@@ -414,6 +414,94 @@ async fn measure_reset_streams(network: &str, streams: usize, poll_stopped: bool
     live_bytes() - baseline
 }
 
+/// What `streams` open uni streams with one byte on them cost on one
+/// connection, with (`ack_wait_tasks`) or without a task per stream shaped as
+/// the one `Outgoing`'s drop leaves for a send waiting for its
+/// acknowledgement: the boxed, polled `stopped()` future (with quinn's
+/// `stopped` map entry it registers), an optional permit and the send-window
+/// epoch, awaited in a spawned task.
+/// The real task also holds the path's `AckWait` guard
+/// (`Option<AckWait>`, an `Arc` and a few words), left out here; it adds at
+/// most 16 B to the future, inside the 384 B charge against the 296 B
+/// measured. The streams stay open (not finished), so
+/// `stopped()` never resolves and no retransmission runs while it is measured.
+async fn measure_ack_waits(network: &str, streams: usize, ack_wait_tasks: bool) -> Live {
+    use futures::FutureExt;
+    let _seed = GlobalRng::seed_guard(SEED);
+    let rig = StreamRig::new(network).await;
+    let (time, raw) = (rig.time.clone(), rig.raw.clone());
+    let warm = raw.clone();
+    drive(&time, LIMIT, async move {
+        let mut send = warm.open_uni().await.expect("open");
+        send.write_all(&[1]).await.expect("write");
+        send.finish().expect("finish");
+    })
+    .await;
+    settle(&time).await;
+    let epoch = Arc::new(());
+    let baseline = live_bytes();
+    let (held, tasks) = drive(&time, LIMIT, async move {
+        let mut held = Vec::with_capacity(streams);
+        let mut tasks = Vec::with_capacity(streams);
+        for _ in 0..streams {
+            let mut send = raw.open_uni().await.expect("open");
+            send.write_all(&[1]).await.expect("write");
+            if ack_wait_tasks {
+                let mut stopped: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = _> + Send + Sync>,
+                > = Box::pin(send.stopped());
+                assert!((&mut stopped).now_or_never().is_none());
+                let slot: Option<tokio::sync::OwnedSemaphorePermit> = None;
+                let epoch = Some(epoch.clone());
+                tasks.push(crate::config::GlobalExecutor::spawn(async move {
+                    let _ended = stopped.await;
+                    drop(slot);
+                    drop(epoch);
+                }));
+            }
+            held.push(send);
+        }
+        (held, tasks)
+    })
+    .await;
+    settle(&time).await;
+    let cost = live_bytes() - baseline;
+    for task in tasks {
+        task.abort();
+    }
+    drop(held);
+    cost
+}
+
+/// A send waiting for its acknowledgement in a task (`Outgoing`'s drop,
+/// bounded per path by `path::ACK_WAITS_WITHOUT_PERMIT` without a permit and
+/// `STREAMED_SEND_LIMIT` with one) costs at most [`QUIC_ACK_WAIT_BYTES`]
+/// beyond its stream, in jemalloc-rounded bytes: the task, the boxed
+/// `stopped()` future and its `stopped` map entry. Measured as the difference
+/// between 32 open streams with such tasks and 32 without, on connections of
+/// their own.
+#[test]
+fn an_ack_wait_task_measures_within_its_pin() {
+    use super::config::QUIC_ACK_WAIT_BYTES;
+    bounded(|| async move {
+        let streams = 32;
+        let with = measure_ack_waits("quic-memory-ack-waits", streams, true).await;
+        let without = measure_ack_waits("quic-memory-no-ack-waits", streams, false).await;
+        let tasks = with.rounded - without.rounded;
+        assert!(
+            tasks > 0,
+            "premise: the tasks left memory: {with:?} against {without:?}"
+        );
+        let per_wait = (tasks as usize).div_ceil(streams);
+        eprintln!("ack wait: {per_wait} B ({with:?} against {without:?})");
+        assert!(
+            per_wait <= QUIC_ACK_WAIT_BYTES,
+            "{per_wait} B per ack wait ({with:?} against {without:?}) exceeds \
+             QUIC_ACK_WAIT_BYTES ({QUIC_ACK_WAIT_BYTES} B); re-measure and raise it"
+        );
+    })
+}
+
 /// Polling `stopped()` on a stream this side then resets costs at most
 /// [`QUIC_STOPPED_ENTRY_BYTES`] per stream until the connection closes, in
 /// jemalloc-rounded bytes: quinn's `stopped` map entry. Measured as the
@@ -932,8 +1020,9 @@ fn quic_memory_figures_match_the_locked_versions() {
 }
 
 /// The fixed charge per connection is the sum the buffer-budget design gives
-/// (888 KiB, the `stopped` map at the reset limit's worst case), and the budget
-/// for what scales with the windows is a sixteenth of node memory. A change to
+/// (930 KiB, the `stopped` map at the reset limit's worst case and the
+/// acknowledgement waits), and the budget for what scales with the windows is
+/// a sixteenth of node memory. A change to
 /// any term moves the first figure, so the design's connection caps are
 /// re-derived with it.
 #[test]
@@ -943,11 +1032,101 @@ fn the_fixed_charge_and_the_buffer_budget_match_the_design() {
         super::recycle::SEND_ABORT_LIMIT as usize * QUIC_STOPPED_ENTRY_BYTES,
         416 * 1024
     );
-    assert_eq!(QUIC_CONNECTION_CHARGE_BYTES, 909_312);
+    assert_eq!(QUIC_CONNECTION_CHARGE_BYTES, 952_320);
     const MIB: usize = 1024 * 1024;
     assert_eq!(quic_buffer_budget_for(1024 * MIB), 64 * MIB);
     assert_eq!(quic_buffer_budget_for(2048 * MIB), 128 * MIB);
     assert_eq!(quic_buffer_budget_for(7600 * MIB), 475 * MIB);
+}
+
+/// The QUIC connection cap and the memory it bounds (#5940 buffer budget):
+/// the floor grants these were derived with, the cap at each host size, the
+/// three labelled terms of the ceiling (each present and non-zero), and the
+/// ceiling within an eighth of memory, the share the aggregate test checks.
+#[test]
+fn the_connection_cap_keeps_quic_within_an_eighth_of_memory() {
+    use super::budget::{floor_grant, floor_window_bytes};
+    use super::config::{
+        QUIC_CONNECTION_CHARGE_BYTES, QUIC_MEMORY_DIVISOR, quic_buffer_budget_for,
+        quic_connection_cap, quic_memory_ceiling, quic_memory_ceiling_terms,
+    };
+    const MIB: usize = 1024 * 1024;
+    const GIB: usize = 1024 * MIB;
+    assert_eq!(QUIC_MEMORY_DIVISOR, 8);
+    assert_eq!(floor_grant(floor_window_bytes(GIB)), 435_712);
+    assert_eq!(floor_grant(floor_window_bytes(2 * GIB)), 706_048);
+    for (memory, cap) in [
+        (GIB / 2, 24),
+        (GIB, 48),
+        (2 * GIB, 80),
+        (4 * GIB, 161),
+        (8 * GIB, 323),
+        (7_600 * MIB, 300),
+    ] {
+        assert_eq!(quic_connection_cap(memory), cap, "{memory}");
+        let terms = quic_memory_ceiling_terms(memory);
+        assert_eq!(
+            terms.map(|(label, _)| label),
+            [
+                "quic_buffer_budget_for",
+                "QUIC_CONNECTION_CHARGE_BYTES",
+                "floor_grant"
+            ]
+        );
+        assert_eq!(terms[0].1, quic_buffer_budget_for(memory));
+        assert_eq!(terms[1].1, cap * QUIC_CONNECTION_CHARGE_BYTES);
+        assert_eq!(
+            terms[2].1,
+            cap * floor_grant(floor_window_bytes(memory)) as usize
+        );
+        assert!(terms.iter().all(|(_, bytes)| *bytes > 0), "{terms:?}");
+        let data_on: usize = terms.iter().map(|(_, bytes)| bytes).sum();
+        assert!(
+            data_on <= memory / QUIC_MEMORY_DIVISOR,
+            "{memory}: {data_on}"
+        );
+        assert_eq!(
+            quic_memory_ceiling(memory),
+            data_on.max(super::config::quic_shadow_memory_ceiling())
+        );
+    }
+}
+
+/// A shadow path's charge is derived from what it grants the peer, each input's
+/// value pinned here: raising a shadow grant (uni streams, the initial window,
+/// the gap cap, the control channel) or this node's control sends per path
+/// fails here until the charge is re-derived. These are constants; the
+/// behaviour they stand for is pinned by
+/// `path::tests::only_a_path_that_takes_data_lets_its_peer_open_streams` (a
+/// shadow peer opens exactly `INITIAL_UNI_STREAMS`),
+/// `tests::endpoint_config_pins_every_value` (the transport parameters),
+/// `path::tests::refused_data_readers_stay_within_the_shadow_stream_grant`
+/// (refused readers stay within the grant) and
+/// `upgrade::machine::tests::control_frames_are_sent_once_per_path`.
+#[test]
+fn a_shadow_path_is_charged_for_what_it_grants() {
+    use super::budget::{GAP_BYTES, MIN_GAPS_PER_CONNECTION};
+    use super::config::{
+        INITIAL_RECEIVE_WINDOW_BYTES, INITIAL_UNI_STREAMS, QUIC_SHADOW_CONNECTION_CHARGE_BYTES,
+        quic_shadow_memory_ceiling,
+    };
+    use super::framing::MAX_CONTROL_BYTES;
+    use super::path::{CONTROL_CHANNEL_CAPACITY, QuicPathLimits};
+    use super::upgrade::machine::CONTROL_SENDS_PER_PATH;
+    assert_eq!(INITIAL_UNI_STREAMS, 4);
+    assert_eq!(INITIAL_RECEIVE_WINDOW_BYTES, 16 * 1024);
+    assert_eq!((MIN_GAPS_PER_CONNECTION, GAP_BYTES), (256, 70));
+    assert_eq!((CONTROL_CHANNEL_CAPACITY, MAX_CONTROL_BYTES), (16, 4096));
+    assert_eq!(CONTROL_SENDS_PER_PATH, 1);
+    // A shadow path refuses data, so its peer's stream limit stays the
+    // endpoint's initial one and nothing raises its window or gap cap.
+    const { assert!(!QuicPathLimits::SHADOW.accept_data) };
+    assert_eq!(
+        QuicPathLimits::SHADOW.control_capacity,
+        CONTROL_CHANNEL_CAPACITY
+    );
+    assert_eq!(QUIC_SHADOW_CONNECTION_CHARGE_BYTES, 498_152);
+    assert_eq!(quic_shadow_memory_ceiling(), 200 * 498_152);
 }
 
 /// Every stream is read unordered from its first byte (`path::inbound`), so

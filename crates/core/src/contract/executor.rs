@@ -1815,13 +1815,13 @@ pub(crate) fn declared_cache_ceiling_terms(
     let quic_ingress = crate::transport::demux::QUIC_INGRESS_QUEUE_BYTES;
     // quinn's buffer for pending QUIC connection attempts (#5940): one
     // endpoint per node, and fixed. Summed whatever `transport-quic` says, as
-    // the ingress queue is. The QUIC flow-control windows and quinn's
-    // per-connection state are NOT summed, so this aggregate does not
-    // account a node's QUIC connections; see `NOT_SUMMED`. The aggregate
-    // step (#5940, PR 5) must sum data paths x (the fixed charge
-    // `QUIC_CONNECTION_CHARGE_BYTES` + the floor grant `quic::budget::floor_grant`)
-    // + the buffer budget `quic_buffer_budget_for`, which holds only growth
-    // above the floor grants.
+    // the ingress queue is. A node's QUIC connections (their flow-control
+    // windows and quinn's per-connection state) are NOT in this cache sum:
+    // they are the transport share, `quic::config::quic_memory_ceiling`
+    // (the buffer budget plus, at the QUIC connection cap, the fixed charge
+    // and the floor grant per connection), which
+    // `declared_caches_plus_hosting_budget_leave_room_for_the_runtime` adds
+    // to the caches and the hosting budget. See `NOT_SUMMED`.
     let quic_incoming = crate::transport::quic::config::INCOMING_BUFFER_TOTAL_BYTES as usize;
     // The delegate context cache (`ctx.write()` bytes). One per node, shared
     // by every executor, so NOT multiplied by the pool.
@@ -3079,8 +3079,8 @@ mod tests {
                 "a measurement of one QUIC connection term (idle connection state, \
                  jemalloc-rounded on linux-gnu), not a ceiling; an input to the \
                  per-path ceiling (memory gate M2, #5940), plus the unmeasured terms \
-                 in the quic::config module doc; summed once a QUIC path cap exists \
-                 (M4, #5940)",
+                 in the quic::config module doc; a term inside \
+                 QUIC_CONNECTION_CHARGE_BYTES, which the QUIC transport share sums",
             ),
             (
                 "QUIC_ACK_TAIL_BYTES",
@@ -3088,14 +3088,16 @@ mod tests {
                  the last ack-eliciting send), not a ceiling; the per-path ceiling \
                  (memory gate M2, #5940) must re-check it against quinn-proto's \
                  behaviour, plus the unmeasured terms in the quic::config module \
-                 doc; summed once a QUIC path cap exists (M4, #5940)",
+                 doc; a term inside QUIC_CONNECTION_CHARGE_BYTES, which the QUIC \
+                 transport share sums",
             ),
             // Buffer-budget terms (#5940): the fixed charge per QUIC connection
             // and the node-wide budget for what scales with the windows. Both
-            // are summed (budget + quic_connections x charge) by the buffer
-            // budget's aggregate-accounting step (PR 5), which must land before
-            // any release carries data on QUIC
-            // (`no_data_share_before_the_quic_budget_is_summed`).
+            // are summed in the QUIC transport share
+            // (`quic::config::quic_memory_ceiling_terms`, budget + cap x
+            // (charge + floor grant)), which the aggregate test adds to these
+            // caches and the hosting budget; the caches keep their own
+            // half-of-memory rule here.
             (
                 "QUIC_OPEN_STREAM_BYTES",
                 "a measurement of one QUIC connection term (one open stream, both \
@@ -3119,17 +3121,49 @@ mod tests {
             ),
             (
                 "QUIC_CONNECTION_CHARGE_BYTES",
-                "the fixed charge per QUIC connection; summed as quic_connections x \
-                 this, plus each data path's floor grant (quic::budget::floor_grant), \
-                 by the buffer budget's aggregate-accounting step (#5940, PR 5), \
-                 before any release carries data on QUIC",
+                "the fixed charge per QUIC connection; summed at the QUIC connection \
+                 cap in the QUIC transport share (quic::config::quic_memory_ceiling), \
+                 which declared_caches_plus_hosting_budget_leave_room_for_the_runtime \
+                 adds to these caches and the hosting budget",
             ),
             (
                 "quic_buffer_budget_for",
                 "the node-wide QUIC buffer budget (memory / 16): the data paths' \
                  window growth above their floor grants (quic::budget), which are \
-                 not in it; summed with data paths x (fixed charge + floor grant) \
-                 by the buffer budget's aggregate-accounting step (#5940)",
+                 not in it; summed in the QUIC transport share \
+                 (quic::config::quic_memory_ceiling) with the fixed charge and floor \
+                 grant per connection at the QUIC connection cap",
+            ),
+            (
+                "QUIC_ACK_WAIT_BYTES",
+                "a measurement of one QUIC acknowledgement wait (task, boxed stopped() \
+                 future, stopped map entry); a term inside QUIC_CONNECTION_CHARGE_BYTES \
+                 and QUIC_SHADOW_CONNECTION_CHARGE_BYTES, which the QUIC transport share sums",
+            ),
+            (
+                "QUIC_SHADOW_CONNECTION_CHARGE_BYTES",
+                "what ONE shadow QUIC path may hold, from what it grants; summed at the \
+                 default connection limit in the QUIC transport share's data-off case \
+                 (quic::config::quic_shadow_memory_ceiling)",
+            ),
+            (
+                "quic_connection_cap",
+                "a COUNT of QUIC connections (how many fit an eighth of memory), not \
+                 bytes; the node's connection limit is lowered to it while it may \
+                 carry QUIC data, and quic_memory_ceiling sums the bytes at it",
+            ),
+            (
+                "quic_memory_ceiling_terms",
+                "the QUIC transport share itself (budget + cap x (charge + floor \
+                 grant)); summed with these caches and the hosting budget by \
+                 declared_caches_plus_hosting_budget_leave_room_for_the_runtime, \
+                 not in this cache sum, which keeps its own half-of-memory rule",
+            ),
+            (
+                "quic_memory_ceiling",
+                "the sum of quic_memory_ceiling_terms, the QUIC transport share; \
+                 summed with these caches and the hosting budget by \
+                 declared_caches_plus_hosting_budget_leave_room_for_the_runtime",
             ),
             (
                 "MAX_CONTROL_BYTES",

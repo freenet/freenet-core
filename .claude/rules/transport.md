@@ -1591,10 +1591,13 @@ not a whole number is ignored with a WARN at startup (only when
 release's value cannot stop the node. On the command line a negative value
 needs `=` (`--quic-max-paths=-1`): with a space clap reads `-1` as a flag and
 refuses the command line, as for every numeric option.
-The default is `max-number-of-connections`, and a larger value is lowered to
-it.
-At the default the limit rarely binds (a permit is held from the offer, so a
-path still closing can briefly hold a slot). A rollback to a release before
+The default is the node's connection limit (`connection_limit().max`:
+`max-number-of-connections`, lowered to the QUIC connection cap while the
+node may carry data), and a larger value is lowered to it. Without data the
+limit rarely binds at the default (a permit is held from the offer, so a path
+still closing can briefly hold a slot). With data on a host under about 5 GiB
+the connection limit is itself the QUIC cap, so the ring and quic-max-paths
+are bounded by the same number. A rollback to a release before
 the key drops it: the older binary rewrites `config.toml` without it. It is
 kebab-case from the start, so it has no `CONFIG_KEY_SPELLINGS` entry.
 
@@ -1703,12 +1706,40 @@ charge, not of the budget: the budget holds only each path's growth above
 it, so a path that arrives never pushes the budget over, whatever the
 others hold. The bound is
 memory <= data paths x (QUIC_CONNECTION_CHARGE_BYTES + floor grant) + budget.
-Until the aggregate step (PR 5) caps data paths, their number is bounded
-only by the connection limit (default 200). PROVISIONAL figures at 200,
-re-sized by PR 5: 1 GiB: 64 MiB + 200 x 1313.5 KiB = 320.5 MiB; 2 GiB:
-128 MiB + 200 x 1577.5 KiB = 436.1 MiB; 7600 MiB gateway: 475 MiB +
-200 x 1577.5 KiB = 783.1 MiB. No data runs on them: QUIC_DATA_PERCENT stays 0
-until PR 5 (`no_data_share_before_the_quic_budget_is_summed`).
+The fixed charge includes the acknowledgement waits a path's dropped sends
+leave (`path::ACK_WAITS_WITHOUT_PERMIT` 64 + STREAMED_SEND_LIMIT 48, each
+QUIC_ACK_WAIT_BYTES 384 B: task, boxed stopped() future and map entry,
+measured 296 B), 952,320 B in all.
+Data paths are bounded by the connection limit, which is lowered to the QUIC
+connection cap (`quic::config::quic_connection_cap`: an eighth of memory, less
+the budget, over fixed charge + floor grant, every connection counted as a data
+path) while the node may carry data (`upgrade::policy::may_carry_data`: prefer
+with a data share above 0, and quic-max-paths not 0; `NetworkApiConfig::connection_limit`,
+applied in `NodeConfig::new`, never below min-number-of-connections; the
+configured value is kept, so config.toml is unchanged). Cap 48 / 80 / 161 / 323 / 300 at
+1 / 2 / 4 / 8 GiB / the 7600 MiB gateway (not monotonic across 2 GiB, where
+the floor window doubles: about 96 just under it), so the default 200 is lowered below
+about 5 GiB; QUIC then holds at most an eighth of memory (128 MiB at 1 GiB).
+A lowered default logs INFO, a lowered explicit setting WARN, and a limit
+min-number-of-connections holds above the cap WARN, lowered or not.
+With data off nothing is lowered, and the bound is per shadow path:
+QUIC_SHADOW_CONNECTION_CHARGE_BYTES (498,152 B), derived from what a shadow
+path GRANTS the peer, not what an honest peer sends (4 uni streams, the
+16 KiB window and its staging cap, 256 gaps, the control channel full, the
+ACK-only tail, and its own single control send: upgrade::machine::CONTROL_SENDS_PER_PATH;
+`a_shadow_path_is_charged_for_what_it_grants` pins each input). At the
+default 200 that is about 95 MiB. A node set to more connections with data
+off holds proportionally more (1,000: about 475 MiB); that is stated, not
+clamped. Below about 760 MiB the data-off bound is above an eighth of memory,
+and the aggregate is checked from 1 GiB up: at 512 MiB with data off,
+caches + hosting + 200 shadow paths come to about 431-464 MB depending on
+pool size (1/4/16) against 75% of memory (403 MB). Stated, not clamped; lowering connections with data off is
+a separate decision. The aggregate test sums the larger of the two cases
+(`quic_memory_ceiling`: data on at the cap, or shadow at 200) with the caches
+and the hosting budget in
+`declared_caches_plus_hosting_budget_leave_room_for_the_runtime`, within 75%.
+The clamp does not know whether QUIC actually runs (the breaker, a failed
+bind): a node that runs without it keeps the lower limit.
   → W + debt: quinn records a shrink as debt paid by later credits; the
     meter mirrors it from the bytes the reader reads (where it can differ,
     it over-estimates). Every window change and every read
@@ -1779,10 +1810,9 @@ the buffers behind sent data, allocators other than jemalloc, CRYPTO-frame
 reassembly (`crypto_buffer_size` 16 KiB, charged in the fixed charge). Some quinn terms depend on
 traffic rate and time rather than configuration, as the UDP transport's
 dedup window and sent-packet tracker do, so the per-path ceiling (memory
-gate M2, #5940) cannot be the sum of these measurements alone. This
-memory is NOT accounted in the node aggregate and must be before QUIC carries
-data by default (before `QUIC_DATA_PERCENT` > 0, pinned by
-`no_data_share_before_the_quic_budget_is_summed`). Shadow paths carry no data, so
+gate M2, #5940) cannot be the sum of these measurements alone. The node
+aggregate sums this memory as the fixed charge and floor grant per connection
+at the QUIC connection cap, plus the buffer budget (above). Shadow paths carry no data, so
 what they hold is the fixed per-path terms, and Step 2's gate watches that as
 RSS against `quic_paths_active`. The fixed
 node-wide endpoint buffers are summed whatever `transport-quic` says:
@@ -2222,7 +2252,7 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   on a closed connection) and closes the connection past
   recycle::SEND_ABORT_LIMIT (4096) with close code SEND_ABORT_LIMIT (M6).
   The fixed charge per connection (config::QUIC_CONNECTION_CHARGE_BYTES,
-  888 KiB) takes the map at that worst case, 4096 x QUIC_STOPPED_ENTRY_BYTES
+  930 KiB) takes the map at that worst case, 4096 x QUIC_STOPPED_ENTRY_BYTES
   (104 B, measured 88 B). Polling stopped() only after finish() would not
   avoid the entries: a writer blocked on connection credit must still race
   stopped() (below), so the poll stays on every wait and the common resets
@@ -2586,7 +2616,9 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   NOT_ACCEPTING_DATA and closes the path with DOWNGRADE REFUSAL_CLOSE_DELAY (2 s)
   later (closed_refusing_data, a WARN once per path). The delay lets the stops
   reach the sender first: a sender that sees the close before a stream's stop
-  drops the stream, where the stop sends it on UDP. Without the close, a Short of
+  drops the stream, where the stop sends it on UDP. The receive task arms the
+  one delayed close per path, and refused readers stay within the stream grant
+  (refused_data_readers_stay_within_the_shadow_stream_grant). Without the close, a Short of
   one packet is acknowledged before its stop arrives, so its sender reads Sent,
   never clears send_data and loses every short on the path. The pair then
   negotiates again after the normal backoff. Residual: a one-packet short sent

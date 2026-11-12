@@ -4683,6 +4683,8 @@ mod tests {
         for (label, limit) in [
             ("1 GiB VPS", GIB),
             ("2 GiB peer", 2 * GIB),
+            ("4 GiB host", 4 * GIB),
+            ("8 GiB host", 8 * GIB),
             ("gateway", 7_600 * 1024 * 1024),
         ] {
             for pool_size in [1, 4, MAX_POOL_SIZE] {
@@ -4690,10 +4692,15 @@ mod tests {
                     crate::contract::declared_cache_ceiling(limit as usize, pool_size) as u64;
                 let hosting =
                     resident_overhead_budget_for(limit, DEFAULT_RESIDENT_OVERHEAD_MEM_SHARE);
+                // QUIC, data on or off (#5940 buffer budget): the larger of
+                // every connection a data path at the connection cap, and
+                // every connection a shadow path at the default limit.
+                let transport =
+                    crate::transport::quic::config::quic_memory_ceiling(limit as usize) as u64;
                 assert!(
-                    caches + hosting <= limit / 4 * 3,
+                    caches + hosting + transport <= limit / 4 * 3,
                     "{label} with {pool_size} workers: caches {caches} + hosting {hosting} \
-                     must stay within 75% of {limit}"
+                     + QUIC transport {transport} must stay within 75% of {limit}"
                 );
             }
         }

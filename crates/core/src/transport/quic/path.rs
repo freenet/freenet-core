@@ -801,6 +801,9 @@ pub(crate) struct QuicPath {
     /// The receive side's staged bytes. Tests only.
     #[cfg(test)]
     inbound_staging: Arc<inbound::ConnStaging>,
+    /// The most stream readers the receive side held at once. Tests only.
+    #[cfg(test)]
+    inbound_readers_peak: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// The path never had both data bits: nothing may send data on it.
@@ -980,6 +983,8 @@ impl QuicPath {
         let inbound_ranges = receiver.ranges();
         #[cfg(test)]
         let inbound_staging = receiver.staging();
+        #[cfg(test)]
+        let inbound_readers_peak = receiver.readers_peak();
         let receiver_rtt = receiver.path_rtt();
         let aborts = Arc::new(SendAborts::new(
             limits.max_send_aborts,
@@ -1057,6 +1062,8 @@ impl QuicPath {
                 inbound_ranges,
                 #[cfg(test)]
                 inbound_staging,
+                #[cfg(test)]
+                inbound_readers_peak,
             },
             controls,
         )
@@ -1105,6 +1112,13 @@ impl QuicPath {
     #[cfg(test)]
     pub(in crate::transport) fn inbound_gaps_peak(&self) -> usize {
         self.inbound_ranges.peak()
+    }
+
+    /// The most stream readers the receive side held at once. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport) fn inbound_readers_peak(&self) -> usize {
+        self.inbound_readers_peak
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Staged bytes the receive side holds now. Tests only.

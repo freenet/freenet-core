@@ -1415,7 +1415,11 @@ impl P2pConnManager {
                             .unwrap_or(
                                 crate::transport::global_bandwidth::DEFAULT_MIN_PER_CONNECTION,
                             ),
-                        config.config.network_api.max_connections,
+                        // The limit the ring runs with, lowered for QUIC
+                        // memory where it applies (`NodeConfig::new`).
+                        config
+                            .max_number_conn
+                            .unwrap_or(config.config.network_api.max_connections),
                     );
                     // Phase 1.6 shadow telemetry (#4074): expose the
                     // effective aggregate rate R to the demand aggregator.
