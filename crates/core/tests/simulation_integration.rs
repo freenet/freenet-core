@@ -22616,7 +22616,7 @@ fn native_floor_for_tests() -> (u8, u8, u16) {
 /// on an undecodable message. Fails closed: each count must be above zero.
 #[test_log::test]
 fn test_quic_native_offer_and_decision_reach_the_wire() {
-    const SEED: u64 = 0x5940_A3_0001;
+    const SEED: u64 = 0x0059_40A3_0001;
     let run = run_native_wire_sim("native-wire-v2", SEED, |sim| {
         sim.enable_gateway_ack_version();
         sim.with_quic_native_floor(native_floor_for_tests());
@@ -22660,7 +22660,7 @@ fn test_quic_native_offer_and_decision_reach_the_wire() {
 #[test_log::test]
 fn test_quic_native_pre_floor_nodes_never_receive_the_native_variants() {
     use freenet::dev_tool::NodeLabel;
-    const SEED: u64 = 0x5940_A3_0002;
+    const SEED: u64 = 0x0059_40A3_0002;
     let (min, real) = (
         SimNetwork::min_compatible_protocol_version(),
         SimNetwork::real_protocol_version(),
@@ -22724,7 +22724,7 @@ fn test_quic_native_pre_floor_nodes_never_receive_the_native_variants() {
 /// encoding) forms the same mesh, edge for edge.
 #[test_log::test]
 fn test_quic_native_zero_percent_forms_the_same_mesh() {
-    const SEED: u64 = 0x5940_A3_0003;
+    const SEED: u64 = 0x0059_40A3_0003;
     let off = run_native_wire_sim("native-wire-off", SEED, |sim| {
         sim.enable_gateway_ack_version();
     });

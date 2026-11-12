@@ -659,7 +659,6 @@ impl RelayState {
     /// `now` is passed in (not derived from `Instant::now()`) so callers can
     /// provide a consistent timestamp shared with other time-sensitive operations
     /// in the same routing decision.
-
     fn forward_to_peer<C: RelayContext>(
         &mut self,
         _ctx: &C,
