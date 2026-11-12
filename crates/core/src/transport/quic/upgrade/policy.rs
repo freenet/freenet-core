@@ -927,7 +927,11 @@ mod tests {
             DataShare::Fixed(40),
             "quic-data-percent replaces the ramp"
         );
-        assert_eq!(DataShare::of(None, None), DataShare::Fixed(0), "no ramp");
+        assert_eq!(
+            DataShare::of(None, None),
+            DataShare::Fixed(QUIC_DATA_PERCENT),
+            "no ramp: the release's fixed share"
+        );
         let shadow = policy("shadow", None);
         assert_eq!(
             shadow.own_caps_with(ramp, &local, &peers[0], at(start + 30 * 3600)),
