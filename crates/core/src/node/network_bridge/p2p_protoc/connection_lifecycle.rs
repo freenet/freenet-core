@@ -459,7 +459,7 @@ impl P2pConnManager {
         // Forget this peer's subscriptions and cached contract state, only
         // when no other open connection is bound to its key. A connection
         // that never named a peer has none.
-        let removed = self.connections.remove(&peer_addr);
+        let removed = self.remove_connection(peer_addr);
         if let Some(pub_key) = &pub_key_to_remove {
             self.release_identity(peer_addr, pub_key, true).await;
         }
@@ -525,7 +525,7 @@ impl P2pConnManager {
         // The peer's subscriptions and cached contract state are forgotten
         // only when no other open connection is bound to its key (a
         // connection that never named a peer has none).
-        let removed = self.connections.remove(&peer_addr);
+        let removed = self.remove_connection(peer_addr);
         if let Some(pub_key) = &pub_key_to_remove {
             self.release_identity(peer_addr, pub_key, true).await;
         }
@@ -1482,7 +1482,7 @@ impl P2pConnManager {
         // suspend/resume), replace it. Dropping the old sender causes its
         // peer_connection_listener to fire TransportClosed; the connection_id mechanism
         // ensures that stale event won't remove the new entry.
-        if let Some(old) = self.connections.remove(&peer_addr) {
+        if let Some(old) = self.remove_connection(peer_addr) {
             self.record_identity_teardown(peer_addr, &old);
 
             // Full cleanup: handle both transient and ring-promoted connections.
@@ -1583,7 +1583,7 @@ impl P2pConnManager {
         );
         let now = Instant::now();
         let link_use = zombie_sweep::LinkUseStamp::new(now);
-        self.connections.insert(
+        self.insert_connection(
             peer_addr,
             ConnectionEntry {
                 sender: tx,
@@ -1694,6 +1694,7 @@ impl P2pConnManager {
         let propagation = crate::operations::update::propagation_stats::PropagationSink::of(
             &self.bridge.op_manager,
         );
+        let native_wire = self.bridge.op_manager.ring.connection_manager.native_wire();
         tokio::spawn(async move {
             peer_connection_listener(
                 rx,
@@ -1704,6 +1705,7 @@ impl P2pConnManager {
                 outbound_mix,
                 propagation,
                 link_use,
+                native_wire,
             )
             .await;
         });
@@ -2168,7 +2170,7 @@ impl P2pConnManager {
                     }
                 }
                 // Look up the connection directly by address
-                if let Some(entry) = self.connections.remove(&remote_addr) {
+                if let Some(entry) = self.remove_connection(remote_addr) {
                     self.record_identity_teardown(remote_addr, &entry);
                     tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, peer = ?entry.pub_key(), socket_addr = %remote_addr, conn_map_size = self.connections.len(), "[CONN_TRACK] REMOVE: TransportClosed - removing from connections HashMap");
                     let prune_result = self

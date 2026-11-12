@@ -507,7 +507,15 @@ is not activity by itself) and the endpoint's state (`quic_endpoint`: `up`, or
 `unknown` before the node reaches the bind; set at startup after the breaker
 gate, at the bind, and at the endpoint's death, which is final for the process;
 a state that is never reset and is not activity by itself) and QUIC connections this node closed, by close code
-(`quic_close_sent_<label>`, one per `QuicCloseCode`) and the shadow-mode upgrade
+(`quic_close_sent_<label>`, one per `QuicCloseCode`), the QUIC-native connect
+offer and decision (`connect_native_offered_{zero,nonzero}` built as joiner,
+`connect_native_decided_{native,udp}` made as acceptor for an offered request,
+`connect_native_decision_{without_offer,native_unsupported}` for a `Native`
+decision a joiner could not use, `connect_native_decision_over_cap` for one
+dropped unanswered past the per-CONNECT cap on refused acceptors, and the last
+offer as states
+`connect_native_offer_{level,percent,ready}`; see
+`operations/connect/native.rs`) and the shadow-mode upgrade
 telemetry (below, "Upgrade telemetry"). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
 path writes are single relaxed atomics; `SentPacketTracker` keeps an
@@ -2020,9 +2028,9 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   sent is NOT delivered. send_stream_chunks_bounded resets the stream if the
   source fails or delivers a different length, and takes nothing before the
   source's first chunk (no permit, no stream; a source that ends or fails first
-  opens no stream). quinn's MAX_UNI_STREAMS (64)
-  uni streams are the back-pressure (open_uni waits; quinn returns
-  credit only after more than an eighth of the limit is freed).
+  opens no stream). The peer's current uni-stream limit (16 on a data path,
+  rising to 64, MAX_UNI_STREAMS) is the back-pressure (open_uni waits; quinn
+  returns credit only after more than an eighth of the limit is freed).
   Slot reservation: send_stream_bounded / send_stream_chunks_bounded, and
   send_short_bounded for a message past one packet (fits_one_packet), each
   take one of the path's STREAMED_SEND_LIMIT semaphore permits before
@@ -2696,7 +2704,8 @@ QUIC receive flow (#5940 e5b-4):
   not hold the sender's flow-control credit; its end stays unread until it is
   announced. A Short waits BEFORE its end is read
   (reading the end frees the stream and returns its credit), so waiters are
-  capped by MAX_UNI_STREAMS. A Short of one packet or less
+  capped by this node's current stream limit for the peer (16 on a data
+  path, rising to 64). A Short of one packet or less
   (fits_one_packet) is not charged, as on UDP, and is bounded by that cap and
   the channel. A Stream arm with no registry
   cancels the handle and releases its charge.

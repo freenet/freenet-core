@@ -327,6 +327,11 @@ pub(crate) struct QuicPathLimits {
     /// ([`staging_cap_without_meter`]). A metered path's follows its credit.
     #[cfg(test)]
     pub(crate) staging_cap: Option<usize>,
+    /// While the flag is set, the receive side cancels the handle of the
+    /// next Stream it admits, before its announce, and clears the flag: a
+    /// test of how a stream cancelled that early ends.
+    #[cfg(test)]
+    pub(crate) cancel_next_admitted: Option<&'static std::sync::atomic::AtomicBool>,
 }
 
 /// The cap of a connection's staged bytes on a path with no buffer budget
@@ -376,6 +381,8 @@ impl QuicPathLimits {
         max_gaps: inbound::MAX_GAPS_PER_CONNECTION,
         #[cfg(test)]
         staging_cap: None,
+        #[cfg(test)]
+        cancel_next_admitted: None,
     };
 
     /// [`Self::DEFAULT`] for a path in shadow mode: control frames only.
@@ -954,6 +961,7 @@ impl QuicPath {
         #[cfg(test)]
         {
             receiver.panic_on_stream = limits.panic_in_receive;
+            receiver.cancel_next_admitted = limits.cancel_next_admitted;
             receiver.set_gap_cap(limits.max_gaps);
         }
         // A path that reads data lets the peer open
@@ -1535,6 +1543,12 @@ impl QuicPath {
     pub(crate) fn control_first(&self) -> ControlFirst {
         self.controls_opening.pending.fetch_add(1, Ordering::SeqCst);
         ControlFirst(Arc::clone(&self.controls_opening))
+    }
+
+    /// Control frames holding a reservation now. Tests only.
+    #[cfg(test)]
+    pub(crate) fn controls_reserved(&self) -> usize {
+        self.controls_opening.pending.load(Ordering::SeqCst)
     }
 
     /// [`Self::send_control_bounded`] with a reservation taken earlier

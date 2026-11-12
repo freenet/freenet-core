@@ -222,6 +222,15 @@ pub(crate) async fn start_client_connect_counted(
 
     let request_msg =
         super::prepare_join_request(tx, &own, &gateway, desired_location, ttl, &exclude_addrs);
+    // The offer this request carries, against which a response's QUIC-native
+    // decision is judged.
+    let sent_offer = match &request_msg {
+        ConnectMsg::Request { payload, .. } => payload.native_offer,
+        ConnectMsg::Response { .. }
+        | ConnectMsg::ObservedAddress { .. }
+        | ConnectMsg::Rejected { .. }
+        | ConnectMsg::ConnectFailed { .. } => None,
+    };
 
     if let Some(event) = NetEventLog::connect_request_sent(
         &tx,
@@ -278,6 +287,7 @@ pub(crate) async fn start_client_connect_counted(
         receiver,
         op_manager,
         kind,
+        sent_offer,
         &mut connected,
     );
 
@@ -375,6 +385,7 @@ async fn drive_client_connect(
     mut receiver: mpsc::Receiver<WaiterReply>,
     op_manager: &OpManager,
     kind: ClientConnectKind,
+    sent_offer: Option<super::native::NativeOffer>,
     connected_dials: &mut usize,
 ) -> Result<ClientConnectEnd, OpError> {
     use futures::StreamExt;
@@ -387,6 +398,14 @@ async fn drive_client_connect(
     };
 
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
+    // Acceptors that decided `Native`, which this build cannot dial: each is
+    // counted and reported upstream once, whatever duplicates arrive. The
+    // acceptor in a response is named by whoever sent it, so this holds at
+    // most `refused_native_cap` (the most acceptors this CONNECT takes);
+    // further `Native` responses are dropped unanswered and counted, so a
+    // misbehaving relay cannot grow it or the `ConnectFailed` traffic.
+    let refused_native_cap = acceptor_limit(target_connections);
+    let mut refused_native: HashSet<PeerKeyLocation> = HashSet::new();
     // `connected_dials`: acceptors actually connected. `accepted` also holds
     // acceptors still queued or being dialled, so it cannot decide that the
     // target is reached.
@@ -761,8 +780,74 @@ async fn drive_client_connect(
                     continue;
                 }
 
-                if accepted.contains(&payload.acceptor) {
+                #[cfg(any(test, feature = "testing"))]
+                if let Some(addr) = payload.acceptor.socket_addr() {
+                    super::wire::sim_trace::record_at(
+                        addr,
+                        super::wire::sim_trace::NativeWireEvent::JoinerResponse {
+                            with_decision: payload.native_decision.is_some(),
+                        },
+                    );
+                }
+                if accepted.contains(&payload.acceptor)
+                    || refused_native.contains(&payload.acceptor)
+                {
                     // Duplicate acceptor — ignore.
+                    continue;
+                }
+
+                // `None` and `Udp` go on as today. This build has no native
+                // dial, so a `Native` decision cannot be honoured: the attempt
+                // with this acceptor fails, is counted by why, and is reported
+                // upstream as `ConnectFailed` like a failed punch, so the relay
+                // re-routes and the acceptor's reservation is released.
+                if let Err(failure) =
+                    super::native::joiner_response_action(sent_offer, payload.native_decision)
+                {
+                    if refused_native.len() >= refused_native_cap {
+                        crate::transport::metrics::TRANSPORT_METRICS
+                            .record_connect_native_decision_over_cap();
+                        tracing::debug!(
+                            tx = %tx,
+                            acceptor = %payload.acceptor,
+                            "connect driver: Native response past the refused-acceptor cap; \
+                             dropped"
+                        );
+                        continue;
+                    }
+                    crate::transport::metrics::TRANSPORT_METRICS
+                        .record_connect_native_decision_failure(failure);
+                    tracing::warn!(
+                        tx = %tx,
+                        acceptor = %payload.acceptor,
+                        ?failure,
+                        "connect driver: acceptor decided a native connection this node \
+                         cannot set up; reporting it failed"
+                    );
+                    refused_native.insert(payload.acceptor.clone());
+                    if collection_end.is_none() {
+                        if let Some(failed_acceptor_addr) = payload.acceptor.socket_addr() {
+                            let failed_msg = ConnectMsg::ConnectFailed {
+                                id: tx,
+                                failed_acceptor_addr,
+                            };
+                            if let Err(e) = op_manager
+                                .notify_node_event(NodeEvent::SendNetMessage {
+                                    target: gateway_addr,
+                                    msg: Box::new(NetMessage::V1(NetMessageV1::Connect(
+                                        failed_msg,
+                                    ))),
+                                })
+                                .await
+                            {
+                                tracing::warn!(
+                                    tx = %tx,
+                                    error = %e,
+                                    "connect driver: failed to emit ConnectFailed"
+                                );
+                            }
+                        }
+                    }
                     continue;
                 }
 
@@ -927,6 +1012,21 @@ struct AcceptorDial {
     acceptor: PeerKeyLocation,
     acceptor_addr: SocketAddr,
     result: Option<crate::message::ConnectResult>,
+}
+/// Records an accept in the simulation's native-wire trace: whether the
+/// request carried an offer (the response carries a decision exactly then),
+/// and whether it was accepted after a `Rejected` or `ConnectFailed` re-route.
+fn trace_accept(upstream: SocketAddr, response: &super::ConnectResponse, retry: bool) {
+    #[cfg(any(test, feature = "testing"))]
+    super::native_wire_trace::record_at(
+        upstream,
+        super::native_wire_trace::NativeWireEvent::Accepted {
+            with_offer: response.native_decision.is_some(),
+            retry,
+        },
+    );
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = (upstream, response, retry);
 }
 
 /// Starts the hole punch to `acceptor`, whose Response arrived at
@@ -1289,6 +1389,7 @@ async fn drive_relay_connect(
         ) {
             op_manager.ring.register_events(Either::Left(event)).await;
         }
+        trace_accept(upstream_addr, &accept.response, false);
         let mut ctx = op_manager.op_ctx(incoming_tx);
         ctx.send_fire_and_forget(
             upstream_addr,
@@ -1464,6 +1565,7 @@ async fn drive_relay_connect(
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
                     dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner).await?;
+                    trace_accept(upstream_addr, &accept.response, true);
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
                         upstream_addr,
@@ -1635,6 +1737,7 @@ async fn drive_relay_connect(
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
                     dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner).await?;
+                    trace_accept(upstream_addr, &accept.response, true);
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
                         upstream_addr,
@@ -2165,7 +2268,7 @@ mod tests {
         );
         assert!(
             counted.contains("kind:ClientConnectKind,")
-                && counted.contains("op_manager,kind,&mutconnected,);"),
+                && counted.contains("op_manager,kind,sent_offer,&mutconnected,);"),
             "start_client_connect_counted must forward its kind to the driver"
         );
         let body = item(&driver, "async fn drive_client_connect(", "\n}\n");
@@ -2245,6 +2348,7 @@ mod driver_timing_tests {
             receiver,
             op_manager,
             kind,
+            Some(super::super::native::NativeOffer::capable(0)),
             &mut connected,
         )
         .await
@@ -2361,6 +2465,7 @@ mod driver_timing_tests {
                 id: tx,
                 payload: ConnectResponse {
                     acceptor: acceptor.clone(),
+                    native_decision: None,
                 },
             },
         )))
@@ -2524,6 +2629,68 @@ mod driver_timing_tests {
             "the late acceptor must be dialled; dials {:?}",
             log.dials
         );
+    }
+
+    /// The relay's "holds a transport to the joiner" input, read from the
+    /// ring when it decides: a ring connection under the joiner's key (at any
+    /// address), a ring connection at the joiner's address (under any key),
+    /// or a transient transport at its address. Each is read live, so one
+    /// made after the request arrived counts.
+    #[tokio::test(start_paused = true)]
+    async fn the_relay_reads_held_transports_from_the_ring_when_it_decides() {
+        use crate::operations::connect::{RelayContext, RelayEnv};
+        let (op_manager, events) = op_manager_with_events("relay-holds-transport").await;
+        std::mem::forget(events);
+        let connections = &op_manager.ring.connection_manager;
+        let env = RelayEnv::new(&op_manager);
+
+        let by_key = peer(24901);
+        assert!(!env.holds_transport_to(&by_key), "nothing held yet");
+        let other_addr = peer(24902).socket_addr().unwrap();
+        assert!(connections.add_connection(
+            Location::from_address(&other_addr),
+            other_addr,
+            by_key.pub_key().clone(),
+            false,
+        ));
+        assert!(env.holds_transport_to(&by_key), "same key, other address");
+
+        let by_addr = peer(24903);
+        let addr = by_addr.socket_addr().unwrap();
+        assert!(!env.holds_transport_to(&by_addr));
+        assert!(connections.add_connection(
+            Location::from_address(&addr),
+            addr,
+            TransportKeypair::new().public().clone(),
+            false,
+        ));
+        assert!(env.holds_transport_to(&by_addr), "same address, other key");
+
+        let transient = peer(24904);
+        assert!(!env.holds_transport_to(&transient));
+        assert!(connections.try_register_transient(transient.socket_addr().unwrap(), None));
+        assert!(env.holds_transport_to(&transient), "a transient transport");
+
+        // A gateway's joiner that has not been promoted: its transient entry
+        // expires after the TTL while the bridge keeps the transport open.
+        let unpromoted = peer(24906);
+        let addr = unpromoted.socket_addr().unwrap();
+        connections.note_transport_open(addr);
+        assert!(connections.try_register_transient(addr, None));
+        tokio::time::advance(connections.transient_ttl() + Duration::from_secs(1)).await;
+        connections.cleanup_expired_transients();
+        assert!(
+            !connections.is_transient(addr),
+            "premise: the entry expired"
+        );
+        assert!(
+            env.holds_transport_to(&unpromoted),
+            "the transport is still open past the transient TTL"
+        );
+        connections.note_transport_closed(addr);
+        assert!(!env.holds_transport_to(&unpromoted), "closed");
+
+        assert!(!env.holds_transport_to(&peer(24905)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -3210,6 +3377,204 @@ mod driver_timing_tests {
         log
     }
 
+    fn response_deciding(
+        tx: Transaction,
+        acceptor: &PeerKeyLocation,
+        decision: Option<crate::operations::connect::native::NativeDecision>,
+    ) -> WaiterReply {
+        WaiterReply::Reply(NetMessage::V1(NetMessageV1::Connect(
+            ConnectMsg::Response {
+                id: tx,
+                payload: ConnectResponse {
+                    acceptor: acceptor.clone(),
+                    native_decision: decision,
+                },
+            },
+        )))
+    }
+
+    /// What a joiner did with the responses it got.
+    struct DecisionRun {
+        /// The acceptors it dialled.
+        dialled: Vec<SocketAddr>,
+        /// Every acceptor's address, by index.
+        all: Vec<SocketAddr>,
+        /// The acceptors it reported to the gateway as failed.
+        connect_failed: Vec<SocketAddr>,
+        /// The CONNECT's acceptor limit.
+        acceptor_limit: usize,
+    }
+
+    /// Runs a joiner that sent `sent_offer` against `responses`, each an
+    /// acceptor's index and its decision (an index may repeat, for a
+    /// duplicate response).
+    async fn dials_for_decisions(
+        name: &str,
+        sent_offer: Option<crate::operations::connect::native::NativeOffer>,
+        responses: Vec<(
+            usize,
+            Option<crate::operations::connect::native::NativeDecision>,
+        )>,
+    ) -> DecisionRun {
+        let (op_manager, events) = op_manager_with_events(name).await;
+        connect_existing_peer(&op_manager, 24949);
+        let log = scripted_event_loop(events, vec![]);
+        let tx = Transaction::new::<ConnectMsg>();
+        let gateway = peer(24950);
+        let count = responses.iter().map(|(i, _)| i + 1).max().unwrap_or(0);
+        let acceptors: Vec<_> = (0..count as u16).map(|i| peer(24951 + i)).collect();
+        let (replies_tx, replies_rx) = mpsc::channel(responses.len().max(1));
+        for (index, decision) in responses {
+            replies_tx
+                .send(response_deciding(tx, &acceptors[index], decision))
+                .await
+                .unwrap();
+        }
+        drop(replies_tx);
+        let mut connected = 0;
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            super::drive_client_connect(
+                tx,
+                gateway.clone(),
+                gateway.socket_addr().unwrap(),
+                Location::new(0.5),
+                op_manager.ring.connection_manager.min_connections,
+                false,
+                replies_rx,
+                &op_manager,
+                ClientConnectKind::Standard,
+                sent_offer,
+                &mut connected,
+            ),
+        )
+        .await
+        .expect("bounded")
+        .expect("driver result");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let log = log.lock();
+        DecisionRun {
+            dialled: log.dials.iter().map(|(addr, _)| *addr).collect(),
+            all: acceptors.iter().map(|a| a.socket_addr().unwrap()).collect(),
+            connect_failed: log.connect_failed.clone(),
+            acceptor_limit: crate::operations::connect::bootstrap::acceptor_limit(
+                op_manager.ring.connection_manager.min_connections,
+            ),
+        }
+    }
+
+    fn decision_failures_here() -> (u64, u64) {
+        let [without_offer, unsupported] =
+            crate::transport::metrics::NATIVE_DECISION_FAILURES_ON_THIS_THREAD.with(|c| c.get());
+        (without_offer, unsupported)
+    }
+
+    /// A response deciding `Native` to a joiner that offered 0 cannot be
+    /// honoured: that acceptor is not dialled, it is reported to the gateway
+    /// as failed (so the relay re-routes), and it counts as a decision without
+    /// an offer. `Udp`, no decision and an unknown decision are dialled as
+    /// today. (One run per test: an `OpManager` per test runtime.)
+    #[tokio::test(start_paused = true)]
+    async fn a_native_decision_to_a_zero_offer_fails_the_attempt() {
+        use crate::operations::connect::native::{NativeDecision, NativeOffer};
+        let before = decision_failures_here();
+        let run = dials_for_decisions(
+            "native-decision-zero-offer",
+            Some(NativeOffer::capable(0)),
+            vec![
+                (0, None),
+                (1, Some(NativeDecision::Udp)),
+                (2, Some(NativeDecision::Native)),
+                (3, Some(NativeDecision::Unknown(9))),
+            ],
+        )
+        .await;
+        assert_eq!(
+            run.dialled,
+            vec![run.all[0], run.all[1], run.all[3]],
+            "only the Native one is skipped"
+        );
+        assert_eq!(run.connect_failed, vec![run.all[2]]);
+        assert_eq!(decision_failures_here(), (before.0 + 1, before.1));
+    }
+
+    /// `Native` responses from more distinct acceptors than the CONNECT's
+    /// acceptor limit: the first `limit` are counted and reported, the rest
+    /// are dropped with no message and counted as over the cap. A `Udp`
+    /// response after them is still dialled.
+    #[tokio::test(start_paused = true)]
+    async fn native_decisions_past_the_acceptor_limit_are_dropped_and_counted() {
+        use crate::operations::connect::native::{NativeDecision, NativeOffer};
+        let over_cap = || {
+            crate::transport::metrics::NATIVE_DECISIONS_OVER_CAP_ON_THIS_THREAD
+                .with(std::cell::Cell::get)
+        };
+        const NATIVE: usize = 200;
+        let before = (decision_failures_here(), over_cap());
+        let mut responses: Vec<_> = (0..NATIVE)
+            .map(|i| (i, Some(NativeDecision::Native)))
+            .collect();
+        responses.push((NATIVE, Some(NativeDecision::Udp)));
+        let run = dials_for_decisions(
+            "native-decision-over-cap",
+            Some(NativeOffer::capable(30)),
+            responses,
+        )
+        .await;
+        let limit = run.acceptor_limit;
+        assert!(
+            limit < NATIVE,
+            "premise: more Native responses than the limit"
+        );
+        assert_eq!(run.connect_failed, run.all[..limit].to_vec());
+        assert_eq!(
+            decision_failures_here(),
+            (before.0.0, before.0.1 + limit as u64)
+        );
+        assert_eq!(over_cap(), before.1 + (NATIVE - limit) as u64);
+        assert_eq!(run.dialled, vec![run.all[NATIVE]]);
+    }
+
+    /// A duplicate of a `Native` response is ignored: one count, one report.
+    #[tokio::test(start_paused = true)]
+    async fn a_duplicate_native_decision_counts_once() {
+        use crate::operations::connect::native::{NativeDecision, NativeOffer};
+        let before = decision_failures_here();
+        let run = dials_for_decisions(
+            "native-decision-duplicate",
+            Some(NativeOffer::capable(30)),
+            vec![
+                (0, Some(NativeDecision::Native)),
+                (0, Some(NativeDecision::Native)),
+                (1, Some(NativeDecision::Udp)),
+            ],
+        )
+        .await;
+        assert_eq!(run.dialled, vec![run.all[1]]);
+        assert_eq!(run.connect_failed, vec![run.all[0]]);
+        assert_eq!(decision_failures_here(), (before.0, before.1 + 1));
+    }
+
+    /// The same for a joiner that offered above 0: counted as unsupported,
+    /// since this build has no native dial.
+    #[tokio::test(start_paused = true)]
+    async fn a_native_decision_to_a_real_offer_fails_the_attempt() {
+        use crate::operations::connect::native::{NativeDecision, NativeOffer};
+        let before = decision_failures_here();
+        let run = dials_for_decisions(
+            "native-decision-real-offer",
+            Some(NativeOffer::capable(30)),
+            vec![
+                (0, Some(NativeDecision::Native)),
+                (1, Some(NativeDecision::Udp)),
+            ],
+        )
+        .await;
+        assert_eq!(run.dialled, run.all[1..].to_vec());
+        assert_eq!(run.connect_failed, vec![run.all[0]]);
+        assert_eq!(decision_failures_here(), (before.0, before.1 + 1));
+    }
+
     /// When the waiter closes, acceptors already taken are still dialled,
     /// queued ones included (review item 2: a connected peer dials one at a
     /// time, so the second acceptor is queued when the waiter closes), but a
@@ -3292,6 +3657,7 @@ mod driver_timing_tests {
                 replies_rx,
                 &op_manager,
                 ClientConnectKind::Standard,
+                Some(super::super::native::NativeOffer::capable(0)),
                 &mut connected,
             ),
             expire

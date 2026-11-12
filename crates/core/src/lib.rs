@@ -109,6 +109,8 @@ pub mod dev_tool {
         write_backend_marker,
     };
     #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::connect::native_wire_trace::NativeWireTrace;
+    #[cfg(any(test, feature = "testing"))]
     pub use crate::transport::quic::upgrade::sim_trace::{QuicUpgradeRecord, QuicUpgradeTrace};
     // Backend constructors live in the `kek` submodule rather than the
     // top-level `config` re-export to keep `Config`'s public surface

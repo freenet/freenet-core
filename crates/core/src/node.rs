@@ -62,7 +62,7 @@ pub(crate) use network_bridge::broadcast_queue_metrics::BROADCAST_QUEUE_EFFICIEN
 // re-export rather than a path through `network_bridge` directly. Mirrors
 // `BROADCAST_STREAM_METRICS` above.
 pub(crate) use network_bridge::p2p_protoc::{
-    BROADCAST_TARGET_LIST_MIN_VERSION, HASH_FIRST_SUMMARIES_MIN_VERSION,
+    BROADCAST_TARGET_LIST_MIN_VERSION, HASH_FIRST_SUMMARIES_MIN_VERSION, QUIC_NATIVE_MIN_VERSION,
     SUMMARY_FIRST_PUT_MIN_VERSION, version_supports_broadcast_target_list,
     version_supports_hash_first_summaries, version_supports_summary_first_put,
 };
@@ -521,6 +521,24 @@ pub struct NodeConfig {
     /// its version changes. `None` in production. `#[serde(skip)]`.
     #[serde(skip)]
     pub(crate) advertised_version_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the QUIC-native wire floor
+    /// ([`QUIC_NATIVE_MIN_VERSION`], #5940), read by the connection listener
+    /// as `quic_native_floor_override.unwrap_or(QUIC_NATIVE_MIN_VERSION)`.
+    /// Until the release that ships the decoder, the real floor is above every
+    /// version a test runs, so a test that wants the native wire variants on
+    /// the wire must lower it (`SimNetwork::with_quic_native_floor`). `None`
+    /// in production. `#[serde(skip)]`.
+    #[serde(skip)]
+    pub(crate) quic_native_floor_override: Option<(u8, u8, u16)>,
+    /// Simulation-only: decode the QUIC-native wire variants as a release
+    /// below their floor does, failing the message and closing the
+    /// connection, and never emit them
+    /// (`SimNetwork::with_node_pre_floor_native_decoder`). Combined with an
+    /// advertised pre-floor version, the node stands in for an older peer
+    /// whose decoder lacks the variants. `false` in production.
+    /// `#[serde(skip)]`.
+    #[serde(skip)]
+    pub(crate) native_wire_pre_floor: bool,
     /// Simulation-only: the QUIC endpoint's idle timeout instead of its
     /// clock's (24 h on `VirtualTime`), so a simulation can see a silent QUIC
     /// path time out (`SimNetwork::with_quic_idle_timeout`). `None` in
@@ -877,6 +895,8 @@ impl NodeConfig {
             ack_version_floor_override: None,
             broadcast_target_list_floor_override: None,
             advertised_version_override: None,
+            quic_native_floor_override: None,
+            native_wire_pre_floor: false,
             quic_idle_timeout_override: None,
             advertise_seeded_hosts: false,
             hosting_time_source_override: None,
@@ -10194,6 +10214,7 @@ mod tests {
             let id = Transaction::new::<ConnectMsg>();
             let payload = ConnectResponse {
                 acceptor: dummy_unknown_pkl(),
+                native_decision: None,
             };
             let msg = ConnectMsg::Response { id, payload };
 
@@ -10219,6 +10240,7 @@ mod tests {
                     pub_key: pkl.pub_key,
                     peer_addr: PeerAddr::Known(original_addr),
                 },
+                native_decision: None,
             };
             let msg = ConnectMsg::Response { id, payload };
 
@@ -10245,6 +10267,7 @@ mod tests {
             let id = Transaction::new::<ConnectMsg>();
             let payload = ConnectResponse {
                 acceptor: dummy_unknown_pkl(),
+                native_decision: None,
             };
             let msg = ConnectMsg::Response { id, payload };
 

@@ -224,6 +224,10 @@ pub(in crate::transport::quic) struct Receiver<T> {
     /// Panic on the next short message, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
+    /// `QuicPathLimits::cancel_next_admitted`.
+    #[cfg(test)]
+    pub(in crate::transport::quic) cancel_next_admitted:
+        Option<&'static std::sync::atomic::AtomicBool>,
 }
 
 impl<T: TimeSource> Receiver<T> {
@@ -351,6 +355,8 @@ impl<T: TimeSource> Receiver<T> {
             stream_limit: Arc::new(StreamLimit::new(None, 0, 0)),
             #[cfg(test)]
             panic_on_stream: false,
+            #[cfg(test)]
+            cancel_next_admitted: None,
         }
     }
 }
@@ -2345,6 +2351,13 @@ impl<T: TimeSource> Receiver<T> {
             token: None,
             complete: false,
         };
+        #[cfg(test)]
+        if self
+            .cancel_next_admitted
+            .is_some_and(|next| next.swap(false, Ordering::Relaxed))
+        {
+            guard.handle().cancel();
+        }
         reader.set_age_limit(stream_age_limit());
         reader.source = guard.handle().quic_source().cloned();
         if let Some(source) = &reader.source {
