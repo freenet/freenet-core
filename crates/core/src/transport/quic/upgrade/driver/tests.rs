@@ -1000,9 +1000,9 @@ fn data_is_enabled_once_per_activation() {
             now,
         );
         let quiet = now + 11_000_000_000;
-        let timed_out = BoundedSend::Failed(crate::transport::quic::path::SendFailure::NotOpened(
-            crate::transport::quic::path::NotOpened::TimedOut,
-        ));
+        // A timeout with the stream open: one before it opened is back-pressure
+        // and does not count.
+        let timed_out = BoundedSend::Failed(crate::transport::quic::path::SendFailure::TimedOut);
         first.path().settle(
             crate::transport::quic::path::SendKind::Short,
             &timed_out,

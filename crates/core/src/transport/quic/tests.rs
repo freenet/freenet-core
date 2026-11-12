@@ -4915,7 +4915,9 @@ fn quinn_reports_a_write_blocked_by_the_peers_credit_and_only_that() {
             let mut send = raw.open_uni().await.expect("open");
             let writer = tokio::spawn(async move {
                 // Twice the peer's whole credit (`TEST_WINDOW`).
-                let _ = send.write_all(&payload(2 * TEST_WINDOW as usize)).await;
+                send.write_all(&payload(2 * TEST_WINDOW as usize))
+                    .await
+                    .ok();
                 send
             });
             let _recv = server.inner().accept_uni().await.expect("accept");
@@ -5029,7 +5031,9 @@ fn the_credit_rule_on_real_connections() {
             let result = drive(&pair.time, Duration::from_secs(300), async move {
                 let writer = tokio::spawn(async move {
                     let mut send = raw.open_uni().await.expect("open");
-                    let _ = send.write_all(&payload(4 * TEST_WINDOW as usize)).await;
+                    send.write_all(&payload(4 * TEST_WINDOW as usize))
+                        .await
+                        .ok();
                     send
                 });
                 let reader = tokio::spawn({
@@ -5040,7 +5044,7 @@ fn the_credit_rule_on_real_connections() {
                             return std::future::pending::<()>().await;
                         };
                         loop {
-                            let _ = recv.read_chunk(4096, false).await;
+                            recv.read_chunk(4096, false).await.ok();
                             time.sleep(every).await;
                         }
                     }
@@ -5099,7 +5103,9 @@ fn the_credit_rule_on_real_connections() {
                 let writer = tokio::spawn(async move {
                     // More than the peer's credit, so quinn buffers up to it
                     // and blocks on it while the congestion window drains it.
-                    let _ = send.write_all(&payload(4 * TEST_WINDOW as usize)).await;
+                    send.write_all(&payload(4 * TEST_WINDOW as usize))
+                        .await
+                        .ok();
                     send
                 });
                 let reader = tokio::spawn(async move {
@@ -5166,7 +5172,9 @@ fn quinn_reports_application_limited_batches_as_the_credit_rule_needs() {
         let (before, after) = drive(&credit.time, Duration::from_secs(120), async move {
             let writer = tokio::spawn(async move {
                 let mut send = raw.open_uni().await.expect("open");
-                let _ = send.write_all(&payload(2 * TEST_WINDOW as usize)).await;
+                send.write_all(&payload(2 * TEST_WINDOW as usize))
+                    .await
+                    .ok();
                 send
             });
             let mut recv = server.inner().accept_uni().await.expect("accept");
@@ -5174,7 +5182,7 @@ fn quinn_reports_application_limited_batches_as_the_credit_rule_needs() {
             assert!(blocked_frames(&client) > 0, "premise: blocked by credit");
             let before = ack_sample(&client, &writers);
             for _ in 0..100 {
-                let _ = recv.read_chunk(4096, false).await;
+                recv.read_chunk(4096, false).await.ok();
                 time.sleep(Duration::from_millis(200)).await;
             }
             let after = ack_sample(&client, &writers);

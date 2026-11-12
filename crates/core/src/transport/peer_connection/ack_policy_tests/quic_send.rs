@@ -158,6 +158,20 @@ where
     F: FnOnce(Rig) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    run_with(network, subnet, QuicPathLimits::DEFAULT, peer_limits, test);
+}
+
+/// [`run`] with our side's path limits given too.
+fn run_with<F, Fut>(
+    network: &'static str,
+    subnet: u8,
+    our_limits: QuicPathLimits,
+    peer_limits: QuicPathLimits,
+    test: F,
+) where
+    F: FnOnce(Rig) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     run_bounded(move || async move {
         let mut e = single(CAPABLE);
         let (data, inbox) = data_channels();
@@ -165,7 +179,7 @@ where
         let path = data_path_to(
             network,
             subnet,
-            QuicPathLimits::DEFAULT,
+            our_limits,
             peer_limits,
             e.conn.inbound_budget(),
             data,
@@ -938,9 +952,9 @@ fn a_busy_relay_whose_transfers_are_acknowledged_keeps_its_path() {
 }
 
 /// Permits held by sends waiting for acknowledgements that never come: nothing on
-/// the path is acknowledged, every large message times out waiting for a permit,
-/// and eight of those past the window close the path. That close is the only thing
-/// that recycles such a path.
+/// the path is acknowledged and every large message times out waiting for a
+/// permit. Those timeouts are back-pressure and do not count toward the stall
+/// close; the acknowledgement watch's dark-path rule closes the path instead.
 #[test]
 fn permits_held_with_nothing_acknowledged_close_the_path() {
     run(
@@ -964,15 +978,30 @@ fn permits_held_with_nothing_acknowledged_close_the_path() {
                     .await
                     .unwrap();
             }
-            rig.path.settle(Duration::from_secs(3)).await;
+            // The watch's window runs from its first sample that saw the
+            // streams sent (one tick in) to a sample at least the window later.
+            rig.path
+                .settle(
+                    Duration::from_secs(3) + 2 * crate::transport::quic::recycle::ACK_WATCH_TICK,
+                )
+                .await;
             drop(silenced);
             assert_eq!(
                 rig.stats()
                     .send_count(SendKind::LargeShort, R::NotOpenedUdp),
                 u64::from(STALLED_SENDS_LIMIT)
             );
-            assert_eq!(rig.stats().send_event_count(E::StalledClosed), 1);
+            assert_eq!(
+                rig.stats().send_event_count(E::StalledClosed),
+                0,
+                "a send that never opened does not count"
+            );
             assert!(rig.route.path().quinn_connection().close_reason().is_some());
+            assert_eq!(
+                crate::transport::quic::recycle::stalls_to(rig.path.peer_addr()),
+                vec![crate::transport::quic::recycle::Stall::Dark],
+                "closed by the watch as dark"
+            );
         },
     );
 }
@@ -981,9 +1010,15 @@ fn permits_held_with_nothing_acknowledged_close_the_path() {
 /// window, close the path.
 #[test]
 fn eight_streams_that_stall_after_opening_close_the_path() {
-    run(
+    run_with(
         "quic-send-stall-close",
         68,
+        // The stall count's close, which the acknowledgement watch would
+        // otherwise preempt on this dark path (`recycle::AckWatch`).
+        QuicPathLimits {
+            watch_closes: false,
+            ..QuicPathLimits::DEFAULT
+        },
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let silenced = DropFrom::new("quic-send-stall-close", &[rig.path.peer_addr()]);
@@ -1164,9 +1199,15 @@ fn a_pipe_that_stalls_after_opening_gives_up() {
 /// each later one goes exactly once.
 #[test]
 fn a_suspect_path_sends_new_shorts_on_udp_until_it_is_acknowledged() {
-    run(
+    run_with(
         "quic-send-suspect",
         75,
+        // The path is dark for 15 s, which its acknowledgement watch would
+        // close first (`recycle::AckWatch`); this test is the route's.
+        QuicPathLimits {
+            watch_closes: false,
+            ..QuicPathLimits::DEFAULT
+        },
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let silenced = DropFrom::new("quic-send-suspect", &[rig.path.peer_addr()]);
