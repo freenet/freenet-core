@@ -1627,9 +1627,12 @@ the streams to 16 at build (`config::DATA_START_UNI_STREAMS`, in tests and
 simulations too), doubling toward 64 once the peer has had every stream busy
 at once (holding a slot with its end not yet read; a stream whole and
 waiting on this node's consumer is not busy) and as many again have
-completed with no gap, with none failing (any end but a completion, a reset
-by the sender or the connection ending, through the reader's
-`inbound::LimitTicket`), the connection not throttled and the buffer budget
+completed with no gap (a hole between received runs, or a first packet
+read after a later one; a lost LAST packet leaves no hole and is not
+counted), with none failing (any end but a completion, a reset by the
+sender, the connection ending, or an end of this node's own doing: a
+consumer that cancelled, or a consumer of new streams that is gone; through
+the reader's `inbound::LimitTicket`), the connection not throttled and the buffer budget
 charged at most 3/4 (`budget::QuicBudget::has_room`) at the completion that
 would raise (`inbound::StreamLimit`, never lowered; a waiting one-packet
 Short takes one off while it waits), and its meter raises the receive window to the
@@ -2019,9 +2022,15 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
     control, waits in open_uni until its open deadline (2 s streamed, 1 s a
     one-packet Short) and ends NotOpened, which goes on UDP; it never ends
     MaybeDelivered, since nothing was written. Each is counted
-    quic_data_event_stream_limit_full (pinned by
-    sends_past_a_fresh_peers_stream_limit_end_not_opened). Control frames
-    are sent only during setup, before any data stream.
+    quic_data_event_stream_limit_full when its open deadline ends the wait
+    (a send cancelled earlier, by a teardown or shutdown, is not counted;
+    pinned by sends_past_a_fresh_peers_stream_limit_end_not_opened). Control
+    frames are sent only during setup, but a client's ReadyAck goes out in
+    the step that enables its data, so it would race its own data for the
+    peer's slots: the driver reserves the frame's stream before the send
+    runs (QuicPath::control_first), and no data send opens a stream until
+    the control frame has one or its send ended (pinned by
+    a_reserved_control_frame_opens_ahead_of_data_at_a_full_limit).
   → Once the UDP transport is removed there is no UDP to go to: a send that
     finds the peer's limit full then waits for a slot, bounded by its send
     deadline, and fails NotOpened at the deadline. Not built; the
@@ -2278,7 +2287,15 @@ Inbound adapter: a Stream's payload goes into an ordinary StreamHandle,
     assemble() waits another gap while the throttle lasts
     (streaming::ThrottleProbe on QuicSourcePath), so a throttled stream
     does not fail at its consumer either; the reader still ends it if the
-    peer is idle. The throttle cannot tell why a connection was held back:
+    peer is idle. The probe holds the connection's meter weakly: a handle
+    that outlives its connection (orphan registry, an op, a pipe fork) does
+    not keep the connection charged in the budget, and reads it as not
+    throttled. A relay pipe (pipe_stream_on_path) does NOT wait out a
+    throttle of its upstream path: it fails at its source gap as before.
+    The pipe's source gap is already capped at the downstream receiver's
+    gap (QuicPath::receiver_gap), and the downstream node cannot see this
+    node's throttle, so it would give up on the stream at that gap anyway;
+    waiting longer would write into a stream nobody assembles. The throttle cannot tell why a connection was held back:
     a peer sending flat out into the window it was given marks its own
     connection throttled and pauses its other active streams' idle timers,
     which gives it nothing a byte per idle period would not (each stream
