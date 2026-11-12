@@ -166,6 +166,7 @@ use parking_lot::Mutex;
 use quinn::FrameStats;
 use quinn::congestion::{Controller, ControllerFactory, ControllerMetrics};
 
+use self::loss_gate::{GateVerdicts, LossGate};
 use super::QuicCloser;
 use super::config::{MAX_UDP_PAYLOAD, QuicRateLimit};
 #[cfg(doc)]
@@ -178,9 +179,11 @@ use crate::transport::metrics::QuicCloseCode;
 /// ([`close_code::SEND_ABORT_LIMIT`]).
 ///
 /// A healthy path resets a send only when the send is cancelled (a caller's
-/// timeout) or its chunk source fails, both rare, so 4096 is far above what
-/// one does over a long life, and a path that gets there is closed and
-/// rebuilt with nothing lost but the upgrade. The `stopped` map entries the
+/// timeout), its chunk source fails, or a cancelled one-packet send finds
+/// `path::ACK_WAITS_WITHOUT_PERMIT` sends already waiting for their
+/// acknowledgement (a peer withholding acknowledgements), all rare, so 4096
+/// is far above what one does over a long life, and a path that gets there
+/// is closed and rebuilt with nothing lost but the upgrade. The `stopped` map entries the
 /// limit bounds are measured at under `config::QUIC_STOPPED_ENTRY_BYTES`
 /// (104 B) each, so at most 416 KiB per path, which the per-connection fixed
 /// charge (`config::QUIC_CONNECTION_CHARGE_BYTES`) takes in full. How often
@@ -302,8 +305,13 @@ impl Default for CappedCubicFactory {
 
 impl ControllerFactory for CappedCubicFactory {
     fn build(self: Arc<Self>, now: Instant, current_mtu: u16) -> Box<dyn Controller> {
+        let cubic = self.cubic.clone().build(now, current_mtu);
+        #[cfg(test)]
+        if self.rate.without_loss_gate {
+            return Box::new(CappedCubic::new(cubic, self.rate.clone(), current_mtu));
+        }
         Box::new(CappedCubic::new(
-            self.cubic.clone().build(now, current_mtu),
+            Box::new(LossGate::new(cubic)),
             self.rate.clone(),
             current_mtu,
         ))
@@ -425,10 +433,24 @@ impl CappedCubic {
         }
     }
 
-    /// Whether the wrapped controller is a `C`.
+    /// The loss gate's verdict counts, if the wrapped controller is a gate.
+    fn gate_verdicts(&self) -> Option<Arc<GateVerdicts>> {
+        self.inner
+            .clone_box()
+            .into_any()
+            .downcast::<LossGate>()
+            .ok()
+            .map(|gate| gate.verdicts())
+    }
+
+    /// The loss gate inside, if the wrapped controller is one.
     #[cfg(test)]
-    pub(crate) fn wraps<C: Controller + 'static>(&self) -> bool {
-        self.inner.clone_box().into_any().downcast::<C>().is_ok()
+    pub(crate) fn gate(&self) -> Option<Box<LossGate>> {
+        self.inner
+            .clone_box()
+            .into_any()
+            .downcast::<LossGate>()
+            .ok()
     }
 }
 
@@ -858,6 +880,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     time: T,
     cap_holds: Arc<CapHolds>,
     heard: Arc<PeerHeard>,
+    rtt: Arc<crate::transport::peer_connection::streaming::PathRtt>,
     report: &mut PathReport,
 ) {
     let Some(first) = AckSample::of(&connection, &cap_holds) else {
@@ -872,6 +895,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
+        rtt.set(connection.rtt());
         // Read before the counts, so a closed connection's counts are its
         // final ones.
         let closed = connection.close_reason().is_some();
@@ -900,12 +924,17 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     }
 }
 
+pub(crate) mod loss_gate;
+
 #[cfg(test)]
 mod cap_tests;
 
 /// What a path's receive supervisor keeps for its acknowledgement watch.
 pub(crate) struct AckWatchParts {
     pub(crate) cap_holds: Arc<CapHolds>,
+    /// The connection's round trip for the consumers of its streams, set at
+    /// each tick (`streaming::PathRtt`).
+    pub(crate) rtt: Arc<crate::transport::peer_connection::streaming::PathRtt>,
     pub(crate) heard: Arc<PeerHeard>,
     pub(crate) report: PathReport,
 }
@@ -933,6 +962,10 @@ pub(crate) struct PathReport {
     bytes: UdpBytes,
     loss: PathLoss,
     window: crate::transport::metrics::PathLossWindow,
+    /// The loss gate's verdict counts and those already reported; `None` when
+    /// the connection's controller has no gate.
+    gate: Option<(Arc<GateVerdicts>, [u64; loss_gate::GATE_VERDICTS])>,
+    gate_window: crate::transport::metrics::PathGateWindow,
     /// When the path's time was last reported, in the time source's
     /// nanoseconds.
     timed_at: u64,
@@ -954,12 +987,24 @@ impl PathReport {
         meter: Option<Arc<super::budget::ConnMeter>>,
     ) -> Self {
         let stats = connection.stats();
+        let gate = connection
+            .congestion_state()
+            .into_any()
+            .downcast::<CappedCubic>()
+            .ok()
+            .and_then(|capped| capped.gate_verdicts())
+            .map(|verdicts| {
+                let seen = verdicts.read();
+                (verdicts, seen)
+            });
         Self {
             timed_at: built_at,
             meter,
             bytes: UdpBytes::of(&stats),
             loss: PathLoss::of(&stats),
             window: crate::transport::metrics::PathLossWindow::new(node),
+            gate,
+            gate_window: crate::transport::metrics::PathGateWindow::new(node),
             connection,
             node,
             #[cfg(test)]
@@ -988,6 +1033,13 @@ impl PathReport {
         let (next, delta) = self.loss.step(PathLoss::of(&stats));
         self.node.record_path_loss(&mut self.window, delta);
         self.loss = next;
+        if let Some((verdicts, seen)) = &mut self.gate {
+            let now = verdicts.read();
+            let delta: [u64; loss_gate::GATE_VERDICTS] =
+                std::array::from_fn(|i| now[i].saturating_sub(seen[i]));
+            *seen = now;
+            self.node.record_gate(&mut self.gate_window, delta);
+        }
         #[cfg(test)]
         if self.panic_once_bucketed && self.window.is_bucketed() {
             self.panic_once_bucketed = false;

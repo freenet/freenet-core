@@ -224,6 +224,11 @@ struct Inner {
     live: Mutex<HashMap<GrantTokenHash, Vec<(u64, CancellationToken)>>>,
     next_live_id: AtomicU64,
     polls: AtomicUsize,
+    /// Test hook: when set, the next `resolve_connection` waits on it between
+    /// registering the connection and reading the store, so a test can act in
+    /// that window deterministically.
+    #[cfg(test)]
+    read_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
 }
 
 struct PendingRequest {
@@ -343,6 +348,8 @@ impl AppGrantState {
             live: Mutex::new(HashMap::new()),
             next_live_id: AtomicU64::new(0),
             polls: AtomicUsize::new(0),
+            #[cfg(test)]
+            read_gate: Mutex::new(None),
         }))
     }
 
@@ -387,6 +394,14 @@ impl AppGrantState {
         };
         let hash = GrantTokenHash::of(token.as_str());
         let guard = self.register_live(hash);
+        #[cfg(test)]
+        {
+            let gate = self.0.read_gate.lock().take();
+            if let Some(gate) = gate {
+                // A dropped sender also releases the read.
+                drop(gate.await);
+            }
+        }
         // The read, and the hourly last-used refresh it may do, off the
         // async workers.
         match off_thread(move || caps.native_grant_for(hash)).await {
@@ -488,6 +503,15 @@ impl AppGrantState {
             cancel.cancel();
         }
         self.wake_all_pollers();
+    }
+
+    /// Hold the next `resolve_connection` between registration and the store
+    /// read until the returned sender is used or dropped.
+    #[cfg(test)]
+    pub(crate) fn hold_next_read(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self.0.read_gate.lock() = Some(rx);
+        tx
     }
 
     #[cfg(test)]

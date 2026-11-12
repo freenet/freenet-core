@@ -190,7 +190,8 @@ Alice                                                Bob
 - 8 bytes: `[0xFF:1][major:1][minor:1][patch_hi:1][patch_lo:1][min_patch_hi:1][min_patch_lo:1][format:1]`
 - `0xFF` marker in byte 0 distinguishes from old format (old peers see major mismatch → clean reject)
 - `min_patch` encodes the minimum compatible patch version (bidirectional range check)
-- `format` byte (currently 1) in byte 7 provides additional old-format discrimination
+- `format` byte in byte 7 provides additional old-format discrimination. It is 1 when the floor shares the sender's major.minor.
+- Format 2 carries a floor in a different series (e.g. 1.0.0 with floor 0.2.N). Bytes 5-6 hold `0x8000 | major_back<<14 | floor_minor<<8 | floor_patch` (`major_back` 0 or 1, `floor_minor` < 64, `floor_patch` < 256). Releases that predate format 2 read that as a `min_patch` of at least 32768, so they reject the peer and take the update path.
 
 **Version Format (old, ≤0.1.152):**
 - 8 bytes: `[major:1][minor:1][patch:1][flags:4][reserved=0:1]`

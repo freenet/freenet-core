@@ -3310,6 +3310,57 @@ mod tests {
         Ok(())
     }
 
+    /// A relay piping a QUIC-fed inbound stream onward over UDP keeps the UDP
+    /// 5 s source gap, however long the source path's own gap is: the UDP
+    /// receiver downstream gives up after 5 s, so waiting longer would only
+    /// keep sending to a peer that has gone. A 6 s gap fails the pipe even
+    /// though the source path's gap (24 x 800 ms) would allow it.
+    #[tokio::test(start_paused = true)]
+    async fn a_udp_pipe_keeps_five_seconds_for_a_quic_fed_source() {
+        use crate::transport::peer_connection::streaming::{PathRtt, QuicSourcePath, StreamHandle};
+        use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(1000);
+        let drain = tokio::spawn(async move { while outbound_receiver.recv().await.is_some() {} });
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let total = FRAGMENT_PAYLOAD_SIZE * 2;
+        let source = StreamHandle::new_quic(StreamId::next(), total as u64);
+        source
+            .quic_source()
+            .expect("QUIC-fed")
+            .set_path(QuicSourcePath {
+                rtt: Arc::new(PathRtt::new(Duration::from_millis(800))),
+                idle: Duration::from_secs(30),
+            });
+        assert!(source.fragment_gap_limit() > Duration::from_secs(6));
+        let pipe_task = GlobalExecutor::spawn(pipe_stream(
+            source.fork().into(),
+            StreamId::next(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            random_cipher(),
+            Arc::new(parking_lot::Mutex::new(SentPacketTracker::new())),
+            Arc::new(TokenBucket::new(1_000_000, 100_000_000)),
+            big_cwnd(),
+            RealTime::new(),
+            None,
+            None,
+        ));
+        source
+            .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        source
+            .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+            .unwrap();
+        pipe_task
+            .await
+            .expect("join error")
+            .expect_err("a 6 s gap fails a UDP pipe whatever its source");
+        drain.abort();
+    }
+
     /// Regression test for #4345 (relay-pipe inbound-stream-error path,
     /// outbound_stream.rs:471): when the UPSTREAM inbound stream yields an
     /// error, pipe_stream must fail only THIS stream — not the DOWNSTREAM
