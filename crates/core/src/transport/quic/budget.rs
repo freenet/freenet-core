@@ -499,6 +499,12 @@ impl QuicBudget {
             .sum()
     }
 
+    /// Connections registered and not yet dropped. Tests only.
+    #[cfg(test)]
+    pub(crate) fn connections(&self) -> usize {
+        self.state.lock().conns.len()
+    }
+
     /// The running total. Tests only.
     #[cfg(test)]
     pub(crate) fn running_total(&self) -> u64 {

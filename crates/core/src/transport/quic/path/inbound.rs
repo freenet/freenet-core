@@ -260,12 +260,19 @@ impl<T: TimeSource> Receiver<T> {
     }
 
     /// For the consumers of the streams this path fills: whether the budget
-    /// throttles the connection now, on the path's clock.
+    /// throttles the connection now, on the path's clock. The probe holds the
+    /// meter weakly: every clone and fork of a stream's handle shares it, and
+    /// a handle can outlive its connection (the orphan registry, an op, a
+    /// pipe), while dropping the meter is what takes the connection's windows
+    /// out of the budget (`ConnMeter`'s drop). A connection gone is not
+    /// throttled.
     fn throttle_probe(&self) -> Option<ThrottleProbe> {
-        let meter = self.meter.clone()?;
+        let meter = Arc::downgrade(self.meter.as_ref()?);
         let time = self.time.clone();
         Some(ThrottleProbe(Arc::new(move || {
-            meter.throttled_since(time.now_nanos()).is_some()
+            meter
+                .upgrade()
+                .is_some_and(|meter| meter.throttled_since(time.now_nanos()).is_some())
         })))
     }
 
@@ -510,7 +517,8 @@ enum Vote {
     /// its reader says otherwise, so a new way for a stream to end cannot
     /// let a failing peer keep earning a raise.
     Failed,
-    /// Reset by its sender, or the connection ended: counts neither way.
+    /// Reset by its sender, the connection ended, or ended by this node
+    /// ([`ended_locally`]): counts neither way.
     Neutral,
     /// Delivered whole ([`Receiver::completed`]).
     Completed,
@@ -524,6 +532,16 @@ struct LimitTicket {
     /// The stream had a gap at some read.
     gapped: bool,
     vote: Vote,
+}
+
+/// The stream ended on this side's doing (its consumer cancelled it, or the
+/// node's consumer of new streams is gone): counts neither way, as a reset
+/// by the peer does not. Holding it against the peer would restart its run
+/// toward a raise for what this node did.
+fn ended_locally<T: TimeSource>(reader: &mut BodyReader<T>) {
+    if let Some(ticket) = &mut reader.ticket {
+        ticket.vote = Vote::Neutral;
+    }
 }
 
 impl LimitTicket {
@@ -801,7 +819,13 @@ impl<T: TimeSource> BodyReader<T> {
                 if !self.conn_ranges.add(added, now) {
                     return Err(ReadFailure::TooManyRanges);
                 }
-                let gapped = self.ranges.gaps() > 0;
+                // A hole between two received runs, or before the first: a
+                // first packet that arrives after a later one (lost, or
+                // reordered) leaves no run at offset 0. A lost last packet
+                // leaves no hole to see: until its retransmission the stream
+                // reads as one whose sender is slow, so it is not counted.
+                let gapped = self.ranges.gaps() > 0
+                    || (self.ranges.last_stop() > 0 && self.ranges.prefix() == 0);
                 if let Some(ticket) = &mut self.ticket {
                     ticket.gapped |= gapped;
                 }
@@ -2233,6 +2257,7 @@ impl<T: TimeSource> Receiver<T> {
                     // The consumer is gone: the connection is ending.
                     Ok(Err(_)) => {
                         self.stats.record(QuicInboundOutcome::ShortDroppedFull);
+                        ended_locally(&mut reader);
                         return;
                     }
                     Err(failure) => {
@@ -2243,6 +2268,7 @@ impl<T: TimeSource> Receiver<T> {
             }
             Err(mpsc::error::TrySendError::Closed(())) => {
                 self.stats.record(QuicInboundOutcome::ShortDroppedFull);
+                ended_locally(&mut reader);
                 return;
             }
         };
@@ -2360,6 +2386,9 @@ impl<T: TimeSource> Receiver<T> {
                     (Ok(metadata), _) => Some(metadata),
                     // Recorded where the piece was refused.
                     (Err(_), Some(code)) => {
+                        if code == stop_code::CANCELLED {
+                            ended_locally(&mut reader);
+                        }
                         reader.stop(code);
                         return;
                     }
@@ -2386,6 +2415,9 @@ impl<T: TimeSource> Receiver<T> {
         });
         drop(handle);
         if let Err(code) = fed {
+            if code == stop_code::CANCELLED {
+                ended_locally(&mut reader);
+            }
             reader.stop(code);
             return;
         }
@@ -2446,8 +2478,10 @@ impl<T: TimeSource> Receiver<T> {
                 waiting.disarm();
                 match waited {
                     Ok(Ok(permit)) => permit,
+                    // The node's consumer of new streams is gone.
                     Ok(Err(_)) => {
                         self.stats.record(QuicInboundOutcome::StreamDroppedFull);
+                        ended_locally(&mut reader);
                         reader.stop(stop_code::CHANNEL_FULL);
                         return;
                     }
@@ -2459,6 +2493,7 @@ impl<T: TimeSource> Receiver<T> {
             }
             Err(mpsc::error::TrySendError::Closed(())) => {
                 self.stats.record(QuicInboundOutcome::StreamDroppedFull);
+                ended_locally(&mut reader);
                 reader.stop(stop_code::CHANNEL_FULL);
                 return;
             }
@@ -2574,6 +2609,7 @@ impl<T: TimeSource> Receiver<T> {
             Ok(_) => true,
             Err(StreamError::Cancelled) => {
                 self.stats.record(QuicInboundOutcome::CancelledLocally);
+                ended_locally(reader);
                 reader.stop(stop_code::CANCELLED);
                 false
             }

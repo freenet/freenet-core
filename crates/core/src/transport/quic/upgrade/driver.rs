@@ -1109,7 +1109,10 @@ impl Session {
     }
 
     /// Send a control frame on the live attempt's path, bounded, in a task. The
-    /// only kind of send a path without both data bits makes.
+    /// only kind of send a path without both data bits makes. The frame's
+    /// stream is reserved here, before the task runs (`QuicPath::control_first`),
+    /// so data enabled later in the same step (a client's `ReadyAck`) does not
+    /// take the peer's stream slots ahead of it.
     fn send_control(
         &self,
         state: &mut SessionState,
@@ -1122,11 +1125,12 @@ impl Session {
         let Some(path) = held.path.as_ref().map(Arc::clone) else {
             return;
         };
+        let first = path.control_first();
         let clock = self.hub.path_clock.clone();
         let inbox = self.inbox.clone();
         held.tasks.push(GlobalExecutor::spawn(async move {
             let outcome = path
-                .send_control_bounded(&clock, CONTROL_SEND_TIMEOUT, control)
+                .send_control_first(&clock, CONTROL_SEND_TIMEOUT, control, first)
                 .await;
             report(&inbox, SessionEvent::ControlSent { attempt, outcome }).await;
         }));

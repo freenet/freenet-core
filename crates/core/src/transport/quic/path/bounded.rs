@@ -283,6 +283,23 @@ impl SendProgress {
         }))
     }
 
+    /// The send is still opening and its open deadline has passed, so the
+    /// timer ends it now (or has ended it). `false` for a send with no
+    /// deadline.
+    pub(super) fn open_deadline_passed(&self) -> bool {
+        self.stage() == STAGE_OPENING
+            && self
+                .0
+                .deadlines
+                .as_ref()
+                .is_some_and(|(deadlines, started)| {
+                    let open = started
+                        .saturating_add(nanos(deadlines.open))
+                        .min(started.saturating_add(nanos(deadlines.total)));
+                    (self.0.now)() >= open
+                })
+    }
+
     /// How long a pacer may make the send wait: until the send's own
     /// deadline for its stage (its own gap while the stream is open, never
     /// the connection's window), so no later than the deadline its timer
