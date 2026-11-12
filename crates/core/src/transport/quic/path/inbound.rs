@@ -1653,6 +1653,7 @@ impl<T: TimeSource> Receiver<T> {
                 | ReadFailure::ConnectionLost
                 | ReadFailure::TooManyRanges
                 | ReadFailure::Overlap
+                | ReadFailure::StagedOverCap
                 | ReadFailure::Other => QuicSourceEnd::Ended,
             });
         }
