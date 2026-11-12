@@ -296,7 +296,7 @@ pub(crate) struct QuicPathLimits {
     /// `TRANSPORT_METRICS`. A test passes its own, since every test in a process
     /// writes the global one.
     pub(crate) counters: Option<&'static QuicDataCounters>,
-    /// The receive task panics on its first stream (supervisor test).
+    /// The receive task panics on its first short message (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_receive: bool,
     /// The acknowledgement watch panics once the path is in a loss-rate bucket
@@ -866,6 +866,7 @@ impl QuicPath {
         }
         #[cfg(test)]
         let inbound_ranges = receiver.ranges();
+        let receiver_rtt = receiver.path_rtt();
         let aborts = Arc::new(SendAborts::new(
             limits.max_send_aborts,
             connection.closer(),
@@ -903,6 +904,7 @@ impl QuicPath {
             time,
             recycle::AckWatchParts {
                 cap_holds: connection.cap_holds(),
+                rtt: receiver_rtt,
                 heard: heard.clone(),
                 report,
             },
@@ -1064,6 +1066,25 @@ impl QuicPath {
     #[cfg(test)]
     pub(crate) fn charged_streams_now(&self) -> usize {
         self.budget.lock().stream_count()
+    }
+
+    /// An estimate, from below, of the gap the receiver of a stream sent on
+    /// this path allows between two pieces before it gives up:
+    /// [`quic_fragment_gap`] of the path's minimum round trip, under the idle
+    /// limit every reader uses. A pipe into this path waits on its source no
+    /// longer than this. The receiver times its gap from its own smoothed
+    /// round trip; this end's smoothed round trip also carries its own
+    /// queueing, so it can sit above the receiver's, and the minimum is used
+    /// instead. That errs short, which costs at most a pipe dropped early
+    /// (floored at 5 s), and makes a pipe that writes into a stream its
+    /// receiver has given up on unlikely, not impossible.
+    ///
+    /// [`quic_fragment_gap`]: crate::transport::peer_connection::streaming::quic_fragment_gap
+    pub(crate) fn receiver_gap(&self) -> Duration {
+        crate::transport::peer_connection::streaming::quic_fragment_gap(
+            self.connection.inner().stats().path.min_rtt,
+            crate::transport::peer_connection::streaming_handle_idle_timeout(),
+        )
     }
 
     /// The connection, for tests that write raw streams.
@@ -1404,7 +1425,7 @@ impl QuicPath {
     /// [`Self::send_stream_bounded`] does, and tells `observer` the same.
     ///
     /// Waits for the first chunk before anything else, for as long as
-    /// [`SendDeadlines::gap`] and `total` allow, so a source that has nothing
+    /// [`SendDeadlines::source_gap`] (or `gap`) and `total` allow, so a source that has nothing
     /// yet holds no permit and no stream. `open` runs from when it arrives;
     /// `total` counts the wait. A wait that runs out or a connection lost
     /// during it is [`SendFailure::NotOpened`]. A source that ends or fails
@@ -1433,7 +1454,7 @@ impl QuicPath {
         let started = time.now_nanos();
         let connection = self.connection.inner();
         let wait = deadlines
-            .gap
+            .gap_for(true)
             .map_or(deadlines.total, |gap| gap.min(deadlines.total));
         let first = tokio::select! {
             first = chunks.next() => first,
@@ -1693,6 +1714,7 @@ async fn supervise_receive<T: TimeSource>(
     // report: it ends with this task ([`recycle::PathReport`]).
     let recycle::AckWatchParts {
         cap_holds,
+        rtt,
         heard,
         mut report,
     } = watch;
@@ -1702,6 +1724,7 @@ async fn supervise_receive<T: TimeSource>(
         time,
         cap_holds,
         heard,
+        rtt,
         &mut report,
     ))
     .catch_unwind();

@@ -2296,13 +2296,177 @@ fn dropping_the_path_cancels_streams_in_progress() {
             .await;
         let arrival = p.b_in.streams.try_recv().expect("announced");
         assert!(!arrival.handle.is_cancelled());
+        // A fork does not share the handle's cancel; it must still end.
+        let fork = arrival.handle.fork();
+        let forked = tokio::spawn(async move { fork.assemble().await });
         let b =
             Arc::try_unwrap(std::mem::replace(&mut p.b, p.a.clone())).expect("the only reference");
         drop(b);
         // The receive task is aborted on its next poll.
         p.drive(async { tokio::task::yield_now().await }).await;
         assert!(arrival.handle.is_cancelled());
+        let forked = p.drive(async move { forked.await.unwrap() }).await;
+        assert_eq!(forked, Err(StreamError::Cancelled));
         drop(open);
+    })
+}
+
+/// Write the first `split` bytes of a `total`-byte Stream frame on a new
+/// stream of `p.a`, let them reach `b`, and return the open stream and
+/// `b`'s announcement of it.
+async fn half_sent_stream(
+    p: &mut Paths,
+    body: &[u8],
+    split: usize,
+) -> (quinn::SendStream, InboundStreamArrival) {
+    let conn = p.a_raw();
+    let mut first = header(1, 1, StreamId::next().0, body.len() as u64, 0);
+    first.extend_from_slice(&body[..split]);
+    let time = p.time();
+    let send = p
+        .drive(async move {
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(&first).await.unwrap();
+            time.sleep(Duration::from_secs(1)).await;
+            send
+        })
+        .await;
+    let arrival = p.b_in.streams.try_recv().expect("announced");
+    (send, arrival)
+}
+
+/// What one consumer's `assemble()` returned.
+type Assembled = Result<Vec<u8>, StreamError>;
+
+/// Assemble `arrival` through a clone and a fork of its handle, on a task.
+fn assemble_both(
+    arrival: &InboundStreamArrival,
+) -> tokio::task::JoinHandle<(Assembled, Assembled)> {
+    let handle = arrival.handle.clone();
+    let fork = arrival.handle.fork();
+    tokio::spawn(async move { tokio::join!(handle.assemble(), fork.assemble()) })
+}
+
+/// A QUIC-fed stream on a slow path (400 ms each way, so the reader gives
+/// its consumers 24 round trips, 19.2 s) whose sender is silent for 8 s,
+/// longer than the UDP transport's fragment gap (`STREAM_INACTIVITY_TIMEOUT`,
+/// 5 s), still assembles, through the handle and a fork. quinn's retransmit
+/// backoff at a high RTT with loss leaves such gaps in a stream it then
+/// delivers. The gap passes on both clocks: the path's virtual one, and
+/// tokio's paused one, which `assemble()`'s timer runs on. The reader set the
+/// path's round trip on the handle, so this fails if it does not.
+#[test]
+fn a_quic_fed_stream_assembles_across_a_gap_past_the_udp_limit() {
+    bounded(|| async move {
+        use crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT;
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-gap";
+        // Before the handshake, so its round trip is quinn's first sample.
+        crate::transport::in_memory_socket::set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                crate::transport::in_memory_socket::PacketDeliveryDecision::DelayedDelivery(
+                    Duration::from_millis(400),
+                )
+            })),
+        );
+        let mut p = paths(network, 200, QuicPathLimits::DEFAULT).await;
+        tokio::time::pause();
+        let gap = Duration::from_secs(8);
+        assert!(gap > STREAM_INACTIVITY_TIMEOUT, "premise: {gap:?}");
+        let body = payload(10_000);
+        let (mut send, arrival) = half_sent_stream(&mut p, &body, 5000).await;
+        assert!(!arrival.handle.is_complete(), "premise: half sent");
+        assert!(
+            arrival.handle.fragment_gap_limit() > gap,
+            "the reader gave the handle its path's gap: {:?}",
+            arrival.handle.fragment_gap_limit()
+        );
+        let assembled = assemble_both(&arrival);
+        let time = p.time();
+        let rest = body[5000..].to_vec();
+        p.drive(async move {
+            tokio::time::advance(gap).await;
+            time.sleep(gap).await;
+            send.write_all(&rest).await.unwrap();
+            send.finish().unwrap();
+            send.stopped().await.ok();
+        })
+        .await;
+        let (handle, fork) = p.drive(async move { assembled.await.unwrap() }).await;
+        assert_eq!(handle.as_deref(), Ok(&body[..]));
+        assert_eq!(fork.as_deref(), Ok(&body[..]));
+        assert_eq!(
+            p.b.stats().shared_count(InboundStreamOutcome::EvictedIdle),
+            0
+        );
+    })
+}
+
+/// A QUIC-fed stream whose sender goes silent ends for every consumer when
+/// the path evicts it idle, with `InactivityTimeout`, forks included (a fork
+/// does not see the handle's cancel), and not before.
+#[test]
+fn a_quic_fed_stream_evicted_idle_ends_every_consumer_with_inactivity() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-gap-idle", 201, QuicPathLimits::DEFAULT).await;
+        let idle = streaming_handle_idle_timeout();
+        let body = payload(10_000);
+        let (send, arrival) = half_sent_stream(&mut p, &body, 5000).await;
+        let assembled = assemble_both(&arrival);
+        let time = p.time();
+        let started = time.now_nanos();
+        let ((handle, fork), ended) = p
+            .drive(async move {
+                let ended = assembled.await.unwrap();
+                (ended, time.now_nanos())
+            })
+            .await;
+        assert_eq!(handle, Err(StreamError::InactivityTimeout));
+        assert_eq!(fork, Err(StreamError::InactivityTimeout));
+        let waited = Duration::from_nanos(ended - started);
+        assert!(
+            waited + Duration::from_secs(1) >= idle,
+            "ended after {waited:?}, before the idle limit {idle:?}"
+        );
+        assert_eq!(
+            p.b.stats().shared_count(InboundStreamOutcome::EvictedIdle),
+            1
+        );
+        drop(send);
+    })
+}
+
+/// A panic in the receive task ends a stream it was receiving for every
+/// consumer, forks included: unwinding drops the stream's reader.
+#[test]
+fn a_panicking_receive_task_ends_a_stream_in_progress_for_forks() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            panic_in_receive: true,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-gap-panic", 202, limits).await;
+        let body = payload(10_000);
+        let (send, arrival) = half_sent_stream(&mut p, &body, 5000).await;
+        let assembled = assemble_both(&arrival);
+        let a = p.a.clone();
+        let (handle, fork) = p
+            .drive(async move {
+                // The send itself may fail when the connection closes.
+                a.send_short(b"boom").await.ok();
+                assembled.await.unwrap()
+            })
+            .await;
+        assert_eq!(handle, Err(StreamError::Cancelled));
+        assert_eq!(fork, Err(StreamError::Cancelled));
+        assert_eq!(
+            p.b.stats().count(QuicInboundOutcome::ReceiveTaskPanicked),
+            1
+        );
+        drop(send);
     })
 }
 
@@ -4393,6 +4557,7 @@ fn the_gap_runs_from_the_last_step_and_total_still_binds() {
         let deadlines = SendDeadlines {
             open: Duration::from_secs(2),
             gap: Some(Duration::from_secs(5)),
+            source_gap: None,
             total: Duration::from_secs(60),
         };
         let (stalled, stalled_after, steady, steady_after) = drive(&time, LIMIT, async move {
@@ -4457,6 +4622,7 @@ async fn stuck_send(
     let deadlines = SendDeadlines {
         open: Duration::from_secs(2),
         gap: Some(Duration::from_secs(5)),
+        source_gap: None,
         total,
     };
     let start = clock.now();
@@ -4579,6 +4745,7 @@ fn a_live_send_held_in_the_cap_queue_past_its_gap_is_sent() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let ticking = clock.clone();
@@ -4644,6 +4811,7 @@ fn an_acknowledgement_the_record_has_not_seen_credits_the_next_send() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let ticking = clock.clone();
@@ -4752,6 +4920,7 @@ fn a_send_waiting_for_its_source_ends_at_its_own_gap() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let start = clock.now();
@@ -4810,6 +4979,7 @@ fn progress_from_before_the_send_does_not_extend_its_gap() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let start = clock.now();
@@ -4843,6 +5013,7 @@ fn a_quiet_proof_says_whether_its_send_saw_a_live_hold() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let mut proofs = Vec::new();
@@ -4907,6 +5078,7 @@ fn a_hold_read_live_by_a_wake_voids_the_proof() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let start = clock.now();
@@ -4947,6 +5119,102 @@ fn a_hold_read_live_by_a_wake_voids_the_proof() {
     })
 }
 
+/// `source_gap` bounds only the waits for the send's own source: a send
+/// waiting 20 s for its source under a 30 s source gap goes on, and the same
+/// send stuck 20 s on a write (not its source) fails at the 5 s gap.
+#[test]
+fn the_source_gap_applies_only_to_source_waits() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (on_source, on_write) = drive(&time, LIMIT, async move {
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                source_gap: None,
+                total: Duration::from_secs(120),
+            }
+            .with_source_gap(Duration::from_secs(30));
+            let sleeps = clock.clone();
+            let on_source = bounded_send(&clock, deadlines, None, |progress| async move {
+                progress.mark_opened();
+                progress.waiting_on_source(true);
+                sleeps.sleep(Duration::from_secs(20)).await;
+                progress.waiting_on_source(false);
+                progress.step();
+                Ok(())
+            })
+            .await;
+            let start = clock.now();
+            let sleeps = clock.clone();
+            let on_write = bounded_send(&clock, deadlines, None, |progress| async move {
+                progress.mark_opened();
+                sleeps.sleep(Duration::from_secs(20)).await;
+                Ok(())
+            })
+            .await;
+            (on_source, (on_write, clock.now() - start))
+        })
+        .await;
+        assert!(matches!(on_source, BoundedSend::Sent), "{on_source:?}");
+        let (on_write, took) = on_write;
+        assert!(
+            matches!(on_write, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{on_write:?}"
+        );
+        assert_eq!(took, Duration::from_secs(5));
+    })
+}
+
+/// A source wait that ends re-arms the timer at the send's own gap: the
+/// source gap (30 s) armed during the wait does not carry over to a write
+/// that stalls after the chunk arrives, which fails at its own gap (5 s
+/// after the chunk), not 30 s after the last step before the wait.
+#[test]
+fn the_end_of_a_source_wait_rearms_the_timer_at_the_own_gap() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let (outcome, took) = drive(&time, LIMIT, async move {
+            let deadlines = SendDeadlines {
+                open: Duration::from_secs(2),
+                gap: Some(Duration::from_secs(5)),
+                source_gap: None,
+                total: Duration::from_secs(120),
+            }
+            .with_source_gap(Duration::from_secs(30));
+            let start = clock.now();
+            let sleeps = clock.clone();
+            let outcome = bounded_send(&clock, deadlines, None, |progress| async move {
+                progress.mark_opened();
+                // A write until 3 s: the loop wakes at the 2 s open deadline
+                // and arms at the own gap (5 s).
+                sleeps.sleep(Duration::from_secs(3)).await;
+                progress.step();
+                // A source wait from 3 s to 6 s: the 5 s timer fires during
+                // it, and the loop arms at the source gap (33 s).
+                progress.waiting_on_source(true);
+                sleeps.sleep(Duration::from_secs(3)).await;
+                progress.waiting_on_source(false);
+                progress.step();
+                // A write that stalls from 6 s.
+                sleeps.sleep(Duration::from_secs(60)).await;
+                Ok(())
+            })
+            .await;
+            (outcome, clock.now() - start)
+        })
+        .await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        // 6 s plus the own gap, where a timer left at the source gap would
+        // fire at 33 s.
+        assert_eq!(took, Duration::from_secs(11));
+    })
+}
+
 /// A wait for the source wakes the timer loop only when the connection's
 /// window has pushed the timer past the send's own gap: a send that reads
 /// its source many times with no window arms its timer only a few times, not
@@ -4966,6 +5234,7 @@ fn source_waits_do_not_rearm_the_timer_without_an_extension() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let arms = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -5011,6 +5280,7 @@ fn source_waits_rearm_the_timer_once_while_it_is_extended() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let ticking = clock.clone();
@@ -5076,6 +5346,7 @@ fn a_later_proof_of_the_same_counts_keeps_the_earlier_since() {
             let deadlines = SendDeadlines {
                 open: Duration::from_secs(2),
                 gap: Some(Duration::from_secs(5)),
+                source_gap: None,
                 total: Duration::from_secs(120),
             };
             let stuck = |progress: bounded::SendProgress| async move {
@@ -5132,6 +5403,7 @@ fn the_gap_ends_at_the_end_of_the_stream_and_open_binds_first() {
         let deadlines = SendDeadlines {
             open: Duration::from_secs(2),
             gap: Some(Duration::from_secs(5)),
+            source_gap: None,
             total: Duration::from_secs(60),
         };
         let (finished, finished_after, unopened, unopened_after) =
@@ -5545,6 +5817,7 @@ fn a_real_path_carries_its_last_acknowledgement_to_the_next_send() {
                 let deadlines = SendDeadlines {
                     open: Duration::from_secs(2),
                     gap: Some(Duration::from_secs(5)),
+                    source_gap: None,
                     total: Duration::from_secs(120),
                 };
                 let ticking = time.clone();
@@ -6529,5 +6802,98 @@ fn a_first_chunk_at_the_deadline_opens_no_stream() {
         }
         assert_eq!(p.a.send_aborts(), 0);
         assert_eq!(p.b.stats().count(QuicInboundOutcome::AnnouncedStream), 0);
+    })
+}
+
+/// The case that motivated a path-derived consumer gap (e5b-9-perf's cold
+/// start lab, 64 KiB at 800 ms RTT and 15% loss): over many seeds, the worst
+/// gap between two fragments arriving at the receiver stays under the gap
+/// the handle gives its consumers (24 round trips, about 19.2 s here), and
+/// every stream assembles. Prints the worst gap per seed.
+///
+/// Deterministic: virtual time, loss drawn from a per-seed RNG, and the
+/// global RNG seeded, so the gaps are the same on every run, alone or beside
+/// other tests (checked: identical per-seed output over repeated and parallel
+/// runs). Worst here 8.09 s against 19.2 s. A wider sweep (outside CI) is in
+/// the PR.
+#[test]
+fn a_slow_lossy_path_stays_within_its_consumer_gap() {
+    bounded(|| async move {
+        use crate::transport::quic::path::bounded::SendDeadlines;
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut worst = Duration::ZERO;
+        let mut subnet = 150u8;
+        for len in [64 * 1024usize, 256 * 1024] {
+            for seed in 1..=20u64 {
+                let network: &'static str =
+                    Box::leak(format!("quic-gap-lossy-{len}-{seed}").into_boxed_str());
+                // The handshake runs on the delay alone, so the round trip is
+                // known before the loss starts.
+                crate::transport::in_memory_socket::set_packet_delivery_callback(
+                    network,
+                    Some(Arc::new(|_, _, _, _| {
+                        crate::transport::in_memory_socket::PacketDeliveryDecision::DelayedDelivery(
+                            Duration::from_millis(400),
+                        )
+                    })),
+                );
+                let mut p = paths(network, subnet, QuicPathLimits::DEFAULT).await;
+                subnet += 1;
+                let _loss = seeded_loss_from(network, 15, seed, Some(Duration::from_millis(400)));
+                let (a, time) = (p.a.clone(), p.time());
+                let send = tokio::spawn(async move {
+                    a.send_stream_bounded(
+                        &time,
+                        SendDeadlines::stream(len as u64),
+                        StreamId::next(),
+                        None,
+                        Bytes::from(payload(len)),
+                        None,
+                    )
+                    .await
+                });
+                // Wait for the announcement, then watch its fragments arrive.
+                let time = p.time();
+                let mut b_in =
+                    std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+                let (gap, limit, assembled) = p
+                    .drive(async move {
+                        let arrival = b_in.recv().await.expect("announced");
+                        let handle = arrival.handle;
+                        let limit = handle.fragment_gap_limit();
+                        let mut last_change = time.now_nanos();
+                        let mut seen = handle.received_bytes();
+                        let mut gap = 0u64;
+                        while !handle.is_complete() && handle.try_assemble().is_none() {
+                            time.sleep(Duration::from_millis(10)).await;
+                            let now = time.now_nanos();
+                            let got = handle.received_bytes();
+                            if got != seen {
+                                seen = got;
+                                last_change = now;
+                            }
+                            gap = gap.max(now - last_change);
+                            if Duration::from_nanos(now - last_change) > Duration::from_secs(60) {
+                                break;
+                            }
+                        }
+                        let assembled = handle.try_assemble().is_some();
+                        let _outcome = send.await.expect("the send task ran");
+                        (Duration::from_nanos(gap), limit, assembled)
+                    })
+                    .await;
+                eprintln!(
+                    "gap lossy: len {len} seed {seed}: worst gap {gap:?}, limit {limit:?}, assembled {assembled}"
+                );
+                worst = worst.max(gap);
+                assert!(
+                    gap < limit,
+                    "len {len} seed {seed}: gap {gap:?} >= {limit:?}"
+                );
+                assert!(assembled, "len {len} seed {seed}: did not assemble");
+                crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
+            }
+        }
+        eprintln!("gap lossy: worst over all seeds {worst:?}");
     })
 }

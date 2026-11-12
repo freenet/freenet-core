@@ -1332,6 +1332,193 @@ fn pipes_whose_source_stalls_do_not_close_the_path() {
     );
 }
 
+/// A pipe from a QUIC-fed source waits for the source's own gap where the
+/// path it pipes into allows it: with both paths slow (800 ms round trips, so
+/// 19.2 s gaps), an 8 s gap between two pieces (quinn's retransmit backoff at
+/// a high RTT with loss) ends `Sent`, where a UDP-fed source would time out.
+/// So does an 8 s wait for the first piece.
+#[test]
+fn a_pipe_from_a_quic_fed_source_waits_out_a_gap_past_five_seconds() {
+    // The downstream path: every datagram takes 400 ms each way, from the
+    // handshake on, so its round trip is 800 ms.
+    crate::transport::in_memory_socket::set_packet_delivery_callback(
+        "quic-send-pipe-quic-gap",
+        Some(Arc::new(|_, _, _, _| {
+            crate::transport::in_memory_socket::PacketDeliveryDecision::DelayedDelivery(
+                Duration::from_millis(400),
+            )
+        })),
+    );
+    run(
+        "quic-send-pipe-quic-gap",
+        76,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            assert!(
+                rig.route.path().receiver_gap() > Duration::from_secs(8),
+                "premise: the downstream receiver waits past 8 s: {:?}",
+                rig.route.path().receiver_gap()
+            );
+            let total = 2 * FRAGMENT_PAYLOAD_SIZE;
+            // `mid` has its first piece, `first` has nothing yet. Both come
+            // over a slow path too.
+            let mid = quic_source_on_path(total, Duration::from_millis(800));
+            let first = quic_source_on_path(total, Duration::from_millis(800));
+            mid.push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+            for source in [&mid, &first] {
+                rig.e
+                    .conn
+                    .pipe_stream_to_remote(
+                        StreamId::next(),
+                        crate::transport::IncomingStream::from(source.fork()),
+                        None,
+                        None,
+                    )
+                    .await;
+            }
+            rig.path.settle(Duration::from_secs(8)).await;
+            mid.push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+            for index in 1..=2 {
+                first
+                    .push_fragment(index, Bytes::from(vec![3u8; FRAGMENT_PAYLOAD_SIZE]))
+                    .unwrap();
+            }
+            rig.path.settle(Duration::from_secs(10)).await;
+            assert_eq!(rig.stats().send_count(SendKind::Pipe, R::Sent), 2);
+            for result in [R::MaybeDelivered, R::NotOpenedUdp, R::FailedUdp, R::Dropped] {
+                assert_eq!(
+                    rig.stats().send_count(SendKind::Pipe, result),
+                    0,
+                    "{result:?}"
+                );
+            }
+        },
+    );
+    crate::transport::in_memory_socket::set_packet_delivery_callback(
+        "quic-send-pipe-quic-gap",
+        None,
+    );
+}
+
+/// A slow upstream feeding a fast downstream: the source's path allows a
+/// 19.2 s gap, but the receiver downstream gives up after 5 s. The pipe waits
+/// on its source no longer than the receiver does, so after an 8 s gap it
+/// has given up (`Dropped`, not read again for UDP) and never reports the
+/// stream sent, while the receiver's consumer gets an error, not the stream.
+#[test]
+fn a_pipe_into_a_fast_path_waits_no_longer_than_its_receiver() {
+    run(
+        "quic-send-pipe-asymmetric",
+        78,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            assert_eq!(
+                rig.route.path().receiver_gap(),
+                Duration::from_secs(5),
+                "premise: a fast downstream path"
+            );
+            let total = 2 * FRAGMENT_PAYLOAD_SIZE;
+            let source = quic_source_on_path(total, Duration::from_millis(800));
+            assert_eq!(
+                source.fragment_gap_limit(),
+                Duration::from_millis(19_200),
+                "premise: a slow upstream path"
+            );
+            source
+                .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+            rig.e
+                .conn
+                .pipe_stream_to_remote(
+                    StreamId::next(),
+                    crate::transport::IncomingStream::from(source.fork()),
+                    None,
+                    None,
+                )
+                .await;
+            rig.path.settle(Duration::from_millis(200)).await;
+            let arrival = rig
+                .path
+                .peer_inbound()
+                .streams
+                .try_recv()
+                .expect("the stream reached the receiver with its first piece");
+            let assembled = tokio::spawn(async move { arrival.handle.assemble().await });
+            rig.path.settle(Duration::from_secs(8)).await;
+            source
+                .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+            rig.path.settle(Duration::from_secs(2)).await;
+            rig.collect_tasks().await;
+            assert_eq!(rig.stats().send_count(SendKind::Pipe, R::Sent), 0);
+            assert_eq!(rig.stats().send_count(SendKind::Pipe, R::Dropped), 1);
+            assert!(rig.udp_data().ids.is_empty(), "not read again for UDP");
+            assert!(assembled.is_finished(), "the receiver's consumer ended");
+            assert!(
+                assembled.await.expect("the consumer task").is_err(),
+                "the receiver did not assemble a stream the pipe gave up on"
+            );
+        },
+    );
+}
+
+/// A handle as a QUIC path's reader fills it, on a path with round trip `rtt`.
+fn quic_source_on_path(total: usize, rtt: Duration) -> StreamHandle {
+    use crate::transport::peer_connection::streaming::{PathRtt, QuicSourcePath};
+    let handle = StreamHandle::new_quic(StreamId::next(), total as u64);
+    handle
+        .quic_source()
+        .expect("QUIC-fed")
+        .set_path(QuicSourcePath {
+            rtt: Arc::new(PathRtt::new(rtt)),
+            idle: Duration::from_secs(30),
+        });
+    handle
+}
+
+/// The same pipe ends as soon as its source's reader stops (here: evicted
+/// idle), without waiting out the long gap, and it is the source's doing, so
+/// the path stays up.
+#[test]
+fn a_pipe_from_a_quic_fed_source_ends_when_the_reader_stops() {
+    use crate::transport::peer_connection::streaming::QuicSourceEnd;
+    run(
+        "quic-send-pipe-quic-end",
+        77,
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let total = 2 * FRAGMENT_PAYLOAD_SIZE;
+            let source = StreamHandle::new_quic(StreamId::next(), total as u64);
+            source
+                .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+            rig.e
+                .conn
+                .pipe_stream_to_remote(
+                    StreamId::next(),
+                    crate::transport::IncomingStream::from(source.fork()),
+                    None,
+                    None,
+                )
+                .await;
+            rig.path.settle(Duration::from_secs(1)).await;
+            assert_eq!(rig.stats().send_total(R::Sent), 0);
+            source.end_quic_source(QuicSourceEnd::Idle);
+            rig.path.settle(Duration::from_secs(1)).await;
+            assert_eq!(rig.stats().send_count(SendKind::Pipe, R::Sent), 0);
+            let ended: u64 = [R::FailedUdp, R::Dropped]
+                .into_iter()
+                .map(|result| rig.stats().send_count(SendKind::Pipe, result))
+                .sum();
+            assert_eq!(ended, 1, "the pipe ended within 1 s of its reader");
+            assert_eq!(rig.stats().send_event_count(E::StalledClosed), 0);
+            assert!(rig.route.path().quinn_connection().close_reason().is_none());
+        },
+    );
+}
+
 /// A UDP session that records what the worker hands it.
 #[derive(Default)]
 struct CollectUdp(std::sync::Mutex<Vec<Vec<u8>>>);
