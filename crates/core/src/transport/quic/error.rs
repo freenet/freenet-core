@@ -77,8 +77,10 @@ pub(crate) mod close_code {
     /// falls back and counts as `quic_fallback_reset`.
     pub(crate) const OVER_BUDGET: u32 = 0x08;
     /// The peer's `Hello` on a native connection carried a version this node
-    /// cannot talk to (`is_compatible`). The reason is this node's 8-byte
-    /// version, so the peer can tell whether it is the one that must update.
+    /// cannot talk to (`is_compatible`). The reason must be this node's 8-byte
+    /// version, so the peer can tell whether it is the one that must update:
+    /// send it with `QuicCloser::close_with_reason`, never `close`, whose
+    /// reason is the code's fixed text.
     /// Sent only on native connections, which only peers at or above the
     /// native floor set up; a node that does not know it reads it as
     /// `QuicErrorKind::ConnectionLost`.

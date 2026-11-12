@@ -631,10 +631,9 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
 
-    /// The expected class of a first byte, written out as literal ranges
-    /// rather than through the constants the implementation uses.
-    /// Every first byte's class, by value: the UDP transport's two types,
-    /// the reserved punch byte, and the QUIC-shaped range.
+    /// Every first byte's expected class, by value: the UDP transport's two
+    /// types, the reserved punch byte and the QUIC-shaped range, written out
+    /// as literals rather than through the constants the implementation uses.
     fn expected_class(first: u8) -> DemuxClass {
         match first {
             0x01 | 0x02 => DemuxClass::Legacy,

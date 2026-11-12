@@ -1259,7 +1259,8 @@ fn every_close_code_falls_back_then_upgrades_again() {
 
 /// Close codes 1, 3, 4 and 5 read as a downgrade, and record that cause; code 6
 /// records `session_ended_rx` and code 8 `over_budget_rx`. An
-/// unknown one, which is how an older node reads code 5, is a lost connection.
+/// unknown one, which is how an older node reads code 5, is a lost connection,
+/// and so are the native-only codes 9 and 10 on an upgrade path.
 #[test]
 fn close_codes_record_their_cause() {
     let downgrade = Outcome::Fallback(FallbackCause::DowngradeReceived);
@@ -1282,6 +1283,8 @@ fn close_codes_record_their_cause() {
             QuicCloseCode::OverBudget.code(),
             Outcome::Fallback(FallbackCause::OverBudgetReceived),
         ),
+        (QuicCloseCode::VersionIncompatible.code(), lost),
+        (QuicCloseCode::HelloRefused.code(), lost),
         (0x0f, lost),
     ] {
         let mut rig = Rig::promoted(Role::Server);
@@ -1310,6 +1313,25 @@ fn a_downgrade_close_in_setup_is_not_a_path_fallback() {
             Action::Record(Outcome::SetupDowngraded),
             "code {:#x}",
             code.code()
+        );
+    }
+}
+
+/// The native-only close codes, arriving during an upgrade's setup, read as a
+/// failed handshake, as an unknown code does: not a setup downgrade.
+#[test]
+fn a_native_only_close_in_setup_is_a_failed_handshake() {
+    for code in [
+        QuicCloseCode::VersionIncompatible.code(),
+        QuicCloseCode::HelloRefused.code(),
+        0x0f,
+    ] {
+        let mut rig = reach(Role::Server, S::Confirming);
+        let actions = rig.close_with(attempt_of(Role::Server), u64::from(code));
+        assert_eq!(
+            actions[1],
+            Action::Record(Outcome::HandshakeFailed),
+            "code {code:#x}"
         );
     }
 }

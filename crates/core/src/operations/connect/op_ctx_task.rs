@@ -1025,10 +1025,11 @@ struct AcceptorDial {
 /// Records an accept in the simulation's native-wire trace: whether the
 /// request carried an offer (the response carries a decision exactly then),
 /// and whether it was accepted after a `Rejected` or `ConnectFailed` re-route.
+/// Called once the accept is dispatched, so a failed dispatch is not traced.
 fn trace_accept(
     upstream: SocketAddr,
     response: &super::ConnectResponse,
-    joiner: &PeerKeyLocation,
+    joiner: Option<SocketAddr>,
     retry: bool,
 ) {
     #[cfg(any(test, feature = "testing"))]
@@ -1037,7 +1038,7 @@ fn trace_accept(
         super::native_wire_trace::NativeWireEvent::Accepted {
             with_offer: response.native_decision.is_some(),
             retry,
-            joiner: joiner.socket_addr(),
+            joiner,
         },
     );
     #[cfg(not(any(test, feature = "testing")))]
@@ -1404,7 +1405,12 @@ async fn drive_relay_connect(
         ) {
             op_manager.ring.register_events(Either::Left(event)).await;
         }
-        trace_accept(upstream_addr, &accept.response, &accept.joiner, false);
+        trace_accept(
+            upstream_addr,
+            &accept.response,
+            accept.joiner.socket_addr(),
+            false,
+        );
         let mut ctx = op_manager.op_ctx(incoming_tx);
         ctx.send_fire_and_forget(
             upstream_addr,
@@ -1579,8 +1585,9 @@ async fn drive_relay_connect(
                     ) {
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
-                    trace_accept(upstream_addr, &accept.response, &accept.joiner, true);
+                    let joiner_addr = accept.joiner.socket_addr();
                     dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner).await?;
+                    trace_accept(upstream_addr, &accept.response, joiner_addr, true);
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
                         upstream_addr,
@@ -1751,8 +1758,9 @@ async fn drive_relay_connect(
                     ) {
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
-                    trace_accept(upstream_addr, &accept.response, &accept.joiner, true);
+                    let joiner_addr = accept.joiner.socket_addr();
                     dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner).await?;
+                    trace_accept(upstream_addr, &accept.response, joiner_addr, true);
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
                         upstream_addr,

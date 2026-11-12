@@ -39,6 +39,7 @@ use std::net::SocketAddr;
 use crate::transport::TransportPublicKey;
 
 use super::ConnectionEntry;
+use super::connection_map::ConnectionMap;
 
 /// How a connection's peer identity was bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,7 +247,7 @@ pub(super) fn check(
 /// pending for the same key keeps `promote` if either says so), `None`
 /// leaves the connection as it was.
 pub(super) fn bind(
-    connections: &mut BTreeMap<SocketAddr, ConnectionEntry>,
+    connections: &mut ConnectionMap,
     index: &mut KeyIndex,
     addr: SocketAddr,
     key: &TransportPublicKey,
@@ -353,7 +354,7 @@ pub(super) const LONG_CLAIM_WAIT: std::time::Duration =
 /// counted, so a claim is returned once. The caller calls this only while a
 /// holder that is heard from holds `key`.
 pub(super) fn mark_long_waits(
-    connections: &mut BTreeMap<SocketAddr, ConnectionEntry>,
+    connections: &mut ConnectionMap,
     key: &TransportPublicKey,
     now: tokio::time::Instant,
 ) -> Vec<SocketAddr> {
@@ -374,10 +375,7 @@ pub(super) fn mark_long_waits(
 
 /// Mark the newest pending claim of `key` as promoting: it takes the ring
 /// place of a holder in the ring that is being replaced for it.
-pub(super) fn promote_newest_claim(
-    connections: &mut BTreeMap<SocketAddr, ConnectionEntry>,
-    key: &TransportPublicKey,
-) {
+pub(super) fn promote_newest_claim(connections: &mut ConnectionMap, key: &TransportPublicKey) {
     if let Some((claimant, _)) = pending_claimant(connections, None, key) {
         if let Some(entry) = connections.get_mut(&claimant) {
             if let State::Pending(claim) = &mut entry.identity.0 {
@@ -462,7 +460,7 @@ mod tests {
     }
 
     struct Table {
-        connections: BTreeMap<SocketAddr, ConnectionEntry>,
+        connections: ConnectionMap,
         index: KeyIndex,
         next_id: u64,
     }
@@ -470,7 +468,7 @@ mod tests {
     impl Table {
         fn new() -> Self {
             Self {
-                connections: BTreeMap::new(),
+                connections: ConnectionMap::untracked(),
                 index: KeyIndex::default(),
                 next_id: 0,
             }
@@ -512,7 +510,7 @@ mod tests {
         }
 
         fn close(&mut self, at: SocketAddr, key: &TransportPublicKey) -> Release {
-            self.connections.remove(&at);
+            self.connections.remove(at);
             release(&self.connections, &mut self.index, at, key)
         }
     }
@@ -819,7 +817,7 @@ mod tests {
         );
         t.bind(addr(61), &k, IdentitySource::Claimed, Some(false));
         assert!(t.index.may_have_pending_claims());
-        t.connections.remove(&addr(61));
+        t.connections.remove(addr(61));
         clear_pending_hint(&t.connections, &mut t.index);
         assert!(!t.index.may_have_pending_claims());
     }

@@ -16,6 +16,16 @@
 //! `total_len` comes right after the magic so a reader knows how much to read,
 //! and can refuse more than [`HELLO_MAX`], from the first six bytes
 //! ([`declared_len`]). Decoding refuses and never panics.
+//!
+//! A TLV type has no must-understand bit: every reader skips a type it does
+//! not know. A field that an older reader must not ignore therefore cannot be
+//! sent as a TLV to that reader; send it only to a peer whose version is known
+//! to read it.
+//!
+//! The observed address is encoded in the family of the `SocketAddr` given.
+//! The caller hands in an IPv4 peer's address as IPv4 (an IPv4-mapped IPv6
+//! address normalized first, as the demux does), so the reader's counters
+//! compare like with like.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
@@ -24,6 +34,11 @@ pub(crate) const HELLO_MAGIC: [u8; 4] = *b"FNH1";
 
 /// The largest `Hello`, in bytes, magic included. A peer that declares more
 /// is refused (`close_code::HELLO_REFUSED`).
+///
+/// Effectively frozen: every release that reads a `Hello` refuses one longer
+/// than its own `HELLO_MAX`, so raising it lets a newer node send what older
+/// ones refuse. A sender must stay within the smallest limit any peer it talks
+/// to has.
 pub(crate) const HELLO_MAX: usize = 1024;
 
 /// Magic and `total_len`: what a reader needs to know how long the `Hello` is.
@@ -326,22 +341,67 @@ mod tests {
         );
     }
 
-    /// Every byte string up to a few bytes past the shortest Hello decodes or
-    /// is refused, without a panic.
+    /// Every truncation and extension of each golden frame (IPv4, IPv6 with a
+    /// TLV, and one of exactly HELLO_MAX bytes) decodes or is refused, without
+    /// a panic, and so does every single-byte change of it: at every length for
+    /// the short frames, at its own length for the HELLO_MAX frame.
     #[test]
     fn decoding_never_panics_on_short_or_mutated_input() {
-        let good = v4().encode();
-        for len in 0..=good.len() + 4 {
-            let mut bytes = good.clone();
-            bytes.resize(len, 0xAA);
-            drop(Hello::decode(&bytes));
-            for i in 0..len {
+        let v6 = Hello {
+            protoc_version: V2,
+            caps: 0x0102_0304,
+            observed: "[2001:db8::1]:443".parse().unwrap(),
+        }
+        .encode_with_tlvs(&[(0x7F, &[0xAA, 0xBB])])
+        .unwrap();
+        let fill = vec![0u8; HELLO_MAX - 25 - TLV_HEADER_LEN];
+        let max = v4().encode_with_tlvs(&[(1, &fill)]).unwrap();
+        let mutate = |bytes: &[u8]| {
+            for i in 0..bytes.len() {
                 for flip in [0x01u8, 0x80, 0xFF] {
-                    let mut mutated = bytes.clone();
+                    let mut mutated = bytes.to_vec();
                     mutated[i] ^= flip;
                     drop(Hello::decode(&mutated));
                 }
             }
+        };
+        for (good, every_length) in [(v4().encode(), true), (v6, true), (max, false)] {
+            for len in 0..=good.len() + 4 {
+                let mut bytes = good.clone();
+                bytes.resize(len, 0xAA);
+                drop(Hello::decode(&bytes));
+                if every_length {
+                    mutate(&bytes);
+                }
+            }
+            mutate(&good);
         }
+    }
+
+    /// Several TLVs in a row, a zero-length one among them, are each skipped,
+    /// byte for byte.
+    #[test]
+    fn several_tlvs_and_an_empty_one_are_skipped() {
+        let bytes = v4()
+            .encode_with_tlvs(&[(0x10, &[1, 2, 3]), (0x11, &[]), (0x12, &[4])])
+            .unwrap();
+        let expected: Vec<u8> = [
+            &b"FNH1"[..],
+            &[0, 38], // total_len: 25 + 6 + 3 + 4
+            &V1,
+            &[0, 0, 0, 0],
+            &[4, 203, 0, 113, 7],
+            &[0x7A, 0x69],
+            &[0x10, 0, 3, 1, 2, 3], // TLV with three bytes
+            &[0x11, 0, 0],          // zero-length TLV
+            &[0x12, 0, 1, 4],       // TLV with one byte
+        ]
+        .concat();
+        assert_eq!(bytes, expected);
+        assert_eq!(Hello::decode(&bytes), Ok(v4()));
+        // A zero-length TLV alone, last.
+        let bytes = v4().encode_with_tlvs(&[(0x11, &[])]).unwrap();
+        assert_eq!(bytes.len(), 28);
+        assert_eq!(Hello::decode(&bytes), Ok(v4()));
     }
 }
