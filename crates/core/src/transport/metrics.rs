@@ -873,6 +873,10 @@ pub struct TransportMetrics {
     /// build cannot dial (reset each snapshot). Each failed that attempt.
     connect_native_decision_without_offer: AtomicU64,
     connect_native_decision_native_unsupported: AtomicU64,
+    /// `Native` responses dropped unanswered once a CONNECT had refused as
+    /// many acceptors as its acceptor limit (reset each snapshot). Not counted
+    /// as failures above.
+    connect_native_decision_over_cap: AtomicU64,
     /// The last offer this node built: level, percent and whether it was
     /// ready to dial native (a state, never reset).
     connect_native_offer_level: AtomicU8,
@@ -1240,6 +1244,11 @@ thread_local! {
     pub(crate) static NATIVE_DECISION_FAILURES_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
         const { std::cell::Cell::new([0; 2]) };
 
+    /// Test-only: `Native` responses dropped past the per-CONNECT cap on
+    /// this thread, for the same reason.
+    pub(crate) static NATIVE_DECISIONS_OVER_CAP_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
     /// Test-only: QUIC-native offers recorded on this thread, for the same
     /// reason.
     pub(crate) static NATIVE_OFFERS_ON_THIS_THREAD: std::cell::Cell<u64> =
@@ -1345,6 +1354,7 @@ impl TransportMetrics {
             connect_native_decided_udp: AtomicU64::new(0),
             connect_native_decision_without_offer: AtomicU64::new(0),
             connect_native_decision_native_unsupported: AtomicU64::new(0),
+            connect_native_decision_over_cap: AtomicU64::new(0),
             connect_native_offer_level: AtomicU8::new(0),
             connect_native_offer_percent: AtomicU8::new(0),
             connect_native_offer_ready: AtomicBool::new(false),
@@ -1883,6 +1893,15 @@ impl TransportMetrics {
             .store(ready, Ordering::Relaxed);
         #[cfg(test)]
         NATIVE_OFFERS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    }
+
+    /// A `Native` response was dropped unanswered: the CONNECT had already
+    /// refused its cap of acceptors.
+    pub(crate) fn record_connect_native_decision_over_cap(&self) {
+        self.connect_native_decision_over_cap
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_DECISIONS_OVER_CAP_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     }
 
     /// The acceptor decided `decision` for a request that carried an offer.
@@ -2744,6 +2763,7 @@ impl TransportMetrics {
             connect_native_decision_native_unsupported: get64(
                 &self.connect_native_decision_native_unsupported,
             ),
+            connect_native_decision_over_cap: get64(&self.connect_native_decision_over_cap),
             connect_native_offer_level: self.connect_native_offer_level.load(Ordering::Relaxed),
             connect_native_offer_percent: self.connect_native_offer_percent.load(Ordering::Relaxed),
             connect_native_offer_ready: self.connect_native_offer_ready.load(Ordering::Relaxed),
@@ -3421,6 +3441,9 @@ pub struct TransportSnapshot {
     /// cannot dial.
     pub connect_native_decision_without_offer: u64,
     pub connect_native_decision_native_unsupported: u64,
+    /// `Native` responses dropped past the per-CONNECT cap on refused
+    /// acceptors.
+    pub connect_native_decision_over_cap: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -3826,6 +3849,7 @@ impl TransportSnapshot {
             connect_native_decided_udp,
             connect_native_decision_without_offer,
             connect_native_decision_native_unsupported,
+            connect_native_decision_over_cap,
             connect_native_offer_level,
             connect_native_offer_percent,
             connect_native_offer_ready,
@@ -3985,6 +4009,7 @@ impl TransportSnapshot {
         self.connect_native_decision_without_offer = connect_native_decision_without_offer;
         self.connect_native_decision_native_unsupported =
             connect_native_decision_native_unsupported;
+        self.connect_native_decision_over_cap = connect_native_decision_over_cap;
         self.connect_native_offer_level = connect_native_offer_level;
         self.connect_native_offer_percent = connect_native_offer_percent;
         self.connect_native_offer_ready = connect_native_offer_ready;
@@ -4206,6 +4231,9 @@ struct SnapshotExtras {
     /// cannot dial.
     pub connect_native_decision_without_offer: u64,
     pub connect_native_decision_native_unsupported: u64,
+    /// `Native` responses dropped past the per-CONNECT cap on refused
+    /// acceptors.
+    pub connect_native_decision_over_cap: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -4433,6 +4461,7 @@ impl SnapshotExtras {
             || self.connect_native_decided_udp != 0
             || self.connect_native_decision_without_offer != 0
             || self.connect_native_decision_native_unsupported != 0
+            || self.connect_native_decision_over_cap != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -6905,6 +6934,7 @@ mod tests {
             "connect_native_decided_udp",
             "connect_native_decision_without_offer",
             "connect_native_decision_native_unsupported",
+            "connect_native_decision_over_cap",
             "connect_native_offer_level",
             "connect_native_offer_percent",
             "connect_native_offer_ready",

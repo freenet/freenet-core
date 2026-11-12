@@ -548,6 +548,12 @@ pub(crate) struct ConnectionManager {
     migration_scan_cursor: Arc<AtomicUsize>,
     /// Transient connections keyed by socket address.
     transient_connections: Arc<DashMap<SocketAddr, TransientEntry>>,
+    /// Addresses of the transports the network bridge holds open, whether or
+    /// not they are ring connections or still tracked as transient (a
+    /// transient entry expires while its transport can stay open). Written
+    /// only by `P2pConnManager::insert_connection` / `remove_connection`, so
+    /// it holds exactly the bridge's connection map's keys; bounded by it.
+    open_transports: Arc<dashmap::DashSet<SocketAddr>>,
     transient_in_use: Arc<AtomicUsize>,
     transient_budget: usize,
     transient_ttl: Duration,
@@ -748,6 +754,7 @@ impl ConnectionManager {
             broadcast_target_list_floor_override: None,
             migration_scan_cursor: Arc::new(AtomicUsize::new(0)),
             transient_connections: Arc::new(DashMap::new()),
+            open_transports: Arc::new(dashmap::DashSet::new()),
             transient_in_use: Arc::new(AtomicUsize::new(0)),
             transient_budget,
             transient_ttl,
@@ -1997,6 +2004,28 @@ impl ConnectionManager {
             self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
         }
         removed
+    }
+
+    /// The bridge opened a transport to `addr`.
+    pub(crate) fn note_transport_open(&self, addr: SocketAddr) {
+        self.open_transports.insert(addr);
+    }
+
+    /// The bridge closed its transport to `addr`.
+    pub(crate) fn note_transport_closed(&self, addr: SocketAddr) {
+        self.open_transports.remove(&addr);
+    }
+
+    /// Whether the bridge holds an open transport to `addr`.
+    pub(crate) fn has_open_transport(&self, addr: SocketAddr) -> bool {
+        self.open_transports.contains(&addr)
+    }
+
+    /// The addresses in the open-transport set, for tests that check it
+    /// against the bridge's connection map.
+    #[cfg(test)]
+    pub(crate) fn open_transport_addrs(&self) -> std::collections::BTreeSet<SocketAddr> {
+        self.open_transports.iter().map(|addr| *addr).collect()
     }
 
     /// Check whether a peer is currently tracked as transient.

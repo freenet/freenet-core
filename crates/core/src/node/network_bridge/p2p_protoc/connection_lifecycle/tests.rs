@@ -301,6 +301,7 @@ impl Harness {
             .await
             .expect("handle_successful_connection");
         assert!(self.mgr.connections.contains_key(&addr), "connection kept");
+        self.assert_open_transports_match();
     }
 
     /// The outbound dial path: `HandshakeEvent::OutboundEstablished`.
@@ -416,6 +417,7 @@ impl Harness {
         })
         .await;
         assert!(self.mgr.connections.contains_key(&addr), "connection kept");
+        self.assert_open_transports_match();
     }
 
     /// A handshake event, handled by the event loop's handler.
@@ -480,6 +482,24 @@ impl Harness {
             .await
             .expect("handle_transport_event");
         assert!(!self.mgr.connections.contains_key(&addr));
+        self.assert_open_transports_match();
+    }
+
+    /// The connection manager's open-transport set, which the relay reads
+    /// for its QUIC-native decision, holds exactly the bridge's connection
+    /// map's addresses.
+    fn assert_open_transports_match(&self) {
+        let map: std::collections::BTreeSet<SocketAddr> =
+            self.mgr.connections.keys().copied().collect();
+        assert_eq!(
+            self.mgr
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .open_transport_addrs(),
+            map
+        );
     }
 }
 

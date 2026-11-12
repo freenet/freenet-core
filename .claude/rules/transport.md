@@ -511,7 +511,9 @@ a state that is never reset and is not activity by itself) and QUIC connections 
 offer and decision (`connect_native_offered_{zero,nonzero}` built as joiner,
 `connect_native_decided_{native,udp}` made as acceptor for an offered request,
 `connect_native_decision_{without_offer,native_unsupported}` for a `Native`
-decision a joiner could not use, and the last offer as states
+decision a joiner could not use, `connect_native_decision_over_cap` for one
+dropped unanswered past the per-CONNECT cap on refused acceptors, and the last
+offer as states
 `connect_native_offer_{level,percent,ready}`; see
 `operations/connect/native.rs`) and the shadow-mode upgrade
 telemetry (below, "Upgrade telemetry"). Each label set is declared once in a

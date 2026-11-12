@@ -998,14 +998,17 @@ impl RelayContext for RelayEnv<'_> {
         &self.self_location
     }
 
-    /// A ring connection to the joiner's key or address, or a transient
-    /// transport at its address (a gateway holds one for every joiner it
-    /// relays for).
+    /// A ring connection to the joiner's key, or any transport the bridge
+    /// holds open at its address: a ring connection, a transient one (a
+    /// gateway holds one for every joiner it relays for), or one whose
+    /// transient entry expired while the transport stayed open.
     fn holds_transport_to(&self, joiner: &PeerKeyLocation) -> bool {
         let connections = &self.op_manager.ring.connection_manager;
         connections.get_peer_by_pub_key(joiner.pub_key()).is_some()
             || joiner.socket_addr().is_some_and(|addr| {
-                connections.is_transient(addr) || connections.get_peer_by_addr(addr).is_some()
+                connections.has_open_transport(addr)
+                    || connections.is_transient(addr)
+                    || connections.get_peer_by_addr(addr).is_some()
             })
     }
 

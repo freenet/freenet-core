@@ -291,9 +291,10 @@ pub mod sim_trace {
     pub(crate) enum NativeWireEvent {
         /// A `ConnectMsg` of this wire index was handed to the transport.
         Sent(u32),
-        /// A request or response carrying a native field went out in today's
-        /// encoding (index 0 or 1), so the field was dropped: the peer is
-        /// below the floor or its version is unknown.
+        /// A node not in pre-floor mode sent a request or response carrying a
+        /// native field in today's encoding (index 0 or 1) to a peer whose
+        /// version it knows, so the field was dropped because that peer is
+        /// below the floor.
         NativeFieldsDropped,
         /// A connection was closed on a message that did not decode.
         UndecodableClose,
@@ -371,8 +372,8 @@ pub mod sim_trace {
         pub fn responses_native(&self) -> u64 {
             self.sent(6)
         }
-        /// Requests and responses whose native field was dropped because the
-        /// peer they went to gets today's encoding.
+        /// Requests and responses an at-floor node sent with their native
+        /// field dropped, to a peer it knew to be below the floor.
         pub fn native_fields_dropped(&self) -> u64 {
             Self::get(&self.0.native_fields_dropped)
         }
@@ -614,6 +615,18 @@ mod tests {
                 "variant {index} decodes on a release without the fields"
             );
         }
+        // A decision value this release does not know is dropped from V1 like
+        // any other: the response encodes as today's.
+        let unknown = response(&f, Some(NativeDecision::Unknown(9)));
+        let today = bincode::serialize(&frozen::ConnectMsg::Response {
+            id: f.id,
+            payload: frozen::ConnectResponse {
+                acceptor: f.acceptor.clone(),
+            },
+        })
+        .unwrap();
+        assert_eq!(bincode::serialize(&unknown).unwrap(), today);
+        assert_eq!(encode_for_peer(&unknown, BELOW, FLOOR).unwrap(), today);
     }
 
     /// A V1 message decodes to the same internal value with the native fields

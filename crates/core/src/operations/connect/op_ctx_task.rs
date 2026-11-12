@@ -399,7 +399,12 @@ async fn drive_client_connect(
 
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
     // Acceptors that decided `Native`, which this build cannot dial: each is
-    // counted and reported upstream once, whatever duplicates arrive.
+    // counted and reported upstream once, whatever duplicates arrive. The
+    // acceptor in a response is named by whoever sent it, so this holds at
+    // most `refused_native_cap` (the most acceptors this CONNECT takes);
+    // further `Native` responses are dropped unanswered and counted, so a
+    // misbehaving relay cannot grow it or the `ConnectFailed` traffic.
+    let refused_native_cap = acceptor_limit(target_connections);
     let mut refused_native: HashSet<PeerKeyLocation> = HashSet::new();
     // `connected_dials`: acceptors actually connected. `accepted` also holds
     // acceptors still queued or being dialled, so it cannot decide that the
@@ -799,6 +804,17 @@ async fn drive_client_connect(
                 if let Err(failure) =
                     super::native::joiner_response_action(sent_offer, payload.native_decision)
                 {
+                    if refused_native.len() >= refused_native_cap {
+                        crate::transport::metrics::TRANSPORT_METRICS
+                            .record_connect_native_decision_over_cap();
+                        tracing::debug!(
+                            tx = %tx,
+                            acceptor = %payload.acceptor,
+                            "connect driver: Native response past the refused-acceptor cap; \
+                             dropped"
+                        );
+                        continue;
+                    }
                     crate::transport::metrics::TRANSPORT_METRICS
                         .record_connect_native_decision_failure(failure);
                     tracing::warn!(
@@ -2655,6 +2671,25 @@ mod driver_timing_tests {
         assert!(connections.try_register_transient(transient.socket_addr().unwrap(), None));
         assert!(env.holds_transport_to(&transient), "a transient transport");
 
+        // A gateway's joiner that has not been promoted: its transient entry
+        // expires after the TTL while the bridge keeps the transport open.
+        let unpromoted = peer(24906);
+        let addr = unpromoted.socket_addr().unwrap();
+        connections.note_transport_open(addr);
+        assert!(connections.try_register_transient(addr, None));
+        tokio::time::advance(connections.transient_ttl() + Duration::from_secs(1)).await;
+        connections.cleanup_expired_transients();
+        assert!(
+            !connections.is_transient(addr),
+            "premise: the entry expired"
+        );
+        assert!(
+            env.holds_transport_to(&unpromoted),
+            "the transport is still open past the transient TTL"
+        );
+        connections.note_transport_closed(addr);
+        assert!(!env.holds_transport_to(&unpromoted), "closed");
+
         assert!(!env.holds_transport_to(&peer(24905)));
     }
 
@@ -3366,6 +3401,8 @@ mod driver_timing_tests {
         all: Vec<SocketAddr>,
         /// The acceptors it reported to the gateway as failed.
         connect_failed: Vec<SocketAddr>,
+        /// The CONNECT's acceptor limit.
+        acceptor_limit: usize,
     }
 
     /// Runs a joiner that sent `sent_offer` against `responses`, each an
@@ -3386,7 +3423,7 @@ mod driver_timing_tests {
         let gateway = peer(24950);
         let count = responses.iter().map(|(i, _)| i + 1).max().unwrap_or(0);
         let acceptors: Vec<_> = (0..count as u16).map(|i| peer(24951 + i)).collect();
-        let (replies_tx, replies_rx) = mpsc::channel(16);
+        let (replies_tx, replies_rx) = mpsc::channel(responses.len().max(1));
         for (index, decision) in responses {
             replies_tx
                 .send(response_deciding(tx, &acceptors[index], decision))
@@ -3420,6 +3457,9 @@ mod driver_timing_tests {
             dialled: log.dials.iter().map(|(addr, _)| *addr).collect(),
             all: acceptors.iter().map(|a| a.socket_addr().unwrap()).collect(),
             connect_failed: log.connect_failed.clone(),
+            acceptor_limit: crate::operations::connect::bootstrap::acceptor_limit(
+                op_manager.ring.connection_manager.min_connections,
+            ),
         }
     }
 
@@ -3456,6 +3496,43 @@ mod driver_timing_tests {
         );
         assert_eq!(run.connect_failed, vec![run.all[2]]);
         assert_eq!(decision_failures_here(), (before.0 + 1, before.1));
+    }
+
+    /// `Native` responses from more distinct acceptors than the CONNECT's
+    /// acceptor limit: the first `limit` are counted and reported, the rest
+    /// are dropped with no message and counted as over the cap. A `Udp`
+    /// response after them is still dialled.
+    #[tokio::test(start_paused = true)]
+    async fn native_decisions_past_the_acceptor_limit_are_dropped_and_counted() {
+        use crate::operations::connect::native::{NativeDecision, NativeOffer};
+        let over_cap = || {
+            crate::transport::metrics::NATIVE_DECISIONS_OVER_CAP_ON_THIS_THREAD
+                .with(std::cell::Cell::get)
+        };
+        const NATIVE: usize = 200;
+        let before = (decision_failures_here(), over_cap());
+        let mut responses: Vec<_> = (0..NATIVE)
+            .map(|i| (i, Some(NativeDecision::Native)))
+            .collect();
+        responses.push((NATIVE, Some(NativeDecision::Udp)));
+        let run = dials_for_decisions(
+            "native-decision-over-cap",
+            Some(NativeOffer::capable(30)),
+            responses,
+        )
+        .await;
+        let limit = run.acceptor_limit;
+        assert!(
+            limit < NATIVE,
+            "premise: more Native responses than the limit"
+        );
+        assert_eq!(run.connect_failed, run.all[..limit].to_vec());
+        assert_eq!(
+            decision_failures_here(),
+            (before.0.0, before.0.1 + limit as u64)
+        );
+        assert_eq!(over_cap(), before.1 + (NATIVE - limit) as u64);
+        assert_eq!(run.dialled, vec![run.all[NATIVE]]);
     }
 
     /// A duplicate of a `Native` response is ignored: one count, one report.

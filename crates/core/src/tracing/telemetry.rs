@@ -3088,6 +3088,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.connect_native_decision_native_unsupported),
             );
             m.insert(
+                "connect_native_decision_over_cap".into(),
+                serde_json::json!(snapshot.connect_native_decision_over_cap),
+            );
+            m.insert(
                 "connect_native_offer_level".into(),
                 serde_json::json!(snapshot.connect_native_offer_level),
             );
