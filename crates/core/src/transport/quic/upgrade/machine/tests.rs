@@ -656,6 +656,22 @@ fn expected_with(
         });
         actions.push(Action::Record(Outcome::DataEnabled));
     }
+    // A path that carried data, active or rechecked after it was, has each of
+    // its fallbacks recorded again as carrying, after the step's other actions.
+    let carried =
+        matches!(state, S::Active | S::Rechecking) && own_caps & peer_caps & caps::DATA != 0;
+    if carried {
+        let carrying: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Record(Outcome::Fallback(cause)) => {
+                    Some(Action::Record(Outcome::CarryingFallback(*cause)))
+                }
+                _ => None,
+            })
+            .collect();
+        actions.extend(carrying);
+    }
     Some((next, actions))
 }
 

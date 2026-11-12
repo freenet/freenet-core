@@ -361,6 +361,9 @@ fn build_quic_upgrades(
     let (endpoint, policy, _registrar) = (endpoint?, policy?, registrar?);
     let policy =
         super::quic::upgrade::policy::QuicPolicy::from_config(policy, endpoint.availability());
+    super::TRANSPORT_METRICS
+        .quic_data
+        .set_share(policy.advertised_share());
     // The clock quinn runs on (`bind_udp_listener`).
     let path_clock = get_socket_virtual_time(&socket_addr)
         .map_or_else(|| PathClock::Real(time_source.clone()), PathClock::Virtual);
