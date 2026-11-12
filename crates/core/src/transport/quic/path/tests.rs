@@ -7090,6 +7090,8 @@ fn a_waiting_one_packet_short_is_not_charged() {
         assert_eq!(&delivered.payload()[..], b"waits");
         let (_, key) = delivered.into_parts();
         assert!(key.is_none(), "it carries no charge");
+    })
+}
 
 /// The case that motivated a path-derived consumer gap (e5b-9-perf's cold
 /// start lab, 64 KiB at 800 ms RTT and 15% loss): over many seeds, the worst

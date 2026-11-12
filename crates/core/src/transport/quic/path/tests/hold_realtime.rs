@@ -87,12 +87,12 @@ fn hold_real_time(connections: usize, workers: usize, hogs: usize) -> RealHoldRu
     runtime.block_on(async move {
         use super::super::super::QuicEndpoint;
         use super::super::super::config::QuicSettings;
+        use crate::transport::Socket;
         use crate::transport::UdpTransportSocket;
         use crate::transport::crypto::TransportKeypair;
         use crate::transport::demux::DemuxSocket;
         use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
         use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
-        use crate::transport::Socket;
 
         let time = RealTime::new();
         let settings = QuicSettings {
@@ -110,8 +110,8 @@ fn hold_real_time(connections: usize, workers: usize, hogs: usize) -> RealHoldRu
                 let addr = raw.local_addr().expect("local addr");
                 let socket = Arc::new(DemuxSocket::wrap(raw, None));
                 let keys = TransportKeypair::new();
-                let endpoint =
-                    QuicEndpoint::bind(socket.clone(), addr, time, &settings, &keys).expect("endpoint");
+                let endpoint = QuicEndpoint::bind(socket.clone(), addr, time, &settings, &keys)
+                    .expect("endpoint");
                 let pump = tokio::spawn(async move {
                     let mut buf = vec![0u8; MAX_RECV_PACKET_SIZE];
                     while socket.recv_classified(&mut buf).await.is_ok() {}
@@ -131,11 +131,7 @@ fn hold_real_time(connections: usize, workers: usize, hogs: usize) -> RealHoldRu
             let permit = hub.allow_peer(addr, keys.public()).expect("allow-set room");
             let hub_key = hub_keys.public().clone();
             let (client, server) = tokio::join!(endpoint.connect(hub_addr, &hub_key), async {
-                hub.accept()
-                    .await
-                    .expect("an attempt")
-                    .establish()
-                    .await
+                hub.accept().await.expect("an attempt").establish().await
             });
             drop(permit);
             let limits = QuicPathLimits::DEFAULT;
@@ -265,7 +261,8 @@ fn hold_real_time(connections: usize, workers: usize, hogs: usize) -> RealHoldRu
         let mut previous: Option<std::time::Instant> = None;
         for (at, row) in &samples {
             if let Some(previous) = previous {
-                worst_sample_gap_us = worst_sample_gap_us.max(at.duration_since(previous).as_micros());
+                worst_sample_gap_us =
+                    worst_sample_gap_us.max(at.duration_since(previous).as_micros());
             }
             previous = Some(*at);
             let (mut total, mut total_raw) = (0u64, 0u64);
@@ -321,11 +318,20 @@ fn quinns_hold_between_reader_polls_in_real_time() {
         Ok(spec) => spec
             .split(';')
             .map(|shape| {
-                let n: Vec<usize> = shape.split(',').map(|n| n.trim().parse().unwrap()).collect();
+                let n: Vec<usize> = shape
+                    .split(',')
+                    .map(|n| n.trim().parse().unwrap())
+                    .collect();
                 (n[0], n[1], n[2])
             })
             .collect(),
-        Err(_) => vec![(100, 2, 0), (100, 2, 4), (300, 2, 4), (300, 4, 8), (300, 1, 2)],
+        Err(_) => vec![
+            (100, 2, 0),
+            (100, 2, 4),
+            (300, 2, 4),
+            (300, 4, 8),
+            (300, 1, 2),
+        ],
     };
     for (connections, workers, hogs) in shapes {
         let run = hold_real_time(connections, workers, hogs);
