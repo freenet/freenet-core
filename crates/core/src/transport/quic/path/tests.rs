@@ -8607,7 +8607,10 @@ fn a_path_dark_mid_stream_is_closed_before_the_receiver_evicts_it_idle() {
 /// start lab, 64 KiB at 800 ms RTT and 15% loss): over many seeds, the worst
 /// gap between two fragments arriving at the receiver stays under the gap
 /// the handle gives its consumers (24 round trips, about 19.2 s here), and
-/// every stream assembles. Prints the worst gap per seed.
+/// every stream assembles. Prints the worst gap per seed. With the path's
+/// liveness rules on (the acknowledgement watch, loss gate on): the send,
+/// on the deadlines a node uses (`QuicPath::stream_deadlines`), ends `Sent`,
+/// and the watch closes neither end (no false stall at 800 ms and 15%).
 ///
 /// Deterministic: virtual time, loss drawn from a per-seed RNG, and the
 /// global RNG seeded, so the gaps are the same on every run, alone or beside
@@ -8617,7 +8620,6 @@ fn a_path_dark_mid_stream_is_closed_before_the_receiver_evicts_it_idle() {
 #[test]
 fn a_slow_lossy_path_stays_within_its_consumer_gap() {
     bounded(|| async move {
-        use crate::transport::quic::path::bounded::SendDeadlines;
         let _seed = GlobalRng::seed_guard(SEED);
         let mut worst = Duration::ZERO;
         for len in [64 * 1024usize, 256 * 1024] {
@@ -8637,10 +8639,11 @@ fn a_slow_lossy_path_stays_within_its_consumer_gap() {
                 let mut p = paths(network, QuicPathLimits::DEFAULT).await;
                 let _loss = seeded_loss_from(network, 15, seed, Some(Duration::from_millis(400)));
                 let (a, time) = (p.a.clone(), p.time());
+                let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
                 let send = tokio::spawn(async move {
                     a.send_stream_bounded(
                         &time,
-                        SendDeadlines::stream(len as u64),
+                        a.stream_deadlines(len as u64),
                         StreamId::next(),
                         None,
                         Bytes::from(payload(len)),
@@ -8674,7 +8677,11 @@ fn a_slow_lossy_path_stays_within_its_consumer_gap() {
                             }
                         }
                         let assembled = handle.try_assemble().is_some();
-                        let _outcome = send.await.expect("the send task ran");
+                        let outcome = send.await.expect("the send task ran");
+                        assert!(
+                            matches!(outcome, BoundedSend::Sent),
+                            "len {len} seed {seed}: {outcome:?}"
+                        );
                         (Duration::from_nanos(gap), limit, assembled)
                     })
                     .await;
@@ -8687,6 +8694,10 @@ fn a_slow_lossy_path_stays_within_its_consumer_gap() {
                     "len {len} seed {seed}: gap {gap:?} >= {limit:?}"
                 );
                 assert!(assembled, "len {len} seed {seed}: did not assemble");
+                assert!(
+                    recycle::stalls_to(a_addr).is_empty() && recycle::stalls_to(b_addr).is_empty(),
+                    "len {len} seed {seed}: a false stall"
+                );
                 crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
             }
         }
