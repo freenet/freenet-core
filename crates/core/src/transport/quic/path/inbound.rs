@@ -2304,6 +2304,87 @@ fn clamp(len: u64) -> usize {
 mod tests {
     use super::*;
 
+    /// Bytes read above a gap are credit the meter counts as read, never as
+    /// delivery that grows a window: the reader tells the meter only how far
+    /// the stream's in-order prefix moved. Counting every byte read as
+    /// delivered would let a peer grow its window by sending gapped data.
+    #[test]
+    fn bytes_read_above_a_gap_are_not_delivery() {
+        use super::super::super::budget::{QuicBudget, WindowControl, floor_window_bytes};
+        use super::super::super::tests::{bounded, drive, pair};
+        bounded(|| async move {
+            let a_addr: std::net::SocketAddr = "10.209.1.1:5000".parse().unwrap();
+            let b_addr: std::net::SocketAddr = "10.209.1.2:5000".parse().unwrap();
+            let p = pair("quic-inbound-gapped-delivery", a_addr, b_addr, None).await;
+            let permit =
+                p.b.allow_peer(p.a_addr, p.a_keys.public())
+                    .expect("allow-set has room");
+            let (a, b) = (p.a.clone(), p.b.clone());
+            let b_key = p.b_keys.public().clone();
+            let time = p.time.clone();
+            let (send, recv, server) = drive(&p.time, Duration::from_secs(10), async move {
+                let (client, server) = tokio::join!(a.connect(b_addr, &b_key), async {
+                    b.accept().await.expect("an attempt").establish().await
+                });
+                let client = client.expect("client handshake");
+                let server = server.expect("server accepted");
+                let mut send = client.inner().open_uni().await.expect("open stream");
+                send.write_all(b"x").await.expect("write");
+                let recv = server.inner().accept_uni().await.expect("accept stream");
+                (send, recv, server)
+            })
+            .await;
+            let counters: &'static crate::transport::metrics::QuicDataCounters =
+                Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+            let floor = floor_window_bytes(1 << 30);
+            let budget = QuicBudget::new(64 << 20, floor, counters);
+            let ranges = Arc::new(ConnRanges::new(MAX_GAPS_PER_CONNECTION, 64));
+            let staging = Arc::new(ConnStaging::new(1 << 20, counters));
+            let control: Arc<dyn WindowControl> = Arc::new(server.inner().clone());
+            let meter = Arc::new(budget.register(
+                control,
+                ranges.clone(),
+                staging.clone(),
+                time.now_nanos(),
+            ));
+            let mut reader = BodyReader::new(
+                recv,
+                time.clone(),
+                Duration::from_secs(30),
+                ranges,
+                Some(meter.clone()),
+                staging,
+            );
+            let chunk = |offset: u64, len: usize| {
+                Ok(Some(quinn::Chunk {
+                    offset,
+                    bytes: Bytes::from(vec![7u8; len]),
+                }))
+            };
+            // The clock does not move, so the meter does not evaluate and
+            // what it was told stays readable.
+            reader
+                .on_read(chunk(1000, 500))
+                .expect("a piece above the gap");
+            assert_eq!(
+                meter.unevaluated(),
+                (500, 0),
+                "bytes above a gap are read, not delivered"
+            );
+            reader
+                .on_read(chunk(2000, 300))
+                .expect("another piece above a gap");
+            assert_eq!(meter.unevaluated(), (800, 0));
+            reader.on_read(chunk(0, 1000)).expect("the gap filled");
+            assert_eq!(
+                meter.unevaluated(),
+                (1800, 1500),
+                "filling the gap delivers it and what was above it, up to the next gap"
+            );
+            drop((reader, send, server, permit));
+        })
+    }
+
     const F: usize = FRAGMENT_PAYLOAD_SIZE;
 
     fn bytes(len: usize, seed: u8) -> Bytes {

@@ -933,6 +933,15 @@ impl ConnMeter {
         self.budget.debt(self.id).unwrap_or(0)
     }
 
+    /// Bytes read, and contiguous bytes delivered, since the last evaluation.
+    #[cfg(test)]
+    pub(crate) fn unevaluated(&self) -> (u64, u64) {
+        (
+            self.read.load(Ordering::Relaxed),
+            self.delivered.load(Ordering::Relaxed),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn pending_shrink(&self) -> Option<(u64, u64)> {
         self.budget.pending_shrink(self.id)
