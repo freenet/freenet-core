@@ -1609,8 +1609,9 @@ fn session_and_setup_endings_reach_their_own_counters() {
     });
 }
 
-/// A fallback and a fallback the session's end followed reach their two
-/// counter families under the same label, for every cause.
+/// A fallback, a fallback the session's end followed, and a fallback of a path
+/// that carried data reach their three counter families under the same label,
+/// for every cause.
 #[test]
 fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
     use crate::transport::metrics::QuicFallback;
@@ -1647,6 +1648,7 @@ fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
                     [
                         Action::Record(Outcome::Fallback(*cause)),
                         Action::Record(Outcome::ChurnedFallback(*cause)),
+                        Action::Record(Outcome::CarryingFallback(*cause)),
                     ]
                 })
                 .collect(),
@@ -1654,7 +1656,13 @@ fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
         drop(state);
         let want: Vec<String> = causes
             .iter()
-            .flat_map(|(_, label)| [format!("{label:?}"), format!("(\"churned\", {label:?})")])
+            .flat_map(|(_, label)| {
+                [
+                    format!("{label:?}"),
+                    format!("(\"churned\", {label:?})"),
+                    format!("(\"carrying\", {label:?})"),
+                ]
+            })
             .collect();
         assert_eq!(TRANSPORT_METRICS.quic_events_of(h.remote), want);
     });
