@@ -618,9 +618,9 @@ impl Controller for CappedCubic {
 /// CONNECTION_CLOSE (PADDING is not counted by quinn). A packet is
 /// ack-eliciting exactly when it carries at least one of them, so this
 /// grows whenever an ack-eliciting packet is sent. quinn-proto 0.11.19
-/// does not count the STREAMS_BLOCKED frames it sends; a packet carrying
-/// only that frame is missed, which can only delay a close, never cause
-/// one.
+/// never sends STREAMS_BLOCKED (it only parses the frame), so that count
+/// stays 0 here; were a later quinn to send it uncounted, a packet carrying
+/// only that frame would be missed, which can only delay a close.
 pub(crate) fn ack_eliciting_frames(frames: &FrameStats) -> u64 {
     [
         frames.ack_frequency,
@@ -680,6 +680,18 @@ pub(crate) struct AckSample {
     writers: usize,
     /// quinn's smoothed round trip (`PathStats::rtt`).
     rtt: Duration,
+    /// This side's sends waiting for the peer's stream credit
+    /// ([`Writers::stream_waiters`]). quinn 0.11 sends no STREAMS_BLOCKED
+    /// (its frame count only counts received ones), so the path counts its
+    /// own waits.
+    stream_waiters: usize,
+    /// MAX_STREAMS (uni) frames received: the peer raised its limit.
+    max_streams_raised: u64,
+    /// This side's streams finished and wholly acknowledged
+    /// ([`Writers::streams_acknowledged`]).
+    streams_acknowledged: u64,
+    /// This side's data streams opened ([`Writers::streams_opened`]).
+    streams_opened: u64,
 }
 
 impl AckSample {
@@ -721,6 +733,10 @@ impl AckSample {
             stream_frames: stats.frame_tx.stream,
             writers: writers.count(),
             rtt: stats.path.rtt,
+            stream_waiters: writers.stream_waiters(),
+            max_streams_raised: stats.frame_rx.max_streams_uni,
+            streams_acknowledged: writers.streams_acknowledged(),
+            streams_opened: writers.streams_opened(),
         })
     }
 
@@ -782,6 +798,10 @@ impl AckSample {
             stream_frames: 0,
             writers: 0,
             rtt: Duration::ZERO,
+            stream_waiters: 0,
+            max_streams_raised: 0,
+            streams_acknowledged: 0,
+            streams_opened: 0,
         }
     }
 
@@ -805,6 +825,24 @@ impl AckSample {
         self
     }
 
+    /// The same sample with these stream-credit readings
+    /// ([`StreamCreditWatch`]): sends waiting for stream credit, MAX_STREAMS
+    /// received, streams wholly acknowledged and opened. Tests only.
+    #[cfg(test)]
+    pub(crate) fn with_stream_credit(
+        mut self,
+        stream_waiters: usize,
+        max_streams_raised: u64,
+        streams_acknowledged: u64,
+        streams_opened: u64,
+    ) -> Self {
+        self.stream_waiters = stream_waiters;
+        self.max_streams_raised = max_streams_raised;
+        self.streams_acknowledged = streams_acknowledged;
+        self.streams_opened = streams_opened;
+        self
+    }
+
     /// The same sample with quinn's smoothed round trip at `rtt`. Tests only.
     #[cfg(test)]
     pub(crate) fn with_rtt(mut self, rtt: Duration) -> Self {
@@ -818,17 +856,57 @@ impl AckSample {
 /// [`CreditWatch`], so a blocked frame from a send that has since ended does
 /// not keep the path counted as waiting on the peer's credit.
 #[derive(Debug, Default)]
-pub(crate) struct Writers(AtomicUsize);
+pub(crate) struct Writers(AtomicUsize, AtomicU64, AtomicU64, AtomicUsize);
 
 impl Writers {
-    /// One more send writing, until the guard is dropped.
+    /// One more send writing, until the guard is dropped; its stream is
+    /// counted as opened.
     pub(crate) fn start(self: &Arc<Self>) -> Writing {
         self.0.fetch_add(1, Ordering::Relaxed);
+        self.2.fetch_add(1, Ordering::Relaxed);
         Writing(self.clone())
+    }
+
+    /// The path's data streams opened so far.
+    pub(crate) fn streams_opened(&self) -> u64 {
+        self.2.load(Ordering::Relaxed)
+    }
+
+    /// One more send waiting in `open_uni` for the peer's stream credit,
+    /// until the guard is dropped.
+    pub(crate) fn wait_for_stream(self: &Arc<Self>) -> StreamWait {
+        self.3.fetch_add(1, Ordering::Relaxed);
+        StreamWait(self.clone())
+    }
+
+    /// Sends waiting for the peer's stream credit now.
+    pub(crate) fn stream_waiters(&self) -> usize {
+        self.3.load(Ordering::Relaxed)
     }
 
     pub(crate) fn count(&self) -> usize {
         self.0.load(Ordering::Relaxed)
+    }
+
+    /// One of the path's streams was finished and every byte of it
+    /// acknowledged, for the stream-credit rule ([`StreamCreditWatch`]).
+    pub(crate) fn stream_acknowledged(&self) {
+        self.1.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The path's streams finished and wholly acknowledged so far.
+    pub(crate) fn streams_acknowledged(&self) -> u64 {
+        self.1.load(Ordering::Relaxed)
+    }
+}
+
+/// One send counted in [`Writers::stream_waiters`] while it is held.
+#[derive(Debug)]
+pub(crate) struct StreamWait(Arc<Writers>);
+
+impl Drop for StreamWait {
+    fn drop(&mut self) {
+        self.0.3.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -912,6 +990,7 @@ pub(crate) struct AckWatch {
     /// anywhere.
     dark_counts: Option<&'static crate::transport::metrics::QuicDataCounters>,
     credit: CreditWatch,
+    stream_credit: StreamCreditWatch,
     /// Why the last [`Self::observe`] that said close did.
     stall: Option<Stall>,
     /// When the window started.
@@ -975,6 +1054,7 @@ impl AckWatch {
         Self {
             window_nanos,
             credit: CreditWatch::new(window_nanos, &first),
+            stream_credit: StreamCreditWatch::default(),
             dark_since: None,
             dark_rtt: Duration::ZERO,
             dark_probe_at: None,
@@ -1073,6 +1153,7 @@ impl AckWatch {
         let previous_cap = self.previous.cap;
         let cap_held = self.cap_held(now_nanos, &sample.cap, &previous_cap);
         let previous_now = self.previous_now.replace(now_nanos);
+        let withheld = same_controller && self.stream_credit.observe(now_nanos, &sample);
         let rtt = sample.rtt;
         let starved = self.credit.observe(
             now_nanos,
@@ -1104,6 +1185,9 @@ impl AckWatch {
         }
         if starved {
             return Some(Stall::CreditStarved);
+        }
+        if withheld {
+            return Some(Stall::StreamCreditWithheld);
         }
         let outstanding = outstanding_after_acks || self.sent_after_acks;
         // The dark-path rule: this side's packets outstanding at every sample
@@ -1191,6 +1275,11 @@ pub(crate) enum Stall {
     /// [`CREDIT_LIMITED_MIN`] of the window, and the peer acknowledged less
     /// than [`FLOOR_RATE_BYTES_PER_SEC`] over that time ([`CreditWatch`]).
     CreditStarved,
+    /// The peer kept its stream limit closed while this side wanted streams,
+    /// for [`STREAM_CREDIT_WINDOW`] after enough of this side's streams were
+    /// wholly acknowledged that an honest peer would have raised it
+    /// ([`StreamCreditWatch`]).
+    StreamCreditWithheld,
 }
 
 impl Stall {
@@ -1200,6 +1289,7 @@ impl Stall {
             Self::NotAcknowledging => "not_acknowledging",
             Self::Dark => "dark",
             Self::CreditStarved => "credit_starved",
+            Self::StreamCreditWithheld => "stream_credit_withheld",
         }
     }
 }
@@ -1338,6 +1428,78 @@ impl CreditWatch {
         let acked = sample.state.acked_bytes.saturating_sub(self.history[0].3);
         let floor = u128::from(credit_floor_rate(sample.rtt)) * u128::from(counted) / 1_000_000_000;
         u128::from(acked) < floor
+    }
+}
+
+/// How long the peer may keep its stream limit closed while this side wants
+/// streams, after enough of this side's streams were wholly acknowledged
+/// that it should have raised it ([`StreamCreditWatch`]). Longer than the
+/// other rules' window: an honest receiver lowers its limit on purpose, by
+/// one per one-packet Short waiting for its consumer (`inbound::StreamLimit`),
+/// and a consumer may be slow for a while; one that stalls a minute is not
+/// worth keeping the path for.
+pub(crate) const STREAM_CREDIT_WINDOW: Duration = Duration::from_secs(60);
+
+/// Streams of this side wholly acknowledged since the peer last raised its
+/// limit, past which an honest peer has raised it, at most: quinn returns
+/// stream credit once more than an eighth of its limit is freed, and the
+/// limit is at most `MAX_UNI_STREAMS` (64). A smaller limit needs fewer
+/// ([`StreamCreditWatch`]).
+pub(crate) const STREAM_CREDIT_FREED: u64 = super::config::MAX_UNI_STREAMS as u64 / 8 + 1;
+
+/// The stream-credit rule: a peer that acknowledges this side's streams but
+/// never raises its stream limit holds every new stream at its open
+/// deadline, so every streamed send goes on UDP after it, without stalling
+/// anything the other rules watch.
+///
+/// From the first sample at which a send of this side waits for the peer's
+/// stream credit, and enough of this side's streams were wholly
+/// acknowledged since then, the path is closed if no MAX_STREAMS arrives for
+/// [`STREAM_CREDIT_WINDOW`] (and a send waits at every sample meanwhile).
+/// Enough is [`STREAM_CREDIT_FREED`], or every
+/// stream opened since the raise if fewer (at least one): a blocked side has
+/// used every slot the raise gave, and quinn gives more than an eighth of
+/// the limit at a time, so the streams opened since a raise are already
+/// more than the eighth an honest peer waits for. Our receiver reads
+/// every stream to its end as it arrives (a Stream also while it waits for
+/// its consumer), so its quinn frees the slot once the bytes are all there;
+/// only a one-packet Short waiting for its consumer holds one, and lowers
+/// the limit it advertises while it does.
+#[derive(Default)]
+pub(crate) struct StreamCreditWatch {
+    /// MAX_STREAMS received at the latest raise seen, and this side's
+    /// streams wholly acknowledged and opened by then; all 0 from the path's
+    /// start (its counts start there too).
+    raised: (u64, u64, u64),
+    /// Since when the limit has been withheld with enough freed.
+    withheld_since: Option<u64>,
+}
+
+impl StreamCreditWatch {
+    /// Take `sample` at `now_nanos`; whether the peer withheld its stream
+    /// limit for the window.
+    fn observe(&mut self, now_nanos: u64, sample: &AckSample) -> bool {
+        let (raises, acked_then, opened_then) = self.raised;
+        if sample.max_streams_raised != raises {
+            self.raised = (
+                sample.max_streams_raised,
+                sample.streams_acknowledged,
+                sample.streams_opened,
+            );
+            self.withheld_since = None;
+            return false;
+        }
+        let blocked = sample.stream_waiters > 0;
+        let freed = sample.streams_acknowledged.saturating_sub(acked_then);
+        let opened = sample.streams_opened.saturating_sub(opened_then);
+        let enough = STREAM_CREDIT_FREED.min(opened).max(1);
+        if !blocked || freed < enough {
+            self.withheld_since = None;
+            return false;
+        }
+        let since = *self.withheld_since.get_or_insert(now_nanos);
+        let window = u64::try_from(STREAM_CREDIT_WINDOW.as_nanos()).unwrap_or(u64::MAX);
+        now_nanos.saturating_sub(since) >= window
     }
 }
 

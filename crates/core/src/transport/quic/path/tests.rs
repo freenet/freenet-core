@@ -3978,6 +3978,111 @@ fn a_path_without_data_idles_out_after_a_long_dark_spell_and_counts_it_unrecover
     })
 }
 
+/// The stream-credit rule on a real path: `b` acknowledges every stream but
+/// never reads one, so it never frees a slot and never raises its stream
+/// limit. `a` has more streams to send than the limit: those within it are
+/// wholly acknowledged, the rest wait to open for its stream credit,
+/// and the path is closed as `StreamCreditWithheld` about
+/// `STREAM_CREDIT_WINDOW` after that, by no other rule first.
+#[test]
+fn a_peer_that_never_raises_its_stream_limit_is_closed() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-stream-credit";
+        let mut s = Scripted::connect(network).await;
+        let limit = super::super::config::INITIAL_UNI_STREAMS as usize;
+        for _ in 0..limit + 8 {
+            let a = s.a.clone();
+            s.tasks.push(tokio::spawn(async move {
+                a.send_stream(StreamId::next(), None, Bytes::from(payload(100)))
+                    .await
+                    .ok();
+            }));
+        }
+        let start = s.time.now_nanos();
+        let waited = s.closed_after(start).await;
+        assert!(
+            waited >= recycle::STREAM_CREDIT_WINDOW
+                && waited <= recycle::STREAM_CREDIT_WINDOW + Duration::from_secs(8),
+            "closed {waited:?} after the sends"
+        );
+        assert_eq!(
+            recycle::stalls_to(s.b_addr),
+            vec![recycle::Stall::StreamCreditWithheld]
+        );
+    })
+}
+
+/// An honest receiver whose consumer stalls for 30 s: one-packet Shorts wait
+/// for room in its channel (capacity 1), each lowering the limit it
+/// advertises, so `a`'s further streams wait to open for its stream credit,
+/// while many of `a`'s streams were wholly acknowledged.
+/// The consumer then drains, the limit comes back up, and the path is not
+/// closed: the stream-credit rule waits `STREAM_CREDIT_WINDOW`.
+#[test]
+fn a_consumer_that_stalls_half_a_minute_does_not_close_the_path() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            short_capacity: 1,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-stream-credit-consumer", limits).await;
+        let mut shorts = std::mem::replace(&mut p.b_in.shorts, tokio::sync::mpsc::channel(1).1);
+        let (a, time) = (p.a.clone(), p.time());
+        let sends = p
+            .drive(async move {
+                let sends: Vec<_> = (0..40)
+                    .map(|_| {
+                        let a = a.clone();
+                        let time = time.clone();
+                        tokio::spawn(async move {
+                            a.send_short_bounded(&time, Duration::from_secs(120), b"x")
+                                .await
+                        })
+                    })
+                    .collect();
+                time.sleep(Duration::from_secs(30)).await;
+                sends
+            })
+            .await;
+        let time = p.time();
+        let outcomes = p
+            .drive(async move {
+                let mut delivered = 0;
+                let mut results = Vec::new();
+                for send in sends {
+                    while !send.is_finished() {
+                        while shorts.try_recv().is_ok() {
+                            delivered += 1;
+                        }
+                        time.sleep(Duration::from_millis(50)).await;
+                    }
+                    results.push(send.await.expect("the send ran"));
+                }
+                // A Short reads as Sent once acknowledged, before it is
+                // delivered: drain until every one has arrived.
+                let drained_by = time.now_nanos() + 60_000_000_000;
+                while delivered < 40 && time.now_nanos() < drained_by {
+                    while shorts.try_recv().is_ok() {
+                        delivered += 1;
+                    }
+                    time.sleep(Duration::from_millis(50)).await;
+                }
+                (results, delivered)
+            })
+            .await;
+        let (results, delivered) = outcomes;
+        assert!(
+            p.a.connection().inner().close_reason().is_none(),
+            "{:?}",
+            recycle::stalls_to(p.pair.b_addr)
+        );
+        assert!(recycle::stalls_to(p.pair.b_addr).is_empty());
+        assert_eq!(delivered, 40, "{results:?}");
+    })
+}
+
 /// The credit rule on a real path: `b` acknowledges everything but never
 /// reads, so it never returns credit, and `a` has more to send than `b`'s
 /// window. `a` closes the path as credit-starved within the window and a

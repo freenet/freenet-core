@@ -1862,7 +1862,9 @@ impl QuicPath {
                 // Counted if the send's deadline drops this wait: the peer's
                 // stream limit was full for all of it.
                 let waiting = CreditWait(Some((&self.stats, &progress)));
+                let wanted = (opener == Opener::Data).then(|| self.writers.wait_for_stream());
                 let opened = open.await;
+                drop(wanted);
                 waiting.disarm();
                 opened
             }
@@ -1873,6 +1875,7 @@ impl QuicPath {
         let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress, epoch);
         send.meter = self.meter.clone();
         send.writing = Some(self.writers.start());
+        send.writers = Some(self.writers.clone());
         send.ack_waits = Some(self.ack_waits.clone());
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
@@ -2113,6 +2116,9 @@ struct Outgoing {
     /// The path's count of cancelled sends waiting for their acknowledgement
     /// without a permit ([`AckWaits`]).
     ack_waits: Option<Arc<AckWaits>>,
+    /// Where the stream is counted once wholly acknowledged
+    /// (`recycle::Writers::stream_acknowledged`).
+    writers: Option<Arc<recycle::Writers>>,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
@@ -2141,6 +2147,7 @@ impl Outgoing {
             meter: None,
             writing: None,
             ack_waits: None,
+            writers: None,
         }
     }
 
@@ -2344,7 +2351,12 @@ impl Outgoing {
         let stopped = (&mut self.stopped).await;
         self.awaiting_ack = false;
         match stopped {
-            Ok(None) => Ok(()),
+            Ok(None) => {
+                if let Some(writers) = &self.writers {
+                    writers.stream_acknowledged();
+                }
+                Ok(())
+            }
             Ok(Some(code)) => Err(QuicSendError::Stopped(code.into_inner())),
             Err(quinn::StoppedError::ConnectionLost(error)) => {
                 Err(QuicSendError::ConnectionLost(error))
@@ -2420,10 +2432,13 @@ impl Drop for Outgoing {
             None
         };
         let stopped = std::mem::replace(&mut self.stopped, Box::pin(std::future::pending()));
+        let writers = self.writers.take();
         // Bounded as above, and ending with the acknowledgement or the
         // connection, so the handle is not monitored.
         drop(GlobalExecutor::spawn(async move {
-            let _ended = stopped.await;
+            if let (Ok(None), Some(writers)) = (stopped.await, writers) {
+                writers.stream_acknowledged();
+            }
             drop(slot);
             drop(epoch);
             drop(waiting);

@@ -1405,6 +1405,77 @@ fn the_credit_floor_follows_the_round_trip_up_to_its_cap() {
     );
 }
 
+/// Feed a watch a busy conforming peer's readings (the other rules never
+/// close it) with stream-credit readings `at(t)`: (sends waiting for stream credit,
+/// MAX_STREAMS received, streams wholly acknowledged).
+fn run_stream_credit(ticks: u64, at: impl Fn(u64) -> (usize, u64, u64)) -> Option<(u64, Stall)> {
+    let record = Arc::default();
+    let sample = |t: u64| {
+        let (blocked, raised, acked) = at(t);
+        AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
+            .with_stream_credit(blocked, raised, acked, 64)
+    };
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+    (1..=ticks).find_map(|t| {
+        watch
+            .observe(t * ACK_WATCH_TICK.as_secs() * SEC, sample(t))
+            .then(|| (t, watch.stall().expect("a reason")))
+    })
+}
+
+/// The stream-credit rule: a send waiting for stream credit from tick 1, with
+/// `STREAM_CREDIT_FREED` of this side's streams wholly acknowledged and no
+/// MAX_STREAMS since: closed `STREAM_CREDIT_WINDOW` (30 ticks) later. Not
+/// closed when the peer raises its limit within the window, when fewer
+/// streams were freed than quinn needs before it raises, or when this side
+/// never wanted another stream.
+#[test]
+fn a_peer_that_withholds_its_stream_limit_is_closed() {
+    let freed = STREAM_CREDIT_FREED;
+    let window_ticks = STREAM_CREDIT_WINDOW.as_secs() / ACK_WATCH_TICK.as_secs();
+    assert_eq!(
+        run_stream_credit(100, |t| (usize::from(t >= 1), 0, freed)),
+        Some((1 + window_ticks, Stall::StreamCreditWithheld))
+    );
+    // A raise every 20 ticks, with a send waiting throughout.
+    assert_eq!(
+        run_stream_credit(100, |t| (1, t / 20, freed * (1 + t / 20))),
+        None
+    );
+    assert_eq!(
+        run_stream_credit(100, |t| (usize::from(t >= 1), 0, freed - 1)),
+        None
+    );
+    assert_eq!(run_stream_credit(100, |_| (0, 0, freed)), None);
+}
+
+/// A peer that withholds a small limit (here the 4 streams a connection
+/// starts with): only 4 of this side's streams could open, all were wholly
+/// acknowledged, and that is every stream opened since the start, so it is
+/// enough: closed. With one of them not yet acknowledged it is not.
+#[test]
+fn a_peer_that_withholds_a_small_stream_limit_is_closed() {
+    let run = |acked: u64| {
+        let record = Arc::default();
+        let sample = |t: u64| {
+            AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
+                .with_stream_credit(usize::from(t >= 1), 0, acked, 4)
+        };
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+        (1..=100u64).find_map(|t| {
+            watch
+                .observe(t * ACK_WATCH_TICK.as_secs() * SEC, sample(t))
+                .then(|| (t, watch.stall().expect("a reason")))
+        })
+    };
+    let window_ticks = STREAM_CREDIT_WINDOW.as_secs() / ACK_WATCH_TICK.as_secs();
+    assert_eq!(
+        run(4),
+        Some((1 + window_ticks, Stall::StreamCreditWithheld))
+    );
+    assert_eq!(run(3), None);
+}
+
 /// The egress cap holds for most of each window and releases for one
 /// interval in five: only the released intervals can count, 2 s of every
 /// 10 s, under `CREDIT_LIMITED_MIN`, so the send is never closed, though it
