@@ -3103,10 +3103,10 @@ impl NetworkApiConfig {
             return None;
         }
         Some(crate::transport::quic::QuicSettings {
-            max_connections: self.max_connections,
             memory_limit: crate::wasm_runtime::read_total_ram_bytes()
                 .unwrap_or(QUIC_FALLBACK_TOTAL_RAM),
             idle_timeout: None,
+            initial_window: None,
             // The transport sets it from its bandwidth settings when it binds.
             rate_limit: Default::default(),
         })
@@ -3116,12 +3116,14 @@ impl NetworkApiConfig {
     /// lowered to [`Self::max_connections`], which is also the value when the
     /// key is unset or cannot be parsed ([`Self::quic_max_paths_setting`]).
     ///
-    /// The cap is `max_connections` because the endpoint's flow-control
-    /// windows are sized for that many connections
-    /// (`quic::config::connection_window_bytes`); more paths would exceed the
-    /// memory share they were sized for. At the default the limit rarely
-    /// binds: a connection has at most one path, but a permit is held from
-    /// the offer, so a path still closing can briefly hold a slot.
+    /// The cap is `max_connections`: a path needs a UDP session, and the
+    /// node's QUIC memory is bounded per path (the fixed charge,
+    /// `quic::config::QUIC_CONNECTION_CHARGE_BYTES`, plus, for a data path, the
+    /// floor grant, `quic::budget::floor_grant`) and by the buffer budget its
+    /// data paths' windows grow into above that (`quic::budget`). At the
+    /// default the limit rarely binds: a connection has at most one path, but
+    /// a permit is held from the offer, so a path still closing can briefly
+    /// hold a slot.
     pub(crate) fn quic_max_paths(&self) -> usize {
         match self.quic_max_paths_setting() {
             QuicMaxPathsSetting::Set(limit) => limit.min(self.max_connections),
@@ -7624,9 +7626,6 @@ shutdown-drain-secs = 42
                 on,
                 "transport-quic = {value:?}"
             );
-            if let Some(settings) = cfg.network_api.quic_settings() {
-                assert_eq!(settings.max_connections, cfg.network_api.max_connections);
-            }
             let rewritten = toml::to_string(&cfg).unwrap();
             assert!(
                 rewritten.contains(&format!("transport-quic = \"{value}\"")),

@@ -890,17 +890,21 @@ Audit questions for any new byte budget:
 aggregate (listed in `NOT_SUMMED` with the reason). They bound one stream and
 one peer, not the node: reassembly memory across the node is at most the
 number of peers times the per-peer allowance (one budget, shared by a peer's
-UDP connection and QUIC path). The QUIC
-flow-control windows (`quic::config::connection_window_bytes`, #5940) are
-the same class of per-connection exception and are in `NOT_SUMMED`. They are
-NOT covered by the reassembly allowance: they come on top of it, the send
-window is outbound, and quinn's own per-connection state is unbounded by
-the windows. That memory (measurements of some of its terms, and a list of
-what was not measured, are in `quic/config.rs`) is not accounted in the
-aggregate and must be before QUIC carries data by default (Step 3 at
-100%; shadow paths, on by default since Step 2, carry none). A node-wide share
-and fairness between connections are deferred to the transport redesign. Do
-not copy this shape for memory the node holds on its own initiative.
+UDP connection and QUIC path). QUIC memory is NOT covered by the reassembly
+allowance: it comes on top of it, the send window is outbound, and quinn holds
+per-connection state of its own. Since the buffer budget (#5940) a QUIC data
+path at its floor windows is charged a floor grant (`quic::budget::floor_grant`),
+part of its per-path fixed charge, and its windows grow above that from one
+node-wide budget (`quic::budget`, `quic_buffer_budget_for`, memory / 16)
+shared max-min between the paths; what does not scale with the windows is a
+fixed charge per connection (`quic::config::QUIC_CONNECTION_CHARGE_BYTES`).
+The budget holds only growth, so the node's QUIC memory is data paths x
+(fixed charge + floor grant) + budget. All of it is in `NOT_SUMMED`
+until the buffer budget's aggregate-accounting step sums those terms, which must
+happen before any release sets `QUIC_DATA_PERCENT` above 0 (pinned by
+`upgrade::policy::tests::no_data_share_before_the_quic_budget_is_summed`;
+shadow paths, on by default since Step 2, carry no data). Do not copy the per-connection
+exception shape for memory the node holds on its own initiative.
 
 ```bash
 # Flat byte budgets, which should be rare:

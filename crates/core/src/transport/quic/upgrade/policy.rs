@@ -341,6 +341,21 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
 mod tests {
     use super::*;
 
+    /// No release carries data on QUIC by default until the node's memory
+    /// aggregate sums the QUIC buffer budget (growth above the floors), the
+    /// fixed charge per connection and each data path's floor grant
+    /// (`declared_caches_plus_hosting_budget_leave_room_for_the_runtime`;
+    /// all are outside the aggregate until then, #5940 buffer-budget PR 5).
+    /// The PR that sums them removes this test; a PR that raises the share
+    /// without summing them fails here.
+    #[test]
+    fn no_data_share_before_the_quic_budget_is_summed() {
+        assert_eq!(
+            QUIC_DATA_PERCENT, 0,
+            "QUIC data needs the buffer budget summed in the node's memory aggregate first"
+        );
+    }
+
     const AVAILABILITIES: [QuicAvailability; 4] = [
         QuicAvailability::Disabled,
         QuicAvailability::Up,

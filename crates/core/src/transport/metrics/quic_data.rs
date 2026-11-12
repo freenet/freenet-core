@@ -11,7 +11,7 @@
 //! | Key | What |
 //! |---|---|
 //! | `quic_data_send_<kind>_<result>` | data sends by kind and how they ended |
-//! | `quic_data_event_<event>` | short overflow to UDP, refusals, stall closes, lost UDP sends |
+//! | `quic_data_event_<event>` | short overflow to UDP, refusals, stall closes, lost UDP sends, ack waits released at their bound |
 //! | `quic_data_stop_<code>` | stops the peer sent to data sends, by code |
 //! | `quic_inbound_<outcome>` | every `QuicInboundOutcome`, node-wide |
 //! | `quic_enabled_data_paths` | paths where both sides set the data bit |
@@ -28,6 +28,9 @@
 //! | `quic_gate_loss_<verdict>` | congestion events by the loss gate's verdict (`recycle::loss_gate`): passed to Cubic as `queue`, `share` (loss share above the ceiling), `persistent`, `ecn` (a congestion mark), `no_sample`, or `ignored` as random loss; summed over the node's paths up to each path's last tick. Over a path's life they sum to its `quic_congestion_events`; within one period they can differ by the events between the two reads of a tick |
 //! | `quic_gate_ended_queue_<bucket>` | paths that ended in the period after at least 20 gate verdicts, by the share of them passed as `queue`: `lt_10pct`, `lt_50pct`, `ge_50pct`. A path whose losses mostly read as a queue runs as plain Cubic, whether the queue is real or jitter |
 //! | `quic_send_resets`, `quic_path_ms` | sends a path reset on this side, and the time QUIC paths were up, shadow paths included, up to each path's last tick: resets per connection-hour is their ratio |
+//! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
+//! | `quic_staged_peak_pct` | the most any connection staged in the period (bytes read for streams whose header its reader had not taken yet) as a percentage of its staging cap (`quic::path::inbound::ConnStaging`); streams stopped at the cap are `quic_inbound_evicted_staged` |
+//! | `quic_window_grew`, `quic_window_grow_refused`, `quic_window_shrank` | window-limited data paths whose receive window grew, those that found no room, and paths whose windows the budget lowered |
 //! | `quic_send_resets_reached_<n>`, `quic_send_resets_path_max` | paths whose lifetime reset count reached each level in the period, and the highest count a reset in the period took a path to: how close paths get to `recycle::SEND_ABORT_LIMIT` |
 //!
 //! What the loss rate is: quinn's lost over sent (quinn-proto 0.11.19). `sent`
@@ -283,6 +286,11 @@ pub(crate) struct QuicDataCounters {
     path_ms: AtomicU64,
     send_resets_reached: [AtomicU64; QUIC_SEND_RESET_LEVELS.len()],
     send_resets_path_max: AtomicU64,
+    budget_bytes: AtomicU64,
+    budget_charged: AtomicU64,
+    budget_charged_peak: AtomicU64,
+    window_changes: [AtomicU64; 3],
+    staged_peak_pct: AtomicU64,
     gate_loss: [AtomicU64; GATE_VERDICTS],
     gate_ended_queue: [AtomicU64; GATE_QUEUE_LABELS.len()],
 }
@@ -311,6 +319,11 @@ impl QuicDataCounters {
             path_ms: zero(),
             send_resets_reached: std::array::from_fn(|_| zero()),
             send_resets_path_max: zero(),
+            budget_bytes: zero(),
+            budget_charged: zero(),
+            budget_charged_peak: zero(),
+            window_changes: std::array::from_fn(|_| zero()),
+            staged_peak_pct: zero(),
             gate_loss: std::array::from_fn(|_| zero()),
             gate_ended_queue: std::array::from_fn(|_| zero()),
         }
@@ -484,6 +497,36 @@ impl QuicDataCounters {
         self.path_ms.fetch_add(ms, Ordering::Relaxed);
     }
 
+    /// The node's QUIC buffer budget, set when the endpoint is built.
+    pub(crate) fn set_budget_bytes(&self, bytes: u64) {
+        self.budget_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// What the node's data paths are charged against the budget now.
+    pub(crate) fn set_budget_charged(&self, bytes: u64) {
+        self.budget_charged.store(bytes, Ordering::Relaxed);
+        self.budget_charged_peak.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    /// What one evaluation did to a path's windows.
+    pub(crate) fn record_window_change(
+        &self,
+        change: crate::transport::quic::budget::WindowChange,
+    ) {
+        use crate::transport::quic::budget::WindowChange;
+        let index = match change {
+            WindowChange::Grew => 0,
+            WindowChange::Refused => 1,
+            WindowChange::Shrank => 2,
+        };
+        self.window_changes[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A connection's staged bytes reached `pct` percent of its staging cap.
+    pub(crate) fn record_staged_level(&self, pct: u64) {
+        self.staged_peak_pct.fetch_max(pct, Ordering::Relaxed);
+    }
+
     /// The period's counts, reset when `reset`. The gauge is read, never reset.
     pub(crate) fn snapshot(&self, reset: bool) -> QuicDataSnapshot {
         let get = |a: &AtomicU64| {
@@ -542,6 +585,21 @@ impl QuicDataCounters {
             path_ms: get(&self.path_ms),
             send_resets_reached: self.send_resets_reached.iter().map(get).collect(),
             send_resets_path_max: get(&self.send_resets_path_max),
+            budget_bytes: self.budget_bytes.load(Ordering::Relaxed),
+            budget_charged: self.budget_charged.load(Ordering::Relaxed),
+            // The peak of the period starts again from what is charged now.
+            budget_charged_peak: if reset {
+                self.budget_charged_peak.swap(
+                    self.budget_charged.load(Ordering::Relaxed),
+                    Ordering::Relaxed,
+                )
+            } else {
+                self.budget_charged_peak.load(Ordering::Relaxed)
+            },
+            window_grew: get(&self.window_changes[0]),
+            window_grow_refused: get(&self.window_changes[1]),
+            window_shrank: get(&self.window_changes[2]),
+            staged_peak_pct: get(&self.staged_peak_pct),
             gate_loss: self.gate_loss.iter().map(get).collect(),
             gate_ended_queue: self.gate_ended_queue.iter().map(get).collect(),
         }
@@ -590,6 +648,15 @@ pub struct QuicDataSnapshot {
     /// By `QUIC_SEND_RESET_LEVELS`.
     pub send_resets_reached: Vec<u64>,
     pub send_resets_path_max: u64,
+    /// A gauge, not reset.
+    pub budget_bytes: u64,
+    /// A gauge, not reset.
+    pub budget_charged: u64,
+    pub budget_charged_peak: u64,
+    pub window_grew: u64,
+    pub window_grow_refused: u64,
+    pub window_shrank: u64,
+    pub staged_peak_pct: u64,
     /// Congestion events by loss-gate verdict, by `loss_gate::Verdict::ALL`.
     /// Defaulted, so JSON from before the gate decodes. This does not help
     /// bincode: the local event log drops a snapshot written by an older
@@ -645,6 +712,13 @@ impl QuicDataSnapshot {
             path_ms,
             send_resets_reached,
             send_resets_path_max,
+            budget_bytes,
+            budget_charged,
+            budget_charged_peak,
+            window_grew,
+            window_grow_refused,
+            window_shrank,
+            staged_peak_pct,
             gate_loss,
             gate_ended_queue,
         } = self;
@@ -759,6 +833,13 @@ impl QuicDataSnapshot {
             ("quic_send_resets", *send_resets),
             ("quic_path_ms", *path_ms),
             ("quic_send_resets_path_max", *send_resets_path_max),
+            ("quic_budget_bytes", *budget_bytes),
+            ("quic_budget_charged_bytes", *budget_charged),
+            ("quic_budget_charged_peak_bytes", *budget_charged_peak),
+            ("quic_window_grew", *window_grew),
+            ("quic_window_grow_refused", *window_grow_refused),
+            ("quic_window_shrank", *window_shrank),
+            ("quic_staged_peak_pct", *staged_peak_pct),
         ] {
             keys.push((None, key.to_string(), value));
         }
@@ -808,6 +889,13 @@ impl QuicDataSnapshot {
             path_ms,
             send_resets_reached,
             send_resets_path_max: _,
+            budget_bytes: _,
+            budget_charged: _,
+            budget_charged_peak: _,
+            window_grew,
+            window_grow_refused,
+            window_shrank,
+            staged_peak_pct: _,
             gate_loss,
             gate_ended_queue,
         } = self;
@@ -837,6 +925,9 @@ impl QuicDataSnapshot {
                 u64::from(*streams_open_paths_sampled),
                 *send_resets,
                 *path_ms,
+                *window_grew,
+                *window_grow_refused,
+                *window_shrank,
             ]
             .iter()
             .any(|n| *n != 0)

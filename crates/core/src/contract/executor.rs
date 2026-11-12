@@ -1817,8 +1817,11 @@ pub(crate) fn declared_cache_ceiling_terms(
     // endpoint per node, and fixed. Summed whatever `transport-quic` says, as
     // the ingress queue is. The QUIC flow-control windows and quinn's
     // per-connection state are NOT summed, so this aggregate does not
-    // account a node's QUIC connections; see `NOT_SUMMED` and
-    // `quic::config::connection_window_bytes`.
+    // account a node's QUIC connections; see `NOT_SUMMED`. The aggregate
+    // step (#5940, PR 5) must sum data paths x (the fixed charge
+    // `QUIC_CONNECTION_CHARGE_BYTES` + the floor grant `quic::budget::floor_grant`)
+    // + the buffer budget `quic_buffer_budget_for`, which holds only growth
+    // above the floor grants.
     let quic_incoming = crate::transport::quic::config::INCOMING_BUFFER_TOTAL_BYTES as usize;
     // The delegate context cache (`ctx.write()` bytes). One per node, shared
     // by every executor, so NOT multiplied by the pool.
@@ -3008,29 +3011,59 @@ mod tests {
                 "WAKE_DATAGRAM_BYTES",
                 "egress-cap wake threshold for a QUIC datagram (a rate quantity), not memory",
             ),
-            // The QUIC flow-control windows are the same class of
-            // per-connection exception as inbound stream reassembly (see the
-            // MAX_STREAM_TOTAL_BYTES row). The memory one QUIC connection
-            // holds (some of its terms are measured in quic::config) is NOT
-            // accounted in this aggregate,
-            // and must be before QUIC carries data by default (Step 3 at 100%,
-            // a gate in the #5940 rollout plan; shadow paths carry none). It is in addition to reassembly, not covered by
-            // it.
+            // A QUIC data path's flow-control windows are set per connection:
+            // at the floor windows a path is charged its floor grant
+            // (quic::budget::floor_grant), part of the path's fixed charge, and
+            // growth above that comes from the node's buffer budget
+            // (quic_buffer_budget_for, listed below). These are the bounds and
+            // terms inside the two, not budgets of their own.
             (
-                "connection_window_bytes",
-                "one QUIC connection's flow-control window W: a per-connection \
-                 exception like MAX_STREAM_TOTAL_BYTES; quinn holds received data \
-                 beyond W and state W does not limit (measured terms in \
-                 quic::config); not accounted here, and must be before QUIC \
-                 carries data by default",
+                "floor_window_bytes",
+                "the floor window of one QUIC connection, inside each data path's \
+                 floor grant, which is per path and not in quic_buffer_budget_for",
+            ),
+            (
+                "STAGING_BUFFER_OVERHEAD_BYTES",
+                "the overhead charged per staging buffer of ONE QUIC stream \
+                 (quic::path::inbound), against its connection's staging cap, \
+                 inside the path's floor grant and its growth charged to \
+                 quic_buffer_budget_for",
+            ),
+            (
+                "INITIAL_RECEIVE_WINDOW_BYTES",
+                "the window ONE QUIC connection starts with before a data path's \
+                 meter raises it; part of the fixed charge per connection",
             ),
             (
                 "MIN_WINDOW_BYTES",
-                "clamp inside connection_window_bytes (per connection, not summed)",
+                "floor of one QUIC connection's window, inside each data path's \
+                 floor grant (per path, not in quic_buffer_budget_for)",
+            ),
+            (
+                "MIN_WINDOW_SMALL_HOST_BYTES",
+                "floor of one QUIC connection's window under 2 GiB, inside each \
+                 data path's floor grant (per path, not in quic_buffer_budget_for)",
             ),
             (
                 "MAX_WINDOW_BYTES",
-                "clamp inside connection_window_bytes (per connection, not summed)",
+                "the largest window one QUIC connection grows to; its growth above \
+                 the floor grant is charged to quic_buffer_budget_for (per \
+                 connection, not summed)",
+            ),
+            (
+                "GAP_BYTES",
+                "the charge per received gap of one QUIC connection, inside the \
+                 path's floor grant and its growth charged to quic_buffer_budget_for",
+            ),
+            (
+                "WAITING_SHORT_BYTES",
+                "one waiting one-packet Short body on ONE QUIC data path, inside \
+                 CONTROL_BUFFER_BYTES",
+            ),
+            (
+                "CONTROL_BUFFER_BYTES",
+                "the control and short buffers of one QUIC data path, inside its \
+                 floor grant (per path, not in quic_buffer_budget_for)",
             ),
             (
                 "INCOMING_BUFFER_BYTES",
@@ -3049,17 +3082,6 @@ mod tests {
                  in the quic::config module doc; summed once a QUIC path cap exists \
                  (M4, #5940)",
             ),
-            // QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE (a multiple of the window,
-            // so not a `_BYTES` name the discovery scan finds) is the other
-            // half of this term: streams x this + that multiple x W.
-            (
-                "QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES",
-                "a measurement of one QUIC connection term (received data per uni \
-                 stream, 1200-byte datagrams; with QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE \
-                 x W), not a ceiling; an input to the per-path ceiling (memory gate \
-                 M2, #5940), plus the unmeasured terms in the quic::config module \
-                 doc; summed once a QUIC path cap exists (M4, #5940)",
-            ),
             (
                 "QUIC_ACK_TAIL_BYTES",
                 "a measurement of one QUIC connection term (ACK-only records after \
@@ -3071,8 +3093,9 @@ mod tests {
             // Buffer-budget terms (#5940): the fixed charge per QUIC connection
             // and the node-wide budget for what scales with the windows. Both
             // are summed (budget + quic_connections x charge) by the buffer
-            // budget's aggregate-accounting step, which waits for the
-            // small-host decision; nothing is charged against either yet.
+            // budget's aggregate-accounting step (PR 5), which must land before
+            // any release carries data on QUIC
+            // (`no_data_share_before_the_quic_budget_is_summed`).
             (
                 "QUIC_OPEN_STREAM_BYTES",
                 "a measurement of one QUIC connection term (one open stream, both \
@@ -3097,21 +3120,16 @@ mod tests {
             (
                 "QUIC_CONNECTION_CHARGE_BYTES",
                 "the fixed charge per QUIC connection; summed as quic_connections x \
-                 this by the buffer budget's aggregate-accounting step (#5940), \
-                 which waits for the small-host decision on the connection cap",
+                 this, plus each data path's floor grant (quic::budget::floor_grant), \
+                 by the buffer budget's aggregate-accounting step (#5940, PR 5), \
+                 before any release carries data on QUIC",
             ),
             (
                 "quic_buffer_budget_for",
-                "the node-wide QUIC buffer budget (memory / 16); summed by the buffer \
-                 budget's aggregate-accounting step (#5940), which waits for the \
-                 small-host decision; nothing is metered against it yet",
-            ),
-            (
-                "READ_START_BYTES",
-                "initial allocation of ONE QUIC stream read (quic::path::inbound), \
-                 at most the stream's declared length, which is charged to the \
-                 per-connection inbound budget or held to a small per-message \
-                 bound; not a node budget",
+                "the node-wide QUIC buffer budget (memory / 16): the data paths' \
+                 window growth above their floor grants (quic::budget), which are \
+                 not in it; summed with data paths x (fixed charge + floor grant) \
+                 by the buffer budget's aggregate-accounting step (#5940)",
             ),
             (
                 "MAX_CONTROL_BYTES",

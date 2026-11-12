@@ -1071,6 +1071,7 @@ impl Session {
             limits,
             self.budget.clone(),
             self.data.clone(),
+            Some(self.hub.endpoint.buffer_budget()),
         );
         let pump = spawn_pump(
             attempt,
@@ -1167,6 +1168,14 @@ impl Session {
                     "path was suspect: entered {}, left {}",
                     stats.send_event_count(E::SuspectEntered),
                     stats.send_event_count(E::SuspectLeft)
+                )
+            });
+            self.note(|| {
+                use crate::transport::quic::path::QuicSendEvent as E;
+                format!(
+                    "path stall-closed: {}, first closed by this node with: {:?}",
+                    path.stats().send_event_count(E::StalledClosed),
+                    path.closed_with()
                 )
             });
             self.note(|| {

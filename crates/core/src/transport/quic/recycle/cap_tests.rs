@@ -24,6 +24,7 @@ use crate::transport::in_memory_socket::{
     unregister_address_network, unregister_network_time_source,
 };
 use crate::transport::packet_data::MAX_RECV_PACKET_SIZE;
+use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 
 const MTU: u16 = 1200;
 
@@ -364,10 +365,12 @@ impl Link {
         )
         .await;
         let b_socket = socket(b_addr, None, Arc::default()).await;
+        // At a data path's floor window, which its meter raises a fresh
+        // connection to (`budget`).
         let settings = |rate_limit| QuicSettings {
-            max_connections: 4,
             memory_limit: 1024 * 1024 * 1024,
             idle_timeout: None,
+            initial_window: Some(crate::transport::quic::budget::MIN_WINDOW_BYTES),
             rate_limit,
         };
         let (a_keys, b_keys) = (TransportKeypair::new(), TransportKeypair::new());
@@ -444,7 +447,16 @@ impl Link {
             let mut send = sender.open_uni().await.expect("open");
             let (_, read) = tokio::join!(
                 async {
-                    send.write_all(&vec![7u8; len]).await.expect("write");
+                    // In the data path's pieces (`QuicPath::send_short`,
+                    // `write_fragments`), not one write: a write counts
+                    // against the send window until all of it is
+                    // acknowledged, so with the send window now at the floor
+                    // a write the size of the window stalls the writer for a
+                    // round trip plus the peer's ACK delay each time the
+                    // window turns over, a stall the cap does not cause.
+                    for piece in vec![7u8; len].chunks(FRAGMENT_PAYLOAD_SIZE) {
+                        send.write_all(piece).await.expect("write");
+                    }
                     send.finish().expect("finish");
                 },
                 async {

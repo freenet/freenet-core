@@ -7,7 +7,7 @@
 //! measurement runs both endpoints, quinn's drivers and the paths' receive
 //! tasks on the test's current-thread runtime, over `SimulationSocket` on
 //! one `VirtualTime`, with `GlobalRng` seeded, so a run is repeatable. The
-//! received-data measurements (assembler hold, ACK tail) drive quinn-proto
+//! received-data measurements (unordered reads, ACK tail) drive quinn-proto
 //! directly, with no runtime at all. The open-stream and `stopped`-entry
 //! measurements (`StreamRig`) run real endpoints the same way as the
 //! idle-connection one, on the current-thread runtime, and take the
@@ -19,9 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::config::{
-    QUIC_ACK_TAIL_BYTES, QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES, QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE,
-    QUIC_CONNECTION_FIXED_BYTES, QUIC_MEMORY_MEASURED_WITH, QUIC_OPEN_STREAM_BYTES,
-    QUIC_STOPPED_ENTRY_BYTES, QuicSettings,
+    QUIC_ACK_TAIL_BYTES, QUIC_CONNECTION_FIXED_BYTES, QUIC_MEMORY_MEASURED_WITH,
+    QUIC_OPEN_STREAM_BYTES, QUIC_STOPPED_ENTRY_BYTES, QuicSettings,
 };
 use super::path::{QuicInbound, QuicPath};
 use super::tests::{SEED, bounded, drive};
@@ -51,13 +50,17 @@ const SETTLE: Duration = Duration::from_secs(30);
 /// still running, and the baseline would not be one.
 const SETTLE_DRIFT_BYTES: isize = 1024;
 
-/// The settings of a node with 2 GiB of memory (the shipped `MemoryMax`) and
-/// the default 200 connections: a window of 268,435 bytes.
+/// The settings of a node with 2 GiB of memory (the shipped `MemoryMax`), at
+/// a window of 268,435 bytes: the window such a node had at 200 connections
+/// before windows were set per path from the buffer budget, which the
+/// measurements' figures were taken at. A data path's window now moves from
+/// the floor (128 KiB) to `budget::MAX_WINDOW_BYTES`; the window-scaled pins
+/// are checked across that range below.
 fn settings() -> QuicSettings {
     QuicSettings {
-        max_connections: 200,
         memory_limit: 2 * 1024 * 1024 * 1024,
         idle_timeout: None,
+        initial_window: Some(268_435),
         rate_limit: Default::default(),
     }
 }
@@ -588,22 +591,17 @@ impl Shape {
 /// What the receiver held while a peer fed it [`Shape`]s.
 #[derive(Debug, Clone)]
 struct GapHold {
-    /// The receiver's packet processing, net, after the last frame: stream
-    /// state and the data its assembler holds.
-    held: Live,
-    /// The largest rounded [`Self::held`] after any frame.
+    /// The largest rounded hold (stream state and the data quinn holds,
+    /// net) after any frame.
     peak: isize,
     /// The largest rounded hold at any instant, inside a receive call
-    /// included: compaction allocates the copy while the chunks it copies
-    /// are still alive.
+    /// included.
     transient: isize,
     /// The receiver's sending, net: the acknowledgement-only packets it
     /// tracks after its last ack-eliciting send (none is acknowledged here).
     acks_tracked: Live,
     /// Packets the receiver sent while being fed.
     receiver_sent: u64,
-    /// Rounded [`Self::held`] after each frame of the first stream.
-    first_stream_curve: Vec<isize>,
 }
 
 /// A receiver built with the node's own endpoint, transport, server and TLS
@@ -694,7 +692,12 @@ fn connected_pair_with_factory(
     let b_peer = super::identity::PeerKey::of(b_keys.public()).expect("b's key");
     let real = RealTime::new();
 
-    let receiver_transport = Arc::new(super::config::transport_config(settings, &real));
+    let mut receiver_transport = super::config::transport_config(settings, &real);
+    // The receiver is a data path, which raises the endpoint's initial stream
+    // limit (`QuicPath::with_budget`).
+    receiver_transport
+        .max_concurrent_uni_streams(quinn::VarInt::from_u32(super::config::MAX_UNI_STREAMS));
+    let receiver_transport = Arc::new(receiver_transport);
     let server = super::config::server_config(
         Arc::new(b_identity.server_tls(&a_peer).expect("server tls")),
         receiver_transport,
@@ -783,8 +786,19 @@ fn measure_gap_hold(shapes: &[Shape]) -> GapHold {
     measure_gap_hold_at(&settings(), shapes)
 }
 
-/// [`measure_gap_hold`] with the window `settings` give.
+/// [`measure_gap_hold_at`] with nothing read, as a stream in its ordered
+/// phase (header, metadata, short or control body) is while its first bytes
+/// are missing.
 fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
+    measure_gap_hold_reading(settings, shapes, false)
+}
+
+/// [`measure_gap_hold`] with the window `settings` give. With `unordered`, the
+/// receiver reads every stream unordered after each datagram, as the path's
+/// reader does in a Stream's payload phase, and drops what it read: what is
+/// measured is then quinn's own hold, without the charged buffer the reader
+/// copies into.
+fn measure_gap_hold_reading(settings: &QuicSettings, shapes: &[Shape], unordered: bool) -> GapHold {
     use quinn_proto::Dir;
 
     let _seed = GlobalRng::seed_guard(SEED);
@@ -810,8 +824,8 @@ fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
     let mut acks_tracked = Live::default();
     let mut peak = 0isize;
     let mut transient = 0isize;
-    let mut first_stream_curve = Vec::new();
-    for (index, shape) in shapes.iter().enumerate() {
+    let mut accepted = Vec::new();
+    for shape in shapes {
         let id = sender
             .conn()
             .streams()
@@ -829,16 +843,30 @@ fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
                 usize::from(super::config::MAX_UDP_PAYLOAD),
                 "padded to the MTU"
             );
-            let (_, delta, inside) = peak_delta(|| receiver.receive(now, sender.addr, &datagram));
+            let (_, delta, inside) = peak_delta(|| {
+                receiver.receive(now, sender.addr, &datagram);
+                if unordered {
+                    while let Some(stream) = receiver.conn().streams().accept(Dir::Uni) {
+                        accepted.push(stream);
+                    }
+                    for stream in &accepted {
+                        let mut recv = receiver.conn().recv_stream(*stream);
+                        if let Ok(mut chunks) = recv.read(false) {
+                            while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                                drop(chunk);
+                            }
+                            // The receiver transmits after each datagram anyway.
+                            let _should_transmit: quinn_proto::ShouldTransmit = chunks.finalize();
+                        }
+                    }
+                }
+            });
             transient = transient.max(held.rounded + inside);
             // The receiver's acknowledgements are dropped.
             let (_, acks) = live_delta(|| drop(receiver.transmit(now)));
             held += delta;
             acks_tracked += acks;
             peak = peak.max(held.rounded);
-            if index == 0 {
-                first_stream_curve.push(held.rounded);
-            }
         }
     }
     assert!(
@@ -851,159 +879,10 @@ fn measure_gap_hold_at(settings: &QuicSettings, shapes: &[Shape]) -> GapHold {
         "the sender declared nothing lost"
     );
     GapHold {
-        held,
         peak,
         transient,
         acks_tracked,
         receiver_sent: receiver.conn().stats().path.sent_packets - sent_before,
-        first_stream_curve,
-    }
-}
-
-/// The node's flow-control window at 2 GiB.
-fn window() -> usize {
-    settings().window_bytes() as usize
-}
-
-/// What the assembler pins allow for `streams` uni streams at window `w`:
-/// `streams x QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES` plus
-/// `QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE x w`.
-fn assembler_pin(streams: usize, w: usize) -> isize {
-    (streams * QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES + QUIC_ASSEMBLER_HOLD_WINDOW_MULTIPLE * w)
-        as isize
-}
-
-/// With one-byte frames above a gap, each in a padded datagram, a stream
-/// held about one datagram per frame until the assembler's waste estimate
-/// passed 32 KiB and it compacted: one stream's peak is within
-/// [`QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES`], and [`MAX_UNI_STREAMS`] such
-/// streams, which use almost none of the window, are within that many
-/// times the pin.
-///
-/// [`MAX_UNI_STREAMS`]: super::config::MAX_UNI_STREAMS
-#[test]
-fn one_byte_frames_measure_within_the_per_stream_pin() {
-    let single = measure_gap_hold(&[Shape::one_byte(64)]);
-    let curve = &single.first_stream_curve;
-    let peak = *curve.iter().max().expect("frames");
-    let at = curve.iter().position(|held| *held == peak).expect("peak");
-    assert!(
-        peak <= QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES as isize,
-        "one stream peaked at {peak} B: {single:?}"
-    );
-    let after = *curve
-        .get(at + 1)
-        .unwrap_or_else(|| panic!("premise: the stream compacted within the frames: {curve:?}"));
-    assert!(
-        peak >= 32 * 1024 && after < 8 * 1024,
-        "premise: datagrams were held until compaction, then copied out: {curve:?}"
-    );
-
-    let streams = super::config::MAX_UNI_STREAMS as usize;
-    let many = measure_gap_hold(&vec![Shape::one_byte(at + 1); streams]);
-    let pinned = (streams * QUIC_ASSEMBLER_HOLD_PER_STREAM_BYTES) as isize;
-    assert!(
-        many.transient <= pinned,
-        "{streams} streams of {} one-byte frames held {} B, over the pinned {pinned} B: \
-         {many:?}",
-        at + 1,
-        many.transient
-    );
-    assert!(
-        many.held.rounded >= streams as isize * 32 * 1024,
-        "premise: every stream held its datagrams: {many:?}"
-    );
-}
-
-/// With frames long enough that the proportional compaction threshold
-/// governs, a stream held a datagram per frame up to the window, and
-/// compaction copied while the old chunks were alive. The hold at any
-/// instant is within [`assembler_pin`] for the shapes the manual sweep in
-/// the constants' docs found worst and the ways to combine them: one stream
-/// filling the window at 444 B (highest at any instant at 2 GiB, 4.115 W),
-/// at 470 B (highest between packets, 3.05 W), both also at the smallest
-/// and largest windows, and at 50 B (thousands of short frames, compacted
-/// again and again); 64 streams sharing the window; and
-/// `MAX_UNI_STREAMS - 1` one-byte streams beside one that fills the rest.
-/// All datagrams are padded to 1200 B; other sizes are not measured.
-#[test]
-fn frames_filling_the_window_measure_within_the_window_multiple() {
-    let w = window();
-    let one_byte_streams = super::config::MAX_UNI_STREAMS as usize - 1;
-    let mut mixed = vec![Shape::one_byte(28); one_byte_streams];
-    let used: usize = mixed.iter().map(Shape::credit).sum();
-    mixed.push(Shape::filling(444, w - used));
-    let cases: Vec<(&str, Vec<Shape>)> = vec![
-        ("444 B frames", vec![Shape::filling(444, w)]),
-        ("470 B frames", vec![Shape::filling(470, w)]),
-        ("50 B frames", vec![Shape::filling(50, w)]),
-        (
-            "64 streams of 460 B frames",
-            vec![Shape::filling(460, w / 64); 64],
-        ),
-        ("one-byte streams and one of 444 B frames", mixed),
-    ];
-    for (name, shapes) in cases {
-        let hold = measure_gap_hold(&shapes);
-        let pinned = assembler_pin(shapes.len(), w);
-        assert!(
-            hold.transient <= pinned,
-            "{name}: held {} B at its highest, over the pinned {pinned} B: {hold:?}",
-            hold.transient
-        );
-        if name == "470 B frames" {
-            assert!(
-                hold.peak as f64 >= 2.8 * w as f64,
-                "premise: no compaction, a datagram held per frame: {} B",
-                hold.peak
-            );
-        }
-        if name == "444 B frames" {
-            assert!(
-                hold.transient as f64 >= 3.5 * w as f64,
-                "premise: the copy overlapped the old chunks, over 3.5 x W: {} B",
-                hold.transient
-            );
-        }
-        if name.starts_with("one-byte") {
-            assert!(
-                hold.held.rounded >= one_byte_streams as isize * 32 * 1024,
-                "premise: the one-byte streams held their datagrams: {hold:?}"
-            );
-        }
-    }
-
-    // The same two lengths at the smallest window (MIN_WINDOW_BYTES, a
-    // 512 MiB node) and the largest (MAX_WINDOW_BYTES, a 64 GiB node). At
-    // the largest, these lengths make over 2048 chunks, so the chunk-count
-    // trigger compacts them; the premise is only that the stream held more
-    // than the window.
-    for (memory_limit, expected) in [
-        (512usize << 20, super::config::MIN_WINDOW_BYTES),
-        (64usize << 30, super::config::MAX_WINDOW_BYTES),
-    ] {
-        let settings = QuicSettings {
-            max_connections: 200,
-            memory_limit,
-            idle_timeout: None,
-            rate_limit: Default::default(),
-        };
-        let w = settings.window_bytes() as usize;
-        assert_eq!(w, expected as usize, "premise: the window at its extreme");
-        for len in [444, 470] {
-            let hold = measure_gap_hold_at(&settings, &[Shape::filling(len, w)]);
-            assert!(
-                hold.transient <= assembler_pin(1, w),
-                "{len} B frames at W = {w}: held {} B at its highest, over the pinned {} B",
-                hold.transient,
-                assembler_pin(1, w)
-            );
-            assert!(
-                hold.peak as f64 >= 1.5 * w as f64,
-                "premise: the stream held more than the window at W = {w}: {} B",
-                hold.peak
-            );
-        }
     }
 }
 
@@ -1056,7 +935,7 @@ fn quic_memory_figures_match_the_locked_versions() {
 }
 
 /// The fixed charge per connection is the sum the buffer-budget design gives
-/// (840 KiB, the `stopped` map at the reset limit's worst case), and the budget
+/// (888 KiB, the `stopped` map at the reset limit's worst case), and the budget
 /// for what scales with the windows is a sixteenth of node memory. A change to
 /// any term moves the first figure, so the design's connection caps are
 /// re-derived with it.
@@ -1067,9 +946,46 @@ fn the_fixed_charge_and_the_buffer_budget_match_the_design() {
         super::recycle::SEND_ABORT_LIMIT as usize * QUIC_STOPPED_ENTRY_BYTES,
         416 * 1024
     );
-    assert_eq!(QUIC_CONNECTION_CHARGE_BYTES, 860_160);
+    assert_eq!(QUIC_CONNECTION_CHARGE_BYTES, 909_312);
     const MIB: usize = 1024 * 1024;
     assert_eq!(quic_buffer_budget_for(1024 * MIB), 64 * MIB);
     assert_eq!(quic_buffer_budget_for(2048 * MIB), 128 * MIB);
     assert_eq!(quic_buffer_budget_for(7600 * MIB), 475 * MIB);
+}
+
+/// Every stream is read unordered from its first byte (`path::inbound`), so
+/// quinn hands over every chunk as it arrives, gap or not: with the stream's
+/// first byte withheld and the reader reading after each datagram, quinn
+/// holds at most the window's worth, within the `W + debt` the buffer budget
+/// charges a data path for
+/// received data that is not read yet (`budget::receive_charge`). Measured at
+/// the floor window and at the largest a path grows to.
+#[test]
+fn an_unordered_reader_leaves_quinn_within_the_window_charge() {
+    for window in [
+        super::budget::MIN_WINDOW_BYTES,
+        super::budget::MAX_WINDOW_BYTES,
+    ] {
+        let settings = QuicSettings {
+            memory_limit: 2 * 1024 * 1024 * 1024,
+            idle_timeout: None,
+            initial_window: Some(window),
+            rate_limit: Default::default(),
+        };
+        let w = window as usize;
+        for len in [444, 470] {
+            let held = measure_gap_hold_reading(&settings, &[Shape::filling(len, w)], false);
+            assert!(
+                held.peak > w as isize,
+                "premise: unread, {len} B frames held more than W = {w}: {} B",
+                held.peak
+            );
+            let read = measure_gap_hold_reading(&settings, &[Shape::filling(len, w)], true);
+            assert!(
+                read.transient <= w as isize,
+                "read unordered, {len} B frames at W = {w}: quinn held {} B, over the window",
+                read.transient
+            );
+        }
+    }
 }

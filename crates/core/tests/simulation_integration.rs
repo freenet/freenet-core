@@ -21510,6 +21510,7 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
     }
     let records = run.trace.records();
     let mut on_udp_while_dark = false;
+    let mut idle_fallbacks = 0;
     // Each end: its path went suspect before it closed, and fell back on the
     // idle timeout. Times are compared per node: each host's trace clock starts
     // on its own.
@@ -21520,16 +21521,32 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
                 .filter(|r| r.node == *address && r.what.starts_with(what))
                 .collect::<Vec<_>>()
         };
+        // On the idle timeout, or on the stall close (STALLED_SENDS_LIMIT
+        // sends timed out in a row with nothing acknowledged), which this node
+        // sends and its machine reads as a lost connection (`Reset`). Which
+        // one depends on timing: an end that had a burst of sends on the path
+        // when it went dark closes on the stall; with windows set per path
+        // from the buffer budget (#5940), the gateway's sends after the
+        // node's slower transfer come in such a burst.
         let fell_back = of_node("Fallback(");
-        assert_eq!(
-            fell_back
-                .iter()
-                .map(|r| r.what.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Fallback(Idle)"],
-            "{address} fell back on the idle timeout: {}",
+        let causes: Vec<&str> = fell_back.iter().map(|r| r.what.as_str()).collect();
+        let closed_here = of_node("path stall-closed: ");
+        let stall_closed = closed_here.iter().any(|r| {
+            r.what == "path stall-closed: 1, first closed by this node with: Some(Downgrade)"
+        });
+        assert!(
+            causes == ["Fallback(Idle)"] || (causes == ["Fallback(Reset)"] && stall_closed),
+            "{address} fell back once, on the idle timeout, or on a Reset that was its own \
+             stall close and no other close: {}",
             run.dump()
         );
+        // A `Reset` accepted here is this node's own stall close: the machine
+        // reads the connection loss that close causes as `Reset`, so the close
+        // comes first, and the note shows it was the only close this node
+        // sent on the path.
+        if causes == ["Fallback(Idle)"] {
+            idle_fallbacks += 1;
+        }
         let fell_back_at = fell_back[0].at;
         assert!(
             of_node("path was suspect: entered ")
@@ -21551,6 +21568,13 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
                 .any(|r| r.at > last_on_path && r.at < fell_back_at);
         }
     }
+    // The idle-timeout fallback this test was written for still happens: the
+    // end without a burst of sends when the path went dark waits it out.
+    assert!(
+        idle_fallbacks >= 1,
+        "at least one end fell back on the idle timeout: {}",
+        run.dump()
+    );
     // At least one end had data for the other while the path was dark, and it
     // went on UDP: without suspect routing it went on the dark path and was lost.
     assert!(

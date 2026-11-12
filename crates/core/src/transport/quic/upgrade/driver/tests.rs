@@ -334,7 +334,7 @@ async fn data_path_with(
     drop(permit);
     let time = pair.time.clone();
     let (peer, peer_inbound) = QuicPath::with_limits(client, time.clone(), peer_limits);
-    let (ours, controls) = QuicPath::with_budget(server, time.clone(), limits, budget, data);
+    let (ours, controls) = QuicPath::with_budget(server, time.clone(), limits, budget, data, None);
     DataPath {
         time,
         _pair: pair,
