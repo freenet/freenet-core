@@ -5,7 +5,8 @@
 //! and registers here for the peer's address. The attempt router hands each
 //! native attempt from that address to the waiter, which is the only way a
 //! native attempt reaches anything. An address gets an entry only from
-//! [`NativeWaiters::register`], and the native accept is its only caller.
+//! `NativeWaiters::register`, visible to the native module only, whose one
+//! caller is the native accept.
 //!
 //! At most one attempt per waiter is in flight: while the waiter is
 //! completing one handshake the router ignores the next attempts, and the
@@ -73,8 +74,9 @@ impl Drop for InFlight {
 impl NativeWaiters {
     /// Wait for native attempts from `addr`. `None` when a waiter for it
     /// already exists: one native connection is set up per address at a
-    /// time.
-    pub(crate) fn register(self: &Arc<Self>, addr: SocketAddr) -> Option<NativeWaiter> {
+    /// time. Visible to the native module only, and called there only by
+    /// `setup::accept_native` (pinned in `native::pins`).
+    pub(super) fn register(self: &Arc<Self>, addr: SocketAddr) -> Option<NativeWaiter> {
         let addr = crate::transport::normalize_mapped_addr(addr);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel(1);
@@ -125,6 +127,14 @@ impl NativeWaiters {
                 NativeRoute::Busy
             }
         }
+    }
+
+    /// [`Self::register`] for a test outside the native module.
+    #[cfg(test)]
+    pub(crate) fn register_for_test(self: &Arc<Self>, addr: SocketAddr) -> Option<NativeWaiter> {
+        // Called by path, so `native::pins` (which counts `.register(` calls
+        // in the module's production code) does not count this test helper.
+        NativeWaiters::register(self, addr)
     }
 
     /// The number of addresses with a waiter.

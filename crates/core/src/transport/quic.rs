@@ -399,6 +399,8 @@ pub(crate) enum QuicAllowError {
 trait QuicSources: Send + Sync {
     fn allow(&self, addr: SocketAddr) -> Option<QuicSourcePermit>;
     fn allow_existing(&self, addr: SocketAddr) -> Option<QuicSourcePermit>;
+    /// Send one datagram outside quinn, without waiting (a native punch).
+    fn try_send(&self, datagram: &[u8], to: SocketAddr) -> io::Result<usize>;
 }
 
 impl<S: Socket> QuicSources for DemuxSocket<S> {
@@ -408,6 +410,10 @@ impl<S: Socket> QuicSources for DemuxSocket<S> {
 
     fn allow_existing(&self, addr: SocketAddr) -> Option<QuicSourcePermit> {
         self.allow_existing_quic_source(addr)
+    }
+
+    fn try_send(&self, datagram: &[u8], to: SocketAddr) -> io::Result<usize> {
+        Socket::try_send_to(self, datagram, to)
     }
 }
 
@@ -816,6 +822,17 @@ impl QuicEndpoint {
         expected: &TransportPublicKey,
     ) -> Result<QuicPeerPermit, QuicAllowError> {
         self.allow_peer_for(addr, expected, config::Alpn::Upgrade)
+    }
+
+    /// Send one punch datagram (`native::punch::punch_datagram`) to `to` on
+    /// the endpoint's socket, without waiting. It is charged to the egress cap
+    /// like any unpaced send. A send the socket cannot take now is lost, as a
+    /// punch lost on the way would be.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn send_punch(&self, datagram: &[u8; super::demux::PUNCH_LEN], to: SocketAddr) {
+        if let Err(error) = self.sources.try_send(datagram, to) {
+            tracing::debug!(%to, %error, "A QUIC-native punch was not sent");
+        }
     }
 
     /// [`Self::allow_peer`] for a native connection: an attempt from `addr`

@@ -35,11 +35,11 @@ pub(in crate::transport) const SEED: u64 = 0x0059_40C2;
 
 /// One datagram as a test socket saw it leave.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Sent {
-    at_ns: u64,
-    from: SocketAddr,
-    to: SocketAddr,
-    bytes: Vec<u8>,
+pub(in crate::transport::quic) struct Sent {
+    pub(in crate::transport::quic) at_ns: u64,
+    pub(in crate::transport::quic) from: SocketAddr,
+    pub(in crate::transport::quic) to: SocketAddr,
+    pub(in crate::transport::quic) bytes: Vec<u8>,
 }
 
 /// A socket that records every datagram sent through it, with the time on
@@ -389,7 +389,7 @@ impl Pair {
         result
     }
 
-    fn sent(&self) -> Vec<Sent> {
+    pub(in crate::transport::quic) fn sent(&self) -> Vec<Sent> {
         self.log.lock().unwrap().clone()
     }
 
@@ -566,6 +566,28 @@ fn a_peer_leaves_the_allow_set_when_its_connection_ends() {
         );
         drop(server);
     })
+}
+
+/// A punch goes out on the endpoint's own socket: one datagram of
+/// `PUNCH_LEN` bytes from the endpoint's address, starting with the reserved
+/// byte, which the receiving demux drops as `Other`.
+#[test]
+fn a_punch_goes_out_on_the_endpoints_socket() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-punch", net.addr(1), net.addr(2), None).await;
+        let datagram = super::native::punch::punch_datagram();
+        pair.a.send_punch(&datagram, pair.b_addr);
+        let sent = pair.sent();
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let punch = &sent[0];
+        assert_eq!((punch.from, punch.to), (pair.a_addr, pair.b_addr));
+        assert_eq!(punch.bytes.len(), crate::transport::demux::PUNCH_LEN);
+        assert_eq!(punch.bytes[0], crate::transport::demux::PUNCH_FIRST_BYTE);
+        assert_eq!(punch.bytes, datagram);
+        assert_eq!(classify(&punch.bytes), DemuxClass::Other);
+    });
 }
 
 /// The ALPN protocol `conn`'s handshake settled on.

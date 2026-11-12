@@ -1968,7 +1968,7 @@ fn native_attempts_reach_only_native_waiters() {
         let mut waiter = h
             .hub
             .native_waiters()
-            .register(h.remote)
+            .register_for_test(h.remote)
             .expect("the waiter");
         // The first attempt is answered with a Retry, the second is handed.
         for _ in 0..2 {

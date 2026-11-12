@@ -17,3 +17,14 @@ pub(crate) mod exchange;
 // (the next step) registers a waiter.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod waiters;
+// Punches and their per-destination budget; run by the native entry points
+// (the next step).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod punch;
+// The native entry points; called by the connect op once
+// `NATIVE_DIAL_READY` is true, until then only by their tests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod setup;
+
+#[cfg(test)]
+mod pins;
