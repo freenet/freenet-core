@@ -76,9 +76,19 @@ pub(crate) mod close_code {
     /// this code reads it as `QuicErrorKind::ConnectionLost`, which also
     /// falls back and counts as `quic_fallback_reset`.
     pub(crate) const OVER_BUDGET: u32 = 0x08;
+    /// The peer's `Hello` on a native connection carried a version this node
+    /// cannot talk to (`is_compatible`). The reason is this node's 8-byte
+    /// version, so the peer can tell whether it is the one that must update.
+    /// Sent only on native connections, which only peers at or above the
+    /// native floor set up; a node that does not know it reads it as
+    /// `QuicErrorKind::ConnectionLost`.
+    pub(crate) const VERSION_INCOMPATIBLE: u32 = 0x09;
+    /// The peer's `Hello` on a native connection was malformed or larger
+    /// than `HELLO_MAX`. Sent only on native connections.
+    pub(crate) const HELLO_REFUSED: u32 = 0x0A;
     /// Every close code, for the range and duplicate checks. A source-scrape
     /// test checks that each `const` in this module is listed.
-    pub(crate) const ALL: [u32; 8] = [
+    pub(crate) const ALL: [u32; 10] = [
         NODE_DROPPED_PEER,
         DOWNGRADE,
         IDENTITY_MISMATCH,
@@ -87,6 +97,8 @@ pub(crate) mod close_code {
         CONTROL_REFUSED,
         SESSION_ENDED,
         OVER_BUDGET,
+        VERSION_INCOMPATIBLE,
+        HELLO_REFUSED,
     ];
 }
 
@@ -101,7 +113,7 @@ const _: () = {
     let reset = reset_code::ALL;
     // No code is used twice, within or across the namespaces.
     let all_len = close.len() + stop.len() + reset.len();
-    let mut all = [0u32; 8 + 9 + 2];
+    let mut all = [0u32; 10 + 9 + 2];
     assert!(all.len() == all_len, "update the combined length");
     let mut n = 0;
     let mut i = 0;
@@ -166,6 +178,8 @@ impl QuicCloseCode {
             Self::ControlRefused => close_code::CONTROL_REFUSED,
             Self::SessionEnded => close_code::SESSION_ENDED,
             Self::OverBudget => close_code::OVER_BUDGET,
+            Self::VersionIncompatible => close_code::VERSION_INCOMPATIBLE,
+            Self::HelloRefused => close_code::HELLO_REFUSED,
         }
     }
 
@@ -187,6 +201,8 @@ impl QuicCloseCode {
             Self::ControlRefused => b"control frame refused",
             Self::SessionEnded => b"udp session ended",
             Self::OverBudget => b"over budget",
+            Self::VersionIncompatible => b"version incompatible",
+            Self::HelloRefused => b"hello refused",
         }
     }
 }
@@ -260,6 +276,8 @@ pub(in crate::transport) fn attribute(
                 | QuicRefusal::Downgrade
                 | QuicRefusal::SessionEnded
                 | QuicRefusal::OverBudget
+                | QuicRefusal::VersionIncompatible
+                | QuicRefusal::HelloRefused
                 | QuicRefusal::AllowSetFull
                 | QuicRefusal::KeyConflict
                 | QuicRefusal::UnusableKey
@@ -338,6 +356,12 @@ impl From<quinn::ConnectionError> for QuicErrorKind {
                     },
                     Some(QuicCloseCode::OverBudget) => Self::Refused {
                         reason: QuicRefusal::OverBudget,
+                    },
+                    Some(QuicCloseCode::VersionIncompatible) => Self::Refused {
+                        reason: QuicRefusal::VersionIncompatible,
+                    },
+                    Some(QuicCloseCode::HelloRefused) => Self::Refused {
+                        reason: QuicRefusal::HelloRefused,
                     },
                     // A code a newer peer added still ends the connection.
                     Some(QuicCloseCode::NodeDroppedPeer) | None => Self::ConnectionLost,

@@ -394,6 +394,11 @@ labelled_counters! {
         /// The peer held more of this node's QUIC buffer budget than it
         /// allows (its gaps past the cap a second time).
         OverBudget => "over_budget",
+        /// A native connection's peer sent a `Hello` with a version this node
+        /// cannot talk to.
+        VersionIncompatible => "version_incompatible",
+        /// A native connection's peer sent a malformed or oversized `Hello`.
+        HelloRefused => "hello_refused",
     }
 }
 
@@ -2788,6 +2793,12 @@ impl TransportMetrics {
             quic_close_sent_over_budget: get64(
                 &self.quic_close_sent[QuicCloseCode::OverBudget as usize],
             ),
+            quic_close_sent_version_incompatible: get64(
+                &self.quic_close_sent[QuicCloseCode::VersionIncompatible as usize],
+            ),
+            quic_close_sent_hello_refused: get64(
+                &self.quic_close_sent[QuicCloseCode::HelloRefused as usize],
+            ),
             quic_close_received: std::array::from_fn(|i| get64(&self.quic_close_received[i])),
             quic_upgrade: std::array::from_fn(|i| get64(&self.quic_upgrade[i])),
             quic_fallback: std::array::from_fn(|i| get64(&self.quic_fallback[i])),
@@ -3460,6 +3471,10 @@ pub struct TransportSnapshot {
     pub quic_close_sent_session_ended: u64,
     /// QUIC connections this node closed with `over_budget`.
     pub quic_close_sent_over_budget: u64,
+    /// Native QUIC connections this node closed with `version_incompatible`.
+    pub quic_close_sent_version_incompatible: u64,
+    /// Native QUIC connections this node closed with `hello_refused`.
+    pub quic_close_sent_hello_refused: u64,
     /// QUIC connections closed by the peer's application close, by
     /// [`QuicCloseCode`] in order; the last slot is a code this node does not
     /// know (`quic_close_received_<label>`, `..._unknown_code`).
@@ -3861,6 +3876,8 @@ impl TransportSnapshot {
             quic_close_sent_control_refused,
             quic_close_sent_session_ended,
             quic_close_sent_over_budget,
+            quic_close_sent_version_incompatible,
+            quic_close_sent_hello_refused,
             quic_close_received,
             quic_upgrade,
             quic_fallback,
@@ -4021,6 +4038,8 @@ impl TransportSnapshot {
         self.quic_close_sent_control_refused = quic_close_sent_control_refused;
         self.quic_close_sent_session_ended = quic_close_sent_session_ended;
         self.quic_close_sent_over_budget = quic_close_sent_over_budget;
+        self.quic_close_sent_version_incompatible = quic_close_sent_version_incompatible;
+        self.quic_close_sent_hello_refused = quic_close_sent_hello_refused;
         self.quic_close_received = quic_close_received;
         self.quic_upgrade = quic_upgrade;
         self.quic_fallback = quic_fallback;
@@ -4250,6 +4269,10 @@ struct SnapshotExtras {
     pub quic_close_sent_session_ended: u64,
     /// QUIC connections this node closed with `over_budget`.
     pub quic_close_sent_over_budget: u64,
+    /// Native QUIC connections this node closed with `version_incompatible`.
+    pub quic_close_sent_version_incompatible: u64,
+    /// Native QUIC connections this node closed with `hello_refused`.
+    pub quic_close_sent_hello_refused: u64,
     /// QUIC connections closed by the peer's application close, by
     /// [`QuicCloseCode`] in order; the last slot is a code this node does not
     /// know (`quic_close_received_<label>`, `..._unknown_code`).
@@ -4470,6 +4493,8 @@ impl SnapshotExtras {
             || self.quic_close_sent_control_refused != 0
             || self.quic_close_sent_session_ended != 0
             || self.quic_close_sent_over_budget != 0
+            || self.quic_close_sent_version_incompatible != 0
+            || self.quic_close_sent_hello_refused != 0
             || self.quic_close_received.iter().any(|n| *n != 0)
             || self.quic_upgrade.iter().any(|n| *n != 0)
             || self.quic_fallback.iter().any(|n| *n != 0)
@@ -5664,6 +5689,8 @@ mod tests {
             QuicCloseCode::ControlRefused => snap.quic_close_sent_control_refused,
             QuicCloseCode::SessionEnded => snap.quic_close_sent_session_ended,
             QuicCloseCode::OverBudget => snap.quic_close_sent_over_budget,
+            QuicCloseCode::VersionIncompatible => snap.quic_close_sent_version_incompatible,
+            QuicCloseCode::HelloRefused => snap.quic_close_sent_hello_refused,
         }
     }
 
@@ -6946,6 +6973,8 @@ mod tests {
             "quic_close_sent_control_refused",
             "quic_close_sent_session_ended",
             "quic_close_sent_over_budget",
+            "quic_close_sent_version_incompatible",
+            "quic_close_sent_hello_refused",
             "quic_close_received",
             "quic_upgrade",
             "quic_fallback",

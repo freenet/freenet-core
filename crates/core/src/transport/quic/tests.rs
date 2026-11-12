@@ -2779,6 +2779,12 @@ fn close_codes_reach_the_peer() {
             QuicCloseCode::OverBudget => QuicErrorKind::Refused {
                 reason: QuicRefusal::OverBudget,
             },
+            QuicCloseCode::VersionIncompatible => QuicErrorKind::Refused {
+                reason: QuicRefusal::VersionIncompatible,
+            },
+            QuicCloseCode::HelloRefused => QuicErrorKind::Refused {
+                reason: QuicRefusal::HelloRefused,
+            },
         };
         let mut sent_by_a = Vec::new();
         let mut sent_by_b = Vec::new();

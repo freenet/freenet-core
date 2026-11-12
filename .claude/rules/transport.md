@@ -1238,7 +1238,9 @@ doc has the transition table.
   for the later of the seed and its own delay. e5a-5b must carry it per peer key
   across a replaced session, or a session that flaps retries at session rate.
   Failures: close codes 1, 3, 4, 5, 6 and 8, a lost connection, an idle timeout and a
-  deadline each mean fallback plus normal backoff, then a new offer. Never a
+  deadline each mean fallback plus normal backoff, then a new offer. Codes 9
+  (VERSION_INCOMPATIBLE) and 10 (HELLO_REFUSED) are sent only on native
+  connections; on an upgrade path they read as a lost connection. Never a
   permanent downgrade. Identity: close code 2 received, or Event::IdentityMismatch
   (closes with IDENTITY_MISMATCH). A TLS failure during the handshake
   (Refused{Handshake}) takes the normal backoff.
@@ -1408,7 +1410,8 @@ snapshot except the two gauges.
   watcher, because `QuicErrorKind` merges codes 1, 3, 4 and 5); a code with no
   name is `unknown_code`, always the last slot. A new code goes in before it,
   so a reader must take the last slot as unknown and not use a fixed index
-  (SESSION_ENDED moved `unknown_code` from index 6 to 7). A local close is not
+  (SESSION_ENDED moved `unknown_code` from index 6 to 7, and
+  VERSION_INCOMPATIBLE and HELLO_REFUSED from 8 to 10). A local close is not
   counted.
   `quic_path_age_at_close_<lt_1m|lt_10m|lt_1h|lt_1d|ge_1d>`: age of an active
   path at the teardown that ends it. `quic_establish_ms_p50`/`_p90`/`_samples`:

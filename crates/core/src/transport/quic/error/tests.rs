@@ -617,6 +617,8 @@ fn close_codes_have_fixed_distinct_wire_values() {
         (QuicCloseCode::ControlRefused, 5),
         (QuicCloseCode::SessionEnded, 6),
         (QuicCloseCode::OverBudget, 8),
+        (QuicCloseCode::VersionIncompatible, 9),
+        (QuicCloseCode::HelloRefused, 10),
     ];
     assert_eq!(expected.len(), QuicCloseCode::COUNT);
     for (code, wire) in expected {
@@ -625,7 +627,7 @@ fn close_codes_have_fixed_distinct_wire_values() {
         assert!(!code.reason().is_empty());
     }
     // 7 is left to the ramp branch's RECYCLE_FOR_DATA.
-    for unknown in [7_u64, 9, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
+    for unknown in [7_u64, 11, 0x0f, 0x11, 0x21, u64::from(u32::MAX)] {
         assert_eq!(QuicCloseCode::from_code(unknown), None, "{unknown:#x}");
     }
 }

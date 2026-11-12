@@ -45,6 +45,7 @@ pub(crate) mod error;
 pub(crate) mod framing;
 pub(crate) mod identity;
 pub(crate) mod liveness;
+pub(crate) mod native;
 #[cfg(any(test, feature = "quic-panic-injection"))]
 pub(crate) mod panic_injection;
 pub(crate) mod path;
