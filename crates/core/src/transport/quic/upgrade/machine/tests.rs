@@ -663,11 +663,12 @@ fn expected_with(
     if carried {
         let carrying: Vec<_> = actions
             .iter()
-            .filter_map(|action| match action {
-                Action::Record(Outcome::Fallback(cause)) => {
+            .filter_map(|action| {
+                if let Action::Record(Outcome::Fallback(cause)) = action {
                     Some(Action::Record(Outcome::CarryingFallback(*cause)))
+                } else {
+                    None
                 }
-                _ => None,
             })
             .collect();
         actions.extend(carrying);
