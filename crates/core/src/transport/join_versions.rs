@@ -17,11 +17,15 @@
 //!   connection events, so reconnects do not skew it.
 //!
 //! **Bounded labels.** A version maps to a label relative to this node's own
-//! version ([`OWN_VERSION`]): the exact version string for this node's
-//! major.minor and a patch in the last [`EXACT_WINDOW`] releases up to and
-//! including its own, otherwise `older`, `newer` or `unknown`. So there are at
-//! most [`BUCKET_SLOTS`] labels whatever a peer sends: a joiner-chosen version
-//! can never create a new one. Counts are fixed arrays indexed by slot, so the
+//! version ([`OWN_VERSION`]) and compatibility floor ([`OWN_FLOOR`]): the exact
+//! version string for this node's major.minor and a patch in the last
+//! [`EXACT_WINDOW`] releases up to and including its own; when the floor is in
+//! an earlier series (wire format 2, #6189), also the exact version for the
+//! floor's major.minor and a patch in the [`EXACT_WINDOW`] releases from the
+//! floor's; otherwise `older`, `newer` or `unknown`. So there are at most
+//! [`BUCKET_SLOTS`] (67) labels whatever a peer sends, and 35 while the floor
+//! shares this node's series: a joiner-chosen version can never create a new
+//! one. Counts are fixed arrays indexed by slot, so the
 //! bound is structural, not a cap that is checked.
 //!
 //! **Privacy.** No keys, no addresses. In `gateway_joins` only, a count from 1
@@ -40,28 +44,55 @@ use std::time::Duration;
 
 use crate::node::background_task_monitor::BackgroundTaskMonitor;
 use crate::ring::ConnectionManager;
-use crate::transport::connection_handler::OWN_VERSION;
+use crate::transport::connection_handler::{OWN_FLOOR, OWN_VERSION};
 
 /// How often `join_versions` is emitted, and the window `gateway_joins`
 /// covers (its counters reset at each emission).
 pub(crate) const JOIN_VERSIONS_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// Releases with an exact label: this node's own patch and the 31 before it,
-/// in this node's major.minor. 32 covers well over the releases a peer can be
-/// behind while still compatible, and keeps the label set small.
+/// Releases with an exact label in each series: this node's own patch and
+/// the 31 before it in this node's major.minor, and, when the compatibility
+/// floor is in an earlier series, the floor's patch and the 31 after it.
+/// 32 covers well over the releases a peer can be behind while still
+/// compatible, and keeps the label set small.
 pub(crate) const EXACT_WINDOW: u16 = 32;
 
 /// Gateway-join counts below this are reported as `"<5"`.
 const SMALL_COUNT_FLOOR: u64 = 5;
 
-/// One slot per exact version, then `older`, `newer`, `unknown`.
-pub(crate) const BUCKET_SLOTS: usize = EXACT_WINDOW as usize + 3;
-const OLDER_SLOT: usize = EXACT_WINDOW as usize;
-const NEWER_SLOT: usize = EXACT_WINDOW as usize + 1;
-const UNKNOWN_SLOT: usize = EXACT_WINDOW as usize + 2;
+/// One slot per exact version in this node's series, one per exact version
+/// in the floor's series, then `older`, `newer`, `unknown`.
+pub(crate) const BUCKET_SLOTS: usize = 2 * EXACT_WINDOW as usize + 3;
+const FLOOR_SLOT_BASE: usize = EXACT_WINDOW as usize;
+const OLDER_SLOT: usize = 2 * EXACT_WINDOW as usize;
+const NEWER_SLOT: usize = OLDER_SLOT + 1;
+const UNKNOWN_SLOT: usize = OLDER_SLOT + 2;
 
 /// Counts per version bucket, indexed by [`VersionBucket::slot`].
 pub(crate) type BucketCounts = [u64; BUCKET_SLOTS];
+
+/// The versions buckets are relative to: this build's version and its
+/// compatibility floor, the two values the handshake advertises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VersionRef {
+    pub(crate) own: (u8, u8, u16),
+    pub(crate) floor: (u8, u8, u16),
+}
+
+impl VersionRef {
+    /// Whether the floor is in another major.minor series than this build
+    /// (wire format 2, #6189), so that series gets exact labels too.
+    const fn cross_series(self) -> bool {
+        self.floor.0 != self.own.0 || self.floor.1 != self.own.1
+    }
+}
+
+/// This build: [`OWN_VERSION`] and [`OWN_FLOOR`], read from the same
+/// constants `PROTOC_VERSION` encodes.
+pub(crate) const THIS_BUILD: VersionRef = VersionRef {
+    own: OWN_VERSION,
+    floor: OWN_FLOOR,
+};
 
 /// The transport a joiner reached the gateway over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,12 +123,17 @@ impl JoinTransport {
     }
 }
 
-/// A peer version relative to this node's own version. See the module doc.
+/// A peer version relative to a [`VersionRef`]. See the module doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VersionBucket {
     /// This node's major.minor, `own_patch - offset` with `offset <
     /// EXACT_WINDOW`.
     Exact {
+        offset: u16,
+    },
+    /// The floor's major.minor (only when it differs from this node's),
+    /// `floor_patch + offset` with `offset < EXACT_WINDOW`.
+    FloorExact {
         offset: u16,
     },
     Older,
@@ -109,6 +145,7 @@ impl VersionBucket {
     const fn slot(self) -> usize {
         match self {
             Self::Exact { offset } => offset as usize,
+            Self::FloorExact { offset } => FLOOR_SLOT_BASE + offset as usize,
             Self::Older => OLDER_SLOT,
             Self::Newer => NEWER_SLOT,
             Self::Unknown => UNKNOWN_SLOT,
@@ -116,24 +153,36 @@ impl VersionBucket {
     }
 
     /// The bucket a slot holds, or `None` for an exact slot that is not a
-    /// real version (own patch below 31).
-    fn from_slot(own: (u8, u8, u16), slot: usize) -> Option<Self> {
+    /// real version (own patch below 31, a floor in this node's own series,
+    /// or a floor patch within 31 of `u16::MAX`).
+    fn from_slot(r: VersionRef, slot: usize) -> Option<Self> {
         match slot {
             OLDER_SLOT => Some(Self::Older),
             NEWER_SLOT => Some(Self::Newer),
             UNKNOWN_SLOT => Some(Self::Unknown),
-            offset if offset < EXACT_WINDOW as usize && offset <= own.2 as usize => {
-                Some(Self::Exact {
+            offset if offset < FLOOR_SLOT_BASE => {
+                (offset <= r.own.2 as usize).then_some(Self::Exact {
                     offset: offset as u16,
                 })
+            }
+            slot if slot < OLDER_SLOT => {
+                let offset = slot - FLOOR_SLOT_BASE;
+                (r.cross_series() && r.floor.2 as usize + offset <= u16::MAX as usize).then_some(
+                    Self::FloorExact {
+                        offset: offset as u16,
+                    },
+                )
             }
             _ => None,
         }
     }
 
-    pub(crate) fn label(self, own: (u8, u8, u16)) -> String {
+    pub(crate) fn label(self, r: VersionRef) -> String {
         match self {
-            Self::Exact { offset } => format!("{}.{}.{}", own.0, own.1, own.2 - offset),
+            Self::Exact { offset } => format!("{}.{}.{}", r.own.0, r.own.1, r.own.2 - offset),
+            Self::FloorExact { offset } => {
+                format!("{}.{}.{}", r.floor.0, r.floor.1, r.floor.2 + offset)
+            }
             Self::Older => "older".to_string(),
             Self::Newer => "newer".to_string(),
             Self::Unknown => "unknown".to_string(),
@@ -141,12 +190,13 @@ impl VersionBucket {
     }
 }
 
-/// Bucket `peer` relative to `own`. `None` (the version was not learned) is
+/// Bucket `peer` relative to `r`. `None` (the version was not learned) is
 /// `unknown`.
-pub(crate) fn version_bucket(own: (u8, u8, u16), peer: Option<(u8, u8, u16)>) -> VersionBucket {
+pub(crate) fn version_bucket(r: VersionRef, peer: Option<(u8, u8, u16)>) -> VersionBucket {
     let Some(peer) = peer else {
         return VersionBucket::Unknown;
     };
+    let own = r.own;
     if peer > own {
         return VersionBucket::Newer;
     }
@@ -155,13 +205,23 @@ pub(crate) fn version_bucket(own: (u8, u8, u16), peer: Option<(u8, u8, u16)>) ->
             offset: own.2 - peer.2,
         };
     }
+    let floor = r.floor;
+    if r.cross_series()
+        && (peer.0, peer.1) == (floor.0, floor.1)
+        && peer.2 >= floor.2
+        && peer.2 - floor.2 < EXACT_WINDOW
+    {
+        return VersionBucket::FloorExact {
+            offset: peer.2 - floor.2,
+        };
+    }
     VersionBucket::Older
 }
 
-/// The label `peer` is reported under, relative to `own`.
+/// The label `peer` is reported under, relative to `r`.
 #[cfg(test)]
-pub(crate) fn bucket_label(own: (u8, u8, u16), peer: Option<(u8, u8, u16)>) -> String {
-    version_bucket(own, peer).label(own)
+pub(crate) fn bucket_label(r: VersionRef, peer: Option<(u8, u8, u16)>) -> String {
+    version_bucket(r, peer).label(r)
 }
 
 /// Successful gateway joins since the last emission, by transport and bucket.
@@ -178,7 +238,7 @@ impl GatewayJoinCounters {
     }
 
     pub(crate) fn record(&self, transport: JoinTransport, peer: Option<(u8, u8, u16)>) {
-        let slot = version_bucket(OWN_VERSION, peer).slot();
+        let slot = version_bucket(THIS_BUILD, peer).slot();
         self.counts[transport.index()][slot].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -241,18 +301,18 @@ pub(crate) mod test_registry {
 
 /// Count `versions` (one per live connection) into buckets.
 pub(crate) fn neighbour_counts(
-    own: (u8, u8, u16),
+    r: VersionRef,
     versions: impl IntoIterator<Item = Option<(u8, u8, u16)>>,
 ) -> BucketCounts {
     let mut counts = [0; BUCKET_SLOTS];
     for version in versions {
-        counts[version_bucket(own, version).slot()] += 1;
+        counts[version_bucket(r, version).slot()] += 1;
     }
     counts
 }
 
 fn bucket_map(
-    own: (u8, u8, u16),
+    r: VersionRef,
     counts: &BucketCounts,
     render: impl Fn(u64) -> serde_json::Value,
 ) -> serde_json::Map<String, serde_json::Value> {
@@ -261,7 +321,7 @@ fn bucket_map(
         .enumerate()
         .filter(|(_, count)| **count > 0)
         .filter_map(|(slot, count)| {
-            VersionBucket::from_slot(own, slot).map(|bucket| (bucket.label(own), render(*count)))
+            VersionBucket::from_slot(r, slot).map(|bucket| (bucket.label(r), render(*count)))
         })
         .collect()
 }
@@ -278,7 +338,7 @@ fn suppressed_count(count: u64) -> serde_json::Value {
 /// Build the `join_versions` event. `gateway_joins` is `Some` only on a
 /// gateway; a transport with no joins is omitted from it.
 pub(crate) fn join_versions_json(
-    own: (u8, u8, u16),
+    r: VersionRef,
     gateway_joins: Option<&[BucketCounts; JoinTransport::ALL.len()]>,
     neighbours: &BucketCounts,
 ) -> serde_json::Value {
@@ -291,7 +351,7 @@ pub(crate) fn join_versions_json(
         let by_transport: serde_json::Map<String, serde_json::Value> = JoinTransport::ALL
             .iter()
             .filter_map(|transport| {
-                let buckets = bucket_map(own, &joins[transport.index()], suppressed_count);
+                let buckets = bucket_map(r, &joins[transport.index()], suppressed_count);
                 (!buckets.is_empty()).then(|| (transport.as_str().to_string(), buckets.into()))
             })
             .collect();
@@ -299,7 +359,7 @@ pub(crate) fn join_versions_json(
     }
     event.insert(
         "neighbours".to_string(),
-        bucket_map(own, neighbours, serde_json::Value::from).into(),
+        bucket_map(r, neighbours, serde_json::Value::from).into(),
     );
     event.into()
 }
@@ -311,8 +371,8 @@ fn take_join_versions(
     neighbour_versions: Vec<Option<(u8, u8, u16)>>,
 ) -> serde_json::Value {
     let joins = is_gateway.then(|| counters.take());
-    let neighbours = neighbour_counts(OWN_VERSION, neighbour_versions);
-    join_versions_json(OWN_VERSION, joins.as_ref(), &neighbours)
+    let neighbours = neighbour_counts(THIS_BUILD, neighbour_versions);
+    join_versions_json(THIS_BUILD, joins.as_ref(), &neighbours)
 }
 
 /// Spawn the hourly `join_versions` emitter and register it with the
@@ -350,11 +410,20 @@ pub(crate) fn spawn_join_versions_reporter(
 mod tests {
     use super::*;
 
-    const OWN: (u8, u8, u16) = (0, 2, 157);
+    /// A floor in this node's own series: the only exact labels are its own.
+    const OWN: VersionRef = VersionRef {
+        own: (0, 2, 157),
+        floor: (0, 2, 150),
+    };
+    /// A floor in the previous series (#6189 format 2).
+    const CROSS: VersionRef = VersionRef {
+        own: (1, 0, 2),
+        floor: (0, 2, 150),
+    };
 
     #[test]
     fn buckets_at_the_window_edges() {
-        assert_eq!(bucket_label(OWN, Some(OWN)), "0.2.157");
+        assert_eq!(bucket_label(OWN, Some(OWN.own)), "0.2.157");
         assert_eq!(bucket_label(OWN, Some((0, 2, 157 - 31))), "0.2.126");
         assert_eq!(bucket_label(OWN, Some((0, 2, 157 - 32))), "older");
         assert_eq!(bucket_label(OWN, Some((0, 2, 158))), "newer");
@@ -366,38 +435,101 @@ mod tests {
 
     #[test]
     fn a_low_own_patch_has_a_short_window() {
-        let own = (0, 3, 2);
+        let own = VersionRef {
+            own: (0, 3, 2),
+            floor: (0, 3, 0),
+        };
         assert_eq!(bucket_label(own, Some((0, 3, 0))), "0.3.0");
         assert_eq!(bucket_label(own, Some((0, 2, 999))), "older");
         // A slot beyond patch 0 is not a real version and is never reported.
         assert_eq!(VersionBucket::from_slot(own, 3), None);
+        // With the floor in its own series, no floor slot is a version.
+        assert_eq!(VersionBucket::from_slot(own, FLOOR_SLOT_BASE), None);
+    }
+
+    fn distinct_labels(r: VersionRef) -> usize {
+        let mut labels = std::collections::HashSet::new();
+        for major in [0u8, 1, 2, 254, 255] {
+            for minor in [0u8, 1, 2, 3, 255] {
+                for patch in (0..=u16::MAX).step_by(7).chain(100..=200) {
+                    labels.insert(bucket_label(r, Some((major, minor, patch))));
+                }
+            }
+        }
+        labels.insert(bucket_label(r, None));
+        labels.len()
     }
 
     #[test]
     fn the_label_set_is_bounded_whatever_peers_send() {
-        let mut labels = std::collections::HashSet::new();
-        for own in [OWN, (0, 2, 3), (1, 0, 0), (255, 255, u16::MAX)] {
-            for major in [0u8, 1, 2, 254, 255] {
-                for minor in [0u8, 1, 2, 3, 255] {
-                    for patch in (0..=u16::MAX).step_by(7).chain(100..=200) {
-                        labels.insert(bucket_label(own, Some((major, minor, patch))));
-                    }
-                }
-            }
-            labels.insert(bucket_label(own, None));
-            assert!(
-                labels.len() <= BUCKET_SLOTS,
-                "{} labels for own {own:?}",
-                labels.len()
-            );
-            labels.clear();
+        assert_eq!(BUCKET_SLOTS, 67);
+        let same_series = [
+            OWN,
+            VersionRef {
+                own: (0, 2, 3),
+                floor: (0, 2, 0),
+            },
+            VersionRef {
+                own: (255, 255, u16::MAX),
+                floor: (255, 255, 0),
+            },
+        ];
+        for r in same_series {
+            let n = distinct_labels(r);
+            assert!(n <= 35, "{n} labels for {r:?}");
         }
-        assert_eq!(BUCKET_SLOTS, 35);
+        let cross_series = [
+            CROSS,
+            VersionRef {
+                own: (1, 0, 0),
+                floor: (0, 255, u16::MAX - 3),
+            },
+            VersionRef {
+                own: (2, 0, 40),
+                floor: (1, 3, 0),
+            },
+        ];
+        for r in cross_series {
+            let n = distinct_labels(r);
+            assert!(n <= BUCKET_SLOTS, "{n} labels for {r:?}");
+        }
+    }
+
+    #[test]
+    fn a_cross_series_floor_gets_exact_labels_for_its_series() {
+        assert_eq!(bucket_label(CROSS, Some((0, 2, 150))), "0.2.150");
+        assert_eq!(bucket_label(CROSS, Some((0, 2, 181))), "0.2.181");
+        assert_eq!(bucket_label(CROSS, Some((0, 2, 182))), "older");
+        assert_eq!(bucket_label(CROSS, Some((0, 2, 149))), "older");
+        assert_eq!(bucket_label(CROSS, Some((0, 1, 160))), "older");
+        assert_eq!(bucket_label(CROSS, Some((1, 0, 0))), "1.0.0");
+        assert_eq!(bucket_label(CROSS, Some((1, 0, 2))), "1.0.2");
+        assert_eq!(bucket_label(CROSS, Some((1, 0, 3))), "newer");
+        for patch in 150..=181u16 {
+            assert_eq!(
+                bucket_label(CROSS, Some((0, 2, patch))),
+                format!("0.2.{patch}")
+            );
+        }
+        // A floor in this node's own series adds nothing: below the own
+        // window is `older`, even at the floor's patch.
+        let same = VersionRef {
+            own: (0, 2, 200),
+            floor: (0, 2, 150),
+        };
+        assert_eq!(bucket_label(same, Some((0, 2, 150))), "older");
+        // Every reachable cross-series bucket round-trips through its slot.
+        for (series, patches) in [((0u8, 2u8), 140..=190u16), ((1, 0), 0..=3)] {
+            for patch in patches {
+                let b = version_bucket(CROSS, Some((series.0, series.1, patch)));
+                assert_eq!(VersionBucket::from_slot(CROSS, b.slot()), Some(b));
+            }
+        }
     }
 
     #[test]
     fn every_reachable_bucket_survives_the_slot_round_trip() {
-        for patch in 0..=OWN.2 + 1 {
+        for patch in 0..=OWN.own.2 + 1 {
             let bucket = version_bucket(OWN, Some((0, 2, patch)));
             assert_eq!(VersionBucket::from_slot(OWN, bucket.slot()), Some(bucket));
         }
@@ -457,7 +589,7 @@ mod tests {
             counters.record(JoinTransport::LegacyIntro, Some(OWN_VERSION));
         }
         counters.record(JoinTransport::LegacyIntro, None);
-        let own_label = bucket_label(OWN_VERSION, Some(OWN_VERSION));
+        let own_label = bucket_label(THIS_BUILD, Some(OWN_VERSION));
 
         let first = take_join_versions(&counters, true, vec![Some(OWN_VERSION), None]);
         assert_eq!(first["gateway_joins"]["legacy_intro"][&own_label], 6);

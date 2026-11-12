@@ -27,8 +27,8 @@ use tokio::{
     task_local,
 };
 use tracing::{Instrument, span};
-pub(crate) use version_cmp::OWN_VERSION;
 use version_cmp::PROTOC_VERSION;
+pub(crate) use version_cmp::{OWN_FLOOR, OWN_VERSION};
 
 use super::{
     Socket, SocketRead, TransportError, UdpError, UdpErrorKind,

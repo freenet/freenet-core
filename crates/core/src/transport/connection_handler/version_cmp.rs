@@ -41,6 +41,10 @@ pub(super) const PROTOC_VERSION: [u8; 8] = encode_new_format(PCK_VERSION, MIN_CO
 /// This build's version tuple, the one [`PROTOC_VERSION`] advertises.
 pub(crate) const OWN_VERSION: (u8, u8, u16) = parse_semver(PCK_VERSION);
 
+/// This build's compatibility floor, the one [`PROTOC_VERSION`] advertises.
+/// May be in the previous major.minor series (format 2, `FORMAT_CROSS_SERIES`).
+pub(crate) const OWN_FLOOR: (u8, u8, u16) = parse_semver(MIN_COMPATIBLE_VERSION);
+
 /// Parsed version info from an 8-byte wire version field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct VersionInfo {
@@ -536,6 +540,10 @@ mod tests {
     #[test]
     fn own_version_is_the_advertised_version() {
         assert_eq!(OWN_VERSION, parse_version_bytes(&PROTOC_VERSION).version);
+        assert_eq!(
+            Some(OWN_FLOOR),
+            parse_version_bytes(&PROTOC_VERSION).min_compatible
+        );
     }
 
     #[test]
