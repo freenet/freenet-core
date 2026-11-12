@@ -3282,6 +3282,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_ingress_no_ingress),
             );
             m.insert(
+                "quic_ingress_reserve_full".into(),
+                serde_json::json!(snapshot.quic_ingress_reserve_full),
+            );
+            m.insert(
                 "egress_immediate".into(),
                 serde_json::json!(snapshot.egress_immediate),
             );
@@ -7893,6 +7897,7 @@ mod tests {
             quic_ingress_queue_full: 48,
             quic_ingress_source_full: 50,
             quic_ingress_no_ingress: 49,
+            quic_ingress_reserve_full: 51,
             egress_immediate: 22,
             egress_waited: 23,
             egress_unpaced: 25,
@@ -7946,6 +7951,7 @@ mod tests {
             ("quic_ingress_queue_full", 48),
             ("quic_ingress_source_full", 50),
             ("quic_ingress_no_ingress", 49),
+            ("quic_ingress_reserve_full", 51),
             ("egress_immediate", 22),
             ("egress_waited", 23),
             ("egress_unpaced", 25),

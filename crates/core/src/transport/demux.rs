@@ -57,11 +57,15 @@ pub(crate) const QUIC_INGRESS_PER_SOURCE_DATAGRAMS: usize = QUIC_INGRESS_QUEUE_D
 
 /// The last slots of the QUIC ingress queue, kept for sources that have fewer
 /// than [`QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS`] datagrams queued. Once only
-/// these are free, a datagram from a source holding more is dropped as
-/// `queue_full`, as if the queue were full. So sources that are bursting can
-/// fill at most `QUIC_INGRESS_QUEUE_DATAGRAMS - QUIC_INGRESS_QUIET_RESERVE`
-/// (896) slots between them, and a quiet connection's datagram (a loss probe,
-/// an acknowledgement) still finds room. Without it, when the endpoint drained
+/// these are free, a datagram from a source holding more is dropped and
+/// counted as `reserve_full`. So sources that are bursting can fill at most
+/// `QUIC_INGRESS_QUEUE_DATAGRAMS - QUIC_INGRESS_QUIET_RESERVE` (896) slots
+/// between them at any moment (a source that drains below the mark counts as
+/// quiet again), and a quiet connection's datagram (a loss probe, an
+/// acknowledgement) still finds room. The cost is 12.5% less burst room for
+/// busy sources. With about 256 or more connections each holding a few
+/// datagrams, most traffic counts as quiet and the queue is close to a plain
+/// FIFO. Without it, when the endpoint drained
 /// the queue more slowly than busy connections filled it, a quiet
 /// connection's probes kept arriving at a full queue. quinn doubled its probe
 /// timeout after each loss, and the connection went silent for 5 to 11 s
@@ -441,7 +445,7 @@ impl QuicIngress {
                 // A source that newly took an entry above holds none, so
                 // only a non-zero count can reach here: no empty entry is
                 // left behind.
-                return QuicIngressOutcome::QueueFull;
+                return QuicIngressOutcome::ReserveFull;
             }
             *queued += 1;
         }
@@ -851,40 +855,52 @@ mod tests {
             );
         }
         assert!(queue.try_recv().is_err(), "nothing else was queued");
-        assert_eq!(outcomes(&socket), [3, 0, 0, 0, 0]);
+        assert_eq!(outcomes(&socket), [3, 0, 0, 0, 0, 0]);
     }
 
     /// With the queue full and nobody reading it, QUIC-class datagrams are
     /// dropped and counted, and a legacy datagram behind them is still
     /// returned at once. Four sources send their shares: they fill the queue
-    /// up to its quiet reserve, and the fourth's last datagrams find it full;
-    /// a fifth source takes its few datagrams from the reserve and is then
-    /// refused too. The test runs on a
+    /// up to its quiet reserve and the fourth's last datagrams are refused at
+    /// the reserve; quiet sources then fill the reserve, and a last source's
+    /// datagrams find the queue itself full. The test runs on a
     /// paused clock, so if the listener waited for room in the queue the
     /// runtime would go idle, the clock would jump to the 5 s timeout and the
     /// test would fail at once rather than after 5 real seconds.
     #[tokio::test(start_paused = true)]
     async fn quic_ingress_queue_full_drops_and_counts_without_stalling_legacy() {
-        let sources: Vec<SocketAddr> = (0..5u16)
+        let sources: Vec<SocketAddr> = (0..4u16)
             .map(|i| SocketAddr::from(([10, 254, 2, 2], 4102 + i)))
             .collect();
+        let fillers: Vec<SocketAddr> =
+            (0..(QUIC_INGRESS_QUIET_RESERVE / QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS) as u16)
+                .map(|i| SocketAddr::from(([10, 254, 2, 5], 4500 + i)))
+                .collect();
+        let last = SocketAddr::from(([10, 254, 2, 6], 4600));
         let overflow = 5;
         let shares = QUIC_INGRESS_QUEUE_DATAGRAMS / QUIC_INGRESS_PER_SOURCE_DATAGRAMS;
         assert_eq!(shares, 4, "the test fills the queue with four shares");
         let mut script: Vec<Step> = Vec::new();
-        for from in &sources[..shares] {
+        for from in &sources {
             for i in 0..QUIC_INGRESS_PER_SOURCE_DATAGRAMS {
                 script.push(Step::Packet(*from, quic(i as u8)));
             }
         }
+        for from in &fillers {
+            for i in 0..QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS {
+                script.push(Step::Packet(*from, quic(i as u8)));
+            }
+        }
         for i in 0..overflow {
-            script.push(Step::Packet(sources[shares], quic(i as u8)));
+            script.push(Step::Packet(last, quic(i as u8)));
         }
         script.push(Step::Packet(sources[0], vec![PACKET_TYPE_INTRO, 7]));
         let socket = DemuxSocket::wrap(ScriptedSocket::new(script), None);
         let queue = socket.enable_quic_ingress().expect("first enable");
         let _permits: Vec<_> = sources
             .iter()
+            .chain(&fillers)
+            .chain(std::iter::once(&last))
             .map(|a| socket.allow_quic_source(*a).expect("allowed"))
             .collect();
 
@@ -894,97 +910,110 @@ mod tests {
             (&buf[..len], got_from),
             (&[PACKET_TYPE_INTRO, 7][..], sources[0])
         );
-        let busy = QUIC_INGRESS_QUEUE_DATAGRAMS - QUIC_INGRESS_QUIET_RESERVE;
-        let quiet = QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS;
-        let sent = shares * QUIC_INGRESS_PER_SOURCE_DATAGRAMS + overflow;
+        let refused_at_mark = QUIC_INGRESS_QUIET_RESERVE as u64;
         assert_eq!(
             outcomes(&socket),
-            [(busy + quiet) as u64, 0, (sent - busy - quiet) as u64, 0, 0]
+            [
+                QUIC_INGRESS_QUEUE_DATAGRAMS as u64,
+                0,
+                overflow as u64,
+                0,
+                0,
+                refused_at_mark
+            ]
         );
-        assert_eq!(queue.len(), busy + quiet);
+        assert_eq!(queue.len(), QUIC_INGRESS_QUEUE_DATAGRAMS);
     }
 
-    /// The last [`QUIC_INGRESS_QUIET_RESERVE`] slots are for quiet sources.
-    /// Busy sources fill the queue up to that mark and are then refused while
-    /// they still hold less than their share; a source with fewer than
-    /// [`QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS`] queued still gets in. Many
-    /// quiet sources (a flood spoofing allowed addresses) can fill the
-    /// reserve, which leaves the queue as full as without it: they cannot take
-    /// more than [`QUIC_INGRESS_QUEUE_DATAGRAMS`] between them.
+    /// The quiet reserve, step by step: its sizes; a busy source refused at
+    /// the 896 mark while under its share (and the share checked first); a
+    /// quiet source admitted up to its fourth datagram and refused at its
+    /// fifth; the reserve reopening as the queue drains; a source that drained
+    /// below four admitted again at the mark; and every per-source count back
+    /// to zero once the queue is empty.
     #[tokio::test]
     async fn quic_ingress_keeps_its_last_slots_for_quiet_sources() {
-        let busy_each = (QUIC_INGRESS_QUEUE_DATAGRAMS - QUIC_INGRESS_QUIET_RESERVE) / 4;
-        assert!(busy_each < QUIC_INGRESS_PER_SOURCE_DATAGRAMS);
-        let busy: Vec<SocketAddr> = (0..4u16)
-            .map(|i| SocketAddr::from(([10, 254, 3, 1], 4200 + i)))
-            .collect();
-        let quiet_count = QUIC_INGRESS_QUIET_RESERVE / QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS;
-        let quiet: Vec<SocketAddr> = (0..quiet_count as u16)
-            .map(|i| SocketAddr::from(([10, 254, 3, 2], 4300 + i)))
-            .collect();
-        let late: SocketAddr = "10.254.3.3:4400".parse().unwrap();
+        assert_eq!(QUIC_INGRESS_QUIET_RESERVE, 128);
+        assert_eq!(QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS, 4);
+        assert_eq!(
+            QUIC_INGRESS_QUEUE_DATAGRAMS - QUIC_INGRESS_QUIET_RESERVE,
+            896
+        );
+        let share = QUIC_INGRESS_PER_SOURCE_DATAGRAMS;
+        let addr = |host: u8, port: u16| SocketAddr::from(([10, 254, 3, host], port));
+        // Three sources at their full share and one at half: 896, the mark.
+        let busy: Vec<SocketAddr> = (0..4u16).map(|i| addr(1, 4200 + i)).collect();
+        let quiet = addr(2, 4300);
+        let refill = addr(3, 4400);
         let mut script = Vec::new();
-        for from in &busy {
-            for i in 0..busy_each {
-                script.push(Step::Packet(*from, quic(i as u8)));
-            }
+        for (i, from) in busy.iter().enumerate() {
+            let count = if i < 3 { share } else { share / 2 };
+            script.extend((0..count).map(|n| Step::Packet(*from, quic(n as u8))));
         }
-        // At the mark: a busy source holding less than its share is refused.
-        script.push(Step::Packet(busy[0], quic(0xB0)));
-        // A quiet source is admitted, up to its few datagrams.
-        for i in 0..=QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS {
-            script.push(Step::Packet(quiet[0], quic(0xC0 + i as u8)));
-        }
-        // The other quiet sources fill the reserve; then even a new quiet
-        // source finds the queue full, as it would without the reserve.
-        for from in &quiet[1..] {
-            for i in 0..QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS {
-                script.push(Step::Packet(*from, quic(i as u8)));
-            }
-        }
-        script.push(Step::Packet(late, quic(0xD0)));
-        let steps = script.len();
+        let at_mark = script.len();
+        script.push(Step::Packet(busy[0], quic(0xB0))); // at its share
+        script.push(Step::Packet(busy[3], quic(0xB3))); // under its share
+        script.extend((0..5u8).map(|n| Step::Packet(quiet, quic(0xC0 + n))));
+        let after_quiet = script.len();
+        // Drained by 5 below the mark (in the test): one more busy datagram
+        // gets in, the next finds the mark again.
+        script.push(Step::Packet(busy[3], quic(0xB4)));
+        script.push(Step::Packet(busy[3], quic(0xB5)));
+        let after_reopen = script.len();
+        // busy[0] drained to 3 queued (in the test), the queue refilled to
+        // the mark by another source; busy[0] is quiet again: its next
+        // datagram gets in, the one after is refused.
+        script.extend((0..248u16).map(|n| Step::Packet(refill, quic(n as u8))));
+        script.push(Step::Packet(busy[0], quic(0xB6)));
+        script.push(Step::Packet(busy[0], quic(0xB7)));
+        let total = script.len();
         let socket = DemuxSocket::wrap(ScriptedSocket::new(script), None);
-        let queue = socket.enable_quic_ingress().expect("first enable");
+        let mut queue = socket.enable_quic_ingress().expect("first enable");
         let _permits: Vec<_> = busy
             .iter()
-            .chain(&quiet)
-            .chain(std::iter::once(&late))
+            .chain([&quiet, &refill])
             .map(|a| socket.allow_quic_source(*a).expect("allowed"))
             .collect();
-        let mut buf = [0u8; 64];
-        for step in 0..steps {
-            socket.recv_classified(&mut buf).await.unwrap();
-            if step + 1 == 4 * busy_each + 1 {
-                assert_eq!(
-                    outcomes(&socket),
-                    [(4 * busy_each) as u64, 0, 1, 0, 0],
-                    "a busy source is refused at the mark"
-                );
-            }
-            if step + 1 == 4 * busy_each + 1 + QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS {
-                assert_eq!(
-                    outcomes(&socket),
-                    [
-                        (4 * busy_each + QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS) as u64,
-                        0,
-                        1,
-                        0,
-                        0
-                    ],
-                    "a quiet source is admitted past the mark"
-                );
+        async fn read(socket: &DemuxSocket<ScriptedSocket>, n: usize) {
+            let mut buf = [0u8; 64];
+            for _ in 0..n {
+                socket.recv_classified(&mut buf).await.unwrap();
             }
         }
-        assert_eq!(
-            queue.len(),
-            QUIC_INGRESS_QUEUE_DATAGRAMS,
-            "never past the queue"
-        );
+        read(&socket, at_mark).await;
+        assert_eq!(outcomes(&socket), [896, 0, 0, 0, 0, 0]);
+        read(&socket, after_quiet - at_mark).await;
         assert_eq!(
             outcomes(&socket),
-            [QUIC_INGRESS_QUEUE_DATAGRAMS as u64, 0, 3, 0, 0],
-            "busy at the mark, the quiet source's fifth, and the late one"
+            [900, 0, 0, 1, 0, 2],
+            "at the mark: the share first, then the reserve; the quiet source's \
+             fourth gets in and its fifth does not"
+        );
+        // Five read off the queue (all busy[0]'s): 895 queued, the reserve
+        // is no longer all that is free.
+        for _ in 0..5 {
+            assert_eq!(queue.try_recv().unwrap().from, busy[0]);
+        }
+        read(&socket, after_reopen - after_quiet).await;
+        assert_eq!(outcomes(&socket), [901, 0, 0, 1, 0, 3]);
+        assert_eq!(queue.len(), 896);
+        // Drain busy[0] (first in the queue) down to 3 queued.
+        for _ in 0..(share - 5 - 3) {
+            assert_eq!(queue.try_recv().unwrap().from, busy[0]);
+        }
+        assert_eq!(queue.len(), 896 - 248);
+        read(&socket, total - after_reopen).await;
+        assert_eq!(
+            outcomes(&socket),
+            [901 + 248 + 1, 0, 0, 1, 0, 4],
+            "busy[0], drained below 4, is admitted at the mark once more"
+        );
+        assert_eq!(queue.len(), 897);
+        while queue.try_recv().is_ok() {}
+        let ingress = socket.quic.get().expect("ingress");
+        assert!(
+            ingress.shared.queued.is_empty(),
+            "every per-source count is back to zero"
         );
     }
 
@@ -1012,7 +1041,7 @@ mod tests {
         }
         assert_eq!(
             outcomes(&socket),
-            [QUIC_INGRESS_PER_SOURCE_DATAGRAMS as u64 + 1, 0, 0, 3, 0],
+            [QUIC_INGRESS_PER_SOURCE_DATAGRAMS as u64 + 1, 0, 0, 3, 0, 0],
             "the flooder's share filled; the other source still got in"
         );
         // Reading one of the flooder's datagrams frees one slot of its share.
@@ -1021,7 +1050,7 @@ mod tests {
         socket.recv_classified(&mut buf).await.unwrap();
         assert_eq!(
             outcomes(&socket),
-            [QUIC_INGRESS_PER_SOURCE_DATAGRAMS as u64 + 2, 0, 0, 4, 0],
+            [QUIC_INGRESS_PER_SOURCE_DATAGRAMS as u64 + 2, 0, 0, 4, 0, 0],
             "one freed slot admits exactly one more"
         );
     }
@@ -1064,7 +1093,7 @@ mod tests {
             queue.try_recv().is_err(),
             "a stranger's datagram is not queued"
         );
-        assert_eq!(outcomes(&socket), [0, 1, 0, 0, 0]);
+        assert_eq!(outcomes(&socket), [0, 1, 0, 0, 0, 0]);
 
         socket.recv_classified(&mut buf).await.unwrap();
         assert_eq!(queue.try_recv().unwrap().bytes, quic(2));
@@ -1081,7 +1110,7 @@ mod tests {
         );
         socket.recv_classified(&mut buf).await.unwrap();
         assert!(queue.try_recv().is_err(), "a removed source is not queued");
-        assert_eq!(outcomes(&socket), [2, 2, 0, 0, 0]);
+        assert_eq!(outcomes(&socket), [2, 2, 0, 0, 0, 0]);
     }
 
     /// The allow-set holds at most `QUIC_ALLOWED_SOURCES_MAX` addresses: past
@@ -1194,7 +1223,7 @@ mod tests {
         let mut buf = [0u8; 64];
         socket.recv_classified(&mut buf).await.unwrap();
         socket.recv_classified(&mut buf).await.unwrap();
-        assert_eq!(outcomes(&socket), [0, 0, 0, 0, 1]);
+        assert_eq!(outcomes(&socket), [0, 0, 0, 0, 1, 0]);
 
         let queue = socket.enable_quic_ingress().expect("first enable");
         assert!(socket.enable_quic_ingress().is_none(), "enabled only once");
@@ -1203,7 +1232,7 @@ mod tests {
         socket.recv_classified(&mut buf).await.unwrap();
         assert_eq!(
             outcomes(&socket),
-            [0, 0, 0, 0, 2],
+            [0, 0, 0, 0, 2, 0],
             "a closed queue is no ingress"
         );
     }
@@ -1237,7 +1266,7 @@ mod tests {
         drop(held);
         let mut buf = [0u8; 2048];
         socket.recv_classified(&mut buf).await.unwrap();
-        assert_eq!(outcomes(&socket), [0, 0, 0, 0, 1], "no ingress");
+        assert_eq!(outcomes(&socket), [0, 0, 0, 0, 1, 0], "no ingress");
         assert!(socket.with_quic_ingress(|_| Ok::<(), ()>(())).is_none());
 
         let working = DemuxSocket::wrap(ScriptedSocket::new(Vec::new()), None);
