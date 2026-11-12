@@ -10,3 +10,6 @@
 // step; until then only its tests use it.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod hello;
+// Run by the native entry points (the next step); until then only its tests.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod exchange;

@@ -30,6 +30,51 @@ use tracing::{Instrument, span};
 use version_cmp::PROTOC_VERSION;
 pub(crate) use version_cmp::{OWN_FLOOR, OWN_VERSION};
 
+/// The UDP handshake's version rules, for the `Hello` of a native QUIC
+/// connection (#5940, design 2.1), so both paths read a peer's version the
+/// same way.
+pub(crate) mod native_version {
+    use super::version_cmp::{
+        PROTOC_VERSION, is_compatible, parse_version_bytes, remote_requires_newer_than_us,
+    };
+
+    /// This build's 8 version bytes, as the UDP handshake sends them.
+    pub(crate) const OWN: [u8; 8] = PROTOC_VERSION;
+
+    /// Check a peer's version bytes as the UDP handshake checks an intro's:
+    /// the version is reported (`report_peer_version`) either way, and a peer
+    /// whose floor is above this build asks for an urgent update. `Err` names
+    /// why the two cannot talk.
+    pub(crate) fn check(remote: &[u8; 8]) -> Result<(u8, u8, u16), String> {
+        match is_compatible(&OWN, remote) {
+            Ok(info) => {
+                crate::transport::report_peer_version(info.version);
+                Ok(info.version)
+            }
+            Err(reason) => {
+                crate::transport::report_peer_version(parse_version_bytes(remote).version);
+                if remote_requires_newer_than_us(&OWN, remote) {
+                    crate::transport::signal_urgent_update();
+                }
+                Err(reason)
+            }
+        }
+    }
+
+    /// A peer closed with `VERSION_INCOMPATIBLE`, its version bytes as the
+    /// reason. As for a gateway's version-mismatch ack on UDP, only a
+    /// gateway's rejection sets the version-mismatch signal, and only when
+    /// its floor is above this build.
+    pub(crate) fn rejected_by(peer_version: &[u8], peer_is_gateway: bool) {
+        let Ok(bytes) = <[u8; 8]>::try_from(peer_version) else {
+            return;
+        };
+        if peer_is_gateway && remote_requires_newer_than_us(&OWN, &bytes) {
+            crate::transport::signal_version_mismatch();
+        }
+    }
+}
+
 use super::{
     Socket, SocketRead, TransportError, UdpError, UdpErrorKind,
     congestion_control::{CongestionControl, CongestionControlConfig},
