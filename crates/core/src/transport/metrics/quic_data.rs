@@ -120,6 +120,48 @@ pub(crate) const GATE_MIN_VERDICTS: u64 = 20;
 /// queue: under 10%, under 50%, 50% or more.
 pub(crate) const GATE_QUEUE_LABELS: [&str; 3] = ["lt_10pct", "lt_50pct", "ge_50pct"];
 
+/// The labels of `quic_dark_episode_<label>`: dark episodes on QUIC paths
+/// (`recycle::AckWatch`: this side's packets outstanding, nothing
+/// acknowledged and nothing heard), by how they ended: the peer was heard
+/// from again within 2/5/10/30/120 s or later; the episode ended without that
+/// (the path closed, at the latest on quinn's idle timeout, or nothing was
+/// outstanding any more); or the dark-path rule closed the path at its
+/// window, on a path that carries data. A path that carries no data is never
+/// closed by that rule, so its episodes run to their end and fill the longer
+/// buckets: that is what the dark-path threshold is to be checked against.
+pub(crate) const DARK_EPISODE_LABELS: [&str; 8] = [
+    "recovered_lt_2s",
+    "recovered_lt_5s",
+    "recovered_lt_10s",
+    "recovered_lt_30s",
+    "recovered_lt_120s",
+    "recovered_ge_120s",
+    "unrecovered",
+    "closed_at_window",
+];
+
+/// The upper bounds of the `recovered_` buckets of [`DARK_EPISODE_LABELS`],
+/// in seconds.
+pub(crate) const DARK_RECOVERED_BOUNDS_SECS: [u64; 5] = [2, 5, 10, 30, 120];
+
+/// [`DARK_EPISODE_LABELS`]' `recovered_ge_120s`, `unrecovered` and
+/// `closed_at_window`.
+const DARK_RECOVERED_LATE: usize = 5;
+const DARK_UNRECOVERED: usize = 6;
+const DARK_CLOSED: usize = 7;
+
+/// How a dark episode ended, for `quic_dark_episode_<label>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DarkEnd {
+    /// The peer was heard from or acknowledged something after this many
+    /// nanoseconds.
+    Recovered(u64),
+    /// It ended without that.
+    Unrecovered,
+    /// The dark-path rule closed the path at its window.
+    Closed,
+}
+
 /// The bucket of a path that had `queue` of `total` verdicts passed as a queue.
 fn gate_queue_bucket(queue: u64, total: u64) -> usize {
     if queue.saturating_mul(10) < total {
@@ -293,6 +335,7 @@ pub(crate) struct QuicDataCounters {
     staged_peak_pct: AtomicU64,
     gate_loss: [AtomicU64; GATE_VERDICTS],
     gate_ended_queue: [AtomicU64; GATE_QUEUE_LABELS.len()],
+    dark_episodes: [AtomicU64; DARK_EPISODE_LABELS.len()],
 }
 
 impl QuicDataCounters {
@@ -326,6 +369,7 @@ impl QuicDataCounters {
             staged_peak_pct: zero(),
             gate_loss: std::array::from_fn(|_| zero()),
             gate_ended_queue: std::array::from_fn(|_| zero()),
+            dark_episodes: std::array::from_fn(|_| zero()),
         }
     }
 
@@ -503,6 +547,25 @@ impl QuicDataCounters {
     }
 
     /// What the node's data paths are charged against the budget now.
+    /// A dark episode ended as `ended` says.
+    pub(crate) fn record_dark_episode(&self, ended: DarkEnd) {
+        let bucket = match ended {
+            DarkEnd::Recovered(nanos) => {
+                let secs = nanos / 1_000_000_000;
+                match DARK_RECOVERED_BOUNDS_SECS
+                    .iter()
+                    .position(|bound| secs < *bound)
+                {
+                    Some(i) => i,
+                    None => DARK_RECOVERED_LATE,
+                }
+            }
+            DarkEnd::Unrecovered => DARK_UNRECOVERED,
+            DarkEnd::Closed => DARK_CLOSED,
+        };
+        self.dark_episodes[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn set_budget_charged(&self, bytes: u64) {
         self.budget_charged.store(bytes, Ordering::Relaxed);
         self.budget_charged_peak.fetch_max(bytes, Ordering::Relaxed);
@@ -602,6 +665,7 @@ impl QuicDataCounters {
             staged_peak_pct: get(&self.staged_peak_pct),
             gate_loss: self.gate_loss.iter().map(get).collect(),
             gate_ended_queue: self.gate_ended_queue.iter().map(get).collect(),
+            dark_episodes: self.dark_episodes.iter().map(get).collect(),
         }
     }
 }
@@ -666,6 +730,9 @@ pub struct QuicDataSnapshot {
     /// Paths that ended in the period, by `GATE_QUEUE_LABELS`.
     #[serde(default)]
     pub gate_ended_queue: Vec<u64>,
+    /// Dark episodes that ended in the period, by `DARK_EPISODE_LABELS`.
+    #[serde(default)]
+    pub dark_episodes: Vec<u64>,
 }
 
 impl QuicDataSnapshot {
@@ -721,6 +788,7 @@ impl QuicDataSnapshot {
             staged_peak_pct,
             gate_loss,
             gate_ended_queue,
+            dark_episodes,
         } = self;
         let mut keys = Vec::new();
         let mut family = |prefix: &'static str, labels: Vec<String>, values: Vec<u64>| {
@@ -811,6 +879,11 @@ impl QuicDataSnapshot {
             GATE_QUEUE_LABELS.iter().map(|l| l.to_string()).collect(),
             gate_ended_queue.clone(),
         );
+        family(
+            "quic_dark_episode_",
+            DARK_EPISODE_LABELS.iter().map(|l| l.to_string()).collect(),
+            dark_episodes.clone(),
+        );
         for (key, value) in [
             ("quic_enabled_data_paths", *data_enabled),
             (LIVE_DATA_PATHS, *data_paths),
@@ -898,6 +971,7 @@ impl QuicDataSnapshot {
             staged_peak_pct: _,
             gate_loss,
             gate_ended_queue,
+            dark_episodes,
         } = self;
         let any = |values: &[u64]| values.iter().any(|n| *n != 0);
         any(sends)
@@ -909,6 +983,7 @@ impl QuicDataSnapshot {
             || any(send_resets_reached)
             || any(gate_loss)
             || any(gate_ended_queue)
+            || any(dark_episodes)
             || [
                 *data_enabled,
                 *sends_opened,
@@ -1041,6 +1116,42 @@ mod tests {
         assert_eq!(keys["quic_gate_loss_queue"], 0, "reset by the snapshot");
         assert!(ended.has_activity(), "an ended path alone is activity");
         assert!(!counters.snapshot(true).has_activity());
+    }
+
+    /// A dark episode is counted in the bucket of how it ended, and the counts
+    /// are activity and reset with the snapshot.
+    #[test]
+    fn dark_episodes_are_counted_by_how_they_ended() {
+        let counters: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
+        const S: u64 = 1_000_000_000;
+        for ended in [
+            DarkEnd::Recovered(S + S / 2),
+            DarkEnd::Recovered(9 * S),
+            DarkEnd::Recovered(30 * S - 1),
+            DarkEnd::Recovered(30 * S),
+            DarkEnd::Recovered(200 * S),
+            DarkEnd::Unrecovered,
+            DarkEnd::Closed,
+        ] {
+            counters.record_dark_episode(ended);
+        }
+        let snap = counters.snapshot(true);
+        assert!(snap.has_activity());
+        let keys: std::collections::BTreeMap<_, _> = snap.keys().into_iter().collect();
+        assert_eq!(keys["quic_dark_episode_recovered_lt_2s"], 1);
+        assert_eq!(
+            keys.get("quic_dark_episode_recovered_lt_5s")
+                .copied()
+                .unwrap_or(0),
+            0
+        );
+        assert_eq!(keys["quic_dark_episode_recovered_lt_10s"], 1);
+        assert_eq!(keys["quic_dark_episode_recovered_lt_30s"], 1);
+        assert_eq!(keys["quic_dark_episode_recovered_lt_120s"], 1);
+        assert_eq!(keys["quic_dark_episode_recovered_ge_120s"], 1);
+        assert_eq!(keys["quic_dark_episode_unrecovered"], 1);
+        assert_eq!(keys["quic_dark_episode_closed_at_window"], 1);
+        assert!(!counters.snapshot(true).has_activity(), "reset");
     }
 
     #[test]

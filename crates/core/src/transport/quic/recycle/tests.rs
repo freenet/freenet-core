@@ -157,6 +157,74 @@ fn run_why(ticks: u64, mut at: impl FnMut(u64) -> Reading) -> Option<(u64, Stall
     })
 }
 
+/// [`run_why`] on a watch observing for `quic_dark_episode_<label>`, on a path
+/// that carries data or not; also the dark-episode counts once the watch is
+/// dropped (`DARK_EPISODE_LABELS` order).
+fn run_observed(
+    ticks: u64,
+    carries_data: bool,
+    mut at: impl FnMut(u64) -> Reading,
+) -> (Option<(u64, Stall)>, Vec<u64>) {
+    let counters: &'static crate::transport::metrics::QuicDataCounters =
+        Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+    let record = Arc::default();
+    let sample = |r: Reading| {
+        AckSample::synthetic(
+            &record,
+            r.acked,
+            r.batches,
+            r.outstanding,
+            r.sent,
+            r.received,
+            NO_CAP,
+        )
+    };
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(carries_data));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0))).observing(flag, counters);
+    let closed = (1..=ticks).find_map(|tick| {
+        watch
+            .observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(tick)))
+            .then(|| (tick, watch.stall().expect("a reason")))
+    });
+    drop(watch);
+    (closed, counters.snapshot(true).dark_episodes)
+}
+
+/// A dark spell of 30 s (sends from tick 1, the peer heard from again at tick
+/// 16) on a path that carries no data is not closed and is counted to its end:
+/// 30 s, in `recovered_lt_120s`. On a path that carries data the dark-path rule
+/// closes it at the window, counted `closed_at_window`.
+#[test]
+fn a_path_without_data_counts_a_dark_spell_to_its_end() {
+    let spell = |t: u64| reading(5, 1200, 10 + t.min(15), 100 + t.saturating_sub(15));
+    let (closed, counts) = run_observed(40, false, spell);
+    assert_eq!(closed, None, "a path that carries no data is not closed");
+    assert_eq!(counts, vec![0, 0, 0, 0, 1, 0, 0, 0]);
+    let (closed, counts) = run_observed(40, true, spell);
+    assert_eq!(closed, Some((closes_at(1), Stall::Dark)));
+    assert_eq!(counts, vec![0, 0, 0, 0, 0, 0, 0, 1]);
+}
+
+/// Short spells land in the short buckets (4 s and 8 s, read at the ticks),
+/// and one still going when the watch ends is `unrecovered`.
+#[test]
+fn dark_spells_are_counted_by_how_long_they_lasted() {
+    // Sends at ticks 1-2, heard from again at tick 3: 4 s.
+    let (_, counts) = run_observed(10, false, |t| {
+        reading(5, 1200, 10 + t.min(2), 100 + t.saturating_sub(2))
+    });
+    assert_eq!(counts, vec![0, 1, 0, 0, 0, 0, 0, 0]);
+    // Sends at ticks 1-4, heard from again at tick 5: 8 s.
+    let (_, counts) = run_observed(10, false, |t| {
+        reading(5, 1200, 10 + t.min(4), 100 + t.saturating_sub(4))
+    });
+    assert_eq!(counts, vec![0, 0, 1, 0, 0, 0, 0, 0]);
+    // Dark to the end of the watch.
+    let (closed, counts) = run_observed(30, false, |t| reading(5, 1200, 10 + t, 100));
+    assert_eq!(closed, None);
+    assert_eq!(counts, vec![0, 0, 0, 0, 0, 0, 1, 0]);
+}
+
 /// A send at tick 1, never acknowledged, while the peer sends every tick:
 /// closed exactly a window after tick 1, not a tick earlier.
 #[test]

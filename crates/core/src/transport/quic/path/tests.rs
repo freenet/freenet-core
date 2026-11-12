@@ -3190,9 +3190,20 @@ impl Scripted {
         Self::connect_capped(network, subnet, None).await
     }
 
+    /// [`Self::connect`] with `a`'s path left without data, as every path is
+    /// while no release sends data on QUIC: its watch counts dark spells and
+    /// does not close on them.
+    async fn connect_without_data(network: &str, subnet: u8) -> Self {
+        Self::connect_built(network, subnet, None, false).await
+    }
+
     /// [`Self::connect`] with a node-wide egress cap of `a_cap` bytes per
     /// second on `a`'s socket.
     async fn connect_capped(network: &str, subnet: u8, a_cap: Option<u64>) -> Self {
+        Self::connect_built(network, subnet, a_cap, true).await
+    }
+
+    async fn connect_built(network: &str, subnet: u8, a_cap: Option<u64>, data: bool) -> Self {
         use super::super::config::{self, QuicSettings};
         use super::super::identity::{PeerKey, QuicIdentity};
         use crate::transport::Socket;
@@ -3313,7 +3324,12 @@ impl Scripted {
             endpoint.connect(b_addr, &b_key).await.expect("connect")
         })
         .await;
-        let (a, a_in) = QuicPath::new(conn, time.clone());
+        let limits = if data {
+            QuicPathLimits::DEFAULT
+        } else {
+            QuicPathLimits::SHADOW
+        };
+        let (a, a_in) = QuicPath::with_limits(conn, time.clone(), limits);
         Self {
             time,
             network: network.to_string(),
@@ -3512,6 +3528,44 @@ fn a_path_dark_in_both_directions_is_closed_as_dark() {
             recycle_closes_to(s.b_addr),
             vec![QuicCloseCode::PeerNotAcknowledging]
         );
+    })
+}
+
+/// On a path that carries no data (every path while no release sends data on
+/// QUIC) the dark-path rule only counts: an outage of 30 s in both directions,
+/// with a control frame sent into it, does not close the path, and the spell
+/// is counted when it ends. quinn's idle timeout (here none) and the M6 rule
+/// still apply.
+#[test]
+fn a_path_without_data_is_not_closed_by_a_dark_spell() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-dark-no-data";
+        let mut s = Scripted::connect_without_data(network, 7).await;
+        s.wait(Duration::from_secs(1)).await;
+        let dark = DropFrom::new(network, &[s.a_addr, s.b_addr]);
+        let (a, time) = (s.a.clone(), s.time.clone());
+        s.tasks.push(tokio::spawn(async move {
+            a.send_control_bounded(
+                &time,
+                Duration::from_secs(60),
+                QuicControl::Ready {
+                    attempt: 1,
+                    caps: 0,
+                },
+            )
+            .await;
+        }));
+        s.wait(Duration::from_secs(30)).await;
+        drop(dark);
+        s.wait(Duration::from_secs(20)).await;
+        assert!(
+            s.a.connection().inner().close_reason().is_none(),
+            "{:?}, {:?}",
+            s.a.connection().inner().close_reason(),
+            recycle::stalls_to(s.b_addr)
+        );
+        assert!(recycle::stalls_to(s.b_addr).is_empty());
     })
 }
 

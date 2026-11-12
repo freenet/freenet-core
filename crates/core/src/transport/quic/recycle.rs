@@ -853,6 +853,13 @@ pub(crate) struct AckWatch {
     /// When this side's packets were last seen outstanding with nothing
     /// acknowledged since, from a send (the dark-path rule, [`Stall::Dark`]).
     dark_since: Option<u64>,
+    /// Whether the path carries data, so the dark-path rule closes it; `None`
+    /// is a path that does. A path that carries none only counts its dark
+    /// episodes, to their end ([`Self::observing`]).
+    carries_data: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Where dark episodes are counted (`quic_dark_episode_<label>`), if
+    /// anywhere.
+    dark_counts: Option<&'static crate::transport::metrics::QuicDataCounters>,
     credit: CreditWatch,
     /// Why the last [`Self::observe`] that said close did.
     stall: Option<Stall>,
@@ -914,6 +921,8 @@ impl AckWatch {
             window_nanos,
             credit: CreditWatch::new(window_nanos, &first),
             dark_since: None,
+            carries_data: None,
+            dark_counts: None,
             stall: None,
             previous: first,
             since: None,
@@ -921,6 +930,43 @@ impl AckWatch {
             quiet_samples: 0,
             hold_unchanged_since: None,
         }
+    }
+
+    /// Count dark episodes in `node`, and let the dark-path rule close the
+    /// path only while `carries_data` is set. On a path that carries no data
+    /// (every path while no release sends data on QUIC), an episode runs to
+    /// its end, so the counts show how long real dark spells last against the
+    /// rule's window. Durations are read at the samples, so they are good to
+    /// one [`ACK_WATCH_TICK`].
+    pub(crate) fn observing(
+        mut self,
+        carries_data: Arc<std::sync::atomic::AtomicBool>,
+        node: &'static crate::transport::metrics::QuicDataCounters,
+    ) -> Self {
+        self.carries_data = Some(carries_data);
+        self.dark_counts = Some(node);
+        self
+    }
+
+    fn closes_dark(&self) -> bool {
+        self.carries_data
+            .as_ref()
+            .is_none_or(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// End the dark episode in progress, if any, counted as `ended`, or not
+    /// counted with `None`.
+    fn end_dark(&mut self, ended: Option<crate::transport::metrics::DarkEnd>) {
+        if self.dark_since.take().is_some()
+            && let (Some(node), Some(ended)) = (self.dark_counts, ended)
+        {
+            node.record_dark_episode(ended);
+        }
+    }
+
+    /// The path ended: a dark episode in progress ended without recovering.
+    pub(crate) fn path_ended(&mut self) {
+        self.end_dark(Some(crate::transport::metrics::DarkEnd::Unrecovered));
     }
 
     /// Why the path must close, once [`Self::observe`] said so.
@@ -969,7 +1015,8 @@ impl AckWatch {
             // cap, so nothing says when it left: no latch, no window.
             self.sent_after_acks = false;
             self.since = None;
-            self.dark_since = None;
+            // Not counted: the cap held this side's own sends.
+            self.end_dark(None);
             return None;
         }
         if starved {
@@ -983,15 +1030,22 @@ impl AckWatch {
         // A peer that sends ends it: one that sends and acknowledges nothing
         // is the rule below's, and one that sends after an outage while this
         // side's backed-off probe has not gone yet is alive.
-        if !outstanding || acknowledged || peer_sent {
-            self.dark_since = None;
+        if acknowledged || peer_sent {
+            let lasted = self
+                .dark_since
+                .map_or(0, |start| now_nanos.saturating_sub(start));
+            self.end_dark(Some(crate::transport::metrics::DarkEnd::Recovered(lasted)));
+        } else if !outstanding {
+            self.end_dark(Some(crate::transport::metrics::DarkEnd::Unrecovered));
         } else if self.dark_since.is_none() && sent_new {
             self.dark_since = Some(now_nanos);
         }
-        if self
-            .dark_since
-            .is_some_and(|start| now_nanos.saturating_sub(start) >= self.window_nanos)
+        if self.closes_dark()
+            && self
+                .dark_since
+                .is_some_and(|start| now_nanos.saturating_sub(start) >= self.window_nanos)
         {
+            self.end_dark(Some(crate::transport::metrics::DarkEnd::Closed));
             return Some(Stall::Dark);
         }
         if !outstanding || self.quiet_samples >= QUIET_SAMPLES_END_WINDOW {
@@ -1008,6 +1062,14 @@ impl AckWatch {
             None => return None,
         };
         (now_nanos.saturating_sub(start) >= self.window_nanos).then_some(Stall::NotAcknowledging)
+    }
+}
+
+impl Drop for AckWatch {
+    /// However the watch ends (it returned, or the path's task dropped it), a
+    /// dark episode still in progress ended without recovering.
+    fn drop(&mut self) {
+        self.path_ended();
     }
 }
 
@@ -1185,6 +1247,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         writers,
         rtt,
         heard,
+        carries_data,
     } = shared;
     let Some(first) = AckSample::of(&connection, &cap_holds, &writers) else {
         tracing::warn!(
@@ -1195,7 +1258,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         return;
     };
     let mut received = first.received;
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first);
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first).observing(carries_data, report.node);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
         rtt.set(connection.rtt());
@@ -1275,6 +1338,9 @@ pub(crate) struct WatchShared {
     /// each tick (`streaming::PathRtt`).
     pub(crate) rtt: Arc<crate::transport::peer_connection::streaming::PathRtt>,
     pub(crate) heard: Arc<PeerHeard>,
+    /// Set once the path may send data (`QuicPath::enable_data`): only then
+    /// does the dark-path rule close it ([`AckWatch::observing`]).
+    pub(crate) carries_data: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Watch panics `PathReport::panic_once_bucketed` raised. Tests only; only

@@ -754,6 +754,9 @@ pub(crate) struct QuicPath {
     /// Sends with data still to write, for the credit rule
     /// (`recycle::CreditWatch`).
     writers: Arc<recycle::Writers>,
+    /// Set once the path may send data: only then does the acknowledgement
+    /// watch's dark-path rule close it (`recycle::AckWatch::observing`).
+    carries_data: Arc<std::sync::atomic::AtomicBool>,
     /// Whether this path may send data, one of the `SEND_DATA_*` values. Off for a
     /// path in shadow, where a fragment taken from an inbound handle cannot
     /// outlive its charge because nothing is ever forwarded.
@@ -1014,6 +1017,7 @@ impl QuicPath {
             report.watch_closes = limits.watch_closes;
         }
         let ack_waits = Arc::new(AckWaits::new(stats.clone()));
+        let carries_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             connection.closer(),
@@ -1026,6 +1030,7 @@ impl QuicPath {
                     writers: writers.clone(),
                     rtt: receiver_rtt,
                     heard: heard.clone(),
+                    carries_data: carries_data.clone(),
                 },
                 report,
             },
@@ -1040,6 +1045,7 @@ impl QuicPath {
                 meter,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
                 writers,
+                carries_data,
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
                 stall: parking_lot::Mutex::new(stall),
@@ -1279,6 +1285,9 @@ impl QuicPath {
     /// separate, set by [`QuicPathLimits::accept_data`] when the path is built.
     pub(in crate::transport) fn enable_data(&self) {
         self.send_data.store(SEND_DATA_ON, Ordering::Release);
+        // From now on the dark-path rule closes the path
+        // (`recycle::AckWatch::observing`).
+        self.carries_data.store(true, Ordering::Release);
     }
 
     /// The peer said it accepts no data on this path, so this node's gating or
