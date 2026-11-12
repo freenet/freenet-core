@@ -680,6 +680,25 @@ impl AckSample {
         self.received
     }
 
+    /// Batches of acknowledgements so far. Tests only.
+    #[cfg(test)]
+    pub(crate) fn batches(&self) -> u64 {
+        self.state.batches
+    }
+
+    /// Bytes the peer has acknowledged so far. Tests only.
+    #[cfg(test)]
+    pub(crate) fn acked_bytes(&self) -> u64 {
+        self.state.acked_bytes
+    }
+
+    /// Batches that came while quinn was not application-limited. Tests
+    /// only.
+    #[cfg(test)]
+    pub(crate) fn congestion_limited_batches(&self) -> u64 {
+        self.state.congestion_limited_batches
+    }
+
     /// A sample with these counts; `batches` counts every batch of
     /// acknowledgements, those with an `on_ack` and those without.
     #[cfg(test)]
