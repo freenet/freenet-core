@@ -949,6 +949,16 @@ impl NodeP2P {
             &background_task_monitor,
         );
 
+        // `join_versions` (#5940): hourly versions of gateway joiners and live
+        // neighbours. Only with telemetry on, since it exists to be uploaded.
+        if config.config.telemetry.enabled && !config.config.telemetry.is_test_environment {
+            crate::transport::join_versions::spawn_join_versions_reporter(
+                config.local_peer_id_string(),
+                op_manager.ring.connection_manager.clone(),
+                &background_task_monitor,
+            );
+        }
+
         let contract_handler = CH::build(ch_inbound, op_manager.clone(), ch_builder)
             .await
             .map_err(|e| anyhow::anyhow!(e))?;

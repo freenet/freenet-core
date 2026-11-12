@@ -566,6 +566,27 @@ topology management; the full list is on `DisconnectReason`). Disconnect
 byte totals are this connection's: the ring `Connection` records the
 per-peer totals when it joins and the event reports the difference.
 
+### Release census (`join_versions`, #5940)
+
+`transport/join_versions.rs` emits `join_versions` once per
+`JOIN_VERSIONS_INTERVAL` (1 h, listed in `PERIODIC_EVENT_TYPES`), only when
+telemetry is on, so the QUIC-only plan can see which releases are out there,
+including nodes whose own telemetry is off. `gateway_joins` (gateways only)
+counts each SUCCESSFUL inbound gateway handshake by transport and the joiner's
+version, at the listener's `complete_gateway_handshake` success arm, never at
+intro receipt (an intro is spoofable); it is process-wide (`GATEWAY_JOINS`) and
+resets at each emission. `neighbours` (every node) is a snapshot of live ring
+connections by peer version (`ConnectionManager::live_neighbour_versions`), so
+reconnects do not skew it. A version is bucketed relative to this build
+(`OWN_VERSION`): the exact version for this major.minor and a patch in
+`own_patch - 31 ..= own_patch`, else `older`, `newer` or `unknown` (no version).
+That is at most 35 labels whatever a peer sends, held in fixed arrays. No keys,
+no addresses; in `gateway_joins` a count of 1 to 4 is reported as `"<5"`, and
+zero counts are omitted in both maps. Transport `legacy_intro` is today's UDP
+handshake; `native` is reserved for QUIC-native joins, which do not exist yet,
+and is never counted. It is not a `KnownShadowRollup`: its admission and drop
+counts are in the per-type `tel_t` row like any other event.
+
 ### Dashboard bandwidth sampler (#5152)
 
 `transport/bandwidth_history.rs` runs one more always-on 1 Hz task
