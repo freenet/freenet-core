@@ -1987,6 +1987,39 @@ refusal of a wrong server key, a wrong client key, a plain Ed25519 key on
 either side, and a man in the middle with its own key on either leg.
 ```
 
+#### QUIC-native setup (`quic/native/`, #5940 QUIC-native connect, A4)
+
+Built and tested, and unreachable: nothing outside `quic/native` names
+`connect_native` or `accept_native` in production code, and the connect op
+reaches them only once `operations::connect::native::NATIVE_DIAL_READY` is
+true (pinned false). `native::pins` scrapes the crate to hold both.
+
+```
+ALPN per attempt: an address allowed with allow_native_peer is accepted with
+  freenet-quic/2 only; every other address keeps freenet-quic/1. An address
+  is allowed for one kind at a time (KeyConflict for the other). dial_native
+  offers /2 only, with a 100 ms initial RTT (NATIVE_INITIAL_RTT).
+Router: an attempt from a native-allowed address goes only to
+  native::waiters (QuicUpgrades::dispatch), never to an upgrade session.
+  NativeWaiters::register is visible to the native module only, and its one
+  production call is in accept_native. A waiter takes one attempt at a time;
+  others are ignored. An attempt without a Retry token gets a Retry first
+  (one more round trip in the window).
+Hello (native/hello.rs, frozen layout) is exchanged on one uni stream each
+  way (native/exchange.rs). A malformed one closes with HELLO_REFUSED; a
+  version this node cannot talk to closes with VERSION_INCOMPATIBLE and this
+  node's 8 version bytes as the reason (close_with_reason). Version rules
+  are the UDP handshake's (connection_handler::native_version).
+Punches (native/punch.rs): byte 0x03 + 8 GlobalRng bytes, sent on the
+  endpoint's socket with try_send (charged unpaced), at once and every
+  250 ms, at most 32 per setup. PunchBudget: 64 KiB per destination IP per
+  minute (token bucket, 4096 IPs, LRU), charged at the setup's worst case
+  before anything is sent.
+Setup (native/setup.rs): one window, 8 s cut to the caller's deadline, not
+  started with less than 4 s left; punching, the handshake and the Hello
+  exchange all inside it. Roles by key order are the caller's decision.
+```
+
 #### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)
 
 The upgrade driver builds a `QuicPath` and sends control frames on it. Data goes on
