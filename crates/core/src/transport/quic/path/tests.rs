@@ -1320,8 +1320,17 @@ fn a_stream_through_random_loss_arrives_intact_far_under_the_gap_cap() {
         assert_eq!(p.b.stats().count(QuicInboundOutcome::TooManyRanges), 0);
         let peak = p.b.inbound_gaps_peak();
         assert!(peak >= 1, "premise: bytes past a gap were read");
+        // Honest loss leaves about loss x packets in flight: with the loss
+        // gate Cubic keeps its window, so up to a window of packets is in
+        // flight (TEST_WINDOW / 1200, about 1750), and 3% of that is about
+        // 52. A quarter of the cap is above that and far under the cap.
+        let expected = 3 * (super::super::tests::TEST_WINDOW as usize / 1200) / 100;
         assert!(
-            peak < inbound::MAX_GAPS_PER_CONNECTION / 8,
+            expected < inbound::MAX_GAPS_PER_CONNECTION / 4,
+            "premise: the bound is above the expected {expected}"
+        );
+        assert!(
+            peak < inbound::MAX_GAPS_PER_CONNECTION / 4,
             "gap peak {peak} against a cap of {}",
             inbound::MAX_GAPS_PER_CONNECTION
         );
