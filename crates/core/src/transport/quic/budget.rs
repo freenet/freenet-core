@@ -43,9 +43,19 @@
 //!   go. The cap follows W + debt and is never set below the gaps held.
 //! - **Control and short buffers**, a constant.
 //!
-//! A path at the floor windows is charged the floor grant ([`floor_grant`]).
-//! The budget does not refuse paths: how many fit is the aggregate step's cap
-//! (PR 5). It decides only growth and shrinking:
+//! A path at the floor windows is charged the floor grant ([`floor_grant`]),
+//! and that grant is part of the data path's fixed charge, not of this
+//! budget: the budget holds only each path's growth above it. So a path that
+//! arrives adds nothing here, however much the paths already here have grown,
+//! and the bound is
+//!
+//! ```text
+//! memory <= data paths x (QUIC_CONNECTION_CHARGE_BYTES + floor grant) + budget
+//! ```
+//!
+//! The budget does not refuse paths: how many there are is the aggregate
+//! step's cap (PR 5), which sums the first term. It decides only growth and
+//! shrinking:
 //!
 //! - A connection grows when it is window-limited on CONTIGUOUS delivery: the
 //!   in-order prefix of its streams advanced, over the last interval (at least
@@ -54,9 +64,9 @@
 //!   not count, so a peer cannot grow its window by sending gapped data.
 //! - A grow at most doubles a window, up to [`MAX_WINDOW_BYTES`], and is
 //!   granted only while the connection's charge stays within its share `C`
-//!   and the node's total within the budget. `C` is the floor grant plus the
-//!   budget above every path's floor grant, split over the connections that
-//!   are growing (max-min with a floor).
+//!   and the node's growth within the budget. `C` is the floor grant plus the
+//!   budget split over the connections that are growing (max-min with a
+//!   floor).
 //! - When a grow does not fit the budget, the connections furthest above their
 //!   floor grant are asked to shrink toward `C`. A receive shrink frees nothing
 //!   until its debt is read, so the room comes as their peers' data is read,
@@ -232,7 +242,8 @@ pub(crate) struct QuicBudget {
 struct BudgetState {
     conns: HashMap<u64, ConnState>,
     next_id: u64,
-    /// The sum of every connection's `charged`.
+    /// The sum of every connection's growth: its `charged` less the floor
+    /// grant, which is the connection's fixed charge, not the budget's.
     charged: u64,
     /// The share cap and when it was computed: recomputed at most once per
     /// [`MIN_EVALUATION_INTERVAL`] node-wide, since counting the connections
@@ -295,8 +306,12 @@ impl ConnState {
 
     /// The terms no window sets directly: gaps at their cap and the control
     /// buffers.
+    /// The gap cap in force is charged when it is above the one `credit`
+    /// sets: it is floored at the gaps held when it was set
+    /// ([`Self::credit_changed`]) and stays there until the credit next
+    /// changes, even once those gaps close, as the staging cap does.
     fn fixed_with(&self, credit: u64) -> u64 {
-        (gap_cap(credit).max(self.ranges.held_now()) as u64)
+        (gap_cap(credit).max(self.ranges.cap()) as u64)
             .saturating_mul(GAP_BYTES)
             .saturating_add(CONTROL_BUFFER_BYTES)
     }
@@ -418,7 +433,11 @@ impl QuicBudget {
             };
             conn.credit_changed();
             conn.charged = conn.charge();
-            state.charged = state.charged.saturating_add(conn.charged);
+            // At the floor its growth is 0: a newcomer adds nothing to the
+            // budget, whatever the paths already here hold.
+            state.charged = state
+                .charged
+                .saturating_add(conn.charged.saturating_sub(self.grant()));
             state.conns.insert(id, conn);
             self.publish(&state);
             id
@@ -439,11 +458,17 @@ impl QuicBudget {
         }
     }
 
-    /// The sum of every connection's charge, recounted.
+    /// The sum of every connection's growth above the floor grant,
+    /// recounted: what the budget holds.
     #[cfg(test)]
     pub(crate) fn charged(&self) -> u64 {
+        let grant = self.grant();
         let mut state = self.state.lock();
-        state.conns.values_mut().map(ConnState::charge).sum()
+        state
+            .conns
+            .values_mut()
+            .map(|conn| conn.charge().saturating_sub(grant))
+            .sum()
     }
 
     /// The running total. Tests only.
@@ -456,15 +481,24 @@ impl QuicBudget {
         self.node.set_budget_charged(state.charged);
     }
 
-    /// Set `conn`'s charge from a recount, keeping the running total.
-    fn recount(total: &mut u64, conn: &mut ConnState) {
+    /// Set `conn`'s charge from a recount, keeping the running total of
+    /// growth above `grant`, the floor grant.
+    fn recount(total: &mut u64, conn: &mut ConnState, grant: u64) {
         let charge = conn.charge();
-        *total = total.saturating_sub(conn.charged).saturating_add(charge);
+        *total = total
+            .saturating_sub(conn.charged.saturating_sub(grant))
+            .saturating_add(charge.saturating_sub(grant));
         conn.charged = charge;
     }
 
-    /// The share cap `C` at `now`: the floor grant plus the budget above every
-    /// path's floor grant, split over the connections growing. Cached for
+    /// A path's charge at the floor windows: part of its fixed charge, not of
+    /// this budget.
+    fn grant(&self) -> u64 {
+        floor_grant(self.floor)
+    }
+
+    /// The share cap `C` at `now`: the floor grant plus the budget (growth
+    /// above floors) split over the connections growing. Cached for
     /// [`MIN_EVALUATION_INTERVAL`]; a connection that starts growing in that
     /// time is counted at the next recount, so for that long a share can be
     /// up to one connection's worth too large, which the node's budget still
@@ -482,14 +516,13 @@ impl QuicBudget {
 
     fn count_share(floor: u64, total: u64, state: &BudgetState, now: u64) -> u64 {
         let grant = floor_grant(floor);
-        let floors = grant.saturating_mul(state.conns.len() as u64);
         let growing = state
             .conns
             .values()
             .filter(|conn| conn.growing_until > now)
             .count()
             .max(1) as u64;
-        grant.saturating_add(total.saturating_sub(floors) / growing)
+        grant.saturating_add(total / growing)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -548,14 +581,17 @@ impl QuicBudget {
             {
                 conn.active_at = now;
             }
-            Self::recount(&mut state.charged, conn);
+            Self::recount(&mut state.charged, conn, self.grant());
             limited
         };
         let grows = limited && state.conns.get(&id)?.recv_window < MAX_WINDOW_BYTES;
         let share = self.share(state, now);
         let conn = state.conns.get_mut(&id)?;
-        let others = state.charged.saturating_sub(conn.charged);
-        let allowed = share.min(self.total.saturating_sub(others));
+        let grant = self.grant();
+        let others = state
+            .charged
+            .saturating_sub(conn.charged.saturating_sub(grant));
+        let allowed = share.min(grant.saturating_add(self.total.saturating_sub(others)));
         let mut squeeze_need = 0;
         if grows {
             let target = conn.recv_window.saturating_mul(2).min(MAX_WINDOW_BYTES);
@@ -606,7 +642,7 @@ impl QuicBudget {
             recv_window: conn.recv_window,
             send_window: conn.send_window,
         };
-        Self::recount(&mut state.charged, conn);
+        Self::recount(&mut state.charged, conn, self.grant());
         if squeeze_need > 0 {
             self.squeeze_others(state, id, share, squeeze_need, now);
         }
@@ -654,17 +690,25 @@ impl QuicBudget {
     fn deregister(&self, id: u64) {
         let mut state = self.state.lock();
         if let Some(conn) = state.conns.remove(&id) {
-            state.charged = state.charged.saturating_sub(conn.charged);
+            state.charged = state
+                .charged
+                .saturating_sub(conn.charged.saturating_sub(self.grant()));
         }
         self.publish(&state);
     }
 
     /// Streams opened from now on take a new send epoch: a shrink was applied
     /// to the connection, and the old epoch is held at the old window.
+    /// The connection is recounted, so the old window leaves its charge as
+    /// soon as no stream holds the old epoch, not at its next evaluation.
     fn renew_send_epoch(&self, id: u64) {
-        if let Some(conn) = self.state.lock().conns.get_mut(&id) {
+        let mut guard = self.state.lock();
+        let state = &mut *guard;
+        if let Some(conn) = state.conns.get_mut(&id) {
             conn.send_epoch = Arc::new(());
+            Self::recount(&mut state.charged, conn, self.grant());
         }
+        self.publish(state);
     }
 
     fn send_epoch(&self, id: u64) -> Option<Arc<()>> {

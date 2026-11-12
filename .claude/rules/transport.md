@@ -1591,7 +1591,18 @@ changes). A shadow path keeps the initial window. A data path registers a
 debt), the staging cap as set) (3 x (W + debt) when the cap follows the
 credit; the cap is never set below the bytes staged) + send x 9/8 + R_conn x
 70 B + CONTROL_BUFFER_BYTES (144 KiB) and sets its windows at runtime
-(`quinn::Connection::set_receive_window` / `set_send_window`):
+(`quinn::Connection::set_receive_window` / `set_send_window`). The charge at
+the floor windows (`budget::floor_grant`) is part of the data path's fixed
+charge, not of the budget: the budget holds only each path's growth above
+it, so a path that arrives never pushes the budget over, whatever the
+others hold. The bound is
+memory <= data paths x (QUIC_CONNECTION_CHARGE_BYTES + floor grant) + budget.
+Until the aggregate step (PR 5) caps data paths, their number is bounded
+only by the connection limit (default 200). PROVISIONAL figures at 200,
+re-sized by PR 5: 1 GiB: 64 MiB + 200 x 1313.5 KiB = 320.5 MiB; 2 GiB:
+128 MiB + 200 x 1577.5 KiB = 436.1 MiB; 7600 MiB gateway: 475 MiB +
+200 x 1577.5 KiB = 783.1 MiB. No data runs on them: QUIC_DATA_PERCENT stays 0
+until PR 5 (`no_data_share_before_the_quic_budget_is_summed`).
   → W + debt: quinn records a shrink as debt paid by later credits; the
     meter mirrors it from the bytes the reader reads (where it can differ,
     it over-estimates). Every window change and every read
@@ -1602,9 +1613,8 @@ credit; the cap is never set below the bytes staged) + send x 9/8 + R_conn x
   → Growth only when window-limited on CONTIGUOUS delivery (the in-order
     prefix of each stream, `RangeMirror::prefix`, at least 75% of a window
     per round trip), at most doubling, up to 8 MiB, while the path's charge
-    stays within its share C (floor grant plus the budget above every
-    path's floor grant, split over the paths growing) and the node's within
-    the budget. Bytes read above a gap are credit, never growth.
+    stays within its share C (floor grant plus the budget split over the
+    paths growing) and the node's growth within the budget. Bytes read above a gap are credit, never growth.
   → A grow that does not fit asks the paths furthest above C to shrink
     toward it; the room comes as their debt is read, never by taking credit
     back.

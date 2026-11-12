@@ -108,7 +108,12 @@ fn a_new_path_is_charged_its_floor_windows() {
         2 * FLOOR as usize,
         "the staging cap follows the credit"
     );
-    assert_eq!(budget.charged(), a.meter.charge());
+    assert_eq!(
+        budget.charged(),
+        0,
+        "the floor grant is the path's fixed charge, not the growth budget's"
+    );
+    assert_eq!(budget.running_total(), 0);
     drop(a);
     assert_eq!(budget.charged(), 0, "a dropped path frees its share");
 }
@@ -157,8 +162,9 @@ fn gapped_reads_do_not_grow_a_window() {
     }
 }
 
-/// Paths growing at once share what is above their floors: none passes its
-/// share, and the node's charge stays within the budget.
+/// Paths growing at once share the growth budget: none passes its share (its
+/// floor grant plus an equal part of the budget), and the growth charged
+/// stays within the budget.
 #[test]
 fn growing_paths_stay_within_their_share_and_the_budget() {
     let total = 12 << 20;
@@ -177,7 +183,7 @@ fn growing_paths_stay_within_their_share_and_the_budget() {
             budget.charged()
         );
     }
-    let share = floor_grant(FLOOR) + (total - 4 * floor_grant(FLOOR)) / 4;
+    let share = floor_grant(FLOOR) + total / 4;
     for path in &paths {
         assert!(
             path.meter.charge() <= share,
@@ -371,6 +377,72 @@ fn a_stream_opened_while_a_shrink_is_applied_keeps_the_old_window_charged() {
     );
 }
 
+/// A send shrink with no stream open leaves the node's total at once, not at
+/// the connection's next evaluation: the epoch renewal recounts it.
+#[test]
+fn a_send_shrink_with_no_stream_open_is_released_at_once() {
+    let budget = QuicBudget::new(64 << 20, FLOOR, counters());
+    let a = conn(&budget, 0);
+    a.fake.cwnd.store(4 * FLOOR, Ordering::Relaxed);
+    assert_eq!(a.meter.evaluate(10 * MS).unwrap().send_window, 8 * FLOOR);
+    let before = budget.running_total();
+    a.fake.cwnd.store(FLOOR / 4, Ordering::Relaxed);
+    assert_eq!(a.meter.evaluate(20 * MS).unwrap().send_window, FLOOR);
+    assert!(
+        budget.running_total() < before,
+        "released at once: {} vs {before}",
+        budget.running_total()
+    );
+    assert_eq!(
+        budget.running_total(),
+        budget.charged(),
+        "the running total is the recount"
+    );
+}
+
+/// Paths arriving while one path holds the whole growth budget never push the
+/// growth charged over it: a newcomer's floor grant is its fixed charge, so it
+/// adds nothing here, and it grows only from room a squeeze frees.
+#[test]
+fn newcomers_never_push_the_growth_over_the_budget() {
+    let total = 12 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let big = conn(&budget, 0);
+    let mut at = 10 * MS;
+    let mut window = FLOOR;
+    for _ in 0..12 {
+        window = deliver_window(&big, window, at).recv_window;
+        at += 10 * MS;
+    }
+    assert!(
+        budget.running_total() + floor_grant(FLOOR) > total,
+        "premise: one more floor grant would not fit, {} of {total}",
+        budget.running_total()
+    );
+    let mut newcomers = Vec::new();
+    for _ in 0..20 {
+        newcomers.push(conn(&budget, at));
+        assert!(
+            budget.running_total() <= total,
+            "{} over {total} with {} newcomers",
+            budget.running_total(),
+            newcomers.len()
+        );
+        // Each newcomer wants to grow, which squeezes the big path.
+        for (i, newcomer) in newcomers.iter().enumerate() {
+            deliver_window(newcomer, FLOOR, at + i as u64 + 1);
+        }
+        big.meter.evaluate(at + MS).unwrap();
+        assert!(budget.running_total() <= total);
+        assert_eq!(
+            budget.running_total(),
+            budget.charged(),
+            "the total is the recount"
+        );
+        at += 10 * MS;
+    }
+}
+
 #[test]
 fn the_floor_and_the_gap_cap_follow_the_design() {
     assert_eq!(floor_window_bytes(1 << 30), MIN_WINDOW_SMALL_HOST_BYTES);
@@ -500,6 +572,20 @@ fn a_shrink_keeps_the_gap_cap_above_the_gaps_held() {
         "premise: the credit alone would lower the cap"
     );
     assert!(big.ranges.cap() >= cap, "{} < {cap}", big.ranges.cap());
+    // The gaps then close: the cap in force stays until the credit next
+    // changes, and so does its charge.
+    let charged = big.meter.charge();
+    big.ranges.add_for_test(-(cap as isize));
+    assert_eq!(big.ranges.held_now(), 0, "premise: the gaps closed");
+    assert!(
+        big.ranges.cap() >= cap,
+        "premise: the cap is still in force"
+    );
+    assert_eq!(
+        big.meter.charge(),
+        charged,
+        "the cap in force stays charged after its gaps close"
+    );
 }
 
 /// Growth with a budget too small for every path to grow: paths still grow
