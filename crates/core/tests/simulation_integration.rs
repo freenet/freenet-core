@@ -21538,6 +21538,57 @@ fn assert_ramp_pairs_carry_data_by(run: &QuicShadowRun, full_at: Duration) {
     }
 }
 
+/// The emergency stop for the data ramp: a release with no ramp and a data
+/// share of 0 (`QUIC_DATA_RAMP_START = None`, `QUIC_DATA_PERCENT = 0`, which is
+/// `DataShare::Fixed(0)`, the same share `quic-data-percent = 0` gives). A node
+/// on it never carries data with a node still on the ramp at 100%: a pair needs
+/// both data bits, the stopped node sets neither its data bit nor its recycle
+/// bit, so the ramp node never recycles a path toward it, and the pair keeps a
+/// shadow path. Two ramp nodes carry data in the same run shape (the positive
+/// control, so the ramp is on and the stop is what turns data off).
+#[test_log::test]
+fn test_quic_data_ramp_stops_against_a_node_on_the_default_off_release() {
+    for (name, seed, stopped, carries) in [
+        ("quic-ramp-stop-mixed", 0x5940_7A00_0101, Some(0), false),
+        ("quic-ramp-stop-control", 0x5940_7A00_0102, None, true),
+    ] {
+        let run = run_quic_shadow_sim(name, seed, (1, 1), 30, |sim, trace, labels| {
+            for label in labels {
+                sim.with_node_transport_quic(label, "prefer");
+            }
+            // Past the end of the day-long ramp: 100% for every ramp node.
+            trace.ramp_data_started_before(30 * RAMP_HOUR);
+            if let Some(percent) = stopped {
+                sim.with_node_quic_data_percent(&labels[1], percent);
+            }
+            run_as_first_negotiating_release(trace);
+        });
+        for node in &run.nodes {
+            assert_eq!(run.whats(*node, "Established"), 1, "{name}: {}", run.dump());
+            assert_eq!(
+                run.whats(*node, "DataEnabled"),
+                usize::from(carries),
+                "{name}: {}",
+                run.dump()
+            );
+        }
+        assert_eq!(
+            run.total("RecycledForData"),
+            0,
+            "{name}: no path is recycled toward a stopped node: {}",
+            run.dump()
+        );
+        if !carries {
+            assert_eq!(
+                run.total("path sent data: sent 0, maybe 0, on udp 0, dropped 0"),
+                2,
+                "{name}: no data on the path: {}",
+                run.dump()
+            );
+        }
+    }
+}
+
 const RAMP_HOUR: Duration = Duration::from_secs(3600);
 
 /// The end of the data ramp's first stage: it started 5 h before the run, so

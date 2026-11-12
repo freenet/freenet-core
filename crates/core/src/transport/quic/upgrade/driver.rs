@@ -665,12 +665,15 @@ impl QuicUpgrades {
         )
     }
 
-    /// The ramp a test's trace gives, and the wall clock now to read it at. A
-    /// start before the epoch (one before the run began, on the virtual wall
-    /// clock) moves both forward by the same amount: the share reads only the
-    /// time since the start.
+    /// The ramp a test's trace gives, and the wall clock now to read it at,
+    /// for a node with no `quic-data-percent`. A start before the epoch (one
+    /// before the run began, on the virtual wall clock) moves both forward by
+    /// the same amount: the share reads only the time since the start.
     #[cfg(any(test, feature = "testing"))]
     fn trace_ramp(&self) -> Option<(super::policy::DataShare, std::time::SystemTime)> {
+        if self.policy.percent_set() {
+            return None;
+        }
         let start = self.trace.as_ref()?.data_ramp_start()?;
         let shift = Duration::from_secs(start.min(0).unsigned_abs());
         let share = super::policy::DataShare::Ramp {
