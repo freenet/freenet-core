@@ -192,6 +192,7 @@ mod crypto;
 pub(crate) mod demux;
 pub(crate) mod egress_cap;
 pub mod in_memory_socket;
+pub(crate) mod join_versions;
 pub(crate) mod quic;
 #[cfg(test)]
 pub(crate) mod test_net;

@@ -453,6 +453,8 @@ pub enum EventPriority {
 ///   `INTEREST_HEARTBEAT_INTERVAL` (2.5 min), from `Ring::interest_heartbeat`.
 /// - `subscription_health_snapshot`: at most one per half
 ///   `INTEREST_SWEEP_INTERVAL` (30 s), from the interest sweep.
+/// - `join_versions`: one per `transport::join_versions::JOIN_VERSIONS_INTERVAL`
+///   (1 h) from one task with `MissedTickBehavior::Delay`.
 ///
 /// The router-snapshot interval and the worker's two intervals use
 /// `MissedTickBehavior::Delay`, so their timer is the bound even after a
@@ -469,7 +471,7 @@ pub enum EventPriority {
 /// peer, per contract or per subscription: only a fixed timer makes bypassing
 /// the cap safe. `interest_expired`, for example, is emitted from the 1-minute
 /// interest sweep but once per expired interest, so it stays operational.
-pub(crate) const PERIODIC_EVENT_TYPES: [&str; 12] = [
+pub(crate) const PERIODIC_EVENT_TYPES: [&str; 13] = [
     "transport_snapshot",
     "resource_utilization",
     "router_snapshot",
@@ -482,6 +484,7 @@ pub(crate) const PERIODIC_EVENT_TYPES: [&str; 12] = [
     "outbound_message_mix",
     "interest_heartbeat_cycle",
     "subscription_health_snapshot",
+    "join_versions",
 ];
 
 /// Rate bound for a periodic event whose producer loop runs on a burst-mode
@@ -538,7 +541,7 @@ fn priority_for_event_type(event_type: &str) -> EventPriority {
 /// final `other` row, so the exported cardinality never depends on what a
 /// producer names its event. A non-zero `other` means an event type is
 /// missing from this list.
-pub(crate) const KNOWN_EVENT_TYPES: [&str; 74] = [
+pub(crate) const KNOWN_EVENT_TYPES: [&str; 75] = [
     // `event_kind_to_string`, in its order.
     "connect_start",
     "connect_connected",
@@ -614,6 +617,7 @@ pub(crate) const KNOWN_EVENT_TYPES: [&str; 74] = [
     "subscription_renewal_outcome",
     "stranded_recovery",
     crate::ring::FLAG_TELEMETRY_EVENT,
+    "join_versions",
     // Must stay last.
     "other",
 ];
@@ -4598,8 +4602,10 @@ mod tests {
         // digits); no fleet value approaches it, so it constrains schema shape
         // rather than real bytes. Raised by #5647 for the same 7 counters as
         // MAX_WORST_CASE_JSON_BYTES (147 bytes at u64::MAX): measured 15414.
-        // Raised by #6001 for `tel_t` and `tel`: measured 18703.
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 18_816;
+        // Raised by #6001 for `tel_t` and `tel`: measured 18703. Raised for the
+        // `join_versions` row of `tel_t` (2 counters, 44 bytes at u64::MAX):
+        // measured 18845.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 18_944;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {
@@ -6664,7 +6670,7 @@ mod tests {
     /// fixed-timer shape. Written out here rather than read from
     /// [`PERIODIC_EVENT_TYPES`], so that dropping a stream from that list fails
     /// the saturation test below instead of shrinking what it checks.
-    const EXPECTED_PERIODIC_EVENT_TYPES: [&str; 12] = [
+    const EXPECTED_PERIODIC_EVENT_TYPES: [&str; 13] = [
         "transport_snapshot",
         "resource_utilization",
         "router_snapshot",
@@ -6677,6 +6683,7 @@ mod tests {
         "outbound_message_mix",
         "interest_heartbeat_cycle",
         "subscription_health_snapshot",
+        "join_versions",
     ];
 
     /// Saturate the per-second cap with operational events, as a busy gateway
@@ -7273,7 +7280,7 @@ mod tests {
         // Exact count of call sites with a literal event type (production and
         // test). A new producer changes it: bump it deliberately after giving
         // the event its own `KNOWN_EVENT_TYPES` row.
-        const EXPECTED_LITERAL_STANDALONE_CALLS: usize = 16;
+        const EXPECTED_LITERAL_STANDALONE_CALLS: usize = 17;
         assert_eq!(
             literal_names.len(),
             EXPECTED_LITERAL_STANDALONE_CALLS,

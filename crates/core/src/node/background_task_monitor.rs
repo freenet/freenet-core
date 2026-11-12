@@ -186,6 +186,13 @@ impl BackgroundTaskMonitor {
         inner.push(TrackedTask { name, handle });
     }
 
+    /// The names of the tasks registered with [`Self::register`] and not yet
+    /// drained, in order.
+    #[cfg(test)]
+    pub fn task_names(&self) -> Vec<&'static str> {
+        self.inner.lock().iter().map(|task| task.name).collect()
+    }
+
     /// Whether `wait_for_any_exit` has drained this monitor, so a new
     /// registration would not be monitored.
     #[cfg_attr(not(test), allow(dead_code))]

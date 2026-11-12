@@ -1633,6 +1633,26 @@ impl ConnectionManager {
         }
     }
 
+    /// The recorded protocol version of each live ring connection, one entry
+    /// per connection (`None` where none was recorded), for `join_versions`.
+    /// Reads the live set, so a stale mirror entry for an address no longer
+    /// connected is never counted. The two locks are taken one after the
+    /// other, never together.
+    pub(crate) fn live_neighbour_versions(&self) -> Vec<Option<(u8, u8, u16)>> {
+        let addrs: Vec<Option<SocketAddr>> = self
+            .connections_by_location
+            .read()
+            .values()
+            .flatten()
+            .map(|conn| conn.location.socket_addr())
+            .collect();
+        let versions = self.remote_version.read();
+        addrs
+            .into_iter()
+            .map(|addr| addr.and_then(|addr| versions.get(&addr).copied()))
+            .collect()
+    }
+
     /// Look up the negotiated protocol version recorded for `addr` via
     /// [`Self::record_remote_version`]. `None` if no connection has been
     /// established at `addr` (or none since this node started).
@@ -3248,6 +3268,25 @@ mod tests {
         );
         assert!(!cm.supports_summary_first_put(addr));
         assert!(!cm.supports_hash_first_summaries(addr));
+    }
+
+    /// `join_versions` reads live connections only: a version recorded for an
+    /// address with no ring connection is not a neighbour.
+    #[test]
+    fn live_neighbour_versions_counts_live_connections_only() {
+        let cm = make_connection_manager(Some(make_addr(9000)), 1, 10, false);
+        let live = make_addr(9011);
+        let unknown = make_addr(9012);
+        let gone = make_addr(9013);
+        for (port, addr) in [(1, live), (2, unknown)] {
+            let peer = PeerKeyLocation::new(TransportKeypair::new().public().clone(), addr);
+            cm.insert_raw_connection_for_test(Location::new(0.1 * port as f64), peer);
+        }
+        cm.record_remote_version(live, Some((0, 2, 150)));
+        cm.record_remote_version(gone, Some((0, 2, 140)));
+        let mut versions = cm.live_neighbour_versions();
+        versions.sort();
+        assert_eq!(versions, vec![None, Some((0, 2, 150))]);
     }
 
     /// The other half of the same rule: a `Some` at a reused address overwrites

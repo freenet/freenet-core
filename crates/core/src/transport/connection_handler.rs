@@ -28,6 +28,7 @@ use tokio::{
 };
 use tracing::{Instrument, span};
 use version_cmp::PROTOC_VERSION;
+pub(crate) use version_cmp::{OWN_FLOOR, OWN_VERSION};
 
 use super::{
     Socket, SocketRead, TransportError, UdpError, UdpErrorKind,
@@ -2204,6 +2205,18 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                             let remote_addr = outbound_remote_conn.remote_addr;
 
                             if self.connections.complete_gateway_handshake(remote_addr, inbound_remote_connection.inbound_packet_sender) {
+                                // `join_versions` (#5940): count the join here, where
+                                // the joiner has proved it holds the session key, never
+                                // at intro receipt (an intro is spoofable). Gateways
+                                // only: a non-gateway also completes this handshake when
+                                // it accepts a restarted peer's intro.
+                                if self.is_gateway {
+                                    super::join_versions::record_gateway_join(
+                                        self.this_addr,
+                                        super::join_versions::JoinTransport::LegacyIntro,
+                                        outbound_remote_conn.remote_protoc_version,
+                                    );
+                                }
                                 if self.new_connection_notifier
                                     .send(PeerConnection::new(outbound_remote_conn).with_upgrade_site(&self.upgrade_site))
                                     .await
@@ -5378,6 +5391,137 @@ pub mod mock_transport {
             joiner_view.is_some(),
             crate_at_or_above_floor,
             "joiner's view of the gateway version must follow the production floor exactly"
+        );
+        Ok(())
+    }
+
+    /// `join_versions` (#5940): a completed gateway handshake is counted once,
+    /// under the joiner's version and the legacy transport.
+    #[tokio::test]
+    async fn a_completed_gateway_join_is_counted() -> anyhow::Result<()> {
+        use crate::transport::join_versions::{JoinTransport, test_registry};
+        let channels = Arc::new(DashMap::new());
+        let (_peer_pub, mut peer, _peer_addr) =
+            create_mock_peer(Default::default(), channels.clone()).await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            create_mock_gateway(Default::default(), channels).await?;
+        let counters = test_registry::isolate(gw_addr);
+
+        let pending = peer.connect(gw_pub, gw_addr).await;
+        let _joiner = tokio::time::timeout(Duration::from_secs(60), pending).await??;
+        let _gateway = tokio::time::timeout(Duration::from_secs(10), gw_conn.recv())
+            .await?
+            .ok_or(anyhow::anyhow!("no connection"))?;
+
+        let counts = counters.take();
+        let legacy: u64 = counts[0].iter().sum();
+        assert_eq!(legacy, 1, "one completed handshake, one join");
+        assert_eq!(
+            counts[0][0], 1,
+            "counted under this build's own version (slot 0)"
+        );
+        assert_eq!(counts[1].iter().sum::<u64>(), 0, "nothing is Native");
+        assert_eq!(JoinTransport::ALL[0], JoinTransport::LegacyIntro);
+        Ok(())
+    }
+
+    /// `join_versions` (#5940): an intro the gateway decodes and acks is NOT a
+    /// join. The joiner's packets after its intro are dropped, so the gateway
+    /// never gets the joiner's final ack. The gateway's ack has reached the
+    /// joiner by the time its connect returns, so the gateway has decoded the
+    /// intro and passed the version check: a count taken at intro receipt or
+    /// at the version check would already be here.
+    #[tokio::test]
+    async fn an_intro_without_a_completed_handshake_is_not_counted() -> anyhow::Result<()> {
+        use crate::transport::join_versions::test_registry;
+        let channels = Arc::new(DashMap::new());
+        let (_peer_pub, mut peer, _peer_addr) = create_mock_peer(
+            PacketDropPolicy::Ranges(vec![1..usize::MAX]),
+            channels.clone(),
+        )
+        .await?;
+        let (gw_pub, (_oc, mut gw_conn), gw_addr) =
+            create_mock_gateway(Default::default(), channels).await?;
+        let counters = test_registry::isolate(gw_addr);
+
+        let pending = peer.connect(gw_pub, gw_addr).await;
+        let joined = tokio::time::timeout(Duration::from_secs(60), pending).await?;
+        assert!(
+            joined.is_ok(),
+            "the joiner got the gateway's ack, so the gateway handled the intro"
+        );
+        assert!(
+            gw_conn.try_recv().is_err(),
+            "the gateway must not have completed the handshake"
+        );
+        let counts = counters.take();
+        assert_eq!(
+            counts.iter().flatten().sum::<u64>(),
+            0,
+            "an intro is not a join"
+        );
+        Ok(())
+    }
+
+    /// `join_versions` (#5940): a NON-gateway completes the same server-side
+    /// handshake when it accepts a restarted peer's intro on an established
+    /// connection, and that is not a gateway join. Pins the `is_gateway`
+    /// check in the `gw_connection_tasks` success arm: without it this
+    /// reconnect is counted.
+    #[tokio::test]
+    async fn a_non_gateway_accepting_a_restarted_peer_does_not_count_a_join() -> anyhow::Result<()>
+    {
+        use crate::transport::join_versions::test_registry;
+        let channels = Arc::new(DashMap::new());
+        let (listener_pub, (mut listener, mut listener_inbound), listener_addr) =
+            create_mock_peer_internal(
+                Default::default(),
+                PacketDelayPolicy::NoDelay,
+                false,
+                channels.clone(),
+                None,
+                None,
+            )
+            .await?;
+        let counters = test_registry::isolate(listener_addr);
+        let restarting_addr = crate::transport::test_net::subnet().addr(1);
+
+        // The two peers hole-punch to each other, so the listener holds an
+        // established connection to `restarting_addr`.
+        let (first_pub, mut first, _) =
+            create_mock_peer_at_addr(Default::default(), restarting_addr, channels.clone()).await?;
+        let listener_pub_for_first = listener_pub.clone();
+        let first_side = GlobalExecutor::spawn(async move {
+            let pending = first.connect(listener_pub_for_first, listener_addr).await;
+            let conn = tokio::time::timeout(Duration::from_secs(60), pending).await??;
+            Ok::<_, anyhow::Error>((first, conn))
+        });
+        let pending = listener.connect(first_pub, restarting_addr).await;
+        let _listener_side = tokio::time::timeout(Duration::from_secs(60), pending).await??;
+        let (first, first_conn) = first_side.await??;
+
+        // The peer restarts at the same address with a new identity and sends
+        // its intro to the listener, which accepts it as a reconnect.
+        drop(first_conn);
+        drop(first);
+        let (_restarted_pub, mut restarted, _) =
+            create_mock_peer_at_addr(Default::default(), restarting_addr, channels).await?;
+        let pending = restarted.connect(listener_pub, listener_addr).await;
+        let _restarted_conn = tokio::time::timeout(Duration::from_secs(60), pending).await??;
+        let reconnect = tokio::time::timeout(Duration::from_secs(10), listener_inbound.recv())
+            .await?
+            .ok_or(anyhow::anyhow!("listener accepted no reconnect"))?;
+        assert_eq!(
+            reconnect.remote_addr(),
+            restarting_addr,
+            "the listener completed the reconnect handshake, so the gated arm ran"
+        );
+
+        let counts = counters.take();
+        assert_eq!(
+            counts.iter().flatten().sum::<u64>(),
+            0,
+            "a non-gateway's reconnect handshake is not a gateway join"
         );
         Ok(())
     }
