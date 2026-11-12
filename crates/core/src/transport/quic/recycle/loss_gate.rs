@@ -236,6 +236,12 @@ impl GateState {
     /// RTT `srtt`.
     pub(crate) fn on_ack(&mut self, now: Instant, sent: Instant, bytes: u64, srtt: Duration) {
         let sample = now.saturating_duration_since(sent);
+        #[cfg(test)]
+        if std::env::var_os("FREENET_GATE_DEBUG").is_some() {
+            gate_debug::ACKS
+                .lock()
+                .push((sample.as_micros() as u64, srtt.as_micros() as u64));
+        }
         self.min_rtt = Some(self.min_rtt.map_or(sample, |m| m.min(sample)));
         self.srtt = Some(srtt);
         self.roll(now);
@@ -346,6 +352,16 @@ impl GateState {
             return Verdict::LossShare;
         }
         let queue = self.queue_at(sent).or_else(|| self.queue());
+        #[cfg(test)]
+        if std::env::var_os("FREENET_GATE_DEBUG").is_some() {
+            gate_debug::LOSSES.lock().push((
+                queue.map_or(u64::MAX, |q| q.as_micros() as u64),
+                self.min_rtt.map_or(0, |m| m.as_micros() as u64),
+                self.srtt.map_or(0, |m| m.as_micros() as u64),
+                self.queue().map_or(u64::MAX, |q| q.as_micros() as u64),
+                self.queue_at(sent).is_some(),
+            ));
+        }
         let (Some(queue), Some(min_rtt)) = (queue, self.min_rtt) else {
             return Verdict::NoSample;
         };
@@ -488,3 +504,53 @@ impl Controller for LossGate {
 
 #[cfg(test)]
 mod tests;
+
+/// DIAGNOSTIC (tests, `FREENET_GATE_DEBUG`): every judged loss as
+/// (queue estimate, min RTT, srtt, round queue, judged by neighbours) in
+/// microseconds, and every acknowledged packet's (sample, srtt).
+#[cfg(test)]
+pub(crate) mod gate_debug {
+    pub(crate) static LOSSES: parking_lot::Mutex<Vec<(u64, u64, u64, u64, bool)>> =
+        parking_lot::Mutex::new(Vec::new());
+    pub(crate) static ACKS: parking_lot::Mutex<Vec<(u64, u64)>> =
+        parking_lot::Mutex::new(Vec::new());
+
+    fn pct(v: &mut [u64], p: usize) -> u64 {
+        if v.is_empty() {
+            return 0;
+        }
+        v.sort_unstable();
+        v[(v.len() - 1) * p / 100]
+    }
+
+    /// Print and clear.
+    pub(crate) fn report(label: &str) {
+        let losses = std::mem::take(&mut *LOSSES.lock());
+        let acks = std::mem::take(&mut *ACKS.lock());
+        let mut samples: Vec<u64> = acks.iter().map(|a| a.0 / 1000).collect();
+        let mut queue: Vec<u64> = losses.iter().map(|l| l.0 / 1000).collect();
+        let mut round: Vec<u64> = losses.iter().map(|l| l.3 / 1000).collect();
+        let mins: Vec<u64> = losses.iter().map(|l| l.1 / 1000).collect();
+        let neighbours = losses.iter().filter(|l| l.4).count();
+        eprintln!(
+            "GATEDBG {label}: acks {} sample ms p1/p10/p50/p90/p99 {}/{}/{}/{}/{}; losses {} judged-by-neighbours {}; \
+             min rtt ms (first/last) {:?}/{:?}; loss queue ms p10/p50/p90 {}/{}/{}; round queue ms p10/p50/p90 {}/{}/{}",
+            samples.len(),
+            pct(&mut samples, 1),
+            pct(&mut samples, 10),
+            pct(&mut samples, 50),
+            pct(&mut samples, 90),
+            pct(&mut samples, 99),
+            losses.len(),
+            neighbours,
+            mins.first(),
+            mins.last(),
+            pct(&mut queue, 10),
+            pct(&mut queue, 50),
+            pct(&mut queue, 90),
+            pct(&mut round, 10),
+            pct(&mut round, 50),
+            pct(&mut round, 90),
+        );
+    }
+}

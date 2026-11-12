@@ -101,15 +101,29 @@ async fn honest_bulk_both_ways(
         a: Some(node_budget(leaked_counters())),
         b: Some(node_budget(leaked_counters())),
     };
+    if std::env::var_os("FREENET_GATE_DELAY_FIRST").is_some() {
+        // The link's delay from the handshake on, as on a real path.
+        crate::transport::in_memory_socket::set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, _, _, _| {
+                crate::transport::in_memory_socket::PacketDeliveryDecision::DelayedDelivery(one_way)
+            })),
+        );
+    }
     let mut p = paths_metered(network, subnet, windows).await;
     let loss = seeded_loss_from(network, loss_percent, seed, Some(one_way));
     let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+    let started_ns = time.now_nanos();
     let (a_watch, b_watch) = (p.a.clone(), p.b.clone());
     let (outcomes, staged) = p
         .drive(async move {
             let mut sends = Vec::new();
+            let one_way_only = std::env::var_os("FREENET_GATE_ONEWAY").is_some();
             for index in 0..BULK_STREAMS {
                 for (from, mark) in [(a.clone(), 0xA0u8), (b.clone(), 0xB0u8)] {
+                    if one_way_only && mark == 0xB0 {
+                        continue;
+                    }
                     let (body, time) = (
                         Bytes::from(vec![mark | index as u8; BULK_STREAM_BYTES]),
                         time.clone(),
@@ -144,6 +158,10 @@ async fn honest_bulk_both_ways(
                 outcomes.push(format!("{:?}", send.await.expect("send task")));
             }
             done.store(true, std::sync::atomic::Ordering::Relaxed);
+            eprintln!(
+                "GATETIME sends done after {} ms virtual",
+                (time.now_nanos() - started_ns) / 1_000_000
+            );
             (outcomes, sampler.await.expect("sampler"))
         })
         .await;
@@ -205,7 +223,11 @@ fn honest_staging_stops_under_loss() {
         let _seed = GlobalRng::seed_guard(SEED);
         let mut rows = Vec::new();
         let mut subnet = 230u8;
-        for loss_percent in [2u64, 5, 10, 15] {
+        let losses: Vec<u64> = std::env::var("FREENET_GATE_LOSSES")
+            .map_or(vec![2, 5, 10, 15], |v| {
+                v.split(',').map(|x| x.parse().unwrap()).collect()
+            });
+        for loss_percent in losses {
             for seed in [0x5940_3c01u64, 0x5940_3c02] {
                 let network: &'static str =
                     Box::leak(format!("quic-3c-honest-{loss_percent}-{seed:x}").into_boxed_str());
@@ -219,6 +241,9 @@ fn honest_staging_stops_under_loss() {
                 .await;
                 subnet += 1;
                 eprintln!("3c honest: {run:?}");
+                crate::transport::quic::recycle::loss_gate::gate_debug::report(&format!(
+                    "loss {loss_percent} seed {seed:x}"
+                ));
                 rows.push(run);
             }
         }
