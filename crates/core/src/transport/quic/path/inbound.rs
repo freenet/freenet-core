@@ -133,7 +133,7 @@ use crate::transport::peer_connection::inbound_budget::{
     SharedInboundBudget,
 };
 use crate::transport::peer_connection::streaming::{
-    PathRtt, QuicSource, QuicSourceEnd, QuicSourcePath, StreamError, StreamHandle,
+    PathRtt, QuicSource, QuicSourceEnd, QuicSourcePath, StreamError, StreamHandle, ThrottleProbe,
 };
 use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 use crate::transport::peer_connection::{
@@ -216,7 +216,7 @@ pub(in crate::transport::quic) struct Receiver<T> {
     staging: Arc<ConnStaging>,
     /// The peer's uni-stream limit, lowered while one-packet Shorts wait for
     /// room ([`StreamLimit`]).
-    stream_limit: StreamLimit,
+    stream_limit: Arc<StreamLimit>,
     /// The connection's round trip, for the consumers of the streams it
     /// fills (`StreamHandle::fragment_gap_limit`): set at each stream
     /// admitted and at each tick of the path's acknowledgement watch.
@@ -249,7 +249,7 @@ impl<T: TimeSource> Receiver<T> {
         let set = move |limit: u32| {
             connection.set_max_concurrent_uni_streams(quinn::VarInt::from_u32(limit));
         };
-        self.stream_limit = StreamLimit::new(Some(Box::new(set)), start, max);
+        self.stream_limit = Arc::new(StreamLimit::new(Some(Box::new(set)), start, max));
         self.stream_limit.apply();
     }
 
@@ -259,9 +259,24 @@ impl<T: TimeSource> Receiver<T> {
             .is_some_and(|meter| meter.throttled_since(self.time.now_nanos()).is_some())
     }
 
-    /// A data stream delivered all it declared.
-    fn completed(&self) {
-        if self.stream_limit.on_completed(self.throttled()) {
+    /// For the consumers of the streams this path fills: whether the budget
+    /// throttles the connection now, on the path's clock.
+    fn throttle_probe(&self) -> Option<ThrottleProbe> {
+        let meter = self.meter.clone()?;
+        let time = self.time.clone();
+        Some(ThrottleProbe(Arc::new(move || {
+            meter.throttled_since(time.now_nanos()).is_some()
+        })))
+    }
+
+    /// A data stream delivered all it declared. Its reader's ticket no
+    /// longer holds back a raise ([`LimitTicket`]).
+    fn completed(&self, reader: &mut BodyReader<T>) {
+        let gapped = reader.ticket.as_mut().is_some_and(|ticket| {
+            ticket.vote = Vote::Completed;
+            ticket.gapped
+        });
+        if self.stream_limit.on_completed(self.throttled(), gapped) {
             self.stats.record(QuicInboundOutcome::StreamLimitRaised);
         }
     }
@@ -318,7 +333,7 @@ impl<T: TimeSource> Receiver<T> {
             )),
             meter: None,
             staging: Arc::new(ConnStaging::new(staging_cap, node)),
-            stream_limit: StreamLimit::new(None, 0, 0),
+            stream_limit: Arc::new(StreamLimit::new(None, 0, 0)),
             #[cfg(test)]
             panic_on_stream: false,
         }
@@ -345,11 +360,18 @@ pub(in crate::transport::quic) const REFUSAL_CLOSE_DELAY: Duration = Duration::f
 ///
 /// **The base.** A data path starts at [`DATA_START_UNI_STREAMS`]. It
 /// doubles, up to [`MAX_UNI_STREAMS`], once the peer has had every stream it
-/// may open in use at once and then as many streams again have completed,
-/// with none failing in between (idle, age, gaps or staging past their caps,
-/// a length mismatch, a budget refusal) and the budget not throttling the
-/// connection when the last of them completed. A raise is never taken back:
-/// quinn cannot take stream credit back, and lowering on load would churn.
+/// may open busy at once and then as many streams again have completed,
+/// with none failing in between and the budget not throttling the
+/// connection when the last of them completed. A stream is busy while it
+/// holds a QUIC slot with bytes still to come from the peer: from its accept
+/// until every byte it declared has arrived, its end is read, or its reader
+/// ends ([`LimitTicket`]). A stream waiting on this node (a Short or Stream
+/// read whole and waiting for channel room or a consumer) is not busy, so a
+/// slow consumer here does not earn the peer a raise. A stream that ends
+/// any way but a completion, a reset by its sender or the connection
+/// ending (a refused header, a duplicate id, a budget refusal, a failed
+/// read) starts the run over. A raise is never taken back: quinn cannot
+/// take stream credit back, and lowering on load would churn.
 ///
 /// Changed only from the path's receive task, where every reader runs, so
 /// the limits quinn is told arrive in the order the counts moved.
@@ -362,7 +384,9 @@ struct StreamLimit {
     base: AtomicU32,
     max: u32,
     waiting: AtomicU32,
-    /// Every stream the peer may open was in use at once since the base was
+    /// Streams busy now ([`LimitTicket`]).
+    busy: AtomicU32,
+    /// Every stream the peer may open was busy at once since the base was
     /// last set or a stream last failed.
     saturated: AtomicBool,
     /// Streams completed since then.
@@ -376,6 +400,7 @@ impl StreamLimit {
             base: AtomicU32::new(base),
             max,
             waiting: AtomicU32::new(0),
+            busy: AtomicU32::new(0),
             saturated: AtomicBool::new(false),
             completed: AtomicU32::new(0),
         }
@@ -396,17 +421,25 @@ impl StreamLimit {
         StreamLimitHold(self)
     }
 
-    /// `open` streams are being read now.
-    fn on_open(&self, open: usize) {
-        if open >= self.base.load(Ordering::Relaxed) as usize {
+    /// The peer opened a stream: busy until its ticket says otherwise.
+    fn open(self: &Arc<Self>) -> LimitTicket {
+        let busy = self.busy.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if busy >= self.base.load(Ordering::Relaxed) {
             self.saturated.store(true, Ordering::Relaxed);
+        }
+        LimitTicket {
+            limit: self.clone(),
+            busy: true,
+            gapped: false,
+            vote: Vote::Failed,
         }
     }
 
     /// A stream delivered all it declared; `throttled` if the budget is
-    /// holding the connection back now. True if the base was raised.
-    fn on_completed(&self, throttled: bool) -> bool {
-        if self.set.is_none() || !self.saturated.load(Ordering::Relaxed) {
+    /// holding the connection back now, `gapped` if the stream ever had a
+    /// gap. True if the base was raised.
+    fn on_completed(&self, throttled: bool, gapped: bool) -> bool {
+        if self.set.is_none() || !self.saturated.load(Ordering::Relaxed) || gapped {
             return false;
         }
         let completed = self
@@ -439,6 +472,12 @@ impl StreamLimit {
     fn base(&self) -> u32 {
         self.base.load(Ordering::Relaxed)
     }
+
+    /// Streams busy now. Tests only.
+    #[cfg(test)]
+    fn busy(&self) -> u32 {
+        self.busy.load(Ordering::Relaxed)
+    }
 }
 
 struct StreamLimitHold<'a>(&'a StreamLimit);
@@ -447,6 +486,47 @@ impl Drop for StreamLimitHold<'_> {
     fn drop(&mut self) {
         self.0.waiting.fetch_sub(1, Ordering::Relaxed);
         self.0.apply();
+    }
+}
+
+/// How a stream's end counts toward a raise of the stream limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Vote {
+    /// Not completed: starts the run over. What a stream counts as unless
+    /// its reader says otherwise, so a new way for a stream to end cannot
+    /// let a failing peer keep earning a raise.
+    Failed,
+    /// Reset by its sender, or the connection ended: counts neither way.
+    Neutral,
+    /// Delivered whole ([`Receiver::completed`]).
+    Completed,
+}
+
+/// One accepted stream's place in its path's [`StreamLimit`]: busy until
+/// [`Self::idle`] or the drop, and its [`Vote`], cast on the drop.
+struct LimitTicket {
+    limit: Arc<StreamLimit>,
+    busy: bool,
+    /// The stream had a gap at some read.
+    gapped: bool,
+    vote: Vote,
+}
+
+impl LimitTicket {
+    /// The stream no longer waits on the peer.
+    fn idle(&mut self) {
+        if std::mem::take(&mut self.busy) {
+            self.limit.busy.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for LimitTicket {
+    fn drop(&mut self) {
+        self.idle();
+        if self.vote == Vote::Failed {
+            self.limit.on_failed();
+        }
     }
 }
 
@@ -479,8 +559,8 @@ pub(in crate::transport::quic) async fn receive<T: TimeSource>(
             }
             accepted = &mut accept => match accepted {
                 Ok(recv) => {
-                    readers.push(read_one(recv, receiver.clone()));
-                    receiver.stream_limit.on_open(readers.len());
+                    let ticket = receiver.stream_limit.open();
+                    readers.push(read_one(recv, receiver.clone(), ticket));
                     receiver.stats.node().record_streams_open(
                         &mut peak,
                         u32::try_from(readers.len()).unwrap_or(u32::MAX),
@@ -593,9 +673,15 @@ struct BodyReader<T: TimeSource> {
     /// The admitted `Stream`'s source, where a failure records why the
     /// stream ended, for consumers that assemble it ([`Receiver::fail`]).
     source: Option<Arc<QuicSource>>,
-    /// The idle timer was paused for the connection's throttle since the
-    /// stream last made progress.
+    /// The idle timer is paused for the connection's throttle: set when
+    /// the throttle pauses it, cleared by progress and when the throttle
+    /// has lapsed.
     paused: bool,
+    /// A byte has arrived on the stream.
+    progressed: bool,
+    /// The stream's place in its path's stream limit; `None` in tests that
+    /// build a reader alone.
+    ticket: Option<LimitTicket>,
 }
 
 impl<T: TimeSource> BodyReader<T> {
@@ -633,6 +719,8 @@ impl<T: TimeSource> BodyReader<T> {
             staging: Staging::new(conn_staging),
             source: None,
             paused: false,
+            progressed: false,
+            ticket: None,
         }
     }
 
@@ -679,6 +767,7 @@ impl<T: TimeSource> BodyReader<T> {
                 let now = self.time.now_nanos();
                 self.last_progress = now;
                 self.paused = false;
+                self.progressed = true;
                 let start = chunk.offset;
                 let stop = start.saturating_add(chunk.bytes.len() as u64);
                 if self.end.is_some_and(|end| stop > end) {
@@ -698,10 +787,21 @@ impl<T: TimeSource> BodyReader<T> {
                 if !self.conn_ranges.add(added, now) {
                     return Err(ReadFailure::TooManyRanges);
                 }
+                let gapped = self.ranges.gaps() > 0;
+                let all_read = self.all_read();
+                if let Some(ticket) = &mut self.ticket {
+                    ticket.gapped |= gapped;
+                    if all_read {
+                        ticket.idle();
+                    }
+                }
                 Ok(Some((start, chunk.bytes)))
             }
             Ok(None) => {
                 self.finished = true;
+                if let Some(ticket) = &mut self.ticket {
+                    ticket.idle();
+                }
                 Ok(None)
             }
             Err(error) => {
@@ -734,9 +834,18 @@ impl<T: TimeSource> BodyReader<T> {
                 read = self.recv.read_chunk(max, false) => return self.on_read(read),
                 () = &mut self.timer => {
                     let now = self.time.now_nanos();
+                    let throttle = self
+                        .meter
+                        .as_ref()
+                        .and_then(|meter| meter.throttled_since(now));
+                    // A pause lasts only while the throttle does, so an age
+                    // limit reached after it lapsed counts as `Age`.
+                    if throttle.is_none() {
+                        self.paused = false;
+                    }
                     // Idle first, as the UDP sweep does.
                     if now >= self.last_progress.saturating_add(self.idle_nanos)
-                        && !self.pause_for_throttle(now)
+                        && !self.pause_for_throttle(now, throttle)
                     {
                         return Err(ReadFailure::Idle);
                     }
@@ -755,17 +864,21 @@ impl<T: TimeSource> BodyReader<T> {
     }
 
     /// The idle timeout passed at `now`. If the budget is throttling the
-    /// connection and this stream was not already idle when the throttle
-    /// began (it made progress in the idle period before it), the slowdown
-    /// is ours, not the peer's: the idle timer is paused (restarted from
-    /// now) and true is returned. A stream already silent then keeps its
-    /// idle timer (buffer-budget design M6). The age limit still applies.
-    fn pause_for_throttle(&mut self, now: u64) -> bool {
-        let began = self
-            .meter
-            .as_ref()
-            .and_then(|meter| meter.throttled_since(now));
-        if !idle_is_ours(self.last_progress, self.idle_nanos, began) {
+    /// connection (since `began`) and this stream was not already idle when
+    /// the throttle began (a byte arrived on it in the idle period before),
+    /// the slowdown is ours, not the peer's: the idle timer is paused
+    /// (restarted from now) and true is returned. A stream already silent
+    /// then, or one that never received a byte, keeps its idle timer
+    /// (buffer-budget design M6). The age limit still applies.
+    ///
+    /// The throttle cannot tell why the connection was held back, so a peer
+    /// that sends flat out and fills the window it was given counts as
+    /// throttled too (`budget::Evaluation::throttled`), pausing the idle
+    /// timers of its own other streams that were active when it began. That
+    /// gives a peer nothing it could not have by trickling a byte per idle
+    /// period: each stream still ends at its age limit.
+    fn pause_for_throttle(&mut self, now: u64, began: Option<u64>) -> bool {
+        if !self.progressed || !idle_is_ours(self.last_progress, self.idle_nanos, began) {
             return false;
         }
         self.paused = true;
@@ -952,6 +1065,9 @@ impl<T: TimeSource> BodyReader<T> {
     /// ended. Nothing more is read from it.
     fn stop(&mut self, code: u32) {
         self.recv.stop(code.into()).ok();
+        if let Some(ticket) = &mut self.ticket {
+            ticket.idle();
+        }
     }
 }
 
@@ -1767,7 +1883,11 @@ impl Drop for StreamGuard {
 }
 
 /// Read one stream: its header, then by kind.
-async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver<T>>) {
+async fn read_one<T: TimeSource>(
+    recv: quinn::RecvStream,
+    receiver: Arc<Receiver<T>>,
+    ticket: LimitTicket,
+) {
     let mut reader = BodyReader::new(
         recv,
         receiver.time.clone(),
@@ -1776,6 +1896,7 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
         receiver.meter.clone(),
         receiver.staging.clone(),
     );
+    reader.ticket = Some(ticket);
     let header = match reader.read_exact(HEADER_LEN).await {
         Ok(bytes) => FrameHeader::decode(&bytes),
         Err(ReadFailure::Truncated(got)) => Err(HeaderError::Truncated(got)),
@@ -1882,10 +2003,12 @@ impl<T: TimeSource> Receiver<T> {
             });
         }
         let stats = &self.stats;
-        // Anything but the peer resetting the stream or the connection ending
-        // holds back a raise of the stream limit until a fresh run of load.
-        if !matches!(failure, ReadFailure::Reset | ReadFailure::ConnectionLost) {
-            self.stream_limit.on_failed();
+        // Any other failure starts a pending raise of the stream limit over,
+        // when the reader's ticket drops ([`LimitTicket`]).
+        if matches!(failure, ReadFailure::Reset | ReadFailure::ConnectionLost)
+            && let Some(ticket) = &mut reader.ticket
+        {
+            ticket.vote = Vote::Neutral;
         }
         match failure {
             ReadFailure::Truncated(_) => stats.record(QuicInboundOutcome::Truncated),
@@ -1970,7 +2093,6 @@ impl<T: TimeSource> Receiver<T> {
         };
         self.stats.record_shared(outcome);
         self.stats.record(kind);
-        self.stream_limit.on_failed();
         tracing::debug!(?rejection, total, "QUIC path: refusing an inbound stream");
         reader.stop(stop_code::BUDGET_REFUSED);
     }
@@ -2118,7 +2240,7 @@ impl<T: TimeSource> Receiver<T> {
             _charge: charge,
         });
         self.stats.record(QuicInboundOutcome::DeliveredShort);
-        self.completed();
+        self.completed(&mut reader);
     }
 
     async fn read_stream(&self, mut reader: BodyReader<T>, header: FrameHeader) {
@@ -2178,6 +2300,7 @@ impl<T: TimeSource> Receiver<T> {
             source.set_path(QuicSourcePath {
                 rtt: self.rtt.clone(),
                 idle: Duration::from_nanos(reader.idle_nanos),
+                throttle: self.throttle_probe(),
             });
         }
         let payload_start = (HEADER_LEN as u64) + u64::from(header.metadata_len());
@@ -2349,7 +2472,7 @@ impl<T: TimeSource> Receiver<T> {
         debug_assert_eq!(guard.handle().received_bytes(), total);
         guard.complete = true;
         self.stats.record(QuicInboundOutcome::CompletedStream);
-        self.completed();
+        self.completed(&mut reader);
     }
 
     /// Feed one payload piece to `rechunker` and push the fragments it
@@ -2464,6 +2587,10 @@ impl<T: TimeSource> Receiver<T> {
         if let Err(failure) = reader.expect_end().await {
             self.fail(&mut reader, failure, Charged::No);
             return;
+        }
+        // A control frame read whole counts neither way toward a raise.
+        if let Some(ticket) = &mut reader.ticket {
+            ticket.vote = Vote::Neutral;
         }
         match self.controls.try_send(payload) {
             Ok(()) => self.stats.record(QuicInboundOutcome::DeliveredControl),
@@ -2992,47 +3119,108 @@ mod tests {
         );
     }
 
-    fn limit(base: u32, max: u32) -> (StreamLimit, Arc<parking_lot::Mutex<Vec<u32>>>) {
+    fn limit(base: u32, max: u32) -> (Arc<StreamLimit>, Arc<parking_lot::Mutex<Vec<u32>>>) {
         let told = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let seen = told.clone();
         let set = move |limit: u32| seen.lock().push(limit);
-        (StreamLimit::new(Some(Box::new(set)), base, max), told)
+        (
+            Arc::new(StreamLimit::new(Some(Box::new(set)), base, max)),
+            told,
+        )
     }
 
-    /// Saturate, then complete `count` streams.
-    fn run(limit: &StreamLimit, count: u32, throttled: bool) -> bool {
-        limit.on_open(limit.base() as usize);
-        (0..count).fold(false, |raised, _| limit.on_completed(throttled) || raised)
+    /// Open `count` streams at once, then complete each (whole, gap-free).
+    fn complete(limit: &Arc<StreamLimit>, count: u32, throttled: bool) -> bool {
+        let mut tickets: Vec<_> = (0..count).map(|_| limit.open()).collect();
+        tickets.iter_mut().fold(false, |raised, ticket| {
+            ticket.vote = Vote::Completed;
+            ticket.idle();
+            limit.on_completed(throttled, false) || raised
+        })
+    }
+
+    /// Saturate, then complete `count` streams one at a time.
+    fn run(limit: &Arc<StreamLimit>, count: u32, throttled: bool) -> bool {
+        drop(saturate(limit));
+        (0..count).fold(false, |raised, _| complete(limit, 1, throttled) || raised)
+    }
+
+    /// Every stream the base allows busy at once; dropped as completed.
+    fn saturate(limit: &Arc<StreamLimit>) -> Vec<LimitTicket> {
+        let mut tickets: Vec<_> = (0..limit.base()).map(|_| limit.open()).collect();
+        for ticket in &mut tickets {
+            ticket.vote = Vote::Neutral;
+        }
+        tickets
     }
 
     #[test]
     fn the_stream_limit_doubles_after_saturation_and_as_many_completions() {
         let (limit, told) = limit(16, 64);
-        // Completions without every stream in use at once do not count.
-        assert!(!(0..40).any(|_| limit.on_completed(false)));
-        limit.on_open(15);
-        assert!(!(0..40).any(|_| limit.on_completed(false)));
+        // Completions without every stream busy at once do not count.
+        assert!(!(0..40).any(|_| complete(&limit, 1, false)));
+        assert!(!complete(&limit, 15, false), "15 busy at once is one short");
         assert!(!run(&limit, 15, false), "15 completions are one short");
-        assert!(limit.on_completed(false));
+        assert!(complete(&limit, 1, false));
         assert_eq!(limit.base(), 32);
         assert!(run(&limit, 32, false));
         assert_eq!(limit.base(), 64);
         assert!(!run(&limit, 200, false), "never past the max");
         assert_eq!(*told.lock(), vec![32, 64]);
+        assert_eq!(limit.busy(), 0);
+    }
+
+    /// A stream that is no longer busy (read whole, or its end read, and
+    /// waiting on this node) does not count toward saturation, so a slow
+    /// consumer here earns the peer nothing.
+    #[test]
+    fn only_busy_streams_saturate() {
+        let (limit, _) = limit(16, 64);
+        let mut waiting: Vec<_> = (0..15).map(|_| limit.open()).collect();
+        for ticket in &mut waiting {
+            ticket.idle();
+        }
+        let busy = limit.open();
+        assert!(!limit.saturated.load(Ordering::Relaxed));
+        drop(busy);
+        drop(waiting);
+        assert_eq!(limit.busy(), 0);
     }
 
     #[test]
     fn a_failure_or_a_throttle_holds_back_a_raise() {
         let (limit, _) = limit(16, 64);
         assert!(!run(&limit, 10, false));
-        limit.on_failed();
+        // A ticket dropped without a vote is a failure.
+        drop(limit.open());
         assert!(
-            !(0..20).any(|_| limit.on_completed(false)),
+            !(0..20).any(|_| complete(&limit, 1, false)),
             "load starts over"
         );
         assert!(!run(&limit, 16, true), "not while throttled");
-        assert!(limit.on_completed(false), "once the throttle is gone");
+        assert!(complete(&limit, 1, false), "once the throttle is gone");
         assert_eq!(limit.base(), 32);
+    }
+
+    /// A reset by the sender or the connection ending counts neither way.
+    #[test]
+    fn a_neutral_end_keeps_the_run() {
+        let (limit, _) = limit(16, 64);
+        assert!(!run(&limit, 15, false));
+        let mut reset = limit.open();
+        reset.vote = Vote::Neutral;
+        drop(reset);
+        assert!(complete(&limit, 1, false));
+    }
+
+    /// A completion of a stream that had a gap does not count, and does not
+    /// start the run over.
+    #[test]
+    fn a_gapped_completion_does_not_count() {
+        let (limit, _) = limit(16, 64);
+        assert!(!run(&limit, 15, false));
+        assert!(!limit.on_completed(false, true));
+        assert!(complete(&limit, 1, false));
     }
 
     #[test]
@@ -3050,9 +3238,9 @@ mod tests {
 
     #[test]
     fn a_path_without_data_never_raises() {
-        let limit = StreamLimit::new(None, 0, 0);
-        limit.on_open(100);
-        assert!(!(0..100).any(|_| limit.on_completed(false)));
+        let limit = Arc::new(StreamLimit::new(None, 0, 0));
+        let _busy: Vec<_> = (0..100).map(|_| limit.open()).collect();
+        assert!(!(0..100).any(|_| limit.on_completed(false, false)));
     }
 
     #[test]

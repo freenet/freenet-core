@@ -140,11 +140,27 @@ impl PathRtt {
 }
 
 /// What the reader of a QUIC-fed stream tells its consumers: its path's
-/// round trip and its own idle limit, from which they take their gap.
+/// round trip and its own idle limit, from which they take their gap, and
+/// whether the node's buffer budget is throttling the path now.
 #[derive(Debug)]
 pub(crate) struct QuicSourcePath {
     pub(crate) rtt: Arc<PathRtt>,
     pub(crate) idle: std::time::Duration,
+    pub(crate) throttle: Option<ThrottleProbe>,
+}
+
+/// Whether the node's buffer budget is holding a QUIC path below what it
+/// needs now (`quic::budget::ConnMeter::throttled_since`). A consumer does
+/// not give up on a gap while it does: the slowdown is this node's own, and
+/// the reader, which ends the stream with a reason if the peer is the one
+/// idle, decides instead.
+#[derive(Clone)]
+pub(crate) struct ThrottleProbe(pub(crate) Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl std::fmt::Debug for ThrottleProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ThrottleProbe")
+    }
 }
 
 /// The source of a QUIC-fed stream, shared by every clone and fork of its
@@ -177,6 +193,14 @@ impl QuicSource {
         self.path.get().map_or(STREAM_INACTIVITY_TIMEOUT, |path| {
             quic_fragment_gap(path.rtt.get(), path.idle)
         })
+    }
+
+    /// The buffer budget is throttling the stream's path now.
+    fn throttled(&self) -> bool {
+        self.path
+            .get()
+            .and_then(|path| path.throttle.as_ref())
+            .is_some_and(|probe| (probe.0)())
     }
 }
 
@@ -773,6 +797,14 @@ impl StreamHandle {
                     }
                     if let Some(data) = self.buffer.assemble() {
                         return Ok(data);
+                    }
+                    // A QUIC-fed stream whose path the node's own budget is
+                    // throttling waits another gap: its reader pauses its
+                    // idle timer for the same throttle, and records an end
+                    // (waking this listener) if the peer is idle or the
+                    // stream reaches its age limit.
+                    if self.quic.as_ref().is_some_and(|quic| quic.throttled()) {
+                        continue;
                     }
                     tracing::warn!(
                         stream_id = %self.stream_id.0,
@@ -2153,6 +2185,7 @@ mod tests {
             .set_path(QuicSourcePath {
                 rtt: Arc::new(PathRtt::new(rtt)),
                 idle: std::time::Duration::from_secs(30),
+                throttle: None,
             });
         handle
     }
@@ -2186,6 +2219,7 @@ mod tests {
             .set_path(QuicSourcePath {
                 rtt: rtt.clone(),
                 idle: Duration::from_secs(30),
+                throttle: None,
             });
         rtt.set(Duration::from_secs(1));
         assert_eq!(moving.fragment_gap_limit(), Duration::from_secs(24));

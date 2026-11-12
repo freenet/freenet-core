@@ -1627,28 +1627,75 @@ fn a_message_waiting_for_room_is_evicted_at_its_age_limit() {
 }
 
 /// A data path's peer starts with `config::DATA_START_UNI_STREAMS` streams.
-/// Once it has had them all in use at once (here: Shorts waiting for room in
-/// a full channel) and as many have completed, the limit doubles, and the
-/// next time the channel is full more Shorts get a stream.
+/// Streamed sends that keep every stream busy at once, with the consumer
+/// draining, double it after as many complete, and again at 32, up to
+/// `MAX_UNI_STREAMS`; every message arrives.
 #[test]
 fn the_stream_limit_starts_low_and_doubles_with_load() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let mut p = paths("quic-path-stream-raise", QuicPathLimits::DEFAULT).await;
+        let count = 160usize;
+        let mut streams = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+        let a = p.a.clone();
+        let assembled = p
+            .drive(async move {
+                let drain = async move {
+                    let mut assembled = 0usize;
+                    while assembled < count {
+                        let arrival = streams.recv().await.expect("announced");
+                        tokio::spawn(async move { arrival.handle.assemble().await });
+                        assembled += 1;
+                    }
+                    assembled
+                };
+                let sends = futures::future::join_all((0..count).map(|_| {
+                    let a = a.clone();
+                    async move {
+                        a.send_stream(StreamId::next(), None, Bytes::from(payload(6000)))
+                            .await
+                    }
+                }));
+                let (sent, assembled) = tokio::join!(sends, drain);
+                assert!(sent.iter().all(Result::is_ok), "every send is acked");
+                assembled
+            })
+            .await;
+        assert_eq!(assembled, count);
+        let stats = p.b.stats();
+        assert_eq!(
+            stats.count(QuicInboundOutcome::CompletedStream) as usize,
+            count
+        );
+        assert_eq!(
+            stats.count(QuicInboundOutcome::StreamLimitRaised),
+            2,
+            "16 -> 32 -> 64"
+        );
+    })
+}
+
+/// Shorts that wait for room behind a slow consumer here do not earn their
+/// peer a raise: a Short read whole is not busy, whatever this node does
+/// with it. With nothing draining, the sends that complete are those the
+/// channel holds plus at most the start limit waiting, and the limit stays.
+#[test]
+fn a_slow_consumer_earns_its_peer_no_raise() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let start = super::super::config::DATA_START_UNI_STREAMS as usize;
         let limits = QuicPathLimits {
             short_capacity: 1,
-            start_streams: start as u32,
             ..QuicPathLimits::DEFAULT
         };
-        let mut p = paths("quic-path-stream-raise", 82, limits).await;
-        // Sends that complete while nothing drains: what the channel holds
-        // plus the readers waiting, one per stream the peer may open.
-        let fill = async |p: &mut Paths, base: u32, count: usize| {
+        let mut p = paths("quic-path-slow-no-raise", limits).await;
+        for round in 0..3u32 {
             let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = 3 * start;
             for i in 0..count {
                 let (a, done) = (p.a.clone(), done.clone());
                 tokio::spawn(async move {
-                    a.send_short(&(base + i as u32).to_be_bytes())
+                    a.send_short(&(round * 1000 + i as u32).to_be_bytes())
                         .await
                         .unwrap();
                     done.fetch_add(1, Ordering::SeqCst);
@@ -1658,6 +1705,7 @@ fn the_stream_limit_starts_low_and_doubles_with_load() {
             p.drive(async move { time.sleep(Duration::from_secs(2)).await })
                 .await;
             let held = done.load(Ordering::SeqCst);
+            assert!(held <= 1 + start, "{held} completed at the start limit");
             let mut got = 0;
             while got < count {
                 while p.b_in.shorts.try_recv().is_ok() {
@@ -1667,16 +1715,8 @@ fn the_stream_limit_starts_low_and_doubles_with_load() {
                 p.drive(async move { time.sleep(Duration::from_millis(10)).await })
                     .await;
             }
-            held
-        };
-        let first = fill(&mut p, 0, 2 * start).await;
-        assert!(first <= 1 + start, "{first} completed at the start limit");
-        assert_eq!(p.b.stats().count(QuicInboundOutcome::StreamLimitRaised), 1);
-        let second = fill(&mut p, 1000, 3 * start).await;
-        assert!(
-            second > 1 + start && second <= 1 + 2 * start,
-            "{second} completed after one raise"
-        );
+        }
+        assert_eq!(p.b.stats().count(QuicInboundOutcome::StreamLimitRaised), 0);
     })
 }
 
@@ -1896,7 +1936,7 @@ fn a_full_budget_still_delivers_a_one_packet_short() {
 fn the_stream_limit_is_back_pressure() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-many", QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-many", QuicPathLimits::FULL_STREAMS).await;
         let limit = super::super::config::MAX_UNI_STREAMS as usize;
         let batch = limit / 8 + 1;
         let (conn, a, time) = (p.a_raw(), p.a.clone(), p.time());
@@ -1950,7 +1990,7 @@ fn the_stream_limit_is_back_pressure() {
 fn a_flood_into_a_slow_receiver_is_held_and_all_delivered() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-flood", QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-flood", QuicPathLimits::FULL_STREAMS).await;
         let count = SHORT_CHANNEL_CAPACITY + 44;
         let a = p.a.clone();
         let results = p
@@ -4138,7 +4178,7 @@ fn bounded_send_that_finishes_early_leaves_no_wakeup() {
 fn bounded_sends_on_a_path_report_each_outcome() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-bounded", QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-bounded", QuicPathLimits::FULL_STREAMS).await;
         let (a, time) = (p.a.clone(), p.time());
         let ready = QuicControl::Ready {
             attempt: 7,
@@ -4196,7 +4236,7 @@ fn bounded_sends_on_a_path_report_each_outcome() {
         drop(silenced);
 
         // A fresh pair, every credit held by streams b is still reading.
-        let p = paths("quic-path-bounded-open", QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-bounded-open", QuicPathLimits::FULL_STREAMS).await;
         let (conn, a, time) = (p.a_raw(), p.a.clone(), p.time());
         let (blocked, held) = p
             .drive(async move {
@@ -4298,7 +4338,7 @@ fn blocked_streamed_sends(
 fn a_short_still_sends_while_streamed_messages_are_blocked() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-reserved", QuicPathLimits::DEFAULT).await;
+        let mut p = paths("quic-path-reserved", QuicPathLimits::FULL_STREAMS).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         assert_eq!(limit, 48);
         let streamed = super::super::config::MAX_UNI_STREAMS as usize + 6;
@@ -4365,7 +4405,7 @@ fn a_short_still_sends_while_streamed_messages_are_blocked() {
 fn streamed_sends_return_their_permits() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-permits", QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-permits", QuicPathLimits::FULL_STREAMS).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         let (a, time) = (p.a.clone(), p.time());
         let (completed, timed_out, later) = p
@@ -4424,7 +4464,7 @@ fn streamed_sends_return_their_permits() {
 fn a_bounded_send_timing_out_on_a_permit_opens_no_stream() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-permit-wait", QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-permit-wait", QuicPathLimits::FULL_STREAMS).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         let (a, time) = (p.a.clone(), p.time());
         let (outcome, aborts) = p
@@ -6583,7 +6623,7 @@ fn cancelled_one_packet_shorts_wait_for_their_ack_only_up_to_the_bound() {
 fn only_a_short_past_one_packet_takes_a_permit() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-short-permit", QuicPathLimits::DEFAULT).await;
+        let p = paths("quic-path-short-permit", QuicPathLimits::FULL_STREAMS).await;
         let limit = super::super::config::STREAMED_SEND_LIMIT as usize;
         let (a, time) = (p.a.clone(), p.time());
         let (large, small) = p
@@ -7057,7 +7097,7 @@ fn a_throttle_pauses_idle_and_the_age_limit_counts_apart() {
             a: Some(test_budget(64 << 20, leaked_counters())),
             b: Some(test_budget(64 << 20, leaked_counters())),
         };
-        let p = paths_metered("quic-budget-throttle-idle", 26, windows).await;
+        let p = paths_metered("quic-budget-throttle-idle", windows).await;
         let meter = p.b.meter().expect("b reads data under a budget").clone();
         let idle = streaming_handle_idle_timeout();
         let total = 10_000u64;
@@ -7155,16 +7195,21 @@ fn a_data_paths_window_grows_when_delivery_fills_it() {
 }
 
 /// A connection starts with `config::INITIAL_UNI_STREAMS` streams for its peer;
-/// a path that accepts data raises that to `MAX_UNI_STREAMS`, and a shadow path
-/// leaves it.
+/// a path that accepts data raises that to `config::DATA_START_UNI_STREAMS`
+/// (or the start its limits give), and a shadow path leaves it.
 #[test]
-fn only_a_path_that_takes_data_lets_its_peer_open_every_stream() {
+fn only_a_path_that_takes_data_lets_its_peer_open_streams() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         for (limits, network, expected) in [
             (
                 QuicPathLimits::DEFAULT,
                 "quic-path-streams-data",
+                super::super::config::DATA_START_UNI_STREAMS,
+            ),
+            (
+                QuicPathLimits::FULL_STREAMS,
+                "quic-path-streams-full",
                 super::super::config::MAX_UNI_STREAMS,
             ),
             (

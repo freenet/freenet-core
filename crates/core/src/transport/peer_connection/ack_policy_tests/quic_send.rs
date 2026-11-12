@@ -1443,6 +1443,7 @@ fn quic_source_on_path(total: usize, rtt: Duration) -> StreamHandle {
         .set_path(QuicSourcePath {
             rtt: Arc::new(PathRtt::new(rtt)),
             idle: Duration::from_secs(30),
+            throttle: None,
         });
     handle
 }

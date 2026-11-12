@@ -91,7 +91,7 @@ fn waits_for_a_stream_and_for_a_permit_are_counted() {
         let node = node_counters();
         let limits = QuicPathLimits {
             counters: Some(node),
-            ..QuicPathLimits::DEFAULT
+            ..QuicPathLimits::FULL_STREAMS
         };
         let p = paths("quic-node-waits", limits).await;
         let permits: Vec<_> = (0..STREAMED_SEND_LIMIT)

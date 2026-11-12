@@ -356,14 +356,9 @@ impl QuicPathLimits {
         control_capacity: CONTROL_CHANNEL_CAPACITY,
         max_send_aborts: recycle::SEND_ABORT_LIMIT,
         accept_data: true,
-        // Tests that are not about the raise start at the full limit, which
-        // their premises (exhausting the peer's streams) are written against;
-        // the raise has its own tests, and the simulation tests run the
-        // production start.
-        #[cfg(not(test))]
+        // The production start in every build, tests and simulations
+        // included; a test whose premise is the full limit sets it.
         start_streams: super::config::DATA_START_UNI_STREAMS,
-        #[cfg(test)]
-        start_streams: MAX_UNI_STREAMS,
         counters: None,
         #[cfg(test)]
         panic_in_receive: false,
@@ -379,6 +374,14 @@ impl QuicPathLimits {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const SHADOW: Self = Self {
         accept_data: false,
+        ..Self::DEFAULT
+    };
+
+    /// [`Self::DEFAULT`] with the peer let open every stream from the
+    /// start, for tests whose premise is the full limit. Tests only.
+    #[cfg(test)]
+    pub(crate) const FULL_STREAMS: Self = Self {
+        start_streams: MAX_UNI_STREAMS,
         ..Self::DEFAULT
     };
 }
