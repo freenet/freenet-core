@@ -4016,10 +4016,11 @@ fn a_peer_that_never_raises_its_stream_limit_is_closed() {
 
 /// An honest receiver whose consumer stalls for 30 s: one-packet Shorts wait
 /// for room in its channel (capacity 1), each lowering the limit it
-/// advertises, so `a`'s further streams wait to open for its stream credit,
-/// while many of `a`'s streams were wholly acknowledged.
-/// The consumer then drains, the limit comes back up, and the path is not
-/// closed: the stream-credit rule waits `STREAM_CREDIT_WINDOW`.
+/// advertises, so `a`'s further sends wait to open for its stream credit.
+/// The stream-credit rule does not engage: the peer raised its limit when
+/// it read the first streams, and no stream `a` opened since was
+/// acknowledged, so nothing says it withholds credit it owes. The consumer
+/// then drains, every Short arrives, and the path is not closed.
 #[test]
 fn a_consumer_that_stalls_half_a_minute_does_not_close_the_path() {
     bounded(|| async move {
@@ -4044,9 +4045,12 @@ fn a_consumer_that_stalls_half_a_minute_does_not_close_the_path() {
                     })
                     .collect();
                 time.sleep(Duration::from_secs(30)).await;
-                sends
+                let waiting = a.writers().stream_waiters();
+                (sends, waiting)
             })
             .await;
+        let (sends, waiting) = sends;
+        assert!(waiting > 0, "premise: sends waited for stream credit");
         let time = p.time();
         let outcomes = p
             .drive(async move {
