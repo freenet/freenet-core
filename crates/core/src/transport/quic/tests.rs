@@ -2779,6 +2779,12 @@ fn close_codes_reach_the_peer() {
             QuicCloseCode::OverBudget => QuicErrorKind::Refused {
                 reason: QuicRefusal::OverBudget,
             },
+            QuicCloseCode::VersionIncompatible => QuicErrorKind::Refused {
+                reason: QuicRefusal::VersionIncompatible,
+            },
+            QuicCloseCode::HelloRefused => QuicErrorKind::Refused {
+                reason: QuicRefusal::HelloRefused,
+            },
         };
         let mut sent_by_a = Vec::new();
         let mut sent_by_b = Vec::new();
@@ -2862,6 +2868,45 @@ fn close_codes_reach_the_peer() {
             TRANSPORT_METRICS.quic_close_sent_to(pair.a_addr),
             sent_by_b,
             "the peer's handle, dropped after the close, sent nothing"
+        );
+    });
+}
+
+/// A close with a reason of the caller's own reaches the peer with that
+/// reason, and counts once by its code like any close.
+#[test]
+fn a_close_with_a_reason_carries_it_to_the_peer() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-close-reason", net.addr(1), net.addr(2), None).await;
+        let (_, client, server) = pair.transfer(payload(100), Duration::from_secs(60)).await;
+        let version = [0, 2, 0, 160, 0, 2, 0, 150];
+        assert!(
+            client
+                .closer()
+                .close_with_reason(QuicCloseCode::VersionIncompatible, &version)
+        );
+        assert!(
+            !client.closer().close(QuicCloseCode::Downgrade),
+            "closed once"
+        );
+        let seen = server.inner().clone();
+        let error = drive(&pair.time, Duration::from_secs(60), async move {
+            seen.closed().await
+        })
+        .await;
+        let quinn::ConnectionError::ApplicationClosed(close) = &error else {
+            panic!("the peer saw {error:?}");
+        };
+        assert_eq!(
+            close.error_code.into_inner(),
+            u64::from(error::close_code::VERSION_INCOMPATIBLE)
+        );
+        assert_eq!(&close.reason[..], &version[..]);
+        assert_eq!(
+            TRANSPORT_METRICS.quic_close_sent_to(pair.b_addr),
+            vec![QuicCloseCode::VersionIncompatible]
         );
     });
 }

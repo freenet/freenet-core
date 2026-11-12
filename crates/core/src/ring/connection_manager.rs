@@ -162,13 +162,18 @@ pub(crate) fn nn_lattice_enabled() -> bool {
 /// lattice (mechanisms 1-4) activates. Below this floor the feature disables
 /// itself. Anchored to [`Ring::DEFAULT_MIN_CONNECTIONS`].
 ///
-/// This is keyed on the CONFIGURED `max_connections` (the cap a node is built
-/// with — 200 by default in production via `DEFAULT_MAX_CONNECTIONS`), NOT the
-/// live connection count. So in PRODUCTION every node is above the floor and the
-/// feature is always active; the floor's only real effect is to disable the
-/// feature at the sparse scales used by the simulation harness. The gate is
-/// therefore production-neutral: any value in `(max sim config, 200)` behaves
-/// identically in production.
+/// This is keyed on the `max_connections` a node is built with (200 by
+/// default in production via `DEFAULT_MAX_CONNECTIONS`), NOT the live
+/// connection count. While a node may carry QUIC data, that limit is lowered
+/// to the QUIC connection cap (`NetworkApiConfig::connection_limit`), but never
+/// below min-number-of-connections (default 25, this floor), so on defaults
+/// every production node stays at or above the floor and the feature is
+/// active. The exception: an operator who set min-number-of-connections below
+/// 25 on a host under about 530 MiB (QUIC cap 24) runs below the floor with
+/// data on, and the lattice switches itself off there. Otherwise the floor's
+/// only effect is to disable the feature at the sparse scales used by the
+/// simulation harness: any value in `(max sim config, 25]` behaves identically
+/// for a production node on defaults.
 ///
 /// Two-tier routing (2 reserved base-lattice edges + `k - 2` Kleinberg long
 /// links) needs enough long links to keep the O(log^2 n) structure; below a
@@ -550,9 +555,9 @@ pub(crate) struct ConnectionManager {
     transient_connections: Arc<DashMap<SocketAddr, TransientEntry>>,
     /// Addresses of the transports the network bridge holds open, whether or
     /// not they are ring connections or still tracked as transient (a
-    /// transient entry expires while its transport can stay open). Written
-    /// only by `P2pConnManager::insert_connection` / `remove_connection`, so
-    /// it holds exactly the bridge's connection map's keys; bounded by it.
+    /// transient entry expires while its transport can stay open). Written by
+    /// the bridge's `ConnectionMap::insert` / `remove`, the only ways that
+    /// map's keys change, so it holds exactly those keys; bounded by it.
     open_transports: Arc<dashmap::DashSet<SocketAddr>>,
     transient_in_use: Arc<AtomicUsize>,
     transient_budget: usize,

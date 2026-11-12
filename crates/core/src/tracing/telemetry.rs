@@ -3135,6 +3135,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "quic_close_sent_over_budget".into(),
                 serde_json::json!(snapshot.quic_close_sent_over_budget),
             );
+            m.insert(
+                "quic_close_sent_version_incompatible".into(),
+                serde_json::json!(snapshot.quic_close_sent_version_incompatible),
+            );
+            m.insert(
+                "quic_close_sent_hello_refused".into(),
+                serde_json::json!(snapshot.quic_close_sent_hello_refused),
+            );
             {
                 use crate::transport::metrics::{
                     QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
@@ -8161,6 +8169,8 @@ mod tests {
             quic_close_sent_control_refused: 8,
             quic_close_sent_session_ended: 10,
             quic_close_sent_over_budget: 11,
+            quic_close_sent_version_incompatible: 12,
+            quic_close_sent_hello_refused: 13,
             quic_breaker_trips: 7,
             quic_send_refused: 9,
             quic_breaker_suppressed: true,
@@ -8181,6 +8191,8 @@ mod tests {
             ("quic_close_sent_control_refused", 8),
             ("quic_close_sent_session_ended", 10),
             ("quic_close_sent_over_budget", 11),
+            ("quic_close_sent_version_incompatible", 12),
+            ("quic_close_sent_hello_refused", 13),
             ("quic_breaker_trips", 7),
             ("quic_send_refused", 9),
         ] {

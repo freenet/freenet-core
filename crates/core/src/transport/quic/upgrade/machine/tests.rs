@@ -981,6 +981,40 @@ fn a_later_frame_does_not_change_an_active_path() {
     }
 }
 
+/// Whatever the peer sends and whatever happens to the path, one attempt
+/// makes at most `CONTROL_SENDS_PER_PATH` control sends: from every state of
+/// the attempt, in each role, each event first and three times over, then
+/// every event in turn.
+#[test]
+fn control_frames_are_sent_once_per_path() {
+    let sends_of = |actions: Vec<Action>, attempt: u32| {
+        actions
+            .iter()
+            .filter(|action| matches!(action, Action::SendControl(c) if c.attempt() == attempt))
+            .count()
+    };
+    for (role, state) in pairs() {
+        let attempt = attempt_of(role);
+        let before = match state {
+            S::Confirming => usize::from(role == Role::Server),
+            S::Active => 1,
+            S::Unpromoted | S::Idle | S::Offered | S::Connecting | S::Rechecking | S::Off => 0,
+        };
+        for first in ATTEMPT_EVENTS {
+            let mut rig = reach(role, state);
+            let mut sends = 0;
+            for name in std::iter::repeat_n(first, 3).chain(ATTEMPT_EVENTS) {
+                let event = event(name, attempt, &rig);
+                sends += sends_of(rig.step(event), attempt);
+            }
+            assert!(
+                sends + before <= super::CONTROL_SENDS_PER_PATH,
+                "{role:?} from {state:?}, {first} first: {sends} more sends after {before}"
+            );
+        }
+    }
+}
+
 /// A path that ends takes the peer's bit with it: the next attempt reads the
 /// peer's new frame, and a peer that stopped setting the bit stays shadow. This
 /// node's own bit stays, as it comes from the promotion. A later promotion
@@ -1259,7 +1293,8 @@ fn every_close_code_falls_back_then_upgrades_again() {
 
 /// Close codes 1, 3, 4 and 5 read as a downgrade, and record that cause; code 6
 /// records `session_ended_rx` and code 8 `over_budget_rx`. An
-/// unknown one, which is how an older node reads code 5, is a lost connection.
+/// unknown one, which is how an older node reads code 5, is a lost connection,
+/// and so are the native-only codes 9 and 10 on an upgrade path.
 #[test]
 fn close_codes_record_their_cause() {
     let downgrade = Outcome::Fallback(FallbackCause::DowngradeReceived);
@@ -1282,6 +1317,8 @@ fn close_codes_record_their_cause() {
             QuicCloseCode::OverBudget.code(),
             Outcome::Fallback(FallbackCause::OverBudgetReceived),
         ),
+        (QuicCloseCode::VersionIncompatible.code(), lost),
+        (QuicCloseCode::HelloRefused.code(), lost),
         (0x0f, lost),
     ] {
         let mut rig = Rig::promoted(Role::Server);
@@ -1310,6 +1347,25 @@ fn a_downgrade_close_in_setup_is_not_a_path_fallback() {
             Action::Record(Outcome::SetupDowngraded),
             "code {:#x}",
             code.code()
+        );
+    }
+}
+
+/// The native-only close codes, arriving during an upgrade's setup, read as a
+/// failed handshake, as an unknown code does: not a setup downgrade.
+#[test]
+fn a_native_only_close_in_setup_is_a_failed_handshake() {
+    for code in [
+        QuicCloseCode::VersionIncompatible.code(),
+        QuicCloseCode::HelloRefused.code(),
+        0x0f,
+    ] {
+        let mut rig = reach(Role::Server, S::Confirming);
+        let actions = rig.close_with(attempt_of(Role::Server), u64::from(code));
+        assert_eq!(
+            actions[1],
+            Action::Record(Outcome::HandshakeFailed),
+            "code {code:#x}"
         );
     }
 }

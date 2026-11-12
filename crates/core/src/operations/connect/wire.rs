@@ -284,6 +284,9 @@ pub mod sim_trace {
         retry_accepts_with_offer: AtomicU64,
         joiner_decisions: AtomicU64,
         joiner_responses_without_decision: AtomicU64,
+        /// Nodes standing in for a release below the floor
+        /// ([`mark_pre_floor`]).
+        pre_floor: parking_lot::Mutex<std::collections::HashSet<SocketAddr>>,
     }
 
     /// What the connect op saw, for [`record_at`].
@@ -299,7 +302,15 @@ pub mod sim_trace {
         /// A connection was closed on a message that did not decode.
         UndecodableClose,
         /// An acceptor answered a request; `retry` for a re-routed one.
-        Accepted { with_offer: bool, retry: bool },
+        ///
+        /// `joiner` is the joiner's address. An answer without an offer to a
+        /// joiner marked pre-floor ([`mark_pre_floor`]) is not counted: such a
+        /// joiner sends no offer by design.
+        Accepted {
+            with_offer: bool,
+            retry: bool,
+            joiner: Option<SocketAddr>,
+        },
         /// A joiner received a response.
         JoinerResponse { with_decision: bool },
     }
@@ -332,6 +343,7 @@ pub mod sim_trace {
             NativeWireEvent::Accepted {
                 with_offer: true,
                 retry,
+                ..
             } => {
                 if retry {
                     c.retry_accepts_with_offer.fetch_add(1, Ordering::Relaxed);
@@ -339,8 +351,15 @@ pub mod sim_trace {
                 &c.accepts_with_offer
             }
             NativeWireEvent::Accepted {
-                with_offer: false, ..
-            } => &c.accepts_without_offer,
+                with_offer: false,
+                joiner,
+                ..
+            } => {
+                if joiner.is_some_and(|joiner| c.pre_floor.lock().contains(&joiner)) {
+                    return;
+                }
+                &c.accepts_without_offer
+            }
             NativeWireEvent::JoinerResponse {
                 with_decision: true,
             } => &c.joiner_decisions,
@@ -349,6 +368,13 @@ pub mod sim_trace {
             } => &c.joiner_responses_without_decision,
         };
         counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Marks the node at `addr` in `network` as standing in for a release
+    /// below the floor, so answers to its offerless requests are not counted
+    /// as offers dropped on the way.
+    pub(crate) fn mark_pre_floor(network: &str, addr: SocketAddr) {
+        trace(network).0.pre_floor.lock().insert(addr);
     }
 
     /// Removes the trace of `network` (on `SimNetwork` drop).

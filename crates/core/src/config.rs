@@ -364,7 +364,7 @@ impl Default for ConfigArgs {
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
                 transport_quic: None,      // Default: shadow on Linux, macOS and Windows
-                quic_max_paths: None,      // Default: max-number-of-connections
+                quic_max_paths: None,      // Default: the node's connection limit
                 quic_data_percent: None,   // Default: this release's share of pairs
                 quic_ignore_crash_breaker: None,
             },
@@ -2521,7 +2521,13 @@ pub struct NetworkArgs {
     )]
     pub min_connections: Option<usize>,
 
-    /// Maximum allowed connections for the ring topology. Defaults to 20.
+    /// Maximum allowed connections for the ring topology. Default: 200.
+    ///
+    /// While this node carries data on QUIC (`transport-quic` prefer with a
+    /// data share above 0), it is lowered to what QUIC's per-connection memory
+    /// fits in an eighth of the host's memory (about 48 at 1 GiB, 80 at 2 GiB,
+    /// 161 at 4 GiB; 200 is kept from about 5 GiB up), with a line in the log,
+    /// but never below min-number-of-connections. The configured value is kept.
     #[arg(long = "max-number-of-connections", env = "MAX_NUMBER_OF_CONNECTIONS")]
     #[serde(
         rename = "max-number-of-connections",
@@ -2598,8 +2604,9 @@ pub struct NetworkArgs {
     /// The most QUIC paths this node holds at once, counting paths being
     /// offered or dialed (#5940).
     ///
-    /// Default: `max-number-of-connections`; a larger value is lowered to it,
-    /// and 0 turns QUIC upgrades off. A value that is not a whole number is
+    /// Default: the node's connection limit (`max-number-of-connections`,
+    /// lowered for QUIC memory while the node may carry data); a larger value
+    /// is lowered to it, and 0 turns QUIC upgrades off. A value that is not a whole number is
     /// ignored with a warning in the log.
     #[arg(
         long = "quic-max-paths",
@@ -3113,10 +3120,12 @@ impl NetworkApiConfig {
     }
 
     /// The most QUIC paths this node may hold at once: `quic-max-paths`,
-    /// lowered to [`Self::max_connections`], which is also the value when the
-    /// key is unset or cannot be parsed ([`Self::quic_max_paths_setting`]).
+    /// lowered to the node's connection limit ([`Self::connection_limit`]:
+    /// `max-number-of-connections`, lowered for QUIC memory while the node may
+    /// carry data), which is also the value when the key is unset or cannot be
+    /// parsed ([`Self::quic_max_paths_setting`]).
     ///
-    /// The cap is `max_connections`: a path needs a UDP session, and the
+    /// The cap is the connection limit: a path needs a UDP session, and the
     /// node's QUIC memory is bounded per path (the fixed charge,
     /// `quic::config::QUIC_CONNECTION_CHARGE_BYTES`, plus, for a data path, the
     /// floor grant, `quic::budget::floor_grant`) and by the buffer budget its
@@ -3125,10 +3134,39 @@ impl NetworkApiConfig {
     /// a permit is held from the offer, so a path still closing can briefly
     /// hold a slot.
     pub(crate) fn quic_max_paths(&self) -> usize {
+        let max_connections = self.connection_limit().max;
         match self.quic_max_paths_setting() {
-            QuicMaxPathsSetting::Set(limit) => limit.min(self.max_connections),
-            QuicMaxPathsSetting::Unset | QuicMaxPathsSetting::Invalid(_) => self.max_connections,
+            QuicMaxPathsSetting::Set(limit) => limit.min(max_connections),
+            QuicMaxPathsSetting::Unset | QuicMaxPathsSetting::Invalid(_) => max_connections,
         }
+    }
+
+    /// The connection limit this node runs with: `max-number-of-connections`,
+    /// lowered for QUIC memory while the node may carry QUIC data
+    /// ([`connection_limit_for`]). The host's memory is read as for the QUIC
+    /// endpoint ([`Self::quic_settings`]). The configured value is not
+    /// changed, so config.toml keeps it.
+    pub(crate) fn connection_limit(&self) -> ConnectionLimit {
+        self.connection_limit_with_memory(
+            crate::wasm_runtime::read_total_ram_bytes().unwrap_or(QUIC_FALLBACK_TOTAL_RAM),
+        )
+    }
+
+    /// [`Self::connection_limit`] on a host with `memory` bytes.
+    pub(crate) fn connection_limit_with_memory(&self, memory: usize) -> ConnectionLimit {
+        // `quic-max-paths` 0 turns QUIC paths off, so no connection holds QUIC
+        // memory. Whether QUIC actually runs (the crash-loop breaker, a failed
+        // bind) is not known here; a node that turns out to run without QUIC
+        // keeps the lower limit, the conservative side.
+        let carries_data = crate::transport::quic::upgrade::policy::may_carry_data(self)
+            && self.quic_settings().is_some()
+            && !matches!(self.quic_max_paths_setting(), QuicMaxPathsSetting::Set(0));
+        connection_limit_for(
+            self.max_connections,
+            self.min_connections,
+            carries_data,
+            memory,
+        )
     }
 
     /// `quic-data-percent`, if it is set and reads as a whole number from 0 to
@@ -3286,6 +3324,105 @@ mod lenient_count {
 
 fn default_max_connections() -> usize {
     DEFAULT_MAX_CONNECTIONS
+}
+
+/// The connection limit a node runs with, and whether it was lowered for QUIC
+/// memory ([`connection_limit_for`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectionLimit {
+    /// The most connections the ring keeps.
+    pub max: usize,
+    /// `max-number-of-connections` as configured, when `max` is lower.
+    pub lowered_from: Option<usize>,
+    /// The memory the cap was computed for.
+    pub memory: usize,
+    /// The QUIC connection cap at that memory, while the node may carry QUIC
+    /// data; `None` without data, where no cap applies.
+    pub cap: Option<usize>,
+}
+
+impl ConnectionLimit {
+    /// Whether the limit is above the QUIC connection cap while the node may
+    /// carry data: min-number-of-connections held it there, so QUIC may use
+    /// more than an eighth of memory. Logged at WARN whether or not anything
+    /// was lowered.
+    pub(crate) fn above_cap(&self) -> bool {
+        self.cap.is_some_and(|cap| self.max > cap)
+    }
+
+    /// Log a lowered limit once, at startup. The configured value is the
+    /// default when it is [`DEFAULT_MAX_CONNECTIONS`], which is logged at
+    /// INFO; any other value was set by the operator and is a WARN.
+    pub(crate) fn log(&self) {
+        let Some(cap) = self.cap else {
+            return;
+        };
+        let memory_mib = self.memory / (1024 * 1024);
+        match self.lowered_from {
+            Some(configured) if configured == DEFAULT_MAX_CONNECTIONS => tracing::info!(
+                max_connections = self.max,
+                memory_mib,
+                "Connection limit lowered from {configured} (the default value) to {} for \
+                 QUIC memory on this host",
+                self.max
+            ),
+            Some(configured) => tracing::warn!(
+                max_connections = self.max,
+                configured,
+                quic_connection_cap = cap,
+                memory_mib,
+                "max-number-of-connections {configured} is more than QUIC's memory fits \
+                 on this host ({memory_mib} MiB); running with {}",
+                self.max
+            ),
+            None => {}
+        }
+        // Whether or not anything was lowered: min-number-of-connections can
+        // hold the limit above the cap.
+        if self.above_cap() {
+            tracing::warn!(
+                max_connections = self.max,
+                quic_connection_cap = cap,
+                "min-number-of-connections keeps the limit above what QUIC's memory fits \
+                 on this host; QUIC may use more than an eighth of its memory"
+            );
+        }
+    }
+}
+
+/// The connection limit for a node configured with `max_connections` and
+/// `min_connections` on a host with `memory` bytes. While the node may carry
+/// QUIC data (`carries_data`), a limit above the QUIC connection cap
+/// (`quic::config::quic_connection_cap`) is lowered to it, but never below
+/// `min_connections`: a host too small for that many runs over the eighth of
+/// its memory QUIC is sized for. Otherwise the configured limit stands: a
+/// shadow path carries no data and costs only the fixed charge.
+pub(crate) fn connection_limit_for(
+    max_connections: usize,
+    min_connections: usize,
+    carries_data: bool,
+    memory: usize,
+) -> ConnectionLimit {
+    if !carries_data {
+        return ConnectionLimit {
+            max: max_connections,
+            lowered_from: None,
+            memory,
+            cap: None,
+        };
+    }
+    let cap = crate::transport::quic::config::quic_connection_cap(memory);
+    let max = if max_connections <= cap {
+        max_connections
+    } else {
+        cap.max(min_connections).min(max_connections)
+    };
+    ConnectionLimit {
+        max,
+        lowered_from: (max < max_connections).then_some(max_connections),
+        memory,
+        cap: Some(cap),
+    }
 }
 
 /// Default streaming threshold: 64KB
@@ -9993,6 +10130,123 @@ shutdown-drain-secs = 42
             );
             assert_eq!(cfg.network_api.quic_data_percent(), percent, "{value:?}");
         }
+    }
+
+    /// The connection limit while the node may carry QUIC data: the default
+    /// and any larger setting are lowered to the QUIC connection cap, a
+    /// smaller setting is kept, and min-number-of-connections is a floor.
+    /// Without data the configured limit always stands.
+    #[test]
+    fn the_connection_limit_is_lowered_for_quic_memory_only_with_data() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let at = |max, min, data, memory| connection_limit_for(max, min, data, memory);
+        // The default at each host size, with data.
+        for (memory, max) in [
+            (GIB, 48),
+            (2 * GIB, 80),
+            (4 * GIB, 161),
+            (8 * GIB, DEFAULT_MAX_CONNECTIONS),
+            (7_600 * 1024 * 1024, DEFAULT_MAX_CONNECTIONS),
+        ] {
+            let limit = at(
+                DEFAULT_MAX_CONNECTIONS,
+                DEFAULT_MIN_CONNECTIONS,
+                true,
+                memory,
+            );
+            assert_eq!(limit.max, max, "{memory}");
+            assert_eq!(
+                limit.lowered_from,
+                (max < DEFAULT_MAX_CONNECTIONS).then_some(DEFAULT_MAX_CONNECTIONS)
+            );
+        }
+        // Without data nothing is lowered.
+        assert_eq!(at(200, 25, false, GIB).max, 200);
+        assert_eq!(at(200, 25, false, GIB).lowered_from, None);
+        // A setting below the cap is kept; one above it is lowered.
+        assert_eq!(at(30, 25, true, GIB).max, 30);
+        assert_eq!(at(1000, 25, true, 8 * GIB).max, 323);
+        assert_eq!(at(1000, 25, true, 8 * GIB).lowered_from, Some(1000));
+        // min-number-of-connections is a floor, on a small host or set high.
+        assert_eq!(at(200, 25, true, GIB / 2).max, 25);
+        assert_eq!(at(200, 60, true, GIB).max, 60);
+        assert_eq!(at(200, 60, true, GIB).lowered_from, Some(200));
+        // A floor above the setting does not raise it.
+        assert_eq!(at(20, 25, true, GIB / 2).max, 20);
+        // Above the cap with nothing lowered (max = min = 60 at 1 GiB, cap 48):
+        // still reported, so it is warned about.
+        let held = at(60, 60, true, GIB);
+        assert_eq!(
+            (held.max, held.lowered_from, held.cap),
+            (60, None, Some(48))
+        );
+        assert!(held.above_cap());
+        assert!(!at(200, 25, true, GIB).above_cap(), "lowered to the cap");
+        assert!(!at(200, 25, false, GIB).above_cap(), "no cap without data");
+        assert_eq!(at(200, 25, false, GIB).cap, None);
+    }
+
+    /// The node's limit follows its data share: `prefer` with a share above 0
+    /// lowers it on a 1 GiB host; a share of 0, `shadow`, or an off endpoint
+    /// keeps 200. `quic-max-paths` follows the limit.
+    #[tokio::test]
+    async fn the_node_lowers_its_connection_limit_only_when_it_may_carry_quic_data() {
+        const GIB: usize = 1024 * 1024 * 1024;
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut cfg = local_args(temp_dir.path()).build().await.unwrap();
+        assert_eq!(cfg.network_api.max_connections, DEFAULT_MAX_CONNECTIONS);
+        for (mode, percent, lowered) in [
+            ("prefer", Some("5"), true),
+            ("prefer", Some("100"), true),
+            ("prefer", Some("0"), false),
+            ("prefer", None, false),
+            ("shadow", Some("5"), false),
+            ("off", Some("5"), false),
+        ] {
+            cfg.network_api.transport_quic = Some(mode.to_string());
+            cfg.network_api.quic_data_percent = percent.map(str::to_string);
+            cfg.network_api.quic_max_paths = None;
+            let limit = cfg.network_api.connection_limit_with_memory(GIB);
+            let expected = if lowered { 48 } else { DEFAULT_MAX_CONNECTIONS };
+            assert_eq!(limit.max, expected, "{mode} {percent:?}");
+            assert_eq!(
+                cfg.network_api.max_connections, DEFAULT_MAX_CONNECTIONS,
+                "the configured value is kept"
+            );
+        }
+        // quic-max-paths 0 turns QUIC paths off: nothing is lowered.
+        cfg.network_api.transport_quic = Some("prefer".to_string());
+        cfg.network_api.quic_data_percent = Some("5".to_string());
+        cfg.network_api.quic_max_paths = Some("0".to_string());
+        assert_eq!(
+            cfg.network_api.connection_limit_with_memory(GIB).max,
+            DEFAULT_MAX_CONNECTIONS
+        );
+        cfg.network_api.quic_max_paths = Some("10".to_string());
+        assert_eq!(cfg.network_api.connection_limit_with_memory(GIB).max, 48);
+    }
+
+    /// The node runs with the lowered limit, and `quic-max-paths` follows it:
+    /// with data on, a setting far above any host's cap is lowered in the
+    /// `NodeConfig` the ring is built from, and the path limit with it.
+    #[tokio::test]
+    async fn the_node_config_and_quic_max_paths_take_the_lowered_limit() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut args = local_args(temp_dir.path());
+        args.network_api.max_connections = Some(1_000_000);
+        args.network_api.transport_quic = Some("prefer".to_string());
+        args.network_api.quic_data_percent = Some("5".to_string());
+        let cfg = args.build().await.unwrap();
+        let limit = cfg.network_api.connection_limit();
+        assert!(limit.max < 1_000_000, "{limit:?}");
+        assert_eq!(cfg.network_api.quic_max_paths(), limit.max);
+        let node = NodeConfig::new(cfg.clone()).await.unwrap();
+        assert_eq!(node.max_number_conn, Some(limit.max));
+        // Without data the configured value stands.
+        let mut off = cfg;
+        off.network_api.quic_data_percent = Some("0".to_string());
+        assert_eq!(off.network_api.connection_limit().max, 1_000_000);
+        assert_eq!(off.network_api.quic_max_paths(), 1_000_000);
     }
 
     /// `quic-max-paths` (#5940) survives a bare restart, an unparsable value

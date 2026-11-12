@@ -207,6 +207,14 @@ pub(in crate::transport::quic) struct Receiver<T> {
     accept_data: bool,
     /// Closes the path on the first data frame it refuses ([`Self::accept_data`]).
     closer: super::super::QuicCloser,
+    /// A data frame was refused on this path: the receive task arms the one
+    /// delayed close ([`REFUSAL_CLOSE_DELAY`]) and the refused reader ends.
+    refused_data: AtomicBool,
+    /// The kind of the first refused data frame, for the close's WARN.
+    refused_kind: parking_lot::Mutex<Option<FrameKind>>,
+    /// The most stream readers the receive task held at once. Tests only.
+    #[cfg(test)]
+    readers_peak: Arc<AtomicUsize>,
     /// The connection's gaps over all its streams.
     ranges: Arc<ConnRanges>,
     /// The connection's share of the node's buffer budget, for a path that
@@ -231,6 +239,27 @@ pub(in crate::transport::quic) struct Receiver<T> {
 }
 
 impl<T: TimeSource> Receiver<T> {
+    /// Close the path after a refused data frame ([`Self::refused_data`]).
+    /// `QuicCloser::close` is at most once per connection and a no-op once it
+    /// has ended, so only a close that happens is counted and logged.
+    fn close_refusing_data(&self) {
+        if self.closer.close(QuicCloseCode::Downgrade) {
+            self.stats.record(QuicInboundOutcome::ClosedRefusingData);
+            let kind = *self.refused_kind.lock();
+            tracing::warn!(
+                ?kind,
+                "QUIC path: the peer sent data on a path where this node did not \
+                 set its data bit; closing the path so the peer falls back to UDP"
+            );
+        }
+    }
+
+    /// The most stream readers the receive task held at once. Tests only.
+    #[cfg(test)]
+    pub(in crate::transport::quic) fn readers_peak(&self) -> Arc<AtomicUsize> {
+        self.readers_peak.clone()
+    }
+
     /// The connection's gap count.
     pub(in crate::transport::quic) fn ranges(&self) -> Arc<ConnRanges> {
         self.ranges.clone()
@@ -346,6 +375,10 @@ impl<T: TimeSource> Receiver<T> {
             accept_data,
             rtt: Arc::new(PathRtt::new(closer.rtt())),
             closer,
+            refused_data: AtomicBool::new(false),
+            refused_kind: parking_lot::Mutex::new(None),
+            #[cfg(test)]
+            readers_peak: Arc::new(AtomicUsize::new(0)),
             ranges: Arc::new(ConnRanges::new(
                 MAX_GAPS_PER_CONNECTION,
                 super::super::config::MAX_UNI_STREAMS as usize,
@@ -587,8 +620,27 @@ pub(in crate::transport::quic) async fn receive<T: TimeSource>(
     // task that reads, so the meter's evaluations never run concurrently.
     let meter = receiver.meter.clone();
     let mut sending = std::pin::pin!(send_progress(&meter));
+    // The close after a refused data frame: one per connection, armed here
+    // rather than held by each refused reader, so the readers stay within the
+    // peer's stream grant.
+    let mut refusal_close: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>> =
+        None;
     loop {
+        if refusal_close.is_none() && receiver.refused_data.load(Ordering::Relaxed) {
+            refusal_close = Some(receiver.time.sleep(REFUSAL_CLOSE_DELAY));
+        }
+        #[cfg(test)]
+        receiver
+            .readers_peak
+            .fetch_max(readers.len(), Ordering::Relaxed);
         tokio::select! {
+            // The precondition makes this arm run only while a close is armed,
+            // and `select!` evaluates it before polling the arm, so the
+            // `expect` cannot fire.
+            () = async { refusal_close.as_mut().expect("the precondition checks it is armed").await }, if refusal_close.is_some() => {
+                refusal_close = Some(Box::pin(std::future::pending()));
+                receiver.close_refusing_data();
+            }
             () = &mut sending => {
                 if let Some(meter) = &meter {
                     meter.maybe_evaluate(receiver.time.now_nanos());
@@ -2101,24 +2153,12 @@ async fn read_one<T: TimeSource>(
             .stats
             .record(QuicInboundOutcome::RefusedNotAcceptingData);
         reader.stop(stop_code::NOT_ACCEPTING_DATA);
-        // The close waits, in this reader alone, so the stops already sent reach
-        // the sender first: a sender that sees the close before a stream's stop
-        // reads the stream as lost and drops it, where the stop sends it on UDP.
-        // Every refused frame's reader waits and then asks; `QuicCloser::close`
-        // is at most once per connection and a no-op once it has ended, so the
-        // first close is the only one counted and logged. The waits are bounded
-        // by the peer's stream credit and end with the connection.
-        receiver.time.sleep(REFUSAL_CLOSE_DELAY).await;
-        if receiver.closer.close(QuicCloseCode::Downgrade) {
-            receiver
-                .stats
-                .record(QuicInboundOutcome::ClosedRefusingData);
-            tracing::warn!(
-                kind = ?header.kind(),
-                "QUIC path: the peer sent data on a path where this node did not \
-                 set its data bit; closing the path so the peer falls back to UDP"
-            );
-        }
+        // The close waits, so the stops already sent reach the sender first: a
+        // sender that sees the close before a stream's stop reads the stream as
+        // lost and drops it, where the stop sends it on UDP. The receive task
+        // arms it once per connection ([`receive`]); this reader ends here.
+        receiver.refused_kind.lock().get_or_insert(header.kind());
+        receiver.refused_data.store(true, Ordering::Relaxed);
         return;
     }
     match header.kind() {

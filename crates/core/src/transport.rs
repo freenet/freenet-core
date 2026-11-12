@@ -544,6 +544,15 @@ pub(in crate::transport) enum QuicRefusal {
     /// its QUIC buffer budget than it allows. Fall back to UDP.
     #[error("the peer closed the path for holding more than its budget")]
     OverBudget,
+    /// The peer closed a native connection with
+    /// `close_code::VERSION_INCOMPATIBLE`: its version and this node's cannot
+    /// talk to each other.
+    #[error("the peer's version is incompatible with this node's")]
+    VersionIncompatible,
+    /// The peer closed a native connection with `close_code::HELLO_REFUSED`:
+    /// it could not read this node's `Hello`.
+    #[error("the peer refused this node's Hello")]
+    HelloRefused,
     /// The peer closed with `close_code::IDENTITY_MISMATCH`: the key this
     /// node proved is not the one the peer has on record for it.
     #[error("the peer reported an identity mismatch")]

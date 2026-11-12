@@ -5423,9 +5423,59 @@ fn a_shadow_path_refuses_data_before_charging_the_budget_and_closes() {
     })
 }
 
+/// Refused data frames on a shadow path never leave more stream readers alive
+/// at once than the path's stream grant: the path's one delayed close is armed
+/// by the receive task, not held by each refused reader. The close still
+/// follows, once.
+#[test]
+fn refused_data_readers_stay_within_the_shadow_stream_grant() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths_with("quic-path-refused-churn", QuicPathLimits::SHADOW, None).await;
+        let (conn, time) = (p.a.quinn_connection(), p.time());
+        let mut frame = FrameHeader::short(10)
+            .expect("a short header")
+            .encode()
+            .to_vec();
+        frame.extend_from_slice(&[7; 10]);
+        let opened = p
+            .drive(async move {
+                let start = time.now_nanos();
+                let window = (inbound::REFUSAL_CLOSE_DELAY / 2).as_nanos() as u64;
+                let mut opened = 0usize;
+                // 2,000 streams inside the close delay: 500 times the grant.
+                while opened < 2_000 && time.now_nanos() - start < window {
+                    let Ok(mut send) = conn.open_uni().await else {
+                        break;
+                    };
+                    if send.write_all(&frame).await.is_err() || send.finish().is_err() {
+                        break;
+                    }
+                    opened += 1;
+                }
+                time.sleep(inbound::REFUSAL_CLOSE_DELAY * 2).await;
+                opened
+            })
+            .await;
+        let stats = p.b.stats();
+        let refused = stats.count(QuicInboundOutcome::RefusedNotAcceptingData);
+        assert!(
+            refused >= 50 * super::super::config::INITIAL_UNI_STREAMS as u64,
+            "premise: the peer churned its streams ({refused} refused, {opened} opened)"
+        );
+        let peak = p.b.inbound_readers_peak();
+        assert!(
+            peak <= super::super::config::INITIAL_UNI_STREAMS as usize,
+            "{peak} readers alive at once, {refused} refused"
+        );
+        assert_eq!(stats.count(QuicInboundOutcome::ClosedRefusingData), 1);
+        assert!(p.b.quinn_connection().close_reason().is_some());
+    })
+}
+
 /// A path that ends inside the refusal's close delay is not closed again: no
-/// `ClosedRefusingData` is counted, and the receiver's reader for the refused
-/// frame ends with the connection.
+/// `ClosedRefusingData` is counted, and the close armed by the receive task
+/// ends with the connection.
 #[test]
 fn a_path_that_ends_inside_the_refusal_delay_is_not_closed_again() {
     bounded(|| async move {

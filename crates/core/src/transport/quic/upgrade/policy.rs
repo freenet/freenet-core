@@ -41,6 +41,17 @@ use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 /// release that puts it in the slice. `quic-data-percent` replaces it on one node.
 pub(in crate::transport) const QUIC_DATA_PERCENT: u8 = 0;
 
+/// Whether this node, as configured, may carry data on QUIC: `transport-quic`
+/// is `prefer` and its share of pairs (`quic-data-percent`, or
+/// [`QUIC_DATA_PERCENT`]) is above 0. While it is not, its QUIC paths are
+/// shadow paths, which take no data and cost only the fixed charge, so the
+/// connection limit is not lowered for QUIC memory
+/// (`NetworkApiConfig::connection_limit`).
+pub(crate) fn may_carry_data(config: &NetworkApiConfig) -> bool {
+    configured_mode(config) == QuicMode::Prefer
+        && config.quic_data_percent().unwrap_or(QUIC_DATA_PERCENT) > 0
+}
+
 /// Whether this build reads data from a QUIC path. It does: `PeerConnection::recv`
 /// drains the session's data channels, so a node that says it accepts data delivers
 /// a peer's frames. While this is `false`, [`QuicPolicy::own_caps`] returns 0
@@ -309,7 +320,7 @@ fn set_to_off(config: &NetworkApiConfig) -> bool {
 /// each says so in its own line), the share of
 /// pairs `prefer` negotiates data with (INFO), and, with QUIC on, a
 /// `quic-data-percent` (WARN) or `quic-max-paths` (WARN) that cannot be parsed, or
-/// a `quic-max-paths` lowered to `max-number-of-connections` (INFO). In a build
+/// a `quic-max-paths` lowered to the node's connection limit (INFO). In a build
 /// that aborts on panic QUIC stays off whatever the
 /// configuration (`QuicEndpoint::bind` refuses), and after the mode line only
 /// that is reported (WARN).
@@ -356,18 +367,19 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
              this release's share of pairs"
         );
     }
+    let max_connections = config.connection_limit().max;
     match config.quic_max_paths_setting() {
         QuicMaxPathsSetting::Unset => {}
         QuicMaxPathsSetting::Invalid(raw) => tracing::warn!(
             quic_max_paths = %raw,
-            default = config.max_connections,
-            "quic-max-paths is not a whole number and is ignored; using \
-             max-number-of-connections"
+            default = max_connections,
+            "quic-max-paths is not a whole number and is ignored; using the connection \
+             limit"
         ),
-        QuicMaxPathsSetting::Set(limit) if limit > config.max_connections => tracing::info!(
+        QuicMaxPathsSetting::Set(limit) if limit > max_connections => tracing::info!(
             quic_max_paths = limit,
-            max_connections = config.max_connections,
-            "quic-max-paths is above max-number-of-connections and is lowered to it"
+            max_connections,
+            "quic-max-paths is above the connection limit and is lowered to it"
         ),
         QuicMaxPathsSetting::Set(_) => {}
     }
@@ -376,21 +388,6 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// No release carries data on QUIC by default until the node's memory
-    /// aggregate sums the QUIC buffer budget (growth above the floors), the
-    /// fixed charge per connection and each data path's floor grant
-    /// (`declared_caches_plus_hosting_budget_leave_room_for_the_runtime`;
-    /// all are outside the aggregate until then, #5940 buffer-budget PR 5).
-    /// The PR that sums them removes this test; a PR that raises the share
-    /// without summing them fails here.
-    #[test]
-    fn no_data_share_before_the_quic_budget_is_summed() {
-        assert_eq!(
-            QUIC_DATA_PERCENT, 0,
-            "QUIC data needs the buffer budget summed in the node's memory aggregate first"
-        );
-    }
 
     const AVAILABILITIES: [QuicAvailability; 4] = [
         QuicAvailability::Disabled,
@@ -543,9 +540,9 @@ mod tests {
     }
 
     /// The policy takes its mode and limit from the config: the limit is
-    /// `quic-max-paths` lowered to
-    /// `max-number-of-connections`, and an unparsable value means the
-    /// default.
+    /// `quic-max-paths` lowered to the node's connection limit
+    /// (`max-number-of-connections` here, as mode `off` carries no data), and
+    /// an unparsable value means the default.
     #[test]
     fn the_policy_reads_mode_and_limit_from_the_config() {
         let up = || QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
@@ -580,8 +577,41 @@ mod tests {
         assert_eq!(
             build("shadow", Some(&above)).permits().limit(),
             max_connections,
-            "lowered to max-number-of-connections"
+            "lowered to the connection limit (max-number-of-connections, as shadow carries no data)"
         );
+    }
+
+    /// `may_carry_data` (what lowers the connection limit) holds exactly when
+    /// `own_caps` can give some pair the data bit, so the two rules cannot
+    /// drift: for each mode and share, over 400 pairs (at 5% the chance that
+    /// none is in the slice is under 1e-8).
+    #[test]
+    fn may_carry_data_matches_the_data_bit_rule() {
+        use crate::transport::TransportKeypair;
+        let pairs: Vec<_> = (0..400)
+            .map(|_| {
+                (
+                    TransportKeypair::new().public().clone(),
+                    TransportKeypair::new().public().clone(),
+                )
+            })
+            .collect();
+        for mode in ["off", "shadow", "prefer"] {
+            for percent in [None, Some("0"), Some("5"), Some("50"), Some("100")] {
+                let mut config = config(mode, None);
+                config.quic_data_percent = percent.map(str::to_string);
+                let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+                let policy = QuicPolicy::new(&config, BreakerOutcome::NotConsulted, up);
+                let some_pair_carries = pairs
+                    .iter()
+                    .any(|(local, peer)| policy.own_caps(local, peer) & caps::DATA != 0);
+                assert_eq!(
+                    may_carry_data(&config),
+                    some_pair_carries,
+                    "{mode} {percent:?}"
+                );
+            }
+        }
     }
 
     /// The data bit needs `prefer`, the peer in the slice, and the key or the
@@ -742,7 +772,7 @@ mod tests {
     fn startup_reports_prefer_and_max_paths() {
         const PREFER: &str = "negotiates data with this share of pairs";
         const INVALID: &str = "quic-max-paths is not a whole number";
-        const LOWERED: &str = "quic-max-paths is above max-number-of-connections";
+        const LOWERED: &str = "quic-max-paths is above the connection limit";
         let above = (config("off", None).max_connections + 1).to_string();
         for (mode, max_paths, expected) in [
             ("off", None, None),

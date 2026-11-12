@@ -899,11 +899,13 @@ node-wide budget (`quic::budget`, `quic_buffer_budget_for`, memory / 16)
 shared max-min between the paths; what does not scale with the windows is a
 fixed charge per connection (`quic::config::QUIC_CONNECTION_CHARGE_BYTES`).
 The budget holds only growth, so the node's QUIC memory is data paths x
-(fixed charge + floor grant) + budget. All of it is in `NOT_SUMMED`
-until the buffer budget's aggregate-accounting step sums those terms, which must
-happen before any release sets `QUIC_DATA_PERCENT` above 0 (pinned by
-`upgrade::policy::tests::no_data_share_before_the_quic_budget_is_summed`;
-shadow paths, on by default since Step 2, carry no data). Do not copy the per-connection
+(fixed charge + floor grant) + budget. It is not in `declared_cache_ceiling`
+(caches keep their own half-of-memory rule): it is the transport share,
+`quic::config::quic_memory_ceiling_terms`, summed at the QUIC connection cap
+with the caches and the hosting budget in
+`declared_caches_plus_hosting_budget_leave_room_for_the_runtime`. The node's
+connection limit is lowered to that cap while it may carry QUIC data, so the
+bound holds when data is on. Do not copy the per-connection
 exception shape for memory the node holds on its own initiative.
 
 ```bash

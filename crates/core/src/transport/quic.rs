@@ -45,6 +45,7 @@ pub(crate) mod error;
 pub(crate) mod framing;
 pub(crate) mod identity;
 pub(crate) mod liveness;
+pub(crate) mod native;
 #[cfg(any(test, feature = "quic-panic-injection"))]
 pub(crate) mod panic_injection;
 pub(crate) mod path;
@@ -1247,6 +1248,14 @@ impl QuicCloser {
     /// close the connection's watcher makes on Down, and a close after a
     /// panic that left the endpoint Released.
     pub(crate) fn close(&self, code: QuicCloseCode) -> bool {
+        self.close_with_reason(code, code.reason())
+    }
+
+    /// [`Self::close`] with `reason` in place of the code's own text: the
+    /// native Hello exchange closes with `VERSION_INCOMPATIBLE` and this
+    /// node's 8 version bytes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn close_with_reason(&self, code: QuicCloseCode, reason: &[u8]) -> bool {
         if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return false;
         }
@@ -1256,7 +1265,7 @@ impl QuicCloser {
         if self.health.closes_can_be_sent() {
             TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
         }
-        self.connection.close(code.code().into(), code.reason());
+        self.connection.close(code.code().into(), reason);
         let _first = self.closed_with.set(code);
         true
     }
