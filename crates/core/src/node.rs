@@ -10998,11 +10998,15 @@ mod tests {
                     "{what} must note client-op progress"
                 );
             }
+            // The call spans lines once rustfmt splits its arguments, so
+            // match it with whitespace removed, comment lines left out.
+            let compact: String = fn_body(get, "\nasync fn assemble_and_cache_stream(")
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .flat_map(|l| l.split_whitespace())
+                .collect();
             assert!(
-                calls(
-                    fn_body(get, "\nasync fn assemble_and_cache_stream("),
-                    "assemble_noting_progress(handle.assemble()"
-                ),
+                compact.contains("assemble_noting_progress(handle.assemble(),"),
                 "GET stream assembly must go through assemble_noting_progress"
             );
             let assemble_and_cache = fn_body(get, "\nasync fn assemble_and_cache_stream(");

@@ -2193,26 +2193,27 @@ async fn claim_noting_progress<T>(claim: impl std::future::Future<Output = T>) -
 
 /// Await a stream's `assembly`, noting client-op progress (#5838) when it
 /// starts and whenever `received_fragments` has grown since the last
-/// check (once a second), with the transport's own stall window plus the
-/// check spacing, and with the tail window when assembly succeeds. The
+/// check (once a second), with the stream's own stall window
+/// (`fragment_gap`, `StreamHandle::fragment_gap_limit`: 5 s on the UDP
+/// transport, the source path's gap on a QUIC path) plus the check
+/// spacing, and with the tail window when assembly succeeds. The
 /// shutdown drain then keeps waiting for a client GET whose body is
 /// streaming in, and stops soon after the stream stalls. A no-op on the
 /// sub-op path, which has no client-op scope.
 async fn assemble_noting_progress<T, E>(
     assembly: impl std::future::Future<Output = Result<T, E>>,
     received_fragments: impl Fn() -> usize,
+    fragment_gap: std::time::Duration,
 ) -> Result<T, E> {
-    // The transport's own stall rule for an inbound stream, plus the
-    // one-second spacing of the checks below.
-    const FRAGMENT_WINDOW: std::time::Duration = std::time::Duration::from_secs(
-        crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT.as_secs() + 1,
-    );
+    // The stream's own stall rule, plus the one-second spacing of the
+    // checks below.
+    let fragment_window = fragment_gap + std::time::Duration::from_secs(1);
     let mut seen: Option<usize> = None;
     let result = await_with_ticks(assembly, || {
         let received = received_fragments();
         if seen.is_none_or(|seen| received > seen) {
             seen = Some(received);
-            crate::node::note_client_op_progress(FRAGMENT_WINDOW);
+            crate::node::note_client_op_progress(fragment_window);
         }
     })
     .await;
@@ -2296,25 +2297,30 @@ async fn assemble_and_cache_stream(
         }
     };
 
-    let bytes =
-        match assemble_noting_progress(handle.assemble(), || handle.received_fragments()).await {
-            Ok(b) => b,
-            Err(e) => {
-                // Read fragment counts BEFORE building the error (the WHERE
-                // signal). The inactivity / cancelled AGGREGATE counters are
-                // recorded by the transport `StreamHandle::assemble` site itself
-                // (which also covers relay receive paths), so they are NOT
-                // re-recorded here — only the per-op terminal-event cause is
-                // classified from the `StreamError` variant.
-                let fragments_received = Some(handle.received_fragments() as u32);
-                let total_fragments = Some(handle.total_fragments() as u32);
-                return Err(AssemblyFailure::from_failure(
-                    &StreamFailure::Assembly(e),
-                    fragments_received,
-                    total_fragments,
-                ));
-            }
-        };
+    let bytes = match assemble_noting_progress(
+        handle.assemble(),
+        || handle.received_fragments(),
+        handle.fragment_gap_limit(),
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            // Read fragment counts BEFORE building the error (the WHERE
+            // signal). The inactivity / cancelled AGGREGATE counters are
+            // recorded by the transport `StreamHandle::assemble` site itself
+            // (which also covers relay receive paths), so they are NOT
+            // re-recorded here — only the per-op terminal-event cause is
+            // classified from the `StreamError` variant.
+            let fragments_received = Some(handle.received_fragments() as u32);
+            let total_fragments = Some(handle.total_fragments() as u32);
+            return Err(AssemblyFailure::from_failure(
+                &StreamFailure::Assembly(e),
+                fragments_received,
+                total_fragments,
+            ));
+        }
+    };
 
     // Assembly succeeded: every expected fragment is present.
     let fragments_received = Some(handle.received_fragments() as u32);
@@ -7072,7 +7078,11 @@ mod tests {
         let counter = fragments.clone();
         crate::node::with_client_op_drain(
             guard.drain_handle(),
-            assemble_noting_progress(assembly, move || counter.load(Ordering::SeqCst)),
+            assemble_noting_progress(
+                assembly,
+                move || counter.load(Ordering::SeqCst),
+                crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT,
+            ),
         )
         .await
         .unwrap();
@@ -7121,10 +7131,15 @@ mod tests {
             "assemble_and_cache_stream must claim the stream via \
              orphan_stream_registry().claim_or_wait()"
         );
-        // Assembly runs through `assemble_noting_progress` (#5838).
+        // Assembly runs through `assemble_noting_progress` (#5838), with the
+        // stream's own gap limit, which is not 5 s on a QUIC path.
+        let compact: String = body.split_whitespace().collect();
         assert!(
-            body.contains("assemble_noting_progress(handle.assemble()") && body.contains(".await"),
-            "assemble_and_cache_stream must await stream assembly"
+            compact.contains(
+                "assemble_noting_progress(handle.assemble(),||handle.received_fragments(),handle.fragment_gap_limit(),)"
+            ) && body.contains(".await"),
+            "assemble_and_cache_stream must await stream assembly, noting \
+             progress against the stream's own gap limit"
         );
         assert!(
             body.contains("GetStreamingPayload") && body.contains("bincode::deserialize"),

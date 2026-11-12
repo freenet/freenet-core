@@ -1201,6 +1201,11 @@ pub(crate) struct QuicCloser {
 }
 
 impl QuicCloser {
+    /// The connection's smoothed round trip, as quinn estimates it.
+    pub(crate) fn rtt(&self) -> std::time::Duration {
+        self.connection.rtt()
+    }
+
     fn new(connection: quinn::Connection, health: Arc<EndpointHealth>) -> Self {
         Self {
             connection,

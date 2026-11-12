@@ -131,7 +131,9 @@ use crate::transport::peer_connection::inbound_budget::{
     BudgetRejection, InboundKey, InboundStreamBudget, LegacyStreamToken, Liveness, Releaser,
     SharedInboundBudget,
 };
-use crate::transport::peer_connection::streaming::{StreamError, StreamHandle};
+use crate::transport::peer_connection::streaming::{
+    PathRtt, QuicSource, QuicSourceEnd, QuicSourcePath, StreamError, StreamHandle,
+};
 use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
 use crate::transport::peer_connection::{
     fits_one_packet, inbound_stream_age_limit, streaming_handle_idle_timeout,
@@ -214,7 +216,11 @@ pub(in crate::transport::quic) struct Receiver<T> {
     /// The peer's uni-stream limit, lowered while one-packet Shorts wait for
     /// room ([`StreamLimit`]).
     stream_limit: StreamLimit,
-    /// Panic on the next stream, to test the supervisor.
+    /// The connection's round trip, for the consumers of the streams it
+    /// fills (`StreamHandle::fragment_gap_limit`): set at each stream
+    /// admitted and at each tick of the path's acknowledgement watch.
+    rtt: Arc<PathRtt>,
+    /// Panic on the next short message, to test the supervisor.
     #[cfg(test)]
     pub(in crate::transport::quic) panic_on_stream: bool,
 }
@@ -247,6 +253,12 @@ impl<T: TimeSource> Receiver<T> {
     /// Tell `meter` of every read from now on. Before any stream is read.
     pub(in crate::transport::quic) fn set_meter(&mut self, meter: Arc<ConnMeter>) {
         self.meter = Some(meter);
+    }
+
+    /// The connection's round trip as the receiver keeps it, for the path's
+    /// acknowledgement watch to keep current.
+    pub(in crate::transport::quic) fn path_rtt(&self) -> Arc<PathRtt> {
+        self.rtt.clone()
     }
 
     /// Replace the gap cap, before any stream is read. Tests only.
@@ -282,6 +294,7 @@ impl<T: TimeSource> Receiver<T> {
             controls,
             next_short_key: AtomicU32::new(1),
             accept_data,
+            rtt: Arc::new(PathRtt::new(closer.rtt())),
             closer,
             ranges: Arc::new(ConnRanges::new(
                 MAX_GAPS_PER_CONNECTION,
@@ -497,6 +510,9 @@ struct BodyReader<T: TimeSource> {
     meter: Option<Arc<ConnMeter>>,
     /// Bytes read but not yet taken ([`Self::read_exact`]).
     staging: Staging,
+    /// The admitted `Stream`'s source, where a failure records why the
+    /// stream ended, for consumers that assemble it ([`Receiver::fail`]).
+    source: Option<Arc<QuicSource>>,
 }
 
 impl<T: TimeSource> BodyReader<T> {
@@ -531,6 +547,7 @@ impl<T: TimeSource> BodyReader<T> {
             conn_ranges,
             meter,
             staging: Staging::new(conn_staging),
+            source: None,
         }
     }
 
@@ -1582,8 +1599,12 @@ impl Rechunker {
 }
 
 /// Owns the reader's handle (or token) of a charged stream: on drop it
-/// cancels the handle if the stream did not complete, drops it, and then
-/// releases the charge if no other clone is left. The reader keeps no
+/// cancels the handle if the stream did not complete, recording on the
+/// stream's source that the reader stopped (a reason a failure recorded
+/// first stays; forks, which do not see the cancel, see this), drops it, and
+/// then releases the charge if no other clone is left. It drops however the
+/// reader ends: a return, a panic in its task, or the path or connection
+/// dropping the reader. The reader keeps no
 /// clone of its own, so the guard's is the last one the reader holds.
 struct StreamGuard {
     budget: SharedInboundBudget,
@@ -1606,6 +1627,7 @@ impl Drop for StreamGuard {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.take() {
             if !self.complete {
+                handle.end_quic_source(QuicSourceEnd::Ended);
                 handle.cancel();
             }
         }
@@ -1616,10 +1638,6 @@ impl Drop for StreamGuard {
 
 /// Read one stream: its header, then by kind.
 async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver<T>>) {
-    #[cfg(test)]
-    if receiver.panic_on_stream {
-        panic!("test: the receive task panics");
-    }
     let mut reader = BodyReader::new(
         recv,
         receiver.time.clone(),
@@ -1636,6 +1654,12 @@ async fn read_one<T: TimeSource>(recv: quinn::RecvStream, receiver: Arc<Receiver
             return;
         }
     };
+    // On a short message only, so a test can have a stream in progress
+    // when the task panics.
+    #[cfg(test)]
+    if receiver.panic_on_stream && matches!(&header, Ok(h) if h.kind() == FrameKind::Short) {
+        panic!("test: the receive task panics");
+    }
     let header = match header {
         Ok(header) => {
             let body = match header.kind() {
@@ -1709,6 +1733,20 @@ impl<T: TimeSource> Receiver<T> {
     /// Count a failed read and stop the stream where that tells the sender
     /// something.
     fn fail(&self, reader: &mut BodyReader<T>, failure: ReadFailure, charged: Charged) {
+        if let Some(source) = &reader.source {
+            source.end(match failure {
+                ReadFailure::Idle => QuicSourceEnd::Idle,
+                ReadFailure::Age => QuicSourceEnd::Age,
+                ReadFailure::Truncated(_)
+                | ReadFailure::Overlong
+                | ReadFailure::Reset
+                | ReadFailure::ConnectionLost
+                | ReadFailure::TooManyRanges
+                | ReadFailure::Overlap
+                | ReadFailure::StagedOverCap
+                | ReadFailure::Other => QuicSourceEnd::Ended,
+            });
+        }
         let stats = &self.stats;
         match failure {
             ReadFailure::Truncated(_) => stats.record(QuicInboundOutcome::Truncated),
@@ -1964,7 +2002,9 @@ impl<T: TimeSource> Receiver<T> {
             }
             // Allocates only the buffer's chunk table (see
             // `LockFreeStreamBuffer`); slots come as fragments arrive.
-            let handle = StreamHandle::new(stream_id, total);
+            // A QUIC-fed handle: its consumers wait on this reader's rules,
+            // not the UDP transport's 5 s fragment gap.
+            let handle = StreamHandle::new_quic(stream_id, total);
             budget.charge(
                 key,
                 total,
@@ -1984,6 +2024,15 @@ impl<T: TimeSource> Receiver<T> {
             complete: false,
         };
         reader.set_age_limit(inbound_stream_age_limit(total));
+        reader.source = guard.handle().quic_source().cloned();
+        if let Some(source) = &reader.source {
+            // The round trip as of this stream; the watch keeps it current.
+            self.rtt.set(self.closer.rtt());
+            source.set_path(QuicSourcePath {
+                rtt: self.rtt.clone(),
+                idle: Duration::from_nanos(reader.idle_nanos),
+            });
+        }
         let payload_start = (HEADER_LEN as u64) + u64::from(header.metadata_len());
         let mut rechunker = Rechunker::new(total);
         let metadata = match header.metadata_len() {
