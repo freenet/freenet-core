@@ -1798,11 +1798,12 @@ impl TransportMetrics {
     /// set after it replaces it.
     pub(crate) fn set_quic_endpoint_state(&self, state: QuicEndpointState) {
         let died = QuicEndpointState::Died as u8;
-        let _ = self.quic_endpoint_state.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| (current != died).then_some(state as u8),
-        );
+        // An `Err` is a death already recorded, which stays.
+        self.quic_endpoint_state
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current != died).then_some(state as u8)
+            })
+            .ok();
     }
 
     /// The QUIC endpoint's state as last recorded.
@@ -3076,16 +3077,6 @@ impl TransportMetrics {
     }
 }
 
-/// Periodic transport metrics snapshot.
-///
-/// Emitted every N seconds to provide aggregate transport layer statistics
-/// without flooding the telemetry server with per-transfer events.
-///
-/// # Sentinel Values
-///
-/// - `min_cwnd_bytes`: 0 indicates no cwnd samples were recorded
-/// - `min_rtt_us`: 0 indicates no RTT samples were recorded
-/// - Other fields: 0 is a valid value indicating no activity for that metric
 /// The node's QUIC endpoint state for telemetry: whether it is up, and if
 /// not, why. The telemetry gate for removing the UDP transport counts nodes
 /// whose endpoint is up, not nodes on a release that has one (#5940).
@@ -3146,6 +3137,16 @@ impl QuicEndpointState {
     }
 }
 
+/// Periodic transport metrics snapshot.
+///
+/// Emitted every N seconds to provide aggregate transport layer statistics
+/// without flooding the telemetry server with per-transfer events.
+///
+/// # Sentinel Values
+///
+/// - `min_cwnd_bytes`: 0 indicates no cwnd samples were recorded
+/// - `min_rtt_us`: 0 indicates no RTT samples were recorded
+/// - Other fields: 0 is a valid value indicating no activity for that metric
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct TransportSnapshot {
