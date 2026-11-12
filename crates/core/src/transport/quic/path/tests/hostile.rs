@@ -56,6 +56,8 @@ struct HonestRun {
     b_stops: StagingStops,
     /// Either side's connection closed.
     closed: bool,
+    /// Virtual time from the first send to the last one ending.
+    took: Duration,
     /// How the sends ended, by outcome.
     send_outcomes: std::collections::BTreeMap<String, usize>,
     staged: StagedPeak,
@@ -123,7 +125,8 @@ async fn honest_bulk_both_ways(
     let loss = seeded_loss_from(network, loss_percent, seed, Some(one_way));
     let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
     let (a_watch, b_watch) = (p.a.clone(), p.b.clone());
-    let (outcomes, staged) = p
+    let started = time.now_nanos();
+    let (outcomes, staged, ended) = p
         .drive(async move {
             let mut sends = Vec::new();
             for index in 0..BULK_STREAMS {
@@ -162,7 +165,8 @@ async fn honest_bulk_both_ways(
                 outcomes.push(format!("{:?}", send.await.expect("send task")));
             }
             done.store(true, std::sync::atomic::Ordering::Relaxed);
-            (outcomes, sampler.await.expect("sampler"))
+            let ended = time.now_nanos();
+            (outcomes, sampler.await.expect("sampler"), ended)
         })
         .await;
     let mut send_outcomes = std::collections::BTreeMap::<String, usize>::new();
@@ -209,6 +213,7 @@ async fn honest_bulk_both_ways(
             || p.b.connection().inner().close_reason().is_some(),
         send_outcomes,
         staged,
+        took: Duration::from_nanos(ended - started),
     }
 }
 
