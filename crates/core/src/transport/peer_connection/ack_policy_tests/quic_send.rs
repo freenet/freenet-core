@@ -105,15 +105,18 @@ impl Rig {
         self.ack(&[]).await;
     }
 
-    /// Fill every uni stream the peer allows with one it is still reading. The
-    /// next send on the path cannot open a stream.
+    /// Fill every uni stream the peer allows with one it is still reading,
+    /// whatever its limit now (`config::DATA_START_UNI_STREAMS` on a fresh
+    /// data path). The next send on the path cannot open a stream.
     fn hold_stream_credit(&self) -> impl Future<Output = Vec<quinn::SendStream>> + use<> {
         let connection = self.route.path().connection().inner().clone();
         let time = self.path.time.clone();
         async move {
+            // Let the peer's limit reach this side.
+            time.sleep(Duration::from_millis(50)).await;
             let mut held = Vec::new();
-            for _ in 0..MAX_UNI_STREAMS {
-                let mut stream = connection.open_uni().await.expect("open");
+            while let Some(stream) = futures::FutureExt::now_or_never(connection.open_uni()) {
+                let mut stream = stream.expect("open");
                 let header =
                     FrameHeader::stream(StreamId::next(), 1000, 0).expect("a valid header");
                 stream.write_all(&header.encode()).await.expect("header");
@@ -923,7 +926,8 @@ fn a_busy_relay_whose_transfers_are_acknowledged_keeps_its_path() {
 fn permits_held_with_nothing_acknowledged_close_the_path() {
     run(
         "quic-send-held-permits",
-        QuicPathLimits::DEFAULT,
+        // Every permit held needs a peer at the full stream limit.
+        QuicPathLimits::FULL_STREAMS,
         |mut rig| async move {
             let silenced = DropFrom::new("quic-send-held-permits", &[rig.path.peer_addr()]);
             for _ in 0..STREAMED_SEND_LIMIT {
@@ -1443,6 +1447,7 @@ fn quic_source_on_path(total: usize, rtt: Duration) -> StreamHandle {
         .set_path(QuicSourcePath {
             rtt: Arc::new(PathRtt::new(rtt)),
             idle: Duration::from_secs(30),
+            throttle: None,
         });
     handle
 }

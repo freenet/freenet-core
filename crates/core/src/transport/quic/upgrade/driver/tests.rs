@@ -938,6 +938,63 @@ fn a_connection_without_a_route_takes_no_lock_to_send() {
     });
 }
 
+/// The driver reserves a control frame's stream when it acts on the frame,
+/// before the task that sends it has run (`QuicPath::control_first`): a
+/// client's `ReadyAck` goes out in the step that enables its data, and a
+/// reservation taken only when the task is first polled would let data sends
+/// spawned in that step take the peer's stream slots first. The test runtime
+/// is single-threaded, so no task runs until the test yields.
+#[test]
+fn a_control_send_reserves_its_stream_before_its_task_runs() {
+    use crate::transport::quic::control::QuicControl;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server_with("quic-driver-control-first", "prefer", Some("100")).await;
+        let (session, inbox) = h.session();
+        let attempt = offered(&h, &session);
+        let up = path_up(&h, &session, inbox);
+        let time = h.pair.time.clone();
+        let (_peer_path, mut peer_inbound, _inbox) =
+            drive(&h.pair.time, Duration::from_secs(60), async move {
+                let up = up.await;
+                time.sleep(Duration::from_secs(1)).await;
+                up
+            })
+            .await;
+        let path = session
+            .state
+            .lock()
+            .attempt
+            .as_ref()
+            .and_then(|held| held.path.clone())
+            .expect("the path is up");
+        assert!(
+            peer_inbound.controls.try_recv().is_ok(),
+            "the Ready arrived"
+        );
+        assert_eq!(path.controls_reserved(), 0, "the Ready has its stream");
+        session.send_control(
+            &mut session.state.lock(),
+            QuicControl::Ready { attempt, caps: 0 },
+        );
+        assert_eq!(
+            path.controls_reserved(),
+            1,
+            "reserved before the send task ran"
+        );
+        let time = h.pair.time.clone();
+        drive(&h.pair.time, Duration::from_secs(60), async move {
+            time.sleep(Duration::from_secs(1)).await;
+        })
+        .await;
+        assert_eq!(path.controls_reserved(), 0, "released once sent");
+        assert!(
+            peer_inbound.controls.try_recv().is_ok(),
+            "the frame arrived"
+        );
+    });
+}
+
 /// `EnableData` builds one route per activation: a frame repeated by the peer
 /// changes nothing, and a second call is a bug the debug build catches.
 #[test]

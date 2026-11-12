@@ -671,6 +671,55 @@ fn concurrent_evaluations_stay_within_the_budget() {
     );
 }
 
+/// A path the budget holds below what it needs is throttled: a grow it needs
+/// that does not fit, or a shrink another path's growth asked of it. The
+/// throttle lasts `GROWING_FOR` past the last such evaluation and remembers
+/// when it began; a path that grows freely is never throttled.
+#[test]
+fn a_held_back_path_is_throttled_until_it_is_not() {
+    let total = 4 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let a = conn(&budget, 0);
+    let b = conn(&budget, 0);
+    let mut at = 10 * MS;
+    let mut window = FLOOR;
+    let mut first = None;
+    for _ in 0..12 {
+        let seen = deliver_window(&a, window, at);
+        window = seen.recv_window;
+        if seen.throttled && first.is_none() {
+            first = Some(at);
+        }
+        if first.is_none() {
+            assert!(a.meter.throttled_since(at).is_none(), "grew freely");
+        }
+        at += 10 * MS;
+    }
+    let began = first.expect("a reached the budget and was held back");
+    assert_eq!(a.meter.throttled_since(at - 10 * MS), Some(began));
+    // b's growth squeezes a, which then counts as throttled too.
+    let mut bw = FLOOR;
+    for _ in 0..12 {
+        bw = deliver_window(&b, bw, at).recv_window;
+        at += 10 * MS;
+    }
+    assert!(
+        a.meter.pending_shrink().is_some(),
+        "premise: b asked a to shrink"
+    );
+    let later = at + nanos(GROWING_FOR) * 2;
+    assert!(a.meter.throttled_since(later).is_none(), "premise: lapsed");
+    let seen = a.meter.evaluate(later).unwrap();
+    assert!(seen.throttled, "a shrink it was asked for throttles it");
+    assert_eq!(a.meter.throttled_since(later + MS), Some(later));
+    assert!(
+        a.meter
+            .throttled_since(later + nanos(GROWING_FOR) + MS)
+            .is_none(),
+        "the throttle lapses"
+    );
+}
+
 /// A shrink whose debt is then read lowers the staging cap, but never below
 /// what is staged, and the charge covers the cap as set: staged bytes are
 /// never over the cap or uncharged.
@@ -909,4 +958,32 @@ fn a_later_sender_reaches_its_share_once_the_squeezed_streams_end() {
             "{name}: {charge} short of its share {share}"
         );
     }
+}
+
+/// A stream-limit raise needs the budget charged at most three quarters
+/// (`QuicBudget::has_room`): a path growing into the budget takes the room
+/// away once its growth passes three quarters, and it comes back when the
+/// path's window decays.
+#[test]
+fn the_budget_has_room_for_a_stream_raise_up_to_three_quarters() {
+    let total = 4 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let a = conn(&budget, 0);
+    assert!(a.meter.budget_has_room(), "nothing charged");
+    let mut at = 10 * MS;
+    let mut window = FLOOR;
+    let mut was_room = true;
+    for _ in 0..12 {
+        window = deliver_window(&a, window, at).recv_window;
+        let charged = budget.running_total();
+        let room = a.meter.budget_has_room();
+        assert_eq!(
+            room,
+            charged * 4 <= total * 3,
+            "charged {charged} of {total}"
+        );
+        was_room &= room;
+        at += 10 * MS;
+    }
+    assert!(!was_room, "premise: the growth passed three quarters");
 }

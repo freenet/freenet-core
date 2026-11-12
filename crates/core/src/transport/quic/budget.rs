@@ -137,6 +137,11 @@ pub(crate) const WAITING_SHORT_BYTES: u64 = 1280;
 /// and the ramp gate needs them near zero at 5%).
 pub(crate) const STAGING_CREDIT_MULTIPLE: u64 = 2;
 
+/// The share of the budget, as (numerator, denominator), that may be
+/// charged when a data path's stream limit is raised: a raise is new load
+/// the node takes on, so it waits while the budget is mostly spent.
+pub(crate) const ROOM_FOR_A_STREAM_RAISE: (u64, u64) = (3, 4);
+
 /// A connection is window-limited when its contiguous delivery reached this
 /// share of a window per round trip.
 pub(crate) const LIMITED_PERCENT: u64 = 75;
@@ -389,6 +394,11 @@ impl ConnState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Evaluation {
     pub(crate) limited: bool,
+    /// The budget held the connection below what it needed: a grow it
+    /// needed was refused or cut short, or another path's growth shrank it.
+    /// The budget cannot tell why it was needed: a peer sending flat out
+    /// into the window it was given makes its own connection throttled.
+    pub(crate) throttled: bool,
     pub(crate) recv_window: u64,
     pub(crate) send_window: u64,
 }
@@ -407,6 +417,15 @@ impl QuicBudget {
 
     pub(crate) fn total(&self) -> u64 {
         self.total
+    }
+
+    /// The budget is charged at most three quarters
+    /// ([`ROOM_FOR_A_STREAM_RAISE`]): a data path's stream limit may be
+    /// raised (`path::inbound::StreamLimit`).
+    pub(crate) fn has_room(&self) -> bool {
+        let charged = self.state.lock().charged;
+        charged.saturating_mul(ROOM_FOR_A_STREAM_RAISE.1)
+            <= self.total.saturating_mul(ROOM_FOR_A_STREAM_RAISE.0)
     }
 
     /// Register a data path's connection at the floor windows, which are set
@@ -462,6 +481,8 @@ impl QuicBudget {
             evaluated_at: AtomicU64::new(now),
             interval: AtomicU64::new(nanos(MIN_EVALUATION_INTERVAL)),
             wake: tokio::sync::Notify::new(),
+            throttled_until: AtomicU64::new(0),
+            throttle_began: AtomicU64::new(0),
         }
     }
 
@@ -476,6 +497,12 @@ impl QuicBudget {
             .values_mut()
             .map(|conn| conn.charge().saturating_sub(grant))
             .sum()
+    }
+
+    /// Connections registered and not yet dropped. Tests only.
+    #[cfg(test)]
+    pub(crate) fn connections(&self) -> usize {
+        self.state.lock().conns.len()
     }
 
     /// The running total. Tests only.
@@ -548,6 +575,7 @@ impl QuicBudget {
         let state = &mut *guard;
         let mut changes = Changes::default();
         let send_target = cwnd.saturating_mul(2).clamp(self.floor, MAX_WINDOW_BYTES);
+        let mut throttled = false;
         let (limited, send_wants) = {
             let conn = state.conns.get_mut(&id)?;
             // Reads made before any change this evaluation makes, so they paid
@@ -560,6 +588,7 @@ impl QuicBudget {
                 if recv < conn.recv_window {
                     conn.set_recv(recv, &mut changes);
                     self.node.record_window_change(WindowChange::Shrank);
+                    throttled = true;
                 }
                 if send < conn.send_window {
                     conn.set_send(send, &mut changes);
@@ -631,6 +660,7 @@ impl QuicBudget {
                     .min(share)
                     .saturating_sub(allowed);
             }
+            throttled |= window < target;
         } else if conn.recv_window > self.floor
             && now.saturating_sub(conn.active_at) >= nanos(IDLE_DECAY)
         {
@@ -663,6 +693,7 @@ impl QuicBudget {
         }
         let result = Evaluation {
             limited,
+            throttled,
             recv_window: conn.recv_window,
             send_window: conn.send_window,
         };
@@ -835,6 +866,11 @@ pub(crate) struct ConnMeter {
     /// Woken by sends, so a path that only sends still has its send window
     /// evaluated ([`Self::send_progress`]).
     wake: tokio::sync::Notify,
+    /// Until when the connection counts as throttled, in nanoseconds
+    /// ([`Self::throttled_since`]).
+    throttled_until: AtomicU64,
+    /// When the current throttle began.
+    throttle_began: AtomicU64,
 }
 
 impl ConnMeter {
@@ -890,6 +926,17 @@ impl ConnMeter {
             self.control.congestion_window(),
             now,
         )?;
+        if result.throttled {
+            if self.throttled_until.load(Ordering::Relaxed) <= now {
+                self.throttle_began.store(now, Ordering::Relaxed);
+            }
+            let hold = self
+                .interval
+                .load(Ordering::Relaxed)
+                .max(nanos(GROWING_FOR));
+            self.throttled_until
+                .store(now.saturating_add(hold), Ordering::Relaxed);
+        }
         // After the budget's lock is released, in the order decided.
         if let Some(window) = changes.recv {
             self.control.set_receive_window(window);
@@ -903,10 +950,34 @@ impl ConnMeter {
         Some(result)
     }
 
+    /// When the budget began holding this connection below what it needs,
+    /// if it still does at `now`: an evaluation found it throttled
+    /// ([`Evaluation::throttled`]) within the last [`GROWING_FOR`] (or round
+    /// trip, if longer). Our decision, so its readers do not count the
+    /// slowdown it causes as the peer's idleness (buffer-budget design M6).
+    pub(crate) fn throttled_since(&self, now: u64) -> Option<u64> {
+        (now < self.throttled_until.load(Ordering::Relaxed))
+            .then(|| self.throttle_began.load(Ordering::Relaxed))
+    }
+
+    /// Count the connection as throttled from `began` until `until`. Tests
+    /// only, for the readers' side of a throttle.
+    #[cfg(test)]
+    pub(crate) fn throttle_for_test(&self, began: u64, until: u64) {
+        self.throttle_began.store(began, Ordering::Relaxed);
+        self.throttled_until.store(until, Ordering::Relaxed);
+    }
+
     /// The epoch a stream opened now holds until it ends, which keeps a
     /// shrunk send window charged while quinn may still hold its data.
     pub(crate) fn send_epoch(&self) -> Option<Arc<()>> {
         self.budget.send_epoch(self.id)
+    }
+
+    /// The node's buffer budget has room for a raise of this path's stream
+    /// limit ([`QuicBudget::has_room`]).
+    pub(crate) fn budget_has_room(&self) -> bool {
+        self.budget.has_room()
     }
 
     #[cfg(test)]

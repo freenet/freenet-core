@@ -22,7 +22,7 @@ use super::config::{
     QUIC_ACK_TAIL_BYTES, QUIC_CONNECTION_FIXED_BYTES, QUIC_MEMORY_MEASURED_WITH,
     QUIC_OPEN_STREAM_BYTES, QUIC_STOPPED_ENTRY_BYTES, QuicSettings,
 };
-use super::path::{QuicInbound, QuicPath};
+use super::path::{QuicInbound, QuicPath, QuicPathLimits};
 use super::tests::{SEED, bounded, drive};
 use super::{QuicConnection, QuicEndpoint};
 use crate::config::GlobalRng;
@@ -315,7 +315,8 @@ impl StreamRig {
         .await;
         let raw = client.inner().clone();
         let hold = |conn: QuicConnection, time: &VirtualTime| {
-            let (path, inbound) = QuicPath::new(conn, time.clone());
+            let (path, inbound) =
+                QuicPath::with_limits(conn, time.clone(), QuicPathLimits::FULL_STREAMS);
             Held {
                 _path: path,
                 _inbound: inbound,

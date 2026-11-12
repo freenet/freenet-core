@@ -179,9 +179,11 @@ use crate::transport::metrics::QuicCloseCode;
 /// ([`close_code::SEND_ABORT_LIMIT`]).
 ///
 /// A healthy path resets a send only when the send is cancelled (a caller's
-/// timeout) or its chunk source fails, both rare, so 4096 is far above what
-/// one does over a long life, and a path that gets there is closed and
-/// rebuilt with nothing lost but the upgrade. The `stopped` map entries the
+/// timeout), its chunk source fails, or a cancelled one-packet send finds
+/// `path::ACK_WAITS_WITHOUT_PERMIT` sends already waiting for their
+/// acknowledgement (a peer withholding acknowledgements), all rare, so 4096
+/// is far above what one does over a long life, and a path that gets there
+/// is closed and rebuilt with nothing lost but the upgrade. The `stopped` map entries the
 /// limit bounds are measured at under `config::QUIC_STOPPED_ENTRY_BYTES`
 /// (104 B) each, so at most 416 KiB per path, which the per-connection fixed
 /// charge (`config::QUIC_CONNECTION_CHARGE_BYTES`) takes in full. How often

@@ -3331,6 +3331,7 @@ mod tests {
             .set_path(QuicSourcePath {
                 rtt: Arc::new(PathRtt::new(Duration::from_millis(800))),
                 idle: Duration::from_secs(30),
+                throttle: None,
             });
         assert!(source.fragment_gap_limit() > Duration::from_secs(6));
         let pipe_task = GlobalExecutor::spawn(pipe_stream(

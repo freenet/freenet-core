@@ -140,11 +140,27 @@ impl PathRtt {
 }
 
 /// What the reader of a QUIC-fed stream tells its consumers: its path's
-/// round trip and its own idle limit, from which they take their gap.
+/// round trip and its own idle limit, from which they take their gap, and
+/// whether the node's buffer budget is throttling the path now.
 #[derive(Debug)]
 pub(crate) struct QuicSourcePath {
     pub(crate) rtt: Arc<PathRtt>,
     pub(crate) idle: std::time::Duration,
+    pub(crate) throttle: Option<ThrottleProbe>,
+}
+
+/// Whether the node's buffer budget is holding a QUIC path below what it
+/// needs now (`quic::budget::ConnMeter::throttled_since`). A consumer does
+/// not give up on a gap while it does: the slowdown is this node's own, and
+/// the reader, which ends the stream with a reason if the peer is the one
+/// idle, decides instead.
+#[derive(Clone)]
+pub(crate) struct ThrottleProbe(pub(crate) Arc<dyn Fn() -> bool + Send + Sync>);
+
+impl std::fmt::Debug for ThrottleProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ThrottleProbe")
+    }
 }
 
 /// The source of a QUIC-fed stream, shared by every clone and fork of its
@@ -177,6 +193,14 @@ impl QuicSource {
         self.path.get().map_or(STREAM_INACTIVITY_TIMEOUT, |path| {
             quic_fragment_gap(path.rtt.get(), path.idle)
         })
+    }
+
+    /// The buffer budget is throttling the stream's path now.
+    fn throttled(&self) -> bool {
+        self.path
+            .get()
+            .and_then(|path| path.throttle.as_ref())
+            .is_some_and(|probe| (probe.0)())
     }
 }
 
@@ -409,6 +433,13 @@ impl StreamHandle {
     /// stopped; `None` for the UDP transport.
     pub(crate) fn quic_source(&self) -> Option<&Arc<QuicSource>> {
         self.quic.as_ref()
+    }
+
+    /// Whether the node's buffer budget throttles this stream's QUIC path
+    /// now, as a consumer reads it. Tests only.
+    #[cfg(test)]
+    pub(crate) fn quic_path_throttled(&self) -> bool {
+        self.quic.as_ref().is_some_and(|quic| quic.throttled())
     }
 
     /// Record that the reader of a QUIC-fed stream stopped before the stream
@@ -773,6 +804,14 @@ impl StreamHandle {
                     }
                     if let Some(data) = self.buffer.assemble() {
                         return Ok(data);
+                    }
+                    // A QUIC-fed stream whose path the node's own budget is
+                    // throttling waits another gap: its reader pauses its
+                    // idle timer for the same throttle, and records an end
+                    // (waking this listener) if the peer is idle or the
+                    // stream reaches its age limit.
+                    if self.quic.as_ref().is_some_and(|quic| quic.throttled()) {
+                        continue;
                     }
                     tracing::warn!(
                         stream_id = %self.stream_id.0,
@@ -2044,6 +2083,59 @@ mod tests {
         assert_eq!(b.unwrap().len(), total as usize);
     }
 
+    /// A consumer of a QUIC-fed stream does not give up on a gap while the
+    /// node's buffer budget throttles the stream's path: with the throttle
+    /// on through a 20 s gap (four times the 5 s gap) it assembles; with it
+    /// off it times out at the gap.
+    #[tokio::test(start_paused = true)]
+    async fn a_quic_consumer_waits_out_a_gap_while_its_path_is_throttled() {
+        use super::super::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        for throttled in [true, false] {
+            let total = (FRAGMENT_PAYLOAD_SIZE * 2) as u64;
+            let on = Arc::new(AtomicBool::new(throttled));
+            let probe = on.clone();
+            let handle = StreamHandle::new_quic(make_stream_id(), total);
+            handle
+                .quic_source()
+                .expect("QUIC-fed")
+                .set_path(QuicSourcePath {
+                    rtt: Arc::new(PathRtt::new(Duration::from_millis(10))),
+                    idle: Duration::from_secs(30),
+                    throttle: Some(ThrottleProbe(Arc::new(move || {
+                        probe.load(Ordering::Relaxed)
+                    }))),
+                });
+            assert_eq!(handle.fragment_gap_limit(), STREAM_INACTIVITY_TIMEOUT);
+            let consumer = {
+                let handle = handle.clone();
+                tokio::spawn(async move { handle.assemble().await })
+            };
+            handle
+                .push_fragment(1, Bytes::from(vec![1u8; FRAGMENT_PAYLOAD_SIZE]))
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            on.store(false, Ordering::Relaxed);
+            // Pushed only if the consumer is still waiting.
+            if !consumer.is_finished() {
+                handle
+                    .push_fragment(2, Bytes::from(vec![2u8; FRAGMENT_PAYLOAD_SIZE]))
+                    .unwrap();
+            }
+            let result = consumer.await.unwrap();
+            if throttled {
+                assert_eq!(result.expect("assembled").len(), total as usize);
+            } else {
+                assert!(
+                    matches!(result, Err(StreamError::InactivityTimeout)),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
     /// When the reader of a QUIC-fed stream records why it stopped, every
     /// waiting consumer ends at once with that reason's error: a fork too,
     /// which does not share the handle's cancel. The first reason stays.
@@ -2153,6 +2245,7 @@ mod tests {
             .set_path(QuicSourcePath {
                 rtt: Arc::new(PathRtt::new(rtt)),
                 idle: std::time::Duration::from_secs(30),
+                throttle: None,
             });
         handle
     }
@@ -2186,6 +2279,7 @@ mod tests {
             .set_path(QuicSourcePath {
                 rtt: rtt.clone(),
                 idle: Duration::from_secs(30),
+                throttle: None,
             });
         rtt.set(Duration::from_secs(1));
         assert_eq!(moving.fragment_gap_limit(), Duration::from_secs(24));
