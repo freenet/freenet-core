@@ -1968,9 +1968,9 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   sent is NOT delivered. send_stream_chunks_bounded resets the stream if the
   source fails or delivers a different length, and takes nothing before the
   source's first chunk (no permit, no stream; a source that ends or fails first
-  opens no stream). quinn's MAX_UNI_STREAMS (64)
-  uni streams are the back-pressure (open_uni waits; quinn returns
-  credit only after more than an eighth of the limit is freed).
+  opens no stream). The peer's current uni-stream limit (16 on a data path,
+  rising to 64, MAX_UNI_STREAMS) is the back-pressure (open_uni waits; quinn
+  returns credit only after more than an eighth of the limit is freed).
   Slot reservation: send_stream_bounded / send_stream_chunks_bounded, and
   send_short_bounded for a message past one packet (fits_one_packet), each
   take one of the path's STREAMED_SEND_LIMIT semaphore permits before
@@ -2589,7 +2589,8 @@ QUIC receive flow (#5940 e5b-4):
   not hold the sender's flow-control credit; its end stays unread until it is
   announced. A Short waits BEFORE its end is read
   (reading the end frees the stream and returns its credit), so waiters are
-  capped by MAX_UNI_STREAMS. A Short of one packet or less
+  capped by this node's current stream limit for the peer (16 on a data
+  path, rising to 64). A Short of one packet or less
   (fits_one_packet) is not charged, as on UDP, and is bounded by that cap and
   the channel. A Stream arm with no registry
   cancels the handle and releases its charge.

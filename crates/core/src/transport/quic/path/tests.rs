@@ -7737,6 +7737,334 @@ fn a_local_cancel_keeps_a_pending_raise() {
     })
 }
 
+/// A frame kind for the raise tests below, written by hand: `Short` is kind
+/// 0 with no stream id, `Stream` kind 1 with a fresh id.
+#[derive(Clone, Copy)]
+enum Framed {
+    Short,
+    Stream,
+}
+
+impl Framed {
+    fn header(self, total: usize, metadata_len: u32) -> Vec<u8> {
+        match self {
+            Framed::Short => header(1, 0, 0, total as u64, 0),
+            Framed::Stream => header(1, 1, StreamId::next().0, total as u64, metadata_len),
+        }
+    }
+}
+
+/// The body length of the held and completing streams in the raise tests:
+/// more than one packet, so a Short of it is charged.
+const RAISE_TOTAL: usize = 4 * FRAGMENT_PAYLOAD_SIZE;
+
+/// Open `count` streams of `kind`, each with its header and 100 bytes, and
+/// hold them open.
+async fn hold_open(raw: &quinn::Connection, kind: Framed, count: usize) -> Vec<quinn::SendStream> {
+    let mut held = Vec::new();
+    for _ in 0..count {
+        let mut send = raw.open_uni().await.unwrap();
+        let mut bytes = kind.header(RAISE_TOTAL, 0);
+        bytes.extend_from_slice(&payload(100));
+        send.write_all(&bytes).await.unwrap();
+        held.push(send);
+    }
+    held
+}
+
+/// Write one whole stream of `kind` and `total` bytes, and finish it.
+async fn send_whole(raw: &quinn::Connection, kind: Framed, total: usize) {
+    let mut send = raw.open_uni().await.unwrap();
+    let mut bytes = kind.header(total, 0);
+    bytes.extend_from_slice(&payload(total));
+    send.write_all(&bytes).await.unwrap();
+    send.finish().unwrap();
+}
+
+/// The end of each raise test below: the held streams complete, then one
+/// more stream of `kind` completes alone. With the base's worth of streams
+/// busy at once before (the held ones and the stream the test ended), that
+/// raises the limit if, and only if, the ended stream did not start the run
+/// over: had it voted `Failed`, the held completions count for nothing, and
+/// the last stream, alone, does not saturate the limit.
+async fn complete_held_then_one(
+    held: Vec<quinn::SendStream>,
+    raw: quinn::Connection,
+    time: VirtualTime,
+    kind: Framed,
+) {
+    for mut send in held {
+        send.write_all(&payload(RAISE_TOTAL - 100)).await.unwrap();
+        send.finish().unwrap();
+    }
+    time.sleep(Duration::from_millis(500)).await;
+    send_whole(&raw, kind, RAISE_TOTAL).await;
+    time.sleep(Duration::from_millis(500)).await;
+}
+
+/// A Short dropped because the node's consumer of Shorts is gone votes
+/// neutral (the closed-channel arm, and the arm where the consumer goes
+/// while the Short waits for room): the stream limit is still raised.
+#[test]
+fn a_short_whose_consumer_is_gone_keeps_a_pending_raise() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let start = super::super::config::DATA_START_UNI_STREAMS as usize;
+        for (network, waits) in [
+            ("quic-path-raise-short-closed", false),
+            ("quic-path-raise-short-gone-waiting", true),
+        ] {
+            let limits = QuicPathLimits {
+                short_capacity: 1,
+                ..QuicPathLimits::DEFAULT
+            };
+            let mut p = paths(network, limits).await;
+            let (raw, time) = (p.a_raw(), p.time());
+            if waits {
+                // Fills the channel; it completes before the limit is
+                // saturated, so it counts for nothing. Two control frames
+                // after it free enough streams (more than an eighth of the
+                // limit) for quinn to return their credit.
+                p.drive({
+                    let (raw, time, a) = (raw.clone(), time.clone(), p.a.clone());
+                    async move {
+                        send_whole(&raw, Framed::Short, 100).await;
+                        a.send_control(b"one").await.unwrap();
+                        a.send_control(b"two").await.unwrap();
+                        time.sleep(Duration::from_millis(200)).await;
+                    }
+                })
+                .await;
+            } else {
+                p.b_in.shorts = tokio::sync::mpsc::channel(1).1;
+            }
+            let held = p
+                .drive({
+                    let (raw, time) = (raw.clone(), time.clone());
+                    async move {
+                        let held = hold_open(&raw, Framed::Stream, start - 1).await;
+                        time.sleep(Duration::from_millis(200)).await;
+                        send_whole(&raw, Framed::Short, 100).await;
+                        time.sleep(Duration::from_millis(200)).await;
+                        held
+                    }
+                })
+                .await;
+            if waits {
+                assert_eq!(
+                    p.b.stats().count(QuicInboundOutcome::ShortDroppedFull),
+                    0,
+                    "{network}: the Short waits for room"
+                );
+                p.b_in.shorts = tokio::sync::mpsc::channel(1).1;
+            }
+            p.drive(complete_held_then_one(held, raw, time, Framed::Stream))
+                .await;
+            let stats = p.b.stats();
+            assert_eq!(
+                stats.count(QuicInboundOutcome::ShortDroppedFull),
+                1,
+                "{network}"
+            );
+            assert_eq!(
+                stats.count(QuicInboundOutcome::CompletedStream) as usize,
+                start,
+                "{network}"
+            );
+            assert_eq!(
+                stats.count(QuicInboundOutcome::StreamLimitRaised),
+                1,
+                "{network}"
+            );
+        }
+    })
+}
+
+/// A Stream dropped because the node's consumer of new streams is gone
+/// votes neutral (the closed-channel arm, and the arm where the consumer
+/// goes while the stream waits for room): the stream limit is still raised.
+#[test]
+fn a_stream_whose_consumer_is_gone_keeps_a_pending_raise() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let start = super::super::config::DATA_START_UNI_STREAMS as usize;
+        for (network, waits) in [
+            ("quic-path-raise-stream-closed", false),
+            ("quic-path-raise-stream-gone-waiting", true),
+        ] {
+            let limits = QuicPathLimits {
+                stream_capacity: 1,
+                ..QuicPathLimits::DEFAULT
+            };
+            let mut p = paths(network, limits).await;
+            let (raw, time) = (p.a_raw(), p.time());
+            if waits {
+                // Fills the channel; it completes before the limit is
+                // saturated, so it counts for nothing. Two control frames
+                // after it free enough streams (more than an eighth of the
+                // limit) for quinn to return their credit.
+                p.drive({
+                    let (raw, time, a) = (raw.clone(), time.clone(), p.a.clone());
+                    async move {
+                        send_whole(&raw, Framed::Stream, 100).await;
+                        a.send_control(b"one").await.unwrap();
+                        a.send_control(b"two").await.unwrap();
+                        time.sleep(Duration::from_millis(200)).await;
+                    }
+                })
+                .await;
+            } else {
+                p.b_in.streams = tokio::sync::mpsc::channel(1).1;
+            }
+            let held = p
+                .drive({
+                    let (raw, time) = (raw.clone(), time.clone());
+                    async move {
+                        let held = hold_open(&raw, Framed::Short, start - 1).await;
+                        time.sleep(Duration::from_millis(200)).await;
+                        send_whole(&raw, Framed::Stream, 100).await;
+                        time.sleep(Duration::from_millis(200)).await;
+                        held
+                    }
+                })
+                .await;
+            if waits {
+                assert_eq!(
+                    p.b.stats().count(QuicInboundOutcome::StreamDroppedFull),
+                    0,
+                    "{network}: the stream waits for room"
+                );
+                p.b_in.streams = tokio::sync::mpsc::channel(1).1;
+            }
+            p.drive(complete_held_then_one(held, raw, time, Framed::Short))
+                .await;
+            let stats = p.b.stats();
+            assert_eq!(
+                stats.count(QuicInboundOutcome::StreamDroppedFull),
+                1,
+                "{network}"
+            );
+            assert_eq!(
+                stats.count(QuicInboundOutcome::DeliveredShort) as usize,
+                start,
+                "{network}"
+            );
+            assert_eq!(
+                stats.count(QuicInboundOutcome::StreamLimitRaised),
+                1,
+                "{network}"
+            );
+        }
+    })
+}
+
+/// A Stream whose handle is cancelled before its announce votes neutral
+/// where the reader finds the cancel: feeding payload that arrived while
+/// the metadata was still missing (the metadata arm), or payload staged
+/// before the header (the staged-feed arm). A packet of the stream is lost
+/// so that payload comes first. The stream limit is still raised.
+#[test]
+fn a_stream_cancelled_before_its_announce_keeps_a_pending_raise() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let start = super::super::config::DATA_START_UNI_STREAMS as usize;
+        for (network, metadata) in [
+            ("quic-path-raise-cancel-staged", false),
+            ("quic-path-raise-cancel-metadata", true),
+        ] {
+            let cancel: &'static std::sync::atomic::AtomicBool =
+                Box::leak(Box::new(std::sync::atomic::AtomicBool::new(false)));
+            let limits = QuicPathLimits {
+                cancel_next_admitted: Some(cancel),
+                ..QuicPathLimits::DEFAULT
+            };
+            let p = paths(network, limits).await;
+            let (raw, time, from) = (p.a_raw(), p.time(), p.pair.a_addr);
+            let net = network.to_string();
+            let held = p
+                .drive({
+                    let (raw, time) = (raw.clone(), time.clone());
+                    async move {
+                        let held = hold_open(&raw, Framed::Stream, start - 1).await;
+                        time.sleep(Duration::from_millis(200)).await;
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        let mut send = raw.open_uni().await.unwrap();
+                        let meta_len = MAX_METADATA_BYTES as usize;
+                        let mut first = Framed::Stream
+                            .header(RAISE_TOTAL, if metadata { meta_len as u32 } else { 0 });
+                        if metadata {
+                            // The header and a little of the metadata, alone,
+                            // so the header arrives and the metadata is missing.
+                            first.extend_from_slice(&payload(10));
+                            send.write_all(&first).await.unwrap();
+                            time.sleep(Duration::from_millis(200)).await;
+                        }
+                        // The first full-size packet from here on (the rest
+                        // of the metadata, or the header) is lost once, so
+                        // the payload after it arrives first.
+                        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                        set_packet_delivery_callback(
+                            &net,
+                            Some(Arc::new(move |_: &str, sender, _, bytes: &[u8]| {
+                                if sender == from
+                                    && bytes.len() >= 1000
+                                    && !seen.swap(true, std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    PacketDeliveryDecision::Drop
+                                } else {
+                                    PacketDeliveryDecision::Deliver
+                                }
+                            })),
+                        );
+                        let mut rest = if metadata {
+                            payload(meta_len - 10)
+                        } else {
+                            first
+                        };
+                        rest.extend_from_slice(&payload(RAISE_TOTAL));
+                        send.write_all(&rest).await.unwrap();
+                        send.finish().unwrap();
+                        time.sleep(Duration::from_secs(2)).await;
+                        set_packet_delivery_callback(&net, None);
+                        held
+                    }
+                })
+                .await;
+            let stats = p.b.stats();
+            assert!(
+                !cancel.load(std::sync::atomic::Ordering::Relaxed),
+                "{network}: premise: the stream was admitted"
+            );
+            assert_eq!(
+                stats.count(QuicInboundOutcome::CancelledLocally),
+                1,
+                "{network}"
+            );
+            assert_eq!(
+                stats.count(QuicInboundOutcome::AnnouncedStream) as usize,
+                start - 1,
+                "{network}: the cancelled stream is not announced"
+            );
+            p.drive(complete_held_then_one(held, raw, time, Framed::Stream))
+                .await;
+            let stats = p.b.stats();
+            assert_eq!(
+                stats.count(QuicInboundOutcome::CompletedStream) as usize,
+                start,
+                "{network}"
+            );
+            assert_eq!(
+                stats.count(QuicInboundOutcome::StreamLimitRaised),
+                1,
+                "{network}"
+            );
+        }
+    })
+}
+
 /// On a real connection, a stream whose in-order delivery fills the receive
 /// window grows it, and the node's charge stays within the budget.
 #[test]
