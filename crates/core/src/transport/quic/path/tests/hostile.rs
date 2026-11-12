@@ -112,6 +112,35 @@ async fn honest_bulk_both_ways(
     }
     let mut p = paths_metered(network, subnet, windows).await;
     let loss = seeded_loss_from(network, loss_percent, seed, Some(one_way));
+    // LAB (FREENET_GATE_LINKLOG): the same seeded loss, logging every
+    // datagram as (virtual ns, from A, length, dropped).
+    let link_log: Arc<parking_lot::Mutex<Vec<(u64, bool, usize, bool)>>> = Default::default();
+    if std::env::var_os("FREENET_GATE_LINKLOG").is_some() {
+        use crate::transport::in_memory_socket::{
+            PacketDeliveryDecision, set_packet_delivery_callback,
+        };
+        let state = Arc::new(std::sync::atomic::AtomicU64::new(seed));
+        let (log, clock, a_addr) = (link_log.clone(), p.time(), p.pair.a_addr);
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, from, _, datagram| {
+                use std::sync::atomic::Ordering::Relaxed;
+                let next = state
+                    .fetch_update(Relaxed, Relaxed, |x| {
+                        Some(x.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1))
+                    })
+                    .unwrap_or_default();
+                let drop = (next >> 33) % 100 < loss_percent;
+                log.lock()
+                    .push((clock.now_nanos(), from == a_addr, datagram.len(), drop));
+                if drop {
+                    PacketDeliveryDecision::Drop
+                } else {
+                    PacketDeliveryDecision::DelayedDelivery(one_way)
+                }
+            })),
+        );
+    }
     let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
     let started_ns = time.now_nanos();
     let (a_watch, b_watch) = (p.a.clone(), p.b.clone());
@@ -195,6 +224,28 @@ async fn honest_bulk_both_ways(
         .drive(async move { (count(a_handles).await, count(b_handles).await) })
         .await;
     crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
+    {
+        let log = link_log.lock();
+        if let Some(first) = log.first().map(|e| e.0) {
+            // 10 ms bins over the first 600 ms: datagrams each side sent
+            // (small = under 200 B, ack-only or control), and dropped.
+            eprintln!("LINKLOG bin_ms: A sent (small) | B sent (small)");
+            for bin in 0..60u64 {
+                let (from, to) = (first + bin * 10_000_000, first + (bin + 1) * 10_000_000);
+                let in_bin: Vec<_> = log.iter().filter(|e| e.0 >= from && e.0 < to).collect();
+                let count = |a: bool| in_bin.iter().filter(|e| e.1 == a).count();
+                let small = |a: bool| in_bin.iter().filter(|e| e.1 == a && e.2 < 200).count();
+                eprintln!(
+                    "LINKLOG {:>4}: A {:>3} ({:>2}) | B {:>3} ({:>2})",
+                    bin * 10,
+                    count(true),
+                    small(true),
+                    count(false),
+                    small(false)
+                );
+            }
+        }
+    }
     use std::sync::atomic::Ordering::Relaxed;
     HonestRun {
         loss_percent,
