@@ -362,14 +362,9 @@ impl QuicPathLimits {
         control_capacity: CONTROL_CHANNEL_CAPACITY,
         max_send_aborts: recycle::SEND_ABORT_LIMIT,
         accept_data: true,
-        // Tests that are not about the raise start at the full limit, which
-        // their premises (exhausting the peer's streams) are written against;
-        // the raise has its own tests, and the simulation tests run the
-        // production start.
-        #[cfg(not(test))]
+        // The production start in every build, tests and simulations
+        // included; a test whose premise is the full limit sets it.
         start_streams: super::config::DATA_START_UNI_STREAMS,
-        #[cfg(test)]
-        start_streams: MAX_UNI_STREAMS,
         counters: None,
         #[cfg(test)]
         panic_in_receive: false,
@@ -387,6 +382,14 @@ impl QuicPathLimits {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const SHADOW: Self = Self {
         accept_data: false,
+        ..Self::DEFAULT
+    };
+
+    /// [`Self::DEFAULT`] with the peer let open every stream from the
+    /// start, for tests whose premise is the full limit. Tests only.
+    #[cfg(test)]
+    pub(crate) const FULL_STREAMS: Self = Self {
+        start_streams: MAX_UNI_STREAMS,
         ..Self::DEFAULT
     };
 }
@@ -1774,7 +1777,12 @@ impl QuicPath {
             }
             std::task::Poll::Pending => {
                 self.stats.node.record_open(true);
-                open.await
+                // Counted if the send's deadline drops this wait: the peer's
+                // stream limit was full for all of it.
+                let waiting = CreditWait(Some(&self.stats));
+                let opened = open.await;
+                waiting.disarm();
+                opened
             }
         };
         let stream = opened?;
@@ -1792,6 +1800,25 @@ impl QuicPath {
             paid.spent();
         }
         Ok(send)
+    }
+}
+
+/// A send waiting in `open_uni` for a stream credit; dropped armed (the
+/// send's deadline ended the wait), it counts
+/// [`QuicSendEvent::StreamLimitFull`].
+struct CreditWait<'a>(Option<&'a QuicPathStats>);
+
+impl CreditWait<'_> {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CreditWait<'_> {
+    fn drop(&mut self) {
+        if let Some(stats) = self.0 {
+            stats.record_send_event(QuicSendEvent::StreamLimitFull);
+        }
     }
 }
 

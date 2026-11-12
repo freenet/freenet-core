@@ -30,7 +30,7 @@ fn a_paths_sends_and_receives_reach_the_node() {
             max_bytes: 64 * 1024,
             ..QuicPathLimits::DEFAULT
         };
-        let p = paths("quic-node-counts", 80, limits).await;
+        let p = paths("quic-node-counts", limits).await;
         let (a, time) = (p.a.clone(), p.time());
         p.drive(async move {
             let sent = a
@@ -91,9 +91,9 @@ fn waits_for_a_stream_and_for_a_permit_are_counted() {
         let node = node_counters();
         let limits = QuicPathLimits {
             counters: Some(node),
-            ..QuicPathLimits::DEFAULT
+            ..QuicPathLimits::FULL_STREAMS
         };
-        let p = paths("quic-node-waits", 81, limits).await;
+        let p = paths("quic-node-waits", limits).await;
         let permits: Vec<_> = (0..STREAMED_SEND_LIMIT)
             .map(|_| {
                 Arc::clone(&p.a.stream_slots)
@@ -182,7 +182,7 @@ fn an_overflow_to_udp_and_a_stall_close_reach_the_node() {
             counters: Some(node),
             ..QuicPathLimits::DEFAULT
         };
-        let p = paths("quic-node-events", 82, limits).await;
+        let p = paths("quic-node-events", limits).await;
         p.a.enable_data();
         // The worker is never run, so the queue only fills.
         let (route, _worker) = DataRoute::new(

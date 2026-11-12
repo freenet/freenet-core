@@ -123,8 +123,9 @@ pub(crate) const INITIAL_UNI_STREAMS: u32 = 4;
 /// The uni streams a data path's peer may open at first. The limit doubles
 /// toward [`MAX_UNI_STREAMS`] once the peer has used every stream at once and
 /// as many again have completed with none failing and the buffer budget not
-/// throttling the connection (`path::inbound::StreamLimit`): the stream limit
-/// is the one term per connection a raise cannot take back, so it is earned.
+/// throttling the connection, among other conditions
+/// (`path::inbound::StreamLimit`): the stream limit is the one term per
+/// connection a raise cannot take back, so it is raised only under load.
 pub(crate) const DATA_START_UNI_STREAMS: u32 = 16;
 
 /// The connection receive window every connection starts with, until a data
@@ -185,8 +186,12 @@ pub(crate) const UNANNOUNCED_CREDIT_SLACK: u32 = MAX_UNI_STREAMS / 8;
 ///   waits on the connection's shared flow control and send window
 ///   (quinn-proto `write_limit`).
 /// - The division uses this node's [`MAX_UNI_STREAMS`], not the limit the
-///   peer advertised. A change to the limit needs a plan for peers still
-///   advertising the old one.
+///   peer advertised (quinn does not expose it). A data path's peer starts
+///   at [`DATA_START_UNI_STREAMS`] and raises only once all its streams are
+///   busy, so capping the permits below its limit would stop the raise.
+///   Until it raises, the reserve does not hold: a send past its limit waits
+///   in `open_uni` until its open deadline and ends `NotOpened` (on UDP),
+///   never `MaybeDelivered`, counted `quic_data_event_stream_limit_full`.
 pub(crate) const STREAMED_SEND_LIMIT: u32 =
     MAX_UNI_STREAMS - RESERVED_UNI_STREAMS - UNANNOUNCED_CREDIT_SLACK;
 const _: () = assert!(RESERVED_UNI_STREAMS > 0 && STREAMED_SEND_LIMIT > 0);
