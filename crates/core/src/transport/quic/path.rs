@@ -712,6 +712,9 @@ pub(crate) struct QuicPath {
     receive: tokio::task::JoinHandle<()>,
     /// Sends this side reset; closes the connection past the limit.
     aborts: Arc<SendAborts>,
+    /// Cancelled one-packet sends still waiting for their acknowledgement
+    /// ([`AckWaits`]).
+    ack_waits: Arc<AckWaits>,
     /// The path's share of the node's buffer budget, for a path that reads
     /// data (`budget::ConnMeter`); `None` for a shadow path.
     meter: Option<Arc<super::budget::ConnMeter>>,
@@ -970,6 +973,7 @@ impl QuicPath {
         {
             report.panic_once_bucketed = limits.panic_in_watch;
         }
+        let ack_waits = Arc::new(AckWaits::new(stats.clone()));
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             connection.closer(),
@@ -988,6 +992,7 @@ impl QuicPath {
                 stats,
                 receive,
                 aborts,
+                ack_waits,
                 meter,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
@@ -1118,6 +1123,12 @@ impl QuicPath {
     #[cfg(test)]
     pub(crate) fn stats_handle(&self) -> Arc<QuicPathStats> {
         self.stats.clone()
+    }
+
+    /// Cancelled sends without a permit waiting for their acknowledgement.
+    #[cfg(test)]
+    pub(crate) fn ack_waits(&self) -> &AckWaits {
+        &self.ack_waits
     }
 
     /// Sends this side reset on this path so far.
@@ -1686,6 +1697,7 @@ impl QuicPath {
         let epoch = self.meter.as_ref().and_then(|meter| meter.send_epoch());
         let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress, epoch);
         send.meter = self.meter.clone();
+        send.ack_waits = Some(self.ack_waits.clone());
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
             send.write_all(metadata).await?;
@@ -1860,6 +1872,9 @@ struct Outgoing {
     /// The path's budget meter, woken by each write so a path that only sends
     /// still has its send window evaluated (`budget::ConnMeter::note_send`).
     meter: Option<Arc<super::budget::ConnMeter>>,
+    /// The path's count of cancelled sends waiting for their acknowledgement
+    /// without a permit ([`AckWaits`]).
+    ack_waits: Option<Arc<AckWaits>>,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
@@ -1886,6 +1901,7 @@ impl Outgoing {
             pacing,
             epoch,
             meter: None,
+            ack_waits: None,
         }
     }
 
@@ -1968,7 +1984,7 @@ impl Outgoing {
             written = send.write_all(buf) => written,
             result = stopped => return Err(self.stopped_early(result)),
         };
-        self.written(written)
+        self.written(written, buf.len())
     }
 
     /// Write `chunk` in pieces of at most `FRAGMENT_PAYLOAD_SIZE`, telling
@@ -1995,26 +2011,31 @@ impl Outgoing {
     }
 
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), QuicSendError> {
+        let len = chunk.len();
         let Self { send, stopped, .. } = self;
         let written = tokio::select! {
             written = send.write_chunk(chunk) => written,
             result = stopped => return Err(self.stopped_early(result)),
         };
-        self.written(written)
+        self.written(written, len)
     }
 
-    /// The outcome of a write. A stop the peer sent is handled as in
+    /// The outcome of a write of `len` bytes. A stop the peer sent is handled as in
     /// [`Self::stopped_early`]: on STOP_SENDING both the write and the
     /// `stopped` future become ready, and `select!` may pick the write.
     /// Returned through `?` instead, the stream would be left open and
     /// `Drop` would reset it as an abort of this side's own
     /// ([`SendAborts`]), which it is not.
-    fn written(&mut self, written: Result<(), quinn::WriteError>) -> Result<(), QuicSendError> {
+    fn written(
+        &mut self,
+        written: Result<(), quinn::WriteError>,
+        len: usize,
+    ) -> Result<(), QuicSendError> {
         match written {
             Ok(()) => {
                 self.progress.step();
                 if let Some(meter) = &self.meter {
-                    meter.note_send();
+                    meter.note_send(len as u64);
                 }
                 Ok(())
             }
@@ -2088,14 +2109,18 @@ impl Drop for Outgoing {
     /// that simply ended early.
     ///
     /// A stream dropped while it waits for its acknowledgement goes on to the
-    /// end, so its permit and its send epoch wait with it, in a small task:
-    /// one per cancelled send awaiting its acknowledgement. Those are the
-    /// streams the peer's uni-stream limit lets this side have open, plus
-    /// streams the peer has read in full but not yet acknowledged, for as
-    /// long as the peer delays those acknowledgements: that second part is
-    /// not bounded by a count. Each task ends with its stream's
-    /// acknowledgement or with the connection, and the acknowledgement watch
-    /// closes a path whose peer acknowledges nothing.
+    /// end, so its permit and its send epoch wait with it, in a small task
+    /// that ends with the stream's acknowledgement or with the connection.
+    /// A send holding a permit is one of at most [`STREAMED_SEND_LIMIT`]. One
+    /// without a permit (a one-packet Short) holds only its epoch, and a peer
+    /// that acknowledges other traffic while withholding some acknowledgements
+    /// could keep any number of those waiting, so at most
+    /// [`ACK_WAITS_WITHOUT_PERMIT`] wait per path; past that the epoch is
+    /// released at once and counted ([`QuicSendEvent::AckWaitReleased`]). A
+    /// released epoch lets a send window lowered since that stream opened
+    /// leave the charge while quinn may still hold the stream's one packet:
+    /// accepted, as the window it held is charged for as long as any other
+    /// stream of its epoch is open.
     fn drop(&mut self) {
         self.reset(reset_code::SENDER_ABORTED);
         if !self.awaiting_ack {
@@ -2109,6 +2134,16 @@ impl Drop for Outgoing {
         if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
+        let waiting = if slot.is_none() {
+            match self.ack_waits.as_ref().map(AckWaits::enter) {
+                Some(Some(waiting)) => Some(waiting),
+                // Past the bound: the epoch goes now.
+                Some(None) => return,
+                None => None,
+            }
+        } else {
+            None
+        };
         let stopped = std::mem::replace(&mut self.stopped, Box::pin(std::future::pending()));
         // Bounded as above, and ending with the acknowledgement or the
         // connection, so the handle is not monitored.
@@ -2116,6 +2151,69 @@ impl Drop for Outgoing {
             let _ended = stopped.await;
             drop(slot);
             drop(epoch);
+            drop(waiting);
         }));
+    }
+}
+
+/// The most cancelled sends without a permit that wait for their
+/// acknowledgement on one path, each holding its send epoch in a task
+/// ([`Outgoing`]'s drop).
+pub(crate) const ACK_WAITS_WITHOUT_PERMIT: usize = super::config::MAX_UNI_STREAMS as usize;
+
+/// A path's count of cancelled sends without a permit waiting for their
+/// acknowledgement.
+pub(crate) struct AckWaits {
+    waiting: std::sync::atomic::AtomicUsize,
+    /// [`ACK_WAITS_WITHOUT_PERMIT`], lower in a test.
+    limit: std::sync::atomic::AtomicUsize,
+    stats: Arc<QuicPathStats>,
+}
+
+/// One cancelled send waiting for its acknowledgement; dropping it frees its
+/// place.
+pub(crate) struct AckWait(Arc<AckWaits>);
+
+impl AckWaits {
+    fn new(stats: Arc<QuicPathStats>) -> Self {
+        Self {
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            limit: std::sync::atomic::AtomicUsize::new(ACK_WAITS_WITHOUT_PERMIT),
+            stats,
+        }
+    }
+
+    /// A place to wait, or `None` (counted) when [`ACK_WAITS_WITHOUT_PERMIT`]
+    /// already wait.
+    fn enter(this: &Arc<Self>) -> Option<AckWait> {
+        let limit = this.limit.load(Ordering::Relaxed);
+        let entered = this
+            .waiting
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |waiting| {
+                (waiting < limit).then_some(waiting + 1)
+            })
+            .is_ok();
+        if entered {
+            Some(AckWait(this.clone()))
+        } else {
+            this.stats.record_send_event(QuicSendEvent::AckWaitReleased);
+            None
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_limit(&self, limit: usize) {
+        self.limit.store(limit, Ordering::Relaxed);
+    }
+}
+
+impl Drop for AckWait {
+    fn drop(&mut self) {
+        self.0.waiting.fetch_sub(1, Ordering::AcqRel);
     }
 }

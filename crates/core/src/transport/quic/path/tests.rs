@@ -2786,9 +2786,10 @@ fn a_stop_reported_by_the_write_is_not_counted() {
                     .open(&header, &[], None, None, SendProgress::new())
                     .await
                     .expect("open");
-                let written = send.written(Err(quinn::WriteError::Stopped(
-                    stop_code::BUDGET_REFUSED.into(),
-                )));
+                let written = send.written(
+                    Err(quinn::WriteError::Stopped(stop_code::BUDGET_REFUSED.into())),
+                    10,
+                );
                 drop(send);
                 (written, a.send_aborts())
             })
@@ -6090,6 +6091,67 @@ fn a_one_packet_short_holds_its_send_epoch_until_the_ack() {
     })
 }
 
+/// A peer that never acknowledges cancelled one-packet Shorts cannot make
+/// the path keep a task per Short: past the bound, a Short's epoch goes at
+/// once and is counted. Without the bound every one of them waits.
+#[test]
+fn cancelled_one_packet_shorts_wait_for_their_ack_only_up_to_the_bound() {
+    const BOUND: usize = 4;
+    const SHORTS: usize = BOUND + 3;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let windows = Windows {
+            a: Some(test_budget(64 << 20, leaked_counters())),
+            b: None,
+        };
+        let network = "quic-path-ack-wait-bound";
+        let p = paths_metered(network, 79, windows).await;
+        p.a.ack_waits().set_limit(BOUND);
+        // One acknowledged send first, so the peer's stream credit for a data
+        // path has arrived before its packets are dropped.
+        let (a, time) = (p.a.clone(), p.time());
+        let first = p
+            .drive(async move {
+                a.send_short_bounded(&time, Duration::from_secs(5), b"first")
+                    .await
+            })
+            .await;
+        assert!(matches!(first, BoundedSend::Sent), "{first:?}");
+        let _silenced = DropFrom::new(network, &[p.pair.b_addr]);
+        let (a, time) = (p.a.clone(), p.time());
+        let (outcomes, waiting, holders, released) = p
+            .drive(async move {
+                let mut outcomes = Vec::new();
+                for _ in 0..SHORTS {
+                    outcomes.push(
+                        a.send_short_bounded(&time, Duration::from_secs(1), b"short")
+                            .await,
+                    );
+                }
+                time.sleep(Duration::from_secs(1)).await;
+                (
+                    outcomes,
+                    a.ack_waits().waiting(),
+                    a.send_epoch_holders(),
+                    a.stats().send_event_count(QuicSendEvent::AckWaitReleased),
+                )
+            })
+            .await;
+        for outcome in &outcomes {
+            assert!(
+                matches!(
+                    outcome,
+                    BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+                ),
+                "premise: every Short waited for an ack that never came: {outcome:?}"
+            );
+        }
+        assert_eq!(waiting, BOUND, "at most the bound wait");
+        assert_eq!(holders, BOUND, "the rest released their epochs at once");
+        assert_eq!(released, (SHORTS - BOUND) as u64, "each release is counted");
+    })
+}
+
 /// A Short past one packet waits for a permit as a stream does, and one that
 /// fits a packet does not.
 #[test]
@@ -6596,11 +6658,10 @@ fn a_data_paths_window_grows_when_delivery_fills_it() {
         assert_eq!(arrival.handle.assemble().await.expect("assembled"), body);
         let snap = counters.snapshot(false);
         assert!(snap.window_grew > 0, "the receive window grew: {snap:?}");
-        let grant = super::super::budget::floor_grant(super::super::tests::TEST_WINDOW);
+        // The budget holds only growth above the floor grants.
         assert!(
-            snap.budget_charged_peak > grant,
-            "charged {} at most, the floor grant is {grant}",
-            snap.budget_charged_peak
+            snap.budget_charged_peak > 0,
+            "the growth was charged: {snap:?}"
         );
         assert!(snap.budget_charged_peak <= total);
         assert!(

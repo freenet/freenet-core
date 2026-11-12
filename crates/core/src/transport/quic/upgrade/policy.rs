@@ -342,9 +342,10 @@ mod tests {
     use super::*;
 
     /// No release carries data on QUIC by default until the node's memory
-    /// aggregate sums the QUIC buffer budget and the fixed charge per
-    /// connection (`declared_caches_plus_hosting_budget_leave_room_for_the_runtime`;
-    /// both are in `executor::NOT_SUMMED` until then, #5940 buffer-budget PR 5).
+    /// aggregate sums the QUIC buffer budget (growth above the floors), the
+    /// fixed charge per connection and each data path's floor grant
+    /// (`declared_caches_plus_hosting_budget_leave_room_for_the_runtime`;
+    /// all are outside the aggregate until then, #5940 buffer-budget PR 5).
     /// The PR that sums them removes this test; a PR that raises the share
     /// without summing them fails here.
     #[test]

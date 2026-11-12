@@ -420,8 +420,11 @@ fn newcomers_never_push_the_growth_over_the_budget() {
         budget.running_total()
     );
     let mut newcomers = Vec::new();
+    let mut windows = Vec::new();
+    let mut debt_paid = 0;
     for _ in 0..20 {
         newcomers.push(conn(&budget, at));
+        windows.push(FLOOR);
         assert!(
             budget.running_total() <= total,
             "{} over {total} with {} newcomers",
@@ -429,10 +432,17 @@ fn newcomers_never_push_the_growth_over_the_budget() {
             newcomers.len()
         );
         // Each newcomer wants to grow, which squeezes the big path.
-        for (i, newcomer) in newcomers.iter().enumerate() {
-            deliver_window(newcomer, FLOOR, at + i as u64 + 1);
+        for (i, (newcomer, window)) in newcomers.iter().zip(windows.iter_mut()).enumerate() {
+            *window = deliver_window(newcomer, *window, at + i as u64 + 1).recv_window;
         }
         big.meter.evaluate(at + MS).unwrap();
+        assert!(budget.running_total() <= total);
+        // The big path's peer sends what its credit allowed, and its reader
+        // reads it: the debt is paid and the room is freed.
+        let debt = big.meter.debt();
+        debt_paid += debt;
+        big.meter.on_read(debt, 0, at + 2 * MS);
+        big.meter.evaluate(at + 3 * MS).unwrap();
         assert!(budget.running_total() <= total);
         assert_eq!(
             budget.running_total(),
@@ -441,6 +451,16 @@ fn newcomers_never_push_the_growth_over_the_budget() {
         );
         at += 10 * MS;
     }
+    assert!(
+        debt_paid > 0,
+        "premise: the squeeze left the big path a debt"
+    );
+    let grown = windows.iter().filter(|window| **window > FLOOR).count();
+    assert!(
+        grown >= newcomers.len() / 2,
+        "the newcomers grow into the room the big path freed: {grown} of {} grew",
+        newcomers.len()
+    );
 }
 
 #[test]
@@ -738,5 +758,88 @@ fn a_squeeze_asks_the_largest_first_and_only_as_many_as_needed() {
         asked(both, at + 20 * MS),
         vec![false, true, true],
         "the two largest"
+    );
+}
+
+/// Send at the full send window for one round trip, with a congestion window
+/// that wants the largest send window, and evaluate at the end of it.
+fn send_window(conn: &Conn, at: u64) -> Evaluation {
+    conn.fake.cwnd.store(MAX_WINDOW_BYTES, Ordering::Relaxed);
+    let window = conn
+        .fake
+        .send
+        .lock()
+        .unwrap()
+        .last()
+        .copied()
+        .unwrap_or(FLOOR);
+    conn.meter.note_send(window);
+    conn.meter.evaluate(at).expect("registered")
+}
+
+/// Two paths that only send, arriving in turn: the first takes the growth
+/// budget alone, and the second still reaches its share, because a send
+/// window held back by the budget asks the first to make room as a receive
+/// window does.
+#[test]
+fn a_later_sender_reaches_its_share() {
+    let total = 12 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let first = conn(&budget, 0);
+    let mut at = 10 * MS;
+    for _ in 0..12 {
+        send_window(&first, at);
+        at += 10 * MS;
+    }
+    assert!(
+        budget.running_total() > total / 2,
+        "premise: the first sender took most of the budget, {} of {total}",
+        budget.running_total()
+    );
+    let second = conn(&budget, at);
+    for _ in 0..40 {
+        send_window(&second, at + MS);
+        send_window(&first, at + 2 * MS);
+        assert!(
+            budget.running_total() <= total,
+            "{} over {total}",
+            budget.running_total()
+        );
+        at += 10 * MS;
+    }
+    let share = floor_grant(FLOOR) + total / 2;
+    for (name, path) in [("first", &first), ("second", &second)] {
+        let charge = path.meter.charge();
+        assert!(charge <= share, "{name}: {charge} over its share {share}");
+        assert!(
+            charge + 16 * 1024 >= share,
+            "{name}: {charge} short of its share {share}"
+        );
+    }
+}
+
+/// A path whose sends buffer less than most of its send window per round trip
+/// is not held back by it, so a large congestion window alone neither grows
+/// it toward the budget's limit nor squeezes others.
+#[test]
+fn a_sender_the_window_does_not_hold_back_asks_no_room() {
+    let total = 12 << 20;
+    let budget = QuicBudget::new(total, FLOOR, counters());
+    let big = conn(&budget, 0);
+    let mut at = 10 * MS;
+    for _ in 0..12 {
+        send_window(&big, at);
+        at += 10 * MS;
+    }
+    let idle = conn(&budget, at);
+    idle.fake.cwnd.store(MAX_WINDOW_BYTES, Ordering::Relaxed);
+    for _ in 0..10 {
+        at += 10 * MS;
+        idle.meter.note_send(FLOOR / 4);
+        idle.meter.evaluate(at).unwrap();
+    }
+    assert!(
+        big.meter.pending_shrink().is_none(),
+        "a sender with little to send squeezed another"
     );
 }

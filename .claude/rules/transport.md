@@ -1385,7 +1385,7 @@ a test passes its own; tests read their own, never the global).
   quic_data_send_<short|large_short|stream|pipe>_<sent|maybe_delivered|
   not_opened_udp|failed_udp|dropped>; quic_data_event_<short_overflow_udp|
   data_refused|stalled_closed|udp_send_failed|suspect_entered|suspect_left|
-  pacer_refused>; quic_data_stop_<code> (stops a
+  pacer_refused|ack_wait_released>; quic_data_stop_<code> (stops a
   peer sent to data sends); quic_inbound_<QuicInboundOutcome> (every receive
   outcome, refusals by frame kind as short_refused_budget and
   stream_refused_budget); quic_enabled_data_paths; quic_live_data_paths (a gauge of
@@ -1620,7 +1620,10 @@ until PR 5 (`no_data_share_before_the_quic_budget_is_summed`).
     uses it, so a peer that grew and went silent keeps its charge while it
     stays silent: that limits other paths' growth, not memory.
   → The send window follows 2 x cwnd within the same share, lowered only at
-    half; a window lowered while streams opened before it are open stays
+    half. A path whose sends filled at least 75% of its send window per round
+    trip while 2 x cwnd is above it counts as growing for C, and a send grow
+    held back by the budget below C asks others to shrink as a receive grow
+    does (budget::tests::a_later_sender_reaches_its_share). A window lowered while streams opened before it are open stays
     charged until they end, at the largest window set while they are open
     (the stream's epoch, held until its data is acknowledged). Streams
     opened before the lower window is applied to the connection take the
@@ -1636,8 +1639,9 @@ until PR 5 (`no_data_share_before_the_quic_budget_is_summed`).
     of paths, except counting the paths growing (at most once per 10 ms
     node-wide) and asking others to shrink.
   Telemetry: quic_budget_bytes, quic_budget_charged_bytes and
-  quic_budget_charged_peak_bytes, quic_window_grew, _grow_refused, _shrank,
-  quic_staged_peak_pct.
+  quic_budget_charged_peak_bytes (growth above the floor grants only: a node
+  with every path at the floor reports 0, so uploads neither),
+  quic_window_grew, _grow_refused, _shrank, quic_staged_peak_pct.
   Staging (path/inbound.rs, `ConnStaging`): every stream is read unordered
   from its first byte, so quinn holds nothing for a stream beyond the chunks
   its reader has not polled yet. Bytes read for a stream before its header,
@@ -1913,7 +1917,11 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   open_uni. The stream holds it until it is acknowledged, stopped or reset,
   also past a deadline that reported MaybeDelivered: Outgoing's drop hands
   the wait to a small task (at most 48 per path, each ending with the
-  connection). A streamed send past the limit waits for a permit without
+  connection). A one-packet Short holds no permit but its send epoch, and
+  waits the same way, at most ACK_WAITS_WITHOUT_PERMIT (64) per path; past
+  that its epoch is released at once and counted
+  (quic_data_event_ack_wait_released), so a peer withholding some
+  acknowledgements cannot make the path hold a task per Short. A streamed send past the limit waits for a permit without
   opening a stream, and that wait races connection.closed(), because the
   semaphore never closes. One-packet shorts and control sends take no
   permit. The limit divides as STREAMED_SEND_LIMIT 48 + UNANNOUNCED_CREDIT_SLACK 8 +

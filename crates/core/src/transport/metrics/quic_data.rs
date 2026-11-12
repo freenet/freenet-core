@@ -11,7 +11,7 @@
 //! | Key | What |
 //! |---|---|
 //! | `quic_data_send_<kind>_<result>` | data sends by kind and how they ended |
-//! | `quic_data_event_<event>` | short overflow to UDP, refusals, stall closes, lost UDP sends |
+//! | `quic_data_event_<event>` | short overflow to UDP, refusals, stall closes, lost UDP sends, ack waits released at their bound |
 //! | `quic_data_stop_<code>` | stops the peer sent to data sends, by code |
 //! | `quic_inbound_<outcome>` | every `QuicInboundOutcome`, node-wide |
 //! | `quic_enabled_data_paths` | paths where both sides set the data bit |
@@ -26,7 +26,7 @@
 //! | `quic_ended_paths_below_floor` | paths that ended in the period before sending 200 packets, so in no bucket |
 //! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
 //! | `quic_send_resets`, `quic_path_ms` | sends a path reset on this side, and the time QUIC paths were up, shadow paths included, up to each path's last tick: resets per connection-hour is their ratio |
-//! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths are charged against it now (gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
+//! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
 //! | `quic_staged_peak_pct` | the most any connection staged in the period (bytes read for streams whose header its reader had not taken yet) as a percentage of its staging cap (`quic::path::inbound::ConnStaging`); streams stopped at the cap are `quic_inbound_evicted_staged` |
 //! | `quic_window_grew`, `quic_window_grow_refused`, `quic_window_shrank` | window-limited data paths whose receive window grew, those that found no room, and paths whose windows the budget lowered |
 //! | `quic_send_resets_reached_<n>`, `quic_send_resets_path_max` | paths whose lifetime reset count reached each level in the period, and the highest count a reset in the period took a path to: how close paths get to `recycle::SEND_ABORT_LIMIT` |
