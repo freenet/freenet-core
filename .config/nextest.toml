@@ -149,6 +149,25 @@ retries = 0
 filter = "test(/link_model::r1_tests::/)"
 retries = 0
 
+# #6138 data ramp, PR CI's two short runs of the real ramp curve (the whole
+# 26 h day runs nightly under nightly_tests). Deterministic direct-runner
+# simulations, so retries = 0: a retry could only turn a real regression into
+# a green run. Measured on nova: 42.5 s alone for the end-of-day run, with
+# test_connection_growth_stall_regression at 143 s in the same run against its
+# 138-147 s on CI (#5176), so nova and the CI runner are about the same speed
+# here; under heavy local load the end-of-day run took 198 s. The five-percent
+# run (3 h of virtual time) took 38.4 s beside the end-of-day run's 46.7 s.
+# Caps leave room for load like that: 360 s each.
+[[profile.ci.overrides]]
+filter = "test(test_quic_data_ramp_recycles_nothing_while_the_share_is_five_percent)"
+slow-timeout = { period = "180s", terminate-after = 2 }
+retries = 0
+
+[[profile.ci.overrides]]
+filter = "test(test_quic_data_ramp_turns_on_every_pair_by_the_end_of_the_day)"
+slow-timeout = { period = "180s", terminate-after = 2 }
+retries = 0
+
 [profile.nightly]
 # Nightly tests run longer by design; no retries since failures need investigation.
 retries = 0
@@ -178,3 +197,9 @@ retries = 0
 [[profile.ci.overrides]]
 filter = "binary(quic_breaker_windows)"
 retries = 0
+# #6138 the QUIC data ramp over a 26 h virtual day: 772 s alone on nova and
+# 1536 s beside other simulations, against the profile's 1800 s cap. The
+# nightly step runs one test at a time, but give it room.
+[[profile.nightly.overrides]]
+filter = "test(test_quic_data_ramp_turns_on_every_pair_within_a_day)"
+slow-timeout = { period = "1200s", terminate-after = 2 }

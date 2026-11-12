@@ -5318,6 +5318,69 @@ fn streamed_sends_return_their_permits() {
     })
 }
 
+/// A path whose data bit comes on after its watch started is counted as
+/// carrying from then on: its packets before the flip are only in the
+/// all-paths sums, those after it in the carrying sums too, and when it ends
+/// it is counted once in each family. Its peer never carried, so it is in the
+/// all-paths family only. The flag is the one the node sets for
+/// `quic_live_data_paths` (`QuicPath::count_as_data_path`).
+#[test]
+fn a_path_counts_as_carrying_from_when_its_data_comes_on() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-carrying-flip", limits).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let (before, after) = p
+            .drive(async move {
+                a.send_short(&[1u8; 600]).await.expect("sent");
+                // After the first tick (2 s): what was sent so far is not carrying.
+                time.sleep(Duration::from_millis(2500)).await;
+                let before = counters.snapshot(false);
+                a.count_as_data_path();
+                a.send_short(&[2u8; 600]).await.expect("sent");
+                time.sleep(Duration::from_secs(2)).await;
+                (before, counters.snapshot(false))
+            })
+            .await;
+        assert!(before.sent_packets > 0);
+        assert_eq!(
+            before.carrying_sent_packets, 0,
+            "nothing carried before the flip"
+        );
+        assert!(after.carrying_sent_packets > 0, "the second short carried");
+        assert!(
+            after.carrying_sent_packets < after.sent_packets,
+            "the carrying sums are a subset: {} of {}",
+            after.carrying_sent_packets,
+            after.sent_packets
+        );
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        p.drive(async move {
+            a.connection().close(QuicCloseCode::Downgrade);
+            time.sleep(Duration::from_secs(5)).await;
+            drop(b);
+        })
+        .await;
+        let snap = counters.snapshot(false);
+        let ended = |rates: &[u64], below: u64| rates.iter().sum::<u64>() + below;
+        assert_eq!(ended(&snap.ended_loss_rate, snap.ended_below_floor), 2);
+        assert_eq!(
+            ended(
+                &snap.carrying_ended_loss_rate,
+                snap.carrying_ended_below_floor
+            ),
+            1,
+            "only a carried"
+        );
+    })
+}
+
 /// A bounded send whose deadline passes while it waits for a permit is
 /// `NotOpened`, and it opened no stream: the receiver announces only the
 /// streams holding permits, and nothing had to be reset.
