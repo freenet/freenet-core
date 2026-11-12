@@ -260,6 +260,26 @@ mod tests {
     /// #5842: BOTH fan-out paths apply the per-pair spacing. The simulation
     /// runs only its inline copy and the production binary only the queue, so
     /// a behavioural test of one says nothing about the other.
+    /// The body of the block that `opener` (ending in its `{`) starts in `src`,
+    /// by brace matching, so a line moved out of the block is not in it.
+    fn spawned_block<'a>(src: &'a str, opener: &str) -> Option<&'a str> {
+        let start = src.find(opener)? + opener.len();
+        let mut depth = 1usize;
+        for (i, byte) in src.bytes().enumerate().skip(start) {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(&src[start..i]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     #[test]
     fn both_fan_out_paths_apply_the_spacing() {
         let drain = region(QUEUE_SRC, "    async fn drain_lane<D, F>(", "\n    }\n");
@@ -302,9 +322,20 @@ mod tests {
         );
         assert!(
             heal.contains("op_manager.broadcast_spacing.try_begin(key.id(), &peer_key)")
-                && heal.contains("Ok(_claim) =>"),
-            "the simulation heal path must apply the spacing and hold the claim \
-             across its send"
+                && heal.contains("Ok(claim) =>"),
+            "the simulation heal path must apply the spacing"
+        );
+        // The send runs in a spawned task, not on the event loop: it waits for
+        // its stream's completion, which only the event loop dispatches. The
+        // claim moves into that task and is bound there before the send, so it
+        // stays held until the send ends.
+        let task = spawned_block(&heal, "GlobalExecutor::spawn(async move {")
+            .expect("the simulation heal sends from a spawned task, not the event loop");
+        let held = task.find("let _claim = claim;");
+        let sent = task.find("broadcast_to_single_peer(");
+        assert!(
+            matches!((held, sent), (Some(held), Some(sent)) if held < sent),
+            "the spawned heal must hold the claim across its send, both inside the task"
         );
     }
 

@@ -785,17 +785,30 @@ impl P2pConnManager {
             // interval is handed to the held-legs timer instead.
             let peer_key = crate::ring::PeerKey::from(target.pub_key().clone());
             match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
-                Ok(_claim) => {
-                    super::super::broadcast_queue::broadcast_to_single_peer(
-                        &self.bridge,
-                        op_manager,
-                        key,
-                        new_state,
-                        target,
-                        None,
-                        super::super::broadcast_queue::no_fanout(),
-                    )
-                    .await;
+                Ok(claim) => {
+                    // Detached, as production's queue worker is: the send waits
+                    // for its stream's completion (up to
+                    // STREAM_COMPLETION_TIMEOUT), and that stream is handed to
+                    // the event loop through the bridge, so awaiting it here, on
+                    // the event loop, would hold both until the timeout. The
+                    // claim moves into the task: it records the send for the
+                    // #5842 spacing when the send ends. Unlike production's
+                    // queue lanes, nothing limits how many heals run at once.
+                    let bridge = self.bridge.clone();
+                    let op_manager = op_manager.clone();
+                    GlobalExecutor::spawn(async move {
+                        let _claim = claim;
+                        super::super::broadcast_queue::broadcast_to_single_peer(
+                            &bridge,
+                            &op_manager,
+                            key,
+                            new_state,
+                            target,
+                            None,
+                            super::super::broadcast_queue::no_fanout(),
+                        )
+                        .await;
+                    });
                 }
                 Err(wait) => {
                     crate::config::GlobalTestMetrics::record_broadcast_leg_spaced();
