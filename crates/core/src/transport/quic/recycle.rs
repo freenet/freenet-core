@@ -872,6 +872,10 @@ pub(crate) struct AckWatch {
     quiet_samples: u32,
     /// Since when a cap hold has been reported with no new hold event.
     hold_unchanged_since: Option<u64>,
+    /// When the previous sample was taken, on the caller's clock.
+    previous_at: Option<u64>,
+    /// Time skipped so far because a sample came late ([`Self::watch_time`]).
+    skipped: u64,
 }
 
 /// Whether the egress cap holds, or held since `previous` was read, a QUIC
@@ -929,7 +933,27 @@ impl AckWatch {
             sent_after_acks: false,
             quiet_samples: 0,
             hold_unchanged_since: None,
+            previous_at: None,
+            skipped: 0,
         }
+    }
+
+    /// `now_nanos` on the watch's own clock, which leaves out the time a late
+    /// sample covers past one tick. A sample more than two ticks after the
+    /// previous one means this side's runtime stalled (or the host
+    /// suspended): the interval is read as one tick, so a stall of this
+    /// side's own cannot make a healthy path look dark, unacknowledging or
+    /// starved. What happened meanwhile is still read from the sample.
+    fn watch_time(&mut self, now_nanos: u64) -> u64 {
+        let tick = u64::try_from(ACK_WATCH_TICK.as_nanos()).unwrap_or(u64::MAX);
+        if let Some(previous) = self.previous_at {
+            let gap = now_nanos.saturating_sub(previous);
+            if gap > tick.saturating_mul(2) {
+                self.skipped = self.skipped.saturating_add(gap - tick);
+            }
+        }
+        self.previous_at = Some(now_nanos);
+        now_nanos.saturating_sub(self.skipped)
     }
 
     /// Count dark episodes in `node`, and let the dark-path rule close the
@@ -977,6 +1001,7 @@ impl AckWatch {
     /// Take `sample`, taken at `now_nanos`; whether the path must close
     /// ([`Self::stall`] says why).
     pub(crate) fn observe(&mut self, now_nanos: u64, sample: AckSample) -> bool {
+        let now_nanos = self.watch_time(now_nanos);
         self.stall = self.decide(now_nanos, sample);
         self.stall.is_some()
     }
@@ -1015,8 +1040,9 @@ impl AckWatch {
             // cap, so nothing says when it left: no latch, no window.
             self.sent_after_acks = false;
             self.since = None;
-            // Not counted: the cap held this side's own sends.
-            self.end_dark(None);
+            // The cap held this side's own sends: whether the peer is dark
+            // can no longer be told.
+            self.end_dark(Some(crate::transport::metrics::DarkEnd::CapHeld));
             return None;
         }
         if starved {

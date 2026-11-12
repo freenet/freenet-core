@@ -3215,16 +3215,28 @@ impl Scripted {
     /// while no release sends data on QUIC: its watch counts dark spells and
     /// does not close on them.
     async fn connect_without_data(network: &str) -> Self {
-        Self::connect_built(network, None, false).await
+        Self::connect_built(network, None, false, None).await
+    }
+
+    /// [`Self::connect_without_data`] with quinn's idle timeout set to
+    /// `idle` on both ends, as a node's is (120 s), in place of virtual
+    /// time's 24 h. Keepalives stay off: virtual time has none.
+    async fn connect_without_data_idle(network: &str, idle: Duration) -> Self {
+        Self::connect_built(network, None, false, Some(idle)).await
     }
 
     /// [`Self::connect`] with a node-wide egress cap of `a_cap` bytes per
     /// second on `a`'s socket.
     async fn connect_capped(network: &str, a_cap: Option<u64>) -> Self {
-        Self::connect_built(network, a_cap, true).await
+        Self::connect_built(network, a_cap, true, None).await
     }
 
-    async fn connect_built(network: &str, a_cap: Option<u64>, data: bool) -> Self {
+    async fn connect_built(
+        network: &str,
+        a_cap: Option<u64>,
+        data: bool,
+        idle_timeout: Option<Duration>,
+    ) -> Self {
         use super::super::config::{self, QuicSettings};
         use super::super::identity::{PeerKey, QuicIdentity};
         use crate::transport::Socket;
@@ -3245,7 +3257,7 @@ impl Scripted {
         register_address_network(b_addr, network);
         let settings = QuicSettings {
             memory_limit: 1024 * 1024 * 1024,
-            idle_timeout: None,
+            idle_timeout,
             initial_window: Some(super::super::tests::TEST_WINDOW),
             rate_limit: Default::default(),
         };
@@ -3615,7 +3627,7 @@ fn a_path_without_data_is_not_closed_by_a_dark_spell() {
         let mut s = Scripted::connect_without_data(network).await;
         s.wait(Duration::from_secs(1)).await;
         let mut expected = vec![0u64; 8];
-        for (spell, bucket) in [(30, 4), (100, 5)] {
+        for (spell, bucket) in [(30, 3), (100, 4)] {
             let dark = DropFrom::new(network, &[s.a_addr, s.b_addr]);
             let (a, time) = (s.a.clone(), s.time.clone());
             s.tasks.push(tokio::spawn(async move {
@@ -3653,6 +3665,59 @@ fn a_path_without_data_is_not_closed_by_a_dark_spell() {
             assert_eq!(s.dark_episodes(), expected, "after a {spell} s spell");
         }
         assert!(recycle::stalls_to(s.b_addr).is_empty());
+    })
+}
+
+/// [`a_path_without_data_is_not_closed_by_a_dark_spell`] with quinn's idle
+/// timeout at a node's 120 s: a 30 s outage still reads below 120 s and the
+/// path lives, but after a 100 s outage the next backed-off probe comes after
+/// the idle timeout, so the path ends silent and the episode counts
+/// `unrecovered`, not as a long recovery. The dark rule closes neither.
+#[test]
+fn a_path_without_data_idles_out_after_a_long_dark_spell_and_counts_it_unrecovered() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-dark-idle";
+        let idle = Duration::from_secs(120);
+        let mut s = Scripted::connect_without_data_idle(network, idle).await;
+        s.wait(Duration::from_secs(1)).await;
+        let mut expected = vec![0u64; 8];
+        for spell in [30u64, 100] {
+            let dark = DropFrom::new(network, &[s.a_addr, s.b_addr]);
+            let (a, time) = (s.a.clone(), s.time.clone());
+            s.tasks.push(tokio::spawn(async move {
+                a.send_control_bounded(
+                    &time,
+                    Duration::from_secs(60),
+                    QuicControl::Ready {
+                        attempt: 1,
+                        caps: 0,
+                    },
+                )
+                .await;
+            }));
+            s.wait(Duration::from_secs(spell)).await;
+            drop(dark);
+            let mut waited = 0;
+            while s.dark_episodes().iter().sum::<u64>() < expected.iter().sum::<u64>() + 1 {
+                assert!(waited < 300, "the {spell} s spell was never counted");
+                s.wait(Duration::from_secs(1)).await;
+                waited += 1;
+            }
+            let label = if spell == 30 {
+                expected[3] += 1;
+                "recovered_lt_120s"
+            } else {
+                expected[5] += 1;
+                "unrecovered"
+            };
+            assert_eq!(s.dark_episodes(), expected, "a {spell} s spell is {label}");
+        }
+        assert!(
+            s.a.connection().inner().close_reason().is_some(),
+            "premise: the idle timeout ended the path"
+        );
+        assert!(recycle::stalls_to(s.b_addr).is_empty(), "not the dark rule");
     })
 }
 

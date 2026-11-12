@@ -176,7 +176,12 @@ fn run_observed(
             r.outstanding,
             r.sent,
             r.received,
-            NO_CAP,
+            CapHoldReading {
+                holds: r.cap_holds,
+                held_now: r.cap_held_now,
+                validity: r.cap_validity,
+                longest_wait: Duration::ZERO,
+            },
         )
     };
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(carries_data));
@@ -199,7 +204,7 @@ fn a_path_without_data_counts_a_dark_spell_to_its_end() {
     let spell = |t: u64| reading(5, 1200, 10 + t.min(15), 100 + t.saturating_sub(15));
     let (closed, counts) = run_observed(40, false, spell);
     assert_eq!(closed, None, "a path that carries no data is not closed");
-    assert_eq!(counts, vec![0, 0, 0, 0, 1, 0, 0, 0]);
+    assert_eq!(counts, vec![0, 0, 0, 1, 0, 0, 0, 0]);
     let (closed, counts) = run_observed(40, true, spell);
     assert_eq!(closed, Some((closes_at(1), Stall::Dark)));
     assert_eq!(counts, vec![0, 0, 0, 0, 0, 0, 0, 1]);
@@ -213,16 +218,85 @@ fn dark_spells_are_counted_by_how_long_they_lasted() {
     let (_, counts) = run_observed(10, false, |t| {
         reading(5, 1200, 10 + t.min(2), 100 + t.saturating_sub(2))
     });
-    assert_eq!(counts, vec![0, 1, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(counts, vec![1, 0, 0, 0, 0, 0, 0, 0]);
     // Sends at ticks 1-4, heard from again at tick 5: 8 s.
     let (_, counts) = run_observed(10, false, |t| {
         reading(5, 1200, 10 + t.min(4), 100 + t.saturating_sub(4))
     });
-    assert_eq!(counts, vec![0, 0, 1, 0, 0, 0, 0, 0]);
+    assert_eq!(counts, vec![0, 1, 0, 0, 0, 0, 0, 0]);
     // Dark to the end of the watch.
     let (closed, counts) = run_observed(30, false, |t| reading(5, 1200, 10 + t, 100));
     assert_eq!(closed, None);
+    assert_eq!(counts, vec![0, 0, 0, 0, 0, 1, 0, 0]);
+}
+
+/// A dark spell that the egress cap interrupts (it holds this side's sends
+/// from tick 3) ends there, counted `cap_held`: whether the peer is dark can
+/// no longer be told, and the episode is not dropped uncounted.
+#[test]
+fn a_dark_spell_ended_by_a_cap_hold_is_counted_cap_held() {
+    let (closed, counts) = run_observed(10, false, |t| {
+        let reading = reading(5, 1200, 10 + t, 100);
+        if t >= 3 {
+            reading.cap_held(t - 2)
+        } else {
+            reading
+        }
+    });
+    assert_eq!(closed, None);
     assert_eq!(counts, vec![0, 0, 0, 0, 0, 0, 1, 0]);
+}
+
+/// Feed a watch the readings `at(i)` taken at `times[i]` seconds; the first
+/// index at which it said close, and why.
+fn run_at(times: &[u64], mut at: impl FnMut(usize) -> Reading) -> Option<(usize, Stall)> {
+    let record = Arc::default();
+    let sample = |r: Reading| {
+        AckSample::synthetic(
+            &record,
+            r.acked,
+            r.batches,
+            r.outstanding,
+            r.sent,
+            r.received,
+            NO_CAP,
+        )
+    };
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)));
+    (1..times.len()).find_map(|i| {
+        watch
+            .observe(times[i] * SEC, sample(at(i)))
+            .then(|| (i, watch.stall().expect("a reason")))
+    })
+}
+
+/// This side's runtime stalls for 30 s between two samples (a late tick, or
+/// a suspended host) while a send is outstanding on a live path: the late
+/// sample counts as one tick, so the path is not closed as dark, and the
+/// peer's acknowledgement at the next sample ends the spell. A path that
+/// stays dark after the stall still closes, a window of samples later.
+#[test]
+fn a_stall_of_this_sides_runtime_does_not_close_the_path() {
+    // Samples every 2 s, then one 30 s late, then every 2 s again.
+    let times: Vec<u64> = (0..=3)
+        .map(|i| 2 * i)
+        .chain((0..=20).map(|i| 36 + 2 * i))
+        .collect();
+    // A send at index 1, outstanding through the stall, acknowledged at the
+    // sample after it (index 5).
+    let recovered = run_at(&times, |i| {
+        if i >= 5 {
+            reading(6, 0, 11, 100 + i as u64)
+        } else {
+            reading(5, 1200, 10 + u64::from(i >= 1), 100)
+        }
+    });
+    assert_eq!(recovered, None, "a stall of our own is not darkness");
+    // Dark from index 1 to the end: the stall counts as one tick, so the
+    // window ends at the sixth sample after index 1, not at the first after
+    // the stall.
+    let dark = run_at(&times, |i| reading(5, 1200, 10 + i as u64, 100));
+    assert_eq!(dark, Some((6, Stall::Dark)));
 }
 
 /// A send at tick 1, never acknowledged, while the peer sends every tick:
@@ -1156,6 +1230,39 @@ fn a_send_held_by_the_egress_cap_is_not_starved() {
             },
         )
         .cap_held(t)
+    });
+    assert_eq!(closed, None);
+}
+
+/// The egress cap holds for most of each window and releases for one
+/// interval in five: only the released intervals can count, 2 s of every
+/// 10 s, under `CREDIT_LIMITED_MIN`, so the send is never closed, though it
+/// is blocked and almost nothing is acknowledged throughout. Counting the
+/// held intervals too would close it at the first released sample.
+#[test]
+fn a_send_held_by_the_egress_cap_for_part_of_the_window_is_not_starved() {
+    let held = |t: u64| t % 5 != 0;
+    let closed = run(100, |t| {
+        let reading = busy(
+            t,
+            Credit {
+                acked_bytes: 100 * t,
+                blocked: t,
+                stream_frames: 50,
+                writers: 1,
+                ..Credit::default()
+            },
+        );
+        // Hold events so far, unchanged at a released sample.
+        let holds = (1..=t).filter(|&i| held(i)).count() as u64;
+        if held(t) {
+            reading.cap_held(holds)
+        } else {
+            Reading {
+                cap_holds: holds,
+                ..reading
+            }
+        }
     });
     assert_eq!(closed, None);
 }

@@ -21532,6 +21532,24 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
             "{address} fell back once, on its own watch's close of the dark path: {}",
             run.dump()
         );
+        // In place of the suspect routing this test asserted before the
+        // watch: the watch closes first (neither end goes suspect here), so
+        // what bounds the data lost to the dark path is how soon the end falls
+        // back after the last data the path delivered to it. The window plus
+        // two samples and the time the close takes to reach the machine.
+        let last_on_path = of_node("received a short on the path")
+            .iter()
+            .chain(of_node("received a stream on the path").iter())
+            .map(|r| r.at)
+            .max()
+            .expect("the path carried data before it went dark");
+        let fell_back_at = of_node("Fallback(")[0].at;
+        let dark_for = fell_back_at.saturating_sub(last_on_path);
+        assert!(
+            dark_for <= std::time::Duration::from_secs(16),
+            "{address} fell back {dark_for:?} after the path last delivered to it: {}",
+            run.dump()
+        );
     }
     let fell_back = records
         .iter()

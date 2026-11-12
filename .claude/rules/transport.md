@@ -1487,9 +1487,12 @@ a test passes its own; tests read their own, never the global).
   level in the period, and the highest count a reset in the period took a path
   to). They are for the fixed charge, which takes quinn's stopped map at
   SEND_ABORT_LIMIT x QUIC_STOPPED_ENTRY_BYTES until field data justifies less.
-  quic_dark_episode_<recovered_lt_2s|lt_5s|lt_10s|lt_30s|lt_120s|recovered_ge_120s|
-  unrecovered|closed_at_window>: dark episodes (recycle::AckWatch: packets
-  outstanding, nothing acknowledged, nothing heard) by how they ended. The
+  quic_dark_episode_<recovered_lt_5s|lt_10s|lt_30s|lt_120s|recovered_ge_120s|
+  unrecovered|cap_held|closed_at_window>: dark episodes (recycle::AckWatch:
+  packets outstanding, nothing acknowledged, nothing heard) by how they ended;
+  read at the watch's 2 s samples, so none recovers in under 2 s, and
+  `cap_held` is an episode ended by the egress cap holding this side's sends
+  (the watch cannot tell then whether the peer is dark). The
   dark-path rule closes only a path that carries data (QuicPath::enable_data);
   on every other path (all of them while QUIC_DATA_PERCENT is 0) it only
   counts, so the field shows how long real dark spells last. A spell is read
