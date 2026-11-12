@@ -634,6 +634,24 @@ fn the_production_values_are_pinned() {
     assert_eq!(ACK_WATCH_WINDOW, Duration::from_secs(10));
     assert_eq!(ACK_WATCH_TICK, Duration::from_secs(2));
     assert!(ACK_WATCH_WINDOW > 2 * ACK_WATCH_TICK);
+    // The liveness rules' values, as literals: the tests that take their
+    // windows from these constants stay green if one changes, so the change
+    // must show up here.
+    assert_eq!(DARK_GRACE_MAX, Duration::from_secs(10));
+    assert_eq!(FLOOR_RATE_BYTES_PER_SEC, 32 * 1024);
+    assert_eq!(CREDIT_LIMITED_MIN, Duration::from_secs(4));
+    assert_eq!(CREDIT_FLOOR_RTT_MAX, Duration::from_secs(4));
+    assert_eq!(credit_floor_rate(Duration::from_secs(4)), 16 * 1024);
+    assert_eq!(STREAM_CREDIT_WINDOW, Duration::from_secs(60));
+    assert_eq!(STREAM_CREDIT_FREED, 9);
+    assert_eq!(
+        crate::transport::peer_connection::streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC,
+        32 * 1024
+    );
+    assert_eq!(
+        super::super::path::inbound::STREAM_AGE_LIMIT,
+        Duration::from_secs(2 * 60 * 60)
+    );
     assert_eq!(
         super::super::path::QuicPathLimits::DEFAULT.max_send_aborts,
         SEND_ABORT_LIMIT

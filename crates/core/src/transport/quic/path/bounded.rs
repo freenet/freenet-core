@@ -121,7 +121,6 @@ impl SendDeadlines {
     /// least 5 min (`inbound_stream_age_limit`): by then the peer has had
     /// the whole stream, and at most a send window of backlog (8 MiB, 256 s
     /// at that rate) was ahead of its end.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stream(len: u64) -> Self {
         let total = super::inbound::stream_age_limit();
         Self {

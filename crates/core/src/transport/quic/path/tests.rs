@@ -826,60 +826,79 @@ fn a_trickle_holding_many_streams_is_evicted_at_their_first_age() {
 
 /// A slow stream on a busy connection is kept past its first age: a trickle
 /// that alone would be evicted at its first age, beside a bulk stream that
-/// keeps the connection reading above the floor rate. quinn shares a
-/// connection between its streams, so a stream's own rate says little; the
-/// connection's says whether the peer is delivering.
+/// keeps the connection reading at 36 KiB/s, just above the 32 KiB/s floor.
+/// quinn shares a connection between its streams, so a stream's own rate
+/// says little; the connection's says whether the peer is delivering. At
+/// 28 KiB/s, just under the floor, the trickle is evicted at its first age.
 #[test]
 fn a_slow_stream_on_a_busy_connection_is_kept_past_its_first_age() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let mut p = paths("quic-path-busy-age", QuicPathLimits::DEFAULT).await;
-        let idle = streaming_handle_idle_timeout();
-        let total = 100_000u64;
-        let age = max_inbound_stream_age(total);
-        let (conn, time) = (p.a_raw(), p.time());
-        let held = age + age / 2;
-        let outcome = drive(&p.pair.time, held + LIMIT, async move {
-            let mut slow = conn.open_uni().await.unwrap();
-            slow.write_all(&header(1, 1, StreamId::next().0, total, 0))
-                .await
-                .unwrap();
-            // The bulk: 64 KiB a second, twice the floor, in streams of 1 MiB.
-            let bulk_conn = conn.clone();
-            let bulk_time = time.clone();
-            let bulk = tokio::spawn(async move {
-                loop {
-                    let mut send = bulk_conn.open_uni().await.unwrap();
-                    let len = MIB;
-                    send.write_all(&header(1, 1, StreamId::next().0, len as u64, 0))
-                        .await
-                        .unwrap();
-                    for _ in 0..len / (64 * 1024) {
-                        send.write_all(&payload(64 * 1024)).await.unwrap();
-                        bulk_time.sleep(Duration::from_secs(1)).await;
+        for (network, rate, kept) in [
+            ("quic-path-busy-age-above", 36 * 1024usize, true),
+            ("quic-path-busy-age-below", 28 * 1024, false),
+        ] {
+            let mut p = paths(network, QuicPathLimits::DEFAULT).await;
+            let idle = streaming_handle_idle_timeout();
+            let total = 100_000u64;
+            let age = max_inbound_stream_age(total);
+            let (conn, time) = (p.a_raw(), p.time());
+            let held = age + age / 2;
+            let outcome = drive(&p.pair.time, held + LIMIT, async move {
+                let mut slow = conn.open_uni().await.unwrap();
+                slow.write_all(&header(1, 1, StreamId::next().0, total, 0))
+                    .await
+                    .unwrap();
+                // The bulk: `rate` bytes a second, in streams of 1 MiB.
+                let bulk_conn = conn.clone();
+                let bulk_time = time.clone();
+                let bulk = tokio::spawn(async move {
+                    loop {
+                        let mut send = bulk_conn.open_uni().await.unwrap();
+                        let len = MIB;
+                        send.write_all(&header(1, 1, StreamId::next().0, len as u64, 0))
+                            .await
+                            .unwrap();
+                        let mut left = len;
+                        while left > 0 {
+                            let piece = rate.min(left);
+                            send.write_all(&payload(piece)).await.unwrap();
+                            left -= piece;
+                            bulk_time.sleep(Duration::from_secs(1)).await;
+                        }
+                        send.finish().unwrap();
                     }
-                    send.finish().unwrap();
+                });
+                let start = time.now_nanos();
+                let mut evicted = None;
+                while Duration::from_nanos(time.now_nanos() - start) < held {
+                    if let Err(quinn::WriteError::Stopped(code)) = slow.write_all(b"x").await {
+                        evicted = Some((code.into_inner(), time.now_nanos() - start));
+                        break;
+                    }
+                    time.sleep(idle / 2).await;
                 }
-            });
-            let start = time.now_nanos();
-            let mut evicted = None;
-            while Duration::from_nanos(time.now_nanos() - start) < held {
-                if let Err(quinn::WriteError::Stopped(code)) = slow.write_all(b"x").await {
-                    evicted = Some(code.into_inner());
-                    break;
-                }
-                time.sleep(idle / 2).await;
+                bulk.abort();
+                evicted
+            })
+            .await;
+            if kept {
+                assert_eq!(outcome, None, "{network}: kept past its first age {age:?}");
+                assert_eq!(
+                    p.b.stats().shared_count(InboundStreamOutcome::EvictedAge),
+                    0
+                );
+            } else {
+                let (code, at) = outcome.expect("evicted");
+                assert_eq!(code, u64::from(stop_code::EVICTED), "{network}");
+                let at = Duration::from_nanos(at);
+                assert!(
+                    at >= age && at < age + idle,
+                    "{network}: evicted at {at:?}, first age {age:?}"
+                );
             }
-            bulk.abort();
-            evicted
-        })
-        .await;
-        assert_eq!(outcome, None, "kept past its first age {age:?}");
-        assert_eq!(
-            p.b.stats().shared_count(InboundStreamOutcome::EvictedAge),
-            0
-        );
-        while p.b_in.streams.try_recv().is_ok() {}
+            while p.b_in.streams.try_recv().is_ok() {}
+        }
     })
 }
 

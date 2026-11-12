@@ -1,9 +1,11 @@
 //! When a QUIC path is closed so its peer falls back to the UDP session
 //! (#5940, step M6).
 //!
-//! Two conditions close a path, each with its own close code and counted in
-//! `quic_close_sent_<label>` ([`QuicCloseCode`]). Either code asks the peer
-//! to fall back to UDP for THIS connection only. It is not a permanent
+//! Two close codes recycle a path, each counted in `quic_close_sent_<label>`
+//! ([`QuicCloseCode`]): too many locally reset sends (1, below), and
+//! `PEER_NOT_ACKNOWLEDGING`, which the acknowledgement watch's rules (2-5,
+//! below) all close with. Either code asks the peer to fall back to UDP for
+//! THIS connection only. It is not a permanent
 //! downgrade: e5 must let the pair upgrade again after its normal backoff.
 //!
 //! 1. **Too many locally reset sends** ([`close_code::SEND_ABORT_LIMIT`]).
@@ -242,7 +244,9 @@ pub(crate) const DARK_GRACE_MAX: Duration = Duration::from_secs(10);
 /// quinn's probes back off by doubling, so the first one after that time
 /// goes out by twice it plus one probe timeout (at most 3 x `rtt` + 25 ms,
 /// quinn's with its initial variance); it is seen within a tick and closes
-/// after its grace. About 32 s at a 50 ms or 300 ms round trip and 35 s at
+/// after its grace. The probe timeout is quinn's with its initial variance
+/// (half the round trip); on a jittery path quinn's variance, and so the
+/// bound, can be somewhat higher. About 32 s at a 50 ms or 300 ms round trip and 35 s at
 /// 800 ms. Measured on real paths: 19.9 s, 21.6 s and 29.1 s
 /// (`the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer`), and
 /// 31 s on a path whose permits were all held
@@ -890,52 +894,63 @@ impl AckSample {
     }
 }
 
-/// A path's sends that still have data to write: counted from the stream's
-/// open until the end of its data is sent, or the send is dropped. Read by
-/// [`CreditWatch`], so a blocked frame from a send that has since ended does
-/// not keep the path counted as waiting on the peer's credit.
+/// A path's send counts, read by the watch: sends that still have data to
+/// write (counted from the stream's open until the end of its data is sent,
+/// or the send is dropped; read by [`CreditWatch`], so a blocked frame from a
+/// send that has since ended does not keep the path counted as waiting on
+/// the peer's credit), and the stream counts [`StreamCreditWatch`] reads.
 #[derive(Debug, Default)]
-pub(crate) struct Writers(AtomicUsize, AtomicU64, AtomicU64, AtomicUsize);
+pub(crate) struct Writers {
+    /// Sends with data still to write.
+    writing: AtomicUsize,
+    /// Streams finished and wholly acknowledged so far.
+    acknowledged: AtomicU64,
+    /// Data streams opened so far.
+    opened: AtomicU64,
+    /// Sends waiting in `open_uni` for the peer's stream credit now.
+    waiting_for_stream: AtomicUsize,
+}
 
 impl Writers {
     /// One more send writing, until the guard is dropped; its stream is
     /// counted as opened.
     pub(crate) fn start(self: &Arc<Self>) -> Writing {
-        self.0.fetch_add(1, Ordering::Relaxed);
-        self.2.fetch_add(1, Ordering::Relaxed);
+        self.writing.fetch_add(1, Ordering::Relaxed);
+        self.opened.fetch_add(1, Ordering::Relaxed);
         Writing(self.clone())
     }
 
     /// The path's data streams opened so far.
     pub(crate) fn streams_opened(&self) -> u64 {
-        self.2.load(Ordering::Relaxed)
+        self.opened.load(Ordering::Relaxed)
     }
 
     /// One more send waiting in `open_uni` for the peer's stream credit,
     /// until the guard is dropped.
     pub(crate) fn wait_for_stream(self: &Arc<Self>) -> StreamWait {
-        self.3.fetch_add(1, Ordering::Relaxed);
+        self.waiting_for_stream.fetch_add(1, Ordering::Relaxed);
         StreamWait(self.clone())
     }
 
     /// Sends waiting for the peer's stream credit now.
     pub(crate) fn stream_waiters(&self) -> usize {
-        self.3.load(Ordering::Relaxed)
+        self.waiting_for_stream.load(Ordering::Relaxed)
     }
 
+    /// Sends with data still to write now.
     pub(crate) fn count(&self) -> usize {
-        self.0.load(Ordering::Relaxed)
+        self.writing.load(Ordering::Relaxed)
     }
 
     /// One of the path's streams was finished and every byte of it
     /// acknowledged, for the stream-credit rule ([`StreamCreditWatch`]).
     pub(crate) fn stream_acknowledged(&self) {
-        self.1.fetch_add(1, Ordering::Relaxed);
+        self.acknowledged.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The path's streams finished and wholly acknowledged so far.
     pub(crate) fn streams_acknowledged(&self) -> u64 {
-        self.1.load(Ordering::Relaxed)
+        self.acknowledged.load(Ordering::Relaxed)
     }
 }
 
@@ -945,17 +960,17 @@ pub(crate) struct StreamWait(Arc<Writers>);
 
 impl Drop for StreamWait {
     fn drop(&mut self) {
-        self.0.3.fetch_sub(1, Ordering::Relaxed);
+        self.0.waiting_for_stream.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-/// One send counted in [`Writers`] while it is held.
+/// One send counted in [`Writers::count`] while it is held.
 #[derive(Debug)]
 pub(crate) struct Writing(Arc<Writers>);
 
 impl Drop for Writing {
     fn drop(&mut self) {
-        self.0.0.fetch_sub(1, Ordering::Relaxed);
+        self.0.writing.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
