@@ -49,15 +49,21 @@ WHEN accepting a new connection (should_accept):
      CONNECT path, not just should_accept. See connection_manager.rs.
      MINIMUM-DEGREE FLOOR: the whole lattice feature (this exception, the
      per-side acceptance clause, the route-to-self discovery probe, and the
-     topology.rs retention exemption) is GATED OFF when this peer's CONFIGURED
-     max_connections is below NN_LATTICE_MIN_MAX_CONNECTIONS (= 25 =
+     topology.rs retention exemption) is GATED OFF when the max_connections
+     this peer is built with is below NN_LATTICE_MIN_MAX_CONNECTIONS (= 25 =
      DEFAULT_MIN_CONNECTIONS). Two-tier routing needs enough long links left
      after the 2-slot base-lattice reserve; below the network's own
      minimum-degree target a node can't sustain the structure. The gate reads
-     CONFIGURED max (200 in production), NOT the live connection count, so
-     production peers are always active and the floor's real job is to keep the
-     sparse simulation suite (configs top out at max=16) at its pre-lattice
-     baseline — only the production-scale max=200 sim tests exercise the lattice.
+     the built max (NetworkApiConfig::connection_limit().max: 200 by default,
+     lowered to the QUIC connection cap while the node may carry QUIC data, but
+     never below min-number-of-connections), NOT the live connection count. On
+     defaults that is at least 25, so production peers are active. The
+     exception: an operator who set min-number-of-connections below 25 on a
+     host under about 530 MiB (QUIC cap 24) runs below the floor with data on,
+     and the lattice turns itself off there. Otherwise the floor's job is to
+     keep the sparse simulation suite (configs top out at max=16) at its
+     pre-lattice baseline; only the production-scale max=200 sim tests
+     exercise the lattice.
      The single activation gate is nn_lattice_active_for(max_connections) /
      ConnectionManager::nn_lattice_active(); the test-only override that flips
      the stock/fix validation arm also force-activates below the floor (so the

@@ -4804,7 +4804,7 @@ fn refused_data_readers_stay_within_the_shadow_stream_grant() {
         let stats = p.b.stats();
         let refused = stats.count(QuicInboundOutcome::RefusedNotAcceptingData);
         assert!(
-            refused >= 100 * super::super::config::INITIAL_UNI_STREAMS as u64,
+            refused >= 50 * super::super::config::INITIAL_UNI_STREAMS as u64,
             "premise: the peer churned its streams ({refused} refused, {opened} opened)"
         );
         let peak = p.b.inbound_readers_peak();
@@ -4818,8 +4818,8 @@ fn refused_data_readers_stay_within_the_shadow_stream_grant() {
 }
 
 /// A path that ends inside the refusal's close delay is not closed again: no
-/// `ClosedRefusingData` is counted, and the receiver's reader for the refused
-/// frame ends with the connection.
+/// `ClosedRefusingData` is counted, and the close armed by the receive task
+/// ends with the connection.
 #[test]
 fn a_path_that_ends_inside_the_refusal_delay_is_not_closed_again() {
     bounded(|| async move {

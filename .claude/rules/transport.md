@@ -1588,10 +1588,13 @@ not a whole number is ignored with a WARN at startup (only when
 release's value cannot stop the node. On the command line a negative value
 needs `=` (`--quic-max-paths=-1`): with a space clap reads `-1` as a flag and
 refuses the command line, as for every numeric option.
-The default is `max-number-of-connections`, and a larger value is lowered to
-it.
-At the default the limit rarely binds (a permit is held from the offer, so a
-path still closing can briefly hold a slot). A rollback to a release before
+The default is the node's connection limit (`connection_limit().max`:
+`max-number-of-connections`, lowered to the QUIC connection cap while the
+node may carry data), and a larger value is lowered to it. Without data the
+limit rarely binds at the default (a permit is held from the offer, so a path
+still closing can briefly hold a slot). With data on a host under about 5 GiB
+the connection limit is itself the QUIC cap, so the ring and quic-max-paths
+are bounded by the same number. A rollback to a release before
 the key drops it: the older binary rewrites `config.toml` without it. It is
 kebab-case from the start, so it has no `CONFIG_KEY_SPELLINGS` entry.
 
@@ -1726,8 +1729,8 @@ default 200 that is about 95 MiB. A node set to more connections with data
 off holds proportionally more (1,000: about 475 MiB); that is stated, not
 clamped. Below about 760 MiB the data-off bound is above an eighth of memory,
 and the aggregate is checked from 1 GiB up: at 512 MiB with data off,
-caches + hosting + 200 shadow paths come to about 431 MB against 75% of
-memory (403 MB). Stated, not clamped; lowering connections with data off is
+caches + hosting + 200 shadow paths come to about 431-464 MB depending on
+pool size (1/4/16) against 75% of memory (403 MB). Stated, not clamped; lowering connections with data off is
 a separate decision. The aggregate test sums the larger of the two cases
 (`quic_memory_ceiling`: data on at the cap, or shadow at 200) with the caches
 and the hosting budget in

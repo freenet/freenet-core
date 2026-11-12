@@ -210,6 +210,8 @@ pub(in crate::transport::quic) struct Receiver<T> {
     /// A data frame was refused on this path: the receive task arms the one
     /// delayed close ([`REFUSAL_CLOSE_DELAY`]) and the refused reader ends.
     refused_data: AtomicBool,
+    /// The kind of the first refused data frame, for the close's WARN.
+    refused_kind: parking_lot::Mutex<Option<FrameKind>>,
     /// The most stream readers the receive task held at once. Tests only.
     #[cfg(test)]
     readers_peak: Arc<AtomicUsize>,
@@ -243,7 +245,9 @@ impl<T: TimeSource> Receiver<T> {
     fn close_refusing_data(&self) {
         if self.closer.close(QuicCloseCode::Downgrade) {
             self.stats.record(QuicInboundOutcome::ClosedRefusingData);
+            let kind = *self.refused_kind.lock();
             tracing::warn!(
+                ?kind,
                 "QUIC path: the peer sent data on a path where this node did not \
                  set its data bit; closing the path so the peer falls back to UDP"
             );
@@ -372,6 +376,7 @@ impl<T: TimeSource> Receiver<T> {
             rtt: Arc::new(PathRtt::new(closer.rtt())),
             closer,
             refused_data: AtomicBool::new(false),
+            refused_kind: parking_lot::Mutex::new(None),
             #[cfg(test)]
             readers_peak: Arc::new(AtomicUsize::new(0)),
             ranges: Arc::new(ConnRanges::new(
@@ -629,7 +634,10 @@ pub(in crate::transport::quic) async fn receive<T: TimeSource>(
             .readers_peak
             .fetch_max(readers.len(), Ordering::Relaxed);
         tokio::select! {
-            () = async { refusal_close.as_mut().expect("guarded").await }, if refusal_close.is_some() => {
+            // The precondition makes this arm run only while a close is armed,
+            // and `select!` evaluates it before polling the arm, so the
+            // `expect` cannot fire.
+            () = async { refusal_close.as_mut().expect("the precondition checks it is armed").await }, if refusal_close.is_some() => {
                 refusal_close = Some(Box::pin(std::future::pending()));
                 receiver.close_refusing_data();
             }
@@ -2044,6 +2052,7 @@ async fn read_one<T: TimeSource>(
         // sender that sees the close before a stream's stop reads the stream as
         // lost and drops it, where the stop sends it on UDP. The receive task
         // arms it once per connection ([`receive`]); this reader ends here.
+        receiver.refused_kind.lock().get_or_insert(header.kind());
         receiver.refused_data.store(true, Ordering::Relaxed);
         return;
     }
