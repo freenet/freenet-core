@@ -3056,6 +3056,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_breaker_suppressed),
             );
             m.insert(
+                "quic_endpoint".into(),
+                serde_json::json!(snapshot.quic_endpoint),
+            );
+            m.insert(
                 "quic_close_sent_node_dropped_peer".into(),
                 serde_json::json!(snapshot.quic_close_sent_node_dropped_peer),
             );

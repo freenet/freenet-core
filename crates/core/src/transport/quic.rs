@@ -120,6 +120,19 @@ pub enum QuicMode {
     Prefer,
 }
 
+/// The endpoint state a bind leaves: `Up` when it built the endpoint, and
+/// otherwise why not. An aborting build is refused before anything is bound
+/// (`QuicEndpoint::bind_checked`), so a failure there is the abort, not the
+/// socket.
+fn bound_state(unwinds: bool, built: bool) -> crate::transport::metrics::QuicEndpointState {
+    use crate::transport::metrics::QuicEndpointState;
+    match (built, unwinds) {
+        (true, _) => QuicEndpointState::Up,
+        (false, true) => QuicEndpointState::OffBind,
+        (false, false) => QuicEndpointState::OffAbort,
+    }
+}
+
 impl Default for QuicMode {
     fn default() -> Self {
         Self::default_mode()
@@ -524,7 +537,10 @@ impl QuicEndpoint {
         settings: &QuicSettings,
         keypair: &TransportKeypair,
     ) -> Option<Self> {
-        match Self::bind_checked(unwinds, socket, local_addr, time, settings, keypair) {
+        let result = Self::bind_checked(unwinds, socket, local_addr, time, settings, keypair);
+        crate::transport::metrics::TRANSPORT_METRICS
+            .set_quic_endpoint_state(bound_state(unwinds, result.is_ok()));
+        match result {
             Ok(endpoint) => Some(endpoint),
             Err(error) => {
                 tracing::warn!(

@@ -502,7 +502,11 @@ within ten minutes after recording a panic in QUIC code (quinn, quinn-proto or
 transport/quic, by panic location), each starting within 24 h of the one before;
 see `quic/breaker.rs`) and whether the breaker keeps QUIC
 off in this process (`quic_breaker_suppressed`, a state that is never reset and
-is not activity by itself) and QUIC connections this node closed, by close code
+is not activity by itself) and the endpoint's state (`quic_endpoint`: `up`, or
+`off_config`, `off_platform`, `off_abort`, `off_bind`, `off_breaker`, or `died`;
+`unknown` before the node reaches the bind; set at startup after the breaker
+gate, at the bind, and at the endpoint's death, which is final for the process;
+a state that is never reset and is not activity by itself) and QUIC connections this node closed, by close code
 (`quic_close_sent_<label>`, one per `QuicCloseCode`) and the shadow-mode upgrade
 telemetry (below, "Upgrade telemetry"). Each label set is declared once in a
 `labelled_counters!` list, so a new variant needs a snapshot field. Hot
@@ -1125,7 +1129,9 @@ with both bits sends its data on the path ("QUIC send route" below). At a share 
 0, with no `quic-data-percent`, `prefer` differs from `shadow` only by the bit, which
 stays 0. The release that raises the share above 0 must say in its notes that
 existing `prefer` configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
-changes. Windows is shadow by default too since its crash-loop breaker was
+changes, except that `off` set in the config is deprecated and logs a WARN at
+startup (`upgrade::policy::log_startup`); the endpoint state telemetry reports it
+as `off_config`. Windows is shadow by default too since its crash-loop breaker was
 confirmed on a real Windows machine (#6031). The default is
 read, never written to config.toml: a node that did not set the key follows the
 release it runs, so a default-off release is the kill switch. It does not reach
@@ -1545,7 +1551,9 @@ kebab-case from the start, so it has no `CONFIG_KEY_SPELLINGS` entry.
 An unknown `transport-quic` value is off with a warning, never an error: a
 crash-loop rollback
 reinstalls an older binary, which must start with a value a later release
-wrote, and keeps it in config.toml.
+wrote, and keeps it in config.toml. `off` itself is deprecated: it still turns
+QUIC off and logs a deprecation WARN at startup, since QUIC is to replace the
+UDP transport (#5940).
 
 ```
 QuicSocket (quic/socket.rs) is quinn's AsyncUdpSocket:

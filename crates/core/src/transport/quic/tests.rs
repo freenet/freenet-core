@@ -4869,3 +4869,57 @@ fn a_handoff_is_used_only_by_its_own_cap() {
         "Y's send must not use X's handoff as Y's admission"
     );
 }
+
+/// A bind reports `up` when it built the endpoint, and otherwise why not: an
+/// aborting build is refused before the socket is touched, so its failure is
+/// the abort, and any other failure is the bind.
+#[test]
+fn a_bind_reports_up_or_why_it_failed() {
+    use crate::transport::metrics::QuicEndpointState;
+    assert_eq!(super::bound_state(true, true), QuicEndpointState::Up);
+    assert_eq!(super::bound_state(false, true), QuicEndpointState::Up);
+    assert_eq!(super::bound_state(true, false), QuicEndpointState::OffBind);
+    assert_eq!(
+        super::bound_state(false, false),
+        QuicEndpointState::OffAbort
+    );
+}
+
+/// The bind records its outcome as the endpoint state, in code (not a
+/// comment) inside `bind_or_warn_checked`, for every result: `up` on a node
+/// with a healthy endpoint is the figure this state exists to measure. A
+/// source pin, because a test on the process-global metrics would race other
+/// tests' endpoints under `cargo test`.
+#[test]
+fn the_bind_records_its_endpoint_state() {
+    let source = include_str!("../quic.rs");
+    let signature = "    fn bind_or_warn_checked<";
+    assert_eq!(
+        source.matches(signature).count(),
+        1,
+        "one bind_or_warn_checked"
+    );
+    let start = source.find(signature).expect("found above");
+    // The tests are a separate file (`quic/tests.rs`), so the one match is
+    // the production function, not text in a test.
+    let end = start
+        + source[start..]
+            .find("\n    }\n")
+            .expect("the function ends");
+    let flat: String = source[start..end]
+        .lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .collect::<String>()
+        .split_whitespace()
+        .collect();
+    let record = flat
+        .find("TRANSPORT_METRICS.set_quic_endpoint_state(bound_state(unwinds,result.is_ok()));")
+        .expect("the bind records its state");
+    let branch = flat
+        .find("matchresult{")
+        .expect("the bind matches its result");
+    assert!(
+        record < branch,
+        "recorded before the result is used, for both arms"
+    );
+}

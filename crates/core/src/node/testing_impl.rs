@@ -8515,6 +8515,31 @@ mod tests {
         );
     }
 
+    /// `build` records the QUIC endpoint state telemetry reports when QUIC is
+    /// already off before the bind (#5940 UDP removal, phase A): from the
+    /// breaker's result, after the gate, as code and not in a comment.
+    #[test]
+    fn build_records_the_endpoint_state_after_the_breaker_gate() {
+        let source = include_str!("network_bridge/p2p_protoc.rs");
+        let flat: String = method_body(source, "    pub async fn build(")
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<String>()
+            .split_whitespace()
+            .collect();
+        let gate = flat
+            .find("letquic=crate::transport::quic::breaker::gate(")
+            .expect("`build` runs the breaker gate");
+        let record = flat
+            .find("endpoint_state_before_bind(&config.config.network_api,quic.settings.is_some(),)")
+            .expect("`build` decides the state from the gate's settings");
+        assert!(record > gate, "the state is decided after the gate");
+        assert!(
+            flat[record..].contains("TRANSPORT_METRICS.set_quic_endpoint_state(state)"),
+            "`build` records it"
+        );
+    }
+
     /// The body of the method `signature` (indented four spaces, as in an
     /// `impl` block) in `src`: from the signature to the method's closing
     /// brace at the same indentation. Panics, rather than widening
