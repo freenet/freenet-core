@@ -857,6 +857,31 @@ pub struct TransportMetrics {
     /// The QUIC endpoint's state, a [`QuicEndpointState`] as `u8` (a state,
     /// never reset).
     quic_endpoint_state: AtomicU8,
+    /// QUIC-native connect offers this node built as joiner, at percent 0
+    /// and above 0 (#5940; reset each snapshot).
+    connect_native_offered_zero: AtomicU64,
+    connect_native_offered_nonzero: AtomicU64,
+    /// QUIC-native decisions this node made as acceptor for a request that
+    /// carried an offer, by decision (reset each snapshot). One per accept: a
+    /// relay accepts a transaction at most once, but a join re-routed to
+    /// several acceptors counts at each of them, so these count decisions,
+    /// not joins.
+    connect_native_decided_native: AtomicU64,
+    connect_native_decided_udp: AtomicU64,
+    /// Responses deciding `Native` this node received as joiner and could not
+    /// use: to a request with no offer or percent 0, or to a real offer this
+    /// build cannot dial (reset each snapshot). Each failed that attempt.
+    connect_native_decision_without_offer: AtomicU64,
+    connect_native_decision_native_unsupported: AtomicU64,
+    /// `Native` responses dropped unanswered once a CONNECT had refused as
+    /// many acceptors as its acceptor limit (reset each snapshot). Not counted
+    /// as failures above.
+    connect_native_decision_over_cap: AtomicU64,
+    /// The last offer this node built: level, percent and whether it was
+    /// ready to dial native (a state, never reset).
+    connect_native_offer_level: AtomicU8,
+    connect_native_offer_percent: AtomicU8,
+    connect_native_offer_ready: AtomicBool,
     /// QUIC connections this node closed, by [`QuicCloseCode`] (reset each
     /// snapshot). Counted when the close is queued, and only while it can
     /// still be sent (not after the endpoint went Down or its socket adapter
@@ -1213,6 +1238,25 @@ impl ConnRttDistribution {
 
 #[cfg(test)]
 thread_local! {
+    /// Test-only: joiner decision failures recorded on this thread, by
+    /// `JoinerDecisionFailure` discriminant. The global counters are reset by
+    /// any test that takes a snapshot, so a test reads these instead.
+    pub(crate) static NATIVE_DECISION_FAILURES_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
+
+    /// Test-only: `Native` responses dropped past the per-CONNECT cap on
+    /// this thread, for the same reason.
+    pub(crate) static NATIVE_DECISIONS_OVER_CAP_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Test-only: QUIC-native offers recorded on this thread, for the same
+    /// reason.
+    pub(crate) static NATIVE_OFFERS_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
     /// Test-only per-address byte totals returned by
     /// [`TransportMetrics::connection_peer_bytes`] in place of the global table.
     pub(crate) static PEER_BYTES_OVERRIDE: std::cell::RefCell<
@@ -1304,6 +1348,16 @@ impl TransportMetrics {
             quic_send_refused: AtomicU64::new(0),
             quic_breaker_suppressed: AtomicBool::new(false),
             quic_endpoint_state: AtomicU8::new(QuicEndpointState::Unknown as u8),
+            connect_native_offered_zero: AtomicU64::new(0),
+            connect_native_offered_nonzero: AtomicU64::new(0),
+            connect_native_decided_native: AtomicU64::new(0),
+            connect_native_decided_udp: AtomicU64::new(0),
+            connect_native_decision_without_offer: AtomicU64::new(0),
+            connect_native_decision_native_unsupported: AtomicU64::new(0),
+            connect_native_decision_over_cap: AtomicU64::new(0),
+            connect_native_offer_level: AtomicU8::new(0),
+            connect_native_offer_percent: AtomicU8::new(0),
+            connect_native_offer_ready: AtomicBool::new(false),
             quic_close_sent: Default::default(),
             quic_close_received: Default::default(),
             quic_upgrade: Default::default(),
@@ -1815,6 +1869,77 @@ impl TransportMetrics {
     /// The QUIC endpoint's state as last recorded.
     pub(crate) fn quic_endpoint_state(&self) -> QuicEndpointState {
         QuicEndpointState::from_u8(self.quic_endpoint_state.load(Ordering::Relaxed))
+    }
+
+    /// The joiner built a connect request carrying `offer`; `ready` is
+    /// whether it could dial native. Also records the offer as the current
+    /// state.
+    pub(crate) fn record_connect_native_offered(
+        &self,
+        offer: crate::operations::connect::native::NativeOffer,
+        ready: bool,
+    ) {
+        let counter = if offer.percent == 0 {
+            &self.connect_native_offered_zero
+        } else {
+            &self.connect_native_offered_nonzero
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.connect_native_offer_level
+            .store(offer.level, Ordering::Relaxed);
+        self.connect_native_offer_percent
+            .store(offer.percent, Ordering::Relaxed);
+        self.connect_native_offer_ready
+            .store(ready, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_OFFERS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    }
+
+    /// A `Native` response was dropped unanswered: the CONNECT had already
+    /// refused its cap of acceptors.
+    pub(crate) fn record_connect_native_decision_over_cap(&self) {
+        self.connect_native_decision_over_cap
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_DECISIONS_OVER_CAP_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    }
+
+    /// The acceptor decided `decision` for a request that carried an offer.
+    pub(crate) fn record_connect_native_decided(
+        &self,
+        decision: crate::operations::connect::native::NativeDecision,
+    ) {
+        use crate::operations::connect::native::NativeDecision;
+        let counter = match decision {
+            NativeDecision::Native => &self.connect_native_decided_native,
+            // This node never decides a value it does not know; were one to
+            // reach here, it is not `Native`.
+            NativeDecision::Udp | NativeDecision::Unknown(_) => &self.connect_native_decided_udp,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The joiner could not use a response deciding `Native`.
+    pub(crate) fn record_connect_native_decision_failure(
+        &self,
+        failure: crate::operations::connect::native::JoinerDecisionFailure,
+    ) {
+        use crate::operations::connect::native::JoinerDecisionFailure;
+        let counter = match failure {
+            JoinerDecisionFailure::DecisionWithoutOffer => {
+                &self.connect_native_decision_without_offer
+            }
+            JoinerDecisionFailure::NativeUnsupported => {
+                &self.connect_native_decision_native_unsupported
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_DECISION_FAILURES_ON_THIS_THREAD.with(|counts| {
+            let mut now = counts.get();
+            now[failure as usize] += 1;
+            counts.set(now);
+        });
     }
 
     /// Test-only: how many times the QUIC endpoint bound at `local` went
@@ -2628,6 +2753,20 @@ impl TransportMetrics {
             quic_send_refused: get64(&self.quic_send_refused),
             quic_breaker_suppressed: self.quic_breaker_suppressed.load(Ordering::Relaxed),
             quic_endpoint: self.quic_endpoint_state().label().to_string(),
+            connect_native_offered_zero: get64(&self.connect_native_offered_zero),
+            connect_native_offered_nonzero: get64(&self.connect_native_offered_nonzero),
+            connect_native_decided_native: get64(&self.connect_native_decided_native),
+            connect_native_decided_udp: get64(&self.connect_native_decided_udp),
+            connect_native_decision_without_offer: get64(
+                &self.connect_native_decision_without_offer,
+            ),
+            connect_native_decision_native_unsupported: get64(
+                &self.connect_native_decision_native_unsupported,
+            ),
+            connect_native_decision_over_cap: get64(&self.connect_native_decision_over_cap),
+            connect_native_offer_level: self.connect_native_offer_level.load(Ordering::Relaxed),
+            connect_native_offer_percent: self.connect_native_offer_percent.load(Ordering::Relaxed),
+            connect_native_offer_ready: self.connect_native_offer_ready.load(Ordering::Relaxed),
             quic_close_sent_node_dropped_peer: get64(
                 &self.quic_close_sent[QuicCloseCode::NodeDroppedPeer as usize],
             ),
@@ -3290,6 +3429,26 @@ pub struct TransportSnapshot {
     /// The QUIC endpoint's state ([`QuicEndpointState::label`]): `up`, or why
     /// there is no endpoint. A state, never reset, and not activity.
     pub quic_endpoint: String,
+    /// QUIC-native connect offers built as joiner, at percent 0 and above 0
+    /// (#5940).
+    pub connect_native_offered_zero: u64,
+    pub connect_native_offered_nonzero: u64,
+    /// QUIC-native decisions made as acceptor for an offered request.
+    pub connect_native_decided_native: u64,
+    pub connect_native_decided_udp: u64,
+    /// `Native` decisions received as joiner that failed the attempt: to a
+    /// request with no offer (or percent 0), and to a real offer this build
+    /// cannot dial.
+    pub connect_native_decision_without_offer: u64,
+    pub connect_native_decision_native_unsupported: u64,
+    /// `Native` responses dropped past the per-CONNECT cap on refused
+    /// acceptors.
+    pub connect_native_decision_over_cap: u64,
+    /// The last offer built: level, percent, and whether the node could dial
+    /// native. States, never reset, and not activity.
+    pub connect_native_offer_level: u8,
+    pub connect_native_offer_percent: u8,
+    pub connect_native_offer_ready: bool,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
@@ -3684,6 +3843,16 @@ impl TransportSnapshot {
             quic_send_refused,
             quic_breaker_suppressed,
             quic_endpoint,
+            connect_native_offered_zero,
+            connect_native_offered_nonzero,
+            connect_native_decided_native,
+            connect_native_decided_udp,
+            connect_native_decision_without_offer,
+            connect_native_decision_native_unsupported,
+            connect_native_decision_over_cap,
+            connect_native_offer_level,
+            connect_native_offer_percent,
+            connect_native_offer_ready,
             quic_close_sent_node_dropped_peer,
             quic_close_sent_downgrade,
             quic_close_sent_identity_mismatch,
@@ -3833,6 +4002,17 @@ impl TransportSnapshot {
         self.quic_send_refused = quic_send_refused;
         self.quic_breaker_suppressed = quic_breaker_suppressed;
         self.quic_endpoint = quic_endpoint;
+        self.connect_native_offered_zero = connect_native_offered_zero;
+        self.connect_native_offered_nonzero = connect_native_offered_nonzero;
+        self.connect_native_decided_native = connect_native_decided_native;
+        self.connect_native_decided_udp = connect_native_decided_udp;
+        self.connect_native_decision_without_offer = connect_native_decision_without_offer;
+        self.connect_native_decision_native_unsupported =
+            connect_native_decision_native_unsupported;
+        self.connect_native_decision_over_cap = connect_native_decision_over_cap;
+        self.connect_native_offer_level = connect_native_offer_level;
+        self.connect_native_offer_percent = connect_native_offer_percent;
+        self.connect_native_offer_ready = connect_native_offer_ready;
         self.quic_close_sent_node_dropped_peer = quic_close_sent_node_dropped_peer;
         self.quic_close_sent_downgrade = quic_close_sent_downgrade;
         self.quic_close_sent_identity_mismatch = quic_close_sent_identity_mismatch;
@@ -4039,6 +4219,26 @@ struct SnapshotExtras {
     /// The QUIC endpoint's state ([`QuicEndpointState::label`]): `up`, or why
     /// there is no endpoint. A state, never reset, and not activity.
     pub quic_endpoint: String,
+    /// QUIC-native connect offers built as joiner, at percent 0 and above 0
+    /// (#5940).
+    pub connect_native_offered_zero: u64,
+    pub connect_native_offered_nonzero: u64,
+    /// QUIC-native decisions made as acceptor for an offered request.
+    pub connect_native_decided_native: u64,
+    pub connect_native_decided_udp: u64,
+    /// `Native` decisions received as joiner that failed the attempt: to a
+    /// request with no offer (or percent 0), and to a real offer this build
+    /// cannot dial.
+    pub connect_native_decision_without_offer: u64,
+    pub connect_native_decision_native_unsupported: u64,
+    /// `Native` responses dropped past the per-CONNECT cap on refused
+    /// acceptors.
+    pub connect_native_decision_over_cap: u64,
+    /// The last offer built: level, percent, and whether the node could dial
+    /// native. States, never reset, and not activity.
+    pub connect_native_offer_level: u8,
+    pub connect_native_offer_percent: u8,
+    pub connect_native_offer_ready: bool,
     /// QUIC connections this node closed, by close code
     /// ([`QuicCloseCode`]).
     pub quic_close_sent_node_dropped_peer: u64,
@@ -4255,6 +4455,13 @@ impl SnapshotExtras {
             || self.quic_adapter_panicked != 0
             || self.quic_breaker_trips != 0
             || self.quic_send_refused != 0
+            || self.connect_native_offered_zero != 0
+            || self.connect_native_offered_nonzero != 0
+            || self.connect_native_decided_native != 0
+            || self.connect_native_decided_udp != 0
+            || self.connect_native_decision_without_offer != 0
+            || self.connect_native_decision_native_unsupported != 0
+            || self.connect_native_decision_over_cap != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -5109,6 +5316,43 @@ mod tests {
         let snap = metrics.take_snapshot().expect("a drop is activity");
         assert_eq!(snap.inbound_queue_depth_hwm, 17);
         assert_eq!(snap.inbound_queue_drops, 1);
+    }
+
+    /// The QUIC-native connect counters reach the snapshot by kind and reset;
+    /// the effective offer is a state that stays.
+    #[test]
+    fn connect_native_counters_reach_snapshot_and_reset() {
+        use crate::operations::connect::native::{
+            JoinerDecisionFailure, NativeDecision, NativeOffer,
+        };
+        let metrics = TransportMetrics::new();
+        metrics.record_connect_native_offered(NativeOffer::capable(0), false);
+        metrics.record_connect_native_offered(NativeOffer::capable(0), false);
+        metrics.record_connect_native_offered(NativeOffer::capable(25), true);
+        metrics.record_connect_native_decided(NativeDecision::Udp);
+        metrics.record_connect_native_decided(NativeDecision::Udp);
+        metrics.record_connect_native_decided(NativeDecision::Native);
+        metrics.record_connect_native_decision_failure(JoinerDecisionFailure::DecisionWithoutOffer);
+        metrics.record_connect_native_decision_failure(JoinerDecisionFailure::NativeUnsupported);
+        metrics.record_connect_native_decision_failure(JoinerDecisionFailure::NativeUnsupported);
+        let snap = metrics.take_snapshot().expect("offers are activity");
+        assert_eq!(snap.connect_native_offered_zero, 2);
+        assert_eq!(snap.connect_native_offered_nonzero, 1);
+        assert_eq!(snap.connect_native_decided_udp, 2);
+        assert_eq!(snap.connect_native_decided_native, 1);
+        assert_eq!(snap.connect_native_decision_without_offer, 1);
+        assert_eq!(snap.connect_native_decision_native_unsupported, 2);
+        assert_eq!(snap.connect_native_offer_level, 1);
+        assert_eq!(snap.connect_native_offer_percent, 25);
+        assert!(snap.connect_native_offer_ready);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["connect_native_offered_zero"], 2);
+        assert_eq!(json["connect_native_offer_percent"], 25);
+        assert!(metrics.take_snapshot().is_none(), "the counters reset");
+        metrics.record_connect_native_decided(NativeDecision::Udp);
+        let snap = metrics.take_snapshot().expect("a decision is activity");
+        assert_eq!(snap.connect_native_offer_percent, 25, "the state stays");
+        assert_eq!(snap.connect_native_offered_zero, 0);
     }
 
     /// Received QUIC upgrade control messages reach the snapshot, count as
@@ -6684,6 +6928,16 @@ mod tests {
             "quic_send_refused",
             "quic_breaker_suppressed",
             "quic_endpoint",
+            "connect_native_offered_zero",
+            "connect_native_offered_nonzero",
+            "connect_native_decided_native",
+            "connect_native_decided_udp",
+            "connect_native_decision_without_offer",
+            "connect_native_decision_native_unsupported",
+            "connect_native_decision_over_cap",
+            "connect_native_offer_level",
+            "connect_native_offer_percent",
+            "connect_native_offer_ready",
             "quic_close_sent_node_dropped_peer",
             "quic_close_sent_downgrade",
             "quic_close_sent_identity_mismatch",

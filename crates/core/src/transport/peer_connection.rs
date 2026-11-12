@@ -2762,7 +2762,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         self.remote_conn.token_bucket.capacity()
     }
 
-    /// Remote peer's negotiated protocol version, if known (None on joiner->gateway connections).
+    /// Remote peer's negotiated protocol version, if the handshake carried it.
+    /// `None` when it did not: a joiner's connection to a gateway below the
+    /// version-carrying ack floor (#5161).
     pub fn remote_version(&self) -> Option<(u8, u8, u16)> {
         self.remote_conn.remote_protoc_version
     }
