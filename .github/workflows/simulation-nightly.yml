@@ -133,6 +133,9 @@ jobs:
       # Includes:
       #   - test_long_running_deterministic: 1 hour virtual time
       #   - test_subscription_renewal_at_scale: 250 contracts regression test
+      #   - test_quic_data_ramp_turns_on_every_pair_within_a_day: the QUIC data
+      #     ramp over a 26 h virtual day (about 13 min); PR CI runs two short
+      #     runs of the same curve instead
       # NOTE: Gated by nightly_tests feature — does NOT run in regular CI
       - name: Nightly simulation tests (long-running + high-scale)
         run: |

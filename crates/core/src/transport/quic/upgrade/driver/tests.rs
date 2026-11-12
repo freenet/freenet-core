@@ -597,7 +597,8 @@ fn a_routed_attempt_becomes_a_shadow_path() {
         let payload = peer_inbound.controls.try_recv().expect("Ready arrived");
         assert_eq!(
             peer_path.decode_control(&payload),
-            Ok(QuicControl::Ready { attempt, caps: 0 })
+            Ok(QuicControl::Ready { attempt, caps: 0 }),
+            "a shadow node says nothing: it never carries data"
         );
     });
 }
@@ -713,7 +714,18 @@ fn a_path_follows_the_data_bits() {
                 if accepts { (1, 0) } else { (0, 1) },
                 "{case}: a frame before the peer's bit has arrived"
             );
-            let want_caps = if accepts { caps::DATA } else { 0 };
+            // A data-capable node (a share that is not fixed at 0) says it
+            // recycles; the others say nothing.
+            let data_capable = match percent {
+                Some(p) => p != "0",
+                None => crate::transport::quic::upgrade::policy::QUIC_DATA_RAMP_START.is_some(),
+            };
+            let recycles = if mode == "prefer" && data_capable {
+                caps::RECYCLES
+            } else {
+                0
+            };
+            let want_caps = if accepts { caps::DATA } else { 0 } | recycles;
             let payload = peer_inbound.controls.try_recv().expect("Ready arrived");
             assert_eq!(
                 peer_path.decode_control(&payload),

@@ -1858,8 +1858,10 @@ fn transport_quic_values_and_unknown_ones() {
     assert_eq!(QuicMode::from_config_value(Some("force")), QuicMode::Off);
     assert_eq!(QuicMode::from_config_value(Some("")), QuicMode::Off);
     assert_eq!(QuicMode::default(), QuicMode::default_mode());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    assert_eq!(QuicMode::from_config_value(None), QuicMode::Shadow);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Prefer);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Off);
 }
 
 /// The socket sends one datagram per transmit and receives one per call.
@@ -2780,6 +2782,9 @@ fn close_codes_reach_the_peer() {
             },
             QuicCloseCode::SessionEnded => QuicErrorKind::Refused {
                 reason: QuicRefusal::SessionEnded,
+            },
+            QuicCloseCode::RecycleForData => QuicErrorKind::Refused {
+                reason: QuicRefusal::RecycleForData,
             },
             QuicCloseCode::OverBudget => QuicErrorKind::Refused {
                 reason: QuicRefusal::OverBudget,
