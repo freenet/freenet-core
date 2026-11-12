@@ -29,8 +29,21 @@
 //! bound is structural, not a cap that is checked.
 //!
 //! **Privacy.** No keys, no addresses. In `gateway_joins` only, a count from 1
-//! to 4 is reported as the string `"<5"`, so one joiner in a quiet hour cannot
-//! be singled out. Zero counts are omitted in both maps.
+//! to 4 is reported as the string `"<5"`, which hides small counts in the
+//! hourly aggregate and nothing more. It does not stop a peer's version being
+//! tied to the peer: `neighbours` is not suppressed, `connect_connected`
+//! already uploads each connected peer's id and address, and peers with
+//! telemetry on upload their own version, so a node's `neighbours` histogram
+//! minus the known versions can give a telemetry-off neighbour's version. What
+//! this event adds over existing telemetry is that version, which the peer
+//! already advertises in the handshake to every node it connects to.
+//! Reporting the versions of peers that turned their own telemetry off is
+//! deliberate: it is the point of the census. Zero counts are omitted in both
+//! maps.
+//!
+//! **Limits.** The first tick is skipped, so a node that restarts more often
+//! than hourly never emits. Anyone who completes handshakes with a gateway can
+//! inflate `gateway_joins` under a version of their choosing.
 //!
 //! **Observation only.** Nothing on the data path reads these counters.
 //!
@@ -378,7 +391,22 @@ fn take_join_versions(
 /// Spawn the hourly `join_versions` emitter and register it with the
 /// `BackgroundTaskMonitor`. The caller in `p2p_impl.rs` spawns it only when
 /// telemetry is enabled.
-pub(crate) fn spawn_join_versions_reporter(
+/// Spawn the reporter only when telemetry is on and this is not a test
+/// environment: the event exists to be uploaded, and nothing else reads it.
+pub(crate) fn spawn_join_versions_reporter_if_enabled(
+    telemetry: &crate::config::TelemetryConfig,
+    local_peer_id: String,
+    connection_manager: ConnectionManager,
+    monitor: &BackgroundTaskMonitor,
+) -> bool {
+    if !telemetry.enabled || telemetry.is_test_environment {
+        return false;
+    }
+    spawn_join_versions_reporter(local_peer_id, connection_manager, monitor);
+    true
+}
+
+fn spawn_join_versions_reporter(
     local_peer_id: String,
     connection_manager: ConnectionManager,
     monitor: &BackgroundTaskMonitor,
@@ -409,6 +437,43 @@ pub(crate) fn spawn_join_versions_reporter(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reporter runs only with telemetry on outside a test environment,
+    /// and is registered with the node's monitor under its name, so its exit
+    /// is noticed like any other background task's.
+    #[tokio::test]
+    async fn the_reporter_is_gated_on_telemetry_and_registered() {
+        let cases = [
+            (true, false, true),
+            (false, false, false),
+            (true, true, false),
+            (false, true, false),
+        ];
+        for (enabled, is_test_environment, expected) in cases {
+            let telemetry = crate::config::TelemetryConfig {
+                enabled,
+                is_test_environment,
+                ..Default::default()
+            };
+            let monitor = BackgroundTaskMonitor::new();
+            let spawned = spawn_join_versions_reporter_if_enabled(
+                &telemetry,
+                "peer".to_string(),
+                ConnectionManager::test_default(),
+                &monitor,
+            );
+            assert_eq!(
+                spawned, expected,
+                "enabled={enabled} test_env={is_test_environment}"
+            );
+            let names = monitor.task_names();
+            if expected {
+                assert_eq!(names, vec!["join_versions_reporter"]);
+            } else {
+                assert!(names.is_empty(), "nothing spawned, got {names:?}");
+            }
+        }
+    }
 
     /// A floor in this node's own series: the only exact labels are its own.
     const OWN: VersionRef = VersionRef {

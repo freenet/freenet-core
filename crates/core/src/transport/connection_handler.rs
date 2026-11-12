@@ -5463,6 +5463,69 @@ pub mod mock_transport {
         Ok(())
     }
 
+    /// `join_versions` (#5940): a NON-gateway completes the same server-side
+    /// handshake when it accepts a restarted peer's intro on an established
+    /// connection, and that is not a gateway join. Pins the `is_gateway`
+    /// check in the `gw_connection_tasks` success arm: without it this
+    /// reconnect is counted.
+    #[tokio::test]
+    async fn a_non_gateway_accepting_a_restarted_peer_does_not_count_a_join() -> anyhow::Result<()>
+    {
+        use crate::transport::join_versions::test_registry;
+        let channels = Arc::new(DashMap::new());
+        let (listener_pub, (mut listener, mut listener_inbound), listener_addr) =
+            create_mock_peer_internal(
+                Default::default(),
+                PacketDelayPolicy::NoDelay,
+                false,
+                channels.clone(),
+                None,
+                None,
+            )
+            .await?;
+        let counters = test_registry::isolate(listener_addr);
+        let restarting_addr = crate::transport::test_net::subnet().addr(1);
+
+        // The two peers hole-punch to each other, so the listener holds an
+        // established connection to `restarting_addr`.
+        let (first_pub, mut first, _) =
+            create_mock_peer_at_addr(Default::default(), restarting_addr, channels.clone()).await?;
+        let listener_pub_for_first = listener_pub.clone();
+        let first_side = GlobalExecutor::spawn(async move {
+            let pending = first.connect(listener_pub_for_first, listener_addr).await;
+            let conn = tokio::time::timeout(Duration::from_secs(60), pending).await??;
+            Ok::<_, anyhow::Error>((first, conn))
+        });
+        let pending = listener.connect(first_pub, restarting_addr).await;
+        let _listener_side = tokio::time::timeout(Duration::from_secs(60), pending).await??;
+        let (first, first_conn) = first_side.await??;
+
+        // The peer restarts at the same address with a new identity and sends
+        // its intro to the listener, which accepts it as a reconnect.
+        drop(first_conn);
+        drop(first);
+        let (_restarted_pub, mut restarted, _) =
+            create_mock_peer_at_addr(Default::default(), restarting_addr, channels).await?;
+        let pending = restarted.connect(listener_pub, listener_addr).await;
+        let _restarted_conn = tokio::time::timeout(Duration::from_secs(60), pending).await??;
+        let reconnect = tokio::time::timeout(Duration::from_secs(10), listener_inbound.recv())
+            .await?
+            .ok_or(anyhow::anyhow!("listener accepted no reconnect"))?;
+        assert_eq!(
+            reconnect.remote_addr(),
+            restarting_addr,
+            "the listener completed the reconnect handshake, so the gated arm ran"
+        );
+
+        let counts = counters.take();
+        assert_eq!(
+            counts.iter().flatten().sum::<u64>(),
+            0,
+            "a non-gateway's reconnect handshake is not a gateway join"
+        );
+        Ok(())
+    }
+
     /// The transport holds the peer key the node recorded: the key dialled
     /// on the joiner's side, and none on the gateway's side until the node
     /// gives it one at promotion. A key given when none is held is set; the
