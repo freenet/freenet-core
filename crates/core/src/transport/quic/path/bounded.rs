@@ -834,7 +834,11 @@ where
         #[cfg(test)]
         progress.0.arms.fetch_add(1, Ordering::Relaxed);
         let wait = Duration::from_nanos(deadline.saturating_sub(time.now_nanos()));
-        tokio::select! {
+        // `deterministic_select!`, not `tokio::select!`: which arm is polled
+        // first decides whether `source_wait` is registered before `send`
+        // notifies it, and tokio draws that order from an RNG a simulation's
+        // seed does not set.
+        crate::deterministic_select! {
             result = &mut send => {
                 // A refusal returns an error only to end the send, which then
                 // ends as a deadline would at that stage. It leaves no
@@ -843,8 +847,8 @@ where
                     return progress.paced();
                 }
                 return outcome(result, &progress);
-            }
-            () = progress.0.source_wait.notified() => {}
+            },
+            () = progress.0.source_wait.notified() => {},
             () = time.sleep_cancelable(wait) => {
                 let now = time.now_nanos();
                 // Only the gap of an open stream reads the connection.

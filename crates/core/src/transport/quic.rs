@@ -747,7 +747,7 @@ impl QuicEndpoint {
         let full = self.owner.accept_queue_full.clone();
         let handle = GlobalExecutor::spawn(async move {
             loop {
-                let incoming = tokio::select! {
+                let incoming = crate::deterministic_select! {
                     incoming = core.accept() => incoming,
                     _ = availability.not_up() => None,
                 };
@@ -1174,8 +1174,8 @@ impl QuicConnection {
                     std::future::pending::<()>().await;
                 }
             };
-            tokio::select! {
-                _ = watched.closed() => {}
+            crate::deterministic_select! {
+                _ = watched.closed() => {},
                 _ = close_now => {
                     down_closer.close(QuicCloseCode::Downgrade);
                 }

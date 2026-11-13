@@ -200,7 +200,7 @@ pub(in crate::transport) async fn connect_native<T: TimeSource>(
         .charge(peer.addr, CLIENT_BYTES_PER_DIAL, clock.now())
         .map_err(NativeSetupError::OverBudget)?;
     let left = end.saturating_sub(clock.now());
-    let connection = tokio::select! {
+    let connection = crate::deterministic_select! {
         dialled = endpoint.dial_native(peer.addr, peer.key) => dialled?,
         () = clock.sleep_cancelable(left) => return Err(NativeSetupError::TimedOut),
         never = punch_until(endpoint, peer.addr, clock, end) => match never {},
@@ -248,7 +248,7 @@ pub(in crate::transport) async fn accept_native<T: TimeSource>(
         }
     };
     let left = end.saturating_sub(clock.now());
-    let connection = tokio::select! {
+    let connection = crate::deterministic_select! {
         accepted = accept => accepted?,
         () = clock.sleep_cancelable(left) => return Err(NativeSetupError::TimedOut),
         never = punch_until(endpoint, peer.addr, clock, end) => match never {},
