@@ -3616,7 +3616,7 @@ async fn promoting_a_connection_already_in_the_ring_sends_no_second_key() {
 async fn a_native_connection_binds_its_proven_key() {
     use crate::operations::connect::native::DialTransport;
     let mut h = Harness::new("conn-identity-native-proven").await;
-    let addr: SocketAddr = "203.0.113.180:5801".parse().unwrap();
+    let addr: SocketAddr = "203.0.113.230:6201".parse().unwrap();
     let peer = key();
     h.watch(&[addr]);
     let mut result = pending_connect_peer_over(
@@ -3657,7 +3657,7 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
         (1, NativeSetupOutcome::TimedOut, 1),
     ] {
         for i in 0..3u16 {
-            let addr: SocketAddr = format!("203.0.113.181:{}", 5810 + round * 10 + i)
+            let addr: SocketAddr = format!("203.0.113.231:{}", 6210 + round * 10 + i)
                 .parse()
                 .unwrap();
             let peer = PeerKeyLocation::new(key(), addr);
@@ -3706,7 +3706,7 @@ async fn a_late_native_failure_keeps_the_connection_made_meanwhile() {
     use crate::operations::connect::native::DialTransport;
     use crate::transport::NativeSetupOutcome;
     let mut h = Harness::new("native-late-failure").await;
-    let addr: SocketAddr = "203.0.113.182:5830".parse().unwrap();
+    let addr: SocketAddr = "203.0.113.232:6230".parse().unwrap();
     let peer = key();
     let mut result = pending_connect_peer(&mut h, PeerKeyLocation::new(peer.clone(), addr)).await;
     h.handshake_event(HandshakeEvent::OutboundEstablished {
