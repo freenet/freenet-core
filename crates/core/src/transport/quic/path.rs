@@ -1123,6 +1123,14 @@ impl QuicPath {
         self.connection.closer().closed_with()
     }
 
+    /// Whether quinn closed the path's connection for its idle timeout.
+    pub(in crate::transport) fn idle_timed_out(&self) -> bool {
+        matches!(
+            self.connection.inner().close_reason(),
+            Some(quinn::ConnectionError::TimedOut)
+        )
+    }
+
     /// Pace this path's data sends with `pacer` (`pacer` module): the
     /// connection's token bucket when a bandwidth limit is set. A second call
     /// changes nothing.

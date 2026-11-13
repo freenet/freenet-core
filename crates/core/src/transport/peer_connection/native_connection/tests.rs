@@ -1,0 +1,494 @@
+//! [`NativePeerConnection`] against the [`PeerConnectionApi`] contract, over a
+//! real QUIC connection on VirtualTime. The node is the server; the peer's side
+//! is a plain [`QuicPath`] that carries data.
+
+use std::future::Future;
+use std::time::Duration;
+
+use bytes::Bytes;
+
+use super::*;
+use crate::operations::orphan_streams::OrphanStreamRegistry;
+use crate::simulation::VirtualTime;
+use crate::transport::StreamId;
+use crate::transport::boundary::StreamSendOutcome;
+use crate::transport::metrics::ConnIdentity;
+use crate::transport::quic::path::{BoundedSend, QuicSendResult, SendKind};
+use crate::transport::quic::upgrade::driver::tests::{NativeServer, native_server, run_bounded};
+
+const SEND_LIMIT: Duration = Duration::from_secs(30);
+const VERSION: (u8, u8, u16) = (0, 2, 160);
+
+struct Rig {
+    conn: NativePeerConnection,
+    peer: NativeServer,
+    registry: Arc<OrphanStreamRegistry>,
+}
+
+impl Rig {
+    fn time(&self) -> VirtualTime {
+        self.peer.time.clone()
+    }
+
+    async fn settle(&self, by: Duration) {
+        self.peer.time.sleep(by).await;
+    }
+
+    async fn peer_sends_short(&self, payload: &[u8]) {
+        let sent = self
+            .peer
+            .peer
+            .send_short_bounded(&self.peer.time, SEND_LIMIT, payload)
+            .await;
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+    }
+
+    async fn peer_sends_stream(&self, id: StreamId, metadata: Option<&[u8]>, payload: Bytes) {
+        let sent = self
+            .peer
+            .peer
+            .send_stream_bounded(&self.peer.time, SEND_LIMIT, id, metadata, payload, None)
+            .await;
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+    }
+
+    /// What `recv` returns within a few turns of the scheduler, if anything.
+    async fn recv_soon(&mut self) -> Option<Vec<u8>> {
+        let turns = async {
+            for _ in 0..64 {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            biased;
+            message = self.conn.recv() => Some(message.expect("recv must not fail")),
+            () = turns => None,
+        }
+    }
+
+    /// How many sends of `kind` the node's path ended as `result`.
+    fn sends(&self, kind: SendKind, result: QuicSendResult) -> u64 {
+        self.conn.path().stats().send_count(kind, result)
+    }
+}
+
+/// Run `test` on a native connection whose peer's path has `peer_limits`.
+fn run<F, Fut>(
+    network: &'static str,
+    peer_limits: QuicPathLimits,
+    idle_timeout: Option<Duration>,
+    test: F,
+) where
+    F: FnOnce(Rig) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    run_bounded(move || async move {
+        let (peer, server) = native_server(network, peer_limits, idle_timeout).await;
+        let time = peer.time.clone();
+        let mut conn = NativePeerConnection::new(
+            server,
+            VERSION,
+            PathClock::Virtual(time.clone()),
+            None,
+            RouteNote::default(),
+        );
+        let registry = Arc::new(OrphanStreamRegistry::new());
+        conn.set_inbound_stream_registry(registry.clone());
+        (
+            time,
+            test(Rig {
+                conn,
+                peer,
+                registry,
+            }),
+        )
+    });
+}
+
+fn bytes_of(len: usize) -> Bytes {
+    (0..len).map(|i| i as u8).collect::<Vec<_>>().into()
+}
+
+/// A short message and a stream from the peer come out of `recv` as a UDP
+/// connection's do: the short as itself, the stream as its metadata, with its
+/// payload registered under its id.
+#[test]
+fn a_short_and_a_stream_from_the_peer_come_out_of_recv() {
+    run(
+        "native-conn-inbound",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            rig.peer_sends_short(b"hello").await;
+            assert_eq!(rig.conn.recv().await.unwrap(), b"hello");
+
+            let id = StreamId::next();
+            let payload = bytes_of(5000);
+            rig.peer_sends_stream(id, Some(b"announce"), payload.clone())
+                .await;
+            assert_eq!(rig.conn.recv().await.unwrap(), b"announce");
+            let stream = rig
+                .registry
+                .claim_or_wait(rig.conn.remote_addr(), id, Duration::from_secs(1))
+                .await
+                .expect("the stream was registered");
+            assert_eq!(stream.assemble().await.unwrap(), payload.to_vec());
+            assert!(rig.recv_soon().await.is_none());
+        },
+    );
+}
+
+/// Metadata already handed to the node as a short message is not handed over
+/// again with its stream, through the same record a UDP connection keeps.
+#[test]
+fn metadata_already_dispatched_as_a_short_is_not_dispatched_again() {
+    run(
+        "native-conn-dedup",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            rig.peer_sends_short(b"first").await;
+            assert_eq!(rig.conn.recv().await.unwrap(), b"first");
+            rig.peer_sends_stream(StreamId::next(), Some(b"first"), bytes_of(10))
+                .await;
+            assert!(rig.recv_soon().await.is_none(), "already dispatched");
+
+            rig.peer_sends_stream(StreamId::next(), Some(b"second"), bytes_of(10))
+                .await;
+            assert_eq!(rig.conn.recv().await.unwrap(), b"second");
+        },
+    );
+}
+
+/// `recv` loses nothing when it is dropped mid-wait, over shorts and streams.
+#[test]
+fn a_cancelled_recv_loses_nothing() {
+    run(
+        "native-conn-cancel",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            const COUNT: usize = 30;
+            let mut cancelled = 0usize;
+            let (mut got, mut want) = (Vec::new(), Vec::new());
+            for i in 0..COUNT {
+                tokio::select! {
+                    biased;
+                    message = rig.conn.recv() => panic!("unexpected message {message:?}"),
+                    () = tokio::task::yield_now() => cancelled += 1,
+                }
+                let message = format!("message {i}").into_bytes();
+                if i % 10 == 9 {
+                    rig.peer_sends_stream(StreamId::next(), Some(&message), bytes_of(50))
+                        .await;
+                } else {
+                    rig.peer_sends_short(&message).await;
+                }
+                want.push(message);
+                for _ in 0..100_000 {
+                    tokio::select! {
+                        biased;
+                        message = rig.conn.recv() => {
+                            got.push(message.unwrap());
+                            break;
+                        }
+                        () = tokio::task::yield_now() => cancelled += 1,
+                    }
+                }
+            }
+            assert!(cancelled > 0, "no recv was ever cancelled");
+            got.sort();
+            want.sort();
+            assert_eq!(got, want);
+            assert!(rig.recv_soon().await.is_none());
+        },
+    );
+}
+
+/// Every way the node sends reaches the peer on the path: a short of one
+/// packet, a short past one packet, a stream with metadata, and a pipe of a
+/// stream the node received.
+#[test]
+fn every_send_reaches_the_peer_on_the_path() {
+    run(
+        "native-conn-outbound",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            rig.conn.send_bytes(b"small".to_vec()).await.unwrap();
+            let large = bytes_of(10_000).to_vec();
+            rig.conn.send_bytes(large.clone()).await.unwrap();
+            let mut shorts = Vec::new();
+            for _ in 0..2 {
+                let short = rig.peer.peer_inbound.shorts.recv().await.expect("a short");
+                shorts.push(short.into_payload().to_vec());
+            }
+            shorts.sort_by_key(Vec::len);
+            assert_eq!(shorts, vec![b"small".to_vec(), large]);
+
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let id = StreamId::next();
+            let payload = bytes_of(7000);
+            rig.conn
+                .send_stream_data(
+                    id,
+                    payload.clone(),
+                    Some(b"meta".to_vec().into()),
+                    Some(done_tx),
+                    None,
+                )
+                .await
+                .unwrap();
+            let arrival = rig
+                .peer
+                .peer_inbound
+                .streams
+                .recv()
+                .await
+                .expect("a stream");
+            assert_eq!(arrival.stream_id, id);
+            assert_eq!(arrival.metadata.as_deref(), Some(&b"meta"[..]));
+            assert_eq!(arrival.handle.assemble().await.unwrap(), payload.to_vec());
+            assert!(matches!(done_rx.await, Ok(StreamSendOutcome::Delivered)));
+
+            // A stream from the peer, piped back to it under a new id.
+            let inbound_id = StreamId::next();
+            let piped = bytes_of(6000);
+            rig.peer_sends_stream(inbound_id, Some(b"pipe me"), piped.clone())
+                .await;
+            assert_eq!(rig.conn.recv().await.unwrap(), b"pipe me");
+            let source = rig
+                .registry
+                .claim_or_wait(rig.conn.remote_addr(), inbound_id, Duration::from_secs(1))
+                .await
+                .expect("registered");
+            let outbound_id = StreamId::next();
+            rig.conn
+                .pipe_stream_data(outbound_id, source, Some(b"piped".to_vec().into()), None)
+                .await
+                .unwrap();
+            let arrival = rig
+                .peer
+                .peer_inbound
+                .streams
+                .recv()
+                .await
+                .expect("the pipe");
+            assert_eq!(arrival.stream_id, outbound_id);
+            assert_eq!(arrival.handle.assemble().await.unwrap(), piped.to_vec());
+
+            // The finished tasks are counted on `recv`'s next turn.
+            rig.settle(Duration::from_secs(1)).await;
+            assert!(rig.recv_soon().await.is_none());
+            assert!(rig.conn.outbound.is_empty(), "every send task was reaped");
+            assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Sent), 1);
+            assert_eq!(rig.sends(SendKind::LargeShort, QuicSendResult::Sent), 1);
+            assert_eq!(rig.sends(SendKind::Stream, QuicSendResult::Sent), 1);
+            assert_eq!(rig.sends(SendKind::Pipe, QuicSendResult::Sent), 1);
+        },
+    );
+}
+
+/// A send the peer refuses ends dropped: the node has no UDP session to send
+/// it on, and the stream's completion is told it was not delivered. On an
+/// upgrade path both would go on UDP (`NotOpenedUdp` / `FailedUdp`).
+#[test]
+fn a_refused_send_is_dropped_and_nothing_goes_to_udp() {
+    run(
+        "native-conn-refused",
+        QuicPathLimits::SHADOW,
+        None,
+        |mut rig| async move {
+            // Past the 2 MiB window, so the peer's stop arrives before
+            // the last byte could be acknowledged.
+            let big = 3 * 1024 * 1024;
+            rig.conn.send_bytes(bytes_of(big).to_vec()).await.unwrap();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            rig.conn
+                .send_stream_data(StreamId::next(), bytes_of(big), None, Some(done_tx), None)
+                .await
+                .unwrap();
+            assert!(matches!(done_rx.await, Ok(StreamSendOutcome::Dropped)));
+            rig.settle(Duration::from_secs(1)).await;
+            assert!(rig.recv_soon().await.is_none());
+            assert!(rig.conn.outbound.is_empty(), "every send task was reaped");
+
+            for kind in [SendKind::LargeShort, SendKind::Stream] {
+                assert_eq!(rig.sends(kind, QuicSendResult::Dropped), 1, "{kind:?}");
+            }
+            for kind in [
+                SendKind::Short,
+                SendKind::LargeShort,
+                SendKind::Stream,
+                SendKind::Pipe,
+            ] {
+                for result in [QuicSendResult::NotOpenedUdp, QuicSendResult::FailedUdp] {
+                    assert_eq!(rig.sends(kind, result), 0, "{kind:?} {result:?}");
+                }
+            }
+        },
+    );
+}
+
+/// A path the peer closes ends the connection: `recv` fails, with no idle
+/// reason.
+#[test]
+fn a_path_the_peer_closes_ends_recv_without_an_idle_reason() {
+    run(
+        "native-conn-peer-close",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            rig.peer.peer.close(QuicCloseCode::Downgrade);
+            let ended = rig.conn.recv().await;
+            assert!(
+                matches!(ended, Err(TransportError::ConnectionClosed(addr)) if addr == rig.conn.remote_addr()),
+                "{ended:?}"
+            );
+            assert_eq!(rig.conn.close_reason(), None);
+        },
+    );
+}
+
+/// What arrived before the peer closed is still delivered, whichever inbox
+/// channel holds it, and only then does `recv` report the end.
+#[test]
+fn what_arrived_before_the_close_is_delivered_first() {
+    run(
+        "native-conn-drain",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            rig.peer_sends_stream(StreamId::next(), Some(b"last words"), bytes_of(100))
+                .await;
+            rig.peer.peer.close(QuicCloseCode::Downgrade);
+            // Both channels are closed by now, with the arrival still queued.
+            rig.settle(Duration::from_secs(1)).await;
+            assert_eq!(rig.conn.recv().await.unwrap(), b"last words");
+            let ended = rig.conn.recv().await;
+            assert!(
+                matches!(ended, Err(TransportError::ConnectionClosed(_))),
+                "{ended:?}"
+            );
+        },
+    );
+}
+
+/// A path quinn closes for its idle timeout ends `recv` with
+/// [`CloseReason::IdleTimeout`], as a UDP connection's idle timeout does.
+#[test]
+fn an_idle_path_ends_recv_with_the_idle_reason() {
+    run(
+        "native-conn-idle",
+        QuicPathLimits::DEFAULT,
+        Some(Duration::from_secs(7)),
+        |mut rig| async move {
+            let start = rig.time().now();
+            let ended = rig.conn.recv().await;
+            assert!(
+                matches!(ended, Err(TransportError::ConnectionClosed(_))),
+                "{ended:?}"
+            );
+            assert!(rig.time().now() - start >= Duration::from_secs(7));
+            assert_eq!(rig.conn.close_reason(), Some(CloseReason::IdleTimeout));
+        },
+    );
+}
+
+/// Dropping the connection closes it for the peer at once, with
+/// NODE_DROPPED_PEER, even while a send task still holds the path.
+#[test]
+fn dropping_the_connection_closes_it_for_the_peer() {
+    run(
+        "native-conn-drop",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            // A stream larger than the window, still sending when dropped.
+            rig.conn
+                .send_stream_data(
+                    StreamId::next(),
+                    bytes_of(4 * 1024 * 1024),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            drop(rig.conn);
+            rig.peer.time.sleep(Duration::from_secs(1)).await;
+            let reason = rig.peer.peer.connection().inner().close_reason();
+            assert!(
+                matches!(
+                    &reason,
+                    Some(quinn::ConnectionError::ApplicationClosed(close))
+                        if close.error_code.into_inner()
+                            == u64::from(QuicCloseCode::NodeDroppedPeer.code())
+                ),
+                "{reason:?}"
+            );
+        },
+    );
+}
+
+/// The version is the Hello's, and the key is the one proven in the
+/// handshake: a promotion under it is `Same`, under another `Refused`.
+#[test]
+fn the_version_is_the_hellos_and_the_key_the_handshakes() {
+    run(
+        "native-conn-identity",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            assert_eq!(rig.conn.remote_version(), Some(VERSION));
+            let remote = rig.conn.remote_addr();
+            TRANSPORT_METRICS.watch_conn_identity(remote);
+            rig.conn.set_peer_identity(rig.peer.peer_key.clone());
+            let other = crate::transport::crypto::TransportKeypair::new()
+                .public()
+                .clone();
+            rig.conn.set_peer_identity(other);
+            assert_eq!(
+                TRANSPORT_METRICS.conn_identity_from(remote),
+                vec![
+                    ConnIdentity::TransportKeySame,
+                    ConnIdentity::TransportKeyRefused
+                ]
+            );
+            assert_eq!(
+                rig.conn.peer_key, rig.peer.peer_key,
+                "the proven key is kept"
+            );
+        },
+    );
+}
+
+/// The receipt stamp ages while the path is quiet and is renewed when the
+/// peer is heard from on it.
+#[test]
+fn the_receipt_stamp_moves_with_the_path() {
+    run(
+        "native-conn-receipt",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            let stamp = rig
+                .conn
+                .receipt_stamp()
+                .expect("a native connection has a stamp");
+            rig.settle(Duration::from_secs(20)).await;
+            assert!(
+                stamp.since_last_receipt() >= Duration::from_secs(18),
+                "quiet"
+            );
+            rig.peer_sends_short(b"ping").await;
+            assert_eq!(rig.conn.recv().await.unwrap(), b"ping");
+            rig.settle(Duration::from_secs(3)).await;
+            assert!(
+                stamp.since_last_receipt() <= Duration::from_secs(3),
+                "{:?}",
+                stamp.since_last_receipt()
+            );
+        },
+    );
+}
