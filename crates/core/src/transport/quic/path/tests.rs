@@ -78,7 +78,16 @@ async fn paths_with(
     b_limits: QuicPathLimits,
     b_budget: Option<SharedInboundBudget>,
 ) -> Paths {
-    paths_built(network, b_limits, b_budget, None, Windows::default(), true).await
+    paths_built(
+        network,
+        b_limits,
+        QuicPathLimits::DEFAULT,
+        b_budget,
+        None,
+        Windows::default(),
+        true,
+    )
+    .await
 }
 
 /// The buffer budgets a test's paths take their windows from, if any
@@ -92,13 +101,23 @@ struct Windows {
 
 /// [`paths`] with each side's path taking its windows from a buffer budget.
 async fn paths_metered(network: &str, windows: Windows) -> Paths {
-    paths_built(network, QuicPathLimits::DEFAULT, None, None, windows, true).await
+    paths_built(
+        network,
+        QuicPathLimits::DEFAULT,
+        QuicPathLimits::DEFAULT,
+        None,
+        None,
+        windows,
+        true,
+    )
+    .await
 }
 
 /// [`paths`] with an egress cap of `a_cap` bytes per second on `a`'s socket.
 async fn paths_capped(network: &str, a_cap: u64) -> Paths {
     paths_built(
         network,
+        QuicPathLimits::DEFAULT,
         QuicPathLimits::DEFAULT,
         None,
         Some(a_cap),
@@ -115,6 +134,7 @@ async fn paths_without_loss_gate(network: &str) -> Paths {
     paths_built(
         network,
         QuicPathLimits::DEFAULT,
+        QuicPathLimits::DEFAULT,
         None,
         None,
         Windows::default(),
@@ -126,6 +146,7 @@ async fn paths_without_loss_gate(network: &str) -> Paths {
 async fn paths_built(
     network: &str,
     b_limits: QuicPathLimits,
+    a_base: QuicPathLimits,
     b_budget: Option<SharedInboundBudget>,
     a_cap: Option<u64>,
     windows: Windows,
@@ -162,7 +183,7 @@ async fn paths_built(
     let a_limits = QuicPathLimits {
         counters: b_limits.counters,
         watch_closes: b_limits.watch_closes,
-        ..QuicPathLimits::DEFAULT
+        ..a_base
     };
     let own =
         |limits: QuicPathLimits| SharedInboundBudget::new(limits.max_streams, limits.max_bytes);
@@ -7159,6 +7180,130 @@ fn a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect() {
         p.a.settle(SendKind::Stream, &outcome, false, p.time().now_nanos());
         assert!(p.a.is_suspect(), "the first timeout makes the path suspect");
         drop(silencer.silenced.lock().take());
+    })
+}
+
+/// [`a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect`] on a
+/// native sender's path ([`QuicPathLimits::NATIVE`]): the send fails the same
+/// way, but the path does not turn suspect, since a native connection has no
+/// UDP session to divert to; a dark one ends by its stall close.
+#[test]
+fn a_native_path_dark_mid_send_does_not_turn_suspect() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-native-dark";
+        let p = paths_built(
+            network,
+            QuicPathLimits::DEFAULT,
+            QuicPathLimits::NATIVE,
+            None,
+            None,
+            Windows::default(),
+            true,
+        )
+        .await;
+        let (a, time) = (p.a.clone(), p.time());
+        let body = over_window();
+        let fragments = body.len().div_ceil(FRAGMENT_PAYLOAD_SIZE);
+        let silencer = Arc::new(SilenceAfter {
+            network,
+            from: p.pair.b_addr,
+            after: fragments * 3 / 4,
+            sent: std::sync::atomic::AtomicUsize::new(0),
+            silenced: parking_lot::Mutex::new(None),
+        });
+        let watched = silencer.clone();
+        let deadlines = SendDeadlines::stream(body.len() as u64);
+        let outcome = p
+            .drive(async move {
+                a.send_stream_bounded(
+                    &time,
+                    deadlines,
+                    StreamId::next(),
+                    None,
+                    body,
+                    Some(&*watched),
+                )
+                .await
+            })
+            .await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        let step =
+            p.a.settle(SendKind::Stream, &outcome, false, p.time().now_nanos());
+        assert_eq!(step, NextStep::GiveUp);
+        assert!(!p.a.is_suspect(), "a native path never turns suspect");
+        drop(silencer.silenced.lock().take());
+    })
+}
+
+/// Every outcome that sends a message on UDP from an upgrade's path gives it up
+/// on a native path, and is counted as dropped there, never as sent on UDP; the
+/// outcomes that are done or given up anyway are the same on both.
+#[test]
+fn a_native_path_gives_up_what_an_upgrade_path_sends_on_udp() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let upgrade = paths("quic-path-fallback-upgrade", QuicPathLimits::DEFAULT).await;
+        let native = paths_built(
+            "quic-path-fallback-native",
+            QuicPathLimits::DEFAULT,
+            QuicPathLimits::NATIVE,
+            None,
+            None,
+            Windows::default(),
+            true,
+        )
+        .await;
+        let outcomes = || {
+            vec![
+                BoundedSend::Sent,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)),
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)),
+                BoundedSend::Failed(SendFailure::Error(stopped(stop_code::NOT_ACCEPTING_DATA))),
+                BoundedSend::Failed(SendFailure::Error(stopped(stop_code::BUDGET_REFUSED))),
+                BoundedSend::Failed(SendFailure::TimedOut),
+            ]
+        };
+        let mut udp_seen = 0;
+        for kind in SendKind::ALL {
+            for (on_upgrade, on_native) in outcomes().iter().zip(outcomes().iter()) {
+                let now = upgrade.time().now_nanos();
+                let up = upgrade.a.settle(kind, on_upgrade, false, now);
+                let nat = native.a.settle(kind, on_native, false, now);
+                match up {
+                    NextStep::SendOnUdp => {
+                        udp_seen += 1;
+                        assert_eq!(nat, NextStep::GiveUp, "{kind:?} {on_native:?}");
+                    }
+                    step => assert_eq!(nat, step, "{kind:?} {on_native:?}"),
+                }
+            }
+        }
+        assert!(
+            udp_seen > 0,
+            "some outcome sends on UDP from an upgrade path"
+        );
+        for kind in SendKind::ALL {
+            for result in [QuicSendResult::NotOpenedUdp, QuicSendResult::FailedUdp] {
+                assert_eq!(native.a.stats().send_count(kind, result), 0, "{kind:?}");
+            }
+        }
+        let dropped: u64 = SendKind::ALL
+            .iter()
+            .map(|kind| native.a.stats().send_count(*kind, QuicSendResult::Dropped))
+            .sum();
+        let upgrade_dropped: u64 = SendKind::ALL
+            .iter()
+            .map(|kind| upgrade.a.stats().send_count(*kind, QuicSendResult::Dropped))
+            .sum();
+        assert_eq!(
+            dropped,
+            upgrade_dropped + udp_seen,
+            "each UDP fallback is a drop"
+        );
     })
 }
 

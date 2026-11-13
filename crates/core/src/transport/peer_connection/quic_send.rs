@@ -107,6 +107,65 @@ impl<S: Socket, T: TimeSource> UdpStreamSender<S, T> {
     }
 }
 
+/// Where a stream the path cannot deliver goes: the UDP session, as a boxed
+/// [`UdpStreamSender`] so the path's send code is not generic over the socket.
+/// A native connection has none (`None` in the `*_with` functions), and its path
+/// gives such a send up (`QuicPath::settle`).
+pub(super) trait UdpStreams: Send {
+    fn send_stream(
+        self: Box<Self>,
+        stream_id: StreamId,
+        data: Bytes,
+        metadata: Option<Bytes>,
+        completion_tx: Option<oneshot::Sender<StreamSendOutcome>>,
+        progress: Option<Arc<dyn StreamProgressObserver>>,
+    ) -> Pin<Box<dyn std::future::Future<Output = OutboundStreamResult> + Send>>;
+
+    fn pipe_stream(
+        self: Box<Self>,
+        stream_id: StreamId,
+        inbound_handle: IncomingStream,
+        metadata: Option<Bytes>,
+        progress: Option<Arc<dyn StreamProgressObserver>>,
+    ) -> Pin<Box<dyn std::future::Future<Output = OutboundStreamResult> + Send>>;
+}
+
+impl<S: Socket, T: TimeSource> UdpStreams for UdpStreamSender<S, T> {
+    fn send_stream(
+        self: Box<Self>,
+        stream_id: StreamId,
+        data: Bytes,
+        metadata: Option<Bytes>,
+        completion_tx: Option<oneshot::Sender<StreamSendOutcome>>,
+        progress: Option<Arc<dyn StreamProgressObserver>>,
+    ) -> Pin<Box<dyn std::future::Future<Output = OutboundStreamResult> + Send>> {
+        Box::pin(UdpStreamSender::send_stream(
+            *self,
+            stream_id,
+            data,
+            metadata,
+            completion_tx,
+            progress,
+        ))
+    }
+
+    fn pipe_stream(
+        self: Box<Self>,
+        stream_id: StreamId,
+        inbound_handle: IncomingStream,
+        metadata: Option<Bytes>,
+        progress: Option<Arc<dyn StreamProgressObserver>>,
+    ) -> Pin<Box<dyn std::future::Future<Output = OutboundStreamResult> + Send>> {
+        Box::pin(UdpStreamSender::pipe_stream(
+            *self,
+            stream_id,
+            inbound_handle,
+            metadata,
+            progress,
+        ))
+    }
+}
+
 /// A transfer on a path, for the same telemetry as a UDP one. The figures that
 /// come from the UDP congestion controller and sent tracker do not exist here,
 /// so they are left out (`None`) of the event and 0 in the stats.
@@ -224,8 +283,29 @@ pub(super) async fn send_large_short_on_path<S: Socket, T: TimeSource>(
     data: Bytes,
     udp: UdpStreamSender<S, T>,
 ) -> OutboundStreamResult {
+    let (remote_addr, time_source) = (udp.remote_addr, udp.time_source.clone());
+    send_large_short_with(
+        route,
+        stream_id,
+        data,
+        Some(Box::new(udp)),
+        remote_addr,
+        time_source,
+    )
+    .await
+}
+
+/// [`send_large_short_on_path`] with an optional fallback.
+pub(super) async fn send_large_short_with<T: TimeSource>(
+    route: DataRoute,
+    stream_id: StreamId,
+    data: Bytes,
+    udp: Option<Box<dyn UdpStreams>>,
+    remote_addr: SocketAddr,
+    time_source: T,
+) -> OutboundStreamResult {
     let bytes = data.len() as u64;
-    let transfer = PathTransfer::start(stream_id, udp.remote_addr, bytes, udp.time_source.clone());
+    let transfer = PathTransfer::start(stream_id, remote_addr, bytes, time_source);
     let outcome = route
         .path()
         .send_short_bounded(route.clock(), SendDeadlines::short(bytes), &data)
@@ -238,11 +318,14 @@ pub(super) async fn send_large_short_on_path<S: Socket, T: TimeSource>(
         route.clock().now_nanos(),
     ) {
         NextStep::Done => transfer.completed(),
-        NextStep::SendOnUdp => {
-            let sent = udp.send_stream(stream_id, data, None, None, None).await;
-            charge_fallback_if_sent(&route, &outcome, bytes, &sent);
-            sent
-        }
+        NextStep::SendOnUdp => match udp {
+            Some(udp) => {
+                let sent = udp.send_stream(stream_id, data, None, None, None).await;
+                charge_fallback_if_sent(&route, &outcome, bytes, &sent);
+                sent
+            }
+            None => transfer.failed(&outcome),
+        },
         NextStep::GiveUp => transfer.failed(&outcome),
     }
 }
@@ -258,8 +341,36 @@ pub(super) async fn send_stream_on_path<S: Socket, T: TimeSource>(
     progress: Option<Arc<dyn StreamProgressObserver>>,
     udp: UdpStreamSender<S, T>,
 ) -> OutboundStreamResult {
+    let (remote_addr, time_source) = (udp.remote_addr, udp.time_source.clone());
+    send_stream_with(
+        route,
+        stream_id,
+        data,
+        metadata,
+        completion_tx,
+        progress,
+        Some(Box::new(udp)),
+        remote_addr,
+        time_source,
+    )
+    .await
+}
+
+/// [`send_stream_on_path`] with an optional fallback.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn send_stream_with<T: TimeSource>(
+    route: DataRoute,
+    stream_id: StreamId,
+    data: Bytes,
+    metadata: Option<Bytes>,
+    completion_tx: Option<oneshot::Sender<StreamSendOutcome>>,
+    progress: Option<Arc<dyn StreamProgressObserver>>,
+    udp: Option<Box<dyn UdpStreams>>,
+    remote_addr: SocketAddr,
+    time_source: T,
+) -> OutboundStreamResult {
     let bytes = data.len() as u64;
-    let transfer = PathTransfer::start(stream_id, udp.remote_addr, bytes, udp.time_source.clone());
+    let transfer = PathTransfer::start(stream_id, remote_addr, bytes, time_source);
     let outcome = route
         .path()
         .send_stream_bounded(
@@ -280,13 +391,19 @@ pub(super) async fn send_stream_on_path<S: Socket, T: TimeSource>(
             complete(completion_tx, stream_send_outcome(&outcome));
             transfer.completed()
         }
-        NextStep::SendOnUdp => {
-            let sent = udp
-                .send_stream(stream_id, data, metadata, completion_tx, progress)
-                .await;
-            charge_fallback_if_sent(&route, &outcome, bytes, &sent);
-            sent
-        }
+        NextStep::SendOnUdp => match udp {
+            Some(udp) => {
+                let sent = udp
+                    .send_stream(stream_id, data, metadata, completion_tx, progress)
+                    .await;
+                charge_fallback_if_sent(&route, &outcome, bytes, &sent);
+                sent
+            }
+            None => {
+                complete(completion_tx, StreamSendOutcome::Dropped);
+                transfer.failed(&outcome)
+            }
+        },
         NextStep::GiveUp => {
             complete(completion_tx, StreamSendOutcome::Dropped);
             transfer.failed(&outcome)
@@ -306,8 +423,34 @@ pub(super) async fn pipe_stream_on_path<S: Socket, T: TimeSource>(
     progress: Option<Arc<dyn StreamProgressObserver>>,
     udp: UdpStreamSender<S, T>,
 ) -> OutboundStreamResult {
+    let (remote_addr, time_source) = (udp.remote_addr, udp.time_source.clone());
+    pipe_stream_with(
+        route,
+        stream_id,
+        inbound_handle,
+        metadata,
+        progress,
+        Some(Box::new(udp)),
+        remote_addr,
+        time_source,
+    )
+    .await
+}
+
+/// [`pipe_stream_on_path`] with an optional fallback.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn pipe_stream_with<T: TimeSource>(
+    route: DataRoute,
+    stream_id: StreamId,
+    inbound_handle: IncomingStream,
+    metadata: Option<Bytes>,
+    progress: Option<Arc<dyn StreamProgressObserver>>,
+    udp: Option<Box<dyn UdpStreams>>,
+    remote_addr: SocketAddr,
+    time_source: T,
+) -> OutboundStreamResult {
     let bytes = inbound_handle.total_bytes();
-    let transfer = PathTransfer::start(stream_id, udp.remote_addr, bytes, udp.time_source.clone());
+    let transfer = PathTransfer::start(stream_id, remote_addr, bytes, time_source);
     let mut source = WatchedSource::new(inbound_handle.chunks());
     // The source's own gap (5 s for a UDP-fed stream, the source path's gap
     // for a QUIC-fed one, whose chunks also end when its reader does), but no
@@ -344,13 +487,16 @@ pub(super) async fn pipe_stream_on_path<S: Socket, T: TimeSource>(
         .settle(SendKind::Pipe, &outcome, stalled, route.clock().now_nanos())
     {
         NextStep::Done => transfer.completed(),
-        NextStep::SendOnUdp => {
-            let sent = udp
-                .pipe_stream(stream_id, inbound_handle, metadata, progress)
-                .await;
-            charge_fallback_if_sent(&route, &outcome, bytes, &sent);
-            sent
-        }
+        NextStep::SendOnUdp => match udp {
+            Some(udp) => {
+                let sent = udp
+                    .pipe_stream(stream_id, inbound_handle, metadata, progress)
+                    .await;
+                charge_fallback_if_sent(&route, &outcome, bytes, &sent);
+                sent
+            }
+            None => transfer.failed(&outcome),
+        },
         NextStep::GiveUp => transfer.failed(&outcome),
     }
 }

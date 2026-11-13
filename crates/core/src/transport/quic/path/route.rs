@@ -430,7 +430,13 @@ impl QuicPath {
         source_stalled: bool,
         now_nanos: u64,
     ) -> NextStep {
-        let (step, result) = next_step(kind, outcome);
+        let (step, result) = match next_step(kind, outcome) {
+            // A native path has no UDP session: what would go there is given up.
+            (NextStep::SendOnUdp, _) if !self.udp_fallback => {
+                (NextStep::GiveUp, QuicSendResult::Dropped)
+            }
+            other => other,
+        };
         self.stats.record_send(kind, result);
         if matches!(
             outcome,
@@ -462,7 +468,8 @@ impl QuicPath {
                 (verdict, acked)
             })
         };
-        if let (true, Some(acked)) = (verdict.quiet_timeout, acked) {
+        // Suspect diverts new sends to UDP; a native path has none to divert to.
+        if let (true, Some(acked), true) = (verdict.quiet_timeout, acked, self.udp_fallback) {
             self.become_suspect(acked);
         }
         if verdict.close {

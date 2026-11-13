@@ -100,6 +100,26 @@ impl DataRoute {
         udp: Arc<dyn UdpShorts>,
         note: RouteNote,
     ) -> (Self, impl Future<Output = ()> + Send + 'static) {
+        Self::with_fallback(path, clock, Some(udp), note)
+    }
+
+    /// A route over a native connection's path, which has no UDP session: a
+    /// short the path cannot send is dropped and counted, never sent elsewhere.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::transport) fn native(
+        path: Arc<QuicPath>,
+        clock: PathClock,
+        note: RouteNote,
+    ) -> (Self, impl Future<Output = ()> + Send + 'static) {
+        Self::with_fallback(path, clock, None, note)
+    }
+
+    fn with_fallback(
+        path: Arc<QuicPath>,
+        clock: PathClock,
+        udp: Option<Arc<dyn UdpShorts>>,
+        note: RouteNote,
+    ) -> (Self, impl Future<Output = ()> + Send + 'static) {
         let (shorts, queue) = mpsc::channel(SHORT_QUEUE_CAPACITY);
         let worker = run_worker(Arc::clone(&path), clock.clone(), queue, udp, note.clone());
         (
@@ -164,7 +184,7 @@ async fn run_worker(
     path: Arc<QuicPath>,
     clock: PathClock,
     mut queue: mpsc::Receiver<SerializedMessage>,
-    udp: Arc<dyn UdpShorts>,
+    udp: Option<Arc<dyn UdpShorts>>,
     note: RouteNote,
 ) {
     let connection = path.quinn_connection();
@@ -190,7 +210,7 @@ async fn run_worker(
                     note.note(|| format!("sent a short on the path: {outcome:?}"));
                     let step = path.settle(SendKind::Short, &outcome, false, clock.now_nanos());
                     if step == NextStep::SendOnUdp {
-                        send_on_udp(&path, udp.as_ref(), &note, payload).await;
+                        send_elsewhere(&path, udp.as_deref(), &note, payload).await;
                     }
                 }
             },
@@ -199,7 +219,7 @@ async fn run_worker(
                     Some(payload) if connected && path.sends_data() && !path.is_suspect() => {
                         in_flight.push(send_on_path(&path, &clock, payload));
                     }
-                    Some(payload) => send_on_udp(&path, udp.as_ref(), &note, payload).await,
+                    Some(payload) => send_elsewhere(&path, udp.as_deref(), &note, payload).await,
                     None => queue_open = false,
                 }
             },
@@ -215,6 +235,23 @@ fn send_on_path(path: &Arc<QuicPath>, clock: &PathClock, payload: SerializedMess
         let outcome = path.send_short_bounded(&clock, deadlines, &payload).await;
         (payload, outcome)
     })
+}
+
+/// A message the path does not send: on the UDP session if there is one, else
+/// dropped and counted (a native connection, whose path has ended).
+async fn send_elsewhere(
+    path: &QuicPath,
+    udp: Option<&dyn UdpShorts>,
+    note: &RouteNote,
+    payload: SerializedMessage,
+) {
+    match udp {
+        Some(udp) => send_on_udp(path, udp, note, payload).await,
+        None => {
+            path.stats().record_send_dropped(SendKind::Short);
+            note.note(|| "dropped a short: the native path has ended".to_string());
+        }
+    }
 }
 
 /// Hand a message to the UDP session, once. A send error there costs what a lost

@@ -301,6 +301,11 @@ pub(crate) struct QuicPathLimits {
     /// The uni streams a data path's peer may open at first, raised with
     /// load up to [`MAX_UNI_STREAMS`] (`inbound::StreamLimit`).
     pub(crate) start_streams: u32,
+    /// Whether a data send this path cannot deliver may go on a UDP session.
+    /// False for a native connection's path ([`Self::NATIVE`]), which has no
+    /// UDP session: such a send is given up instead (`route::QuicPath::settle`),
+    /// and the path never turns suspect, since there is nowhere to divert to.
+    pub(crate) udp_fallback: bool,
     /// Where the path's counts are also kept node-wide; `None` is
     /// `TRANSPORT_METRICS`. A test passes its own, since every test in a process
     /// writes the global one.
@@ -370,6 +375,7 @@ impl QuicPathLimits {
         // The production start in every build, tests and simulations
         // included; a test whose premise is the full limit sets it.
         start_streams: super::config::DATA_START_UNI_STREAMS,
+        udp_fallback: true,
         counters: None,
         #[cfg(test)]
         panic_in_receive: false,
@@ -389,6 +395,14 @@ impl QuicPathLimits {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const SHADOW: Self = Self {
         accept_data: false,
+        ..Self::DEFAULT
+    };
+
+    /// [`Self::DEFAULT`] for a native connection's path: data on from the
+    /// start, and no UDP session to fall back to.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const NATIVE: Self = Self {
+        udp_fallback: false,
         ..Self::DEFAULT
     };
 
@@ -598,6 +612,12 @@ impl QuicPathStats {
     }
 
     /// The data-send counts are kept here and node-wide (`metrics::quic_data`).
+    /// Count a send of `kind` that was dropped without a path outcome (a native
+    /// route's short after its path ended).
+    pub(in crate::transport) fn record_send_dropped(&self, kind: SendKind) {
+        self.record_send(kind, QuicSendResult::Dropped);
+    }
+
     fn record_send(&self, kind: SendKind, result: QuicSendResult) {
         self.node.record_send(kind, result);
         self.sends[kind as usize][result as usize].fetch_add(1, Ordering::Relaxed);
@@ -778,6 +798,9 @@ pub(crate) struct QuicPath {
     /// from [`Self::count_as_data_path`] until the peer refuses data or
     /// [`Self::uncount_as_data_path`], whichever is first, so it is lowered once.
     counted_as_data_path: std::sync::atomic::AtomicBool,
+    /// Whether a send this path cannot deliver may go on UDP
+    /// ([`QuicPathLimits::udp_fallback`]).
+    udp_fallback: bool,
     /// Send timeouts while nothing is acknowledged ([`route::StallCount`]).
     stall: parking_lot::Mutex<route::StallCount>,
     /// The [`bounded::QuietProof`] sends that ran out of gap left, read (not
@@ -1068,6 +1091,7 @@ impl QuicPath {
                 controls_opening: Arc::default(),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
+                udp_fallback: limits.udp_fallback,
                 stall: parking_lot::Mutex::new(stall),
                 quiet: Arc::default(),
                 last_acked: Arc::new(bounded::AckRecord::new(
