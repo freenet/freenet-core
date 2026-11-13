@@ -2809,6 +2809,14 @@ mod tests {
                 "PACED_TAKE_BYTES",
                 "egress-cap take per datagram (a rate charge), not memory",
             ),
+            (
+                "PUNCH_BUDGET_BYTES",
+                "native punch egress allowance per destination per minute (bytes sent), not memory",
+            ),
+            (
+                "NODE_PUNCH_BUDGET_BYTES",
+                "native punch egress allowance per node per minute (bytes sent), not memory",
+            ),
             ("BLOOM_BYTES", "fixed size of one bloom filter"),
             (
                 "CACHE_ENTRY_OVERHEAD_BYTES",
