@@ -65,8 +65,21 @@ impl Paths {
     /// nothing. `a_in` is dropped here; `net` is `Copy`.
     fn into_parts(self) -> PathsParts {
         let p = std::mem::ManuallyDrop::new(self);
+        // Names every field, with no `..`: a field added to `Paths` is a
+        // compile error here until it is read below, so none is leaked.
+        let Paths {
+            pair: _,
+            net: _,
+            a: _,
+            b: _,
+            a_in: _,
+            b_in: _,
+        } = &*p;
         // SAFETY: `p` is never dropped or used again, and each field is read
-        // exactly once, so every value has exactly one owner afterwards.
+        // exactly once, so every value has exactly one owner afterwards. The
+        // pattern above lists every field, so a field this does not read
+        // cannot be added without a compile error (`net` is `Copy` and needs
+        // no read).
         unsafe {
             drop(std::ptr::read(&p.a_in));
             PathsParts {
