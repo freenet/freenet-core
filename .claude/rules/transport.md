@@ -2672,11 +2672,12 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     acknowledgement is awaited for at most its first age
     (inbound_stream_age_limit(len): its length at 32 KiB/s, at least
     5 min), or, on a node's sends (QuicPath::stream_deadlines), the longer
-    of the stream's length and the backlog that can be ahead of its end
-    (the streamed sends in flight, their permits, times the connection's
-    send window, which quinn shares round-robin), at the credit floor at
-    the path's round trip (credit_floor_rate, at least 16 KiB/s), and at
-    most the 2 h total. On a busy slow path each wait can run the full 2 h,
+    of that, the stream's length at the credit floor at the path's round
+    trip (credit_floor_rate, at least 16 KiB/s), and the backlog that can
+    be ahead of its end, read when the end is sent (the streamed sends in
+    flight then, their permits, times the largest send window,
+    MAX_WINDOW_BYTES, which quinn shares round-robin, at the floor;
+    QuicPath::backlog_wait), and at most the 2 h total. On a busy slow path each wait can run the full 2 h,
     so the expiry rule below can take up to that long to fire there. When
     a stream send's deadline runs out after its end was sent (the ack wait,
     or the total), the send ends MaybeDelivered(TimedOut) and the stream is
@@ -2689,14 +2690,21 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     own deadline (a teardown) still waits on in the background for its
     acknowledgement or the connection.
   → Ack waits expired (#6205, recycle::AckWatch, Stall::AckWaitsExpired):
-    a reset at an expired wait (above) is a STRIKE only if, between the end
-    being sent and the expiry, the egress cap held none of the connection's
-    transmits and the connection acknowledged at least the credit floor at
-    its round trip (path::StrikeCheck). This node's own throttling, or a
-    path too slow to have delivered the bytes ahead of the end, leaves the
-    peer nothing to acknowledge and is not a strike
-    (ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes; the
-    quiet case of the test below). Strikes are counted in
+    a reset at an expired wait (above) is a STRIKE when there is evidence
+    the end went out and the peer is alive (path::StrikeCheck): ack batches
+    came after the end was sent and the latest came while quinn was
+    application-limited (quinn-proto app_limited = nothing built and not
+    held back by the congestion window or pacing), whatever the rate, so a
+    peer that withholds only stream ends on a quiet connection is struck;
+    or the connection acknowledged at least the credit floor at its round
+    trip over the wait. Time the egress cap held this connection's
+    transmits is this node's own throttling: each hold event since the end
+    takes the cap's longest wait off the time the floor is judged over, and
+    while the cap holds a transmit now neither evidence counts. A genuinely
+    slow path (every batch congestion-limited, under the floor) is not
+    struck (the_strike_check_needs_evidence_that_the_end_went_out,
+    ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes,
+    ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes). Strikes are counted in
     quic_ack_wait_expired_<stream|short|control>, and
     ACK_WAIT_EXPIRY_LIMIT (3) of them within ACK_WAIT_EXPIRY_WINDOW
     (30 min) close the path. Acknowledgements never reset the count: an
@@ -2727,7 +2735,9 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     path's clock with no late-sample forgiveness (the watch's): after a
     multi-minute stall of this side's runtime or a host suspend, a timer
     can fire before an acknowledgement already waiting in the socket is
-    read, which can produce a strike; three in 30 min are needed to close.
+    read. That makes a strike less likely, not more: the wait grows while
+    nothing more is acknowledged, and the application-limited evidence
+    still needs batches after the end.
     Residual, open (#6205, a gate before UDP removal): a peer that
     acknowledges each stream's end (or stops it) just before its ack wait
     runs out holds the 48 permits (each for at least 5 min) and the 64
