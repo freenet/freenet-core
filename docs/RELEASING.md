@@ -618,11 +618,12 @@ Current wire-gated floors:
   `QUIC_DATA_RAMP_START` back to `None`, which gives every `prefer` node a
   share of 0, so none of its pairs carries data; only a node that set
   `quic-data-percent` keeps a share. It also sets the default mode back to
-  shadow on Linux, macOS and Windows, so a node that did not set
-  `transport-quic` keeps its endpoint and its paths as shadow paths, the state
-  releases before the ramp ran in (the default is read, never written to
-  `config.toml`). Shadow, not off: off would tear down every node's QUIC
-  endpoint mid-incident, a larger change than the stop needs. A node that set
+  0.2.156's: shadow on Linux and macOS, off on Windows. An emergency release
+  should only go back to states the field has run, and no release before the
+  ramp ran QUIC on Windows. So a Linux or macOS node that did not set
+  `transport-quic` keeps its endpoint with shadow paths (off would tear down
+  every endpoint mid-incident), and a Windows node turns QUIC off (the default
+  is read, never written to `config.toml`). A node that set
   `transport-quic = "prefer"` itself stays in prefer at a share of 0, which
   acts as shadow on the wire.
   A node takes either change only when it restarts into the release (an
