@@ -1002,6 +1002,77 @@ fn cache_reconciled_recently(instance_id: &ContractInstanceId) -> bool {
         .unwrap_or(false)
 }
 
+/// Releases a transient node-side client registration when the HTTP handler
+/// that opened it is done with it.
+///
+/// The handlers below register a client with the node, wait on it, and then
+/// send a `Disconnect` so the node drops the client's response channel and its
+/// subscription. Hyper drops a handler future when the browser aborts the load,
+/// which skips every statement after the await it was suspended at, so the
+/// `Disconnect` is sent from `Drop` as well. [`Self::finish`] is the normal
+/// path: it awaits the send and disarms the guard.
+///
+/// The `Drop` path spawns the send, because `Drop` cannot await and the request
+/// channel is bounded, so a `try_send` could be refused exactly when the node
+/// is busy. If the runtime is already gone there is nothing left to release.
+struct DisconnectOnDrop {
+    sender: HttpClientApiRequest,
+    client_id: crate::client_events::ClientId,
+    armed: bool,
+}
+
+impl DisconnectOnDrop {
+    fn new(sender: &HttpClientApiRequest, client_id: crate::client_events::ClientId) -> Self {
+        Self {
+            sender: sender.clone(),
+            client_id,
+            armed: true,
+        }
+    }
+
+    fn message(client_id: crate::client_events::ClientId) -> ClientConnection {
+        ClientConnection::Request {
+            client_id,
+            req: Box::new(ClientRequest::Disconnect { cause: None }),
+            auth_token: None,
+            origin_contract: None,
+            // Node-internal fetch issued by the HTTP layer itself (webapp cache
+            // reconcile), not a client connection. It carries no
+            // `origin_contract`, so the scope attests nothing either way.
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            // Internal node-query request: no delegate secrets, no user context.
+            user_context: None,
+            api_version: Default::default(),
+        }
+    }
+
+    /// Sends the `Disconnect` and disarms the guard. If this future is dropped
+    /// while the send is pending the guard is still armed, so `Drop` sends it.
+    async fn finish(mut self, context: &str) {
+        if let Err(err) = self.sender.send(Self::message(self.client_id)).await {
+            tracing::warn!("{context}: disconnect send failed: {err}");
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for DisconnectOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let sender = self.sender.clone();
+        let client_id = self.client_id;
+        runtime.spawn(async move {
+            // A send failure means the node is gone, so there is nothing to release.
+            drop(sender.send(Self::message(client_id)).await);
+        });
+    }
+}
+
 /// Whether the local node already has `instance_id` in its contract store /
 /// hosting cache, or holds an active subscription to it.
 ///
@@ -1048,7 +1119,7 @@ fn cache_reconciled_recently(instance_id: &ContractInstanceId) -> bool {
 ///
 /// On any error or timeout this returns `false` (fail closed): an attacker
 /// must not be able to turn a transient node hiccup into an open fetch.
-async fn is_locally_known(
+pub(super) async fn is_locally_known(
     instance_id: ContractInstanceId,
     request_sender: &HttpClientApiRequest,
 ) -> bool {
@@ -1072,6 +1143,7 @@ async fn is_locally_known(
         Ok(Some(HostCallbackResult::NewId { id })) => id,
         _ => return false,
     };
+    let disconnect = DisconnectOnDrop::new(request_sender, client_id);
 
     // Scope the diagnostics query to this one contract: only the store-presence
     // answer (`contract_keys`) and the application-subscription set
@@ -1129,24 +1201,7 @@ async fn is_locally_known(
     }
 
     // Reap the transient client registration regardless of outcome.
-    if let Err(err) = request_sender
-        .send(ClientConnection::Request {
-            client_id,
-            req: Box::new(ClientRequest::Disconnect { cause: None }),
-            auth_token: None,
-            origin_contract: None,
-            // Node-internal fetch issued by the HTTP layer itself (webapp cache
-            // reconcile), not a client connection. It carries no
-            // `origin_contract`, so the scope attests nothing either way.
-            connection_scope: crate::client_events::ConnectionScope::Local,
-            // Internal node-query request: no delegate secrets, no user context.
-            user_context: None,
-            api_version: Default::default(),
-        })
-        .await
-    {
-        tracing::warn!("is_locally_known: disconnect send failed: {err}");
-    }
+    disconnect.finish("is_locally_known").await;
 
     known
 }
@@ -1437,7 +1492,7 @@ pub(super) async fn contract_home(
 /// requested `/v1/contract/web/<KEY>/image.jpg` before any load of the
 /// contract root (e.g. cross-contract `<img src>` from a different webapp),
 /// the cache directory did not exist and the request 404'd. See #3940.
-async fn ensure_contract_cached(
+pub(super) async fn ensure_contract_cached(
     instance_id: ContractInstanceId,
     request_sender: &HttpClientApiRequest,
     assigned_token: Option<(AuthToken, ContractInstanceId)>,
@@ -1471,6 +1526,7 @@ async fn ensure_contract_cached(
             });
         }
     };
+    let disconnect = DisconnectOnDrop::new(request_sender, client_id);
     request_sender
         .send(ClientConnection::Request {
             client_id,
@@ -1506,25 +1562,10 @@ async fn ensure_contract_cached(
     // can reap the transient client registration. A send failure means the
     // node is gone, which is already the important signal — we don't fail
     // the user's request over it, but we log at warn! so an operator sees
-    // the trail if WebSocket connections subsequently hang.
-    if let Err(err) = request_sender
-        .send(ClientConnection::Request {
-            client_id,
-            req: Box::new(ClientRequest::Disconnect { cause: None }),
-            auth_token: None,
-            origin_contract: None,
-            // Node-internal fetch issued by the HTTP layer itself (webapp cache
-            // reconcile), not a client connection. It carries no
-            // `origin_contract`, so the scope attests nothing either way.
-            connection_scope: crate::client_events::ConnectionScope::Local,
-            // Internal node-query request: no delegate secrets, no user context.
-            user_context: None,
-            api_version: Default::default(),
-        })
-        .await
-    {
-        tracing::warn!("ensure_contract_cached: disconnect send failed: {err}");
-    }
+    // the trail if WebSocket connections subsequently hang. If the handler is
+    // dropped before reaching here (the browser aborted the load) the guard
+    // sends it instead.
+    disconnect.finish("ensure_contract_cached").await;
 
     outcome
 }
@@ -4294,6 +4335,19 @@ mod tests {
         assert!(
             in_flight.await.is_err(),
             "the in-flight fetch must be cancelled, not have completed on its own"
+        );
+        // Dropping the handler releases its client registration with the node.
+        let released = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an aborted fetch must send Disconnect")
+            .expect("channel must remain open");
+        assert!(
+            matches!(
+                &released,
+                ClientConnection::Request { req, .. }
+                    if matches!(req.as_ref(), ClientRequest::Disconnect { .. })
+            ),
+            "an aborted fetch must release its client, got: {released:?}"
         );
         let retried = {
             let (sender, webapp_cache) = (sender.clone(), webapp_cache.clone());

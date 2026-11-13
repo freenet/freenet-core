@@ -1702,21 +1702,28 @@ async fn websocket_interface(
         }
         .into();
 
-        let serialized_error = match encoding_protoc {
-            EncodingProtocol::Flatbuffers => error
-                .into_fbs_bytes()
-                .map_err(|e| anyhow::anyhow!("Failed to serialize error: {:?}", e))?,
-            EncodingProtocol::Native => {
-                bincode::serialize(&Err::<HostResponse, ClientError>(error))?
-            }
-        };
+        // The send can fail when the client is already gone. That must not skip
+        // the Disconnect below, or the node keeps this client's response
+        // channel until exit, so the result is only propagated afterwards.
+        let send_result: anyhow::Result<()> = async {
+            let serialized_error = match encoding_protoc {
+                EncodingProtocol::Flatbuffers => error
+                    .into_fbs_bytes()
+                    .map_err(|e| anyhow::anyhow!("Failed to serialize error: {:?}", e))?,
+                EncodingProtocol::Native => {
+                    bincode::serialize(&Err::<HostResponse, ClientError>(error))?
+                }
+            };
+            send_response_message(&mut server_sink, serialized_error, &mut conn_state, None)
+                .await?;
+            tracing::debug!(
+                prefix,
+                "Sent auth token error to client, closing connection"
+            );
+            Ok(())
+        }
+        .await;
 
-        send_response_message(&mut server_sink, serialized_error, &mut conn_state, None).await?;
-
-        tracing::debug!(
-            prefix,
-            "Sent auth token error to client, closing connection"
-        );
         // Close the connection after sending the error. Keeping it open causes delegate
         // failures: all subsequent messages would be processed with origin_contract=None
         // (since auth_token=None), so the delegate receives origin=None and fails with
@@ -1730,6 +1737,7 @@ async fn websocket_interface(
             api_version,
         )
         .await;
+        send_result?;
         // Close with the trusted application code (not a bare close) so the shell
         // can distinguish a stale-token rejection from any other disconnect and
         // recover autonomously — see AUTH_TOKEN_INVALID_CLOSE_CODE. The serialized

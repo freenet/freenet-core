@@ -1319,6 +1319,61 @@ mod tests {
     use super::*;
     use freenet_stdlib::client_api::ClientRequest;
 
+    /// The HTTP handlers register a transient client with the node and send a
+    /// `Disconnect` after waiting on it. Hyper drops the handler future when
+    /// the browser aborts the load, which used to skip that `Disconnect`, so
+    /// the response channel (and the subscription under the client id) leaked.
+    /// Drives the real `HttpClientApi` and drops the handler mid-wait.
+    #[tokio::test]
+    async fn aborted_handler_still_releases_its_client() {
+        use crate::client_events::ClientEventsProxy;
+        let (mut api, _router) = HttpClientApi::as_router(&"127.0.0.1:0".parse().unwrap());
+        let (tx, rx) = mpsc::channel(1);
+        api.proxy_server_request = rx;
+        let sender = HttpClientApiRequest(tx);
+        let cache_root = tempfile::tempdir().unwrap();
+        let cache = path_handlers::WebappCache::with_root(cache_root.path().to_path_buf());
+        let id = ContractInstanceId::new([7u8; 32]);
+
+        for presence_query in [false, true] {
+            let handler = {
+                let sender = sender.clone();
+                let cache = cache.clone();
+                tokio::spawn(async move {
+                    if presence_query {
+                        let _known = path_handlers::is_locally_known(id, &sender).await;
+                    } else {
+                        drop(
+                            path_handlers::ensure_contract_cached(id, &sender, None, &cache).await,
+                        );
+                    }
+                })
+            };
+            // The handler is now suspended waiting for the node's answer to
+            // its first request (the GET, or the diagnostics query).
+            let first = tokio::time::timeout(std::time::Duration::from_secs(5), api.recv())
+                .await
+                .expect("handler must send a request")
+                .expect("recv must not fail");
+            assert!(!matches!(*first.request, ClientRequest::Disconnect { .. }));
+            assert_eq!(api.response_channels.len(), 1);
+
+            // The browser aborts the load: the handler future is dropped.
+            handler.abort();
+            assert!(handler.await.unwrap_err().is_cancelled());
+
+            let last = tokio::time::timeout(std::time::Duration::from_secs(5), api.recv())
+                .await
+                .expect("an aborted handler must still send Disconnect")
+                .expect("recv must not fail");
+            assert!(matches!(*last.request, ClientRequest::Disconnect { .. }));
+            assert!(
+                api.response_channels.is_empty(),
+                "presence_query={presence_query}: client leaked after the handler was dropped"
+            );
+        }
+    }
+
     /// A client's final `Disconnect` is never answered by the node, so the
     /// proxy must drop that client's response channel itself. Before the fix
     /// the entry (~10 KB per page load) stayed until the process exited.
