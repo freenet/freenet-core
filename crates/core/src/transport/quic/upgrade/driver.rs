@@ -383,7 +383,7 @@ impl Drop for Attempt {
             routed.store(false, Ordering::Release);
         }
         if let Some(route) = &self.route {
-            route.path().uncount_as_data_path();
+            route.path().end_as_data_path();
         }
     }
 }

@@ -5381,6 +5381,54 @@ fn a_path_counts_as_carrying_from_when_its_data_comes_on() {
     })
 }
 
+/// A data path whose attempt ends before the acknowledgement watch's first
+/// tick is still counted as carrying: the attempt takes it out of the gauge
+/// first (`end_as_data_path`, as `Attempt::drop` does), and the loss report's
+/// final reading, taken after, counts its packets and its end as carried.
+#[test]
+fn a_data_path_that_ends_before_its_first_tick_is_counted_as_carrying() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-carrying-end", limits).await;
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        p.drive(async move {
+            a.count_as_data_path();
+            a.send_short(&[3u8; 600]).await.expect("sent");
+            // Inside the first 2 s tick: no report has read the path yet.
+            time.sleep(Duration::from_millis(500)).await;
+            a.end_as_data_path();
+            a.connection().close(QuicCloseCode::Downgrade);
+            time.sleep(Duration::from_secs(5)).await;
+            drop(b);
+        })
+        .await;
+        drop(p);
+        let snap = counters.snapshot(false);
+        assert!(snap.sent_packets > 0, "premise: the path sent");
+        assert!(
+            snap.carrying_sent_packets > 0,
+            "the final reading counted as carrying: {} of {}",
+            snap.carrying_sent_packets,
+            snap.sent_packets
+        );
+        let ended = |rates: &[u64], below: u64| rates.iter().sum::<u64>() + below;
+        assert_eq!(
+            ended(
+                &snap.carrying_ended_loss_rate,
+                snap.carrying_ended_below_floor
+            ),
+            1,
+            "the data path ended as a carried path"
+        );
+    })
+}
+
 /// A bounded send whose deadline passes while it waits for a permit is
 /// `NotOpened`, and it opened no stream: the receiver announces only the
 /// streams holding permits, and nothing had to be reset.
