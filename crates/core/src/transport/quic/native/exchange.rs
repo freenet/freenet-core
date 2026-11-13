@@ -350,6 +350,34 @@ mod tests {
         });
     }
 
+    /// A peer that closes with any other code, RECYCLE_FOR_DATA (a ramp's
+    /// recycle, which a native connection never sees from an honest peer)
+    /// included, is no setup failure of its own: the exchange reads it as a
+    /// lost connection.
+    #[test]
+    fn a_peers_other_close_codes_read_as_a_lost_connection() {
+        bounded(|| async {
+            for code in [QuicCloseCode::RecycleForData, QuicCloseCode::Downgrade] {
+                let net = crate::transport::test_net::subnet();
+                let pair = pair("native-hello-other-close", net.addr(1), net.addr(2), None).await;
+                let (a, b, _permit) = connected(&pair).await;
+                let clock = pair.time.clone();
+                let own = hello(native_version::OWN, pair.b_addr);
+                b.closer().close(code);
+                let ra = drive(&pair.time, LIMIT * 2, async move {
+                    let ra = exchange(&a, &own, true, &clock, LIMIT).await;
+                    drop(b);
+                    ra
+                })
+                .await;
+                assert!(
+                    matches!(ra, Err(HelloFailure::ConnectionLost(_))),
+                    "{code:?}: {ra:?}"
+                );
+            }
+        });
+    }
+
     /// A Hello declaring more than HELLO_MAX is refused from its prefix:
     /// HELLO_REFUSED, before the rest is read.
     #[test]

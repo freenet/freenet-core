@@ -3517,7 +3517,9 @@ pub struct TransportSnapshot {
     pub quic_churned_fallback: [u64; QuicFallback::COUNT],
     /// The fallbacks of paths that carried data when they ended, by label
     /// (`quic_carried_fallback_<label>`): a subset of `quic_fallback`, counted
-    /// by the same decision. Defaulted, so JSON from before it decodes.
+    /// by the same decision. Defaulted, so JSON from before it decodes; the
+    /// bincode event log is positional and skips older records once, with a
+    /// WARN (see `upload_json`).
     #[serde(default)]
     pub quic_carried_fallback: [u64; QuicFallback::COUNT],
     /// Active paths that ended, by [`QuicPathAge`]

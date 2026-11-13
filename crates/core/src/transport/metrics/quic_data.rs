@@ -35,7 +35,7 @@
 //! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
 //! | `quic_staged_peak_pct` | the most any connection staged in the period (bytes read for streams whose header its reader had not taken yet) as a percentage of its staging cap (`quic::path::inbound::ConnStaging`); streams stopped at the cap are `quic_inbound_evicted_staged` |
 //! | `quic_window_grew`, `quic_window_grow_refused`, `quic_window_shrank` | window-limited data paths whose receive window grew, those that found no room, and paths whose windows the budget lowered |
-//! | `quic_ramp_share_pct` | the share of pairs, in percent, this node sets its data bit for now: its `quic-data-percent`, or the ramp's share at the snapshot (`upgrade::slice::ramp_percent`); 0 unless `transport-quic = prefer`. A gauge, sent every period, 0 included, so the release watch can group each period by ramp step |
+//! | `quic_ramp_share_pct` | the share of pairs, in percent, this node sets its data bit for now: its `quic-data-percent`, or the ramp's share at the snapshot (`upgrade::slice::ramp_percent`); 0 unless the node can carry data (`prefer`, no breaker, paths allowed, the endpoint up). Read on the path clock's wall time. A gauge, sent every period, 0 included, so the release watch can group each period by ramp step. One value per process: in a simulation every node in the process shares it |
 //! | `quic_send_resets_reached_<n>`, `quic_send_resets_path_max` | paths whose lifetime reset count reached each level in the period, and the highest count a reset in the period took a path to: how close paths get to `recycle::SEND_ABORT_LIMIT` |
 //!
 //! What the loss rate is: quinn's lost over sent (quinn-proto 0.11.19). `sent`
@@ -825,6 +825,12 @@ impl QuicDataCounters {
 
 /// The QUIC data counts of one period. Vectors, in the order of their label lists,
 /// so a family can pass 32 entries; [`Self::keys`] names every value.
+///
+/// Fields added after a release carry `#[serde(default)]`, so JSON written
+/// before them still decodes. That does not hold for bincode, which is
+/// positional: the node's local event log cannot read a snapshot an older
+/// release wrote, so after an update that adds a field the older records are
+/// skipped once, with a WARN, as `TransportSnapshot::upload_json` notes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct QuicDataSnapshot {
@@ -858,16 +864,21 @@ pub struct QuicDataSnapshot {
     pub ended_below_floor: u64,
     /// The period's packets sent, and declared lost, while their path carried
     /// data: a subset of `sent_packets` and `lost_packets`.
+    #[serde(default)]
     pub carrying_sent_packets: u64,
+    #[serde(default)]
     pub carrying_lost_packets: u64,
     /// Live paths that carry data, by their loss while carrying, in the order
     /// of `LOSS_RATE_LABELS`: a gauge, not reset.
+    #[serde(default)]
     pub carrying_loss_rate: Vec<u32>,
     /// Paths that carried data and ended in the period, by their last carrying
     /// bucket.
+    #[serde(default)]
     pub carrying_ended_loss_rate: Vec<u64>,
     /// Paths that carried data and ended in the period before sending
     /// [`LOSS_RATE_MIN_SENT`] packets while carrying.
+    #[serde(default)]
     pub carrying_ended_below_floor: u64,
     pub streams_open_paths_sampled: u32,
     /// By `QUIC_STREAMS_OPEN_THRESHOLDS`.

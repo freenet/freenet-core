@@ -547,8 +547,15 @@ Current wire-gated floors:
   3 h past T0, re-set T0 in a new reviewed PR before publishing.** The same PR
   sets `QUIC_DATA_RAMP_RELEASE` (see the entry above for the release-time check). A node whose
   clock reads before T0 gets 5%. The soak runs before T0, so it exercises only
-  the 5% share. That PR also updates the expectation that pins the release's
-  share, the `quic-data-release-share` case in `simulation_integration.rs`.
+  the 5% share. That PR also updates the expectations that read the
+  constant: the `quic-data-release-share` case in `simulation_integration.rs`;
+  in `policy.rs` the tests that branch on `QUIC_DATA_RAMP_START`
+  (`own_caps_needs_prefer_and_the_peer_in_the_slice` asserts "no ramp, no
+  data" only while it is `None`; `startup_reports_prefer_and_max_paths`
+  expects a different line once it is set); and in `driver/tests.rs` the
+  `RECYCLES` expectation, which reads the production constant. Run the
+  `transport::quic::upgrade` tests with T0 set before the PR merges, so each
+  branch that only runs then has run.
 
   Release notes. The release that sets T0 must say in its notes that `prefer`
   nodes, which is every Linux, macOS and Windows node that did not set `transport-quic`,
