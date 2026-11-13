@@ -7278,7 +7278,9 @@ fn a_native_path_gives_up_what_an_upgrade_path_sends_on_udp() {
                         udp_seen += 1;
                         assert_eq!(nat, NextStep::GiveUp, "{kind:?} {on_native:?}");
                     }
-                    step => assert_eq!(nat, step, "{kind:?} {on_native:?}"),
+                    step @ (NextStep::Done | NextStep::GiveUp) => {
+                        assert_eq!(nat, step, "{kind:?} {on_native:?}")
+                    }
                 }
             }
         }
