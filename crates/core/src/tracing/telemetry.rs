@@ -7905,6 +7905,7 @@ mod tests {
         data.dark_episodes = (1059..1067).collect();
         data.ack_wait_expired = (1067..1070).collect();
         data.stall_closes = (1070..1075).collect();
+        data.stall_would_close = (1075..1080).collect();
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));

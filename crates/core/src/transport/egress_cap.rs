@@ -1080,12 +1080,12 @@ impl EgressCap {
         Some(Self::new(total_bytes_per_sec as u64, time_source))
     }
 
-    /// The cap's rate, in bytes per second.
     /// The cap's clock, in nanoseconds.
     pub(crate) fn now_nanos(&self) -> u64 {
         (self.clock)()
     }
 
+    /// The cap's rate, in bytes per second.
     pub(crate) fn rate_bytes_per_sec(&self) -> u64 {
         self.rate_bytes_per_sec
     }

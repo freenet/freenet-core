@@ -1089,28 +1089,31 @@ fn the_strike_check_needs_evidence_that_the_end_went_out() {
 /// cannot be met (1 s on a 4 s round trip), standing in for a peer that
 /// never acknowledges stream ends. A bulk transfer runs throughout, so the
 /// connection acknowledges well above the floor, as a peer that acknowledges
-/// every packet except stream ends does: each expiry is a strike.
+/// every packet except stream ends does: each expiry is a strike. The rule
+/// only observes (`recycle::ACK_WAITS_EXPIRED_CLOSES`), so three strikes
+/// count a would-close (`quic_stall_would_close_ack_waits_expired`) and the
+/// path stays open:
 /// - three such sends, with acknowledged multi-packet Shorts between them
 ///   (they have an ack wait of their own and were what reset round 4's
-///   rule): closed at the third (`AckWaitsExpired`);
+///   rule): three strikes, one would-close, not closed;
 /// - expiry, expiry, a stream acknowledged within its ack wait, expiry (one
-///   end in three acknowledged): still closed at the third, since
-///   acknowledgements never reset the count;
+///   end in three acknowledged): the same, since acknowledgements never
+///   reset the count;
 /// - the same three expiries with no bulk transfer: each wait (1 s) ends
 ///   before any acknowledgement could come back (4 s round trip), so there
-///   is no evidence the end went out yet and no strike: not closed. (The
+///   is no evidence the end went out yet and no strike, no would-close. (The
 ///   evidence on a quiet connection, ack batches after the end while quinn
 ///   was application-limited, is tested on its own in
 ///   `the_strike_check_needs_evidence_that_the_end_went_out`: this harness's
 ///   peer acknowledges every packet it gets, so it cannot withhold an end.)
 #[test]
-fn ack_wait_expiries_close_a_path_whatever_else_is_acknowledged() {
+fn ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged() {
     use crate::transport::in_memory_socket::{
         PacketDeliveryDecision, set_packet_delivery_callback,
     };
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        for (network, acked_between, bulk, closes) in [
+        for (network, acked_between, bulk, strikes) in [
             ("quic-path-expiries-shorts", false, true, true),
             ("quic-path-expiries-one-in-three", true, true, true),
             ("quic-path-expiries-quiet", false, false, false),
@@ -1233,23 +1236,20 @@ fn ack_wait_expiries_close_a_path_whatever_else_is_acknowledged() {
                 .await;
             drain.abort();
             set_packet_delivery_callback(network, None);
-            if closes {
-                assert_eq!(closed_at, Some(3), "{network}: closed at the third");
-                assert_eq!(
-                    recycle::stalls_to(b_addr),
-                    vec![recycle::Stall::AckWaitsExpired],
-                    "{network}"
-                );
-                let snapshot = counters.snapshot(false);
+            assert_eq!(closed_at, None, "{network}: not closed");
+            assert_eq!(recycle::stalls_to(b_addr), vec![], "{network}");
+            let snapshot = counters.snapshot(false);
+            assert_eq!(snapshot.stall_closes, vec![0; 5], "{network}");
+            if strikes {
                 assert_eq!(snapshot.ack_wait_expired, vec![3, 0, 0], "{network}");
                 assert_eq!(
-                    snapshot.stall_closes,
+                    snapshot.stall_would_close,
                     vec![0, 0, 0, 0, 1],
-                    "{network}: counted as an ack-waits close"
+                    "{network}: one would-close, under ack_waits_expired"
                 );
             } else {
-                assert_eq!(closed_at, None, "{network}: no strike, not closed");
                 assert_eq!(p.a.writers().ack_wait_expiries(), 0, "{network}");
+                assert_eq!(snapshot.stall_would_close, vec![0; 5], "{network}");
                 assert_eq!(p.a.send_aborts(), 3, "{network}: still reset");
             }
         }
@@ -1338,7 +1338,7 @@ fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes() {
 /// trip), holding its send epoch. The wait is bounded (here 10 ms in place of
 /// `SHORT_ACK_WAIT`, 120 s): past it the stream is reset and the epoch is
 /// released. Nothing else was acknowledged meanwhile, so it is not a strike
-/// (`ack_wait_expiries_close_a_path_whatever_else_is_acknowledged` covers
+/// (`ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged` covers
 /// strikes). An honest peer acknowledges the Short's one packet on arrival,
 /// so with a bound longer than the round trip (here 10 s) the
 /// acknowledgement comes first and nothing is reset.

@@ -59,9 +59,11 @@
 //!    [`STREAM_CREDIT_WINDOW`] while this side wanted streams, though enough
 //!    of this side's streams were wholly acknowledged that an honest peer
 //!    would have.
-//! 6. **Ack waits expired** ([`Stall::AckWaitsExpired`]):
-//!    [`ACK_WAIT_EXPIRY_LIMIT`] sends had their wait for the acknowledgement
-//!    of their end run out within [`ACK_WAIT_EXPIRY_WINDOW`].
+//! 6. **Ack waits expired** ([`Stall::AckWaitsExpired`]), observe-only
+//!    ([`ACK_WAITS_EXPIRED_CLOSES`]): [`ACK_WAIT_EXPIRY_LIMIT`] sends had
+//!    their wait for the acknowledgement of their end run out within
+//!    [`ACK_WAIT_EXPIRY_WINDOW`]; counted (`quic_stall_would_close_<label>`),
+//!    and the path stays open.
 //!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
 //! counter of packets the peer newly acknowledged: `frame_rx.acks` counts
@@ -1154,6 +1156,9 @@ pub(crate) struct AckWatch {
     /// seen, within [`ACK_WAIT_EXPIRY_WINDOW`].
     expiries_seen: u64,
     expiries_at: VecDeque<u64>,
+    /// Times the ack-wait expiry rule would have closed the path
+    /// ([`ACK_WAITS_EXPIRED_CLOSES`]).
+    would_close: u64,
 }
 
 /// Whether the egress cap holds, or held since `previous` was read, a QUIC
@@ -1224,6 +1229,7 @@ impl AckWatch {
             skipped: 0,
             expiries_seen,
             expiries_at: VecDeque::new(),
+            would_close: 0,
         }
     }
 
@@ -1317,6 +1323,13 @@ impl AckWatch {
         }
     }
 
+    /// Times the ack-wait expiry rule would have closed the path
+    /// ([`ACK_WAITS_EXPIRED_CLOSES`]). Tests only.
+    #[cfg(test)]
+    pub(crate) fn would_close(&self) -> u64 {
+        self.would_close
+    }
+
     /// Why the path must close, once [`Self::observe`] said so.
     pub(crate) fn stall(&self) -> Option<Stall> {
         self.stall
@@ -1377,7 +1390,16 @@ impl AckWatch {
         // Not judged against the peer's timing, so a cap hold does not
         // suspend it.
         if expired {
-            return Some(Stall::AckWaitsExpired);
+            if ACK_WAITS_EXPIRED_CLOSES {
+                return Some(Stall::AckWaitsExpired);
+            }
+            // Observe only: count it, and start the window afresh so the
+            // next count needs as many new strikes.
+            if let Some(node) = self.dark_counts {
+                node.record_stall_would_close(Stall::AckWaitsExpired.index());
+            }
+            self.would_close += 1;
+            self.expiries_at.clear();
         }
         if cap_held {
             // A send counted in quinn's stats may still wait in the egress
@@ -1679,14 +1701,25 @@ pub(crate) const STREAM_CREDIT_WINDOW: Duration = Duration::from_secs(60);
 /// ([`StreamCreditWatch`]).
 pub(crate) const STREAM_CREDIT_FREED: u64 = super::config::MAX_UNI_STREAMS as u64 / 8 + 1;
 
-/// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that close a path
-/// ([`Stall::AckWaitsExpired`]): sends whose wait for the acknowledgement of
+/// Whether the ack-wait expiry rule ([`Stall::AckWaitsExpired`]) closes a
+/// path. It does not yet: strikes are counted (`quic_ack_wait_expired_<label>`)
+/// and each time [`ACK_WAIT_EXPIRY_LIMIT`] come within
+/// [`ACK_WAIT_EXPIRY_WINDOW`] is counted as a would-close
+/// (`quic_stall_would_close_ack_waits_expired`), and the path stays open.
+/// The strike can still misjudge an honest path (the backlog ahead of a
+/// stream's end is read when the end is sent, so streams started after it
+/// are not counted), so the close waits for a follow-up calibrated from
+/// those counts (#6205).
+pub(crate) const ACK_WAITS_EXPIRED_CLOSES: bool = false;
+
+/// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that would close a
+/// path ([`Stall::AckWaitsExpired`]; counted only, [`ACK_WAITS_EXPIRED_CLOSES`]): sends whose wait for the acknowledgement of
 /// their end ran out (`bounded::SendDeadlines::ack_wait`, at least 5 min, or
 /// a one-packet Short's background wait, `path::SHORT_ACK_WAIT`, 120 s) and
 /// whose stream was reset. Counted only when the reset happened (an
 /// acknowledgement racing the deadline leaves nothing to reset), and never
 /// reset by acknowledgements, so a peer that acknowledges everything else,
-/// or one end in three, is still closed.
+/// or one end in three, is still counted.
 pub(crate) const ACK_WAIT_EXPIRY_LIMIT: u32 = 3;
 
 /// The window [`ACK_WAIT_EXPIRY_LIMIT`] expiries must fall in.

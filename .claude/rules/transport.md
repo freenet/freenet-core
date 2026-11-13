@@ -2723,7 +2723,7 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     acknowledgements are high), acknowledged multi-packet Shorts between
     included, or one end in three, is closed at about its third ack wait,
     not after SEND_ABORT_LIMIT (4096) resets
-    (ack_wait_expiries_close_a_path_whatever_else_is_acknowledged). Flow
+    (ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged). Flow
     control cannot hold bytes back after the end is sent (every byte
     written before it was within the peer's credit; a peer whose app stops
     reading blocks the write before the end, which the gap and credit

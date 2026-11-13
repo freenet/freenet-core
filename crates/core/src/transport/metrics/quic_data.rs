@@ -30,6 +30,7 @@
 //! | `quic_dark_episode_<label>` | dark episodes on QUIC paths (`recycle::AckWatch`: packets outstanding, nothing acknowledged and nothing heard) by how they ended: `recovered_lt_5s`, `lt_10s`, `lt_30s`, `lt_120s`, `recovered_ge_120s`, `unrecovered` (the path closed, or nothing was outstanding any more), `cap_held` (the egress cap held this side's sends, so darkness could no longer be told), `closed_at_window` (the dark-path rule closed a path that carries data). A path that carries no data is never closed by that rule, so its episodes run to their end; read at the watch's 2 s ticks |
 //! | `quic_ack_wait_expired_<label>` | sends whose wait for the acknowledgement of their end ran out and whose stream was reset, by kind: `stream` (a send with an ack wait: a Stream, or a Short past one packet), `short` (a one-packet Short, past its 120 s bound) or `control` (a control frame, bounded as a one-packet Short); only those that count as strikes (the egress cap held none of the connection's transmits and the connection acknowledged at the floor meanwhile). An honest peer acknowledges an end within a few round trips, so this should be 0 on every honest path (`recycle::ACK_WAIT_EXPIRY_LIMIT` in `ACK_WAIT_EXPIRY_WINDOW` closes a path) |
 //! | `quic_stall_close_<label>` | paths the acknowledgement watch closed, by why: `not_acknowledging`, `dark`, `credit_starved`, `stream_credit_withheld`, `ack_waits_expired` (`recycle::Stall`) |
+//! | `quic_stall_would_close_<label>` | times a rule that only observes would have closed a path, by the same labels; each count starts the rule's window afresh. Only `ack_waits_expired` observes today (`recycle::ACK_WAITS_EXPIRED_CLOSES` is false): it counts each time `ACK_WAIT_EXPIRY_LIMIT` strikes came within `ACK_WAIT_EXPIRY_WINDOW`, for calibrating the close from the field (#6205) |
 //! | `quic_send_resets`, `quic_path_ms` | sends a path reset on this side, and the time QUIC paths were up, shadow paths included, up to each path's last tick: resets per connection-hour is their ratio |
 //! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
 //! | `quic_staged_peak_pct` | the most any connection staged in the period (bytes read for streams whose header its reader had not taken yet) as a percentage of its staging cap (`quic::path::inbound::ConnStaging`); streams stopped at the cap are `quic_inbound_evicted_staged` |
@@ -376,6 +377,7 @@ pub(crate) struct QuicDataCounters {
     dark_episodes: [AtomicU64; DARK_EPISODE_LABELS.len()],
     ack_wait_expired: [AtomicU64; ACK_WAIT_EXPIRED_LABELS.len()],
     stall_closes: [AtomicU64; STALL_CLOSE_LABELS.len()],
+    stall_would_close: [AtomicU64; STALL_CLOSE_LABELS.len()],
 }
 
 impl QuicDataCounters {
@@ -412,6 +414,7 @@ impl QuicDataCounters {
             dark_episodes: std::array::from_fn(|_| zero()),
             ack_wait_expired: std::array::from_fn(|_| zero()),
             stall_closes: std::array::from_fn(|_| zero()),
+            stall_would_close: std::array::from_fn(|_| zero()),
         }
     }
 
@@ -596,6 +599,14 @@ impl QuicDataCounters {
         }
     }
 
+    /// A rule that only observes would have closed a path, for the reason
+    /// at `index` of [`STALL_CLOSE_LABELS`].
+    pub(crate) fn record_stall_would_close(&self, index: usize) {
+        if let Some(count) = self.stall_would_close.get(index) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// A send's wait for the acknowledgement of its end ran out.
     pub(crate) fn record_ack_wait_expired(&self, kind: AckWaitKind) {
         self.ack_wait_expired[kind as usize].fetch_add(1, Ordering::Relaxed);
@@ -724,6 +735,7 @@ impl QuicDataCounters {
             dark_episodes: self.dark_episodes.iter().map(get).collect(),
             ack_wait_expired: self.ack_wait_expired.iter().map(get).collect(),
             stall_closes: self.stall_closes.iter().map(get).collect(),
+            stall_would_close: self.stall_would_close.iter().map(get).collect(),
         }
     }
 }
@@ -798,6 +810,10 @@ pub struct QuicDataSnapshot {
     /// `STALL_CLOSE_LABELS`.
     #[serde(default)]
     pub stall_closes: Vec<u64>,
+    /// Times a rule that only observes would have closed a path, in the
+    /// period, by `STALL_CLOSE_LABELS`.
+    #[serde(default)]
+    pub stall_would_close: Vec<u64>,
 }
 
 impl QuicDataSnapshot {
@@ -856,6 +872,7 @@ impl QuicDataSnapshot {
             dark_episodes,
             ack_wait_expired,
             stall_closes,
+            stall_would_close,
         } = self;
         let mut keys = Vec::new();
         let mut family = |prefix: &'static str, labels: Vec<String>, values: Vec<u64>| {
@@ -964,6 +981,11 @@ impl QuicDataSnapshot {
             STALL_CLOSE_LABELS.iter().map(|l| l.to_string()).collect(),
             stall_closes.clone(),
         );
+        family(
+            "quic_stall_would_close_",
+            STALL_CLOSE_LABELS.iter().map(|l| l.to_string()).collect(),
+            stall_would_close.clone(),
+        );
         for (key, value) in [
             ("quic_enabled_data_paths", *data_enabled),
             (LIVE_DATA_PATHS, *data_paths),
@@ -1054,6 +1076,7 @@ impl QuicDataSnapshot {
             dark_episodes,
             ack_wait_expired,
             stall_closes,
+            stall_would_close,
         } = self;
         let any = |values: &[u64]| values.iter().any(|n| *n != 0);
         any(sends)
@@ -1068,6 +1091,7 @@ impl QuicDataSnapshot {
             || any(dark_episodes)
             || any(ack_wait_expired)
             || any(stall_closes)
+            || any(stall_would_close)
             || [
                 *data_enabled,
                 *sends_opened,

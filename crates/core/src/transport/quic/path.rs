@@ -1319,9 +1319,10 @@ impl QuicPath {
     /// 16 KiB/s), when that is longer than its first age, so an honest slow
     /// path's stream is not reset while its acknowledgement is on the way.
     ///
-    /// The backlog ahead of the stream's end is added when the end is sent
-    /// ([`Outgoing::finish`]): the streams in flight then, times the send
-    /// window, at the floor.
+    /// The time the rest of the stream may take is added when the end is
+    /// sent ([`Outgoing::finish`], [`Self::backlog_wait`]): the streams in
+    /// flight then, times the rest of this one (at most `len`), at the
+    /// floor.
     pub(crate) fn stream_deadlines(&self, len: u64) -> SendDeadlines {
         let deadlines = SendDeadlines::stream(len).with_gap(self.receiver_gap());
         let floor = recycle::credit_floor_rate(self.connection.inner().stats().path.rtt).max(1);
@@ -2257,7 +2258,13 @@ type Sleeper = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> 
 /// in its queue), or when the expiry's timer woke more than
 /// [`LATE_WAKE_SLACK`] past its deadline: this node's runtime stalled (or
 /// its host slept), and acknowledgements already in the socket may not have
-/// been read yet.
+/// been read yet. Lateness is measured against the deadline only, so a
+/// stall that began during the wait and ended within the slack of its
+/// deadline (one of nearly the whole wait, about 118 s for a one-packet
+/// Short) still has its stale evidence judged.
+///
+/// A strike only counts toward telemetry for now
+/// (`recycle::ACK_WAITS_EXPIRED_CLOSES`).
 #[derive(Clone)]
 struct StrikeCheck {
     acks: recycle::AckProgress,
@@ -2699,8 +2706,13 @@ impl Drop for Outgoing {
             // Not reached by a node's sends today: a permit holder's send
             // ends at its own deadline, which takes the branch above. Bounded
             // anyway, at the rest of its ack wait, so a cancelled one cannot
-            // hold its permit for as long as the peer withholds the end.
-            self.progress.ack_wait_left()
+            // hold its permit for as long as the peer withholds the end; at
+            // the 2 h total if its wait was not armed yet.
+            Some(
+                self.progress
+                    .ack_wait_left()
+                    .unwrap_or_else(inbound::stream_age_limit),
+            )
         };
         let bound = bound_for.and_then(|bound| self.sleep.as_ref().map(|(sleep, _)| sleep(bound)));
         let due = bound_for
@@ -2710,7 +2722,9 @@ impl Drop for Outgoing {
         let send = if bounded { self.send.take() } else { None };
         let (aborts, node) = (self.aborts.clone(), self.node);
         let strike = self.strike.clone().zip(self.finished_at).zip(due);
-        let kind = if self.control {
+        let kind = if bound_for.is_some() && slot.is_some() {
+            crate::transport::metrics::AckWaitKind::Stream
+        } else if self.control {
             crate::transport::metrics::AckWaitKind::Control
         } else {
             crate::transport::metrics::AckWaitKind::Short

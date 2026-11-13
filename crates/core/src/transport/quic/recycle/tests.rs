@@ -1617,9 +1617,10 @@ fn a_peer_that_withholds_a_small_stream_limit_is_closed() {
 
 /// Feed a watch a busy conforming peer's readings (acknowledgements every
 /// tick, so no other rule closes it), one at each of `times` (seconds), with
-/// `expiries(i)` ack waits run out so far; the first index at which it
-/// closed, and why.
-fn run_expiries(times: &[u64], expiries: impl Fn(usize) -> u64) -> Option<(usize, Stall)> {
+/// `expiries(i)` ack waits run out so far; the indices at which the
+/// ack-wait expiry rule would have closed the path, and whether anything
+/// closed it.
+fn run_expiries(times: &[u64], expiries: impl Fn(usize) -> u64) -> (Vec<usize>, bool) {
     let record = Arc::default();
     let sample = |i: usize| {
         let t = i as u64;
@@ -1627,22 +1628,31 @@ fn run_expiries(times: &[u64], expiries: impl Fn(usize) -> u64) -> Option<(usize
             .with_ack_wait_expiries(expiries(i))
     };
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
-    (1..times.len()).find_map(|i| {
-        watch
-            .observe(times[i] * SEC, sample(i))
-            .then(|| (i, watch.stall().expect("a reason")))
-    })
+    let (mut would, mut closed) = (Vec::new(), false);
+    for i in 1..times.len() {
+        let before = watch.would_close();
+        closed |= watch.observe(times[i] * SEC, sample(i));
+        if watch.would_close() > before {
+            would.push(i);
+        }
+    }
+    (would, closed)
 }
 
-/// The ack-wait expiry rule, with literal times, on a peer that acknowledges
-/// everything else at every sample (acknowledgements never reset it):
-/// - three expiries at 2, 10 and 20 min: closed at the third;
-/// - three at once: closed at that sample;
+/// The ack-wait expiry rule only observes (`ACK_WAITS_EXPIRED_CLOSES`), with
+/// literal times, on a peer that acknowledges everything else at every
+/// sample (acknowledgements never reset it). The path is never closed; a
+/// would-close is counted:
+/// - three expiries at 2, 10 and 20 min: at the third;
+/// - three at once: at that sample;
+/// - six at 2, 4, 6, 8, 10 and 12 min: at the third and the sixth (each count
+///   starts the window afresh);
 /// - two, then a third 31 min after the first: the first has left the 30 min
-///   window, so only two count, not closed;
-/// - two only: not closed.
+///   window, so only two count, none;
+/// - two only: none.
 #[test]
-fn ack_wait_expiries_within_the_window_close_the_path() {
+fn ack_wait_expiries_within_the_window_would_close_the_path() {
+    const _: () = assert!(!ACK_WAITS_EXPIRED_CLOSES, "the rule only observes");
     // Samples every 2 s for 40 min.
     let times: Vec<u64> = (0..=1200).map(|i| 2 * i).collect();
     let at = |minutes: u64| (minutes * 60 / 2) as usize;
@@ -1650,18 +1660,25 @@ fn ack_wait_expiries_within_the_window_close_the_path() {
         |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
     assert_eq!(
         run_expiries(&times, counted(vec![at(2), at(10), at(20)])),
-        Some((at(20), Stall::AckWaitsExpired))
+        (vec![at(20)], false)
     );
     assert_eq!(
         run_expiries(&times, |i| if i >= at(5) { 3 } else { 0 }),
-        Some((at(5), Stall::AckWaitsExpired))
+        (vec![at(5)], false)
+    );
+    assert_eq!(
+        run_expiries(&times, counted((1..=6).map(|m| at(2 * m)).collect())),
+        (vec![at(6), at(12)], false)
     );
     assert_eq!(
         run_expiries(&times, counted(vec![at(2), at(10), at(33)])),
-        None,
+        (vec![], false),
         "the first left the window"
     );
-    assert_eq!(run_expiries(&times, counted(vec![at(2), at(10)])), None);
+    assert_eq!(
+        run_expiries(&times, counted(vec![at(2), at(10)])),
+        (vec![], false)
+    );
 }
 
 /// The labels `quic_stall_close_<label>` counts under are the stalls'
