@@ -3696,3 +3696,49 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
         );
     }
 }
+
+/// The server of a native setup waits longer than its client, so the pair
+/// can connect by the client's UDP fallback before the server's setup ends.
+/// That late failure must leave the connection alone: it stays in the
+/// connection map and in the ring, and the address is not marked failed.
+#[tokio::test]
+async fn a_late_native_failure_keeps_the_connection_made_meanwhile() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::NativeSetupOutcome;
+    let mut h = Harness::new("native-late-failure").await;
+    let addr: SocketAddr = "203.0.113.182:5830".parse().unwrap();
+    let peer = key();
+    let mut result = pending_connect_peer(&mut h, PeerKeyLocation::new(peer.clone(), addr)).await;
+    h.handshake_event(HandshakeEvent::OutboundEstablished {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: PeerKeyLocation::new(peer.clone(), addr),
+        connection: Box::new(IdleConnection::new(addr)),
+        transient: false,
+        transport: DialTransport::Udp,
+    })
+    .await;
+    assert!(matches!(result.try_recv(), Ok(Ok(_))), "premise: connected");
+    assert_eq!(
+        h.ring_key_at(addr).as_ref(),
+        Some(&peer),
+        "premise: in the ring"
+    );
+
+    h.handshake_event(HandshakeEvent::OutboundFailed {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: PeerKeyLocation::new(peer.clone(), addr),
+        error: ConnectionError::FailedConnectOp,
+        transient: false,
+        transport: DialTransport::Native,
+        native_outcome: Some(NativeSetupOutcome::TimedOut),
+    })
+    .await;
+    assert!(h.mgr.connections.contains_key(&addr), "still connected");
+    assert_eq!(
+        h.ring_key_at(addr).as_ref(),
+        Some(&peer),
+        "still in the ring"
+    );
+    assert!(!failed_addrs(&h).contains(&addr));
+    assert_eq!(h_count(&h), 1);
+}

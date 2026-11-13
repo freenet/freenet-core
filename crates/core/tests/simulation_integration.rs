@@ -22815,6 +22815,11 @@ fn test_quic_native_connections_form_and_carry_messages() {
         native_shorts_sent(&run.upgrades) > 0,
         "messages went over native paths"
     );
+    assert_eq!(
+        t.native_failures_without_fallback(),
+        Vec::<String>::new(),
+        "every failed native setup was followed by a UDP dial"
+    );
     assert_eq!(t.undecodable_closes(), 0);
     let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
     assert_eq!(peers.len(), run.wire.nodes, "every node joined");
@@ -22850,6 +22855,16 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
     assert!(t.native_failed() > 0, "premise: native setups failed");
     assert_eq!(t.native_established(), 0, "premise: no native setup worked");
     assert!(t.native_demotions() > 0, "nodes demoted themselves");
+    // Each side falls back: a joiner and an acceptor whose setup failed each
+    // ask for a UDP dial to the same peer in the same CONNECT. With no NAT in
+    // the simulation one side's dial would connect the pair alone, so the
+    // join counts below cannot show that both sides did.
+    assert_eq!(
+        t.native_failures_without_fallback(),
+        Vec::<String>::new(),
+        "every failed native setup was followed by a UDP dial"
+    );
+    assert_eq!(t.native_fallbacks_dialled(), t.native_failed());
     let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
     assert_eq!(peers.len(), run.wire.nodes, "every node joined over UDP");
     assert!(connected);

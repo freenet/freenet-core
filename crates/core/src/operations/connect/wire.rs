@@ -287,6 +287,16 @@ pub mod sim_trace {
         native_established: AtomicU64,
         native_failed: AtomicU64,
         native_demotions: AtomicU64,
+        /// Native failures, as (transaction, node, peer), whose node has not
+        /// yet asked for a UDP dial to that peer in that transaction.
+        fallbacks_pending: parking_lot::Mutex<
+            std::collections::HashSet<(
+                crate::message::Transaction,
+                Option<SocketAddr>,
+                SocketAddr,
+            )>,
+        >,
+        fallbacks_dialled: AtomicU64,
         /// Nodes standing in for a release below the floor
         /// ([`mark_pre_floor`]).
         pre_floor: parking_lot::Mutex<std::collections::HashSet<SocketAddr>>,
@@ -320,6 +330,19 @@ pub mod sim_trace {
         NativeDial { established: bool },
         /// A node turned its own native connects off.
         NativeDemoted,
+        /// The node `own` failed a native setup with `peer` in `tx`; the
+        /// connect op must dial UDP to that peer next.
+        NativeFailedFor {
+            tx: crate::message::Transaction,
+            own: Option<SocketAddr>,
+            peer: SocketAddr,
+        },
+        /// The node `own` was asked for a UDP dial to `peer` in `tx`.
+        UdpDialFor {
+            tx: crate::message::Transaction,
+            own: Option<SocketAddr>,
+            peer: SocketAddr,
+        },
     }
 
     static TRACES: LazyLock<dashmap::DashMap<String, NativeWireTrace>> =
@@ -341,6 +364,16 @@ pub mod sim_trace {
         };
         let c = &trace.0;
         let counter = match event {
+            NativeWireEvent::NativeFailedFor { tx, own, peer } => {
+                c.fallbacks_pending.lock().insert((tx, own, peer));
+                return;
+            }
+            NativeWireEvent::UdpDialFor { tx, own, peer } => {
+                if c.fallbacks_pending.lock().remove(&(tx, own, peer)) {
+                    c.fallbacks_dialled.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
             NativeWireEvent::Sent(index) => match c.sent.get(index as usize) {
                 Some(counter) => counter,
                 None => return,
@@ -450,6 +483,24 @@ pub mod sim_trace {
         /// Times a node demoted itself.
         pub fn native_demotions(&self) -> u64 {
             Self::get(&self.0.native_demotions)
+        }
+        /// Native failures followed by a UDP dial from the same node to the
+        /// same peer in the same transaction.
+        pub fn native_fallbacks_dialled(&self) -> u64 {
+            Self::get(&self.0.fallbacks_dialled)
+        }
+        /// Native failures with no UDP dial after them (yet), as
+        /// `transaction node -> peer`.
+        pub fn native_failures_without_fallback(&self) -> Vec<String> {
+            let mut out: Vec<String> = self
+                .0
+                .fallbacks_pending
+                .lock()
+                .iter()
+                .map(|(tx, own, peer)| format!("{tx} {own:?} -> {peer}"))
+                .collect();
+            out.sort();
+            out
         }
     }
 }

@@ -1583,7 +1583,7 @@ pub(super) async fn dispatch_expect_connection_from(
                 tracing::info!(
                     %connected_peer,
                     tx = %tx,
-                    "connect: acceptor's QUIC-native connection succeeded"
+                    "connect: acceptor connected to the joiner (natively, or by the joiner's UDP fallback)"
                 );
             }
             failed @ (Some(Err(_)) | None) => {

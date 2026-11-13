@@ -778,6 +778,22 @@ impl P2pConnManager {
         let mut peer_addr = peer
             .socket_addr()
             .unwrap_or_else(|| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0));
+        #[cfg(any(test, feature = "testing"))]
+        if transport == crate::operations::connect::native::DialTransport::Udp {
+            crate::operations::connect::native_wire_trace::record_at(
+                peer_addr,
+                crate::operations::connect::native_wire_trace::NativeWireEvent::UdpDialFor {
+                    tx,
+                    own: self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .get_own_addr(),
+                    peer: peer_addr,
+                },
+            );
+        }
 
         // IMPORTANT: Always try pub_key lookup first, not just for unspecified addresses.
         // The peer's advertised address (from PeerKeyLocation) may differ from the actual
@@ -1355,6 +1371,31 @@ impl P2pConnManager {
                     }
                 };
 
+                let native = transport == crate::operations::connect::native::DialTransport::Native;
+                // A native setup can end after the pair connected another way:
+                // the server waits longer than the client, and the client's UDP
+                // fallback can connect the pair meanwhile. Its failure then
+                // must not touch that connection: the in-transit prune below
+                // removes an address's ring entry whether or not it is in
+                // transit, and nothing waits on this dial any more (the
+                // connection answered its callback). Counted toward demotion
+                // above; nothing else to do.
+                if native && self.connections.contains_key(&peer_addr) {
+                    tracing::debug!(
+                        remote = %peer_addr,
+                        transaction = %transaction,
+                        "QUIC-native setup ended after the peer connected another way; keeping that connection"
+                    );
+                    #[cfg(any(test, feature = "testing"))]
+                    crate::operations::connect::native_wire_trace::record_at(
+                        peer_addr,
+                        crate::operations::connect::native_wire_trace::NativeWireEvent::NativeDial {
+                            established: false,
+                        },
+                    );
+                    return Ok(());
+                }
+
                 tracing::info!(
                     remote = %peer_addr,
                     transient,
@@ -1377,13 +1418,26 @@ impl P2pConnManager {
                 // whether the peer is unreachable: neither this mark nor the
                 // backoff below is taken for it, or the fallback would be
                 // refused.
-                let native = transport == crate::operations::connect::native::DialTransport::Native;
                 #[cfg(any(test, feature = "testing"))]
                 if native {
-                    crate::operations::connect::native_wire_trace::record_at(
+                    use crate::operations::connect::native_wire_trace::{
+                        NativeWireEvent, record_at,
+                    };
+                    record_at(
                         peer_addr,
-                        crate::operations::connect::native_wire_trace::NativeWireEvent::NativeDial {
-                            established: false,
+                        NativeWireEvent::NativeDial { established: false },
+                    );
+                    record_at(
+                        peer_addr,
+                        NativeWireEvent::NativeFailedFor {
+                            tx: transaction,
+                            own: self
+                                .bridge
+                                .op_manager
+                                .ring
+                                .connection_manager
+                                .get_own_addr(),
+                            peer: peer_addr,
                         },
                     );
                 }
