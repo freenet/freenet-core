@@ -95,7 +95,7 @@ pub(crate) const RAMP_START_IS_SET: bool = QUIC_DATA_RAMP_START.is_some();
 /// ship the ramp unchecked (before this release, or skipping it) is refused. An
 /// emergency stop that sets the start back to `None` leaves this as it is.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(in crate::transport) const QUIC_DATA_RAMP_RELEASE: Option<&str> = Some("0.2.157");
+pub(in crate::transport) const QUIC_DATA_RAMP_RELEASE: Option<&str> = Some("0.2.158");
 
 /// Whether this build reads data from a QUIC path. It does: `PeerConnection::recv`
 /// drains the session's data channels, so a node that says it accepts data delivers
