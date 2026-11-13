@@ -687,7 +687,7 @@ fn a_session_ended_close_reads_as_its_own_refusal_and_unknown_codes_as_lost() {
             reason: QuicRefusal::RecycleForData,
         }
     );
-    for unknown in [9, 0x0f] {
+    for unknown in [0x0b, 0x0f] {
         assert_eq!(
             close(unknown),
             QuicErrorKind::ConnectionLost,
