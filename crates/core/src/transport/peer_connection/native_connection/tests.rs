@@ -13,6 +13,7 @@ use crate::simulation::VirtualTime;
 use crate::transport::StreamId;
 use crate::transport::boundary::StreamSendOutcome;
 use crate::transport::metrics::ConnIdentity;
+use crate::transport::quic::framing::FrameHeader;
 use crate::transport::quic::path::{BoundedSend, QuicSendResult, SendKind};
 use crate::transport::quic::upgrade::driver::tests::{NativeServer, native_server, run_bounded};
 
@@ -396,7 +397,9 @@ fn an_idle_path_ends_recv_with_the_idle_reason() {
 }
 
 /// Dropping the connection closes it for the peer at once, with
-/// NODE_DROPPED_PEER, even while a send task still holds the path.
+/// NODE_DROPPED_PEER, while a send task still holds the path: here a pipe
+/// whose source the peer keeps open, which would otherwise hold the path for
+/// the source's gap.
 #[test]
 fn dropping_the_connection_closes_it_for_the_peer() {
     run(
@@ -404,17 +407,31 @@ fn dropping_the_connection_closes_it_for_the_peer() {
         QuicPathLimits::DEFAULT,
         None,
         |mut rig| async move {
-            // A stream larger than the window, still sending when dropped.
+            let id = StreamId::next();
+            let mut held = rig
+                .peer
+                .peer
+                .connection()
+                .inner()
+                .open_uni()
+                .await
+                .expect("open");
+            let header = FrameHeader::stream(id, 100_000, 0).expect("a valid header");
+            held.write_all(&header.encode()).await.expect("header");
+            held.write_all(&[7; 3000]).await.expect("payload");
+            // `recv` registers the stream; it has no metadata to return.
+            rig.settle(Duration::from_millis(500)).await;
+            assert!(rig.recv_soon().await.is_none());
+            let source = rig
+                .registry
+                .claim_or_wait(rig.conn.remote_addr(), id, Duration::from_secs(1))
+                .await
+                .expect("registered");
             rig.conn
-                .send_stream_data(
-                    StreamId::next(),
-                    bytes_of(4 * 1024 * 1024),
-                    None,
-                    None,
-                    None,
-                )
+                .pipe_stream_data(StreamId::next(), source, None, None)
                 .await
                 .unwrap();
+            rig.settle(Duration::from_millis(500)).await;
             drop(rig.conn);
             rig.peer.time.sleep(Duration::from_secs(1)).await;
             let reason = rig.peer.peer.connection().inner().close_reason();
@@ -427,6 +444,7 @@ fn dropping_the_connection_closes_it_for_the_peer() {
                 ),
                 "{reason:?}"
             );
+            drop(held);
         },
     );
 }
