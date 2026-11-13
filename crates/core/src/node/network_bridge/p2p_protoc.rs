@@ -2076,6 +2076,7 @@ impl P2pConnManager {
                                             callback,
                                             is_gw,
                                             origin: unconnected_dial_origin(is_gw),
+                                            transport: crate::operations::connect::native::DialTransport::Udp,
                                         }),
                                     ) {
                                         // `err` owns the ConnectPeer event (and thus the
@@ -2649,6 +2650,7 @@ impl P2pConnManager {
                                 callback,
                                 is_gw: transient,
                                 origin,
+                                transport,
                             } => {
                                 tracing::debug!(
                                     tx = %tx,
@@ -2666,6 +2668,7 @@ impl P2pConnManager {
                                     &mut state,
                                     transient,
                                     origin,
+                                    transport,
                                 )
                                 .await?;
                             }
@@ -4902,7 +4905,15 @@ pub(crate) mod tests {
         let (me, other) = (peer(1), peer(4));
         let gateway = std::net::SocketAddr::from(([127, 0, 0, 1], 2));
         let tx = Transaction::new::<ConnectMsg>();
-        let own_request = prepare_join_request(tx, &me, &peer(2), Location::new(0.5), 10, &[]);
+        let own_request = prepare_join_request(
+            tx,
+            &me,
+            &peer(2),
+            Location::new(0.5),
+            10,
+            &[],
+            crate::operations::connect::native::NativeReadiness::current(),
+        );
         let notice = |msg: ConnectMsg| {
             super::unsent_message_notice(
                 &NetMessage::V1(NetMessageV1::Connect(msg)),
@@ -4917,7 +4928,15 @@ pub(crate) mod tests {
             }
             other => panic!("an unsent CONNECT request must end its driver, got {other:?}"),
         }
-        let relayed = prepare_join_request(tx, &other, &peer(2), Location::new(0.5), 10, &[]);
+        let relayed = prepare_join_request(
+            tx,
+            &other,
+            &peer(2),
+            Location::new(0.5),
+            10,
+            &[],
+            crate::operations::connect::native::NativeReadiness::current(),
+        );
         assert!(
             notice(relayed).is_none(),
             "a relayed request is not ours to end"

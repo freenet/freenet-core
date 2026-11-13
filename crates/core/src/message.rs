@@ -881,6 +881,9 @@ pub(crate) enum NodeEvent {
         /// Why this dial is made (telemetry only; a configured gateway is
         /// tagged `Gateway` whatever is passed here).
         origin: crate::transport::NatAttemptOrigin,
+        /// Which transport to dial. `Native` only from the connect op, for a
+        /// pair whose acceptor decided native (#5940).
+        transport: crate::operations::connect::native::DialTransport,
     },
     Disconnect {
         cause: Option<Cow<'static, str>>,

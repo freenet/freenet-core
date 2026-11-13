@@ -220,8 +220,19 @@ pub(crate) async fn start_client_connect_counted(
     let mut exclude_addrs = failed_addrs;
     exclude_addrs.extend(connected_addrs);
 
-    let request_msg =
-        super::prepare_join_request(tx, &own, &gateway, desired_location, ttl, &exclude_addrs);
+    let request_msg = super::prepare_join_request(
+        tx,
+        &own,
+        &gateway,
+        desired_location,
+        ttl,
+        &exclude_addrs,
+        op_manager
+            .ring
+            .connection_manager
+            .native_connect()
+            .readiness(),
+    );
     // The offer this request carries, against which a response's QUIC-native
     // decision is judged.
     let sent_offer = match &request_msg {
@@ -406,6 +417,9 @@ async fn drive_client_connect(
     // misbehaving relay cannot grow it or the `ConnectFailed` traffic.
     let refused_native_cap = acceptor_limit(target_connections);
     let mut refused_native: HashSet<PeerKeyLocation> = HashSet::new();
+    // Acceptors that decided `Native` and that this node dials native. A
+    // subset of `accepted`, so it stays within `acceptor_limit`.
+    let mut native_acceptors: HashSet<PeerKeyLocation> = HashSet::new();
     // `connected_dials`: acceptors actually connected. `accepted` also holds
     // acceptors still queued or being dialled, so it cannot decide that the
     // target is reached.
@@ -542,9 +556,43 @@ async fn drive_client_connect(
                 acceptor,
                 acceptor_addr,
                 result,
+                transport,
             })) => {
+                // A native dial that failed is followed at once by a UDP dial to
+                // the same acceptor, in the same dial slot, before anything
+                // counts it as failed: until UDP is removed a failed native
+                // setup must never cost the join. It also counts towards
+                // demotion (three peers in a row stop native offers).
+                if transport == super::native::DialTransport::Native {
+                    let native_state = op_manager.ring.connection_manager.native_connect();
+                    if matches!(result, Some(Ok(_))) {
+                        native_state.record_success();
+                    } else {
+                        native_state.record_failure(acceptor.pub_key());
+                        native_acceptors.remove(&acceptor);
+                        tracing::info!(
+                            tx = %tx,
+                            acceptor = %acceptor_addr,
+                            "connect driver: QUIC-native setup failed; dialling UDP"
+                        );
+                        dials.push(
+                            begin_acceptor_dial(
+                                op_manager,
+                                tx,
+                                acceptor,
+                                Instant::now(),
+                                super::native::DialTransport::Udp,
+                            )
+                            .await?,
+                        );
+                        continue;
+                    }
+                }
                 if let Some((next, answered_at)) = dial_queue.finish() {
-                    dials.push(begin_acceptor_dial(op_manager, tx, next, answered_at).await?);
+                    let transport = dial_transport(&native_acceptors, &next);
+                    dials.push(
+                        begin_acceptor_dial(op_manager, tx, next, answered_at, transport).await?,
+                    );
                 }
                 // The address the connection was made to, which can differ from
                 // the advertised one when an existing transport is reused.
@@ -804,73 +852,92 @@ async fn drive_client_connect(
                     continue;
                 }
 
-                // `None` and `Udp` go on as today. This build has no native
-                // dial, so a `Native` decision cannot be honoured: the attempt
-                // with this acceptor fails, is counted by why, and is reported
-                // upstream as `ConnectFailed` like a failed punch, so the relay
-                // marks the acceptor visited and re-routes. The acceptor's
-                // reservation is not released by this; it times out.
-                if let Err(failure) =
-                    super::native::joiner_response_action(sent_offer, payload.native_decision)
-                {
-                    if refused_native.len() >= refused_native_cap {
+                // `None` and `Udp` dial UDP as today; `Native` dials native
+                // when this node offered and can still dial. A `Native` this
+                // node cannot honour fails the attempt with this acceptor, is
+                // counted by why, and is reported upstream as `ConnectFailed`
+                // like a failed punch, so the relay marks the acceptor visited
+                // and re-routes. The acceptor's native wait then times out and
+                // falls back to UDP.
+                let can_dial = op_manager
+                    .ring
+                    .connection_manager
+                    .native_connect()
+                    .readiness()
+                    .ready;
+                let transport = match super::native::joiner_response_action(
+                    sent_offer,
+                    payload.native_decision,
+                    can_dial,
+                ) {
+                    Ok(transport) => transport,
+                    Err(failure) => {
+                        if refused_native.len() >= refused_native_cap {
+                            crate::transport::metrics::TRANSPORT_METRICS
+                                .record_connect_native_decision_over_cap();
+                            tracing::debug!(
+                                tx = %tx,
+                                acceptor = %payload.acceptor,
+                                "connect driver: Native response past the refused-acceptor cap; \
+                                 dropped"
+                            );
+                            continue;
+                        }
                         crate::transport::metrics::TRANSPORT_METRICS
-                            .record_connect_native_decision_over_cap();
-                        tracing::debug!(
+                            .record_connect_native_decision_failure(failure);
+                        tracing::warn!(
                             tx = %tx,
                             acceptor = %payload.acceptor,
-                            "connect driver: Native response past the refused-acceptor cap; \
-                             dropped"
+                            ?failure,
+                            "connect driver: acceptor decided a native connection this node \
+                             cannot set up; reporting it failed"
                         );
-                        continue;
-                    }
-                    crate::transport::metrics::TRANSPORT_METRICS
-                        .record_connect_native_decision_failure(failure);
-                    tracing::warn!(
-                        tx = %tx,
-                        acceptor = %payload.acceptor,
-                        ?failure,
-                        "connect driver: acceptor decided a native connection this node \
-                         cannot set up; reporting it failed"
-                    );
-                    refused_native.insert(payload.acceptor.clone());
-                    if collection_end.is_none() {
-                        if let Some(failed_acceptor_addr) = payload.acceptor.socket_addr() {
-                            let failed_msg = ConnectMsg::ConnectFailed {
-                                id: tx,
-                                failed_acceptor_addr,
-                            };
-                            if let Err(e) = op_manager
-                                .notify_node_event(NodeEvent::SendNetMessage {
-                                    target: gateway_addr,
-                                    msg: Box::new(NetMessage::V1(NetMessageV1::Connect(
-                                        failed_msg,
-                                    ))),
-                                })
-                                .await
-                            {
-                                tracing::warn!(
-                                    tx = %tx,
-                                    error = %e,
-                                    "connect driver: failed to emit ConnectFailed"
-                                );
+                        refused_native.insert(payload.acceptor.clone());
+                        if collection_end.is_none() {
+                            if let Some(failed_acceptor_addr) = payload.acceptor.socket_addr() {
+                                let failed_msg = ConnectMsg::ConnectFailed {
+                                    id: tx,
+                                    failed_acceptor_addr,
+                                };
+                                if let Err(e) = op_manager
+                                    .notify_node_event(NodeEvent::SendNetMessage {
+                                        target: gateway_addr,
+                                        msg: Box::new(NetMessage::V1(NetMessageV1::Connect(
+                                            failed_msg,
+                                        ))),
+                                    })
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        tx = %tx,
+                                        error = %e,
+                                        "connect driver: failed to emit ConnectFailed"
+                                    );
+                                }
                             }
                         }
+                        continue;
                     }
-                    continue;
-                }
+                };
 
                 // `accepted` only grows with what the queue takes, so both
                 // stay within `acceptor_limit`.
                 match dial_queue.offer((payload.acceptor.clone(), Instant::now())) {
                     Offer::Dial((acceptor, answered_at)) => {
                         accepted.insert(acceptor.clone());
+                        if transport == super::native::DialTransport::Native {
+                            native_acceptors.insert(acceptor.clone());
+                        }
                         dials.push(
-                            begin_acceptor_dial(op_manager, tx, acceptor, answered_at).await?,
+                            begin_acceptor_dial(op_manager, tx, acceptor, answered_at, transport)
+                                .await?,
                         );
                     }
                     Offer::Queued => {
                         accepted.insert(payload.acceptor.clone());
+                        if transport == super::native::DialTransport::Native {
+                            native_acceptors.insert(payload.acceptor.clone());
+                        }
                     }
                     Offer::Refused => {
                         tracing::debug!(
@@ -1021,6 +1088,20 @@ struct AcceptorDial {
     acceptor: PeerKeyLocation,
     acceptor_addr: SocketAddr,
     result: Option<crate::message::ConnectResult>,
+    /// The transport dialled; a failed native dial is retried over UDP.
+    transport: super::native::DialTransport,
+}
+
+/// How to dial `acceptor`: native if it decided native for this CONNECT.
+fn dial_transport(
+    native_acceptors: &std::collections::HashSet<PeerKeyLocation>,
+    acceptor: &PeerKeyLocation,
+) -> super::native::DialTransport {
+    if native_acceptors.contains(acceptor) {
+        super::native::DialTransport::Native
+    } else {
+        super::native::DialTransport::Udp
+    }
 }
 /// Records an accept in the simulation's native-wire trace: whether the
 /// request carried an offer (the response carries a decision exactly then),
@@ -1053,15 +1134,20 @@ async fn begin_acceptor_dial(
     tx: Transaction,
     acceptor: PeerKeyLocation,
     answered_at: Instant,
+    transport: super::native::DialTransport,
 ) -> Result<impl std::future::Future<Output = AcceptorDial> + Send + 'static, OpError> {
     // The Response arm only queues acceptors that have a socket address.
     let acceptor_addr = acceptor.socket_addr().ok_or(OpError::UnexpectedOpState)?;
-    op_manager
-        .notify_node_event(NodeEvent::ExpectPeerConnection {
-            addr: acceptor_addr,
-            peer_key: acceptor.pub_key().clone(),
-        })
-        .await?;
+    // A native dial expects no UDP handshake; its UDP fallback, if it fails,
+    // registers its own expectation then.
+    if transport == super::native::DialTransport::Udp {
+        op_manager
+            .notify_node_event(NodeEvent::ExpectPeerConnection {
+                addr: acceptor_addr,
+                peer_key: acceptor.pub_key().clone(),
+            })
+            .await?;
+    }
 
     let (callback, mut rx) = mpsc::channel(1);
     op_manager
@@ -1071,6 +1157,7 @@ async fn begin_acceptor_dial(
             callback,
             is_gw: false,
             origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
+            transport,
         })
         .await?;
     // The acceptor started punching when it accepted, before its Response
@@ -1086,6 +1173,7 @@ async fn begin_acceptor_dial(
             acceptor,
             acceptor_addr,
             result,
+            transport,
         }
     })
 }
@@ -1343,7 +1431,13 @@ async fn drive_relay_connect(
     // Local accept (promote joiner BEFORE sending Response upstream;
     // legacy connect.rs:1636).
     if let Some(ref accept) = initial_actions.accept {
-        dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner.clone()).await?;
+        dispatch_expect_connection_from(
+            op_manager,
+            incoming_tx,
+            accept.joiner.clone(),
+            accept.response.native_decision,
+        )
+        .await?;
     }
 
     // Forward downstream (legacy connect.rs:1641). The forward decision
@@ -1586,7 +1680,13 @@ async fn drive_relay_connect(
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
                     let joiner_addr = accept.joiner.socket_addr();
-                    dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner).await?;
+                    dispatch_expect_connection_from(
+                        op_manager,
+                        incoming_tx,
+                        accept.joiner,
+                        accept.response.native_decision,
+                    )
+                    .await?;
                     trace_accept(upstream_addr, &accept.response, joiner_addr, true);
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
@@ -1759,7 +1859,13 @@ async fn drive_relay_connect(
                         op_manager.ring.register_events(Either::Left(event)).await;
                     }
                     let joiner_addr = accept.joiner.socket_addr();
-                    dispatch_expect_connection_from(op_manager, incoming_tx, accept.joiner).await?;
+                    dispatch_expect_connection_from(
+                        op_manager,
+                        incoming_tx,
+                        accept.joiner,
+                        accept.response.native_decision,
+                    )
+                    .await?;
                     trace_accept(upstream_addr, &accept.response, joiner_addr, true);
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
@@ -2086,9 +2192,7 @@ mod tests {
         //    promotion dispatch. The count is load-bearing: an added accept
         //    branch without a matching dispatch would NOT raise this above 3,
         //    so the per-branch checks below are also required.
-        let dispatch_sites = prod
-            .matches("dispatch_expect_connection_from(op_manager, incoming_tx,")
-            .count();
+        let dispatch_sites = prod.matches("dispatch_expect_connection_from(").count();
         assert_eq!(
             dispatch_sites, 3,
             "expected exactly 3 `dispatch_expect_connection_from` call sites in \
@@ -2137,8 +2241,7 @@ mod tests {
                          branch still promotes the joiner before replying (#3838)."
                     )
                 });
-            let dispatch_offset =
-                window.find("dispatch_expect_connection_from(op_manager, incoming_tx,");
+            let dispatch_offset = window.find("dispatch_expect_connection_from(");
             assert!(
                 dispatch_offset.is_some_and(|d| d < response_send_offset),
                 "{branch} branch (anchored at {anchor:?}) forwards the ConnectResponse \
@@ -2159,8 +2262,7 @@ mod tests {
                  promotes the joiner.",
             );
         let happy_window = &prod[happy_pos..];
-        let happy_dispatch =
-            happy_window.find("dispatch_expect_connection_from(op_manager, incoming_tx,");
+        let happy_dispatch = happy_window.find("dispatch_expect_connection_from(");
         let happy_block_end = happy_window.find("\n    }").unwrap_or(happy_window.len());
         assert!(
             happy_dispatch.is_some_and(|d| d < happy_block_end),
@@ -2168,6 +2270,20 @@ mod tests {
              `dispatch_expect_connection_from` to promote the joiner to a ring \
              connection before forwarding the response upstream (#3838 / PR #3893)."
         );
+
+        // 4. Every site passes the response's QUIC-native decision, so an
+        //    acceptor that decided native sets up the connection it promised
+        //    (#5940). Passing `None` would dial UDP and leave the joiner's
+        //    native dial with nobody waiting.
+        for (at, _) in prod.match_indices("dispatch_expect_connection_from(") {
+            let call = &prod[at..];
+            let call = &call[..call.find(".await").expect("each call is awaited")];
+            assert!(
+                call.contains("accept.response.native_decision"),
+                "a `dispatch_expect_connection_from` call does not pass \
+                 `accept.response.native_decision`: {call}"
+            );
+        }
     }
 
     /// Pins the wiring of the lattice-probe miss report (#5814), which the
@@ -3164,9 +3280,15 @@ mod driver_timing_tests {
         drop(events);
         let unsent = peer(24920);
         assert!(
-            super::begin_acceptor_dial(&op_manager, tx, unsent.clone(), Instant::now())
-                .await
-                .is_err(),
+            super::begin_acceptor_dial(
+                &op_manager,
+                tx,
+                unsent.clone(),
+                Instant::now(),
+                super::super::native::DialTransport::Udp
+            )
+            .await
+            .is_err(),
             "premise: the dial cannot be sent"
         );
         assert!(waits(&unsent).is_empty(), "an unsent dial records no wait");
@@ -3200,9 +3322,15 @@ mod driver_timing_tests {
             expected
         });
         assert!(
-            super::begin_acceptor_dial(&op_manager, tx, half.clone(), Instant::now())
-                .await
-                .is_err(),
+            super::begin_acceptor_dial(
+                &op_manager,
+                tx,
+                half.clone(),
+                Instant::now(),
+                super::super::native::DialTransport::Udp
+            )
+            .await
+            .is_err(),
             "premise: ConnectPeer cannot be sent"
         );
         assert!(
@@ -3236,9 +3364,15 @@ mod driver_timing_tests {
             }
             panic!("no ConnectPeer");
         });
-        let dial = super::begin_acceptor_dial(&op_manager, tx, held.clone(), answered_at)
-            .await
-            .expect("sent");
+        let dial = super::begin_acceptor_dial(
+            &op_manager,
+            tx,
+            held.clone(),
+            answered_at,
+            super::super::native::DialTransport::Udp,
+        )
+        .await
+        .expect("sent");
         assert_eq!(waits(&held), vec![DialQueueWait::Ge3S]);
         drop(slow_loop.await.expect("event loop"));
         drop(dial);
@@ -3251,7 +3385,7 @@ mod driver_timing_tests {
         let (op_manager, mut events) = op_manager_with_events("acceptor-origin").await;
         let joiner = peer(24880);
         let tx = Transaction::new::<ConnectMsg>();
-        super::super::dispatch_expect_connection_from(&op_manager, tx, joiner.clone())
+        super::super::dispatch_expect_connection_from(&op_manager, tx, joiner.clone(), None)
             .await
             .expect("dispatch");
         loop {

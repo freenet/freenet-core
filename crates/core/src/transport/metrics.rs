@@ -131,6 +131,9 @@ labelled_counters! {
         /// An outbound connection was established and bound to the key
         /// it was dialled with.
         SetDialed => "set_dialed",
+        /// A QUIC-native connection was established and bound to the key its
+        /// peer proved in the TLS handshake (`IdentitySource::Proven`).
+        SetProven => "set_proven",
         /// An inbound connection matched an expected-inbound registration and
         /// was bound to the key the connect op dialled, which the
         /// registration carried. The match is by address only, so this
@@ -2967,6 +2970,7 @@ impl TransportMetrics {
             egress_retransmits_uncapped_bytes: get64(&egress.retransmits_uncapped_bytes),
             egress_probes_skipped: get64(&egress.probes_skipped),
             conn_identity_set_dialed: get32(&identity[ConnIdentity::SetDialed as usize]),
+            conn_identity_set_proven: get32(&identity[ConnIdentity::SetProven as usize]),
             conn_identity_expected_inbound_bound: get32(
                 &identity[ConnIdentity::ExpectedInboundBound as usize],
             ),
@@ -3673,6 +3677,7 @@ pub struct TransportSnapshot {
     /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
     /// addresses or keys.
     pub conn_identity_set_dialed: u32,
+    pub conn_identity_set_proven: u32,
     pub conn_identity_expected_inbound_bound: u32,
     pub conn_identity_expected_inbound_unbound: u32,
     pub conn_identity_set_connect_request: u32,
@@ -3757,6 +3762,7 @@ impl TransportSnapshot {
     pub(crate) fn conn_identity(&self, kind: ConnIdentity) -> u32 {
         match kind {
             ConnIdentity::SetDialed => self.conn_identity_set_dialed,
+            ConnIdentity::SetProven => self.conn_identity_set_proven,
             ConnIdentity::ExpectedInboundBound => self.conn_identity_expected_inbound_bound,
             ConnIdentity::ExpectedInboundUnbound => self.conn_identity_expected_inbound_unbound,
             ConnIdentity::SetConnectRequest => self.conn_identity_set_connect_request,
@@ -4005,6 +4011,7 @@ impl TransportSnapshot {
             egress_retransmits_uncapped_bytes,
             egress_probes_skipped,
             conn_identity_set_dialed,
+            conn_identity_set_proven,
             conn_identity_expected_inbound_bound,
             conn_identity_expected_inbound_unbound,
             conn_identity_set_connect_request,
@@ -4168,6 +4175,7 @@ impl TransportSnapshot {
         self.egress_retransmits_uncapped_bytes = egress_retransmits_uncapped_bytes;
         self.egress_probes_skipped = egress_probes_skipped;
         self.conn_identity_set_dialed = conn_identity_set_dialed;
+        self.conn_identity_set_proven = conn_identity_set_proven;
         self.conn_identity_expected_inbound_bound = conn_identity_expected_inbound_bound;
         self.conn_identity_expected_inbound_unbound = conn_identity_expected_inbound_unbound;
         self.conn_identity_set_connect_request = conn_identity_set_connect_request;
@@ -4476,6 +4484,7 @@ struct SnapshotExtras {
     /// [`ConnIdentity`] (the field suffix is its label). Counts only, no
     /// addresses or keys.
     pub conn_identity_set_dialed: u32,
+    pub conn_identity_set_proven: u32,
     pub conn_identity_expected_inbound_bound: u32,
     pub conn_identity_expected_inbound_unbound: u32,
     pub conn_identity_set_connect_request: u32,
@@ -4623,6 +4632,7 @@ impl SnapshotExtras {
             || self.egress_retransmits_uncapped_bytes != 0
             || self.egress_probes_skipped != 0
             || self.conn_identity_set_dialed != 0
+            || self.conn_identity_set_proven != 0
             || self.conn_identity_expected_inbound_bound != 0
             || self.conn_identity_expected_inbound_unbound != 0
             || self.conn_identity_set_connect_request != 0
@@ -7113,6 +7123,7 @@ mod tests {
             "egress_retransmits_deferred",
             "egress_probes_skipped",
             "conn_identity_set_dialed",
+            "conn_identity_set_proven",
             "conn_identity_expected_inbound_bound",
             "conn_identity_expected_inbound_unbound",
             "conn_identity_set_connect_request",

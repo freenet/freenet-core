@@ -388,6 +388,7 @@ impl Harness {
                 &mut self.state,
                 true,
                 crate::transport::NatAttemptOrigin::ConnectAcceptor,
+                crate::operations::connect::native::DialTransport::Udp,
             )
             .await
             .expect("handle_connect_peer");
@@ -544,6 +545,7 @@ fn is_transport_kind(kind: ConnIdentity) -> bool {
 fn is_set(kind: ConnIdentity) -> bool {
     match kind {
         ConnIdentity::SetDialed
+        | ConnIdentity::SetProven
         | ConnIdentity::ExpectedInboundBound
         | ConnIdentity::ExpectedInboundUnbound
         | ConnIdentity::SetConnectRequest
@@ -1048,6 +1050,7 @@ async fn pending_connect_peer(
             &mut h.state,
             false,
             crate::transport::NatAttemptOrigin::ConnectAcceptor,
+            crate::operations::connect::native::DialTransport::Udp,
         )
         .await
         .expect("handle_connect_peer");
@@ -1114,6 +1117,7 @@ async fn matched_inbound_at_the_cap_is_refused_like_a_dial() {
                 peer: PeerKeyLocation::new(peer.clone(), addr),
                 connection,
                 transient: false,
+                transport: crate::operations::connect::native::DialTransport::Udp,
             }
         })
         .await;
@@ -1321,6 +1325,7 @@ impl DriverRig {
                 &mut h.state,
                 false,
                 crate::transport::NatAttemptOrigin::ConnectAcceptor,
+                crate::operations::connect::native::DialTransport::Udp,
             )
             .await
             .expect("handle_connect_peer");
@@ -1608,6 +1613,7 @@ async fn successful_dial_drops_the_expectation_for_its_address() {
         peer: PeerKeyLocation::new(key(), addr),
         connection: Box::new(IdleConnection::new(addr)),
         transient: false,
+        transport: crate::operations::connect::native::DialTransport::Udp,
     })
     .await;
     let mut dropped = false;
@@ -2140,6 +2146,7 @@ impl RestartRig {
                 &mut h.state,
                 false,
                 crate::transport::NatAttemptOrigin::ConnectJoiner,
+                crate::operations::connect::native::DialTransport::Udp,
             )
             .await
             .expect("handle_connect_peer");

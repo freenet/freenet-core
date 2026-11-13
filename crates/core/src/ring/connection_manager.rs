@@ -520,6 +520,8 @@ pub(crate) struct ConnectionManager {
     /// the floor (`NodeConfig::quic_native_floor_override` or the production
     /// one) and the simulation's pre-floor decoder mode.
     native_wire: crate::operations::connect::native::NativeWire,
+    /// This node's QUIC-native connect state: readiness and demotion.
+    native_connect: Arc<crate::operations::connect::native::NativeConnectState>,
     /// Version-gate refusal counters (#5156). Both `supports_hash_first_summaries`
     /// and `supports_summary_first_put` fail closed to the full-bytes fallback
     /// for two causes with opposite implications — a pre-floor peer self-heals
@@ -713,6 +715,9 @@ impl ConnectionManager {
             config.quic_native_floor_override,
             config.native_wire_pre_floor,
         );
+        cm.native_connect = Arc::new(crate::operations::connect::native::NativeConnectState::new(
+            config.native_connect_override,
+        ));
         cm.broadcast_target_list_floor_override = config.broadcast_target_list_floor_override;
         cm
     }
@@ -752,6 +757,9 @@ impl ConnectionManager {
             summary_first_put_floor_override: None,
             hash_first_summaries_floor_override: None,
             native_wire: crate::operations::connect::native::NativeWire::new(None, false),
+            native_connect: Arc::new(crate::operations::connect::native::NativeConnectState::new(
+                None,
+            )),
             hash_first_declined_unknown_version: Arc::new(AtomicU64::new(0)),
             hash_first_declined_pre_floor: Arc::new(AtomicU64::new(0)),
             summary_first_put_declined_unknown_version: Arc::new(AtomicU64::new(0)),
@@ -1613,6 +1621,11 @@ impl ConnectionManager {
     /// How this node encodes and decodes the QUIC-native connect variants.
     pub(crate) fn native_wire(&self) -> crate::operations::connect::native::NativeWire {
         self.native_wire
+    }
+
+    /// This node's QUIC-native connect state.
+    pub(crate) fn native_connect(&self) -> &crate::operations::connect::native::NativeConnectState {
+        &self.native_connect
     }
 
     /// Record (or CLEAR) the negotiated protocol version for a peer at `addr`,

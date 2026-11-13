@@ -8106,6 +8106,7 @@ mod tests {
     fn transport_snapshot_json_carries_conn_identity_values() {
         let snapshot = crate::transport::metrics::TransportSnapshot {
             conn_identity_set_dialed: 61,
+            conn_identity_set_proven: 761,
             conn_identity_expected_inbound_bound: 62,
             conn_identity_expected_inbound_unbound: 80,
             conn_identity_set_connect_request: 63,
@@ -8139,6 +8140,7 @@ mod tests {
         )));
         for (key, expected) in [
             ("conn_identity_set_dialed", 61),
+            ("conn_identity_set_proven", 761),
             ("conn_identity_expected_inbound_bound", 62),
             ("conn_identity_expected_inbound_unbound", 80),
             ("conn_identity_set_connect_request", 63),

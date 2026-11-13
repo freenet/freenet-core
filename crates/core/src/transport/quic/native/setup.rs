@@ -506,11 +506,13 @@ mod tests {
                     matches!(result, Err(NativeSetupError::TimedOut)),
                     "client {client_side}: {result:?}"
                 );
-                assert_eq!(
-                    ended - started,
-                    Duration::from_secs(8),
-                    "client {client_side}"
-                );
+                // The server waits the client's window plus its allowance.
+                let window = if client_side {
+                    NATIVE_WINDOW
+                } else {
+                    NATIVE_WINDOW + SERVER_WINDOW_ALLOWANCE
+                };
+                assert_eq!(ended - started, window, "client {client_side}");
                 let (from, to) = if client_side {
                     (a_addr, b_addr)
                 } else {

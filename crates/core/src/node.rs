@@ -530,6 +530,13 @@ pub struct NodeConfig {
     /// in production. `#[serde(skip)]`.
     #[serde(skip)]
     pub(crate) quic_native_floor_override: Option<(u8, u8, u16)>,
+    /// Simulation-only: QUIC-native connects on, at this release percent, in
+    /// place of `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, both off in
+    /// production until the A+ ramp (`SimNetwork::with_native_connect`). Read
+    /// into the node's `NativeConnectState`. `None` in production.
+    /// `#[serde(skip)]`.
+    #[serde(skip)]
+    pub(crate) native_connect_override: Option<u8>,
     /// Simulation-only: decode the QUIC-native wire variants as a release
     /// below their floor does, failing the message and closing the
     /// connection, and never emit them
@@ -898,6 +905,7 @@ impl NodeConfig {
             broadcast_target_list_floor_override: None,
             advertised_version_override: None,
             quic_native_floor_override: None,
+            native_connect_override: None,
             native_wire_pre_floor: false,
             quic_idle_timeout_override: None,
             advertise_seeded_hosts: false,
