@@ -200,6 +200,10 @@ jobs:
         env:
           RELEASE_VERSION: ${{ steps.validate.outputs.version }}
           RELEASE_LIVE: ${{ steps.mode.outputs.live }}
+          # Read-only: the check asks the GitHub API whether a release is
+          # published, and the anonymous limit is shared by the runner's
+          # address. The workflow token is enough to read; nothing here writes.
+          GH_TOKEN: ${{ github.token }}
         run: bash scripts/check_quic_data_ramp_t0.sh --version "$RELEASE_VERSION" --live "$RELEASE_LIVE"
 
   # Runs in BOTH modes: the bump is computed and committed locally either way.

@@ -55,22 +55,42 @@ cargo_at() {
 SHIPPED="$(cargo_at 0.2.157)"
 BEFORE="$(cargo_at 0.2.156)"
 
-# crates.io, as the check sees it: a `curl` first on PATH that records its
-# arguments and prints the HTTP status in $FAKE_CRATES_CODE, or exits
-# $FAKE_CURL_EXIT when that is set (no answer at all).
+# crates.io and GitHub, as the check sees them: a `curl` first on PATH that
+# records its arguments (and the header file it is given, which is where a
+# token goes) and answers by host: GitHub with HTTP $FAKE_GH_CODE and body
+# $FAKE_GH_BODY written to the -o file, crates.io with HTTP $FAKE_CRATES_CODE.
+# $FAKE_CURL_EXIT, when set, makes it fail with no answer at all. A `gh` that
+# fails keeps the check from reading a real token on this machine.
 mkdir -p "$WORK/bin"
 cat > "$WORK/bin/curl" <<'CURL'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$FAKE_CURL_LOG"
+out="" url=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        -H) if [[ "$2" == @* ]]; then cat "${2#@}" >> "$FAKE_CURL_LOG.headers"; fi; shift 2 ;;
+        http*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
 if [[ -n "${FAKE_CURL_EXIT:-}" ]]; then
     exit "$FAKE_CURL_EXIT"
 fi
-printf '%s' "$FAKE_CRATES_CODE"
+case "$url" in
+    https://api.github.com/*)
+        if [[ -n "$out" ]]; then printf '%s' "$FAKE_GH_BODY" > "$out"; fi
+        printf '%s' "$FAKE_GH_CODE" ;;
+    *) printf '%s' "$FAKE_CRATES_CODE" ;;
+esac
 CURL
-chmod +x "$WORK/bin/curl"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$WORK/bin/gh"
+chmod +x "$WORK/bin/curl" "$WORK/bin/gh"
 export PATH="$WORK/bin:$PATH"
+unset GH_TOKEN GITHUB_TOKEN
 export FAKE_CURL_LOG="$WORK/curl.log"
-export FAKE_CRATES_CODE=200
+export FAKE_CRATES_CODE=200 FAKE_GH_CODE=200
+export FAKE_GH_BODY='{"tag_name": "v0.2.157", "draft": false, "prerelease": false}'
 : > "$FAKE_CURL_LOG"
 
 # check_case NAME EXPECTED_RC EXPECTED_TEXT -- ARGS...
@@ -104,22 +124,48 @@ check_case "a later release that skips the unshipped ramp release, live: refused
     --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$BEFORE"
 check_case "a missing Cargo.toml for a later release: refused" 2 "Cargo.toml not found" -- \
     --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$WORK/none.toml"
-if grep -qF -- "-A freenet-release-check" "$FAKE_CURL_LOG" && grep -qF "https://crates.io/api/v1/crates/freenet/0.2.157" "$FAKE_CURL_LOG"; then
-    echo "ok - a later release asks crates.io for freenet at the ramp release's version"
+if grep -qF -- "-A freenet-release-check" "$FAKE_CURL_LOG" \
+    && grep -qF "https://crates.io/api/v1/crates/freenet/0.2.157" "$FAKE_CURL_LOG" \
+    && grep -qF "https://api.github.com/repos/freenet/freenet-core/releases/tags/v0.2.157" "$FAKE_CURL_LOG"; then
+    echo "ok - a later release asks GitHub for v0.2.157 and crates.io for freenet 0.2.157, with a User-Agent"
 else
-    echo "FAIL - a later release did not ask crates.io for freenet 0.2.157 with a User-Agent: $(cat "$FAKE_CURL_LOG")"
+    echo "FAIL - a later release did not ask GitHub and crates.io about 0.2.157 with a User-Agent: $(cat "$FAKE_CURL_LOG")"
     FAILURES=$((FAILURES + 1))
 fi
-export FAKE_CRATES_CODE=404
-check_case "a later release whose ramp release was never published, live: refused" 1 "is not on crates.io" -- \
+: > "$FAKE_CURL_LOG"
+GH_TOKEN=test-secret-token bash "$CHECK" --version 0.2.158 --live true --now "$T0" \
+    --policy "$set_both" --cargo-toml "$SHIPPED" > /dev/null 2>&1
+if grep -qF "test-secret-token" "$FAKE_CURL_LOG"; then
+    echo "FAIL - the GitHub token is on curl's command line"
+    FAILURES=$((FAILURES + 1))
+elif grep -qxF "Authorization: Bearer test-secret-token" "$FAKE_CURL_LOG.headers" 2>/dev/null; then
+    echo "ok - the GitHub token reaches curl in a header file, not on its command line"
+else
+    echo "FAIL - the GitHub token did not reach curl"
+    FAILURES=$((FAILURES + 1))
+fi
+export FAKE_GH_CODE=404
+check_case "a later release whose ramp release is not a published GitHub release (none, or a draft), live: refused" 1 "is not a published GitHub release" -- \
     --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
-check_case "a later release whose ramp release was never published, dry run: warning only" 0 "::warning" -- \
+check_case "the same, dry run: warning only" 0 "::warning" -- \
+    --version 0.2.158 --live false --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
+export FAKE_GH_CODE=403
+check_case "a later release when GitHub refuses to answer, live: refused" 1 "is a published GitHub release cannot be determined" -- \
+    --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
+export FAKE_GH_CODE=200 FAKE_GH_BODY='{"tag_name": "v0.2.157", "draft": true}'
+check_case "a later release when GitHub's answer does not say published, live: refused" 1 "is a published GitHub release cannot be determined" -- \
+    --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
+export FAKE_GH_BODY='{"tag_name": "v0.2.157", "draft": false, "prerelease": false}'
+export FAKE_CRATES_CODE=404
+check_case "a later release whose ramp release is published on GitHub but not on crates.io, live: refused" 1 "is not on crates.io" -- \
+    --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
+check_case "the same, dry run: warning only" 0 "::warning" -- \
     --version 0.2.158 --live false --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
 export FAKE_CRATES_CODE=403
 check_case "a later release when crates.io refuses to answer, live: refused" 1 "cannot be determined" -- \
     --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
 export FAKE_CRATES_CODE=200 FAKE_CURL_EXIT=7
-check_case "a later release when crates.io cannot be reached, live: refused" 1 "cannot be determined" -- \
+check_case "a later release when nothing can be reached, live: refused" 1 "cannot be determined" -- \
     --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
 unset FAKE_CURL_EXIT
 : > "$FAKE_CURL_LOG"
@@ -161,7 +207,7 @@ check_case "wrapped declarations, 3 h 1 s late, live: refused" 1 "min after its 
     --version 0.2.157 --live true --now $((T0 + 3 * HOUR + 1)) --policy "$wrapped"
 
 release_no_start="$(policy None 'Some("0.2.157")')"
-check_case "ramp release with no start, live: refused" 1 "QUIC_DATA_RAMP_START is None" -- \
+check_case "ramp release with no start, live: refused, naming the stop remedies" 1 "cut another version instead, or set QUIC_DATA_RAMP_RELEASE to None" -- \
     --version 0.2.157 --live true --now "$T0" --policy "$release_no_start"
 check_case "emergency stop release (start reset) is not checked" 0 "no ramp start" -- \
     --version 0.2.158 --live true --now "$T0" --policy "$release_no_start"
@@ -344,6 +390,7 @@ exact "the validate step runs the check on the resolved version and run mode, an
         env:
           RELEASE_VERSION: ${{ steps.validate.outputs.version }}
           RELEASE_LIVE: ${{ steps.mode.outputs.live }}
+          GH_TOKEN: ${{ github.token }}
         run: bash scripts/check_quic_data_ramp_t0.sh --version "$RELEASE_VERSION" --live "$RELEASE_LIVE"'
 no_continue_on_error "release.yml's validate job" "$validate_job"
 order="$(printf '%s\n' "$validate_job" | grep -nxE '        id: (mode|validate)|      - name: '"$VALIDATE_STEP" | cut -d: -f1 | tr '\n' ' ')"
@@ -368,6 +415,8 @@ exact "the attach step runs the check live on the tag's version, in the source, 
     "      - name: $ATTACH_STEP
 $ATTACH_IF
         working-directory: _src
+        env:
+          GH_TOKEN: \${{ github.token }}
         run: |
           TAG_NAME=\"\${GITHUB_REF#refs/tags/}\"
           bash scripts/check_quic_data_ramp_t0.sh --version \"\${TAG_NAME#v}\" --live true"
@@ -378,12 +427,25 @@ no_continue_on_error "cross-compile.yml's attach-to-release job" "$attach_job"
 # is why the check's own `if:` is pinned above.
 publish_ifs="$(printf '%s\n' "$attach_job" | step_block "Publish crates to crates.io" | code_lines | grep -E '^        if:')"
 exact "the crates.io publish runs only on success, under the check's condition" "$publish_ifs" "$ATTACH_IF"
-undraft_ifs="$(printf '%s\n' "$attach_job" | step_block "Publish release" | code_lines | grep -E '^        if:' || true)"
+# The un-draft is the step named exactly "Publish release", and it is the only
+# step in the job that un-drafts: renaming it, or un-drafting from another
+# step, fails here rather than leaving the condition check below reading an
+# empty step.
+undraft_step="$(printf '%s\n' "$attach_job" | step_block "Publish release")"
+expect "attach-to-release has the un-draft step, named \"Publish release\"" "$(nonempty "$undraft_step")"
+undraft_in_job="$(printf '%s\n' "$attach_job" | code_lines | grep -cF -- '--draft=false' || true)"
+undraft_in_step="$(printf '%s\n' "$undraft_step" | code_lines | grep -cF -- '--draft=false' || true)"
+if [[ "$undraft_in_step" -ge 1 && "$undraft_in_job" == "$undraft_in_step" ]]; then
+    expect "only the \"Publish release\" step un-drafts" yes
+else
+    expect "only the \"Publish release\" step un-drafts (job $undraft_in_job, step $undraft_in_step)" no
+fi
+undraft_ifs="$(printf '%s\n' "$undraft_step" | code_lines | grep -E '^        if:' || true)"
 exact "the un-draft has no condition of its own (success() applies)" "$undraft_ifs" ""
 checkout_at="$(step_index "$attach_job" "Check out the release source")"
 check_at="$(step_index "$attach_job" "$ATTACH_STEP")"
 publish_at="$(step_index "$attach_job" "Publish crates to crates.io")"
-undraft_at="$(printf '%s\n' "$attach_job" | grep -E '^      - name: ' | grep -nE 'Publish (the )?release' | tail -1 | cut -d: -f1)"
+undraft_at="$(step_index "$attach_job" "Publish release")"
 if [[ -n "$checkout_at" && -n "$check_at" && -n "$publish_at" && "$check_at" -gt "$checkout_at" && "$check_at" -lt "$publish_at" ]]; then
     expect "the attach check comes after the checkout and before the crates.io publish" yes
 else
@@ -409,6 +471,10 @@ for fn in publish_crates publish_draft_release; do
     exact "the local release script checks first thing in $fn" \
         "$(fn_body "$RELEASE_SH" "$fn" | code_lines | head -1)" '    check_quic_data_ramp_t0'
 done
+# One definition of the helper: bash runs the last one, while fn_body reads
+# the first, so a second definition would replace the one pinned below.
+helper_defs="$(grep -cE '^[[:space:]]*(function[[:space:]]+)?check_quic_data_ramp_t0[[:space:]]*(\(\))?[[:space:]]*\{' "$RELEASE_SH" || true)"
+exact "the local release script defines the helper once" "$helper_defs" "1"
 # The helper refuses with exit 1 on any failure of the check, whatever the run
 # mode (the check itself makes a dry run's finding a warning).
 exact "the local release script's helper exits 1 when the check refuses" \

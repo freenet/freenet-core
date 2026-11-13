@@ -519,10 +519,14 @@ Current wire-gated floors:
   version passes with a warning. A version that would ship the ramp unchecked
   fails closed: one before `QUIC_DATA_RAMP_RELEASE`, one that skips it while
   the tree has not reached it (an auto-bump past a taken number), one cut
-  while `freenet` at `QUIC_DATA_RAMP_RELEASE` is not on crates.io or crates.io
-  gives no clear answer (the ramp release's bump merged but its publish failed
-  or was cancelled), or one cut more than 3 h before T0, and T0 set with no
-  ramp release named. Cut the ramp release with `--field version=X.Y.Z` set to
+  while `v<QUIC_DATA_RAMP_RELEASE>` is not a published (non-draft) GitHub
+  release or `freenet` at that version is not on crates.io, or either gives
+  no clear answer (the ramp release's bump merged but its publish or un-draft
+  failed or was cancelled; nodes update from GitHub's latest release, so a
+  crates.io publish alone did not reach them), or one cut more than 3 h
+  before T0, and T0 set with no ramp release named. The check reads the
+  GitHub API with `GH_TOKEN` (the workflow token in CI, `gh auth token`
+  locally) when it has one. Cut the ramp release with `--field version=X.Y.Z` set to
   `QUIC_DATA_RAMP_RELEASE`, not the auto-bump. If that version is already
   taken, change the constant in the same reviewed PR as T0. A later re-ramp
   must set a new T0 and a new `QUIC_DATA_RAMP_RELEASE` together: a new T0 with
@@ -541,7 +545,9 @@ Current wire-gated floors:
   above the `crates/core` version. The same test requires each state the
   constants pass through to pass CI, including the emergency stop (T0 back to
   `None` with the release left named: a later version passes, the named one is
-  refused).
+  refused). A stop taken before the ramp release ships leaves the next
+  auto-bump equal to the named version, which is then refused: cut another
+  version, or set `QUIC_DATA_RAMP_RELEASE` to `None` in the stop PR.
 
   The attach-to-release check reads the version from the tag and accepts only
   `X.Y.Z`. A pre-release tag (`v0.2.157-rc1`) exits 2 there and stops the

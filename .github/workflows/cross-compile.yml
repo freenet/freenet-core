@@ -936,6 +936,11 @@ jobs:
       - name: Check the QUIC data ramp start is near now (before publishing)
         if: ${{ success() && startsWith(github.ref, 'refs/tags/v') }}
         working-directory: _src
+        env:
+          # Read-only: the check asks the GitHub API whether a release is
+          # published, and the anonymous limit is shared by the runner's
+          # address. The workflow token is enough to read; nothing here writes.
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG_NAME="${GITHUB_REF#refs/tags/}"
           bash scripts/check_quic_data_ramp_t0.sh --version "${TAG_NAME#v}" --live true
