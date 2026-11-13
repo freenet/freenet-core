@@ -504,6 +504,58 @@ Current wire-gated floors:
   `quic_native_floor_stays_above_every_release_without_the_decoder` catches the
   floor being lowered.
 
+- `QUIC_DATA_RAMP_START` (T0) and `QUIC_DATA_RAMP_RELEASE` in
+  `crates/core/src/transport/quic/upgrade/policy.rs` (#5940): both `None` in
+  tree. The reviewed PR for the QUIC data ramp release sets T0 to the planned
+  publish time, in Unix seconds, and `QUIC_DATA_RAMP_RELEASE` to that release's
+  version. `scripts/check_quic_data_ramp_t0.sh` then refuses a live cut of
+  that version when the clock is more than 3 h from T0 either side (a dry run
+  only warns). It runs at dispatch (release.yml's validate job), again in
+  cross-compile.yml's attach-to-release job just before the crates.io publish
+  and the un-draft (so "re-run failed jobs" checks the clock it publishes at),
+  and in `scripts/release.sh` at its start and before each publish. What it
+  measures is the publish time; nodes take the release over the 0-4 h
+  auto-update stagger on top of it. Both constants stay set afterwards: a later
+  version passes with a warning. A version that would ship the ramp unchecked
+  fails closed: one before `QUIC_DATA_RAMP_RELEASE`, one that skips it while
+  the tree has not reached it (an auto-bump past a taken number), one cut
+  while `v<QUIC_DATA_RAMP_RELEASE>` is not a published (non-draft) GitHub
+  release, GitHub's latest release is before it, or `freenet` at that version
+  is not on crates.io, or any of these gives no clear answer (the ramp
+  release's bump merged but its publish or un-draft failed or was cancelled,
+  or "latest" stayed pinned to an older build; nodes update from GitHub's
+  latest release, so a crates.io publish alone did not reach them), or one
+  cut more than 3 h
+  before T0, and T0 set with no ramp release named. The check reads the
+  GitHub API with `GH_TOKEN` (the workflow token in CI, `gh auth token`
+  locally) when it has one. Cut the ramp release with `--field version=X.Y.Z` set to
+  `QUIC_DATA_RAMP_RELEASE`, not the auto-bump. If that version is already
+  taken, change the constant in the same reviewed PR as T0. A later re-ramp
+  must set a new T0 and a new `QUIC_DATA_RAMP_RELEASE` together: a new T0 with
+  a stale release name is not caught when the cut comes more than 3 h after
+  the new T0. If the publish slips more than about 3 h past T0, re-set T0 in a
+  new reviewed PR before publishing.
+
+  Which check guards which side. The dispatch check (release.yml) reads the
+  tree before the version bump, so it is the one that sees a cut version
+  skipping or preceding the ramp release. At the tag the tree is already the
+  cut version, so the attach-to-release check sees only the clock and the
+  publication of the ramp release, not a skip. One case neither sees at cut
+  time: `QUIC_DATA_RAMP_RELEASE` naming a version that ships before the ramp
+  PR merges. CI covers it: `scripts/check_quic_data_ramp_t0_test.sh` fails a
+  tree where T0 is more than 3 h away and `QUIC_DATA_RAMP_RELEASE` is not
+  above the `crates/core` version. The same test requires each state the
+  constants pass through to pass CI, including the emergency stop (T0 back to
+  `None` with the release left named: a later version passes, the named one is
+  refused). A stop taken before the ramp release ships leaves the next
+  auto-bump equal to the named version, which is then refused: cut another
+  version, or set `QUIC_DATA_RAMP_RELEASE` to `None` in the stop PR.
+
+  The attach-to-release check reads the version from the tag and accepts only
+  `X.Y.Z`. A pre-release tag (`v0.2.157-rc1`) exits 2 there and stops the
+  publish. The project tags no pre-releases; one would need the check taught
+  its form first.
+
 - `QUIC_DATA_PERCENT` in `crates/core/src/transport/quic/upgrade/policy.rs` (the
   share of pairs that carry data on QUIC, #5940). It stays at its value unless
   this release is a rollout step (0, 5, 25, 100), changed in its own PR. That PR also edits the expectations that pin 0:
