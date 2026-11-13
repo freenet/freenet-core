@@ -1187,7 +1187,7 @@ fn a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry() {
         let outcome = p
             .drive(async move {
                 let arrival = b_in.recv().await.expect("announced");
-                let _ = arrival.handle.assemble().await;
+                arrival.handle.assemble().await.expect("assembled");
                 send.await.expect("the send task ran")
             })
             .await;
