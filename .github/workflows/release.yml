@@ -185,6 +185,19 @@ jobs:
           echo "  freenet: $VERSION"
           echo "  fdev: $FDEV_VERSION"
 
+      # The QUIC data ramp release must be cut within 3 h of its ramp start
+      # (QUIC_DATA_RAMP_START), which is fixed in the binary: a late publish
+      # starts every node part-way along the curve. Checks only the version
+      # named by QUIC_DATA_RAMP_RELEASE; with it None, or for any other
+      # version, the step prints a notice and passes. A live run that fails it
+      # stops here, before anything is created; a dry run gets a warning.
+      # Pinned by scripts/check_quic_data_ramp_t0_test.sh.
+      - name: Check the QUIC data ramp start is near now
+        env:
+          RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+          RELEASE_LIVE: ${{ steps.mode.outputs.live }}
+        run: bash scripts/check_quic_data_ramp_t0.sh --version "$RELEASE_VERSION" --live "$RELEASE_LIVE"
+
   # Runs in BOTH modes: the bump is computed and committed locally either way.
   # Only a live run pushes it, opens the PR and enables auto-merge (#5936: a
   # dry run used to do all three, landing the version bump on main).

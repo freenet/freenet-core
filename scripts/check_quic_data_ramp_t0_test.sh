@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# Tests for scripts/check_quic_data_ramp_t0.sh, the release-time check that the
+# QUIC data ramp release is cut within 3 h of its ramp start (#5940, #6138).
+#
+# Each case runs the script against a policy file written here, with the clock
+# passed as --now, and checks its exit code and one line of its output. Then it
+# checks the tree as it is: with QUIC_DATA_RAMP_RELEASE = None the check is a
+# no-op for any version, live or dry, and release.yml's validate job runs it on
+# the resolved version and run mode.
+#
+# Run manually: bash scripts/check_quic_data_ramp_t0_test.sh
+# Also wired into CI (the Fmt job in .github/workflows/ci.yml).
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CHECK="$SCRIPT_DIR/check_quic_data_ramp_t0.sh"
+POLICY="$SCRIPT_DIR/../crates/core/src/transport/quic/upgrade/policy.rs"
+RELEASE_YML="$SCRIPT_DIR/../.github/workflows/release.yml"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+FAILURES=0
+T0=1800000000
+HOUR=3600
+
+# A policy file declaring the two constants as $1 and $2.
+policy() {
+    local file="$WORK/policy-$RANDOM.rs"
+    {
+        echo "/// When this release's data ramp starts."
+        echo "pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = $1;"
+        echo ""
+        echo "#[cfg_attr(not(test), allow(dead_code))]"
+        echo "pub(in crate::transport) const QUIC_DATA_RAMP_RELEASE: Option<&str> = $2;"
+        echo "// QUIC_DATA_RAMP_START: Option<u64> = Some(1); a comment is not read"
+    } > "$file"
+    printf '%s' "$file"
+}
+
+# check_case NAME EXPECTED_RC EXPECTED_TEXT -- ARGS...
+check_case() {
+    local name="$1" want_rc="$2" want_text="$3" out rc
+    shift 4
+    out="$(bash "$CHECK" "$@" 2>&1)"
+    rc=$?
+    if [[ "$rc" != "$want_rc" || "$out" != *"$want_text"* ]]; then
+        echo "FAIL - $name: rc=$rc (want $want_rc), output: $out"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "ok - $name"
+    fi
+}
+
+unset_both="$(policy None None)"
+check_case "no ramp release, live: no-op" 0 "no ramp release" -- \
+    --version 0.2.156 --live true --now "$T0" --policy "$unset_both"
+check_case "no ramp release, dry run: no-op" 0 "no ramp release" -- \
+    --version 0.2.156 --live false --now "$T0" --policy "$unset_both"
+
+set_both="$(policy "Some(1_800_000_000)" 'Some("0.2.157")')"
+check_case "another release is not checked" 0 "is not the ramp release" -- \
+    --version 0.2.158 --live true --now $((T0 + 30 * HOUR)) --policy "$set_both"
+check_case "ramp release at T0" 0 "within 180 min" -- \
+    --version 0.2.157 --live true --now "$T0" --policy "$set_both"
+check_case "ramp release 3 h after T0 (boundary)" 0 "within 180 min" -- \
+    --version 0.2.157 --live true --now $((T0 + 3 * HOUR)) --policy "$set_both"
+check_case "ramp release 3 h before T0 (boundary)" 0 "within 180 min" -- \
+    --version 0.2.157 --live true --now $((T0 - 3 * HOUR)) --policy "$set_both"
+check_case "ramp release 3 h 1 s after T0, live: refused" 1 "min after its ramp start" -- \
+    --version 0.2.157 --live true --now $((T0 + 3 * HOUR + 1)) --policy "$set_both"
+check_case "ramp release 3 h 1 s before T0, live: refused" 1 "min before its ramp start" -- \
+    --version 0.2.157 --live true --now $((T0 - 3 * HOUR - 1)) --policy "$set_both"
+check_case "ramp release a day late, dry run: warning only" 0 "::warning" -- \
+    --version 0.2.157 --live false --now $((T0 + 24 * HOUR)) --policy "$set_both"
+
+# The two declarations as rustfmt would wrap them if they grew past the line
+# width: read the same as on one line.
+wrapped="$WORK/wrapped.rs"
+cat > "$wrapped" <<'RUST'
+pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = Some(
+    1_800_000_000,
+);
+pub(in crate::transport) const QUIC_DATA_RAMP_RELEASE: Option<&str> =
+    Some("0.2.157");
+RUST
+check_case "wrapped declarations, ramp release at T0" 0 "within 180 min" -- \
+    --version 0.2.157 --live true --now "$T0" --policy "$wrapped"
+check_case "wrapped declarations, 3 h 1 s late, live: refused" 1 "min after its ramp start" -- \
+    --version 0.2.157 --live true --now $((T0 + 3 * HOUR + 1)) --policy "$wrapped"
+
+release_no_start="$(policy None 'Some("0.2.157")')"
+check_case "ramp release with no start, live: refused" 1 "QUIC_DATA_RAMP_START is None" -- \
+    --version 0.2.157 --live true --now "$T0" --policy "$release_no_start"
+check_case "emergency stop release (start reset) is not checked" 0 "is not the ramp release" -- \
+    --version 0.2.158 --live true --now "$T0" --policy "$release_no_start"
+
+check_case "missing policy file: refused" 2 "policy file not found" -- \
+    --version 0.2.157 --live false --now "$T0" --policy "$WORK/does-not-exist.rs"
+only_start="$WORK/only-start.rs"
+grep -v QUIC_DATA_RAMP_RELEASE "$set_both" > "$only_start"
+check_case "missing constant: refused in both modes" 2 "expected one declaration of QUIC_DATA_RAMP_RELEASE" -- \
+    --version 0.2.157 --live false --now "$T0" --policy "$only_start"
+two="$WORK/two.rs"
+cat "$set_both" "$set_both" > "$two"
+check_case "two declarations: refused" 2 "found 2" -- \
+    --version 0.2.157 --live true --now "$T0" --policy "$two"
+bad_release="$(policy "Some(1_800_000_000)" 'Some("v0.2.157")')"
+check_case "release not X.Y.Z: refused" 2 "must be None or Some" -- \
+    --version 0.2.157 --live true --now "$T0" --policy "$bad_release"
+check_case "bad --version: refused" 2 "--version must be X.Y.Z" -- \
+    --version v0.2.157 --live true --now "$T0" --policy "$set_both"
+check_case "bad --live: refused" 2 "--live must be true or false" -- \
+    --version 0.2.157 --live yes --now "$T0" --policy "$set_both"
+
+# The tree as it is.
+if [[ ! -f "$POLICY" ]]; then
+    echo "FAIL - policy.rs not found at $POLICY"
+    FAILURES=$((FAILURES + 1))
+fi
+if grep -qE '^pub\(in crate::transport\) const QUIC_DATA_RAMP_RELEASE: Option<&str> = None;$' "$POLICY"; then
+    for live in true false; do
+        check_case "this tree (release None), live=$live: no-op" 0 "no ramp release" -- \
+            --version 0.2.156 --live "$live" --policy "$POLICY"
+    done
+else
+    # Once the ramp release is named, only that version is checked.
+    check_case "this tree reads" 0 "QUIC data ramp:" -- \
+        --version 0.0.1 --live true --policy "$POLICY"
+fi
+
+# release.yml's validate job runs the check, on the resolved version and run
+# mode, after both are resolved. Read from the job's own block, so a call left
+# in another job, or in a comment, does not count.
+validate_block="$(awk '
+    /^  validate:/ { inside = 1; print; next }
+    inside && /^  [A-Za-z0-9_]+:/ { exit }
+    inside { print }
+' "$RELEASE_YML")"
+call_line="$(printf '%s\n' "$validate_block" | grep -E '^[[:space:]]+run: bash scripts/check_quic_data_ramp_t0\.sh ' || true)"
+if [[ -z "$call_line" ]]; then
+    echo "FAIL - release.yml's validate job does not run scripts/check_quic_data_ramp_t0.sh"
+    FAILURES=$((FAILURES + 1))
+else
+    echo "ok - release.yml's validate job runs the check"
+    for needle in 'steps.validate.outputs.version' 'steps.mode.outputs.live'; do
+        if [[ "$validate_block" != *"$needle"* ]]; then
+            echo "FAIL - the validate job's check is not given $needle"
+            FAILURES=$((FAILURES + 1))
+        fi
+    done
+    order="$(printf '%s\n' "$validate_block" | grep -nE 'id: (mode|validate)$|run: bash scripts/check_quic_data_ramp_t0\.sh' | cut -d: -f1 | tr '\n' ' ')"
+    read -r first second third <<< "$order"
+    if [[ -z "${third:-}" || "$third" -le "$first" || "$third" -le "$second" ]]; then
+        echo "FAIL - the check must come after the mode and version steps (lines: $order)"
+        FAILURES=$((FAILURES + 1))
+    else
+        echo "ok - the check runs after the mode and version are resolved"
+    fi
+fi
+
+if [[ "$FAILURES" -gt 0 ]]; then
+    echo "$FAILURES failure(s)"
+    exit 1
+fi
+echo "all passed"

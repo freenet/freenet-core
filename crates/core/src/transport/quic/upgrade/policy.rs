@@ -52,6 +52,25 @@ pub(crate) fn may_carry_data(config: &NetworkApiConfig) -> bool {
         && config.quic_data_percent().unwrap_or(QUIC_DATA_PERCENT) > 0
 }
 
+/// When this release's QUIC data ramp starts (T0), in seconds since the Unix
+/// epoch, or `None` for no ramp. `None` in tree; the data ramp (#5940) reads
+/// it, and the reviewed PR for the ramp release sets it to the planned publish
+/// time. `scripts/check_quic_data_ramp_t0.sh` reads this line, so keep it on
+/// one line in this form.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = None;
+
+/// The release whose cut must come within 3 h of [`QUIC_DATA_RAMP_START`], as
+/// `"X.Y.Z"`, or `None`. Set together with the ramp start, in the same reviewed
+/// PR, to the version of the release that ships it; release.yml's validate job
+/// then refuses a live cut of that version unless the clock is within 3 h of the
+/// start (`scripts/check_quic_data_ramp_t0.sh`, which reads this line, so keep
+/// it on one line in this form). Left set afterwards, like the start: it names
+/// one version, so later releases are not checked. An emergency stop that sets
+/// the start back to `None` leaves this as it is.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::transport) const QUIC_DATA_RAMP_RELEASE: Option<&str> = None;
+
 /// Whether this build reads data from a QUIC path. It does: `PeerConnection::recv`
 /// drains the session's data channels, so a node that says it accepts data delivers
 /// a peer's frames. While this is `false`, [`QuicPolicy::own_caps`] returns 0
@@ -388,6 +407,31 @@ pub(crate) fn log_startup(config: &NetworkApiConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A ramp start names the release it ships in, so the release-time check
+    /// (`scripts/check_quic_data_ramp_t0.sh`) has a version to key on; a
+    /// named release is `X.Y.Z`, the form the script and release.yml use. A
+    /// release with no start is allowed: an emergency stop resets the start
+    /// and leaves the release, which names an earlier version.
+    #[test]
+    fn a_ramp_start_names_its_release() {
+        if QUIC_DATA_RAMP_START.is_some() {
+            assert!(
+                QUIC_DATA_RAMP_RELEASE.is_some(),
+                "QUIC_DATA_RAMP_START is set, so QUIC_DATA_RAMP_RELEASE must name its release"
+            );
+        }
+        if let Some(release) = QUIC_DATA_RAMP_RELEASE {
+            let parts: Vec<&str> = release.split('.').collect();
+            assert!(
+                parts.len() == 3
+                    && parts
+                        .iter()
+                        .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())),
+                "QUIC_DATA_RAMP_RELEASE must be X.Y.Z, got {release:?}"
+            );
+        }
+    }
 
     const AVAILABILITIES: [QuicAvailability; 4] = [
         QuicAvailability::Disabled,
