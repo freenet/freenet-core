@@ -1248,6 +1248,15 @@ impl ClientEventsProxy for HttpClientApi {
                         user_context,
                         ..
                     } => {
+                        // The node never answers a `Disconnect`, so `send()`
+                        // would never remove this client's channel: drop it
+                        // here or it stays until the process exits.
+                        if matches!(
+                            &*req,
+                            freenet_stdlib::client_api::ClientRequest::Disconnect { .. }
+                        ) {
+                            self.response_channels.remove(&client_id);
+                        }
                         return Ok(OpenRequest::new(client_id, req)
                             .with_token(auth_token)
                             .with_origin_contract(origin_contract)
@@ -1308,6 +1317,57 @@ impl ClientEventsProxy for HttpClientApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use freenet_stdlib::client_api::ClientRequest;
+
+    /// A client's final `Disconnect` is never answered by the node, so the
+    /// proxy must drop that client's response channel itself. Before the fix
+    /// the entry (~10 KB per page load) stayed until the process exited.
+    #[tokio::test]
+    async fn disconnect_drops_http_response_channel() {
+        use crate::client_events::ClientEventsProxy;
+        let (mut api, _router) = HttpClientApi::as_router(&"127.0.0.1:0".parse().unwrap());
+        let (tx, rx) = mpsc::channel(8);
+        api.proxy_server_request = rx;
+
+        const N: usize = 25;
+        let mut keep_open = vec![];
+        for _ in 0..N {
+            let (cb_tx, mut cb_rx) = mpsc::unbounded_channel();
+            tx.send(ClientConnection::NewConnection {
+                callbacks: cb_tx,
+                assigned_token: None,
+            })
+            .await
+            .unwrap();
+            // recv() processes the NewConnection while waiting for a request,
+            // so drive it concurrently with the client side.
+            let client = async {
+                let Some(HostCallbackResult::NewId { id }) = cb_rx.recv().await else {
+                    unreachable!("NewId must be the first callback")
+                };
+                tx.send(ClientConnection::Request {
+                    client_id: id,
+                    req: Box::new(ClientRequest::Disconnect { cause: None }),
+                    auth_token: None,
+                    origin_contract: None,
+                    connection_scope: crate::client_events::ConnectionScope::Local,
+                    user_context: None,
+                    api_version: Default::default(),
+                })
+                .await
+                .unwrap();
+            };
+            let (req, ()) = tokio::join!(api.recv(), client);
+            let req = req.expect("Disconnect must be forwarded");
+            assert!(matches!(*req.request, ClientRequest::Disconnect { .. }));
+            keep_open.push(cb_rx);
+        }
+        assert!(
+            api.response_channels.is_empty(),
+            "{} response channels leaked after {N} disconnected clients",
+            api.response_channels.len()
+        );
+    }
 
     /// Builds an `HttpClientApiRequest` whose receiver is dropped immediately,
     /// so any attempt to send on it fails fast with a closed-channel error.

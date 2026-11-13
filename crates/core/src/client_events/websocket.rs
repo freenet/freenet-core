@@ -845,6 +845,14 @@ impl WebSocketProxy {
                     | _ => None,
                 };
 
+                // A forwarded `Disconnect` is the client's last message and the
+                // node never answers it, so `send()` (the only other place an
+                // entry is removed) would never run: drop the response channel
+                // here or it stays until the process exits.
+                if matches!(&*req, ClientRequest::Disconnect { .. }) {
+                    self.response_channels.remove(&client_id);
+                }
+
                 let open_req = if let Some(key) = sub_key {
                     tracing::debug!(%client_id, contract = %key, "setting up subscription channel");
                     match self.setup_subscription(
@@ -5825,6 +5833,56 @@ mod tests {
         assert!(
             drive_msg(auth, Some(&ctx), Some(&limiter)).await,
             "Authenticate must not be rate-limited even with an empty op bucket"
+        );
+    }
+
+    /// A WebSocket's final synthetic `Disconnect` is never answered by the
+    /// node, so the proxy must drop the client's response channel when it
+    /// forwards it. Before the fix every opened-and-closed socket leaked its
+    /// entry (~9 KB) until the process exited.
+    #[tokio::test]
+    async fn disconnect_drops_websocket_response_channel() {
+        let (mut proxy, _router) = WebSocketProxy::create_router(axum::Router::new());
+
+        const N: usize = 25;
+        let mut keep_open = vec![];
+        for _ in 0..N {
+            let (cb_tx, mut cb_rx) = mpsc::unbounded_channel::<HostCallbackResult>();
+            let none = proxy
+                .internal_proxy_recv(ClientConnection::NewConnection {
+                    callbacks: cb_tx,
+                    assigned_token: None,
+                })
+                .await
+                .expect("NewConnection must not error");
+            assert!(none.is_none());
+            let Some(HostCallbackResult::NewId { id }) = cb_rx.recv().await else {
+                panic!("NewId must be the first callback");
+            };
+            assert!(proxy.response_channels.contains_key(&id));
+            let open_req = proxy
+                .internal_proxy_recv(ClientConnection::Request {
+                    client_id: id,
+                    req: Box::new(ClientRequest::Disconnect { cause: None }),
+                    auth_token: None,
+                    origin_contract: None,
+                    connection_scope: ConnectionScope::Local,
+                    user_context: None,
+                    api_version: ApiVersion::V1,
+                })
+                .await
+                .expect("Disconnect must not error")
+                .expect("Disconnect must still be forwarded to the node");
+            assert!(matches!(
+                *open_req.request,
+                ClientRequest::Disconnect { .. }
+            ));
+            keep_open.push(cb_rx);
+        }
+        assert!(
+            proxy.response_channels.is_empty(),
+            "{} response channels leaked after {N} disconnected clients",
+            proxy.response_channels.len()
         );
     }
 
