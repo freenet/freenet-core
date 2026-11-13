@@ -82,8 +82,9 @@ pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = None;
 /// then refuses a live cut of that version unless the clock is within 3 h of the
 /// start (`scripts/check_quic_data_ramp_t0.sh`, which reads this line, so keep
 /// it on one line in this form). Left set afterwards, like the start: it names
-/// one version, so later releases are not checked. An emergency stop that sets
-/// the start back to `None` leaves this as it is.
+/// one version, so a later release is not held to T0, though one that would
+/// ship the ramp unchecked (before this release, or skipping it) is refused. An
+/// emergency stop that sets the start back to `None` leaves this as it is.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(in crate::transport) const QUIC_DATA_RAMP_RELEASE: Option<&str> = None;
 

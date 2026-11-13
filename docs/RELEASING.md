@@ -504,6 +504,30 @@ Current wire-gated floors:
   `quic_native_floor_stays_above_every_release_without_the_decoder` catches the
   floor being lowered.
 
+- `QUIC_DATA_RAMP_START` (T0) and `QUIC_DATA_RAMP_RELEASE` in
+  `crates/core/src/transport/quic/upgrade/policy.rs` (#5940): both `None` in
+  tree. The reviewed PR for the QUIC data ramp release sets T0 to the planned
+  publish time, in Unix seconds, and `QUIC_DATA_RAMP_RELEASE` to that release's
+  version. `scripts/check_quic_data_ramp_t0.sh` then refuses a live cut of
+  that version when the clock is more than 3 h from T0 either side (a dry run
+  only warns). It runs at dispatch (release.yml's validate job), again in
+  cross-compile.yml's attach-to-release job just before the crates.io publish
+  and the un-draft (so "re-run failed jobs" checks the clock it publishes at),
+  and in `scripts/release.sh` at its start and before each publish. What it
+  measures is the publish time; nodes take the release over the 0-4 h
+  auto-update stagger on top of it. Both constants stay set afterwards: a later
+  version passes with a warning. A version that would ship the ramp unchecked
+  fails closed: one before `QUIC_DATA_RAMP_RELEASE`, one that skips it while
+  the tree has not reached it (an auto-bump past a taken number), or one cut
+  more than 3 h before T0, and T0 set with no ramp release named. Cut the ramp
+  release with `--field version=X.Y.Z` set to `QUIC_DATA_RAMP_RELEASE`, not
+  the auto-bump. If that version is already taken, change the constant in the
+  same reviewed PR as T0. A later re-ramp must set a new T0 and a new
+  `QUIC_DATA_RAMP_RELEASE` together: a new T0 with a stale release name is
+  not caught when the cut comes more than 3 h after the new T0. If the publish
+  slips more than about 3 h past T0, re-set T0 in a new reviewed PR before
+  publishing.
+
 - `QUIC_DATA_PERCENT` in `crates/core/src/transport/quic/upgrade/policy.rs` (the
   share of pairs that carry data on QUIC, #5940). It stays at its value unless
   this release is a rollout step (0, 5, 25, 100), changed in its own PR. That PR also edits the expectations that pin 0:
@@ -521,15 +545,7 @@ Current wire-gated floors:
   updates 12 h after T0 starts at 25%, and one that updates 24 h or more after
   T0 starts at 100%, skipping the ramp. **If the publish slips more than about
   3 h past T0, re-set T0 in a new reviewed PR before publishing.** The same PR
-  sets `QUIC_DATA_RAMP_RELEASE` (beside T0) to that release's version, and
-  release.yml's validate job then refuses a live cut of that version when the
-  clock is more than 3 h from T0 either side (`scripts/check_quic_data_ramp_t0.sh`;
-  a dry run only warns). It checks no other version, so both constants stay set
-  afterwards. Because it is keyed on the exact version, cut the ramp release
-  with `--field version=X.Y.Z` set to the value of `QUIC_DATA_RAMP_RELEASE`,
-  not the auto-bump. If the ramp ships under another version, the check passes
-  without checking anything. If that version is already taken, change the
-  constant in the same reviewed PR as T0. A node whose
+  sets `QUIC_DATA_RAMP_RELEASE` (see the entry above for the release-time check). A node whose
   clock reads before T0 gets 5%. The soak runs before T0, so it exercises only
   the 5% share. That PR also updates the expectation that pins the release's
   share, the `quic-data-release-share` case in `simulation_integration.rs`.
