@@ -165,6 +165,7 @@ fn peer_close(connection: &QuicConnection, peer_is_gateway: bool) -> Option<Hell
         | QuicCloseCode::PeerNotAcknowledging
         | QuicCloseCode::ControlRefused
         | QuicCloseCode::SessionEnded
+        | QuicCloseCode::RecycleForData
         | QuicCloseCode::OverBudget => None,
     }
 }
