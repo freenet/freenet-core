@@ -3,7 +3,7 @@
 //!
 //! Two close codes recycle a path, each counted in `quic_close_sent_<label>`
 //! ([`QuicCloseCode`]): too many locally reset sends (1, below), and
-//! `PEER_NOT_ACKNOWLEDGING`, which the acknowledgement watch's rules (2-5,
+//! `PEER_NOT_ACKNOWLEDGING`, which the acknowledgement watch's rules (2-6,
 //! below) all close with. Either code asks the peer to fall back to UDP for
 //! THIS connection only. It is not a permanent
 //! downgrade: e5 must let the pair upgrade again after its normal backoff.
@@ -39,25 +39,29 @@
 //!    that sends ACK frames for none of this side's data; a peer that
 //!    acknowledges something within each window is never closed by it.
 //!
-//! The same watch runs three liveness rules (#5940 PR 4), each also closing
+//! The same watch runs four liveness rules (#5940 PR 4), each also closing
 //! with [`close_code::PEER_NOT_ACKNOWLEDGING`] and recorded as a [`Stall`]:
 //!
 //! 3. **Dark** ([`Stall::Dark`]): this side's packets outstanding at every
 //!    sample for the window, nothing acknowledged and nothing heard from the
-//!    peer, and a send made a window after the spell began unanswered for
-//!    its grace (three round trips, from one tick up to [`DARK_GRACE_MAX`]).
-//!    quinn sends again after an outage only at its next backed-off probe,
-//!    so without that probe a spell shorter than the window could still
-//!    close the path ([`dark_close_bound`] gives the latest close). It closes
+//!    peer, and two rounds of sends made after the window unanswered, the
+//!    second for its grace (three round trips, from one tick up to
+//!    [`DARK_GRACE_MAX`]). quinn sends again after an outage only at its
+//!    next backed-off probe, so without those rounds a spell shorter than
+//!    the window, or one lost probe round, could close the path ([`dark_close_bound`] gives the latest close). It closes
 //!    only a path that carries data; every path counts its dark episodes.
 //! 4. **Credit-starved** ([`Stall::CreditStarved`], [`CreditWatch`]): sends
 //!    waited on the peer's flow-control credit, seen either with
 //!    application-limited acknowledgements or with nothing outstanding, and
 //!    the peer acknowledged under its floor rate ([`credit_floor_rate`]).
 //! 5. **Stream credit withheld** ([`Stall::StreamCreditWithheld`],
-//!    [`StreamCreditWatch`]): sends waited for the peer's stream limit for
-//!    [`STREAM_CREDIT_WINDOW`] after enough of this side's streams were
-//!    wholly acknowledged that an honest peer would have raised it.
+//!    [`StreamCreditWatch`]): the peer granted no stream credit for
+//!    [`STREAM_CREDIT_WINDOW`] while this side wanted streams, though enough
+//!    of this side's streams were wholly acknowledged that an honest peer
+//!    would have.
+//! 6. **Stream ends unacknowledged** ([`Stall::StreamEndsUnacknowledged`]):
+//!    [`ACK_WAIT_EXPIRY_LIMIT`] streams in a row reached their ack wait with
+//!    their end unacknowledged and none was wholly acknowledged between.
 //!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
 //! counter of packets the peer newly acknowledged: `frame_rx.acks` counts

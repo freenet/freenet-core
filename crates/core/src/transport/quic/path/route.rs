@@ -182,8 +182,8 @@ pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, Qui
 /// count: a path whose sends nothing acknowledges is closed by its
 /// acknowledgement watch's dark-path rule (`recycle::AckWatch`); a peer that
 /// acknowledges other traffic but never a stream's end has the stream reset
-/// at its ack wait, counted as an abort toward `recycle::SEND_ABORT_LIMIT`
-/// (`bounded::SendDeadlines::ack_wait`); and a peer that withholds its
+/// at its ack wait (`bounded::SendDeadlines::ack_wait`), and three in a row
+/// close the path (`recycle::ACK_WAIT_EXPIRY_LIMIT`); and a peer that withholds its
 /// stream limit is closed by the stream-credit rule
 /// (`recycle::StreamCreditWatch`).
 fn timed_out(outcome: &BoundedSend) -> bool {
