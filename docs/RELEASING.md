@@ -518,15 +518,35 @@ Current wire-gated floors:
   auto-update stagger on top of it. Both constants stay set afterwards: a later
   version passes with a warning. A version that would ship the ramp unchecked
   fails closed: one before `QUIC_DATA_RAMP_RELEASE`, one that skips it while
-  the tree has not reached it (an auto-bump past a taken number), or one cut
-  more than 3 h before T0, and T0 set with no ramp release named. Cut the ramp
-  release with `--field version=X.Y.Z` set to `QUIC_DATA_RAMP_RELEASE`, not
-  the auto-bump. If that version is already taken, change the constant in the
-  same reviewed PR as T0. A later re-ramp must set a new T0 and a new
-  `QUIC_DATA_RAMP_RELEASE` together: a new T0 with a stale release name is
-  not caught when the cut comes more than 3 h after the new T0. If the publish
-  slips more than about 3 h past T0, re-set T0 in a new reviewed PR before
-  publishing.
+  the tree has not reached it (an auto-bump past a taken number), one cut
+  while `freenet` at `QUIC_DATA_RAMP_RELEASE` is not on crates.io or crates.io
+  gives no clear answer (the ramp release's bump merged but its publish failed
+  or was cancelled), or one cut more than 3 h before T0, and T0 set with no
+  ramp release named. Cut the ramp release with `--field version=X.Y.Z` set to
+  `QUIC_DATA_RAMP_RELEASE`, not the auto-bump. If that version is already
+  taken, change the constant in the same reviewed PR as T0. A later re-ramp
+  must set a new T0 and a new `QUIC_DATA_RAMP_RELEASE` together: a new T0 with
+  a stale release name is not caught when the cut comes more than 3 h after
+  the new T0. If the publish slips more than about 3 h past T0, re-set T0 in a
+  new reviewed PR before publishing.
+
+  Which check guards which side. The dispatch check (release.yml) reads the
+  tree before the version bump, so it is the one that sees a cut version
+  skipping or preceding the ramp release. At the tag the tree is already the
+  cut version, so the attach-to-release check sees only the clock and the
+  publication of the ramp release, not a skip. One case neither sees at cut
+  time: `QUIC_DATA_RAMP_RELEASE` naming a version that ships before the ramp
+  PR merges. CI covers it: `scripts/check_quic_data_ramp_t0_test.sh` fails a
+  tree where T0 is more than 3 h away and `QUIC_DATA_RAMP_RELEASE` is not
+  above the `crates/core` version. The same test requires each state the
+  constants pass through to pass CI, including the emergency stop (T0 back to
+  `None` with the release left named: a later version passes, the named one is
+  refused).
+
+  The attach-to-release check reads the version from the tag and accepts only
+  `X.Y.Z`. A pre-release tag (`v0.2.157-rc1`) exits 2 there and stops the
+  publish. The project tags no pre-releases; one would need the check taught
+  its form first.
 
 - `QUIC_DATA_PERCENT` in `crates/core/src/transport/quic/upgrade/policy.rs` (the
   share of pairs that carry data on QUIC, #5940). It stays at its value unless
