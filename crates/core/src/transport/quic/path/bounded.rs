@@ -79,6 +79,10 @@ pub(crate) struct SendDeadlines {
     /// abort (`Outgoing`'s drop), so a peer that never acknowledges a
     /// stream's last packet cannot hold its permit and send epoch for long.
     pub(crate) ack_wait: Option<Duration>,
+    /// The ack wait also covers the backlog ahead of the stream's end, read
+    /// when the end is sent ([`SendProgress::mark_finished_behind`]): a
+    /// node's sends (`QuicPath::stream_deadlines`).
+    pub(crate) ack_wait_covers_backlog: bool,
 }
 
 impl SendDeadlines {
@@ -90,6 +94,7 @@ impl SendDeadlines {
             source_gap: None,
             total: timeout,
             ack_wait: None,
+            ack_wait_covers_backlog: false,
         }
     }
 
@@ -104,9 +109,15 @@ impl SendDeadlines {
                 source_gap: None,
                 total: SHORT_TOTAL_TIMEOUT,
                 ack_wait: None,
+                ack_wait_covers_backlog: false,
             }
         } else {
-            Self::stream(len)
+            // It holds a permit and shares the link as a stream does, so its
+            // ack wait covers the backlog ahead of its end too.
+            Self {
+                ack_wait_covers_backlog: true,
+                ..Self::stream(len)
+            }
         }
     }
 
@@ -129,6 +140,7 @@ impl SendDeadlines {
             source_gap: None,
             total,
             ack_wait: Some(inbound_stream_age_limit(len).min(total)),
+            ack_wait_covers_backlog: false,
         }
     }
 
@@ -266,6 +278,14 @@ struct ProgressState {
     finished_at: AtomicU64,
     /// [`SendProgress::ack_wait_ended`].
     ack_wait_ended: AtomicBool,
+    /// [`SendProgress::ack_wait_due`].
+    ack_wait_due: AtomicU64,
+    /// The ack wait's deadline once the end is sent, recorded each time the
+    /// loop arms; zero before ([`SendProgress::ack_wait_left`]).
+    ack_wait_deadline: AtomicU64,
+    /// The backlog ahead of the end when it was sent, in nanoseconds
+    /// ([`SendProgress::mark_finished_behind`]).
+    backlog_wait: AtomicU64,
 }
 
 impl SendProgress {
@@ -286,6 +306,9 @@ impl SendProgress {
             refused: AtomicBool::new(false),
             finished_at: AtomicU64::new(0),
             ack_wait_ended: AtomicBool::new(false),
+            ack_wait_due: AtomicU64::new(0),
+            ack_wait_deadline: AtomicU64::new(0),
+            backlog_wait: AtomicU64::new(0),
         }))
     }
 
@@ -305,6 +328,9 @@ impl SendProgress {
             refused: AtomicBool::new(false),
             finished_at: AtomicU64::new(0),
             ack_wait_ended: AtomicBool::new(false),
+            ack_wait_due: AtomicU64::new(0),
+            ack_wait_deadline: AtomicU64::new(0),
+            backlog_wait: AtomicU64::new(0),
         }))
     }
 
@@ -403,7 +429,16 @@ impl SendProgress {
     }
 
     /// Every byte was written and the end of the stream queued.
+    #[cfg(test)]
     pub(super) fn mark_finished(&self) {
+        self.mark_finished_behind(Duration::ZERO);
+    }
+
+    /// [`Self::mark_finished`], with `backlog`: how long the bytes still
+    /// ahead of the stream's end may take to go out, which extends its ack
+    /// wait ([`SendDeadlines::ack_wait`]) to at least that, within its total.
+    pub(super) fn mark_finished_behind(&self, backlog: Duration) {
+        self.0.backlog_wait.store(nanos(backlog), Ordering::Release);
         self.0.finished_at.store((self.0.now)(), Ordering::Release);
         self.0.stage.store(STAGE_FINISHED, Ordering::Release);
         // The loop re-arms at the ack wait's end, which may come before the
@@ -417,6 +452,20 @@ impl SendProgress {
     /// sees it.
     pub(super) fn ack_wait_ended(&self) -> bool {
         self.0.ack_wait_ended.load(Ordering::Acquire)
+    }
+
+    /// When the ack wait that ended was due, in nanoseconds on the send's
+    /// clock ([`Self::ack_wait_ended`]).
+    pub(super) fn ack_wait_due(&self) -> u64 {
+        self.0.ack_wait_due.load(Ordering::Acquire)
+    }
+
+    /// What is left of the ack wait of a send whose end was sent, if it has
+    /// one: from now to its deadline, at most `deadlines.total` from the
+    /// start (recorded by [`bounded_send`]).
+    pub(super) fn ack_wait_left(&self) -> Option<Duration> {
+        let deadline = self.0.ack_wait_deadline.load(Ordering::Acquire);
+        (deadline != 0).then(|| Duration::from_nanos(deadline.saturating_sub((self.0.now)())))
     }
 
     fn stage(&self) -> u8 {
@@ -461,10 +510,15 @@ impl SendProgress {
             }
             _ => (
                 deadlines.ack_wait.map_or(total, |wait| {
+                    let backlog = if deadlines.ack_wait_covers_backlog {
+                        self.0.backlog_wait.load(Ordering::Acquire)
+                    } else {
+                        0
+                    };
                     self.0
                         .finished_at
                         .load(Ordering::Acquire)
-                        .saturating_add(nanos(wait))
+                        .saturating_add(nanos(wait).max(backlog))
                         .min(total)
                 }),
                 false,
@@ -833,6 +887,12 @@ where
         }
         #[cfg(test)]
         progress.0.arms.fetch_add(1, Ordering::Relaxed);
+        if progress.stage() == STAGE_FINISHED && deadlines.ack_wait.is_some() {
+            progress
+                .0
+                .ack_wait_deadline
+                .store(deadline, Ordering::Release);
+        }
         let wait = Duration::from_nanos(deadline.saturating_sub(time.now_nanos()));
         tokio::select! {
             result = &mut send => {
@@ -864,6 +924,9 @@ where
                     // send without one keeps waiting for its acknowledgement
                     // past its own deadline (`Outgoing`'s drop).
                     if progress.stage() == STAGE_FINISHED && deadlines.ack_wait.is_some() {
+                        // The deadline this timer slept to: a late wake is
+                        // judged against it (`StrikeCheck`).
+                        progress.0.ack_wait_due.store(deadline, Ordering::Release);
                         progress.0.ack_wait_ended.store(true, Ordering::Release);
                     }
                     return progress.timed_out();

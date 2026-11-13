@@ -3,7 +3,7 @@
 //!
 //! Two close codes recycle a path, each counted in `quic_close_sent_<label>`
 //! ([`QuicCloseCode`]): too many locally reset sends (1, below), and
-//! `PEER_NOT_ACKNOWLEDGING`, which the acknowledgement watch's rules (2-5,
+//! `PEER_NOT_ACKNOWLEDGING`, which the acknowledgement watch's rules (2-6,
 //! below) all close with. Either code asks the peer to fall back to UDP for
 //! THIS connection only. It is not a permanent
 //! downgrade: e5 must let the pair upgrade again after its normal backoff.
@@ -39,7 +39,7 @@
 //!    that sends ACK frames for none of this side's data; a peer that
 //!    acknowledges something within each window is never closed by it.
 //!
-//! The same watch runs three liveness rules (#5940 PR 4), each also closing
+//! The same watch runs four liveness rules (#5940 PR 4, #6205), each also closing
 //! with [`close_code::PEER_NOT_ACKNOWLEDGING`] and recorded as a [`Stall`]:
 //!
 //! 3. **Dark** ([`Stall::Dark`]): this side's packets outstanding at every
@@ -59,6 +59,11 @@
 //!    [`STREAM_CREDIT_WINDOW`] while this side wanted streams, though enough
 //!    of this side's streams were wholly acknowledged that an honest peer
 //!    would have.
+//! 6. **Ack waits expired** ([`Stall::AckWaitsExpired`]), observe-only
+//!    ([`ACK_WAITS_EXPIRED_CLOSES`]): [`ACK_WAIT_EXPIRY_LIMIT`] sends had
+//!    their wait for the acknowledgement of their end run out within
+//!    [`ACK_WAIT_EXPIRY_WINDOW`]; counted (`quic_stall_would_close_<label>`),
+//!    and the path stays open.
 //!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
 //! counter of packets the peer newly acknowledged: `frame_rx.acks` counts
@@ -260,6 +265,13 @@ pub(crate) fn dark_close_bound(rtt: Duration) -> Duration {
     first * 2 + pto + ACK_WATCH_TICK * 2 + grace
 }
 
+/// The latest the dark rule closes a path that stays dark, at round trips
+/// up to 800 ms ([`dark_close_bound`], about 74 s there). A send waiting for
+/// its acknowledgement through an outage the dark rule tolerates is acked
+/// after it, at the latest when the peer is next heard (`SHORT_ACK_WAIT` is
+/// sized from this).
+pub(crate) const DARK_CLOSE_MAX: Duration = Duration::from_secs(75);
+
 /// How often the acknowledgement watch samples the connection.
 ///
 /// The window starts at the first sample that sees its starting event (a
@@ -452,6 +464,12 @@ pub(crate) struct AckState {
     in_flight_after_acks: u64,
     /// Bytes declared lost since that batch (`on_congestion_event`).
     lost_since_acks: u64,
+    /// The latest batch came while quinn was application-limited: its last
+    /// `poll_transmit` built nothing and was not held back by the congestion
+    /// window or pacing (quinn-proto `app_limited = buf.is_empty() &&
+    /// !congestion_blocked`), so it had nothing left to send but what the
+    /// peer's flow control held.
+    last_batch_app_limited: bool,
 }
 
 impl AckState {
@@ -485,10 +503,36 @@ impl AckProgress {
         self.0.lock().acked
     }
 
+    /// Bytes the peer has newly acknowledged so far.
+    pub(crate) fn acked_bytes(&self) -> u64 {
+        self.0.lock().acked_bytes
+    }
+
+    /// Batches of acknowledgements so far, and whether the latest came while
+    /// quinn was application-limited ([`AckState`]).
+    pub(crate) fn batches_app_limited(&self) -> (u64, bool) {
+        let state = self.0.lock();
+        (state.batches, state.last_batch_app_limited)
+    }
+
     /// A record of no connection, moved by [`Self::ack`]. Tests only.
     #[cfg(test)]
     pub(crate) fn detached() -> Self {
         Self(Arc::default())
+    }
+
+    /// A batch of acknowledgements of `bytes`, which came while quinn was
+    /// `app_limited` or not. Tests only.
+    #[cfg(test)]
+    pub(crate) fn batch(&self, bytes: u64, app_limited: bool) {
+        let mut state = self.0.lock();
+        state.acked += 1;
+        state.acked_bytes += bytes;
+        state.batches += 1;
+        if !app_limited {
+            state.congestion_limited_batches += 1;
+        }
+        state.last_batch_app_limited = app_limited;
     }
 
     /// The peer newly acknowledged one more packet. Tests only.
@@ -604,6 +648,7 @@ impl Controller for CappedCubic {
             if !app_limited {
                 state.congestion_limited_batches += 1;
             }
+            state.last_batch_app_limited = app_limited;
             state.in_flight_after_acks = in_flight;
             state.lost_since_acks = 0;
         }
@@ -739,6 +784,8 @@ pub(crate) struct AckSample {
     streams_ended: u64,
     /// This side's data streams opened ([`Writers::streams_opened`]).
     streams_opened: u64,
+    /// This side's ack waits run out ([`Writers::ack_wait_expiries`]).
+    ack_wait_expiries: u64,
 }
 
 impl AckSample {
@@ -783,6 +830,7 @@ impl AckSample {
             stream_waiters: writers.stream_waiters(),
             streams_ended: writers.streams_ended(),
             streams_opened: writers.streams_opened(),
+            ack_wait_expiries: writers.ack_wait_expiries(),
         })
     }
 
@@ -847,6 +895,7 @@ impl AckSample {
             stream_waiters: 0,
             streams_ended: 0,
             streams_opened: 0,
+            ack_wait_expiries: 0,
         }
     }
 
@@ -886,6 +935,13 @@ impl AckSample {
         self
     }
 
+    /// The same sample with `expiries` ack waits run out so far. Tests only.
+    #[cfg(test)]
+    pub(crate) fn with_ack_wait_expiries(mut self, expiries: u64) -> Self {
+        self.ack_wait_expiries = expiries;
+        self
+    }
+
     /// The same sample with quinn's smoothed round trip at `rtt`. Tests only.
     #[cfg(test)]
     pub(crate) fn with_rtt(mut self, rtt: Duration) -> Self {
@@ -910,6 +966,9 @@ pub(crate) struct Writers {
     opened: AtomicU64,
     /// Sends waiting in `open_uni` for the peer's stream credit now.
     waiting_for_stream: AtomicUsize,
+    /// Sends whose wait for the acknowledgement of their end ran out and
+    /// whose stream was reset, so far ([`ACK_WAIT_EXPIRY_LIMIT`]).
+    ack_wait_expiries: AtomicU64,
 }
 
 impl Writers {
@@ -949,6 +1008,22 @@ impl Writers {
         LiveStream(self.clone())
     }
 
+    /// A send's wait for the acknowledgement of its end ran out and its
+    /// stream was reset; counted in `node` by `kind` too.
+    pub(crate) fn ack_wait_expired(
+        &self,
+        node: &crate::transport::metrics::QuicDataCounters,
+        kind: crate::transport::metrics::AckWaitKind,
+    ) {
+        self.ack_wait_expiries.fetch_add(1, Ordering::Relaxed);
+        node.record_ack_wait_expired(kind);
+    }
+
+    /// The path's ack waits run out so far.
+    pub(crate) fn ack_wait_expiries(&self) -> u64 {
+        self.ack_wait_expiries.load(Ordering::Relaxed)
+    }
+
     /// The path's data streams that have ended so far, in any way.
     pub(crate) fn streams_ended(&self) -> u64 {
         self.ended.load(Ordering::Relaxed)
@@ -959,6 +1034,13 @@ impl Writers {
 /// ended ([`Writers::streams_ended`]), however it ended.
 #[derive(Debug)]
 pub(crate) struct LiveStream(Arc<Writers>);
+
+impl LiveStream {
+    /// The path's counts it is counted in.
+    pub(crate) fn writers(&self) -> &Writers {
+        &self.0
+    }
+}
 
 impl Drop for LiveStream {
     fn drop(&mut self) {
@@ -1075,6 +1157,13 @@ pub(crate) struct AckWatch {
     previous_at: Option<u64>,
     /// Time skipped so far because a sample came late ([`Self::watch_time`]).
     skipped: u64,
+    /// The ack-wait expiries seen so far, and when the latest ones were
+    /// seen, within [`ACK_WAIT_EXPIRY_WINDOW`].
+    expiries_seen: u64,
+    expiries_at: VecDeque<u64>,
+    /// Times the ack-wait expiry rule would have closed the path
+    /// ([`ACK_WAITS_EXPIRED_CLOSES`]).
+    would_close: u64,
 }
 
 /// Whether the egress cap holds, or held since `previous` was read, a QUIC
@@ -1119,6 +1208,7 @@ impl AckWatch {
     }
 
     pub(crate) fn new(window: Duration, first: AckSample) -> Self {
+        let expiries_seen = first.ack_wait_expiries;
         let window_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
         Self {
             window_nanos,
@@ -1142,6 +1232,9 @@ impl AckWatch {
             hold_unchanged_since: None,
             previous_at: None,
             skipped: 0,
+            expiries_seen,
+            expiries_at: VecDeque::new(),
+            would_close: 0,
         }
     }
 
@@ -1162,6 +1255,30 @@ impl AckWatch {
         }
         self.previous_at = Some(now_nanos);
         now_nanos.saturating_sub(self.skipped)
+    }
+
+    /// The ack-wait expiry rule: `expiries` so far, at `now_nanos`; whether
+    /// [`ACK_WAIT_EXPIRY_LIMIT`] of them came within
+    /// [`ACK_WAIT_EXPIRY_WINDOW`]. Acknowledgements never reset the count:
+    /// an honest peer acknowledges a send's end within a few round trips of
+    /// its last byte, the ack wait is minutes, and a path dark for that long
+    /// is the dark rule's first, so an expiry on a live path is evidence on
+    /// its own, whatever else the peer acknowledges.
+    fn ack_waits_expired(&mut self, now_nanos: u64, expiries: u64) -> bool {
+        let new = expiries.saturating_sub(self.expiries_seen);
+        self.expiries_seen = expiries;
+        for _ in 0..new.min(u64::from(ACK_WAIT_EXPIRY_LIMIT)) {
+            self.expiries_at.push_back(now_nanos);
+        }
+        let window = u64::try_from(ACK_WAIT_EXPIRY_WINDOW.as_nanos()).unwrap_or(u64::MAX);
+        while self
+            .expiries_at
+            .front()
+            .is_some_and(|&at| now_nanos.saturating_sub(at) > window)
+        {
+            self.expiries_at.pop_front();
+        }
+        self.expiries_at.len() >= ACK_WAIT_EXPIRY_LIMIT as usize
     }
 
     /// Count dark episodes in `node`, and let the dark-path rule close the
@@ -1203,6 +1320,21 @@ impl AckWatch {
         self.end_dark(Some(crate::transport::metrics::DarkEnd::Unrecovered));
     }
 
+    /// Count the close [`Self::observe`] asked for, by why, where dark
+    /// episodes are counted (`quic_stall_close_<label>`).
+    pub(crate) fn record_close(&self) {
+        if let (Some(node), Some(stall)) = (self.dark_counts, self.stall) {
+            node.record_stall_close(stall.index());
+        }
+    }
+
+    /// Times the ack-wait expiry rule would have closed the path
+    /// ([`ACK_WAITS_EXPIRED_CLOSES`]). Tests only.
+    #[cfg(test)]
+    pub(crate) fn would_close(&self) -> u64 {
+        self.would_close
+    }
+
     /// Why the path must close, once [`Self::observe`] said so.
     pub(crate) fn stall(&self) -> Option<Stall> {
         self.stall
@@ -1235,6 +1367,7 @@ impl AckWatch {
         let cap_held = self.cap_held(now_nanos, &sample.cap, &previous_cap);
         let previous_now = self.previous_now.replace(dark_now);
         let withheld = same_controller && self.stream_credit.observe(now_nanos, &sample);
+        let expired = self.ack_waits_expired(now_nanos, sample.ack_wait_expiries);
         let rtt = sample.rtt;
         // Packets this side sent after the latest batch of acknowledgements
         // are outstanding too, though no batch counted them: at the start of
@@ -1259,6 +1392,20 @@ impl AckWatch {
         } else {
             self.quiet_samples.saturating_add(1)
         };
+        // Not judged against the peer's timing, so a cap hold does not
+        // suspend it.
+        if expired {
+            if ACK_WAITS_EXPIRED_CLOSES {
+                return Some(Stall::AckWaitsExpired);
+            }
+            // Observe only: count it, and start the window afresh so the
+            // next count needs as many new strikes.
+            if let Some(node) = self.dark_counts {
+                node.record_stall_would_close(Stall::AckWaitsExpired.index());
+            }
+            self.would_close += 1;
+            self.expiries_at.clear();
+        }
         if cap_held {
             // A send counted in quinn's stats may still wait in the egress
             // cap, so nothing says when it left: no latch, no window.
@@ -1373,6 +1520,11 @@ pub(crate) enum Stall {
     /// for [`STREAM_CREDIT_WINDOW`], though enough of this side's streams
     /// ended that an honest peer would have ([`StreamCreditWatch`]).
     StreamCreditWithheld,
+    /// [`ACK_WAIT_EXPIRY_LIMIT`] of this side's sends had their wait for the
+    /// acknowledgement of their end run out within
+    /// [`ACK_WAIT_EXPIRY_WINDOW`] ([`AckWatch`]). Observe-only for now: counted
+    /// as a would-close, the path not closed ([`ACK_WAITS_EXPIRED_CLOSES`]).
+    AckWaitsExpired,
 }
 
 impl Stall {
@@ -1383,6 +1535,18 @@ impl Stall {
             Self::Dark => "dark",
             Self::CreditStarved => "credit_starved",
             Self::StreamCreditWithheld => "stream_credit_withheld",
+            Self::AckWaitsExpired => "ack_waits_expired",
+        }
+    }
+
+    /// Its index in `quic_stall_close_<label>`.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::NotAcknowledging => 0,
+            Self::Dark => 1,
+            Self::CreditStarved => 2,
+            Self::StreamCreditWithheld => 3,
+            Self::AckWaitsExpired => 4,
         }
     }
 }
@@ -1542,6 +1706,31 @@ pub(crate) const STREAM_CREDIT_WINDOW: Duration = Duration::from_secs(60);
 /// at most `MAX_UNI_STREAMS` (64). Fewer streams in flight need fewer
 /// ([`StreamCreditWatch`]).
 pub(crate) const STREAM_CREDIT_FREED: u64 = super::config::MAX_UNI_STREAMS as u64 / 8 + 1;
+
+/// Whether the ack-wait expiry rule ([`Stall::AckWaitsExpired`]) closes a
+/// path. It does not yet: strikes are counted (`quic_ack_wait_expired_<label>`)
+/// and each time [`ACK_WAIT_EXPIRY_LIMIT`] come within
+/// [`ACK_WAIT_EXPIRY_WINDOW`] is counted as a would-close
+/// (`quic_stall_would_close_ack_waits_expired`), and the path stays open.
+/// The strike can still misjudge an honest path (the backlog ahead of a
+/// stream's end is read when the end is sent, so streams started after it
+/// are not counted), so the close waits for a follow-up calibrated from
+/// those counts (#6205).
+pub(crate) const ACK_WAITS_EXPIRED_CLOSES: bool = false;
+
+/// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that would close a
+/// path ([`Stall::AckWaitsExpired`]; counted only,
+/// [`ACK_WAITS_EXPIRED_CLOSES`]): sends whose wait for the acknowledgement of
+/// their end ran out (`bounded::SendDeadlines::ack_wait`, at least 5 min, or
+/// a one-packet Short's background wait, `path::SHORT_ACK_WAIT`, 120 s) and
+/// whose stream was reset. Counted only when the reset happened (an
+/// acknowledgement racing the deadline leaves nothing to reset), and never
+/// reset by acknowledgements, so a peer that acknowledges everything else,
+/// or one end in three, is still counted.
+pub(crate) const ACK_WAIT_EXPIRY_LIMIT: u32 = 3;
+
+/// The window [`ACK_WAIT_EXPIRY_LIMIT`] expiries must fall in.
+pub(crate) const ACK_WAIT_EXPIRY_WINDOW: Duration = Duration::from_secs(30 * 60);
 
 /// How recently a send must have waited for stream credit for the
 /// stream-credit rule to close the path: a peer withholding credit nobody
@@ -1717,12 +1906,13 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
             if !report.watch_closes {
                 continue;
             }
-            // One close code for all three: it tells the peer only that this
-            // side stopped using the path.
+            // One close code for every rule: it tells the peer only that this
+            // side stopped using the path; why is counted and logged here.
             if closer.close_for(
                 QuicCloseCode::PeerNotAcknowledging,
                 crate::transport::boundary::QuicPathEnd::NotAcknowledging,
             ) {
+                watch.record_close();
                 #[cfg(test)]
                 if let Some(stall) = watch.stall() {
                     TEST_STALLS
@@ -1731,10 +1921,9 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
                 }
                 tracing::warn!(
                     remote = %connection.remote_address(),
-                    window = ?ACK_WATCH_WINDOW,
                     stall = watch.stall().map_or("", Stall::label),
-                    "QUIC path: the peer did not acknowledge this node's data within \
-                     the window; closing the path so the connection falls back to UDP"
+                    "QUIC path: the peer stopped delivering on this path (see the stall \
+                     reason); closing the path so the connection falls back to UDP"
                 );
             }
             return;

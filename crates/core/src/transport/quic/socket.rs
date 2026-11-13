@@ -87,6 +87,9 @@ pub(crate) struct CapHolds {
     /// Polls the cap answered `Pending`, ever: a poller starting to wait,
     /// and every later poll while it still waits.
     holds: AtomicU64,
+    /// Time pollers spent held, in nanoseconds on the cap's clock, added
+    /// when each hold ends ([`Self::held_time`]).
+    held_nanos: AtomicU64,
     /// [`cap_hold_validity`] of the cap's rate; zero without a cap.
     validity: Duration,
     /// [`cap_transmit_wait`] of the cap's rate; zero without a cap.
@@ -177,8 +180,16 @@ impl CapHolds {
         self.holds.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn release(&self) {
+    /// A held poller was admitted (or dropped) after `held_nanos` held.
+    fn release(&self, held_nanos: u64) {
+        self.held_nanos.fetch_add(held_nanos, Ordering::Relaxed);
         self.held_now.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Time pollers spent held so far, summed over holds that have ended;
+    /// a hold in progress is not included ([`CapHoldReading::held_now`]).
+    pub(crate) fn held_time(&self) -> Duration {
+        Duration::from_nanos(self.held_nanos.load(Ordering::Relaxed))
     }
 
     /// The cap starts holding one more poller, as a poll answered `Pending`
@@ -188,10 +199,22 @@ impl CapHolds {
         self.waiting(false);
     }
 
+    /// A held poller was polled and is still held. Tests only.
+    #[cfg(test)]
+    pub(crate) fn poll_held_one(&self) {
+        self.waiting(true);
+    }
+
     /// A held poller was admitted. Tests only.
     #[cfg(test)]
     pub(crate) fn release_one(&self) {
-        self.release();
+        self.release(0);
+    }
+
+    /// A held poller was admitted after `held`. Tests only.
+    #[cfg(test)]
+    pub(crate) fn release_one_after(&self, held: Duration) {
+        self.release(u64::try_from(held.as_nanos()).unwrap_or(u64::MAX));
     }
 
     /// Pollers built outside [`with_poller_holds`] from this template
@@ -534,6 +557,7 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
             socket: self,
             waiter: std::sync::Mutex::new(AdmissionWaiter::default()),
             held: false,
+            held_since: 0,
         })
     }
 
@@ -783,15 +807,21 @@ struct QuicPoller<S> {
     waiter: std::sync::Mutex<AdmissionWaiter>,
     /// The cap is holding this poller's transmit ([`CapHolds`]).
     held: bool,
+    /// When the current hold started, in nanoseconds on the cap's clock.
+    held_since: u64,
 }
 
 impl<S> QuicPoller<S> {
     /// Record the cap's answer to this poll ([`CapHolds`]).
-    fn record_admission(&mut self, waiting: bool) {
+    /// `now` is the cap's clock.
+    fn record_admission(&mut self, waiting: bool, now: u64) {
         if waiting {
+            if !self.held {
+                self.held_since = now;
+            }
             self.holds.waiting(self.held);
         } else if self.held {
-            self.holds.release();
+            self.holds.release(now.saturating_sub(self.held_since));
         }
         self.held = waiting;
     }
@@ -800,7 +830,9 @@ impl<S> QuicPoller<S> {
 impl<S> Drop for QuicPoller<S> {
     fn drop(&mut self) {
         if self.held {
-            self.holds.release();
+            // The hold's time is not known without the cap's clock here; a
+            // poller dropped while held belongs to a connection that ended.
+            self.holds.release(0);
         }
     }
 }
@@ -887,7 +919,7 @@ impl<S: Socket> QuicPoller<S> {
                 HANDED_ADMISSION.set(Some((cap_key(cap), id)));
             }
         }
-        this.record_admission(admitted.is_pending());
+        this.record_admission(admitted.is_pending(), cap.now_nanos());
         admitted.map(Ok)
     }
 }
