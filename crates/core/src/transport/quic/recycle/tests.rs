@@ -655,6 +655,8 @@ fn the_production_values_are_pinned() {
     assert_eq!(STREAM_CREDIT_WINDOW, Duration::from_secs(60));
     assert_eq!(STREAM_CREDIT_FREED, 9);
     assert_eq!(ACK_WAIT_EXPIRY_LIMIT, 3);
+    assert_eq!(DARK_CLOSE_MAX, Duration::from_secs(75));
+    assert!(dark_close_bound(Duration::from_millis(800)) <= DARK_CLOSE_MAX);
     assert_eq!(ACK_WAIT_EXPIRY_WINDOW, Duration::from_secs(30 * 60));
     assert_eq!(super::super::path::SHORT_ACK_WAIT, Duration::from_secs(120));
     assert_eq!(

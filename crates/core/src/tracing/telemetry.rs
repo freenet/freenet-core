@@ -7903,7 +7903,8 @@ mod tests {
         data.gate_loss = (1050..1056).collect();
         data.gate_ended_queue = (1056..1059).collect();
         data.dark_episodes = (1059..1067).collect();
-        data.ack_wait_expired = (1067..1069).collect();
+        data.ack_wait_expired = (1067..1070).collect();
+        data.stall_closes = (1070..1075).collect();
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));

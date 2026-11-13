@@ -28,7 +28,8 @@
 //! | `quic_gate_loss_<verdict>` | congestion events by the loss gate's verdict (`recycle::loss_gate`): passed to Cubic as `queue`, `share` (loss share above the ceiling), `persistent`, `ecn` (a congestion mark), `no_sample`, or `ignored` as random loss; summed over the node's paths up to each path's last tick. Over a path's life they sum to its `quic_congestion_events`; within one period they can differ by the events between the two reads of a tick |
 //! | `quic_gate_ended_queue_<bucket>` | paths that ended in the period after at least 20 gate verdicts, by the share of them passed as `queue`: `lt_10pct`, `lt_50pct`, `ge_50pct`. A path whose losses mostly read as a queue runs as plain Cubic, whether the queue is real or jitter |
 //! | `quic_dark_episode_<label>` | dark episodes on QUIC paths (`recycle::AckWatch`: packets outstanding, nothing acknowledged and nothing heard) by how they ended: `recovered_lt_5s`, `lt_10s`, `lt_30s`, `lt_120s`, `recovered_ge_120s`, `unrecovered` (the path closed, or nothing was outstanding any more), `cap_held` (the egress cap held this side's sends, so darkness could no longer be told), `closed_at_window` (the dark-path rule closed a path that carries data). A path that carries no data is never closed by that rule, so its episodes run to their end; read at the watch's 2 s ticks |
-//! | `quic_ack_wait_expired_<label>` | sends whose wait for the acknowledgement of their end ran out and whose stream was reset, by kind: `stream` (a send with an ack wait: a Stream, or a Short past one packet) or `short` (a one-packet Short, past its 120 s bound). An honest peer acknowledges an end within a few round trips, so this should be 0 on every honest path (`recycle::ACK_WAIT_EXPIRY_LIMIT` in `ACK_WAIT_EXPIRY_WINDOW` closes a path) |
+//! | `quic_ack_wait_expired_<label>` | sends whose wait for the acknowledgement of their end ran out and whose stream was reset, by kind: `stream` (a send with an ack wait: a Stream, or a Short past one packet), `short` (a one-packet Short, past its 120 s bound) or `control` (a control frame, bounded as a one-packet Short); only those that count as strikes (the egress cap held none of the connection's transmits and the connection acknowledged at the floor meanwhile). An honest peer acknowledges an end within a few round trips, so this should be 0 on every honest path (`recycle::ACK_WAIT_EXPIRY_LIMIT` in `ACK_WAIT_EXPIRY_WINDOW` closes a path) |
+//! | `quic_stall_close_<label>` | paths the acknowledgement watch closed, by why: `not_acknowledging`, `dark`, `credit_starved`, `stream_credit_withheld`, `ack_waits_expired` (`recycle::Stall`) |
 //! | `quic_send_resets`, `quic_path_ms` | sends a path reset on this side, and the time QUIC paths were up, shadow paths included, up to each path's last tick: resets per connection-hour is their ratio |
 //! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
 //! | `quic_staged_peak_pct` | the most any connection staged in the period (bytes read for streams whose header its reader had not taken yet) as a percentage of its staging cap (`quic::path::inbound::ConnStaging`); streams stopped at the cap are `quic_inbound_evicted_staged` |
@@ -122,6 +123,35 @@ pub(crate) const GATE_MIN_VERDICTS: u64 = 20;
 /// queue: under 10%, under 50%, 50% or more.
 pub(crate) const GATE_QUEUE_LABELS: [&str; 3] = ["lt_10pct", "lt_50pct", "ge_50pct"];
 
+/// The labels of `quic_ack_wait_expired_<label>`: sends whose wait for the
+/// acknowledgement of their end ran out (`recycle::AckWatch`'s expiry rule),
+/// by kind: a send with an ack wait (a Stream, or a Short past one packet),
+/// a one-packet Short, or a control frame (whose background wait is bounded
+/// as a one-packet Short's).
+pub(crate) const ACK_WAIT_EXPIRED_LABELS: [&str; 3] = ["stream", "short", "control"];
+
+/// What kind of send's ack wait ran out, for `quic_ack_wait_expired_<label>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AckWaitKind {
+    /// A send with an ack wait (`bounded::SendDeadlines::ack_wait`).
+    Stream = 0,
+    /// A one-packet Short, whose acknowledgement is waited for in the
+    /// background up to its bound.
+    Short = 1,
+    /// A control frame, waited for as a one-packet Short.
+    Control = 2,
+}
+
+/// The labels of `quic_stall_close_<label>`: paths the acknowledgement watch
+/// closed, by why (`recycle::Stall::label`, in its order).
+pub(crate) const STALL_CLOSE_LABELS: [&str; 5] = [
+    "not_acknowledging",
+    "dark",
+    "credit_starved",
+    "stream_credit_withheld",
+    "ack_waits_expired",
+];
+
 /// The labels of `quic_dark_episode_<label>`: dark episodes on QUIC paths
 /// (`recycle::AckWatch`: this side's packets outstanding, nothing
 /// acknowledged and nothing heard), by how they ended: the peer was heard
@@ -133,22 +163,6 @@ pub(crate) const GATE_QUEUE_LABELS: [&str; 3] = ["lt_10pct", "lt_50pct", "ge_50p
 /// window, on a path that carries data. A path that carries no data is never
 /// closed by that rule, so its episodes run to their end and fill the longer
 /// buckets: that is what the dark-path threshold is to be checked against.
-/// The labels of `quic_ack_wait_expired_<label>`: sends whose wait for the
-/// acknowledgement of their end ran out (`recycle::AckWatch`'s expiry rule),
-/// by kind: a send with an ack wait (a Stream, or a Short past one packet),
-/// or a one-packet Short.
-pub(crate) const ACK_WAIT_EXPIRED_LABELS: [&str; 2] = ["stream", "short"];
-
-/// What kind of send's ack wait ran out, for `quic_ack_wait_expired_<label>`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AckWaitKind {
-    /// A send with an ack wait (`bounded::SendDeadlines::ack_wait`).
-    Stream = 0,
-    /// A one-packet Short, whose acknowledgement is waited for in the
-    /// background up to its bound.
-    Short = 1,
-}
-
 pub(crate) const DARK_EPISODE_LABELS: [&str; 8] = [
     "recovered_lt_5s",
     "recovered_lt_10s",
@@ -361,6 +375,7 @@ pub(crate) struct QuicDataCounters {
     gate_ended_queue: [AtomicU64; GATE_QUEUE_LABELS.len()],
     dark_episodes: [AtomicU64; DARK_EPISODE_LABELS.len()],
     ack_wait_expired: [AtomicU64; ACK_WAIT_EXPIRED_LABELS.len()],
+    stall_closes: [AtomicU64; STALL_CLOSE_LABELS.len()],
 }
 
 impl QuicDataCounters {
@@ -396,6 +411,7 @@ impl QuicDataCounters {
             gate_ended_queue: std::array::from_fn(|_| zero()),
             dark_episodes: std::array::from_fn(|_| zero()),
             ack_wait_expired: std::array::from_fn(|_| zero()),
+            stall_closes: std::array::from_fn(|_| zero()),
         }
     }
 
@@ -572,6 +588,14 @@ impl QuicDataCounters {
         self.budget_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// The acknowledgement watch closed a path, for the reason at `index` of
+    /// [`STALL_CLOSE_LABELS`].
+    pub(crate) fn record_stall_close(&self, index: usize) {
+        if let Some(count) = self.stall_closes.get(index) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// A send's wait for the acknowledgement of its end ran out.
     pub(crate) fn record_ack_wait_expired(&self, kind: AckWaitKind) {
         self.ack_wait_expired[kind as usize].fetch_add(1, Ordering::Relaxed);
@@ -699,6 +723,7 @@ impl QuicDataCounters {
             gate_ended_queue: self.gate_ended_queue.iter().map(get).collect(),
             dark_episodes: self.dark_episodes.iter().map(get).collect(),
             ack_wait_expired: self.ack_wait_expired.iter().map(get).collect(),
+            stall_closes: self.stall_closes.iter().map(get).collect(),
         }
     }
 }
@@ -769,6 +794,10 @@ pub struct QuicDataSnapshot {
     /// Ack waits that ran out in the period, by `ACK_WAIT_EXPIRED_LABELS`.
     #[serde(default)]
     pub ack_wait_expired: Vec<u64>,
+    /// Paths the acknowledgement watch closed in the period, by
+    /// `STALL_CLOSE_LABELS`.
+    #[serde(default)]
+    pub stall_closes: Vec<u64>,
 }
 
 impl QuicDataSnapshot {
@@ -826,6 +855,7 @@ impl QuicDataSnapshot {
             gate_ended_queue,
             dark_episodes,
             ack_wait_expired,
+            stall_closes,
         } = self;
         let mut keys = Vec::new();
         let mut family = |prefix: &'static str, labels: Vec<String>, values: Vec<u64>| {
@@ -929,6 +959,11 @@ impl QuicDataSnapshot {
                 .collect(),
             ack_wait_expired.clone(),
         );
+        family(
+            "quic_stall_close_",
+            STALL_CLOSE_LABELS.iter().map(|l| l.to_string()).collect(),
+            stall_closes.clone(),
+        );
         for (key, value) in [
             ("quic_enabled_data_paths", *data_enabled),
             (LIVE_DATA_PATHS, *data_paths),
@@ -1018,6 +1053,7 @@ impl QuicDataSnapshot {
             gate_ended_queue,
             dark_episodes,
             ack_wait_expired,
+            stall_closes,
         } = self;
         let any = |values: &[u64]| values.iter().any(|n| *n != 0);
         any(sends)
@@ -1031,6 +1067,7 @@ impl QuicDataSnapshot {
             || any(gate_ended_queue)
             || any(dark_episodes)
             || any(ack_wait_expired)
+            || any(stall_closes)
             || [
                 *data_enabled,
                 *sends_opened,

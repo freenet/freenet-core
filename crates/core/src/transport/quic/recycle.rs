@@ -263,6 +263,13 @@ pub(crate) fn dark_close_bound(rtt: Duration) -> Duration {
     first * 2 + pto + ACK_WATCH_TICK * 2 + grace
 }
 
+/// The latest the dark rule closes a path that stays dark, at round trips
+/// up to 800 ms ([`dark_close_bound`], about 74 s there). A send waiting for
+/// its acknowledgement through an outage the dark rule tolerates is acked
+/// after it, at the latest when the peer is next heard (`SHORT_ACK_WAIT` is
+/// sized from this).
+pub(crate) const DARK_CLOSE_MAX: Duration = Duration::from_secs(75);
+
 /// How often the acknowledgement watch samples the connection.
 ///
 /// The window starts at the first sample that sees its starting event (a
@@ -481,6 +488,11 @@ impl AckProgress {
     /// Ack-eliciting packets the peer has newly acknowledged so far.
     pub(crate) fn acked(&self) -> u64 {
         self.0.lock().acked
+    }
+
+    /// Bytes the peer has newly acknowledged so far.
+    pub(crate) fn acked_bytes(&self) -> u64 {
+        self.0.lock().acked_bytes
     }
 
     /// A record of no connection, moved by [`Self::ack`]. Tests only.
@@ -1269,6 +1281,14 @@ impl AckWatch {
         self.end_dark(Some(crate::transport::metrics::DarkEnd::Unrecovered));
     }
 
+    /// Count the close [`Self::observe`] asked for, by why, where dark
+    /// episodes are counted (`quic_stall_close_<label>`).
+    pub(crate) fn record_close(&self) {
+        if let (Some(node), Some(stall)) = (self.dark_counts, self.stall) {
+            node.record_stall_close(stall.index());
+        }
+    }
+
     /// Why the path must close, once [`Self::observe`] said so.
     pub(crate) fn stall(&self) -> Option<Stall> {
         self.stall
@@ -1460,6 +1480,17 @@ impl Stall {
             Self::CreditStarved => "credit_starved",
             Self::StreamCreditWithheld => "stream_credit_withheld",
             Self::AckWaitsExpired => "ack_waits_expired",
+        }
+    }
+
+    /// Its index in `quic_stall_close_<label>`.
+    pub(crate) const fn index(self) -> usize {
+        match self {
+            Self::NotAcknowledging => 0,
+            Self::Dark => 1,
+            Self::CreditStarved => 2,
+            Self::StreamCreditWithheld => 3,
+            Self::AckWaitsExpired => 4,
         }
     }
 }
@@ -1807,9 +1838,10 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
             if !report.watch_closes {
                 continue;
             }
-            // One close code for all three: it tells the peer only that this
-            // side stopped using the path.
+            // One close code for every rule: it tells the peer only that this
+            // side stopped using the path; why is counted and logged here.
             if closer.close(QuicCloseCode::PeerNotAcknowledging) {
+                watch.record_close();
                 #[cfg(test)]
                 if let Some(stall) = watch.stall() {
                     TEST_STALLS
@@ -1818,10 +1850,9 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
                 }
                 tracing::warn!(
                     remote = %connection.remote_address(),
-                    window = ?ACK_WATCH_WINDOW,
                     stall = watch.stall().map_or("", Stall::label),
-                    "QUIC path: the peer did not acknowledge this node's data within \
-                     the window; closing the path so the connection falls back to UDP"
+                    "QUIC path: the peer stopped delivering on this path (see the stall \
+                     reason); closing the path so the connection falls back to UDP"
                 );
             }
             return;

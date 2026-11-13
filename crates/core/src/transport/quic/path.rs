@@ -775,6 +775,8 @@ pub(crate) struct QuicPath {
     sleeper: Sleeper,
     /// [`SHORT_ACK_WAIT`], or a test's.
     short_ack_wait: Duration,
+    /// The path's clock, for judging expired ack waits ([`StrikeCheck`]).
+    clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     /// Set once the path may send data: only then does the acknowledgement
     /// watch's dark-path rule close it (`recycle::AckWatch::observing`).
     carries_data: Arc<std::sync::atomic::AtomicBool>,
@@ -954,6 +956,10 @@ impl QuicPath {
             let time = time.clone();
             Arc::new(move |duration| time.sleep_cancelable(duration))
         };
+        let clock: Arc<dyn Fn() -> u64 + Send + Sync> = {
+            let time = time.clone();
+            Arc::new(move || time.now_nanos())
+        };
         let stats = Arc::new(QuicPathStats::new(
             limits
                 .counters
@@ -1084,6 +1090,7 @@ impl QuicPath {
                 short_ack_wait: limits.short_ack_wait.unwrap_or(SHORT_ACK_WAIT),
                 #[cfg(not(test))]
                 short_ack_wait: SHORT_ACK_WAIT,
+                clock,
                 carries_data,
                 controls_opening: Arc::default(),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
@@ -1311,10 +1318,25 @@ impl QuicPath {
     /// the credit rule's floor (`recycle::credit_floor_rate`, at least
     /// 16 KiB/s), when that is longer than its first age, so an honest slow
     /// path's stream is not reset while its acknowledgement is on the way.
+    ///
+    /// It also covers the backlog ahead of the stream's end: at most the
+    /// connection's send window, which quinn shares round-robin among the
+    /// streams with data, so a stream's tail may wait for `n` windows' worth
+    /// at the floor, `n` being the streamed sends in flight (their permits)
+    /// with this one. On a busy slow path the wait can reach the 2 h total,
+    /// and the expiry rule then takes as long to fire.
     pub(crate) fn stream_deadlines(&self, len: u64) -> SendDeadlines {
         let deadlines = SendDeadlines::stream(len).with_gap(self.receiver_gap());
         let floor = recycle::credit_floor_rate(self.connection.inner().stats().path.rtt).max(1);
-        let at_floor = Duration::from_secs(len.div_ceil(floor));
+        let in_flight = (STREAMED_SEND_LIMIT as u64)
+            .saturating_sub(self.stream_slots.available_permits() as u64)
+            .saturating_add(1);
+        let window = self
+            .meter
+            .as_ref()
+            .map_or(super::budget::MAX_WINDOW_BYTES, |meter| meter.send_window());
+        let backlog = in_flight.saturating_mul(window);
+        let at_floor = Duration::from_secs(len.max(backlog).div_ceil(floor));
         SendDeadlines {
             ack_wait: deadlines
                 .ack_wait
@@ -1924,6 +1946,13 @@ impl QuicPath {
         send.writing = Some(self.writers.start());
         send.live = Some(self.writers.live());
         send.sleep = Some((self.sleeper.clone(), self.short_ack_wait));
+        send.control = opener == Opener::Control;
+        send.strike = self.ack_progress.clone().map(|acks| StrikeCheck {
+            acks,
+            cap: self.connection.cap_holds(),
+            connection: self.connection.inner().clone(),
+            now: self.clock.clone(),
+        });
         send.node = Some(self.stats.node());
         send.ack_waits = Some(self.ack_waits.clone());
         send.write_all(&header.encode()).await?;
@@ -2176,10 +2205,64 @@ struct Outgoing {
     sleep: Option<(Sleeper, Duration)>,
     /// Where the path's counts are kept node-wide.
     node: Option<&'static QuicDataCounters>,
+    /// What an expired ack wait is judged against ([`StrikeCheck`]), and the
+    /// path's state when the end was sent.
+    strike: Option<StrikeCheck>,
+    finished_at: Option<StrikeMark>,
+    /// A control frame's stream (`Opener::Control`).
+    control: bool,
 }
 
 /// A sleep on the path's clock.
 type Sleeper = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
+/// What a send's expired ack wait is judged against: whether the path was
+/// in a state where the peer could have acknowledged the send's end. An
+/// expiry counts toward `recycle::ACK_WAIT_EXPIRY_LIMIT` only if, between the
+/// end being sent and the expiry, the egress cap held none of this
+/// connection's transmits and the connection acknowledged at least the
+/// credit floor at its round trip (`recycle::credit_floor_rate`). Our own
+/// cap, or a path too slow to have delivered the bytes ahead of the end,
+/// leaves the peer nothing to acknowledge, and does not make it a strike; a
+/// peer that acknowledges everything else at the floor or better does.
+#[derive(Clone)]
+struct StrikeCheck {
+    acks: recycle::AckProgress,
+    cap: Arc<super::socket::CapHolds>,
+    connection: quinn::Connection,
+    now: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+/// The path's state when a send's end was sent ([`StrikeCheck::mark`]).
+#[derive(Clone, Copy)]
+struct StrikeMark {
+    at: u64,
+    acked_bytes: u64,
+    holds: u64,
+}
+
+impl StrikeCheck {
+    fn mark(&self) -> StrikeMark {
+        StrikeMark {
+            at: (self.now)(),
+            acked_bytes: self.acks.acked_bytes(),
+            holds: self.cap.read().holds,
+        }
+    }
+
+    /// Whether an ack wait that ran out now, for a send whose end was sent
+    /// at `mark`, counts as a strike against the peer.
+    fn strikes(&self, mark: StrikeMark) -> bool {
+        let cap = self.cap.read();
+        if cap.holds != mark.holds || cap.held_now {
+            return false;
+        }
+        let elapsed = u128::from((self.now)().saturating_sub(mark.at));
+        let floor = u128::from(recycle::credit_floor_rate(self.connection.stats().path.rtt));
+        let acked = u128::from(self.acks.acked_bytes().saturating_sub(mark.acked_bytes));
+        acked * 1_000_000_000 >= floor * elapsed
+    }
+}
 
 /// The most a one-packet Short's acknowledgement is waited for after its
 /// send ended (`Outgoing`'s drop): its send reports `MaybeDelivered` at its
@@ -2188,7 +2271,22 @@ type Sleeper = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> 
 /// packet, which the peer's QUIC stack acknowledges on arrival), and past the
 /// dark rule's close of a dark path. At the bound the stream is reset,
 /// freeing the epoch, and counted toward `recycle::ACK_WAIT_EXPIRY_LIMIT`.
+///
+/// Its margin: through an outage the dark rule tolerates (at most
+/// `recycle::DARK_CLOSE_MAX`), an honest Short waits for the peer to be
+/// heard again, which a live peer's keepalive (`config::KEEPALIVE_INTERVAL`,
+/// 15 s) brings at the latest, and is then retransmitted and acknowledged
+/// within a couple of round trips: about 91 s at an 800 ms round trip.
+/// Asserted below with 15 s to spare. Virtual time runs no keepalive, so a
+/// simulation relies on quinn's probe backoff instead
+/// (`one_packet_shorts_through_a_tolerated_outage_do_not_expire`).
 pub(crate) const SHORT_ACK_WAIT: Duration = Duration::from_secs(120);
+
+const _: () = assert!(
+    SHORT_ACK_WAIT.as_secs()
+        >= recycle::DARK_CLOSE_MAX.as_secs() + super::config::KEEPALIVE_INTERVAL.as_secs() + 15,
+    "SHORT_ACK_WAIT must outlast a tolerated outage plus a keepalive"
+);
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
 
@@ -2219,6 +2317,9 @@ impl Outgoing {
             live: None,
             sleep: None,
             node: None,
+            strike: None,
+            finished_at: None,
+            control: false,
         }
     }
 
@@ -2434,6 +2535,7 @@ impl Outgoing {
             .finish()
             .map_err(|_| QuicSendError::Closed)?;
         self.writing = None;
+        self.finished_at = self.strike.as_ref().map(StrikeCheck::mark);
         self.progress.mark_finished();
         self.awaiting_ack = true;
         let stopped = (&mut self.stopped).await;
@@ -2491,6 +2593,8 @@ impl Drop for Outgoing {
             // raced the deadline left nothing to reset.
             if self.reset_finished()
                 && let (Some(live), Some(node)) = (&self.live, self.node)
+                && let (Some(check), Some(mark)) = (&self.strike, self.finished_at)
+                && check.strikes(mark)
             {
                 live.writers()
                     .ack_wait_expired(node, crate::transport::metrics::AckWaitKind::Stream);
@@ -2514,6 +2618,9 @@ impl Drop for Outgoing {
                 Some(Some(waiting)) => Some(waiting),
                 // Past the bound: the epoch goes now, and so does the
                 // stream's data, so the release matches the memory freed.
+                // Past the bound of waiting Shorts: reset at once, before any
+                // ack wait could run out, so it is not an expiry and is not
+                // counted as one (the overflow is, as `AckWaitReleased`).
                 Some(None) => {
                     let _reset = self.reset_finished();
                     return;
@@ -2537,6 +2644,12 @@ impl Drop for Outgoing {
         let bounded = bound.is_some();
         let send = if bounded { self.send.take() } else { None };
         let (aborts, node) = (self.aborts.clone(), self.node);
+        let strike = self.strike.clone().zip(self.finished_at);
+        let kind = if self.control {
+            crate::transport::metrics::AckWaitKind::Control
+        } else {
+            crate::transport::metrics::AckWaitKind::Short
+        };
         // Bounded as above, and ending with the acknowledgement or the
         // connection, so the handle is not monitored.
         drop(GlobalExecutor::spawn(async move {
@@ -2555,9 +2668,10 @@ impl Drop for Outgoing {
                 && send.reset(reset_code::SENDER_ABORTED.into()).is_ok()
             {
                 aborts.record();
-                if let (Some(live), Some(node)) = (&live, node) {
-                    live.writers()
-                        .ack_wait_expired(node, crate::transport::metrics::AckWaitKind::Short);
+                if let (Some(live), Some(node)) = (&live, node)
+                    && strike.is_some_and(|(check, mark)| check.strikes(mark))
+                {
+                    live.writers().ack_wait_expired(node, kind);
                 }
             }
             drop(live);

@@ -960,13 +960,19 @@ fn a_send_past_its_ack_wait_is_reset_and_counted() {
 }
 
 /// The ack-wait expiry rule on a real path (#6205), with sends whose ack wait
-/// cannot be met (10 ms on a 200 ms round trip), standing in for a peer that
-/// never acknowledges stream ends:
-/// - three such sends, with acknowledged one-packet Shorts between them:
-///   closed at the third (`AckWaitsExpired`);
-/// - expiry, expiry, a send acknowledged within its ack wait, expiry (one
-///   end in three acknowledged): still closed at the third expiry, since
-///   acknowledgements never reset the count.
+/// cannot be met (1 s on a 4 s round trip), standing in for a peer that
+/// never acknowledges stream ends. A bulk transfer runs throughout, so the
+/// connection acknowledges well above the floor, as a peer that acknowledges
+/// every packet except stream ends does: each expiry is a strike.
+/// - three such sends, with acknowledged multi-packet Shorts between them
+///   (they have an ack wait of their own and were what reset round 4's
+///   rule): closed at the third (`AckWaitsExpired`);
+/// - expiry, expiry, a stream acknowledged within its ack wait, expiry (one
+///   end in three acknowledged): still closed at the third, since
+///   acknowledgements never reset the count;
+/// - the same three expiries with no bulk transfer, so the connection
+///   acknowledges nothing during each wait (a path too slow to have
+///   delivered the end): no strike, not closed.
 #[test]
 fn ack_wait_expiries_close_a_path_whatever_else_is_acknowledged() {
     use crate::transport::in_memory_socket::{
@@ -974,14 +980,15 @@ fn ack_wait_expiries_close_a_path_whatever_else_is_acknowledged() {
     };
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        for (network, acked_between) in [
-            ("quic-path-expiries-shorts", false),
-            ("quic-path-expiries-one-in-three", true),
+        for (network, acked_between, bulk, closes) in [
+            ("quic-path-expiries-shorts", false, true, true),
+            ("quic-path-expiries-one-in-three", true, true, true),
+            ("quic-path-expiries-quiet", false, false, false),
         ] {
             set_packet_delivery_callback(
                 network,
                 Some(Arc::new(|_, _, _, _| {
-                    PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(100))
+                    PacketDeliveryDecision::DelayedDelivery(Duration::from_secs(2))
                 })),
             );
             let counters = leaked_counters();
@@ -989,15 +996,57 @@ fn ack_wait_expiries_close_a_path_whatever_else_is_acknowledged() {
                 counters: Some(counters),
                 ..QuicPathLimits::DEFAULT
             };
-            let p = paths(network, limits).await;
+            let mut p = paths(network, limits).await;
+            // Drain what `b` receives, as a node does.
+            let mut streams =
+                std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+            let mut shorts = std::mem::replace(&mut p.b_in.shorts, tokio::sync::mpsc::channel(1).1);
+            // Keep what arrives (dropping a stream's handle would cancel it).
+            let drain = tokio::spawn(async move {
+                let mut kept = Vec::new();
+                loop {
+                    tokio::select! {
+                        Some(stream) = streams.recv() => kept.push(stream),
+                        Some(short) = shorts.recv() => drop(short),
+                        else => break,
+                    }
+                }
+            });
             let (a, time) = (p.a.clone(), p.time());
             let b_addr = p.pair.b_addr;
-            let never = SendDeadlines {
-                ack_wait: Some(Duration::from_millis(10)),
+            // Room to open behind the bulk's streams at a 4 s round trip.
+            let roomy = SendDeadlines {
+                open: Duration::from_secs(30),
+                gap: Some(Duration::from_secs(30)),
                 ..SendDeadlines::stream(10_000)
+            };
+            let never = SendDeadlines {
+                ack_wait: Some(Duration::from_secs(1)),
+                ..roomy
             };
             let closed_at = p
                 .drive(async move {
+                    // About 128 KiB/s, well above the floor, acknowledged
+                    // steadily.
+                    let bulk = bulk.then(|| {
+                        let (a, time) = (a.clone(), time.clone());
+                        tokio::spawn(async move {
+                            loop {
+                                let a = a.clone();
+                                tokio::spawn(async move {
+                                    a.send_stream(
+                                        StreamId::next(),
+                                        None,
+                                        Bytes::from(payload(64 * 1024)),
+                                    )
+                                    .await
+                                    .ok();
+                                });
+                                time.sleep(Duration::from_millis(500)).await;
+                            }
+                        })
+                    });
+                    time.sleep(Duration::from_secs(10)).await;
                     let send = |deadlines: SendDeadlines| {
                         let (a, time) = (a.clone(), time.clone());
                         async move {
@@ -1012,54 +1061,124 @@ fn ack_wait_expiries_close_a_path_whatever_else_is_acknowledged() {
                             .await
                         }
                     };
+                    let mut closed = None;
                     for i in 1..=3u32 {
                         if acked_between && i == 3 {
-                            assert!(matches!(
-                                send(SendDeadlines::stream(10_000)).await,
-                                BoundedSend::Sent
-                            ));
+                            assert!(matches!(send(roomy).await, BoundedSend::Sent));
                         }
-                        assert!(matches!(
-                            send(never).await,
-                            BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
-                        ));
-                        assert!(matches!(
-                            a.send_short_bounded(&time, Duration::from_secs(5), b"short")
-                                .await,
-                            BoundedSend::Sent
-                        ));
-                        time.sleep(Duration::from_secs(3)).await;
+                        let expired = send(never).await;
+                        assert!(
+                            matches!(
+                                expired,
+                                BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+                            ),
+                            "{expired:?}"
+                        );
+                        if i < 3 {
+                            let long = payload(3_000);
+                            let short = a
+                                .send_short_bounded(
+                                    &time,
+                                    SendDeadlines {
+                                        open: Duration::from_secs(30),
+                                        gap: Some(Duration::from_secs(30)),
+                                        ..SendDeadlines::short(3_000)
+                                    },
+                                    &long[..],
+                                )
+                                .await;
+                            assert!(matches!(short, BoundedSend::Sent), "{short:?}");
+                        }
+                        time.sleep(Duration::from_secs(8)).await;
                         if a.connection().inner().close_reason().is_some() {
-                            return Some(i);
+                            closed = Some(i);
+                            break;
                         }
                     }
-                    None
+                    if let Some(bulk) = bulk {
+                        bulk.abort();
+                    }
+                    closed
                 })
                 .await;
+            drain.abort();
             set_packet_delivery_callback(network, None);
-            assert_eq!(closed_at, Some(3), "{network}: closed at the third");
-            assert_eq!(
-                recycle::stalls_to(b_addr),
-                vec![recycle::Stall::AckWaitsExpired],
-                "{network}"
-            );
-            assert_eq!(
-                counters.snapshot(false).ack_wait_expired,
-                vec![3, 0],
-                "{network}"
-            );
+            if closes {
+                assert_eq!(closed_at, Some(3), "{network}: closed at the third");
+                assert_eq!(
+                    recycle::stalls_to(b_addr),
+                    vec![recycle::Stall::AckWaitsExpired],
+                    "{network}"
+                );
+                assert_eq!(
+                    counters.snapshot(false).ack_wait_expired,
+                    vec![3, 0, 0],
+                    "{network}"
+                );
+            } else {
+                assert_eq!(closed_at, None, "{network}: no strike, not closed");
+                assert_eq!(p.a.writers().ack_wait_expiries(), 0, "{network}");
+                assert_eq!(p.a.send_aborts(), 3, "{network}: still reset");
+            }
         }
+    })
+}
+
+/// The ack-wait expiry rule does not count this node's own throttling: with
+/// the egress cap holding the connection's transmits (a 20 kB/s
+/// `total-bandwidth-limit` under a bulk transfer), sends whose ack wait runs
+/// out are reset but are not strikes, and the path is not closed.
+#[test]
+fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths_capped("quic-path-expiries-capped", 20_000).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let never = SendDeadlines {
+            ack_wait: Some(Duration::from_millis(10)),
+            ..SendDeadlines::stream(10_000)
+        };
+        let holds = a.connection().cap_holds();
+        p.drive(async move {
+            let bulk = {
+                let a = a.clone();
+                tokio::spawn(async move {
+                    a.send_stream(StreamId::next(), None, Bytes::from(payload(4 * MIB)))
+                        .await
+                        .ok();
+                })
+            };
+            time.sleep(Duration::from_secs(2)).await;
+            for _ in 0..3 {
+                a.send_stream_bounded(
+                    &time,
+                    never,
+                    StreamId::next(),
+                    None,
+                    Bytes::from(payload(10_000)),
+                    None,
+                )
+                .await;
+                time.sleep(Duration::from_secs(3)).await;
+            }
+            bulk.abort();
+        })
+        .await;
+        assert!(holds.read().holds > 0, "premise: the cap held transmits");
+        assert_eq!(p.a.writers().ack_wait_expiries(), 0);
+        assert!(p.a.connection().inner().close_reason().is_none());
     })
 }
 
 /// A one-packet Short's acknowledgement is waited for in the background once
 /// its send has ended (here at its own 50 ms deadline, on a 200 ms round
 /// trip), holding its send epoch. The wait is bounded (here 10 ms in place of
-/// `SHORT_ACK_WAIT`, 120 s): past it the stream is reset, the epoch is
-/// released, and the expiry is counted as a Short's. An honest peer
-/// acknowledges the Short's one packet on arrival, so with a bound longer
-/// than the round trip (here 10 s) the acknowledgement comes first and
-/// nothing is counted.
+/// `SHORT_ACK_WAIT`, 120 s): past it the stream is reset and the epoch is
+/// released. Nothing else was acknowledged meanwhile, so it is not a strike
+/// (`ack_wait_expiries_close_a_path_whatever_else_is_acknowledged` covers
+/// strikes). An honest peer acknowledges the Short's one packet on arrival,
+/// so with a bound longer than the round trip (here 10 s) the
+/// acknowledgement comes first and nothing is reset.
 #[test]
 fn a_one_packet_shorts_background_ack_wait_is_bounded() {
     use crate::transport::in_memory_socket::{
@@ -1067,7 +1186,7 @@ fn a_one_packet_shorts_background_ack_wait_is_bounded() {
     };
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        for (network, bound, expired) in [
+        for (network, bound, reset) in [
             ("quic-path-short-ack-bound", Duration::from_millis(10), 1u64),
             ("quic-path-short-ack-honest", Duration::from_secs(10), 0),
         ] {
@@ -1111,8 +1230,180 @@ fn a_one_packet_shorts_background_ack_wait_is_bounded() {
                 0,
                 "{network}: the epoch is released"
             );
-            assert_eq!(p.a.writers().ack_wait_expiries(), expired, "{network}");
-            assert_eq!(p.a.send_aborts(), expired, "{network}");
+            assert_eq!(p.a.send_aborts(), reset, "{network}");
+            assert_eq!(p.a.writers().ack_wait_expiries(), 0, "{network}: no strike");
+        }
+    })
+}
+
+/// Several large streams at once on a slow path see no ack-wait expiry: four
+/// 2 MiB streams on a 40 KiB/s link (a 400 ms round trip, a 1 s queue), sent
+/// on a node's deadlines. quinn shares the link round-robin, so each
+/// stream's tail waits behind the others' bytes; the ack wait covers the
+/// streams in flight times the send window at the floor
+/// (`QuicPath::stream_deadlines`), and every send ends `Sent` with no reset.
+#[test]
+fn concurrent_large_streams_on_a_slow_path_see_no_expiry() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    const RATE: u64 = 40 * 1024;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-slow-many";
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(200))
+            })),
+        );
+        let mut p = paths(network, QuicPathLimits::DEFAULT).await;
+        let (a_addr, time) = (p.pair.a_addr, p.time());
+        let free_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, bytes: &[u8]| {
+                let now = time.now_nanos();
+                if sender != a_addr {
+                    return PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(200));
+                }
+                let start = free_at.load(Relaxed).max(now);
+                if start - now > 1_000_000_000 {
+                    return PacketDeliveryDecision::Drop;
+                }
+                let done = start + bytes.len() as u64 * 1_000_000_000 / RATE;
+                free_at.store(done, Relaxed);
+                PacketDeliveryDecision::DelayedDelivery(
+                    Duration::from_nanos(done - now) + Duration::from_millis(200),
+                )
+            })),
+        );
+        let len = 2 * MIB;
+        let mut b_in = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+        let (a, time) = (p.a.clone(), p.time());
+        let outcomes = p
+            .drive(async move {
+                let sends: Vec<_> = (0..4)
+                    .map(|_| {
+                        let (a, time) = (a.clone(), time.clone());
+                        tokio::spawn(async move {
+                            let deadlines = a.stream_deadlines(len as u64);
+                            a.send_stream_bounded(
+                                &time,
+                                deadlines,
+                                StreamId::next(),
+                                None,
+                                Bytes::from(payload(len)),
+                                None,
+                            )
+                            .await
+                        })
+                    })
+                    .collect();
+                let mut kept = Vec::new();
+                let mut outcomes = Vec::new();
+                for send in sends {
+                    while !send.is_finished() {
+                        while let Ok(arrival) = b_in.try_recv() {
+                            kept.push(arrival);
+                        }
+                        time.sleep(Duration::from_millis(200)).await;
+                    }
+                    outcomes.push(send.await.expect("the send task ran"));
+                }
+                outcomes
+            })
+            .await;
+        set_packet_delivery_callback(network, None);
+        assert!(
+            outcomes.iter().all(|o| matches!(o, BoundedSend::Sent)),
+            "{outcomes:?}"
+        );
+        assert_eq!(p.a.send_aborts(), 0, "no stream was reset");
+        assert_eq!(p.a.writers().ack_wait_expiries(), 0);
+    })
+}
+
+/// One-packet Shorts in flight when both directions go dark for an outage
+/// the dark rule tolerates (11 s on a fast path, 30 s at an 800 ms round
+/// trip), on virtual time, which runs no keepalive (as the simulations):
+/// after the outage quinn's probes bring the peer back and the Shorts are
+/// retransmitted and acknowledged within their 120 s background wait
+/// (`SHORT_ACK_WAIT`). None is reset and the path is not closed.
+#[test]
+fn one_packet_shorts_through_a_tolerated_outage_do_not_expire() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (network, one_way_ms, outage_s) in [
+            ("quic-path-shorts-outage-fast", 0u64, 11u64),
+            ("quic-path-shorts-outage-800", 400, 30),
+        ] {
+            let one_way = Duration::from_millis(one_way_ms);
+            let dark = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let dark = dark.clone();
+                set_packet_delivery_callback(
+                    network,
+                    Some(Arc::new(move |_, _, _, _| {
+                        if dark.load(Relaxed) {
+                            PacketDeliveryDecision::Drop
+                        } else if one_way.is_zero() {
+                            PacketDeliveryDecision::Deliver
+                        } else {
+                            PacketDeliveryDecision::DelayedDelivery(one_way)
+                        }
+                    })),
+                );
+            }
+            let windows = Windows {
+                a: Some(test_budget(64 << 20, leaked_counters())),
+                b: Some(test_budget(64 << 20, leaked_counters())),
+            };
+            let p = paths_metered(network, windows).await;
+            let b_addr = p.pair.b_addr;
+            dark.store(true, Relaxed);
+            let (a, time) = (p.a.clone(), p.time());
+            let outcomes = p
+                .drive({
+                    let dark = dark.clone();
+                    async move {
+                        let mut outcomes = Vec::new();
+                        for i in 0..3u8 {
+                            outcomes.push(
+                                a.send_short_bounded(&time, Duration::from_secs(1), &[i])
+                                    .await,
+                            );
+                        }
+                        time.sleep(Duration::from_secs(outage_s - 3)).await;
+                        dark.store(false, Relaxed);
+                        time.sleep(Duration::from_secs(150)).await;
+                        outcomes
+                    }
+                })
+                .await;
+            set_packet_delivery_callback(network, None);
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|o| matches!(o, BoundedSend::MaybeDelivered(_))),
+                "{network}: premise: their sends ended during the outage: {outcomes:?}"
+            );
+            assert_eq!(p.a.send_aborts(), 0, "{network}: none reset");
+            assert_eq!(
+                p.a.send_epoch_holders(),
+                0,
+                "{network}: acknowledged after the outage"
+            );
+            assert!(
+                p.a.connection().inner().close_reason().is_none(),
+                "{network}: {:?}",
+                recycle::stalls_to(b_addr)
+            );
         }
     })
 }
