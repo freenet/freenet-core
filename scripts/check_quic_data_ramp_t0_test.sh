@@ -43,6 +43,15 @@ policy() {
     printf '%s' "$file"
 }
 
+# A crates/core/Cargo.toml at version $1.
+cargo_at() {
+    local file="$WORK/cargo-$1.toml"
+    printf '[package]\nname = "freenet"\nversion = "%s"\n' "$1" > "$file"
+    printf '%s' "$file"
+}
+SHIPPED="$(cargo_at 0.2.157)"
+BEFORE="$(cargo_at 0.2.156)"
+
 # check_case NAME EXPECTED_RC EXPECTED_TEXT -- ARGS...
 check_case() {
     local name="$1" want_rc="$2" want_text="$3" out rc
@@ -64,18 +73,22 @@ check_case "no ramp release, dry run: no-op" 0 "no ramp release" -- \
     --version 0.2.156 --live false --now "$T0" --policy "$unset_both"
 
 set_both="$(policy "Some(1_800_000_000)" 'Some("0.2.157")')"
-check_case "a later release, after T0, is not checked" 0 "comes after the ramp release" -- \
-    --version 0.2.158 --live true --now $((T0 + 30 * HOUR)) --policy "$set_both"
-check_case "a later release at T0 (a hotfix) is not checked" 0 "comes after the ramp release" -- \
-    --version 0.2.158 --live true --now "$T0" --policy "$set_both"
+check_case "a later release, after T0, is not checked (a warning)" 0 "::warning title=QUIC data ramp start::Release 0.2.158 comes after" -- \
+    --version 0.2.158 --live true --now $((T0 + 30 * HOUR)) --policy "$set_both" --cargo-toml "$SHIPPED"
+check_case "a later release at T0 (a hotfix) is not checked" 0 "comes after the QUIC data ramp release" -- \
+    --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
 check_case "a later release cut more than 3 h before T0, live: refused" 1 "ahead of its start" -- \
-    --version 0.2.158 --live true --now $((T0 - 3 * HOUR - 1)) --policy "$set_both"
+    --version 0.2.158 --live true --now $((T0 - 3 * HOUR - 1)) --policy "$set_both" --cargo-toml "$SHIPPED"
+check_case "a later release that skips the unshipped ramp release, live: refused" 1 "skips the QUIC data ramp release" -- \
+    --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$BEFORE"
+check_case "a missing Cargo.toml for a later release: refused" 2 "Cargo.toml not found" -- \
+    --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$WORK/none.toml"
 check_case "an earlier release carrying the ramp, live: refused" 1 "comes before the QUIC data ramp release" -- \
-    --version 0.2.156 --live true --now "$T0" --policy "$set_both"
+    --version 0.2.156 --live true --now "$T0" --policy "$set_both" --cargo-toml "$BEFORE"
 check_case "an earlier release carrying the ramp, dry run: warning only" 0 "::warning" -- \
-    --version 0.2.156 --live false --now "$T0" --policy "$set_both"
+    --version 0.2.156 --live false --now "$T0" --policy "$set_both" --cargo-toml "$BEFORE"
 check_case "versions compare as numbers, not text" 1 "comes before the QUIC data ramp release" -- \
-    --version 0.2.99 --live true --now "$T0" --policy "$set_both"
+    --version 0.2.99 --live true --now "$T0" --policy "$set_both" --cargo-toml "$(cargo_at 0.2.98)"
 start_no_release="$(policy "Some(1_800_000_000)" None)"
 check_case "a ramp start with no ramp release, live: refused" 1 "QUIC_DATA_RAMP_RELEASE is None" -- \
     --version 0.2.157 --live true --now "$T0" --policy "$start_no_release"
@@ -142,9 +155,18 @@ if grep -qE '^pub\(in crate::transport\) const QUIC_DATA_RAMP_RELEASE: Option<&s
             --version 0.2.156 --live "$live" --policy "$POLICY"
     done
 else
-    # Once the ramp release is named, only that version is checked.
-    check_case "this tree reads" 0 "QUIC data ramp:" -- \
-        --version 0.0.1 --live true --policy "$POLICY"
+    # Once the ramp release is named, check the tree as that release at its own
+    # T0, so a T0 the script cannot read fails CI instead of passing as "not
+    # the ramp release".
+    tree_release="$(sed -n 's/^pub(in crate::transport) const QUIC_DATA_RAMP_RELEASE: Option<&str> = Some("\([0-9.]*\)");$/\1/p' "$POLICY")"
+    tree_t0="$(tr -d '\n ' < "$POLICY" | sed -n 's/.*pub(incrate::transport)constQUIC_DATA_RAMP_START:Option<u64>=Some(\([0-9_]*\),\{0,1\});.*/\1/p' | tr -d _)"
+    if [[ -z "$tree_release" || -z "$tree_t0" ]]; then
+        echo "FAIL - this tree names a ramp release but its release or T0 cannot be read (release '$tree_release', T0 '$tree_t0')"
+        FAILURES=$((FAILURES + 1))
+    else
+        check_case "this tree, as its ramp release at its T0" 0 "is the ramp release" -- \
+            --version "$tree_release" --live true --now "$tree_t0" --policy "$POLICY"
+    fi
 fi
 
 # The lines of job $2 in workflow file $1, from its `  <job>:` line to the next

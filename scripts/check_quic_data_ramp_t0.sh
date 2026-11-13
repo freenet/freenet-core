@@ -8,14 +8,19 @@
 # long before T0 holds every node at 5% until T0. So the ramp release must be
 # cut within WINDOW of T0, or T0 must be re-set in a new reviewed PR first.
 #
-# Only the release named by `QUIC_DATA_RAMP_RELEASE` (beside T0) is checked:
-# T0 stays set after it (past 24 h it reads 100%, the steady state), and later
-# releases must not be held to it. With `QUIC_DATA_RAMP_RELEASE = None`, or a
-# release of another version, this prints a notice and exits 0.
+# Only the release named by `QUIC_DATA_RAMP_RELEASE` (beside T0) is held to
+# T0: T0 stays set after it (past 24 h it reads 100%, the steady state), and
+# later releases must not be held to it, so one passes with a warning. A
+# version that would ship the ramp unchecked fails closed like a late cut:
+# T0 set with no release named; a version before the named one; a later one
+# that skips it while this tree (crates/core/Cargo.toml) has not reached it;
+# a later one cut more than WINDOW before T0. With no T0, or no ramp release
+# and no T0, it prints a notice and exits 0.
 #
 # Usage:
 #   check_quic_data_ramp_t0.sh --version X.Y.Z --live true|false
 #                              [--now UNIX_SECS] [--policy PATH] [--window SECS]
+#                              [--cargo-toml PATH]
 #
 # --now defaults to the clock (`date +%s`); tests pass it. A live run that
 # fails the check exits 1. A dry run reports the same finding as a warning and
@@ -27,6 +32,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 POLICY="$SCRIPT_DIR/../crates/core/src/transport/quic/upgrade/policy.rs"
+CARGO_TOML="$SCRIPT_DIR/../crates/core/Cargo.toml"
 WINDOW=$((3 * 3600))
 VERSION=""
 LIVE=""
@@ -39,6 +45,7 @@ while [[ $# -gt 0 ]]; do
         --now) NOW="${2:-}"; shift 2 ;;
         --policy) POLICY="${2:-}"; shift 2 ;;
         --window) WINDOW="${2:-}"; shift 2 ;;
+        --cargo-toml) CARGO_TOML="${2:-}"; shift 2 ;;
         *) echo "::error::check_quic_data_ramp_t0: unknown argument '$1'"; exit 2 ;;
     esac
 done
@@ -143,17 +150,34 @@ if [[ "$ramp_release" != "$VERSION" ]]; then
         exit 0
     fi
     earlier="$(printf '%s\n%s\n' "$VERSION" "$ramp_release" | sort -V | head -1)"
+    # The tree's own version: the last release at dispatch (before the bump),
+    # the cut version at the tag.
+    if [[ ! -f "$CARGO_TOML" ]]; then
+        echo "::error::check_quic_data_ramp_t0: Cargo.toml not found: $CARGO_TOML"
+        exit 2
+    fi
+    tree_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' "$CARGO_TOML" | head -1)"
+    if [[ ! "$tree_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "::error::check_quic_data_ramp_t0: no X.Y.Z version in $CARGO_TOML (got '$tree_version')"
+        exit 2
+    fi
     if [[ "$earlier" == "$VERSION" ]]; then
         # Fail closed: the ramp is in the tree and this version comes before
         # the one named for it, so it would ship the ramp under another
         # version (an auto-bump, or the name set ahead of the cut).
         finding "Release $VERSION comes before the QUIC data ramp release ($ramp_release) but carries the ramp (QUIC_DATA_RAMP_START is set), so it would ship the ramp unchecked. Cut the ramp release as $ramp_release, or change QUIC_DATA_RAMP_RELEASE in the same reviewed PR as T0 (docs/RELEASING.md)."
     fi
+    shipped="$(printf '%s\n%s\n' "$ramp_release" "$tree_version" | sort -V | tail -1)"
+    if [[ "$shipped" != "$tree_version" ]]; then
+        # Fail closed: the ramp release has not been cut from this tree yet,
+        # and this later version skips it (an auto-bump past a taken number).
+        finding "Release $VERSION skips the QUIC data ramp release ($ramp_release), which this tree ($tree_version) has not reached, and carries the ramp (QUIC_DATA_RAMP_START is set), so it would ship the ramp unchecked. Cut $ramp_release, or change QUIC_DATA_RAMP_RELEASE in the same reviewed PR as T0 (docs/RELEASING.md)."
+    fi
     if (( NOW + WINDOW < t0 )); then
         # A later version cut before T0 would start the ramp at 5% early.
         finding "Release $VERSION comes after the QUIC data ramp release ($ramp_release) but is cut more than $((WINDOW / 60)) min before T0 ($t0), so it would ship the ramp ahead of its start. Re-set T0 or the ramp release in a reviewed PR (docs/RELEASING.md)."
     fi
-    echo "QUIC data ramp: release $VERSION comes after the ramp release ($ramp_release); not checked."
+    echo "::warning title=QUIC data ramp start::Release $VERSION comes after the QUIC data ramp release ($ramp_release) and carries its ramp start T0 ($t0); its timing is not checked. If this release starts a new ramp, QUIC_DATA_RAMP_RELEASE must name it."
     exit 0
 fi
 
