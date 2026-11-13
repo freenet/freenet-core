@@ -151,7 +151,8 @@ impl QuicMode {
     /// and macOS, and off elsewhere, Windows included. This is the emergency
     /// stop of the QUIC data ramp, and it returns exactly to 0.2.156's
     /// defaults, because an emergency release should only go back to states
-    /// the field has run (Windows never ran QUIC in a release before the ramp).
+    /// the field has run (Windows with QUIC off is what every release through
+    /// 0.2.156 ran).
     pub const fn default_mode() -> Self {
         if cfg!(any(target_os = "linux", target_os = "macos")) {
             Self::Shadow
