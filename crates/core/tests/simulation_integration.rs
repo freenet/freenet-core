@@ -22843,7 +22843,10 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
     });
     log_native_connect("fallback", &run);
     let t = &run.wire.trace;
-    assert!(t.responses_native() > 0, "premise: acceptors decided native");
+    assert!(
+        t.responses_native() > 0,
+        "premise: acceptors decided native"
+    );
     assert!(t.native_failed() > 0, "premise: native setups failed");
     assert_eq!(t.native_established(), 0, "premise: no native setup worked");
     assert!(t.native_demotions() > 0, "nodes demoted themselves");
@@ -22924,11 +22927,18 @@ fn test_quic_native_on_at_zero_percent_forms_the_same_mesh() {
     let zero = run_native_connect_sim("native-connect-zero-on", SEED, 40, |sim| {
         sim.with_native_connect(0);
     });
-    assert!(off.wire.trace.responses_native() > 0, "premise: decisions sent");
+    assert!(
+        off.wire.trace.responses_native() > 0,
+        "premise: decisions sent"
+    );
     assert_eq!(zero.wire.trace.native_established(), 0);
     assert_eq!(zero.wire.trace.native_failed(), 0);
     let (off_peers, off_connected) = quic_mesh_peers_and_connected(&off.wire.mesh);
-    assert_eq!(off_peers.len(), off.wire.nodes, "premise: every node joined");
+    assert_eq!(
+        off_peers.len(),
+        off.wire.nodes,
+        "premise: every node joined"
+    );
     assert!(off_connected);
     assert_eq!(zero.wire.mesh, off.wire.mesh, "the same connections form");
 }

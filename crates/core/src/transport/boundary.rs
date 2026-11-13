@@ -242,6 +242,9 @@ pub(crate) struct TransportHandle {
     /// the endpoint bound). Only then does the node give a connection's
     /// transport its peer key, which only a QUIC upgrade reads.
     pub(crate) quic_endpoint: bool,
+    /// This node's QUIC endpoint, as it goes up and down: what decides
+    /// whether the node can set up a QUIC-native connection now.
+    pub(crate) quic_availability: super::quic::QuicAvailabilityWatch,
 }
 
 /// Registers peers the node expects to connect in, so the transport accepts
@@ -329,17 +332,18 @@ pub(crate) trait OutboundConnector: Send + Sync {
     /// transport with no QUIC upgrades hub answers
     /// `NativeSetupOutcome::Unavailable`. Every end is counted as
     /// `connect_native_setup_<label>`.
-    fn connect_native(
-        &self,
-        dial: super::NativeDial,
-    ) -> std::pin::Pin<
-        Box<
-            dyn Future<Output = Result<Box<dyn PeerConnectionApi>, super::NativeSetupOutcome>>
-                + Send
-                + '_,
-        >,
-    >;
+    fn connect_native(&self, dial: super::NativeDial) -> NativeConnectFuture<'_>;
 }
+
+/// What [`OutboundConnector::connect_native`] returns: the connection, or
+/// how the setup ended without one.
+pub(crate) type NativeConnectFuture<'a> = std::pin::Pin<
+    Box<
+        dyn Future<Output = Result<Box<dyn PeerConnectionApi>, super::NativeSetupOutcome>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// Why a connection's `recv` ended it, as reported by
 /// [`PeerConnectionApi::close_reason`].

@@ -947,8 +947,9 @@ pub struct TransportMetrics {
     connect_native_decided_native: AtomicU64,
     connect_native_decided_udp: AtomicU64,
     /// Responses deciding `Native` this node received as joiner and could not
-    /// use: to a request with no offer or percent 0, or to a real offer this
-    /// build cannot dial (reset each snapshot). Each failed that attempt.
+    /// use: to a request with no offer or percent 0, or to a real offer when
+    /// it can no longer dial native (reset each snapshot). Each failed that
+    /// attempt.
     connect_native_decision_without_offer: AtomicU64,
     connect_native_decision_native_unsupported: AtomicU64,
     /// `Native` responses dropped unanswered once a CONNECT had refused as
@@ -3543,8 +3544,8 @@ pub struct TransportSnapshot {
     pub connect_native_decided_native: u64,
     pub connect_native_decided_udp: u64,
     /// `Native` decisions received as joiner that failed the attempt: to a
-    /// request with no offer (or percent 0), and to a real offer this build
-    /// cannot dial.
+    /// request with no offer (or percent 0), and to a real offer when it can
+    /// no longer dial native.
     pub connect_native_decision_without_offer: u64,
     pub connect_native_decision_native_unsupported: u64,
     /// `Native` responses dropped past the per-CONNECT cap on refused
@@ -4354,8 +4355,8 @@ struct SnapshotExtras {
     pub connect_native_decided_native: u64,
     pub connect_native_decided_udp: u64,
     /// `Native` decisions received as joiner that failed the attempt: to a
-    /// request with no offer (or percent 0), and to a real offer this build
-    /// cannot dial.
+    /// request with no offer (or percent 0), and to a real offer when it can
+    /// no longer dial native.
     pub connect_native_decision_without_offer: u64,
     pub connect_native_decision_native_unsupported: u64,
     /// `Native` responses dropped past the per-CONNECT cap on refused
@@ -5895,6 +5896,22 @@ mod tests {
         check_quic_family(
             |m, slot, remote| m.record_quic_close_received(raw(slot), remote),
             |snap| snap.quic_close_received,
+        );
+    }
+
+    #[test]
+    fn only_path_failures_count_toward_demotion() {
+        let counted: Vec<NativeSetupOutcome> = NativeSetupOutcome::ALL
+            .into_iter()
+            .filter(|o| o.counts_toward_demotion())
+            .collect();
+        assert_eq!(
+            counted,
+            [
+                NativeSetupOutcome::TimedOut,
+                NativeSetupOutcome::HandshakeFailed,
+                NativeSetupOutcome::HelloLost,
+            ]
         );
     }
 

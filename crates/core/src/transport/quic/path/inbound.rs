@@ -636,28 +636,20 @@ pub(in crate::transport::quic) async fn receive<T: TimeSource>(
         receiver
             .readers_peak
             .fetch_max(readers.len(), Ordering::Relaxed);
-        // `deterministic_select!`, not `tokio::select!`: tokio picks the
-        // first arm it polls from its own RNG, which a simulation's seed does
-        // not set, so a seeded run would not repeat itself.
-        crate::deterministic_select! {
-            // Pending while no close is armed, so the arm never completes then.
-            () = async {
-                match refusal_close.as_mut() {
-                    Some(close) => close.await,
-                    None => std::future::pending().await,
-                }
-            } => {
+        tokio::select! {
+            // The precondition makes this arm run only while a close is armed,
+            // and `select!` evaluates it before polling the arm, so the
+            // `expect` cannot fire.
+            () = async { refusal_close.as_mut().expect("the precondition checks it is armed").await }, if refusal_close.is_some() => {
                 refusal_close = Some(Box::pin(std::future::pending()));
                 receiver.close_refusing_data();
-            },
+            }
             () = &mut sending => {
                 if let Some(meter) = &meter {
                     meter.maybe_evaluate(receiver.time.now_nanos());
                 }
                 sending.set(send_progress(&meter));
-            },
-            // Never `None` while the guard holds: `readers` is not empty.
-            _ = readers.next(), if !readers.is_empty() => {},
+            }
             accepted = &mut accept => match accepted {
                 Ok(recv) => {
                     let ticket = receiver.stream_limit.open();
@@ -673,6 +665,7 @@ pub(in crate::transport::quic) async fn receive<T: TimeSource>(
                     break;
                 }
             },
+            Some(()) = readers.next(), if !readers.is_empty() => {}
         }
     }
     while readers.next().await.is_some() {}
@@ -1085,7 +1078,7 @@ impl<T: TimeSource> BodyReader<T> {
                 self.timer_at = self.age_deadline;
                 self.timer = self.time.sleep_until(self.timer_at);
             }
-            crate::deterministic_select! {
+            tokio::select! {
                 out = &mut ready => break out,
                 () = &mut self.timer => {
                     if !self.extend_age(self.time.now_nanos()) {
@@ -1115,7 +1108,7 @@ impl<T: TimeSource> BodyReader<T> {
                 Ready(O),
                 Read(Result<Option<(u64, Bytes)>, ReadFailure>),
             }
-            let next = crate::deterministic_select! {
+            let next = tokio::select! {
                 out = &mut ready => Next::Ready(out),
                 read = self.next_piece() => Next::Read(read),
             };
@@ -2605,7 +2598,7 @@ impl<T: TimeSource> Receiver<T> {
                         Room(P),
                         Piece(Result<Option<(u64, Bytes)>, ReadFailure>),
                     }
-                    let next = crate::deterministic_select! {
+                    let next = tokio::select! {
                         room = &mut reserve => Next::Room(room),
                         piece = reader.next_piece() => Next::Piece(piece),
                     };

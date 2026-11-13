@@ -66,6 +66,7 @@ async fn udp_handle_shares_one_expected_ip_set_and_reports_the_listener() {
         expected_inbound,
         listener,
         quic_endpoint: _,
+        quic_availability: _,
     } = udp_transport_handle(outbound, inbound, listen_task);
 
     let inbound_addr: SocketAddr = "192.0.2.10:1000".parse().unwrap();
@@ -128,6 +129,7 @@ async fn listener_outlives_a_dropped_connector_while_a_clone_remains() {
         expected_inbound: _expected,
         mut listener,
         quic_endpoint: _,
+        quic_availability: _,
     } = udp_transport_handle(outbound, inbound, listen_task);
     let keepalive = Arc::clone(&connector);
 

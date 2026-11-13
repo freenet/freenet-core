@@ -7,10 +7,13 @@
 //! forms of `ConnectMsg` that only peers at or above
 //! [`crate::node::QUIC_NATIVE_MIN_VERSION`] receive (`connect::wire`).
 //!
-//! Nothing here changes how a connection is set up yet: [`NATIVE_DIAL_READY`]
-//! is false, so every offer carries percent 0 and every decision is
-//! [`NativeDecision::Udp`]. A response that says `Native` cannot be honoured,
-//! and the joiner fails that attempt ([`joiner_response_action`]).
+//! On `Native` the joiner and the acceptor each dial a native connection
+//! ([`DialTransport::Native`]), and a failed setup falls back to today's UDP
+//! dial. In production nothing changes yet: [`NATIVE_DIAL_READY`] is false,
+//! so every offer carries percent 0 and every decision is
+//! [`NativeDecision::Udp`]; a simulation turns it on per node
+//! ([`NativeConnectState`]). A `Native` the joiner cannot honour fails that
+//! attempt ([`joiner_response_action`]).
 //!
 //! The pair slice:
 //!
@@ -30,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use crate::transport::TransportPublicKey;
-use crate::transport::metrics::{QuicEndpointState, TRANSPORT_METRICS};
+use crate::transport::metrics::TRANSPORT_METRICS;
 
 /// Whether this build can dial a native connection. False until the native
 /// connection exists and is wired into the connect op; while false, every offer
@@ -223,8 +226,8 @@ pub(crate) struct NativeReadiness {
 }
 
 impl NativeReadiness {
-    /// Readiness from this process's QUIC endpoint state and this release's
-    /// constants, with no demotion. A node reads its own through
+    /// Readiness of a node in this release with no transport open yet: never
+    /// ready, offering 0. A node reads its own through
     /// [`NativeConnectState::readiness`].
     #[cfg(test)]
     pub(crate) fn current() -> Self {
@@ -317,7 +320,8 @@ pub(crate) enum JoinerDecisionFailure {
     /// `Native` answered a request that carried no offer, or percent 0. Only a
     /// bug or a misbehaving relay produces it.
     DecisionWithoutOffer,
-    /// `Native` answered a real offer, but this build has no native dial.
+    /// `Native` answered a real offer, but the joiner can no longer dial
+    /// native (demoted, or its QUIC endpoint is not up).
     NativeUnsupported,
 }
 
@@ -355,6 +359,11 @@ pub(crate) struct NativeConnectState {
     /// (`NodeConfig::native_connect_override`). `None` in production.
     release_override: Option<u8>,
     demotion: parking_lot::Mutex<NativeDemotion>,
+    /// This node's QUIC endpoint, set when its transport opens. Until then,
+    /// and when it is not up, the node cannot dial native. Read per node, not
+    /// from the process-wide endpoint metric, which several simulated nodes
+    /// in one process share.
+    endpoint: std::sync::OnceLock<crate::transport::QuicAvailabilityWatch>,
 }
 
 impl NativeConnectState {
@@ -362,12 +371,22 @@ impl NativeConnectState {
         Self {
             release_override,
             demotion: parking_lot::Mutex::new(NativeDemotion::new()),
+            endpoint: std::sync::OnceLock::new(),
         }
+    }
+
+    /// The node's transport opened with this QUIC endpoint. Only the first
+    /// call counts: a node opens one transport.
+    pub(crate) fn set_endpoint(&self, endpoint: crate::transport::QuicAvailabilityWatch) {
+        self.endpoint.get_or_init(|| endpoint);
     }
 
     /// This node's readiness now, as joiner and as acceptor.
     pub(crate) fn readiness(&self) -> NativeReadiness {
-        let endpoint_up = TRANSPORT_METRICS.quic_endpoint_state() == QuicEndpointState::Up;
+        let endpoint_up = self
+            .endpoint
+            .get()
+            .is_some_and(|e| e.get() == crate::transport::QuicAvailability::Up);
         let (dial_ready, release_percent) = match self.release_override {
             Some(percent) => (true, percent),
             None => (NATIVE_DIAL_READY, QUIC_NATIVE_PERCENT),
@@ -670,16 +689,28 @@ mod tests {
         );
     }
 
-    /// A node's state reads demotion into its readiness: three native failures
-    /// with distinct peers stop it offering, and a simulation override turns
-    /// dialling on at its percent.
+    /// A node's state reads its own endpoint, its override and its demotion
+    /// into its readiness: it can dial only once its transport opened with
+    /// an endpoint that is up, a simulation override turns dialling on at
+    /// its percent, and three native failures with distinct peers stop it
+    /// offering.
     #[test]
-    fn native_connect_state_reads_its_override_and_demotion() {
+    fn native_connect_state_reads_its_endpoint_override_and_demotion() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
         let off = NativeConnectState::new(None);
+        off.set_endpoint(watch.clone());
         assert!(!off.readiness().ready, "production: not ready to dial");
         let on = NativeConnectState::new(Some(100));
-        let endpoint_up = TRANSPORT_METRICS.quic_endpoint_state() == QuicEndpointState::Up;
-        assert_eq!(on.readiness().ready, endpoint_up);
+        assert!(!on.readiness().ready, "no transport yet");
+        assert_eq!(on.readiness().percent, 0);
+        on.set_endpoint(watch);
+        assert!(on.readiness().ready);
+        assert_eq!(on.readiness().percent, 100);
+        endpoint.send(QuicAvailability::Down).unwrap();
+        assert!(!on.readiness().ready, "the endpoint went down");
+        endpoint.send(QuicAvailability::Up).unwrap();
+        assert!(on.readiness().ready);
         for i in 1..=3 {
             on.record_failure(&key(i));
         }

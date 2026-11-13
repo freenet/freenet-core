@@ -395,7 +395,7 @@ async fn run_driver(
             _ = sweep_timer.tick() => expected_inbound.sweep(),
             command = commands_rx.recv() => match command {
                 Some(Command::Connect { peer, transaction, transient, origin, transport }) => {
-                    spawn_outbound(outbound.clone(), events_tx.clone(), peer, transaction, transient, origin, transport, peer_ready.clone());
+                    spawn_outbound(outbound.clone(), events_tx.clone(), OutboundDial { peer, transaction, transient, origin, transport }, peer_ready.clone());
                 }
                 Some(Command::ExpectInbound { addr, peer_key, transaction, transient }) => {
                     expected_inbound.register(addr, peer_key, transaction, transient);
@@ -508,27 +508,23 @@ async fn run_driver(
     }
 }
 
-fn spawn_outbound(
-    outbound: Arc<dyn OutboundConnector>,
-    events_tx: mpsc::Sender<Event>,
+/// One outbound connect the driver was asked for (`Command::Connect`).
+struct OutboundDial {
     peer: PeerKeyLocation,
     transaction: Transaction,
     transient: bool,
     origin: crate::transport::NatAttemptOrigin,
     transport: crate::operations::connect::native::DialTransport,
+}
+
+fn spawn_outbound(
+    outbound: Arc<dyn OutboundConnector>,
+    events_tx: mpsc::Sender<Event>,
+    dial: OutboundDial,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     GlobalExecutor::spawn(async move {
-        let event = connect_outbound(
-            &*outbound,
-            peer,
-            transaction,
-            transient,
-            origin,
-            transport,
-            peer_ready.as_deref(),
-        )
-        .await;
+        let event = connect_outbound(&*outbound, dial, peer_ready.as_deref()).await;
 
         // channel-safety: ok — this runs in a detached per-connection task
         // (GlobalExecutor::spawn), NOT on the event loop or the run_driver
@@ -555,13 +551,16 @@ const NATIVE_CONNECT_WITHIN: Duration = Duration::from_secs(20);
 /// emits. Sets `peer_ready` only on success.
 async fn connect_outbound(
     outbound: &dyn OutboundConnector,
-    peer: PeerKeyLocation,
-    transaction: Transaction,
-    transient: bool,
-    origin: crate::transport::NatAttemptOrigin,
-    transport: crate::operations::connect::native::DialTransport,
+    dial: OutboundDial,
     peer_ready: Option<&std::sync::atomic::AtomicBool>,
 ) -> Event {
+    let OutboundDial {
+        peer,
+        transaction,
+        transient,
+        origin,
+        transport,
+    } = dial;
     let addr = peer
         .socket_addr()
         .expect("Connect requires known peer address");
@@ -891,17 +890,7 @@ mod tests {
         fn connect_native(
             &self,
             _dial: crate::transport::NativeDial,
-        ) -> Pin<
-            Box<
-                dyn std::future::Future<
-                        Output = Result<
-                            Box<dyn PeerConnectionApi>,
-                            crate::transport::NativeSetupOutcome,
-                        >,
-                    > + Send
-                    + '_,
-            >,
-        > {
+        ) -> crate::transport::NativeConnectFuture<'_> {
             // The handshake tests dial UDP only.
             Box::pin(async { Err(crate::transport::NativeSetupOutcome::Unavailable) })
         }
@@ -935,11 +924,13 @@ mod tests {
         let start = tokio::time::Instant::now();
         let event = connect_outbound(
             &connector,
-            peer.clone(),
-            transaction,
-            true,
-            RUN_ORIGIN,
-            crate::operations::connect::native::DialTransport::Udp,
+            super::OutboundDial {
+                peer: peer.clone(),
+                transaction,
+                transient: true,
+                origin: RUN_ORIGIN,
+                transport: crate::operations::connect::native::DialTransport::Udp,
+            },
             Some(&ready),
         )
         .await;

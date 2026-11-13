@@ -1784,11 +1784,11 @@ impl QuicPath {
         let wait = deadlines
             .gap_for(true)
             .map_or(deadlines.total, |gap| gap.min(deadlines.total));
-        let first = crate::deterministic_select! {
+        let first = tokio::select! {
             first = chunks.next() => first,
             () = time.sleep_cancelable(wait) => {
                 return BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut));
-            },
+            }
             error = connection.closed() => {
                 return BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(error)));
             }
@@ -1904,10 +1904,10 @@ impl QuicPath {
         }
         self.stats.node.record_permit(true);
         let connection = self.connection.inner();
-        crate::deterministic_select! {
+        tokio::select! {
             permit = Arc::clone(&self.stream_slots).acquire_owned() => {
                 permit.map_err(|_| QuicSendError::Closed)
-            },
+            }
             error = connection.closed() => Err(error.into()),
         }
     }
@@ -2138,7 +2138,7 @@ async fn supervise_receive<T: TimeSource>(
         &mut report,
     ))
     .catch_unwind();
-    let ended = crate::deterministic_select! {
+    let ended = tokio::select! {
         ended = &mut receive => ended,
         watched = watch => {
             if watched.is_err() {
@@ -2315,7 +2315,7 @@ impl Outgoing {
     /// at once instead of holding its uni-stream credit (and, for a blocked
     /// write, the connection's flow-control credit).
     async fn race<F: Future>(&mut self, fut: F) -> Result<F::Output, QuicSendError> {
-        crate::deterministic_select! {
+        tokio::select! {
             out = fut => Ok(out),
             stopped = &mut self.stopped => Err(self.stopped_early(stopped)),
         }
@@ -2323,7 +2323,7 @@ impl Outgoing {
 
     async fn write_all(&mut self, buf: &[u8]) -> Result<(), QuicSendError> {
         let Self { send, stopped, .. } = self;
-        let written = crate::deterministic_select! {
+        let written = tokio::select! {
             written = send.write_all(buf) => written,
             result = stopped => return Err(self.stopped_early(result)),
         };
@@ -2356,7 +2356,7 @@ impl Outgoing {
     async fn write_chunk(&mut self, chunk: Bytes) -> Result<(), QuicSendError> {
         let len = chunk.len();
         let Self { send, stopped, .. } = self;
-        let written = crate::deterministic_select! {
+        let written = tokio::select! {
             written = send.write_chunk(chunk) => written,
             result = stopped => return Err(self.stopped_early(result)),
         };

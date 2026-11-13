@@ -112,9 +112,9 @@ pub(crate) const THIS_BUILD: VersionRef = VersionRef {
 pub(crate) enum JoinTransport {
     /// Today's UDP gateway handshake (intro packet, then ack).
     LegacyIntro,
-    /// A join made over QUIC directly. Reserved: QUIC-native joins do not
-    /// exist yet, so nothing records this and its count is always zero.
-    #[allow(dead_code)]
+    /// A join made over QUIC directly: a gateway records it when its native
+    /// dial gives a connection. Zero in production until native connects
+    /// are on.
     Native,
 }
 

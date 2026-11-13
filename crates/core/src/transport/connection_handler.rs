@@ -580,6 +580,7 @@ pub(crate) fn udp_transport_handle<S: Socket>(
     super::TransportHandle {
         quic_endpoint: outbound.quic_availability().get()
             != super::quic::liveness::QuicAvailability::Disabled,
+        quic_availability: outbound.quic_availability(),
         expected_inbound: Arc::new(outbound.expected_inbound_tracker()),
         connector: Arc::new(outbound),
         acceptor: Box::new(inbound),
@@ -1004,17 +1005,7 @@ impl<S: Socket> super::OutboundConnector for OutboundConnectionHandler<S> {
         })
     }
 
-    fn connect_native(
-        &self,
-        dial: super::NativeDial,
-    ) -> Pin<
-        Box<
-            dyn Future<
-                    Output = Result<Box<dyn super::PeerConnectionApi>, super::NativeSetupOutcome>,
-                > + Send
-                + '_,
-        >,
-    > {
+    fn connect_native(&self, dial: super::NativeDial) -> super::boundary::NativeConnectFuture<'_> {
         let upgrades = self.upgrade_site.upgrades();
         Box::pin(async move {
             let Some(upgrades) = upgrades else {

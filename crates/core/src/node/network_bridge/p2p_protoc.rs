@@ -1557,7 +1557,14 @@ impl P2pConnManager {
             expected_inbound,
             listener: mut listener_liveness,
             quic_endpoint: transport_has_quic,
+            quic_availability,
         } = transport;
+        bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .native_connect()
+            .set_endpoint(quic_availability);
 
         tracing::info!(
             listening_port,
@@ -5029,7 +5036,8 @@ pub(crate) mod tests {
 
     /// Source pin: the event loop's dial for a message with no connection
     /// is tagged by `unconnected_dial_origin` (the event loop has no harness
-    /// here). The call must be the `origin:` field of that `ConnectPeer`.
+    /// here). The call must be the `origin:` field of that `ConnectPeer`,
+    /// and the dial is UDP: only the connect op asks for a native one.
     #[test]
     fn the_unconnected_dial_uses_unconnected_dial_origin() {
         let code = event_loop_code();
@@ -5038,7 +5046,7 @@ pub(crate) mod tests {
             .expect("the unconnected-dial ConnectPeer");
         assert!(
             code[dispatch..].starts_with(
-                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw),}),"
+                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw),transport:crate::operations::connect::native::DialTransport::Udp,}),"
             ),
             "the dial's origin must come from unconnected_dial_origin"
         );

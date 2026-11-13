@@ -200,7 +200,11 @@ pub(in crate::transport) async fn connect_native<T: TimeSource>(
         .charge(peer.addr, CLIENT_BYTES_PER_DIAL, clock.now())
         .map_err(NativeSetupError::OverBudget)?;
     let left = end.saturating_sub(clock.now());
-    let connection = crate::deterministic_select! {
+    // `biased` (dial, window, punches): a fixed order so a simulation's seed
+    // decides the run, and a dial that completes as the window ends still
+    // counts. The punch arm never completes, so nothing starves.
+    let connection = tokio::select! {
+        biased;
         dialled = endpoint.dial_native(peer.addr, peer.key) => dialled?,
         () = clock.sleep_cancelable(left) => return Err(NativeSetupError::TimedOut),
         never = punch_until(endpoint, peer.addr, clock, end) => match never {},
@@ -248,7 +252,9 @@ pub(in crate::transport) async fn accept_native<T: TimeSource>(
         }
     };
     let left = end.saturating_sub(clock.now());
-    let connection = crate::deterministic_select! {
+    // `biased`, as in `connect_native`.
+    let connection = tokio::select! {
+        biased;
         accepted = accept => accepted?,
         () = clock.sleep_cancelable(left) => return Err(NativeSetupError::TimedOut),
         never = punch_until(endpoint, peer.addr, clock, end) => match never {},

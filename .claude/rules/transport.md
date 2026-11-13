@@ -512,8 +512,10 @@ offer and decision (`connect_native_offered_{zero,nonzero}` built as joiner,
 `connect_native_decided_{native,udp}` made as acceptor for an offered request,
 `connect_native_decision_{without_offer,native_unsupported}` for a `Native`
 decision a joiner could not use, `connect_native_decision_over_cap` for one
-dropped unanswered past the per-CONNECT cap on refused acceptors, and the last
-offer as states
+dropped unanswered past the per-CONNECT cap on refused acceptors,
+`connect_native_setup_<label>` for how each native setup ended (one per
+`NativeSetupOutcome`), `connect_native_demotions` for each time the node
+turned its own native connects off, and the last offer as states
 `connect_native_offer_{level,percent,ready}`; see
 `operations/connect/native.rs`) and the shadow-mode upgrade
 telemetry (below, "Upgrade telemetry"). Each label set is declared once in a
@@ -595,8 +597,9 @@ most 67 labels whatever a peer sends (35 while the floor shares this
 series), held in fixed arrays. No keys,
 no addresses; in `gateway_joins` a count of 1 to 4 is reported as `"<5"`, and
 zero counts are omitted in both maps. Transport `legacy_intro` is today's UDP
-handshake; `native` is reserved for QUIC-native joins, which do not exist yet,
-and is never counted. It is not a `KnownShadowRollup`: its admission and drop
+handshake; `native` is a QUIC-native join, counted by a gateway when its
+native dial gives a connection (zero in production until native connects
+are on). It is not a `KnownShadowRollup`: its admission and drop
 counts are in the per-type `tel_t` row like any other event.
 
 ### Dashboard bandwidth sampler (#5152)
@@ -2017,7 +2020,9 @@ no extra message, no exporter proof.
     off nothing is sent. Counters (conn_identity_*): transport_key_sent
     (handed to the connection's task), transport_key_undelivered (not handed
     over within the 1 s fallback; not re-sent), transport_key_set / _same
-    (the transport took it), and promotion_key_mismatch (promoted under a key
+    (the transport took it), set_proven (a QUIC-native connection's key,
+    proven in its handshake, bound as IdentitySource::Proven), and
+    promotion_key_mismatch (promoted under a key
     that is not the bound one; nothing sent) and transport_key_refused (the
     transport holds another key and keeps it), which must stay at 0 (the
     simulation tripwire and test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off
@@ -2039,13 +2044,14 @@ either side, and a man in the middle with its own key on either leg.
 
 #### QUIC-native setup (`quic/native/`, #5940 QUIC-native connect, A4)
 
-Built and tested, and unreachable by construction: `setup::connect_native`,
-`setup::accept_native` and the endpoint's native side (`native/endpoint.rs`:
-`allow_native_peer`, `dial_native`, `send_punch`) are
-`pub(in crate::transport::quic::native)`, and registering a native waiter is
-private to `setup`. Nothing outside `quic/native` can call them; A5 widens
-them in a visible diff. The connect op also gates on
-`operations::connect::native::NATIVE_DIAL_READY` (pinned false).
+`setup::connect_native` and `setup::accept_native` are
+`pub(in crate::transport)`, called only by the upgrades hub's
+`QuicUpgrades::setup_native` (A5b, below); the endpoint's native side
+(`native/endpoint.rs`: `allow_native_peer`, `dial_native`, `send_punch`)
+stays `pub(in crate::transport::quic::native)`, and registering a native
+waiter is private to `setup`. In production nothing asks for a setup: the
+connect op gates on `operations::connect::native::NATIVE_DIAL_READY` (pinned
+false) and `QUIC_NATIVE_PERCENT` (0).
 
 ```
 ALPN per attempt: an address allowed with allow_native_peer is accepted with
@@ -2077,7 +2083,8 @@ Punches (native/punch.rs): byte 0x03 + 8 GlobalRng bytes, sent on the
   The silent-peer test checks a client sends no more than it was charged.
 Setup (native/setup.rs): one window, 8 s cut to the caller's deadline, not
   started with less than 4 s left; punching, the handshake and the Hello
-  exchange all inside it. The budget is charged after the checks that fail
+  exchange all inside it. The server waits 4 s more
+  (SERVER_WINDOW_ALLOWANCE), so a client that starts late still finds it. The budget is charged after the checks that fail
   without sending (window, key, waiter, allow). Roles by key order are the
   caller's decision.
 Not decided here (A5): fairness between the requesters that steer setups,
@@ -2089,8 +2096,8 @@ Not decided here (A5): fairness between the requesters that steer setups,
 ```
 
 Native connection (`peer_connection/native_connection.rs`, A5a): the
-`PeerConnectionApi` over a native connection, built by nothing in production
-until A5b wires the connect op.
+`PeerConnectionApi` over a native connection, built by
+`QuicUpgrades::setup_native` once a native setup gives a connection.
 
 ```
 Path: QuicPathLimits::NATIVE (DEFAULT with udp_fallback off) and data
@@ -2121,7 +2128,9 @@ End reasons (close_reason after recv fails): quinn's idle TimedOut is
 Pacing: the bandwidth limit paces its data with a LimitPacer on the path's
   clock, as an upgrade session's does, except that a message the pacer
   refuses is dropped (no UDP to send it on) and nothing is charged as
-  fallback debt.
+  fallback debt. A native connection counts in the node's shared bandwidth
+  pool (GlobalBandwidthManager) while it lives, as a UDP connection does, so
+  its share of the total limit shrinks with the connection count.
 Drop: closes with NODE_DROPPED_PEER at once (send tasks hold the path) and
   cancels its unclaimed inbound streams, as PeerConnection's drop does.
 send_bytes_observed is always Unobserved: no message is a stream it reports.
@@ -2131,6 +2140,59 @@ A route worker panic is counted on the path and node-wide as
 The transient-send warn in peer_connection_listener is throttled per
   connection (1st, 2nd, 4th ... failure, with the count), since a backed-up
   short queue refuses every send with SendQueueFull.
+```
+
+Native connect (`operations/connect/native.rs`, `quic/upgrade/driver/native.rs`,
+A5b): the connect op asks for a native connection when the acceptor decides
+`Native`. Off in production (gates above); a simulation turns it on per node
+with `SimNetwork::with_native_connect` / `with_node_native_connect`
+(`NodeConfig::native_connect_override`).
+
+```
+Readiness: NativeConnectState, one per node in the ConnectionManager. Ready
+  when dialling is on (NATIVE_DIAL_READY, or the override), this node's own
+  QUIC endpoint is up (its QuicAvailabilityWatch from TransportHandle, read
+  per node: the process-wide quic_endpoint metric is shared by simulated
+  nodes) and the node is not demoted. The relay's decision and the joiner's
+  offer both read it.
+Dial: NodeEvent::ConnectPeer and HandshakeCommand::Connect carry a
+  DialTransport. A native dial registers no UDP expectation and runs
+  OutboundConnector::connect_native -> QuicUpgrades::setup_native: the
+  higher key is the server (accept_native), the lower the client
+  (connect_native); one PunchBudget per node shared by both roles; at most
+  NATIVE_SETUPS_MAX (64, lowered to the connection limit) setups at once,
+  refused at once past that (setups_full). Each end is counted once as
+  connect_native_setup_<label> by an exhaustive match on the setup error.
+Joiner: joiner_response_action gives Native when it offered and can still
+  dial. Acceptor: dispatch_expect_connection_from takes the response's
+  decision; every accept site passes it (source-scrape pin).
+Fallback: a failed native setup is followed at once by today's UDP dial to
+  the same peer (joiner: in the same dial slot, before anything counts the
+  acceptor failed; acceptor: expectation plus dial). A native failure marks
+  no failed address and records no peer backoff, so the fallback is not
+  refused. Until UDP is removed a failed native setup never costs the join
+  (test_quic_native_failed_setups_fall_back_to_udp).
+Success: the connection's key is bound as IdentitySource::Proven; a
+  gateway records a JoinTransport::Native join.
+Demotion: recorded in the connection lifecycle, where the outcome is known.
+  Only timed_out, handshake_failed and hello_lost count
+  (NativeSetupOutcome::counts_toward_demotion): a refusal by the node's own
+  limits, or a Hello the peer answered, says nothing about the path. Three
+  such failures with distinct peers turn native off for 6 h
+  (connect_native_demotions); a success resets the streak.
+Existing transport: a native dial does not drop a connection the node
+  already has to that peer; the joiner may have connected another way since
+  the acceptor decided.
+Simulation: every node shares [::1], so the per-destination punch budget
+  is one bucket for all of a node's peers, and a joiner dialling several
+  acceptors at once refuses some setups (over_budget_destination) and their
+  servers time out. The fallback covers them.
+Determinism: a plain tokio::select! draws its arm order from tokio's RNG,
+  which the seed does not set. bounded_send's loop and the native setup's
+  two selects are `biased` with a documented order, so one seed runs the
+  same twice (test_quic_native_connect_is_deterministic). Not
+  deterministic_select!: it draws from GlobalRng, which shifts the seed's
+  stream for every QUIC test after it.
 ```
 
 #### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)

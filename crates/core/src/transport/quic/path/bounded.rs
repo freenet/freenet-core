@@ -834,11 +834,17 @@ where
         #[cfg(test)]
         progress.0.arms.fetch_add(1, Ordering::Relaxed);
         let wait = Duration::from_nanos(deadline.saturating_sub(time.now_nanos()));
-        // `deterministic_select!`, not `tokio::select!`: which arm is polled
-        // first decides whether `source_wait` is registered before `send`
-        // notifies it, and tokio draws that order from an RNG a simulation's
-        // seed does not set.
-        crate::deterministic_select! {
+        // `biased`: which arm is polled first decides whether `source_wait`
+        // is registered before `send` notifies it, and without it tokio draws
+        // that order from an RNG a simulation's seed does not set, so one seed
+        // ran differently twice. A fixed order draws nothing from `GlobalRng`
+        // either, so a seed's stream is what it was. No arm can starve
+        // another: `send` ends the loop when ready; the timer is polled
+        // before `source_wait`, so a source that notifies on every
+        // iteration cannot hold off the deadline check; and `source_wait`
+        // only re-arms the loop, which recomputes the deadline.
+        tokio::select! {
+            biased;
             result = &mut send => {
                 // A refusal returns an error only to end the send, which then
                 // ends as a deadline would at that stage. It leaves no
@@ -847,8 +853,7 @@ where
                     return progress.paced();
                 }
                 return outcome(result, &progress);
-            },
-            () = progress.0.source_wait.notified() => {},
+            }
             () = time.sleep_cancelable(wait) => {
                 let now = time.now_nanos();
                 // Only the gap of an open stream reads the connection.
@@ -873,6 +878,7 @@ where
                     return progress.timed_out();
                 }
             }
+            () = progress.0.source_wait.notified() => {}
         }
     }
 }
