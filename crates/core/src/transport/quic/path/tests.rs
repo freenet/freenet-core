@@ -1438,7 +1438,16 @@ fn a_one_packet_shorts_background_ack_wait_is_bounded() {
                 short_ack_wait: Some(bound),
                 ..QuicPathLimits::DEFAULT
             };
-            let p = paths_built(network, limits, None, None, windows, true).await;
+            let p = paths_built(
+                network,
+                limits,
+                QuicPathLimits::DEFAULT,
+                None,
+                None,
+                windows,
+                true,
+            )
+            .await;
             let (a, time) = (p.a.clone(), p.time());
             let (outcome, held) = p
                 .drive(async move {
@@ -1595,7 +1604,16 @@ fn a_short_and_a_control_past_their_bound_under_bulk_acks_are_strikes() {
             counters: Some(counters),
             ..QuicPathLimits::DEFAULT
         };
-        let mut p = paths_built(network, limits, None, None, windows, true).await;
+        let mut p = paths_built(
+            network,
+            limits,
+            QuicPathLimits::DEFAULT,
+            None,
+            None,
+            windows,
+            true,
+        )
+        .await;
         let mut streams = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
         let mut shorts = std::mem::replace(&mut p.b_in.shorts, tokio::sync::mpsc::channel(1).1);
         let drain = tokio::spawn(async move {
@@ -1701,7 +1719,16 @@ fn an_expiry_whose_timer_woke_late_is_not_a_strike() {
                 a: Some(test_budget(64 << 20, leaked_counters())),
                 b: Some(test_budget(64 << 20, leaked_counters())),
             };
-            let mut p = paths_built(network, limits, None, None, windows, true).await;
+            let mut p = paths_built(
+                network,
+                limits,
+                QuicPathLimits::DEFAULT,
+                None,
+                None,
+                windows,
+                true,
+            )
+            .await;
             let (a_addr, time) = (p.pair.a_addr, p.time());
             let cut = time.now_nanos() + 2_500_000_000;
             set_packet_delivery_callback(
