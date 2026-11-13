@@ -42,6 +42,43 @@ struct Paths {
     b_in: QuicInbound,
 }
 
+/// Does nothing: it exists so a test body that names one field captures the
+/// whole value. Without it, an `async move` block naming only some fields
+/// (Rust 2021 disjoint capture) drops `pair` when the block is built, and
+/// `Pair`'s drop stops the socket pumps: nothing more is delivered (#6211).
+/// A test that takes the paths apart calls [`Paths::into_parts`].
+impl Drop for Paths {
+    fn drop(&mut self) {}
+}
+
+/// [`Paths`]' fields, for a test that drops some of them early.
+struct PathsParts {
+    pair: Pair,
+    a: Arc<QuicPath>,
+    b: Arc<QuicPath>,
+    b_in: QuicInbound,
+}
+
+impl Paths {
+    /// Move the fields out. `Paths` has a `Drop`, so they cannot be moved
+    /// out by a pattern; its `Drop` is empty, so not running it loses
+    /// nothing. `a_in` is dropped here; `net` is `Copy`.
+    fn into_parts(self) -> PathsParts {
+        let p = std::mem::ManuallyDrop::new(self);
+        // SAFETY: `p` is never dropped or used again, and each field is read
+        // exactly once, so every value has exactly one owner afterwards.
+        unsafe {
+            drop(std::ptr::read(&p.a_in));
+            PathsParts {
+                pair: std::ptr::read(&p.pair),
+                a: std::ptr::read(&p.a),
+                b: std::ptr::read(&p.b),
+                b_in: std::ptr::read(&p.b_in),
+            }
+        }
+    }
+}
+
 impl Paths {
     fn time(&self) -> VirtualTime {
         self.pair.time.clone()
@@ -2079,7 +2116,7 @@ fn readers_waiting_for_room_when_the_path_ends_are_counted() {
         let stats = p.b.stats_handle();
         assert_eq!(stats.count(QuicInboundOutcome::ShortAbandonedWaiting), 0);
         assert_eq!(stats.count(QuicInboundOutcome::StreamAbandonedWaiting), 0);
-        let Paths { pair, b, .. } = p;
+        let PathsParts { pair, b, .. } = p.into_parts();
         drop(b);
         drive(&pair.time, LIMIT, async move {
             time.sleep(Duration::from_secs(1)).await
@@ -5178,7 +5215,7 @@ fn a_reserved_control_frame_opens_ahead_of_data_at_a_full_limit() {
             "the control frame did not wait for a slot"
         );
         let mut announced = 0;
-        let mut b_in = p.b_in;
+        let mut b_in = p.into_parts().b_in;
         while b_in.streams.try_recv().is_ok() {
             announced += 1;
         }
@@ -8224,13 +8261,13 @@ fn a_closed_path_with_a_surviving_handle_leaves_the_budget() {
             std::mem::forget(send);
         })
         .await;
-        let Paths {
+        let PathsParts {
             pair,
             a,
             b,
             mut b_in,
             ..
-        } = p;
+        } = p.into_parts();
         let handle = b_in.streams.try_recv().expect("announced").handle;
         assert_eq!(budget.connections(), 1);
         let now = pair.time.now_nanos();
