@@ -544,7 +544,8 @@ Current wire-gated floors:
   than T0 starts every node that updates part-way along the curve: a node that
   updates 12 h after T0 starts at 25%, and one that updates 24 h or more after
   T0 starts at 100%, skipping the ramp. **If the publish slips more than about
-  3 h past T0, re-set T0 in a new reviewed PR before publishing.** A node whose
+  3 h past T0, re-set T0 in a new reviewed PR before publishing.** The same PR
+  sets `QUIC_DATA_RAMP_RELEASE` (see the entry above for the release-time check). A node whose
   clock reads before T0 gets 5%. The soak runs before T0, so it exercises only
   the 5% share. That PR also updates the expectation that pins the release's
   share, the `quic-data-release-share` case in `simulation_integration.rs`.
