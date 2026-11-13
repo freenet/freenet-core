@@ -2588,7 +2588,7 @@ pub struct NetworkArgs {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`. Unset means
-    /// `shadow` on Linux, macOS and Windows, and `off` elsewhere.
+    /// `shadow` on Linux and macOS, and `off` elsewhere, Windows included.
     ///
     /// `shadow` builds a QUIC endpoint on the network port and upgrades
     /// connections to peers that also run it to a QUIC path. The path carries

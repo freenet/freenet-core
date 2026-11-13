@@ -21567,7 +21567,7 @@ fn assert_ramp_pairs_carry_data_by(run: &QuicShadowRun, full_at: Duration) {
 /// shadow path that carries no data. Two ramp nodes in the same run shape carry
 /// data (the positive control).
 #[test_log::test]
-fn test_quic_data_ramp_stops_against_a_node_on_the_default_off_release() {
+fn test_quic_data_ramp_stops_against_a_node_on_the_stop_release() {
     for (name, stopped, carries) in [
         ("quic-ramp-stop-mixed", true, false),
         ("quic-ramp-stop-control", false, true),

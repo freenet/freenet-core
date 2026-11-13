@@ -99,7 +99,7 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuicMode {
     /// No QUIC endpoint is built and no QUIC datagram is read. The default on
-    /// platforms other than Linux, macOS and Windows.
+    /// platforms other than Linux and macOS, Windows included.
     Off,
     /// The node builds a QUIC endpoint on its UDP port and upgrades a UDP
     /// session to a QUIC path that carries only control frames: all
