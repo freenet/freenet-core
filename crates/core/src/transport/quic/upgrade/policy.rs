@@ -811,7 +811,7 @@ mod tests {
             ("prefer", None, ramp, true),
             ("prefer", Some("0"), ramp, false),
             ("prefer", Some("5"), ramp, true),
-            ("prefer", None, None, QUIC_DATA_PERCENT > 0),
+            ("prefer", None, None, false),
             ("prefer", Some("0"), None, false),
             ("shadow", None, ramp, false),
             ("off", None, ramp, false),
