@@ -1125,46 +1125,70 @@ fn ack_wait_expiries_close_a_path_whatever_else_is_acknowledged() {
 }
 
 /// The ack-wait expiry rule does not count this node's own throttling: with
-/// the egress cap holding the connection's transmits (a 20 kB/s
-/// `total-bandwidth-limit` under a bulk transfer), sends whose ack wait runs
-/// out are reset but are not strikes, and the path is not closed.
+/// the egress cap holding the connection's transmits (a 100 kB/s
+/// `total-bandwidth-limit` under a bulk transfer, so the connection still
+/// acknowledges above the floor and only the cap hold excuses it), sends
+/// whose ack wait runs out are reset but are not strikes, and the path is
+/// not closed.
 #[test]
 fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths_capped("quic-path-expiries-capped", 20_000).await;
+        let p = paths_capped("quic-path-expiries-capped", 100_000).await;
         let (a, time) = (p.a.clone(), p.time());
+        // The cap queues the bulk's bytes ahead of each end past the wait.
         let never = SendDeadlines {
-            ack_wait: Some(Duration::from_millis(10)),
+            open: Duration::from_secs(30),
+            gap: Some(Duration::from_secs(30)),
+            ack_wait: Some(Duration::from_millis(300)),
             ..SendDeadlines::stream(10_000)
         };
         let holds = a.connection().cap_holds();
         p.drive(async move {
-            let bulk = {
-                let a = a.clone();
-                tokio::spawn(async move {
-                    a.send_stream(StreamId::next(), None, Bytes::from(payload(4 * MIB)))
-                        .await
-                        .ok();
+            // Four transfers at once keep the cap's queue full.
+            let bulk: Vec<_> = (0..4)
+                .map(|_| {
+                    let a = a.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            a.send_stream(StreamId::next(), None, Bytes::from(payload(MIB)))
+                                .await
+                                .ok();
+                        }
+                    })
                 })
-            };
+                .collect();
             time.sleep(Duration::from_secs(2)).await;
             for _ in 0..3 {
-                a.send_stream_bounded(
-                    &time,
-                    never,
-                    StreamId::next(),
-                    None,
-                    Bytes::from(payload(10_000)),
-                    None,
-                )
-                .await;
+                let expired = a
+                    .send_stream_bounded(
+                        &time,
+                        never,
+                        StreamId::next(),
+                        None,
+                        Bytes::from(payload(10_000)),
+                        None,
+                    )
+                    .await;
+                assert!(
+                    matches!(
+                        expired,
+                        BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+                    ),
+                    "{expired:?}"
+                );
                 time.sleep(Duration::from_secs(3)).await;
             }
-            bulk.abort();
+            for bulk in bulk {
+                bulk.abort();
+            }
         })
         .await;
         assert!(holds.read().holds > 0, "premise: the cap held transmits");
+        assert!(
+            p.a.send_aborts() >= 1,
+            "premise: an ack wait ran out and its stream was reset"
+        );
         assert_eq!(p.a.writers().ack_wait_expiries(), 0);
         assert!(p.a.connection().inner().close_reason().is_none());
     })
