@@ -613,13 +613,18 @@ Current wire-gated floors:
   can turn a pair's bit on a second time and recycle it again.
 
   Emergency stop: a parked release, built and soaked before the ramp release is
-  cut, is published through the normal auto-update stagger (0 to 4 h). It makes
-  two changes, and needs both. It sets the default mode to off, which turns QUIC
-  off on every node that did not set `transport-quic` itself (the default is
-  read, never written to `config.toml`). It also sets `QUIC_DATA_RAMP_START`
-  back to `None`, which gives every node that set `transport-quic = "prefer"`
-  itself (testers, possibly our own gateways) a share of 0, so none of its pairs
-  carries data; only a node that also set `quic-data-percent` keeps a share.
+  cut, is published through the normal auto-update stagger (0 to 4 h). It
+  restores the pre-ramp state with two changes, and needs both. It sets
+  `QUIC_DATA_RAMP_START` back to `None`, which gives every `prefer` node a
+  share of 0, so none of its pairs carries data; only a node that set
+  `quic-data-percent` keeps a share. It also sets the default mode back to
+  shadow on Linux, macOS and Windows, so a node that did not set
+  `transport-quic` keeps its endpoint and its paths as shadow paths, the state
+  releases before the ramp ran in (the default is read, never written to
+  `config.toml`). Shadow, not off: off would tear down every node's QUIC
+  endpoint mid-incident, a larger change than the stop needs. A node that set
+  `transport-quic = "prefer"` itself stays in prefer at a share of 0, which
+  acts as shadow on the wire.
   A node takes either change only when it restarts into the release (an
   auto-update restarts it, 0 to 4 h after publish). Until then its paths with
   data keep carrying data: a path with data is never rechecked.
