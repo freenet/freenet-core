@@ -1168,8 +1168,9 @@ it must not wait unless it is a pacing point.
 #### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
 `transport-quic` (config key: `off`, `shadow` or `prefer`; unset is
-`QuicMode::default_mode`, prefer on Linux, macOS and Windows and off
-elsewhere, since the breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
+`QuicMode::default_mode`, shadow on Linux and macOS and off elsewhere, Windows
+included: the data ramp's emergency stop returned to 0.2.156's defaults, the last
+state the field ran) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
 `prefer` negotiates data with the share of pairs the ramp gives at the time ("Data
 slice" below; `upgrade::policy::log_startup` reports the share at INFO once per
 node, and each band the ramp enters is logged at INFO), and a pair with both bits
@@ -1180,8 +1181,8 @@ bit, which stays 0. The release that sets the ramp start must say in its notes t
 carrying data. Off: no endpoint, no QUIC ingress, nothing
 changes, except that `off` set in the config is deprecated and logs a WARN at
 startup (`upgrade::policy::log_startup`); the endpoint state telemetry reports it
-as `off_config`. Windows has the same default since its crash-loop breaker was
-confirmed on a real Windows machine (#6031). The default is
+as `off_config`. Windows had prefer by default for the ramp release only (its
+crash-loop breaker was confirmed on a real Windows machine, #6031). The default is
 read, never written to config.toml: a node that did not set the key follows the
 release it runs, so a default-off release is the kill switch for QUIC as a
 whole. Stopping only the data ramp is smaller: `QUIC_DATA_RAMP_START = None`

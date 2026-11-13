@@ -313,15 +313,16 @@ fn three_quic_panics_keep_quic_off_for_the_cooldown() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// QUIC is on by default on Windows (prefer, as on Linux and macOS), now that
-/// the breaker has been confirmed on a real Windows machine (#6031): a node
-/// with no `transport-quic` builds the endpoint and arms the breaker's marker.
-/// This fails if the default stops building the endpoint.
+/// QUIC is off by default on Windows: the emergency stop of the QUIC data
+/// ramp returns to 0.2.156's defaults, the last state the field ran. A node
+/// with no `transport-quic` builds no endpoint and writes no breaker marker.
+/// This fails if the default changes.
 #[test]
-fn quic_is_on_by_default_on_windows() -> anyhow::Result<()> {
+fn quic_is_off_by_default_on_windows() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut node = Node::start(dir.path(), dir.path().join("logs"), &[])?;
-    node.wait_for_log(QUIC_BUILT)?;
-    node.wait_for_marker(dir.path(), 0)?;
+    let node = Node::start(dir.path(), dir.path().join("logs"), &[])?;
+    let logs = node.logs();
+    assert!(!logs.contains(QUIC_BUILT), "{logs}");
+    assert_eq!(read_marker(dir.path())?, None, "no marker with QUIC off");
     Ok(())
 }
