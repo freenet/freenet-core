@@ -905,8 +905,8 @@ fn a_slow_stream_on_a_busy_connection_is_kept_past_its_first_age() {
 /// A send whose acknowledgement does not come within its ack wait
 /// (`SendDeadlines::ack_wait`, here 10 ms on a 200 ms round trip, so it
 /// cannot) ends `MaybeDelivered` at it, and its stream is reset and counted
-/// as an abort, so a peer that never acknowledges a stream's end is
-/// recycled by `SEND_ABORT_LIMIT` and does not hold the permit and epoch.
+/// as an abort, releasing its permit and epoch; three in a row close the
+/// path (`three_ack_wait_expiries_in_a_row_close_the_path_on_a_real_path`).
 #[test]
 fn a_send_past_its_ack_wait_is_reset_and_counted() {
     use crate::transport::in_memory_socket::{
@@ -949,14 +949,20 @@ fn a_send_past_its_ack_wait_is_reset_and_counted() {
             "{outcome:?}"
         );
         assert_eq!(p.a.send_aborts(), 1, "reset and counted");
+        assert_eq!(
+            p.a.writers().streams_ended(),
+            p.a.writers().streams_opened(),
+            "a reset stream has ended, for the stream-credit rule"
+        );
         assert_eq!(p.a.send_epoch_holders(), 0, "nothing left waiting");
     })
 }
 
 /// A peer whose acknowledgement of stream ends never comes in time (here
 /// each send's ack wait is 10 ms on a 200 ms round trip, so it cannot): two
-/// such sends, then a stream wholly acknowledged, which resets the count,
-/// then three more in a row: the path closes after the third
+/// such sends, then a stream wholly acknowledged within its ack wait, which
+/// resets the count, then three more, with acknowledged one-packet Shorts
+/// between them that do not: the path closes after the third
 /// (`StreamEndsUnacknowledged`, `recycle::ACK_WAIT_EXPIRY_LIMIT` = 3), and
 /// not before.
 #[test]
@@ -1015,6 +1021,14 @@ fn three_ack_wait_expiries_in_a_row_close_the_path_on_a_real_path() {
                 );
                 for i in 1..=3 {
                     send(short_wait).await;
+                    // One-packet Shorts, acknowledged, between the expiries:
+                    // they say nothing about stream ends and do not reset
+                    // the count.
+                    assert!(matches!(
+                        a.send_short_bounded(&time, Duration::from_secs(5), b"short")
+                            .await,
+                        BoundedSend::Sent
+                    ));
                     settle(time.clone()).await;
                     let closed = a.connection().inner().close_reason().is_some();
                     if closed {
@@ -4151,16 +4165,16 @@ fn a_consumer_that_stalls_45_s_does_not_close_the_path() {
                 let engaged = (
                     writers.stream_waiters(),
                     writers.streams_opened(),
-                    writers.streams_acknowledged(),
+                    writers.streams_ended(),
                 );
                 (sends, engaged)
             })
             .await;
-        let (sends, (waiting, opened, acknowledged)) = sends;
+        let (sends, (waiting, opened, ended)) = sends;
         assert!(waiting > 0, "premise: sends waited for stream credit");
         assert!(
-            opened >= 9 && acknowledged == opened,
-            "premise: every stream opened was wholly acknowledged ({acknowledged} of {opened})"
+            opened >= 9 && ended == opened,
+            "premise: every stream opened has ended, wholly acknowledged ({ended} of {opened})"
         );
         assert!(
             p.a.connection().inner().close_reason().is_none(),

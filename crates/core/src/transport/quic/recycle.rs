@@ -253,7 +253,7 @@ pub(crate) const DARK_GRACE_MAX: Duration = Duration::from_secs(10);
 /// second round must be seen at a later sample, so it goes out by twice that
 /// plus a probe timeout and is seen within a tick, and the close comes after
 /// its grace: 2 x (2 x (window + 2 ticks) + PTO + tick) + PTO + 2 ticks +
-/// grace. About 67 s at a 50 ms or 300 ms round trip and 74 s at 800 ms.
+/// grace. About 67 s at a 50 ms round trip, 69 s at 300 ms and 74 s at 800 ms.
 /// New sends leave a dark path much sooner, by suspect routing (`route`).
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn dark_close_bound(rtt: Duration) -> Duration {
@@ -733,9 +733,8 @@ pub(crate) struct AckSample {
     /// (its frame count only counts received ones), so the path counts its
     /// own waits.
     stream_waiters: usize,
-    /// This side's streams finished and wholly acknowledged
-    /// ([`Writers::streams_acknowledged`]).
-    streams_acknowledged: u64,
+    /// This side's data streams ended, in any way ([`Writers::streams_ended`]).
+    streams_ended: u64,
     /// This side's data streams opened ([`Writers::streams_opened`]).
     streams_opened: u64,
     /// This side's streams in a row whose ack wait ran out
@@ -783,7 +782,7 @@ impl AckSample {
             writers: writers.count(),
             rtt: stats.path.rtt,
             stream_waiters: writers.stream_waiters(),
-            streams_acknowledged: writers.streams_acknowledged(),
+            streams_ended: writers.streams_ended(),
             streams_opened: writers.streams_opened(),
             ack_wait_expiries: writers.ack_wait_expiries(),
         })
@@ -848,7 +847,7 @@ impl AckSample {
             writers: 0,
             rtt: Duration::ZERO,
             stream_waiters: 0,
-            streams_acknowledged: 0,
+            streams_ended: 0,
             streams_opened: 0,
             ack_wait_expiries: 0,
         }
@@ -876,16 +875,16 @@ impl AckSample {
 
     /// The same sample with these stream-credit readings
     /// ([`StreamCreditWatch`]): sends waiting for stream credit, streams
-    /// wholly acknowledged and opened. Tests only.
+    /// ended and opened. Tests only.
     #[cfg(test)]
     pub(crate) fn with_stream_credit(
         mut self,
         stream_waiters: usize,
-        streams_acknowledged: u64,
+        streams_ended: u64,
         streams_opened: u64,
     ) -> Self {
         self.stream_waiters = stream_waiters;
-        self.streams_acknowledged = streams_acknowledged;
+        self.streams_ended = streams_ended;
         self.streams_opened = streams_opened;
         self
     }
@@ -914,14 +913,15 @@ impl AckSample {
 pub(crate) struct Writers {
     /// Sends with data still to write.
     writing: AtomicUsize,
-    /// Streams finished and wholly acknowledged so far.
-    acknowledged: AtomicU64,
+    /// Data streams that have ended so far, in any way: wholly acknowledged,
+    /// stopped by the peer, or reset by this side ([`LiveStream`]).
+    ended: AtomicU64,
     /// Data streams opened so far.
     opened: AtomicU64,
     /// Sends waiting in `open_uni` for the peer's stream credit now.
     waiting_for_stream: AtomicUsize,
-    /// Streams in a row whose ack wait ran out, since the last stream
-    /// wholly acknowledged.
+    /// Streams in a row whose ack wait ran out, since the last stream with
+    /// an ack wait that was wholly acknowledged.
     ack_wait_expiries: std::sync::atomic::AtomicU32,
 }
 
@@ -956,10 +956,18 @@ impl Writers {
         self.writing.load(Ordering::Relaxed)
     }
 
-    /// One of the path's streams was finished and every byte of it
-    /// acknowledged, for the stream-credit rule ([`StreamCreditWatch`]).
-    pub(crate) fn stream_acknowledged(&self) {
-        self.acknowledged.fetch_add(1, Ordering::Relaxed);
+    /// The stream just opened is live until the guard is dropped, which
+    /// counts it as ended ([`Self::streams_ended`]).
+    pub(crate) fn live(self: &Arc<Self>) -> LiveStream {
+        LiveStream(self.clone())
+    }
+
+    /// A stream with an ack wait (`bounded::SendDeadlines::ack_wait`) was
+    /// finished and every byte of it acknowledged: the run of ack-wait
+    /// expiries is over. Only such a stream ends it: a one-packet Short or a
+    /// control frame acknowledged says nothing about whether the peer
+    /// acknowledges the ends of streams.
+    pub(crate) fn acknowledged_within_ack_wait(&self) {
         self.ack_wait_expiries.store(0, Ordering::Relaxed);
     }
 
@@ -975,9 +983,27 @@ impl Writers {
         self.ack_wait_expiries.load(Ordering::Relaxed)
     }
 
-    /// The path's streams finished and wholly acknowledged so far.
-    pub(crate) fn streams_acknowledged(&self) -> u64 {
-        self.acknowledged.load(Ordering::Relaxed)
+    /// The path's data streams that have ended so far, in any way.
+    pub(crate) fn streams_ended(&self) -> u64 {
+        self.ended.load(Ordering::Relaxed)
+    }
+}
+
+/// A data stream of the path, live until dropped; its drop counts it as
+/// ended ([`Writers::streams_ended`]), however it ended.
+#[derive(Debug)]
+pub(crate) struct LiveStream(Arc<Writers>);
+
+impl LiveStream {
+    /// The path's counts it is counted in.
+    pub(crate) fn writers(&self) -> &Writers {
+        &self.0
+    }
+}
+
+impl Drop for LiveStream {
+    fn drop(&mut self) {
+        self.0.ended.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1163,9 +1189,10 @@ impl AckWatch {
     /// `now_nanos` on the watch's own clock, which leaves out the time a late
     /// sample covers past one tick. A sample more than two ticks after the
     /// previous one means this side's runtime stalled (or the host
-    /// suspended): the interval is read as one tick, so a stall of this
-    /// side's own cannot make a healthy path look dark, unacknowledging or
-    /// starved. What happened meanwhile is still read from the sample.
+    /// suspended): the interval is read as one tick, for every rule, so a
+    /// stall of this side's own cannot make a healthy path look dark,
+    /// unacknowledging, starved or withholding. What happened meanwhile is
+    /// still read from the sample.
     fn watch_time(&mut self, now_nanos: u64) -> u64 {
         let tick = u64::try_from(ACK_WATCH_TICK.as_nanos()).unwrap_or(u64::MAX);
         if let Some(previous) = self.previous_at {
@@ -1225,19 +1252,18 @@ impl AckWatch {
     /// Take `sample`, taken at `now_nanos`; whether the path must close
     /// ([`Self::stall`] says why).
     pub(crate) fn observe(&mut self, now_nanos: u64, sample: AckSample) -> bool {
-        let dark_now = self.watch_time(now_nanos);
-        self.stall = self.decide(now_nanos, dark_now, sample);
+        let now_nanos = self.watch_time(now_nanos);
+        self.stall = self.decide(now_nanos, sample);
         self.stall.is_some()
     }
 
-    /// `now_nanos` is the caller's clock; `dark_now` the watch's own
-    /// ([`Self::watch_time`]), which only the dark rule reads. The other
-    /// rules judge counters that quinn's own driver keeps up to date (the
-    /// acknowledgements, the frames, the bytes acknowledged), so a late
-    /// sample still sees what the peer did meanwhile and needs no
-    /// forgiveness; the dark rule judges an absence over time, which a late
-    /// sample of this side's own could fake.
-    fn decide(&mut self, now_nanos: u64, dark_now: u64, sample: AckSample) -> Option<Stall> {
+    /// Every rule reads time on the watch's own clock ([`Self::watch_time`]):
+    /// quinn's driver runs on the same runtime, so when the runtime stalls
+    /// or the host suspends, the counters stop too, and an interval that
+    /// long would read as the peer's silence or slowness. A peer cannot make
+    /// this side's runtime late, so the forgiveness gives it nothing.
+    fn decide(&mut self, now_nanos: u64, sample: AckSample) -> Option<Stall> {
+        let dark_now = now_nanos;
         let same_controller = Arc::ptr_eq(&sample.record, &self.previous.record);
         // A new controller restarts the counts: read it as an
         // acknowledgement, with nothing known to be outstanding.
@@ -1252,12 +1278,17 @@ impl AckWatch {
         let withheld = same_controller && self.stream_credit.observe(now_nanos, &sample);
         let expired = sample.ack_wait_expiries >= ACK_WAIT_EXPIRY_LIMIT;
         let rtt = sample.rtt;
+        // Packets this side sent after the latest batch of acknowledgements
+        // are outstanding too, though no batch counted them: at the start of
+        // the interval (the latch) or within it.
+        let sent_unacknowledged = self.sent_after_acks || (sent_new && !new_batch);
         let starved = self.credit.observe(
             now_nanos,
             &self.previous,
             &sample,
             same_controller,
             cap_held,
+            sent_unacknowledged,
         );
         self.previous = sample;
         if new_batch {
@@ -1386,8 +1417,7 @@ pub(crate) enum Stall {
     CreditStarved,
     /// The peer granted no stream credit while this side wanted streams,
     /// for [`STREAM_CREDIT_WINDOW`], though enough of this side's streams
-    /// were wholly acknowledged that an honest peer would have
-    /// ([`StreamCreditWatch`]).
+    /// ended that an honest peer would have ([`StreamCreditWatch`]).
     StreamCreditWithheld,
     /// [`ACK_WAIT_EXPIRY_LIMIT`] of this side's streams in a row reached
     /// their ack wait with their end unacknowledged, and none was wholly
@@ -1473,6 +1503,7 @@ impl CreditWatch {
         sample: &AckSample,
         same_controller: bool,
         cap_held: bool,
+        sent_unacknowledged: bool,
     ) -> bool {
         if !same_controller {
             self.carry = false;
@@ -1489,8 +1520,9 @@ impl CreditWatch {
         // when every batch of them was application-limited, so what held
         // delivery back was the credit, not this side's window. An interval
         // with none counts only if nothing was outstanding at either end of
-        // it ("settled"): everything this side sent was acknowledged, so the
-        // only thing it waits for is credit. With packets outstanding and no
+        // it ("settled": no bytes in flight after the latest batch, and no
+        // send since it, `sent_unacknowledged`): everything this side sent
+        // was acknowledged, so the only thing it waits for is credit. With packets outstanding and no
         // acknowledgement the peer may simply be unreachable for a moment,
         // which is the dark rule's to judge, and the interval counts nothing.
         let new_batch = sample.state.batches != previous.state.batches;
@@ -1498,6 +1530,7 @@ impl CreditWatch {
         let waited = base && new_batch && !congestion_limited;
         let settled = base
             && !new_batch
+            && !sent_unacknowledged
             && sample.state.outstanding_after_acks() == 0
             && previous.state.outstanding_after_acks() == 0;
         let since = self.history.back().map_or(UNKNOWN_AT, |&(at, ..)| at);
@@ -1554,8 +1587,8 @@ impl CreditWatch {
 /// worth keeping the path for.
 pub(crate) const STREAM_CREDIT_WINDOW: Duration = Duration::from_secs(60);
 
-/// Streams of this side wholly acknowledged during a withheld spell past
-/// which an honest peer has granted more, at most: quinn returns stream
+/// Streams of this side ended during a withheld spell past which an honest
+/// peer has granted more, at most: quinn returns stream
 /// credit once more than an eighth of its limit is freed, and the limit is
 /// at most `MAX_UNI_STREAMS` (64). Fewer streams in flight need fewer
 /// ([`StreamCreditWatch`]).
@@ -1585,19 +1618,21 @@ pub(crate) const STREAM_CREDIT_DEMAND: Duration = Duration::from_secs(20);
 /// whether credit was granted). A withheld spell starts at the first sample
 /// at which a send waits in `open_uni` for the peer's stream credit with no
 /// stream opened since the previous sample, and ends only when a stream
-/// opens. It survives samples with no waiting send: a send waits at most its
-/// open deadline (2 s) and then goes on UDP, so a path whose sends come now
-/// and then shows a waiter only at some samples. The path is closed when the
-/// spell has lasted [`STREAM_CREDIT_WINDOW`], a send waited within the last
-/// [`STREAM_CREDIT_DEMAND`], and enough of this side's streams were wholly
-/// acknowledged during the spell: [`STREAM_CREDIT_FREED`], or every stream
-/// in flight when it began (opened and not yet wholly acknowledged) if
-/// fewer. When a spell begins every slot of the peer's is taken by this
-/// side's streams, and our receiver reads every stream to its end as it
-/// arrives (a Stream also while it waits for its consumer), so the streams
-/// acknowledged during the spell are slots an honest peer has freed; only a
-/// one-packet Short waiting for its consumer holds one, and lowers the limit
-/// it advertises while it does.
+/// opens. It survives samples with no waiting send for up to
+/// [`STREAM_CREDIT_DEMAND`] (a send waits at most its open deadline, 2 s,
+/// and then goes on UDP, so a path whose sends come now and then shows a
+/// waiter only at some samples), and ends past that. The path is closed when
+/// the spell has lasted [`STREAM_CREDIT_WINDOW`] and enough of this side's
+/// streams ended during it: [`STREAM_CREDIT_FREED`], or every stream live
+/// when it began if fewer. A stream ends however it ends (wholly
+/// acknowledged, stopped by the peer, or reset by this side), so a stream
+/// the peer stopped long ago is not counted as live. When a spell begins
+/// every slot of the peer's is taken by this side's live streams, and our
+/// receiver reads every stream to its end as it arrives (a Stream also
+/// while it waits for its consumer), so the streams that end during the
+/// spell are slots an honest peer has freed; only a one-packet Short
+/// waiting for its consumer holds one, and lowers the limit it advertises
+/// while it does.
 ///
 /// Residual, accepted: a peer that grants one stream just before each
 /// window ends keeps the path open while starving it. What bounds it is that
@@ -1614,9 +1649,9 @@ pub(crate) struct StreamCreditWatch {
 struct WithheldSpell {
     /// When it began.
     since: u64,
-    /// This side's streams wholly acknowledged when it began.
-    acknowledged_then: u64,
-    /// This side's streams in flight when it began.
+    /// This side's streams ended when it began.
+    ended_then: u64,
+    /// This side's streams live (opened and not ended) when it began.
     in_flight_then: u64,
     /// When a send was last seen waiting for stream credit.
     last_waiter: u64,
@@ -1626,6 +1661,7 @@ impl StreamCreditWatch {
     /// Take `sample` at `now_nanos`; whether the peer withheld its stream
     /// credit for the window.
     fn observe(&mut self, now_nanos: u64, sample: &AckSample) -> bool {
+        let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
         let granted = sample.streams_opened != self.opened_before;
         self.opened_before = sample.streams_opened;
         if granted {
@@ -1635,23 +1671,24 @@ impl StreamCreditWatch {
         if sample.stream_waiters > 0 {
             let spell = self.spell.get_or_insert(WithheldSpell {
                 since: now_nanos,
-                acknowledged_then: sample.streams_acknowledged,
-                in_flight_then: sample
-                    .streams_opened
-                    .saturating_sub(sample.streams_acknowledged),
+                ended_then: sample.streams_ended,
+                in_flight_then: sample.streams_opened.saturating_sub(sample.streams_ended),
                 last_waiter: now_nanos,
             });
             spell.last_waiter = now_nanos;
         }
+        // A spell nobody has wanted a stream in for a while is over: a later
+        // wait starts a new one.
+        if self.spell.as_ref().is_some_and(|spell| {
+            now_nanos.saturating_sub(spell.last_waiter) > nanos(STREAM_CREDIT_DEMAND)
+        }) {
+            self.spell = None;
+        }
         let Some(spell) = &self.spell else {
             return false;
         };
-        let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
-        let freed = sample
-            .streams_acknowledged
-            .saturating_sub(spell.acknowledged_then);
+        let freed = sample.streams_ended.saturating_sub(spell.ended_then);
         now_nanos.saturating_sub(spell.since) >= nanos(STREAM_CREDIT_WINDOW)
-            && now_nanos.saturating_sub(spell.last_waiter) <= nanos(STREAM_CREDIT_DEMAND)
             && freed >= STREAM_CREDIT_FREED.min(spell.in_flight_then)
     }
 }

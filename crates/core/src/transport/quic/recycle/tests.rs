@@ -1391,6 +1391,60 @@ fn a_settled_credit_wait_closes_only_when_it_fills_the_window() {
     assert_eq!(at(30), Some((quiet_after + 5, Stall::CreditStarved)));
 }
 
+/// A send blocked by the peer's credit whose last batch of acknowledgements
+/// left nothing in flight, and which then sends (its blocked frame, say)
+/// just before an outage: that send is outstanding though no batch counts
+/// it, so the silence that follows is not "settled" waiting and the credit
+/// rule does not count it; whether the peer is reachable is the dark rule's.
+/// Counted as settled, the path would close as credit-starved at the
+/// window.
+#[test]
+fn a_send_after_the_last_batch_is_not_settled_waiting() {
+    let closed = run_why(40, |t| {
+        let live = t.min(3);
+        reading(live * 7, 0, 10 + t.min(4), 100 + live).credit(Credit {
+            acked_bytes: 2 * FLOOR_PER_TICK * live,
+            blocked: live,
+            stream_frames: 50 + live,
+            writers: 1,
+            ..Credit::default()
+        })
+    });
+    assert!(
+        !matches!(closed, Some((_, Stall::CreditStarved))),
+        "{closed:?}"
+    );
+}
+
+/// This side's runtime stalls for 16 s (quinn's driver with it, so nothing
+/// moves) in the middle of a credit-limited transfer delivering at twice the
+/// floor: the late sample counts as one tick on the watch's clock, so the
+/// stall does not read as 16 s of waiting with one window acknowledged.
+#[test]
+fn a_stall_of_this_sides_runtime_does_not_starve_the_credit_rule() {
+    let times: Vec<u64> = (0..=4)
+        .map(|i| 2 * i)
+        .chain((0..=20).map(|i| 24 + 2 * i))
+        .collect();
+    let record = Arc::default();
+    let sample = |i: u64| {
+        AckSample::synthetic(&record, i * 7, i * 7, 30_000, i * 9, i * 11, NO_CAP).with_credit(
+            2 * FLOOR_PER_TICK * i,
+            0,
+            i,
+            50 + i,
+            1,
+        )
+    };
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+    let closed = (1..times.len()).find_map(|i| {
+        watch
+            .observe(times[i] * SEC, sample(i as u64))
+            .then(|| (i, watch.stall().expect("a reason")))
+    });
+    assert_eq!(closed, None);
+}
+
 /// The floor follows the round trip: at a 3 s round trip an honest receiver
 /// with the smallest window (64 KiB) returns 64 KiB per round trip, about
 /// 21.8 KB/s, under the 32 KiB/s floor, and is not closed; the floor at that
@@ -1435,7 +1489,7 @@ fn the_credit_floor_follows_the_round_trip_up_to_its_cap() {
 
 /// Feed a watch a busy conforming peer's readings (the other rules never
 /// close it), one every 2 s, with stream-credit readings `at(t)`: (sends
-/// waiting for stream credit, streams wholly acknowledged, streams opened).
+/// waiting for stream credit, streams ended, streams opened).
 /// The first tick at which it closed, and why.
 fn run_stream_credit(ticks: u64, at: impl Fn(u64) -> (usize, u64, u64)) -> Option<(u64, Stall)> {
     let record = Arc::default();
@@ -1504,7 +1558,30 @@ fn a_peer_that_withholds_stream_credit_is_closed() {
     assert_eq!(
         run_stream_credit(200, |t| (usize::from(t >= 1), 16, 16)),
         Some((31, Stall::StreamCreditWithheld)),
-        "all acknowledged before the spell"
+        "all ended before the spell"
+    );
+    // One stream the peer stopped long before (ended, so not live), then 16
+    // live ones that all end at tick 2: still closed at 62 s.
+    assert_eq!(
+        run_stream_credit(200, |t| (
+            usize::from(t >= 1),
+            if t >= 2 { 17 } else { 1 },
+            17
+        )),
+        Some((31, Stall::StreamCreditWithheld)),
+        "a stream stopped before the spell is not live"
+    );
+    // A waiter at ticks 1-5, then none for 70 s, then one at tick 40: the
+    // first spell ended 20 s after its last waiter, so the one at tick 40
+    // starts a new spell and closes nothing at once.
+    assert_eq!(
+        run_stream_credit(60, |t| (
+            usize::from((1..=5).contains(&t) || t == 40),
+            acked(t),
+            16
+        )),
+        None,
+        "a spell with no waiter for 20 s is over"
     );
 }
 
@@ -1543,11 +1620,11 @@ fn three_ack_wait_expiries_in_a_row_close_the_path() {
     writers.ack_wait_expired();
     writers.ack_wait_expired();
     assert_eq!(writers.ack_wait_expiries(), 2);
-    writers.stream_acknowledged();
+    writers.acknowledged_within_ack_wait();
     assert_eq!(
         writers.ack_wait_expiries(),
         0,
-        "a stream acknowledged resets it"
+        "a stream with an ack wait acknowledged resets it"
     );
     writers.ack_wait_expired();
     writers.ack_wait_expired();

@@ -1416,8 +1416,8 @@ impl QuicPath {
     /// the first time this is asked after the connection acknowledged something
     /// new, which quinn's keepalive brings within its interval on a live path.
     ///
-    /// A path that stays dark ends on quinn's idle timeout (120 s in
-    /// production), not on the stall close: once it is suspect no new send
+    /// A path that stays dark is closed by the acknowledgement watch's dark
+    /// rule (`recycle::dark_close_bound`), not by the stall close: once it is suspect no new send
     /// reaches it, so `route::STALLED_SENDS_LIMIT` timeouts in a row happen only
     /// if that many sends were already on it. Nothing is lost meanwhile, since
     /// new data goes on UDP.
@@ -1902,7 +1902,7 @@ impl QuicPath {
         let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress, epoch);
         send.meter = self.meter.clone();
         send.writing = Some(self.writers.start());
-        send.writers = Some(self.writers.clone());
+        send.live = Some(self.writers.live());
         send.ack_waits = Some(self.ack_waits.clone());
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
@@ -2143,9 +2143,10 @@ struct Outgoing {
     /// The path's count of cancelled sends waiting for their acknowledgement
     /// without a permit ([`AckWaits`]).
     ack_waits: Option<Arc<AckWaits>>,
-    /// Where the stream is counted once wholly acknowledged
-    /// (`recycle::Writers::stream_acknowledged`).
-    writers: Option<Arc<recycle::Writers>>,
+    /// The stream, counted live in its path's counts until this is dropped
+    /// (`recycle::LiveStream`), which a stream waiting for its
+    /// acknowledgement in a task after its send ended keeps.
+    live: Option<recycle::LiveStream>,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
@@ -2174,7 +2175,7 @@ impl Outgoing {
             meter: None,
             writing: None,
             ack_waits: None,
-            writers: None,
+            live: None,
         }
     }
 
@@ -2361,10 +2362,12 @@ impl Outgoing {
     /// polled while the stream waited for its acknowledgement, so the reset
     /// leaves an entry in quinn's `stopped` map, which is what the abort limit
     /// bounds. A stream already acknowledged in full is not reset.
-    fn reset_finished(&mut self) {
-        if self.send.reset(reset_code::SENDER_ABORTED.into()).is_ok() {
+    fn reset_finished(&mut self) -> bool {
+        let reset = self.send.reset(reset_code::SENDER_ABORTED.into()).is_ok();
+        if reset {
             self.aborts.record();
         }
+        reset
     }
 
     /// End the stream and wait until the peer has acknowledged every byte or
@@ -2379,8 +2382,10 @@ impl Outgoing {
         self.awaiting_ack = false;
         match stopped {
             Ok(None) => {
-                if let Some(writers) = &self.writers {
-                    writers.stream_acknowledged();
+                if self.progress.has_ack_wait()
+                    && let Some(live) = &self.live
+                {
+                    live.writers().acknowledged_within_ack_wait();
                 }
                 Ok(())
             }
@@ -2430,9 +2435,12 @@ impl Drop for Outgoing {
         // third in a row. A send cancelled before then (a teardown) waits
         // below, ending with the acknowledgement or the connection.
         if self.progress.ack_wait_ended() {
-            self.reset_finished();
-            if let Some(writers) = &self.writers {
-                writers.ack_wait_expired();
+            // Counted only if the reset happened: an acknowledgement that
+            // raced the deadline left nothing to reset.
+            if self.reset_finished()
+                && let Some(live) = &self.live
+            {
+                live.writers().ack_wait_expired();
             }
             return;
         }
@@ -2450,7 +2458,7 @@ impl Drop for Outgoing {
                 // Past the bound: the epoch goes now, and so does the
                 // stream's data, so the release matches the memory freed.
                 Some(None) => {
-                    self.reset_finished();
+                    let _reset = self.reset_finished();
                     return;
                 }
                 None => None,
@@ -2459,13 +2467,15 @@ impl Drop for Outgoing {
             None
         };
         let stopped = std::mem::replace(&mut self.stopped, Box::pin(std::future::pending()));
-        let writers = self.writers.take();
+        let live = self.live.take();
+        let has_ack_wait = self.progress.has_ack_wait();
         // Bounded as above, and ending with the acknowledgement or the
         // connection, so the handle is not monitored.
         drop(GlobalExecutor::spawn(async move {
-            if let (Ok(None), Some(writers)) = (stopped.await, writers) {
-                writers.stream_acknowledged();
+            if let (Ok(None), true, Some(live)) = (stopped.await, has_ack_wait, &live) {
+                live.writers().acknowledged_within_ack_wait();
             }
+            drop(live);
             drop(slot);
             drop(epoch);
             drop(waiting);

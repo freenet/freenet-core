@@ -418,6 +418,14 @@ impl SendProgress {
     pub(super) fn ack_wait_ended(&self) -> bool {
         self.0.ack_wait_ended.load(Ordering::Acquire)
     }
+
+    /// The send has an ack wait ([`SendDeadlines::ack_wait`]): a stream's.
+    pub(super) fn has_ack_wait(&self) -> bool {
+        self.0
+            .deadlines
+            .as_ref()
+            .is_some_and(|(deadlines, _)| deadlines.ack_wait.is_some())
+    }
     fn stage(&self) -> u8 {
         self.0.stage.load(Ordering::Acquire)
     }

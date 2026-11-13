@@ -2515,7 +2515,7 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     than the window is survived whatever the backoff, and so is one lost
     probe round (a probe pair or its acknowledgement: at 15% loss a round
     is lost 5-17% of the time). Worst close latency for a path that stays
-    dark (recycle::dark_close_bound): about 67 s at 50 ms and 300 ms, 74 s
+    dark (recycle::dark_close_bound): about 67 s at 50 ms, 69 s at 300 ms, 74 s
     at 800 ms; measured 35.9 s, 41.6 s and 53.1 s
     (the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer, which
     also keeps 6.5 s, 13 s and 30 s outages at 800 ms open; the 30 s one
@@ -2529,18 +2529,19 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     Closes only a path that carries data (QuicPath::enable_data); every
     other path only counts its dark episodes (quic_dark_episode_*, above).
     A sample more than two ticks after the previous one counts as one tick
-    for this rule only (the watch's own clock skips it), so a stall of this
-    side's runtime or a suspended host does not read as darkness. The
-    other rules read counters quinn's own driver keeps up to date, which a
-    late sample still sees, so they need no forgiveness, and a peer that
-    could make this side's task late gains nothing on them.
+    for every rule of the watch (its own clock skips the rest), so a stall
+    of this side's runtime or a suspended host, which stops quinn's driver
+    too, does not read as darkness, starvation or withheld credit. A peer
+    cannot make this side's runtime late, so it gains nothing from that.
   → Credit-starved (recycle::CreditWatch): sends waited on the peer's
     flow-control credit (a send still writing, quinn sent DATA_BLOCKED or
     STREAM_DATA_BLOCKED with no STREAM frame since, no egress cap hold),
     counted only on affirmative evidence: an interval whose ack batches
     were all application-limited counts toward CREDIT_LIMITED_MIN (two
     2 s intervals); an interval with nothing outstanding at either end
-    ("settled": everything acknowledged, only credit is awaited) counts
+    ("settled": nothing in flight after the latest batch, and no send since
+    it, which no batch counts yet; everything acknowledged, only credit is
+    awaited) counts
     only once such intervals fill the whole window, as the dark rule's
     outage must. An interval with packets outstanding and no
     acknowledgement counts nothing (silence is the dark rule's). Closed
@@ -2563,14 +2564,17 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     and a MAX_STREAMS may repeat an old limit). A grant is a stream of this
     side opening. A withheld spell starts at a sample where a send waits in
     open_uni for stream credit with nothing opened since the previous
-    sample, survives samples with no waiter (a send waits at most its 2 s
-    open deadline, then goes on UDP), and ends only at a grant. Closed when
-    the spell has lasted STREAM_CREDIT_WINDOW (60 s), a send waited within
-    STREAM_CREDIT_DEMAND (20 s), and enough of this side's streams were
-    wholly acknowledged during the spell: STREAM_CREDIT_FREED (9), or
-    every stream in flight when it began if fewer (quinn grants once more
-    than an eighth of its limit, at most 64, is freed; at the spell's start
-    every slot is taken by this side's streams). 60 s, not 10 s: an honest
+    sample, survives samples with no waiter for up to STREAM_CREDIT_DEMAND
+    (20 s: a send waits at most its 2 s open deadline, then goes on UDP),
+    and ends at a grant or past that. Closed when the spell has lasted
+    STREAM_CREDIT_WINDOW (60 s) and enough of this side's streams ENDED
+    during it, in any way (wholly acknowledged, stopped by the peer, reset
+    by this side: recycle::LiveStream): STREAM_CREDIT_FREED (9), or every
+    stream live when it began if fewer (quinn grants once more than an
+    eighth of its limit, at most 64, is freed; at the spell's start every
+    slot is taken by this side's live streams). A stream that ended long
+    before is not live, so a peer cannot pin the threshold by stopping one
+    stream. 60 s, not 10 s: an honest
     receiver lowers its limit by one per one-packet Short waiting for its
     consumer, and a consumer stalled a minute is not worth keeping the path
     for (a_consumer_that_stalls_45_s_does_not_close_the_path engages the
@@ -2596,15 +2600,27 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     least 16 KiB/s) if that is longer, and at most the 2 h total. When a
     stream send's deadline runs out after its end was sent (the ack wait,
     or the total), the send ends MaybeDelivered(TimedOut) and the stream is
-    reset, counted as an abort, freeing its permit and send epoch. Three in
-    a row with no stream wholly acknowledged between
-    (ACK_WAIT_EXPIRY_LIMIT) close the path (StreamEndsUnacknowledged), so a
+    reset, counted as an abort, freeing its permit and send epoch (counted
+    as an expiry only when the reset happened; an acknowledgement racing
+    the deadline leaves nothing to reset). Three in a row with no stream
+    WITH AN ACK WAIT wholly acknowledged between (ACK_WAIT_EXPIRY_LIMIT)
+    close the path (StreamEndsUnacknowledged); an acknowledged one-packet
+    Short or control frame says nothing about stream ends and does not
+    reset the run (a peer acknowledging everything else is still caught), so a
     peer that never acknowledges stream ends is recycled after three ack
     waits, not after SEND_ABORT_LIMIT (4096) resets. Until then the sends
     waiting for their acknowledgement hold their permits and epochs, up to
     all 48. A Short or a send without an ack wait that times out after its
     end waits on in a task for its acknowledgement or the connection, as
-    does a send cancelled earlier (a teardown).
+    does a send cancelled earlier (a teardown). Residual, recorded: a
+    one-packet Short has no ack wait, and no rule closes a peer that
+    acknowledges everything except one-packet Short ends. At most
+    ACK_WAITS_WITHOUT_PERMIT (64) such Shorts wait per path, but for as
+    long as the path lives, and each pins its send epoch (and with it the
+    connection's pre-shrink window charge). Counting Short ends in the
+    expiry rule would need an ack wait for one-packet Shorts; their 5 s
+    total is too short for one, since a Short past it is MaybeDelivered,
+    not lost. Left for the follow-up on this rule.
   → No false close at 800 ms round trip and 15% loss with the loss gate on
     (a_slow_lossy_path_stays_within_its_consumer_gap: the send ends Sent on
     a node's deadlines and no watch fires), nor at 25% loss with consumers
@@ -2775,8 +2791,9 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   within 15 s on a live path), the path takes data again (suspect_left). Without
   it every short into a dark path ends MaybeDelivered(TimedOut), is never resent
   and is lost, and an operation's retry lands in the same place until quinn's
-  idle timeout. A path that stays dark ends on quinn's idle timeout (120 s in
-  production, Fallback(Idle)), not on the stall close: once suspect no new send
+  idle timeout. A path that stays dark is closed by the acknowledgement
+  watch's dark rule (recycle::dark_close_bound, about 67-74 s), not on the
+  stall close: once suspect no new send
   reaches it, so the stall close fires only when STALLED_SENDS_LIMIT sends were
   already on it. New data goes on UDP meanwhile, so nothing is lost. Entering
   and leaving are under one lock. Fallback is a testing-period crutch: this
