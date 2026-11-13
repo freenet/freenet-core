@@ -886,6 +886,7 @@ fn ack_counting_forwards_every_call_unchanged() {
             batches: 1,
             in_flight_after_acks: 2400,
             lost_since_acks: 1200,
+            last_batch_app_limited: true,
             ..AckState::default()
         }
     );
