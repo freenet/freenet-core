@@ -3037,8 +3037,8 @@ QUIC receive flow (#5940 e5b-4):
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
 
-Live in production on Linux, macOS and Windows, where `prefer` is the default:
-until a release's share reaches a pair its path carries control frames only,
+Live in production on Linux and macOS, where `shadow` is the default since the
+data ramp's emergency stop (off on Windows): a path carries control frames only,
 but endpoints, connections and their errors are real. With `transport-quic` off no endpoint is built and the transport
 reports `Disabled`.
 

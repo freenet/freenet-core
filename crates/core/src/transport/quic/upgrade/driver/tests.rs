@@ -1044,7 +1044,7 @@ fn data_route_takes_no_lock(session: &Arc<Session>) -> bool {
 
 /// With no route, as on a path without both data bits, a send reads one atomic
 /// and never waits for the session's lock, which the driver also takes. Shadow is
-/// the default on Linux, macOS and Windows, so this is every connection there.
+/// the default on Linux and macOS, so this is every connection there.
 #[test]
 fn a_connection_without_a_route_takes_no_lock_to_send() {
     bounded(|| async move {
