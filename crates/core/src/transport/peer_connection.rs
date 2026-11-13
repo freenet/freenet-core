@@ -1128,16 +1128,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// A Short from a QUIC path, as the UDP arm takes a `ShortMessage`, with its
     /// charge released at once. It moves neither of the UDP session's clocks.
     fn take_quic_short(&mut self, short: super::quic::path::InboundShort) -> Vec<u8> {
-        let (payload, key) = short.into_parts();
-        if let Some(key) = key {
-            self.inbound_budget.lock().release_if_gone(key);
-        }
-        let bytes = Vec::from(payload);
-        // Only so that the same metadata embedded in a stream is suppressed; a
-        // Short itself is always delivered, as on UDP.
-        self.dispatch
-            .dispatched_msg_hashes
-            .put(inbound_dispatch::InboundDispatch::msg_hash(&bytes), ());
+        let bytes = self.dispatch.take_short(short, &self.inbound_budget);
         self.note_quic_delivery(|| {
             let decoded = bincode::deserialize::<crate::message::NetMessage>(&bytes).is_ok();
             format!(
@@ -1153,79 +1144,28 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         bytes
     }
 
-    /// A Stream from a QUIC path: hand it to the registry, as the UDP path does at
-    /// its first fragment, and return its embedded metadata if that is new. The
-    /// reader task feeds the handle, so unlike a UDP stream it is not in
-    /// `streaming_handles`, and it evicts its own stream on its own timer. Moves
-    /// neither of the UDP session's clocks.
     fn take_quic_stream(
         &mut self,
         arrival: super::quic::path::InboundStreamArrival,
     ) -> Option<Vec<u8>> {
-        let super::quic::path::InboundStreamArrival {
-            stream_id,
-            metadata,
-            handle,
-        } = arrival;
-        // The stream's payload length, counted here because the reader task
-        // completes the stream later, with no way to count it from there.
-        // UDP counts at completion; this counts at arrival, and a stream that
-        // later fails is counted too.
-        let total = handle.total_bytes();
-        let seen_on_udp = self
-            .inbound_budget
-            .lock()
-            .contains(InboundKey::Udp(stream_id));
-        // An id in use on UDP, or used before on either path: only a faulty peer
-        // or a bug sends one, and the shared budget bounds what it costs.
-        if seen_on_udp || self.dispatch.completed_inbound_streams.contains(&stream_id) {
-            handle.cancel();
-            drop(handle);
-            self.inbound_budget
-                .lock()
-                .release_if_gone(InboundKey::Quic(stream_id));
-            self.record_inbound_outcome(super::metrics::InboundStreamOutcome::StreamIdOnBothPaths);
-            tracing::debug!(
-                peer_addr = %self.remote_conn.remote_addr,
-                stream_id = %stream_id,
-                seen_on_udp,
-                "Refusing a QUIC stream whose id was already used"
-            );
-            return None;
+        match self
+            .dispatch
+            .take_stream(arrival, &self.inbound_budget, self.remote_conn.remote_addr)
+        {
+            inbound_dispatch::TakenStream::IdInUse => {
+                self.record_inbound_outcome(
+                    super::metrics::InboundStreamOutcome::StreamIdOnBothPaths,
+                );
+                None
+            }
+            inbound_dispatch::TakenStream::Dropped => None,
+            inbound_dispatch::TakenStream::Registered { stream_id, message } => {
+                self.note_quic_delivery(|| {
+                    format!("received a stream on the path, id {stream_id}")
+                });
+                message
+            }
         }
-        // So a later UDP fragment with this id is refused as `AlreadyCompleted`.
-        self.dispatch.completed_inbound_streams.put(stream_id, ());
-        // It ended while it waited in the channel. Its metadata would send an
-        // operation after a stream that is gone, and the sender treats it as failed.
-        if handle.is_cancelled() {
-            drop(handle);
-            self.inbound_budget
-                .lock()
-                .release_if_gone(InboundKey::Quic(stream_id));
-            return None;
-        }
-        let Some(registry) = &self.dispatch.inbound_stream_registry else {
-            tracing::error!(
-                peer_addr = %self.remote_conn.remote_addr,
-                stream_id = %stream_id,
-                "A QUIC stream arrived but inbound_stream_registry is None; cancelling it"
-            );
-            handle.cancel();
-            drop(handle);
-            self.inbound_budget
-                .lock()
-                .release_if_gone(InboundKey::Quic(stream_id));
-            return None;
-        };
-        registry.register_inbound_stream(
-            self.remote_conn.remote_addr,
-            stream_id,
-            super::IncomingStream::from(handle),
-        );
-        super::TRANSPORT_METRICS.record_inbound_completed(total);
-        self.note_quic_delivery(|| format!("received a stream on the path, id {stream_id}"));
-        let bytes = metadata?.to_vec();
-        (!self.dispatch.is_duplicate_dispatch(&bytes)).then_some(bytes)
     }
 
     /// Tell a test's trace that data arrived on UDP on a connection with upgrades.
