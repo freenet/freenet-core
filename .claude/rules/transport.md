@@ -2171,7 +2171,12 @@ Fallback: a failed native setup is followed at once by today's UDP dial to
   acceptor failed; acceptor: expectation plus dial). A native failure marks
   no failed address and records no peer backoff, so the fallback is not
   refused. Until UDP is removed a failed native setup never costs the join
-  (test_quic_native_failed_setups_fall_back_to_udp).
+  (test_quic_native_failed_setups_fall_back_to_udp, which also checks that
+  each failure is followed by a UDP dial from that node to that peer).
+  The server waits longer than its client, so the client's fallback can
+  connect the pair before the server's setup ends; a native failure for an
+  address that is already connected only counts toward demotion (the
+  in-transit prune would remove the live peer's ring entry).
 Success: the connection's key is bound as IdentitySource::Proven; a
   gateway records a JoinTransport::Native join.
 Demotion: recorded in the connection lifecycle, where the outcome is known.
