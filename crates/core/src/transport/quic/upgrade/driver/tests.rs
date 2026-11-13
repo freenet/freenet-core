@@ -97,6 +97,14 @@ impl UdpShorts for RecordingUdp {
     }
 }
 
+/// Never moved out of, so a test body that names one field captures the
+/// whole value. Without it, an `async move` block naming only some fields
+/// (Rust 2021 disjoint capture) drops `pair` when the block is built, and
+/// `Pair`'s drop stops the socket pumps: nothing more is delivered (#6211).
+impl Drop for Harness {
+    fn drop(&mut self) {}
+}
+
 impl Harness {
     /// A hub whose node has the higher key, so its sessions are servers.
     pub(in crate::transport) async fn server(network: &str) -> Self {
