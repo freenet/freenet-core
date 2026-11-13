@@ -312,6 +312,12 @@ pub(crate) struct QuicPathLimits {
     /// (supervisor test).
     #[cfg(test)]
     pub(crate) panic_in_watch: bool,
+    /// The acknowledgement watch closes the path when a liveness rule says
+    /// so (`recycle::AckWatch`). Off in tests of the send deadlines and the
+    /// stall count on a dark path, which the watch would otherwise close
+    /// first.
+    #[cfg(test)]
+    pub(crate) watch_closes: bool,
     /// The receive side's gap cap (`inbound::MAX_GAPS_PER_CONNECTION`), lower
     /// in a test that trips it.
     #[cfg(test)]
@@ -369,6 +375,8 @@ impl QuicPathLimits {
         panic_in_receive: false,
         #[cfg(test)]
         panic_in_watch: false,
+        #[cfg(test)]
+        watch_closes: true,
         #[cfg(test)]
         max_gaps: inbound::MAX_GAPS_PER_CONNECTION,
         #[cfg(test)]
@@ -753,6 +761,12 @@ pub(crate) struct QuicPath {
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
     stream_slots: Arc<tokio::sync::Semaphore>,
+    /// Sends with data still to write, for the credit rule
+    /// (`recycle::CreditWatch`).
+    writers: Arc<recycle::Writers>,
+    /// Set once the path may send data: only then does the acknowledgement
+    /// watch's dark-path rule close it (`recycle::AckWatch::observing`).
+    carries_data: Arc<std::sync::atomic::AtomicBool>,
     /// Control frames taking their stream ([`Self::control_first`]); a data
     /// send opens no stream while any is.
     controls_opening: Arc<ControlsOpening>,
@@ -1008,6 +1022,7 @@ impl QuicPath {
             built_at,
         );
         let heard = Arc::new(recycle::PeerHeard::default());
+        let writers = Arc::new(recycle::Writers::default());
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut report = recycle::PathReport::new(
             connection.inner().clone(),
@@ -1018,8 +1033,10 @@ impl QuicPath {
         #[cfg(test)]
         {
             report.panic_once_bucketed = limits.panic_in_watch;
+            report.watch_closes = limits.watch_closes;
         }
         let ack_waits = Arc::new(AckWaits::new(stats.clone()));
+        let carries_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             connection.closer(),
@@ -1027,9 +1044,13 @@ impl QuicPath {
             stats.clone(),
             time,
             recycle::AckWatchParts {
-                cap_holds: connection.cap_holds(),
-                rtt: receiver_rtt,
-                heard: heard.clone(),
+                shared: recycle::WatchShared {
+                    cap_holds: connection.cap_holds(),
+                    writers: writers.clone(),
+                    rtt: receiver_rtt,
+                    heard: heard.clone(),
+                    carries_data: carries_data.clone(),
+                },
                 report,
             },
         ));
@@ -1042,6 +1063,8 @@ impl QuicPath {
                 ack_waits,
                 meter,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
+                writers,
+                carries_data,
                 controls_opening: Arc::default(),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
@@ -1209,6 +1232,12 @@ impl QuicPath {
             .map_or(0, |meter| meter.send_epoch_holders())
     }
 
+    /// The path's sends still writing (`recycle::Writers`). Tests only.
+    #[cfg(test)]
+    pub(crate) fn writers(&self) -> &recycle::Writers {
+        &self.writers
+    }
+
     /// Streamed-message permits free right now.
     #[cfg(test)]
     pub(crate) fn free_stream_slots(&self) -> usize {
@@ -1251,6 +1280,29 @@ impl QuicPath {
         )
     }
 
+    /// Deadlines for a node's streamed send of `len` bytes on this path:
+    /// [`SendDeadlines::stream`] with the gap the path's receiver allows
+    /// ([`Self::receiver_gap`], from the path's round trip, at least 5 s)
+    /// rather than a flat 5 s, so a slow path's send is not failed at a gap
+    /// its receiver still waits through. The gap applies only once the
+    /// connection has also stopped making progress (`bounded::ConnectionWatch`).
+    ///
+    /// The ack wait follows the path's round trip too: a stream's length at
+    /// the credit rule's floor (`recycle::credit_floor_rate`, at least
+    /// 16 KiB/s), when that is longer than its first age, so an honest slow
+    /// path's stream is not reset while its acknowledgement is on the way.
+    pub(crate) fn stream_deadlines(&self, len: u64) -> SendDeadlines {
+        let deadlines = SendDeadlines::stream(len).with_gap(self.receiver_gap());
+        let floor = recycle::credit_floor_rate(self.connection.inner().stats().path.rtt).max(1);
+        let at_floor = Duration::from_secs(len.div_ceil(floor));
+        SendDeadlines {
+            ack_wait: deadlines
+                .ack_wait
+                .map(|wait| wait.max(at_floor).min(deadlines.total)),
+            ..deadlines
+        }
+    }
+
     /// The connection, for tests that write raw streams.
     #[cfg(test)]
     pub(crate) fn connection(&self) -> &QuicConnection {
@@ -1285,6 +1337,9 @@ impl QuicPath {
     /// separate, set by [`QuicPathLimits::accept_data`] when the path is built.
     pub(in crate::transport) fn enable_data(&self) {
         self.send_data.store(SEND_DATA_ON, Ordering::Release);
+        // From now on the dark-path rule closes the path
+        // (`recycle::AckWatch::observing`).
+        self.carries_data.store(true, Ordering::Release);
     }
 
     /// The peer said it accepts no data on this path, so this node's gating or
@@ -1361,8 +1416,8 @@ impl QuicPath {
     /// the first time this is asked after the connection acknowledged something
     /// new, which quinn's keepalive brings within its interval on a live path.
     ///
-    /// A path that stays dark ends on quinn's idle timeout (120 s in
-    /// production), not on the stall close: once it is suspect no new send
+    /// A path that stays dark is closed by the acknowledgement watch's dark
+    /// rule (`recycle::dark_close_bound`), not by the stall close: once it is suspect no new send
     /// reaches it, so `route::STALLED_SENDS_LIMIT` timeouts in a row happen only
     /// if that many sends were already on it. Nothing is lost meanwhile, since
     /// new data goes on UDP.
@@ -1834,7 +1889,9 @@ impl QuicPath {
                 // Counted if the send's deadline drops this wait: the peer's
                 // stream limit was full for all of it.
                 let waiting = CreditWait(Some((&self.stats, &progress)));
+                let wanted = (opener == Opener::Data).then(|| self.writers.wait_for_stream());
                 let opened = open.await;
+                drop(wanted);
                 waiting.disarm();
                 opened
             }
@@ -1844,6 +1901,8 @@ impl QuicPath {
         let epoch = self.meter.as_ref().and_then(|meter| meter.send_epoch());
         let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress, epoch);
         send.meter = self.meter.clone();
+        send.writing = Some(self.writers.start());
+        send.live = Some(self.writers.live());
         send.ack_waits = Some(self.ack_waits.clone());
         send.write_all(&header.encode()).await?;
         if !metadata.is_empty() {
@@ -2008,19 +2067,12 @@ async fn supervise_receive<T: TimeSource>(
     );
     // Outside the watch, so a panic the watch contains does not end the path's
     // report: it ends with this task ([`recycle::PathReport`]).
-    let recycle::AckWatchParts {
-        cap_holds,
-        rtt,
-        heard,
-        mut report,
-    } = watch;
+    let recycle::AckWatchParts { shared, mut report } = watch;
     let watch = std::panic::AssertUnwindSafe(recycle::watch_acknowledgements(
         connection.clone(),
         closer.clone(),
         time,
-        cap_holds,
-        heard,
-        rtt,
+        shared,
         &mut report,
     ))
     .catch_unwind();
@@ -2085,9 +2137,16 @@ struct Outgoing {
     /// The path's budget meter, woken by each write so a path that only sends
     /// still has its send window evaluated (`budget::ConnMeter::note_send`).
     meter: Option<Arc<super::budget::ConnMeter>>,
+    /// Counted among the path's sends still writing until the end of the
+    /// stream is sent (`recycle::Writers`).
+    writing: Option<recycle::Writing>,
     /// The path's count of cancelled sends waiting for their acknowledgement
     /// without a permit ([`AckWaits`]).
     ack_waits: Option<Arc<AckWaits>>,
+    /// The stream, counted live in its path's counts until this is dropped
+    /// (`recycle::LiveStream`), which a stream waiting for its
+    /// acknowledgement in a task after its send ended keeps.
+    live: Option<recycle::LiveStream>,
 }
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
@@ -2114,7 +2173,9 @@ impl Outgoing {
             pacing,
             epoch,
             meter: None,
+            writing: None,
             ack_waits: None,
+            live: None,
         }
     }
 
@@ -2312,6 +2373,7 @@ impl Outgoing {
     async fn finish(mut self) -> Result<(), QuicSendError> {
         self.closed = true;
         self.send.finish().map_err(|_| QuicSendError::Closed)?;
+        self.writing = None;
         self.progress.mark_finished();
         self.awaiting_ack = true;
         let stopped = (&mut self.stopped).await;
@@ -2333,7 +2395,10 @@ impl Drop for Outgoing {
     /// FINISH it, and the receiver would take a cut-short message for one
     /// that simply ended early.
     ///
-    /// A stream dropped while it waits for its acknowledgement goes on to the
+    /// A stream dropped because its ack wait ran out
+    /// ([`bounded::SendDeadlines::ack_wait`]) is reset and counted as an
+    /// abort. One dropped earlier while it waits for its acknowledgement
+    /// (a cancelled send) goes on to the
     /// end, so its permit and its send epoch wait with it, in a small task
     /// that ends with the stream's acknowledgement or with the connection.
     /// A send holding a permit is one of at most [`STREAMED_SEND_LIMIT`]. One
@@ -2352,7 +2417,23 @@ impl Drop for Outgoing {
         if !self.awaiting_ack {
             return;
         }
+        // The send's deadline ran out after its end was sent (its ack wait,
+        // `SendDeadlines::ack_wait`, or its total): the peer had the whole
+        // stream and never acknowledged its end. The stream is reset,
+        // counted as an abort, and its permit and epoch go now with quinn's
+        // copy of its data. A peer that never acknowledges stream ends is
+        // bounded by `recycle::SEND_ABORT_LIMIT`, as before this rule. A
+        // send cancelled before then (a teardown) waits below, ending with
+        // the acknowledgement or the connection.
+        if self.progress.ack_wait_ended() {
+            self.reset_finished();
+            return;
+        }
         let (slot, epoch) = (self.slot.take(), self.epoch.take());
+        // Nothing held (a send with neither a permit nor an epoch, which a
+        // node's sends practically never are): the stream counts as ended
+        // here, for the stream-credit rule, though its end may still be
+        // unacknowledged.
         if slot.is_none() && epoch.is_none() {
             return;
         }
@@ -2375,10 +2456,12 @@ impl Drop for Outgoing {
             None
         };
         let stopped = std::mem::replace(&mut self.stopped, Box::pin(std::future::pending()));
+        let live = self.live.take();
         // Bounded as above, and ending with the acknowledgement or the
         // connection, so the handle is not monitored.
         drop(GlobalExecutor::spawn(async move {
             let _ended = stopped.await;
+            drop(live);
             drop(slot);
             drop(epoch);
             drop(waiting);

@@ -161,13 +161,26 @@ where
     F: FnOnce(Rig) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    run_with(network, QuicPathLimits::DEFAULT, peer_limits, test);
+}
+
+/// [`run`] with our side's path limits given too.
+fn run_with<F, Fut>(
+    network: &'static str,
+    our_limits: QuicPathLimits,
+    peer_limits: QuicPathLimits,
+    test: F,
+) where
+    F: FnOnce(Rig) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     run_bounded(move || async move {
         let mut e = single(CAPABLE);
         let (data, inbox) = data_channels();
         e.conn.attach_quic_inbox(inbox);
         let path = data_path_to(
             network,
-            QuicPathLimits::DEFAULT,
+            our_limits,
             peer_limits,
             e.conn.inbound_budget(),
             data,
@@ -919,9 +932,9 @@ fn a_busy_relay_whose_transfers_are_acknowledged_keeps_its_path() {
 }
 
 /// Permits held by sends waiting for acknowledgements that never come: nothing on
-/// the path is acknowledged, every large message times out waiting for a permit,
-/// and eight of those past the window close the path. That close is the only thing
-/// that recycles such a path.
+/// the path is acknowledged and every large message times out waiting for a
+/// permit. Those timeouts are back-pressure and do not count toward the stall
+/// close; the acknowledgement watch's dark-path rule closes the path instead.
 #[test]
 fn permits_held_with_nothing_acknowledged_close_the_path() {
     run(
@@ -945,15 +958,33 @@ fn permits_held_with_nothing_acknowledged_close_the_path() {
                     .await
                     .unwrap();
             }
-            rig.path.settle(Duration::from_secs(3)).await;
+            // The dark rule closes once a send made a window into the spell
+            // goes unanswered for its grace: at the latest
+            // `dark_close_bound` after the silence began, 9 s of which have
+            // passed.
+            rig.path
+                .settle(
+                    crate::transport::quic::recycle::dark_close_bound(Duration::from_millis(50))
+                        - Duration::from_secs(9),
+                )
+                .await;
             drop(silenced);
             assert_eq!(
                 rig.stats()
                     .send_count(SendKind::LargeShort, R::NotOpenedUdp),
                 u64::from(STALLED_SENDS_LIMIT)
             );
-            assert_eq!(rig.stats().send_event_count(E::StalledClosed), 1);
+            assert_eq!(
+                rig.stats().send_event_count(E::StalledClosed),
+                0,
+                "a send that never opened does not count"
+            );
             assert!(rig.route.path().quinn_connection().close_reason().is_some());
+            assert_eq!(
+                crate::transport::quic::recycle::stalls_to(rig.path.peer_addr()),
+                vec![crate::transport::quic::recycle::Stall::Dark],
+                "closed by the watch as dark"
+            );
         },
     );
 }
@@ -962,8 +993,14 @@ fn permits_held_with_nothing_acknowledged_close_the_path() {
 /// window, close the path.
 #[test]
 fn eight_streams_that_stall_after_opening_close_the_path() {
-    run(
+    run_with(
         "quic-send-stall-close",
+        // The stall count's close, which the acknowledgement watch would
+        // otherwise preempt on this dark path (`recycle::AckWatch`).
+        QuicPathLimits {
+            watch_closes: false,
+            ..QuicPathLimits::DEFAULT
+        },
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let silenced = DropFrom::new("quic-send-stall-close", &[rig.path.peer_addr()]);
@@ -1133,6 +1170,53 @@ fn a_pipe_that_stalls_after_opening_gives_up() {
     );
 }
 
+/// With the watch on, a dead path costs new traffic seconds, not a minute:
+/// the peer goes silent, a short sent 9 s later times out with nothing
+/// acknowledged and makes the path suspect by 15 s, and from then on new
+/// shorts go on UDP at once, while the path is still up. The watch's dark
+/// rule closes the path only later, waiting out two probe rounds after its
+/// 10 s window (`recycle::dark_close_bound`, about 67 s at this round trip).
+#[test]
+fn a_dark_path_takes_no_new_data_long_before_the_watch_closes_it() {
+    run(
+        "quic-send-suspect-watch-on",
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let _silenced = DropFrom::new("quic-send-suspect-watch-on", &[rig.path.peer_addr()]);
+            rig.path.settle(Duration::from_secs(9)).await;
+            rig.e.conn.send_serialized(message(1)).await.unwrap();
+            rig.path.settle(Duration::from_secs(6)).await;
+            assert!(rig.route.path().is_suspect(), "suspect by 15 s");
+            assert!(
+                rig.route.path().quinn_connection().close_reason().is_none(),
+                "the path is still up"
+            );
+            rig.udp_data();
+            rig.e.conn.send_serialized(message(2)).await.unwrap();
+            rig.path.settle(Duration::from_millis(50)).await;
+            assert_eq!(rig.udp_data().shorts, vec![message(2)], "on UDP at once");
+            // The watch closes it later, as dark.
+            let mut waited = Duration::from_secs(15);
+            while rig.route.path().quinn_connection().close_reason().is_none() {
+                assert!(
+                    waited
+                        <= crate::transport::quic::recycle::dark_close_bound(
+                            Duration::from_millis(50)
+                        ),
+                    "not closed {waited:?} after the silence"
+                );
+                rig.path.settle(Duration::from_secs(1)).await;
+                waited += Duration::from_secs(1);
+            }
+            assert!(waited >= Duration::from_secs(30), "closed at {waited:?}");
+            assert_eq!(
+                crate::transport::quic::recycle::stalls_to(rig.path.peer_addr()),
+                vec![crate::transport::quic::recycle::Stall::Dark]
+            );
+        },
+    );
+}
+
 /// A path whose sends time out with nothing acknowledged takes no new data: a
 /// short queued to it then goes on UDP, though the path is up. Once the peer
 /// acknowledges again, data goes on the path again. Across
@@ -1141,8 +1225,15 @@ fn a_pipe_that_stalls_after_opening_gives_up() {
 /// each later one goes exactly once.
 #[test]
 fn a_suspect_path_sends_new_shorts_on_udp_until_it_is_acknowledged() {
-    run(
+    run_with(
         "quic-send-suspect",
+        // The route's rule alone: the path is dark for 15 s, and with the
+        // watch on `a_dark_path_takes_no_new_data_long_before_the_watch_closes_it`
+        // covers the same with the watch's close after it.
+        QuicPathLimits {
+            watch_closes: false,
+            ..QuicPathLimits::DEFAULT
+        },
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
             let silenced = DropFrom::new("quic-send-suspect", &[rig.path.peer_addr()]);

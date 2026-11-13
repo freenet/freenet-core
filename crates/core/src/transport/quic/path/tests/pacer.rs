@@ -545,7 +545,13 @@ fn a_paced_send_to_a_dark_peer_times_out_and_the_path_goes_suspect() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-pacer-dark";
-        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        // The send's deadlines and the stall count, which the watch would
+        // otherwise preempt by closing the dark path.
+        let limits = QuicPathLimits {
+            watch_closes: false,
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths(network, limits).await;
         let pacer = Arc::new(CountsWaits {
             inner: pacer_at(&p.time(), 400_000),
             waited: AtomicUsize::new(0),
@@ -800,7 +806,13 @@ fn a_paced_path_dark_mid_send_fails_within_two_windows_and_goes_suspect() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-pacer-dark-mid-send";
-        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        // The send's deadlines and the stall count, which the watch would
+        // otherwise preempt by closing the dark path.
+        let limits = QuicPathLimits {
+            watch_closes: false,
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths(network, limits).await;
         let pacer = Arc::new(CountsWaits {
             inner: pacer_at(&p.time(), 400_000),
             waited: AtomicUsize::new(0),

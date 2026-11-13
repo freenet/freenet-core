@@ -1490,6 +1490,22 @@ a test passes its own; tests read their own, never the global).
   level in the period, and the highest count a reset in the period took a path
   to). They are for the fixed charge, which takes quinn's stopped map at
   SEND_ABORT_LIMIT x QUIC_STOPPED_ENTRY_BYTES until field data justifies less.
+  quic_dark_episode_<recovered_lt_5s|lt_10s|lt_30s|lt_120s|recovered_ge_120s|
+  unrecovered|cap_held|closed_at_window>: dark episodes (recycle::AckWatch:
+  packets outstanding, nothing acknowledged, nothing heard) by how they ended;
+  read at the watch's 2 s samples, so none recovers in under 2 s, and
+  `cap_held` is an episode ended by the egress cap holding this side's sends
+  (the watch cannot tell then whether the peer is dark). The
+  dark-path rule closes only a path that carries data (QuicPath::enable_data);
+  on every other path (all of them while QUIC_DATA_PERCENT is 0) it only
+  counts, so the field shows how long real dark spells last. A spell is read
+  up to when the peer is next heard from, which waits for quinn's backed-off
+  probes after the outage ends, so it reads longer than the outage (in
+  a_path_without_data_is_not_closed_by_a_dark_spell a 30 s outage read about
+  45 s and a 100 s one about 200 s), and an outage whose backoff runs past
+  quinn's 120 s idle timeout ends the path and counts `unrecovered`. The dark
+  threshold (the 10 s window) is to be revisited from these numbers before the
+  data ramp passes 5%.
   quic_gate_loss_<queue|share|persistent|ecn|no_sample|ignored> (congestion
   events by the loss gate's verdict, recycle::loss_gate, reported by the path's
   report at each tick; over a path's life they sum to its quic_congestion_events,
@@ -2190,7 +2206,9 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   while the stream is open, and not during the ack wait, which includes a send
   window of backlog) and total. SendDeadlines::short(len) is 1 s and 5 s, or
   a stream's for a message past one packet; ::stream(len) is 2 s, 5 s
-  (STREAM_INACTIVITY_TIMEOUT) and inbound_stream_age_limit(len); a plain
+  (STREAM_INACTIVITY_TIMEOUT) and STREAM_AGE_LIMIT (2 h, below), with an
+  ack wait of inbound_stream_age_limit(len) after the end is sent, and a
+  node sends with QuicPath::stream_deadlines (the gap from the path); a plain
   Duration is one deadline for all of it. A send from a source waits for the
   first chunk for the gap, counted in total, and open runs from when it arrives.
   The gap is judged on CONNECTION progress (bounded::ConnectionWatch): a node
@@ -2261,9 +2279,11 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   receiver gives up at 5 s. End to end, a fast last hop still fails a slow
   chain at its own gap: the receiver does not learn the upstream gap. Control sends have no gap. A receiver reads every announced
   stream to its end whatever its consumer does (push_fragment does not wait);
-  its one wait is announcing a stream into a full channel, bounded by
-  inbound_stream_age_limit(len), the sender's total, so the two give up
-  together. With keepalive PINGs (15 s apart) as its only acknowledgements, at
+  its one wait is announcing a stream into a full channel, bounded by the
+  stream's age (inbound_stream_age_limit(len), extended while the
+  connection reads at 32 KiB/s, at most STREAM_AGE_LIMIT; see the stream
+  age under the liveness rules), which never ends before the sender's ack
+  wait would and never after the sender's 2 h total. With keepalive PINGs (15 s apart) as its only acknowledgements, at
   most two wakes in a row (10 s apart) can each see a new one, so they alone
   extend a stopped send by at most two wakes. Argued, not tested.
   One timer per send, re-armed when it fires, as BodyReader. Messages are
@@ -2532,6 +2552,175 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
   a held transmit is also in quinn's bytes in flight. A hold whose poller
   is not polled again within socket::cap_hold_validity of the cap's rate
   (a poller left by an ended connection) stops counting.
+  Liveness rules (#5940 PR 4, recycle::AckWatch, all closing with
+  PEER_NOT_ACKNOWLEDGING; why is in recycle::Stall and the log):
+  → Not acknowledging (above): the peer keeps sending and acknowledges
+    none of ours for ACK_WATCH_WINDOW (10 s).
+  → Dark: this side's packets outstanding at every sample for the window,
+    from a send, nothing acknowledged and nothing heard from the peer, AND
+    two rounds of sends made after the window gone unanswered: the first
+    send made a window after the spell began, then a send seen at a later
+    sample (quinn's next backed-off probe), the second for its grace (3 x
+    the round trip from before the spell, at least one 2 s tick, at most
+    DARK_GRACE_MAX 10 s, so an inflated round trip cannot postpone it).
+    After an outage quinn sends again only at its next backed-off probe,
+    and an ack-only peer (keepalive 15 s) sends nothing until then, so
+    darkness for the window alone would close paths after 5-7 s outages
+    at high round trips; with the post-window rounds every outage shorter
+    than the window is survived whatever the backoff, and so is one lost
+    probe round (a probe pair or its acknowledgement: at 15% loss a round
+    is lost 5-17% of the time). Worst close latency for a path that stays
+    dark (recycle::dark_close_bound): about 67 s at 50 ms, 69 s at 300 ms, 74 s
+    at 800 ms; measured 35.9 s, 41.6 s and 53.1 s
+    (the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer, which
+    also keeps 6.5 s, 13 s and 30 s outages at 800 ms open; the 30 s one
+    swallows the first post-window round, and with one round outages of
+    26-40 s closed there). New sends leave a dark path far
+    sooner: a send that times out with nothing acknowledged for 10 s makes
+    the path suspect (route::StallCount), and new data then goes on UDP at
+    once, about 10-15 s after the silence began
+    (a_dark_path_takes_no_new_data_long_before_the_watch_closes_it). So a
+    dead path costs new traffic seconds; the close only frees the path.
+    Closes only a path that carries data (QuicPath::enable_data); every
+    other path only counts its dark episodes (quic_dark_episode_*, above).
+    A sample more than two ticks after the previous one counts as one tick
+    for every rule of the watch (its own clock skips the rest), so a stall
+    of this side's runtime or a suspended host, which stops quinn's driver
+    too, does not read as darkness, starvation or withheld credit. A peer
+    cannot make this side's runtime late, so it gains nothing from that.
+  → Credit-starved (recycle::CreditWatch): sends waited on the peer's
+    flow-control credit (a send still writing, quinn sent DATA_BLOCKED or
+    STREAM_DATA_BLOCKED with no STREAM frame since, no egress cap hold),
+    counted only on affirmative evidence: an interval whose ack batches
+    were all application-limited counts toward CREDIT_LIMITED_MIN (two
+    2 s intervals); an interval with nothing outstanding at either end
+    ("settled": nothing in flight after the latest batch, and no send since
+    it, which no batch counts yet; everything acknowledged, only credit is
+    awaited) counts
+    only once such intervals fill the whole window, as the dark rule's
+    outage must. An interval with packets outstanding and no
+    acknowledgement counts nothing (silence is the dark rule's). Closed
+    when the peer acknowledged under its floor over the counted time:
+    credit_floor_rate = min(32 KiB/s, 64 KiB / round trip), the round trip
+    capped at CREDIT_FLOOR_RTT_MAX (4 s), so the floor is at least
+    16 KiB/s and a peer cannot lower it at will by acknowledging late. An
+    honest receiver never lowers its window below 64 KiB and reads every
+    byte as it arrives, so it returns at least that per round trip. What
+    bounds a peer that acknowledges slowly on purpose is the stream age on
+    its streams (below) and the ack wait on ours. A path held back by its
+    congestion window, a shared uplink or the egress cap never counts
+    (a_congestion_limited_path_under_the_floor_rate_is_never_closed,
+    a_send_held_by_the_egress_cap_for_part_of_the_window_is_not_starved).
+    quinn's blocked-frame behaviour this relies on is pinned on a real
+    connection (quinn_reports_a_write_blocked_by_the_peers_credit_and_only_that,
+    quinn_reports_application_limited_batches_as_the_credit_rule_needs).
+  → Stream credit withheld (recycle::StreamCreditWatch): judged by
+    credit granted, not frames (quinn 0.11.19 never sends STREAMS_BLOCKED,
+    and a MAX_STREAMS may repeat an old limit). A grant is a stream of this
+    side opening. A withheld spell starts at a sample where a send waits in
+    open_uni for stream credit with nothing opened since the previous
+    sample, survives samples with no waiter for up to STREAM_CREDIT_DEMAND
+    (20 s: a send waits at most its 2 s open deadline, then goes on UDP),
+    and ends at a grant or past that. Closed when the spell has lasted
+    STREAM_CREDIT_WINDOW (60 s) and enough of this side's streams ENDED
+    during it, in any way (wholly acknowledged, stopped by the peer, reset
+    by this side: recycle::LiveStream): STREAM_CREDIT_FREED (9), or every
+    stream live when it began if fewer (quinn grants once more than an
+    eighth of its limit, at most 64, is freed; at the spell's start every
+    slot is taken by this side's live streams). A stream that ended long
+    before is not live, so a peer cannot pin the threshold by stopping one
+    stream. A stream this side reset counts as ended though the reset may
+    never reach the peer (during an outage nothing does), so "ended" is
+    not always a slot the peer has freed. Corner, recorded: in-flight
+    streams reset by cancellation during an outage, before any send
+    timeout counts (so the path never goes suspect), with sends still
+    waiting to keep the spell alive, close the path as
+    StreamCreditWithheld at about 60 s, before the dark rule's 67-74 s:
+    the path should close, under the wrong label. Residual, recorded: with
+    streamed sends more than 20 s apart the spell ends between them
+    (STREAM_CREDIT_DEMAND), so a withholding peer is never closed; each
+    such send waits its 2 s open deadline and goes on UDP. 60 s, not 10 s: an honest
+    receiver lowers its limit by one per one-packet Short waiting for its
+    consumer, and a consumer stalled a minute is not worth keeping the path
+    for (a_consumer_that_stalls_45_s_does_not_close_the_path engages the
+    rule and drains in time). Residual, accepted: a peer that grants one
+    stream just before each 60 s mark keeps the path open while starving
+    it; each starved send waits its 2 s open deadline and then goes on UDP,
+    so it costs latency, not data. Mixed versions: releases before this
+    one (v0.2.154-156) ship with the data share at 0, but quic-data-percent
+    can force data on by hand, and those releases' receivers hold a
+    stream's slot while waiting for their consumer; against such a node a
+    consumer stalled 60 s closes the path and that connection falls back
+    to UDP, the same outcome as a current receiver whose consumer stalls
+    with one-packet Shorts waiting.
+  → A send timeout before its stream opened (a wait for its source, for a
+    permit or for the peer's stream credit) is back-pressure and does not
+    count toward the stall close (route::timed_out); withheld stream
+    credit is the rule above's.
+  → Ack wait (SendDeadlines::ack_wait): once a stream's end is sent, its
+    acknowledgement is awaited for at most its first age
+    (inbound_stream_age_limit(len): its length at 32 KiB/s, at least
+    5 min), or, on a node's sends (QuicPath::stream_deadlines), its length
+    at the credit floor at the path's round trip (credit_floor_rate, at
+    least 16 KiB/s) if that is longer, and at most the 2 h total. When a
+    stream send's deadline runs out after its end was sent (the ack wait,
+    or the total), the send ends MaybeDelivered(TimedOut) and the stream is
+    reset, counted as an abort toward SEND_ABORT_LIMIT, freeing its permit
+    and send epoch. Residual, open (#6205, a gate before UDP removal): no
+    rule recycles a peer that acknowledges other traffic but not Stream
+    ends; only SEND_ABORT_LIMIT (4096 resets) does, as before this rule, so
+    such a peer can keep a path degraded for hours, its streamed sends
+    holding permits and epochs (up to all 48) for their ack waits. A rule
+    counting expiries in a row was removed: an acknowledged multi-packet
+    Short (which has an ack wait) reset it, and acknowledging one Stream
+    end in three defeated it. With UDP present the harm is performance on
+    that path. A Short or a send without an ack wait that times out after its
+    end waits on in a task for its acknowledgement or the connection, as
+    does a send cancelled earlier (a teardown). Residual, recorded: a
+    one-packet Short has no ack wait, and no rule closes a peer that
+    acknowledges everything except one-packet Short ends. At most
+    ACK_WAITS_WITHOUT_PERMIT (64) such Shorts wait per path, but for as
+    long as the path lives, and each pins its send epoch (and with it the
+    connection's pre-shrink window charge). Counting Short ends in the
+    rule of #6205 would need an ack wait for one-packet Shorts; their 5 s
+    total is too short for one, since a Short past it is MaybeDelivered,
+    not lost. Left for #6205.
+  → No false close at 800 ms round trip and 15% loss with the loss gate on
+    (a_slow_lossy_path_stays_within_its_consumer_gap: the send ends Sent on
+    a node's deadlines and no watch fires), nor at 25% loss with consumers
+    that keep up (a_lossy_path_is_not_closed), nor on a slow uplink below
+    the floor (a_slow_uplink_below_the_floor_rate_is_never_closed).
+  → A node's streamed send takes its gap from the path
+    (QuicPath::stream_deadlines: the receiver's gap from the path's round
+    trip, at least 5 s), not a flat 5 s, so a slow path's send is not
+    failed at a gap its receiver still waits through.
+  → Stream age (BodyReader::set_stream_age): an admitted stream's first
+    age is inbound_stream_age_limit(len), as on UDP (its length at
+    32 KiB/s, at least 5 min). When it is reached the stream is kept only
+    while its CONNECTION has read at least 32 KiB/s since the stream was
+    admitted, its deadline moved to when the connection would fall under
+    that, up to STREAM_AGE_LIMIT (2 h). quinn shares a connection between
+    its streams round-robin, so a per-stream rate fails honest streams on a
+    busy connection; the connection's rate does not. Invariant: to keep
+    streams open past their first age a peer must keep its connection
+    delivering at the floor, 32 KiB/s, and 2 h ends even that. The bound
+    is per connection, not per stream: one stream at 32 KiB/s keeps every
+    other stream of its connection, so holding a peer's charged streams
+    (up to about 170 MB) costs it 32 KiB/s on average, as on main, where
+    one large stream's own age already allowed it
+    (a_trickle_holding_many_streams_is_evicted_at_their_first_age: 64
+    streams at about 2 KB/s in all go at their first age;
+    a_slow_stream_on_a_busy_connection_is_kept_past_its_first_age). Memory
+    is not bounded by time: held streams are bounded by their charges, at
+    most the per-peer inbound budget
+    (MAX_INBOUND_STREAM_BYTES_PER_CONNECTION), and by the stream limit,
+    with no node-wide allowance; what the age changes is what holding
+    costs the peer.
+  → Once the UDP transport is removed, a close by any of these rules ends
+    the peer's only connection: the node reconnects to it, with the
+    upgrade's backoff (60 s doubling to 1 h, +/-20%), and data to it waits
+    or fails meanwhile. Not built; the dark-episode counts are what the
+    10 s window is to be checked against before the data ramp passes 5%.
   e5 constraint: SEND_ABORT_LIMIT and PEER_NOT_ACKNOWLEDGING ask the peer to
   fall back to UDP for THIS connection only. They are not a permanent
   downgrade: e5 must allow a new upgrade after its normal backoff.
@@ -2608,9 +2797,14 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   newly acknowledged within STALL_PROGRESS_WINDOW (ACK_WATCH_WINDOW, 10 s), read
   from CappedCubic's record (recycle::AckProgress) when a send settles
   (route::StallCount). Any acknowledgement or any Sent starts the count again. All
-  three kinds count: Failed(NotOpened(TimedOut)), Failed(TimedOut),
-  MaybeDelivered(TimedOut). NotOpened must count: a path whose permits are all
-  held by sends stuck waiting for acknowledgements is recycled only by this close.
+  kinds count: Failed(TimedOut) and MaybeDelivered(TimedOut).
+  Failed(NotOpened(TimedOut)) does not (route::timed_out): a wait to open is
+  back-pressure. What recycles the cases it used to: a path whose sends
+  nobody acknowledges is closed by the dark rule; a peer that never
+  acknowledges a stream's end has the stream reset at its ack wait, counted
+  toward SEND_ABORT_LIMIT (no rule closes it sooner yet: #6205); a peer
+  that withholds its stream limit
+  is closed by the stream-credit rule (liveness rules, above).
   The window must stay: without it a busy relay whose 48 permits hold transfers
   that are being acknowledged, or a receiver whose consumer is slow while its QUIC
   stack acknowledges, is closed and loses what the receiver's readers hold. Known
@@ -2661,8 +2855,9 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   within 15 s on a live path), the path takes data again (suspect_left). Without
   it every short into a dark path ends MaybeDelivered(TimedOut), is never resent
   and is lost, and an operation's retry lands in the same place until quinn's
-  idle timeout. A path that stays dark ends on quinn's idle timeout (120 s in
-  production, Fallback(Idle)), not on the stall close: once suspect no new send
+  idle timeout. A path that stays dark is closed by the acknowledgement
+  watch's dark rule (recycle::dark_close_bound, about 67-74 s), not on the
+  stall close: once suspect no new send
   reaches it, so the stall close fires only when STALLED_SENDS_LIMIT sends were
   already on it. New data goes on UDP meanwhile, so nothing is lost. Entering
   and leaving are under one lock. Fallback is a testing-period crutch: this

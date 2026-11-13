@@ -161,6 +161,7 @@ async fn paths_built(
     // `a` keeps its node-wide counts where `b` does.
     let a_limits = QuicPathLimits {
         counters: b_limits.counters,
+        watch_closes: b_limits.watch_closes,
         ..QuicPathLimits::DEFAULT
     };
     let own =
@@ -769,6 +770,194 @@ fn a_sender_that_gives_up_resets_the_stream() {
     })
 }
 
+/// 64 streams held open by a trickle, about 2 KB/s for all of them (32 bytes
+/// a second each, so no stream is ever idle): their connection reads far
+/// under the floor rate, so each is evicted at its first age, its length at
+/// 32 KiB/s and at least 5 min, not at the 2 h ceiling. To keep streams open
+/// past that, a peer must keep its connection delivering at the floor.
+#[test]
+fn a_trickle_holding_many_streams_is_evicted_at_their_first_age() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-trickle-age", QuicPathLimits::FULL_STREAMS).await;
+        const STREAMS: usize = 64;
+        let total = 100_000u64;
+        let age = max_inbound_stream_age(total);
+        assert!(
+            age < super::inbound::STREAM_AGE_LIMIT / 10,
+            "premise: {age:?}"
+        );
+        let (conn, time) = (p.a_raw(), p.time());
+        let started = time.now_nanos();
+        let stopped = drive(&p.pair.time, age * 3, async move {
+            let mut sends = Vec::new();
+            for _ in 0..STREAMS {
+                let mut send = conn.open_uni().await.unwrap();
+                send.write_all(&header(1, 1, StreamId::next().0, total, 0))
+                    .await
+                    .unwrap();
+                sends.push(send);
+            }
+            let mut stopped = 0;
+            while stopped < STREAMS {
+                time.sleep(Duration::from_secs(1)).await;
+                stopped = 0;
+                for send in &mut sends {
+                    if send.write_all(&[0u8; 32]).await.is_err() {
+                        stopped += 1;
+                    }
+                }
+            }
+            stopped
+        })
+        .await;
+        assert_eq!(stopped, STREAMS);
+        let waited = Duration::from_nanos(p.time().now_nanos() - started);
+        assert!(
+            waited >= age && waited < age + Duration::from_secs(10),
+            "evicted after {waited:?}, first age {age:?}"
+        );
+        assert_eq!(
+            p.b.stats().shared_count(InboundStreamOutcome::EvictedAge) as usize,
+            STREAMS
+        );
+    })
+}
+
+/// A slow stream on a busy connection is kept past its first age: a trickle
+/// that alone would be evicted at its first age, beside a bulk stream that
+/// keeps the connection reading at 36 KiB/s, just above the 32 KiB/s floor.
+/// quinn shares a connection between its streams, so a stream's own rate
+/// says little; the connection's says whether the peer is delivering. At
+/// 28 KiB/s, just under the floor, the trickle is evicted at its first age.
+#[test]
+fn a_slow_stream_on_a_busy_connection_is_kept_past_its_first_age() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (network, rate, kept) in [
+            ("quic-path-busy-age-above", 36 * 1024usize, true),
+            ("quic-path-busy-age-below", 28 * 1024, false),
+        ] {
+            let mut p = paths(network, QuicPathLimits::DEFAULT).await;
+            let idle = streaming_handle_idle_timeout();
+            let total = 100_000u64;
+            let age = max_inbound_stream_age(total);
+            let (conn, time) = (p.a_raw(), p.time());
+            let held = age + age / 2;
+            let outcome = drive(&p.pair.time, held + LIMIT, async move {
+                let mut slow = conn.open_uni().await.unwrap();
+                slow.write_all(&header(1, 1, StreamId::next().0, total, 0))
+                    .await
+                    .unwrap();
+                // The bulk: `rate` bytes a second, in streams of 1 MiB.
+                let bulk_conn = conn.clone();
+                let bulk_time = time.clone();
+                let bulk = tokio::spawn(async move {
+                    loop {
+                        let mut send = bulk_conn.open_uni().await.unwrap();
+                        let len = MIB;
+                        send.write_all(&header(1, 1, StreamId::next().0, len as u64, 0))
+                            .await
+                            .unwrap();
+                        let mut left = len;
+                        while left > 0 {
+                            let piece = rate.min(left);
+                            send.write_all(&payload(piece)).await.unwrap();
+                            left -= piece;
+                            bulk_time.sleep(Duration::from_secs(1)).await;
+                        }
+                        send.finish().unwrap();
+                    }
+                });
+                let start = time.now_nanos();
+                let mut evicted = None;
+                while Duration::from_nanos(time.now_nanos() - start) < held {
+                    if let Err(quinn::WriteError::Stopped(code)) = slow.write_all(b"x").await {
+                        evicted = Some((code.into_inner(), time.now_nanos() - start));
+                        break;
+                    }
+                    time.sleep(idle / 2).await;
+                }
+                bulk.abort();
+                evicted
+            })
+            .await;
+            if kept {
+                assert_eq!(outcome, None, "{network}: kept past its first age {age:?}");
+                assert_eq!(
+                    p.b.stats().shared_count(InboundStreamOutcome::EvictedAge),
+                    0
+                );
+            } else {
+                let (code, at) = outcome.expect("evicted");
+                assert_eq!(code, u64::from(stop_code::EVICTED), "{network}");
+                let at = Duration::from_nanos(at);
+                assert!(
+                    at >= age && at < age + idle,
+                    "{network}: evicted at {at:?}, first age {age:?}"
+                );
+            }
+            while p.b_in.streams.try_recv().is_ok() {}
+        }
+    })
+}
+
+/// A send whose acknowledgement does not come within its ack wait
+/// (`SendDeadlines::ack_wait`, here 10 ms on a 200 ms round trip, so it
+/// cannot) ends `MaybeDelivered` at it, and its stream is reset and counted
+/// as an abort toward `recycle::SEND_ABORT_LIMIT`, releasing its permit
+/// and epoch.
+#[test]
+fn a_send_past_its_ack_wait_is_reset_and_counted() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-wait";
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(100))
+            })),
+        );
+        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let deadlines = SendDeadlines {
+            ack_wait: Some(Duration::from_millis(10)),
+            ..SendDeadlines::stream(10_000)
+        };
+        let outcome = p
+            .drive(async move {
+                a.send_stream_bounded(
+                    &time,
+                    deadlines,
+                    StreamId::next(),
+                    None,
+                    Bytes::from(payload(10_000)),
+                    None,
+                )
+                .await
+            })
+            .await;
+        set_packet_delivery_callback(network, None);
+        assert!(
+            matches!(
+                outcome,
+                BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(p.a.send_aborts(), 1, "reset and counted");
+        assert_eq!(
+            p.a.writers().streams_ended(),
+            p.a.writers().streams_opened(),
+            "a reset stream has ended, for the stream-credit rule"
+        );
+        assert_eq!(p.a.send_epoch_holders(), 0, "nothing left waiting");
+    })
+}
+
 /// A stream that stops making progress is evicted after the idle timeout,
 /// and one that keeps trickling is evicted at its age limit: stopped with
 /// `EVICTED`, counted as the UDP transport counts them, handle cancelled.
@@ -805,29 +994,30 @@ fn idle_and_old_streams_are_evicted() {
         );
         assert!(p.b_in.streams.try_recv().unwrap().handle.is_cancelled());
 
-        // Age: a byte every half idle period, so it is never idle.
+        // Age: a byte every half idle period, so it is never idle, and its
+        // connection reads far under the floor rate, so the stream is not
+        // kept past its first age, its length at 32 KiB/s and at least 5 min.
         let total = 100_000u64;
         let age = max_inbound_stream_age(total);
         let conn = p.a_raw();
         let sleeper = time.clone();
         let started = time.now_nanos();
-        let code = p
-            .drive(async move {
-                let mut send = conn.open_uni().await.unwrap();
-                send.write_all(&header(1, 1, StreamId::next().0, total, 0))
-                    .await
-                    .unwrap();
-                loop {
-                    if let Err(quinn::WriteError::Stopped(code)) = send.write_all(b"x").await {
-                        return Some(code.into_inner());
-                    }
-                    tokio::select! {
-                        () = sleeper.sleep(idle / 2) => {}
-                        stopped = send.stopped() => return stopped.unwrap().map(|c| c.into_inner()),
-                    }
+        let code = drive(&p.pair.time, age + LIMIT, async move {
+            let mut send = conn.open_uni().await.unwrap();
+            send.write_all(&header(1, 1, StreamId::next().0, total, 0))
+                .await
+                .unwrap();
+            loop {
+                if let Err(quinn::WriteError::Stopped(code)) = send.write_all(b"x").await {
+                    return Some(code.into_inner());
                 }
-            })
-            .await;
+                tokio::select! {
+                    () = sleeper.sleep(idle / 2) => {}
+                    stopped = send.stopped() => return stopped.unwrap().map(|c| c.into_inner()),
+                }
+            }
+        })
+        .await;
         assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
         let waited = Duration::from_nanos(time.now_nanos() - started);
         assert!(waited >= age, "evicted after {waited:?}, age limit {age:?}");
@@ -1122,7 +1312,13 @@ fn a_stream_stopped_with_gaps_is_released_after_the_grace_period() {
         };
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-stopped-gaps";
-        let mut p = paths(network, QuicPathLimits::DEFAULT).await;
+        // `a`'s datagrams stop reaching `b`, so `a`'s watch would close the
+        // path as dark before `b` evicts the stream; this test is `b`'s.
+        let limits = QuicPathLimits {
+            watch_closes: false,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths(network, limits).await;
         // Let the paths' stream-limit raises (`config::INITIAL_UNI_STREAMS`)
         // and their acknowledgements settle, so the first datagram `a` sends
         // below is the stream's.
@@ -3162,8 +3358,11 @@ const PEER_STEP: Duration = Duration::from_millis(20);
 /// A transfer still in flight 100 ms in, for the tests that cut the link
 /// mid-transfer. The round trip here is about one [`PEER_STEP`], so the window
 /// doubles every 20 ms from the initial 32 datagrams: 1 MiB would be done
-/// before the cut (38 + 77 + 154 + 307 + 614 kB in five round trips).
-const IN_FLIGHT_AT_THE_CUT: usize = 8 * 1024 * 1024;
+/// before the cut (38 + 77 + 154 + 307 + 614 kB in five round trips). Within
+/// `b`'s credit, which `b` never returns (it reads nothing), so the sender is
+/// never blocked on credit and the credit rule (`recycle::CreditWatch`) stays
+/// out of these tests.
+const IN_FLIGHT_AT_THE_CUT: usize = super::super::tests::TEST_WINDOW as usize - 64 * 1024;
 
 /// A real `QuicPath` (`a`, the client) connected to a peer `b` that is a
 /// quinn-proto endpoint driven by hand on the simulated network, so a test
@@ -3182,6 +3381,8 @@ struct Scripted {
     b_addr: SocketAddr,
     keep_sending: Arc<std::sync::atomic::AtomicBool>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
+    /// Where `a`'s path counts, its own.
+    counters: &'static crate::transport::metrics::QuicDataCounters,
 }
 
 impl Drop for Scripted {
@@ -3199,9 +3400,32 @@ impl Scripted {
         Self::connect_capped(network, None).await
     }
 
+    /// [`Self::connect`] with `a`'s path left without data, as every path is
+    /// while no release sends data on QUIC: its watch counts dark spells and
+    /// does not close on them.
+    async fn connect_without_data(network: &str) -> Self {
+        Self::connect_built(network, None, false, None).await
+    }
+
+    /// [`Self::connect_without_data`] with quinn's idle timeout set to
+    /// `idle` on both ends, as a node's is (120 s), in place of virtual
+    /// time's 24 h. Keepalives stay off: virtual time has none.
+    async fn connect_without_data_idle(network: &str, idle: Duration) -> Self {
+        Self::connect_built(network, None, false, Some(idle)).await
+    }
+
     /// [`Self::connect`] with a node-wide egress cap of `a_cap` bytes per
     /// second on `a`'s socket.
     async fn connect_capped(network: &str, a_cap: Option<u64>) -> Self {
+        Self::connect_built(network, a_cap, true, None).await
+    }
+
+    async fn connect_built(
+        network: &str,
+        a_cap: Option<u64>,
+        data: bool,
+        idle_timeout: Option<Duration>,
+    ) -> Self {
         use super::super::config::{self, QuicSettings};
         use super::super::identity::{PeerKey, QuicIdentity};
         use crate::transport::Socket;
@@ -3222,7 +3446,7 @@ impl Scripted {
         register_address_network(b_addr, network);
         let settings = QuicSettings {
             memory_limit: 1024 * 1024 * 1024,
-            idle_timeout: None,
+            idle_timeout,
             initial_window: Some(super::super::tests::TEST_WINDOW),
             rate_limit: Default::default(),
         };
@@ -3322,7 +3546,16 @@ impl Scripted {
             endpoint.connect(b_addr, &b_key).await.expect("connect")
         })
         .await;
-        let (a, a_in) = QuicPath::new(conn, time.clone());
+        let counters = leaked_counters();
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..if data {
+                QuicPathLimits::DEFAULT
+            } else {
+                QuicPathLimits::SHADOW
+            }
+        };
+        let (a, a_in) = QuicPath::with_limits(conn, time.clone(), limits);
         Self {
             time,
             network: network.to_string(),
@@ -3333,7 +3566,13 @@ impl Scripted {
             b_addr,
             keep_sending,
             tasks,
+            counters,
         }
+    }
+
+    /// `a`'s dark episodes so far, by `quic_dark_episode_<label>`.
+    fn dark_episodes(&self) -> Vec<u64> {
+        self.counters.snapshot(false).dark_episodes
     }
 
     /// A sample of `a`'s connection, as the acknowledgement watch takes it.
@@ -3341,6 +3580,7 @@ impl Scripted {
         recycle::AckSample::of(
             self.a.connection().inner(),
             &self.a.connection().cap_holds(),
+            self.a.writers(),
         )
         .expect("a CappedCubic controller")
     }
@@ -3452,8 +3692,9 @@ fn packets_left_outstanding_when_the_peer_stops_acknowledging_close_the_path() {
     })
 }
 
-/// #5940 step M6, guard 2 (review finding 2): an outage of 30 s in both
-/// directions in the middle of a transfer, then recovery. `b` sends all the
+/// #5940 step M6, guard 2 (review finding 2): an outage of 8 s in both
+/// directions in the middle of a transfer, then recovery (shorter than the
+/// window: a longer one is a dark path, closed by the dark-path rule). `b` sends all the
 /// time once it is back, but has nothing new to acknowledge, while `a`'s
 /// data waits for its backed-off probe timer; `b` acknowledges the probe
 /// when it comes. `b` is a conforming peer: `a` must not close.
@@ -3475,7 +3716,7 @@ fn recovery_from_an_outage_in_both_directions_does_not_close() {
         assert!(s.sample().outstanding_after_acks() > 0);
         drop(cut);
         let outage = DropFrom::new(network, &[s.a_addr, s.b_addr]);
-        s.wait(Duration::from_secs(30)).await;
+        s.wait(Duration::from_secs(8)).await;
         drop(outage);
         let at_recovery = s.sample().received();
         s.wait(Duration::from_secs(60)).await;
@@ -3491,6 +3732,439 @@ fn recovery_from_an_outage_in_both_directions_does_not_close() {
             s.a.connection().inner().close_reason()
         );
         assert!(recycle_closes_to(s.b_addr).is_empty());
+    })
+}
+
+/// The dark-path rule on a real path: an outage in both directions in the
+/// middle of a transfer, with `a`'s data outstanding, closes the path within
+/// `recycle::dark_close_bound` of the cut (the first probe after the window
+/// goes unanswered), as dark: nothing is acknowledged and
+/// nothing comes from `b`. The M6 rule cannot see it, since it needs the peer
+/// to keep sending.
+#[test]
+fn a_path_dark_in_both_directions_is_closed_as_dark() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-dark";
+        let mut s = Scripted::connect(network).await;
+        s.a_sends(IN_FLIGHT_AT_THE_CUT);
+        s.wait(Duration::from_millis(100)).await;
+        let _dark = DropFrom::new(network, &[s.a_addr, s.b_addr]);
+        let cut_at = s.time.now_nanos();
+        let waited = s.closed_after(cut_at).await;
+        assert!(
+            waited <= recycle::dark_close_bound(Duration::from_millis(50)),
+            "closed {waited:?} after the cut"
+        );
+        assert_eq!(recycle::stalls_to(s.b_addr), vec![recycle::Stall::Dark]);
+        assert_eq!(
+            recycle_closes_to(s.b_addr),
+            vec![QuicCloseCode::PeerNotAcknowledging]
+        );
+    })
+}
+
+/// The dark-path rule against quinn's probe backoff, on a real path at an
+/// 800 ms round trip whose peer only acknowledges (it sends nothing of its
+/// own, and virtual time runs no keepalive): `a` has data outstanding when
+/// both directions go dark. After an outage quinn sends again only at its
+/// next backed-off probe, so a 6.5 s outage still reads dark past the 10 s
+/// window; the rule waits for two rounds of sends made after the window,
+/// and the first is answered, so the path lives. So is a 13 s outage, past
+/// the window, when it has ended before quinn's first probe after the
+/// window. A 30 s outage swallows that first post-window round (as a lost
+/// probe pair would) and is still survived: the second round is answered
+/// (with one round, outages of 26 s to 40 s closed here).
+/// A path that stays dark is closed as dark. Prints the close latency
+/// at 50, 300 and 800 ms round trips for a path that stays dark (the figures
+/// in `transport.md`).
+#[test]
+fn the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (one_way_ms, outage_ms, closes) in [
+            (400u64, 6_500u64, false),
+            (400, 13_000, false),
+            (400, 30_000, false),
+            (25, u64::MAX, true),
+            (150, u64::MAX, true),
+            (400, u64::MAX, true),
+        ] {
+            let network: &'static str = Box::leak(
+                format!("quic-path-dark-backoff-{one_way_ms}-{outage_ms}").into_boxed_str(),
+            );
+            let one_way = Duration::from_millis(one_way_ms);
+            let dark_from = Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
+            let dark_until = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let clock: Arc<std::sync::OnceLock<VirtualTime>> = Arc::default();
+            {
+                let (from, until, clock) = (dark_from.clone(), dark_until.clone(), clock.clone());
+                set_packet_delivery_callback(
+                    network,
+                    Some(Arc::new(move |_, _, _, _| {
+                        let now = clock.get().map_or(0, |time| time.now_nanos());
+                        if now >= from.load(Relaxed) && now < until.load(Relaxed) {
+                            PacketDeliveryDecision::Drop
+                        } else {
+                            PacketDeliveryDecision::DelayedDelivery(one_way)
+                        }
+                    })),
+                );
+            }
+            let mut s = Scripted::connect(network).await;
+            clock.set(s.time.clone()).ok();
+            s.a_sends(IN_FLIGHT_AT_THE_CUT);
+            // About one round trip in: the transfer is still in flight.
+            s.wait(one_way * 2 + Duration::from_millis(100)).await;
+            assert!(
+                s.sample().outstanding_after_acks() > 0,
+                "premise: data outstanding at the cut"
+            );
+            let cut_at = s.time.now_nanos();
+            dark_from.store(cut_at, Relaxed);
+            dark_until.store(
+                cut_at.saturating_add(outage_ms.saturating_mul(1_000_000)),
+                Relaxed,
+            );
+            let case = format!("{}ms RTT, outage {outage_ms} ms", 2 * one_way_ms);
+            if closes {
+                let waited = s.closed_after(cut_at).await;
+                eprintln!("dark close latency: {case}: {waited:?}");
+                assert!(
+                    waited <= recycle::dark_close_bound(one_way * 2),
+                    "{case}: closed {waited:?} after the cut"
+                );
+                assert!(waited >= recycle::ACK_WATCH_WINDOW, "{case}: {waited:?}");
+                assert_eq!(
+                    recycle::stalls_to(s.b_addr),
+                    vec![recycle::Stall::Dark],
+                    "{case}"
+                );
+            } else {
+                s.wait(Duration::from_secs(90)).await;
+                assert!(
+                    s.a.connection().inner().close_reason().is_none(),
+                    "{case}: {:?}, {:?}",
+                    s.a.connection().inner().close_reason(),
+                    recycle::stalls_to(s.b_addr)
+                );
+                assert!(recycle::stalls_to(s.b_addr).is_empty(), "{case}");
+            }
+        }
+    })
+}
+
+/// A node's streamed send takes its write gap from the path, as its receiver
+/// does (#6186): 5 s on a fast path, and on a 1 s round trip the 24 round
+/// trips the receiver waits between pieces, never a flat 5 s.
+#[test]
+fn a_streamed_sends_gap_follows_its_paths_round_trip() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let fast = paths("quic-path-gap-fast", QuicPathLimits::DEFAULT).await;
+        let deadlines = fast.a.stream_deadlines(100_000);
+        assert_eq!(
+            deadlines.gap,
+            Some(crate::transport::peer_connection::streaming::STREAM_INACTIVITY_TIMEOUT)
+        );
+        let network = "quic-path-gap-slow";
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(500))
+            })),
+        );
+        let slow = paths(network, QuicPathLimits::DEFAULT).await;
+        let deadlines = slow.a.stream_deadlines(100_000);
+        assert_eq!(deadlines.gap, Some(slow.a.receiver_gap()));
+        assert!(
+            deadlines.gap.unwrap() >= Duration::from_secs(20),
+            "{deadlines:?}"
+        );
+        assert!(deadlines.open <= deadlines.gap.unwrap());
+        set_packet_delivery_callback(network, None);
+    })
+}
+
+/// The dark-path rule closes only a path that carries data. On one that
+/// does not (every path while no release sends data on QUIC), a dark spell
+/// in both directions, with a control frame sent into it, does not close
+/// the path, and the spell is counted when it ends. Its length is read up
+/// to when the peer is heard from again, which waits for quinn's
+/// backed-off probes after the outage ends, so it reads longer than the
+/// outage: here (no idle timeout) a 30 s outage lands below 120 s and a
+/// 100 s one at 120 s or more. With quinn's 120 s idle timeout, an outage
+/// long enough that the backoff passes it ends the path and counts
+/// `unrecovered`. The M6 rule still applies.
+#[test]
+fn a_path_without_data_is_not_closed_by_a_dark_spell() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-dark-no-data";
+        let mut s = Scripted::connect_without_data(network).await;
+        s.wait(Duration::from_secs(1)).await;
+        let mut expected = vec![0u64; 8];
+        for (spell, bucket) in [(30, 3), (100, 4)] {
+            let dark = DropFrom::new(network, &[s.a_addr, s.b_addr]);
+            let (a, time) = (s.a.clone(), s.time.clone());
+            s.tasks.push(tokio::spawn(async move {
+                a.send_control_bounded(
+                    &time,
+                    Duration::from_secs(60),
+                    QuicControl::Ready {
+                        attempt: 1,
+                        caps: 0,
+                    },
+                )
+                .await;
+            }));
+            s.wait(Duration::from_secs(spell)).await;
+            drop(dark);
+            // Counted once the peer is heard from again, which waits for
+            // quinn's backed-off probes after the outage ends.
+            let ended = s.time.now_nanos();
+            let mut waited = 0;
+            while s.dark_episodes().iter().sum::<u64>() < expected.iter().sum::<u64>() + 1 {
+                assert!(waited < 300, "the {spell} s spell was never counted");
+                s.wait(Duration::from_secs(1)).await;
+                waited += 1;
+            }
+            let read =
+                Duration::from_nanos(s.time.now_nanos() - ended) + Duration::from_secs(spell);
+            assert!(read > Duration::from_secs(spell), "{read:?}");
+            assert!(
+                s.a.connection().inner().close_reason().is_none(),
+                "{:?}, {:?}",
+                s.a.connection().inner().close_reason(),
+                recycle::stalls_to(s.b_addr)
+            );
+            expected[bucket] += 1;
+            assert_eq!(s.dark_episodes(), expected, "after a {spell} s spell");
+        }
+        assert!(recycle::stalls_to(s.b_addr).is_empty());
+    })
+}
+
+/// [`a_path_without_data_is_not_closed_by_a_dark_spell`] with quinn's idle
+/// timeout at a node's 120 s: a 30 s outage still reads below 120 s and the
+/// path lives, but after a 100 s outage the next backed-off probe comes after
+/// the idle timeout, so the path ends silent and the episode counts
+/// `unrecovered`, not as a long recovery. The dark rule closes neither.
+#[test]
+fn a_path_without_data_idles_out_after_a_long_dark_spell_and_counts_it_unrecovered() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-dark-idle";
+        let idle = Duration::from_secs(120);
+        let mut s = Scripted::connect_without_data_idle(network, idle).await;
+        s.wait(Duration::from_secs(1)).await;
+        let mut expected = vec![0u64; 8];
+        for spell in [30u64, 100] {
+            let dark = DropFrom::new(network, &[s.a_addr, s.b_addr]);
+            let (a, time) = (s.a.clone(), s.time.clone());
+            s.tasks.push(tokio::spawn(async move {
+                a.send_control_bounded(
+                    &time,
+                    Duration::from_secs(60),
+                    QuicControl::Ready {
+                        attempt: 1,
+                        caps: 0,
+                    },
+                )
+                .await;
+            }));
+            s.wait(Duration::from_secs(spell)).await;
+            drop(dark);
+            let mut waited = 0;
+            while s.dark_episodes().iter().sum::<u64>() < expected.iter().sum::<u64>() + 1 {
+                assert!(waited < 300, "the {spell} s spell was never counted");
+                s.wait(Duration::from_secs(1)).await;
+                waited += 1;
+            }
+            let label = if spell == 30 {
+                expected[3] += 1;
+                "recovered_lt_120s"
+            } else {
+                expected[5] += 1;
+                "unrecovered"
+            };
+            assert_eq!(s.dark_episodes(), expected, "a {spell} s spell is {label}");
+        }
+        assert!(
+            s.a.connection().inner().close_reason().is_some(),
+            "premise: the idle timeout ended the path"
+        );
+        assert!(recycle::stalls_to(s.b_addr).is_empty(), "not the dark rule");
+    })
+}
+
+/// The stream-credit rule on a real path: `b` acknowledges every stream but
+/// never reads one, so it never frees a slot and never raises its stream
+/// limit. `a` has more streams to send than the limit: those within it are
+/// wholly acknowledged, the rest wait to open for its stream credit,
+/// and the path is closed as `StreamCreditWithheld` about
+/// `STREAM_CREDIT_WINDOW` after that, by no other rule first.
+#[test]
+fn a_peer_that_never_raises_its_stream_limit_is_closed() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-stream-credit";
+        let mut s = Scripted::connect(network).await;
+        let limit = super::super::config::INITIAL_UNI_STREAMS as usize;
+        for _ in 0..limit + 8 {
+            let a = s.a.clone();
+            s.tasks.push(tokio::spawn(async move {
+                a.send_stream(StreamId::next(), None, Bytes::from(payload(100)))
+                    .await
+                    .ok();
+            }));
+        }
+        let start = s.time.now_nanos();
+        let waited = s.closed_after(start).await;
+        assert!(
+            waited >= recycle::STREAM_CREDIT_WINDOW
+                && waited <= recycle::STREAM_CREDIT_WINDOW + Duration::from_secs(8),
+            "closed {waited:?} after the sends"
+        );
+        assert_eq!(
+            recycle::stalls_to(s.b_addr),
+            vec![recycle::Stall::StreamCreditWithheld]
+        );
+    })
+}
+
+/// An honest receiver whose consumer stalls for 45 s: one-packet Shorts wait
+/// for room in its channel (capacity 1), each lowering the limit it
+/// advertises, so `a`'s further sends wait to open for its stream credit
+/// while every stream `a` opened is wholly acknowledged. That engages the
+/// stream-credit rule (a withheld spell with nothing in flight), which
+/// would close the path at 60 s; the consumer drains at 45 s, the limit
+/// comes back up, every Short arrives, and the path is not closed. With the
+/// rule's window cut to 20 s this test fails.
+#[test]
+fn a_consumer_that_stalls_45_s_does_not_close_the_path() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let limits = QuicPathLimits {
+            short_capacity: 1,
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths("quic-path-stream-credit-consumer", limits).await;
+        let mut shorts = std::mem::replace(&mut p.b_in.shorts, tokio::sync::mpsc::channel(1).1);
+        let (a, time) = (p.a.clone(), p.time());
+        let sends = p
+            .drive(async move {
+                let sends: Vec<_> = (0..40)
+                    .map(|_| {
+                        let a = a.clone();
+                        let time = time.clone();
+                        tokio::spawn(async move {
+                            a.send_short_bounded(&time, Duration::from_secs(120), b"x")
+                                .await
+                        })
+                    })
+                    .collect();
+                time.sleep(Duration::from_secs(45)).await;
+                let writers = a.writers();
+                let engaged = (
+                    writers.stream_waiters(),
+                    writers.streams_opened(),
+                    writers.streams_ended(),
+                );
+                (sends, engaged)
+            })
+            .await;
+        let (sends, (waiting, opened, ended)) = sends;
+        assert!(waiting > 0, "premise: sends waited for stream credit");
+        assert!(
+            opened >= 9 && ended == opened,
+            "premise: every stream opened has ended, wholly acknowledged ({ended} of {opened})"
+        );
+        assert!(
+            p.a.connection().inner().close_reason().is_none(),
+            "not closed during the stall"
+        );
+        let time = p.time();
+        let outcomes = p
+            .drive(async move {
+                let mut delivered = 0;
+                let mut results = Vec::new();
+                for send in sends {
+                    while !send.is_finished() {
+                        while shorts.try_recv().is_ok() {
+                            delivered += 1;
+                        }
+                        time.sleep(Duration::from_millis(50)).await;
+                    }
+                    results.push(send.await.expect("the send ran"));
+                }
+                // A Short reads as Sent once acknowledged, before it is
+                // delivered: drain until every one has arrived.
+                let drained_by = time.now_nanos() + 60_000_000_000;
+                while delivered < 40 && time.now_nanos() < drained_by {
+                    while shorts.try_recv().is_ok() {
+                        delivered += 1;
+                    }
+                    time.sleep(Duration::from_millis(50)).await;
+                }
+                (results, delivered)
+            })
+            .await;
+        let (results, delivered) = outcomes;
+        assert!(
+            p.a.connection().inner().close_reason().is_none(),
+            "{:?}",
+            recycle::stalls_to(p.pair.b_addr)
+        );
+        assert!(recycle::stalls_to(p.pair.b_addr).is_empty());
+        assert_eq!(delivered, 40, "{results:?}");
+    })
+}
+
+/// The credit rule on a real path: `b` acknowledges everything but never
+/// reads, so it never returns credit, and `a` has more to send than `b`'s
+/// window. `a` closes the path as credit-starved within the window and a
+/// tick of its sends blocking (they block once the window's bytes are
+/// written, within the first second).
+#[test]
+fn a_peer_that_acknowledges_but_returns_no_credit_is_closed_as_credit_starved() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-ack-watch-credit";
+        let mut s = Scripted::connect(network).await;
+        let start = s.time.now_nanos();
+        s.a_sends(4 * super::super::tests::TEST_WINDOW as usize);
+        let waited = s.closed_after(start).await;
+        assert!(
+            waited <= Duration::from_secs(1) + recycle::ACK_WATCH_WINDOW + recycle::ACK_WATCH_TICK,
+            "closed {waited:?} after the send started"
+        );
+        assert!(
+            s.a.connection().inner().stats().frame_tx.data_blocked
+                + s.a
+                    .connection()
+                    .inner()
+                    .stats()
+                    .frame_tx
+                    .stream_data_blocked
+                > 0,
+            "premise: blocked by b's credit"
+        );
+        assert_eq!(
+            recycle::stalls_to(s.b_addr),
+            vec![recycle::Stall::CreditStarved]
+        );
+        assert_eq!(
+            recycle_closes_to(s.b_addr),
+            vec![QuicCloseCode::PeerNotAcknowledging]
+        );
     })
 }
 
@@ -3910,9 +4584,11 @@ async fn max_outstanding(paths: [Arc<QuicPath>; 2], time: VirtualTime, end: u64)
     let mut max = 0;
     while time.now_nanos() < end {
         for path in &paths {
-            if let Some(sample) =
-                recycle::AckSample::of(path.connection().inner(), &path.connection().cap_holds())
-            {
+            if let Some(sample) = recycle::AckSample::of(
+                path.connection().inner(),
+                &path.connection().cap_holds(),
+                path.writers(),
+            ) {
                 max = max.max(sample.outstanding_after_acks());
             }
         }
@@ -3924,16 +4600,33 @@ async fn max_outstanding(paths: [Arc<QuicPath>; 2], time: VirtualTime, end: u64)
 /// #5940 step M6, guard 2 must not fire on a conforming peer over a lossy
 /// path: 25% of datagrams lost in both directions (seeded), a 2 MiB
 /// transfer each way plus a short message each way every 500 ms, for three
-/// virtual minutes.
+/// virtual minutes. Both ends' consumers take what arrives, as a node's do
+/// (one that never does holds the peer's stream limit down, which the
+/// stream-credit rule closes after a minute).
 #[test]
 fn a_lossy_path_is_not_closed() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-ack-watch-lossy";
         let loss = seeded_loss(network, 25);
-        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        let mut p = paths(network, QuicPathLimits::DEFAULT).await;
         let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
         let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        let consumers = [&mut p.a_in, &mut p.b_in].map(|inbound| {
+            let mut shorts =
+                std::mem::replace(&mut inbound.shorts, tokio::sync::mpsc::channel(1).1);
+            let mut streams =
+                std::mem::replace(&mut inbound.streams, tokio::sync::mpsc::channel(1).1);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        Some(short) = shorts.recv() => drop(short),
+                        Some(stream) = streams.recv() => drop(stream),
+                        else => break,
+                    }
+                }
+            })
+        });
         let (bulk_ab, bulk_ba, trickles) = p
             .drive(async move {
                 let end = time.now_nanos() + Duration::from_secs(180).as_nanos() as u64;
@@ -3957,6 +4650,9 @@ fn a_lossy_path_is_not_closed() {
             })
             .await;
         let (trickles, max_outstanding) = trickles;
+        for consumer in consumers {
+            consumer.abort();
+        }
         // The loss really happened, and the watch really had packets
         // outstanding to judge, so "no close" is not vacuous.
         let (seen, dropped) = (
@@ -4886,7 +5582,14 @@ fn send_deadlines_have_these_values() {
     assert_eq!(stream.gap, Some(Duration::from_secs(5)));
     assert_eq!(
         stream.total,
-        crate::transport::peer_connection::inbound_stream_age_limit(MIB as u64)
+        inbound::stream_age_limit(),
+        "the 2 h cap, whatever the size: progress is the connection's rule"
+    );
+    assert_eq!(SendDeadlines::stream(1).total, stream.total);
+    assert_eq!(
+        stream.ack_wait,
+        Some(max_inbound_stream_age(MIB as u64)),
+        "the ack wait is the stream's first age"
     );
 
     assert_eq!(
@@ -4908,6 +5611,7 @@ fn the_gap_runs_from_the_last_step_and_total_still_binds() {
             gap: Some(Duration::from_secs(5)),
             source_gap: None,
             total: Duration::from_secs(60),
+            ack_wait: None,
         };
         let (stalled, stalled_after, steady, steady_after) = drive(&time, LIMIT, async move {
             let start = clock.now();
@@ -4973,6 +5677,7 @@ async fn stuck_send(
         gap: Some(Duration::from_secs(5)),
         source_gap: None,
         total,
+        ack_wait: None,
     };
     let start = clock.now();
     let ticking = clock.clone();
@@ -5096,6 +5801,7 @@ fn a_live_send_held_in_the_cap_queue_past_its_gap_is_sent() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let ticking = clock.clone();
             let queue = async move {
@@ -5162,6 +5868,7 @@ fn an_acknowledgement_the_record_has_not_seen_credits_the_next_send() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let ticking = clock.clone();
             let queue = async move {
@@ -5271,6 +5978,7 @@ fn a_send_waiting_for_its_source_ends_at_its_own_gap() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let start = clock.now();
             let ticking = clock.clone();
@@ -5330,6 +6038,7 @@ fn progress_from_before_the_send_does_not_extend_its_gap() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let start = clock.now();
             let sent = bounded_send(&clock, deadlines, Some(connection), |progress| async move {
@@ -5364,6 +6073,7 @@ fn a_quiet_proof_says_whether_its_send_saw_a_live_hold() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let mut proofs = Vec::new();
             for live in [true, false] {
@@ -5429,6 +6139,7 @@ fn a_hold_read_live_by_a_wake_voids_the_proof() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let start = clock.now();
             let holding = clock.clone();
@@ -5482,6 +6193,7 @@ fn the_source_gap_applies_only_to_source_waits() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             }
             .with_source_gap(Duration::from_secs(30));
             let sleeps = clock.clone();
@@ -5530,6 +6242,7 @@ fn the_end_of_a_source_wait_rearms_the_timer_at_the_own_gap() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             }
             .with_source_gap(Duration::from_secs(30));
             let start = clock.now();
@@ -5585,6 +6298,7 @@ fn source_waits_do_not_rearm_the_timer_without_an_extension() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let arms = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let seen = arms.clone();
@@ -5631,6 +6345,7 @@ fn source_waits_rearm_the_timer_once_while_it_is_extended() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let ticking = clock.clone();
             let peer = async move {
@@ -5697,6 +6412,7 @@ fn a_later_proof_of_the_same_counts_keeps_the_earlier_since() {
                 gap: Some(Duration::from_secs(5)),
                 source_gap: None,
                 total: Duration::from_secs(120),
+                ack_wait: None,
             };
             let stuck = |progress: bounded::SendProgress| async move {
                 progress.mark_opened();
@@ -5754,6 +6470,7 @@ fn the_gap_ends_at_the_end_of_the_stream_and_open_binds_first() {
             gap: Some(Duration::from_secs(5)),
             source_gap: None,
             total: Duration::from_secs(60),
+            ack_wait: None,
         };
         let (finished, finished_after, unopened, unopened_after) =
             drive(&time, LIMIT, async move {
@@ -6138,6 +6855,128 @@ fn a_live_path_under_a_binding_cap_is_not_stall_closed() {
     })
 }
 
+/// A slow uplink never stall-closes a path that is moving data, also below
+/// the credit rule's floor rate (32 KiB/s). 25 kB/s is one of 40 connections
+/// sharing 1 MB/s. Two ways a node's sends are held back, both this side's
+/// back-pressure and not the peer's: the node's own egress cap
+/// (`a`'s socket cap), and a bottleneck the node cannot see (a 25 kB/s link
+/// with a 250 ms drop-tail queue, so the sender is congestion-window
+/// limited). The peer reads every byte. With the watch and the loss gate on,
+/// a 2 MiB stream on a node's deadlines ends `Sent`, slower than the floor,
+/// and neither end closes or records a stall. Such a path never waits on
+/// the peer's credit (its writes wait on its own send window), so the credit
+/// rule never starts counting: a rule that judged a writing path by its rate
+/// alone fails here, while the rule's congestion and cap exclusions are
+/// pinned by the recycle tests.
+#[test]
+fn a_slow_uplink_below_the_floor_rate_is_never_closed() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    const RATE: u64 = 25_000;
+    const LEN: usize = 2 * MIB;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (network, capped) in [
+            ("quic-path-slow-uplink-cap", true),
+            ("quic-path-slow-uplink-link", false),
+        ] {
+            let mut p = if capped {
+                paths_capped(network, RATE).await
+            } else {
+                paths(network, QuicPathLimits::DEFAULT).await
+            };
+            let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
+            let dropped = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            if !capped {
+                // `a`'s datagrams leave a FIFO link of RATE bytes/s; one that
+                // would wait more than 250 ms in its queue is dropped.
+                let (time, counted) = (p.time(), dropped.clone());
+                let free_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
+                set_packet_delivery_callback(
+                    network,
+                    Some(Arc::new(move |_, sender, _, bytes: &[u8]| {
+                        if sender != a_addr {
+                            return PacketDeliveryDecision::Deliver;
+                        }
+                        let now = time.now_nanos();
+                        let start = free_at.load(Relaxed).max(now);
+                        if start - now > 250_000_000 {
+                            counted.fetch_add(1, Relaxed);
+                            return PacketDeliveryDecision::Drop;
+                        }
+                        let done = start + bytes.len() as u64 * 1_000_000_000 / RATE;
+                        free_at.store(done, Relaxed);
+                        PacketDeliveryDecision::DelayedDelivery(Duration::from_nanos(done - now))
+                    })),
+                );
+            }
+            let (a, time) = (p.a.clone(), p.time());
+            let started = time.now_nanos();
+            let send = tokio::spawn(async move {
+                a.send_stream_bounded(
+                    &time,
+                    a.stream_deadlines(LEN as u64),
+                    StreamId::next(),
+                    None,
+                    Bytes::from(payload(LEN)),
+                    None,
+                )
+                .await
+            });
+            let mut b_in = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+            let time = p.time();
+            let (outcome, assembled, took) = p
+                .drive(async move {
+                    let arrival = b_in.recv().await.expect("announced");
+                    let assembled = arrival.handle.assemble().await;
+                    let outcome = send.await.expect("the send task ran");
+                    (outcome, assembled, time.now_nanos() - started)
+                })
+                .await;
+            set_packet_delivery_callback(network, None);
+            assert!(
+                matches!(outcome, BoundedSend::Sent),
+                "{network}: {outcome:?}"
+            );
+            assert_eq!(assembled.expect("assembled").len(), LEN, "{network}");
+            let rate = LEN as u64 * 1_000_000_000 / took;
+            assert!(
+                rate < recycle::FLOOR_RATE_BYTES_PER_SEC,
+                "{network}: premise: under the floor rate, got {rate} B/s"
+            );
+            if capped {
+                assert!(
+                    p.a.connection().cap_holds().read().holds > 0,
+                    "{network}: premise: the cap held transmits"
+                );
+            } else {
+                assert!(
+                    dropped.load(Relaxed) > 0,
+                    "{network}: premise: the link's queue filled"
+                );
+            }
+            assert!(
+                p.a.connection().inner().close_reason().is_none()
+                    && p.b.connection().inner().close_reason().is_none(),
+                "{network}: {:?}",
+                p.a.connection().inner().close_reason()
+            );
+            assert!(
+                recycle::stalls_to(b_addr).is_empty() && recycle::stalls_to(a_addr).is_empty(),
+                "{network}: a false stall: {:?}",
+                recycle::stalls_to(b_addr)
+            );
+            assert_eq!(
+                p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
+                0,
+                "{network}"
+            );
+        }
+    })
+}
+
 /// How a real path carries its last acknowledgement to its next send: a settle
 /// that sees the peer's acknowledgement records it on the path, and a later
 /// send whose writes the cap queue holds for 8 s, past its 5 s gap, with the
@@ -6168,6 +7007,7 @@ fn a_real_path_carries_its_last_acknowledgement_to_the_next_send() {
                     gap: Some(Duration::from_secs(5)),
                     source_gap: None,
                     total: Duration::from_secs(120),
+                    ack_wait: None,
                 };
                 let ticking = time.clone();
                 let queue = async move {
@@ -6514,7 +7354,13 @@ fn a_dark_path_beside_a_cap_held_one_times_out_and_goes_suspect() {
             })
             .await;
         drop(permit);
-        let (ac, _ac_in) = QuicPath::with_limits(ac, time.clone(), QuicPathLimits::DEFAULT);
+        // The send's deadlines and the hold credit, which the watch would
+        // otherwise preempt by closing the dark connection.
+        let quiet = QuicPathLimits {
+            watch_closes: false,
+            ..QuicPathLimits::DEFAULT
+        };
+        let (ac, _ac_in) = QuicPath::with_limits(ac, time.clone(), quiet);
         let (_ca, _ca_in) = QuicPath::with_limits(_ca, time.clone(), QuicPathLimits::DEFAULT);
         let ac = Arc::new(ac);
         let ab = p.a.clone();
@@ -7323,21 +8169,20 @@ fn a_throttle_pauses_idle_and_the_age_limit_counts_apart() {
         );
         let (raw, time) = (p.a_raw(), p.time());
         let started = time.now_nanos();
-        let code = p
-            .drive(async move {
-                let id = StreamId::next().0;
-                let mut bytes = header(1, 1, id, total, 0);
-                bytes.extend_from_slice(&payload(1000));
-                let mut send = raw.open_uni().await.unwrap();
-                send.write_all(&bytes).await.unwrap();
-                time.sleep(Duration::from_millis(100)).await;
-                // The throttle begins just after the stream's last progress
-                // and lasts past its age limit.
-                let now = time.now_nanos();
-                meter.throttle_for_test(now, now + 2 * age.as_nanos() as u64);
-                send.stopped().await.unwrap().map(|code| code.into_inner())
-            })
-            .await;
+        let code = drive(&p.pair.time, age + LIMIT, async move {
+            let id = StreamId::next().0;
+            let mut bytes = header(1, 1, id, total, 0);
+            bytes.extend_from_slice(&payload(1000));
+            let mut send = raw.open_uni().await.unwrap();
+            send.write_all(&bytes).await.unwrap();
+            time.sleep(Duration::from_millis(100)).await;
+            // The throttle begins just after the stream's last progress
+            // and lasts past its age limit.
+            let now = time.now_nanos();
+            meter.throttle_for_test(now, now + 2 * age.as_nanos() as u64);
+            send.stopped().await.unwrap().map(|code| code.into_inner())
+        })
+        .await;
         assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
         let waited = Duration::from_nanos(p.time().now_nanos() - started);
         assert!(
@@ -7477,20 +8322,19 @@ fn an_age_limit_after_the_throttle_lapsed_counts_as_age() {
         // The throttle lapses after the last pause, before the age limit.
         let lapse = last_pause + (age - last_pause) / 2;
         let (raw, time) = (p.a_raw(), p.time());
-        let code = p
-            .drive(async move {
-                let start = time.now_nanos();
-                let mut bytes = header(1, 1, StreamId::next().0, total, 0);
-                bytes.extend_from_slice(&payload(1000));
-                let mut send = raw.open_uni().await.unwrap();
-                send.write_all(&bytes).await.unwrap();
-                time.sleep(progress).await;
-                send.write_all(&payload(1)).await.unwrap();
-                time.sleep(Duration::from_millis(100)).await;
-                meter.throttle_for_test(time.now_nanos(), start + lapse.as_nanos() as u64);
-                send.stopped().await.unwrap().map(|code| code.into_inner())
-            })
-            .await;
+        let code = drive(&p.pair.time, age + LIMIT, async move {
+            let start = time.now_nanos();
+            let mut bytes = header(1, 1, StreamId::next().0, total, 0);
+            bytes.extend_from_slice(&payload(1000));
+            let mut send = raw.open_uni().await.unwrap();
+            send.write_all(&bytes).await.unwrap();
+            time.sleep(progress).await;
+            send.write_all(&payload(1)).await.unwrap();
+            time.sleep(Duration::from_millis(100)).await;
+            meter.throttle_for_test(time.now_nanos(), start + lapse.as_nanos() as u64);
+            send.stopped().await.unwrap().map(|code| code.into_inner())
+        })
+        .await;
         assert_eq!(code, Some(u64::from(stop_code::EVICTED)));
         let stats = p.b.stats();
         assert_eq!(stats.count(QuicInboundOutcome::ThrottledPastAge), 0);
@@ -8673,11 +9517,108 @@ fn a_waiting_one_packet_short_is_not_charged() {
     })
 }
 
+/// The interplay the `watch_closes` tests leave out, with the watch on: a send
+/// on a path whose peer is dark from the start (`b`'s packets stop reaching
+/// `a`: nothing is acknowledged and no credit returns) times out at its own
+/// gap. That comes inside the progress window of the setup's acknowledgements,
+/// so it neither counts nor makes the path suspect; the watch closes the path
+/// (within `recycle::dark_close_bound`), so neither the stall count nor
+/// suspect routing is what ends a dark path.
+#[test]
+fn a_dark_path_is_closed_by_the_watch_not_by_its_send_timeouts() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-dark-watch-after";
+        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        let _dark = DropFrom::new(network, &[p.pair.b_addr]);
+        let cut_at = p.time().now();
+        let (a, time) = (p.a.clone(), p.time());
+        let body = over_window();
+        let deadlines = SendDeadlines::stream(body.len() as u64);
+        let outcome = p
+            .drive(async move {
+                a.send_stream_bounded(&time, deadlines, StreamId::next(), None, body, None)
+                    .await
+            })
+            .await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "the send's gap comes first: {outcome:?}"
+        );
+        let now = p.time().now_nanos();
+        p.a.settle(SendKind::Stream, &outcome, false, now);
+        assert_eq!(p.a.stall_state().0, 0, "inside the progress window");
+        assert!(!p.a.is_suspect());
+        let (conn, time) = (p.a.connection().inner().clone(), p.time());
+        let closed_at = p
+            .drive(async move {
+                conn.closed().await;
+                time.now()
+            })
+            .await;
+        assert!(
+            closed_at - cut_at <= recycle::dark_close_bound(Duration::from_millis(50)),
+            "the watch closed it {:?} after the cut",
+            closed_at - cut_at
+        );
+        assert!(
+            !recycle::stalls_to(p.pair.b_addr).is_empty(),
+            "the watch closed the path"
+        );
+        assert_eq!(
+            p.a.stats().send_event_count(QuicSendEvent::StalledClosed),
+            0,
+            "not the stall count"
+        );
+    })
+}
+
+/// The interplay for the receive side, with the watch on: `a`'s datagrams stop
+/// reaching `b` mid-stream. That is an outage, not withheld credit: `a`'s
+/// blocked frame went out after the last batch of acknowledgements, so the
+/// silence is not "settled" waiting and the credit rule does not count it.
+/// `a`'s dark rule closes the path, within `recycle::dark_close_bound`. `b`
+/// never hears the close (it is lost with the rest) and ends the stream at
+/// its own timeouts.
+#[test]
+fn a_path_dark_mid_stream_is_closed_as_dark() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-dark-before-idle";
+        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        let settle = p.time();
+        p.drive(async move { settle.sleep(Duration::from_millis(200)).await })
+            .await;
+        let _dark = DropFrom::new(network, &[p.pair.a_addr]);
+        let (a, id) = (p.a.clone(), StreamId::next());
+        let sender = tokio::spawn(async move { a.send_stream(id, None, over_window()).await });
+        let (time, conn) = (p.time(), p.a.connection().inner().clone());
+        let closed_at = p
+            .drive(async move {
+                conn.closed().await;
+                time.now()
+            })
+            .await;
+        assert!(
+            closed_at <= recycle::dark_close_bound(Duration::from_millis(50)),
+            "closed at {closed_at:?}"
+        );
+        assert_eq!(
+            recycle::stalls_to(p.pair.b_addr),
+            vec![recycle::Stall::Dark]
+        );
+        sender.abort();
+    })
+}
+
 /// The case that motivated a path-derived consumer gap (e5b-9-perf's cold
 /// start lab, 64 KiB at 800 ms RTT and 15% loss): over many seeds, the worst
 /// gap between two fragments arriving at the receiver stays under the gap
 /// the handle gives its consumers (24 round trips, about 19.2 s here), and
-/// every stream assembles. Prints the worst gap per seed.
+/// every stream assembles. Prints the worst gap per seed. With the path's
+/// liveness rules on (the acknowledgement watch, loss gate on): the send,
+/// on the deadlines a node uses (`QuicPath::stream_deadlines`), ends `Sent`,
+/// and the watch closes neither end (no false stall at 800 ms and 15%).
 ///
 /// Deterministic: virtual time, loss drawn from a per-seed RNG, and the
 /// global RNG seeded, so the gaps are the same on every run, alone or beside
@@ -8687,7 +9628,6 @@ fn a_waiting_one_packet_short_is_not_charged() {
 #[test]
 fn a_slow_lossy_path_stays_within_its_consumer_gap() {
     bounded(|| async move {
-        use crate::transport::quic::path::bounded::SendDeadlines;
         let _seed = GlobalRng::seed_guard(SEED);
         let mut worst = Duration::ZERO;
         for len in [64 * 1024usize, 256 * 1024] {
@@ -8707,10 +9647,11 @@ fn a_slow_lossy_path_stays_within_its_consumer_gap() {
                 let mut p = paths(network, QuicPathLimits::DEFAULT).await;
                 let _loss = seeded_loss_from(network, 15, seed, Some(Duration::from_millis(400)));
                 let (a, time) = (p.a.clone(), p.time());
+                let (a_addr, b_addr) = (p.pair.a_addr, p.pair.b_addr);
                 let send = tokio::spawn(async move {
                     a.send_stream_bounded(
                         &time,
-                        SendDeadlines::stream(len as u64),
+                        a.stream_deadlines(len as u64),
                         StreamId::next(),
                         None,
                         Bytes::from(payload(len)),
@@ -8744,7 +9685,11 @@ fn a_slow_lossy_path_stays_within_its_consumer_gap() {
                             }
                         }
                         let assembled = handle.try_assemble().is_some();
-                        let _outcome = send.await.expect("the send task ran");
+                        let outcome = send.await.expect("the send task ran");
+                        assert!(
+                            matches!(outcome, BoundedSend::Sent),
+                            "len {len} seed {seed}: {outcome:?}"
+                        );
                         (Duration::from_nanos(gap), limit, assembled)
                     })
                     .await;
@@ -8757,6 +9702,10 @@ fn a_slow_lossy_path_stays_within_its_consumer_gap() {
                     "len {len} seed {seed}: gap {gap:?} >= {limit:?}"
                 );
                 assert!(assembled, "len {len} seed {seed}: did not assemble");
+                assert!(
+                    recycle::stalls_to(a_addr).is_empty() && recycle::stalls_to(b_addr).is_empty(),
+                    "len {len} seed {seed}: a false stall"
+                );
                 crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
             }
         }

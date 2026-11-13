@@ -32,7 +32,9 @@ use crate::tracing::{TransferDirection, TransferEvent};
 
 mod quic_data;
 pub use quic_data::QuicDataSnapshot;
-pub(crate) use quic_data::{PathGateWindow, PathLossWindow, QuicDataCounters, StreamsOpenPeak};
+pub(crate) use quic_data::{
+    DarkEnd, PathGateWindow, PathLossWindow, QuicDataCounters, StreamsOpenPeak,
+};
 
 /// Global transport metrics instance.
 ///
