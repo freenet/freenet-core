@@ -50,6 +50,8 @@ struct TraceData {
     /// A data ramp start of the test's own, in seconds on the virtual clock;
     /// negative for one before the run began.
     ramp_start: Mutex<Option<i64>>,
+    /// Nodes that run the release's own share instead ([`QuicUpgradeTrace::run_without_ramp`]).
+    no_ramp: Mutex<BTreeSet<SocketAddr>>,
     /// Nodes that build their paths to refuse data while they advertise the bit.
     refuse_data: Mutex<BTreeSet<SocketAddr>>,
     /// The version a peer reports, and the release it then reads as.
@@ -132,6 +134,14 @@ impl QuicUpgradeTrace {
     /// on the real curve.
     pub fn ramp_data_started_before(&self, ago: Duration) {
         *self.data.ramp_start.lock() = Some(-i64::try_from(ago.as_secs()).unwrap_or(i64::MAX));
+    }
+
+    /// `node` takes no ramp from [`Self::ramp_data_started_before`]: it runs the
+    /// share this build gives with no ramp (`QUIC_DATA_RAMP_START = None`, so
+    /// the fixed `QUIC_DATA_PERCENT`), as a node on the emergency-stop release
+    /// does.
+    pub fn run_without_ramp(&self, node: SocketAddr) {
+        self.data.no_ramp.lock().insert(node);
     }
 
     /// `node` advertises its data bit but builds every path to refuse data, as a
@@ -233,6 +243,9 @@ impl NodeTrace {
     }
 
     pub(crate) fn data_ramp_start(&self) -> Option<i64> {
+        if self.trace.data.no_ramp.lock().contains(&self.addr) {
+            return None;
+        }
         *self.trace.data.ramp_start.lock()
     }
 
