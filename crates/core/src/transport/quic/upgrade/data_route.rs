@@ -157,6 +157,24 @@ impl DataRoute {
         self.note.note(what);
     }
 
+    /// Take `payload` for a native connection's path, which has no UDP
+    /// session to hand it to. Never waits. A message refused because the queue
+    /// is full is counted as a dropped short; one refused because the path has
+    /// ended is not, since the connection is over.
+    pub(in crate::transport) fn queue_native_short(
+        &self,
+        payload: SerializedMessage,
+    ) -> Result<(), ShortRefused> {
+        match self.shorts.try_send(payload) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.path.stats().record_send_dropped(SendKind::Short);
+                Err(ShortRefused::Full)
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(ShortRefused::Closed),
+        }
+    }
+
     /// Take `payload` for the path, or hand it back for UDP: the queue is full,
     /// or the path has ended. Never waits.
     pub(in crate::transport) fn queue_short(
@@ -174,6 +192,15 @@ impl DataRoute {
             Err(mpsc::error::TrySendError::Closed(payload)) => Err(payload),
         }
     }
+}
+
+/// Why a native connection's short was not queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::transport) enum ShortRefused {
+    /// The queue is full: the path is behind. The connection carries on.
+    Full,
+    /// The path has ended.
+    Closed,
 }
 
 type ShortSend = Pin<Box<dyn Future<Output = (SerializedMessage, BoundedSend)> + Send>>;
@@ -249,7 +276,11 @@ async fn send_elsewhere(
         Some(udp) => send_on_udp(path, udp, note, payload).await,
         None => {
             path.stats().record_send_dropped(SendKind::Short);
-            note.note(|| "dropped a short: the native path has ended".to_string());
+            note.note(|| {
+                "dropped a short: the native path does not take it (ended, or the peer \
+                 refused data) and there is no UDP session"
+                    .to_string()
+            });
         }
     }
 }

@@ -1377,8 +1377,12 @@ async fn report(inbox: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
 }
 
 /// Run `task`. If it panics, count that and raise the same panic again, so the
-/// runtime sees what it saw before.
-async fn report_panics(remote: SocketAddr, task: impl Future<Output = ()>) {
+/// runtime sees what it saw before. Also wraps a native connection's route
+/// worker, whose panic counts here too.
+pub(in crate::transport) async fn report_panics(
+    remote: SocketAddr,
+    task: impl Future<Output = ()>,
+) {
     use futures::FutureExt;
     if let Err(payload) = std::panic::AssertUnwindSafe(task).catch_unwind().await {
         TRANSPORT_METRICS.record_quic_upgrade(QuicUpgradeOutcome::TaskPanicked, remote);

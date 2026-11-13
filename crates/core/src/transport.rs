@@ -399,6 +399,12 @@ pub enum TransportError {
     /// the same message fails the same way on every attempt.
     #[error("outbound stream to {0} not sent: length {1} is outside the stream limits")]
     OutboundStreamInvalidLength(SocketAddr, u64),
+    /// A message to the peer was not sent because the connection's queue for
+    /// it is full (a QUIC-native connection's short-message queue, which has
+    /// no UDP session to spill to). Transient: the connection survives, and
+    /// the operation layer retries or gives up as for a lost message.
+    #[error("message to {0} not sent: the connection's send queue is full")]
+    SendQueueFull(SocketAddr),
     #[error(transparent)]
     Other(#[from] anyhow::Error),
     /// An error only the UDP transport produces (a socket send or I/O
@@ -638,6 +644,7 @@ impl TransportError {
     pub fn scope(&self) -> ErrorScope {
         match self {
             TransportError::OutboundStreamFailed(..)
+            | TransportError::SendQueueFull(..)
             | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => ErrorScope::Transient,
             TransportError::Quic(QuicError(QuicErrorKind::Stopped { code }))
                 if quic::error::stop_is_retryable(*code) =>
@@ -1204,6 +1211,7 @@ mod tests {
                     (ErrorScope::Transient, true, false)
                 }
                 TransportError::OutboundStreamFailed(_) => (ErrorScope::Transient, true, false),
+                TransportError::SendQueueFull(_) => (ErrorScope::Transient, true, false),
                 TransportError::OutboundStreamInvalidLength(..) => {
                     (ErrorScope::Stream, false, false)
                 }
@@ -1254,6 +1262,7 @@ mod tests {
             },
             TransportError::send_failed(addr, io::ErrorKind::NetworkUnreachable),
             TransportError::OutboundStreamFailed(addr),
+            TransportError::SendQueueFull(addr),
             TransportError::OutboundStreamInvalidLength(addr, 0),
             TransportError::from(io::Error::other("x")),
             TransportError::Other(anyhow::anyhow!("x")),

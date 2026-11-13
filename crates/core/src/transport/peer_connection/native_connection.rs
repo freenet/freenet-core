@@ -5,10 +5,13 @@
 //! (`quic::native::setup`). Its path carries data from birth and has no UDP
 //! session to fall back to ([`QuicPathLimits::NATIVE`]):
 //! - a send the path cannot deliver is given up (the operation layer retries,
-//!   as after a UDP stream failure), and a short the full queue hands back fails
-//!   its send; nothing is ever sent elsewhere;
-//! - any end of the path ends the connection, and `recv` then returns an error,
-//!   with [`CloseReason::IdleTimeout`] when quinn timed it out;
+//!   as after a UDP stream failure), and a short the full queue refuses fails
+//!   its send with a transient error ([`TransportError::SendQueueFull`]), the
+//!   connection surviving; nothing is ever sent elsewhere;
+//! - its data is paced by the bandwidth limit, as an upgrade path's is;
+//! - any end of the path ends the connection, and `recv` then returns an error
+//!   with a [`CloseReason`] for the end: [`CloseReason::IdleTimeout`] when quinn
+//!   timed it out, else [`CloseReason::QuicPath`] with the cause;
 //! - what `recv` hands the node goes through the same record as a UDP
 //!   connection's ([`InboundDispatch`]), so a stream's metadata is not
 //!   dispatched twice and a stream id is not reused;
@@ -42,17 +45,19 @@ use super::{
 use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
 use crate::transport::boundary::{
-    CloseReason, InboundStreamRegistry, ObservedSend, PeerConnectionApi, ReceiptStamp,
+    CloseReason, InboundStreamRegistry, ObservedSend, PeerConnectionApi, QuicPathEnd, ReceiptStamp,
     StreamProgressObserver, StreamSendOutcome,
 };
 use crate::transport::crypto::TransportPublicKey;
 use crate::transport::metrics::QuicCloseCode;
 use crate::transport::quic::QuicConnection;
+use crate::transport::quic::config::QuicRateLimit;
+use crate::transport::quic::path::pacer::LimitPacer;
 use crate::transport::quic::path::{
     InboundShort, InboundStreamArrival, QuicPath, QuicPathLimits, data_channels,
 };
-use crate::transport::quic::upgrade::data_route::{DataRoute, RouteNote};
-use crate::transport::quic::upgrade::driver::PathClock;
+use crate::transport::quic::upgrade::data_route::{DataRoute, RouteNote, ShortRefused};
+use crate::transport::quic::upgrade::driver::{PathClock, report_panics};
 use crate::transport::{IncomingStream, TRANSPORT_METRICS, TransportError, normalize_mapped_addr};
 
 /// A QUIC-native connection to one peer.
@@ -83,12 +88,15 @@ pub(crate) struct NativePeerConnection {
 impl NativePeerConnection {
     /// Wrap `connection`, whose Hello exchange gave `remote_version`, in a path
     /// that carries data from birth. `windows` is the node's buffer budget,
-    /// which sets the path's windows, as for an upgrade's data path.
+    /// which sets the path's windows, as for an upgrade's data path, and
+    /// `rate_limit` the node's bandwidth limit, which paces its data on the
+    /// path's clock as an upgrade session's pacer does.
     pub(crate) fn new(
         connection: QuicConnection,
         remote_version: (u8, u8, u16),
         clock: PathClock,
         windows: Option<&Arc<crate::transport::quic::budget::QuicBudget>>,
+        rate_limit: QuicRateLimit,
         note: RouteNote,
     ) -> Self {
         let remote_addr = normalize_mapped_addr(connection.inner().remote_address());
@@ -107,6 +115,9 @@ impl NativePeerConnection {
             windows,
         );
         path.enable_data();
+        if let Some(pacer) = LimitPacer::new(rate_limit, clock.clone()) {
+            path.pace_with(Arc::new(pacer));
+        }
         let receipt_nanos = Arc::new(AtomicU64::new(clock.now_nanos()));
         let (stamp, stamp_clock) = (Arc::clone(&receipt_nanos), clock.clone());
         path.report_receipts_to(Box::new(move || {
@@ -114,8 +125,9 @@ impl NativePeerConnection {
         }));
         let (route, worker) = DataRoute::native(Arc::new(path), clock.clone(), note);
         route.path().count_as_data_path();
-        // Bounded by the path: it ends when the connection does.
-        drop(GlobalExecutor::spawn(worker));
+        // Bounded by the path: it ends when the connection does. A panic is
+        // counted (task_panicked) and raised again, as for an upgrade's worker.
+        drop(GlobalExecutor::spawn(report_panics(remote_addr, worker)));
         Self {
             remote_addr,
             remote_version,
@@ -144,8 +156,9 @@ impl NativePeerConnection {
     }
 
     /// Send one serialized message: queued for the path if it fits one packet
-    /// (never waits; a full queue fails this send), otherwise as a large short
-    /// in a task of its own.
+    /// (never waits; a full queue fails this send with
+    /// [`TransportError::SendQueueFull`], and only an ended path with
+    /// `ConnectionClosed`), otherwise as a large short in a task of its own.
     fn route_serialized(&mut self, data: Vec<u8>) -> Result<ObservedSend, TransportError> {
         if !fits_one_packet(data.len() as u64) {
             let stream_id = StreamId::next_transport_internal();
@@ -159,9 +172,10 @@ impl NativePeerConnection {
             ));
             return Ok(ObservedSend::Unobserved);
         }
-        match self.route.queue_short(data) {
+        match self.route.queue_native_short(data) {
             Ok(()) => Ok(ObservedSend::Unobserved),
-            Err(_) => Err(TransportError::ConnectionClosed(self.remote_addr)),
+            Err(ShortRefused::Full) => Err(TransportError::SendQueueFull(self.remote_addr)),
+            Err(ShortRefused::Closed) => Err(TransportError::ConnectionClosed(self.remote_addr)),
         }
     }
 
@@ -241,19 +255,52 @@ impl NativePeerConnection {
     /// The connection ended: the path's receive side let go of the inbox and
     /// everything in it was delivered.
     fn ended(&mut self) -> TransportError {
-        if self.route.path().idle_timed_out() {
-            self.close_reason = Some(CloseReason::IdleTimeout);
-        }
+        self.close_reason = Some(end_reason(self.route.path()));
         TransportError::ConnectionClosed(self.remote_addr)
+    }
+}
+
+/// Why `path`'s connection ended: quinn's idle timeout, a cause this node
+/// closed for, the peer's close, or a loss.
+fn end_reason(path: &QuicPath) -> CloseReason {
+    use quinn::ConnectionError as E;
+    match path.quinn_connection().close_reason() {
+        Some(E::TimedOut) => CloseReason::IdleTimeout,
+        Some(E::ApplicationClosed(_)) => CloseReason::QuicPath(QuicPathEnd::ClosedByPeer),
+        Some(E::LocallyClosed) => {
+            CloseReason::QuicPath(path.closed_for().unwrap_or(QuicPathEnd::ClosedLocally))
+        }
+        Some(
+            E::VersionMismatch
+            | E::TransportError(_)
+            | E::ConnectionClosed(_)
+            | E::Reset
+            | E::CidsExhausted,
+        )
+        | None => CloseReason::QuicPath(QuicPathEnd::Lost),
     }
 }
 
 /// The node let the peer go: close the connection now, since stream tasks
 /// still running hold the path and would keep it open until they end.
+/// Its streams that nobody claimed are cancelled after, as a UDP connection's
+/// are, so they do not wait out the orphan timeout with nothing accounting
+/// for them.
 impl Drop for NativePeerConnection {
     fn drop(&mut self) {
         self.route.path().uncount_as_data_path();
         self.route.path().close(QuicCloseCode::NodeDroppedPeer);
+        if let Some(registry) = &self.dispatch.inbound_stream_registry {
+            // Collected first, so the budget is not locked while the registry
+            // runs.
+            let live: Vec<_> = self.budget.lock().live_buffer_streams().collect();
+            registry.cancel_unclaimed_streams(
+                self.remote_addr,
+                &mut live.into_iter().map(|(id, buffer)| {
+                    (id, crate::transport::StreamIdentity::from_buffer(buffer))
+                }),
+            );
+        }
     }
 }
 
@@ -302,6 +349,10 @@ impl PeerConnectionApi for NativePeerConnection {
         Box::pin(async move { sent })
     }
 
+    /// Always [`ObservedSend::Unobserved`], with `completion_tx` dropped: a
+    /// message goes on the path as a short (one packet) or a large short
+    /// (more), neither of which is a stream the caller can observe. On a UDP
+    /// connection a large message is a stream, and its completion is reported.
     fn send_bytes_observed(
         &mut self,
         data: Vec<u8>,
@@ -309,7 +360,6 @@ impl PeerConnectionApi for NativePeerConnection {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<ObservedSend, TransportError>> + Send + '_>,
     > {
-        // No UDP stream to observe: a short or a large short on the path.
         drop(completion_tx);
         let sent = self.route_serialized(data);
         Box::pin(async move { sent })

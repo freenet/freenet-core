@@ -14,7 +14,10 @@ use crate::transport::StreamId;
 use crate::transport::boundary::StreamSendOutcome;
 use crate::transport::metrics::ConnIdentity;
 use crate::transport::quic::framing::FrameHeader;
-use crate::transport::quic::path::{BoundedSend, QuicSendResult, SendKind};
+use crate::transport::quic::path::{
+    BoundedSend, QuicSendEvent, QuicSendResult, SendFailure, SendKind,
+};
+use crate::transport::quic::upgrade::data_route::SHORT_QUEUE_CAPACITY;
 use crate::transport::quic::upgrade::driver::tests::{NativeServer, native_server, run_bounded};
 
 const SEND_LIMIT: Duration = Duration::from_secs(30);
@@ -83,6 +86,20 @@ fn run<F, Fut>(
     F: FnOnce(Rig) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
+    run_with(network, peer_limits, idle_timeout, None, test);
+}
+
+/// [`run`], with the node's `bandwidth-limit` set to `bandwidth_limit`.
+fn run_with<F, Fut>(
+    network: &'static str,
+    peer_limits: QuicPathLimits,
+    idle_timeout: Option<Duration>,
+    bandwidth_limit: Option<usize>,
+    test: F,
+) where
+    F: FnOnce(Rig) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     run_bounded(move || async move {
         let (peer, server) = native_server(network, peer_limits, idle_timeout).await;
         let time = peer.time.clone();
@@ -91,6 +108,7 @@ fn run<F, Fut>(
             VERSION,
             PathClock::Virtual(time.clone()),
             None,
+            QuicRateLimit::new(bandwidth_limit, None),
             RouteNote::default(),
         );
         let registry = Arc::new(OrphanStreamRegistry::new());
@@ -317,6 +335,16 @@ fn a_refused_send_is_dropped_and_nothing_goes_to_udp() {
             for kind in [SendKind::LargeShort, SendKind::Stream] {
                 assert_eq!(rig.sends(kind, QuicSendResult::Dropped), 1, "{kind:?}");
             }
+            // The refusals stopped data on the path, so a short queued now is
+            // dropped by the route's worker, which has no UDP session for it.
+            assert!(!rig.conn.path().sends_data());
+            rig.conn.send_bytes(b"after".to_vec()).await.unwrap();
+            rig.settle(Duration::from_secs(1)).await;
+            assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Dropped), 1);
+            assert!(
+                rig.peer.peer_inbound.shorts.try_recv().is_err(),
+                "nothing reached the peer"
+            );
             for kind in [
                 SendKind::Short,
                 SendKind::LargeShort,
@@ -331,10 +359,10 @@ fn a_refused_send_is_dropped_and_nothing_goes_to_udp() {
     );
 }
 
-/// A path the peer closes ends the connection: `recv` fails, with no idle
-/// reason.
+/// A path the peer closes ends the connection: `recv` fails, and the reason
+/// says the peer closed it.
 #[test]
-fn a_path_the_peer_closes_ends_recv_without_an_idle_reason() {
+fn a_path_the_peer_closes_ends_recv_with_the_peers_reason() {
     run(
         "native-conn-peer-close",
         QuicPathLimits::DEFAULT,
@@ -346,7 +374,10 @@ fn a_path_the_peer_closes_ends_recv_without_an_idle_reason() {
                 matches!(ended, Err(TransportError::ConnectionClosed(addr)) if addr == rig.conn.remote_addr()),
                 "{ended:?}"
             );
-            assert_eq!(rig.conn.close_reason(), None);
+            assert_eq!(
+                rig.conn.close_reason(),
+                Some(CloseReason::QuicPath(QuicPathEnd::ClosedByPeer))
+            );
         },
     );
 }
@@ -506,6 +537,294 @@ fn the_receipt_stamp_moves_with_the_path() {
                 stamp.since_last_receipt() <= Duration::from_secs(3),
                 "{:?}",
                 stamp.since_last_receipt()
+            );
+        },
+    );
+}
+
+/// A full short queue refuses the send with a transient error and the
+/// connection carries on: nothing is closed, nothing counts as a UDP overflow,
+/// and the refused message is counted as dropped. `send_bytes_observed` takes
+/// the same route. Nothing yields while the queue fills, so the route's worker
+/// takes nothing in between.
+#[test]
+fn a_full_short_queue_refuses_the_send_and_keeps_the_connection() {
+    run(
+        "native-conn-queue-full",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            let mut queued = 0usize;
+            let refused = loop {
+                match rig.conn.send_bytes(format!("m{queued}").into_bytes()).await {
+                    Ok(()) => queued += 1,
+                    Err(error) => break error,
+                }
+                assert!(queued <= SHORT_QUEUE_CAPACITY, "the queue never filled");
+            };
+            assert_eq!(queued, SHORT_QUEUE_CAPACITY);
+            assert!(
+                matches!(refused, TransportError::SendQueueFull(addr) if addr == rig.conn.remote_addr()),
+                "{refused:?}"
+            );
+            assert!(!refused.closes_connection(), "a full queue is transient");
+            let (done_tx, _done_rx) = tokio::sync::oneshot::channel();
+            let observed = rig.conn.send_bytes_observed(b"x".to_vec(), done_tx).await;
+            assert!(
+                matches!(observed, Err(TransportError::SendQueueFull(_))),
+                "{observed:?}"
+            );
+            assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Dropped), 2);
+            assert_eq!(
+                rig.conn
+                    .path()
+                    .stats()
+                    .send_event_count(QuicSendEvent::ShortOverflowUdp),
+                0
+            );
+
+            // The queue drains, the connection is still up and takes more.
+            let mut received = 0usize;
+            while received < SHORT_QUEUE_CAPACITY {
+                rig.peer.peer_inbound.shorts.recv().await.expect("a short");
+                received += 1;
+            }
+            assert!(rig.recv_soon().await.is_none(), "recv did not end");
+            rig.conn.send_bytes(b"again".to_vec()).await.unwrap();
+            let again = rig.peer.peer_inbound.shorts.recv().await.expect("a short");
+            assert_eq!(again.into_payload().as_ref(), b"again");
+        },
+    );
+}
+
+/// Once the path has ended, a send fails with `ConnectionClosed`, from both
+/// `send_bytes` and `send_bytes_observed`.
+#[test]
+fn a_send_after_the_path_ends_reports_the_connection_closed() {
+    run(
+        "native-conn-send-after-end",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            rig.peer.peer.close(QuicCloseCode::Downgrade);
+            assert!(rig.conn.recv().await.is_err());
+            rig.settle(Duration::from_secs(1)).await;
+            let sent = rig.conn.send_bytes(b"late".to_vec()).await;
+            assert!(
+                matches!(&sent, Err(error @ TransportError::ConnectionClosed(_)) if error.closes_connection()),
+                "{sent:?}"
+            );
+            let (done_tx, _done_rx) = tokio::sync::oneshot::channel();
+            let observed = rig
+                .conn
+                .send_bytes_observed(b"late".to_vec(), done_tx)
+                .await;
+            assert!(
+                matches!(observed, Err(TransportError::ConnectionClosed(_))),
+                "{observed:?}"
+            );
+            assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Dropped), 0);
+        },
+    );
+}
+
+/// A stream the peer sent whole that nobody claimed is cancelled when the
+/// connection drops, and so is one still arriving, as a UDP connection does:
+/// neither waits out the orphan timeout.
+#[test]
+fn dropping_the_connection_cancels_its_unclaimed_streams() {
+    run(
+        "native-conn-unclaimed",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            let (whole, partial) = (StreamId::next(), StreamId::next());
+            rig.peer_sends_stream(whole, None, bytes_of(50)).await;
+            let mut held = rig
+                .peer
+                .peer
+                .connection()
+                .inner()
+                .open_uni()
+                .await
+                .expect("open");
+            let header = FrameHeader::stream(partial, 100_000, 0).expect("a valid header");
+            held.write_all(&header.encode()).await.expect("header");
+            held.write_all(&[7; 3000]).await.expect("payload");
+            while rig.registry.orphan_count() < 2 {
+                assert!(rig.recv_soon().await.is_none());
+                rig.settle(Duration::from_millis(100)).await;
+            }
+            let registry = Arc::clone(&rig.registry);
+            drop(rig.conn);
+            rig.peer.time.sleep(Duration::from_secs(1)).await;
+            registry.gc_expired();
+            assert_eq!(registry.orphan_count(), 0);
+            drop(held);
+        },
+    );
+}
+
+/// With a bandwidth limit the connection paces its data at it, on the path's
+/// clock; without one, nothing is paced.
+#[test]
+fn the_bandwidth_limit_paces_a_native_connections_data() {
+    run(
+        "native-conn-unpaced",
+        QuicPathLimits::DEFAULT,
+        None,
+        |rig| async move {
+            assert!(!rig.conn.path().is_paced());
+        },
+    );
+    run_with(
+        "native-conn-paced",
+        QuicPathLimits::DEFAULT,
+        None,
+        Some(100_000),
+        |mut rig| async move {
+            assert!(rig.conn.path().is_paced());
+            let start = rig.time().now();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            rig.conn
+                .send_stream_data(
+                    StreamId::next(),
+                    bytes_of(400_000),
+                    None,
+                    Some(done_tx),
+                    None,
+                )
+                .await
+                .unwrap();
+            let arrival = rig
+                .peer
+                .peer_inbound
+                .streams
+                .recv()
+                .await
+                .expect("a stream");
+            assert_eq!(arrival.handle.assemble().await.unwrap().len(), 400_000);
+            assert!(matches!(done_rx.await, Ok(StreamSendOutcome::Delivered)));
+            let took = rig.time().now() - start;
+            // 400 kB at 100 kB/s, less the bucket's burst.
+            assert!(took >= Duration::from_secs(3), "took {took:?}");
+        },
+    );
+}
+
+/// A path whose sends keep timing out with nothing acknowledged closes, and
+/// `recv` reports why.
+#[test]
+fn a_stalled_path_ends_recv_with_the_stall_reason() {
+    run(
+        "native-conn-stall",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            let later = rig.time().now_nanos() + Duration::from_secs(60).as_nanos() as u64;
+            let timeout = BoundedSend::Failed(SendFailure::TimedOut);
+            // The stall count closes the path after a fixed number in a row
+            // (route::STALLED_SENDS_LIMIT, 8).
+            let mut settled = 0;
+            while rig.conn.path().quinn_connection().close_reason().is_none() {
+                rig.conn
+                    .path()
+                    .settle(SendKind::Stream, &timeout, false, later);
+                settled += 1;
+                assert!(settled <= 8, "the path did not close");
+            }
+            assert!(rig.conn.recv().await.is_err());
+            assert_eq!(
+                rig.conn.close_reason(),
+                Some(CloseReason::QuicPath(QuicPathEnd::Stalled))
+            );
+            assert!(
+                !rig.conn.path().is_suspect(),
+                "a native path is never suspect"
+            );
+        },
+    );
+}
+
+/// A peer that goes dark while the node has data outstanding ends the
+/// connection well before quinn's idle timeout (24 h on VirtualTime), with a
+/// reason that is not a loss or an idle timeout.
+#[test]
+fn a_dark_native_path_closes() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    run(
+        "native-conn-dark",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            let peer = rig.conn.remote_addr();
+            set_packet_delivery_callback(
+                "native-conn-dark",
+                Some(Arc::new(move |_, sender, _, _| {
+                    if sender == peer {
+                        PacketDeliveryDecision::Drop
+                    } else {
+                        PacketDeliveryDecision::Deliver
+                    }
+                })),
+            );
+            let start = rig.time().now();
+            rig.conn
+                .send_stream_data(StreamId::next(), bytes_of(100_000), None, None, None)
+                .await
+                .unwrap();
+            let ended = rig.conn.recv().await;
+            let took = rig.time().now() - start;
+            set_packet_delivery_callback("native-conn-dark", None);
+            assert!(ended.is_err());
+            assert!(took < Duration::from_secs(60), "took {took:?}");
+            let reason = rig.conn.close_reason();
+            assert!(
+                matches!(
+                    reason,
+                    Some(CloseReason::QuicPath(
+                        QuicPathEnd::NotAcknowledging | QuicPathEnd::Stalled
+                    ))
+                ),
+                "{reason:?}"
+            );
+        },
+    );
+}
+
+/// A close records its cause once: the first close names it and a later one
+/// changes nothing, and `recv` reports it. A close with no cause reads as
+/// `ClosedLocally`.
+#[test]
+fn a_close_reports_the_cause_it_was_given_first() {
+    run(
+        "native-conn-cause",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            let path = rig.conn.path();
+            path.close_for(QuicCloseCode::SendAbortLimit, QuicPathEnd::SendAborts);
+            path.close_for(QuicCloseCode::OverBudget, QuicPathEnd::PeerOverBudget);
+            assert_eq!(path.closed_for(), Some(QuicPathEnd::SendAborts));
+            assert!(rig.conn.recv().await.is_err());
+            assert_eq!(
+                rig.conn.close_reason(),
+                Some(CloseReason::QuicPath(QuicPathEnd::SendAborts))
+            );
+        },
+    );
+    run(
+        "native-conn-no-cause",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            rig.conn.path().close(QuicCloseCode::Downgrade);
+            assert!(rig.conn.recv().await.is_err());
+            assert_eq!(
+                rig.conn.close_reason(),
+                Some(CloseReason::QuicPath(QuicPathEnd::ClosedLocally))
             );
         },
     );

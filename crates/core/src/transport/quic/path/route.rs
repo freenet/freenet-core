@@ -474,12 +474,23 @@ impl QuicPath {
         }
         if verdict.close {
             self.stats.record_send_event(QuicSendEvent::StalledClosed);
-            tracing::warn!(
-                in_a_row = STALLED_SENDS_LIMIT,
-                "QUIC path: sends keep timing out and nothing is acknowledged; closing \
-                 the path, and the connection stays on UDP"
+            if self.udp_fallback {
+                tracing::warn!(
+                    in_a_row = STALLED_SENDS_LIMIT,
+                    "QUIC path: sends keep timing out and nothing is acknowledged; closing \
+                     the path, and the connection stays on UDP"
+                );
+            } else {
+                tracing::warn!(
+                    in_a_row = STALLED_SENDS_LIMIT,
+                    "QUIC path: sends keep timing out and nothing is acknowledged; closing \
+                     the native connection"
+                );
+            }
+            self.close_for(
+                QuicCloseCode::Downgrade,
+                crate::transport::boundary::QuicPathEnd::Stalled,
             );
-            self.close(QuicCloseCode::Downgrade);
         }
         step
     }

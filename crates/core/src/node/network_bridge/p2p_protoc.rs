@@ -4116,6 +4116,9 @@ fn disconnect_reason_for_close(
         Some(CloseReason::InboundStreamRefusals) => {
             crate::tracing::DisconnectReason::Explicit("inbound_stream_refusals".into())
         }
+        Some(CloseReason::QuicPath(end)) => {
+            crate::tracing::DisconnectReason::Explicit(end.label().into())
+        }
         None => crate::tracing::DisconnectReason::NetworkError("transport_closed".into()),
     }
 }

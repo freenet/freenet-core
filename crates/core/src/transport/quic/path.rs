@@ -398,8 +398,11 @@ impl QuicPathLimits {
         ..Self::DEFAULT
     };
 
-    /// [`Self::DEFAULT`] for a native connection's path: data on from the
-    /// start, and no UDP session to fall back to.
+    /// [`Self::DEFAULT`] for a native connection's path, with no UDP session
+    /// to fall back to: a send whose next step would be UDP is given up, and a
+    /// quiet timeout never makes the path suspect. It accepts data as
+    /// [`Self::DEFAULT`] does; sending data is enabled with
+    /// [`QuicPath::enable_data`], which the native connection calls at once.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const NATIVE: Self = Self {
         udp_fallback: false,
@@ -611,13 +614,15 @@ impl QuicPathStats {
         self.shared[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The data-send counts are kept here and node-wide (`metrics::quic_data`).
-    /// Count a send of `kind` that was dropped without a path outcome (a native
-    /// route's short after its path ended).
+    /// Count a send of `kind` that was dropped without a path outcome: a
+    /// native route's short refused by its full queue, or one the route could
+    /// not send on the path (it ended, or the peer refused data) and had no
+    /// UDP session for.
     pub(in crate::transport) fn record_send_dropped(&self, kind: SendKind) {
         self.record_send(kind, QuicSendResult::Dropped);
     }
 
+    /// The data-send counts are kept here and node-wide (`metrics::quic_data`).
     fn record_send(&self, kind: SendKind, result: QuicSendResult) {
         self.node.record_send(kind, result);
         self.sends[kind as usize][result as usize].fetch_add(1, Ordering::Relaxed);
@@ -1123,12 +1128,12 @@ impl QuicPath {
         self.connection.closer().closed_with()
     }
 
-    /// Whether quinn closed the path's connection for its idle timeout.
-    pub(in crate::transport) fn idle_timed_out(&self) -> bool {
-        matches!(
-            self.connection.inner().close_reason(),
-            Some(quinn::ConnectionError::TimedOut)
-        )
+    /// Why this node closed the path's connection, if it said
+    /// ([`QuicCloser::close_for`](crate::transport::quic::QuicCloser::close_for)).
+    pub(in crate::transport) fn closed_for(
+        &self,
+    ) -> Option<crate::transport::boundary::QuicPathEnd> {
+        self.connection.closer().closed_for()
     }
 
     /// Pace this path's data sends with `pacer` (`pacer` module): the
@@ -1358,6 +1363,15 @@ impl QuicPath {
     /// error.
     pub(in crate::transport) fn close(&self, code: QuicCloseCode) {
         self.connection.close(code);
+    }
+
+    /// [`Self::close`], recording `cause` as why this node closed.
+    pub(in crate::transport) fn close_for(
+        &self,
+        code: QuicCloseCode,
+        cause: crate::transport::boundary::QuicPathEnd,
+    ) {
+        self.connection.closer().close_for(code, cause);
     }
 
     /// The quinn connection, to wait for its end.
@@ -2130,7 +2144,14 @@ async fn supervise_receive<T: TimeSource>(
         );
     }
     // Only if still open and not already being closed (QuicCloser).
-    closer.close(QuicCloseCode::Downgrade);
+    if ended.is_err() {
+        closer.close_for(
+            QuicCloseCode::Downgrade,
+            crate::transport::boundary::QuicPathEnd::ReceiveTaskPanicked,
+        );
+    } else {
+        closer.close(QuicCloseCode::Downgrade);
+    }
 }
 
 /// A uni stream being written that sees the peer stop it even while a

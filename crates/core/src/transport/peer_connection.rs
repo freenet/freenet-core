@@ -1147,6 +1147,11 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         bytes
     }
 
+    /// A Stream from a QUIC path: hand it to the registry, as the UDP path does at
+    /// its first fragment, and return its embedded metadata if that is new. The
+    /// reader task feeds the handle, so unlike a UDP stream it is not in
+    /// `streaming_handles`, and it evicts its own stream on its own timer. Moves
+    /// neither of the UDP session's clocks.
     fn take_quic_stream(
         &mut self,
         arrival: super::quic::path::InboundStreamArrival,

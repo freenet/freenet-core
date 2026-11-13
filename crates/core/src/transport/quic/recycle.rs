@@ -339,7 +339,12 @@ impl SendAborts {
         }
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         self.node.record_send_reset(count);
-        if count > self.limit && self.closer.close(QuicCloseCode::SendAbortLimit) {
+        if count > self.limit
+            && self.closer.close_for(
+                QuicCloseCode::SendAbortLimit,
+                crate::transport::boundary::QuicPathEnd::SendAborts,
+            )
+        {
             tracing::warn!(
                 remote = %self.closer.remote_address(),
                 aborts = count,
@@ -1714,7 +1719,10 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
             }
             // One close code for all three: it tells the peer only that this
             // side stopped using the path.
-            if closer.close(QuicCloseCode::PeerNotAcknowledging) {
+            if closer.close_for(
+                QuicCloseCode::PeerNotAcknowledging,
+                crate::transport::boundary::QuicPathEnd::NotAcknowledging,
+            ) {
                 #[cfg(test)]
                 if let Some(stall) = watch.stall() {
                     TEST_STALLS
