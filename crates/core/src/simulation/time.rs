@@ -387,7 +387,9 @@ impl VirtualTime {
             .map(|w| w.deadline)
     }
 
-    /// Registers a wakeup and returns its ID.
+    /// Registers a wakeup and returns its ID, whatever its deadline. Tests
+    /// only; sleeps use [`Self::register_future_wakeup`].
+    #[cfg(test)]
     fn register_wakeup(&self, deadline: u64) -> WakeupId {
         let id = WakeupId::new(
             self.state
@@ -398,6 +400,32 @@ impl VirtualTime {
 
         self.state.pending_wakeups.lock().unwrap().push(wakeup);
         id
+    }
+
+    /// Registers a wakeup for `deadline` if it is still in the future, and
+    /// returns its ID; `None` if the clock has already reached it.
+    ///
+    /// The check and the push are one step under the `pending_wakeups` lock.
+    /// [`Self::advance_to`] stores the new time before it takes that lock to
+    /// pop expired wakeups, so a registration either sees the new time (and
+    /// registers nothing) or is pushed before the pop (and is popped). Checked
+    /// outside the lock, a thread that read the time just before another
+    /// thread's advance could push a wakeup the advance had already passed:
+    /// its deadline is then at or before the current time, which no later
+    /// `advance_to` pops, so the sleep never ends and
+    /// [`Self::advance_to_next_wakeup`] stops at it for good (#6220).
+    fn register_future_wakeup(&self, deadline: u64) -> Option<WakeupId> {
+        let mut pending = self.state.pending_wakeups.lock().unwrap();
+        if deadline <= self.state.current_nanos.load(AtomicOrdering::SeqCst) {
+            return None;
+        }
+        let id = WakeupId::new(
+            self.state
+                .next_wakeup_id
+                .fetch_add(1, AtomicOrdering::SeqCst),
+        );
+        pending.push(Wakeup::new(deadline, id));
+        Some(id)
     }
 
     /// Registers a waker for a wakeup ID.
@@ -508,12 +536,9 @@ impl TimeSource for VirtualTime {
     }
 
     fn sleep_until(&self, deadline_nanos: u64) -> Pin<Box<dyn Future<Output = ()> + Send>> {
-        let current = self.now_nanos();
-        if deadline_nanos <= current {
+        let Some(id) = self.register_future_wakeup(deadline_nanos) else {
             return Box::pin(std::future::ready(()));
-        }
-
-        let id = self.register_wakeup(deadline_nanos);
+        };
         let state = self.state.clone();
 
         Box::pin(VirtualSleep { id, state })
@@ -521,10 +546,9 @@ impl TimeSource for VirtualTime {
 
     fn sleep_cancelable(&self, duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         let deadline = self.now_nanos().saturating_add(duration.as_nanos() as u64);
-        if deadline <= self.now_nanos() {
+        let Some(id) = self.register_future_wakeup(deadline) else {
             return Box::pin(std::future::ready(()));
-        }
-        let id = self.register_wakeup(deadline);
+        };
         let state = self.state.clone();
         Box::pin(CancelableVirtualSleep {
             inner: VirtualSleep { id, state },
@@ -900,6 +924,33 @@ mod tests {
         assert_eq!(triggered[0], id1);
         assert_eq!(triggered[1], id2);
         assert_eq!(triggered[2], id3);
+    }
+
+    /// A sleep registered while another thread advances the clock is never
+    /// left pending with a deadline the clock has already passed: no later
+    /// advance would pop it, so the sleep would never end and
+    /// `advance_to_next_wakeup` would stop at it for good (#6220).
+    #[test]
+    fn a_sleep_registered_during_an_advance_is_never_left_behind() {
+        let vt = VirtualTime::new();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..200_000 {
+                    vt.advance(Duration::from_nanos(1));
+                }
+            });
+            for _ in 0..3 {
+                scope.spawn(|| {
+                    for _ in 0..200_000 {
+                        drop(vt.sleep_until(vt.now_nanos() + 1));
+                    }
+                });
+            }
+        });
+        let now = vt.now_nanos();
+        let pending = vt.state.pending_wakeups.lock().unwrap();
+        let behind = pending.iter().filter(|w| w.deadline <= now).count();
+        assert_eq!(behind, 0, "{behind} wakeups at or before {now} ns");
     }
 
     #[test]

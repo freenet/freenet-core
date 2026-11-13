@@ -138,10 +138,17 @@ where
     }
 }
 
-/// [`drive`] on a multi-thread runtime. There, a task can still be running on
-/// another worker when this one runs out of things to poll, so after its turns it
-/// pauses briefly in real time, and moves the clock only to a wakeup that is
-/// armed. A stuck test is caught by the caller's real-time limit.
+/// [`drive`] on a multi-thread runtime. The clock moves to the next wakeup
+/// only when the runtime is idle ([`idle_workers`]): every worker parked
+/// and nothing in the global queue, the same on two readings a real-time
+/// millisecond apart (a worker that ran in between changes its park count).
+/// Moving it while a worker is still busy (a handshake's crypto in a debug
+/// build, say) fires that work's timers before it has had a chance to run,
+/// up to quinn's idle timeout (#6220). A stuck test is caught by the
+/// caller's real-time limit.
+///
+/// Must run on the thread that called `block_on`, not on a worker: its own
+/// worker would never read as parked.
 pub(in crate::transport) async fn drive_on_threads<F>(
     time: &VirtualTime,
     limit: Duration,
@@ -151,6 +158,11 @@ where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    assert_ne!(
+        std::thread::current().name(),
+        Some("tokio-rt-worker"),
+        "drive_on_threads runs on the block_on thread, not on a worker"
+    );
     let task = tokio::spawn(fut);
     let limit_ns = time.now_nanos() + limit.as_nanos() as u64;
     loop {
@@ -160,9 +172,16 @@ where
             }
             tokio::task::yield_now().await;
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        let before = idle_workers();
+        // Blocks only this thread (not a worker), and sets no runtime timer
+        // that would wake the worker holding the time driver and change its
+        // park count.
+        std::thread::sleep(Duration::from_millis(1));
         if task.is_finished() {
             return task.await.expect("the driven future panicked");
+        }
+        if before.is_none() || before != idle_workers() {
+            continue;
         }
         time.advance_to_next_wakeup();
         assert!(
@@ -170,6 +189,21 @@ where
             "virtual time passed {limit:?} before the future finished"
         );
     }
+}
+
+/// Each worker's park count if the runtime is idle (every worker parked,
+/// none queued globally), else `None`. Two equal readings mean no worker
+/// ran between them.
+fn idle_workers() -> Option<Vec<u64>> {
+    let metrics = tokio::runtime::Handle::current().metrics();
+    if metrics.global_queue_depth() > 0 {
+        return None;
+    }
+    let counts: Vec<u64> = (0..metrics.num_workers())
+        .map(|worker| metrics.worker_park_unpark_count(worker))
+        .collect();
+    // Odd while the worker is parked.
+    counts.iter().all(|count| count % 2 == 1).then_some(counts)
 }
 
 /// How long a QUIC test may run, in real time, before it is failed.
