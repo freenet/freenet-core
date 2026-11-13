@@ -29,6 +29,7 @@
 //! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
 //! | `quic_gate_loss_<verdict>` | congestion events by the loss gate's verdict (`recycle::loss_gate`): passed to Cubic as `queue`, `share` (loss share above the ceiling), `persistent`, `ecn` (a congestion mark), `no_sample`, or `ignored` as random loss; summed over the node's paths up to each path's last tick. Over a path's life they sum to its `quic_congestion_events`; within one period they can differ by the events between the two reads of a tick |
 //! | `quic_gate_ended_queue_<bucket>` | paths that ended in the period after at least 20 gate verdicts, by the share of them passed as `queue`: `lt_10pct`, `lt_50pct`, `ge_50pct`. A path whose losses mostly read as a queue runs as plain Cubic, whether the queue is real or jitter |
+//! | `quic_carried_dark_episode_<label>` | the same, for the episodes of paths that carried data when the episode ended: a subset of `quic_dark_episode_<label>`, counted by the same decision |
 //! | `quic_dark_episode_<label>` | dark episodes on QUIC paths (`recycle::AckWatch`: packets outstanding, nothing acknowledged and nothing heard) by how they ended: `recovered_lt_5s`, `lt_10s`, `lt_30s`, `lt_120s`, `recovered_ge_120s`, `unrecovered` (the path closed, or nothing was outstanding any more), `cap_held` (the egress cap held this side's sends, so darkness could no longer be told), `closed_at_window` (the dark-path rule closed a path that carries data). A path that carries no data is never closed by that rule, so its episodes run to their end; read at the watch's 2 s ticks |
 //! | `quic_send_resets`, `quic_path_ms` | sends a path reset on this side, and the time QUIC paths were up, shadow paths included, up to each path's last tick: resets per connection-hour is their ratio |
 //! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
@@ -418,6 +419,7 @@ pub(crate) struct QuicDataCounters {
     gate_loss: [AtomicU64; GATE_VERDICTS],
     gate_ended_queue: [AtomicU64; GATE_QUEUE_LABELS.len()],
     dark_episodes: [AtomicU64; DARK_EPISODE_LABELS.len()],
+    carried_dark_episodes: [AtomicU64; DARK_EPISODE_LABELS.len()],
     /// The data share this node applies, set when its upgrades are built;
     /// `None` unless `transport-quic = prefer`.
     share: Mutex<Option<DataShare>>,
@@ -455,6 +457,7 @@ impl QuicDataCounters {
             gate_loss: std::array::from_fn(|_| zero()),
             gate_ended_queue: std::array::from_fn(|_| zero()),
             dark_episodes: std::array::from_fn(|_| zero()),
+            carried_dark_episodes: std::array::from_fn(|_| zero()),
             share: Mutex::new(None),
         }
     }
@@ -648,8 +651,9 @@ impl QuicDataCounters {
         self.budget_bytes.store(bytes, Ordering::Relaxed);
     }
 
-    /// A dark episode ended as `ended` says.
-    pub(crate) fn record_dark_episode(&self, ended: DarkEnd) {
+    /// A dark episode ended as `ended` says, on a path that `carried` data
+    /// when it ended (counted in `quic_carried_dark_episode_<label>` as well).
+    pub(crate) fn record_dark_episode(&self, ended: DarkEnd, carried: bool) {
         let bucket = match ended {
             DarkEnd::Recovered(nanos) => {
                 let secs = nanos / 1_000_000_000;
@@ -666,6 +670,9 @@ impl QuicDataCounters {
             DarkEnd::Closed => DARK_CLOSED,
         };
         self.dark_episodes[bucket].fetch_add(1, Ordering::Relaxed);
+        if carried {
+            self.carried_dark_episodes[bucket].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// What the node's data paths are charged against the budget now.
@@ -775,6 +782,7 @@ impl QuicDataCounters {
             gate_loss: self.gate_loss.iter().map(get).collect(),
             gate_ended_queue: self.gate_ended_queue.iter().map(get).collect(),
             dark_episodes: self.dark_episodes.iter().map(get).collect(),
+            carried_dark_episodes: self.carried_dark_episodes.iter().map(get).collect(),
             ramp_share_pct: self.share.lock().map_or(0, |share| {
                 u64::from(share.percent_at(std::time::SystemTime::now()))
             }),
@@ -858,6 +866,10 @@ pub struct QuicDataSnapshot {
     /// Dark episodes that ended in the period, by `DARK_EPISODE_LABELS`.
     #[serde(default)]
     pub dark_episodes: Vec<u64>,
+    /// The dark episodes of paths that carried data when the episode ended, by
+    /// `DARK_EPISODE_LABELS`: a subset of `dark_episodes`.
+    #[serde(default)]
+    pub carried_dark_episodes: Vec<u64>,
     /// The share of pairs this node sets its data bit for at the snapshot, in
     /// percent: a gauge.
     #[serde(default)]
@@ -923,6 +935,7 @@ impl QuicDataSnapshot {
             gate_loss,
             gate_ended_queue,
             dark_episodes,
+            carried_dark_episodes,
             ramp_share_pct,
         } = self;
         let mut keys = Vec::new();
@@ -1028,6 +1041,11 @@ impl QuicDataSnapshot {
             "quic_dark_episode_",
             DARK_EPISODE_LABELS.iter().map(|l| l.to_string()).collect(),
             dark_episodes.clone(),
+        );
+        family(
+            "quic_carried_dark_episode_",
+            DARK_EPISODE_LABELS.iter().map(|l| l.to_string()).collect(),
+            carried_dark_episodes.clone(),
         );
         for (key, value) in [
             ("quic_enabled_data_paths", *data_enabled),
@@ -1135,6 +1153,7 @@ impl QuicDataSnapshot {
             gate_loss,
             gate_ended_queue,
             dark_episodes,
+            carried_dark_episodes,
             ramp_share_pct: _,
         } = self;
         let any = |values: &[u64]| values.iter().any(|n| *n != 0);
@@ -1148,6 +1167,7 @@ impl QuicDataSnapshot {
             || any(gate_loss)
             || any(gate_ended_queue)
             || any(dark_episodes)
+            || any(carried_dark_episodes)
             || any(carrying_ended_loss_rate)
             || [
                 *data_enabled,
@@ -1306,7 +1326,7 @@ mod tests {
             DarkEnd::CapHeld,
             DarkEnd::Closed,
         ] {
-            counters.record_dark_episode(ended);
+            counters.record_dark_episode(ended, false);
         }
         let snap = counters.snapshot(true);
         assert!(snap.has_activity());
