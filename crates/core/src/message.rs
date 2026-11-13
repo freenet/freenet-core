@@ -95,10 +95,15 @@ impl Transaction {
 
     pub(crate) fn transaction_type(&self) -> TransactionType {
         let id_byte = (self.id.0 & 0xFFu128) as u8;
-        // Deserialization rejects unknown type bytes and every constructor sets a
-        // valid one, so the fallback is unreachable; it exists so that a value
-        // built some other way can never panic the network event loop.
-        TransactionType::try_from(id_byte).unwrap_or(TransactionType::Connect)
+        // Deserialization rejects unknown type bytes and every constructor
+        // (including `ttl_transaction_with_multiplier`) sets a valid one, so
+        // the fallback is unreachable. It exists so that a value built some
+        // other way can never panic the network event loop; the debug_assert
+        // makes such a value visible in tests instead of silently
+        // misclassifying it.
+        let ty = TransactionType::try_from(id_byte);
+        debug_assert!(ty.is_ok(), "Transaction with invalid type byte {id_byte}");
+        ty.unwrap_or(TransactionType::Connect)
     }
 
     pub fn timed_out(&self) -> bool {
@@ -173,7 +178,10 @@ impl Transaction {
 
         // Clear the timestamp bits and replace with the cutoff timestamp.
         const TIMESTAMP_MASK: u128 = 0x00000000000000000000FFFFFFFFFFFFFFFF;
-        let new_ulid = (id.0 & TIMESTAMP_MASK) | ((ttl_epoch as u128) << 80);
+        // Keep the low byte a valid type byte (Connect = 0): the cutoff id is
+        // only compared against, but it must still satisfy the invariant that
+        // every Transaction carries a valid type.
+        let new_ulid = (id.0 & TIMESTAMP_MASK & !0xFFu128) | ((ttl_epoch as u128) << 80);
         Self {
             id: Ulid(new_ulid),
             parent: None,
@@ -1546,12 +1554,14 @@ mod tests {
     }
 
     #[test]
-    fn transaction_type_never_panics_on_unvalidated_value() {
-        let tx = Transaction {
-            id: Ulid(0xFF),
-            parent: None,
-        };
-        let _ = tx.transaction_type();
+    fn ttl_transactions_carry_a_valid_type_byte() {
+        for _ in 0..512 {
+            for m in [1u64, 2, 5] {
+                let tx = Transaction::ttl_transaction_with_multiplier(m);
+                assert!(TransactionType::try_from((tx.id.0 & 0xFF) as u8).is_ok());
+                let _ = tx.transaction_type();
+            }
+        }
     }
 
     #[test]

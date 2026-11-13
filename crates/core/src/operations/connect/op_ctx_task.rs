@@ -956,7 +956,8 @@ async fn drive_client_connect(
                 // the gateway observes it from the UDP packet source
                 // and ships it back. Update both `own_addr` (for
                 // diagnostics) and `own_location` (for routing).
-                // Idempotent: subsequent observations overwrite.
+                // Only the first ObservedAddress per transaction is applied
+                // (see the guard arm above); repeats are ignored.
                 let location = Location::from_address(&address);
                 // GLOBAL-ADDR-WRITE-OK: production. A real node learning its
                 // peer-observed address is exactly what the external_address
@@ -1971,6 +1972,32 @@ mod tests {
             "start_relay_connect MUST increment RELAY_CONNECT_DEDUP_REJECTS \
              when the dedup gate fires; without it, dedup storms are \
              invisible to telemetry."
+        );
+    }
+
+    /// Source-literal guard: the joiner driver applies only the first
+    /// `ObservedAddress` per CONNECT transaction. Repeats must hit the
+    /// ignoring arm BEFORE the applying arm, and the applying arm must set the
+    /// flag, so a peer cannot keep rewriting this node's own address.
+    #[test]
+    fn joiner_driver_applies_only_first_observed_address() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let guard = SOURCE
+            .find("ConnectMsg::ObservedAddress { address, .. } if applied_observed_address =>")
+            .expect("repeat-ignoring ObservedAddress arm removed");
+        let apply = SOURCE
+            .find("ConnectMsg::ObservedAddress { address, .. } => {\n                applied_observed_address = true;")
+            .expect("applying arm must set applied_observed_address first");
+        assert!(
+            guard < apply,
+            "the ignoring arm must precede the applying arm"
+        );
+        let body_end = SOURCE[apply..]
+            .find("set_own_addr(address)")
+            .expect("set_own_addr call");
+        assert!(
+            body_end < 2000,
+            "set_own_addr must stay in the applying arm"
         );
     }
 
