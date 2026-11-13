@@ -619,8 +619,8 @@ Current wire-gated floors:
   share of 0, so none of its pairs carries data; only a node that set
   `quic-data-percent` keeps a share. It also sets the default mode back to
   0.2.156's: shadow on Linux and macOS, off on Windows. An emergency release
-  should only go back to states the field has run, and no release before the
-  ramp ran QUIC on Windows. So a Linux or macOS node that did not set
+  should only go back to states the field has run, and Windows with QUIC off
+  is what every release through 0.2.156 ran. So a Linux or macOS node that did not set
   `transport-quic` keeps its endpoint with shadow paths (off would tear down
   every endpoint mid-incident), and a Windows node turns QUIC off (the default
   is read, never written to `config.toml`). A node that set
