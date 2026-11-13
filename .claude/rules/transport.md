@@ -1441,7 +1441,7 @@ a test passes its own; tests read their own, never the global).
   quic_data_send_<short|large_short|stream|pipe>_<sent|maybe_delivered|
   not_opened_udp|failed_udp|dropped>; quic_data_event_<short_overflow_udp|
   data_refused|stalled_closed|udp_send_failed|suspect_entered|suspect_left|
-  pacer_refused|ack_wait_released|stream_limit_full>; quic_data_stop_<code> (stops a
+  pacer_refused|ack_wait_released|stream_limit_full|native_worker_panicked>; quic_data_stop_<code> (stops a
   peer sent to data sends); quic_inbound_<QuicInboundOutcome> (every receive
   outcome, refusals by frame kind as short_refused_budget and
   stream_refused_budget); quic_enabled_data_paths; quic_live_data_paths (a gauge of
@@ -2116,14 +2116,21 @@ End reasons (close_reason after recv fails): quinn's idle TimedOut is
   (QuicCloser::close_for: Stalled, NotAcknowledging, SendAborts,
   PeerOverBudget, RefusedData, PeerRefusedData, ReceiveTaskPanicked), first
   cause wins; a
-  local close with none is ClosedLocally, the peer's close ClosedByPeer, and
-  any other end Lost. The disconnect label is QuicPathEnd::label.
+  local close with none is ClosedLocally, the peer's close (application or
+  transport level) ClosedByPeer, and any other end Lost. The disconnect label is QuicPathEnd::label.
 Pacing: the bandwidth limit paces its data with a LimitPacer on the path's
-  clock, as an upgrade session's does.
+  clock, as an upgrade session's does, except that a message the pacer
+  refuses is dropped (no UDP to send it on) and nothing is charged as
+  fallback debt.
 Drop: closes with NODE_DROPPED_PEER at once (send tasks hold the path) and
   cancels its unclaimed inbound streams, as PeerConnection's drop does.
 send_bytes_observed is always Unobserved: no message is a stream it reports.
-The route worker runs under report_panics (task_panicked).
+A route worker panic is counted on the path and node-wide as
+  quic_data_event_native_worker_panicked, then raised again (an upgrade's
+  worker counts as quic_upgrade_task_panicked).
+The transient-send warn in peer_connection_listener is throttled per
+  connection (1st, 2nd, 4th ... failure, with the count), since a backed-up
+  short queue refuses every send with SendQueueFull.
 ```
 
 #### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)

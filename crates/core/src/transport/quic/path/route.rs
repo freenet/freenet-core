@@ -137,6 +137,10 @@ quic_outcomes! {
         /// `config::DATA_START_UNI_STREAMS` yet. Also counted under its
         /// kind's result.
         StreamLimitFull => "stream_limit_full",
+        /// A native connection's route worker panicked (counted, then the panic
+        /// is raised again). An upgrade's worker counts as
+        /// `quic_upgrade_task_panicked` instead.
+        NativeWorkerPanicked => "native_worker_panicked",
     }
 }
 

@@ -855,3 +855,57 @@ fn a_close_reports_the_cause_it_was_given_first() {
         },
     );
 }
+
+/// The peer's close reads as `ClosedByPeer` whether its application or its
+/// QUIC stack closed; a local close takes the recorded cause; the rest is a
+/// loss.
+#[test]
+fn close_reasons_follow_quinns_end() {
+    use quinn::ConnectionError as E;
+    let transport_close = E::ConnectionClosed(quinn::ConnectionClose {
+        error_code: quinn::TransportErrorCode::crypto(0x28),
+        frame_type: None,
+        reason: Bytes::new(),
+    });
+    let by_peer = CloseReason::QuicPath(QuicPathEnd::ClosedByPeer);
+    assert_eq!(reason_for(Some(&transport_close), None), by_peer);
+    assert_eq!(
+        reason_for(Some(&transport_close), Some(QuicPathEnd::Stalled)),
+        by_peer,
+        "a cause recorded locally does not override the peer's close"
+    );
+    assert_eq!(
+        reason_for(Some(&E::TimedOut), None),
+        CloseReason::IdleTimeout
+    );
+    assert_eq!(
+        reason_for(Some(&E::LocallyClosed), Some(QuicPathEnd::SendAborts)),
+        CloseReason::QuicPath(QuicPathEnd::SendAborts)
+    );
+    assert_eq!(
+        reason_for(Some(&E::Reset), None),
+        CloseReason::QuicPath(QuicPathEnd::Lost)
+    );
+}
+
+/// A panic in the route worker is counted on its path, then raised again.
+#[test]
+fn a_native_worker_panic_is_counted_and_raised() {
+    run(
+        "native-conn-worker-panic",
+        QuicPathLimits::DEFAULT,
+        None,
+        |rig| async move {
+            let stats = rig.conn.path().stats_handle();
+            let task = tokio::spawn(count_panics(stats.clone(), async {
+                panic!("a worker panic for the test");
+            }));
+            let joined = task.await;
+            assert!(joined.is_err_and(|error| error.is_panic()), "raised again");
+            assert_eq!(
+                stats.send_event_count(QuicSendEvent::NativeWorkerPanicked),
+                1
+            );
+        },
+    );
+}

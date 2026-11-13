@@ -3868,6 +3868,9 @@ async fn peer_connection_listener(
         "[CONN_LIFECYCLE] Starting peer_connection_listener task"
     );
 
+    // Transient send failures on this connection so far, for the warn's
+    // throttle (`warn_transient_send_failure`).
+    let mut transient_send_failures: u64 = 0;
     loop {
         // Yield to allow the tokio runtime to schedule other tasks.
         // This is critical for cooperative scheduling - without it, tokio's coop
@@ -3898,10 +3901,10 @@ async fn peer_connection_listener(
                     .await
                     {
                         if !error.closes_connection() {
-                            tracing::warn!(
-                                to = %remote_addr,
-                                ?error,
-                                "[CONN_LIFECYCLE] Transient send failure, continuing"
+                            warn_transient_send_failure(
+                                remote_addr,
+                                &error,
+                                &mut transient_send_failures,
                             );
                         } else {
                             tracing::debug!(
@@ -3967,10 +3970,10 @@ async fn peer_connection_listener(
                     Some(msg) => {
                         if let Err(error) = handle_peer_channel_message(&mut conn, msg, &outbound_mix, &propagation, native_wire).await {
                             if !error.closes_connection() {
-                                tracing::warn!(
-                                    to = %remote_addr,
-                                    ?error,
-                                    "[CONN_LIFECYCLE] Transient send failure, continuing"
+                                warn_transient_send_failure(
+                                    remote_addr,
+                                    &error,
+                                    &mut transient_send_failures,
                                 );
                             } else {
                                 tracing::debug!(
@@ -4102,6 +4105,32 @@ async fn peer_connection_listener(
             },
         }
     }
+}
+
+/// Log a send that failed without ending the connection, throttled per
+/// connection: at the 1st, 2nd, 4th, 8th ... failure, with the count so far.
+/// A connection whose sends keep failing (a QUIC-native connection with its
+/// short queue backed up refuses every send with `SendQueueFull`) then logs a
+/// few lines over its life, not one per message.
+fn warn_transient_send_failure(
+    remote_addr: std::net::SocketAddr,
+    error: &crate::transport::TransportError,
+    failures: &mut u64,
+) {
+    *failures = failures.saturating_add(1);
+    if transient_failure_warns(*failures) {
+        tracing::warn!(
+            to = %remote_addr,
+            ?error,
+            failures_so_far = *failures,
+            "[CONN_LIFECYCLE] Transient send failure, continuing"
+        );
+    }
+}
+
+/// Whether the `count`th transient send failure on a connection is logged.
+fn transient_failure_warns(count: u64) -> bool {
+    count.is_power_of_two()
 }
 
 /// The telemetry label for a connection that `recv` ended: the idle timeout
@@ -4471,6 +4500,17 @@ pub(crate) mod tests {
                 assert_eq!(new, old, "idle={idle} refusals={refusals}");
             }
         }
+    }
+
+    /// The transient-send warn fires at the 1st, 2nd, 4th ... failure only, so
+    /// 10,000 failures on one connection log 14 lines.
+    #[test]
+    fn transient_send_failures_log_at_powers_of_two() {
+        let logged: Vec<u64> = (1..=10_000)
+            .filter(|n| super::transient_failure_warns(*n))
+            .collect();
+        assert_eq!(logged.len(), 14);
+        assert_eq!(&logged[..5], &[1, 2, 4, 8, 16]);
     }
 
     /// Every `QuicPathEnd` label reaches telemetry as `Explicit(label)`, both
