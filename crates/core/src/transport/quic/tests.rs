@@ -149,6 +149,21 @@ where
 ///
 /// Must run on the thread that called `block_on`, not on a worker: its own
 /// worker would never read as parked.
+///
+/// Limits: idleness is read from the workers only. Work elsewhere is
+/// invisible to it: `spawn_blocking` and `block_in_place` threads, a
+/// `std::thread` that wakes tasks, real I/O or real-time timers. So is a
+/// worker preempted between parking and taking a task another thread just
+/// queued for it, for as long as the global queue is not read. A caller with
+/// any of those can still have the clock advanced over busy work; the QUIC
+/// tests here use none (in-memory sockets on virtual time).
+///
+/// A run that cannot go on prints why once, so a caller's real-time watchdog
+/// failure shows it: the runtime never read as idle for
+/// [`DRIVE_DIAGNOSTIC_CHECKS`] checks in a row (busy work it cannot see the
+/// end of, or a task that never parks), or it was idle with no wakeup left
+/// to advance to for as many (a lost wakeup, or a task waiting on something
+/// no timer will bring).
 pub(in crate::transport) async fn drive_on_threads<F>(
     time: &VirtualTime,
     limit: Duration,
@@ -165,6 +180,9 @@ where
     );
     let task = tokio::spawn(fut);
     let limit_ns = time.now_nanos() + limit.as_nanos() as u64;
+    // Checks in a row that found the runtime busy, and that found it idle
+    // with nothing to advance to.
+    let (mut busy, mut stuck) = (0u32, 0u32);
     loop {
         for _ in 0..64 {
             if task.is_finished() {
@@ -181,15 +199,40 @@ where
             return task.await.expect("the driven future panicked");
         }
         if before.is_none() || before != idle_workers() {
+            busy += 1;
+            if busy == DRIVE_DIAGNOSTIC_CHECKS {
+                eprintln!(
+                    "drive_on_threads: the runtime has not been idle for {busy} checks in a row \
+                     at {} ns: work it cannot see the end of, or a task that never parks",
+                    time.now_nanos()
+                );
+            }
             continue;
         }
-        time.advance_to_next_wakeup();
+        busy = 0;
+        if time.advance_to_next_wakeup().is_none() {
+            stuck += 1;
+            if stuck == DRIVE_DIAGNOSTIC_CHECKS {
+                eprintln!(
+                    "drive_on_threads: the runtime is idle and no wakeup is left to advance to \
+                     at {} ns: a lost wakeup, or a task waiting on something no timer brings",
+                    time.now_nanos()
+                );
+            }
+            continue;
+        }
+        stuck = 0;
         assert!(
             time.now_nanos() <= limit_ns,
-            "virtual time passed {limit:?} before the future finished"
+            "virtual time passed {limit:?} before the future finished, advancing only while \
+             the runtime was idle"
         );
     }
 }
+
+/// Checks in a row of one kind after which [`drive_on_threads`] prints why
+/// it cannot go on: about a second or more of real time.
+const DRIVE_DIAGNOSTIC_CHECKS: u32 = 1000;
 
 /// Each worker's park count if the runtime is idle (every worker parked,
 /// none queued globally), else `None`. Two equal readings mean no worker

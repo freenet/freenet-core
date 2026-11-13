@@ -318,14 +318,17 @@ impl VirtualTime {
     ///
     /// Returns the list of wakeup IDs that were triggered, in order.
     pub fn advance_to(&self, target_nanos: u64) -> Vec<WakeupId> {
-        let current = self.state.current_nanos.load(AtomicOrdering::SeqCst);
-        if target_nanos <= current {
+        // One atomic step, so two threads advancing at once cannot move the
+        // clock backwards (a load then a store could store the smaller
+        // target last). The time is stored before `pending_wakeups` is taken
+        // below, which `register_future_wakeup` relies on.
+        let previous = self
+            .state
+            .current_nanos
+            .fetch_max(target_nanos, AtomicOrdering::SeqCst);
+        if target_nanos <= previous {
             return Vec::new();
         }
-
-        self.state
-            .current_nanos
-            .store(target_nanos, AtomicOrdering::SeqCst);
 
         let mut triggered = Vec::new();
         let mut wakers_to_wake = Vec::new();
@@ -951,6 +954,28 @@ mod tests {
         let pending = vt.state.pending_wakeups.lock().unwrap();
         let behind = pending.iter().filter(|w| w.deadline <= now).count();
         assert_eq!(behind, 0, "{behind} wakeups at or before {now} ns");
+    }
+
+    /// Threads advancing the clock at once never move it backwards: each
+    /// reading by one thread is at least the one before.
+    #[test]
+    fn concurrent_advances_never_move_the_clock_backwards() {
+        let vt = VirtualTime::new();
+        std::thread::scope(|scope| {
+            for start in 0..4u64 {
+                let vt = &vt;
+                scope.spawn(move || {
+                    let mut last = 0;
+                    for step in 0..50_000u64 {
+                        vt.advance_to(start + 4 * step);
+                        let now = vt.now_nanos();
+                        assert!(now >= last, "{now} after {last}");
+                        last = now;
+                    }
+                });
+            }
+        });
+        assert_eq!(vt.now_nanos(), 3 + 4 * 49_999);
     }
 
     #[test]
