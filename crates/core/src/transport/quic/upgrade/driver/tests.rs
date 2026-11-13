@@ -56,7 +56,7 @@ use crate::config::GlobalRng;
 use crate::transport::quic::QuicAvailability;
 use crate::transport::quic::breaker::BreakerOutcome;
 use crate::transport::quic::path::QuicInbound;
-use crate::transport::quic::tests::{Pair, SEED, bounded, drive, pair};
+use crate::transport::quic::tests::{Pair, SEED, bounded, drive, pair, pair_with};
 use crate::transport::quic::upgrade::machine::{BACKOFF_MIN, OFFER_TIMEOUT};
 use crate::transport::quic::upgrade::policy::QuicPolicyConfig;
 use crate::transport::symmetric_message::QUIC_UPGRADE_NEGOTIATES_IN;
@@ -263,6 +263,12 @@ impl DataPath {
     }
 }
 
+/// See the `Drop` on [`NativeServer`]: it keeps `_pair`, and with it the
+/// socket pumps, alive for as long as a test body uses any field.
+impl Drop for DataPath {
+    fn drop(&mut self) {}
+}
+
 pub(in crate::transport) async fn data_path(
     network: &str,
     limits: QuicPathLimits,
@@ -301,9 +307,34 @@ async fn data_path_with(
     data: QuicDataSenders,
     on_threads: bool,
 ) -> DataPath {
+    let (pair, client, server) = handshake(network, on_threads, None).await;
+    let time = pair.time.clone();
+    let (peer, peer_inbound) = QuicPath::with_limits(client, time.clone(), peer_limits);
+    let (ours, controls) = QuicPath::with_budget(server, time.clone(), limits, budget, data, None);
+    DataPath {
+        time,
+        _pair: pair,
+        peer,
+        peer_inbound,
+        ours: Some(Arc::new(ours)),
+        _controls: controls,
+    }
+}
+
+/// A connection from the peer (`a`, the client) to the node (`b`).
+/// `idle_timeout` replaces the clock's for both endpoints.
+async fn handshake(
+    network: &str,
+    on_threads: bool,
+    idle_timeout: Option<Duration>,
+) -> (Pair, QuicConnection, QuicConnection) {
     let net = crate::transport::test_net::subnet();
     let (a_addr, b_addr) = (net.addr(1), net.addr(2));
-    let pair = pair(network, a_addr, b_addr, None).await;
+    let settings = crate::transport::quic::config::QuicSettings {
+        idle_timeout,
+        ..crate::transport::quic::tests::settings()
+    };
+    let pair = pair_with(network, a_addr, b_addr, None, settings).await;
     let permit = pair
         .b
         .allow_peer(a_addr, pair.a_keys.public())
@@ -323,17 +354,54 @@ async fn data_path_with(
         drive(&pair.time, limit, handshake).await
     };
     drop(permit);
+    (pair, client, server)
+}
+
+/// The peer's side of a connection whose node side is left unwrapped, for a
+/// node that builds its own path (a QUIC-native connection).
+pub(in crate::transport) struct NativeServer {
+    pub(in crate::transport) time: VirtualTime,
+    _pair: Pair,
+    /// The peer's path, which carries data.
+    pub(in crate::transport) peer: QuicPath,
+    pub(in crate::transport) peer_inbound: QuicInbound,
+    /// The key the peer proved in the handshake.
+    pub(in crate::transport) peer_key: TransportPublicKey,
+}
+
+/// Never moved out of, so a test body that uses one field keeps the whole
+/// value. Without it, an `async move` block that names only `peer` captures
+/// only that field (Rust 2021 disjoint capture), `_pair` is dropped when the
+/// block is built, and its drop stops the socket pumps: nothing more is
+/// delivered on the connection.
+impl Drop for NativeServer {
+    fn drop(&mut self) {}
+}
+
+/// A connection to the node, with the peer's path built from `peer_limits`
+/// and enabled for data, and the node's connection returned unwrapped.
+/// `idle_timeout` replaces the clock's (24 h on VirtualTime, which also turns
+/// keepalive off, so a connection with no traffic idles out at it).
+pub(in crate::transport) async fn native_server(
+    network: &str,
+    peer_limits: QuicPathLimits,
+    idle_timeout: Option<Duration>,
+) -> (NativeServer, QuicConnection) {
+    let (pair, client, server) = handshake(network, false, idle_timeout).await;
     let time = pair.time.clone();
+    let peer_key = pair.a_keys.public().clone();
     let (peer, peer_inbound) = QuicPath::with_limits(client, time.clone(), peer_limits);
-    let (ours, controls) = QuicPath::with_budget(server, time.clone(), limits, budget, data, None);
-    DataPath {
-        time,
-        _pair: pair,
-        peer,
-        peer_inbound,
-        ours: Some(Arc::new(ours)),
-        _controls: controls,
-    }
+    peer.enable_data();
+    (
+        NativeServer {
+            time,
+            _pair: pair,
+            peer,
+            peer_inbound,
+            peer_key,
+        },
+        server,
+    )
 }
 
 /// Set up with `prepare`, then drive its test on the virtual clock it returns, under

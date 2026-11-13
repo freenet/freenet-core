@@ -301,6 +301,11 @@ pub(crate) struct QuicPathLimits {
     /// The uni streams a data path's peer may open at first, raised with
     /// load up to [`MAX_UNI_STREAMS`] (`inbound::StreamLimit`).
     pub(crate) start_streams: u32,
+    /// Whether a data send this path cannot deliver may go on a UDP session.
+    /// False for a native connection's path ([`Self::NATIVE`]), which has no
+    /// UDP session: such a send is given up instead (`route::QuicPath::settle`),
+    /// and the path never turns suspect, since there is nowhere to divert to.
+    pub(crate) udp_fallback: bool,
     /// Where the path's counts are also kept node-wide; `None` is
     /// `TRANSPORT_METRICS`. A test passes its own, since every test in a process
     /// writes the global one.
@@ -370,6 +375,7 @@ impl QuicPathLimits {
         // The production start in every build, tests and simulations
         // included; a test whose premise is the full limit sets it.
         start_streams: super::config::DATA_START_UNI_STREAMS,
+        udp_fallback: true,
         counters: None,
         #[cfg(test)]
         panic_in_receive: false,
@@ -389,6 +395,17 @@ impl QuicPathLimits {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const SHADOW: Self = Self {
         accept_data: false,
+        ..Self::DEFAULT
+    };
+
+    /// [`Self::DEFAULT`] for a native connection's path, with no UDP session
+    /// to fall back to: a send whose next step would be UDP is given up, and a
+    /// quiet timeout never makes the path suspect. It accepts data as
+    /// [`Self::DEFAULT`] does; sending data is enabled with
+    /// [`QuicPath::enable_data`], which the native connection calls at once.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const NATIVE: Self = Self {
+        udp_fallback: false,
         ..Self::DEFAULT
     };
 
@@ -597,6 +614,14 @@ impl QuicPathStats {
         self.shared[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a send of `kind` that was dropped without a path outcome: a
+    /// native route's short refused by its full queue, or one the route could
+    /// not send on the path (it ended, or the peer refused data) and had no
+    /// UDP session for.
+    pub(in crate::transport) fn record_send_dropped(&self, kind: SendKind) {
+        self.record_send(kind, QuicSendResult::Dropped);
+    }
+
     /// The data-send counts are kept here and node-wide (`metrics::quic_data`).
     fn record_send(&self, kind: SendKind, result: QuicSendResult) {
         self.node.record_send(kind, result);
@@ -778,6 +803,9 @@ pub(crate) struct QuicPath {
     /// from [`Self::count_as_data_path`] until the peer refuses data or
     /// [`Self::uncount_as_data_path`], whichever is first, so it is lowered once.
     counted_as_data_path: std::sync::atomic::AtomicBool,
+    /// Whether a send this path cannot deliver may go on UDP
+    /// ([`QuicPathLimits::udp_fallback`]).
+    udp_fallback: bool,
     /// Send timeouts while nothing is acknowledged ([`route::StallCount`]).
     stall: parking_lot::Mutex<route::StallCount>,
     /// The [`bounded::QuietProof`] sends that ran out of gap left, read (not
@@ -1068,6 +1096,7 @@ impl QuicPath {
                 controls_opening: Arc::default(),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
                 counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
+                udp_fallback: limits.udp_fallback,
                 stall: parking_lot::Mutex::new(stall),
                 quiet: Arc::default(),
                 last_acked: Arc::new(bounded::AckRecord::new(
@@ -1097,6 +1126,14 @@ impl QuicPath {
     #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
     pub(in crate::transport) fn closed_with(&self) -> Option<QuicCloseCode> {
         self.connection.closer().closed_with()
+    }
+
+    /// Why this node closed the path's connection, if it said
+    /// ([`QuicCloser::close_for`](crate::transport::quic::QuicCloser::close_for)).
+    pub(in crate::transport) fn closed_for(
+        &self,
+    ) -> Option<crate::transport::boundary::QuicPathEnd> {
+        self.connection.closer().closed_for()
     }
 
     /// Pace this path's data sends with `pacer` (`pacer` module): the
@@ -1328,6 +1365,15 @@ impl QuicPath {
         self.connection.close(code);
     }
 
+    /// [`Self::close`], recording `cause` as why this node closed.
+    pub(in crate::transport) fn close_for(
+        &self,
+        code: QuicCloseCode,
+        cause: crate::transport::boundary::QuicPathEnd,
+    ) {
+        self.connection.closer().close_for(code, cause);
+    }
+
     /// The quinn connection, to wait for its end.
     pub(in crate::transport) fn quinn_connection(&self) -> quinn::Connection {
         self.connection.inner().clone()
@@ -1343,10 +1389,12 @@ impl QuicPath {
     }
 
     /// The peer said it accepts no data on this path, so this node's gating or
-    /// the peer's is wrong. Logged once per path. New sends go on UDP from now
-    /// on. This side does not close the path: the refusing receiver does, with
-    /// DOWNGRADE, [`inbound::REFUSAL_CLOSE_DELAY`] after its first refusal, and
-    /// this side falls back on that close.
+    /// the peer's is wrong. Logged once per path. On an upgrade path new sends
+    /// go on UDP from now on, and this side does not close the path: the
+    /// refusing receiver does, with DOWNGRADE, [`inbound::REFUSAL_CLOSE_DELAY`]
+    /// after its first refusal, and this side falls back on that close. A
+    /// native path has nothing to fall back to, so it closes at once
+    /// ([`QuicPathEnd::PeerRefusedData`](crate::transport::boundary::QuicPathEnd::PeerRefusedData)).
     fn stop_sending_data(&self) {
         self.stats.record_send_event(QuicSendEvent::DataRefused);
         // No longer a path that carries data.
@@ -1360,7 +1408,21 @@ impl QuicPath {
                 Ordering::Acquire,
             )
             .is_ok();
-        if was_on {
+        if !self.udp_fallback {
+            // A native path has no UDP session: left open, it would drop every
+            // later send while the connection looked alive. Close it, so the
+            // connection ends with a reason that says why.
+            if was_on {
+                tracing::warn!(
+                    remote = %self.connection.inner().remote_address(),
+                    "QUIC path: the peer refused data on a native connection; closing it"
+                );
+            }
+            self.close_for(
+                QuicCloseCode::Downgrade,
+                crate::transport::boundary::QuicPathEnd::PeerRefusedData,
+            );
+        } else if was_on {
             tracing::warn!(
                 remote = %self.connection.inner().remote_address(),
                 "QUIC path: the peer refused data after both sides set the data bit; \
@@ -2098,7 +2160,14 @@ async fn supervise_receive<T: TimeSource>(
         );
     }
     // Only if still open and not already being closed (QuicCloser).
-    closer.close(QuicCloseCode::Downgrade);
+    if ended.is_err() {
+        closer.close_for(
+            QuicCloseCode::Downgrade,
+            crate::transport::boundary::QuicPathEnd::ReceiveTaskPanicked,
+        );
+    } else {
+        closer.close(QuicCloseCode::Downgrade);
+    }
 }
 
 /// A uni stream being written that sees the peer stop it even while a

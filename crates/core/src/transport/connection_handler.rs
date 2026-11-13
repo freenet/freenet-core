@@ -2451,7 +2451,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     crate::transport::TRANSPORT_METRICS
                                         .record_nat_traversal_failed_version();
                                 }
-                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) | TransportError::OutboundStreamFailed(_) | TransportError::OutboundStreamInvalidLength(..) | TransportError::Udp(UdpError(UdpErrorKind::IO(_))) | TransportError::Other(_) | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_))) | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) | TransportError::Quic(_) => {
+                                TransportError::ChannelClosed | TransportError::ConnectionClosed(_) | TransportError::ConnectionEstablishmentFailure { .. } | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) | TransportError::OutboundStreamFailed(_) | TransportError::OutboundStreamInvalidLength(..) | TransportError::SendQueueFull(_) | TransportError::Udp(UdpError(UdpErrorKind::IO(_))) | TransportError::Other(_) | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_))) | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_))) | TransportError::Quic(_) => {
                                     tracing::error!(error = %error, peer_addr = %remote_addr, "Failed NAT traversal");
                                     crate::transport::TRANSPORT_METRICS
                                         .record_nat_traversal_failed_error();
@@ -3566,6 +3566,7 @@ fn classify_nat_failure(
         | TransportError::ConnectionEstablishmentFailure { .. }
         | TransportError::OutboundStreamFailed(_)
         | TransportError::OutboundStreamInvalidLength(..)
+        | TransportError::SendQueueFull(_)
         | TransportError::Udp(UdpError(UdpErrorKind::IO(_)))
         | TransportError::Other(_)
         | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_)))
@@ -4021,6 +4022,7 @@ pub mod mock_transport {
             | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..)))
             | TransportError::OutboundStreamFailed(_)
             | TransportError::OutboundStreamInvalidLength(..)
+            | TransportError::SendQueueFull(_)
             | TransportError::Udp(UdpError(UdpErrorKind::IO(_)))
             | TransportError::Other(_)
             | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_)))
@@ -4041,6 +4043,7 @@ pub mod mock_transport {
             | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..)))
             | TransportError::OutboundStreamFailed(_)
             | TransportError::OutboundStreamInvalidLength(..)
+            | TransportError::SendQueueFull(_)
             | TransportError::Udp(UdpError(UdpErrorKind::IO(_)))
             | TransportError::Other(_)
             | TransportError::Udp(UdpError(UdpErrorKind::PubKeyDecryptionError(_)))
