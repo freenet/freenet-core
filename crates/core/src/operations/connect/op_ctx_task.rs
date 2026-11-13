@@ -424,6 +424,10 @@ async fn drive_client_connect(
     // Standard join at zero connections, but its first hop is no gateway.
     let started = Instant::now();
     let mut heard_gateway = false;
+    // The first relay sends exactly one `ObservedAddress` per CONNECT, so only
+    // the first one is acted on; repeats would otherwise let any sender keep
+    // rewriting this node's own address until the TTL.
+    let mut applied_observed_address = false;
     let through_gateway = op_manager
         .configured_gateways
         .iter()
@@ -939,7 +943,15 @@ async fn drive_client_connect(
                 collection_end = Some((CollectionEnd::Rejected, Instant::now()));
                 continue;
             }
+            ConnectMsg::ObservedAddress { address, .. } if applied_observed_address => {
+                tracing::debug!(
+                    tx = %tx,
+                    observed_address = %address,
+                    "connect driver: ignoring repeated ObservedAddress"
+                );
+            }
             ConnectMsg::ObservedAddress { address, .. } => {
+                applied_observed_address = true;
                 // The joiner doesn't know its external IP behind NAT;
                 // the gateway observes it from the UDP packet source
                 // and ships it back. Update both `own_addr` (for
