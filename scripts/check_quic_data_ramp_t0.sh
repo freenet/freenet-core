@@ -14,8 +14,9 @@
 # version that would ship the ramp unchecked fails closed like a late cut:
 # T0 set with no release named; a version before the named one; a later one
 # that skips it while this tree (crates/core/Cargo.toml) has not reached it;
-# a later one while the ramp release is not on crates.io, or crates.io gives
-# no clear answer (the bump can merge and the publish then fail); a later one
+# a later one while the ramp release is not a published (non-draft) GitHub
+# release or not on crates.io, or either gives no clear answer (the bump can
+# merge and the publish or un-draft then fail); a later one
 # cut more than WINDOW before T0. With no T0, or no ramp release and no T0, it
 # prints a notice and exits 0.
 #
@@ -132,6 +133,47 @@ published() {
     esac
 }
 
+# Whether v$1 is a published (non-draft) GitHub release: returns 0 published,
+# 1 not (HTTP 404: no release, or only a draft, which this endpoint does not
+# return), 2 unknown (any other answer, or none). Nodes update from GitHub's
+# latest release, so this, not crates.io, is what says a release reached them.
+# Authenticated when a token is at hand (GH_TOKEN, GITHUB_TOKEN, or `gh auth
+# token`), since the anonymous limit is 60 requests an hour per address.
+github_release_published() {
+    local code token dir answer=2
+    token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+    if [[ -z "$token" ]] && command -v gh >/dev/null 2>&1; then
+        token="$(gh auth token 2>/dev/null || true)"
+    fi
+    # The token goes to curl in a file (mktemp makes it private), not on its
+    # command line, where other processes could read it.
+    dir="$(mktemp -d)"
+    local auth=()
+    if [[ -n "$token" ]]; then
+        printf 'Authorization: Bearer %s\n' "$token" > "$dir/auth"
+        auth=(-H "@$dir/auth")
+    fi
+    if code="$(curl -sS -o "$dir/body" -w '%{http_code}' -A 'freenet-release-check' \
+        -H 'Accept: application/vnd.github+json' "${auth[@]}" \
+        --max-time 30 --retry 3 --retry-all-errors \
+        "https://api.github.com/repos/freenet/freenet-core/releases/tags/v$1")"; then
+        case "$code" in
+            200)
+                # The endpoint returns published releases only; require the body
+                # to say so too, so an answer that is not that does not pass.
+                if [[ "$(tr -d '[:space:]' < "$dir/body")" == *'"draft":false'* ]]; then
+                    answer=0
+                else
+                    echo "GitHub answered 200 for v$1 without \"draft\": false"
+                fi ;;
+            404) answer=1 ;;
+            *) echo "GitHub answered HTTP $code for v$1" ;;
+        esac
+    fi
+    rm -rf "$dir"
+    return "$answer"
+}
+
 # T0 in seconds, or empty for None; a value written another way exits 2.
 t0=""
 if [[ "$start_value" != "None" ]]; then
@@ -194,8 +236,14 @@ if [[ "$ramp_release" != "$VERSION" ]]; then
     # The tree reaching the ramp release says only that its bump merged; its
     # publish can still have failed or been cancelled, and then this later
     # version would be the first to ship the ramp, unchecked. So the ramp
-    # release must be on crates.io, and an answer that is not a clear yes or
-    # no fails closed.
+    # release must be a published GitHub release (what nodes update from) and
+    # on crates.io, and an answer that is not a clear yes or no fails closed.
+    github_release_published "$ramp_release"
+    case $? in
+        0) ;;
+        1) finding "Release $VERSION comes after the QUIC data ramp release ($ramp_release), but v$ramp_release is not a published GitHub release (none, or still a draft), so nodes never received it and this release would ship the ramp unchecked. Publish v$ramp_release first (scripts/RELEASE_RECOVERY.md), or change QUIC_DATA_RAMP_RELEASE and T0 in a reviewed PR (docs/RELEASING.md)." ;;
+        *) finding "Release $VERSION comes after the QUIC data ramp release ($ramp_release), and whether v$ramp_release is a published GitHub release cannot be determined, so this release is refused rather than risk shipping the ramp unchecked. Retry when GitHub answers." ;;
+    esac
     published freenet "$ramp_release"
     case $? in
         0) ;;
@@ -212,7 +260,7 @@ fi
 
 # This is the ramp release.
 if [[ -z "$t0" ]]; then
-    finding "Release $VERSION is the QUIC data ramp release (QUIC_DATA_RAMP_RELEASE), but QUIC_DATA_RAMP_START is None. Set T0 to the planned publish time in a reviewed PR first (docs/RELEASING.md)."
+    finding "Release $VERSION is the QUIC data ramp release (QUIC_DATA_RAMP_RELEASE), but QUIC_DATA_RAMP_START is None. To cut the ramp, set T0 to the planned publish time in a reviewed PR first. After an emergency stop, cut another version instead, or set QUIC_DATA_RAMP_RELEASE to None in a reviewed PR (docs/RELEASING.md)."
 fi
 off=$((NOW - t0))
 abs=${off#-}
