@@ -2186,8 +2186,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                             // here). Accept it exactly as when the old
                                             // session was still `Established`, so a
                                             // reconnect through the existing NAT hole keeps
-                                            // working. Bounded: the entry lives for
-                                            // `RECENTLY_CLOSED_DURATION` after the sweep.
+                                            // working. Bounded: the entry is removed by the
+                                            // first sweep after `RECENTLY_CLOSED_DURATION`
+                                            // has passed (sweeps run every
+                                            // `RATE_LIMIT_CLEANUP_INTERVAL`).
                                             tracing::info!(
                                                 peer_addr = %remote_addr,
                                                 "Detected peer restart (new intro on recently closed connection). Resetting session."
@@ -5754,6 +5756,7 @@ pub mod mock_transport {
     #[tokio::test(start_paused = true)]
     async fn a_non_gateway_accepts_a_restart_after_the_ended_session_was_swept()
     -> anyhow::Result<()> {
+        let (logs, log_guard) = crate::util::test_log_capture::install();
         let channels = Arc::new(DashMap::new());
         let (listener_pub, (mut listener, mut listener_inbound), listener_addr) =
             create_mock_peer_internal(
@@ -5811,6 +5814,24 @@ pub mod mock_transport {
             reconnect.remote_addr(),
             restarting_addr,
             "the listener accepted the restarted peer's intro"
+        );
+
+        // Fail closed: if the sweep had not run, the intro would have been
+        // accepted by the `Established` restart path and this test would pass
+        // without touching the `RecentlyClosed` branch. Require the log of
+        // that branch, and none from the other one.
+        drop(log_guard);
+        let logs = logs.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("new intro on recently closed connection")),
+            "the restart must be accepted by the RecentlyClosed branch; captured: {logs:?}"
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|l| l.contains("new intro on established connection")),
+            "the Established restart path must not have handled it; captured: {logs:?}"
         );
         Ok(())
     }
