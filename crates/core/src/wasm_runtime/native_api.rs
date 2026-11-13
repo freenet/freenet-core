@@ -1655,6 +1655,22 @@ fn validate_and_compute_ptr<T>(
 pub(super) mod log {
     use super::*;
 
+    /// Render at most `MAX_GUEST_ERROR_TEXT_BYTES` of a guest log line. `bytes`
+    /// is the prefix already cut to that bound; `full_len` is the length the
+    /// guest asked to log.
+    pub(super) fn guest_log_message(bytes: &[u8], full_len: usize) -> String {
+        let mut msg = String::from_utf8_lossy(bytes).into_owned();
+        if full_len > bytes.len() {
+            // The cut may split a multi-byte char, which lossy decoding turns
+            // into U+FFFD; drop that trailing artefact.
+            while msg.ends_with('\u{FFFD}') {
+                msg.pop();
+            }
+            msg.push_str(&format!("... [truncated, {full_len} bytes total]"));
+        }
+        msg
+    }
+
     // TODO: this API right now is just a patch, ideally we want to impl a tracing subscriber
     // that can be used in wasm and that under the hood will just pass data to the host via
     // functions like this in a structured way
@@ -1670,12 +1686,17 @@ pub(super) mod log {
             tracing::error!("Memory bounds violation in freenet_log::info");
             return;
         };
-        // SAFETY: `ptr` was validated by `validate_and_compute_ptr` to be within the
-        // WASM linear memory bounds. The bytes come from an untrusted WASM contract and
-        // may not be valid UTF-8, so we use from_utf8_lossy which replaces invalid byte
+        // Only a bounded prefix is read: the guest picks `len`, and logging all
+        // of it lets one call write up to the whole linear memory to the logs.
+        let full_len = len as usize;
+        let take = full_len.min(super::super::error::MAX_GUEST_ERROR_TEXT_BYTES);
+        // SAFETY: `ptr` was validated by `validate_and_compute_ptr` to cover
+        // `len` bytes of WASM linear memory, and `take <= len`. The bytes come
+        // from an untrusted WASM contract and may not be valid UTF-8, so
+        // `guest_log_message` uses from_utf8_lossy, which replaces invalid byte
         // sequences with U+FFFD rather than invoking undefined behavior.
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-        let msg = String::from_utf8_lossy(bytes);
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, take) };
+        let msg = guest_log_message(bytes, full_len);
         tracing::info!(target: "contract", contract = %info.value().key(), "{msg}");
     }
 }
@@ -3573,5 +3594,23 @@ mod secret_read_memo_tests {
             "the shared-borrow form must appear; if it does not, the search is \
              wrong and the assertion above proves nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod guest_log_tests {
+    use super::log::guest_log_message;
+
+    #[test]
+    fn short_log_line_is_unchanged() {
+        assert_eq!(guest_log_message(b"hello", 5), "hello");
+    }
+
+    #[test]
+    fn oversize_log_line_is_truncated_with_marker() {
+        let big = vec![b'a'; 1024];
+        let out = guest_log_message(&big, 80_000_000);
+        assert!(out.len() < 1100);
+        assert!(out.ends_with("[truncated, 80000000 bytes total]"));
     }
 }
