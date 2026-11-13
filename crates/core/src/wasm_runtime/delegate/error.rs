@@ -3,8 +3,9 @@ use freenet_stdlib::prelude::{DelegateError, DelegateKey, SecretsId};
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
 pub enum DelegateExecError {
-    /// Built only through the `From<DelegateError>` impl, which bounds
-    /// the guest-supplied text.
+    /// Guest-returned errors reach this variant through the `From` impl, which
+    /// bounds the guest-supplied text. Constructing it directly (tests, mocks)
+    /// bypasses that bound, so only do so with host-authored text.
     #[error(transparent)]
     DelegateError(DelegateError),
 

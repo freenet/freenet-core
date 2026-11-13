@@ -61,25 +61,62 @@ impl Drop for DelegateEnvGuard {
 /// return a handful of messages per call.
 pub(crate) const MAX_OUTBOUND_MSGS_PER_RUN: usize = 4096;
 
-/// Largest serialized result accepted from one `process()` call, and the most
-/// serialized bytes of results kept across one request.
+/// Largest serialized result accepted from one `process()` call.
+///
+/// Only the top-level message count is checked before decoding. Collections
+/// nested inside a message (payloads, contract code and state) are bounded by
+/// bytes alone, so the real ceiling on their size is this cap together with
+/// the guest's 256 MiB linear memory limit.
 pub(crate) const MAX_OUTBOUND_BYTES_PER_RUN: usize = 128 * 1024 * 1024;
 
-/// Read the (guest pointer, length) pair out of a `DelegateInterfaceResult`,
-/// whose fields are private to stdlib. Its layout is `#[repr(C)] { ptr: i64,
-/// size: u32 }`; the `descriptor_layout_matches_stdlib` test pins that.
-fn descriptor_parts(d: DelegateInterfaceResult) -> (i64, u32) {
-    #[repr(C)]
-    struct Mirror {
-        ptr: i64,
-        size: u32,
+/// Most serialized bytes of results kept across all inbound messages of one
+/// request. Larger than the per-call cap because `PutContractRequest` carries
+/// contract code and state (each up to `MAX_STATE_SIZE`), so several legitimate
+/// PUTs in one request must fit.
+pub(crate) const MAX_OUTBOUND_BYTES_PER_REQUEST: usize = 256 * 1024 * 1024;
+
+/// Mirror of stdlib's private `DelegateInterfaceResult` layout:
+/// `#[repr(C)] { ptr: i64, size: u32 }`. The `descriptor_layout_matches_stdlib`
+/// test pins that.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DescriptorMirror {
+    ptr: i64,
+    size: u32,
+}
+
+const _: () = assert!(
+    std::mem::size_of::<DelegateInterfaceResult>() == std::mem::size_of::<DescriptorMirror>()
+);
+
+/// Read the result descriptor the guest's `process()` returned a pointer to.
+///
+/// `res` is guest-controlled, so it is checked against the linear memory size
+/// (with checked arithmetic) and read unaligned, since the guest may return any
+/// offset.
+fn read_descriptor(
+    mem: &freenet_stdlib::memory::WasmLinearMem,
+    res: i64,
+) -> Result<DescriptorMirror, DelegateExecError> {
+    let bad = || {
+        DelegateExecError::from(freenet_stdlib::prelude::DelegateError::Other(
+            "delegate result descriptor points outside linear memory".into(),
+        ))
+    };
+    let offset = u64::try_from(res).map_err(|_| bad())?;
+    let end = offset
+        .checked_add(std::mem::size_of::<DescriptorMirror>() as u64)
+        .ok_or_else(bad)?;
+    if end > mem.size {
+        return Err(bad());
     }
-    const _: () =
-        assert!(std::mem::size_of::<DelegateInterfaceResult>() == std::mem::size_of::<Mirror>());
-    // SAFETY: sizes are equal (asserted above) and both are `repr(C)` with the
-    // same field types; the layout test guards against stdlib changing it.
-    let m = unsafe { std::mem::transmute_copy::<DelegateInterfaceResult, Mirror>(&d) };
-    (m.ptr, m.size)
+    // SAFETY: [offset, offset + size_of::<DescriptorMirror>()) was just checked
+    // to lie within the linear memory starting at `start_ptr`; the read is
+    // unaligned, so no alignment is assumed. `DescriptorMirror` is plain data
+    // for which every bit pattern is valid.
+    Ok(unsafe {
+        std::ptr::read_unaligned(mem.start_ptr.add(offset as usize) as *const DescriptorMirror)
+    })
 }
 
 /// Refuse a run whose accumulated results, plus the queue about to be added,
@@ -92,8 +129,8 @@ pub(crate) fn check_run_budget(
     let total = results.len().saturating_add(queue.len());
     if total > MAX_OUTBOUND_MSGS_PER_RUN {
         return Err(DelegateError::Other(format!(
-            "delegate produced {total} messages in one request, more than the limit of \
-             {MAX_OUTBOUND_MSGS_PER_RUN}"
+            "per-request message budget exceeded: delegate produced {total} messages in one \
+             request, more than the limit of {MAX_OUTBOUND_MSGS_PER_RUN}"
         ))
         .into());
     }
@@ -102,10 +139,10 @@ pub(crate) fn check_run_budget(
         .saturating_add(
             bincode::serialized_size(&queue.iter().collect::<Vec<_>>()).unwrap_or(u64::MAX),
         );
-    if bytes > MAX_OUTBOUND_BYTES_PER_RUN as u64 {
+    if bytes > MAX_OUTBOUND_BYTES_PER_REQUEST as u64 {
         return Err(DelegateError::Other(format!(
-            "delegate results of {bytes} bytes in one request exceed the limit of \
-             {MAX_OUTBOUND_BYTES_PER_RUN}"
+            "per-request byte budget exceeded: delegate results of {bytes} bytes in one \
+             request exceed the limit of {MAX_OUTBOUND_BYTES_PER_REQUEST}"
         ))
         .into());
     }
@@ -123,7 +160,8 @@ pub(crate) fn decode_delegate_result(
 
     if serialized.len() > MAX_OUTBOUND_BYTES_PER_RUN {
         return Err(refuse(format!(
-            "delegate result of {} bytes exceeds the {MAX_OUTBOUND_BYTES_PER_RUN} byte limit",
+            "per-call byte limit exceeded: delegate result of {} bytes exceeds the \
+             {MAX_OUTBOUND_BYTES_PER_RUN} byte limit",
             serialized.len()
         )));
     }
@@ -415,11 +453,8 @@ impl Runtime {
         )?;
 
         let linear_mem = self.linear_mem(handle)?;
-        // SAFETY: `res` is the return value from the WASM `process` call and
-        // `linear_mem` points to the instance's live linear memory, so `from_raw`
-        // reads a valid, in-bounds result descriptor.
-        let descriptor = unsafe { DelegateInterfaceResult::from_raw(res, &linear_mem) };
-        let (data_ptr, data_len) = descriptor_parts(descriptor);
+        let descriptor = read_descriptor(&linear_mem, res)?;
+        let (data_ptr, data_len) = (descriptor.ptr, descriptor.size);
         // The descriptor is guest-controlled: check the range it names lies
         // inside linear memory before building a slice over it.
         let end = u64::try_from(data_ptr)
@@ -723,7 +758,11 @@ mod bound_tests {
     fn huge_claimed_count_is_refused_without_allocating() {
         let mut bytes = vec![0u8; 4];
         bytes.extend_from_slice(&u64::MAX.to_le_bytes());
-        assert!(decode_delegate_result(&bytes).is_err());
+        // Pad so that decoding would not hit EOF before reaching the element
+        // count: only the pre-check can produce the count-limit error.
+        bytes.extend_from_slice(&[0u8; 64]);
+        let err = decode_delegate_result(&bytes).unwrap_err();
+        assert!(err.to_string().contains("more than the limit"), "{err}");
     }
 
     #[test]
@@ -748,7 +787,11 @@ mod bound_tests {
         let ok_queue: VecDeque<_> = mk(half).into();
         assert!(check_run_budget(&mk(half), &ok_queue).is_ok());
         let big_queue: VecDeque<_> = mk(half + 1).into();
-        assert!(check_run_budget(&mk(half), &big_queue).is_err());
+        let err = check_run_budget(&mk(half), &big_queue).unwrap_err();
+        assert!(
+            err.to_string().contains("per-request message budget"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -759,9 +802,40 @@ mod bound_tests {
             serialized_len = bincode::serialized_size(&r).unwrap() as u32;
             r.into()
         };
-        let (ptr, len) = descriptor_parts(d);
-        assert_ne!(ptr, 0);
-        assert_eq!(len, serialized_len);
+        // SAFETY: sizes are equal (const-asserted above); both are `repr(C)`.
+        let m =
+            unsafe { std::mem::transmute_copy::<DelegateInterfaceResult, DescriptorMirror>(&d) };
+        assert_ne!(m.ptr, 0);
+        assert_eq!(m.size, serialized_len);
+    }
+
+    fn mem_over(buf: &[u8]) -> freenet_stdlib::memory::WasmLinearMem {
+        // SAFETY: `buf` outlives the returned view within each test.
+        unsafe { freenet_stdlib::memory::WasmLinearMem::new(buf.as_ptr(), buf.len() as u64) }
+    }
+
+    #[test]
+    fn descriptor_out_of_range_is_refused() {
+        let buf = vec![0u8; 64];
+        let mem = mem_over(&buf);
+        for res in [-1i64, i64::MIN, 1 << 40, i64::MAX, 64, 64 - 11] {
+            let err = read_descriptor(&mem, res).err().expect("must be refused");
+            assert!(
+                err.to_string().contains("outside linear memory"),
+                "{res}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn unaligned_descriptor_is_read() {
+        let mut buf = vec![0u8; 64];
+        let (ptr, size) = (0x0102_0304_0506_0708i64, 0x0a0b_0c0du32);
+        // Offset 3 is misaligned for an i64.
+        buf[3..11].copy_from_slice(&ptr.to_ne_bytes());
+        buf[11..15].copy_from_slice(&size.to_ne_bytes());
+        let d = read_descriptor(&mem_over(&buf), 3).unwrap();
+        assert_eq!((d.ptr, d.size), (ptr, size));
     }
 }
 

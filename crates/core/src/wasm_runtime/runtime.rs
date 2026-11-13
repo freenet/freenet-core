@@ -373,8 +373,9 @@ impl From<ContractError> for ContractExecError {
 
 #[derive(thiserror::Error, Debug)]
 pub enum ContractExecError {
-    /// Built only through the `From<ContractError>` impl, which bounds
-    /// the guest-supplied text.
+    /// Guest-returned errors reach this variant through the `From` impl, which
+    /// bounds the guest-supplied text. Constructing it directly (tests, mocks)
+    /// bypasses that bound, so only do so with host-authored text.
     #[error(transparent)]
     ContractError(ContractError),
 
