@@ -8,13 +8,15 @@
 //! or remove a key also note it in the set: anything outside this module reads
 //! the map through `Deref` (a shared `BTreeMap`) and changes an entry in place
 //! through [`ConnectionMap::get_mut`] or [`ConnectionMap::iter_mut`], none of
-//! which can add, remove or replace a key. A map that is dropped, including
-//! one replaced or taken out of its field whole, closes its keys in the set.
-//! The compiler enforces all of this, so no source scan has to.
+//! which can add, remove or replace a key. A map that is dropped closes its
+//! keys in the set. The compiler enforces all of this, so no source scan has
+//! to.
 //!
-//! What it does not cover: two live maps over one manager. Production builds
-//! one; a second would share the set, and dropping it would close addresses
-//! the first still holds.
+//! It holds for one live map per manager, which is what production builds.
+//! [`ConnectionMap::new`] debug-asserts the manager's set is empty. A second
+//! live map over the same manager would share the set, so replacing a map
+//! with a non-empty one, or dropping one while another holds the same
+//! addresses, would leave the set out of step with the live map.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map;
@@ -36,7 +38,13 @@ pub(super) struct ConnectionMap {
 
 impl ConnectionMap {
     /// An empty map whose keys `transports`' open-transport set mirrors.
+    /// The set must be empty: one live map per manager.
     pub(super) fn new(transports: ConnectionManager) -> Self {
+        debug_assert_eq!(
+            transports.open_transport_count(),
+            0,
+            "a ConnectionMap over a manager whose open-transport set is not empty"
+        );
         Self {
             map: BTreeMap::new(),
             transports: Some(transports),
@@ -158,21 +166,62 @@ mod tests {
         assert_eq!(manager.open_transport_addrs(), keys(&map));
     }
 
-    /// A map replaced or taken out of its place whole closes its addresses,
-    /// so the set holds the keys of the map that replaced it.
+    /// A dropped map closes its addresses, after which the manager can take
+    /// a new map.
     #[tokio::test]
-    async fn a_replaced_map_closes_its_addresses() {
+    async fn a_dropped_map_closes_its_addresses() {
         let manager = ConnectionManager::test_default();
         let mut map = ConnectionMap::new(manager.clone());
         map.insert(addr(1), entry(1));
         map.insert(addr(2), entry(2));
-        map = ConnectionMap::new(manager.clone());
+        drop(map);
         assert!(manager.open_transport_addrs().is_empty());
+        let mut map = ConnectionMap::new(manager.clone());
         map.insert(addr(3), entry(3));
-        let taken = std::mem::replace(&mut map, ConnectionMap::new(manager.clone()));
-        assert_eq!(keys(&taken), BTreeSet::from([addr(3)]));
-        drop(taken);
         assert_eq!(manager.open_transport_addrs(), keys(&map));
-        assert!(manager.open_transport_addrs().is_empty());
+    }
+
+    /// A map replaced whole, by assignment or taken out with `mem::replace`,
+    /// closes its addresses in its own manager's set once it is dropped, and
+    /// the map that replaced it is mirrored in its manager.
+    #[tokio::test]
+    async fn a_replaced_map_closes_its_addresses_in_its_own_manager() {
+        let (first, second, third) = (
+            ConnectionManager::test_default(),
+            ConnectionManager::test_default(),
+            ConnectionManager::test_default(),
+        );
+        let mut map = ConnectionMap::new(first.clone());
+        map.insert(addr(1), entry(1));
+        map.insert(addr(2), entry(2));
+        let taken = std::mem::replace(&mut map, ConnectionMap::new(second.clone()));
+        assert_eq!(
+            first.open_transport_addrs(),
+            keys(&taken),
+            "held while alive"
+        );
+        drop(taken);
+        assert!(first.open_transport_addrs().is_empty());
+        map.insert(addr(3), entry(3));
+        assert_eq!(second.open_transport_addrs(), keys(&map));
+        map = ConnectionMap::new(third.clone());
+        assert!(
+            second.open_transport_addrs().is_empty(),
+            "assignment drops the old map"
+        );
+        map.insert(addr(4), entry(4));
+        assert_eq!(third.open_transport_addrs(), keys(&map));
+    }
+
+    /// A second map over a manager that already has open transports is
+    /// refused in debug builds: one live map per manager.
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "open-transport set is not empty")]
+    async fn a_second_live_map_over_one_manager_is_refused() {
+        let manager = ConnectionManager::test_default();
+        let mut map = ConnectionMap::new(manager.clone());
+        map.insert(addr(1), entry(1));
+        let _second = ConnectionMap::new(manager.clone());
     }
 }

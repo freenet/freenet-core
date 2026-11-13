@@ -35,11 +35,11 @@ pub(in crate::transport) const SEED: u64 = 0x0059_40C2;
 
 /// One datagram as a test socket saw it leave.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Sent {
-    at_ns: u64,
-    from: SocketAddr,
-    to: SocketAddr,
-    bytes: Vec<u8>,
+pub(in crate::transport::quic) struct Sent {
+    pub(in crate::transport::quic) at_ns: u64,
+    pub(in crate::transport::quic) from: SocketAddr,
+    pub(in crate::transport::quic) to: SocketAddr,
+    pub(in crate::transport::quic) bytes: Vec<u8>,
 }
 
 /// A socket that records every datagram sent through it, with the time on
@@ -389,7 +389,7 @@ impl Pair {
         result
     }
 
-    fn sent(&self) -> Vec<Sent> {
+    pub(in crate::transport::quic) fn sent(&self) -> Vec<Sent> {
         self.log.lock().unwrap().clone()
     }
 
@@ -705,7 +705,12 @@ fn client_config_presenting(
     server_key: &TransportPublicKey,
 ) -> (quinn::ClientConfig, PeerKey) {
     let peer = PeerKey::of(server_key).unwrap();
-    let tls = config::tls_client_config(key, Arc::new(PinnedServerKey::new(&peer))).unwrap();
+    let tls = config::tls_client_config(
+        key,
+        Arc::new(PinnedServerKey::new(&peer)),
+        config::Alpn::Upgrade,
+    )
+    .unwrap();
     (endpoint.client_config(Arc::new(tls)), peer)
 }
 

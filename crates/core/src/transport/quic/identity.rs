@@ -39,7 +39,7 @@ use rustls::{
 };
 use subtle::ConstantTimeEq;
 
-use super::config::{self, TlsConfigError};
+use super::config::{self, Alpn, TlsConfigError};
 use crate::transport::crypto::{TransportKeypair, TransportPublicKey};
 
 /// DER prefix of an Ed25519 SubjectPublicKeyInfo (RFC 8410); the 32-byte
@@ -284,15 +284,42 @@ impl QuicIdentity {
         &self,
         server: &PeerKey,
     ) -> Result<quinn::crypto::rustls::QuicClientConfig, TlsConfigError> {
-        config::tls_client_config(self.certified_key(), Arc::new(PinnedServerKey::new(server)))
+        self.client_tls_for(server, Alpn::Upgrade)
+    }
+
+    /// [`Self::client_tls`] offering `alpn`.
+    pub(crate) fn client_tls_for(
+        &self,
+        server: &PeerKey,
+        alpn: Alpn,
+    ) -> Result<quinn::crypto::rustls::QuicClientConfig, TlsConfigError> {
+        config::tls_client_config(
+            self.certified_key(),
+            Arc::new(PinnedServerKey::new(server)),
+            alpn,
+        )
     }
 
     /// TLS for accepting a connection from the holder of `client`.
+    #[cfg(test)]
     pub(crate) fn server_tls(
         &self,
         client: &PeerKey,
     ) -> Result<quinn::crypto::rustls::QuicServerConfig, TlsConfigError> {
-        config::tls_server_config(self.certified_key(), Arc::new(PinnedClientKey::new(client)))
+        self.server_tls_for(client, Alpn::Upgrade)
+    }
+
+    /// [`Self::server_tls`] offering `alpn`.
+    pub(crate) fn server_tls_for(
+        &self,
+        client: &PeerKey,
+        alpn: Alpn,
+    ) -> Result<quinn::crypto::rustls::QuicServerConfig, TlsConfigError> {
+        config::tls_server_config(
+            self.certified_key(),
+            Arc::new(PinnedClientKey::new(client)),
+            alpn,
+        )
     }
 
     /// TLS that completes no handshake: the endpoint's default server
@@ -301,7 +328,11 @@ impl QuicIdentity {
     pub(crate) fn refusing_server_tls(
         &self,
     ) -> Result<quinn::crypto::rustls::QuicServerConfig, TlsConfigError> {
-        config::tls_server_config(self.certified_key(), Arc::new(RefuseEveryClient))
+        config::tls_server_config(
+            self.certified_key(),
+            Arc::new(RefuseEveryClient),
+            Alpn::Upgrade,
+        )
     }
 }
 

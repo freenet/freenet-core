@@ -1944,3 +1944,48 @@ fn a_data_route_is_paced_only_when_the_session_has_a_pacer() {
         }
     });
 }
+
+/// The router hands a native attempt only to a native waiter: with none for
+/// its address it is ignored, even while an upgrade session holds a route for
+/// that address, and once a waiter is registered it reaches the waiter after a
+/// Retry. The session's inbox never sees it.
+#[test]
+fn native_attempts_reach_only_native_waiters() {
+    bounded(|| async {
+        let h = Harness::server("driver-native-dispatch").await;
+        let rig = RetryRig::of(&h);
+        let (_session, mut inbox) = h.session();
+        let _permit = rig
+            .ours
+            .allow_native_peer_for_test(h.remote, &h.peer)
+            .expect("room");
+        let (theirs, our_addr, our_key) = (rig.theirs.clone(), rig.our_addr, rig.our_key.clone());
+        let dial =
+            tokio::spawn(async move { theirs.dial_native_for_test(our_addr, &our_key).await });
+
+        let attempt = rig.next_attempt().await;
+        assert!(attempt.is_native());
+        h.hub.dispatch(attempt);
+        assert_eq!(h.hub.native_waiters().len(), 0, "nothing registered");
+        assert!(inbox.try_recv().is_err(), "not routed to the session");
+
+        let mut waiter = h
+            .hub
+            .native_waiters()
+            .register_for_test(h.remote)
+            .expect("the waiter");
+        // The first attempt is answered with a Retry, the second is handed.
+        for _ in 0..2 {
+            let attempt = rig.next_attempt().await;
+            assert!(attempt.is_native());
+            h.hub.dispatch(attempt);
+        }
+        let (handed, _in_flight) = drive(&h.pair.time, Duration::from_secs(1), async move {
+            waiter.next().await.expect("handed")
+        })
+        .await;
+        assert_eq!(handed.source(), h.remote);
+        assert!(inbox.try_recv().is_err(), "not routed to the session");
+        dial.abort();
+    });
+}

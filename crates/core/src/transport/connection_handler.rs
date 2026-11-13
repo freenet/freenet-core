@@ -30,6 +30,144 @@ use tracing::{Instrument, span};
 use version_cmp::PROTOC_VERSION;
 pub(crate) use version_cmp::{OWN_FLOOR, OWN_VERSION};
 
+/// The UDP handshake's version rules, for the `Hello` of a native QUIC
+/// connection (#5940, design 2.1), so both paths read a peer's version the
+/// same way.
+pub(crate) mod native_version {
+    use super::version_cmp::{
+        PROTOC_VERSION, is_compatible, parse_version_bytes, remote_requires_newer_than_us,
+    };
+
+    /// This build's 8 version bytes, as the UDP handshake sends them.
+    pub(crate) const OWN: [u8; 8] = PROTOC_VERSION;
+
+    /// Check a peer's version bytes as the UDP handshake checks an intro's:
+    /// the version is reported (`report_peer_version`) either way, and a peer
+    /// whose floor is above this build asks for an urgent update
+    /// ([`needs_urgent_update`]). `Err` names why the two cannot talk.
+    pub(crate) fn check(remote: &[u8; 8]) -> Result<(u8, u8, u16), String> {
+        check_then(remote, crate::transport::signal_urgent_update)
+    }
+
+    /// [`check`] with the urgent-update signal as `urgent`, so a test can see
+    /// it fire without latching the process-wide flag.
+    fn check_then(remote: &[u8; 8], urgent: impl FnOnce()) -> Result<(u8, u8, u16), String> {
+        match is_compatible(&OWN, remote) {
+            Ok(info) => {
+                crate::transport::report_peer_version(info.version);
+                Ok(info.version)
+            }
+            Err(reason) => {
+                crate::transport::report_peer_version(parse_version_bytes(remote).version);
+                if needs_urgent_update(remote) {
+                    urgent();
+                }
+                Err(reason)
+            }
+        }
+    }
+
+    /// Whether a peer's version bytes say this build must update: the peer's
+    /// floor is above this build.
+    pub(crate) fn needs_urgent_update(remote: &[u8; 8]) -> bool {
+        remote_requires_newer_than_us(&OWN, remote)
+    }
+
+    /// A peer closed with `VERSION_INCOMPATIBLE`, its version bytes as the
+    /// reason; sets the version-mismatch signal when
+    /// [`rejection_signals_mismatch`] says so.
+    pub(crate) fn rejected_by(peer_version: &[u8], peer_is_gateway: bool) {
+        rejected_by_then(
+            peer_version,
+            peer_is_gateway,
+            crate::transport::signal_version_mismatch,
+        );
+    }
+
+    /// [`rejected_by`] with the mismatch signal as `mismatch`, so a test can
+    /// see it fire without latching the process-wide flag.
+    fn rejected_by_then(peer_version: &[u8], peer_is_gateway: bool, mismatch: impl FnOnce()) {
+        if rejection_signals_mismatch(peer_version, peer_is_gateway) {
+            mismatch();
+        }
+    }
+
+    /// As for a gateway's version-mismatch ack on UDP, only a gateway's
+    /// rejection counts, only when its floor is above this build, and only
+    /// with a reason of exactly 8 bytes.
+    pub(crate) fn rejection_signals_mismatch(peer_version: &[u8], peer_is_gateway: bool) -> bool {
+        let Ok(bytes) = <[u8; 8]>::try_from(peer_version) else {
+            return false;
+        };
+        peer_is_gateway && remote_requires_newer_than_us(&OWN, &bytes)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::version_cmp::OWN_VERSION;
+        use super::*;
+
+        /// Version bytes in format 1 for this build's major.minor, with
+        /// `patch` and a floor of `floor`.
+        fn same_series(patch: u16, floor: u16) -> [u8; 8] {
+            let (major, minor, _) = OWN_VERSION;
+            let [p_hi, p_lo] = patch.to_be_bytes();
+            let [f_hi, f_lo] = floor.to_be_bytes();
+            [0xFF, major, minor, p_hi, p_lo, f_hi, f_lo, 1]
+        }
+
+        /// A peer whose floor is above this build.
+        fn requires_newer() -> [u8; 8] {
+            let own = OWN_VERSION.2;
+            let newer = same_series(own + 2, own + 1);
+            assert!(remote_requires_newer_than_us(&OWN, &newer), "premise");
+            newer
+        }
+
+        /// Only a gateway's rejection whose floor is above this build sets
+        /// the mismatch signal; an ordinary peer's, a gateway at this build's
+        /// version, and a reason that is not 8 bytes do not.
+        #[test]
+        fn only_a_gateway_requiring_a_newer_build_signals_a_mismatch() {
+            let newer = requires_newer();
+            assert!(rejection_signals_mismatch(&newer, true));
+            assert!(!rejection_signals_mismatch(&newer, false));
+            assert!(!rejection_signals_mismatch(&OWN, true));
+            assert!(!rejection_signals_mismatch(&newer[..7], true));
+            let mut long = newer.to_vec();
+            long.push(0);
+            assert!(!rejection_signals_mismatch(&long, true));
+            // And the signal is really sent, and only then; through a counter,
+            // so no process-wide flag is latched for other tests.
+            for (version, gateway, expected) in [
+                (&newer[..], true, 1),
+                (&newer[..], false, 0),
+                (&OWN[..], true, 0),
+            ] {
+                let mut fired = 0;
+                rejected_by_then(version, gateway, || fired += 1);
+                assert_eq!(fired, expected, "gateway {gateway}");
+            }
+        }
+
+        /// A peer whose floor is above this build is incompatible and asks
+        /// for an urgent update; a peer this build is compatible with does
+        /// not.
+        #[test]
+        fn a_peer_requiring_a_newer_build_asks_for_an_urgent_update() {
+            let newer = requires_newer();
+            assert!(needs_urgent_update(&newer));
+            assert!(!needs_urgent_update(&OWN));
+            let mut fired = 0;
+            assert!(check_then(&newer, || fired += 1).is_err());
+            assert_eq!(fired, 1);
+            let mut fired = 0;
+            assert_eq!(check_then(&OWN, || fired += 1), Ok(OWN_VERSION));
+            assert_eq!(fired, 0);
+        }
+    }
+}
+
 use super::{
     Socket, SocketRead, TransportError, UdpError, UdpErrorKind,
     congestion_control::{CongestionControl, CongestionControlConfig},

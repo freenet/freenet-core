@@ -1635,7 +1635,9 @@ exposes (its module doc lists the few it does not):
   streams to 16, then toward 64 with load, and its meter the windows), send window the floor (128 KiB,
   64 KiB under 2 GiB), stream receive window 8 MiB, no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
-  no NEW_TOKEN tokens (Retry only), rustls ring, TLS 1.3, fixed ALPN, no SNI, no
+  no NEW_TOKEN tokens (Retry only), rustls ring, TLS 1.3, one ALPN per attempt
+  (freenet-quic/1 for an upgrade, freenet-quic/2 for a native connection; see
+  "QUIC-native setup"), no SNI, no
   resumption, no early data. Keys and seeds (reset key, token key, CID key,
   quinn's rng_seed, initial destination CIDs): keys from the OS, seeds and
   CIDs from GlobalRng (see below).
@@ -1974,10 +1976,12 @@ no extra message, no exporter proof.
     signature is checked with ring against the EXPECTED key. Anything else fails the handshake.
   → Client: connect(addr, &expected_server_key) builds TLS pinned to it.
   → Server: allow_peer(addr, &expected_client_key) puts the address on the
-    allow-set AND records the key (QuicPeerPermit; a second key for an
-    address already held is KeyConflict). accept() looks the key up by the
-    attempt's (normalized) address and accepts with a per-attempt server
-    config whose TLS is pinned to it (Incoming::accept_with); an attempt
+    allow-set AND records the key and the connection's kind (QuicPeerPermit;
+    a second key for an address already held, or the same key for the other
+    kind, upgrade or native, is KeyConflict). accept() looks the key and kind
+    up by the attempt's (normalized) address and accepts with a per-attempt
+    server config whose TLS is pinned to the key and offers that kind's one
+    ALPN (Incoming::accept_with); an attempt
     with no recorded key is ignored. The endpoint's own server config
     (needed so quinn passes Initials to accept) refuses every client.
   → When the SERVER refuses the client, the client may see connect()
@@ -2015,6 +2019,57 @@ signatures verified by ed25519-dalek and refused with any bit flipped,
 nonce differs under one GlobalRng seed, handshakes in both directions, and
 refusal of a wrong server key, a wrong client key, a plain Ed25519 key on
 either side, and a man in the middle with its own key on either leg.
+```
+
+#### QUIC-native setup (`quic/native/`, #5940 QUIC-native connect, A4)
+
+Built and tested, and unreachable by construction: `setup::connect_native`,
+`setup::accept_native` and the endpoint's native side (`native/endpoint.rs`:
+`allow_native_peer`, `dial_native`, `send_punch`) are
+`pub(in crate::transport::quic::native)`, and registering a native waiter is
+private to `setup`. Nothing outside `quic/native` can call them; A5 widens
+them in a visible diff. The connect op also gates on
+`operations::connect::native::NATIVE_DIAL_READY` (pinned false).
+
+```
+ALPN per attempt: an address allowed with allow_native_peer is accepted with
+  freenet-quic/2 only; every other address keeps freenet-quic/1. An address
+  is allowed for one kind at a time (KeyConflict for the other). dial_native
+  offers /2 only, with a 100 ms initial RTT (NATIVE_INITIAL_RTT).
+Router: an attempt from a native-allowed address goes only to
+  native::waiters (QuicUpgrades::dispatch), never to an upgrade session. The
+  only production registration is in accept_native. Handing an attempt over
+  marks the waiter busy until its InFlight guard drops; others are ignored.
+  An attempt without a Retry token gets a Retry first (one more round trip
+  in the window).
+Hello (native/hello.rs, frozen layout) is exchanged on one uni stream each
+  way (native/exchange.rs). A malformed one closes with HELLO_REFUSED; a
+  version this node cannot talk to closes with VERSION_INCOMPATIBLE and this
+  node's 8 version bytes as the reason (close_with_reason). Version rules
+  are the UDP handshake's (connection_handler::native_version).
+Punches (native/punch.rs): byte 0x03 + 8 GlobalRng bytes, sent on the
+  endpoint's socket with try_send (charged unpaced), at once and every
+  250 ms, at most 32 per setup (288 B). A client also sends at most 12
+  padded Initials (quinn sends two probes per timeout: 9 in 8 s and a
+  close; a Retry does not reset the probe count, so one more after a Retry,
+  11 of 12), so a client setup is charged 14688 B and a server
+  setup 288 B, before anything is sent. PunchBudget: 64 KiB per destination
+  per minute (an IPv4 address, or an IPv6 /64), and 1 MiB per minute for the
+  node (provisional); 4096 destinations remembered, and a new one replaces
+  the least recently charged only once that one has refilled (else
+  refused, PunchRefusal::Table), so forgetting never gives bytes back early.
+  The silent-peer test checks a client sends no more than it was charged.
+Setup (native/setup.rs): one window, 8 s cut to the caller's deadline, not
+  started with less than 4 s left; punching, the handshake and the Hello
+  exchange all inside it. The budget is charged after the checks that fail
+  without sending (window, key, waiter, allow). Roles by key order are the
+  caller's decision.
+Not decided here (A5): fairness between the requesters that steer setups,
+  for both budgets. A requester steering about 4 client setups a minute at
+  one destination empties that destination's budget, blocking native setups
+  to every peer behind it; steering about 71 a minute empties the node
+  budget, blocking native setups to every destination. Both must be fair
+  before UDP is removed.
 ```
 
 #### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)

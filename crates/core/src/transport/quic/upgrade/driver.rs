@@ -89,6 +89,7 @@ use crate::transport::peer_connection::inbound_budget::SharedInboundBudget;
 use crate::transport::quic::config::QuicRateLimit;
 use crate::transport::quic::control::ControlError;
 use crate::transport::quic::identity::PeerKey;
+use crate::transport::quic::native::waiters::NativeWaiters;
 use crate::transport::quic::path::pacer::{LimitPacer, SendPacer};
 use crate::transport::quic::path::{
     BoundedSend, QuicDataInbox, QuicDataSenders, QuicPath, QuicPathLimits, data_channels,
@@ -433,6 +434,10 @@ pub(in crate::transport) struct QuicUpgrades {
     /// throttles the warning; the exported count is
     /// `quic_upgrade_inbox_overflow`.
     inbox_overflow: AtomicU64,
+    /// Native servers waiting for their peer's attempt, which the router hands
+    /// every native attempt to (`native::waiters`). Filled only by the native
+    /// accept.
+    native: Arc<NativeWaiters>,
     #[cfg(any(test, feature = "testing"))]
     trace: Option<super::sim_trace::NodeTrace>,
     /// Where a test's paths keep their node-wide counts in place of
@@ -463,6 +468,7 @@ impl QuicUpgrades {
             seeds: Mutex::new(SeedStore::new(SEED_STORE_ENTRIES)),
             next_session: AtomicU64::new(1),
             inbox_overflow: AtomicU64::new(0),
+            native: Arc::default(),
             #[cfg(any(test, feature = "testing"))]
             trace,
             #[cfg(test)]
@@ -483,7 +489,7 @@ impl QuicUpgrades {
         let handle = GlobalExecutor::spawn(async move {
             while let Some(incoming) = attempts.recv().await {
                 match hub.upgrade() {
-                    Some(hub) => hub.route(incoming),
+                    Some(hub) => hub.dispatch(incoming),
                     None => incoming.ignore(),
                 }
             }
@@ -492,6 +498,24 @@ impl QuicUpgrades {
             std::future::pending::<()>().await;
         });
         registrar.register("quic_attempt_router", handle);
+    }
+
+    /// Route one attempt: an attempt from an address allowed as native goes
+    /// only to a native waiter, never to an upgrade session; any other to the
+    /// session of its address.
+    fn dispatch(&self, incoming: QuicIncoming) {
+        if incoming.is_native() {
+            let route = self.native.route(incoming);
+            tracing::debug!(?route, "Routed a native QUIC connection attempt");
+        } else {
+            self.route(incoming);
+        }
+    }
+
+    /// The native waiters the router hands native attempts to.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(in crate::transport) fn native_waiters(&self) -> &Arc<NativeWaiters> {
+        &self.native
     }
 
     /// Hand `incoming` to the session of its address, without waiting. With no
