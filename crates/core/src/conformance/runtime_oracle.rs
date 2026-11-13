@@ -301,7 +301,8 @@ fn classify(err: RuntimeContractError) -> OracleError {
             ContractExecError::DoublePut(_)
             | ContractExecError::InvalidArrayLength(_)
             | ContractExecError::MissingContractExports { .. }
-            | ContractExecError::UnexpectedResult => OracleError::runtime(err.to_string()),
+            | ContractExecError::UnexpectedResult
+            | ContractExecError::InvalidGuestMemory(_) => OracleError::runtime(err.to_string()),
         },
         RuntimeInnerError::Any(_)
         | RuntimeInnerError::BufferError(_)
