@@ -1384,7 +1384,7 @@ impl QuicPath {
     }
 
     /// Count this path in the node's `quic_live_data_paths` gauge, once: its
-    /// route was installed. Undone by [`Self::uncount_as_data_path`] or a refusal.
+    /// route was installed. Undone by [`Self::end_as_data_path`] or a refusal.
     pub(in crate::transport) fn count_as_data_path(&self) {
         if !self.counted_as_data_path.swap(true, Ordering::AcqRel) {
             self.stats.node().data_path_started();
@@ -1406,9 +1406,17 @@ impl QuicPath {
     /// reading, taken after this, is counted as carrying too
     /// (`recycle::Carrying::at_end`). A path the peer refused data on is out
     /// already, so nothing is lowered twice and it is not marked.
+    ///
+    /// The mark is set before the gauge flag is cleared: the final report
+    /// reads the gauge flag first and the mark second, so a report running
+    /// between the two steps sees the path as carrying either way. A refusal
+    /// that takes the path out in between clears the mark again.
     pub(in crate::transport) fn end_as_data_path(&self) {
-        if self.uncount_as_data_path() {
+        if self.counted_as_data_path.load(Ordering::Acquire) {
             self.ended_as_data_path.store(true, Ordering::Release);
+            if !self.uncount_as_data_path() {
+                self.ended_as_data_path.store(false, Ordering::Release);
+            }
         }
     }
 

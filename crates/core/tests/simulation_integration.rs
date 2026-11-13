@@ -21630,9 +21630,14 @@ fn test_quic_data_ramp_stops_against_a_node_on_the_default_off_release() {
             "{name}: premise: the share reached the pair at {reaches_at:?}, well inside the run (to {ran_to:?}): {}",
             run.dump()
         );
+        // The stopped pair keeps its first path: exactly one. The control's
+        // path is recycled once and comes up again with data: exactly two. A
+        // churn loop fails either.
+        let paths = if stopped { 1 } else { 2 };
         for node in &run.nodes {
-            assert!(
-                run.whats(*node, "Established") >= 1,
+            assert_eq!(
+                run.whats(*node, "Established"),
+                paths,
                 "{name}: {}",
                 run.dump()
             );
@@ -21660,6 +21665,13 @@ fn test_quic_data_ramp_stops_against_a_node_on_the_default_off_release() {
             assert!(
                 run.total("RecycledForData") > 0,
                 "{name}: the control recycles the path once the share reaches it: {}",
+                run.dump()
+            );
+            // Positive control for the stopped run's "no data on the path": the
+            // marker is emitted when a pair does carry data.
+            assert!(
+                run.total("sent a short on the path") > 0,
+                "{name}: the control sends data on the path: {}",
                 run.dump()
             );
         }
