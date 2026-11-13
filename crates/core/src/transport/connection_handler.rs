@@ -1788,16 +1788,26 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         }
     }
 
-    /// Clean up expired RecentlyClosed states and rate limit entries.
+    /// Clean up expired RecentlyClosed states, Established states whose
+    /// connection has ended, and rate limit entries.
+    ///
+    /// An `Established` entry is only replaced when the same address sends
+    /// again, so one whose `PeerConnection` is gone (receiver dropped, sender
+    /// closed) would otherwise hold its inbound channel buffer until process
+    /// exit. A closed sender can never deliver another packet, so dropping the
+    /// entry loses nothing; a later packet from that address is handled like
+    /// any packet from an unknown address.
     fn cleanup_expired(&mut self) {
         let now = self.time_source.now_nanos();
 
-        self.states.retain(|_, state| {
-            if let ConnectionState::RecentlyClosed { closed_at_nanos } = state {
+        self.states.retain(|_, state| match state {
+            ConnectionState::RecentlyClosed { closed_at_nanos } => {
                 now.saturating_sub(*closed_at_nanos) < RECENTLY_CLOSED_DURATION.as_nanos() as u64
-            } else {
-                true
             }
+            ConnectionState::Established {
+                inbound_packet_sender,
+            } => !inbound_packet_sender.is_closed(),
+            ConnectionState::GatewayHandshake { .. } | ConnectionState::NatTraversal { .. } => true,
         });
 
         self.last_asym_attempt.retain(|_, last_attempt_nanos| {
