@@ -1252,6 +1252,9 @@ pub(crate) struct QuicCloser {
     health: Arc<EndpointHealth>,
     /// The code of the close this closer sent, if it sent one.
     closed_with: Arc<std::sync::OnceLock<QuicCloseCode>>,
+    /// Why this node closed, when the caller said (`close_for`). Set before
+    /// the close is sent, so whoever sees the connection end sees it.
+    closed_for: Arc<std::sync::OnceLock<crate::transport::boundary::QuicPathEnd>>,
 }
 
 impl QuicCloser {
@@ -1266,6 +1269,7 @@ impl QuicCloser {
             closing: Arc::default(),
             health,
             closed_with: Arc::default(),
+            closed_for: Arc::default(),
         }
     }
 
@@ -1293,11 +1297,33 @@ impl QuicCloser {
     /// node's 8 version bytes.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn close_with_reason(&self, code: QuicCloseCode, reason: &[u8]) -> bool {
+        self.close_inner(code, reason, None)
+    }
+
+    /// [`Self::close`], recording `cause` as why this node closed
+    /// ([`Self::closed_for`]) if this call closes the connection.
+    pub(crate) fn close_for(
+        &self,
+        code: QuicCloseCode,
+        cause: crate::transport::boundary::QuicPathEnd,
+    ) -> bool {
+        self.close_inner(code, code.reason(), Some(cause))
+    }
+
+    fn close_inner(
+        &self,
+        code: QuicCloseCode,
+        reason: &[u8],
+        cause: Option<crate::transport::boundary::QuicPathEnd>,
+    ) -> bool {
         if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return false;
         }
         if self.connection.close_reason().is_some() {
             return false;
+        }
+        if let Some(cause) = cause {
+            let _first = self.closed_for.set(cause);
         }
         if self.health.closes_can_be_sent() {
             TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
@@ -1310,6 +1336,12 @@ impl QuicCloser {
     /// The code of the close this node sent on the connection, if it sent one.
     pub(crate) fn closed_with(&self) -> Option<QuicCloseCode> {
         self.closed_with.get().copied()
+    }
+
+    /// Why this node closed the connection, if it closed it with
+    /// [`Self::close_for`].
+    pub(crate) fn closed_for(&self) -> Option<crate::transport::boundary::QuicPathEnd> {
+        self.closed_for.get().copied()
     }
 
     /// Whether the connection is still open (quinn has no close reason).

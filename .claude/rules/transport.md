@@ -2131,6 +2131,44 @@ Not decided here (A5): fairness between the requesters that steer setups,
   before UDP is removed.
 ```
 
+Native connection (`peer_connection/native_connection.rs`, A5a): the
+`PeerConnectionApi` over a native connection, built by nothing in production
+until A5b wires the connect op.
+
+```
+Path: QuicPathLimits::NATIVE (DEFAULT with udp_fallback off) and data
+  enabled at once. A send whose next step would be UDP is given up (counted
+  Dropped, a stream's completion told Dropped), and a quiet timeout never
+  makes the path suspect (suspect only diverts data to UDP); a dark path
+  ends by the stall close or the acknowledgement watch's dark rule. A peer
+  refusing data (NOT_ACCEPTING_DATA) closes the native path at once
+  (QuicPath::stop_sending_data); left open it would drop every later send.
+  Upgrade paths keep udp_fallback on and are unchanged.
+Shorts: DataRoute::native, no UDP sender. queue_native_short refuses a full
+  queue with TransportError::SendQueueFull (Transient: the connection
+  survives, the message is counted Dropped, no ShortOverflowUdp), and an
+  ended path with ConnectionClosed. The worker drops and counts a short it
+  cannot put on the path (ended, or refusing data while it closes).
+Receive: recv reads the path's inbox through InboundDispatch, the same record
+  a UDP connection keeps (metadata dispatched once, stream ids not reused).
+  When the connection ends, both inbox channels are drained before recv
+  fails.
+End reasons (close_reason after recv fails): quinn's idle TimedOut is
+  CloseReason::IdleTimeout; everything else is CloseReason::QuicPath with a
+  QuicPathEnd. A close this node makes records its cause at the close site
+  (QuicCloser::close_for: Stalled, NotAcknowledging, SendAborts,
+  PeerOverBudget, RefusedData, PeerRefusedData, ReceiveTaskPanicked), first
+  cause wins; a
+  local close with none is ClosedLocally, the peer's close ClosedByPeer, and
+  any other end Lost. The disconnect label is QuicPathEnd::label.
+Pacing: the bandwidth limit paces its data with a LimitPacer on the path's
+  clock, as an upgrade session's does.
+Drop: closes with NODE_DROPPED_PEER at once (send tasks hold the path) and
+  cancels its unclaimed inbound streams, as PeerConnection's drop does.
+send_bytes_observed is always Unobserved: no message is a stream it reports.
+The route worker runs under report_panics (task_panicked).
+```
+
 #### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)
 
 The upgrade driver builds a `QuicPath` and sends control frames on it. Data goes on
@@ -2238,8 +2276,9 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
     repeated timeouts close the path. NotOpened opened nothing, so it does not
     count.
   → A NOT_ACCEPTING_DATA stop means the sender's gating is wrong: log it and
-    send the message on UDP, do not retry on this path. A sender cannot rely
-    on seeing it (see the stop code).
+    send the message on UDP, do not retry on this path (a native path, with no
+    UDP, closes instead). A sender cannot rely on seeing it (see the stop
+    code).
   Sends have no deadline of their own: open_uni, a flow-blocked write
   and the final wait for acks can wait as long as the connection lives
   against a peer that does not cooperate. Every node send MUST go through

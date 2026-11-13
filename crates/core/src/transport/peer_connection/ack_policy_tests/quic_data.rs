@@ -152,7 +152,7 @@ fn a_short_and_a_stream_on_a_path_arrive_as_the_udp_ones_do() {
                 .send_stream(id, Some(b"announce"), payload.clone())
                 .await;
             assert_eq!(rig.e.conn.recv().await.unwrap(), b"announce");
-            assert!(rig.e.conn.completed_inbound_streams.contains(&id));
+            assert!(rig.e.conn.dispatch.completed_inbound_streams.contains(&id));
             assert_eq!(rig.budget().0, 1, "the consumer's to hold");
             let stream = claim((&rig.registry, rig.peer_addr()), id).await;
             assert_eq!(stream.assemble().await.unwrap(), payload.to_vec());
@@ -521,7 +521,7 @@ fn a_stream_with_no_registry_is_cancelled_and_its_charge_released() {
         "quic-data-noregistry",
         QuicPathLimits::DEFAULT,
         |mut rig| async move {
-            rig.e.conn.inbound_stream_registry = None;
+            rig.e.conn.dispatch.inbound_stream_registry = None;
             rig.path
                 .send_stream(StreamId::next(), Some(b"meta"), bytes_of(50))
                 .await;

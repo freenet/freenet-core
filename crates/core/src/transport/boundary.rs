@@ -332,6 +332,59 @@ pub(crate) enum CloseReason {
     /// The peer had more refused inbound streams outstanding than are
     /// remembered.
     InboundStreamRefusals,
+    /// A QUIC-native connection's path ended, for the reason given.
+    QuicPath(QuicPathEnd),
+}
+
+/// Why a QUIC-native connection's path ended, other than the idle timeout
+/// ([`CloseReason::IdleTimeout`]). A cause this node closed for is recorded
+/// where it closed (`QuicCloser::close_for`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuicPathEnd {
+    /// This node's sends kept timing out with nothing acknowledged (the
+    /// path's stall count).
+    Stalled,
+    /// The peer acknowledged none of this node's packets while it kept
+    /// sending, or stopped acknowledging data (the acknowledgement watch).
+    NotAcknowledging,
+    /// This node reset more sends on the connection than it remembers
+    /// (`recycle::SEND_ABORT_LIMIT`).
+    SendAborts,
+    /// The peer held more of this node's buffer budget than it allows.
+    PeerOverBudget,
+    /// The peer sent data on a path that refuses it.
+    RefusedData,
+    /// The peer refused this node's data (`NOT_ACCEPTING_DATA`) on a path that
+    /// has no UDP session to send it on instead.
+    PeerRefusedData,
+    /// The path's receive task panicked.
+    ReceiveTaskPanicked,
+    /// The peer closed the connection.
+    ClosedByPeer,
+    /// This node closed it for another reason (its connection was dropped).
+    ClosedLocally,
+    /// The connection was lost: a reset, a transport error, or an end quinn
+    /// reports in any other way.
+    Lost,
+}
+
+impl QuicPathEnd {
+    /// The disconnect label. None contains "timeout", "limit", "pruned" or
+    /// "unresponsive", which `DisconnectReason` parses as other reasons.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Stalled => "quic_path_stalled",
+            Self::NotAcknowledging => "quic_peer_not_acknowledging",
+            Self::SendAborts => "quic_send_aborts",
+            Self::PeerOverBudget => "quic_peer_over_budget",
+            Self::RefusedData => "quic_refused_data",
+            Self::PeerRefusedData => "quic_peer_refused_data",
+            Self::ReceiveTaskPanicked => "quic_receive_task_panicked",
+            Self::ClosedByPeer => "quic_closed_by_peer",
+            Self::ClosedLocally => "quic_closed_locally",
+            Self::Lost => "quic_connection_lost",
+        }
+    }
 }
 
 /// An inbound stream, as the layers above the transport see it: claimed from
