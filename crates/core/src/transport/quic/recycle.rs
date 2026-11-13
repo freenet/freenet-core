@@ -1189,7 +1189,7 @@ impl AckWatch {
         if self.dark_since.take().is_some()
             && let (Some(node), Some(ended)) = (self.dark_counts, ended)
         {
-            node.record_dark_episode(ended);
+            node.record_dark_episode(ended, self.closes_dark());
         }
     }
 

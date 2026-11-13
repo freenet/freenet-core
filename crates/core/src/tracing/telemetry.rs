@@ -7925,6 +7925,7 @@ mod tests {
         data.carrying_ended_loss_rate = (1069..1077).collect();
         data.carrying_ended_below_floor = 1077;
         data.dark_episodes = (1078..1086).collect();
+        data.carried_dark_episodes = (1087..1095).collect();
         data.ramp_share_pct = 1086;
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
