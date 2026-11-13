@@ -975,16 +975,6 @@ impl ConnMeter {
         self.budget.send_epoch(self.id)
     }
 
-    /// This connection's send window now; [`MAX_WINDOW_BYTES`] if it is not
-    /// metered any more.
-    pub(crate) fn send_window(&self) -> u64 {
-        let state = self.budget.state.lock();
-        state
-            .conns
-            .get(&self.id)
-            .map_or(MAX_WINDOW_BYTES, |conn| conn.send_window)
-    }
-
     /// The node's buffer budget has room for a raise of this path's stream
     /// limit ([`QuicBudget::has_room`]).
     pub(crate) fn budget_has_room(&self) -> bool {

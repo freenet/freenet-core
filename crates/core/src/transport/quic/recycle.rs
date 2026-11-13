@@ -457,6 +457,12 @@ pub(crate) struct AckState {
     in_flight_after_acks: u64,
     /// Bytes declared lost since that batch (`on_congestion_event`).
     lost_since_acks: u64,
+    /// The latest batch came while quinn was application-limited: its last
+    /// `poll_transmit` built nothing and was not held back by the congestion
+    /// window or pacing (quinn-proto `app_limited = buf.is_empty() &&
+    /// !congestion_blocked`), so it had nothing left to send but what the
+    /// peer's flow control held.
+    last_batch_app_limited: bool,
 }
 
 impl AckState {
@@ -495,10 +501,31 @@ impl AckProgress {
         self.0.lock().acked_bytes
     }
 
+    /// Batches of acknowledgements so far, and whether the latest came while
+    /// quinn was application-limited ([`AckState`]).
+    pub(crate) fn batches_app_limited(&self) -> (u64, bool) {
+        let state = self.0.lock();
+        (state.batches, state.last_batch_app_limited)
+    }
+
     /// A record of no connection, moved by [`Self::ack`]. Tests only.
     #[cfg(test)]
     pub(crate) fn detached() -> Self {
         Self(Arc::default())
+    }
+
+    /// A batch of acknowledgements of `bytes`, which came while quinn was
+    /// `app_limited` or not. Tests only.
+    #[cfg(test)]
+    pub(crate) fn batch(&self, bytes: u64, app_limited: bool) {
+        let mut state = self.0.lock();
+        state.acked += 1;
+        state.acked_bytes += bytes;
+        state.batches += 1;
+        if !app_limited {
+            state.congestion_limited_batches += 1;
+        }
+        state.last_batch_app_limited = app_limited;
     }
 
     /// The peer newly acknowledged one more packet. Tests only.
@@ -614,6 +641,7 @@ impl Controller for CappedCubic {
             if !app_limited {
                 state.congestion_limited_batches += 1;
             }
+            state.last_batch_app_limited = app_limited;
             state.in_flight_after_acks = in_flight;
             state.lost_since_acks = 0;
         }

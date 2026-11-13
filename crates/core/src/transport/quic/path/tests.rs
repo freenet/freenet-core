@@ -959,6 +959,90 @@ fn a_send_past_its_ack_wait_is_reset_and_counted() {
     })
 }
 
+/// The strike check on its own (`StrikeCheck`), with a 100 ms round trip
+/// (floor 32 KiB/s) and a 300 s wait since the end was sent:
+/// - a quiet connection whose ack batches after the end came while quinn
+///   was application-limited: the end went out and the peer is alive, a
+///   strike whatever the rate (a peer that withholds only stream ends);
+/// - a congestion-limited connection that acknowledged under the floor: no
+///   evidence, no strike (a genuinely slow path);
+/// - one that acknowledged the floor over the wait: a strike;
+/// - the egress cap holding a transmit now: no strike, whatever else;
+/// - hold events since the end, each credited the cap's longest wait: that
+///   time is taken off the wait the floor is judged over, and a wait wholly
+///   held is no strike.
+#[test]
+fn the_strike_check_needs_evidence_that_the_end_went_out() {
+    use super::super::socket::CapHolds;
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let make = |cap: &Arc<CapHolds>| {
+        let acks = recycle::AckProgress::detached();
+        let clock = now.clone();
+        let check = StrikeCheck {
+            acks: acks.clone(),
+            cap: cap.clone(),
+            rtt: Arc::new(|| Duration::from_millis(100)),
+            now: Arc::new(move || clock.load(Relaxed)),
+        };
+        (check, acks)
+    };
+    let wait = 300 * 1_000_000_000u64;
+    let floor_over = |nanos: u64| (32 * 1024 * u128::from(nanos)).div_ceil(1_000_000_000) as u64;
+    // `during` runs between the end being sent and the expiry.
+    let run = |cap: &Arc<CapHolds>, during: &dyn Fn(&recycle::AckProgress)| {
+        let (check, acks) = make(cap);
+        now.store(1_000, Relaxed);
+        let mark = check.mark();
+        during(&acks);
+        now.store(1_000 + wait, Relaxed);
+        check.strikes(mark)
+    };
+    let uncapped = Arc::new(CapHolds::new(None));
+    assert!(
+        run(&uncapped, &|acks| acks.batch(100, true)),
+        "quiet, application-limited"
+    );
+    assert!(
+        !run(&uncapped, &|acks| acks.batch(100, false)),
+        "slow, congestion-limited"
+    );
+    assert!(
+        run(&uncapped, &|acks| acks.batch(floor_over(wait), false)),
+        "busy at the floor"
+    );
+    assert!(
+        !run(&uncapped, &|_| {}),
+        "nothing acknowledged since the end"
+    );
+
+    let capped = Arc::new(CapHolds::new(Some(100_000)));
+    capped.hold_one();
+    assert!(
+        !run(&capped, &|acks| acks.batch(floor_over(wait), true)),
+        "the cap holds a transmit now"
+    );
+    capped.release_one();
+    // One hold event since the end: the cap's longest wait comes off the
+    // time the floor is judged over.
+    let held = u64::try_from(capped.read().longest_wait.as_nanos()).unwrap();
+    assert!(held > 0 && held < wait);
+    let unheld = floor_over(wait - held);
+    let one_hold = |bytes: u64| {
+        let cap = capped.clone();
+        move |acks: &recycle::AckProgress| {
+            cap.hold_one();
+            cap.release_one();
+            acks.batch(bytes, false);
+        }
+    };
+    assert!(
+        run(&capped, &one_hold(unheld)),
+        "the floor over the unheld time"
+    );
+    assert!(!run(&capped, &one_hold(unheld - 1)), "just under it");
+}
+
 /// The ack-wait expiry rule on a real path (#6205), with sends whose ack wait
 /// cannot be met (1 s on a 4 s round trip), standing in for a peer that
 /// never acknowledges stream ends. A bulk transfer runs throughout, so the
@@ -970,9 +1054,13 @@ fn a_send_past_its_ack_wait_is_reset_and_counted() {
 /// - expiry, expiry, a stream acknowledged within its ack wait, expiry (one
 ///   end in three acknowledged): still closed at the third, since
 ///   acknowledgements never reset the count;
-/// - the same three expiries with no bulk transfer, so the connection
-///   acknowledges nothing during each wait (a path too slow to have
-///   delivered the end): no strike, not closed.
+/// - the same three expiries with no bulk transfer: each wait (1 s) ends
+///   before any acknowledgement could come back (4 s round trip), so there
+///   is no evidence the end went out yet and no strike: not closed. (The
+///   evidence on a quiet connection, ack batches after the end while quinn
+///   was application-limited, is tested on its own in
+///   `the_strike_check_needs_evidence_that_the_end_went_out`: this harness's
+///   peer acknowledges every packet it gets, so it cannot withhold an end.)
 #[test]
 fn ack_wait_expiries_close_a_path_whatever_else_is_acknowledged() {
     use crate::transport::in_memory_socket::{
@@ -1110,15 +1198,15 @@ fn ack_wait_expiries_close_a_path_whatever_else_is_acknowledged() {
                     vec![recycle::Stall::AckWaitsExpired],
                     "{network}"
                 );
+                let snapshot = counters.snapshot(false);
+                assert_eq!(snapshot.ack_wait_expired, vec![3, 0, 0], "{network}");
                 assert_eq!(
-                    counters.snapshot(false).ack_wait_expired,
-                    vec![3, 0, 0],
-                    "{network}"
+                    snapshot.stall_closes,
+                    vec![0, 0, 0, 0, 1],
+                    "{network}: counted as an ack-waits close"
                 );
             } else {
                 assert_eq!(closed_at, None, "{network}: no strike, not closed");
-                assert_eq!(p.a.writers().ack_wait_expiries(), 0, "{network}");
-                assert_eq!(p.a.send_aborts(), 3, "{network}: still reset");
             }
         }
     })
@@ -1144,6 +1232,8 @@ fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes() {
             ..SendDeadlines::stream(10_000)
         };
         let holds = a.connection().cap_holds();
+        let acks = recycle::AckProgress::of(a.connection().inner()).expect("CappedCubic");
+        let (acked_before, started) = (acks.acked_bytes(), time.now_nanos());
         p.drive(async move {
             // Four transfers at once keep the cap's queue full.
             let bulk: Vec<_> = (0..4)
@@ -1185,6 +1275,11 @@ fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes() {
         })
         .await;
         assert!(holds.read().holds > 0, "premise: the cap held transmits");
+        let secs = (p.time().now_nanos() - started) / 1_000_000_000;
+        assert!(
+            acks.acked_bytes() - acked_before >= 32 * 1024 * secs,
+            "premise: the connection acknowledged above the floor, so only the cap excuses it"
+        );
         assert!(
             p.a.send_aborts() >= 1,
             "premise: an ack wait ran out and its stream was reset"
@@ -1260,12 +1355,14 @@ fn a_one_packet_shorts_background_ack_wait_is_bounded() {
     })
 }
 
-/// Several large streams at once on a slow path see no ack-wait expiry: four
-/// 2 MiB streams on a 40 KiB/s link (a 400 ms round trip, a 1 s queue), sent
-/// on a node's deadlines. quinn shares the link round-robin, so each
-/// stream's tail waits behind the others' bytes; the ack wait covers the
-/// streams in flight times the send window at the floor
+/// Several large streams at once on a slow path see no ack-wait expiry:
+/// eight 2 MiB streams on a 40 KiB/s link (a 400 ms round trip, a 1 s queue),
+/// sent on a node's deadlines. quinn shares the link round-robin, so a
+/// stream whose bytes are all queued (its end sent) drains at an eighth of
+/// the link, about 410 s for its 2 MiB, past the 300 s base wait; the ack
+/// wait covers the streams in flight times the send window at the floor
 /// (`QuicPath::stream_deadlines`), and every send ends `Sent` with no reset.
+/// Without that backlog term the later streams are reset.
 #[test]
 fn concurrent_large_streams_on_a_slow_path_see_no_expiry() {
     use crate::transport::in_memory_socket::{
@@ -1308,7 +1405,7 @@ fn concurrent_large_streams_on_a_slow_path_see_no_expiry() {
         let (a, time) = (p.a.clone(), p.time());
         let outcomes = p
             .drive(async move {
-                let sends: Vec<_> = (0..4)
+                let sends: Vec<_> = (0..8)
                     .map(|_| {
                         let (a, time) = (a.clone(), time.clone());
                         tokio::spawn(async move {
@@ -1444,6 +1541,105 @@ fn a_short_and_a_control_past_their_bound_under_bulk_acks_are_strikes() {
         );
         assert_eq!(counters.snapshot(false).ack_wait_expired, vec![0, 1, 1]);
         assert_eq!(p.a.writers().ack_wait_expiries(), 2);
+    })
+}
+
+/// A genuinely slow path is not struck: a hidden 8 KiB/s link (under the
+/// 16 KiB/s floor at its 4 s round trip) kept full by a bulk transfer, so
+/// every ack batch comes while quinn's congestion window holds data back
+/// (not application-limited) and the connection acknowledges under the
+/// floor. Sends whose ack wait runs out (1 s here) are reset, but neither
+/// evidence holds, so they are not strikes and the path is not closed.
+#[test]
+fn ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    const RATE: u64 = 8 * 1024;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-expiries-slow";
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_secs(2))
+            })),
+        );
+        let mut p = paths(network, QuicPathLimits::DEFAULT).await;
+        let (a_addr, time) = (p.pair.a_addr, p.time());
+        let free_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, bytes: &[u8]| {
+                let now = time.now_nanos();
+                if sender != a_addr {
+                    return PacketDeliveryDecision::DelayedDelivery(Duration::from_secs(2));
+                }
+                let start = free_at.load(Relaxed).max(now);
+                if start - now > 2_000_000_000 {
+                    return PacketDeliveryDecision::Drop;
+                }
+                let done = start + bytes.len() as u64 * 1_000_000_000 / RATE;
+                free_at.store(done, Relaxed);
+                PacketDeliveryDecision::DelayedDelivery(
+                    Duration::from_nanos(done - now) + Duration::from_secs(2),
+                )
+            })),
+        );
+        let mut streams = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+        let drain = tokio::spawn(async move {
+            let mut kept = Vec::new();
+            while let Some(stream) = streams.recv().await {
+                kept.push(stream);
+            }
+        });
+        let (a, time) = (p.a.clone(), p.time());
+        let never = SendDeadlines {
+            open: Duration::from_secs(30),
+            gap: Some(Duration::from_secs(30)),
+            ack_wait: Some(Duration::from_secs(1)),
+            ..SendDeadlines::stream(10_000)
+        };
+        let (aborts, closed) = p
+            .drive(async move {
+                let bulk = {
+                    let a = a.clone();
+                    tokio::spawn(async move {
+                        a.send_stream(StreamId::next(), None, Bytes::from(payload(4 * MIB)))
+                            .await
+                            .ok();
+                    })
+                };
+                time.sleep(Duration::from_secs(20)).await;
+                for _ in 0..3 {
+                    let _ = a
+                        .send_stream_bounded(
+                            &time,
+                            never,
+                            StreamId::next(),
+                            None,
+                            Bytes::from(payload(10_000)),
+                            None,
+                        )
+                        .await;
+                    time.sleep(Duration::from_secs(5)).await;
+                }
+                bulk.abort();
+                (
+                    a.send_aborts(),
+                    a.connection().inner().close_reason().is_some(),
+                )
+            })
+            .await;
+        drain.abort();
+        set_packet_delivery_callback(network, None);
+        assert!(
+            aborts >= 1,
+            "premise: an ack wait ran out and its stream was reset"
+        );
+        assert_eq!(p.a.writers().ack_wait_expiries(), 0, "no strike");
+        assert!(!closed);
     })
 }
 
@@ -6264,6 +6460,7 @@ fn the_gap_runs_from_the_last_step_and_total_still_binds() {
             source_gap: None,
             total: Duration::from_secs(60),
             ack_wait: None,
+            ack_wait_covers_backlog: false,
         };
         let (stalled, stalled_after, steady, steady_after) = drive(&time, LIMIT, async move {
             let start = clock.now();
@@ -6330,6 +6527,7 @@ async fn stuck_send(
         source_gap: None,
         total,
         ack_wait: None,
+        ack_wait_covers_backlog: false,
     };
     let start = clock.now();
     let ticking = clock.clone();
@@ -6454,6 +6652,7 @@ fn a_live_send_held_in_the_cap_queue_past_its_gap_is_sent() {
                 source_gap: None,
                 total: Duration::from_secs(120),
                 ack_wait: None,
+                ack_wait_covers_backlog: false,
             };
             let ticking = clock.clone();
             let queue = async move {
@@ -6521,6 +6720,7 @@ fn an_acknowledgement_the_record_has_not_seen_credits_the_next_send() {
                 source_gap: None,
                 total: Duration::from_secs(120),
                 ack_wait: None,
+                ack_wait_covers_backlog: false,
             };
             let ticking = clock.clone();
             let queue = async move {
@@ -6631,6 +6831,7 @@ fn a_send_waiting_for_its_source_ends_at_its_own_gap() {
                 source_gap: None,
                 total: Duration::from_secs(120),
                 ack_wait: None,
+                ack_wait_covers_backlog: false,
             };
             let start = clock.now();
             let ticking = clock.clone();
@@ -6691,6 +6892,7 @@ fn progress_from_before_the_send_does_not_extend_its_gap() {
                 source_gap: None,
                 total: Duration::from_secs(120),
                 ack_wait: None,
+                ack_wait_covers_backlog: false,
             };
             let start = clock.now();
             let sent = bounded_send(&clock, deadlines, Some(connection), |progress| async move {
@@ -6726,6 +6928,7 @@ fn a_quiet_proof_says_whether_its_send_saw_a_live_hold() {
                 source_gap: None,
                 total: Duration::from_secs(120),
                 ack_wait: None,
+                ack_wait_covers_backlog: false,
             };
             let mut proofs = Vec::new();
             for live in [true, false] {
@@ -6792,6 +6995,7 @@ fn a_hold_read_live_by_a_wake_voids_the_proof() {
                 source_gap: None,
                 total: Duration::from_secs(120),
                 ack_wait: None,
+                ack_wait_covers_backlog: false,
             };
             let start = clock.now();
             let holding = clock.clone();
@@ -6846,6 +7050,7 @@ fn the_source_gap_applies_only_to_source_waits() {
                 source_gap: None,
                 total: Duration::from_secs(120),
                 ack_wait: None,
+                ack_wait_covers_backlog: false,
             }
             .with_source_gap(Duration::from_secs(30));
             let sleeps = clock.clone();
@@ -6895,6 +7100,7 @@ fn the_end_of_a_source_wait_rearms_the_timer_at_the_own_gap() {
                 source_gap: None,
                 total: Duration::from_secs(120),
                 ack_wait: None,
+                ack_wait_covers_backlog: false,
             }
             .with_source_gap(Duration::from_secs(30));
             let start = clock.now();
@@ -6951,6 +7157,7 @@ fn source_waits_do_not_rearm_the_timer_without_an_extension() {
                 source_gap: None,
                 total: Duration::from_secs(120),
                 ack_wait: None,
+                ack_wait_covers_backlog: false,
             };
             let arms = Arc::new(std::sync::atomic::AtomicU64::new(0));
             let seen = arms.clone();
@@ -6998,6 +7205,7 @@ fn source_waits_rearm_the_timer_once_while_it_is_extended() {
                 source_gap: None,
                 total: Duration::from_secs(120),
                 ack_wait: None,
+                ack_wait_covers_backlog: false,
             };
             let ticking = clock.clone();
             let peer = async move {
@@ -7065,6 +7273,7 @@ fn a_later_proof_of_the_same_counts_keeps_the_earlier_since() {
                 source_gap: None,
                 total: Duration::from_secs(120),
                 ack_wait: None,
+                ack_wait_covers_backlog: false,
             };
             let stuck = |progress: bounded::SendProgress| async move {
                 progress.mark_opened();
@@ -7123,6 +7332,7 @@ fn the_gap_ends_at_the_end_of_the_stream_and_open_binds_first() {
             source_gap: None,
             total: Duration::from_secs(60),
             ack_wait: None,
+            ack_wait_covers_backlog: false,
         };
         let (finished, finished_after, unopened, unopened_after) =
             drive(&time, LIMIT, async move {
@@ -7660,6 +7870,7 @@ fn a_real_path_carries_its_last_acknowledgement_to_the_next_send() {
                     source_gap: None,
                     total: Duration::from_secs(120),
                     ack_wait: None,
+                    ack_wait_covers_backlog: false,
                 };
                 let ticking = time.clone();
                 let queue = async move {

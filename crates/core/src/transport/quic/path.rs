@@ -1319,30 +1319,42 @@ impl QuicPath {
     /// 16 KiB/s), when that is longer than its first age, so an honest slow
     /// path's stream is not reset while its acknowledgement is on the way.
     ///
-    /// It also covers the backlog ahead of the stream's end: at most the
-    /// connection's send window, which quinn shares round-robin among the
-    /// streams with data, so a stream's tail may wait for `n` windows' worth
-    /// at the floor, `n` being the streamed sends in flight (their permits)
-    /// with this one. On a busy slow path the wait can reach the 2 h total,
-    /// and the expiry rule then takes as long to fire.
+    /// The backlog ahead of the stream's end is added when the end is sent
+    /// ([`Outgoing::finish`]): the streams in flight then, times the send
+    /// window, at the floor.
     pub(crate) fn stream_deadlines(&self, len: u64) -> SendDeadlines {
         let deadlines = SendDeadlines::stream(len).with_gap(self.receiver_gap());
         let floor = recycle::credit_floor_rate(self.connection.inner().stats().path.rtt).max(1);
-        let in_flight = (STREAMED_SEND_LIMIT as u64)
-            .saturating_sub(self.stream_slots.available_permits() as u64)
-            .saturating_add(1);
-        let window = self
-            .meter
-            .as_ref()
-            .map_or(super::budget::MAX_WINDOW_BYTES, |meter| meter.send_window());
-        let backlog = in_flight.saturating_mul(window);
-        let at_floor = Duration::from_secs(len.max(backlog).div_ceil(floor));
+        let at_floor = Duration::from_secs(len.div_ceil(floor));
         SendDeadlines {
             ack_wait: deadlines
                 .ack_wait
                 .map(|wait| wait.max(at_floor).min(deadlines.total)),
+            ack_wait_covers_backlog: true,
             ..deadlines
         }
+    }
+
+    /// How long the bytes ahead of a stream's end may take to go out, read
+    /// when the end is sent: quinn shares the connection's send window
+    /// round-robin among the streams with data, so a stream's tail may wait
+    /// for the streamed sends in flight (their permits) times the window, at
+    /// the credit floor at the path's round trip. The window is taken at its
+    /// largest (`budget::MAX_WINDOW_BYTES`): the budget may raise it, and this
+    /// is only a wait length. On a busy slow path it reaches the 2 h total.
+    fn backlog_wait(&self) -> Arc<dyn Fn() -> Duration + Send + Sync> {
+        let (slots, connection) = (self.stream_slots.clone(), self.connection.inner().clone());
+        Arc::new(move || {
+            let in_flight = (STREAMED_SEND_LIMIT as u64)
+                .saturating_sub(slots.available_permits() as u64)
+                .max(1);
+            let floor = recycle::credit_floor_rate(connection.stats().path.rtt).max(1);
+            Duration::from_secs(
+                in_flight
+                    .saturating_mul(super::budget::MAX_WINDOW_BYTES)
+                    .div_ceil(floor),
+            )
+        })
     }
 
     /// The connection, for tests that write raw streams.
@@ -1947,10 +1959,18 @@ impl QuicPath {
         send.live = Some(self.writers.live());
         send.sleep = Some((self.sleeper.clone(), self.short_ack_wait));
         send.control = opener == Opener::Control;
+        send.backlog = Some(self.backlog_wait());
+        debug_assert!(
+            self.ack_progress.is_some(),
+            "a data path's controller is CappedCubic; without its record no expiry can strike"
+        );
         send.strike = self.ack_progress.clone().map(|acks| StrikeCheck {
             acks,
             cap: self.connection.cap_holds(),
-            connection: self.connection.inner().clone(),
+            rtt: {
+                let connection = self.connection.inner().clone();
+                Arc::new(move || connection.stats().path.rtt)
+            },
             now: self.clock.clone(),
         });
         send.node = Some(self.stats.node());
@@ -2211,25 +2231,38 @@ struct Outgoing {
     finished_at: Option<StrikeMark>,
     /// A control frame's stream (`Opener::Control`).
     control: bool,
+    /// How long the backlog ahead of this stream's end may take, read when
+    /// the end is sent ([`QuicPath::backlog_wait`]).
+    backlog: Option<Arc<dyn Fn() -> Duration + Send + Sync>>,
 }
 
 /// A sleep on the path's clock.
 type Sleeper = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
-/// What a send's expired ack wait is judged against: whether the path was
-/// in a state where the peer could have acknowledged the send's end. An
-/// expiry counts toward `recycle::ACK_WAIT_EXPIRY_LIMIT` only if, between the
-/// end being sent and the expiry, the egress cap held none of this
-/// connection's transmits and the connection acknowledged at least the
-/// credit floor at its round trip (`recycle::credit_floor_rate`). Our own
-/// cap, or a path too slow to have delivered the bytes ahead of the end,
-/// leaves the peer nothing to acknowledge, and does not make it a strike; a
-/// peer that acknowledges everything else at the floor or better does.
+/// What a send's expired ack wait is judged against: whether the peer could
+/// have acknowledged the send's end. An expiry counts toward
+/// `recycle::ACK_WAIT_EXPIRY_LIMIT` (a strike) on either evidence that the end
+/// was sent and the peer is alive:
+/// - ack batches came after the end was sent and the latest came while quinn
+///   was application-limited: it had nothing left to send (the congestion
+///   window and pacing count as holding data back, so they are not
+///   application-limited), so the end went out, whatever the rate. Only the
+///   peer's own flow control can still hold data then, which is a peer whose
+///   app stopped reading, an intended strike;
+/// - or the connection acknowledged at least the credit floor at its round
+///   trip (`recycle::credit_floor_rate`) over the wait, less the time this
+///   node's egress cap held its transmits.
+///
+/// Time the egress cap held this connection's transmits is this node's own
+/// throttling: it is subtracted from the wait (each new hold event credited
+/// its longest wait at the cap, as the stall count does), and while the cap
+/// holds a transmit now the end may still be in its queue, so neither
+/// evidence counts.
 #[derive(Clone)]
 struct StrikeCheck {
     acks: recycle::AckProgress,
     cap: Arc<super::socket::CapHolds>,
-    connection: quinn::Connection,
+    rtt: Arc<dyn Fn() -> Duration + Send + Sync>,
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
 
@@ -2238,6 +2271,7 @@ struct StrikeCheck {
 struct StrikeMark {
     at: u64,
     acked_bytes: u64,
+    batches: u64,
     holds: u64,
 }
 
@@ -2246,6 +2280,7 @@ impl StrikeCheck {
         StrikeMark {
             at: (self.now)(),
             acked_bytes: self.acks.acked_bytes(),
+            batches: self.acks.batches_app_limited().0,
             holds: self.cap.read().holds,
         }
     }
@@ -2254,13 +2289,27 @@ impl StrikeCheck {
     /// at `mark`, counts as a strike against the peer.
     fn strikes(&self, mark: StrikeMark) -> bool {
         let cap = self.cap.read();
-        if cap.holds != mark.holds || cap.held_now {
+        if cap.held_now {
             return false;
         }
-        let elapsed = u128::from((self.now)().saturating_sub(mark.at));
-        let floor = u128::from(recycle::credit_floor_rate(self.connection.stats().path.rtt));
+        let elapsed = (self.now)().saturating_sub(mark.at);
+        let held = u64::try_from(
+            cap.longest_wait
+                .as_nanos()
+                .saturating_mul(u128::from(cap.holds.saturating_sub(mark.holds))),
+        )
+        .unwrap_or(u64::MAX);
+        let unheld = elapsed.saturating_sub(held);
+        if unheld == 0 {
+            return false;
+        }
+        let (batches, app_limited) = self.acks.batches_app_limited();
+        if batches > mark.batches && app_limited {
+            return true;
+        }
+        let floor = u128::from(recycle::credit_floor_rate((self.rtt)()));
         let acked = u128::from(self.acks.acked_bytes().saturating_sub(mark.acked_bytes));
-        acked * 1_000_000_000 >= floor * elapsed
+        acked * 1_000_000_000 >= floor * u128::from(unheld)
     }
 }
 
@@ -2320,6 +2369,7 @@ impl Outgoing {
             strike: None,
             finished_at: None,
             control: false,
+            backlog: None,
         }
     }
 
@@ -2536,7 +2586,8 @@ impl Outgoing {
             .map_err(|_| QuicSendError::Closed)?;
         self.writing = None;
         self.finished_at = self.strike.as_ref().map(StrikeCheck::mark);
-        self.progress.mark_finished();
+        let backlog = self.backlog.as_ref().map_or(Duration::ZERO, |wait| wait());
+        self.progress.mark_finished_behind(backlog);
         self.awaiting_ack = true;
         let stopped = (&mut self.stopped).await;
         self.awaiting_ack = false;

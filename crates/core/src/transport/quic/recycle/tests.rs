@@ -1663,6 +1663,24 @@ fn ack_wait_expiries_within_the_window_close_the_path() {
     assert_eq!(run_expiries(&times, counted(vec![at(2), at(10)])), None);
 }
 
+/// The labels `quic_stall_close_<label>` counts under are the stalls'
+/// labels, in their index order, so a close is counted under its own name.
+#[test]
+fn stall_close_labels_follow_the_stalls() {
+    for stall in [
+        Stall::NotAcknowledging,
+        Stall::Dark,
+        Stall::CreditStarved,
+        Stall::StreamCreditWithheld,
+        Stall::AckWaitsExpired,
+    ] {
+        assert_eq!(
+            crate::transport::metrics::STALL_CLOSE_LABELS[stall.index()],
+            stall.label()
+        );
+    }
+}
+
 /// The egress cap holds for most of each window and releases for one
 /// interval in five: only the released intervals can count, 2 s of every
 /// 10 s, under `CREDIT_LIMITED_MIN`, so the send is never closed, though it
