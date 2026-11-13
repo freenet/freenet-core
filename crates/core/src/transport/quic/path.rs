@@ -2618,8 +2618,9 @@ impl Drop for Outgoing {
     /// (a cancelled send) goes on to the
     /// end, so its permit and its send epoch wait with it, in a small task
     /// that ends with the stream's acknowledgement or with the connection, or
-    /// for a one-packet Short at [`SHORT_ACK_WAIT`], where the stream is
-    /// reset and the expiry counted.
+    /// at a bound (for a one-packet Short [`SHORT_ACK_WAIT`], for a send
+    /// with a permit the rest of its ack wait), where the stream is reset
+    /// and the expiry judged ([`StrikeCheck`]).
     /// A send holding a permit is one of at most [`STREAMED_SEND_LIMIT`]. One
     /// without a permit (a one-packet Short) holds only its epoch, and a peer
     /// that acknowledges other traffic while withholding some acknowledgements
