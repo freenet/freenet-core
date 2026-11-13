@@ -78,6 +78,11 @@ fn may_carry_data_with(config: &NetworkApiConfig, ramp_start: Option<u64>) -> bo
 // soak. Left as is, scripts/check_quic_data_ramp_t0.sh refuses a live cut.
 pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = Some(4_102_444_800);
 
+/// Whether this build sets a ramp start: for tests outside the transport
+/// module whose expectations change once [`QUIC_DATA_RAMP_START`] is set.
+#[cfg(test)]
+pub(crate) const RAMP_START_IS_SET: bool = QUIC_DATA_RAMP_START.is_some();
+
 /// The release whose cut must come within 3 h of [`QUIC_DATA_RAMP_START`], as
 /// `"X.Y.Z"`, or `None`. Set together with the ramp start, in the same reviewed
 /// PR, to the version of the release that ships it; release.yml's validate job
