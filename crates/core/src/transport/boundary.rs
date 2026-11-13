@@ -354,6 +354,9 @@ pub(crate) enum QuicPathEnd {
     PeerOverBudget,
     /// The peer sent data on a path that refuses it.
     RefusedData,
+    /// The peer refused this node's data (`NOT_ACCEPTING_DATA`) on a path that
+    /// has no UDP session to send it on instead.
+    PeerRefusedData,
     /// The path's receive task panicked.
     ReceiveTaskPanicked,
     /// The peer closed the connection.
@@ -375,6 +378,7 @@ impl QuicPathEnd {
             Self::SendAborts => "quic_send_aborts",
             Self::PeerOverBudget => "quic_peer_over_budget",
             Self::RefusedData => "quic_refused_data",
+            Self::PeerRefusedData => "quic_peer_refused_data",
             Self::ReceiveTaskPanicked => "quic_receive_task_panicked",
             Self::ClosedByPeer => "quic_closed_by_peer",
             Self::ClosedLocally => "quic_closed_locally",

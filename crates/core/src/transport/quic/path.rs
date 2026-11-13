@@ -1389,10 +1389,12 @@ impl QuicPath {
     }
 
     /// The peer said it accepts no data on this path, so this node's gating or
-    /// the peer's is wrong. Logged once per path. New sends go on UDP from now
-    /// on. This side does not close the path: the refusing receiver does, with
-    /// DOWNGRADE, [`inbound::REFUSAL_CLOSE_DELAY`] after its first refusal, and
-    /// this side falls back on that close.
+    /// the peer's is wrong. Logged once per path. On an upgrade path new sends
+    /// go on UDP from now on, and this side does not close the path: the
+    /// refusing receiver does, with DOWNGRADE, [`inbound::REFUSAL_CLOSE_DELAY`]
+    /// after its first refusal, and this side falls back on that close. A
+    /// native path has nothing to fall back to, so it closes at once
+    /// ([`QuicPathEnd::PeerRefusedData`](crate::transport::boundary::QuicPathEnd::PeerRefusedData)).
     fn stop_sending_data(&self) {
         self.stats.record_send_event(QuicSendEvent::DataRefused);
         // No longer a path that carries data.
@@ -1406,7 +1408,21 @@ impl QuicPath {
                 Ordering::Acquire,
             )
             .is_ok();
-        if was_on {
+        if !self.udp_fallback {
+            // A native path has no UDP session: left open, it would drop every
+            // later send while the connection looked alive. Close it, so the
+            // connection ends with a reason that says why.
+            if was_on {
+                tracing::warn!(
+                    remote = %self.connection.inner().remote_address(),
+                    "QUIC path: the peer refused data on a native connection; closing it"
+                );
+            }
+            self.close_for(
+                QuicCloseCode::Downgrade,
+                crate::transport::boundary::QuicPathEnd::PeerRefusedData,
+            );
+        } else if was_on {
             tracing::warn!(
                 remote = %self.connection.inner().remote_address(),
                 "QUIC path: the peer refused data after both sides set the data bit; \

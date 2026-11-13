@@ -15,7 +15,7 @@ use crate::transport::boundary::StreamSendOutcome;
 use crate::transport::metrics::ConnIdentity;
 use crate::transport::quic::framing::FrameHeader;
 use crate::transport::quic::path::{
-    BoundedSend, QuicSendEvent, QuicSendResult, SendFailure, SendKind,
+    BoundedSend, QuicSendError, QuicSendEvent, QuicSendResult, SendFailure, SendKind, stop_code,
 };
 use crate::transport::quic::upgrade::data_route::SHORT_QUEUE_CAPACITY;
 use crate::transport::quic::upgrade::driver::tests::{NativeServer, native_server, run_bounded};
@@ -308,11 +308,12 @@ fn every_send_reaches_the_peer_on_the_path() {
     );
 }
 
-/// A send the peer refuses ends dropped: the node has no UDP session to send
-/// it on, and the stream's completion is told it was not delivered. On an
-/// upgrade path both would go on UDP (`NotOpenedUdp` / `FailedUdp`).
+/// A peer that refuses this node's data closes the native connection on the
+/// first refusal: the send is dropped (a stream's completion is told so),
+/// `recv` ends with `PeerRefusedData`, and nothing is counted as sent on UDP.
+/// On an upgrade path the same refusal would put the message on UDP.
 #[test]
-fn a_refused_send_is_dropped_and_nothing_goes_to_udp() {
+fn a_refused_send_closes_the_native_connection() {
     run(
         "native-conn-refused",
         QuicPathLimits::SHADOW,
@@ -321,30 +322,23 @@ fn a_refused_send_is_dropped_and_nothing_goes_to_udp() {
             // Past the 2 MiB window, so the peer's stop arrives before
             // the last byte could be acknowledged.
             let big = 3 * 1024 * 1024;
-            rig.conn.send_bytes(bytes_of(big).to_vec()).await.unwrap();
             let (done_tx, done_rx) = tokio::sync::oneshot::channel();
             rig.conn
                 .send_stream_data(StreamId::next(), bytes_of(big), None, Some(done_tx), None)
                 .await
                 .unwrap();
             assert!(matches!(done_rx.await, Ok(StreamSendOutcome::Dropped)));
-            rig.settle(Duration::from_secs(1)).await;
-            assert!(rig.recv_soon().await.is_none());
-            assert!(rig.conn.outbound.is_empty(), "every send task was reaped");
-
-            for kind in [SendKind::LargeShort, SendKind::Stream] {
-                assert_eq!(rig.sends(kind, QuicSendResult::Dropped), 1, "{kind:?}");
-            }
-            // The refusals stopped data on the path, so a short queued now is
-            // dropped by the route's worker, which has no UDP session for it.
-            assert!(!rig.conn.path().sends_data());
-            rig.conn.send_bytes(b"after".to_vec()).await.unwrap();
-            rig.settle(Duration::from_secs(1)).await;
-            assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Dropped), 1);
+            let ended = rig.conn.recv().await;
             assert!(
-                rig.peer.peer_inbound.shorts.try_recv().is_err(),
-                "nothing reached the peer"
+                matches!(ended, Err(TransportError::ConnectionClosed(_))),
+                "{ended:?}"
             );
+            assert_eq!(
+                rig.conn.close_reason(),
+                Some(CloseReason::QuicPath(QuicPathEnd::PeerRefusedData))
+            );
+            assert!(!rig.conn.path().sends_data());
+            assert_eq!(rig.sends(SendKind::Stream, QuicSendResult::Dropped), 1);
             for kind in [
                 SendKind::Short,
                 SendKind::LargeShort,
@@ -355,6 +349,38 @@ fn a_refused_send_is_dropped_and_nothing_goes_to_udp() {
                     assert_eq!(rig.sends(kind, result), 0, "{kind:?} {result:?}");
                 }
             }
+        },
+    );
+}
+
+/// A short queued after the path stopped taking data is dropped and counted by
+/// the route's worker, which has no UDP session to send it on. The refusal is
+/// settled by hand and the short queued before anything yields, so the worker
+/// finds the short queued and the path refusing data whichever arm it polls
+/// first.
+#[test]
+fn a_short_the_path_no_longer_takes_is_dropped_by_the_worker() {
+    run(
+        "native-conn-worker-drop",
+        QuicPathLimits::DEFAULT,
+        None,
+        |mut rig| async move {
+            let refused = BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(
+                u64::from(stop_code::NOT_ACCEPTING_DATA),
+            )));
+            let now = rig.time().now_nanos();
+            rig.conn
+                .path()
+                .settle(SendKind::Stream, &refused, false, now);
+            assert!(!rig.conn.path().sends_data());
+            rig.conn.send_bytes(b"after".to_vec()).await.unwrap();
+            rig.settle(Duration::from_secs(1)).await;
+            assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Dropped), 1);
+            assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Sent), 0);
+            assert!(
+                rig.peer.peer_inbound.shorts.try_recv().is_err(),
+                "nothing reached the peer"
+            );
         },
     );
 }
