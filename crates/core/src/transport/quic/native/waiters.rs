@@ -129,7 +129,9 @@ impl<A: NativeAttempt> NativeWaiters<A> {
             return NativeRoute::Retried;
         }
         // Busy from here, before the waiter can take it, so the router hands
-        // over nothing more until the waiter's guard drops.
+        // over nothing more until the waiter's guard drops. If the send below
+        // fails the flag stays set, which is bounded: the waiter lives at
+        // most its setup window (8 s), and dropping it removes the slot.
         slot.busy.store(true, Ordering::Release);
         match slot.attempts.try_send(attempt) {
             Ok(()) => NativeRoute::Handed,

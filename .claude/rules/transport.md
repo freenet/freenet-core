@@ -1632,7 +1632,9 @@ exposes (its module doc lists the few it does not):
   streams to 16, then toward 64 with load, and its meter the windows), send window the floor (128 KiB,
   64 KiB under 2 GiB), stream receive window 8 MiB, no unreliable datagrams, no
   spin bit, migration off, max_incoming 64, incoming buffers 64 KiB / 1 MiB,
-  no NEW_TOKEN tokens (Retry only), rustls ring, TLS 1.3, fixed ALPN, no SNI, no
+  no NEW_TOKEN tokens (Retry only), rustls ring, TLS 1.3, one ALPN per attempt
+  (freenet-quic/1 for an upgrade, freenet-quic/2 for a native connection; see
+  "QUIC-native setup"), no SNI, no
   resumption, no early data. Keys and seeds (reset key, token key, CID key,
   quinn's rng_seed, initial destination CIDs): keys from the OS, seeds and
   CIDs from GlobalRng (see below).
@@ -1944,10 +1946,12 @@ no extra message, no exporter proof.
     signature is checked with ring against the EXPECTED key. Anything else fails the handshake.
   → Client: connect(addr, &expected_server_key) builds TLS pinned to it.
   → Server: allow_peer(addr, &expected_client_key) puts the address on the
-    allow-set AND records the key (QuicPeerPermit; a second key for an
-    address already held is KeyConflict). accept() looks the key up by the
-    attempt's (normalized) address and accepts with a per-attempt server
-    config whose TLS is pinned to it (Incoming::accept_with); an attempt
+    allow-set AND records the key and the connection's kind (QuicPeerPermit;
+    a second key for an address already held, or the same key for the other
+    kind, upgrade or native, is KeyConflict). accept() looks the key and kind
+    up by the attempt's (normalized) address and accepts with a per-attempt
+    server config whose TLS is pinned to the key and offers that kind's one
+    ALPN (Incoming::accept_with); an attempt
     with no recorded key is ignored. The endpoint's own server config
     (needed so quinn passes Initials to accept) refuses every client.
   → When the SERVER refuses the client, the client may see connect()

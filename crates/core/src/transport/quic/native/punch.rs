@@ -16,9 +16,9 @@
 //!   together.
 //!
 //! The budget remembers [`PUNCH_BUDGET_ENTRIES`] destinations. A new one
-//! replaces the least recently charged only once that one's budget has
-//! refilled, so forgetting a destination never gives it back bytes early;
-//! otherwise the new one is refused.
+//! replaces the least recently charged (a refused charge counts as a use)
+//! only once that one's budget has refilled, so forgetting a destination
+//! never gives it back bytes early; otherwise the new one is refused.
 
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
@@ -178,6 +178,11 @@ impl PunchBudget {
         bytes: u64,
         now: Duration,
     ) -> Result<(), PunchRefusal> {
+        // More than a destination ever holds: refused without touching the
+        // table, so it neither forgets an entry nor adds one.
+        if bytes > PUNCH_BUDGET_BYTES {
+            return Err(PunchRefusal::Destination);
+        }
         let mut state = self.state.lock();
         let BudgetState { destinations, node } = &mut *state;
         let node = node.get_or_insert_with(|| Bucket::full(NODE_PUNCH_BUDGET_BYTES, now));
@@ -217,8 +222,13 @@ pub(crate) fn punch_datagram() -> [u8; PUNCH_LEN] {
 }
 
 /// Send punches to `to` through `send` every [`PUNCH_INTERVAL`], the first at
-/// once, until [`PUNCHES_PER_DIAL`] have gone or `until` (on `clock`) has
-/// passed. Never returns early otherwise: the caller races it with the
+/// once. A fixed cadence on purpose, with no jitter: it is a bounded pacer
+/// (at most [`PUNCHES_PER_DIAL`], cut off at `until`), not a retry after a
+/// failure, and both sides punching on the same schedule is what opens the
+/// two NATs within one interval of each other.
+///
+/// It stops once [`PUNCHES_PER_DIAL`] have gone or `until` (on `clock`) has
+/// passed, and never returns early otherwise: the caller races it with the
 /// handshake and drops it when that ends. A failed send counts as sent, as a
 /// lost datagram would.
 pub(crate) async fn punch<T: TimeSource>(
@@ -379,6 +389,27 @@ mod tests {
         assert_eq!(
             budget.charge(to("203.0.113.9"), CLIENT_BYTES_PER_DIAL, later),
             Ok(())
+        );
+    }
+
+    /// A charge larger than any destination's budget is refused for its
+    /// destination and leaves the table as it was: the oldest entry is not
+    /// forgotten and the new destination is not added.
+    #[test]
+    fn a_charge_larger_than_a_destination_budget_leaves_the_table_alone() {
+        let budget = PunchBudget::with_entries(1);
+        let t0 = Duration::ZERO;
+        assert_eq!(budget.charge(to("198.51.100.1"), 1, t0), Ok(()));
+        let later = t0 + PUNCH_BUDGET_WINDOW;
+        assert_eq!(
+            budget.charge(to("198.51.100.2"), PUNCH_BUDGET_BYTES + 1, later),
+            Err(PunchRefusal::Destination)
+        );
+        // .1 is still remembered: it is refused at once for its own spent
+        // byte if charged its whole budget at t0 again.
+        assert_eq!(
+            budget.charge(to("198.51.100.1"), PUNCH_BUDGET_BYTES, t0),
+            Err(PunchRefusal::Destination)
         );
     }
 
