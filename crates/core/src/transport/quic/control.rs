@@ -57,9 +57,11 @@ pub(crate) mod caps {
     pub(crate) const DATA: u32 = 1;
     /// The sender takes a `RECYCLE_FOR_DATA` close as no fault
     /// (`upgrade::machine::UpgradeMachine::recheck_data`), so a path to it may be
-    /// recycled when this node's data bit comes on. Every node that knows the
-    /// bit sets it, whatever its data share; one before it clears it on decode,
-    /// and a path to it is never recycled.
+    /// recycled when this node's data bit comes on. Set only by a data-capable
+    /// node (`prefer` with any share but one fixed at 0,
+    /// `upgrade::policy::QuicPolicy::own_caps`); a shadow or off node, or one at
+    /// a share fixed at 0, withholds it. A node before the bit clears it on
+    /// decode, and a path to it is never recycled.
     pub(crate) const RECYCLES: u32 = 2;
     /// Every bit this node knows.
     pub(crate) const KNOWN: u32 = DATA | RECYCLES;

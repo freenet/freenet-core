@@ -1319,13 +1319,17 @@ pair is in the slice when its bucket is below the percentage, so 0 holds none,
   UDP offer does not reach the client before the close and get declined
   `NotReady`): no fault, no backoff charge, not a fallback, not churn, not counted toward the stall close and not DOWNGRADE;
   counted only as `quic_close_sent_recycle_for_data` /
-  `quic_close_received_recycle_for_data`. A path with data, or to a peer without
+  `quic_close_received_recycle_for_data`, and left out of
+  `quic_path_age_at_close_<label>` (it comes about a recheck after activation
+  and would fill the short buckets). A path with data, or to a peer without
   `RECYCLES` (a release before it reads the close as a lost connection), is never
   rechecked, and the next attempt carries data, so a pair is recycled at most once
   per flip. If the close frame is lost, the peer does not see RECYCLE_FOR_DATA:
   its path ends by idle timeout, which it records as a charged fallback (one per
-  lost close, not a recycle). The bit is not tied to a version: every node that
-  knows it sets it.
+  lost close, not a recycle). The bit is not tied to a version. A node sets it
+  when it is data-capable: `prefer` with any share but one fixed at 0. A shadow
+  or off node, or one at a fixed share of 0 (the emergency-stop release), does
+  not, so no peer recycles a path to it that could never carry data.
   `QUIC_DATA_RECEIVER_READY` is true: `recv` reads the path's data ("QUIC receive
   flow" below).
   The machine reads no key to decide it.
@@ -2883,8 +2887,8 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   waiting for its source does not count (WatchedSource). It costs a normal
   backoff.
   Fast path: Session::routed is an atomic set only while the live attempt holds a
-  route, so a connection with no route (shadow, the default on Linux, macOS and Windows)
-  sends without taking the session's lock. enable_data runs once per activation
+  route, so a connection with no route (a shadow path, or a `prefer` pair outside
+  the share) sends without taking the session's lock. enable_data runs once per activation
   (debug assertion); a second route would orphan the first one's worker.
   A path gone dark: the first send timeout that counts toward the stall close
   (nothing acknowledged for the window, no cap hold) makes the path suspect
@@ -2988,9 +2992,9 @@ QUIC receive flow (#5940 e5b-4):
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
 
-Live in production on Linux, macOS and Windows, where shadow is the default: the
-paths carry control frames only, but endpoints, connections and their errors
-are real. With `transport-quic` off no endpoint is built and the transport
+Live in production on Linux, macOS and Windows, where `prefer` is the default:
+until a release's share reaches a pair its path carries control frames only,
+but endpoints, connections and their errors are real. With `transport-quic` off no endpoint is built and the transport
 reports `Disabled`.
 
 ```
@@ -3093,8 +3097,7 @@ Application error codes, one range per QUIC frame type, all one-byte
   The scrape test checks every constant by name against ALL, and
   close_code::ALL against the QuicCloseCode variants.
   The close codes are wire values a peer on another release reads: never
-  renumber them; add a new code at the next free value (0x0B; 0x07 is
-  taken by the ramp branch). A code the peer does not know reads as
+  renumber them; add a new code at the next free value (0x0B). A code the peer does not know reads as
   ConnectionLost there; what this node does with each code it knows is
   listed above. Every close the QUIC code sends
   goes through the connection's QuicCloser (QuicConnection::close and

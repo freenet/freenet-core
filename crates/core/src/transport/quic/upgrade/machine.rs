@@ -199,8 +199,6 @@ pub(in crate::transport) const OFFER_DELAY_MIN: Duration = Duration::from_secs(2
 /// The latest first offer after promotion.
 pub(in crate::transport) const OFFER_DELAY_MAX: Duration = Duration::from_secs(10);
 
-/// When a server offers again after a recycle for data, either side's: the
-/// first-offer spread from now, so the offer follows the close.
 /// How long this side's path must have been active before a peer's
 /// RECYCLE_FOR_DATA close is taken as no fault. An honest peer sends it only at
 /// a data recheck, the first of which comes [`DATA_RECHECK_INTERVAL`] less its
@@ -209,6 +207,15 @@ pub(in crate::transport) const OFFER_DELAY_MAX: Duration = Duration::from_secs(1
 /// recycle an honest peer sends, and is charged like a downgrade.
 pub(in crate::transport) const RECYCLE_MIN_ACTIVE: Duration = Duration::from_secs(30);
 
+// RECYCLE_MIN_ACTIVE must stay below an honest peer's earliest recheck
+// (DATA_RECHECK_INTERVAL less its 20% jitter), or honest recycles are charged.
+const _: () = assert!(
+    RECYCLE_MIN_ACTIVE.as_secs() < DATA_RECHECK_INTERVAL.as_secs() * 4 / 5,
+    "RECYCLE_MIN_ACTIVE must stay below the earliest data recheck"
+);
+
+/// When a server offers again after a recycle for data, either side's: the
+/// first-offer spread from now, so the offer follows the close.
 fn recycle_reoffer_at(cx: Inputs<'_>) -> Duration {
     let spread = OFFER_DELAY_MAX.saturating_sub(OFFER_DELAY_MIN);
     cx.now + OFFER_DELAY_MIN + spread.mul_f64(unit(cx.sample))

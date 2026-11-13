@@ -168,6 +168,12 @@ filter = "test(test_quic_data_ramp_turns_on_every_pair_by_the_end_of_the_day)"
 slow-timeout = { period = "180s", terminate-after = 2 }
 retries = 0
 
+# The emergency-stop run (two 2 h virtual runs): 72 s alone on nova.
+[[profile.ci.overrides]]
+filter = "test(test_quic_data_ramp_stops_against_a_node_on_the_default_off_release)"
+slow-timeout = { period = "180s", terminate-after = 2 }
+retries = 0
+
 [profile.nightly]
 # Nightly tests run longer by design; no retries since failures need investigation.
 retries = 0

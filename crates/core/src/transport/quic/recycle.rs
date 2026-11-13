@@ -1807,11 +1807,8 @@ pub(crate) struct PathReport {
     /// The path's budget meter, evaluated at each tick so an idle path's send
     /// window and held epochs are settled too.
     meter: Option<Arc<super::budget::ConnMeter>>,
-    /// Whether the path carries data now: the path's own flag for the
-    /// `quic_live_data_paths` gauge, read at each report, so a report's
-    /// packets are counted as carrying by the path's state when it is taken
-    /// (a flip inside a 2 s tick goes to the side it reaches).
-    carrying: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the path carries data ([`Carrying`]).
+    carrying: Carrying,
     /// The next report that finds the path in a bucket panics, once
     /// (supervisor test).
     #[cfg(test)]
@@ -1828,7 +1825,7 @@ impl PathReport {
         node: &'static crate::transport::metrics::QuicDataCounters,
         built_at: u64,
         meter: Option<Arc<super::budget::ConnMeter>>,
-        carrying: Arc<std::sync::atomic::AtomicBool>,
+        carrying: Carrying,
     ) -> Self {
         let stats = connection.stats();
         let gate = connection
@@ -1878,7 +1875,12 @@ impl PathReport {
         self.node.record_bytes(sent, got);
         self.bytes = next;
         let (next, delta) = self.loss.step(PathLoss::of(&stats));
-        let carrying = self.carrying.load(std::sync::atomic::Ordering::Acquire);
+        let carrying = self.carrying.now.load(std::sync::atomic::Ordering::Acquire)
+            || (now.is_none()
+                && self
+                    .carrying
+                    .at_end
+                    .load(std::sync::atomic::Ordering::Acquire));
         self.node
             .record_path_loss(&mut self.window, delta, carrying);
         self.loss = next;
@@ -1896,6 +1898,20 @@ impl PathReport {
             panic!("test: the acknowledgement watch panics");
         }
     }
+}
+
+/// Whether a path carries data, for its loss report.
+pub(crate) struct Carrying {
+    /// The path's own flag for the `quic_live_data_paths` gauge, read at each
+    /// report, so a report's packets are counted as carrying by the path's
+    /// state when it is taken (a flip inside a 2 s tick goes to the side it
+    /// reaches).
+    pub(crate) now: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the path's attempt ended while it carried data. The final
+    /// report, on drop, runs after the attempt took the path out of the gauge,
+    /// so it reads this instead: a data path's last reading, and the whole of
+    /// one that ended before its first tick, are counted as carrying.
+    pub(crate) at_end: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for PathReport {

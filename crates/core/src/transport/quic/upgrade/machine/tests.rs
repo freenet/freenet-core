@@ -2462,6 +2462,9 @@ enum Lost {
     /// is lost.
     CloseFromServer,
     CloseFromClient,
+    /// The side named recycles the path for data, and its close is lost.
+    RecycleFromServer,
+    RecycleFromClient,
 }
 
 /// How long after a loss the two sides may still disagree. Only a lost close
@@ -2470,6 +2473,11 @@ enum Lost {
 fn settles_within(lost: Lost) -> Duration {
     match lost {
         Lost::CloseFromServer | Lost::CloseFromClient => IDLE_TIMEOUT + Duration::from_secs(5),
+        // The lost close reaches the peer as an idle timeout, then the server
+        // offers again within the first-offer spread.
+        Lost::RecycleFromServer | Lost::RecycleFromClient => {
+            IDLE_TIMEOUT + OFFER_DELAY_MAX + Duration::from_secs(5)
+        }
         Lost::Nothing
         | Lost::Offer
         | Lost::Accept
@@ -2488,21 +2496,43 @@ struct Pair {
     lost_at: Option<Duration>,
     /// The attempt that has a QUIC connection between the two.
     connection: Option<u32>,
+    /// When both sides' data bits come on (a ramp reaching the pair), if
+    /// they do.
+    flip_at: Option<Duration>,
+}
+
+/// The caps both sides of a [`Pair`] run with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairCaps {
+    /// Data on both, so an active path has nothing more to wait for.
+    Data,
+    /// No data on either, and no bit that can come on (a fixed share of 0):
+    /// a shadow path, which rechecks nothing.
+    Shadow,
+    /// No data bit at first on either side, with `RECYCLES` and a ramp; both
+    /// bits come on together at the flip (the bucket is symmetric), so both
+    /// recycle, at the same time when their draws match.
+    Ramp,
 }
 
 impl Pair {
-    fn new(lost: Lost, samples: [f64; 2]) -> Self {
+    fn with_caps(lost: Lost, samples: [f64; 2], pair_caps: PairCaps) -> Self {
+        let (own_caps, bit_may_come_on) = match pair_caps {
+            PairCaps::Data => (caps::DATA, true),
+            PairCaps::Shadow => (0, false),
+            PairCaps::Ramp => (caps::RECYCLES, true),
+        };
         let mut pair = Self {
-            // With data on both, so an active path has nothing more to wait for
-            // (a path without it rechecks its share for good).
             rigs: [Rig::new(Role::Server), Rig::new(Role::Client)].map(|mut rig| {
-                rig.own_caps = caps::DATA;
+                rig.own_caps = own_caps;
+                rig.bit_may_come_on = bit_may_come_on;
                 rig
             }),
             wire: Vec::new(),
             lost,
             lost_at: None,
             connection: None,
+            flip_at: None,
         };
         for side in [SERVER, CLIENT] {
             pair.rigs[side].sample = samples[side];
@@ -2579,10 +2609,11 @@ impl Pair {
                 }
                 Action::TearDown { attempt, code } if self.connection == Some(attempt) => {
                     self.connection = None;
-                    let kind = if side == SERVER {
-                        Lost::CloseFromServer
-                    } else {
-                        Lost::CloseFromClient
+                    let kind = match (side == SERVER, code == QuicCloseCode::RecycleForData) {
+                        (true, false) => Lost::CloseFromServer,
+                        (false, false) => Lost::CloseFromClient,
+                        (true, true) => Lost::RecycleFromServer,
+                        (false, true) => Lost::RecycleFromClient,
                     };
                     let (delay, kind) = if self.lose(kind) {
                         (IDLE_TIMEOUT, QuicErrorKind::TimedOut)
@@ -2616,10 +2647,20 @@ impl Pair {
             if self.lost_at.is_some() && settled_at.is_none() && self.settled() {
                 settled_at = Some(self.now());
             }
+            if let Some(flip_at) = self.flip_at
+                && self.now() >= flip_at
+            {
+                self.flip_at = None;
+                for rig in &mut self.rigs {
+                    rig.own_caps = caps::DATA | caps::RECYCLES;
+                }
+            }
             let closer = match self.lost {
                 Lost::CloseFromServer => Some(SERVER),
                 Lost::CloseFromClient => Some(CLIENT),
-                Lost::Nothing
+                Lost::RecycleFromServer
+                | Lost::RecycleFromClient
+                | Lost::Nothing
                 | Lost::Offer
                 | Lost::Accept
                 | Lost::Decline
@@ -2650,6 +2691,8 @@ impl Pair {
                 (Some((at, _)), None) | (None, Some((at, _))) => at,
                 (Some((wire, _)), Some((due, _))) => wire.min(due),
             };
+            // The flip is an event of its own: the next step after it reads it.
+            let at = self.flip_at.map_or(at, |flip| at.min(flip.max(self.now())));
             let at = at.max(self.now());
             for rig in &mut self.rigs {
                 rig.now = at;
@@ -2669,26 +2712,77 @@ impl Pair {
     }
 }
 
-/// Lose each kind of message once, at several draws of the jitter. The two
-/// sides end up both active or both idle with no permits within a bound, and
-/// the later attempts bring the path up on both.
+/// Lose each kind of message once, at several draws of the jitter, on a
+/// path with data on both sides and on a shadow path. The two sides end up
+/// both active or both idle with no permits within a bound, and the later
+/// attempts bring the path up on both.
 #[test]
 fn two_machines_agree_after_any_one_lost_message() {
-    for lost in [
-        Lost::Nothing,
-        Lost::Offer,
-        Lost::Accept,
-        Lost::Decline,
-        Lost::Dial,
-        Lost::Ready,
-        Lost::ReadyAck,
-        Lost::CloseFromServer,
-        Lost::CloseFromClient,
+    for pair_caps in [PairCaps::Data, PairCaps::Shadow] {
+        for lost in [
+            Lost::Nothing,
+            Lost::Offer,
+            Lost::Accept,
+            Lost::Decline,
+            Lost::Dial,
+            Lost::Ready,
+            Lost::ReadyAck,
+            Lost::CloseFromServer,
+            Lost::CloseFromClient,
+        ] {
+            for samples in [[NO_JITTER, NO_JITTER], [0.0, 1.0], [1.0, 0.0]] {
+                let case = format!("{pair_caps:?} {lost:?} {samples:?}");
+                let mut pair = Pair::with_caps(lost, samples, pair_caps);
+                let start = pair.now();
+                let settled_at = pair.run();
+                if lost != Lost::Nothing {
+                    let lost_at = pair.lost_at.unwrap_or_else(|| panic!("{case}: not lost"));
+                    let settled_at = settled_at.unwrap_or_else(|| panic!("{case}: never settled"));
+                    assert!(
+                        settled_at - lost_at <= settles_within(lost),
+                        "{case}: settled {:?} after the loss",
+                        settled_at - lost_at
+                    );
+                }
+                assert!(pair.settled(), "{case}: not settled at the end");
+                for rig in &pair.rigs {
+                    assert!(rig.machine.is_active(), "{case}");
+                    assert_eq!(
+                        rig.machine.carries_data(),
+                        pair_caps == PairCaps::Data,
+                        "{case}"
+                    );
+                }
+                assert!(pair.now() - start <= ACTIVE_WITHIN, "{case}");
+            }
+        }
+    }
+}
+
+/// Both sides' data bits come on together while a shadow path is up (a ramp
+/// reaching the pair). The side whose recheck comes first recycles; the other
+/// takes the close as no fault. The pair ends with one path carrying data on
+/// both, also when the recycling side's close is lost (the peer learns of it at
+/// its idle timeout). Neither side charges the other: no backoff grows. The
+/// draws put the server's recheck first ([0.0, 1.0]) or the client's.
+#[test]
+fn both_sides_recycling_for_data_agree_even_when_a_close_is_lost() {
+    for (lost, draws) in [
+        (
+            Lost::Nothing,
+            &[[NO_JITTER, NO_JITTER], [0.0, 1.0], [1.0, 0.0]][..],
+        ),
+        (Lost::RecycleFromServer, &[[0.0, 1.0]][..]),
+        (
+            Lost::RecycleFromClient,
+            &[[NO_JITTER, NO_JITTER], [1.0, 0.0]][..],
+        ),
     ] {
-        for samples in [[NO_JITTER, NO_JITTER], [0.0, 1.0], [1.0, 0.0]] {
+        for &samples in draws {
             let case = format!("{lost:?} {samples:?}");
-            let mut pair = Pair::new(lost, samples);
+            let mut pair = Pair::with_caps(lost, samples, PairCaps::Ramp);
             let start = pair.now();
+            pair.flip_at = Some(start + Duration::from_secs(120));
             let settled_at = pair.run();
             if lost != Lost::Nothing {
                 let lost_at = pair.lost_at.unwrap_or_else(|| panic!("{case}: not lost"));
@@ -2701,11 +2795,23 @@ fn two_machines_agree_after_any_one_lost_message() {
             }
             assert!(pair.settled(), "{case}: not settled at the end");
             for rig in &pair.rigs {
-                assert!(rig.machine.is_active(), "{case}");
+                assert!(
+                    rig.machine.carries_data(),
+                    "{case}: carries data at the end"
+                );
+                assert_eq!(rig.backoff(), Duration::ZERO, "{case}: no backoff");
             }
             assert!(pair.now() - start <= ACTIVE_WITHIN, "{case}");
         }
     }
+}
+
+/// The recycle constants, as literals: the tests above use the constants, so
+/// halving or multiplying one would pass them all.
+#[test]
+fn the_recycle_constants_have_these_values() {
+    assert_eq!(RECYCLE_MIN_ACTIVE, Duration::from_secs(30));
+    assert_eq!(DATA_RECHECK_INTERVAL, Duration::from_secs(45));
 }
 
 /// A machine that was never promoted has no seed to hand on, even after its

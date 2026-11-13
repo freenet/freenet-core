@@ -388,10 +388,30 @@ impl QuicPolicy {
 
     /// The share this node applies to its pairs' data bit, for telemetry
     /// (`quic_ramp_share_pct`): the policy's share in `prefer` where the build
-    /// lets the bit be set, else `None` (reported as 0).
+    /// lets the bit be set and nothing that cannot change while the node runs
+    /// keeps QUIC off (the breaker, `quic-max-paths = 0`), else `None`
+    /// (reported as 0). The endpoint's state can change, so the gauge reads it
+    /// at each snapshot ([`crate::transport::metrics::ShareSource`]).
     pub(crate) fn advertised_share(&self) -> Option<DataShare> {
-        (data_bit_allowed(cfg!(any(test, feature = "testing"))) && self.mode == QuicMode::Prefer)
-            .then_some(self.share)
+        let can_carry = data_bit_allowed(cfg!(any(test, feature = "testing")))
+            && self.mode == QuicMode::Prefer
+            && self.breaker.suppressing_verdict().is_none()
+            && self.permits.limit() > 0;
+        can_carry.then_some(self.share)
+    }
+
+    /// Where `quic_ramp_share_pct` is read from: [`Self::advertised_share`],
+    /// the endpoint's availability and the wall clock `wall`.
+    pub(crate) fn share_source(
+        &self,
+        wall: Box<dyn Fn() -> std::time::SystemTime + Send + Sync>,
+    ) -> Option<crate::transport::metrics::ShareSource> {
+        let share = self.advertised_share()?;
+        Some(crate::transport::metrics::ShareSource {
+            share,
+            availability: self.availability.clone(),
+            wall,
+        })
     }
 
     /// [`Self::bit_may_come_on_with`] with the policy's share.
@@ -873,17 +893,24 @@ mod tests {
     /// `prefer`, none in `shadow` or `off`.
     #[test]
     fn the_advertised_share_is_the_share_only_in_prefer() {
-        for (mode, want) in [
-            ("prefer", Some(DataShare::Fixed(40))),
-            ("shadow", None),
-            ("off", None),
+        for (mode, max_paths, want) in [
+            ("prefer", None, Some(DataShare::Fixed(40))),
+            ("prefer", Some("0"), None),
+            ("shadow", None, None),
+            ("off", None, None),
         ] {
-            let mut config = config(mode, None);
+            let mut config = config(mode, max_paths);
             config.quic_data_percent = Some("40".to_string());
             let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
             let policy = QuicPolicy::new(&config, BreakerOutcome::NotConsulted, up);
-            assert_eq!(policy.advertised_share(), want, "{mode}");
+            assert_eq!(policy.advertised_share(), want, "{mode} {max_paths:?}");
         }
+        // The crash-loop breaker keeping QUIC off for this run.
+        let mut config = config("prefer", None);
+        config.quic_data_percent = Some("40".to_string());
+        let up = QuicAvailabilityWatch::for_test(QuicAvailability::Up).1;
+        let suppressed = QuicPolicy::new(&config, BreakerOutcome::Decided(Verdict::Trip), up);
+        assert_eq!(suppressed.advertised_share(), None, "breaker");
     }
 
     /// The data bit needs `prefer`, the peer in the slice, and the key or the

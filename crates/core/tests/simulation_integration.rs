@@ -21114,8 +21114,24 @@ impl QuicShadowRun {
 fn run_quic_shadow_sim(
     name: &str,
     seed: u64,
+    nodes: (usize, usize),
+    steps: usize,
+    set_up: impl FnOnce(
+        &mut SimNetwork,
+        &freenet::dev_tool::QuicUpgradeTrace,
+        &[freenet::dev_tool::NodeLabel],
+    ),
+) -> QuicShadowRun {
+    run_quic_shadow_sim_waiting(name, seed, nodes, steps, QUIC_EVENT_WAIT, set_up)
+}
+
+/// [`run_quic_shadow_sim`] with `event_wait` between events.
+fn run_quic_shadow_sim_waiting(
+    name: &str,
+    seed: u64,
     (gateways, nodes): (usize, usize),
     steps: usize,
+    event_wait: Duration,
     set_up: impl FnOnce(
         &mut SimNetwork,
         &freenet::dev_tool::QuicUpgradeTrace,
@@ -21141,7 +21157,7 @@ fn run_quic_shadow_sim(
         (sim, logs_handle, trace, addresses)
     });
     drop(rt);
-    sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 1, steps, QUIC_EVENT_WAIT)
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 1, steps, event_wait)
         .expect("direct simulation should succeed");
     let rt = create_runtime();
     let (logs_events, mesh) = rt.block_on(async {
@@ -21539,50 +21555,111 @@ fn assert_ramp_pairs_carry_data_by(run: &QuicShadowRun, full_at: Duration) {
 }
 
 /// The emergency stop for the data ramp: a release with no ramp and a data
-/// share of 0 (`QUIC_DATA_RAMP_START = None`, `QUIC_DATA_PERCENT = 0`, which is
-/// `DataShare::Fixed(0)`, the same share `quic-data-percent = 0` gives). A node
-/// on it never carries data with a node still on the ramp at 100%: a pair needs
-/// both data bits, the stopped node sets neither its data bit nor its recycle
-/// bit, so the ramp node never recycles a path toward it, and the pair keeps a
-/// shadow path. Two ramp nodes carry data in the same run shape (the positive
-/// control, so the ramp is on and the stop is what turns data off).
+/// share of 0 (`QUIC_DATA_RAMP_START = None`, `QUIC_DATA_PERCENT = 0`). The
+/// stopped node runs exactly that: no ramp from the test, no `quic-data-percent`
+/// (`QuicUpgradeTrace::run_without_ramp`). Its peer is still on the ramp, which
+/// started 17 h before a 2 h run, so the ramp node's share grows from 56% to
+/// 69%; with this seed the pair's bucket is 61, so the ramp node's data bit
+/// for the pair is off when the path comes up and comes on during the run
+/// (both asserted as premises from its own share decisions). A pair needs both data
+/// bits, and the stopped node sets neither its data bit nor its recycle bit, so
+/// the ramp node never rechecks the path or recycles it, and the pair keeps a
+/// shadow path that carries no data. Two ramp nodes in the same run shape carry
+/// data (the positive control).
 #[test_log::test]
 fn test_quic_data_ramp_stops_against_a_node_on_the_default_off_release() {
-    for (name, seed, stopped, carries) in [
-        ("quic-ramp-stop-mixed", 0x5940_7A00_0101, Some(0), false),
-        ("quic-ramp-stop-control", 0x5940_7A00_0102, None, true),
+    for (name, stopped, carries) in [
+        ("quic-ramp-stop-mixed", true, false),
+        ("quic-ramp-stop-control", false, true),
     ] {
-        let run = run_quic_shadow_sim(name, seed, (1, 1), 30, |sim, trace, labels| {
-            for label in labels {
-                sim.with_node_transport_quic(label, "prefer");
-            }
-            // Past the end of the day-long ramp: 100% for every ramp node.
-            trace.ramp_data_started_before(30 * RAMP_HOUR);
-            if let Some(percent) = stopped {
-                sim.with_node_quic_data_percent(&labels[1], percent);
-            }
-            run_as_first_negotiating_release(trace);
-        });
+        let run = run_quic_shadow_sim_waiting(
+            name,
+            0x5940_7A00_0101,
+            (1, 1),
+            4,
+            RAMP_HOUR / 2,
+            |sim, trace, labels| {
+                for label in labels {
+                    sim.with_node_transport_quic(label, "prefer");
+                }
+                trace.ramp_data_started_before(17 * RAMP_HOUR);
+                if stopped {
+                    trace.run_without_ramp(sim.all_node_addresses()[&labels[1]]);
+                }
+                run_as_first_negotiating_release(trace);
+            },
+        );
+        let ramp_node = run.nodes[0];
+        // Premise: the ramp node's bit for the pair was off when the path came
+        // up and came on during the run.
+        let decisions: Vec<_> = run
+            .trace
+            .records()
+            .iter()
+            .filter(|r| r.node == ramp_node)
+            .filter_map(|r| ramp_share_of(&r.what))
+            .collect();
+        assert!(
+            decisions
+                .first()
+                .is_some_and(|(bucket, percent)| bucket >= percent),
+            "{name}: premise: the ramp node's bit was off at first: {}",
+            run.dump()
+        );
+        // The ramp's share reaches the pair's bucket b (25 <= b < 100) at
+        // 12 h + (b - 25) x 12 h / 75 after its start, which must fall inside the
+        // run (the run's clock starts 17 h after the ramp's). The ramp node
+        // notes no new decision then unless something rechecks the path, so the
+        // premise is checked against the curve and the run's end.
+        let (bucket, _) = decisions[0];
+        assert!(
+            (25..100).contains(&bucket),
+            "{name}: premise: bucket {bucket}"
+        );
+        let reaches_at = Duration::from_secs(12 * 3600 + u64::from(bucket - 25) * 12 * 3600 / 75)
+            .saturating_sub(17 * RAMP_HOUR);
+        let ran_to = run
+            .trace
+            .records()
+            .iter()
+            .map(|r| r.at)
+            .max()
+            .unwrap_or_default();
+        assert!(
+            ran_to > reaches_at + Duration::from_secs(10 * 60),
+            "{name}: premise: the share reached the pair at {reaches_at:?}, well inside the run (to {ran_to:?}): {}",
+            run.dump()
+        );
         for node in &run.nodes {
-            assert_eq!(run.whats(*node, "Established"), 1, "{name}: {}", run.dump());
+            assert!(
+                run.whats(*node, "Established") >= 1,
+                "{name}: {}",
+                run.dump()
+            );
             assert_eq!(
-                run.whats(*node, "DataEnabled"),
-                usize::from(carries),
+                run.whats(*node, "DataEnabled") > 0,
+                carries,
                 "{name}: {}",
                 run.dump()
             );
         }
-        assert_eq!(
-            run.total("RecycledForData"),
-            0,
-            "{name}: no path is recycled toward a stopped node: {}",
-            run.dump()
-        );
-        if !carries {
+        if stopped {
             assert_eq!(
-                run.total("path sent data: sent 0, maybe 0, on udp 0, dropped 0"),
-                2,
+                run.total("RecycledForData"),
+                0,
+                "{name}: no path is recycled toward a stopped node: {}",
+                run.dump()
+            );
+            assert_eq!(
+                run.total("sent a short on the path"),
+                0,
                 "{name}: no data on the path: {}",
+                run.dump()
+            );
+        } else {
+            assert!(
+                run.total("RecycledForData") > 0,
+                "{name}: the control recycles the path once the share reaches it: {}",
                 run.dump()
             );
         }

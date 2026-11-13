@@ -858,6 +858,45 @@ fn data_paths_are_counted_while_they_carry_data() {
     });
 }
 
+/// A path that ends counts its age in `quic_path_age_at_close_<label>`, except
+/// when it was recycled for data: a recycle is no failure, and counted there it
+/// would fill the short buckets through the ramp.
+#[test]
+fn a_recycle_for_data_is_not_counted_as_a_path_age() {
+    use crate::transport::metrics::QuicPathAge;
+    use crate::transport::quic::upgrade::machine::Action;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (code, counted) in [
+            (QuicCloseCode::RecycleForData, false),
+            (QuicCloseCode::Downgrade, true),
+        ] {
+            let h = Harness::server_with("quic-driver-recycle-age", "prefer", Some("100")).await;
+            let (session, inbox) = h.session();
+            let attempt = offered(&h, &session);
+            let up = path_up(&h, &session, inbox);
+            let time = h.pair.time.clone();
+            let _up = drive(&h.pair.time, Duration::from_secs(60), async move {
+                let up = up.await;
+                time.sleep(Duration::from_secs(1)).await;
+                up
+            })
+            .await;
+            ready_ack(&session, attempt, 0);
+            h.set_now(Duration::from_secs(40));
+            let mut state = session.state.lock();
+            session.apply(&mut state, vec![Action::TearDown { attempt, code }]);
+            drop(state);
+            let aged = TRANSPORT_METRICS
+                .quic_events_of(h.remote)
+                .iter()
+                .filter(|event| *event == &format!("{:?}", QuicPathAge::Lt1M))
+                .count();
+            assert_eq!(aged, usize::from(counted), "{code:?}");
+        }
+    });
+}
+
 /// A path the peer refuses data on leaves the `quic_live_data_paths` gauge at the
 /// refusal, and only once: a second refusal and the attempt's drop lower nothing
 /// more, and a session that ends after the refusal did not end under a data path.
