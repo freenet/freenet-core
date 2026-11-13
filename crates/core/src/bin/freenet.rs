@@ -1658,9 +1658,16 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
     // it (about 900 KiB measured in a Linux debug build at the first event
     // loop turn), within a few KiB of the Windows limit: a branch that grew
     // those frames slightly overflowed at startup on Windows. A spawned task
-    // is polled by a worker, so the main
-    // thread only waits on the join handle. `tests/main_thread_stack.rs` pins
-    // it by starting the node with a small main-thread stack.
+    // is polled by a worker, so the main thread only waits on the join
+    // handle. `tests/main_thread_stack.rs` pins it by starting the node with
+    // a small main-thread stack and workers at their production size.
+    //
+    // The root future is now an ordinary task on a worker, so synchronous
+    // work on its path (config build, logger setup, node construction) holds
+    // a worker while it runs. With `worker_threads` set to the CPU count, a
+    // 1-vCPU host has one worker, so a long blocking call here would stall
+    // the whole runtime. Nothing on that path blocks for long today; anything
+    // added that does belongs in `spawn_blocking`.
     let node = rt.spawn(async move {
         let config = config_args.build().await?;
         freenet::config::set_logger(None, None, config.paths().log_dir());

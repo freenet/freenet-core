@@ -19,9 +19,31 @@
 //! the node task; clap's derived parser alone takes about 400 KiB in a debug
 //! build, so the limit leaves room for it and none for the node.
 //!
-//! Linux only: `ulimit -s` sets the main thread's stack on exec there. The
-//! Windows half is `tests/quic_breaker_windows.rs`, which runs the binary with
-//! its real 1 MiB main stack.
+//! The node's work now runs on tokio workers, whose stack std sizes from
+//! `RUST_MIN_STACK` (2 MiB when it is unset, as in production). CI sets it to
+//! 256 MiB, which would let worker stack use grow far past the production size
+//! unseen, so every case here sets it explicitly: 2 MiB, the production size,
+//! for each transport, and 1.5 MiB as an early warning. The node's root task
+//! keeps the same nested frames on its worker that it had on the main thread:
+//! in a Linux debug build with CI's unit-test features it needs between 896
+//! KiB and 1 MiB there (measured by lowering `RUST_MIN_STACK`; at 896 KiB it
+//! overflows in the event listener's select). Production's 2 MiB leaves about
+//! twice that, and the 1.5 MiB case fails once use grows by about half.
+//!
+//! Linux only: `ulimit -s` before `exec` sets the main thread's stack there;
+//! Windows fixes it in the executable's header at link time. It proves the
+//! Windows property anyway, because what it checks is where the node runs, not
+//! a platform's frame sizes: at 640 KiB no node work fits on the main thread on
+//! any platform. No test runs Windows at its real sizes on both kinds of
+//! thread. `tests/quic_breaker_windows.rs` runs the binary with its real 1 MiB
+//! main stack, but with QUIC at the default mode and with CI's 256 MiB
+//! `RUST_MIN_STACK` on the workers, and Windows frames are usually somewhat
+//! larger than the Linux ones measured here.
+//!
+//! `ulimit -s` also lowers glibc's default stack for threads that C code
+//! creates without a size (Rust's own threads set theirs). A failure here can
+//! therefore come from such a thread rather than from node work on the main
+//! thread: read the overflow message, which names the thread.
 
 #![cfg(target_os = "linux")]
 
@@ -34,6 +56,15 @@ use std::{
 /// Main-thread stack for the node, in KiB. See the module doc for the sizes
 /// measured on either side of it.
 const MAIN_STACK_KIB: u32 = 640;
+
+/// std's default stack for the threads it spawns, tokio's workers included,
+/// when `RUST_MIN_STACK` is unset: the size production runs with.
+const PRODUCTION_WORKER_STACK: usize = 2 * 1024 * 1024;
+
+/// Three quarters of the production worker stack: fails when worker stack use
+/// grows by about half from the measured 896 KiB - 1 MiB, before it reaches
+/// production's limit.
+const EARLY_WARNING_WORKER_STACK: usize = 3 * 512 * 1024;
 
 /// Logged once the network listener is open, after the transport is bound:
 /// the point the Windows run never reached.
@@ -80,7 +111,7 @@ impl Drop for Node {
 }
 
 impl Node {
-    fn spawn(dir: &Path, extra_args: &[&str]) -> anyhow::Result<Self> {
+    fn spawn(dir: &Path, extra_args: &[&str], worker_stack: usize) -> anyhow::Result<Self> {
         let log_dir = dir.join("logs");
         std::fs::create_dir_all(&log_dir)?;
         let ws_port = reserve_port()?.to_string();
@@ -98,6 +129,8 @@ impl Node {
             // INFO file log whatever CI exports, and the QUIC mode from the
             // arguments alone.
             .env("FREENET_TELEMETRY_ENABLED", "false")
+            // Workers at a stated size, not CI's 256 MiB (see the module doc).
+            .env("RUST_MIN_STACK", worker_stack.to_string())
             .env("FREENET_QUIC_BREAKER_STOP_NOTE", dir.join("stop-note"))
             .env("RUST_LOG", "info")
             .env_remove("FREENET_LOG_TO_STDERR")
@@ -156,15 +189,18 @@ impl Node {
     }
 }
 
-fn starts_and_runs_with_a_small_main_stack(extra_args: &[&str]) -> anyhow::Result<()> {
+fn starts_and_runs_with_a_small_main_stack(
+    extra_args: &[&str],
+    worker_stack: usize,
+) -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let mut node = Node::spawn(dir.path(), extra_args)?;
+    let mut node = Node::spawn(dir.path(), extra_args, worker_stack)?;
     let deadline = Instant::now() + Duration::from_secs(120);
     while !node.logs().contains(LISTENER_OPEN) {
         if let Some(exit) = node.exited()? {
             anyhow::bail!(
                 "the node exited before {LISTENER_OPEN:?} with a {MAIN_STACK_KIB} KiB main \
-                 stack; is node work running on the main thread? {exit}"
+                 stack and {worker_stack} byte workers: {exit}"
             );
         }
         if Instant::now() >= deadline {
@@ -177,7 +213,7 @@ fn starts_and_runs_with_a_small_main_stack(extra_args: &[&str]) -> anyhow::Resul
         if let Some(exit) = node.exited()? {
             anyhow::bail!(
                 "the node exited after {LISTENER_OPEN:?} with a {MAIN_STACK_KIB} KiB main \
-                 stack; is node work running on the main thread? {exit}"
+                 stack and {worker_stack} byte workers: {exit}"
             );
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -188,17 +224,31 @@ fn starts_and_runs_with_a_small_main_stack(extra_args: &[&str]) -> anyhow::Resul
 /// The default transport.
 #[test]
 fn the_node_starts_with_a_small_main_thread_stack() -> anyhow::Result<()> {
-    starts_and_runs_with_a_small_main_stack(&[])
+    starts_and_runs_with_a_small_main_stack(&[], PRODUCTION_WORKER_STACK)
 }
 
 /// QUIC `prefer`, the configuration that overflowed on Windows.
 #[test]
 fn the_node_starts_with_a_small_main_thread_stack_with_quic_prefer() -> anyhow::Result<()> {
-    starts_and_runs_with_a_small_main_stack(&["--transport-quic", "prefer"])
+    starts_and_runs_with_a_small_main_stack(
+        &["--transport-quic", "prefer"],
+        PRODUCTION_WORKER_STACK,
+    )
 }
 
 /// QUIC off, so the UDP-only startup path is covered too.
 #[test]
 fn the_node_starts_with_a_small_main_thread_stack_with_quic_off() -> anyhow::Result<()> {
-    starts_and_runs_with_a_small_main_stack(&["--transport-quic", "off"])
+    starts_and_runs_with_a_small_main_stack(&["--transport-quic", "off"], PRODUCTION_WORKER_STACK)
+}
+
+/// QUIC `prefer` with workers at three quarters of their production stack: an
+/// early warning that worker stack use is growing toward the production limit.
+#[test]
+fn the_node_starts_with_workers_at_three_quarters_of_their_production_stack() -> anyhow::Result<()>
+{
+    starts_and_runs_with_a_small_main_stack(
+        &["--transport-quic", "prefer"],
+        EARLY_WARNING_WORKER_STACK,
+    )
 }
