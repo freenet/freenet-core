@@ -7,6 +7,7 @@ mod delegate_store;
 pub(crate) mod delegate_subscriptions;
 pub(crate) mod engine;
 mod error;
+mod guest_mem;
 pub(crate) mod mock_state_storage;
 mod module_cache;
 mod native_api;
