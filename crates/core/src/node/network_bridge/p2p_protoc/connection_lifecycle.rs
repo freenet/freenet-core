@@ -1389,9 +1389,7 @@ impl P2pConnManager {
                     #[cfg(any(test, feature = "testing"))]
                     crate::operations::connect::native_wire_trace::record_at(
                         peer_addr,
-                        crate::operations::connect::native_wire_trace::NativeWireEvent::NativeDial {
-                            established: false,
-                        },
+                        crate::operations::connect::native_wire_trace::NativeWireEvent::NativeSuperseded,
                     );
                     return Ok(());
                 }

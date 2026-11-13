@@ -297,6 +297,7 @@ pub mod sim_trace {
             )>,
         >,
         fallbacks_dialled: AtomicU64,
+        native_superseded: AtomicU64,
         /// Nodes standing in for a release below the floor
         /// ([`mark_pre_floor`]).
         pre_floor: parking_lot::Mutex<std::collections::HashSet<SocketAddr>>,
@@ -337,6 +338,9 @@ pub mod sim_trace {
             own: Option<SocketAddr>,
             peer: SocketAddr,
         },
+        /// A native setup failed after its pair had connected another way, so
+        /// it needs no fallback. Also counted as a failed native dial.
+        NativeSuperseded,
         /// The node `own` was asked for a UDP dial to `peer` in `tx`.
         UdpDialFor {
             tx: crate::message::Transaction,
@@ -409,6 +413,10 @@ pub mod sim_trace {
             NativeWireEvent::NativeDial { established: true } => &c.native_established,
             NativeWireEvent::NativeDial { established: false } => &c.native_failed,
             NativeWireEvent::NativeDemoted => &c.native_demotions,
+            NativeWireEvent::NativeSuperseded => {
+                c.native_failed.fetch_add(1, Ordering::Relaxed);
+                &c.native_superseded
+            }
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -488,6 +496,10 @@ pub mod sim_trace {
         /// same peer in the same transaction.
         pub fn native_fallbacks_dialled(&self) -> u64 {
             Self::get(&self.0.fallbacks_dialled)
+        }
+        /// Native failures after the pair had connected another way.
+        pub fn native_superseded(&self) -> u64 {
+            Self::get(&self.0.native_superseded)
         }
         /// Native failures with no UDP dial after them (yet), as
         /// `transaction node -> peer`.

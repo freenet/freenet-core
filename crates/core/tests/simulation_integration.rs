@@ -22864,7 +22864,12 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
         Vec::<String>::new(),
         "every failed native setup was followed by a UDP dial"
     );
-    assert_eq!(t.native_fallbacks_dialled(), t.native_failed());
+    // A failure after the pair connected another way (the server waits
+    // longer than its client) needs no fallback.
+    assert_eq!(
+        t.native_fallbacks_dialled() + t.native_superseded(),
+        t.native_failed()
+    );
     let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
     assert_eq!(peers.len(), run.wire.nodes, "every node joined over UDP");
     assert!(connected);
