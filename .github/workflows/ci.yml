@@ -1185,7 +1185,7 @@ jobs:
       - name: Test service commands
         run: cargo nextest run -p freenet --bin freenet --profile ci -E 'test(commands::service) | test(commands::url_handler) | test(commands::open_link)'
 
-      # QUIC shadow is the default on macOS (#5940 Step 2), and its crash-loop
+      # QUIC is on by default on macOS (`prefer`, #5940), and its crash-loop
       # breaker reads kern.boottime there: run the real-binary shutdown tests on
       # a real Mac (a clean stop clears it, a SIGKILL trips it, which needs the
       # boot identity, and a node with no setting arms it). Not the lib unit

@@ -673,7 +673,8 @@ fn a_routed_attempt_becomes_a_shadow_path() {
         let payload = peer_inbound.controls.try_recv().expect("Ready arrived");
         assert_eq!(
             peer_path.decode_control(&payload),
-            Ok(QuicControl::Ready { attempt, caps: 0 })
+            Ok(QuicControl::Ready { attempt, caps: 0 }),
+            "a shadow node says nothing: it never carries data"
         );
     });
 }
@@ -789,7 +790,18 @@ fn a_path_follows_the_data_bits() {
                 if accepts { (1, 0) } else { (0, 1) },
                 "{case}: a frame before the peer's bit has arrived"
             );
-            let want_caps = if accepts { caps::DATA } else { 0 };
+            // A data-capable node (a share that is not fixed at 0) says it
+            // recycles; the others say nothing.
+            let data_capable = match percent {
+                Some(p) => p != "0",
+                None => crate::transport::quic::upgrade::policy::QUIC_DATA_RAMP_START.is_some(),
+            };
+            let recycles = if mode == "prefer" && data_capable {
+                caps::RECYCLES
+            } else {
+                0
+            };
+            let want_caps = if accepts { caps::DATA } else { 0 } | recycles;
             let payload = peer_inbound.controls.try_recv().expect("Ready arrived");
             assert_eq!(
                 peer_path.decode_control(&payload),
@@ -918,6 +930,45 @@ fn data_paths_are_counted_while_they_carry_data() {
                 let lt_10m = crate::transport::metrics::QuicPathAge::Lt10M as usize;
                 assert_eq!(snap.session_ended_with_data_path[lt_10m], 1);
             }
+        }
+    });
+}
+
+/// A path that ends counts its age in `quic_path_age_at_close_<label>`, except
+/// when it was recycled for data: a recycle is no failure, and counted there it
+/// would fill the short buckets through the ramp.
+#[test]
+fn a_recycle_for_data_is_not_counted_as_a_path_age() {
+    use crate::transport::metrics::QuicPathAge;
+    use crate::transport::quic::upgrade::machine::Action;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (code, counted) in [
+            (QuicCloseCode::RecycleForData, false),
+            (QuicCloseCode::Downgrade, true),
+        ] {
+            let h = Harness::server_with("quic-driver-recycle-age", "prefer", Some("100")).await;
+            let (session, inbox) = h.session();
+            let attempt = offered(&h, &session);
+            let up = path_up(&h, &session, inbox);
+            let time = h.pair.time.clone();
+            let _up = drive(&h.pair.time, Duration::from_secs(60), async move {
+                let up = up.await;
+                time.sleep(Duration::from_secs(1)).await;
+                up
+            })
+            .await;
+            ready_ack(&session, attempt, 0);
+            h.set_now(Duration::from_secs(40));
+            let mut state = session.state.lock();
+            session.apply(&mut state, vec![Action::TearDown { attempt, code }]);
+            drop(state);
+            let aged = TRANSPORT_METRICS
+                .quic_events_of(h.remote)
+                .iter()
+                .filter(|event| *event == &format!("{:?}", QuicPathAge::Lt1M))
+                .count();
+            assert_eq!(aged, usize::from(counted), "{code:?}");
         }
     });
 }
@@ -1673,8 +1724,9 @@ fn session_and_setup_endings_reach_their_own_counters() {
     });
 }
 
-/// A fallback and a fallback the session's end followed reach their two
-/// counter families under the same label, for every cause.
+/// A fallback, a fallback the session's end followed, and a fallback of a path
+/// that carried data reach their three counter families under the same label,
+/// for every cause.
 #[test]
 fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
     use crate::transport::metrics::QuicFallback;
@@ -1711,6 +1763,7 @@ fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
                     [
                         Action::Record(Outcome::Fallback(*cause)),
                         Action::Record(Outcome::ChurnedFallback(*cause)),
+                        Action::Record(Outcome::CarryingFallback(*cause)),
                     ]
                 })
                 .collect(),
@@ -1718,7 +1771,13 @@ fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
         drop(state);
         let want: Vec<String> = causes
             .iter()
-            .flat_map(|(_, label)| [format!("{label:?}"), format!("(\"churned\", {label:?})")])
+            .flat_map(|(_, label)| {
+                [
+                    format!("{label:?}"),
+                    format!("(\"churned\", {label:?})"),
+                    format!("(\"carrying\", {label:?})"),
+                ]
+            })
             .collect();
         assert_eq!(TRANSPORT_METRICS.quic_events_of(h.remote), want);
     });

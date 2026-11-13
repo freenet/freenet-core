@@ -288,7 +288,7 @@ fn end_reason(path: &QuicPath) -> CloseReason {
 /// for them.
 impl Drop for NativePeerConnection {
     fn drop(&mut self) {
-        self.route.path().uncount_as_data_path();
+        self.route.path().end_as_data_path();
         self.route.path().close(QuicCloseCode::NodeDroppedPeer);
         if let Some(registry) = &self.dispatch.inbound_stream_registry {
             // Collected first, so the budget is not locked while the registry

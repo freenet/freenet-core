@@ -801,8 +801,13 @@ pub(crate) struct QuicPath {
     send_data: AtomicU8,
     /// Whether this path is counted in the node's `quic_live_data_paths` gauge:
     /// from [`Self::count_as_data_path`] until the peer refuses data or
-    /// [`Self::uncount_as_data_path`], whichever is first, so it is lowered once.
-    counted_as_data_path: std::sync::atomic::AtomicBool,
+    /// [`Self::end_as_data_path`], whichever is first, so it is lowered once.
+    counted_as_data_path: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the path's attempt ends while it is still counted
+    /// ([`Self::end_as_data_path`]): the path carried data to its end, so the
+    /// loss report's final reading, taken after the attempt is gone, is still
+    /// counted as carrying. A refusal does not set it.
+    ended_as_data_path: Arc<std::sync::atomic::AtomicBool>,
     /// Whether a send this path cannot deliver may go on UDP
     /// ([`QuicPathLimits::udp_fallback`]).
     udp_fallback: bool,
@@ -1051,12 +1056,20 @@ impl QuicPath {
         );
         let heard = Arc::new(recycle::PeerHeard::default());
         let writers = Arc::new(recycle::Writers::default());
+        // Shared with the loss report, which counts the path's packets as
+        // carrying data while it is in the gauge.
+        let counted_as_data_path = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended_as_data_path = Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut report = recycle::PathReport::new(
             connection.inner().clone(),
             stats.node(),
             built_at,
             meter.clone(),
+            recycle::Carrying {
+                now: counted_as_data_path.clone(),
+                at_end: ended_as_data_path.clone(),
+            },
         );
         #[cfg(test)]
         {
@@ -1095,7 +1108,8 @@ impl QuicPath {
                 carries_data,
                 controls_opening: Arc::default(),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
-                counted_as_data_path: std::sync::atomic::AtomicBool::new(false),
+                counted_as_data_path,
+                ended_as_data_path,
                 udp_fallback: limits.udp_fallback,
                 stall: parking_lot::Mutex::new(stall),
                 quiet: Arc::default(),
@@ -1398,7 +1412,7 @@ impl QuicPath {
     fn stop_sending_data(&self) {
         self.stats.record_send_event(QuicSendEvent::DataRefused);
         // No longer a path that carries data.
-        self.uncount_as_data_path();
+        let _ = self.uncount_as_data_path();
         let was_on = self
             .send_data
             .compare_exchange(
@@ -1432,18 +1446,39 @@ impl QuicPath {
     }
 
     /// Count this path in the node's `quic_live_data_paths` gauge, once: its
-    /// route was installed. Undone by [`Self::uncount_as_data_path`] or a refusal.
+    /// route was installed. Undone by [`Self::end_as_data_path`] or a refusal.
     pub(in crate::transport) fn count_as_data_path(&self) {
         if !self.counted_as_data_path.swap(true, Ordering::AcqRel) {
             self.stats.node().data_path_started();
         }
     }
 
-    /// Take this path out of the gauge if it is in it: its attempt went. A path
-    /// the peer refused data on is out already, so nothing is lowered twice.
-    pub(in crate::transport) fn uncount_as_data_path(&self) {
-        if self.counted_as_data_path.swap(false, Ordering::AcqRel) {
+    /// Take this path out of the gauge if it is in it: the peer refused data.
+    /// Lowered once whichever comes first, this or [`Self::end_as_data_path`].
+    fn uncount_as_data_path(&self) -> bool {
+        let was = self.counted_as_data_path.swap(false, Ordering::AcqRel);
+        if was {
             self.stats.node().data_path_ended();
+        }
+        was
+    }
+
+    /// Take this path out of the gauge if it is in it: its attempt went. A path
+    /// that was still carrying data is marked so, so the loss report's final
+    /// reading, taken after this, is counted as carrying too
+    /// (`recycle::Carrying::at_end`). A path the peer refused data on is out
+    /// already, so nothing is lowered twice and it is not marked.
+    ///
+    /// The mark is set before the gauge flag is cleared: the final report
+    /// reads the gauge flag first and the mark second, so a report running
+    /// between the two steps sees the path as carrying either way. A refusal
+    /// that takes the path out in between clears the mark again.
+    pub(in crate::transport) fn end_as_data_path(&self) {
+        if self.counted_as_data_path.load(Ordering::Acquire) {
+            self.ended_as_data_path.store(true, Ordering::Release);
+            if !self.uncount_as_data_path() {
+                self.ended_as_data_path.store(false, Ordering::Release);
+            }
         }
     }
 

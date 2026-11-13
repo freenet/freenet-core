@@ -1168,17 +1168,19 @@ it must not wait unless it is a pacing point.
 #### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
 `transport-quic` (config key: `off`, `shadow` or `prefer`; unset is
-`QuicMode::default_mode`, shadow on Linux, macOS and Windows and off
+`QuicMode::default_mode`, prefer on Linux, macOS and Windows and off
 elsewhere, since the breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
-`prefer` negotiates data with the release's share of pairs ("Data slice" below;
-`upgrade::policy::log_startup` reports the share at INFO once per node), and a pair
-with both bits sends its data on the path ("QUIC send route" below). At a share of
-0, with no `quic-data-percent`, `prefer` differs from `shadow` only by the bit, which
-stays 0. The release that raises the share above 0 must say in its notes that
-existing `prefer` configs start carrying data. Off: no endpoint, no QUIC ingress, nothing
+`prefer` negotiates data with the share of pairs the ramp gives at the time ("Data
+slice" below; `upgrade::policy::log_startup` reports the share at INFO once per
+node, and each band the ramp enters is logged at INFO), and a pair with both bits
+sends its data on the path ("QUIC send route" below). With no ramp start and no
+`quic-data-percent` the share is 0, and `prefer` differs from `shadow` only by the
+bit, which stays 0. The release that sets the ramp start must say in its notes that
+`prefer` nodes, every Linux, macOS and Windows node that did not set the key, start
+carrying data. Off: no endpoint, no QUIC ingress, nothing
 changes, except that `off` set in the config is deprecated and logs a WARN at
 startup (`upgrade::policy::log_startup`); the endpoint state telemetry reports it
-as `off_config`. Windows is shadow by default too since its crash-loop breaker was
+as `off_config`. Windows has the same default since its crash-loop breaker was
 confirmed on a real Windows machine (#6031). The default is
 read, never written to config.toml: a node that did not set the key follows the
 release it runs, so a default-off release is the kill switch. It does not reach
@@ -1295,12 +1297,39 @@ BLAKE3("freenet-quic-data-slice-v1" || min(a, b) || max(a, b)), big-endian, mod
 100, over the two transport public keys, the peer's from the node's record. A
 pair is in the slice when its bucket is below the percentage, so 0 holds none,
 100 holds all, and slices nest. A test vector pins the function.
-  The percentage: `QUIC_DATA_PERCENT` in `upgrade/policy.rs`, one value per
-  release, 0 today; the config key `quic-data-percent` (lenient text like
-  `quic-max-paths`; anything but a whole number from 0 to 100 reads as unset, with
-  a WARN when QUIC is on) replaces it on one node. Only `prefer` uses it.
-  `QuicPolicy::own_caps` gives `caps::DATA` when the mode is `prefer` and the pair
-  is in the slice, otherwise 0, and the driver passes that in `Event::Promoted`.
+  The percentage: a ramp over one release (`slice::ramp_percent`): 5% for the
+  first 6 h, then linear 5 to 25% to 12 h and 25 to 100% to 24 h, 100% after,
+  from `QUIC_DATA_RAMP_START` in `upgrade/policy.rs` (Unix seconds, or `None`:
+  no ramp, share 0). The start is `None` in tree and set in its own reviewed PR to
+  the planned publish time, just before the release's soak, and left set: past 24 h
+  it reads 100%, the steady state. A node whose clock reads before the start gets
+  5%. Slices nest, so a pair in the slice stays in as the share grows. The config
+  key `quic-data-percent` (lenient text like `quic-max-paths`; anything but a whole
+  number from 0 to 100 reads as unset, with a WARN when QUIC is on) replaces the
+  ramp on one node. Only `prefer` uses it. `QuicPolicy::own_caps` gives
+  `caps::DATA` when the mode is `prefer` and the pair is in the slice at the wall
+  clock now (`PathClock::wall_now`: real time, or a simulation's VirtualTime),
+  otherwise 0. It is read at the start of each attempt (promotion, each Offer and
+  each accept), so a pair the share reaches takes data from its next attempt.
+  Recycle for data: a path that came up without this node's bit, to a peer that
+  advertised `caps::RECYCLES` (2) in its `Ready` or `ReadyAck`, is rechecked every
+  `DATA_RECHECK_INTERVAL` (45 s, jittered +/-20% per pair). Once this node's bit
+  for the pair is on, the recheck closes the path with RECYCLE_FOR_DATA (7) and
+  the pair offers again (a server after the first-offer delay, 2 to 10 s, so its
+  UDP offer does not reach the client before the close and get declined
+  `NotReady`): no fault, no backoff charge, not a fallback, not churn, not counted toward the stall close and not DOWNGRADE;
+  counted only as `quic_close_sent_recycle_for_data` /
+  `quic_close_received_recycle_for_data`, and left out of
+  `quic_path_age_at_close_<label>` (it comes about a recheck after activation
+  and would fill the short buckets). A path with data, or to a peer without
+  `RECYCLES` (a release before it reads the close as a lost connection), is never
+  rechecked, and the next attempt carries data, so a pair is recycled at most once
+  per flip. If the close frame is lost, the peer does not see RECYCLE_FOR_DATA:
+  its path ends by idle timeout, which it records as a charged fallback (one per
+  lost close, not a recycle). The bit is not tied to a version. A node sets it
+  when it is data-capable: `prefer` with any share but one fixed at 0. A shadow
+  or off node, or one at a fixed share of 0 (the emergency-stop release), does
+  not, so no peer recycles a path to it that could never carry data.
   `QUIC_DATA_RECEIVER_READY` is true: `recv` reads the path's data ("QUIC receive
   flow" below).
   The machine reads no key to decide it.
@@ -1464,9 +1493,19 @@ a test passes its own; tests read their own, never the global).
   bucket uploaded every period, 0 included; no per-path values) and
   quic_ended_loss_rate_<bucket> (paths that ended in the period, by their final
   bucket, so paths that fail lossy still show) and quic_ended_paths_below_floor
-  (paths that ended in the period before 200 packets). Packets in flight at close
-  are dropped by quinn, not declared lost, so a final bucket can understate the
-  loss at the end. The rate is quinn's lost over
+  (paths that ended in the period before 200 packets). The same for paths that
+  carry data, counted from the first report that finds the path carrying (the
+  path's quic_live_data_paths flag, so a data bit that comes on after the watch
+  started starts the count then, and a path refused data keeps its bucket until
+  it ends): quic_carrying_loss_rate_<bucket> (gauge, uploaded at 0),
+  quic_carrying_ended_loss_rate_<bucket> and quic_carried_paths_ended_below_floor,
+  with quic_carried_packets_sent / _lost the subset of the period's sums sent
+  while carrying. Shadow = total minus carried is a reconciliation residual:
+  both are recorded in one record_path_loss call under the one loss lock, the
+  exception the bug-prevention rule on a metric re-derived at the call site
+  allows (as for broadcast_payload_mix). The single keys are not under quic_carrying_, which the two carrying
+  families share. Packets in flight at close are dropped by quinn, not declared
+  lost, so a final bucket can understate the loss at the end. The rate is quinn's lost over
   sent (quinn-proto 0.11.19), not a measurement of the link: sent counts every
   packet quinn built, acknowledgement-only ones included; lost counts quinn's
   loss declarations, and a packet declared lost and later acknowledged is not
@@ -1939,8 +1978,12 @@ release goes out.
   terms (about 0.3 to 0.5 MiB per idle path). An abort spike stops the step.
   Shadow carries no data, so it does not measure `MAX_UNI_STREAMS`.
 - Step 3 (e5b): data on a slice of pairs chosen by a hash of their two keys, so
-  both sides agree with no extra message: about 5%, then 25%, then 100%, one
-  release each. Pairs outside the slice are the control. Needs identity PR3, the
+  both sides agree with no extra message, ramped within one release over 24 h
+  from its start (5% for 6 h, then to 25% at 12 h and 100% at 24 h; "Data slice").
+  QUIC's memory is bounded by the buffer budget ("QUIC memory" above) and summed
+  in the node aggregate at the QUIC connection cap, to which the connection
+  limit is lowered while the node may carry data. Pairs outside the slice are
+  the control while it grows. Needs identity PR3, the
   quinn pin decision and #6027. Keep the stream limits if permit waits plus
   `quic_open_uni_waited` stay below 0.5% of sends and ge_48 below 0.2% of
   path-windows.
@@ -2771,7 +2814,8 @@ Control payload (quic/control.rs), the body of a Control frame, one per
   first (a later version is UnknownVersion at any length), refuses an
   unknown type and a v1 payload of any other length (bytes appended at the
   end too, so a field cannot be added without a version), and clears caps
-  bits outside caps::KNOWN (caps::DATA = 1, the only bit, see "Data slice").
+  bits outside caps::KNOWN (caps::DATA = 1 and caps::RECYCLES = 2, see "Data
+  slice").
   The Offer's caps field is separate and stays 0.
   A new type or field needs a new version. UpgradeControl differs: bincode
   tolerates trailing bytes there, so it grows by caps-gated variants. A
@@ -2882,8 +2926,8 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   waiting for its source does not count (WatchedSource). It costs a normal
   backoff.
   Fast path: Session::routed is an atomic set only while the live attempt holds a
-  route, so a connection with no route (shadow, the default on Linux, macOS and Windows)
-  sends without taking the session's lock. enable_data runs once per activation
+  route, so a connection with no route (a shadow path, or a `prefer` pair outside
+  the share) sends without taking the session's lock. enable_data runs once per activation
   (debug assertion); a second route would orphan the first one's worker.
   A path gone dark: the first send timeout that counts toward the stall close
   (nothing acknowledged for the window, no cap hold) makes the path suspect
@@ -2987,9 +3031,9 @@ QUIC receive flow (#5940 e5b-4):
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
 
-Live in production on Linux, macOS and Windows, where shadow is the default: the
-paths carry control frames only, but endpoints, connections and their errors
-are real. With `transport-quic` off no endpoint is built and the transport
+Live in production on Linux, macOS and Windows, where `prefer` is the default:
+until a release's share reaches a pair its path carries control frames only,
+but endpoints, connections and their errors are real. With `transport-quic` off no endpoint is built and the transport
 reports `Disabled`.
 
 ```
@@ -3062,8 +3106,11 @@ Application error codes, one range per QUIC frame type, all one-byte
                 and counts quic_fallback_session_ended_rx, or
                 setup_downgrade_rx in setup; a node without this code reads
                 ConnectionLost: quic_fallback_reset, or
-                quic_upgrade_handshake_failed in setup), 0x07 left to the
-                ramp branch's RECYCLE_FOR_DATA, OVER_BUDGET 8 (the peer held
+                quic_upgrade_handshake_failed in setup),
+                RECYCLE_FOR_DATA 7 (this node's data bit for the pair came on
+                while a path without data was up; sent only to a peer that set
+                caps::RECYCLES, which reads it as no fault and offers again;
+                see "Data slice"), OVER_BUDGET 8 (the peer held
                 more of this node's QUIC buffer budget than it allows: its
                 gaps or staged bytes past their cap a second time within 30 s; the peer reads it as
                 Refused{OverBudget}, falls back, charges as for Downgrade and
@@ -3089,8 +3136,7 @@ Application error codes, one range per QUIC frame type, all one-byte
   The scrape test checks every constant by name against ALL, and
   close_code::ALL against the QuicCloseCode variants.
   The close codes are wire values a peer on another release reads: never
-  renumber them; add a new code at the next free value (0x0B; 0x07 is
-  taken by the ramp branch). A code the peer does not know reads as
+  renumber them; add a new code at the next free value (0x0B). A code the peer does not know reads as
   ConnectionLost there; what this node does with each code it knows is
   listed above. Every close the QUIC code sends
   goes through the connection's QuicCloser (QuicConnection::close and
