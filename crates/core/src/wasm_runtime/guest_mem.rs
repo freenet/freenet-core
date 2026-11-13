@@ -4,7 +4,9 @@
 //! buffer-builder offset from `__frnt__initiate_buffer`, the `start`,
 //! `capacity`, `last_read` and `last_write` fields stored inside that builder,
 //! and the `{ptr, kind, size}` result descriptor returned by each contract
-//! export. (The delegate `process` result descriptor is handled separately.)
+//! export. The delegate `process` result descriptor is NOT checked here: it is
+//! still read through stdlib's `DelegateInterfaceResult` and is being fixed
+//! separately in freenet/freenet-core#6217.
 //! `freenet-stdlib`'s host-side helpers (`BufferMut::from_ptr`,
 //! `ContractInterfaceResult::from_raw` and the `unwrap_*` decoders) add those
 //! offsets to the memory base without checking them against the memory size,

@@ -414,6 +414,35 @@ async fn streaming_refill_of_builder_rewritten_outside_memory_traps() {
 
 // ---- ANT-2026-ZH3GYE67: result descriptor returned by each export ----
 
+/// A contract export may grow its memory and place its result in the new
+/// pages. The host must check and read the result against the memory as it
+/// is AFTER the call; checking against a view taken before the call would
+/// refuse this honest result (and, if the memory moved, read a stale base).
+#[tokio::test(flavor = "multi_thread")]
+async fn result_placed_in_memory_grown_during_the_call_is_accepted() {
+    let mut t = Template::honest();
+    // $end = start of the page just grown. Trap if the grow fails, so the
+    // descriptor can never fall back inside the old memory and pass vacuously.
+    let end = "(i32.mul (i32.sub (memory.size) (i32.const 1)) (i32.const 65536))";
+    t.validate_body = format!(
+        "(if (i32.eq (memory.grow (i32.const 1)) (i32.const -1)) (then unreachable))
+    ;; descriptor at $end: ptr = $end + 16, kind 0 (validate_state), size 8;
+    ;; the payload (8 zero bytes = Ok(ValidateResult::Valid)) is the fresh,
+    ;; zero-filled page after it.
+    (i64.store {end} (i64.extend_i32_u (i32.add {end} (i32.const 16))))
+    (i32.store offset=8 {end} (i32.const 0))
+    (i32.store offset=12 {end} (i32.const 8))
+    (i64.extend_i32_u {end})"
+    );
+    assert_eq!(
+        bincode::serialize(&Ok::<ValidateResult, ContractError>(ValidateResult::Valid)).unwrap(),
+        vec![0u8; 8],
+        "the grown page's zero bytes must be the encoding of Ok(Valid)"
+    );
+    let mut h = harness(t.wasm()).await;
+    assert_eq!(h.validate(vec![1, 2, 3, 4]).unwrap(), ValidateResult::Valid);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn validate_state_result_with_unknown_kind_is_refused() {
     let mut h = harness(Template::honest().set(VALIDATE, DescField::Kind(7)).wasm()).await;
