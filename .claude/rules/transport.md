@@ -1494,7 +1494,9 @@ a test passes its own; tests read their own, never the global).
   counted as strikes (path::StrikeCheck), by kind; expected 0 on honest
   paths. quic_stall_close_<not_acknowledging|dark|credit_starved|
   stream_credit_withheld|ack_waits_expired>: paths the acknowledgement
-  watch closed, by why (recycle::Stall).
+  watch closed, by why (recycle::Stall). quic_stall_would_close_<same
+  labels>: times a rule that only observes would have closed a path; only
+  ack_waits_expired observes today (recycle::ACK_WAITS_EXPIRED_CLOSES).
   quic_dark_episode_<recovered_lt_5s|lt_10s|lt_30s|lt_120s|recovered_ge_120s|
   unrecovered|cap_held|closed_at_window>: dark episodes (recycle::AckWatch:
   packets outstanding, nothing acknowledged, nothing heard) by how they ended;

@@ -1517,7 +1517,8 @@ pub(crate) enum Stall {
     StreamCreditWithheld,
     /// [`ACK_WAIT_EXPIRY_LIMIT`] of this side's sends had their wait for the
     /// acknowledgement of their end run out within
-    /// [`ACK_WAIT_EXPIRY_WINDOW`] ([`AckWatch`]).
+    /// [`ACK_WAIT_EXPIRY_WINDOW`] ([`AckWatch`]). Observe-only for now: counted
+    /// as a would-close, the path not closed ([`ACK_WAITS_EXPIRED_CLOSES`]).
     AckWaitsExpired,
 }
 
@@ -1713,7 +1714,8 @@ pub(crate) const STREAM_CREDIT_FREED: u64 = super::config::MAX_UNI_STREAMS as u6
 pub(crate) const ACK_WAITS_EXPIRED_CLOSES: bool = false;
 
 /// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that would close a
-/// path ([`Stall::AckWaitsExpired`]; counted only, [`ACK_WAITS_EXPIRED_CLOSES`]): sends whose wait for the acknowledgement of
+/// path ([`Stall::AckWaitsExpired`]; counted only,
+/// [`ACK_WAITS_EXPIRED_CLOSES`]): sends whose wait for the acknowledgement of
 /// their end ran out (`bounded::SendDeadlines::ack_wait`, at least 5 min, or
 /// a one-packet Short's background wait, `path::SHORT_ACK_WAIT`, 120 s) and
 /// whose stream was reset. Counted only when the reset happened (an
