@@ -1609,44 +1609,6 @@ fn a_peer_that_withholds_a_small_stream_limit_is_closed() {
     );
 }
 
-/// A peer that acknowledges everything except stream ends: the ack wait of
-/// three of this side's streams in a row runs out, with none wholly
-/// acknowledged between, and the path closes at the third
-/// ([`Stall::StreamEndsUnacknowledged`]). A stream wholly acknowledged
-/// between resets the count ([`Writers`]).
-#[test]
-fn three_ack_wait_expiries_in_a_row_close_the_path() {
-    let writers = Arc::new(Writers::default());
-    writers.ack_wait_expired();
-    writers.ack_wait_expired();
-    assert_eq!(writers.ack_wait_expiries(), 2);
-    writers.acknowledged_within_ack_wait();
-    assert_eq!(
-        writers.ack_wait_expiries(),
-        0,
-        "a stream with an ack wait acknowledged resets it"
-    );
-    writers.ack_wait_expired();
-    writers.ack_wait_expired();
-    writers.ack_wait_expired();
-    assert_eq!(writers.ack_wait_expiries(), 3);
-    let run = |expiries: u32| {
-        let record = Arc::default();
-        let sample = |t: u64| {
-            AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
-                .with_ack_wait_expiries(if t >= 5 { expiries } else { 0 })
-        };
-        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
-        (1..=50u64).find_map(|t| {
-            watch
-                .observe(t * 2 * SEC, sample(t))
-                .then(|| (t, watch.stall().expect("a reason")))
-        })
-    };
-    assert_eq!(run(2), None);
-    assert_eq!(run(3), Some((5, Stall::StreamEndsUnacknowledged)));
-}
-
 /// The egress cap holds for most of each window and releases for one
 /// interval in five: only the released intervals can count, 2 s of every
 /// 10 s, under `CREDIT_LIMITED_MIN`, so the send is never closed, though it

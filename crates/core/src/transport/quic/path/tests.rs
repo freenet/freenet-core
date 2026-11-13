@@ -905,8 +905,8 @@ fn a_slow_stream_on_a_busy_connection_is_kept_past_its_first_age() {
 /// A send whose acknowledgement does not come within its ack wait
 /// (`SendDeadlines::ack_wait`, here 10 ms on a 200 ms round trip, so it
 /// cannot) ends `MaybeDelivered` at it, and its stream is reset and counted
-/// as an abort, releasing its permit and epoch; three in a row close the
-/// path (`three_ack_wait_expiries_in_a_row_close_the_path_on_a_real_path`).
+/// as an abort toward `recycle::SEND_ABORT_LIMIT`, releasing its permit
+/// and epoch.
 #[test]
 fn a_send_past_its_ack_wait_is_reset_and_counted() {
     use crate::transport::in_memory_socket::{
@@ -955,95 +955,6 @@ fn a_send_past_its_ack_wait_is_reset_and_counted() {
             "a reset stream has ended, for the stream-credit rule"
         );
         assert_eq!(p.a.send_epoch_holders(), 0, "nothing left waiting");
-    })
-}
-
-/// A peer whose acknowledgement of stream ends never comes in time (here
-/// each send's ack wait is 10 ms on a 200 ms round trip, so it cannot): two
-/// such sends, then a stream wholly acknowledged within its ack wait, which
-/// resets the count, then three more, with acknowledged one-packet Shorts
-/// between them that do not: the path closes after the third
-/// (`StreamEndsUnacknowledged`, `recycle::ACK_WAIT_EXPIRY_LIMIT` = 3), and
-/// not before.
-#[test]
-fn three_ack_wait_expiries_in_a_row_close_the_path_on_a_real_path() {
-    use crate::transport::in_memory_socket::{
-        PacketDeliveryDecision, set_packet_delivery_callback,
-    };
-    bounded(|| async move {
-        let _seed = GlobalRng::seed_guard(SEED);
-        let network = "quic-path-ack-wait-expiries";
-        set_packet_delivery_callback(
-            network,
-            Some(Arc::new(|_, _, _, _| {
-                PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(100))
-            })),
-        );
-        let p = paths(network, QuicPathLimits::DEFAULT).await;
-        let (a, time) = (p.a.clone(), p.time());
-        let b_addr = p.pair.b_addr;
-        let short_wait = SendDeadlines {
-            ack_wait: Some(Duration::from_millis(10)),
-            ..SendDeadlines::stream(10_000)
-        };
-        let closed_after = p
-            .drive(async move {
-                let send = |deadlines: SendDeadlines| {
-                    let (a, time) = (a.clone(), time.clone());
-                    async move {
-                        a.send_stream_bounded(
-                            &time,
-                            deadlines,
-                            StreamId::next(),
-                            None,
-                            Bytes::from(payload(10_000)),
-                            None,
-                        )
-                        .await
-                    }
-                };
-                let settle = |time: VirtualTime| async move {
-                    time.sleep(Duration::from_secs(3)).await;
-                };
-                for _ in 0..2 {
-                    send(short_wait).await;
-                    settle(time.clone()).await;
-                }
-                assert_eq!(a.writers().ack_wait_expiries(), 2);
-                assert!(matches!(
-                    send(SendDeadlines::stream(10_000)).await,
-                    BoundedSend::Sent
-                ));
-                assert_eq!(
-                    a.writers().ack_wait_expiries(),
-                    0,
-                    "reset by a wholly acknowledged stream"
-                );
-                for i in 1..=3 {
-                    send(short_wait).await;
-                    // One-packet Shorts, acknowledged, between the expiries:
-                    // they say nothing about stream ends and do not reset
-                    // the count.
-                    assert!(matches!(
-                        a.send_short_bounded(&time, Duration::from_secs(5), b"short")
-                            .await,
-                        BoundedSend::Sent
-                    ));
-                    settle(time.clone()).await;
-                    let closed = a.connection().inner().close_reason().is_some();
-                    if closed {
-                        return Some(i);
-                    }
-                }
-                None
-            })
-            .await;
-        set_packet_delivery_callback(network, None);
-        assert_eq!(closed_after, Some(3), "closed at the third in a row");
-        assert_eq!(
-            recycle::stalls_to(b_addr),
-            vec![recycle::Stall::StreamEndsUnacknowledged]
-        );
     })
 }
 

@@ -3,7 +3,7 @@
 //!
 //! Two close codes recycle a path, each counted in `quic_close_sent_<label>`
 //! ([`QuicCloseCode`]): too many locally reset sends (1, below), and
-//! `PEER_NOT_ACKNOWLEDGING`, which the acknowledgement watch's rules (2-6,
+//! `PEER_NOT_ACKNOWLEDGING`, which the acknowledgement watch's rules (2-5,
 //! below) all close with. Either code asks the peer to fall back to UDP for
 //! THIS connection only. It is not a permanent
 //! downgrade: e5 must let the pair upgrade again after its normal backoff.
@@ -39,7 +39,7 @@
 //!    that sends ACK frames for none of this side's data; a peer that
 //!    acknowledges something within each window is never closed by it.
 //!
-//! The same watch runs four liveness rules (#5940 PR 4), each also closing
+//! The same watch runs three liveness rules (#5940 PR 4), each also closing
 //! with [`close_code::PEER_NOT_ACKNOWLEDGING`] and recorded as a [`Stall`]:
 //!
 //! 3. **Dark** ([`Stall::Dark`]): this side's packets outstanding at every
@@ -59,9 +59,6 @@
 //!    [`STREAM_CREDIT_WINDOW`] while this side wanted streams, though enough
 //!    of this side's streams were wholly acknowledged that an honest peer
 //!    would have.
-//! 6. **Stream ends unacknowledged** ([`Stall::StreamEndsUnacknowledged`]):
-//!    [`ACK_WAIT_EXPIRY_LIMIT`] streams in a row reached their ack wait with
-//!    their end unacknowledged and none was wholly acknowledged between.
 //!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
 //! counter of packets the peer newly acknowledged: `frame_rx.acks` counts
@@ -737,9 +734,6 @@ pub(crate) struct AckSample {
     streams_ended: u64,
     /// This side's data streams opened ([`Writers::streams_opened`]).
     streams_opened: u64,
-    /// This side's streams in a row whose ack wait ran out
-    /// ([`Writers::ack_wait_expiries`]).
-    ack_wait_expiries: u32,
 }
 
 impl AckSample {
@@ -784,7 +778,6 @@ impl AckSample {
             stream_waiters: writers.stream_waiters(),
             streams_ended: writers.streams_ended(),
             streams_opened: writers.streams_opened(),
-            ack_wait_expiries: writers.ack_wait_expiries(),
         })
     }
 
@@ -849,7 +842,6 @@ impl AckSample {
             stream_waiters: 0,
             streams_ended: 0,
             streams_opened: 0,
-            ack_wait_expiries: 0,
         }
     }
 
@@ -889,13 +881,6 @@ impl AckSample {
         self
     }
 
-    /// The same sample with `expiries` ack waits in a row run out. Tests only.
-    #[cfg(test)]
-    pub(crate) fn with_ack_wait_expiries(mut self, expiries: u32) -> Self {
-        self.ack_wait_expiries = expiries;
-        self
-    }
-
     /// The same sample with quinn's smoothed round trip at `rtt`. Tests only.
     #[cfg(test)]
     pub(crate) fn with_rtt(mut self, rtt: Duration) -> Self {
@@ -920,9 +905,6 @@ pub(crate) struct Writers {
     opened: AtomicU64,
     /// Sends waiting in `open_uni` for the peer's stream credit now.
     waiting_for_stream: AtomicUsize,
-    /// Streams in a row whose ack wait ran out, since the last stream with
-    /// an ack wait that was wholly acknowledged.
-    ack_wait_expiries: std::sync::atomic::AtomicU32,
 }
 
 impl Writers {
@@ -962,27 +944,6 @@ impl Writers {
         LiveStream(self.clone())
     }
 
-    /// A stream with an ack wait (`bounded::SendDeadlines::ack_wait`) was
-    /// finished and every byte of it acknowledged: the run of ack-wait
-    /// expiries is over. Only such a stream ends it: a one-packet Short or a
-    /// control frame acknowledged says nothing about whether the peer
-    /// acknowledges the ends of streams.
-    pub(crate) fn acknowledged_within_ack_wait(&self) {
-        self.ack_wait_expiries.store(0, Ordering::Relaxed);
-    }
-
-    /// One of the path's streams reached its ack wait with its end
-    /// unacknowledged (`bounded::SendDeadlines::ack_wait`).
-    pub(crate) fn ack_wait_expired(&self) {
-        self.ack_wait_expiries.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// The path's streams in a row whose ack wait ran out, since the last
-    /// stream wholly acknowledged.
-    pub(crate) fn ack_wait_expiries(&self) -> u32 {
-        self.ack_wait_expiries.load(Ordering::Relaxed)
-    }
-
     /// The path's data streams that have ended so far, in any way.
     pub(crate) fn streams_ended(&self) -> u64 {
         self.ended.load(Ordering::Relaxed)
@@ -993,13 +954,6 @@ impl Writers {
 /// ended ([`Writers::streams_ended`]), however it ended.
 #[derive(Debug)]
 pub(crate) struct LiveStream(Arc<Writers>);
-
-impl LiveStream {
-    /// The path's counts it is counted in.
-    pub(crate) fn writers(&self) -> &Writers {
-        &self.0
-    }
-}
 
 impl Drop for LiveStream {
     fn drop(&mut self) {
@@ -1276,7 +1230,6 @@ impl AckWatch {
         let cap_held = self.cap_held(now_nanos, &sample.cap, &previous_cap);
         let previous_now = self.previous_now.replace(dark_now);
         let withheld = same_controller && self.stream_credit.observe(now_nanos, &sample);
-        let expired = sample.ack_wait_expiries >= ACK_WAIT_EXPIRY_LIMIT;
         let rtt = sample.rtt;
         // Packets this side sent after the latest batch of acknowledgements
         // are outstanding too, though no batch counted them: at the start of
@@ -1301,10 +1254,6 @@ impl AckWatch {
         } else {
             self.quiet_samples.saturating_add(1)
         };
-        // Not judged against time, so a cap hold does not suspend it.
-        if expired {
-            return Some(Stall::StreamEndsUnacknowledged);
-        }
         if cap_held {
             // A send counted in quinn's stats may still wait in the egress
             // cap, so nothing says when it left: no latch, no window.
@@ -1419,10 +1368,6 @@ pub(crate) enum Stall {
     /// for [`STREAM_CREDIT_WINDOW`], though enough of this side's streams
     /// ended that an honest peer would have ([`StreamCreditWatch`]).
     StreamCreditWithheld,
-    /// [`ACK_WAIT_EXPIRY_LIMIT`] of this side's streams in a row reached
-    /// their ack wait with their end unacknowledged, and none was wholly
-    /// acknowledged between (`bounded::SendDeadlines::ack_wait`).
-    StreamEndsUnacknowledged,
 }
 
 impl Stall {
@@ -1433,7 +1378,6 @@ impl Stall {
             Self::Dark => "dark",
             Self::CreditStarved => "credit_starved",
             Self::StreamCreditWithheld => "stream_credit_withheld",
-            Self::StreamEndsUnacknowledged => "stream_ends_unacknowledged",
         }
     }
 }
@@ -1594,14 +1538,6 @@ pub(crate) const STREAM_CREDIT_WINDOW: Duration = Duration::from_secs(60);
 /// ([`StreamCreditWatch`]).
 pub(crate) const STREAM_CREDIT_FREED: u64 = super::config::MAX_UNI_STREAMS as u64 / 8 + 1;
 
-/// Streams in a row whose ack wait ran out, with none wholly acknowledged
-/// between, that close the path ([`Stall::StreamEndsUnacknowledged`]). An
-/// honest peer acknowledges a stream's end within a few round trips of its
-/// last byte, and the ack wait is at least 5 min; three in a row with
-/// nothing wholly acknowledged between is a peer that does not acknowledge
-/// stream ends, and each one held a permit and a send epoch for the wait.
-pub(crate) const ACK_WAIT_EXPIRY_LIMIT: u32 = 3;
-
 /// How recently a send must have waited for stream credit for the
 /// stream-credit rule to close the path: a peer withholding credit nobody
 /// wants any more costs nothing ([`StreamCreditWatch`]).
@@ -1629,10 +1565,18 @@ pub(crate) const STREAM_CREDIT_DEMAND: Duration = Duration::from_secs(20);
 /// the peer stopped long ago is not counted as live. When a spell begins
 /// every slot of the peer's is taken by this side's live streams, and our
 /// receiver reads every stream to its end as it arrives (a Stream also
-/// while it waits for its consumer), so the streams that end during the
-/// spell are slots an honest peer has freed; only a one-packet Short
-/// waiting for its consumer holds one, and lowers the limit it advertises
-/// while it does.
+/// while it waits for its consumer), so a stream that ends during the spell
+/// by its acknowledgement or the peer's stop is a slot an honest peer has
+/// freed; only a one-packet Short waiting for its consumer holds one, and
+/// lowers the limit it advertises while it does. A stream this side resets
+/// counts as ended too, though the reset may never reach the peer (during
+/// an outage nothing does): in-flight streams reset by cancellation during
+/// an outage, before any send timeout makes the path suspect, with sends
+/// still waiting, close the path here at about 60 s, before the dark rule
+/// would, under this label instead of [`Stall::Dark`]. And with streamed
+/// sends more than [`STREAM_CREDIT_DEMAND`] apart the spell ends between
+/// them, so a withholding peer is not closed; each such send waits its 2 s
+/// open deadline and goes on UDP.
 ///
 /// Residual, accepted: a peer that grants one stream just before each
 /// window ends keeps the path open while starving it. What bounds it is that

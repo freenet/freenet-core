@@ -2362,12 +2362,10 @@ impl Outgoing {
     /// polled while the stream waited for its acknowledgement, so the reset
     /// leaves an entry in quinn's `stopped` map, which is what the abort limit
     /// bounds. A stream already acknowledged in full is not reset.
-    fn reset_finished(&mut self) -> bool {
-        let reset = self.send.reset(reset_code::SENDER_ABORTED.into()).is_ok();
-        if reset {
+    fn reset_finished(&mut self) {
+        if self.send.reset(reset_code::SENDER_ABORTED.into()).is_ok() {
             self.aborts.record();
         }
-        reset
     }
 
     /// End the stream and wait until the peer has acknowledged every byte or
@@ -2381,14 +2379,7 @@ impl Outgoing {
         let stopped = (&mut self.stopped).await;
         self.awaiting_ack = false;
         match stopped {
-            Ok(None) => {
-                if self.progress.has_ack_wait()
-                    && let Some(live) = &self.live
-                {
-                    live.writers().acknowledged_within_ack_wait();
-                }
-                Ok(())
-            }
+            Ok(None) => Ok(()),
             Ok(Some(code)) => Err(QuicSendError::Stopped(code.into_inner())),
             Err(quinn::StoppedError::ConnectionLost(error)) => {
                 Err(QuicSendError::ConnectionLost(error))
@@ -2430,21 +2421,19 @@ impl Drop for Outgoing {
         // `SendDeadlines::ack_wait`, or its total): the peer had the whole
         // stream and never acknowledged its end. The stream is reset,
         // counted as an abort, and its permit and epoch go now with quinn's
-        // copy of its data. It is also counted toward
-        // `recycle::ACK_WAIT_EXPIRY_LIMIT`, which closes the path at the
-        // third in a row. A send cancelled before then (a teardown) waits
-        // below, ending with the acknowledgement or the connection.
+        // copy of its data. A peer that never acknowledges stream ends is
+        // bounded by `recycle::SEND_ABORT_LIMIT`, as before this rule. A
+        // send cancelled before then (a teardown) waits below, ending with
+        // the acknowledgement or the connection.
         if self.progress.ack_wait_ended() {
-            // Counted only if the reset happened: an acknowledgement that
-            // raced the deadline left nothing to reset.
-            if self.reset_finished()
-                && let Some(live) = &self.live
-            {
-                live.writers().ack_wait_expired();
-            }
+            self.reset_finished();
             return;
         }
         let (slot, epoch) = (self.slot.take(), self.epoch.take());
+        // Nothing held (a send with neither a permit nor an epoch, which a
+        // node's sends practically never are): the stream counts as ended
+        // here, for the stream-credit rule, though its end may still be
+        // unacknowledged.
         if slot.is_none() && epoch.is_none() {
             return;
         }
@@ -2458,7 +2447,7 @@ impl Drop for Outgoing {
                 // Past the bound: the epoch goes now, and so does the
                 // stream's data, so the release matches the memory freed.
                 Some(None) => {
-                    let _reset = self.reset_finished();
+                    self.reset_finished();
                     return;
                 }
                 None => None,
@@ -2468,13 +2457,10 @@ impl Drop for Outgoing {
         };
         let stopped = std::mem::replace(&mut self.stopped, Box::pin(std::future::pending()));
         let live = self.live.take();
-        let has_ack_wait = self.progress.has_ack_wait();
         // Bounded as above, and ending with the acknowledgement or the
         // connection, so the handle is not monitored.
         drop(GlobalExecutor::spawn(async move {
-            if let (Ok(None), true, Some(live)) = (stopped.await, has_ack_wait, &live) {
-                live.writers().acknowledged_within_ack_wait();
-            }
+            let _ended = stopped.await;
             drop(live);
             drop(slot);
             drop(epoch);
