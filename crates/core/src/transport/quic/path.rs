@@ -1335,14 +1335,14 @@ impl QuicPath {
         }
     }
 
-    /// How long the bytes ahead of a stream's end may take to go out, read
-    /// when the end is sent: quinn shares the connection's send window
-    /// round-robin among the streams with data, so a stream's tail may wait
-    /// for the streamed sends in flight (their permits) times the window, at
-    /// the credit floor at the path's round trip. The window is taken at its
-    /// largest (`budget::MAX_WINDOW_BYTES`): the budget may raise it, and this
-    /// is only a wait length. On a busy slow path it reaches the 2 h total.
-    fn backlog_wait(&self) -> Arc<dyn Fn() -> Duration + Send + Sync> {
+    /// How long the rest of a stream of `len` bytes may take to go out, read
+    /// when its end is sent: at most `len` (and at most the send window,
+    /// `budget::MAX_WINDOW_BYTES` at its largest) is left of it, and quinn
+    /// shares the link round-robin among the streams with data, so it goes
+    /// at a share of one in the streamed sends in flight (their permits).
+    /// That is the sends in flight times the rest, at the credit floor at
+    /// the path's round trip.
+    fn backlog_wait(&self, len: u64) -> Arc<dyn Fn() -> Duration + Send + Sync> {
         let (slots, connection) = (self.stream_slots.clone(), self.connection.inner().clone());
         Arc::new(move || {
             let in_flight = (STREAMED_SEND_LIMIT as u64)
@@ -1351,7 +1351,7 @@ impl QuicPath {
             let floor = recycle::credit_floor_rate(connection.stats().path.rtt).max(1);
             Duration::from_secs(
                 in_flight
-                    .saturating_mul(super::budget::MAX_WINDOW_BYTES)
+                    .saturating_mul(len.min(super::budget::MAX_WINDOW_BYTES))
                     .div_ceil(floor),
             )
         })
@@ -1959,7 +1959,7 @@ impl QuicPath {
         send.live = Some(self.writers.live());
         send.sleep = Some((self.sleeper.clone(), self.short_ack_wait));
         send.control = opener == Opener::Control;
-        send.backlog = Some(self.backlog_wait());
+        send.backlog = Some(self.backlog_wait(header.total_len()));
         debug_assert!(
             self.ack_progress.is_some(),
             "a data path's controller is CappedCubic; without its record no expiry can strike"
@@ -2246,18 +2246,18 @@ type Sleeper = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> 
 /// - ack batches came after the end was sent and the latest came while quinn
 ///   was application-limited: it had nothing left to send (the congestion
 ///   window and pacing count as holding data back, so they are not
-///   application-limited), so the end went out, whatever the rate. Only the
-///   peer's own flow control can still hold data then, which is a peer whose
-///   app stopped reading, an intended strike;
+///   application-limited), so the end went out, whatever the rate. Flow
+///   control cannot hold data back after the end is sent: every byte
+///   written before it was within the peer's credit;
 /// - or the connection acknowledged at least the credit floor at its round
 ///   trip (`recycle::credit_floor_rate`) over the wait, less the time this
-///   node's egress cap held its transmits.
+///   node's egress cap held its transmits (`CapHolds::held_time`).
 ///
-/// Time the egress cap held this connection's transmits is this node's own
-/// throttling: it is subtracted from the wait (each new hold event credited
-/// its longest wait at the cap, as the stall count does), and while the cap
-/// holds a transmit now the end may still be in its queue, so neither
-/// evidence counts.
+/// Neither counts while the cap holds a transmit now (the end may still be
+/// in its queue), or when the expiry's timer woke more than
+/// [`LATE_WAKE_SLACK`] past its deadline: this node's runtime stalled (or
+/// its host slept), and acknowledgements already in the socket may not have
+/// been read yet.
 #[derive(Clone)]
 struct StrikeCheck {
     acks: recycle::AckProgress,
@@ -2272,8 +2272,12 @@ struct StrikeMark {
     at: u64,
     acked_bytes: u64,
     batches: u64,
-    holds: u64,
+    held: Duration,
 }
+
+/// How late past its deadline an expiry's timer may wake and still be
+/// judged ([`StrikeCheck`]). Past it this node was not running.
+pub(crate) const LATE_WAKE_SLACK: Duration = Duration::from_secs(2);
 
 impl StrikeCheck {
     fn mark(&self) -> StrikeMark {
@@ -2281,36 +2285,36 @@ impl StrikeCheck {
             at: (self.now)(),
             acked_bytes: self.acks.acked_bytes(),
             batches: self.acks.batches_app_limited().0,
-            holds: self.cap.read().holds,
+            held: self.cap.held_time(),
         }
     }
 
-    /// Whether an ack wait that ran out now, for a send whose end was sent
-    /// at `mark`, counts as a strike against the peer.
-    fn strikes(&self, mark: StrikeMark) -> bool {
-        let cap = self.cap.read();
-        if cap.held_now {
-            return false;
-        }
-        let elapsed = (self.now)().saturating_sub(mark.at);
-        let held = u64::try_from(
-            cap.longest_wait
-                .as_nanos()
-                .saturating_mul(u128::from(cap.holds.saturating_sub(mark.holds))),
-        )
-        .unwrap_or(u64::MAX);
-        let unheld = elapsed.saturating_sub(held);
-        if unheld == 0 {
+    /// Whether an ack wait due at `due` (ns on the path's clock) that ran
+    /// out now, for a send whose end was sent at `mark`, counts as a strike
+    /// against the peer.
+    fn strikes(&self, mark: StrikeMark, due: u64) -> bool {
+        let now = (self.now)();
+        if now.saturating_sub(due) > nanos(LATE_WAKE_SLACK) || self.cap.read().held_now {
             return false;
         }
         let (batches, app_limited) = self.acks.batches_app_limited();
         if batches > mark.batches && app_limited {
             return true;
         }
+        let held = nanos(self.cap.held_time().saturating_sub(mark.held));
+        let unheld = now.saturating_sub(mark.at).saturating_sub(held);
+        if unheld == 0 {
+            return false;
+        }
         let floor = u128::from(recycle::credit_floor_rate((self.rtt)()));
         let acked = u128::from(self.acks.acked_bytes().saturating_sub(mark.acked_bytes));
         acked * 1_000_000_000 >= floor * u128::from(unheld)
     }
+}
+
+/// Nanoseconds in `duration`, saturating.
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The most a one-packet Short's acknowledgement is waited for after its
@@ -2645,7 +2649,7 @@ impl Drop for Outgoing {
             if self.reset_finished()
                 && let (Some(live), Some(node)) = (&self.live, self.node)
                 && let (Some(check), Some(mark)) = (&self.strike, self.finished_at)
-                && check.strikes(mark)
+                && check.strikes(mark, self.progress.ack_wait_due())
             {
                 live.writers()
                     .ack_wait_expired(node, crate::transport::metrics::AckWaitKind::Stream);
@@ -2688,14 +2692,23 @@ impl Drop for Outgoing {
         // A send with a permit waiting here was cancelled before its own
         // deadline (a teardown), and ends with the acknowledgement or the
         // connection, as before.
-        let bound = slot
-            .is_none()
-            .then(|| self.sleep.as_ref().map(|(sleep, bound)| sleep(*bound)))
-            .flatten();
+        let bound_for = if slot.is_none() {
+            self.sleep.as_ref().map(|(_, bound)| *bound)
+        } else {
+            // Not reached by a node's sends today: a permit holder's send
+            // ends at its own deadline, which takes the branch above. Bounded
+            // anyway, at the rest of its ack wait, so a cancelled one cannot
+            // hold its permit for as long as the peer withholds the end.
+            self.progress.ack_wait_left()
+        };
+        let bound = bound_for.and_then(|bound| self.sleep.as_ref().map(|(sleep, _)| sleep(bound)));
+        let due = bound_for
+            .zip(self.strike.as_ref())
+            .map(|(bound, check)| (check.now)().saturating_add(nanos(bound)));
         let bounded = bound.is_some();
         let send = if bounded { self.send.take() } else { None };
         let (aborts, node) = (self.aborts.clone(), self.node);
-        let strike = self.strike.clone().zip(self.finished_at);
+        let strike = self.strike.clone().zip(self.finished_at).zip(due);
         let kind = if self.control {
             crate::transport::metrics::AckWaitKind::Control
         } else {
@@ -2720,7 +2733,7 @@ impl Drop for Outgoing {
             {
                 aborts.record();
                 if let (Some(live), Some(node)) = (&live, node)
-                    && strike.is_some_and(|(check, mark)| check.strikes(mark))
+                    && strike.is_some_and(|((check, mark), due)| check.strikes(mark, due))
                 {
                     live.writers().ack_wait_expired(node, kind);
                 }
