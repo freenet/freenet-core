@@ -10189,7 +10189,9 @@ shutdown-drain-secs = 42
 
     /// The node's limit follows its data share: `prefer` with a share above 0
     /// lowers it on a 1 GiB host; a share of 0, `shadow`, or an off endpoint
-    /// keeps 200. `quic-max-paths` follows the limit.
+    /// keeps 200. `prefer` with no `quic-data-percent` takes the release's
+    /// share: lowered once the release sets a ramp start. `quic-max-paths`
+    /// follows the limit.
     #[tokio::test]
     async fn the_node_lowers_its_connection_limit_only_when_it_may_carry_quic_data() {
         const GIB: usize = 1024 * 1024 * 1024;
@@ -10200,7 +10202,11 @@ shutdown-drain-secs = 42
             ("prefer", Some("5"), true),
             ("prefer", Some("100"), true),
             ("prefer", Some("0"), false),
-            ("prefer", None, false),
+            (
+                "prefer",
+                None,
+                crate::transport::quic::upgrade::policy::RAMP_START_IS_SET,
+            ),
             ("shadow", Some("5"), false),
             ("off", Some("5"), false),
         ] {

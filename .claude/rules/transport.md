@@ -1183,7 +1183,11 @@ startup (`upgrade::policy::log_startup`); the endpoint state telemetry reports i
 as `off_config`. Windows has the same default since its crash-loop breaker was
 confirmed on a real Windows machine (#6031). The default is
 read, never written to config.toml: a node that did not set the key follows the
-release it runs, so a default-off release is the kill switch. It does not reach
+release it runs, so a default-off release is the kill switch for QUIC as a
+whole. Stopping only the data ramp is smaller: `QUIC_DATA_RAMP_START = None`
+with the defaults back to 0.2.156's, shadow on Linux and macOS and off on
+Windows (RELEASING.md, "Emergency stop"), which keeps Linux and macOS
+endpoints and shadow paths up. Neither reaches
 a node that ever ran with `--transport-quic` or `FREENET_TRANSPORT_QUIC`: those
 are saved to config.toml like any setting (the Step 1 gateways are such nodes). Shadow or prefer: the endpoint is built
 with the node's QUIC identity (below) and an EMPTY allow-set, so nothing
@@ -1994,8 +1998,9 @@ release goes out.
   over the slice's release; and the kill switch rehearsed once (a default-off
   release through the stagger). The stream-limit bars are re-derived from real
   data, not loosened.
-- Rollback at any step is a default-off release through auto-update's 0-4 h
-  stagger. Per-path fallback to UDP and the breaker work without a release. A
+- Rollback at any step is a release through auto-update's 0-4 h stagger: for
+  the data ramp, no ramp and 0.2.156's defaults (shadow on Linux and macOS, off
+  on Windows); default-off when QUIC itself is at fault. Per-path fallback to UDP and the breaker work without a release. A
   node in a broken state may not self-update.
 
 Simulation scenarios (`tests/simulation_integration.rs`, `test_quic_*`): two
