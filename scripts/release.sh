@@ -1228,8 +1228,8 @@ See commit history for detailed changes.
 # only the resume flag, DRY_RUN and crates.io presence -- never the gate's
 # verdict. The main flow refuses instead; see the comment at that call site.
 publish_crates() {
-    echo "Confirming crates.io publish (normally already done by cross-compile.yml):"
     check_quic_data_ramp_t0
+    echo "Confirming crates.io publish (normally already done by cross-compile.yml):"
 
     # Skip if already completed
     if is_step_completed "CRATES_PUBLISHED"; then

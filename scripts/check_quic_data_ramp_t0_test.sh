@@ -17,6 +17,9 @@
 # The needles below are literal workflow and script text, `${{ }}` and `$VAR`
 # included, so single quotes are meant.
 # shellcheck disable=SC2016
+# Two cases run check_tree in a subshell on purpose, so the failures they
+# expect stay out of this run's count.
+# shellcheck disable=SC2030,SC2031
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,6 +55,24 @@ cargo_at() {
 SHIPPED="$(cargo_at 0.2.157)"
 BEFORE="$(cargo_at 0.2.156)"
 
+# crates.io, as the check sees it: a `curl` first on PATH that records its
+# arguments and prints the HTTP status in $FAKE_CRATES_CODE, or exits
+# $FAKE_CURL_EXIT when that is set (no answer at all).
+mkdir -p "$WORK/bin"
+cat > "$WORK/bin/curl" <<'CURL'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_CURL_LOG"
+if [[ -n "${FAKE_CURL_EXIT:-}" ]]; then
+    exit "$FAKE_CURL_EXIT"
+fi
+printf '%s' "$FAKE_CRATES_CODE"
+CURL
+chmod +x "$WORK/bin/curl"
+export PATH="$WORK/bin:$PATH"
+export FAKE_CURL_LOG="$WORK/curl.log"
+export FAKE_CRATES_CODE=200
+: > "$FAKE_CURL_LOG"
+
 # check_case NAME EXPECTED_RC EXPECTED_TEXT -- ARGS...
 check_case() {
     local name="$1" want_rc="$2" want_text="$3" out rc
@@ -83,6 +104,25 @@ check_case "a later release that skips the unshipped ramp release, live: refused
     --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$BEFORE"
 check_case "a missing Cargo.toml for a later release: refused" 2 "Cargo.toml not found" -- \
     --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$WORK/none.toml"
+if grep -qF -- "-A freenet-release-check" "$FAKE_CURL_LOG" && grep -qF "https://crates.io/api/v1/crates/freenet/0.2.157" "$FAKE_CURL_LOG"; then
+    echo "ok - a later release asks crates.io for freenet at the ramp release's version"
+else
+    echo "FAIL - a later release did not ask crates.io for freenet 0.2.157 with a User-Agent: $(cat "$FAKE_CURL_LOG")"
+    FAILURES=$((FAILURES + 1))
+fi
+export FAKE_CRATES_CODE=404
+check_case "a later release whose ramp release was never published, live: refused" 1 "is not on crates.io" -- \
+    --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
+check_case "a later release whose ramp release was never published, dry run: warning only" 0 "::warning" -- \
+    --version 0.2.158 --live false --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
+export FAKE_CRATES_CODE=403
+check_case "a later release when crates.io refuses to answer, live: refused" 1 "cannot be determined" -- \
+    --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
+export FAKE_CRATES_CODE=200 FAKE_CURL_EXIT=7
+check_case "a later release when crates.io cannot be reached, live: refused" 1 "cannot be determined" -- \
+    --version 0.2.158 --live true --now "$T0" --policy "$set_both" --cargo-toml "$SHIPPED"
+unset FAKE_CURL_EXIT
+: > "$FAKE_CURL_LOG"
 check_case "an earlier release carrying the ramp, live: refused" 1 "comes before the QUIC data ramp release" -- \
     --version 0.2.156 --live true --now "$T0" --policy "$set_both" --cargo-toml "$BEFORE"
 check_case "an earlier release carrying the ramp, dry run: warning only" 0 "::warning" -- \
@@ -144,29 +184,95 @@ check_case "bad --version: refused" 2 "--version must be X.Y.Z" -- \
 check_case "bad --live: refused" 2 "--live must be true or false" -- \
     --version 0.2.157 --live yes --now "$T0" --policy "$set_both"
 
+# check_tree LABEL POLICY CARGO_TOML NOW: the checks CI runs on the tree, here
+# so the stop and pre-cut states can be run on fixtures as well as on the tree.
+# Each state the constants are meant to pass through must pass CI:
+#   - neither set (no ramp): a no-op for any version;
+#   - both set (the ramp release's PR): the ramp release passes at its own T0,
+#     so a T0 the script cannot read fails CI; and while T0 is more than WINDOW
+#     away, the named release must still be ahead of this tree, or the ramp
+#     release would never be the one cut (it was already taken), which only the
+#     dispatch-time check sees otherwise;
+#   - T0 reset to None with the release left named (the emergency stop): a
+#     later version passes as "no ramp start", and the named release itself is
+#     refused, as the stop intends.
+# Any other shape fails.
+check_tree() {
+    local label="$1" policy="$2" cargo="$3" now="$4"
+    local release_none start_none tree_release tree_t0 tree_version later
+    release_none=no
+    start_none=no
+    grep -qxE 'pub\(in crate::transport\) const QUIC_DATA_RAMP_RELEASE: Option<&str> = None;' "$policy" && release_none=yes
+    grep -qxE 'pub\(in crate::transport\) const QUIC_DATA_RAMP_START: Option<u64> = None;' "$policy" && start_none=yes
+    tree_release="$(sed -n 's/^pub(in crate::transport) const QUIC_DATA_RAMP_RELEASE: Option<&str> = Some("\([0-9]*\.[0-9]*\.[0-9]*\)");$/\1/p' "$policy")"
+    tree_t0="$(tr -d '\n ' < "$policy" | sed -n 's/.*pub(incrate::transport)constQUIC_DATA_RAMP_START:Option<u64>=Some(\([0-9_]*\),\{0,1\});.*/\1/p' | tr -d _)"
+    if [[ "$release_none" == yes && "$start_none" == yes ]]; then
+        for live in true false; do
+            check_case "$label (no ramp), live=$live: no-op" 0 "no ramp release" -- \
+                --version 0.2.156 --live "$live" --policy "$policy" --cargo-toml "$cargo"
+        done
+    elif [[ -n "$tree_release" && "$start_none" == yes ]]; then
+        later="${tree_release%.*}.$(( ${tree_release##*.} + 1 ))"
+        check_case "$label (emergency stop), a later release: passes" 0 "no ramp start" -- \
+            --version "$later" --live true --policy "$policy" --cargo-toml "$cargo"
+        check_case "$label (emergency stop), the named release: refused" 1 "QUIC_DATA_RAMP_START is None" -- \
+            --version "$tree_release" --live true --policy "$policy" --cargo-toml "$cargo"
+    elif [[ -n "$tree_release" && -n "$tree_t0" ]]; then
+        check_case "$label, as its ramp release at its T0" 0 "is the ramp release" -- \
+            --version "$tree_release" --live true --now "$tree_t0" --policy "$policy" --cargo-toml "$cargo"
+        tree_version="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([0-9][0-9.]*\)".*/\1/p' "$cargo" | head -1)"
+        if (( now + 3 * HOUR < 10#$tree_t0 )); then
+            if [[ "$tree_version" != "$tree_release" && "$(printf '%s\n%s\n' "$tree_version" "$tree_release" | sort -V | tail -1)" == "$tree_release" ]]; then
+                expect "$label: before the cut window, the ramp release ($tree_release) is ahead of the tree ($tree_version)" yes
+            else
+                expect "$label: before the cut window, the ramp release ($tree_release) is ahead of the tree ($tree_version)" no
+            fi
+        fi
+    else
+        echo "FAIL - $label: the ramp constants are in no state CI accepts (release '$tree_release', T0 '$tree_t0', release None: $release_none, T0 None: $start_none)"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+expect() {
+    if [[ "$2" == "yes" ]]; then
+        echo "ok - $1"
+    else
+        echo "FAIL - $1"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
 # The tree as it is.
+TREE_CARGO="$SCRIPT_DIR/../crates/core/Cargo.toml"
 if [[ ! -f "$POLICY" ]]; then
     echo "FAIL - policy.rs not found at $POLICY"
     FAILURES=$((FAILURES + 1))
-fi
-if grep -qE '^pub\(in crate::transport\) const QUIC_DATA_RAMP_RELEASE: Option<&str> = None;$' "$POLICY"; then
-    for live in true false; do
-        check_case "this tree (release None), live=$live: no-op" 0 "no ramp release" -- \
-            --version 0.2.156 --live "$live" --policy "$POLICY"
-    done
 else
-    # Once the ramp release is named, check the tree as that release at its own
-    # T0, so a T0 the script cannot read fails CI instead of passing as "not
-    # the ramp release".
-    tree_release="$(sed -n 's/^pub(in crate::transport) const QUIC_DATA_RAMP_RELEASE: Option<&str> = Some("\([0-9.]*\)");$/\1/p' "$POLICY")"
-    tree_t0="$(tr -d '\n ' < "$POLICY" | sed -n 's/.*pub(incrate::transport)constQUIC_DATA_RAMP_START:Option<u64>=Some(\([0-9_]*\),\{0,1\});.*/\1/p' | tr -d _)"
-    if [[ -z "$tree_release" || -z "$tree_t0" ]]; then
-        echo "FAIL - this tree names a ramp release but its release or T0 cannot be read (release '$tree_release', T0 '$tree_t0')"
-        FAILURES=$((FAILURES + 1))
-    else
-        check_case "this tree, as its ramp release at its T0" 0 "is the ramp release" -- \
-            --version "$tree_release" --live true --now "$tree_t0" --policy "$POLICY"
-    fi
+    check_tree "this tree" "$POLICY" "$TREE_CARGO" "$(date +%s)"
+fi
+
+# The same checks on each state the tree is meant to pass through.
+check_tree "fixture: no ramp" "$unset_both" "$BEFORE" "$T0"
+check_tree "fixture: the stop" "$release_no_start" "$SHIPPED" "$T0"
+check_tree "fixture: ramp PR, at T0" "$set_both" "$SHIPPED" "$T0"
+check_tree "fixture: ramp PR, a day before T0" "$set_both" "$BEFORE" $((T0 - 24 * HOUR))
+# The release already taken before the ramp PR merged: refused before the
+# cut window, where only the dispatch check would otherwise see it.
+before_out="$(FAILURES=0; check_tree "x" "$set_both" "$SHIPPED" $((T0 - 24 * HOUR)); echo "rc=$FAILURES")"
+if [[ "$before_out" == *"FAIL - x: before the cut window"* && "$before_out" == *"rc=1" ]]; then
+    echo "ok - a ramp release the tree has already reached, a day before T0: refused"
+else
+    echo "FAIL - a ramp release the tree has already reached, a day before T0, was not refused: $before_out"
+    FAILURES=$((FAILURES + 1))
+fi
+garbled="$(policy "Some(soon)" 'Some("0.2.157")')"
+garbled_out="$(FAILURES=0; check_tree "x" "$garbled" "$BEFORE" "$T0"; echo "rc=$FAILURES")"
+if [[ "$garbled_out" == *"in no state CI accepts"* && "$garbled_out" == *"rc=1" ]]; then
+    echo "ok - an unreadable T0 in the tree fails CI"
+else
+    echo "FAIL - an unreadable T0 in the tree did not fail CI: $garbled_out"
+    FAILURES=$((FAILURES + 1))
 fi
 
 # The lines of job $2 in workflow file $1, from its `  <job>:` line to the next
@@ -196,16 +302,35 @@ step_index() {
     printf '%s\n' "$1" | grep -E '^      - name: ' | sed -E 's/^      - name: //' | grep -nxF -- "$2" | cut -d: -f1 | head -1
 }
 
-expect() {
-    if [[ "$2" == "yes" ]]; then
+nonempty() { if [[ -n "$1" ]]; then echo yes; else echo no; fi; }
+
+# The text on stdin without blank lines and `#` comment lines: what YAML or
+# bash acts on. A step block also holds the next step's leading comments,
+# which this drops.
+code_lines() { grep -vE '^[[:space:]]*(#|$)' || true; }
+
+# exact NAME ACTUAL EXPECTED: the step's (or function's) code is exactly
+# EXPECTED, so an added `continue-on-error`, `if:`, `|| true`, extra argument
+# or extra line fails, where a substring match would pass it.
+exact() {
+    if [[ "$2" == "$3" ]]; then
         echo "ok - $1"
     else
         echo "FAIL - $1"
+        diff <(printf '%s\n' "$3") <(printf '%s\n' "$2") | sed 's/^/    /'
         FAILURES=$((FAILURES + 1))
     fi
 }
-has() { if [[ "$1" == *"$2"* ]]; then echo yes; else echo no; fi; }
-nonempty() { if [[ -n "$1" ]]; then echo yes; else echo no; fi; }
+
+# No `continue-on-error` anywhere in a job block (job or step level): either
+# would let the publish run after a refusal.
+no_continue_on_error() {
+    if printf '%s\n' "$2" | code_lines | grep -qE '^[[:space:]]*continue-on-error:'; then
+        expect "$1 has no continue-on-error" no
+    else
+        expect "$1 has no continue-on-error" yes
+    fi
+}
 
 # release.yml's validate job runs the check, in a step of its own that is given
 # the resolved version and run mode, after the steps that resolve them.
@@ -213,9 +338,14 @@ VALIDATE_STEP="Check the QUIC data ramp start is near now"
 validate_job="$(job_block "$RELEASE_YML" validate)"
 validate_step="$(printf '%s\n' "$validate_job" | step_block "$VALIDATE_STEP")"
 expect "release.yml's validate job has the check step" "$(nonempty "$validate_step")"
-expect "the validate step runs the check" "$(has "$validate_step" 'run: bash scripts/check_quic_data_ramp_t0.sh --version "$RELEASE_VERSION" --live "$RELEASE_LIVE"')"
-expect "the validate step is given the resolved version" "$(has "$validate_step" 'RELEASE_VERSION: ${{ steps.validate.outputs.version }}')"
-expect "the validate step is given the resolved run mode" "$(has "$validate_step" 'RELEASE_LIVE: ${{ steps.mode.outputs.live }}')"
+exact "the validate step runs the check on the resolved version and run mode, and nothing else" \
+    "$(printf '%s\n' "$validate_step" | code_lines)" \
+    '      - name: Check the QUIC data ramp start is near now
+        env:
+          RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+          RELEASE_LIVE: ${{ steps.mode.outputs.live }}
+        run: bash scripts/check_quic_data_ramp_t0.sh --version "$RELEASE_VERSION" --live "$RELEASE_LIVE"'
+no_continue_on_error "release.yml's validate job" "$validate_job"
 order="$(printf '%s\n' "$validate_job" | grep -nxE '        id: (mode|validate)|      - name: '"$VALIDATE_STEP" | cut -d: -f1 | tr '\n' ' ')"
 read -r first second third <<< "$order"
 if [[ -n "${third:-}" && "$third" -gt "$first" && "$third" -gt "$second" ]]; then
@@ -231,11 +361,25 @@ CROSS_YML="$SCRIPT_DIR/../.github/workflows/cross-compile.yml"
 ATTACH_STEP="Check the QUIC data ramp start is near now (before publishing)"
 attach_job="$(job_block "$CROSS_YML" attach-to-release)"
 attach_step="$(printf '%s\n' "$attach_job" | step_block "$ATTACH_STEP")"
+ATTACH_IF='        if: ${{ success() && startsWith(github.ref, '"'refs/tags/v'"') }}'
 expect "attach-to-release has the check step" "$(nonempty "$attach_step")"
-expect "the attach step runs the check live on the tag's version" "$(has "$attach_step" 'bash scripts/check_quic_data_ramp_t0.sh --version "${TAG_NAME#v}" --live true')"
-expect "the attach step takes the tag from the ref" "$(has "$attach_step" 'TAG_NAME="${GITHUB_REF#refs/tags/}"')"
-expect "the attach step runs in the checked-out source" "$(has "$attach_step" 'working-directory: _src')"
-expect "the attach step runs only on success" "$(has "$attach_step" 'if: ${{ success() && startsWith(github.ref, ')"
+exact "the attach step runs the check live on the tag's version, in the source, on success only, and nothing else" \
+    "$(printf '%s\n' "$attach_step" | code_lines)" \
+    "      - name: $ATTACH_STEP
+$ATTACH_IF
+        working-directory: _src
+        run: |
+          TAG_NAME=\"\${GITHUB_REF#refs/tags/}\"
+          bash scripts/check_quic_data_ramp_t0.sh --version \"\${TAG_NAME#v}\" --live true"
+no_continue_on_error "cross-compile.yml's attach-to-release job" "$attach_job"
+# A refusal stops the publish only because the steps after it require success:
+# the crates.io publish states the same `if:` as the check, and the un-draft
+# has none (so success() applies). A skipped check would not stop them, which
+# is why the check's own `if:` is pinned above.
+publish_ifs="$(printf '%s\n' "$attach_job" | step_block "Publish crates to crates.io" | code_lines | grep -E '^        if:')"
+exact "the crates.io publish runs only on success, under the check's condition" "$publish_ifs" "$ATTACH_IF"
+undraft_ifs="$(printf '%s\n' "$attach_job" | step_block "Publish release" | code_lines | grep -E '^        if:' || true)"
+exact "the un-draft has no condition of its own (success() applies)" "$undraft_ifs" ""
 checkout_at="$(step_index "$attach_job" "Check out the release source")"
 check_at="$(step_index "$attach_job" "$ATTACH_STEP")"
 publish_at="$(step_index "$attach_job" "Publish crates to crates.io")"
@@ -262,12 +406,21 @@ fn_body() {
     ' "$1"
 }
 for fn in publish_crates publish_draft_release; do
-    if fn_body "$RELEASE_SH" "$fn" | grep -qxE '[[:space:]]+check_quic_data_ramp_t0'; then
-        expect "the local release script checks in $fn" yes
-    else
-        expect "the local release script checks in $fn" no
-    fi
+    exact "the local release script checks first thing in $fn" \
+        "$(fn_body "$RELEASE_SH" "$fn" | code_lines | head -1)" '    check_quic_data_ramp_t0'
 done
+# The helper refuses with exit 1 on any failure of the check, whatever the run
+# mode (the check itself makes a dry run's finding a warning).
+exact "the local release script's helper exits 1 when the check refuses" \
+    "$(fn_body "$RELEASE_SH" check_quic_data_ramp_t0 | code_lines)" \
+    '    local live=true
+    if [[ "$DRY_RUN" == "true" ]]; then
+        live=false
+    fi
+    if ! bash "$PROJECT_ROOT/scripts/check_quic_data_ramp_t0.sh" --version "$VERSION" --live "$live"; then
+        echo "  ✗ The QUIC data ramp start check refused release $VERSION; see above."
+        exit 1
+    fi'
 if grep -A1 -xF 'check_prerequisites' "$RELEASE_SH" | grep -qxF 'check_quic_data_ramp_t0'; then
     expect "the local release script checks when it starts" yes
 else

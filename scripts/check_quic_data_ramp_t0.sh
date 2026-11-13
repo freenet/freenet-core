@@ -14,8 +14,10 @@
 # version that would ship the ramp unchecked fails closed like a late cut:
 # T0 set with no release named; a version before the named one; a later one
 # that skips it while this tree (crates/core/Cargo.toml) has not reached it;
-# a later one cut more than WINDOW before T0. With no T0, or no ramp release
-# and no T0, it prints a notice and exits 0.
+# a later one while the ramp release is not on crates.io, or crates.io gives
+# no clear answer (the bump can merge and the publish then fail); a later one
+# cut more than WINDOW before T0. With no T0, or no ramp release and no T0, it
+# prints a notice and exits 0.
 #
 # Usage:
 #   check_quic_data_ramp_t0.sh --version X.Y.Z --live true|false
@@ -114,6 +116,22 @@ finding() {
     exit 0
 }
 
+# Whether crate $1 version $2 is on crates.io: returns 0 published, 1 absent
+# (HTTP 404), 2 unknown (any other answer, or none). Same form as
+# scripts/RELEASE_RECOVERY.md's `published`: crates.io answers 403 to a request
+# with no descriptive User-Agent, and only a 404 means absent.
+published() {
+    local code
+    code="$(curl -sS -o /dev/null -w '%{http_code}' -A 'freenet-release-check' \
+        --max-time 30 --retry 3 --retry-all-errors \
+        "https://crates.io/api/v1/crates/$1/$2")" || return 2
+    case "$code" in
+        200) return 0 ;;
+        404) return 1 ;;
+        *) echo "crates.io answered HTTP $code for $1 $2"; return 2 ;;
+    esac
+}
+
 # T0 in seconds, or empty for None; a value written another way exits 2.
 t0=""
 if [[ "$start_value" != "None" ]]; then
@@ -167,12 +185,23 @@ if [[ "$ramp_release" != "$VERSION" ]]; then
         # version (an auto-bump, or the name set ahead of the cut).
         finding "Release $VERSION comes before the QUIC data ramp release ($ramp_release) but carries the ramp (QUIC_DATA_RAMP_START is set), so it would ship the ramp unchecked. Cut the ramp release as $ramp_release, or change QUIC_DATA_RAMP_RELEASE in the same reviewed PR as T0 (docs/RELEASING.md)."
     fi
-    shipped="$(printf '%s\n%s\n' "$ramp_release" "$tree_version" | sort -V | tail -1)"
-    if [[ "$shipped" != "$tree_version" ]]; then
+    reached="$(printf '%s\n%s\n' "$ramp_release" "$tree_version" | sort -V | tail -1)"
+    if [[ "$reached" != "$tree_version" ]]; then
         # Fail closed: the ramp release has not been cut from this tree yet,
         # and this later version skips it (an auto-bump past a taken number).
         finding "Release $VERSION skips the QUIC data ramp release ($ramp_release), which this tree ($tree_version) has not reached, and carries the ramp (QUIC_DATA_RAMP_START is set), so it would ship the ramp unchecked. Cut $ramp_release, or change QUIC_DATA_RAMP_RELEASE in the same reviewed PR as T0 (docs/RELEASING.md)."
     fi
+    # The tree reaching the ramp release says only that its bump merged; its
+    # publish can still have failed or been cancelled, and then this later
+    # version would be the first to ship the ramp, unchecked. So the ramp
+    # release must be on crates.io, and an answer that is not a clear yes or
+    # no fails closed.
+    published freenet "$ramp_release"
+    case $? in
+        0) ;;
+        1) finding "Release $VERSION comes after the QUIC data ramp release ($ramp_release), but freenet $ramp_release is not on crates.io: the ramp release was not published, so this release would ship the ramp unchecked. Publish $ramp_release first (scripts/RELEASE_RECOVERY.md), or change QUIC_DATA_RAMP_RELEASE and T0 in a reviewed PR (docs/RELEASING.md)." ;;
+        *) finding "Release $VERSION comes after the QUIC data ramp release ($ramp_release), and whether freenet $ramp_release is on crates.io cannot be determined, so this release is refused rather than risk shipping the ramp unchecked. Retry when crates.io answers." ;;
+    esac
     if (( NOW + WINDOW < t0 )); then
         # A later version cut before T0 would start the ramp at 5% early.
         finding "Release $VERSION comes after the QUIC data ramp release ($ramp_release) but is cut more than $((WINDOW / 60)) min before T0 ($t0), so it would ship the ramp ahead of its start. Re-set T0 or the ramp release in a reviewed PR (docs/RELEASING.md)."
