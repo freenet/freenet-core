@@ -2518,8 +2518,9 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     dark (recycle::dark_close_bound): about 67 s at 50 ms and 300 ms, 74 s
     at 800 ms; measured 35.9 s, 41.6 s and 53.1 s
     (the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer, which
-    also keeps 6.5 s, 13 s and 22 s outages at 800 ms open; the 22 s one
-    swallows the first post-window round). New sends leave a dark path far
+    also keeps 6.5 s, 13 s and 30 s outages at 800 ms open; the 30 s one
+    swallows the first post-window round, and with one round outages of
+    26-40 s closed there). New sends leave a dark path far
     sooner: a send that times out with nothing acknowledged for 10 s makes
     the path suspect (route::StallCount), and new data then goes on UDP at
     once, about 10-15 s after the silence began

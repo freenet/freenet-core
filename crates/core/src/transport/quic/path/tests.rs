@@ -3847,8 +3847,9 @@ fn a_path_dark_in_both_directions_is_closed_as_dark() {
 /// window; the rule waits for two rounds of sends made after the window,
 /// and the first is answered, so the path lives. So is a 13 s outage, past
 /// the window, when it has ended before quinn's first probe after the
-/// window. A 22 s outage swallows that first post-window round (as a lost
-/// probe pair would) and is still survived: the second round is answered.
+/// window. A 30 s outage swallows that first post-window round (as a lost
+/// probe pair would) and is still survived: the second round is answered
+/// (with one round, outages of 26 s to 40 s closed here).
 /// A path that stays dark is closed as dark. Prints the close latency
 /// at 50, 300 and 800 ms round trips for a path that stays dark (the figures
 /// in `transport.md`).
@@ -3863,7 +3864,7 @@ fn the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer() {
         for (one_way_ms, outage_ms, closes) in [
             (400u64, 6_500u64, false),
             (400, 13_000, false),
-            (400, 22_000, false),
+            (400, 30_000, false),
             (25, u64::MAX, true),
             (150, u64::MAX, true),
             (400, u64::MAX, true),
@@ -3919,7 +3920,7 @@ fn the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer() {
                     "{case}"
                 );
             } else {
-                s.wait(Duration::from_secs(60)).await;
+                s.wait(Duration::from_secs(90)).await;
                 assert!(
                     s.a.connection().inner().close_reason().is_none(),
                     "{case}: {:?}, {:?}",
