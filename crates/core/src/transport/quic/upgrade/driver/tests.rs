@@ -758,6 +758,11 @@ fn a_path_follows_the_data_bits() {
             ("prefer", Some("100"), 0, true, false),
             ("prefer", Some("0"), caps::DATA, false, false),
             ("shadow", Some("100"), caps::DATA, false, false),
+            // No quic-data-percent: the release's share. With no ramp start
+            // that is 0. With one set it is 5% (this harness's virtual clock
+            // reads 1970, before any T0, and a time before T0 reads as T0), so
+            // the row then holds only because this seeded pair's bucket is 5 or
+            // more; a change to key derivation under the seed can flip it.
             ("prefer", None, caps::DATA, false, false),
         ] {
             let case = format!("{mode} {percent:?}, peer {peer_caps}");
