@@ -520,10 +520,12 @@ Current wire-gated floors:
   fails closed: one before `QUIC_DATA_RAMP_RELEASE`, one that skips it while
   the tree has not reached it (an auto-bump past a taken number), one cut
   while `v<QUIC_DATA_RAMP_RELEASE>` is not a published (non-draft) GitHub
-  release or `freenet` at that version is not on crates.io, or either gives
-  no clear answer (the ramp release's bump merged but its publish or un-draft
-  failed or was cancelled; nodes update from GitHub's latest release, so a
-  crates.io publish alone did not reach them), or one cut more than 3 h
+  release, GitHub's latest release is before it, or `freenet` at that version
+  is not on crates.io, or any of these gives no clear answer (the ramp
+  release's bump merged but its publish or un-draft failed or was cancelled,
+  or "latest" stayed pinned to an older build; nodes update from GitHub's
+  latest release, so a crates.io publish alone did not reach them), or one
+  cut more than 3 h
   before T0, and T0 set with no ramp release named. The check reads the
   GitHub API with `GH_TOKEN` (the workflow token in CI, `gh auth token`
   locally) when it has one. Cut the ramp release with `--field version=X.Y.Z` set to

@@ -15,8 +15,9 @@
 # T0 set with no release named; a version before the named one; a later one
 # that skips it while this tree (crates/core/Cargo.toml) has not reached it;
 # a later one while the ramp release is not a published (non-draft) GitHub
-# release or not on crates.io, or either gives no clear answer (the bump can
-# merge and the publish or un-draft then fail); a later one
+# release, GitHub's latest release is before it, or it is not on crates.io,
+# or any of these has no clear answer (the bump can merge and the publish or
+# un-draft then fail); a later one
 # cut more than WINDOW before T0. With no T0, or no ramp release and no T0, it
 # prints a notice and exits 0.
 #
@@ -133,35 +134,56 @@ published() {
     esac
 }
 
-# Whether v$1 is a published (non-draft) GitHub release: returns 0 published,
-# 1 not (HTTP 404: no release, or only a draft, which this endpoint does not
-# return), 2 unknown (any other answer, or none). Nodes update from GitHub's
-# latest release, so this, not crates.io, is what says a release reached them.
+# GET https://api.github.com/repos/freenet/freenet-core/$1 into the file $2;
+# prints the HTTP status, or returns non-zero when there was no answer.
 # Authenticated when a token is at hand (GH_TOKEN, GITHUB_TOKEN, or `gh auth
-# token`), since the anonymous limit is 60 requests an hour per address.
-github_release_published() {
-    local code token dir answer=2
+# token`), since the anonymous limit is 60 requests an hour per address. The
+# token goes to curl in a file in a private directory (mktemp), removed on
+# return or interruption, never on curl's command line.
+github_get() {
+    local token
     token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
     if [[ -z "$token" ]] && command -v gh >/dev/null 2>&1; then
         token="$(gh auth token 2>/dev/null || true)"
     fi
-    # The token goes to curl in a file (mktemp makes it private), not on its
-    # command line, where other processes could read it.
-    dir="$(mktemp -d)"
     local auth=()
     if [[ -n "$token" ]]; then
-        printf 'Authorization: Bearer %s\n' "$token" > "$dir/auth"
-        auth=(-H "@$dir/auth")
+        GITHUB_GET_DIR="$(mktemp -d)"
+        trap 'rm -rf "$GITHUB_GET_DIR"' EXIT INT TERM
+        printf 'Authorization: Bearer %s\n' "$token" > "$GITHUB_GET_DIR/auth"
+        auth=(-H "@$GITHUB_GET_DIR/auth")
     fi
-    if code="$(curl -sS -o "$dir/body" -w '%{http_code}' -A 'freenet-release-check' \
-        -H 'Accept: application/vnd.github+json' "${auth[@]}" \
+    local rc=0
+    # `${auth[@]+...}`: an empty array is "unbound" under `set -u` in bash
+    # before 4.4 (macOS's /bin/bash).
+    curl -sS -o "$2" -w '%{http_code}' -A 'freenet-release-check' \
+        -H 'Accept: application/vnd.github+json' ${auth[@]+"${auth[@]}"} \
         --max-time 30 --retry 3 --retry-all-errors \
-        "https://api.github.com/repos/freenet/freenet-core/releases/tags/v$1")"; then
+        "https://api.github.com/repos/freenet/freenet-core/$1" || rc=$?
+    if [[ -n "${GITHUB_GET_DIR:-}" ]]; then
+        rm -rf "$GITHUB_GET_DIR"
+        GITHUB_GET_DIR=""
+        trap - EXIT INT TERM
+    fi
+    return "$rc"
+}
+
+# Whether v$1 has reached nodes through GitHub: returns 0 yes, 1 no, 2 unknown
+# (any answer other than the ones below, or none). Nodes update from GitHub's
+# latest release, so v$1 must be a published (non-draft) release (404 from
+# releases/tags: none, or a draft, which that endpoint does not return), and
+# /releases/latest must be at v$1 or later: a release un-drafted while
+# "latest" stayed pinned to an older build never reached nodes either.
+github_release_reached_nodes() {
+    local code body answer=2 latest
+    body="$(mktemp)"
+    if code="$(github_get "releases/tags/v$1" "$body")"; then
         case "$code" in
             200)
-                # The endpoint returns published releases only; require the body
-                # to say so too, so an answer that is not that does not pass.
-                if [[ "$(tr -d '[:space:]' < "$dir/body")" == *'"draft":false'* ]]; then
+                # The endpoint returns published releases only; require the
+                # body to say so too, so an answer that is not that does not
+                # pass.
+                if [[ "$(tr -d '[:space:]' < "$body")" == *'"draft":false'* ]]; then
                     answer=0
                 else
                     echo "GitHub answered 200 for v$1 without \"draft\": false"
@@ -170,7 +192,25 @@ github_release_published() {
             *) echo "GitHub answered HTTP $code for v$1" ;;
         esac
     fi
-    rm -rf "$dir"
+    if [[ "$answer" == 0 ]]; then
+        answer=2
+        if code="$(github_get "releases/latest" "$body")"; then
+            if [[ "$code" != 200 ]]; then
+                echo "GitHub answered HTTP $code for the latest release"
+            elif [[ "$(tr -d '[:space:]' < "$body")" =~ \"tag_name\":\"v([0-9]+\.[0-9]+\.[0-9]+)\" ]]; then
+                latest="${BASH_REMATCH[1]}"
+                if [[ "$(printf '%s\n%s\n' "$1" "$latest" | sort -V | tail -1)" == "$latest" ]]; then
+                    answer=0
+                else
+                    echo "GitHub's latest release is v$latest, before v$1"
+                    answer=1
+                fi
+            else
+                echo "GitHub's latest release has no vX.Y.Z tag_name"
+            fi
+        fi
+    fi
+    rm -f "$body"
     return "$answer"
 }
 
@@ -238,11 +278,11 @@ if [[ "$ramp_release" != "$VERSION" ]]; then
     # version would be the first to ship the ramp, unchecked. So the ramp
     # release must be a published GitHub release (what nodes update from) and
     # on crates.io, and an answer that is not a clear yes or no fails closed.
-    github_release_published "$ramp_release"
+    github_release_reached_nodes "$ramp_release"
     case $? in
         0) ;;
-        1) finding "Release $VERSION comes after the QUIC data ramp release ($ramp_release), but v$ramp_release is not a published GitHub release (none, or still a draft), so nodes never received it and this release would ship the ramp unchecked. Publish v$ramp_release first (scripts/RELEASE_RECOVERY.md), or change QUIC_DATA_RAMP_RELEASE and T0 in a reviewed PR (docs/RELEASING.md)." ;;
-        *) finding "Release $VERSION comes after the QUIC data ramp release ($ramp_release), and whether v$ramp_release is a published GitHub release cannot be determined, so this release is refused rather than risk shipping the ramp unchecked. Retry when GitHub answers." ;;
+        1) finding "Release $VERSION comes after the QUIC data ramp release ($ramp_release), but v$ramp_release has not reached nodes (it is not a published GitHub release, or GitHub's latest release is before it), so this release would ship the ramp unchecked. Publish v$ramp_release and make it latest first (scripts/RELEASE_RECOVERY.md), or change QUIC_DATA_RAMP_RELEASE and T0 in a reviewed PR (docs/RELEASING.md)." ;;
+        *) finding "Release $VERSION comes after the QUIC data ramp release ($ramp_release), and whether v$ramp_release has reached nodes through GitHub cannot be determined, so this release is refused rather than risk shipping the ramp unchecked. Retry when GitHub answers." ;;
     esac
     published freenet "$ramp_release"
     case $? in
