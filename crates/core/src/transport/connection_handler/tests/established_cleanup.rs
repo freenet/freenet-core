@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use super::super::mock_transport::MockSocket;
 use super::super::*;
 
@@ -19,12 +21,24 @@ fn establish(
     rx
 }
 
+fn is_recently_closed(
+    manager: &ConnectionStateManager<MockSocket, RealTime>,
+    addr: &SocketAddr,
+) -> bool {
+    matches!(
+        manager.get_state(addr),
+        Some(ConnectionState::RecentlyClosed { .. })
+    )
+}
+
 /// An `Established` entry whose `PeerConnection` has ended (inbound receiver
 /// dropped) is only replaced when the same address sends again, so without the
-/// sweep it holds its channel buffer for the life of the process. A live one
-/// must survive the same sweep.
-#[test]
-fn cleanup_expired_drops_established_entries_with_a_closed_channel() {
+/// sweep it holds its channel buffer for the life of the process. The sweep
+/// turns it into `RecentlyClosed`, which frees the buffer but keeps the drain
+/// window for late packets of the old session; the next sweep after
+/// `RECENTLY_CLOSED_DURATION` removes it. A live entry must survive all of it.
+#[tokio::test(start_paused = true)]
+async fn cleanup_expired_turns_a_closed_established_entry_into_recently_closed() {
     let mut m = manager();
     let live_addr: SocketAddr = "192.0.2.1:1000".parse().unwrap();
     let dead_addr: SocketAddr = "192.0.2.2:1000".parse().unwrap();
@@ -41,10 +55,24 @@ fn cleanup_expired_drops_established_entries_with_a_closed_channel() {
     drop(dead_rx);
     m.cleanup_expired();
     assert!(
-        m.get_state(&dead_addr).is_none(),
-        "an Established entry with a closed inbound channel must be removed"
+        is_recently_closed(&m, &dead_addr),
+        "a closed Established entry must become RecentlyClosed, not vanish: late \
+         packets of the old session still get the drain window"
     );
     assert!(m.is_established(&live_addr), "a live entry must be kept");
+
+    // Still inside the drain window: kept.
+    m.cleanup_expired();
+    assert!(is_recently_closed(&m, &dead_addr));
+
+    // The next sweep after the window frees it, so memory stays bounded.
+    tokio::time::advance(RECENTLY_CLOSED_DURATION + Duration::from_millis(1)).await;
+    m.cleanup_expired();
+    assert!(
+        m.get_state(&dead_addr).is_none(),
+        "the RecentlyClosed entry must be removed once the drain window passed"
+    );
+    assert!(m.is_established(&live_addr));
 }
 
 /// The sweep touches only `Established` and `RecentlyClosed`: in-progress
