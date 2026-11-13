@@ -363,10 +363,21 @@ pub(super) enum Key {
     Delegate(DelegateKey),
 }
 
+impl From<ContractError> for ContractExecError {
+    /// Contract WASM chooses the text of the error it returns; bound it here so
+    /// every log line and client reply built from this error is bounded.
+    fn from(err: ContractError) -> Self {
+        Self::ContractError(super::error::bound_contract_error(err))
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum ContractExecError {
+    /// Guest-returned errors reach this variant through the `From` impl, which
+    /// bounds the guest-supplied text. Constructing it directly (tests, mocks)
+    /// bypasses that bound, so only do so with host-authored text.
     #[error(transparent)]
-    ContractError(#[from] ContractError),
+    ContractError(ContractError),
 
     #[error("Attempted to perform a put for an already put contract ({0}), use update instead")]
     DoublePut(ContractKey),

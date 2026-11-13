@@ -2769,6 +2769,10 @@ mod tests {
             // operation, so they are not memory the node holds resident.
             ("MAX_EVIDENCE_INPUT_BYTES", "per-request input limit"),
             ("MAX_IMPORT_BUNDLE_BYTES", "per-request import limit"),
+            (
+                "MAX_GUEST_ERROR_TEXT_BYTES",
+                "length cap on one guest-supplied error or log string, not a memory budget",
+            ),
             // Inbound stream reassembly is bounded per peer (stream count,
             // bytes, eviction; one budget shared by a peer's UDP connection
             // and QUIC path), not by a node memory budget: an explicit
