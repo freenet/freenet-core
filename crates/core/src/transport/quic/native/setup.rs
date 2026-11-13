@@ -531,6 +531,66 @@ mod tests {
         });
     }
 
+    /// A client answered with one Retry and then nothing sends no more than
+    /// it was charged: its punches, the Initials after the Retry (quinn does
+    /// not reset its probe count for one) and the close.
+    #[test]
+    fn a_client_retried_then_ignored_sends_no_more_than_its_charge() {
+        bounded(|| async {
+            let _seed = GlobalRng::seed_guard(SEED);
+            let net = crate::transport::test_net::subnet();
+            let pair = pair("native-setup-retried", net.addr(1), net.addr(2), None).await;
+            let (a, b, clock) = (pair.a.clone(), pair.b.clone(), pair.time.clone());
+            let (a_addr, b_addr) = (pair.a_addr, pair.b_addr);
+            let b_key = pair.b_keys.public().clone();
+            let _permit = b.allow_native_peer(a_addr, pair.a_keys.public()).unwrap();
+            let (result, retries) = drive(&pair.time, LIMIT, async move {
+                let retries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let counted = retries.clone();
+                let router = tokio::spawn(async move {
+                    while let Some(attempt) = b.accept().await {
+                        if !attempt.address_validated() && counted.load(Ordering::SeqCst) == 0 {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            attempt.retry();
+                        } else {
+                            attempt.ignore();
+                        }
+                    }
+                });
+                let budget = PunchBudget::default();
+                let to_b = NativePeer {
+                    addr: b_addr,
+                    key: &b_key,
+                    is_gateway: false,
+                };
+                let deadline = clock.now() + Duration::from_secs(60);
+                let result = connect_native(&a, &budget, to_b, 0, &clock, deadline).await;
+                clock.sleep(Duration::from_secs(2)).await;
+                router.abort();
+                (result, retries.load(Ordering::SeqCst))
+            })
+            .await;
+            assert!(
+                matches!(result, Err(NativeSetupError::TimedOut)),
+                "{result:?}"
+            );
+            assert_eq!(retries, 1, "the client was answered with a Retry");
+            let sent: Vec<usize> = pair
+                .sent()
+                .iter()
+                .filter(|sent| sent.from == a_addr && sent.to == b_addr)
+                .map(|sent| sent.bytes.len())
+                .collect();
+            let padded = sent.iter().filter(|len| **len >= 1200).count();
+            let bytes: u64 = sent.iter().map(|len| *len as u64).sum();
+            assert!(
+                bytes <= CLIENT_BYTES_PER_DIAL,
+                "{bytes} B > {CLIENT_BYTES_PER_DIAL} B"
+            );
+            assert_eq!(padded, 11, "10 Initials and the close");
+        });
+    }
+
     /// The window is 8 s, cut to the deadline, and at least 4 s, as literals.
     #[test]
     fn the_window_is_eight_seconds_and_at_least_four() {

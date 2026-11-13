@@ -2016,8 +2016,9 @@ Hello (native/hello.rs, frozen layout) is exchanged on one uni stream each
 Punches (native/punch.rs): byte 0x03 + 8 GlobalRng bytes, sent on the
   endpoint's socket with try_send (charged unpaced), at once and every
   250 ms, at most 32 per setup (288 B). A client also sends at most 12
-  padded Initials (quinn sends two probes per timeout: 9 in 8 s, a close,
-  and a Retry's restart), so a client setup is charged 14688 B and a server
+  padded Initials (quinn sends two probes per timeout: 9 in 8 s and a
+  close; a Retry does not reset the probe count, so one more after a Retry,
+  11 of 12), so a client setup is charged 14688 B and a server
   setup 288 B, before anything is sent. PunchBudget: 64 KiB per destination
   per minute (an IPv4 address, or an IPv6 /64), and 1 MiB per minute for the
   node (provisional); 4096 destinations remembered, and a new one replaces
@@ -2029,8 +2030,12 @@ Setup (native/setup.rs): one window, 8 s cut to the caller's deadline, not
   exchange all inside it. The budget is charged after the checks that fail
   without sending (window, key, waiter, allow). Roles by key order are the
   caller's decision.
-Not decided here (A5): fairness of a destination's budget between the
-  requesters that steer setups at it.
+Not decided here (A5): fairness between the requesters that steer setups,
+  for both budgets. A requester steering about 4 client setups a minute at
+  one destination empties that destination's budget, blocking native setups
+  to every peer behind it; steering about 71 a minute empties the node
+  budget, blocking native setups to every destination. Both must be fair
+  before UDP is removed.
 ```
 
 #### QUIC framing and path (`quic/framing.rs`, `quic/path.rs`, #5940 step e3)

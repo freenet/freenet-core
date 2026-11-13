@@ -46,6 +46,12 @@ pub(crate) mod native_version {
     /// whose floor is above this build asks for an urgent update
     /// ([`needs_urgent_update`]). `Err` names why the two cannot talk.
     pub(crate) fn check(remote: &[u8; 8]) -> Result<(u8, u8, u16), String> {
+        check_then(remote, crate::transport::signal_urgent_update)
+    }
+
+    /// [`check`] with the urgent-update signal as `urgent`, so a test can see
+    /// it fire without latching the process-wide flag.
+    fn check_then(remote: &[u8; 8], urgent: impl FnOnce()) -> Result<(u8, u8, u16), String> {
         match is_compatible(&OWN, remote) {
             Ok(info) => {
                 crate::transport::report_peer_version(info.version);
@@ -54,7 +60,7 @@ pub(crate) mod native_version {
             Err(reason) => {
                 crate::transport::report_peer_version(parse_version_bytes(remote).version);
                 if needs_urgent_update(remote) {
-                    crate::transport::signal_urgent_update();
+                    urgent();
                 }
                 Err(reason)
             }
@@ -71,8 +77,18 @@ pub(crate) mod native_version {
     /// reason; sets the version-mismatch signal when
     /// [`rejection_signals_mismatch`] says so.
     pub(crate) fn rejected_by(peer_version: &[u8], peer_is_gateway: bool) {
+        rejected_by_then(
+            peer_version,
+            peer_is_gateway,
+            crate::transport::signal_version_mismatch,
+        );
+    }
+
+    /// [`rejected_by`] with the mismatch signal as `mismatch`, so a test can
+    /// see it fire without latching the process-wide flag.
+    fn rejected_by_then(peer_version: &[u8], peer_is_gateway: bool, mismatch: impl FnOnce()) {
         if rejection_signals_mismatch(peer_version, peer_is_gateway) {
-            crate::transport::signal_version_mismatch();
+            mismatch();
         }
     }
 
@@ -121,11 +137,17 @@ pub(crate) mod native_version {
             let mut long = newer.to_vec();
             long.push(0);
             assert!(!rejection_signals_mismatch(&long, true));
-            // And the signal is really sent: the generation only moves up, so
-            // another test cannot make this pass or fail.
-            let before = crate::transport::version_mismatch_generation();
-            rejected_by(&newer, true);
-            assert!(crate::transport::version_mismatch_generation() > before);
+            // And the signal is really sent, and only then; through a counter,
+            // so no process-wide flag is latched for other tests.
+            for (version, gateway, expected) in [
+                (&newer[..], true, 1),
+                (&newer[..], false, 0),
+                (&OWN[..], true, 0),
+            ] {
+                let mut fired = 0;
+                rejected_by_then(version, gateway, || fired += 1);
+                assert_eq!(fired, expected, "gateway {gateway}");
+            }
         }
 
         /// A peer whose floor is above this build is incompatible and asks
@@ -136,11 +158,12 @@ pub(crate) mod native_version {
             let newer = requires_newer();
             assert!(needs_urgent_update(&newer));
             assert!(!needs_urgent_update(&OWN));
-            let before = crate::transport::version_mismatch_generation();
-            assert!(check(&newer).is_err());
-            assert!(crate::transport::is_urgent_update());
-            assert!(crate::transport::version_mismatch_generation() > before);
-            assert_eq!(check(&OWN), Ok(OWN_VERSION));
+            let mut fired = 0;
+            assert!(check_then(&newer, || fired += 1).is_err());
+            assert_eq!(fired, 1);
+            let mut fired = 0;
+            assert_eq!(check_then(&OWN, || fired += 1), Ok(OWN_VERSION));
+            assert_eq!(fired, 0);
         }
     }
 }

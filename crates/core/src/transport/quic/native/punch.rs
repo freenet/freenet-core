@@ -55,8 +55,10 @@ pub(crate) const PUNCH_BUDGET_ENTRIES: usize = 4096;
 /// 100 ms initial RTT the probe timeout is about 300 ms and doubles, and
 /// quinn (0.11.19) sends two probes per timeout, so an unanswered client
 /// sends 1 + 2 + 2 + 2 + 2 = 9 Initials in 8 s, then one padded close when
-/// the dial is dropped. Two more cover a Retry's restart. Checked against
-/// what a dial to a silent peer really sends (`setup::tests`).
+/// the dial is dropped: 10. A Retry does not reset quinn's probe count, so a
+/// client answered with a Retry and then nothing sends one Initial more:
+/// 10 and the close, 11. 12 leaves one datagram of margin. Both are checked
+/// against what a dial really sends (`setup::tests`).
 pub(crate) const INITIALS_PER_DIAL: u64 = 12;
 
 /// The most one dial's punches can send.
@@ -377,6 +379,37 @@ mod tests {
         assert_eq!(
             budget.charge(to("203.0.113.9"), CLIENT_BYTES_PER_DIAL, later),
             Ok(())
+        );
+    }
+
+    /// A charge refused for its destination takes nothing from the node
+    /// budget: after it, the node budget still holds exactly what the
+    /// accepted charges left.
+    #[test]
+    fn a_refused_destination_charge_leaves_the_node_budget_alone() {
+        let budget = PunchBudget::default();
+        let now = Duration::ZERO;
+        assert_eq!(
+            budget.charge(to("198.51.100.1"), PUNCH_BUDGET_BYTES, now),
+            Ok(())
+        );
+        for _ in 0..100 {
+            assert_eq!(
+                budget.charge(to("198.51.100.1"), PUNCH_BUDGET_BYTES, now),
+                Err(PunchRefusal::Destination)
+            );
+        }
+        // The node has NODE - one destination left: fill it exactly from
+        // fifteen other destinations, then one byte more is the node's refusal.
+        let left = NODE_PUNCH_BUDGET_BYTES - PUNCH_BUDGET_BYTES;
+        assert_eq!(left / PUNCH_BUDGET_BYTES, 15);
+        for i in 0..15u8 {
+            let dest = SocketAddr::from(([203, 0, 113, i + 1], 1));
+            assert_eq!(budget.charge(dest, PUNCH_BUDGET_BYTES, now), Ok(()), "{i}");
+        }
+        assert_eq!(
+            budget.charge(to("192.0.2.1"), 1, now),
+            Err(PunchRefusal::Node)
         );
     }
 
