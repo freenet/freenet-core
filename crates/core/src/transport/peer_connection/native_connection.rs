@@ -9,7 +9,9 @@
 //!   its send with a transient error ([`TransportError::SendQueueFull`]), the
 //!   connection surviving; nothing is ever sent elsewhere;
 //! - its data is paced by the bandwidth limit, as an upgrade path's is, but a
-//!   message the pacer refuses is dropped (there is no UDP to send it on);
+//!   message the pacer refuses is dropped (there is no UDP to send it on); with
+//!   `total-bandwidth-limit` it counts in the shared manager's connections, so
+//!   every connection's share is computed over it too;
 //! - any end of the path ends the connection, and `recv` then returns an error
 //!   with a [`CloseReason`] for the end: [`CloseReason::IdleTimeout`] when quinn
 //!   timed it out, else [`CloseReason::QuicPath`] with the cause;
@@ -84,6 +86,10 @@ pub(crate) struct NativePeerConnection {
     clock: PathClock,
     outbound: FuturesUnordered<JoinHandle<OutboundStreamResult>>,
     close_reason: Option<CloseReason>,
+    /// The node's shared bandwidth manager, which this connection is
+    /// registered with while it lives, as a UDP connection is, so the
+    /// per-connection share counts it.
+    global_bandwidth: Option<Arc<crate::transport::global_bandwidth::GlobalBandwidthManager>>,
 }
 
 impl NativePeerConnection {
@@ -116,6 +122,10 @@ impl NativePeerConnection {
             windows,
         );
         path.enable_data();
+        let global_bandwidth = rate_limit.global().cloned();
+        if let Some(global) = &global_bandwidth {
+            global.register_connection();
+        }
         if let Some(pacer) = LimitPacer::new(rate_limit, clock.clone()) {
             path.pace_with(Arc::new(pacer));
         }
@@ -149,6 +159,7 @@ impl NativePeerConnection {
             clock,
             outbound: FuturesUnordered::new(),
             close_reason: None,
+            global_bandwidth,
         }
     }
 
@@ -295,6 +306,9 @@ fn reason_for(error: Option<&quinn::ConnectionError>, cause: Option<QuicPathEnd>
 /// for them.
 impl Drop for NativePeerConnection {
     fn drop(&mut self) {
+        if let Some(global) = &self.global_bandwidth {
+            global.unregister_connection();
+        }
         self.route.path().uncount_as_data_path();
         self.route.path().close(QuicCloseCode::NodeDroppedPeer);
         if let Some(registry) = &self.dispatch.inbound_stream_registry {

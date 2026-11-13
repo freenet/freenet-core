@@ -551,6 +551,48 @@ labelled_counters! {
     }
 }
 
+labelled_counters! {
+    /// How a QUIC-native connection setup ended, counted where the setup
+    /// decides it (`QuicUpgrades::setup_native`), one per setup. Exported per
+    /// period as `connect_native_setup_<label>`. Zero until the connect op
+    /// asks for native connections (`connect::native::NATIVE_DIAL_READY`).
+    pub(crate) enum NativeSetupOutcome {
+        /// The setup gave a connection, after the Hello exchange.
+        Established => "established",
+        /// Less than `setup::MIN_WINDOW_LEFT` of the window was left.
+        TooLate => "too_late",
+        /// The destination's punch budget was spent.
+        OverBudgetDestination => "over_budget_destination",
+        /// The node's punch budget was spent.
+        OverBudgetNode => "over_budget_node",
+        /// The punch budget's table had no destination it could forget.
+        OverBudgetTable => "over_budget_table",
+        /// The node already ran `QuicPolicy::native_setups_max` setups.
+        SetupsFull => "setups_full",
+        /// A native setup from this address was already waiting.
+        AlreadyWaiting => "already_waiting",
+        /// The QUIC allow-set was full.
+        AllowSetFull => "allow_set_full",
+        /// The address was allowed for another key or kind.
+        KeyConflict => "key_conflict",
+        /// The peer's key cannot be used in a QUIC handshake.
+        UnusableKey => "unusable_key",
+        /// No connection within the window.
+        TimedOut => "timed_out",
+        /// The handshake failed (TLS, the dial, or the connection).
+        HandshakeFailed => "handshake_failed",
+        /// A Hello was refused, by this node or the peer.
+        HelloRefused => "hello_refused",
+        /// The two versions cannot talk to each other.
+        HelloVersion => "hello_version",
+        /// The Hello exchange ran out of time or lost its connection.
+        HelloLost => "hello_lost",
+        /// The node has no QUIC upgrades hub (no endpoint, policy or task
+        /// registrar), so it cannot set one up.
+        Unavailable => "unavailable",
+    }
+}
+
 impl QuicPathAge {
     /// The bucket for a path that lasted `age`.
     pub(crate) fn bucket(age: std::time::Duration) -> Self {
@@ -909,6 +951,8 @@ pub struct TransportMetrics {
     quic_churned_fallback: [AtomicU64; QuicFallback::COUNT],
     /// Active paths that ended this period, by [`QuicPathAge`].
     quic_path_age: [AtomicU64; QuicPathAge::COUNT],
+    /// QUIC-native setups this period, by [`NativeSetupOutcome`].
+    connect_native_setup: [AtomicU64; NativeSetupOutcome::COUNT],
     /// Establish latencies this period in ms (bounded), and how many there
     /// were.
     quic_establish_ms: parking_lot::Mutex<Vec<u64>>,
@@ -1371,6 +1415,7 @@ impl TransportMetrics {
             quic_fallback: Default::default(),
             quic_churned_fallback: Default::default(),
             quic_path_age: Default::default(),
+            connect_native_setup: Default::default(),
             quic_establish_ms: Default::default(),
             quic_establish_samples: AtomicU64::new(0),
             quic_paths_offered_or_dialing: AtomicU64::new(0),
@@ -1963,6 +2008,11 @@ impl TransportMetrics {
 
     /// This node closed a QUIC connection to `remote` with `code`
     /// (`remote` is never exported).
+    /// A QUIC-native setup ended with `outcome`.
+    pub(crate) fn record_connect_native_setup(&self, outcome: NativeSetupOutcome) {
+        self.connect_native_setup[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_quic_close_sent(&self, code: QuicCloseCode, remote: SocketAddr) {
         #[cfg(test)]
         push_test_log(&self.nat_detail.quic_close_sent_to, (remote, code));
@@ -2806,6 +2856,7 @@ impl TransportMetrics {
             quic_fallback: std::array::from_fn(|i| get64(&self.quic_fallback[i])),
             quic_churned_fallback: std::array::from_fn(|i| get64(&self.quic_churned_fallback[i])),
             quic_path_age_at_close: std::array::from_fn(|i| get64(&self.quic_path_age[i])),
+            connect_native_setup: std::array::from_fn(|i| get64(&self.connect_native_setup[i])),
             quic_establish_ms_p50: establish_p50,
             quic_establish_ms_p90: establish_p90,
             quic_establish_samples: get64(&self.quic_establish_samples),
@@ -3496,6 +3547,9 @@ pub struct TransportSnapshot {
     /// Active paths that ended, by [`QuicPathAge`]
     /// (`quic_path_age_at_close_<label>`).
     pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
+    /// QUIC-native setups, by [`NativeSetupOutcome`]
+    /// (`connect_native_setup_<label>`).
+    pub connect_native_setup: [u64; NativeSetupOutcome::COUNT],
     /// Median and p90 of this period's establish latencies, in ms (the
     /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
     /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
@@ -3885,6 +3939,7 @@ impl TransportSnapshot {
             quic_fallback,
             quic_churned_fallback,
             quic_path_age_at_close,
+            connect_native_setup,
             quic_establish_ms_p50,
             quic_establish_ms_p90,
             quic_establish_samples,
@@ -4047,6 +4102,7 @@ impl TransportSnapshot {
         self.quic_fallback = quic_fallback;
         self.quic_churned_fallback = quic_churned_fallback;
         self.quic_path_age_at_close = quic_path_age_at_close;
+        self.connect_native_setup = connect_native_setup;
         self.quic_establish_ms_p50 = quic_establish_ms_p50;
         self.quic_establish_ms_p90 = quic_establish_ms_p90;
         self.quic_establish_samples = quic_establish_samples;
@@ -4294,6 +4350,9 @@ struct SnapshotExtras {
     /// Active paths that ended, by [`QuicPathAge`]
     /// (`quic_path_age_at_close_<label>`).
     pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
+    /// QUIC-native setups, by [`NativeSetupOutcome`]
+    /// (`connect_native_setup_<label>`).
+    pub connect_native_setup: [u64; NativeSetupOutcome::COUNT],
     /// Median and p90 of this period's establish latencies, in ms (the
     /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
     /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
@@ -4505,6 +4564,7 @@ impl SnapshotExtras {
                 .iter()
                 .any(|n| *n != 0)
             || self.quic_path_age_at_close.iter().any(|n| *n != 0)
+            || self.connect_native_setup.iter().any(|n| *n != 0)
             || self.quic_establish_samples != 0
             || self.quic_paths_offered_or_dialing != 0
             || self.quic_paths_active != 0
@@ -5784,6 +5844,14 @@ mod tests {
     }
 
     #[test]
+    fn connect_native_setup_outcomes_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, _| m.record_connect_native_setup(NativeSetupOutcome::ALL[slot]),
+            |snap| snap.connect_native_setup,
+        );
+    }
+
+    #[test]
     fn quic_path_age_buckets_count_snapshot_and_reset() {
         let secs = [0, 59, 60, 599, 600, 3599, 3600, 86399, 86400];
         let want = [2, 2, 2, 2, 1];
@@ -6982,6 +7050,7 @@ mod tests {
             "quic_fallback",
             "quic_churned_fallback",
             "quic_path_age_at_close",
+            "connect_native_setup",
             "quic_establish_ms_p50",
             "quic_establish_ms_p90",
             "quic_establish_samples",

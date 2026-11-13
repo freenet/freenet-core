@@ -86,15 +86,21 @@ fn run<F, Fut>(
     F: FnOnce(Rig) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    run_with(network, peer_limits, idle_timeout, None, test);
+    run_with(
+        network,
+        peer_limits,
+        idle_timeout,
+        QuicRateLimit::new(None, None),
+        test,
+    );
 }
 
-/// [`run`], with the node's `bandwidth-limit` set to `bandwidth_limit`.
+/// [`run`], with the node's bandwidth settings `rate_limit`.
 fn run_with<F, Fut>(
     network: &'static str,
     peer_limits: QuicPathLimits,
     idle_timeout: Option<Duration>,
-    bandwidth_limit: Option<usize>,
+    rate_limit: QuicRateLimit,
     test: F,
 ) where
     F: FnOnce(Rig) -> Fut + Send + 'static,
@@ -108,7 +114,7 @@ fn run_with<F, Fut>(
             VERSION,
             PathClock::Virtual(time.clone()),
             None,
-            QuicRateLimit::new(bandwidth_limit, None),
+            rate_limit,
             RouteNote::default(),
         );
         let registry = Arc::new(OrphanStreamRegistry::new());
@@ -707,7 +713,7 @@ fn the_bandwidth_limit_paces_a_native_connections_data() {
         "native-conn-paced",
         QuicPathLimits::DEFAULT,
         None,
-        Some(100_000),
+        QuicRateLimit::new(Some(100_000), None),
         |mut rig| async move {
             assert!(rig.conn.path().is_paced());
             let start = rig.time().now();
@@ -906,6 +912,29 @@ fn a_native_worker_panic_is_counted_and_raised() {
                 stats.send_event_count(QuicSendEvent::NativeWorkerPanicked),
                 1
             );
+        },
+    );
+}
+
+/// With `total-bandwidth-limit` set, a native connection counts in the shared
+/// manager's connections while it lives, as a UDP connection does, so every
+/// connection's share is computed over it too.
+#[test]
+fn a_native_connection_counts_in_the_shared_bandwidth_pool() {
+    use crate::transport::global_bandwidth::GlobalBandwidthManager;
+    let manager = Arc::new(GlobalBandwidthManager::new(1_000_000, Some(1000)));
+    let watched = Arc::clone(&manager);
+    run_with(
+        "native-conn-pool",
+        QuicPathLimits::DEFAULT,
+        None,
+        QuicRateLimit::new(None, Some(manager)),
+        move |rig| async move {
+            assert_eq!(watched.connection_count(), 1);
+            assert_eq!(watched.current_per_connection_rate(), 1_000_000);
+            assert!(rig.conn.path().is_paced(), "paced at its share");
+            drop(rig.conn);
+            assert_eq!(watched.connection_count(), 0, "unregistered on drop");
         },
     );
 }

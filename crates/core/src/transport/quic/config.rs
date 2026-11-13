@@ -557,6 +557,13 @@ impl QuicRateLimit {
         }
     }
 
+    /// The node's shared bandwidth manager, if `total-bandwidth-limit` is set:
+    /// a connection that paces at its share registers with it so the share is
+    /// computed over every connection (a QUIC-native connection does).
+    pub(crate) fn global(&self) -> Option<&Arc<GlobalBandwidthManager>> {
+        self.global.as_ref()
+    }
+
     /// The cap in bytes per second now, or `None` for no cap. The fair
     /// share is read on each call, so it follows the connection count.
     pub(crate) fn rate(&self) -> Option<u64> {

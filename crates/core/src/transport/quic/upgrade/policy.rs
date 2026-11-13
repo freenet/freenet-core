@@ -74,6 +74,8 @@ pub(crate) struct QuicPolicy {
     breaker: BreakerOutcome,
     availability: QuicAvailabilityWatch,
     permits: QuicPathPermits,
+    /// The most native setups at once (`native_setups_max`).
+    native_setups_max: usize,
 }
 
 /// What a [`QuicPolicy`] takes from the node's configuration and its crash-loop
@@ -84,6 +86,7 @@ pub(crate) struct QuicPolicyConfig {
     data_percent: u8,
     max_paths: usize,
     breaker: BreakerOutcome,
+    native_setups_max: usize,
 }
 
 impl QuicPolicyConfig {
@@ -97,6 +100,8 @@ impl QuicPolicyConfig {
             data_percent: config.quic_data_percent().unwrap_or(QUIC_DATA_PERCENT),
             max_paths: config.quic_max_paths(),
             breaker,
+            native_setups_max: crate::transport::quic::native::setup::NATIVE_SETUPS_MAX
+                .min(config.connection_limit().max),
         }
     }
 }
@@ -171,7 +176,15 @@ impl QuicPolicy {
             breaker: config.breaker,
             availability,
             permits: QuicPathPermits::new(config.max_paths),
+            native_setups_max: config.native_setups_max,
         }
+    }
+
+    /// The most QUIC-native setups the node runs at once:
+    /// `setup::NATIVE_SETUPS_MAX`, lowered to the node's connection limit
+    /// (`NetworkApiConfig::connection_limit`).
+    pub(crate) fn native_setups_max(&self) -> usize {
+        self.native_setups_max
     }
 
     /// The mode the node runs.
