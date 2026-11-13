@@ -1629,9 +1629,9 @@ fn run_expiries(times: &[u64], expiries: impl Fn(usize) -> u64) -> (Vec<usize>, 
     };
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
     let (mut would, mut closed) = (Vec::new(), false);
-    for i in 1..times.len() {
+    for (i, time) in times.iter().enumerate().skip(1) {
         let before = watch.would_close();
-        closed |= watch.observe(times[i] * SEC, sample(i));
+        closed |= watch.observe(time * SEC, sample(i));
         if watch.would_close() > before {
             would.push(i);
         }
