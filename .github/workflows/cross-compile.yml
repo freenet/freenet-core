@@ -925,6 +925,21 @@ jobs:
       # does. The default ref for a tag push is the tag, so the tree published
       # here is exactly the tree the shipped binaries were built from.
       # ---------------------------------------------------------------------
+      # The QUIC data ramp start (T0) is checked again here, against the tag's
+      # version and the clock now, immediately before the irreversible publish
+      # and the un-draft: release.yml's validate job checks it when the run
+      # starts, but the bump PR, the builds and the canary come between, and a
+      # "re-run failed jobs" of this job hours later must check it again rather
+      # than publish on the earlier verdict. A failure leaves the draft
+      # unpublished, which is the safe state. Pinned by
+      # scripts/check_quic_data_ramp_t0_test.sh.
+      - name: Check the QUIC data ramp start is near now (before publishing)
+        if: ${{ success() && startsWith(github.ref, 'refs/tags/v') }}
+        working-directory: _src
+        run: |
+          TAG_NAME="${GITHUB_REF#refs/tags/}"
+          bash scripts/check_quic_data_ramp_t0.sh --version "${TAG_NAME#v}" --live true
+
       - name: Publish crates to crates.io
         # Tag-gated as well as job-gated. The job's own
         # `if: startsWith(github.ref, 'refs/tags/v')` already blocks this on a

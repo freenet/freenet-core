@@ -97,21 +97,7 @@ release_value="$DECLARED"
 read_declared QUIC_DATA_RAMP_START 'Option<u64>'
 start_value="$DECLARED"
 
-if [[ "$release_value" == "None" ]]; then
-    echo "QUIC data ramp: no ramp release (QUIC_DATA_RAMP_RELEASE = None); nothing to check."
-    exit 0
-fi
-if [[ ! "$release_value" =~ ^Some\(\"([0-9]+\.[0-9]+\.[0-9]+)\"\)$ ]]; then
-    echo "::error::check_quic_data_ramp_t0: QUIC_DATA_RAMP_RELEASE must be None or Some(\"X.Y.Z\") (got $release_value)"
-    exit 2
-fi
-ramp_release="${BASH_REMATCH[1]}"
-if [[ "$ramp_release" != "$VERSION" ]]; then
-    echo "QUIC data ramp: release $VERSION is not the ramp release ($ramp_release); nothing to check."
-    exit 0
-fi
-
-# This is the ramp release. Every finding below fails a live run.
+# Every finding below fails a live run and warns in a dry run.
 finding() {
     if [[ "$LIVE" == "true" ]]; then
         echo "::error title=QUIC data ramp start::$1"
@@ -121,19 +107,60 @@ finding() {
     exit 0
 }
 
-if [[ "$start_value" == "None" ]]; then
+# T0 in seconds, or empty for None; a value written another way exits 2.
+t0=""
+if [[ "$start_value" != "None" ]]; then
+    if [[ ! "$start_value" =~ ^Some\(([0-9_]+)\)$ ]]; then
+        echo "::error::check_quic_data_ramp_t0: QUIC_DATA_RAMP_START must be None or Some(<unix seconds>) (got $start_value)"
+        exit 2
+    fi
+    t0="${BASH_REMATCH[1]//_/}"
+    if [[ ! "$t0" =~ ^[0-9]+$ ]]; then
+        echo "::error::check_quic_data_ramp_t0: QUIC_DATA_RAMP_START has no digits (got $start_value)"
+        exit 2
+    fi
+    t0=$((10#$t0))
+fi
+
+if [[ "$release_value" == "None" ]]; then
+    if [[ -n "$t0" ]]; then
+        # Fail closed: a ramp in the tree with no release named for it would
+        # ship under whatever version is cut, unchecked.
+        finding "QUIC_DATA_RAMP_START is set but QUIC_DATA_RAMP_RELEASE is None, so release $VERSION would ship the ramp unchecked. Name the ramp release beside T0 in a reviewed PR (docs/RELEASING.md)."
+    fi
+    echo "QUIC data ramp: no ramp release (QUIC_DATA_RAMP_RELEASE = None); nothing to check."
+    exit 0
+fi
+if [[ ! "$release_value" =~ ^Some\(\"([0-9]+\.[0-9]+\.[0-9]+)\"\)$ ]]; then
+    echo "::error::check_quic_data_ramp_t0: QUIC_DATA_RAMP_RELEASE must be None or Some(\"X.Y.Z\") (got $release_value)"
+    exit 2
+fi
+ramp_release="${BASH_REMATCH[1]}"
+if [[ "$ramp_release" != "$VERSION" ]]; then
+    if [[ -z "$t0" ]]; then
+        # The emergency stop: T0 set back to None, the release left named.
+        echo "QUIC data ramp: no ramp start (QUIC_DATA_RAMP_START = None); release $VERSION is not checked."
+        exit 0
+    fi
+    earlier="$(printf '%s\n%s\n' "$VERSION" "$ramp_release" | sort -V | head -1)"
+    if [[ "$earlier" == "$VERSION" ]]; then
+        # Fail closed: the ramp is in the tree and this version comes before
+        # the one named for it, so it would ship the ramp under another
+        # version (an auto-bump, or the name set ahead of the cut).
+        finding "Release $VERSION comes before the QUIC data ramp release ($ramp_release) but carries the ramp (QUIC_DATA_RAMP_START is set), so it would ship the ramp unchecked. Cut the ramp release as $ramp_release, or change QUIC_DATA_RAMP_RELEASE in the same reviewed PR as T0 (docs/RELEASING.md)."
+    fi
+    if (( NOW + WINDOW < t0 )); then
+        # A later version cut before T0 would start the ramp at 5% early.
+        finding "Release $VERSION comes after the QUIC data ramp release ($ramp_release) but is cut more than $((WINDOW / 60)) min before T0 ($t0), so it would ship the ramp ahead of its start. Re-set T0 or the ramp release in a reviewed PR (docs/RELEASING.md)."
+    fi
+    echo "QUIC data ramp: release $VERSION comes after the ramp release ($ramp_release); not checked."
+    exit 0
+fi
+
+# This is the ramp release.
+if [[ -z "$t0" ]]; then
     finding "Release $VERSION is the QUIC data ramp release (QUIC_DATA_RAMP_RELEASE), but QUIC_DATA_RAMP_START is None. Set T0 to the planned publish time in a reviewed PR first (docs/RELEASING.md)."
 fi
-if [[ ! "$start_value" =~ ^Some\(([0-9_]+)\)$ ]]; then
-    echo "::error::check_quic_data_ramp_t0: QUIC_DATA_RAMP_START must be None or Some(<unix seconds>) (got $start_value)"
-    exit 2
-fi
-t0="${BASH_REMATCH[1]//_/}"
-if [[ ! "$t0" =~ ^[0-9]+$ ]]; then
-    echo "::error::check_quic_data_ramp_t0: QUIC_DATA_RAMP_START has no digits (got $start_value)"
-    exit 2
-fi
-t0=$((10#$t0))
 off=$((NOW - t0))
 abs=${off#-}
 if (( abs > WINDOW )); then
