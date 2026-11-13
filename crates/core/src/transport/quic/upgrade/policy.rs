@@ -951,7 +951,11 @@ mod tests {
                 policy.own_caps_with(policy.share(), &local, &peer, now)
             );
         }
-        assert_eq!(caps_with("prefer", Some("lots".to_string())), 0);
+        // An unreadable quic-data-percent reads as unset: the release's share.
+        assert_eq!(
+            caps_with("prefer", Some("lots".to_string())),
+            caps_with("prefer", None)
+        );
         assert_eq!(
             caps_with("prefer", Some("100".to_string())),
             caps::DATA | caps::RECYCLES
