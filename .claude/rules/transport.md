@@ -1490,6 +1490,11 @@ a test passes its own; tests read their own, never the global).
   level in the period, and the highest count a reset in the period took a path
   to). They are for the fixed charge, which takes quinn's stopped map at
   SEND_ABORT_LIMIT x QUIC_STOPPED_ENTRY_BYTES until field data justifies less.
+  quic_ack_wait_expired_<stream|short|control>: ack-wait expiries that
+  counted as strikes (path::StrikeCheck), by kind; expected 0 on honest
+  paths. quic_stall_close_<not_acknowledging|dark|credit_starved|
+  stream_credit_withheld|ack_waits_expired>: paths the acknowledgement
+  watch closed, by why (recycle::Stall).
   quic_dark_episode_<recovered_lt_5s|lt_10s|lt_30s|lt_120s|recovered_ge_120s|
   unrecovered|cap_held|closed_at_window>: dark episodes (recycle::AckWatch:
   packets outstanding, nothing acknowledged, nothing heard) by how they ended;
@@ -2129,7 +2134,10 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   also past a deadline that reported MaybeDelivered: Outgoing's drop hands
   the wait to a small task (at most 48 per path, each ending with the
   connection). A one-packet Short holds no permit but its send epoch, and
-  waits the same way, at most ACK_WAITS_WITHOUT_PERMIT (64) per path; past
+  waits the same way, at most ACK_WAITS_WITHOUT_PERMIT (64) per path, each
+  for at most SHORT_ACK_WAIT (120 s), after which its stream is reset,
+  freeing the epoch, and may count as a strike (liveness rules, below); a
+  control frame's wait is bounded the same way; past
   that its epoch is released at once and counted
   (quic_data_event_ack_wait_released) and its stream is reset, so quinn
   discards the unacknowledged packet with the epoch (the reset counts toward
@@ -2317,7 +2325,10 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   Dropping a send future resets its stream (Drop on Outgoing; quinn's own
   drop would FINISH it, which the receiver reads as a stream that ended
   early). A send dropped while waiting for acks after finish is not reset
-  and may still be delivered.
+  and may still be delivered, except when its own deadline ended the wait
+  (a stream's ack wait or total, SendDeadlines::ack_wait), and a one-packet
+  Short or control frame whose background wait reaches SHORT_ACK_WAIT:
+  those are reset (liveness rules, below).
   Each locally reset stream leaves one Arc<Notify> in quinn's per-
   connection `stopped` map until the connection closes (quinn 0.11.12:
   stopped() registers it, and a local reset produces neither the Finished

@@ -1349,6 +1349,104 @@ fn concurrent_large_streams_on_a_slow_path_see_no_expiry() {
     })
 }
 
+/// A one-packet Short and a control frame whose acknowledgement does not come
+/// within their background wait (here 1 s in place of `SHORT_ACK_WAIT`,
+/// after sends of at most 3 s, on a 4 s round trip), while a bulk transfer
+/// keeps the connection acknowledging
+/// above the floor: each is reset and counted as a strike, under its own
+/// label (`quic_ack_wait_expired_short`, `_control`).
+#[test]
+fn a_short_and_a_control_past_their_bound_under_bulk_acks_are_strikes() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-short-control-strikes";
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_secs(2))
+            })),
+        );
+        let counters = leaked_counters();
+        let windows = Windows {
+            a: Some(test_budget(64 << 20, leaked_counters())),
+            b: Some(test_budget(64 << 20, leaked_counters())),
+        };
+        let limits = QuicPathLimits {
+            short_ack_wait: Some(Duration::from_secs(1)),
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths_built(network, limits, None, None, windows, true).await;
+        let mut streams = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+        let mut shorts = std::mem::replace(&mut p.b_in.shorts, tokio::sync::mpsc::channel(1).1);
+        let drain = tokio::spawn(async move {
+            let mut kept = Vec::new();
+            loop {
+                tokio::select! {
+                    Some(stream) = streams.recv() => kept.push(stream),
+                    Some(short) = shorts.recv() => drop(short),
+                    else => break,
+                }
+            }
+        });
+        let (a, time) = (p.a.clone(), p.time());
+        let (short, control) = p
+            .drive(async move {
+                // About 128 KiB/s on one stream, acknowledged steadily, and
+                // using one of the peer's stream slots only.
+                let bulk = {
+                    let (a, time) = (a.clone(), time.clone());
+                    tokio::spawn(async move {
+                        let chunks = Box::pin(futures::stream::unfold((), move |()| {
+                            let time = time.clone();
+                            async move {
+                                time.sleep(Duration::from_millis(500)).await;
+                                Some((Ok(Bytes::from(payload(64 * 1024))), ()))
+                            }
+                        }));
+                        a.send_stream_chunks(StreamId::next(), 64 * MIB as u64, None, chunks)
+                            .await
+                            .ok();
+                    })
+                };
+                // Long enough for the bulk's acknowledgements to flow steadily.
+                time.sleep(Duration::from_secs(14)).await;
+                let short = a
+                    .send_short_bounded(&time, Duration::from_secs(3), b"one packet")
+                    .await;
+                let control = a
+                    .send_control_bounded(
+                        &time,
+                        Duration::from_secs(3),
+                        QuicControl::Ready {
+                            attempt: 1,
+                            caps: 0,
+                        },
+                    )
+                    .await;
+                time.sleep(Duration::from_secs(5)).await;
+                bulk.abort();
+                (short, control)
+            })
+            .await;
+        drain.abort();
+        set_packet_delivery_callback(network, None);
+        assert!(
+            matches!(short, BoundedSend::MaybeDelivered(_)),
+            "premise: the Short's send ended before its acknowledgement: {short:?}"
+        );
+        assert!(
+            matches!(control, BoundedSend::MaybeDelivered(_)),
+            "premise: the control's send ended before its acknowledgement: {control:?}"
+        );
+        assert_eq!(counters.snapshot(false).ack_wait_expired, vec![0, 1, 1]);
+        assert_eq!(p.a.writers().ack_wait_expiries(), 2);
+    })
+}
+
 /// One-packet Shorts in flight when both directions go dark for an outage
 /// the dark rule tolerates (11 s on a fast path, 30 s at an 800 ms round
 /// trip), on virtual time, which runs no keepalive (as the simulations):
