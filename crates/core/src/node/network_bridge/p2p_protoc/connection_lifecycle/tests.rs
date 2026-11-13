@@ -3645,16 +3645,35 @@ async fn a_native_connection_binds_its_proven_key() {
 /// A failed native setup: the connect op dials UDP next, so the address is
 /// not marked failed and the peer gets no backoff, either of which would
 /// refuse that dial. Only an outcome that says native does not work on the
-/// path counts toward demotion: three timeouts with distinct peers demote
-/// the node, three refusals by its own punch budget do not.
+/// path, seen as joiner, counts toward demotion: three joiner timeouts with
+/// distinct peers demote the node; three refusals by its own punch budget do
+/// not, nor do three timeouts as acceptor (a joiner chose this node, and
+/// could fail on purpose).
 #[tokio::test]
 async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_path_failures() {
     use crate::operations::connect::native::DialTransport;
     use crate::transport::NativeSetupOutcome;
     let mut h = Harness::new("native-failure").await;
-    for (round, outcome, demotions) in [
-        (0u16, NativeSetupOutcome::OverBudgetDestination, 0),
-        (1, NativeSetupOutcome::TimedOut, 1),
+    use crate::transport::NatAttemptOrigin;
+    for (round, outcome, origin, demotions) in [
+        (
+            0u16,
+            NativeSetupOutcome::OverBudgetDestination,
+            NatAttemptOrigin::ConnectJoiner,
+            0,
+        ),
+        (
+            1,
+            NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::ConnectAcceptor,
+            0,
+        ),
+        (
+            2,
+            NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::ConnectJoiner,
+            1,
+        ),
     ] {
         for i in 0..3u16 {
             let addr: SocketAddr = format!("203.0.113.231:{}", 6210 + round * 10 + i)
@@ -3671,6 +3690,7 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
                 transient: false,
                 transport: DialTransport::Native,
                 native_outcome: Some(outcome),
+                origin,
             })
             .await;
             assert!(matches!(result.try_recv(), Ok(Err(()))), "the dial failed");
@@ -3692,7 +3712,7 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
                 .native_connect()
                 .demotions(),
             demotions,
-            "{outcome:?}"
+            "{outcome:?} as {origin:?}"
         );
     }
 }
@@ -3731,6 +3751,7 @@ async fn a_late_native_failure_keeps_the_connection_made_meanwhile() {
         transient: false,
         transport: DialTransport::Native,
         native_outcome: Some(NativeSetupOutcome::TimedOut),
+        origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
     })
     .await;
     assert!(h.mgr.connections.contains_key(&addr), "still connected");

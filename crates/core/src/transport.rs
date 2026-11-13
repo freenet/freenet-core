@@ -353,6 +353,7 @@ impl From<SocketAddr> for ObservedAddr {
 pub(crate) use self::boundary::NativeConnectFuture;
 pub(crate) use self::boundary::TransportHandle;
 pub(crate) use self::metrics::NativeSetupOutcome;
+pub(crate) use self::quic::native::setup::NATIVE_FALLBACK_AFTER;
 pub(crate) use self::quic::upgrade::driver::NativeDial;
 pub(crate) use self::quic::{QuicAvailability, QuicAvailabilityWatch};
 // For the node's test that pins each end's disconnect label.

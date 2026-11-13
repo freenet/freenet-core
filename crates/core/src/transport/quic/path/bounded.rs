@@ -838,11 +838,17 @@ where
         // is registered before `send` notifies it, and without it tokio draws
         // that order from an RNG a simulation's seed does not set, so one seed
         // ran differently twice. A fixed order draws nothing from `GlobalRng`
-        // either, so a seed's stream is what it was. No arm can starve
-        // another: `send` ends the loop when ready; the timer is polled
-        // before `source_wait`, so a source that notifies on every
-        // iteration cannot hold off the deadline check; and `source_wait`
-        // only re-arms the loop, which recomputes the deadline.
+        // either, so a seed's stream is what it was. This holds for upgrade
+        // paths as well as native ones. The one behaviour it fixes: when the
+        // send and the deadline are ready in the same poll, the send wins,
+        // where tokio picked either. That is the right answer: the send has
+        // finished, so its outcome is the send's, and reading it as a
+        // timeout would report a delivered message as lost and could count
+        // the path quiet. No arm can starve another: `send` ends the loop
+        // when ready; the timer is polled before `source_wait`, so a source
+        // that notifies on every iteration cannot hold off the deadline
+        // check; and `source_wait` only re-arms the loop, which recomputes
+        // the deadline.
         tokio::select! {
             biased;
             result = &mut send => {

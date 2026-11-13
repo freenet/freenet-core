@@ -298,6 +298,9 @@ pub mod sim_trace {
         >,
         fallbacks_dialled: AtomicU64,
         native_superseded: AtomicU64,
+        /// Pairs `(lower, higher address)` where a node's native setup failed.
+        native_failed_pairs:
+            parking_lot::Mutex<std::collections::BTreeSet<(SocketAddr, SocketAddr)>>,
         /// Nodes standing in for a release below the floor
         /// ([`mark_pre_floor`]).
         pre_floor: parking_lot::Mutex<std::collections::HashSet<SocketAddr>>,
@@ -369,6 +372,11 @@ pub mod sim_trace {
         let c = &trace.0;
         let counter = match event {
             NativeWireEvent::NativeFailedFor { tx, own, peer } => {
+                if let Some(own) = own {
+                    c.native_failed_pairs
+                        .lock()
+                        .insert((own.min(peer), own.max(peer)));
+                }
                 c.fallbacks_pending.lock().insert((tx, own, peer));
                 return;
             }
@@ -496,6 +504,10 @@ pub mod sim_trace {
         /// same peer in the same transaction.
         pub fn native_fallbacks_dialled(&self) -> u64 {
             Self::get(&self.0.fallbacks_dialled)
+        }
+        /// The pairs `(lower, higher address)` where a native setup failed.
+        pub fn native_failed_pairs(&self) -> Vec<(SocketAddr, SocketAddr)> {
+            self.0.native_failed_pairs.lock().iter().copied().collect()
         }
         /// Native failures after the pair had connected another way.
         pub fn native_superseded(&self) -> u64 {

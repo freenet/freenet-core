@@ -2166,9 +2166,17 @@ Dial: NodeEvent::ConnectPeer and HandshakeCommand::Connect carry a
 Joiner: joiner_response_action gives Native when it offered and can still
   dial. Acceptor: dispatch_expect_connection_from takes the response's
   decision; every accept site passes it (source-scrape pin).
-Fallback: a failed native setup is followed at once by today's UDP dial to
-  the same peer (joiner: in the same dial slot, before anything counts the
-  acceptor failed; acceptor: expectation plus dial). A native failure marks
+Fallback: a failed native setup is followed by today's UDP dial to the same
+  peer (joiner: in the same dial slot, before anything counts the acceptor
+  failed; acceptor: expectation plus dial). Both sides start it
+  NATIVE_FALLBACK_AFTER (12 s, the server's window) after their own
+  reference, never earlier: the acceptor's decision, the joiner's receipt of
+  the response. Both setups have ended by then, and the references are the
+  response's travel time apart, so the two hole punches
+  (NAT_TRAVERSAL_DEADLINE, 3 s each) overlap. Falling back as each setup
+  ended would not: the client's window ends 4 s before the server's. The
+  simulation cannot show the difference (it has no NAT, and an expected
+  inbound is accepted for 100 s), so unit tests pin the timing. A native failure marks
   no failed address and records no peer backoff, so the fallback is not
   refused. Until UDP is removed a failed native setup never costs the join
   (test_quic_native_failed_setups_fall_back_to_udp, which also checks that
@@ -2179,8 +2187,11 @@ Fallback: a failed native setup is followed at once by today's UDP dial to
   in-transit prune would remove the live peer's ring entry).
 Success: the connection's key is bound as IdentitySource::Proven; a
   gateway records a JoinTransport::Native join.
-Demotion: recorded in the connection lifecycle, where the outcome is known.
-  Only timed_out, handshake_failed and hello_lost count
+Demotion: recorded in the connection lifecycle, where the outcome is known,
+  and only for a dial the node made as joiner (OutboundFailed carries the
+  origin): a joiner's acceptors are the ones its CONNECT was routed to,
+  while an acceptor's joiner chose it and could fail on purpose. Only
+  timed_out, handshake_failed and hello_lost count
   (NativeSetupOutcome::counts_toward_demotion): a refusal by the node's own
   limits, or a Hello the peer answered, says nothing about the path. Three
   such failures with distinct peers turn native off for 6 h
@@ -2193,8 +2204,10 @@ Simulation: every node shares [::1], so the per-destination punch budget
   acceptors at once refuses some setups (over_budget_destination) and their
   servers time out. The fallback covers them.
 Determinism: a plain tokio::select! draws its arm order from tokio's RNG,
-  which the seed does not set. bounded_send's loop and the native setup's
-  two selects are `biased` with a documented order, so one seed runs the
+  which the seed does not set. bounded_send's loop (every QUIC path, upgrade
+  ones included: a send and its deadline ready together now resolve as the
+  send) and the native setup's two selects are `biased` with a documented
+  order, so one seed runs the
   same twice (test_quic_native_connect_is_deterministic). Not
   deterministic_select!: it draws from GlobalRng, which shifts the seed's
   stream for every QUIC test after it.

@@ -557,11 +557,15 @@ async fn drive_client_connect(
                 acceptor_addr,
                 result,
                 transport,
+                answered_at,
             })) => {
-                // A native dial that failed is followed at once by a UDP dial to
-                // the same acceptor, in the same dial slot, before anything
-                // counts it as failed: until UDP is removed a failed native
-                // setup must never cost the join. Demotion is recorded where
+                // A native dial that failed is followed by a UDP dial to the
+                // same acceptor, in the same dial slot, before anything counts
+                // it as failed: until UDP is removed a failed native setup must
+                // never cost the join. The UDP dial starts
+                // `NATIVE_FALLBACK_AFTER` after the response arrived, when the
+                // acceptor starts its own (`dispatch_expect_connection_from`),
+                // so the two hole punches overlap. Demotion is recorded where
                 // the setup's end is known (the connection lifecycle).
                 if transport == super::native::DialTransport::Native
                     && !matches!(result, Some(Ok(_)))
@@ -572,23 +576,21 @@ async fn drive_client_connect(
                         acceptor = %acceptor_addr,
                         "connect driver: QUIC-native setup failed; dialling UDP"
                     );
-                    dials.push(
-                        begin_acceptor_dial(
-                            op_manager,
-                            tx,
-                            acceptor,
-                            Instant::now(),
-                            super::native::DialTransport::Udp,
-                        )
-                        .await?,
-                    );
+                    dials.push(futures::future::Either::Right(udp_fallback_dial(
+                        op_manager.clone(),
+                        tx,
+                        acceptor,
+                        acceptor_addr,
+                        answered_at,
+                        answered_at + crate::transport::NATIVE_FALLBACK_AFTER,
+                    )));
                     continue;
                 }
                 if let Some((next, answered_at)) = dial_queue.finish() {
                     let transport = dial_transport(&native_acceptors, &next);
-                    dials.push(
+                    dials.push(futures::future::Either::Left(
                         begin_acceptor_dial(op_manager, tx, next, answered_at, transport).await?,
-                    );
+                    ));
                 }
                 // The address the connection was made to, which can differ from
                 // the advertised one when an existing transport is reused.
@@ -924,10 +926,10 @@ async fn drive_client_connect(
                         if transport == super::native::DialTransport::Native {
                             native_acceptors.insert(acceptor.clone());
                         }
-                        dials.push(
+                        dials.push(futures::future::Either::Left(
                             begin_acceptor_dial(op_manager, tx, acceptor, answered_at, transport)
                                 .await?,
-                        );
+                        ));
                     }
                     Offer::Queued => {
                         accepted.insert(payload.acceptor.clone());
@@ -1086,6 +1088,44 @@ struct AcceptorDial {
     result: Option<crate::message::ConnectResult>,
     /// The transport dialled; a failed native dial is retried over UDP.
     transport: super::native::DialTransport,
+    /// When the acceptor's response arrived: the joiner's reference point
+    /// for its UDP fallback.
+    answered_at: Instant,
+}
+
+/// The joiner's UDP fallback after a failed native dial: wait until `at`,
+/// then dial as [`begin_acceptor_dial`] does. A dial that cannot be started
+/// ends as a failed one.
+async fn udp_fallback_dial(
+    op_manager: OpManager,
+    tx: Transaction,
+    acceptor: PeerKeyLocation,
+    acceptor_addr: SocketAddr,
+    answered_at: Instant,
+    at: Instant,
+) -> AcceptorDial {
+    tokio::time::sleep_until(at).await;
+    match begin_acceptor_dial(
+        &op_manager,
+        tx,
+        acceptor.clone(),
+        answered_at,
+        super::native::DialTransport::Udp,
+    )
+    .await
+    {
+        Ok(dial) => dial.await,
+        Err(error) => {
+            tracing::warn!(tx = %tx, %error, "connect driver: UDP fallback dial could not start");
+            AcceptorDial {
+                acceptor,
+                acceptor_addr,
+                result: None,
+                transport: super::native::DialTransport::Udp,
+                answered_at,
+            }
+        }
+    }
 }
 
 /// How to dial `acceptor`: native if it decided native for this CONNECT.
@@ -1170,6 +1210,7 @@ async fn begin_acceptor_dial(
             acceptor_addr,
             result,
             transport,
+            answered_at,
         }
     })
 }
@@ -3395,6 +3436,106 @@ mod driver_timing_tests {
                 break;
             }
         }
+    }
+
+    /// The next `NodeEvent` sent, skipping other events.
+    async fn next_node_event<T>(
+        events: &mut tokio::sync::mpsc::Receiver<Either<T, NodeEvent>>,
+    ) -> NodeEvent {
+        loop {
+            if let Either::Right(event) = events.recv().await.expect("events open") {
+                return event;
+            }
+        }
+    }
+
+    /// An acceptor whose native setup fails at once still waits until
+    /// `NATIVE_FALLBACK_AFTER` after its decision before its UDP fallback
+    /// (expectation, then dial), so its hole punch overlaps the joiner's.
+    #[tokio::test(start_paused = true)]
+    async fn an_acceptors_udp_fallback_waits_for_the_common_fallback_time() {
+        use super::super::native::{DialTransport, NativeDecision};
+        let (op_manager, mut events) = op_manager_with_events("acceptor-fallback-time").await;
+        let joiner = peer(24890);
+        let tx = Transaction::new::<ConnectMsg>();
+        let decided_at = Instant::now();
+        super::super::dispatch_expect_connection_from(
+            &op_manager,
+            tx,
+            joiner.clone(),
+            Some(NativeDecision::Native),
+        )
+        .await
+        .expect("dispatch");
+        let NodeEvent::ConnectPeer {
+            callback,
+            transport: DialTransport::Native,
+            ..
+        } = next_node_event(&mut events).await
+        else {
+            panic!("the native dial comes first");
+        };
+        callback.send(Err(())).await.expect("callback open");
+        let NodeEvent::ExpectPeerConnection { addr, .. } = next_node_event(&mut events).await
+        else {
+            panic!("the fallback registers the expectation first");
+        };
+        assert_eq!(Some(addr), joiner.socket_addr());
+        assert!(
+            Instant::now() >= decided_at + crate::transport::NATIVE_FALLBACK_AFTER,
+            "fell back {:?} after the decision",
+            Instant::now() - decided_at
+        );
+        let NodeEvent::ConnectPeer {
+            transport: DialTransport::Udp,
+            ..
+        } = next_node_event(&mut events).await
+        else {
+            panic!("then dials UDP");
+        };
+    }
+
+    /// The joiner's UDP fallback starts at its `at`, not before.
+    #[tokio::test(start_paused = true)]
+    async fn a_joiners_udp_fallback_starts_at_its_time() {
+        let (op_manager, mut events) = op_manager_with_events("joiner-fallback-time").await;
+        let acceptor = peer(24891);
+        let addr = acceptor.socket_addr().unwrap();
+        let answered_at = Instant::now();
+        let at = answered_at + crate::transport::NATIVE_FALLBACK_AFTER;
+        let dial = tokio::spawn(super::udp_fallback_dial(
+            (*op_manager).clone(),
+            Transaction::new::<ConnectMsg>(),
+            acceptor,
+            addr,
+            answered_at,
+            at,
+        ));
+        let NodeEvent::ExpectPeerConnection { addr: expected, .. } =
+            next_node_event(&mut events).await
+        else {
+            panic!("the fallback registers the expectation first");
+        };
+        assert_eq!(expected, addr);
+        assert!(Instant::now() >= at);
+        dial.abort();
+    }
+
+    /// The driver measures the joiner's fallback from the response's arrival,
+    /// as the acceptor measures its own from the decision.
+    #[test]
+    fn the_joiners_fallback_is_timed_from_the_response() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = &SOURCE[..SOURCE.find("\n#[cfg(test)]\n").expect("test module")];
+        let flat: String = prod.split_whitespace().collect();
+        assert!(flat.contains(
+            "dials.push(futures::future::Either::Right(udp_fallback_dial(op_manager.clone(),tx,acceptor,acceptor_addr,answered_at,answered_at+crate::transport::NATIVE_FALLBACK_AFTER,)));"
+        ));
+        const CONNECT: &str = include_str!("../connect.rs");
+        let flat: String = CONNECT.split_whitespace().collect();
+        assert!(flat.contains(
+            "tokio::time::sleep_until(decided_at+crate::transport::NATIVE_FALLBACK_AFTER).await;"
+        ));
     }
 
     /// A peer that already has a connection (#5858 leaves it unchanged):

@@ -22724,6 +22724,7 @@ fn test_quic_native_zero_percent_forms_the_same_mesh() {
 struct NativeConnectRun {
     wire: NativeWireRun,
     upgrades: freenet::dev_tool::QuicUpgradeTrace,
+    gateways: std::collections::BTreeSet<SocketAddr>,
 }
 
 /// Runs 2 gateways and 8 nodes on the direct runner with QUIC on (`prefer`),
@@ -22738,7 +22739,7 @@ fn run_native_connect_sim(
 ) -> NativeConnectRun {
     setup_deterministic_state(seed);
     let rt = create_runtime();
-    let (sim, logs_handle, trace, upgrades, nodes) = rt.block_on(async {
+    let (sim, logs_handle, trace, upgrades, nodes, gateways) = rt.block_on(async {
         let mut sim = SimNetwork::new(name, 2, 8, 10, 3, 10, 3, seed).await;
         sim.enable_gateway_ack_version();
         sim.with_quic_native_floor(native_floor_for_tests());
@@ -22747,8 +22748,14 @@ fn run_native_connect_sim(
         let trace = sim.native_wire_trace();
         let upgrades = sim.quic_upgrade_trace();
         let nodes = sim.all_node_addresses().len();
+        let gateways = sim
+            .all_node_addresses()
+            .iter()
+            .filter(|(label, _)| label.to_string().contains("-gateway-"))
+            .map(|(_, addr)| *addr)
+            .collect();
         let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle, trace, upgrades, nodes)
+        (sim, logs_handle, trace, upgrades, nodes, gateways)
     });
     drop(rt);
     sim.run_simulation_direct::<rand::rngs::SmallRng>(
@@ -22769,6 +22776,7 @@ fn run_native_connect_sim(
     NativeConnectRun {
         wire: NativeWireRun { trace, mesh, nodes },
         upgrades,
+        gateways,
     }
 }
 
@@ -22869,6 +22877,27 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
     assert_eq!(
         t.native_fallbacks_dialled() + t.native_superseded(),
         t.native_failed()
+    );
+    // The pair itself connects. A non-gateway node takes a UDP handshake
+    // only while it is punching too, so the two sides' fallbacks must
+    // overlap; a node joining through some other peer would hide a pair
+    // that never connected.
+    let peer_pairs: Vec<_> = t
+        .native_failed_pairs()
+        .into_iter()
+        .filter(|(a, b)| !run.gateways.contains(a) && !run.gateways.contains(b))
+        .collect();
+    assert!(
+        !peer_pairs.is_empty(),
+        "premise: two non-gateway peers failed"
+    );
+    let unconnected: Vec<_> = peer_pairs
+        .iter()
+        .filter(|pair| !run.wire.mesh.contains(pair))
+        .collect();
+    assert!(
+        unconnected.is_empty(),
+        "pairs whose native setup failed and never connected: {unconnected:?}"
     );
     let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
     assert_eq!(peers.len(), run.wire.nodes, "every node joined over UDP");

@@ -1334,11 +1334,18 @@ impl P2pConnManager {
                 transient,
                 transport,
                 native_outcome,
+                origin,
             } => {
                 // Demotion counts only an end that says native does not work
-                // on the path (`counts_toward_demotion`), once for either
-                // role; the connect op then falls back to UDP.
-                if native_outcome.is_some_and(|o| o.counts_toward_demotion()) {
+                // on the path (`counts_toward_demotion`), and only as joiner:
+                // the acceptors a joiner dials are the ones its CONNECT was
+                // routed to, while an acceptor's joiner chose it, so a joiner
+                // that decided to fail (any number of free keys) could
+                // otherwise demote an honest acceptor. The connect op then
+                // falls back to UDP.
+                if origin == crate::transport::NatAttemptOrigin::ConnectJoiner
+                    && native_outcome.is_some_and(|o| o.counts_toward_demotion())
+                {
                     let demoted = self
                         .bridge
                         .op_manager

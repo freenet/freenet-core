@@ -1557,12 +1557,15 @@ pub(super) async fn dispatch_expect_connection_from(
     // endpoint (the setup's waiter is registered when the dial runs, before
     // the joiner's dial can arrive). A failed setup is followed by today's UDP
     // dial, so until UDP is removed a failed native setup never costs the
-    // join.
+    // join. That dial starts `NATIVE_FALLBACK_AFTER` after this decision,
+    // never earlier, when the joiner starts its own (measured from the
+    // response's arrival), so the two hole punches overlap.
     tracing::info!(
         joiner_addr = %addr,
         tx = %tx,
         "connect: acceptor accepted joiner, setting up a QUIC-native connection"
     );
+    let decided_at = Instant::now();
     let (callback, mut rx) = mpsc::channel(1);
     op_manager
         .notify_node_event(NodeEvent::ConnectPeer {
@@ -1593,6 +1596,8 @@ pub(super) async fn dispatch_expect_connection_from(
                     closed = failed.is_none(),
                     "connect: acceptor's QUIC-native setup failed; falling back to UDP"
                 );
+                tokio::time::sleep_until(decided_at + crate::transport::NATIVE_FALLBACK_AFTER)
+                    .await;
                 match acceptor_udp_dial(&op_manager, tx, &peer, addr).await {
                     Ok(mut rx) => log_acceptor_dial(&peer, tx, rx.recv().await),
                     Err(error) => tracing::warn!(

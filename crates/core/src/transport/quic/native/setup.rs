@@ -46,6 +46,17 @@ pub(crate) const MIN_WINDOW_LEFT: Duration = Duration::from_secs(4);
 /// client's attempt. Provisional: A5c measures the skew.
 pub(crate) const SERVER_WINDOW_ALLOWANCE: Duration = Duration::from_secs(4);
 
+/// When each side of a CONNECT whose native setup failed starts its UDP
+/// fallback: this long after its own reference point (the acceptor's
+/// decision, the joiner's receipt of the response), never earlier. Both
+/// native setups have ended by then, whichever role each side had, and the
+/// two references are the response's travel time apart, so the two UDP hole
+/// punches (each `NAT_TRAVERSAL_DEADLINE`, 3 s) overlap. A side that fell
+/// back as soon as its own setup failed would punch alone: the client's
+/// window ends 4 s before the server's.
+pub(crate) const NATIVE_FALLBACK_AFTER: Duration =
+    Duration::from_secs(NATIVE_WINDOW.as_secs() + SERVER_WINDOW_ALLOWANCE.as_secs());
+
 /// The most native setups a node runs at once, before the node's connection
 /// limit lowers it (`QuicPolicy::native_setups_max`). Each holds an allow-set
 /// slot for up to its window. Provisional.

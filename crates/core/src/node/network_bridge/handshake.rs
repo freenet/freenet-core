@@ -61,6 +61,9 @@ pub(crate) enum Event {
         transport: crate::operations::connect::native::DialTransport,
         /// How a native setup ended; `None` for a UDP dial.
         native_outcome: Option<crate::transport::NativeSetupOutcome>,
+        /// Who asked for the dial. Only a joiner's native failures count
+        /// toward demotion.
+        origin: crate::transport::NatAttemptOrigin,
     },
 }
 
@@ -100,6 +103,7 @@ impl std::fmt::Debug for Event {
                 transient,
                 transport,
                 native_outcome,
+                origin,
             } => f
                 .debug_struct("OutboundFailed")
                 .field("transaction", transaction)
@@ -108,6 +112,7 @@ impl std::fmt::Debug for Event {
                 .field("transient", transient)
                 .field("transport", transport)
                 .field("native_outcome", native_outcome)
+                .field("origin", origin)
                 .finish(),
         }
     }
@@ -612,6 +617,7 @@ async fn connect_outbound(
             transient,
             transport,
             native_outcome,
+            origin,
         },
     }
 }
@@ -983,6 +989,7 @@ mod tests {
             transient,
             transport: _,
             native_outcome: _,
+            origin: _,
         } = run.event
         else {
             panic!("expected OutboundFailed, got {:?}", run.event);
