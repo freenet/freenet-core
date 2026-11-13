@@ -8,7 +8,8 @@
 //!   as after a UDP stream failure), and a short the full queue refuses fails
 //!   its send with a transient error ([`TransportError::SendQueueFull`]), the
 //!   connection surviving; nothing is ever sent elsewhere;
-//! - its data is paced by the bandwidth limit, as an upgrade path's is;
+//! - its data is paced by the bandwidth limit, as an upgrade path's is, but a
+//!   message the pacer refuses is dropped (there is no UDP to send it on);
 //! - any end of the path ends the connection, and `recv` then returns an error
 //!   with a [`CloseReason`] for the end: [`CloseReason::IdleTimeout`] when quinn
 //!   timed it out, else [`CloseReason::QuicPath`] with the cause;
@@ -54,10 +55,10 @@ use crate::transport::quic::QuicConnection;
 use crate::transport::quic::config::QuicRateLimit;
 use crate::transport::quic::path::pacer::LimitPacer;
 use crate::transport::quic::path::{
-    InboundShort, InboundStreamArrival, QuicPath, QuicPathLimits, data_channels,
+    InboundShort, InboundStreamArrival, QuicPath, QuicPathLimits, QuicSendEvent, data_channels,
 };
 use crate::transport::quic::upgrade::data_route::{DataRoute, RouteNote, ShortRefused};
-use crate::transport::quic::upgrade::driver::{PathClock, report_panics};
+use crate::transport::quic::upgrade::driver::PathClock;
 use crate::transport::{IncomingStream, TRANSPORT_METRICS, TransportError, normalize_mapped_addr};
 
 /// A QUIC-native connection to one peer.
@@ -125,9 +126,11 @@ impl NativePeerConnection {
         }));
         let (route, worker) = DataRoute::native(Arc::new(path), clock.clone(), note);
         route.path().count_as_data_path();
-        // Bounded by the path: it ends when the connection does. A panic is
-        // counted (task_panicked) and raised again, as for an upgrade's worker.
-        drop(GlobalExecutor::spawn(report_panics(remote_addr, worker)));
+        // Bounded by the path: it ends when the connection does.
+        drop(GlobalExecutor::spawn(count_panics(
+            route.path().stats_handle(),
+            worker,
+        )));
         Self {
             remote_addr,
             remote_version,
@@ -263,26 +266,30 @@ impl NativePeerConnection {
 /// Why `path`'s connection ended: quinn's idle timeout, a cause this node
 /// closed for, the peer's close, or a loss.
 fn end_reason(path: &QuicPath) -> CloseReason {
+    reason_for(
+        path.quinn_connection().close_reason().as_ref(),
+        path.closed_for(),
+    )
+}
+
+/// [`end_reason`] from quinn's reason and the cause this node recorded.
+fn reason_for(error: Option<&quinn::ConnectionError>, cause: Option<QuicPathEnd>) -> CloseReason {
     use quinn::ConnectionError as E;
-    match path.quinn_connection().close_reason() {
+    match error {
         Some(E::TimedOut) => CloseReason::IdleTimeout,
-        Some(E::ApplicationClosed(_)) => CloseReason::QuicPath(QuicPathEnd::ClosedByPeer),
-        Some(E::LocallyClosed) => {
-            CloseReason::QuicPath(path.closed_for().unwrap_or(QuicPathEnd::ClosedLocally))
+        // The peer's close, by the application or by its QUIC stack.
+        Some(E::ApplicationClosed(_) | E::ConnectionClosed(_)) => {
+            CloseReason::QuicPath(QuicPathEnd::ClosedByPeer)
         }
-        Some(
-            E::VersionMismatch
-            | E::TransportError(_)
-            | E::ConnectionClosed(_)
-            | E::Reset
-            | E::CidsExhausted,
-        )
-        | None => CloseReason::QuicPath(QuicPathEnd::Lost),
+        Some(E::LocallyClosed) => {
+            CloseReason::QuicPath(cause.unwrap_or(QuicPathEnd::ClosedLocally))
+        }
+        Some(E::VersionMismatch | E::TransportError(_) | E::Reset | E::CidsExhausted) | None => {
+            CloseReason::QuicPath(QuicPathEnd::Lost)
+        }
     }
 }
 
-/// The node let the peer go: close the connection now, since stream tasks
-/// still running hold the path and would keep it open until they end.
 /// Its streams that nobody claimed are cancelled after, as a UDP connection's
 /// are, so they do not wait out the orphan timeout with nothing accounting
 /// for them.
@@ -301,6 +308,22 @@ impl Drop for NativePeerConnection {
                 }),
             );
         }
+    }
+}
+
+/// Run a native route's worker. If it panics, count that on its path
+/// (`QuicSendEvent::NativeWorkerPanicked`, also node-wide as
+/// `quic_data_event_native_worker_panicked`) and raise the same panic again, so
+/// the runtime sees what it saw before. An upgrade's worker counts as
+/// `quic_upgrade_task_panicked` instead.
+async fn count_panics(
+    stats: Arc<crate::transport::quic::path::QuicPathStats>,
+    worker: impl std::future::Future<Output = ()>,
+) {
+    use futures::FutureExt;
+    if let Err(payload) = std::panic::AssertUnwindSafe(worker).catch_unwind().await {
+        stats.record_send_event(QuicSendEvent::NativeWorkerPanicked);
+        std::panic::resume_unwind(payload);
     }
 }
 

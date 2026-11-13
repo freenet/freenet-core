@@ -35,7 +35,10 @@
 //! send then ends [`NotOpened::Paced`] before its stream opened, and the
 //! message goes on UDP. After the stream opened it ends
 //! [`SendFailure::Paced`] and the stream is reset; a Stream or pipe is then
-//! dropped, and a Short goes on UDP. Once UDP has sent a message the pacer
+//! dropped, and a Short goes on UDP. On a QUIC-native connection's path
+//! (`QuicPathLimits::NATIVE`) there is no UDP: a refused message of either
+//! kind is dropped and counted, and nothing is charged as fallback debt.
+//! Once UDP has sent a message the pacer
 //! refused, the whole message is charged to this bucket as debt
 //! ([`SendPacer::charge`]), so the next QUIC sends wait for it, up to
 //! [`FALLBACK_DEBT`] (half a second at the rate): a larger debt would fail the

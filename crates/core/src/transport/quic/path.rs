@@ -1242,8 +1242,8 @@ impl QuicPath {
         &self.stats
     }
 
-    /// The counters, outliving the path (tests read them after dropping it).
-    #[cfg(test)]
+    /// The counters, outliving the path: tests read them after dropping it,
+    /// and a native connection's route worker counts its panic in them.
     pub(crate) fn stats_handle(&self) -> Arc<QuicPathStats> {
         self.stats.clone()
     }
