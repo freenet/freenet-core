@@ -376,9 +376,19 @@ impl NativeConnectState {
         NativeReadiness::from_parts(dial_ready, endpoint_up, demoted, release_percent)
     }
 
-    /// A native setup with `peer` failed; the caller falls back to UDP.
-    pub(crate) fn record_failure(&self, peer: &TransportPublicKey) {
-        self.demotion.lock().record_failure(peer, Instant::now());
+    /// A native setup with `peer` failed in a way that says native does not
+    /// work on that path; the caller falls back to UDP. Returns whether this
+    /// failure demoted the node, which is counted.
+    pub(crate) fn record_failure(&self, peer: &TransportPublicKey) -> bool {
+        let demoted = self.demotion.lock().record_failure(peer, Instant::now());
+        if demoted {
+            TRANSPORT_METRICS.record_connect_native_demotion();
+            tracing::info!(
+                cooldown_secs = DEMOTION_COOLDOWN.as_secs(),
+                "QUIC-native connects off after native failures with distinct peers"
+            );
+        }
+        demoted
     }
 
     /// A native setup succeeded.
@@ -420,10 +430,11 @@ impl NativeDemotion {
         }
     }
 
-    /// A native attempt with `acceptor` failed.
-    pub(crate) fn record_failure(&mut self, acceptor: &TransportPublicKey, now: Instant) {
+    /// A native attempt with `acceptor` failed. Returns whether it demoted
+    /// the node.
+    pub(crate) fn record_failure(&mut self, acceptor: &TransportPublicKey, now: Instant) -> bool {
         if self.is_demoted(now) {
-            return;
+            return false;
         }
         if !self.streak.contains(acceptor) {
             self.streak.push(acceptor.clone());
@@ -432,7 +443,9 @@ impl NativeDemotion {
             self.streak.clear();
             self.demoted_until = Some(now + DEMOTION_COOLDOWN);
             self.demotions += 1;
+            return true;
         }
+        false
     }
 
     /// A native attempt succeeded: the streak starts over.

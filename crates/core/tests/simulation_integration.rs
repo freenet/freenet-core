@@ -22718,3 +22718,217 @@ fn test_quic_native_zero_percent_forms_the_same_mesh() {
     assert_eq!(on.mesh, off.mesh, "the same connections form");
     assert_eq!(on.trace.undecodable_closes(), 0);
 }
+
+/// One QUIC-native connect run: the wire run plus the upgrade trace, which
+/// records what native paths sent (session 0).
+struct NativeConnectRun {
+    wire: NativeWireRun,
+    upgrades: freenet::dev_tool::QuicUpgradeTrace,
+}
+
+/// Runs 2 gateways and 8 nodes on the direct runner with QUIC on (`prefer`),
+/// the native floor lowered and `configure` applied, for `iterations` event
+/// steps of 200 ms. A failed native setup ends 8 s (client) or 12 s (server)
+/// after it starts, so a run that must see its fallback runs well past that.
+fn run_native_connect_sim(
+    name: &str,
+    seed: u64,
+    iterations: usize,
+    configure: impl FnOnce(&mut SimNetwork),
+) -> NativeConnectRun {
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+    let (sim, logs_handle, trace, upgrades, nodes) = rt.block_on(async {
+        let mut sim = SimNetwork::new(name, 2, 8, 10, 3, 10, 3, seed).await;
+        sim.enable_gateway_ack_version();
+        sim.with_quic_native_floor(native_floor_for_tests());
+        sim.with_transport_quic("prefer");
+        configure(&mut sim);
+        let trace = sim.native_wire_trace();
+        let upgrades = sim.quic_upgrade_trace();
+        let nodes = sim.all_node_addresses().len();
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle, trace, upgrades, nodes)
+    });
+    drop(rt);
+    sim.run_simulation_direct::<rand::rngs::SmallRng>(
+        seed,
+        6,
+        iterations,
+        Duration::from_millis(200),
+    )
+    .expect("direct simulation should succeed");
+    let rt = create_runtime();
+    let mesh = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        logs.iter()
+            .filter_map(|log| log.kind.connect_connected_addrs())
+            .map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
+            .collect()
+    });
+    NativeConnectRun {
+        wire: NativeWireRun { trace, mesh, nodes },
+        upgrades,
+    }
+}
+
+/// Short messages a node sent on a native path (session 0, the session a
+/// native connection records under) and that the path took.
+fn native_shorts_sent(upgrades: &freenet::dev_tool::QuicUpgradeTrace) -> usize {
+    upgrades
+        .records()
+        .iter()
+        .filter(|r| r.session == 0 && r.what.starts_with("sent a short on the path: Sent"))
+        .count()
+}
+
+fn log_native_connect(name: &str, run: &NativeConnectRun) {
+    let t = &run.wire.trace;
+    tracing::info!(
+        name,
+        established = t.native_established(),
+        failed = t.native_failed(),
+        demotions = t.native_demotions(),
+        responses_native = t.responses_native(),
+        native_shorts = native_shorts_sent(&run.upgrades),
+        "native connect trace"
+    );
+}
+
+/// With native connects on at 100% on every node, acceptors decide native,
+/// joiners dial it, the connections form and messages go over them, and
+/// every node joins. Every node of a simulation shares one IP, so a joiner
+/// dialling several acceptors at once spends its per-destination punch
+/// budget and some setups fail; each is followed by a UDP dial, which the
+/// "every node joined" check covers. Fails closed: native connections must
+/// have formed and carried messages.
+#[test_log::test]
+fn test_quic_native_connections_form_and_carry_messages() {
+    const SEED: u64 = 0x0059_40A5_0001;
+    let run = run_native_connect_sim("native-connect-on", SEED, 40, |sim| {
+        sim.with_native_connect(100);
+    });
+    log_native_connect("on", &run);
+    let t = &run.wire.trace;
+    assert!(t.native_established() > 0, "native connections formed");
+    assert!(
+        native_shorts_sent(&run.upgrades) > 0,
+        "messages went over native paths"
+    );
+    assert_eq!(t.undecodable_closes(), 0);
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined");
+    assert!(connected);
+}
+
+/// Until UDP is removed a failed native setup must never cost the join. Every
+/// QUIC datagram between every pair is dropped, so every native setup times
+/// out; each is followed by today's UDP dial and every node still joins. The
+/// timeouts are with distinct peers, so nodes demote themselves. Fails
+/// closed: native setups must have been tried and failed, and none formed.
+#[test_log::test]
+fn test_quic_native_failed_setups_fall_back_to_udp() {
+    use freenet::dev_tool::NodeLabel;
+    const SEED: u64 = 0x0059_40A5_0002;
+    let name = "native-connect-fallback";
+    let run = run_native_connect_sim(name, SEED, 200, |sim| {
+        sim.with_native_connect(100);
+        let mut labels: Vec<NodeLabel> = sim.all_node_addresses().keys().cloned().collect();
+        labels.sort();
+        for (i, a) in labels.iter().enumerate() {
+            for b in &labels[i + 1..] {
+                sim.drop_quic_datagrams_between(a, b, Duration::ZERO);
+            }
+        }
+    });
+    log_native_connect("fallback", &run);
+    let t = &run.wire.trace;
+    assert!(t.responses_native() > 0, "premise: acceptors decided native");
+    assert!(t.native_failed() > 0, "premise: native setups failed");
+    assert_eq!(t.native_established(), 0, "premise: no native setup worked");
+    assert!(t.native_demotions() > 0, "nodes demoted themselves");
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined over UDP");
+    assert!(connected);
+}
+
+/// The same seed gives the same native connects: the same counts, the same
+/// native messages, the same mesh. Compared within one process, since the
+/// harness picks its ports per process.
+#[test_log::test]
+fn test_quic_native_connect_is_deterministic() {
+    const SEED: u64 = 0x0059_40A5_0005;
+    let once = |name: &str| {
+        let run = run_native_connect_sim(name, SEED, 40, |sim| {
+            sim.with_native_connect(100);
+        });
+        let t = &run.wire.trace;
+        let shorts: Vec<(std::net::SocketAddr, std::net::SocketAddr, String)> = run
+            .upgrades
+            .records()
+            .into_iter()
+            .filter(|r| r.session == 0)
+            .map(|r| (r.node, r.peer, r.what))
+            .collect();
+        (
+            (
+                t.native_established(),
+                t.native_failed(),
+                t.native_demotions(),
+                t.responses_native(),
+            ),
+            shorts,
+            run.wire.mesh,
+        )
+    };
+    let first = once("native-det-run1");
+    let second = once("native-det-run2");
+    assert!(first.0.0 > 0, "premise: native connections formed");
+    assert_eq!(first.0, second.0, "the same native counts");
+    assert_eq!(first.1, second.1, "the same native path records");
+    assert_eq!(first.2, second.2, "the same mesh");
+}
+
+/// A network where only some nodes have native connects on. A node with them
+/// off offers percent 0 and, as acceptor, decides UDP, so native forms only
+/// between two nodes that have them on, and every node joins. Fails closed:
+/// some native connection formed.
+#[test_log::test]
+fn test_quic_native_mixed_network_joins() {
+    use freenet::dev_tool::NodeLabel;
+    const SEED: u64 = 0x0059_40A5_0003;
+    let name = "native-connect-mixed";
+    let run = run_native_connect_sim(name, SEED, 40, |sim| {
+        sim.with_node_native_connect(&NodeLabel::gateway(name, 0), 100);
+        // Nodes are numbered after the gateways: 2 to 9. Half have it on.
+        for id in 2..=5 {
+            sim.with_node_native_connect(&NodeLabel::node(name, id), 100);
+        }
+    });
+    log_native_connect("mixed", &run);
+    let t = &run.wire.trace;
+    assert!(t.native_established() > 0, "native formed between on nodes");
+    assert_eq!(t.undecodable_closes(), 0);
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined");
+    assert!(connected);
+}
+
+/// Native connects on at 0% change no connection: every node may dial
+/// native but every offer is at 0, so no acceptor decides native, and the
+/// same seed forms the same mesh, edge for edge, as with native off.
+#[test_log::test]
+fn test_quic_native_on_at_zero_percent_forms_the_same_mesh() {
+    const SEED: u64 = 0x0059_40A5_0004;
+    let off = run_native_connect_sim("native-connect-zero-off", SEED, 40, |_| {});
+    let zero = run_native_connect_sim("native-connect-zero-on", SEED, 40, |sim| {
+        sim.with_native_connect(0);
+    });
+    assert!(off.wire.trace.responses_native() > 0, "premise: decisions sent");
+    assert_eq!(zero.wire.trace.native_established(), 0);
+    assert_eq!(zero.wire.trace.native_failed(), 0);
+    let (off_peers, off_connected) = quic_mesh_peers_and_connected(&off.wire.mesh);
+    assert_eq!(off_peers.len(), off.wire.nodes, "premise: every node joined");
+    assert!(off_connected);
+    assert_eq!(zero.wire.mesh, off.wire.mesh, "the same connections form");
+}

@@ -1270,6 +1270,12 @@ impl P2pConnManager {
                         IdentitySource::Dialled
                     }
                     crate::operations::connect::native::DialTransport::Native => {
+                        self.bridge
+                            .op_manager
+                            .ring
+                            .connection_manager
+                            .native_connect()
+                            .record_success();
                         if self.bridge.op_manager.ring.connection_manager.is_gateway() {
                             crate::transport::join_versions::record_gateway_join(
                                 self.bridge
@@ -1282,6 +1288,13 @@ impl P2pConnManager {
                                 connection.remote_version(),
                             );
                         }
+                        #[cfg(any(test, feature = "testing"))]
+                        crate::operations::connect::native_wire_trace::record_at(
+                            peer_addr,
+                            crate::operations::connect::native_wire_trace::NativeWireEvent::NativeDial {
+                                established: true,
+                            },
+                        );
                         IdentitySource::Proven
                     }
                 };
@@ -1304,7 +1317,29 @@ impl P2pConnManager {
                 error,
                 transient,
                 transport,
+                native_outcome,
             } => {
+                // Demotion counts only an end that says native does not work
+                // on the path (`counts_toward_demotion`), once for either
+                // role; the connect op then falls back to UDP.
+                if native_outcome.is_some_and(|o| o.counts_toward_demotion()) {
+                    let demoted = self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .native_connect()
+                        .record_failure(peer.pub_key());
+                    #[cfg(any(test, feature = "testing"))]
+                    if let (true, Some(addr)) = (demoted, peer.socket_addr()) {
+                        crate::operations::connect::native_wire_trace::record_at(
+                            addr,
+                            crate::operations::connect::native_wire_trace::NativeWireEvent::NativeDemoted,
+                        );
+                    }
+                    #[cfg(not(any(test, feature = "testing")))]
+                    let _ = demoted;
+                }
                 // Outbound peers must have known addresses - extract once for reuse
                 let peer_addr = match KnownPeerKeyLocation::try_from(&peer) {
                     Ok(k) => k.socket_addr(),
@@ -1343,6 +1378,15 @@ impl P2pConnManager {
                 // backoff below is taken for it, or the fallback would be
                 // refused.
                 let native = transport == crate::operations::connect::native::DialTransport::Native;
+                #[cfg(any(test, feature = "testing"))]
+                if native {
+                    crate::operations::connect::native_wire_trace::record_at(
+                        peer_addr,
+                        crate::operations::connect::native_wire_trace::NativeWireEvent::NativeDial {
+                            established: false,
+                        },
+                    );
+                }
                 if !native
                     && matches!(
                         error,

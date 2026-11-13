@@ -596,6 +596,32 @@ labelled_counters! {
     }
 }
 
+impl NativeSetupOutcome {
+    /// Whether this end says native does not work on the path to that peer,
+    /// so it counts toward the node's demotion. A refusal by this node's own
+    /// limits (budget, setup cap, allow-set, window left, no hub) says
+    /// nothing about the path, nor does a Hello the peer answered: the
+    /// connection worked. Counting those would let a busy node demote itself.
+    pub(crate) fn counts_toward_demotion(self) -> bool {
+        match self {
+            Self::TimedOut | Self::HandshakeFailed | Self::HelloLost => true,
+            Self::Established
+            | Self::TooLate
+            | Self::OverBudgetDestination
+            | Self::OverBudgetNode
+            | Self::OverBudgetTable
+            | Self::SetupsFull
+            | Self::AlreadyWaiting
+            | Self::AllowSetFull
+            | Self::KeyConflict
+            | Self::UnusableKey
+            | Self::HelloRefused
+            | Self::HelloVersion
+            | Self::Unavailable => false,
+        }
+    }
+}
+
 impl QuicPathAge {
     /// The bucket for a path that lasted `age`.
     pub(crate) fn bucket(age: std::time::Duration) -> Self {
@@ -929,6 +955,10 @@ pub struct TransportMetrics {
     /// many acceptors as its acceptor limit (reset each snapshot). Not counted
     /// as failures above.
     connect_native_decision_over_cap: AtomicU64,
+    /// Times this node turned its own QUIC-native connects off after native
+    /// failures with distinct peers (`connect::native::NativeDemotion`)
+    /// (reset each snapshot).
+    connect_native_demotions: AtomicU64,
     /// The last offer this node built: level, percent and whether it was
     /// ready to dial native (a state, never reset).
     connect_native_offer_level: AtomicU8,
@@ -1409,6 +1439,7 @@ impl TransportMetrics {
             connect_native_decision_without_offer: AtomicU64::new(0),
             connect_native_decision_native_unsupported: AtomicU64::new(0),
             connect_native_decision_over_cap: AtomicU64::new(0),
+            connect_native_demotions: AtomicU64::new(0),
             connect_native_offer_level: AtomicU8::new(0),
             connect_native_offer_percent: AtomicU8::new(0),
             connect_native_offer_ready: AtomicBool::new(false),
@@ -1948,6 +1979,12 @@ impl TransportMetrics {
             .store(ready, Ordering::Relaxed);
         #[cfg(test)]
         NATIVE_OFFERS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    }
+
+    /// This node turned its own QUIC-native connects off.
+    pub(crate) fn record_connect_native_demotion(&self) {
+        self.connect_native_demotions
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// A `Native` response was dropped unanswered: the CONNECT had already
@@ -2824,6 +2861,7 @@ impl TransportMetrics {
                 &self.connect_native_decision_native_unsupported,
             ),
             connect_native_decision_over_cap: get64(&self.connect_native_decision_over_cap),
+            connect_native_demotions: get64(&self.connect_native_demotions),
             connect_native_offer_level: self.connect_native_offer_level.load(Ordering::Relaxed),
             connect_native_offer_percent: self.connect_native_offer_percent.load(Ordering::Relaxed),
             connect_native_offer_ready: self.connect_native_offer_ready.load(Ordering::Relaxed),
@@ -3512,6 +3550,8 @@ pub struct TransportSnapshot {
     /// `Native` responses dropped past the per-CONNECT cap on refused
     /// acceptors.
     pub connect_native_decision_over_cap: u64,
+    /// Times the node turned its own native connects off after failures.
+    pub connect_native_demotions: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -3927,6 +3967,7 @@ impl TransportSnapshot {
             connect_native_decision_without_offer,
             connect_native_decision_native_unsupported,
             connect_native_decision_over_cap,
+            connect_native_demotions,
             connect_native_offer_level,
             connect_native_offer_percent,
             connect_native_offer_ready,
@@ -4091,6 +4132,7 @@ impl TransportSnapshot {
         self.connect_native_decision_native_unsupported =
             connect_native_decision_native_unsupported;
         self.connect_native_decision_over_cap = connect_native_decision_over_cap;
+        self.connect_native_demotions = connect_native_demotions;
         self.connect_native_offer_level = connect_native_offer_level;
         self.connect_native_offer_percent = connect_native_offer_percent;
         self.connect_native_offer_ready = connect_native_offer_ready;
@@ -4319,6 +4361,8 @@ struct SnapshotExtras {
     /// `Native` responses dropped past the per-CONNECT cap on refused
     /// acceptors.
     pub connect_native_decision_over_cap: u64,
+    /// Times the node turned its own native connects off after failures.
+    pub connect_native_demotions: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -4555,6 +4599,7 @@ impl SnapshotExtras {
             || self.connect_native_decision_without_offer != 0
             || self.connect_native_decision_native_unsupported != 0
             || self.connect_native_decision_over_cap != 0
+            || self.connect_native_demotions != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -7042,6 +7087,7 @@ mod tests {
             "connect_native_decision_without_offer",
             "connect_native_decision_native_unsupported",
             "connect_native_decision_over_cap",
+            "connect_native_demotions",
             "connect_native_offer_level",
             "connect_native_offer_percent",
             "connect_native_offer_ready",

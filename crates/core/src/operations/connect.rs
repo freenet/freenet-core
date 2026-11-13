@@ -1555,9 +1555,9 @@ pub(super) async fn dispatch_expect_connection_from(
 
     // Native: no UDP expectation, since the connection comes from the QUIC
     // endpoint (the setup's waiter is registered when the dial runs, before
-    // the joiner's dial can arrive). A failed setup demotes towards UDP and is
-    // followed by today's UDP dial, so until UDP is removed a failed native
-    // setup never costs the join.
+    // the joiner's dial can arrive). A failed setup is followed by today's UDP
+    // dial, so until UDP is removed a failed native setup never costs the
+    // join.
     tracing::info!(
         joiner_addr = %addr,
         tx = %tx,
@@ -1576,10 +1576,10 @@ pub(super) async fn dispatch_expect_connection_from(
         .await?;
     let op_manager = op_manager.clone();
     GlobalExecutor::spawn(async move {
-        let native_state = op_manager.ring.connection_manager.native_connect();
+        // Demotion is recorded where the setup's end is known (the
+        // connection lifecycle); this task only falls back.
         match rx.recv().await {
             Some(Ok((connected_peer, _))) => {
-                native_state.record_success();
                 tracing::info!(
                     %connected_peer,
                     tx = %tx,
@@ -1587,7 +1587,6 @@ pub(super) async fn dispatch_expect_connection_from(
                 );
             }
             failed @ (Some(Err(_)) | None) => {
-                native_state.record_failure(peer.pub_key());
                 tracing::info!(
                     %peer,
                     tx = %tx,

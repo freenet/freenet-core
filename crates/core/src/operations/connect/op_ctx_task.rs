@@ -561,32 +561,28 @@ async fn drive_client_connect(
                 // A native dial that failed is followed at once by a UDP dial to
                 // the same acceptor, in the same dial slot, before anything
                 // counts it as failed: until UDP is removed a failed native
-                // setup must never cost the join. It also counts towards
-                // demotion (three peers in a row stop native offers).
-                if transport == super::native::DialTransport::Native {
-                    let native_state = op_manager.ring.connection_manager.native_connect();
-                    if matches!(result, Some(Ok(_))) {
-                        native_state.record_success();
-                    } else {
-                        native_state.record_failure(acceptor.pub_key());
-                        native_acceptors.remove(&acceptor);
-                        tracing::info!(
-                            tx = %tx,
-                            acceptor = %acceptor_addr,
-                            "connect driver: QUIC-native setup failed; dialling UDP"
-                        );
-                        dials.push(
-                            begin_acceptor_dial(
-                                op_manager,
-                                tx,
-                                acceptor,
-                                Instant::now(),
-                                super::native::DialTransport::Udp,
-                            )
-                            .await?,
-                        );
-                        continue;
-                    }
+                // setup must never cost the join. Demotion is recorded where
+                // the setup's end is known (the connection lifecycle).
+                if transport == super::native::DialTransport::Native
+                    && !matches!(result, Some(Ok(_)))
+                {
+                    native_acceptors.remove(&acceptor);
+                    tracing::info!(
+                        tx = %tx,
+                        acceptor = %acceptor_addr,
+                        "connect driver: QUIC-native setup failed; dialling UDP"
+                    );
+                    dials.push(
+                        begin_acceptor_dial(
+                            op_manager,
+                            tx,
+                            acceptor,
+                            Instant::now(),
+                            super::native::DialTransport::Udp,
+                        )
+                        .await?,
+                    );
+                    continue;
                 }
                 if let Some((next, answered_at)) = dial_queue.finish() {
                     let transport = dial_transport(&native_acceptors, &next);

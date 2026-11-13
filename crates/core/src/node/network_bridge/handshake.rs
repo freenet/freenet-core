@@ -59,6 +59,8 @@ pub(crate) enum Event {
         /// The transport dialled: a native failure is followed by a UDP dial,
         /// so it records no backoff.
         transport: crate::operations::connect::native::DialTransport,
+        /// How a native setup ended; `None` for a UDP dial.
+        native_outcome: Option<crate::transport::NativeSetupOutcome>,
     },
 }
 
@@ -97,6 +99,7 @@ impl std::fmt::Debug for Event {
                 error,
                 transient,
                 transport,
+                native_outcome,
             } => f
                 .debug_struct("OutboundFailed")
                 .field("transaction", transaction)
@@ -104,6 +107,7 @@ impl std::fmt::Debug for Event {
                 .field("error", error)
                 .field("transient", transient)
                 .field("transport", transport)
+                .field("native_outcome", native_outcome)
                 .finish(),
         }
     }
@@ -561,6 +565,7 @@ async fn connect_outbound(
     let addr = peer
         .socket_addr()
         .expect("Connect requires known peer address");
+    let mut native_outcome = None;
     let result: Result<Box<dyn PeerConnectionApi>, ConnectionError> = match transport {
         crate::operations::connect::native::DialTransport::Udp => {
             let connect_future = outbound.connect(peer.pub_key.clone(), addr, origin).await;
@@ -580,6 +585,7 @@ async fn connect_outbound(
             // back to a UDP dial at once, which decides that.
             outbound.connect_native(dial).await.map_err(|outcome| {
                 tracing::debug!(%addr, label = outcome.label(), "native dial gave no connection");
+                native_outcome = Some(outcome);
                 ConnectionError::FailedConnectOp
             })
         }
@@ -606,6 +612,7 @@ async fn connect_outbound(
             error,
             transient,
             transport,
+            native_outcome,
         },
     }
 }
@@ -984,6 +991,7 @@ mod tests {
             error,
             transient,
             transport: _,
+            native_outcome: _,
         } = run.event
         else {
             panic!("expected OutboundFailed, got {:?}", run.event);

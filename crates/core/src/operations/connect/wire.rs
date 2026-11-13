@@ -284,6 +284,9 @@ pub mod sim_trace {
         retry_accepts_with_offer: AtomicU64,
         joiner_decisions: AtomicU64,
         joiner_responses_without_decision: AtomicU64,
+        native_established: AtomicU64,
+        native_failed: AtomicU64,
+        native_demotions: AtomicU64,
         /// Nodes standing in for a release below the floor
         /// ([`mark_pre_floor`]).
         pre_floor: parking_lot::Mutex<std::collections::HashSet<SocketAddr>>,
@@ -313,6 +316,10 @@ pub mod sim_trace {
         },
         /// A joiner received a response.
         JoinerResponse { with_decision: bool },
+        /// A node's QUIC-native dial ended, as joiner or acceptor.
+        NativeDial { established: bool },
+        /// A node turned its own native connects off.
+        NativeDemoted,
     }
 
     static TRACES: LazyLock<dashmap::DashMap<String, NativeWireTrace>> =
@@ -366,6 +373,9 @@ pub mod sim_trace {
             NativeWireEvent::JoinerResponse {
                 with_decision: false,
             } => &c.joiner_responses_without_decision,
+            NativeWireEvent::NativeDial { established: true } => &c.native_established,
+            NativeWireEvent::NativeDial { established: false } => &c.native_failed,
+            NativeWireEvent::NativeDemoted => &c.native_demotions,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -427,6 +437,19 @@ pub mod sim_trace {
         /// Responses a joiner received without one.
         pub fn joiner_responses_without_decision(&self) -> u64 {
             Self::get(&self.0.joiner_responses_without_decision)
+        }
+        /// QUIC-native dials that gave a connection (each side of a pair
+        /// counts its own).
+        pub fn native_established(&self) -> u64 {
+            Self::get(&self.0.native_established)
+        }
+        /// QUIC-native dials that failed, each followed by a UDP dial.
+        pub fn native_failed(&self) -> u64 {
+            Self::get(&self.0.native_failed)
+        }
+        /// Times a node demoted itself.
+        pub fn native_demotions(&self) -> u64 {
+            Self::get(&self.0.native_demotions)
         }
     }
 }
