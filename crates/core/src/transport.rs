@@ -350,6 +350,8 @@ impl From<SocketAddr> for ObservedAddr {
 }
 
 pub(crate) use self::boundary::TransportHandle;
+pub(crate) use self::metrics::NativeSetupOutcome;
+pub(crate) use self::quic::upgrade::driver::NativeDial;
 // For the node's test that pins each end's disconnect label.
 #[cfg(test)]
 pub(crate) use self::boundary::QuicPathEnd;

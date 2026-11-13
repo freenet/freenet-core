@@ -495,6 +495,7 @@ fn build_quic_upgrades(
     local_key: TransportPublicKey,
     socket_addr: SocketAddr,
     time_source: &RealTime,
+    native_rate: super::quic::config::QuicRateLimit,
 ) -> Option<Arc<super::quic::upgrade::driver::QuicUpgrades>> {
     use super::quic::upgrade::driver::{PathClock, QuicUpgrades};
     let (endpoint, policy, _registrar) = (endpoint?, policy?, registrar?);
@@ -528,6 +529,7 @@ fn build_quic_upgrades(
         policy,
         local_key,
         path_clock,
+        native_rate,
         #[cfg(any(test, feature = "testing"))]
         trace,
     ))
@@ -787,6 +789,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             local_key,
             socket_addr,
             &time_source,
+            super::quic::config::QuicRateLimit::new(bandwidth_limit, global_bandwidth.clone()),
         );
         // With upgrades the router takes the queue; without them the listener
         // holds it, so the accept loop still has a live consumer.
@@ -998,6 +1001,31 @@ impl<S: Socket> super::OutboundConnector for OutboundConnectionHandler<S> {
                 result.map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>)
             }));
             pending
+        })
+    }
+
+    fn connect_native(
+        &self,
+        dial: super::NativeDial,
+    ) -> Pin<
+        Box<
+            dyn Future<
+                    Output = Result<Box<dyn super::PeerConnectionApi>, super::NativeSetupOutcome>,
+                > + Send
+                + '_,
+        >,
+    > {
+        let upgrades = self.upgrade_site.upgrades();
+        Box::pin(async move {
+            let Some(upgrades) = upgrades else {
+                super::TRANSPORT_METRICS
+                    .record_connect_native_setup(super::NativeSetupOutcome::Unavailable);
+                return Err(super::NativeSetupOutcome::Unavailable);
+            };
+            upgrades
+                .setup_native(dial)
+                .await
+                .map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>)
         })
     }
 }

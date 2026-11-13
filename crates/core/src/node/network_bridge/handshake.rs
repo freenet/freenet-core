@@ -840,6 +840,24 @@ mod tests {
                 pending
             })
         }
+
+        fn connect_native(
+            &self,
+            _dial: crate::transport::NativeDial,
+        ) -> Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Box<dyn PeerConnectionApi>,
+                            crate::transport::NativeSetupOutcome,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            // The handshake tests dial UDP only.
+            Box::pin(async { Err(crate::transport::NativeSetupOutcome::Unavailable) })
+        }
     }
 
     struct ConnectRun {

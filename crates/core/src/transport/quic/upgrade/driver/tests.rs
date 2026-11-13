@@ -136,6 +136,7 @@ impl Harness {
             policy,
             local.public().clone(),
             PathClock::Virtual(pair.time.clone()),
+            crate::transport::quic::config::QuicRateLimit::new(None, None),
             None,
         );
         let counters: &'static _ =
@@ -2064,4 +2065,135 @@ fn native_attempts_reach_only_native_waiters() {
         assert!(inbox.try_recv().is_err(), "not routed to the session");
         dial.abort();
     });
+}
+
+/// The hub sets up a native connection end to end as the server (its key is
+/// the higher): the peer's attempt reaches the hub's native waiter through the
+/// router, and both sides finish the Hello exchange. The node gets a connection
+/// whose version is the Hello's.
+#[test]
+fn a_native_setup_through_the_hub_gives_a_connection() {
+    use crate::transport::PeerConnectionApi;
+    use crate::transport::quic::native::punch::PunchBudget;
+    use crate::transport::quic::native::setup::{NativePeer, connect_native};
+    bounded(|| async {
+        let h = Harness::server("driver-native-setup").await;
+        let rig = RetryRig::of(&h);
+        // What the attempt router task does in production.
+        let (ours, hub) = (rig.ours.clone(), Arc::clone(&h.hub));
+        let router = tokio::spawn(async move {
+            while let Some(attempt) = ours.accept().await {
+                hub.dispatch(attempt);
+            }
+        });
+        let (theirs, our_addr, our_key) = (rig.theirs.clone(), rig.our_addr, rig.our_key.clone());
+        let time = h.time();
+        let client = tokio::spawn(async move {
+            let budget = PunchBudget::default();
+            let deadline = time.now() + Duration::from_secs(30);
+            let peer = NativePeer {
+                addr: our_addr,
+                key: &our_key,
+                is_gateway: false,
+            };
+            connect_native(&theirs, &budget, peer, 0, &time, deadline).await
+        });
+        let dial = NativeDial {
+            addr: h.remote,
+            key: h.peer.clone(),
+            is_gateway: false,
+            within: Duration::from_secs(30),
+        };
+        let hub = Arc::clone(&h.hub);
+        let server = drive(&h.pair.time, Duration::from_secs(60), async move {
+            hub.setup_native(dial).await
+        })
+        .await;
+        let conn = server.expect("the hub's setup gives a connection");
+        assert_eq!(conn.remote_addr(), h.remote);
+        assert_eq!(
+            conn.remote_version(),
+            Some(
+                crate::transport::connection_handler::native_version::check(
+                    &crate::transport::connection_handler::native_version::OWN
+                )
+                .expect("this build talks to itself")
+            )
+        );
+        let client = drive(&h.pair.time, Duration::from_secs(30), client)
+            .await
+            .expect("the client task");
+        assert!(client.is_ok(), "{client:?}");
+        router.abort();
+    });
+}
+
+/// With every setup slot taken the hub refuses at once, sending nothing.
+#[test]
+fn a_native_setup_past_the_cap_is_refused_at_once() {
+    bounded(|| async {
+        let h = Harness::server("driver-native-full").await;
+        let slots = h.hub.native_setups.available_permits();
+        assert_eq!(
+            slots,
+            crate::transport::quic::native::setup::NATIVE_SETUPS_MAX,
+            "min(64, the default connection limit)"
+        );
+        let _all = Arc::clone(&h.hub.native_setups)
+            .try_acquire_many_owned(slots as u32)
+            .expect("free");
+        let dial = NativeDial {
+            addr: h.remote,
+            key: h.peer.clone(),
+            is_gateway: false,
+            within: Duration::from_secs(30),
+        };
+        let refused = h.hub.setup_native(dial).await;
+        assert!(
+            matches!(
+                refused,
+                Err(crate::transport::NativeSetupOutcome::SetupsFull)
+            ),
+            "{:?}",
+            refused.err()
+        );
+    });
+}
+
+/// Each setup error has the label its cause names.
+#[test]
+fn native_setup_errors_have_their_labels() {
+    use crate::transport::NativeSetupOutcome as O;
+    use crate::transport::quic::native::exchange::HelloFailure;
+    use crate::transport::quic::native::punch::PunchRefusal;
+    use crate::transport::quic::native::setup::NativeSetupError as E;
+    use crate::transport::quic::{QuicAllowError, QuicConnectError};
+    let cases = [
+        (E::TooLate, O::TooLate),
+        (
+            E::OverBudget(PunchRefusal::Destination),
+            O::OverBudgetDestination,
+        ),
+        (E::OverBudget(PunchRefusal::Node), O::OverBudgetNode),
+        (E::OverBudget(PunchRefusal::Table), O::OverBudgetTable),
+        (E::AlreadyWaiting, O::AlreadyWaiting),
+        (E::Allow(QuicAllowError::AllowSetFull), O::AllowSetFull),
+        (E::Allow(QuicAllowError::KeyConflict), O::KeyConflict),
+        (E::Connect(QuicConnectError::AllowSetFull), O::AllowSetFull),
+        (E::TimedOut, O::TimedOut),
+        (E::Hello(HelloFailure::TimedOut), O::HelloLost),
+        (
+            E::Hello(HelloFailure::ConnectionLost("gone".into())),
+            O::HelloLost,
+        ),
+        (E::Hello(HelloFailure::PeerRefusedHello), O::HelloRefused),
+        (E::Hello(HelloFailure::RejectedVersion), O::HelloVersion),
+        (
+            E::Hello(HelloFailure::Incompatible("old".into())),
+            O::HelloVersion,
+        ),
+    ];
+    for (error, label) in cases {
+        assert_eq!(super::native::outcome_of(&error), label, "{error}");
+    }
 }

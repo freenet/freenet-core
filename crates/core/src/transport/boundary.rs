@@ -321,6 +321,24 @@ pub(crate) trait OutboundConnector: Send + Sync {
         remote_addr: SocketAddr,
         origin: super::NatAttemptOrigin,
     ) -> std::pin::Pin<Box<dyn Future<Output = PendingConnection> + Send + '_>>;
+
+    /// Set up a QUIC-native connection to `dial`'s peer, with no UDP session
+    /// under it (#5940). One stage: the future ends when the connection has
+    /// finished its Hello exchange or the setup failed, within the setup's own
+    /// window (`quic::native::setup`), so no outer timeout is needed. A
+    /// transport with no QUIC upgrades hub answers
+    /// `NativeSetupOutcome::Unavailable`. Every end is counted as
+    /// `connect_native_setup_<label>`.
+    fn connect_native(
+        &self,
+        dial: super::NativeDial,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<Output = Result<Box<dyn PeerConnectionApi>, super::NativeSetupOutcome>>
+                + Send
+                + '_,
+        >,
+    >;
 }
 
 /// Why a connection's `recv` ended it, as reported by

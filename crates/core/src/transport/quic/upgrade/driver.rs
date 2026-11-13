@@ -55,8 +55,11 @@
 //! connection the path to send its data on ([`super::data_route`]). With no route
 //! it sends on UDP, and the path carries control frames only.
 
+mod native;
 #[cfg(test)]
 pub(in crate::transport) mod tests;
+
+pub(crate) use native::NativeDial;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -438,6 +441,14 @@ pub(in crate::transport) struct QuicUpgrades {
     /// every native attempt to (`native::waiters`). Filled only by the native
     /// accept.
     native: Arc<NativeWaiters>,
+    /// The node's one punch budget, charged by every native setup in either
+    /// role (`native` module).
+    punch_budget: crate::transport::quic::native::punch::PunchBudget,
+    /// Slots for native setups at once, `QuicPolicy::native_setups_max`.
+    native_setups: Arc<tokio::sync::Semaphore>,
+    /// The node's bandwidth settings, which pace a native connection's data
+    /// as a session's settings pace an upgrade path's.
+    native_rate: crate::transport::quic::config::QuicRateLimit,
     #[cfg(any(test, feature = "testing"))]
     trace: Option<super::sim_trace::NodeTrace>,
     /// Where a test's paths keep their node-wide counts in place of
@@ -452,12 +463,14 @@ impl QuicUpgrades {
         policy: QuicPolicy,
         local_key: TransportPublicKey,
         path_clock: PathClock,
+        native_rate: crate::transport::quic::config::QuicRateLimit,
         #[cfg(any(test, feature = "testing"))] trace: Option<super::sim_trace::NodeTrace>,
     ) -> Arc<Self> {
         #[cfg(any(test, feature = "testing"))]
         if let Some(trace) = &trace {
             trace.register_permits(policy.permits().clone());
         }
+        let native_setups = Arc::new(tokio::sync::Semaphore::new(policy.native_setups_max()));
         Arc::new(Self {
             endpoint,
             policy,
@@ -469,6 +482,9 @@ impl QuicUpgrades {
             next_session: AtomicU64::new(1),
             inbox_overflow: AtomicU64::new(0),
             native: Arc::default(),
+            punch_budget: crate::transport::quic::native::punch::PunchBudget::default(),
+            native_setups,
+            native_rate,
             #[cfg(any(test, feature = "testing"))]
             trace,
             #[cfg(test)]
