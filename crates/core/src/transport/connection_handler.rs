@@ -500,12 +500,13 @@ fn build_quic_upgrades(
     let (endpoint, policy, _registrar) = (endpoint?, policy?, registrar?);
     let policy =
         super::quic::upgrade::policy::QuicPolicy::from_config(policy, endpoint.availability());
-    super::TRANSPORT_METRICS
-        .quic_data
-        .set_share(policy.advertised_share());
     // The clock quinn runs on (`bind_udp_listener`).
     let path_clock = get_socket_virtual_time(&socket_addr)
         .map_or_else(|| PathClock::Real(time_source.clone()), PathClock::Virtual);
+    let wall = path_clock.clone();
+    super::TRANSPORT_METRICS
+        .quic_data
+        .set_share(policy.share_source(Box::new(move || wall.wall_now())));
     #[cfg(any(test, feature = "testing"))]
     let trace = super::in_memory_socket::quic_upgrade_trace_at(socket_addr);
     #[cfg(any(test, feature = "testing"))]

@@ -84,6 +84,40 @@ const LIVE_DATA_PATHS: &str = "quic_live_data_paths";
 /// The share gauge's key, uploaded in every snapshot.
 const RAMP_SHARE_PCT: &str = "quic_ramp_share_pct";
 
+/// Where `quic_ramp_share_pct` is read from: the node's data share, read on
+/// its path clock's wall time, while its QUIC endpoint is up. A node that
+/// cannot carry data (QUIC off, shadow, the crash-loop breaker, no paths, the
+/// endpoint down or released) reports 0, so it does not dilute the group of a
+/// share step with a share it cannot use. It is this node's own share: a pair
+/// carries data only when both sides' shares cover it.
+pub(crate) struct ShareSource {
+    pub(crate) share: DataShare,
+    pub(crate) availability: crate::transport::quic::liveness::QuicAvailabilityWatch,
+    pub(crate) wall: Box<dyn Fn() -> std::time::SystemTime + Send + Sync>,
+}
+
+impl ShareSource {
+    fn percent(&self) -> u64 {
+        match self.availability.get() {
+            crate::transport::quic::liveness::QuicAvailability::Up => {
+                u64::from(self.share.percent_at((self.wall)()))
+            }
+            crate::transport::quic::liveness::QuicAvailability::Disabled
+            | crate::transport::quic::liveness::QuicAvailability::Down
+            | crate::transport::quic::liveness::QuicAvailability::Released => 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for ShareSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShareSource")
+            .field("share", &self.share)
+            .field("availability", &self.availability.get())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The loss-rate gauges' prefix; every bucket is uploaded in every snapshot.
 const LOSS_RATE_PREFIX: &str = "quic_loss_rate_";
 
@@ -420,9 +454,9 @@ pub(crate) struct QuicDataCounters {
     gate_ended_queue: [AtomicU64; GATE_QUEUE_LABELS.len()],
     dark_episodes: [AtomicU64; DARK_EPISODE_LABELS.len()],
     carried_dark_episodes: [AtomicU64; DARK_EPISODE_LABELS.len()],
-    /// The data share this node applies, set when its upgrades are built;
-    /// `None` unless `transport-quic = prefer`.
-    share: Mutex<Option<DataShare>>,
+    /// Where this node's data share is read from, set when its upgrades are
+    /// built; `None` unless it may carry data (`policy::QuicPolicy::share_source`).
+    share: Mutex<Option<ShareSource>>,
 }
 
 impl QuicDataCounters {
@@ -462,9 +496,10 @@ impl QuicDataCounters {
         }
     }
 
-    /// The data share this node applies (`policy::QuicPolicy::advertised_share`),
-    /// read at each snapshot as `quic_ramp_share_pct`.
-    pub(crate) fn set_share(&self, share: Option<DataShare>) {
+    /// Where this node's data share is read from
+    /// (`policy::QuicPolicy::share_source`), read at each snapshot as
+    /// `quic_ramp_share_pct`.
+    pub(crate) fn set_share(&self, share: Option<ShareSource>) {
         *self.share.lock() = share;
     }
 
@@ -783,9 +818,7 @@ impl QuicDataCounters {
             gate_ended_queue: self.gate_ended_queue.iter().map(get).collect(),
             dark_episodes: self.dark_episodes.iter().map(get).collect(),
             carried_dark_episodes: self.carried_dark_episodes.iter().map(get).collect(),
-            ramp_share_pct: self.share.lock().map_or(0, |share| {
-                u64::from(share.percent_at(std::time::SystemTime::now()))
-            }),
+            ramp_share_pct: self.share.lock().as_ref().map_or(0, ShareSource::percent),
         }
     }
 }
@@ -1388,7 +1421,9 @@ mod tests {
     /// as set, a ramp's share at the snapshot's time, 0 with no share.
     #[test]
     fn the_ramp_share_gauge_reads_the_share_at_the_snapshot() {
+        use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
         use crate::transport::quic::upgrade::slice::ramp_percent;
+        const HOUR: u64 = 3600;
         let counters = QuicDataCounters::new();
         let share = |counters: &QuicDataCounters| {
             counters
@@ -1398,24 +1433,38 @@ mod tests {
                 .map(|(_, value)| value)
         };
         assert_eq!(share(&counters), Some(0), "no share: 0, still uploaded");
-        counters.set_share(Some(DataShare::Fixed(40)));
+        // The share is read on the source's own clock, at each snapshot.
+        let t0 = 1_800_000_000;
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(t0));
+        let (endpoint, availability) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let source = |share: DataShare| {
+            let clock = clock.clone();
+            Some(ShareSource {
+                share,
+                availability: availability.clone(),
+                wall: Box::new(move || {
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_secs(clock.load(Ordering::Relaxed))
+                }),
+            })
+        };
+        counters.set_share(source(DataShare::Fixed(40)));
         assert_eq!(share(&counters), Some(40));
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("after the epoch")
-            .as_secs();
-        for hours in [1, 7, 13, 30] {
-            counters.set_share(Some(DataShare::Ramp {
-                start_unix_secs: now - hours * 3600,
-            }));
-            let read = share(&counters).expect("uploaded");
-            // The snapshot reads the clock a moment after `now`.
-            let low = u64::from(ramp_percent(std::time::Duration::from_secs(hours * 3600)));
-            let high = u64::from(ramp_percent(std::time::Duration::from_secs(
-                hours * 3600 + 60,
-            )));
-            assert!((low..=high).contains(&read), "{hours} h: {read}");
+        counters.set_share(source(DataShare::Ramp {
+            start_unix_secs: t0,
+        }));
+        for hours in [0, 1, 7, 13, 30] {
+            clock.store(t0 + hours * HOUR, Ordering::Relaxed);
+            let want = u64::from(ramp_percent(std::time::Duration::from_secs(hours * HOUR)));
+            assert_eq!(share(&counters), Some(want), "{hours} h");
         }
+        // An endpoint that is down cannot carry data: 0, until it is up again.
+        for down in [QuicAvailability::Down, QuicAvailability::Released] {
+            endpoint.send_replace(down);
+            assert_eq!(share(&counters), Some(0), "{down:?}");
+        }
+        endpoint.send_replace(QuicAvailability::Up);
+        assert_eq!(share(&counters), Some(100));
         counters.set_share(None);
         assert_eq!(share(&counters), Some(0));
     }
