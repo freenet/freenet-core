@@ -6608,8 +6608,12 @@ fn send_deadlines_have_these_values() {
 
     assert_eq!(
         SendDeadlines::short(MIB as u64),
-        stream,
-        "a Short that does not fit a packet holds a slot as a stream does"
+        SendDeadlines {
+            ack_wait_covers_backlog: true,
+            ..stream
+        },
+        "a Short that does not fit a packet holds a slot as a stream does, and its ack wait \
+         covers the backlog as a node's stream's does"
     );
 }
 
