@@ -654,6 +654,9 @@ fn the_production_values_are_pinned() {
     assert_eq!(credit_floor_rate(Duration::from_secs(4)), 16 * 1024);
     assert_eq!(STREAM_CREDIT_WINDOW, Duration::from_secs(60));
     assert_eq!(STREAM_CREDIT_FREED, 9);
+    assert_eq!(ACK_WAIT_EXPIRY_LIMIT, 3);
+    assert_eq!(ACK_WAIT_EXPIRY_WINDOW, Duration::from_secs(30 * 60));
+    assert_eq!(super::super::path::SHORT_ACK_WAIT, Duration::from_secs(120));
     assert_eq!(
         crate::transport::peer_connection::streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC,
         32 * 1024
@@ -1607,6 +1610,55 @@ fn a_peer_that_withholds_a_small_stream_limit_is_closed() {
         )),
         None
     );
+}
+
+/// Feed a watch a busy conforming peer's readings (acknowledgements every
+/// tick, so no other rule closes it), one at each of `times` (seconds), with
+/// `expiries(i)` ack waits run out so far; the first index at which it
+/// closed, and why.
+fn run_expiries(times: &[u64], expiries: impl Fn(usize) -> u64) -> Option<(usize, Stall)> {
+    let record = Arc::default();
+    let sample = |i: usize| {
+        let t = i as u64;
+        AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
+            .with_ack_wait_expiries(expiries(i))
+    };
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+    (1..times.len()).find_map(|i| {
+        watch
+            .observe(times[i] * SEC, sample(i))
+            .then(|| (i, watch.stall().expect("a reason")))
+    })
+}
+
+/// The ack-wait expiry rule, with literal times, on a peer that acknowledges
+/// everything else at every sample (acknowledgements never reset it):
+/// - three expiries at 2, 10 and 20 min: closed at the third;
+/// - three at once: closed at that sample;
+/// - two, then a third 31 min after the first: the first has left the 30 min
+///   window, so only two count, not closed;
+/// - two only: not closed.
+#[test]
+fn ack_wait_expiries_within_the_window_close_the_path() {
+    // Samples every 2 s for 40 min.
+    let times: Vec<u64> = (0..=1200).map(|i| 2 * i).collect();
+    let at = |minutes: u64| (minutes * 60 / 2) as usize;
+    let counted =
+        |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
+    assert_eq!(
+        run_expiries(&times, counted(vec![at(2), at(10), at(20)])),
+        Some((at(20), Stall::AckWaitsExpired))
+    );
+    assert_eq!(
+        run_expiries(&times, |i| if i >= at(5) { 3 } else { 0 }),
+        Some((at(5), Stall::AckWaitsExpired))
+    );
+    assert_eq!(
+        run_expiries(&times, counted(vec![at(2), at(10), at(33)])),
+        None,
+        "the first left the window"
+    );
+    assert_eq!(run_expiries(&times, counted(vec![at(2), at(10)])), None);
 }
 
 /// The egress cap holds for most of each window and releases for one

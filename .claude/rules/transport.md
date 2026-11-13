@@ -2666,25 +2666,44 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     stream send's deadline runs out after its end was sent (the ack wait,
     or the total), the send ends MaybeDelivered(TimedOut) and the stream is
     reset, counted as an abort toward SEND_ABORT_LIMIT, freeing its permit
-    and send epoch. Residual, open (#6205, a gate before UDP removal): no
-    rule recycles a peer that acknowledges other traffic but not Stream
-    ends; only SEND_ABORT_LIMIT (4096 resets) does, as before this rule, so
-    such a peer can keep a path degraded for hours, its streamed sends
-    holding permits and epochs (up to all 48) for their ack waits. A rule
-    counting expiries in a row was removed: an acknowledged multi-packet
-    Short (which has an ack wait) reset it, and acknowledging one Stream
-    end in three defeated it. With UDP present the harm is performance on
-    that path. A Short or a send without an ack wait that times out after its
-    end waits on in a task for its acknowledgement or the connection, as
-    does a send cancelled earlier (a teardown). Residual, recorded: a
-    one-packet Short has no ack wait, and no rule closes a peer that
-    acknowledges everything except one-packet Short ends. At most
-    ACK_WAITS_WITHOUT_PERMIT (64) such Shorts wait per path, but for as
-    long as the path lives, and each pins its send epoch (and with it the
-    connection's pre-shrink window charge). Counting Short ends in the
-    rule of #6205 would need an ack wait for one-packet Shorts; their 5 s
-    total is too short for one, since a Short past it is MaybeDelivered,
-    not lost. Left for #6205.
+    and send epoch, and counted as an ack-wait expiry (only when the reset
+    happened: an acknowledgement racing the deadline leaves nothing to
+    reset; quic_ack_wait_expired_stream). A one-packet Short has no ack
+    wait: its send reports MaybeDelivered at its 5 s total and its
+    acknowledgement is waited for in the background, holding its send
+    epoch, for at most SHORT_ACK_WAIT (120 s); then its stream is reset,
+    freeing the epoch, and counted as an expiry too
+    (quic_ack_wait_expired_short). A send with a permit cancelled before
+    its own deadline (a teardown) still waits on in the background for its
+    acknowledgement or the connection.
+  → Ack waits expired (#6205, recycle::AckWatch, Stall::AckWaitsExpired):
+    ACK_WAIT_EXPIRY_LIMIT (3) expiries within ACK_WAIT_EXPIRY_WINDOW
+    (30 min) close the path. Acknowledgements never reset the count: an
+    honest peer's QUIC stack acknowledges a packet on arrival (quinn-proto
+    on_packet_authenticated), whatever its app reads, so a send's end is
+    acknowledged within a few round trips of being sent; the ack wait is
+    minutes and a dark path is the dark rule's first, so an expiry on a
+    live path is evidence on its own. A peer that acknowledges everything
+    except stream ends, acknowledged Shorts between included, or one end
+    in three, is closed at about its third ack wait, not after
+    SEND_ABORT_LIMIT (4096) resets
+    (ack_wait_expiries_close_a_path_whatever_else_is_acknowledged). What
+    can make an honest send expire: bytes still unsent when its end was
+    queued, blocked by the peer's flow control because its app stopped
+    reading for longer than the ack wait. That is a pathological peer and
+    the path falls back, as intended. A path that is merely slow does not:
+    at the credit floor (16 KiB/s at a 4 s round trip) the unsent bytes
+    (at most a send window) drain within the ack wait
+    (a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry); and a
+    stream too long for its receiver's first age at that rate is evicted
+    by the receiver first, as on UDP. Older receivers (before #6173) hold a
+    stream's slot while waiting for their consumer, which delays the
+    peer's credit, not its acknowledgements: an expiry against them needs
+    that same pathological stall. A one-packet Short's end is in its one
+    packet, acknowledged on arrival in every version, so its 120 s bound
+    does not fire on an honest peer
+    (a_one_packet_shorts_background_ack_wait_is_bounded, whose control case
+    is acknowledged well inside its bound).
   → No false close at 800 ms round trip and 15% loss with the loss gate on
     (a_slow_lossy_path_stays_within_its_consumer_gap: the send ends Sent on
     a node's deadlines and no watch fires), nor at 25% loss with consumers
@@ -2801,9 +2820,9 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   Failed(NotOpened(TimedOut)) does not (route::timed_out): a wait to open is
   back-pressure. What recycles the cases it used to: a path whose sends
   nobody acknowledges is closed by the dark rule; a peer that never
-  acknowledges a stream's end has the stream reset at its ack wait, counted
-  toward SEND_ABORT_LIMIT (no rule closes it sooner yet: #6205); a peer
-  that withholds its stream limit
+  acknowledges a stream's end has the stream reset at its ack wait, and
+  three within 30 min close the path (ACK_WAIT_EXPIRY_LIMIT); a peer that
+  withholds its stream limit
   is closed by the stream-credit rule (liveness rules, above).
   The window must stay: without it a busy relay whose 48 permits hold transfers
   that are being acknowledged, or a receiver whose consumer is slow while its QUIC

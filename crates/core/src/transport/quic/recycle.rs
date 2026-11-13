@@ -3,7 +3,7 @@
 //!
 //! Two close codes recycle a path, each counted in `quic_close_sent_<label>`
 //! ([`QuicCloseCode`]): too many locally reset sends (1, below), and
-//! `PEER_NOT_ACKNOWLEDGING`, which the acknowledgement watch's rules (2-5,
+//! `PEER_NOT_ACKNOWLEDGING`, which the acknowledgement watch's rules (2-6,
 //! below) all close with. Either code asks the peer to fall back to UDP for
 //! THIS connection only. It is not a permanent
 //! downgrade: e5 must let the pair upgrade again after its normal backoff.
@@ -39,7 +39,7 @@
 //!    that sends ACK frames for none of this side's data; a peer that
 //!    acknowledges something within each window is never closed by it.
 //!
-//! The same watch runs three liveness rules (#5940 PR 4), each also closing
+//! The same watch runs four liveness rules (#5940 PR 4, #6205), each also closing
 //! with [`close_code::PEER_NOT_ACKNOWLEDGING`] and recorded as a [`Stall`]:
 //!
 //! 3. **Dark** ([`Stall::Dark`]): this side's packets outstanding at every
@@ -59,6 +59,9 @@
 //!    [`STREAM_CREDIT_WINDOW`] while this side wanted streams, though enough
 //!    of this side's streams were wholly acknowledged that an honest peer
 //!    would have.
+//! 6. **Ack waits expired** ([`Stall::AckWaitsExpired`]):
+//!    [`ACK_WAIT_EXPIRY_LIMIT`] sends had their wait for the acknowledgement
+//!    of their end run out within [`ACK_WAIT_EXPIRY_WINDOW`].
 //!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
 //! counter of packets the peer newly acknowledged: `frame_rx.acks` counts

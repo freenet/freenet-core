@@ -327,6 +327,10 @@ pub(crate) struct QuicPathLimits {
     /// ([`staging_cap_without_meter`]). A metered path's follows its credit.
     #[cfg(test)]
     pub(crate) staging_cap: Option<usize>,
+    /// The bound on a one-packet Short's background ack wait, in place of
+    /// [`SHORT_ACK_WAIT`], for a test that cannot wait two minutes.
+    #[cfg(test)]
+    pub(crate) short_ack_wait: Option<Duration>,
     /// While the flag is set, the receive side cancels the handle of the
     /// next Stream it admits, before its announce, and clears the flag: a
     /// test of how a stream cancelled that early ends.
@@ -383,6 +387,8 @@ impl QuicPathLimits {
         staging_cap: None,
         #[cfg(test)]
         cancel_next_admitted: None,
+        #[cfg(test)]
+        short_ack_wait: None,
     };
 
     /// [`Self::DEFAULT`] for a path in shadow mode: control frames only.
@@ -767,6 +773,8 @@ pub(crate) struct QuicPath {
     /// A sleep on the path's clock, for a stream's bounded background wait
     /// (`SHORT_ACK_WAIT`).
     sleeper: Sleeper,
+    /// [`SHORT_ACK_WAIT`], or a test's.
+    short_ack_wait: Duration,
     /// Set once the path may send data: only then does the acknowledgement
     /// watch's dark-path rule close it (`recycle::AckWatch::observing`).
     carries_data: Arc<std::sync::atomic::AtomicBool>,
@@ -1072,6 +1080,10 @@ impl QuicPath {
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
                 writers,
                 sleeper,
+                #[cfg(test)]
+                short_ack_wait: limits.short_ack_wait.unwrap_or(SHORT_ACK_WAIT),
+                #[cfg(not(test))]
+                short_ack_wait: SHORT_ACK_WAIT,
                 carries_data,
                 controls_opening: Arc::default(),
                 send_data: AtomicU8::new(SEND_DATA_NEVER),
@@ -1911,7 +1923,7 @@ impl QuicPath {
         send.meter = self.meter.clone();
         send.writing = Some(self.writers.start());
         send.live = Some(self.writers.live());
-        send.sleep = Some(self.sleeper.clone());
+        send.sleep = Some((self.sleeper.clone(), self.short_ack_wait));
         send.node = Some(self.stats.node());
         send.ack_waits = Some(self.ack_waits.clone());
         send.write_all(&header.encode()).await?;
@@ -2159,9 +2171,9 @@ struct Outgoing {
     /// (`recycle::LiveStream`), which a stream waiting for its
     /// acknowledgement in a task after its send ended keeps.
     live: Option<recycle::LiveStream>,
-    /// The path's clock, for the drop's bounded wait ([`SHORT_ACK_WAIT`]);
-    /// `None` in tests that build a stream alone.
-    sleep: Option<Sleeper>,
+    /// The path's clock and the bound for the drop's background wait
+    /// ([`SHORT_ACK_WAIT`]); `None` in tests that build a stream alone.
+    sleep: Option<(Sleeper, Duration)>,
     /// Where the path's counts are kept node-wide.
     node: Option<&'static QuicDataCounters>,
 }
@@ -2448,7 +2460,9 @@ impl Drop for Outgoing {
     /// abort. One dropped earlier while it waits for its acknowledgement
     /// (a cancelled send) goes on to the
     /// end, so its permit and its send epoch wait with it, in a small task
-    /// that ends with the stream's acknowledgement or with the connection.
+    /// that ends with the stream's acknowledgement or with the connection, or
+    /// for a one-packet Short at [`SHORT_ACK_WAIT`], where the stream is
+    /// reset and the expiry counted.
     /// A send holding a permit is one of at most [`STREAMED_SEND_LIMIT`]. One
     /// without a permit (a one-packet Short) holds only its epoch, and a peer
     /// that acknowledges other traffic while withholding some acknowledgements
@@ -2469,10 +2483,9 @@ impl Drop for Outgoing {
         // `SendDeadlines::ack_wait`, or its total): the peer had the whole
         // stream and never acknowledged its end. The stream is reset,
         // counted as an abort, and its permit and epoch go now with quinn's
-        // copy of its data. A peer that never acknowledges stream ends is
-        // bounded by `recycle::SEND_ABORT_LIMIT`, as before this rule. A
-        // send cancelled before then (a teardown) waits below, ending with
-        // the acknowledgement or the connection.
+        // copy of its data, and the expiry counts toward
+        // `recycle::ACK_WAIT_EXPIRY_LIMIT`. A send cancelled before then (a
+        // teardown) waits below.
         if self.progress.ack_wait_ended() {
             // Counted only if the reset happened: an acknowledgement that
             // raced the deadline left nothing to reset.
@@ -2519,7 +2532,7 @@ impl Drop for Outgoing {
         // connection, as before.
         let bound = slot
             .is_none()
-            .then(|| self.sleep.as_ref().map(|sleep| sleep(SHORT_ACK_WAIT)))
+            .then(|| self.sleep.as_ref().map(|(sleep, bound)| sleep(*bound)))
             .flatten();
         let bounded = bound.is_some();
         let send = if bounded { self.send.take() } else { None };
