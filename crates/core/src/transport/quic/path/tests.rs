@@ -9663,11 +9663,14 @@ fn a_dark_path_is_closed_by_the_watch_not_by_its_send_timeouts() {
 }
 
 /// The interplay for the receive side, with the watch on: `a`'s datagrams stop
-/// reaching `b` mid-stream, so `a`'s watch closes the path within its window,
-/// well before `b` would evict the stream idle (`b` never hears the close,
-/// which is lost with the rest, and ends the stream at its own timeouts).
+/// reaching `b` mid-stream. That is an outage, not withheld credit: `a`'s
+/// blocked frame went out after the last batch of acknowledgements, so the
+/// silence is not "settled" waiting and the credit rule does not count it.
+/// `a`'s dark rule closes the path, within `recycle::dark_close_bound`. `b`
+/// never hears the close (it is lost with the rest) and ends the stream at
+/// its own timeouts.
 #[test]
-fn a_path_dark_mid_stream_is_closed_before_the_receiver_evicts_it_idle() {
+fn a_path_dark_mid_stream_is_closed_as_dark() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-dark-before-idle";
@@ -9686,21 +9689,14 @@ fn a_path_dark_mid_stream_is_closed_before_the_receiver_evicts_it_idle() {
             })
             .await;
         assert!(
-            closed_at < streaming_handle_idle_timeout(),
-            "closed at {closed_at:?}, before the idle timeout"
+            closed_at <= recycle::dark_close_bound(Duration::from_millis(50)),
+            "closed at {closed_at:?}"
         );
-        // `a`'s send is blocked on `b`'s credit, which stops with nothing
-        // reaching `b`, so the credit rule (two intervals) comes before the
-        // dark-path window.
         assert_eq!(
             recycle::stalls_to(p.pair.b_addr),
-            vec![recycle::Stall::CreditStarved]
+            vec![recycle::Stall::Dark]
         );
         sender.abort();
-        assert_eq!(
-            p.b.stats().shared_count(InboundStreamOutcome::EvictedIdle),
-            0
-        );
     })
 }
 
