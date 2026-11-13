@@ -350,6 +350,9 @@ impl From<SocketAddr> for ObservedAddr {
 }
 
 pub(crate) use self::boundary::TransportHandle;
+// For the node's test that pins each end's disconnect label.
+#[cfg(test)]
+pub(crate) use self::boundary::QuicPathEnd;
 pub(crate) use self::boundary::{
     CloseReason, InboundAcceptor, InboundExpectations, InboundStreamRegistry, ListenerExit,
     NextConnection, ObservedSend, OutboundConnector, PeerConnectionApi, PendingConnection,

@@ -1467,6 +1467,10 @@ fn a_second_trip_past_the_gap_cap_closes_the_path() {
         assert_eq!(stats.count(QuicInboundOutcome::TooManyRanges), 2);
         assert_eq!(stats.count(QuicInboundOutcome::ClosedTooManyRanges), 1);
         assert_eq!(
+            p.b.closed_for(),
+            Some(crate::transport::boundary::QuicPathEnd::PeerOverBudget)
+        );
+        assert_eq!(
             crate::transport::metrics::TRANSPORT_METRICS.quic_close_sent_to(from),
             vec![QuicCloseCode::OverBudget],
             "counted as quic_close_sent_over_budget"
@@ -2619,6 +2623,10 @@ fn a_panicking_receive_task_closes_the_connection() {
         assert_eq!(
             p.b.stats().count(QuicInboundOutcome::ReceiveTaskPanicked),
             1
+        );
+        assert_eq!(
+            p.b.closed_for(),
+            Some(crate::transport::boundary::QuicPathEnd::ReceiveTaskPanicked)
         );
     })
 }
@@ -5531,6 +5539,10 @@ fn refused_data_readers_stay_within_the_shadow_stream_grant() {
         );
         assert_eq!(stats.count(QuicInboundOutcome::ClosedRefusingData), 1);
         assert!(p.b.quinn_connection().close_reason().is_some());
+        assert_eq!(
+            p.b.closed_for(),
+            Some(crate::transport::boundary::QuicPathEnd::RefusedData)
+        );
     })
 }
 
@@ -9558,6 +9570,10 @@ fn streams_past_the_staging_cap_are_stopped_and_a_second_closes_the_path() {
         assert_eq!(stats.count(QuicInboundOutcome::EvictedStaged), 2);
         assert_eq!(stats.count(QuicInboundOutcome::ClosedStagedOverCap), 1);
         assert_eq!(p.b.closed_with(), Some(QuicCloseCode::OverBudget));
+        assert_eq!(
+            p.b.closed_for(),
+            Some(crate::transport::boundary::QuicPathEnd::PeerOverBudget)
+        );
     })
 }
 

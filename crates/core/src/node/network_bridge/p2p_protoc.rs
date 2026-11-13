@@ -4473,6 +4473,68 @@ pub(crate) mod tests {
         }
     }
 
+    /// Every `QuicPathEnd` label reaches telemetry as `Explicit(label)`, both
+    /// from `disconnect_reason_for_close` and through `DisconnectReason`'s
+    /// substring parser, which reads "timeout", "limit", "pruned" and
+    /// "unresponsive" in a label as another reason. The match gives each
+    /// variant an index, so a new variant does not compile until it has one,
+    /// and the count check fails until it is in the list.
+    #[test]
+    fn every_quic_path_end_label_survives_the_disconnect_reason_parser() {
+        use crate::tracing::DisconnectReason;
+        use crate::transport::{CloseReason, QuicPathEnd as E};
+        fn index(end: E) -> usize {
+            match end {
+                E::Stalled => 0,
+                E::NotAcknowledging => 1,
+                E::SendAborts => 2,
+                E::PeerOverBudget => 3,
+                E::RefusedData => 4,
+                E::PeerRefusedData => 5,
+                E::ReceiveTaskPanicked => 6,
+                E::ClosedByPeer => 7,
+                E::ClosedLocally => 8,
+                E::Lost => 9,
+            }
+        }
+        let all = [
+            E::Stalled,
+            E::NotAcknowledging,
+            E::SendAborts,
+            E::PeerOverBudget,
+            E::RefusedData,
+            E::PeerRefusedData,
+            E::ReceiveTaskPanicked,
+            E::ClosedByPeer,
+            E::ClosedLocally,
+            E::Lost,
+        ];
+        let mut indices: Vec<usize> = all.iter().map(|end| index(*end)).collect();
+        indices.sort_unstable();
+        indices.dedup();
+        assert_eq!(
+            indices,
+            (0..all.len()).collect::<Vec<_>>(),
+            "list every variant once"
+        );
+        let mut labels = std::collections::HashSet::new();
+        for end in all {
+            let label = end.label();
+            assert!(labels.insert(label), "{label} is used twice");
+            let explicit = DisconnectReason::Explicit(label.to_string());
+            assert_eq!(
+                super::disconnect_reason_for_close(Some(CloseReason::QuicPath(end))),
+                explicit,
+                "{end:?}"
+            );
+            assert_eq!(
+                DisconnectReason::from(Some(label.to_string())),
+                explicit,
+                "{label} parses as another reason"
+            );
+        }
+    }
+
     fn hosting_announce() -> crate::message::NetMessage {
         use crate::message::{NeighborHostingMessage, NetMessage, NetMessageV1};
         NetMessage::V1(NetMessageV1::NeighborHosting {
