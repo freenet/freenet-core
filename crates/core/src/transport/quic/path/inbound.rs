@@ -243,7 +243,10 @@ impl<T: TimeSource> Receiver<T> {
     /// `QuicCloser::close` is at most once per connection and a no-op once it
     /// has ended, so only a close that happens is counted and logged.
     fn close_refusing_data(&self) {
-        if self.closer.close(QuicCloseCode::Downgrade) {
+        if self.closer.close_for(
+            QuicCloseCode::Downgrade,
+            crate::transport::boundary::QuicPathEnd::RefusedData,
+        ) {
             self.stats.record(QuicInboundOutcome::ClosedRefusingData);
             let kind = *self.refused_kind.lock();
             tracing::warn!(
@@ -2227,7 +2230,10 @@ impl<T: TimeSource> Receiver<T> {
                 // The peer falls back to the UDP session and counts it as
                 // `quic_fallback_over_budget_rx`.
                 if self.ranges.trip(self.time.now_nanos())
-                    && self.closer.close(QuicCloseCode::OverBudget)
+                    && self.closer.close_for(
+                        QuicCloseCode::OverBudget,
+                        crate::transport::boundary::QuicPathEnd::PeerOverBudget,
+                    )
                 {
                     stats.record(QuicInboundOutcome::ClosedTooManyRanges);
                     tracing::warn!(
@@ -2246,7 +2252,10 @@ impl<T: TimeSource> Receiver<T> {
                 // The peer falls back to the UDP session and counts it as
                 // `quic_fallback_over_budget_rx`.
                 if self.staging.trip(self.time.now_nanos())
-                    && self.closer.close(QuicCloseCode::OverBudget)
+                    && self.closer.close_for(
+                        QuicCloseCode::OverBudget,
+                        crate::transport::boundary::QuicPathEnd::PeerOverBudget,
+                    )
                 {
                     stats.record(QuicInboundOutcome::ClosedStagedOverCap);
                     tracing::warn!(

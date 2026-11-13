@@ -23,8 +23,12 @@ use tracing::{Instrument, span};
 
 pub(super) mod inbound_budget;
 mod inbound_concurrency;
+mod inbound_dispatch;
 mod inbound_stream;
 mod outbound_stream;
+// Built only by its tests until the connect op uses it (#5940, A5b).
+#[cfg_attr(not(test), allow(dead_code))]
+mod native_connection;
 pub(super) use outbound_stream::embeds_metadata;
 mod peer_identity;
 pub(crate) mod piped_stream;
@@ -483,19 +487,10 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     streaming_handles: crate::util::DecisionHashMap<StreamId, (streaming::StreamHandle, u64)>,
     /// Time source for deterministic simulation support
     time_source: T,
-    /// Registry that receives inbound operations streams, handling the race
-    /// between stream fragments and metadata messages
-    /// (RequestStreaming/ResponseStreaming).
-    /// Set by the node layer after connection establishment.
-    inbound_stream_registry: Option<std::sync::Arc<dyn super::InboundStreamRegistry>>,
-    /// LRU cache of recently dispatched metadata hashes (capacity 1000), used to dedup
-    /// embedded-metadata-in-fragment-#1 against the separate ShortMessage.
-    ///
-    /// Uses `DefaultHasher` (not cryptographic). A hash collision would cause
-    /// a silent metadata drop, leading to a 60-second operation timeout for
-    /// the affected stream -- acceptable given the small working set and
-    /// negligible collision probability. See issue #3317.
-    dispatched_msg_hashes: lru::LruCache<u64, ()>,
+    /// What this connection has handed to the node: the inbound stream
+    /// registry, the hashes of dispatched messages and the completed stream
+    /// ids (`inbound_dispatch`).
+    dispatch: inbound_dispatch::InboundDispatch,
     /// Refused stream ids, so a refused stream's later fragments are dropped
     /// rather than admitted part-way through (see
     /// `inbound_budget::RefusedStreams`).
@@ -505,9 +500,6 @@ pub struct PeerConnection<S = super::UdpSocket, T: TimeSource = RealTime> {
     closed_by_stream_refusals: bool,
     /// Rate limiter for the refused-stream warning.
     refusal_log: RefusalLog,
-    /// Recently completed (and released) inbound streams, so a late
-    /// retransmission does not start one again.
-    completed_inbound_streams: lru::LruCache<StreamId, ()>,
     /// Tokens of the legacy streams in `inbound_streams`, to cancel them.
     legacy_tokens: crate::util::DecisionHashMap<StreamId, Arc<inbound_budget::LegacyStreamToken>>,
     /// This connection's inbound stream outcomes, indexed by
@@ -581,7 +573,7 @@ impl<S, T: TimeSource> Drop for PeerConnection<S, T> {
         // retired, too) would otherwise wait out the orphan timeout with
         // nothing accounting for them. Both paths' streams: a QUIC path's reader
         // cancels its own streams but not a complete one.
-        if let Some(registry) = &self.inbound_stream_registry {
+        if let Some(registry) = &self.dispatch.inbound_stream_registry {
             // Collected first, so the shared budget is not locked while the
             // registry runs.
             let live: Vec<_> = self.inbound_budget.lock().live_buffer_streams().collect();
@@ -1139,14 +1131,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
     /// A Short from a QUIC path, as the UDP arm takes a `ShortMessage`, with its
     /// charge released at once. It moves neither of the UDP session's clocks.
     fn take_quic_short(&mut self, short: super::quic::path::InboundShort) -> Vec<u8> {
-        let (payload, key) = short.into_parts();
-        if let Some(key) = key {
-            self.inbound_budget.lock().release_if_gone(key);
-        }
-        let bytes = Vec::from(payload);
-        // Only so that the same metadata embedded in a stream is suppressed; a
-        // Short itself is always delivered, as on UDP.
-        self.dispatched_msg_hashes.put(Self::msg_hash(&bytes), ());
+        let bytes = self.dispatch.take_short(short, &self.inbound_budget);
         self.note_quic_delivery(|| {
             let decoded = bincode::deserialize::<crate::message::NetMessage>(&bytes).is_ok();
             format!(
@@ -1171,70 +1156,24 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         &mut self,
         arrival: super::quic::path::InboundStreamArrival,
     ) -> Option<Vec<u8>> {
-        let super::quic::path::InboundStreamArrival {
-            stream_id,
-            metadata,
-            handle,
-        } = arrival;
-        // The stream's payload length, counted here because the reader task
-        // completes the stream later, with no way to count it from there.
-        // UDP counts at completion; this counts at arrival, and a stream that
-        // later fails is counted too.
-        let total = handle.total_bytes();
-        let seen_on_udp = self
-            .inbound_budget
-            .lock()
-            .contains(InboundKey::Udp(stream_id));
-        // An id in use on UDP, or used before on either path: only a faulty peer
-        // or a bug sends one, and the shared budget bounds what it costs.
-        if seen_on_udp || self.completed_inbound_streams.contains(&stream_id) {
-            handle.cancel();
-            drop(handle);
-            self.inbound_budget
-                .lock()
-                .release_if_gone(InboundKey::Quic(stream_id));
-            self.record_inbound_outcome(super::metrics::InboundStreamOutcome::StreamIdOnBothPaths);
-            tracing::debug!(
-                peer_addr = %self.remote_conn.remote_addr,
-                stream_id = %stream_id,
-                seen_on_udp,
-                "Refusing a QUIC stream whose id was already used"
-            );
-            return None;
+        match self
+            .dispatch
+            .take_stream(arrival, &self.inbound_budget, self.remote_conn.remote_addr)
+        {
+            inbound_dispatch::TakenStream::IdInUse => {
+                self.record_inbound_outcome(
+                    super::metrics::InboundStreamOutcome::StreamIdOnBothPaths,
+                );
+                None
+            }
+            inbound_dispatch::TakenStream::Dropped => None,
+            inbound_dispatch::TakenStream::Registered { stream_id, message } => {
+                self.note_quic_delivery(|| {
+                    format!("received a stream on the path, id {stream_id}")
+                });
+                message
+            }
         }
-        // So a later UDP fragment with this id is refused as `AlreadyCompleted`.
-        self.completed_inbound_streams.put(stream_id, ());
-        // It ended while it waited in the channel. Its metadata would send an
-        // operation after a stream that is gone, and the sender treats it as failed.
-        if handle.is_cancelled() {
-            drop(handle);
-            self.inbound_budget
-                .lock()
-                .release_if_gone(InboundKey::Quic(stream_id));
-            return None;
-        }
-        let Some(registry) = &self.inbound_stream_registry else {
-            tracing::error!(
-                peer_addr = %self.remote_conn.remote_addr,
-                stream_id = %stream_id,
-                "A QUIC stream arrived but inbound_stream_registry is None; cancelling it"
-            );
-            handle.cancel();
-            drop(handle);
-            self.inbound_budget
-                .lock()
-                .release_if_gone(InboundKey::Quic(stream_id));
-            return None;
-        };
-        registry.register_inbound_stream(
-            self.remote_conn.remote_addr,
-            stream_id,
-            super::IncomingStream::from(handle),
-        );
-        super::TRANSPORT_METRICS.record_inbound_completed(total);
-        self.note_quic_delivery(|| format!("received a stream on the path, id {stream_id}"));
-        let bytes = metadata?.to_vec();
-        (!self.is_duplicate_dispatch(&bytes)).then_some(bytes)
     }
 
     /// Tell a test's trace that data arrived on UDP on a connection with upgrades.
@@ -1571,12 +1510,14 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             streaming_registry: Arc::new(streaming::StreamRegistry::new()),
             streaming_handles: Default::default(),
             time_source,
-            inbound_stream_registry: None,
-            dispatched_msg_hashes: lru::LruCache::new(DEDUP_CACHE_CAPACITY),
+            dispatch: inbound_dispatch::InboundDispatch {
+                inbound_stream_registry: None,
+                dispatched_msg_hashes: lru::LruCache::new(DEDUP_CACHE_CAPACITY),
+                completed_inbound_streams: lru::LruCache::new(COMPLETED_STREAM_MEMORY),
+            },
             rejected_inbound_streams: inbound_budget::RefusedStreams::default(),
             closed_by_stream_refusals: false,
             refusal_log: RefusalLog::default(),
-            completed_inbound_streams: lru::LruCache::new(COMPLETED_STREAM_MEMORY),
             legacy_tokens: Default::default(),
             inbound_outcomes: [0; super::metrics::InboundStreamOutcome::COUNT],
             quic_path: None,
@@ -1598,23 +1539,6 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         }
     }
 
-    /// Compute a fast hash of the given bytes for dedup tracking.
-    fn msg_hash(bytes: &[u8]) -> u64 {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        bytes.hash(&mut h);
-        h.finish()
-    }
-
-    /// Returns true if this message was already dispatched (is a duplicate).
-    /// Only used on the embedded-metadata-in-fragment-#1 path to suppress
-    /// duplicates when the same metadata was already dispatched as a ShortMessage.
-    fn is_duplicate_dispatch(&mut self, bytes: &[u8]) -> bool {
-        self.dispatched_msg_hashes
-            .put(Self::msg_hash(bytes), ())
-            .is_some()
-    }
-
     /// Sets the registry that receives this connection's inbound operations
     /// streams, handling the race between stream fragments and metadata
     /// messages.
@@ -1625,7 +1549,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         &mut self,
         registry: std::sync::Arc<dyn super::InboundStreamRegistry>,
     ) {
-        self.inbound_stream_registry = Some(registry);
+        self.dispatch.inbound_stream_registry = Some(registry);
     }
 
     /// Sweep `streaming_handles` of entries that have not seen activity for
@@ -2245,7 +2169,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     self.inbound_budget
                         .lock()
                         .release_if_gone(InboundKey::Udp(stream_id));
-                    self.completed_inbound_streams.put(stream_id, ());
+                    self.dispatch.completed_inbound_streams.put(stream_id, ());
                     // Record inbound bytes for dashboard metrics
                     let bytes_received = msg.len() as u64;
                     super::TRANSPORT_METRICS.record_inbound_completed(bytes_received);
@@ -2901,7 +2825,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         }
         // A late retransmission of a stream that already completed and was
         // released must not start it again.
-        if self.completed_inbound_streams.contains(&stream_id) {
+        if self.dispatch.completed_inbound_streams.contains(&stream_id) {
             return Err(InboundStreamRejection::AlreadyCompleted);
         }
         streaming::check_declared_stream_length(total_length_bytes)
@@ -3157,7 +3081,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
         // Phase 4: Register with orphan stream registry for race condition handling.
         // This allows operations layer to claim the stream when metadata arrives,
         // even if the stream fragments arrived first.
-        if let Some(registry) = &self.inbound_stream_registry {
+        if let Some(registry) = &self.dispatch.inbound_stream_registry {
             registry.register_inbound_stream(
                 self.remote_conn.remote_addr,
                 stream_id,
@@ -3200,7 +3124,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
             self.inbound_budget
                 .lock()
                 .release_if_gone(InboundKey::Udp(stream_id));
-            self.completed_inbound_streams.put(stream_id, ());
+            self.dispatch.completed_inbound_streams.put(stream_id, ());
         }
     }
 
@@ -3331,7 +3255,9 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                 // embedded in a stream fragment, it will be suppressed as a duplicate.
                 // We always dispatch ShortMessages — dedup only suppresses the
                 // redundant embedded-metadata copy, never the ShortMessage itself.
-                self.dispatched_msg_hashes.put(Self::msg_hash(&bytes), ());
+                self.dispatch
+                    .dispatched_msg_hashes
+                    .put(inbound_dispatch::InboundDispatch::msg_hash(&bytes), ());
                 self.sample_inbound_concurrency(true, queued_nanos);
                 self.note_udp_data("a short");
                 Ok(Some(bytes))
@@ -3449,7 +3375,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                     // message was lost over UDP.
                     if let Some(meta) = metadata_bytes {
                         let bytes = meta.to_vec();
-                        if self.is_duplicate_dispatch(&bytes) {
+                        if self.dispatch.is_duplicate_dispatch(&bytes) {
                             tracing::debug!(
                                 peer_addr = %self.remote_conn.remote_addr,
                                 stream_id = %stream_id,
@@ -3567,7 +3493,7 @@ impl<S: super::Socket, T: TimeSource> PeerConnection<S, T> {
                         fragment_number,
                         "Stream finished"
                     );
-                    self.completed_inbound_streams.put(stream_id, ());
+                    self.dispatch.completed_inbound_streams.put(stream_id, ());
                     // Whole on arrival and never charged: on QUIC it would
                     // hold its stream about as long as a short message.
                     self.sample_inbound_concurrency(true, queued_nanos);

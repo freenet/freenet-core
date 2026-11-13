@@ -24,9 +24,12 @@
 //! | `quic_loss_rate_<bucket>` | live paths that have sent at least 200 packets since they started, by their own lost/sent over that time (a gauge, not reset, every bucket sent every period, 0 included): `zero`, `lt_0_5pct`, `lt_1pct`, `lt_2pct`, `lt_5pct`, `lt_10pct`, `lt_20pct`, `ge_20pct` |
 //! | `quic_ended_loss_rate_<bucket>` | paths that ended in the period, by the bucket they were in at the end (same buckets) |
 //! | `quic_ended_paths_below_floor` | paths that ended in the period before sending 200 packets, so in no bucket |
+//! | `quic_carried_packets_sent`, `quic_carried_packets_lost` | the period's packets sent, and declared lost, while their path carried data (a subset of `quic_sent_packets` and `quic_lost_packets`; the shadow share is the difference, a reconciliation residual: both operands are recorded by `record_path_loss` under the one `loss` lock, the exception the bug-prevention rule "metric describing a filtering decision, re-derived at the call site" allows, as for `broadcast_payload_mix`) |
+//! | `quic_carrying_loss_rate_<bucket>`, `quic_carrying_ended_loss_rate_<bucket>`, `quic_carried_paths_ended_below_floor` | the same three as for every path, for paths that carry data, by their loss counted from the first report that found the path carrying (a path whose data bit came on after it started starts its carrying count then); every gauge bucket sent every period |
 //! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
 //! | `quic_gate_loss_<verdict>` | congestion events by the loss gate's verdict (`recycle::loss_gate`): passed to Cubic as `queue`, `share` (loss share above the ceiling), `persistent`, `ecn` (a congestion mark), `no_sample`, or `ignored` as random loss; summed over the node's paths up to each path's last tick. Over a path's life they sum to its `quic_congestion_events`; within one period they can differ by the events between the two reads of a tick |
 //! | `quic_gate_ended_queue_<bucket>` | paths that ended in the period after at least 20 gate verdicts, by the share of them passed as `queue`: `lt_10pct`, `lt_50pct`, `ge_50pct`. A path whose losses mostly read as a queue runs as plain Cubic, whether the queue is real or jitter |
+//! | `quic_carried_dark_episode_<label>` | the same, for the episodes of paths that carried data when the episode ended: a subset of `quic_dark_episode_<label>`, counted by the same decision |
 //! | `quic_dark_episode_<label>` | dark episodes on QUIC paths (`recycle::AckWatch`: packets outstanding, nothing acknowledged and nothing heard) by how they ended: `recovered_lt_5s`, `lt_10s`, `lt_30s`, `lt_120s`, `recovered_ge_120s`, `unrecovered` (the path closed, or nothing was outstanding any more), `cap_held` (the egress cap held this side's sends, so darkness could no longer be told), `closed_at_window` (the dark-path rule closed a path that carries data). A path that carries no data is never closed by that rule, so its episodes run to their end; read at the watch's 2 s ticks |
 //! | `quic_ack_wait_expired_<label>` | sends whose wait for the acknowledgement of their end ran out and whose stream was reset, by kind: `stream` (a send with an ack wait: a Stream, or a Short past one packet), `short` (a one-packet Short, past its 120 s bound) or `control` (a control frame, bounded as a one-packet Short); only those that count as strikes (`path::StrikeCheck`: evidence the end went out and the peer is alive). An honest peer acknowledges an end within a few round trips, so this should be 0 on every honest path (`recycle::ACK_WAIT_EXPIRY_LIMIT` in `ACK_WAIT_EXPIRY_WINDOW` counts a would-close; the rule does not close a path yet) |
 //! | `quic_stall_close_<label>` | paths the acknowledgement watch closed, by why: `not_acknowledging`, `dark`, `credit_starved`, `stream_credit_withheld`, `ack_waits_expired` (`recycle::Stall`) |
@@ -35,6 +38,7 @@
 //! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
 //! | `quic_staged_peak_pct` | the most any connection staged in the period (bytes read for streams whose header its reader had not taken yet) as a percentage of its staging cap (`quic::path::inbound::ConnStaging`); streams stopped at the cap are `quic_inbound_evicted_staged` |
 //! | `quic_window_grew`, `quic_window_grow_refused`, `quic_window_shrank` | window-limited data paths whose receive window grew, those that found no room, and paths whose windows the budget lowered |
+//! | `quic_ramp_share_pct` | the share of pairs, in percent, this node sets its data bit for now: its `quic-data-percent`, or the ramp's share at the snapshot (`upgrade::slice::ramp_percent`); 0 unless the node can carry data (`prefer`, no breaker, paths allowed, the endpoint up). Read on the path clock's wall time. A gauge, sent every period, 0 included, so the release watch can group each period by ramp step. One value per process: in a simulation every node in the process shares it |
 //! | `quic_send_resets_reached_<n>`, `quic_send_resets_path_max` | paths whose lifetime reset count reached each level in the period, and the highest count a reset in the period took a path to: how close paths get to `recycle::SEND_ABORT_LIMIT` |
 //!
 //! What the loss rate is: quinn's lost over sent (quinn-proto 0.11.19). `sent`
@@ -75,12 +79,54 @@ use crate::transport::quic::path::{
     QuicInboundOutcome, QuicSendEvent, QuicSendResult, SendKind, stop_code,
 };
 use crate::transport::quic::recycle::loss_gate::{GATE_VERDICTS, VERDICT_LABELS, Verdict};
+use crate::transport::quic::upgrade::policy::DataShare;
 
 /// The gauge's key, uploaded in every snapshot ([`QuicDataSnapshot::upload_keys`]).
 const LIVE_DATA_PATHS: &str = "quic_live_data_paths";
 
+/// The share gauge's key, uploaded in every snapshot.
+const RAMP_SHARE_PCT: &str = "quic_ramp_share_pct";
+
+/// Where `quic_ramp_share_pct` is read from: the node's data share, read on
+/// its path clock's wall time, while its QUIC endpoint is up. A node that
+/// cannot carry data (QUIC off, shadow, the crash-loop breaker, no paths, the
+/// endpoint down or released) reports 0, so it does not dilute the group of a
+/// share step with a share it cannot use. It is this node's own share: a pair
+/// carries data only when both sides' shares cover it.
+pub(crate) struct ShareSource {
+    pub(crate) share: DataShare,
+    pub(crate) availability: crate::transport::quic::liveness::QuicAvailabilityWatch,
+    pub(crate) wall: Box<dyn Fn() -> std::time::SystemTime + Send + Sync>,
+}
+
+impl ShareSource {
+    fn percent(&self) -> u64 {
+        match self.availability.get() {
+            crate::transport::quic::liveness::QuicAvailability::Up => {
+                u64::from(self.share.percent_at((self.wall)()))
+            }
+            crate::transport::quic::liveness::QuicAvailability::Disabled
+            | crate::transport::quic::liveness::QuicAvailability::Down
+            | crate::transport::quic::liveness::QuicAvailability::Released => 0,
+        }
+    }
+}
+
+impl std::fmt::Debug for ShareSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShareSource")
+            .field("share", &self.share)
+            .field("availability", &self.availability.get())
+            .finish_non_exhaustive()
+    }
+}
+
 /// The loss-rate gauges' prefix; every bucket is uploaded in every snapshot.
 const LOSS_RATE_PREFIX: &str = "quic_loss_rate_";
+
+/// The carrying-data loss-rate gauges' prefix; uploaded like
+/// [`LOSS_RATE_PREFIX`].
+const CARRYING_LOSS_RATE_PREFIX: &str = "quic_carrying_loss_rate_";
 
 /// A path's loss rate is bucketed once it has sent this many packets since it
 /// started; below it the rate says too little.
@@ -250,9 +296,55 @@ const _: () = assert!(matches!(Verdict::ALL[GATE_QUEUE], Verdict::Queue));
 #[derive(Debug)]
 pub(crate) struct PathLossWindow {
     node: &'static QuicDataCounters,
+    /// Every packet of the path since it started.
+    all: PathTally,
+    /// The packets the path sent while it carried data, from the first report
+    /// that found it carrying ([`QuicDataCounters::record_path_loss`]).
+    carrying: PathTally,
+    /// Some report found the path carrying data.
+    carried: bool,
+}
+
+/// One path's packets of one kind and the bucket it is counted in.
+#[derive(Debug, Default)]
+struct PathTally {
     sent: u64,
     lost: u64,
     bucket: Option<usize>,
+}
+
+impl PathTally {
+    /// Add `sent` and `lost`, and move the path to the bucket of its new
+    /// lost/sent in `family` once it has sent [`LOSS_RATE_MIN_SENT`].
+    fn add(&mut self, family: &mut LossFamily, sent: u64, lost: u64) {
+        self.sent = self.sent.saturating_add(sent);
+        self.lost = self.lost.saturating_add(lost);
+        let bucket =
+            (self.sent >= LOSS_RATE_MIN_SENT).then(|| loss_rate_bucket(self.lost, self.sent));
+        if bucket != self.bucket {
+            if let Some(old) = self.bucket {
+                family.rates[old] = family.rates[old].saturating_sub(1);
+            }
+            if let Some(new) = bucket {
+                family.rates[new] += 1;
+            }
+            self.bucket = bucket;
+        }
+    }
+
+    /// The path ended: out of its bucket and counted among `family`'s ended
+    /// paths by it, or as ended below the floor.
+    fn end(&mut self, family: &mut LossFamily) {
+        match self.bucket.take() {
+            Some(bucket) => {
+                family.rates[bucket] = family.rates[bucket].saturating_sub(1);
+                family.ended[bucket] = family.ended[bucket].saturating_add(1);
+            }
+            None => {
+                family.ended_below_floor = family.ended_below_floor.saturating_add(1);
+            }
+        }
+    }
 }
 
 impl PathLossWindow {
@@ -260,9 +352,9 @@ impl PathLossWindow {
     pub(crate) fn new(node: &'static QuicDataCounters) -> Self {
         Self {
             node,
-            sent: 0,
-            lost: 0,
-            bucket: None,
+            all: PathTally::default(),
+            carrying: PathTally::default(),
+            carried: false,
         }
     }
 }
@@ -271,24 +363,20 @@ impl PathLossWindow {
     /// Whether the path is in a loss-rate bucket. Tests only.
     #[cfg(test)]
     pub(crate) fn is_bucketed(&self) -> bool {
-        self.bucket.is_some()
+        self.all.bucket.is_some()
     }
 }
 
 impl Drop for PathLossWindow {
     /// The path ended: out of its bucket, and counted among the period's ended
     /// paths by that bucket, so paths that fail lossy still show; a path that
-    /// never reached the floor is counted as ended below it.
+    /// never reached the floor is counted as ended below it. A path that
+    /// carried data is counted the same way in the carrying family.
     fn drop(&mut self) {
         let mut counts = self.node.loss.lock();
-        match self.bucket.take() {
-            Some(bucket) => {
-                counts.rates[bucket] = counts.rates[bucket].saturating_sub(1);
-                counts.ended[bucket] = counts.ended[bucket].saturating_add(1);
-            }
-            None => {
-                counts.ended_below_floor = counts.ended_below_floor.saturating_add(1);
-            }
+        self.all.end(&mut counts.all);
+        if self.carried {
+            self.carrying.end(&mut counts.carrying);
         }
     }
 }
@@ -304,12 +392,34 @@ struct LossCounts {
     lost_packets: u64,
     lost_bytes: u64,
     congestion_events: u64,
+    /// Every path.
+    all: LossFamily,
+    /// The packets of the period sent while their path carried data.
+    carrying_sent_packets: u64,
+    carrying_lost_packets: u64,
+    /// The paths that carried data, by their loss while they did.
+    carrying: LossFamily,
+}
+
+/// Paths by loss-rate bucket: live ones and those that ended in the period.
+#[derive(Debug, Clone, Copy, Default)]
+struct LossFamily {
     /// A gauge of live paths, not reset by a snapshot.
     rates: [u32; LOSS_RATE_LABELS.len()],
     /// Paths that ended in the period, by their last bucket.
     ended: [u64; LOSS_RATE_LABELS.len()],
     /// Paths that ended in the period before reaching the floor.
     ended_below_floor: u64,
+}
+
+impl LossFamily {
+    /// The period's counts reset; the gauge kept.
+    fn next_period(self) -> Self {
+        Self {
+            rates: self.rates,
+            ..Self::default()
+        }
+    }
 }
 
 /// The levels `quic_streams_open_ge_<n>` reports, up to the streamed-send limit
@@ -375,6 +485,10 @@ pub(crate) struct QuicDataCounters {
     gate_loss: [AtomicU64; GATE_VERDICTS],
     gate_ended_queue: [AtomicU64; GATE_QUEUE_LABELS.len()],
     dark_episodes: [AtomicU64; DARK_EPISODE_LABELS.len()],
+    carried_dark_episodes: [AtomicU64; DARK_EPISODE_LABELS.len()],
+    /// Where this node's data share is read from, set when its upgrades are
+    /// built; `None` unless it may carry data (`policy::QuicPolicy::share_source`).
+    share: Mutex<Option<ShareSource>>,
     ack_wait_expired: [AtomicU64; ACK_WAIT_EXPIRED_LABELS.len()],
     stall_closes: [AtomicU64; STALL_CLOSE_LABELS.len()],
     stall_would_close: [AtomicU64; STALL_CLOSE_LABELS.len()],
@@ -412,10 +526,19 @@ impl QuicDataCounters {
             gate_loss: std::array::from_fn(|_| zero()),
             gate_ended_queue: std::array::from_fn(|_| zero()),
             dark_episodes: std::array::from_fn(|_| zero()),
+            carried_dark_episodes: std::array::from_fn(|_| zero()),
+            share: Mutex::new(None),
             ack_wait_expired: std::array::from_fn(|_| zero()),
             stall_closes: std::array::from_fn(|_| zero()),
             stall_would_close: std::array::from_fn(|_| zero()),
         }
+    }
+
+    /// Where this node's data share is read from
+    /// (`policy::QuicPolicy::share_source`), read at each snapshot as
+    /// `quic_ramp_share_pct`.
+    pub(crate) fn set_share(&self, share: Option<ShareSource>) {
+        *self.share.lock() = share;
     }
 
     pub(crate) fn record_send(&self, kind: SendKind, result: QuicSendResult) {
@@ -485,12 +608,20 @@ impl QuicDataCounters {
     /// from the path's start: once it holds [`LOSS_RATE_MIN_SENT`] sent packets
     /// the path is counted in the bucket of its lost/sent, and moved when that
     /// changes, so each live path is in at most one bucket. See the module doc
-    /// for what the rate is. The sums and the bucket move are written under the
-    /// one lock ([`LossCounts`]).
+    /// for what the rate is. When the path `carrying` data, the same packets are
+    /// also counted in the carrying sums and the path's carrying window, which
+    /// so starts at the first report that finds the path carrying, however long
+    /// after the path started; a path that stops carrying (the peer refused
+    /// data) keeps its carrying bucket until it ends. The sums and the bucket
+    /// moves are written under the one lock ([`LossCounts`]), the total and the
+    /// carrying subset in the same call, so the shadow share (total minus
+    /// carrying) is a reconciliation residual of two values one recording
+    /// produced, not a count re-derived from things another filter touched.
     pub(crate) fn record_path_loss(
         &self,
         window: &mut PathLossWindow,
         delta: crate::transport::quic::recycle::PathLoss,
+        carrying: bool,
     ) {
         debug_assert!(
             std::ptr::eq(window.node, self),
@@ -503,18 +634,20 @@ impl QuicDataCounters {
         counts.congestion_events = counts
             .congestion_events
             .saturating_add(delta.congestion_events);
-        window.sent = window.sent.saturating_add(delta.sent_packets);
-        window.lost = window.lost.saturating_add(delta.lost_packets);
-        let bucket =
-            (window.sent >= LOSS_RATE_MIN_SENT).then(|| loss_rate_bucket(window.lost, window.sent));
-        if bucket != window.bucket {
-            if let Some(old) = window.bucket {
-                counts.rates[old] = counts.rates[old].saturating_sub(1);
-            }
-            if let Some(new) = bucket {
-                counts.rates[new] += 1;
-            }
-            window.bucket = bucket;
+        window
+            .all
+            .add(&mut counts.all, delta.sent_packets, delta.lost_packets);
+        if carrying {
+            counts.carrying_sent_packets = counts
+                .carrying_sent_packets
+                .saturating_add(delta.sent_packets);
+            counts.carrying_lost_packets = counts
+                .carrying_lost_packets
+                .saturating_add(delta.lost_packets);
+            window
+                .carrying
+                .add(&mut counts.carrying, delta.sent_packets, delta.lost_packets);
+            window.carried = true;
         }
     }
 
@@ -612,8 +745,9 @@ impl QuicDataCounters {
         self.ack_wait_expired[kind as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A dark episode ended as `ended` says.
-    pub(crate) fn record_dark_episode(&self, ended: DarkEnd) {
+    /// A dark episode ended as `ended` says, on a path that `carried` data
+    /// when it ended (counted in `quic_carried_dark_episode_<label>` as well).
+    pub(crate) fn record_dark_episode(&self, ended: DarkEnd, carried: bool) {
         let bucket = match ended {
             DarkEnd::Recovered(nanos) => {
                 let secs = nanos / 1_000_000_000;
@@ -630,6 +764,9 @@ impl QuicDataCounters {
             DarkEnd::Closed => DARK_CLOSED,
         };
         self.dark_episodes[bucket].fetch_add(1, Ordering::Relaxed);
+        if carried {
+            self.carried_dark_episodes[bucket].fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// What the node's data paths are charged against the budget now.
@@ -672,7 +809,8 @@ impl QuicDataCounters {
             if reset {
                 // The sums are of the period; the buckets are a gauge.
                 *counts = LossCounts {
-                    rates: now.rates,
+                    all: now.all.next_period(),
+                    carrying: now.carrying.next_period(),
                     ..LossCounts::default()
                 };
             }
@@ -705,9 +843,14 @@ impl QuicDataCounters {
             lost_packets: loss.lost_packets,
             lost_bytes: loss.lost_bytes,
             congestion_events: loss.congestion_events,
-            loss_rate: loss.rates.to_vec(),
-            ended_loss_rate: loss.ended.to_vec(),
-            ended_below_floor: loss.ended_below_floor,
+            loss_rate: loss.all.rates.to_vec(),
+            ended_loss_rate: loss.all.ended.to_vec(),
+            ended_below_floor: loss.all.ended_below_floor,
+            carrying_sent_packets: loss.carrying_sent_packets,
+            carrying_lost_packets: loss.carrying_lost_packets,
+            carrying_loss_rate: loss.carrying.rates.to_vec(),
+            carrying_ended_loss_rate: loss.carrying.ended.to_vec(),
+            carrying_ended_below_floor: loss.carrying.ended_below_floor,
             streams_open_paths_sampled: streams.paths_sampled,
             streams_open_ge: streams.ge.to_vec(),
             streams_open_max: streams.max,
@@ -733,6 +876,8 @@ impl QuicDataCounters {
             gate_loss: self.gate_loss.iter().map(get).collect(),
             gate_ended_queue: self.gate_ended_queue.iter().map(get).collect(),
             dark_episodes: self.dark_episodes.iter().map(get).collect(),
+            carried_dark_episodes: self.carried_dark_episodes.iter().map(get).collect(),
+            ramp_share_pct: self.share.lock().as_ref().map_or(0, ShareSource::percent),
             ack_wait_expired: self.ack_wait_expired.iter().map(get).collect(),
             stall_closes: self.stall_closes.iter().map(get).collect(),
             stall_would_close: self.stall_would_close.iter().map(get).collect(),
@@ -742,6 +887,12 @@ impl QuicDataCounters {
 
 /// The QUIC data counts of one period. Vectors, in the order of their label lists,
 /// so a family can pass 32 entries; [`Self::keys`] names every value.
+///
+/// Fields added after a release carry `#[serde(default)]`, so JSON written
+/// before them still decodes. That does not hold for bincode, which is
+/// positional: the node's local event log cannot read a snapshot an older
+/// release wrote, so after an update that adds a field the older records are
+/// skipped once, with a WARN, as `TransportSnapshot::upload_json` notes.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(test, derive(arbitrary::Arbitrary))]
 pub struct QuicDataSnapshot {
@@ -773,6 +924,24 @@ pub struct QuicDataSnapshot {
     /// Paths that ended in the period before sending
     /// [`LOSS_RATE_MIN_SENT`] packets, so in no bucket.
     pub ended_below_floor: u64,
+    /// The period's packets sent, and declared lost, while their path carried
+    /// data: a subset of `sent_packets` and `lost_packets`.
+    #[serde(default)]
+    pub carrying_sent_packets: u64,
+    #[serde(default)]
+    pub carrying_lost_packets: u64,
+    /// Live paths that carry data, by their loss while carrying, in the order
+    /// of `LOSS_RATE_LABELS`: a gauge, not reset.
+    #[serde(default)]
+    pub carrying_loss_rate: Vec<u32>,
+    /// Paths that carried data and ended in the period, by their last carrying
+    /// bucket.
+    #[serde(default)]
+    pub carrying_ended_loss_rate: Vec<u64>,
+    /// Paths that carried data and ended in the period before sending
+    /// [`LOSS_RATE_MIN_SENT`] packets while carrying.
+    #[serde(default)]
+    pub carrying_ended_below_floor: u64,
     pub streams_open_paths_sampled: u32,
     /// By `QUIC_STREAMS_OPEN_THRESHOLDS`.
     pub streams_open_ge: Vec<u32>,
@@ -803,6 +972,14 @@ pub struct QuicDataSnapshot {
     /// Dark episodes that ended in the period, by `DARK_EPISODE_LABELS`.
     #[serde(default)]
     pub dark_episodes: Vec<u64>,
+    /// The dark episodes of paths that carried data when the episode ended, by
+    /// `DARK_EPISODE_LABELS`: a subset of `dark_episodes`.
+    #[serde(default)]
+    pub carried_dark_episodes: Vec<u64>,
+    /// The share of pairs this node sets its data bit for at the snapshot, in
+    /// percent: a gauge.
+    #[serde(default)]
+    pub ramp_share_pct: u64,
     /// Ack waits that ran out in the period, by `ACK_WAIT_EXPIRED_LABELS`.
     #[serde(default)]
     pub ack_wait_expired: Vec<u64>,
@@ -853,6 +1030,11 @@ impl QuicDataSnapshot {
             loss_rate,
             ended_loss_rate,
             ended_below_floor,
+            carrying_sent_packets,
+            carrying_lost_packets,
+            carrying_loss_rate,
+            carrying_ended_loss_rate,
+            carrying_ended_below_floor,
             streams_open_paths_sampled,
             streams_open_ge,
             streams_open_max,
@@ -870,6 +1052,8 @@ impl QuicDataSnapshot {
             gate_loss,
             gate_ended_queue,
             dark_episodes,
+            carried_dark_episodes,
+            ramp_share_pct,
             ack_wait_expired,
             stall_closes,
             stall_would_close,
@@ -938,6 +1122,16 @@ impl QuicDataSnapshot {
             ended_loss_rate.clone(),
         );
         family(
+            CARRYING_LOSS_RATE_PREFIX,
+            LOSS_RATE_LABELS.iter().map(|l| l.to_string()).collect(),
+            carrying_loss_rate.iter().map(|n| u64::from(*n)).collect(),
+        );
+        family(
+            "quic_carrying_ended_loss_rate_",
+            LOSS_RATE_LABELS.iter().map(|l| l.to_string()).collect(),
+            carrying_ended_loss_rate.clone(),
+        );
+        family(
             "quic_streams_open_ge_",
             QUIC_STREAMS_OPEN_THRESHOLDS
                 .iter()
@@ -967,6 +1161,11 @@ impl QuicDataSnapshot {
             "quic_dark_episode_",
             DARK_EPISODE_LABELS.iter().map(|l| l.to_string()).collect(),
             dark_episodes.clone(),
+        );
+        family(
+            "quic_carried_dark_episode_",
+            DARK_EPISODE_LABELS.iter().map(|l| l.to_string()).collect(),
+            carried_dark_episodes.clone(),
         );
         family(
             "quic_ack_wait_expired_",
@@ -1000,6 +1199,13 @@ impl QuicDataSnapshot {
             ("quic_lost_bytes", *lost_bytes),
             ("quic_congestion_events", *congestion_events),
             ("quic_ended_paths_below_floor", *ended_below_floor),
+            // Not under `quic_carrying_`, which the two carrying families share.
+            ("quic_carried_packets_sent", *carrying_sent_packets),
+            ("quic_carried_packets_lost", *carrying_lost_packets),
+            (
+                "quic_carried_paths_ended_below_floor",
+                *carrying_ended_below_floor,
+            ),
             (
                 "quic_streams_sampled_paths",
                 u64::from(*streams_open_paths_sampled),
@@ -1015,6 +1221,7 @@ impl QuicDataSnapshot {
             ("quic_window_grow_refused", *window_grow_refused),
             ("quic_window_shrank", *window_shrank),
             ("quic_staged_peak_pct", *staged_peak_pct),
+            (RAMP_SHARE_PCT, *ramp_share_pct),
         ] {
             keys.push((None, key.to_string(), value));
         }
@@ -1022,13 +1229,18 @@ impl QuicDataSnapshot {
     }
 
     /// The keys the snapshot uploads: every count that is not 0, and the gauges
-    /// (`quic_live_data_paths` and every `quic_loss_rate_` bucket) always, so a
+    /// (`quic_live_data_paths`, `quic_ramp_share_pct` and every loss-rate
+    /// bucket) always, so a
     /// gauge of 0 is told apart from one not reported.
     pub fn upload_keys(&self) -> impl Iterator<Item = (String, u64)> {
         self.keys_by_family()
             .into_iter()
             .filter(|(family, key, value)| {
-                *value != 0 || key == LIVE_DATA_PATHS || *family == Some(LOSS_RATE_PREFIX)
+                *value != 0
+                    || key == LIVE_DATA_PATHS
+                    || key == RAMP_SHARE_PCT
+                    || *family == Some(LOSS_RATE_PREFIX)
+                    || *family == Some(CARRYING_LOSS_RATE_PREFIX)
             })
             .map(|(_, key, value)| (key, value))
     }
@@ -1057,6 +1269,11 @@ impl QuicDataSnapshot {
             loss_rate: _,
             ended_loss_rate,
             ended_below_floor,
+            carrying_sent_packets,
+            carrying_lost_packets,
+            carrying_loss_rate: _,
+            carrying_ended_loss_rate,
+            carrying_ended_below_floor,
             streams_open_paths_sampled,
             streams_open_ge: _,
             streams_open_max: _,
@@ -1074,6 +1291,8 @@ impl QuicDataSnapshot {
             gate_loss,
             gate_ended_queue,
             dark_episodes,
+            carried_dark_episodes,
+            ramp_share_pct: _,
             ack_wait_expired,
             stall_closes,
             stall_would_close,
@@ -1089,6 +1308,8 @@ impl QuicDataSnapshot {
             || any(gate_loss)
             || any(gate_ended_queue)
             || any(dark_episodes)
+            || any(carried_dark_episodes)
+            || any(carrying_ended_loss_rate)
             || any(ack_wait_expired)
             || any(stall_closes)
             || any(stall_would_close)
@@ -1105,6 +1326,9 @@ impl QuicDataSnapshot {
                 *lost_bytes,
                 *congestion_events,
                 *ended_below_floor,
+                *carrying_sent_packets,
+                *carrying_lost_packets,
+                *carrying_ended_below_floor,
                 u64::from(*streams_open_paths_sampled),
                 *send_resets,
                 *path_ms,
@@ -1177,7 +1401,11 @@ mod tests {
         assert_eq!(after.data_paths, 1, "the gauge is not reset");
         assert!(!after.has_activity(), "a gauge alone is not activity");
         assert!(after.upload_keys().all(|(key, value)| {
-            key == "quic_live_data_paths" || (key.starts_with("quic_loss_rate_") && value == 0)
+            key == "quic_live_data_paths"
+                || (key == "quic_ramp_share_pct" && value == 0)
+                || ((key.starts_with("quic_loss_rate_")
+                    || key.starts_with("quic_carrying_loss_rate_"))
+                    && value == 0)
         }));
         // A new period counts the path again.
         counters.record_streams_open(&mut path, 5);
@@ -1242,7 +1470,7 @@ mod tests {
             DarkEnd::CapHeld,
             DarkEnd::Closed,
         ] {
-            counters.record_dark_episode(ended);
+            counters.record_dark_episode(ended, false);
         }
         let snap = counters.snapshot(true);
         assert!(snap.has_activity());
@@ -1277,19 +1505,79 @@ mod tests {
         let uploaded: Vec<_> = counters.snapshot(true).upload_keys().collect();
         assert_eq!(
             uploaded.len(),
-            LOSS_RATE_LABELS.len() + 1,
+            2 * LOSS_RATE_LABELS.len() + 2,
             "the gauges and nothing else: {uploaded:?}"
         );
         assert!(uploaded.iter().all(|(key, value)| {
-            *value == 0 && (key == "quic_live_data_paths" || key.starts_with("quic_loss_rate_"))
+            *value == 0
+                && (key == "quic_live_data_paths"
+                    || key == "quic_ramp_share_pct"
+                    || key.starts_with("quic_loss_rate_")
+                    || key.starts_with("quic_carrying_loss_rate_"))
         }));
         counters.data_path_started();
         counters.record_open(false);
         let uploaded: std::collections::BTreeMap<_, _> =
             counters.snapshot(true).upload_keys().collect();
-        assert_eq!(uploaded.len(), LOSS_RATE_LABELS.len() + 2, "{uploaded:?}");
+        assert_eq!(
+            uploaded.len(),
+            2 * LOSS_RATE_LABELS.len() + 3,
+            "{uploaded:?}"
+        );
         assert_eq!(uploaded["quic_live_data_paths"], 1);
         assert_eq!(uploaded["quic_sends"], 1);
+    }
+
+    /// The share gauge reads the node's share at each snapshot: a fixed share
+    /// as set, a ramp's share at the snapshot's time, 0 with no share.
+    #[test]
+    fn the_ramp_share_gauge_reads_the_share_at_the_snapshot() {
+        use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
+        use crate::transport::quic::upgrade::slice::ramp_percent;
+        const HOUR: u64 = 3600;
+        let counters = QuicDataCounters::new();
+        let share = |counters: &QuicDataCounters| {
+            counters
+                .snapshot(true)
+                .upload_keys()
+                .find(|(key, _)| key == RAMP_SHARE_PCT)
+                .map(|(_, value)| value)
+        };
+        assert_eq!(share(&counters), Some(0), "no share: 0, still uploaded");
+        // The share is read on the source's own clock, at each snapshot.
+        let t0 = 1_800_000_000;
+        let clock = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(t0));
+        let (endpoint, availability) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let source = |share: DataShare| {
+            let clock = clock.clone();
+            Some(ShareSource {
+                share,
+                availability: availability.clone(),
+                wall: Box::new(move || {
+                    std::time::UNIX_EPOCH
+                        + std::time::Duration::from_secs(clock.load(Ordering::Relaxed))
+                }),
+            })
+        };
+        counters.set_share(source(DataShare::Fixed(40)));
+        assert_eq!(share(&counters), Some(40));
+        counters.set_share(source(DataShare::Ramp {
+            start_unix_secs: t0,
+        }));
+        for hours in [0, 1, 7, 13, 30] {
+            clock.store(t0 + hours * HOUR, Ordering::Relaxed);
+            let want = u64::from(ramp_percent(std::time::Duration::from_secs(hours * HOUR)));
+            assert_eq!(share(&counters), Some(want), "{hours} h");
+        }
+        // An endpoint that is down cannot carry data: 0, until it is up again.
+        for down in [QuicAvailability::Down, QuicAvailability::Released] {
+            endpoint.send_replace(down);
+            assert_eq!(share(&counters), Some(0), "{down:?}");
+        }
+        endpoint.send_replace(QuicAvailability::Up);
+        assert_eq!(share(&counters), Some(100));
+        counters.set_share(None);
+        assert_eq!(share(&counters), Some(0));
     }
 
     /// The keys with the family each is in, from `keys_by_family`; every key the
@@ -1489,10 +1777,10 @@ mod tests {
         let counters: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
         let mut path = PathLossWindow::new(counters);
         let mut quiet = PathLossWindow::new(counters);
-        counters.record_path_loss(&mut path, loss(150, 0));
-        counters.record_path_loss(&mut quiet, loss(199, 3));
+        counters.record_path_loss(&mut path, loss(150, 0), false);
+        counters.record_path_loss(&mut quiet, loss(199, 3), false);
         assert_eq!(counters.snapshot(false).loss_rate.iter().sum::<u32>(), 0);
-        counters.record_path_loss(&mut path, loss(50, 0));
+        counters.record_path_loss(&mut path, loss(50, 0), false);
         let snap = counters.snapshot(false);
         assert_eq!(
             snap.loss_rate,
@@ -1500,7 +1788,7 @@ mod tests {
             "200 sent, none lost"
         );
         // 3 lost of 400: under 1%.
-        counters.record_path_loss(&mut path, loss(200, 3));
+        counters.record_path_loss(&mut path, loss(200, 3), false);
         let snap = counters.snapshot(true);
         assert_eq!(snap.loss_rate, vec![0, 0, 1, 0, 0, 0, 0, 0]);
         assert_eq!(snap.sent_packets, 599);
@@ -1509,7 +1797,7 @@ mod tests {
         assert_eq!(snap.congestion_events, 2);
         // The next period keeps the path's window: 50 more lost of 100 more
         // sent is 53 of 500, under 20%, and the sums start again.
-        counters.record_path_loss(&mut path, loss(100, 50));
+        counters.record_path_loss(&mut path, loss(100, 50), false);
         let snap = counters.snapshot(true);
         assert_eq!(snap.loss_rate, vec![0, 0, 0, 0, 0, 0, 1, 0]);
         assert_eq!(snap.lost_packets, 50);
@@ -1534,8 +1822,8 @@ mod tests {
         let counters: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
         let mut lossy = PathLossWindow::new(counters);
         let mut short = PathLossWindow::new(counters);
-        counters.record_path_loss(&mut lossy, loss(300, 90));
-        counters.record_path_loss(&mut short, loss(150, 0));
+        counters.record_path_loss(&mut lossy, loss(300, 90), false);
+        counters.record_path_loss(&mut short, loss(150, 0), false);
         assert_eq!(
             counters.snapshot(true).loss_rate,
             vec![0, 0, 0, 0, 0, 0, 0, 1]
@@ -1561,7 +1849,7 @@ mod tests {
     fn the_loss_rate_gauges_are_uploaded_at_zero() {
         let counters: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
         let mut path = PathLossWindow::new(counters);
-        counters.record_path_loss(&mut path, loss(300, 90));
+        counters.record_path_loss(&mut path, loss(300, 90), false);
         drop(path);
         let uploaded: std::collections::HashMap<String, u64> =
             counters.snapshot(true).upload_keys().collect();
@@ -1630,6 +1918,128 @@ mod tests {
         };
         assert!(reached.has_activity(), "a level reached");
         assert!(!counters.snapshot(true).has_activity());
+    }
+
+    /// A path's carrying-data count starts at the first report that finds it
+    /// carrying, apart from its count over its whole life: 300 packets without
+    /// data and no loss, then 300 with data and 30 lost, is 30 of 600 (5%) in the
+    /// all-paths buckets and 30 of 300 (10%) in the carrying ones, and only the
+    /// second 300 are in the carrying sums. A path that stops carrying keeps its
+    /// carrying bucket until it ends; a path that never carried is in no
+    /// carrying count. Both families count an ended path once.
+    #[test]
+    fn a_path_counts_its_carrying_packets_from_the_flip() {
+        let counters: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
+        let mut flips = PathLossWindow::new(counters);
+        let mut shadow = PathLossWindow::new(counters);
+        counters.record_path_loss(&mut flips, loss(300, 0), false);
+        counters.record_path_loss(&mut shadow, loss(300, 0), false);
+        let snap = counters.snapshot(true);
+        assert_eq!(snap.carrying_loss_rate.iter().sum::<u32>(), 0);
+        assert_eq!(snap.carrying_sent_packets, 0);
+        counters.record_path_loss(&mut flips, loss(300, 30), true);
+        let snap = counters.snapshot(true);
+        // 30 of 600 is 5%: `lt_10pct`; 30 of 300 is 10%: `lt_20pct`.
+        assert_eq!(snap.loss_rate, vec![1, 0, 0, 0, 0, 1, 0, 0]);
+        assert_eq!(snap.carrying_loss_rate, vec![0, 0, 0, 0, 0, 0, 1, 0]);
+        assert_eq!(
+            (snap.sent_packets, snap.lost_packets),
+            (300, 30),
+            "all paths' sums of the period"
+        );
+        assert_eq!(
+            (snap.carrying_sent_packets, snap.carrying_lost_packets),
+            (300, 30)
+        );
+        // It stops carrying: no more carrying packets, the bucket stays.
+        counters.record_path_loss(&mut flips, loss(100, 0), false);
+        let snap = counters.snapshot(true);
+        assert_eq!(snap.carrying_sent_packets, 0);
+        assert_eq!(snap.carrying_loss_rate, vec![0, 0, 0, 0, 0, 0, 1, 0]);
+        drop(flips);
+        drop(shadow);
+        let snap = counters.snapshot(true);
+        assert_eq!(snap.carrying_loss_rate.iter().sum::<u32>(), 0);
+        assert_eq!(snap.carrying_ended_loss_rate, vec![0, 0, 0, 0, 0, 0, 1, 0]);
+        assert_eq!(
+            snap.carrying_ended_below_floor, 0,
+            "the shadow path never carried"
+        );
+        assert_eq!(snap.ended_loss_rate.iter().sum::<u64>(), 2);
+        assert!(
+            snap.has_activity(),
+            "a carrying path that ended is activity"
+        );
+        // Ended below the carrying floor: it carried, but too few packets.
+        let mut brief = PathLossWindow::new(counters);
+        counters.record_path_loss(&mut brief, loss(50, 0), true);
+        drop(brief);
+        let snap = counters.snapshot(true);
+        assert_eq!(snap.carrying_ended_below_floor, 1);
+        assert_eq!(snap.ended_below_floor, 1);
+    }
+
+    /// A path that never carries data adds nothing to any carrying count, live
+    /// or ended, however lossy it is; one whose bit comes on mid-life adds only
+    /// what it sends from then (its carrying window starts at the flip).
+    #[test]
+    fn a_path_that_never_carries_adds_nothing_to_carrying() {
+        let counters: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
+        let mut shadow = PathLossWindow::new(counters);
+        counters.record_path_loss(&mut shadow, loss(400, 100), false);
+        counters.record_path_loss(&mut shadow, loss(400, 100), false);
+        drop(shadow);
+        let snap = counters.snapshot(true);
+        assert_eq!(snap.sent_packets, 800);
+        assert_eq!(
+            (snap.carrying_sent_packets, snap.carrying_lost_packets),
+            (0, 0)
+        );
+        assert_eq!(snap.carrying_loss_rate.iter().sum::<u32>(), 0);
+        assert_eq!(snap.carrying_ended_loss_rate.iter().sum::<u64>(), 0);
+        assert_eq!(snap.carrying_ended_below_floor, 0);
+        assert_eq!(snap.ended_loss_rate.iter().sum::<u64>(), 1, "it ended");
+
+        let mut flips = PathLossWindow::new(counters);
+        counters.record_path_loss(&mut flips, loss(400, 100), false);
+        counters.record_path_loss(&mut flips, loss(250, 0), true);
+        let snap = counters.snapshot(true);
+        assert_eq!(
+            (snap.carrying_sent_packets, snap.carrying_lost_packets),
+            (250, 0),
+            "only what it sent after the flip"
+        );
+        assert_eq!(
+            snap.carrying_loss_rate,
+            vec![1, 0, 0, 0, 0, 0, 0, 0],
+            "0 of 250 since the flip, not 100 of 650"
+        );
+        drop(flips);
+    }
+
+    /// The carrying gauges are uploaded at 0 like the all-paths ones, and the
+    /// carrying counts only when not 0.
+    #[test]
+    fn the_carrying_gauges_are_uploaded_at_zero() {
+        let uploaded: std::collections::HashMap<String, u64> = QuicDataCounters::new()
+            .snapshot(true)
+            .upload_keys()
+            .collect();
+        for label in LOSS_RATE_LABELS {
+            assert_eq!(
+                uploaded.get(&format!("quic_carrying_loss_rate_{label}")),
+                Some(&0),
+                "{label}"
+            );
+        }
+        for key in [
+            "quic_carried_packets_sent",
+            "quic_carried_packets_lost",
+            "quic_carried_paths_ended_below_floor",
+            "quic_carrying_ended_loss_rate_zero",
+        ] {
+            assert!(!uploaded.contains_key(key), "{key} is a count");
+        }
     }
 
     /// The snapshot round-trips through bincode, as the event log stores it.

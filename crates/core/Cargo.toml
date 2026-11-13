@@ -119,8 +119,8 @@ rustls-native-certs = "0.8.4"
 # Keep it semver-compatible with reqwest's rustls: os_trust probes certificates
 # with it on the assumption that reqwest validates them identically.
 rustls = { version = "0.23", default-features = false, features = ["std"] }
-# QUIC endpoint (transport/quic.rs, #5940): on in shadow by default on Linux,
-# macOS and Windows, off elsewhere (`transport-quic`). Only the ring rustls provider: no runtime-tokio (the endpoint runs on the
+# QUIC endpoint (transport/quic.rs, #5940): on by default on Linux, macOS and
+# Windows (`prefer`), off elsewhere (`transport-quic`). Only the ring rustls provider: no runtime-tokio (the endpoint runs on the
 # crate's own Runtime over TimeSource, so simulation drives it), no
 # platform-verifier (peers are authenticated by raw public keys, never by a CA
 # root store), and no aws-lc-rs (deny.toml bans it).

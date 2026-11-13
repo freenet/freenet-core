@@ -363,10 +363,21 @@ pub(super) enum Key {
     Delegate(DelegateKey),
 }
 
+impl From<ContractError> for ContractExecError {
+    /// Contract WASM chooses the text of the error it returns; bound it here so
+    /// every log line and client reply built from this error is bounded.
+    fn from(err: ContractError) -> Self {
+        Self::ContractError(super::error::bound_contract_error(err))
+    }
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum ContractExecError {
+    /// Guest-returned errors reach this variant through the `From` impl, which
+    /// bounds the guest-supplied text. Constructing it directly (tests, mocks)
+    /// bypasses that bound, so only do so with host-authored text.
     #[error(transparent)]
-    ContractError(#[from] ContractError),
+    ContractError(ContractError),
 
     #[error("Attempted to perform a put for an already put contract ({0}), use update instead")]
     DoublePut(ContractKey),
@@ -376,6 +387,12 @@ pub enum ContractExecError {
 
     #[error("unexpected result from contract interface")]
     UnexpectedResult,
+
+    /// The module returned a buffer or result location that does not lie in
+    /// memory it owns, or a result descriptor of the wrong kind. Refused
+    /// before the host reads or writes through it; see `wasm_runtime::guest_mem`.
+    #[error("WASM module returned an invalid memory reference: {0}")]
+    InvalidGuestMemory(#[from] super::guest_mem::GuestMemoryError),
 
     #[error(
         "The operation ran out of gas. This might be caused by an infinite loop or an inefficient computation."
@@ -1328,31 +1345,36 @@ impl Runtime {
         T: AsRef<[u8]>,
     {
         let data = data.as_ref();
-        // classify_result: a guest-entry epoch interrupt → Timeout class (#4864 round-5).
-        let builder_ptr =
-            super::classify_result(self.engine.initiate_buffer(handle, data.len() as u32))?;
-        let linear_mem = self.linear_mem(handle)?;
-        // SAFETY: `builder_ptr` is returned by the WASM allocator and points to a valid
-        // `BufferBuilder` within the instance's linear memory described by `linear_mem`.
-        unsafe {
-            Ok(BufferMut::from_ptr(
-                builder_ptr as *mut BufferBuilder,
-                linear_mem,
-            ))
-        }
+        self.init_buf_with_capacity(handle, data.len())
     }
 
+    /// Ask the guest to allocate a buffer of `capacity` bytes and return a
+    /// host view of it.
+    ///
+    /// The builder offset the guest returns, and every field inside the
+    /// builder, are guest-controlled. They are checked against the instance's
+    /// linear memory (`guest_mem::check_buffer_builder`) before stdlib's
+    /// `BufferMut::from_ptr` turns them into references; a value outside
+    /// memory is refused with `ContractExecError::InvalidGuestMemory`.
     pub(super) fn init_buf_with_capacity(
         &mut self,
         handle: &InstanceHandle,
         capacity: usize,
     ) -> RuntimeResult<BufferMut<'_>> {
+        let capacity =
+            u32::try_from(capacity).map_err(|_| ContractExecError::InvalidArrayLength(capacity))?;
         // classify_result: a guest-entry epoch interrupt → Timeout class (#4864 round-5).
-        let builder_ptr =
-            super::classify_result(self.engine.initiate_buffer(handle, capacity as u32))?;
+        let builder_ptr = super::classify_result(self.engine.initiate_buffer(handle, capacity))?;
+        // Fetched after the guest call: the allocator may have grown, and so
+        // moved, linear memory.
         let linear_mem = self.linear_mem(handle)?;
-        // SAFETY: `builder_ptr` is returned by the WASM allocator and points to a valid
-        // `BufferBuilder` within the instance's linear memory described by `linear_mem`.
+        super::guest_mem::check_buffer_builder(&linear_mem, builder_ptr)
+            .map_err(ContractExecError::from)?;
+        // SAFETY: `check_buffer_builder` verified that the builder, its two
+        // position counters and its data region all lie inside `linear_mem`,
+        // are suitably aligned and pairwise disjoint, and that both positions
+        // are within the capacity. `linear_mem` describes the live memory and
+        // no guest code runs while the returned `BufferMut` borrows `self`.
         unsafe {
             Ok(BufferMut::from_ptr(
                 builder_ptr as *mut BufferBuilder,

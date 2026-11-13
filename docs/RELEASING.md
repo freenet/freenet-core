@@ -504,11 +504,126 @@ Current wire-gated floors:
   `quic_native_floor_stays_above_every_release_without_the_decoder` catches the
   floor being lowered.
 
+- `QUIC_DATA_RAMP_START` (T0) and `QUIC_DATA_RAMP_RELEASE` in
+  `crates/core/src/transport/quic/upgrade/policy.rs` (#5940): both `None` in
+  tree. The reviewed PR for the QUIC data ramp release sets T0 to the planned
+  publish time, in Unix seconds, and `QUIC_DATA_RAMP_RELEASE` to that release's
+  version. `scripts/check_quic_data_ramp_t0.sh` then refuses a live cut of
+  that version when the clock is more than 3 h from T0 either side (a dry run
+  only warns). It runs at dispatch (release.yml's validate job), again in
+  cross-compile.yml's attach-to-release job just before the crates.io publish
+  and the un-draft (so "re-run failed jobs" checks the clock it publishes at),
+  and in `scripts/release.sh` at its start and before each publish. What it
+  measures is the publish time; nodes take the release over the 0-4 h
+  auto-update stagger on top of it. Both constants stay set afterwards: a later
+  version passes with a warning. A version that would ship the ramp unchecked
+  fails closed: one before `QUIC_DATA_RAMP_RELEASE`, one that skips it while
+  the tree has not reached it (an auto-bump past a taken number), one cut
+  while `v<QUIC_DATA_RAMP_RELEASE>` is not a published (non-draft) GitHub
+  release, GitHub's latest release is before it, or `freenet` at that version
+  is not on crates.io, or any of these gives no clear answer (the ramp
+  release's bump merged but its publish or un-draft failed or was cancelled,
+  or "latest" stayed pinned to an older build; nodes update from GitHub's
+  latest release, so a crates.io publish alone did not reach them), or one
+  cut more than 3 h
+  before T0, and T0 set with no ramp release named. The check reads the
+  GitHub API with `GH_TOKEN` (the workflow token in CI, `gh auth token`
+  locally) when it has one. Cut the ramp release with `--field version=X.Y.Z` set to
+  `QUIC_DATA_RAMP_RELEASE`, not the auto-bump. If that version is already
+  taken, change the constant in the same reviewed PR as T0. A later re-ramp
+  must set a new T0 and a new `QUIC_DATA_RAMP_RELEASE` together: a new T0 with
+  a stale release name is not caught when the cut comes more than 3 h after
+  the new T0. If the publish slips more than about 3 h past T0, re-set T0 in a
+  new reviewed PR before publishing.
+
+  Which check guards which side. The dispatch check (release.yml) reads the
+  tree before the version bump, so it is the one that sees a cut version
+  skipping or preceding the ramp release. At the tag the tree is already the
+  cut version, so the attach-to-release check sees only the clock and the
+  publication of the ramp release, not a skip. One case neither sees at cut
+  time: `QUIC_DATA_RAMP_RELEASE` naming a version that ships before the ramp
+  PR merges. CI covers it: `scripts/check_quic_data_ramp_t0_test.sh` fails a
+  tree where T0 is more than 3 h away and `QUIC_DATA_RAMP_RELEASE` is not
+  above the `crates/core` version. The same test requires each state the
+  constants pass through to pass CI, including the emergency stop (T0 back to
+  `None` with the release left named: a later version passes, the named one is
+  refused). A stop taken before the ramp release ships leaves the next
+  auto-bump equal to the named version, which is then refused: cut another
+  version, or set `QUIC_DATA_RAMP_RELEASE` to `None` in the stop PR.
+
+  The attach-to-release check reads the version from the tag and accepts only
+  `X.Y.Z`. A pre-release tag (`v0.2.157-rc1`) exits 2 there and stops the
+  publish. The project tags no pre-releases; one would need the check taught
+  its form first.
+
 - `QUIC_DATA_PERCENT` in `crates/core/src/transport/quic/upgrade/policy.rs` (the
   share of pairs that carry data on QUIC, #5940). It stays at its value unless
   this release is a rollout step (0, 5, 25, 100), changed in its own PR. That PR also edits the expectations that pin 0:
   `assert_eq!(QUIC_DATA_PERCENT, 0, ...)` in `policy.rs` and the
   `quic-data-release-share` case in `simulation_integration.rs`.
+
+- `QUIC_DATA_RAMP_START` in `crates/core/src/transport/quic/upgrade/policy.rs`
+  (#5940): when the QUIC data ramp starts, in Unix seconds, or `None` (no pair
+  carries data). It is `None` in tree. For the ramp release, a small reviewed PR
+  sets it to the planned publish time (T0) just before the soak, and it stays set
+  afterwards: from T0 the share of pairs carrying data is 5% for 6 h, then rises
+  to 25% at 12 h and 100% at 24 h, and stays at 100% (see "Data slice" in
+  `.claude/rules/transport.md`). T0 is fixed in the binary, so a publish later
+  than T0 starts every node that updates part-way along the curve: a node that
+  updates 12 h after T0 starts at 25%, and one that updates 24 h or more after
+  T0 starts at 100%, skipping the ramp. **If the publish slips more than about
+  3 h past T0, re-set T0 in a new reviewed PR before publishing.** The same PR
+  sets `QUIC_DATA_RAMP_RELEASE` (see the entry above for the release-time check). A node whose
+  clock reads before T0 gets 5%. The soak runs before T0, so it exercises only
+  the 5% share. That PR also updates the expectations that read the
+  constant: the `quic-data-release-share` case in `simulation_integration.rs`;
+  in `policy.rs` the tests that branch on `QUIC_DATA_RAMP_START`
+  (`own_caps_needs_prefer_and_the_peer_in_the_slice` asserts "no ramp, no
+  data" only while it is `None`; `startup_reports_prefer_and_max_paths`
+  expects a different line once it is set); and in `driver/tests.rs` the
+  `RECYCLES` expectation, which reads the production constant. Run the
+  `transport::quic::upgrade` tests with T0 set before the PR merges, so each
+  branch that only runs then has run.
+
+  Release notes. The release that sets T0 must say in its notes that `prefer`
+  nodes, which is every Linux, macOS and Windows node that did not set `transport-quic`,
+  start carrying data with a growing share of their pairs. A release cut from
+  main between the ramp code (#6138) and the T0 PR also changes something: it
+  makes `prefer` the default on Linux, macOS and Windows, at a share of 0. Its nodes
+  then behave as shadow nodes (no pair carries data, no path is recycled), but
+  its notes should still say that the default mode changed.
+
+  Reading the ramp: each node logs at INFO when its share enters a new band
+  ("QUIC data: this node offers data to this share of its pairs", with
+  `data_percent`; at 0% it logs "offers data to none of its pairs"). With T0
+  unset, a `prefer` node logs at startup that it has no data share and keeps
+  every pair's data on UDP. In telemetry, `quic_enabled_data_paths` and
+  `quic_live_data_paths` count paths carrying data, the
+  `quic_close_sent_recycle_for_data` / `quic_close_received_recycle_for_data`
+  counts are paths recycled to take data as the share reaches them (expected,
+  not a fault), and the `quic_loss_rate_*` families give per-path loss over
+  every path. The loss of the paths that carry data alone is in
+  `quic_carrying_loss_rate_*` (live), `quic_carrying_ended_loss_rate_*` (ended),
+  `quic_carried_packets_sent` / `quic_carried_packets_lost`, and
+  `quic_carried_paths_ended_below_floor`; read these, not the all-path
+  families, to judge data on QUIC. Two known sources of noise: a recycle whose
+  close frame is lost reaches the peer as a lost connection, so it counts as a
+  charged fallback (`quic_fallback_reset`) instead of a recycle; and a backward
+  step of a node's wall clock lowers its share, after which the step forward
+  can turn a pair's bit on a second time and recycle it again.
+
+  Emergency stop: a parked release, built and soaked before the ramp release is
+  cut, is published through the normal auto-update stagger (0 to 4 h). It makes
+  two changes, and needs both. It sets the default mode to off, which turns QUIC
+  off on every node that did not set `transport-quic` itself (the default is
+  read, never written to `config.toml`). It also sets `QUIC_DATA_RAMP_START`
+  back to `None`, which gives every node that set `transport-quic = "prefer"`
+  itself (testers, possibly our own gateways) a share of 0, so none of its pairs
+  carries data; only a node that also set `quic-data-percent` keeps a share.
+  A node takes either change only when it restarts into the release (an
+  auto-update restarts it, 0 to 4 h after publish). Until then its paths with
+  data keep carrying data: a path with data is never rechecked.
+  Per-path fallback to UDP needs no release.
 
 When a NEW wire-gated feature first ships (not this one), set its floor to
 **exactly that release version** and freeze it, as described above.

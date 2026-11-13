@@ -181,8 +181,21 @@ fn run_why(ticks: u64, mut at: impl FnMut(u64) -> Reading) -> Option<(u64, Stall
 fn run_observed(
     ticks: u64,
     carries_data: bool,
-    mut at: impl FnMut(u64) -> Reading,
+    at: impl FnMut(u64) -> Reading,
 ) -> (Option<(u64, Stall)>, Vec<u64>) {
+    let (closed, snapshot) = run_observed_snapshot(ticks, carries_data, at);
+    (closed, snapshot.dark_episodes)
+}
+
+/// [`run_observed`], with the whole snapshot of the node's QUIC data counts.
+fn run_observed_snapshot(
+    ticks: u64,
+    carries_data: bool,
+    mut at: impl FnMut(u64) -> Reading,
+) -> (
+    Option<(u64, Stall)>,
+    crate::transport::metrics::QuicDataSnapshot,
+) {
     let counters: &'static crate::transport::metrics::QuicDataCounters =
         Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
     let record = Arc::default();
@@ -210,7 +223,24 @@ fn run_observed(
             .then(|| (tick, watch.stall().expect("a reason")))
     });
     drop(watch);
-    (closed, counters.snapshot(true).dark_episodes)
+    (closed, counters.snapshot(true))
+}
+
+/// A dark episode on a path that carries data is counted in the carried
+/// family as well, by the same decision; one on a path that carries none is
+/// not. Both a closed episode and one that recovered.
+#[test]
+fn a_dark_episode_on_a_data_path_is_also_counted_as_carried() {
+    let spell = |t: u64| reading(5, 1200, 10 + t.min(15), 100 + t.saturating_sub(15));
+    let (_, shadow) = run_observed_snapshot(40, false, spell);
+    assert_eq!(shadow.dark_episodes, vec![0, 0, 0, 1, 0, 0, 0, 0]);
+    assert_eq!(shadow.carried_dark_episodes, vec![0; 8]);
+    let (_, data) = run_observed_snapshot(40, true, spell);
+    assert_eq!(data.dark_episodes, vec![0, 0, 0, 0, 0, 0, 0, 1]);
+    assert_eq!(data.carried_dark_episodes, data.dark_episodes);
+    let short = |t: u64| reading(5, 1200, 10 + t.min(2), 100 + t.saturating_sub(2));
+    let (_, data) = run_observed_snapshot(10, true, short);
+    assert_eq!(data.carried_dark_episodes, vec![1, 0, 0, 0, 0, 0, 0, 0]);
 }
 
 /// A dark spell of 30 s (sends from tick 1, the peer heard from again at tick

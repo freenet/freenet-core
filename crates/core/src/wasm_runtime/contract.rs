@@ -1,11 +1,13 @@
 use super::engine::{WasmEngine, WasmError};
+use super::guest_mem::{ContractResultKind, contract_result_payload};
 use super::native_api::CONTRACT_IO;
 use super::runtime::RunningInstance;
 use super::{ContractExecError, RuntimeResult};
+use freenet_stdlib::memory::WasmLinearMem;
 use freenet_stdlib::prelude::{
-    CodeHash, ContractContainer, ContractInstanceId, ContractInterfaceResult, ContractKey,
-    Parameters, RelatedContracts, StateDelta, StateSummary, UpdateData, UpdateModification,
-    ValidateResult, WrappedState,
+    CodeHash, ContractContainer, ContractError as StdContractError, ContractInstanceId,
+    ContractKey, Parameters, RelatedContracts, StateDelta, StateSummary, UpdateData,
+    UpdateModification, ValidateResult, WrappedState,
 };
 
 /// Maximum buffer size for streaming refill pattern.
@@ -114,6 +116,30 @@ impl Drop for ContractIoGuard {
     }
 }
 
+/// Decode the result a contract export returned.
+///
+/// `result` is the guest-supplied offset of a `{ptr, kind, size}` descriptor.
+/// The descriptor location, its `kind` (which must be the one for the export
+/// that returned it) and the payload range are all checked against
+/// `linear_mem` before any byte is read, so a module returning garbage gets a
+/// `ContractExecError::InvalidGuestMemory` instead of crashing the host. This
+/// replaces stdlib's `ContractInterfaceResult::from_raw` + `unwrap_*`, which
+/// read unchecked offsets and panic on an unexpected kind; `decode` performs
+/// the same bincode decoding those functions do.
+fn decode_contract_result<T>(
+    linear_mem: &WasmLinearMem,
+    result: i64,
+    kind: ContractResultKind,
+    decode: impl FnOnce(&[u8]) -> Result<T, StdContractError>,
+) -> RuntimeResult<T> {
+    // SAFETY: the caller fetched `linear_mem` after the guest call returned,
+    // so it describes the live memory, and no guest code runs while `payload`
+    // is borrowed (it is dropped before this function returns).
+    let payload = unsafe { contract_result_payload(linear_mem, result, kind) }
+        .map_err(ContractExecError::from)?;
+    decode(payload).map_err(|e| ContractExecError::from(e).into())
+}
+
 impl super::Runtime {
     /// Shared body of `validate_state`, parameterized over the already-running
     /// WASM instance (obtained by the caller via either `prepare_contract_call`
@@ -129,8 +155,6 @@ impl super::Runtime {
         let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<ValidateResult> {
-            let linear_mem = self.linear_mem(&running.handle)?;
-
             let param_buf_ptr =
                 self.write_contract_buf(&running, parameters.as_ref(), STREAMING_BUF_CAP)?;
             let state_buf_ptr =
@@ -147,14 +171,18 @@ impl super::Runtime {
             );
             let result = classify_result(result)?;
 
-            // SAFETY: `result` is the return value from the WASM `validate_state` call and
-            // `linear_mem` points to the instance's live linear memory, so `from_raw`
-            // reads a valid, in-bounds result descriptor.
-            let is_valid = unsafe {
-                ContractInterfaceResult::from_raw(result, &linear_mem)
-                    .unwrap_validate_state_res(linear_mem)
-                    .map_err(Into::<ContractExecError>::into)?
-            };
+            // Fetched after the call: the guest may have grown, and so moved,
+            // its linear memory.
+            let linear_mem = self.linear_mem(&running.handle)?;
+            let is_valid = decode_contract_result(
+                &linear_mem,
+                result,
+                ContractResultKind::ValidateState,
+                |bytes| {
+                    bincode::deserialize::<Result<ValidateResult, StdContractError>>(bytes)
+                        .map_err(|e| StdContractError::Other(format!("{e}")))?
+                },
+            )?;
             Ok(is_valid)
         })();
 
@@ -213,8 +241,6 @@ impl ContractRuntimeInterface for super::Runtime {
         let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<UpdateModification<'static>> {
-            let linear_mem = self.linear_mem(&running.handle)?;
-
             let param_buf_ptr =
                 self.write_contract_buf(&running, parameters.as_ref(), STREAMING_BUF_CAP)?;
             let state_buf_ptr =
@@ -231,14 +257,19 @@ impl ContractRuntimeInterface for super::Runtime {
             );
             let result = classify_result(result)?;
 
-            // SAFETY: `result` is the return value from the WASM `update_state` call and
-            // `linear_mem` points to the instance's live linear memory, so `from_raw`
-            // reads a valid, in-bounds result descriptor.
-            let update_res = unsafe {
-                ContractInterfaceResult::from_raw(result, &linear_mem)
-                    .unwrap_update_state(linear_mem)
-                    .map_err(Into::<ContractExecError>::into)?
-            };
+            // Fetched after the call: the guest may have grown, and so moved,
+            // its linear memory.
+            let linear_mem = self.linear_mem(&running.handle)?;
+            let update_res = decode_contract_result(
+                &linear_mem,
+                result,
+                ContractResultKind::UpdateState,
+                |bytes| {
+                    bincode::deserialize::<Result<UpdateModification<'_>, StdContractError>>(bytes)
+                        .map_err(|e| StdContractError::Other(format!("{e}")))?
+                        .map(|r| r.into_owned())
+                },
+            )?;
             Ok(update_res)
         })();
 
@@ -257,8 +288,6 @@ impl ContractRuntimeInterface for super::Runtime {
         let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<StateSummary<'static>> {
-            let linear_mem = self.linear_mem(&running.handle)?;
-
             let param_buf_ptr =
                 self.write_contract_buf(&running, parameters.as_ref(), STREAMING_BUF_CAP)?;
             let state_buf_ptr =
@@ -272,14 +301,19 @@ impl ContractRuntimeInterface for super::Runtime {
             );
             let result = classify_result(result)?;
 
-            // SAFETY: `result` is the return value from the WASM `summarize_state` call and
-            // `linear_mem` points to the instance's live linear memory, so `from_raw`
-            // reads a valid, in-bounds result descriptor.
-            let summary = unsafe {
-                ContractInterfaceResult::from_raw(result, &linear_mem)
-                    .unwrap_summarize_state(linear_mem)
-                    .map_err(Into::<ContractExecError>::into)?
-            };
+            // Fetched after the call: the guest may have grown, and so moved,
+            // its linear memory.
+            let linear_mem = self.linear_mem(&running.handle)?;
+            let summary = decode_contract_result(
+                &linear_mem,
+                result,
+                ContractResultKind::SummarizeState,
+                |bytes| {
+                    bincode::deserialize::<Result<StateSummary<'_>, StdContractError>>(bytes)
+                        .map_err(|e| StdContractError::Other(format!("{e}")))?
+                        .map(|s| StateSummary::from(s.into_bytes()))
+                },
+            )?;
             Ok(summary)
         })();
 
@@ -299,8 +333,6 @@ impl ContractRuntimeInterface for super::Runtime {
         let _io_guard = ContractIoGuard::new(running.id);
 
         let result = (|| -> RuntimeResult<StateDelta<'static>> {
-            let linear_mem = self.linear_mem(&running.handle)?;
-
             let param_buf_ptr =
                 self.write_contract_buf(&running, parameters.as_ref(), STREAMING_BUF_CAP)?;
             let state_buf_ptr =
@@ -317,14 +349,19 @@ impl ContractRuntimeInterface for super::Runtime {
             );
             let result = classify_result(result)?;
 
-            // SAFETY: `result` is the return value from the WASM `get_state_delta` call and
-            // `linear_mem` points to the instance's live linear memory, so `from_raw`
-            // reads a valid, in-bounds result descriptor.
-            let delta = unsafe {
-                ContractInterfaceResult::from_raw(result, &linear_mem)
-                    .unwrap_get_state_delta(linear_mem)
-                    .map_err(Into::<ContractExecError>::into)?
-            };
+            // Fetched after the call: the guest may have grown, and so moved,
+            // its linear memory.
+            let linear_mem = self.linear_mem(&running.handle)?;
+            let delta = decode_contract_result(
+                &linear_mem,
+                result,
+                ContractResultKind::StateDelta,
+                |bytes| {
+                    bincode::deserialize::<Result<StateDelta<'_>, StdContractError>>(bytes)
+                        .map_err(|e| StdContractError::Other(format!("{e}")))?
+                        .map(|d| StateDelta::from(d.into_bytes()))
+                },
+            )?;
             Ok(delta)
         })();
 

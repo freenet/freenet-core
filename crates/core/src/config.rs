@@ -363,7 +363,7 @@ impl Default for ConfigArgs {
                 ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
-                transport_quic: None,      // Default: shadow on Linux, macOS and Windows
+                transport_quic: None,      // Default: prefer on Linux, macOS and Windows
                 quic_max_paths: None,      // Default: the node's connection limit
                 quic_data_percent: None,   // Default: this release's share of pairs
                 quic_ignore_crash_breaker: None,
@@ -2588,13 +2588,14 @@ pub struct NetworkArgs {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`. Unset means
-    /// `shadow` on Linux, macOS and Windows, and `off` elsewhere.
+    /// `prefer` on Linux, macOS and Windows, and `off` elsewhere.
     ///
     /// `shadow` builds a QUIC endpoint on the network port and upgrades
     /// connections to peers that also run it to a QUIC path. The path carries
     /// control frames only, so all traffic stays on the existing transport.
     /// `prefer` also negotiates data with a share of pairs (`quic-data-percent`,
-    /// or this release's share, which is 0), and a pair where both sides did
+    /// or this release's share: its data ramp, or 0 when it has none), and a
+    /// pair where both sides did
     /// sends its traffic on the path. `off` builds no endpoint. An unknown value is treated as `off`,
     /// with a warning in the log.
     #[arg(long, env = "FREENET_TRANSPORT_QUIC", value_name = "off|shadow|prefer")]
@@ -2974,7 +2975,7 @@ pub struct NetworkApiConfig {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`; unset reads as
-    /// `QuicMode::default_mode` (shadow on Linux, macOS and Windows). Kept as written, so a value from a later release
+    /// `QuicMode::default_mode` (prefer on Linux, macOS and Windows). Kept as written, so a value from a later release
     /// round-trips; see [`Self::quic_settings`] for how it is read.
     #[serde(
         default,
@@ -7692,21 +7693,21 @@ shutdown-drain-secs = 42
         assert_seeded_values_bound(&cfg);
     }
 
-    /// An unset `transport-quic` is shadow on Linux, macOS and Windows; Windows
+    /// An unset `transport-quic` is prefer on Linux, macOS and Windows; Windows
     /// joined once its crash-loop breaker was confirmed on a real Windows
     /// machine (#6031). The lib tests do not compile on Windows, so
     /// `tests/quic_breaker_windows.rs` pins the Windows half through the real
     /// binary. The default is not written into the config, so a default-off
     /// release turns QUIC off on every node that did not set the key.
     #[test]
-    fn quic_is_shadow_by_default_on_linux_macos_and_windows() {
+    fn quic_is_prefer_by_default_on_linux_macos_and_windows() {
         use crate::transport::quic::QuicMode;
         let expected = if cfg!(any(
             target_os = "linux",
             target_os = "macos",
             target_os = "windows"
         )) {
-            QuicMode::Shadow
+            QuicMode::Prefer
         } else {
             QuicMode::Off
         };

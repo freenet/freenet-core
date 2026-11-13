@@ -3132,6 +3132,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_close_sent_session_ended),
             );
             m.insert(
+                "quic_close_sent_recycle_for_data".into(),
+                serde_json::json!(snapshot.quic_close_sent_recycle_for_data),
+            );
+            m.insert(
                 "quic_close_sent_over_budget".into(),
                 serde_json::json!(snapshot.quic_close_sent_over_budget),
             );
@@ -3158,6 +3162,12 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 }
                 for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_fallback) {
                     m.insert(format!("quic_fallback_{}", cause.label()), count.into());
+                }
+                for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_carried_fallback) {
+                    m.insert(
+                        format!("quic_carried_fallback_{}", cause.label()),
+                        count.into(),
+                    );
                 }
                 for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_churned_fallback) {
                     m.insert(
@@ -7796,6 +7806,7 @@ mod tests {
         expected.insert("type".to_string());
         // The QUIC data gauge goes out in every snapshot, 0 included.
         expected.insert("quic_live_data_paths".to_string());
+        expected.insert("quic_ramp_share_pct".to_string());
         // The QUIC families are arrays in the snapshot and one key per label in
         // the event.
         use crate::transport::metrics::{
@@ -7806,6 +7817,7 @@ mod tests {
             "quic_upgrade",
             "quic_fallback",
             "quic_churned_fallback",
+            "quic_carried_fallback",
             "quic_path_age_at_close",
         ] {
             assert!(expected.remove(family), "{family} is in the snapshot");
@@ -7831,6 +7843,11 @@ mod tests {
             QuicFallback::ALL
                 .iter()
                 .map(|cause| format!("quic_churned_fallback_{}", cause.label())),
+        );
+        expected.extend(
+            QuicFallback::ALL
+                .iter()
+                .map(|cause| format!("quic_carried_fallback_{}", cause.label())),
         );
         expected.extend(
             QuicPathAge::ALL
@@ -7902,10 +7919,17 @@ mod tests {
         data.staged_peak_pct = 1049;
         data.gate_loss = (1050..1056).collect();
         data.gate_ended_queue = (1056..1059).collect();
-        data.dark_episodes = (1059..1067).collect();
-        data.ack_wait_expired = (1067..1070).collect();
-        data.stall_closes = (1070..1075).collect();
-        data.stall_would_close = (1075..1080).collect();
+        data.carrying_sent_packets = 1059;
+        data.carrying_lost_packets = 1060;
+        data.carrying_loss_rate = (1061..1069).collect();
+        data.carrying_ended_loss_rate = (1069..1077).collect();
+        data.carrying_ended_below_floor = 1077;
+        data.dark_episodes = (1078..1086).collect();
+        data.carried_dark_episodes = (1087..1095).collect();
+        data.ramp_share_pct = 1086;
+        data.ack_wait_expired = (1095..1098).collect();
+        data.stall_closes = (1098..1103).collect();
+        data.stall_would_close = (1103..1108).collect();
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));
@@ -8174,6 +8198,7 @@ mod tests {
             quic_close_sent_over_budget: 11,
             quic_close_sent_version_incompatible: 12,
             quic_close_sent_hello_refused: 13,
+            quic_close_sent_recycle_for_data: 14,
             quic_breaker_trips: 7,
             quic_send_refused: 9,
             quic_breaker_suppressed: true,
@@ -8196,6 +8221,7 @@ mod tests {
             ("quic_close_sent_over_budget", 11),
             ("quic_close_sent_version_incompatible", 12),
             ("quic_close_sent_hello_refused", 13),
+            ("quic_close_sent_recycle_for_data", 14),
             ("quic_breaker_trips", 7),
             ("quic_send_refused", 9),
         ] {
@@ -8228,6 +8254,7 @@ mod tests {
         fill(&mut snapshot.quic_upgrade);
         fill(&mut snapshot.quic_fallback);
         fill(&mut snapshot.quic_churned_fallback);
+        fill(&mut snapshot.quic_carried_fallback);
         fill(&mut snapshot.quic_path_age_at_close);
         snapshot.quic_establish_ms_p50 = Some(901);
         snapshot.quic_establish_ms_p90 = Some(902);
@@ -8251,6 +8278,9 @@ mod tests {
         for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_fallback) {
             expected.push((format!("quic_fallback_{}", cause.label()), count));
         }
+        for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_carried_fallback) {
+            expected.push((format!("quic_carried_fallback_{}", cause.label()), count));
+        }
         for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_churned_fallback) {
             expected.push((format!("quic_churned_fallback_{}", cause.label()), count));
         }
@@ -8272,7 +8302,7 @@ mod tests {
             QuicCloseCode::COUNT
                 + 1
                 + QuicUpgradeOutcome::COUNT
-                + 2 * QuicFallback::COUNT
+                + 3 * QuicFallback::COUNT
                 + QuicPathAge::COUNT
                 + 6
         );

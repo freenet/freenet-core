@@ -17,8 +17,8 @@
 //! [`CONTROL_LEN`] (10) bytes, exactly. `attempt` is the `attempt` of the
 //! `UpgradeControl` Offer this connection was made for, so a frame from an
 //! earlier attempt can be told apart. `caps` carries what the sender
-//! supports on this path. [`caps::DATA`] is the only bit: a path carries data
-//! only if both sides set it (`upgrade::machine`).
+//! supports on this path: [`caps::DATA`] (a path carries data only if both
+//! sides set it) and [`caps::RECYCLES`] (`upgrade::machine`).
 //!
 //! Compatibility rules:
 //! - Unknown caps bits are ignored: [`QuicControl::decode`] clears every bit
@@ -55,8 +55,16 @@ pub(crate) mod caps {
     /// share of pairs (`upgrade::slice`). A node before this bit clears it on
     /// decode and sends 0, so the pair stays in shadow.
     pub(crate) const DATA: u32 = 1;
+    /// The sender takes a `RECYCLE_FOR_DATA` close as no fault
+    /// (`upgrade::machine::UpgradeMachine::recheck_data`), so a path to it may be
+    /// recycled when this node's data bit comes on. Set only by a data-capable
+    /// node (`prefer` with any share but one fixed at 0,
+    /// `upgrade::policy::QuicPolicy::own_caps`); a shadow or off node, or one at
+    /// a share fixed at 0, withholds it. A node before the bit clears it on
+    /// decode, and a path to it is never recycled.
+    pub(crate) const RECYCLES: u32 = 2;
     /// Every bit this node knows.
-    pub(crate) const KNOWN: u32 = DATA;
+    pub(crate) const KNOWN: u32 = DATA | RECYCLES;
 }
 
 /// A control message on a QUIC path.
@@ -202,6 +210,27 @@ mod tests {
             [1, 0, 0, 0, 0, 7, 0, 0, 0, 1],
             "the data bit is the low bit of the field"
         );
+        // RECYCLES is the next bit, with or without the data bit, in either frame.
+        for (control, last) in [
+            (
+                QuicControl::Ready {
+                    attempt: 7,
+                    caps: caps::RECYCLES,
+                },
+                2,
+            ),
+            (
+                QuicControl::ReadyAck {
+                    attempt: 7,
+                    caps: caps::DATA | caps::RECYCLES,
+                },
+                3,
+            ),
+        ] {
+            let bytes = control.encode();
+            assert_eq!(bytes[9], last, "{control:?}");
+            assert_eq!(QuicControl::decode(&bytes), Ok(control));
+        }
         const { assert!(CONTROL_LEN as u64 <= MAX_CONTROL_BYTES) };
     }
 
@@ -210,11 +239,12 @@ mod tests {
     #[test]
     fn unknown_caps_bits_are_ignored() {
         for (kind, raw_caps, kept) in [
-            (0u8, u32::MAX, caps::DATA),
+            (0u8, u32::MAX, caps::KNOWN),
             (1, 0x8000_0001, caps::DATA),
             (0, 1, caps::DATA),
             (1, 0x8000_0000, 0),
-            (0, 2, 0),
+            (0, 2, caps::RECYCLES),
+            (0, 4, 0),
             (1, 0, 0),
         ] {
             let mut bytes = [1, kind, 0, 0, 0, 9, 0, 0, 0, 0];

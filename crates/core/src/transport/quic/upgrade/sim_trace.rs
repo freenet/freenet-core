@@ -47,6 +47,11 @@ struct TraceData {
     connections: Mutex<BTreeMap<SocketAddr, usize>>,
     /// Nodes that receive an extra Initial each time they allow a peer.
     initial_on_attempt: Mutex<BTreeSet<SocketAddr>>,
+    /// A data ramp start of the test's own, in seconds on the virtual clock;
+    /// negative for one before the run began.
+    ramp_start: Mutex<Option<i64>>,
+    /// Nodes that run the release's own share instead ([`QuicUpgradeTrace::run_without_ramp`]).
+    no_ramp: Mutex<BTreeSet<SocketAddr>>,
     /// Nodes that build their paths to refuse data while they advertise the bit.
     refuse_data: Mutex<BTreeSet<SocketAddr>>,
     /// The version a peer reports, and the release it then reads as.
@@ -120,6 +125,23 @@ impl QuicUpgradeTrace {
     /// so the Initial gets there before anything the peer sends.
     pub fn send_initial_on_each_attempt(&self, node: SocketAddr) {
         self.data.initial_on_attempt.lock().insert(node);
+    }
+
+    /// Every node with no `quic-data-percent` ramps its data share
+    /// (`slice::ramp_percent`) from a start `ago` before the run began (zero:
+    /// from the run's start), in place of the release's
+    /// `QUIC_DATA_RAMP_START`, so a short run can cover any part of the ramp
+    /// on the real curve.
+    pub fn ramp_data_started_before(&self, ago: Duration) {
+        *self.data.ramp_start.lock() = Some(-i64::try_from(ago.as_secs()).unwrap_or(i64::MAX));
+    }
+
+    /// `node` takes no ramp from [`Self::ramp_data_started_before`]: it runs the
+    /// share this build gives with no ramp (`QUIC_DATA_RAMP_START = None`, so
+    /// the fixed `QUIC_DATA_PERCENT`), as a node on the emergency-stop release
+    /// does.
+    pub fn run_without_ramp(&self, node: SocketAddr) {
+        self.data.no_ramp.lock().insert(node);
     }
 
     /// `node` advertises its data bit but builds every path to refuse data, as a
@@ -218,6 +240,13 @@ impl NodeTrace {
         if crate::transport::in_memory_socket::deliver_packet_at(self.addr, datagram, source) {
             self.record(source, 0, "injected an Initial".to_string());
         }
+    }
+
+    pub(crate) fn data_ramp_start(&self) -> Option<i64> {
+        if self.trace.data.no_ramp.lock().contains(&self.addr) {
+            return None;
+        }
+        *self.trace.data.ramp_start.lock()
     }
 
     pub(crate) fn refuses_data_while_advertising(&self) -> bool {

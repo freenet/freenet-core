@@ -1651,7 +1651,24 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
         .build()
         .unwrap();
 
-    rt.block_on(async move {
+    // The node runs on a worker thread, never on the main thread. `block_on`
+    // polls its future on the calling thread, and the main thread's stack is
+    // fixed by the platform: 1 MiB on Windows, against 2 MiB for every thread
+    // std spawns. Polled there, the node's nested startup futures used most of
+    // it (about 900 KiB measured in a Linux debug build at the first event
+    // loop turn), within a few KiB of the Windows limit: a branch that grew
+    // those frames slightly overflowed at startup on Windows. A spawned task
+    // is polled by a worker, so the main thread only waits on the join
+    // handle. `tests/main_thread_stack.rs` pins it by starting the node with
+    // a small main-thread stack and workers at their production size.
+    //
+    // The root future is now an ordinary task on a worker, so synchronous
+    // work on its path (config build, logger setup, node construction) holds
+    // a worker while it runs. With `worker_threads` set to the CPU count, a
+    // 1-vCPU host has one worker, so a long blocking call here would stall
+    // the whole runtime. Nothing on that path blocks for long today; anything
+    // added that does belongs in `spawn_blocking`.
+    let node = rt.spawn(async move {
         let config = config_args.build().await?;
         freenet::config::set_logger(None, None, config.paths().log_dir());
         // Same reason as the info! below: `ConfigArgs::build()` resolves the
@@ -1672,7 +1689,14 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
         // installed — operators with a custom `UMask=` see the change.
         log_umask_override();
         run(config).await
-    })?;
+    });
+    match rt.block_on(node) {
+        Ok(result) => result?,
+        // A panic in the node keeps unwinding from `main`, as it did when the
+        // node ran on this thread.
+        Err(join) if join.is_panic() => std::panic::resume_unwind(join.into_panic()),
+        Err(join) => return Err(anyhow::anyhow!("the node task was cancelled: {join}")),
+    }
 
     Ok(())
 }

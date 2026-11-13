@@ -801,15 +801,22 @@ pub(super) static CONTRACT_IO: LazyLock<DashMap<(InstanceId, i64), PendingContra
 ///
 /// Called by the contract's `StreamingBuffer::read` when the buffer is exhausted.
 /// Returns the number of bytes written into the buffer, or 0 for EOF.
-pub(super) fn fill_buffer_impl(instance_id: InstanceId, buf_ptr_offset: i64) -> u32 {
+///
+/// The builder's fields live in guest memory and the guest may have rewritten
+/// them since the host created the buffer, so they are re-checked against
+/// linear memory on every call. A builder that no longer describes guest-owned
+/// memory is an error, which the caller turns into a trap.
+pub(super) fn fill_buffer_impl(
+    instance_id: InstanceId,
+    buf_ptr_offset: i64,
+) -> Result<u32, super::guest_mem::GuestMemoryError> {
     use freenet_stdlib::memory::WasmLinearMem;
-    use freenet_stdlib::memory::buf::{BufferBuilder, compute_ptr};
 
     let Some(mut pending) = CONTRACT_IO.get_mut(&(instance_id, buf_ptr_offset)) else {
-        return 0; // No pending data — all data fit in the initial buffer
+        return Ok(0); // No pending data — all data fit in the initial buffer
     };
     if pending.cursor >= pending.data.len() {
-        return 0; // EOF
+        return Ok(0); // EOF
     }
     let Some(info) = MEM_ADDR.get(&instance_id) else {
         // This is a programming error: refresh_mem_addr_from_caller should always
@@ -825,35 +832,33 @@ pub(super) fn fill_buffer_impl(instance_id: InstanceId, buf_ptr_offset: i64) -> 
     let linear_mem =
         unsafe { WasmLinearMem::new(info.start_ptr as *const u8, info.mem_size as u64) };
 
-    // Get the BufferBuilder in WASM memory
-    let builder_ptr = compute_ptr(buf_ptr_offset as *mut BufferBuilder, &linear_mem);
-    // SAFETY: `builder_ptr` was computed from the WASM-side buffer offset and the
-    // validated linear memory base. The buffer was allocated by `initiate_buffer`.
-    let builder = unsafe { &mut *builder_ptr };
-    let capacity = builder.capacity();
+    let builder = super::guest_mem::check_buffer_builder(&linear_mem, buf_ptr_offset)?;
+    let base = linear_mem.start_ptr as *mut u8;
 
-    // SAFETY: The read/write pointers and data buffer are within the WASM linear
-    // memory region validated above. We reset them to 0 and write the next chunk.
+    let remaining = &pending.data[pending.cursor..];
+    let chunk_size = remaining.len().min(builder.capacity as usize);
+    // SAFETY: `check_buffer_builder` verified that both position counters
+    // (4 bytes each, 4-aligned) and the data region `[start, start + capacity)`
+    // lie inside the live linear memory described by `linear_mem`, and that
+    // they are disjoint from each other and from `remaining` (a host `Vec`).
+    // `chunk_size <= capacity`. No guest code runs during this host call.
     unsafe {
-        // Reset read/write pointers to 0
-        let read_ptr = compute_ptr(builder.last_read_ptr(), &linear_mem);
-        let write_ptr = compute_ptr(builder.last_write_ptr(), &linear_mem);
-        *read_ptr = 0;
-        *write_ptr = 0;
-
-        // Copy next chunk from pending data into the buffer
-        let remaining = &pending.data[pending.cursor..];
-        let chunk_size = remaining.len().min(capacity);
-        let buf_data_ptr = compute_ptr(builder.start(), &linear_mem);
-        std::ptr::copy_nonoverlapping(remaining.as_ptr(), buf_data_ptr, chunk_size);
-
-        // Update write pointer to reflect bytes written
-        let write_ptr = compute_ptr(builder.last_write_ptr(), &linear_mem);
-        *write_ptr = chunk_size as u32;
-
-        pending.cursor += chunk_size;
-        chunk_size as u32
+        // Reset the read position, write the next chunk, and record its length.
+        base.add(builder.last_read as usize)
+            .cast::<u32>()
+            .write_unaligned(0u32.to_le());
+        std::ptr::copy_nonoverlapping(
+            remaining.as_ptr(),
+            base.add(builder.start as usize),
+            chunk_size,
+        );
+        base.add(builder.last_write as usize)
+            .cast::<u32>()
+            .write_unaligned((chunk_size as u32).to_le());
     }
+
+    pending.cursor += chunk_size;
+    Ok(chunk_size as u32)
 }
 
 /// Error codes returned by host functions.
@@ -1655,6 +1660,22 @@ fn validate_and_compute_ptr<T>(
 pub(super) mod log {
     use super::*;
 
+    /// Render at most `MAX_GUEST_ERROR_TEXT_BYTES` of a guest log line. `bytes`
+    /// is the prefix already cut to that bound; `full_len` is the length the
+    /// guest asked to log.
+    pub(super) fn guest_log_message(bytes: &[u8], full_len: usize) -> String {
+        let mut msg = String::from_utf8_lossy(bytes).into_owned();
+        if full_len > bytes.len() {
+            // The cut may split a multi-byte char, which lossy decoding turns
+            // into U+FFFD; drop that trailing artefact.
+            while msg.ends_with('\u{FFFD}') {
+                msg.pop();
+            }
+            msg.push_str(&format!("... [truncated, {full_len} bytes total]"));
+        }
+        msg
+    }
+
     // TODO: this API right now is just a patch, ideally we want to impl a tracing subscriber
     // that can be used in wasm and that under the hood will just pass data to the host via
     // functions like this in a structured way
@@ -1670,12 +1691,17 @@ pub(super) mod log {
             tracing::error!("Memory bounds violation in freenet_log::info");
             return;
         };
-        // SAFETY: `ptr` was validated by `validate_and_compute_ptr` to be within the
-        // WASM linear memory bounds. The bytes come from an untrusted WASM contract and
-        // may not be valid UTF-8, so we use from_utf8_lossy which replaces invalid byte
+        // Only a bounded prefix is read: the guest picks `len`, and logging all
+        // of it lets one call write up to the whole linear memory to the logs.
+        let full_len = len as usize;
+        let take = full_len.min(super::super::error::MAX_GUEST_ERROR_TEXT_BYTES);
+        // SAFETY: `ptr` was validated by `validate_and_compute_ptr` to cover
+        // `len` bytes of WASM linear memory, and `take <= len`. The bytes come
+        // from an untrusted WASM contract and may not be valid UTF-8, so
+        // `guest_log_message` uses from_utf8_lossy, which replaces invalid byte
         // sequences with U+FFFD rather than invoking undefined behavior.
-        let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-        let msg = String::from_utf8_lossy(bytes);
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, take) };
+        let msg = guest_log_message(bytes, full_len);
         tracing::info!(target: "contract", contract = %info.value().key(), "{msg}");
     }
 }
@@ -3573,5 +3599,23 @@ mod secret_read_memo_tests {
             "the shared-borrow form must appear; if it does not, the search is \
              wrong and the assertion above proves nothing"
         );
+    }
+}
+
+#[cfg(test)]
+mod guest_log_tests {
+    use super::log::guest_log_message;
+
+    #[test]
+    fn short_log_line_is_unchanged() {
+        assert_eq!(guest_log_message(b"hello", 5), "hello");
+    }
+
+    #[test]
+    fn oversize_log_line_is_truncated_with_marker() {
+        let big = vec![b'a'; 1024];
+        let out = guest_log_message(&big, 80_000_000);
+        assert!(out.len() < 1100);
+        assert!(out.ends_with("[truncated, 80000000 bytes total]"));
     }
 }

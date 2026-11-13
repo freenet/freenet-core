@@ -42,6 +42,56 @@ struct Paths {
     b_in: QuicInbound,
 }
 
+/// Does nothing: it exists so a test body that names one field captures the
+/// whole value. Without it, an `async move` block naming only some fields
+/// (Rust 2021 disjoint capture) drops `pair` when the block is built, and
+/// `Pair`'s drop stops the socket pumps: nothing more is delivered (#6211).
+/// A test that takes the paths apart calls [`Paths::into_parts`].
+impl Drop for Paths {
+    fn drop(&mut self) {}
+}
+
+/// [`Paths`]' fields, for a test that drops some of them early.
+struct PathsParts {
+    pair: Pair,
+    a: Arc<QuicPath>,
+    b: Arc<QuicPath>,
+    b_in: QuicInbound,
+}
+
+impl Paths {
+    /// Move the fields out. `Paths` has a `Drop`, so they cannot be moved
+    /// out by a pattern; its `Drop` is empty, so not running it loses
+    /// nothing. `a_in` is dropped here; `net` is `Copy`.
+    fn into_parts(self) -> PathsParts {
+        let p = std::mem::ManuallyDrop::new(self);
+        // Names every field, with no `..`: a field added to `Paths` is a
+        // compile error here until it is read below, so none is leaked.
+        let Paths {
+            pair: _,
+            net: _,
+            a: _,
+            b: _,
+            a_in: _,
+            b_in: _,
+        } = &*p;
+        // SAFETY: `p` is never dropped or used again, and each field is read
+        // exactly once, so every value has exactly one owner afterwards. The
+        // pattern above lists every field, so a field this does not read
+        // cannot be added without a compile error (`net` is `Copy` and needs
+        // no read).
+        unsafe {
+            drop(std::ptr::read(&p.a_in));
+            PathsParts {
+                pair: std::ptr::read(&p.pair),
+                a: std::ptr::read(&p.a),
+                b: std::ptr::read(&p.b),
+                b_in: std::ptr::read(&p.b_in),
+            }
+        }
+    }
+}
+
 impl Paths {
     fn time(&self) -> VirtualTime {
         self.pair.time.clone()
@@ -78,7 +128,16 @@ async fn paths_with(
     b_limits: QuicPathLimits,
     b_budget: Option<SharedInboundBudget>,
 ) -> Paths {
-    paths_built(network, b_limits, b_budget, None, Windows::default(), true).await
+    paths_built(
+        network,
+        b_limits,
+        QuicPathLimits::DEFAULT,
+        b_budget,
+        None,
+        Windows::default(),
+        true,
+    )
+    .await
 }
 
 /// The buffer budgets a test's paths take their windows from, if any
@@ -92,13 +151,23 @@ struct Windows {
 
 /// [`paths`] with each side's path taking its windows from a buffer budget.
 async fn paths_metered(network: &str, windows: Windows) -> Paths {
-    paths_built(network, QuicPathLimits::DEFAULT, None, None, windows, true).await
+    paths_built(
+        network,
+        QuicPathLimits::DEFAULT,
+        QuicPathLimits::DEFAULT,
+        None,
+        None,
+        windows,
+        true,
+    )
+    .await
 }
 
 /// [`paths`] with an egress cap of `a_cap` bytes per second on `a`'s socket.
 async fn paths_capped(network: &str, a_cap: u64) -> Paths {
     paths_built(
         network,
+        QuicPathLimits::DEFAULT,
         QuicPathLimits::DEFAULT,
         None,
         Some(a_cap),
@@ -115,6 +184,7 @@ async fn paths_without_loss_gate(network: &str) -> Paths {
     paths_built(
         network,
         QuicPathLimits::DEFAULT,
+        QuicPathLimits::DEFAULT,
         None,
         None,
         Windows::default(),
@@ -126,6 +196,7 @@ async fn paths_without_loss_gate(network: &str) -> Paths {
 async fn paths_built(
     network: &str,
     b_limits: QuicPathLimits,
+    a_base: QuicPathLimits,
     b_budget: Option<SharedInboundBudget>,
     a_cap: Option<u64>,
     windows: Windows,
@@ -163,7 +234,7 @@ async fn paths_built(
         counters: b_limits.counters,
         watch_closes: b_limits.watch_closes,
         short_ack_wait: b_limits.short_ack_wait,
-        ..QuicPathLimits::DEFAULT
+        ..a_base
     };
     let own =
         |limits: QuicPathLimits| SharedInboundBudget::new(limits.max_streams, limits.max_bytes);
@@ -2460,6 +2531,10 @@ fn a_second_trip_past_the_gap_cap_closes_the_path() {
         assert_eq!(stats.count(QuicInboundOutcome::TooManyRanges), 2);
         assert_eq!(stats.count(QuicInboundOutcome::ClosedTooManyRanges), 1);
         assert_eq!(
+            p.b.closed_for(),
+            Some(crate::transport::boundary::QuicPathEnd::PeerOverBudget)
+        );
+        assert_eq!(
             crate::transport::metrics::TRANSPORT_METRICS.quic_close_sent_to(from),
             vec![QuicCloseCode::OverBudget],
             "counted as quic_close_sent_over_budget"
@@ -3093,7 +3168,7 @@ fn readers_waiting_for_room_when_the_path_ends_are_counted() {
         let stats = p.b.stats_handle();
         assert_eq!(stats.count(QuicInboundOutcome::ShortAbandonedWaiting), 0);
         assert_eq!(stats.count(QuicInboundOutcome::StreamAbandonedWaiting), 0);
-        let Paths { pair, b, .. } = p;
+        let PathsParts { pair, b, .. } = p.into_parts();
         drop(b);
         drive(&pair.time, LIMIT, async move {
             time.sleep(Duration::from_secs(1)).await
@@ -3612,6 +3687,10 @@ fn a_panicking_receive_task_closes_the_connection() {
         assert_eq!(
             p.b.stats().count(QuicInboundOutcome::ReceiveTaskPanicked),
             1
+        );
+        assert_eq!(
+            p.b.closed_for(),
+            Some(crate::transport::boundary::QuicPathEnd::ReceiveTaskPanicked)
         );
     })
 }
@@ -6192,7 +6271,7 @@ fn a_reserved_control_frame_opens_ahead_of_data_at_a_full_limit() {
             "the control frame did not wait for a slot"
         );
         let mut announced = 0;
-        let mut b_in = p.b_in;
+        let mut b_in = p.into_parts().b_in;
         while b_in.streams.try_recv().is_ok() {
             announced += 1;
         }
@@ -6329,6 +6408,117 @@ fn streamed_sends_return_their_permits() {
             );
         }
         assert!(matches!(later, BoundedSend::Sent), "{later:?}");
+    })
+}
+
+/// A path whose data bit comes on after its watch started is counted as
+/// carrying from then on: its packets before the flip are only in the
+/// all-paths sums, those after it in the carrying sums too, and when it ends
+/// it is counted once in each family. Its peer never carried, so it is in the
+/// all-paths family only. The flag is the one the node sets for
+/// `quic_live_data_paths` (`QuicPath::count_as_data_path`).
+#[test]
+fn a_path_counts_as_carrying_from_when_its_data_comes_on() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-carrying-flip", limits).await;
+        let (a, time) = (p.a.clone(), p.time());
+        let (before, after) = p
+            .drive(async move {
+                a.send_short(&[1u8; 600]).await.expect("sent");
+                // After the first tick (2 s): what was sent so far is not carrying.
+                time.sleep(Duration::from_millis(2500)).await;
+                let before = counters.snapshot(false);
+                a.count_as_data_path();
+                a.send_short(&[2u8; 600]).await.expect("sent");
+                time.sleep(Duration::from_secs(2)).await;
+                (before, counters.snapshot(false))
+            })
+            .await;
+        assert!(before.sent_packets > 0);
+        assert_eq!(
+            before.carrying_sent_packets, 0,
+            "nothing carried before the flip"
+        );
+        assert!(after.carrying_sent_packets > 0, "the second short carried");
+        assert!(
+            after.carrying_sent_packets < after.sent_packets,
+            "the carrying sums are a subset: {} of {}",
+            after.carrying_sent_packets,
+            after.sent_packets
+        );
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        p.drive(async move {
+            a.connection().close(QuicCloseCode::Downgrade);
+            time.sleep(Duration::from_secs(5)).await;
+            drop(b);
+        })
+        .await;
+        let snap = counters.snapshot(false);
+        let ended = |rates: &[u64], below: u64| rates.iter().sum::<u64>() + below;
+        assert_eq!(ended(&snap.ended_loss_rate, snap.ended_below_floor), 2);
+        assert_eq!(
+            ended(
+                &snap.carrying_ended_loss_rate,
+                snap.carrying_ended_below_floor
+            ),
+            1,
+            "only a carried"
+        );
+    })
+}
+
+/// A data path whose attempt ends before the acknowledgement watch's first
+/// tick is still counted as carrying: the attempt takes it out of the gauge
+/// first (`end_as_data_path`, as `Attempt::drop` does), and the loss report's
+/// final reading, taken after, counts its packets and its end as carried.
+#[test]
+fn a_data_path_that_ends_before_its_first_tick_is_counted_as_carrying() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths("quic-path-carrying-end", limits).await;
+        let (a, b, time) = (p.a.clone(), p.b.clone(), p.time());
+        p.drive(async move {
+            a.count_as_data_path();
+            a.send_short(&[3u8; 600]).await.expect("sent");
+            // Inside the first 2 s tick: no report has read the path yet.
+            time.sleep(Duration::from_millis(500)).await;
+            a.end_as_data_path();
+            a.connection().close(QuicCloseCode::Downgrade);
+            time.sleep(Duration::from_secs(5)).await;
+            drop(b);
+        })
+        .await;
+        drop(p);
+        let snap = counters.snapshot(false);
+        assert!(snap.sent_packets > 0, "premise: the path sent");
+        assert!(
+            snap.carrying_sent_packets > 0,
+            "the final reading counted as carrying: {} of {}",
+            snap.carrying_sent_packets,
+            snap.sent_packets
+        );
+        let ended = |rates: &[u64], below: u64| rates.iter().sum::<u64>() + below;
+        assert_eq!(
+            ended(
+                &snap.carrying_ended_loss_rate,
+                snap.carrying_ended_below_floor
+            ),
+            1,
+            "the data path ended as a carried path"
+        );
     })
 }
 
@@ -6524,6 +6714,10 @@ fn refused_data_readers_stay_within_the_shadow_stream_grant() {
         );
         assert_eq!(stats.count(QuicInboundOutcome::ClosedRefusingData), 1);
         assert!(p.b.quinn_connection().close_reason().is_some());
+        assert_eq!(
+            p.b.closed_for(),
+            Some(crate::transport::boundary::QuicPathEnd::RefusedData)
+        );
     })
 }
 
@@ -8195,6 +8389,132 @@ fn a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect() {
     })
 }
 
+/// [`a_path_dark_mid_send_fails_within_two_windows_and_goes_suspect`] on a
+/// native sender's path ([`QuicPathLimits::NATIVE`]): the send fails the same
+/// way, but the path does not turn suspect, since a native connection has no
+/// UDP session to divert to; a dark one ends by its stall close.
+#[test]
+fn a_native_path_dark_mid_send_does_not_turn_suspect() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-native-dark";
+        let p = paths_built(
+            network,
+            QuicPathLimits::DEFAULT,
+            QuicPathLimits::NATIVE,
+            None,
+            None,
+            Windows::default(),
+            true,
+        )
+        .await;
+        let (a, time) = (p.a.clone(), p.time());
+        let body = over_window();
+        let fragments = body.len().div_ceil(FRAGMENT_PAYLOAD_SIZE);
+        let silencer = Arc::new(SilenceAfter {
+            network,
+            from: p.pair.b_addr,
+            after: fragments * 3 / 4,
+            sent: std::sync::atomic::AtomicUsize::new(0),
+            silenced: parking_lot::Mutex::new(None),
+        });
+        let watched = silencer.clone();
+        let deadlines = SendDeadlines::stream(body.len() as u64);
+        let outcome = p
+            .drive(async move {
+                a.send_stream_bounded(
+                    &time,
+                    deadlines,
+                    StreamId::next(),
+                    None,
+                    body,
+                    Some(&*watched),
+                )
+                .await
+            })
+            .await;
+        assert!(
+            matches!(outcome, BoundedSend::Failed(SendFailure::TimedOut)),
+            "{outcome:?}"
+        );
+        let step =
+            p.a.settle(SendKind::Stream, &outcome, false, p.time().now_nanos());
+        assert_eq!(step, NextStep::GiveUp);
+        assert!(!p.a.is_suspect(), "a native path never turns suspect");
+        drop(silencer.silenced.lock().take());
+    })
+}
+
+/// Every outcome that sends a message on UDP from an upgrade's path gives it up
+/// on a native path, and is counted as dropped there, never as sent on UDP; the
+/// outcomes that are done or given up anyway are the same on both.
+#[test]
+fn a_native_path_gives_up_what_an_upgrade_path_sends_on_udp() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let upgrade = paths("quic-path-fallback-upgrade", QuicPathLimits::DEFAULT).await;
+        let native = paths_built(
+            "quic-path-fallback-native",
+            QuicPathLimits::DEFAULT,
+            QuicPathLimits::NATIVE,
+            None,
+            None,
+            Windows::default(),
+            true,
+        )
+        .await;
+        let outcomes = || {
+            vec![
+                BoundedSend::Sent,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)),
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)),
+                BoundedSend::Failed(SendFailure::Error(stopped(stop_code::NOT_ACCEPTING_DATA))),
+                BoundedSend::Failed(SendFailure::Error(stopped(stop_code::BUDGET_REFUSED))),
+                BoundedSend::Failed(SendFailure::TimedOut),
+            ]
+        };
+        let mut udp_seen = 0;
+        for kind in SendKind::ALL {
+            for (on_upgrade, on_native) in outcomes().iter().zip(outcomes().iter()) {
+                let now = upgrade.time().now_nanos();
+                let up = upgrade.a.settle(kind, on_upgrade, false, now);
+                let nat = native.a.settle(kind, on_native, false, now);
+                match up {
+                    NextStep::SendOnUdp => {
+                        udp_seen += 1;
+                        assert_eq!(nat, NextStep::GiveUp, "{kind:?} {on_native:?}");
+                    }
+                    step @ (NextStep::Done | NextStep::GiveUp) => {
+                        assert_eq!(nat, step, "{kind:?} {on_native:?}")
+                    }
+                }
+            }
+        }
+        assert!(
+            udp_seen > 0,
+            "some outcome sends on UDP from an upgrade path"
+        );
+        for kind in SendKind::ALL {
+            for result in [QuicSendResult::NotOpenedUdp, QuicSendResult::FailedUdp] {
+                assert_eq!(native.a.stats().send_count(kind, result), 0, "{kind:?}");
+            }
+        }
+        let dropped: u64 = SendKind::ALL
+            .iter()
+            .map(|kind| native.a.stats().send_count(*kind, QuicSendResult::Dropped))
+            .sum();
+        let upgrade_dropped: u64 = SendKind::ALL
+            .iter()
+            .map(|kind| upgrade.a.stats().send_count(*kind, QuicSendResult::Dropped))
+            .sum();
+        assert_eq!(
+            dropped,
+            upgrade_dropped + udp_seen,
+            "each UDP fallback is a drop"
+        );
+    })
+}
+
 /// Other sends settling around a timeout do not cost it its quiet proof. An
 /// unrelated `Sent` settles at 8 s (4 s before the
 /// timeout), after the timed-out send's own acknowledgements, so the stall
@@ -9257,13 +9577,13 @@ fn a_closed_path_with_a_surviving_handle_leaves_the_budget() {
             std::mem::forget(send);
         })
         .await;
-        let Paths {
+        let PathsParts {
             pair,
             a,
             b,
             mut b_in,
             ..
-        } = p;
+        } = p.into_parts();
         let handle = b_in.streams.try_recv().expect("announced").handle;
         assert_eq!(budget.connections(), 1);
         let now = pair.time.now_nanos();
@@ -10444,6 +10764,10 @@ fn streams_past_the_staging_cap_are_stopped_and_a_second_closes_the_path() {
         assert_eq!(stats.count(QuicInboundOutcome::EvictedStaged), 2);
         assert_eq!(stats.count(QuicInboundOutcome::ClosedStagedOverCap), 1);
         assert_eq!(p.b.closed_with(), Some(QuicCloseCode::OverBudget));
+        assert_eq!(
+            p.b.closed_for(),
+            Some(crate::transport::boundary::QuicPathEnd::PeerOverBudget)
+        );
     })
 }
 

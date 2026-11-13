@@ -351,7 +351,12 @@ impl SendAborts {
         }
         let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
         self.node.record_send_reset(count);
-        if count > self.limit && self.closer.close(QuicCloseCode::SendAbortLimit) {
+        if count > self.limit
+            && self.closer.close_for(
+                QuicCloseCode::SendAbortLimit,
+                crate::transport::boundary::QuicPathEnd::SendAborts,
+            )
+        {
             tracing::warn!(
                 remote = %self.closer.remote_address(),
                 aborts = count,
@@ -1306,7 +1311,7 @@ impl AckWatch {
         if self.dark_since.take().is_some()
             && let (Some(node), Some(ended)) = (self.dark_counts, ended)
         {
-            node.record_dark_episode(ended);
+            node.record_dark_episode(ended, self.closes_dark());
         }
     }
 
@@ -1903,7 +1908,10 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
             }
             // One close code for every rule: it tells the peer only that this
             // side stopped using the path; why is counted and logged here.
-            if closer.close(QuicCloseCode::PeerNotAcknowledging) {
+            if closer.close_for(
+                QuicCloseCode::PeerNotAcknowledging,
+                crate::transport::boundary::QuicPathEnd::NotAcknowledging,
+            ) {
                 watch.record_close();
                 #[cfg(test)]
                 if let Some(stall) = watch.stall() {
@@ -1996,6 +2004,8 @@ pub(crate) struct PathReport {
     /// The path's budget meter, evaluated at each tick so an idle path's send
     /// window and held epochs are settled too.
     meter: Option<Arc<super::budget::ConnMeter>>,
+    /// Whether the path carries data ([`Carrying`]).
+    carrying: Carrying,
     /// The next report that finds the path in a bucket panics, once
     /// (supervisor test).
     #[cfg(test)]
@@ -2012,6 +2022,7 @@ impl PathReport {
         node: &'static crate::transport::metrics::QuicDataCounters,
         built_at: u64,
         meter: Option<Arc<super::budget::ConnMeter>>,
+        carrying: Carrying,
     ) -> Self {
         let stats = connection.stats();
         let gate = connection
@@ -2034,6 +2045,7 @@ impl PathReport {
             gate_window: crate::transport::metrics::PathGateWindow::new(node),
             connection,
             node,
+            carrying,
             #[cfg(test)]
             panic_once_bucketed: false,
             #[cfg(test)]
@@ -2060,7 +2072,14 @@ impl PathReport {
         self.node.record_bytes(sent, got);
         self.bytes = next;
         let (next, delta) = self.loss.step(PathLoss::of(&stats));
-        self.node.record_path_loss(&mut self.window, delta);
+        let carrying = self.carrying.now.load(std::sync::atomic::Ordering::Acquire)
+            || (now.is_none()
+                && self
+                    .carrying
+                    .at_end
+                    .load(std::sync::atomic::Ordering::Acquire));
+        self.node
+            .record_path_loss(&mut self.window, delta, carrying);
         self.loss = next;
         if let Some((verdicts, seen)) = &mut self.gate {
             let now = verdicts.read();
@@ -2076,6 +2095,20 @@ impl PathReport {
             panic!("test: the acknowledgement watch panics");
         }
     }
+}
+
+/// Whether a path carries data, for its loss report.
+pub(crate) struct Carrying {
+    /// The path's own flag for the `quic_live_data_paths` gauge, read at each
+    /// report, so a report's packets are counted as carrying by the path's
+    /// state when it is taken (a flip inside a 2 s tick goes to the side it
+    /// reaches).
+    pub(crate) now: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when the path's attempt ended while it carried data. The final
+    /// report, on drop, runs after the attempt took the path out of the gauge,
+    /// so it reads this instead: a data path's last reading, and the whole of
+    /// one that ended before its first tick, are counted as carrying.
+    pub(crate) at_end: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for PathReport {
