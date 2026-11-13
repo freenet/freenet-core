@@ -1038,8 +1038,10 @@ fn data_route_takes_no_lock(session: &Arc<Session>) -> bool {
 }
 
 /// With no route, as on a path without both data bits, a send reads one atomic
-/// and never waits for the session's lock, which the driver also takes. Shadow is
-/// the default on Linux, macOS and Windows, so this is every connection there.
+/// and never waits for the session's lock, which the driver also takes. With no
+/// data ramp, a `prefer` path carries no data, so this is every connection on
+/// Linux, macOS and Windows, where `prefer` is the default; with a ramp, every
+/// pair outside its share.
 #[test]
 fn a_connection_without_a_route_takes_no_lock_to_send() {
     bounded(|| async move {

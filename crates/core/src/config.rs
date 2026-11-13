@@ -2588,13 +2588,14 @@ pub struct NetworkArgs {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`. Unset means
-    /// `shadow` on Linux, macOS and Windows, and `off` elsewhere.
+    /// `prefer` on Linux, macOS and Windows, and `off` elsewhere.
     ///
     /// `shadow` builds a QUIC endpoint on the network port and upgrades
     /// connections to peers that also run it to a QUIC path. The path carries
     /// control frames only, so all traffic stays on the existing transport.
     /// `prefer` also negotiates data with a share of pairs (`quic-data-percent`,
-    /// or this release's share, which is 0), and a pair where both sides did
+    /// or this release's share: its data ramp, or 0 when it has none), and a
+    /// pair where both sides did
     /// sends its traffic on the path. `off` builds no endpoint. An unknown value is treated as `off`,
     /// with a warning in the log.
     #[arg(long, env = "FREENET_TRANSPORT_QUIC", value_name = "off|shadow|prefer")]
