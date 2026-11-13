@@ -1252,8 +1252,14 @@ impl Session {
             return;
         };
         // Only the teardown of an active path ends one, so this is where its
-        // age is known.
-        if let Some(since) = held.gauge.active_since {
+        // age is known. A recycle for data (either side's) is no failure and
+        // comes about a recheck after activation, so it is left out of the
+        // ages: counted in them it would fill `lt_1m` / `lt_10m` through the
+        // ramp and hide real short-lived paths. It is counted by its close
+        // code alone.
+        if let Some(since) = held.gauge.active_since
+            && code != QuicCloseCode::RecycleForData
+        {
             TRANSPORT_METRICS
                 .record_quic_path_closed((self.now)().saturating_sub(since), self.remote);
         }
