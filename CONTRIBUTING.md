@@ -32,6 +32,31 @@ When in doubt about which bucket you're in, file an issue first. It costs you a 
 - **Read the codebase conventions.** See [AGENTS.md](AGENTS.md) for project structure, coding standards, and testing requirements.
 - **Ask questions.** If something is unclear, ask on the issue or in our [Matrix channel](https://matrix.to/#/#freenet-locutus:matrix.org) before writing code.
 
+## Build Resources
+
+The heavy compilation units here need roughly 3.5 GB of memory each, and cargo
+runs one job per logical core by default. On a machine with more cores than
+about `RAM_GB / 3.5`, a full-width build can exhaust memory and push the box
+into swap, which looks like a hung machine rather than a build failure. Cap the
+job count:
+
+```bash
+export CARGO_BUILD_JOBS=4    # or pass -j 4 to a single command
+```
+
+`cargo clippy --all-targets` is the most expensive command in the pre-commit
+sequence, so cap that one first. A 10-core host with 30 GB of RAM has been
+reported OOM-killed mid-link at full width and succeeded at `-j 3` (#5634).
+
+Two related surprises, so you do not file them as bugs:
+
+- Dependencies build with `opt-level = 3` even in the dev profile (see
+  `[profile.dev.package."*"]` in the root `Cargo.toml`). That is a deliberate
+  setting, not something misconfigured on your side, so a slow first build is
+  expected. It also puts compile memory above a stock dev profile, which is part
+  of why the cap above is needed.
+- `target/` reaches tens of gigabytes after a clippy run and a few test builds.
+
 ## Building with Nix (optional)
 
 An alternative to a local rustup install, not a requirement.
