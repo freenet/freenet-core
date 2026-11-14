@@ -2146,7 +2146,8 @@ fn extract_zip(archive_path: &Path, dest_dir: &Path, dest_dir_canonical: &Path) 
         let outpath_str = outpath.to_string_lossy();
         validate_extract_path(dest_dir, dest_dir_canonical, Path::new(&*outpath_str))?;
 
-        if file.name().ends_with('/') {
+        // zip 9's name() is fallible; is_dir() reads the raw name instead.
+        if file.is_dir() {
             fs::create_dir_all(&outpath)?;
         } else {
             if let Some(p) = outpath.parent() {
