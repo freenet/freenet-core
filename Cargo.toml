@@ -114,7 +114,7 @@ tracing = "0.1"
 # and nothing in our test suite will notice.
 tracing-appender = "0.2"
 tracing-core = "0.1"
-tracing-opentelemetry = "0.33.0"
+tracing-opentelemetry = "0.34.0"
 tracing-subscriber = "0.3"
 console-subscriber = "0.5.0"
 
