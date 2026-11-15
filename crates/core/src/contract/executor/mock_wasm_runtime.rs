@@ -157,10 +157,11 @@ pub(crate) enum UpdateOverride {
 /// merge), `MockWasmRuntime` delegates to the same `bridged_*` methods that
 /// `Executor<Runtime>` uses, exercising init_tracker, validation, subscriber
 /// notification pipeline, corrupted state recovery, and contract key indexing.
-/// Simulation hook (M1 measurement): contracts whose first id byte is a
+/// Simulation hook (#6190, `dev_tool::sim_merge_budget`): contracts whose first id byte is a
 /// multiple of this modulus merge non-idempotently (fresh bytes on every
 /// apply). 0 disables. Process-global because sim contract ids are random.
-pub static SIM_BAD_CONTRACT_MODULUS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+pub static SIM_BAD_CONTRACT_MODULUS: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
 /// Simulation hook: number of `update_state` calls per contract id.
 pub static SIM_MERGE_COUNTS: std::sync::Mutex<Option<HashMap<ContractInstanceId, u64>>> =
     std::sync::Mutex::new(None);
@@ -505,14 +506,25 @@ impl ContractRuntimeInterface for MockWasmRuntime {
         // to the default merge.
         {
             let mut g = SIM_MERGE_COUNTS.lock().unwrap();
-            *g.get_or_insert_with(HashMap::new).entry(*_key.id()).or_insert(0) += 1;
+            *g.get_or_insert_with(HashMap::new)
+                .entry(*_key.id())
+                .or_insert(0) += 1;
         }
         let sim_mod = SIM_BAD_CONTRACT_MODULUS.load(std::sync::atomic::Ordering::Relaxed);
-        let sim_override = (sim_mod != 0 && _key.id().as_bytes()[0] % sim_mod == 0
+        let sim_override = (sim_mod != 0
+            && _key.id().as_bytes()[0] % sim_mod == 0
             && !self.update_overrides.contains_key(_key.id()))
-        .then(|| UpdateOverride::NonIdempotent(std::sync::Arc::new(
-            std::sync::atomic::AtomicU64::new(SIM_NONCE.fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed)))));
-        if let Some(override_) = self.update_overrides.get(_key.id()).cloned().or(sim_override) {
+        .then(|| {
+            UpdateOverride::NonIdempotent(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                SIM_NONCE.fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed),
+            )))
+        });
+        if let Some(override_) = self
+            .update_overrides
+            .get(_key.id())
+            .cloned()
+            .or(sim_override)
+        {
             match override_ {
                 UpdateOverride::RequiresRelated(ids) => {
                     let has_related = update_data

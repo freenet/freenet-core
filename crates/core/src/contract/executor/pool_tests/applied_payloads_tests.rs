@@ -319,8 +319,11 @@ async fn a_refused_merge_is_not_recorded() {
     );
 }
 
+/// Since #6190 a flagged contract's merge is committed like any other, so its
+/// payload is absorbed and recorded (the flag used to suppress the commit, and
+/// this test used to assert the payload was NOT recorded).
 #[tokio::test(flavor = "current_thread")]
-async fn a_merge_suppressed_for_a_broken_contract_is_not_recorded() {
+async fn a_merge_on_a_flagged_contract_is_recorded() {
     let (op_manager, _guards) = build_op_manager("applied-broken").await;
     let (mut executor, key) = installed(&op_manager, b"applied_broken", b"s0").await;
     op_manager.ring.record_broken_invariant(
@@ -329,6 +332,7 @@ async fn a_merge_suppressed_for_a_broken_contract_is_not_recorded() {
         crate::ring::BrokenInvariantDetector::IdenticalInput,
         "test",
     );
+    assert!(op_manager.ring.is_contract_broken(&key), "premise: flagged");
     let result = executor
         .upsert_contract_state(
             key,
@@ -337,14 +341,17 @@ async fn a_merge_suppressed_for_a_broken_contract_is_not_recorded() {
             None,
         )
         .await
-        .expect("suppressed merge returns Ok");
-    assert!(matches!(result, crate::contract::UpsertResult::NoChange));
+        .expect("merge on a flagged contract");
     assert!(
-        !op_manager
+        matches!(result, crate::contract::UpsertResult::Updated(_)),
+        "a flagged contract's merge must commit, got {result:?}"
+    );
+    assert!(
+        op_manager
             .ring
             .applied_payloads
             .contains(&key, state_hash(&op_manager, b"s1")),
-        "nothing was stored, so the payload was not absorbed"
+        "the committed payload was absorbed, so it is recorded"
     );
 }
 
@@ -408,7 +415,7 @@ fn the_install_reset_precedes_the_store() {
 fn the_recovery_reset_precedes_the_commit() {
     let src = include_str!("../runtime/executor_impl.rs");
     let commit_at = src
-        .find("let commit_outcome = self")
+        .find("self.commit_state_update(&key, &params, &updated_state)")
         .expect("final commit of the merge path");
     let before = &src[..commit_at];
     let gate = before

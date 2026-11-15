@@ -23092,40 +23092,81 @@ fn test_quic_native_zero_percent_forms_the_same_mesh() {
     assert_eq!(on.trace.undecodable_closes(), 0);
 }
 
-/// M1 measurement (temporary): non-convergent contract, flag ON vs OFF.
+// =============================================================================
+// Non-settling merge bounded by the per-contract merge budget (#6190)
+// =============================================================================
+
+/// A contract whose merge never settles (every apply yields fresh bytes, so
+/// the applied-payload skip cannot help) turns every broadcast into another
+/// state change. Since #6190 nothing freezes it; the per-contract merge
+/// budget on the network receive path bounds it, by usage alone, identically
+/// for every contract.
+///
+/// One run with the PRODUCTION budget constants. Asserts:
+/// 1. the budget engaged on a non-settling contract (drops > 0). With the
+///    budget removed this fails: the loop then runs unthrottled;
+/// 2. it never dropped a message for a healthy contract;
+/// 3. nothing bypasses it at scale: `update_state` calls for each hot
+///    non-settling contract stay within 1.5x the messages the budget
+///    admitted for it. The rest is the idempotency probes' re-applies and the
+///    merges of repair `ResyncResponse`s and anti-entropy, which ride other
+///    paths and are bounded by their own limiters.
+///
+/// Admissions per node over time are bounded by the token bucket itself
+/// (`ring::contract_merge_budget` unit tests); this test does not re-derive
+/// that from an estimate of virtual time.
 #[test_log::test]
-fn m1_measure_flag_on_off() {
-    use freenet::dev_tool::sim_m1::*;
-    let iters: usize = std::env::var("M1_ITERS").ok().and_then(|v| v.parse().ok()).unwrap_or(3000);
-    let nodes: usize = std::env::var("M1_NODES").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
-    let m = 4u8;
-    let mut rows = vec![];
-    for (label, off) in [("flag_ON", false), ("flag_OFF", true)] {
-        set_bad_contract_modulus(m);
-        set_gates_off(off);
-        let _ = take_merge_counts();
-        let name: &'static str = if off { "m1-off" } else { "m1-on" };
-        let res = TestConfig::medium(name, 0x4D31_0001)
-            .with_nodes(nodes)
-            .with_gateways(2)
-            .with_iterations(iters)
-            .with_max_contracts(8)
-            .with_connections(4, 10)
-            .with_event_wait(Duration::from_millis(200))
-            .with_mock_wasm()
-            .no_convergence_wait()
-            .run_direct();
-        let counts = take_merge_counts();
-        let (bad, good): (Vec<_>, Vec<_>) = counts.iter().partition(|(b, _, _)| b % m == 0);
-        let sum = |v: &Vec<&(u8, String, u64)>| v.iter().map(|x| x.2).sum::<u64>();
-        let conv = &res.convergence;
-        println!(
-            "M1ROW {label} nodes={nodes} iters={iters} virt_secs~{} bad_contracts={} bad_merges={} good_contracts={} good_merges={} converged={} diverged={} events={}",
-            iters as f64 * 0.2, bad.len(), sum(&bad), good.len(), sum(&good),
-            conv.converged.len(), conv.diverged.len(), res.event_count
-        );
-        rows.push(label);
-    }
+fn non_settling_contract_is_bounded_by_merge_budget() {
+    use freenet::dev_tool::sim_merge_budget::*;
+    const BAD_MODULUS: u8 = 4;
+
+    set_bad_contract_modulus(BAD_MODULUS);
+    let _ = take_merge_counts();
+    let _ = take_merge_budget_counts();
+    let res = TestConfig::medium("merge-budget-non-settling", 0x4D31_0001)
+        .with_nodes(12)
+        .with_gateways(2)
+        .with_iterations(300)
+        .with_max_contracts(8)
+        .with_connections(4, 10)
+        .with_event_wait(Duration::from_millis(200))
+        .with_mock_wasm()
+        .no_convergence_wait()
+        .run_direct();
+    let merges = take_merge_counts();
+    let budget = take_merge_budget_counts();
     set_bad_contract_modulus(0);
-    set_gates_off(false);
+    res.assert_ok();
+
+    let is_bad = |first: u8| first % BAD_MODULUS == 0;
+    println!("merge-budget sim: update_state calls {merges:?}");
+    println!("merge-budget sim: (admitted, dropped) {budget:?}");
+    assert!(
+        merges.iter().any(|(b, _, _)| !is_bad(*b)),
+        "premise: healthy contracts were merged too"
+    );
+
+    let hot: Vec<_> = budget
+        .iter()
+        .filter(|(first, _, _, dropped)| is_bad(*first) && *dropped > 0)
+        .collect();
+    assert!(
+        !hot.is_empty(),
+        "the budget never engaged on any non-settling contract: {budget:?}"
+    );
+    for (first, id, admitted, dropped) in &budget {
+        assert!(
+            is_bad(*first) || *dropped == 0,
+            "the budget dropped {dropped} messages for healthy contract {id} \
+             ({admitted} admitted)"
+        );
+    }
+    for (_, id, admitted, _) in hot {
+        let calls = merges.iter().find(|(_, m, _)| m == id).map_or(0, |m| m.2);
+        assert!(
+            (calls as f64) <= 1.5 * *admitted as f64,
+            "non-settling contract {id}: {calls} update_state calls against {admitted} \
+             admitted messages; something bypasses the budget"
+        );
+    }
 }

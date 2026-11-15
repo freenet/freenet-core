@@ -1,7 +1,7 @@
 //! Tests for the per-contract non-idempotency *fixture*. See
 //! `crate::ring::broken_invariants` (tracker-level unit tests) and
 //! `Executor::maybe_probe_idempotency` in `contract/executor/runtime.rs`
-//! for the detector + gate code itself.
+//! for the detector itself.
 //!
 //! ## What these tests cover
 //!
@@ -15,18 +15,8 @@
 //!    so the property the probe checks doesn't false-positive on
 //!    well-behaved contracts.
 //!
-//! ## What these tests do NOT cover (deferred)
-//!
-//! End-to-end "probe fires inside the executor, sets the flag via
-//! `Ring::record_broken_invariant`, and the next merge / broadcast is
-//! suppressed by the `is_contract_broken` gate in `commit_state_update`
-//! and `broadcast_state_change`" is **NOT** exercised here — the mock
-//! executor path (`Executor::new_mock_wasm`) doesn't wire a real
-//! `OpManager`, so `op_manager.ring.is_contract_broken(...)` from inside
-//! the executor is a no-op against an absent ring. The tracker layer
-//! (record → is_broken) is covered in `ring::broken_invariants::tests`.
-//! Full integration coverage requires a `SimNetwork`-shaped harness and
-//! is filed as a follow-up to #4279.
+//! 3. **No gate on the flag** — `broken_flag_gates_no_commit_broadcast_or_egress`
+//!    pins that the flag stays diagnostic (#6190).
 
 use freenet_stdlib::prelude::*;
 
@@ -111,131 +101,73 @@ fn fixture_non_idempotent_override_produces_distinct_states() {
     );
 }
 
-/// Source-grep pin: the three production gate sites in `runtime.rs`
-/// (`commit_state_update` top-gate, `broadcast_state_change` gate, and
-/// `bridged_upsert_contract_state` merge-suppression after probe) all
-/// MUST consult `op_manager.ring.is_contract_broken(...)`. A regression
-/// that removes or inverts any of these checks silently re-enables the
-/// broadcast storm — this test would fail compile-time-style on string
-/// match in CI before the gap reaches production.
+/// Source-grep pin (#6190): the broken-invariant flag is DIAGNOSTIC ONLY.
+///
+/// It used to gate the commit, the broadcast and three egress paths, so a
+/// flagged contract stopped advancing on this node, including the node's own
+/// client UPDATEs, which were answered `state_changed: false` and silently
+/// discarded. The harm the gates guarded against (a replay loop from a merge
+/// that never settles) is bounded instead by the per-contract merge budget on
+/// the network receive path (`ring::contract_merge_budget`), which applies to
+/// every contract by usage alone and never touches local client writes.
+///
+/// So the only production readers of `is_contract_broken` left are the two
+/// probe prechecks that skip re-probing an already-flagged contract
+/// (detection cost, not a gate on state). A new read anywhere else is a gate
+/// coming back; route it through the budget instead.
 #[test]
-fn production_gate_sites_consult_is_contract_broken() {
-    // Read the full source files at compile time. `include_str!` is
-    // resolved relative to the file containing this macro — these tests
-    // live at `crates/core/src/contract/executor/pool_tests/` so we
-    // climb one level to reach the production files.
-    // `is_contract_broken` call sites live in runtime/executor_impl.rs after
-    // the split; both files are searched independently (not concatenated) so
-    // that `#[cfg(test)]` markers in runtime.rs don't accidentally truncate
-    // the executor_impl.rs search window.
+fn broken_flag_gates_no_commit_broadcast_or_egress() {
     const RUNTIME_RS: &str = include_str!("../runtime.rs");
     const EXECUTOR_IMPL_RS: &str = include_str!("../runtime/executor_impl.rs");
-
-    // Strip test modules from each file independently, then concatenate the
-    // production-only slices. executor_impl.rs has no #[cfg(test)] today so
-    // its split_once is a no-op, but future-proofs against one being added.
-    let runtime_prod = RUNTIME_RS
-        .split_once("#[cfg(test)]")
-        .map(|(prod, _)| prod)
-        .unwrap_or(RUNTIME_RS);
-    let executor_impl_prod = EXECUTOR_IMPL_RS
-        .split_once("#[cfg(test)]")
-        .map(|(prod, _)| prod)
-        .unwrap_or(EXECUTOR_IMPL_RS);
-
-    let occurrences = runtime_prod.matches("is_contract_broken").count()
-        + executor_impl_prod.matches("is_contract_broken").count();
-    assert!(
-        occurrences >= 3,
-        "expected at least 3 `is_contract_broken` checks in production \
-         runtime.rs (commit_state_update top-gate, broadcast_state_change \
-         gate, and bridged_upsert_contract_state post-probe merge \
-         suppression); found {occurrences}. A regression that removed or \
-         inverted any of these silently re-enables the storm we're \
-         defending against — see PR #4279."
-    );
-}
-
-/// Source-grep pin for the full-state EGRESS gates: while a contract is
-/// flagged, the executor's own commit/broadcast suppression is not enough
-/// — three paths still pushed state off the node and kept the broadcast
-/// echo alive network-wide:
-///
-/// 1. `InterestMessage::ResyncRequest` handling in node.rs served a full
-///    `ResyncResponse`.
-/// 2. The Summaries-mismatch heal (`handle_sync_state_to_peer` in
-///    p2p_protoc/broadcast.rs) pushed full state to a "stale" peer.
-/// 3. `handle_broadcast_state_change` (same file) — the highest-
-///    amplification fan-out sink — is re-entered by re-emission paths
-///    that bypass the executor's emission gate (its own no-target retry
-///    re-emissions, the #4359 stashed-broadcast flush, pending flushes),
-///    re-seeding the echo after a flag lands.
-///
-/// All three must consult `is_contract_broken` BEFORE any state leaves
-/// the node. These are pinned by source scrape because driving the
-/// interest-sync handler / p2p bridge in a unit test requires the full
-/// node harness (the flag predicate itself is behavior-tested in
-/// `ring::broken_invariants::tests` and `identical_input_probe_tests`).
-#[test]
-fn egress_paths_gated_on_is_contract_broken() {
+    const CONTRACT_OPS_RS: &str = include_str!("../runtime/contract_ops.rs");
     const NODE_RS: &str = include_str!("../../../node.rs");
     const BROADCAST_RS: &str = include_str!("../../../node/network_bridge/p2p_protoc/broadcast.rs");
 
-    // --- ResyncRequest arm: gate must precede the state fetch/serve. ---
-    let arm_start = NODE_RS
-        .find("InterestMessage::ResyncRequest { key } =>")
-        .expect("node.rs must still have the ResyncRequest handler arm");
-    let arm = &NODE_RS[arm_start..];
-    let gate = arm
-        .find("is_contract_broken")
-        .expect("ResyncRequest arm must gate on is_contract_broken (broken-contract egress)");
-    let serve = arm
-        .find("get_contract_state(op_manager, &key)")
-        .expect("ResyncRequest arm must still fetch state to serve");
-    assert!(
-        gate < serve,
-        "the is_contract_broken gate (offset {gate}) must run BEFORE the \
-         ResyncResponse state fetch (offset {serve}) so a flagged node never \
-         serves full state"
-    );
+    fn production(src: &str) -> &str {
+        src.split_once("#[cfg(test)]").map_or(src, |(prod, _)| prod)
+    }
+    // Comment lines are dropped so prose that names the flag cannot count.
+    fn code_reads(src: &str) -> usize {
+        production(src)
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .filter(|code| code.contains("is_contract_broken("))
+            .count()
+    }
 
-    // --- Broadcast fan-out: gate must precede target selection/send. ---
-    let bc_start = BROADCAST_RS
-        .find("fn handle_broadcast_state_change")
-        .expect("broadcast.rs must still have handle_broadcast_state_change");
-    let bc_body = &BROADCAST_RS[bc_start..];
-    let bc_gate = bc_body
-        .find("is_contract_broken")
-        .expect("handle_broadcast_state_change must gate on is_contract_broken");
-    let bc_send = bc_body
-        .find("get_broadcast_targets_update")
-        .expect("handle_broadcast_state_change must still select broadcast targets");
-    assert!(
-        bc_gate < bc_send,
-        "the is_contract_broken gate (offset {bc_gate}) must run BEFORE \
-         broadcast target selection (offset {bc_send}) so retry/stash/flush \
-         re-emissions cannot re-seed the echo for a flagged contract"
-    );
+    for (name, src) in [
+        ("runtime.rs", RUNTIME_RS),
+        ("contract_ops.rs", CONTRACT_OPS_RS),
+        ("node.rs", NODE_RS),
+        ("p2p_protoc/broadcast.rs", BROADCAST_RS),
+    ] {
+        assert_eq!(
+            code_reads(src),
+            0,
+            "{name} reads `is_contract_broken` in production code. The flag is \
+             diagnostic only (#6190); a read here is a commit/broadcast/egress \
+             gate coming back."
+        );
+    }
 
-    // --- SyncStateToPeer heal: gate must precede the enqueue/send. ---
-    let fn_start = BROADCAST_RS
-        .find("fn handle_sync_state_to_peer")
-        .expect("broadcast.rs must still have handle_sync_state_to_peer");
-    let body = &BROADCAST_RS[fn_start..];
-    let heal_gate = body
-        .find("is_contract_broken")
-        .expect("handle_sync_state_to_peer must gate on is_contract_broken");
-    // Anchor on the method, not `broadcast_queue.enqueue`: rustfmt breaks the
-    // receiver onto its own line once the argument list grows.
-    let heal_send = body
-        .find(".enqueue(")
-        .expect("handle_sync_state_to_peer must still enqueue the heal send");
-    assert!(
-        heal_gate < heal_send,
-        "the is_contract_broken gate (offset {heal_gate}) must run BEFORE the \
-         SyncStateToPeer enqueue (offset {heal_send}) so a flagged node never \
-         heals peers with the problematic state"
+    let impl_prod = production(EXECUTOR_IMPL_RS);
+    assert_eq!(
+        code_reads(EXECUTOR_IMPL_RS),
+        2,
+        "executor_impl.rs must read `is_contract_broken` exactly twice, in the \
+         two probe prechecks"
     );
+    for probe in [
+        "async fn maybe_probe_idempotency(",
+        "fn probe_identical_input_idempotency(",
+    ] {
+        let start = impl_prod.find(probe).expect("probe function exists");
+        let window = &impl_prod[start..(start + 1200).min(impl_prod.len())];
+        assert!(
+            window.contains("is_contract_broken("),
+            "{probe} must keep its already-flagged precheck near its top"
+        );
+    }
 }
 
 /// A healthy fixture — `UpdateOverride` unwired — must produce byte-equal

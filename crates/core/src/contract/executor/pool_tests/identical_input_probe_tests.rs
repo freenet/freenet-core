@@ -21,12 +21,13 @@
 //! `bridged_upsert_contract_state` path via `Executor<MockWasmRuntime>`
 //! wired to a real `OpManager`/`Ring` (harness mirrors
 //! `disk_budget_gate_tests.rs`), so the `is_contract_broken` flag the
-//! probes set — and the commit suppression it gates — are the real ones.
+//! probes set is the real one. Since #6190 the flag gates nothing:
+//! `flagged_contract_subsequent_apply_is_committed` pins that a flagged
+//! contract still commits, and `non_idempotent_detector_tests.rs` pins that
+//! no commit/broadcast/egress path reads the flag.
 //!
 //! The probe cooldown is unit-tested with a mock clock in
-//! `ring::broken_invariants::tests`; the egress gates (ResyncResponse /
-//! SyncStateToPeer / handle_broadcast_state_change) are pinned in
-//! `non_idempotent_detector_tests.rs`.
+//! `ring::broken_invariants::tests`.
 
 use either::Either;
 use freenet_stdlib::prelude::*;
@@ -296,15 +297,18 @@ async fn identical_input_canonicalize_once_is_not_flagged() {
     );
 }
 
-/// While flagged, a subsequent NON-identical apply is fully suppressed:
-/// the merge result is neither committed nor observable — the stored
-/// state stays put and the caller sees `NoChange`. (This is the existing
-/// #4279 commit gate; asserting it here proves the flag set by the NEW
-/// identity probe engages it end-to-end.)
+/// Regression for #6190: a flagged contract still takes updates.
+///
+/// While flagged, a non-identical apply used to be suppressed: nothing was
+/// stored and the caller got `NoChange`. That caller includes this node's own
+/// client, whose UPDATE was then answered `state_changed: false` and silently
+/// discarded (`contract.rs::update_response_from_result` maps `NoChange` to
+/// exactly that). The flag is diagnostic only now, so the apply must commit
+/// and report `Updated`, and the stored state must be the merge result.
 #[tokio::test(flavor = "current_thread")]
-async fn flagged_contract_subsequent_apply_is_suppressed() {
-    let (op_manager, _guards) = build_op_manager("nonidem-identity-suppress").await;
-    let contract = test_contract(b"suppressed_identity_contract");
+async fn flagged_contract_subsequent_apply_is_committed() {
+    let (op_manager, _guards) = build_op_manager("nonidem-identity-commit").await;
+    let contract = test_contract(b"flagged_commit_contract");
     let key = contract.key();
     let state = distinct_bytes_state();
 
@@ -335,10 +339,11 @@ async fn flagged_contract_subsequent_apply_is_suppressed() {
         )
         .await
         .expect("identical re-apply");
-    assert!(op_manager.ring.is_contract_broken(&key));
+    assert!(
+        op_manager.ring.is_contract_broken(&key),
+        "premise: the contract is flagged before the update under test"
+    );
 
-    // A different incoming state now runs the merge, but the flagged-
-    // contract gate suppresses the commit: NoChange, stored state intact.
     let different = WrappedState::new((101u8..=132).collect::<Vec<u8>>());
     let result = executor
         .upsert_contract_state(
@@ -349,18 +354,22 @@ async fn flagged_contract_subsequent_apply_is_suppressed() {
         )
         .await
         .expect("non-identical apply while flagged");
-    assert!(
-        matches!(result, UpsertResult::NoChange),
-        "apply while flagged must be suppressed to NoChange, got {result:?}"
-    );
+    let UpsertResult::Updated(merged) = result else {
+        panic!("an apply on a flagged contract must commit and report Updated, got {result:?}");
+    };
 
     let (stored, _) = executor
         .fetch_contract(key, false)
         .await
-        .expect("fetch after suppressed apply");
+        .expect("fetch after apply");
     assert_eq!(
         stored.map(|s| s.as_ref().to_vec()),
-        Some(state.as_ref().to_vec()),
-        "suppressed apply must not have touched the stored state"
+        Some(merged.as_ref().to_vec()),
+        "the stored state must be the committed merge result"
+    );
+    assert_ne!(
+        merged.as_ref(),
+        state.as_ref(),
+        "the merge must have changed the state"
     );
 }

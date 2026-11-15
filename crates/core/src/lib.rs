@@ -103,23 +103,37 @@ pub mod local_node {
 /// Exports for the dev tool.
 pub mod dev_tool {
     use super::*;
-    /// M1 measurement hooks (broken-invariant flag vs. harm-based protection).
+    /// Simulation hooks for the per-contract merge budget (#6190): make some
+    /// contracts' merges never settle, and count merges and budget drops.
     #[cfg(any(test, feature = "testing"))]
-    pub mod sim_m1 {
+    pub mod sim_merge_budget {
         use std::sync::atomic::Ordering;
         /// Contracts whose first id byte is a multiple of `m` merge non-idempotently (0 = off).
         pub fn set_bad_contract_modulus(m: u8) {
-            crate::contract::executor::mock_wasm_runtime::SIM_BAD_CONTRACT_MODULUS.store(m, Ordering::Relaxed);
+            crate::contract::executor::mock_wasm_runtime::SIM_BAD_CONTRACT_MODULUS
+                .store(m, Ordering::Relaxed);
         }
-        /// Open the broken-invariant commit/broadcast/egress gates (detection still records).
-        pub fn set_gates_off(off: bool) {
-            crate::ring::SIM_GATES_OFF.store(off, Ordering::Relaxed);
+        /// Take and reset per-contract merge-budget counts summed over all
+        /// nodes: (first id byte, id string, admitted, dropped).
+        pub fn take_merge_budget_counts() -> Vec<(u8, String, u64, u64)> {
+            crate::ring::contract_merge_budget::SIM_COUNTS
+                .lock()
+                .take()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, (a, d))| (id.as_bytes()[0], id.to_string(), a, d))
+                .collect()
         }
         /// Take and reset per-contract `update_state` call counts: (first id byte, id string, count).
         pub fn take_merge_counts() -> Vec<(u8, String, u64)> {
-            let mut g = crate::contract::executor::mock_wasm_runtime::SIM_MERGE_COUNTS.lock().unwrap();
-            g.take().unwrap_or_default().into_iter()
-                .map(|(id, n)| (id.as_bytes()[0], id.to_string(), n)).collect()
+            let mut g = crate::contract::executor::mock_wasm_runtime::SIM_MERGE_COUNTS
+                .lock()
+                .unwrap();
+            g.take()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, n)| (id.as_bytes()[0], id.to_string(), n))
+                .collect()
         }
     }
     pub use crate::config::{

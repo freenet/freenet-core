@@ -2128,6 +2128,48 @@ where
                     return Ok(());
                 }
 
+                // Per-contract merge budget (#6190), summed over all senders.
+                // The per-pair limiter above bounds each neighbour; this bounds
+                // the contract, which is what a merge that never settles needs:
+                // every neighbour's broadcast is another state change, so the
+                // per-pair bound multiplies by the neighbour count. Charged only
+                // for a contract this node holds (`should_summarize_or_broadcast`
+                // is synchronous and not self-granting, see Gate B above): a
+                // node that does not hold it forwards without merging, and the
+                // key space stays bounded by the hosted set. Local client UPDATEs
+                // never reach this arm. See `crate::ring::contract_merge_budget`.
+                if op_manager.ring.should_summarize_or_broadcast(&key)
+                    && !op_manager
+                        .ring
+                        .contract_merge_budget
+                        .check_and_record(*key.id())
+                        .is_allowed()
+                {
+                    tracing::debug!(
+                        tx = %op.id(),
+                        %key,
+                        %sender_addr,
+                        phase = "update_dispatch_merge_budget_dropped",
+                        "UPDATE dispatch: dropped, contract over this node's merge budget"
+                    );
+                    // A dropped BROADCAST needs a repair, for the reason written
+                    // out on the `Rejected` arm above: the sender has already
+                    // cached its summary as ours. The holding gate is already
+                    // satisfied. A dropped REQUEST is observed and retried by its
+                    // originator, so it gets none.
+                    if update_class == crate::ring::update_rate_limit::UpdateClass::Broadcast {
+                        update::op_ctx_task::send_dropped_broadcast_resync_request(
+                            &op_manager,
+                            key,
+                            sender_addr,
+                            *op.id(),
+                            update::op_ctx_task::DroppedBroadcastReason::MergeBudget,
+                        )
+                        .await;
+                    }
+                    return Ok(());
+                }
+
                 #[allow(clippy::wildcard_enum_match_arm)]
                 match op {
                     update::UpdateMsg::RequestUpdate {
@@ -5693,36 +5735,13 @@ async fn handle_interest_sync_message(
             // this contract means our delta failed to apply there. Count it
             // toward the sender-side "this contract can't take deltas" memo so
             // the broadcast path falls back to full-state sends instead of
-            // recomputing doomed deltas. Runs BEFORE the rate limiters AND
-            // before the broken-contract egress gate below — the signal is
-            // valid even when the full-state response is suppressed (a broken
-            // contract that also can't take deltas still wants full-state
-            // fallback recorded for the peers we DO serve). See
-            // `crate::ring::delta_incompat`.
+            // recomputing doomed deltas. Runs BEFORE the rate limiters: the
+            // signal is valid even when the full-state response is then
+            // suppressed. See `crate::ring::delta_incompat`.
             op_manager
                 .ring
                 .delta_incompat
                 .note_resync_request(*key.id(), source);
-
-            // Egress gate (broken invariants): a contract flagged as
-            // violating CRDT idempotency must not have its full state
-            // served to peers. The executor already suppresses commit +
-            // BroadcastStateChange for a flagged contract, but a
-            // ResyncResponse from this node would still hand the
-            // problematic state to the requester, re-seeding the
-            // non-idempotent broadcast echo the flag exists to quarantine
-            // (#4279 storm shape). Suppress the response; the requester's
-            // retry lands on an unflagged peer or waits out the TTL. See
-            // `crate::ring::broken_invariants`.
-            if op_manager.ring.is_contract_broken(&key) {
-                tracing::debug!(
-                    from = %source,
-                    contract = %key,
-                    event = "resync_response_suppressed_broken_contract",
-                    "ResyncRequest for contract flagged as broken — not serving full state"
-                );
-                return None;
-            }
 
             // CHEAP existence check BEFORE the rate limiters (#4864 round-4 P1).
             // Both limiter buckets allocate a slot (vacant-at-capacity) BEFORE any
@@ -7077,22 +7096,6 @@ mod tests {
              (memo {memo_pos} < limiter {limiter_pos}) — a suppressed response \
              is still a valid delta-incompatibility signal"
         );
-        // Also lock memo-before-broken-gate: B's `is_contract_broken → return
-        // None` egress gate sits between the memo and the limiters, and the
-        // arming's own comment requires it run "before the broken-contract
-        // egress gate". Without this assertion a future edit could move the
-        // arming after the gate (silently dropping the signal for broken
-        // contracts) and still pass the memo-before-limiter check above.
-        let broken_pos = req_arm
-            .find("is_contract_broken")
-            .expect("the ResyncRequest arm must gate on the broken-contract egress check (B)");
-        assert!(
-            memo_pos < broken_pos,
-            "note_resync_request must run BEFORE the broken-contract egress gate \
-             (memo {memo_pos} < broken {broken_pos}) — the delta-incompatibility \
-             signal is valid even when the full-state response is suppressed for a \
-             broken contract"
-        );
     }
 
     /// Source-scrape pin (HQk7 fork investigation): the `ResyncResponse` arm
@@ -8156,6 +8159,220 @@ mod tests {
              ResyncRequest — its originator observes the failure and it caches no \
              summary of us, so a resync here is pure amplification onto a node \
              already refusing this sender"
+        );
+    }
+
+    /// #6190: the per-contract merge budget on the real UPDATE dispatch path.
+    ///
+    /// Once a HELD contract's budget is spent, a further `BroadcastTo` is
+    /// dropped (before any driver) and repaired with exactly one throttled
+    /// `ResyncRequest`, the same repair a per-pair rate-limit drop gets; a
+    /// further `RequestUpdate` is dropped with no repair. Every message comes
+    /// from a FRESH sender, so the per-pair limiter allows each one and the
+    /// drop is the budget's alone (asserted via `rejected_total() == 0`). That
+    /// is the property the budget adds: the per-pair limiter bounds each
+    /// neighbour, the budget bounds the contract across all of them.
+    ///
+    /// A contract this node does NOT hold is never charged: its message is
+    /// forwarded without a merge, so there is nothing to bound.
+    ///
+    /// Frozen clock via `update_rate_limit_time_source_override`, which the
+    /// budget shares, so no refill happens mid-test.
+    #[cfg(feature = "redb")]
+    #[tokio::test]
+    async fn merge_budget_drops_over_budget_updates_and_repairs_broadcasts() {
+        use crate::message::{DeltaOrFullState, NetMessageV1};
+        use crate::operations::test_utils::MockNetworkBridge;
+        use crate::operations::update::UpdateMsg;
+        use crate::ring::contract_merge_budget::{MERGE_BUDGET_BURST, MergeBudgetDecision};
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let clock = SharedMockTimeSource::new();
+        let config_args = crate::config::ConfigArgs {
+            id: Some("merge-budget-dispatch-6190".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let mut node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        node_config.update_rate_limit_time_source_override =
+            Some(std::sync::Arc::new(clock.clone()));
+
+        let (mut notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14300".parse().unwrap());
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let storage = crate::contract::storages::Storage::new(dir.path())
+            .await
+            .expect("storage");
+        let bridge = MockNetworkBridge::new();
+        let mut listener: Box<dyn NetEventRegister> =
+            Box::new(crate::tracing::DynamicRegister::new(vec![]));
+
+        let key_of = |b: u8| {
+            freenet_stdlib::prelude::ContractKey::from_id_and_code(
+                freenet_stdlib::prelude::ContractInstanceId::new([b; 32]),
+                freenet_stdlib::prelude::CodeHash::new([b.wrapping_add(1); 32]),
+            )
+        };
+        let broadcast_key = key_of(61);
+        let request_key = key_of(63);
+        let unheld_key = key_of(65);
+        for key in [broadcast_key, request_key] {
+            storage
+                .store_state_sync(
+                    &key,
+                    freenet_stdlib::prelude::WrappedState::new(vec![1u8, 2, 3]),
+                )
+                .expect("store state");
+        }
+        op_manager.ring.set_hosting_storage(storage);
+        for key in [broadcast_key, request_key] {
+            op_manager
+                .ring
+                .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+            assert!(op_manager.ring.should_summarize_or_broadcast(&key));
+        }
+        assert!(!op_manager.ring.should_summarize_or_broadcast(&unheld_key));
+
+        // Spend the whole budget of every key, including the unheld one, so an
+        // unheld message that WERE charged would be dropped.
+        let budget = &op_manager.ring.contract_merge_budget;
+        for key in [broadcast_key, request_key, unheld_key] {
+            for _ in 0..(MERGE_BUDGET_BURST as usize) {
+                assert_eq!(
+                    budget.check_and_record(*key.id()),
+                    MergeBudgetDecision::Allowed
+                );
+            }
+        }
+        assert_eq!(budget.dropped_total(), 0, "premise: draining drops nothing");
+
+        fn drain_resync_targets(
+            rx: &mut crate::node::EventLoopNotificationsReceiver,
+            key: freenet_stdlib::prelude::ContractKey,
+        ) -> Vec<SocketAddr> {
+            let mut targets = Vec::new();
+            while let Ok(ev) = rx.notifications_receiver.try_recv() {
+                if let either::Either::Right(NodeEvent::SendInterestMessage {
+                    target,
+                    message: crate::message::InterestMessage::ResyncRequest { key: k },
+                }) = ev
+                {
+                    if k == key {
+                        targets.push(target);
+                    }
+                }
+            }
+            targets
+        }
+        let broadcast = |key, payload: Vec<u8>| {
+            NetMessageV1::Update(UpdateMsg::BroadcastTo {
+                id: Transaction::new::<UpdateMsg>(),
+                key,
+                payload: DeltaOrFullState::Delta(payload),
+                sender_summary_bytes: Vec::new(),
+            })
+        };
+
+        // 1. Over-budget broadcast from a fresh sender: dropped, one repair.
+        let sender_a: SocketAddr = "127.0.0.1:15201".parse().unwrap();
+        handle_pure_network_message_v1(
+            broadcast(broadcast_key, vec![1, 2, 3]),
+            Some(sender_a),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a budget drop");
+        assert_eq!(
+            op_manager.ring.update_rate_limiter.rejected_total(),
+            0,
+            "premise: a fresh sender passes the per-pair limiter, so the drop is the budget's"
+        );
+        assert_eq!(
+            budget.dropped_total(),
+            1,
+            "the over-budget broadcast is dropped"
+        );
+        assert_eq!(
+            drain_resync_targets(&mut notification_rx, broadcast_key),
+            vec![sender_a],
+            "a budget drop of a BroadcastTo must be repaired with one ResyncRequest"
+        );
+
+        // 2. Over-budget request from another fresh sender: dropped, no repair.
+        let sender_b: SocketAddr = "127.0.0.1:15202".parse().unwrap();
+        handle_pure_network_message_v1(
+            NetMessageV1::Update(UpdateMsg::RequestUpdate {
+                id: Transaction::new::<UpdateMsg>(),
+                key: request_key,
+                related_contracts: freenet_stdlib::prelude::RelatedContracts::default(),
+                value: freenet_stdlib::prelude::WrappedState::new(vec![7, 8, 9]),
+            }),
+            Some(sender_b),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a budget drop");
+        assert_eq!(
+            budget.dropped_total(),
+            2,
+            "the over-budget request is dropped"
+        );
+        assert!(
+            drain_resync_targets(&mut notification_rx, request_key).is_empty(),
+            "a dropped RequestUpdate gets no repair: its originator retries"
+        );
+
+        // 3. An unheld contract is not charged, even with its bucket empty.
+        let sender_c: SocketAddr = "127.0.0.1:15203".parse().unwrap();
+        // The message is admitted and forwarded to a relay driver; no contract
+        // handler serves this harness, so the dispatch is bounded by a timeout
+        // and only the budget's own counter is asserted.
+        let _dispatched: Result<_, tokio::time::error::Elapsed> = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            handle_pure_network_message_v1(
+                broadcast(unheld_key, vec![4, 5, 6]),
+                Some(sender_c),
+                op_manager.clone(),
+                bridge.clone(),
+                listener.as_mut(),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            budget.dropped_total(),
+            2,
+            "a contract this node does not hold must not be charged to the budget"
         );
     }
 
