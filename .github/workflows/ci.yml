@@ -1130,8 +1130,12 @@ jobs:
     name: macOS Service Unit
     runs-on: macos-latest
     # 45, not 30: the freenet:// LaunchServices e2e waits for the app to launch
-    # and handle links. Every build in this job is cold (this job never runs on
-    # main, so rust-cache never has an entry to restore), which takes ~35 min.
+    # and handle links, and a cold build of this job takes ~35 min. Normally it
+    # is not cold: this job never runs on main, so ci-cache-warm.yml's
+    # `macos_unit` job writes the cache entry it restores (the key below is that
+    # file's hash; check_cache_warm_parity.py keeps the two in step). After a
+    # lockfile change on main, or if the warm entry was evicted, a PR run is
+    # cold again and the headroom is what keeps it from failing by cancellation.
     timeout-minutes: 45
     # Same skip conditions as test_unit (see test_unit comment for details).
     if: |
@@ -1179,6 +1183,7 @@ jobs:
         # `if:` here, and NOT a separate step.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
 
       # nextest via the maintained action, not a hand-rolled download.
       # Rationale at the first of these in ci.yml (test_unit job); see #5296.
