@@ -112,8 +112,9 @@ fn fixture_non_idempotent_override_produces_distinct_states() {
 /// alone and never touches local client writes.
 ///
 /// Walks every production source file in the crate, so a gate added anywhere
-/// fails it. The only reads allowed are the method's definition in `ring.rs`
-/// and the two probe prechecks in `executor_impl.rs` that skip re-probing an
+/// fails it, including a direct read of the tracker from inside `ring`. The
+/// only reads allowed are `is_contract_broken` itself in `ring.rs` and the two
+/// probe prechecks in `executor_impl.rs` that skip re-probing an
 /// already-flagged contract (detection cost, not a gate on state).
 #[test]
 fn broken_flag_gates_no_commit_broadcast_or_egress() {
@@ -150,9 +151,13 @@ fn broken_flag_gates_no_commit_broadcast_or_egress() {
             .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
             .collect::<Vec<_>>()
             .join("\n");
-        let n = prod.matches("is_contract_broken(").count();
-        if n > 0 {
-            reads.insert(rel.clone(), n);
+        // `is_contract_broken(` is the public reader; `.is_broken(` and
+        // `.current_ttl(` read the tracker directly, which code in `ring` can do.
+        for needle in ["is_contract_broken(", ".is_broken(", ".current_ttl("] {
+            let n = prod.matches(needle).count();
+            if n > 0 {
+                *reads.entry(format!("{rel} {needle}")).or_insert(0) += n;
+            }
         }
         if rel == "contract/executor/runtime/executor_impl.rs" {
             for probe in [
@@ -169,8 +174,14 @@ fn broken_flag_gates_no_commit_broadcast_or_egress() {
     }
 
     let expected: BTreeMap<String, usize> = [
-        ("contract/executor/runtime/executor_impl.rs".to_string(), 2),
-        ("ring.rs".to_string(), 1),
+        // The two probe prechecks.
+        (
+            "contract/executor/runtime/executor_impl.rs is_contract_broken(".to_string(),
+            2,
+        ),
+        // The definition of `is_contract_broken`, and its body.
+        ("ring.rs is_contract_broken(".to_string(), 1),
+        ("ring.rs .is_broken(".to_string(), 1),
     ]
     .into_iter()
     .collect();

@@ -67,6 +67,9 @@ struct TestConfig {
     /// recovery). MockRuntime has its own independent implementation that can silently
     /// drift from production behavior. See issue #3141.
     use_mock_wasm: bool,
+    /// Send states larger than this many bytes as streams (`run_direct` only).
+    /// `None` keeps the simulation default (streaming off).
+    streaming_threshold: Option<usize>,
 }
 
 impl TestConfig {
@@ -90,6 +93,7 @@ impl TestConfig {
             latency_range: None,
             message_loss_rate: 0.0,
             use_mock_wasm: false,
+            streaming_threshold: None,
         }
     }
 
@@ -113,6 +117,7 @@ impl TestConfig {
             latency_range: None,
             message_loss_rate: 0.0,
             use_mock_wasm: false,
+            streaming_threshold: None,
         }
     }
 
@@ -136,6 +141,7 @@ impl TestConfig {
             latency_range: None,
             message_loss_rate: 0.0,
             use_mock_wasm: false,
+            streaming_threshold: None,
         }
     }
 
@@ -179,6 +185,7 @@ impl TestConfig {
             latency_range: Some(Duration::from_millis(10)..Duration::from_millis(50)),
             message_loss_rate: 0.0,
             use_mock_wasm: false,
+            streaming_threshold: None,
         }
     }
 
@@ -266,6 +273,12 @@ impl TestConfig {
     /// Use MockWasmRuntime (production ContractExecutor path) instead of MockRuntime.
     fn with_mock_wasm(mut self) -> Self {
         self.use_mock_wasm = true;
+        self
+    }
+
+    /// Stream states larger than `bytes` (`run_direct` only).
+    fn with_streaming_threshold(mut self, bytes: usize) -> Self {
+        self.streaming_threshold = Some(bytes);
         self
     }
 
@@ -388,6 +401,9 @@ impl TestConfig {
             .await;
             sim.use_mock_wasm = use_mock_wasm;
             sim.skip_convergence_wait = skip_convergence_wait;
+            if let Some(bytes) = self.streaming_threshold {
+                sim.with_streaming_threshold(bytes);
+            }
 
             // Apply fault injection if configured (latency and/or message loss)
             let has_latency = self.latency_range.is_some();
@@ -6579,6 +6595,7 @@ fn test_subscription_renewal_at_scale() {
         latency_range: None,
         message_loss_rate: 0.0,
         use_mock_wasm: false,
+        streaming_threshold: None,
     };
 
     let max_contracts = config.max_contracts; // Save before config.run() moves it
@@ -23109,11 +23126,11 @@ fn test_quic_native_zero_percent_forms_the_same_mesh() {
 ///    healthy contract stays well under one node's burst, so this shows the
 ///    budget leaves ordinary traffic alone, not where its edge is;
 /// 3. nothing bypasses it at scale: `update_state` calls for each hot
-///    non-settling contract stay within 1.5x the broadcasts the budget
-///    admitted for it. The rest is the idempotency probes' re-applies and the
+///    non-settling contract stay within 1.1x the state-changing merges the
+///    budget charged. The rest is the idempotency probes' re-applies and the
 ///    merges of repair `ResyncResponse`s and anti-entropy, which ride other
-///    paths and are bounded by their own limiters (measured: 25.5k calls
-///    against 25.4k admitted).
+///    paths and are bounded by their own limiters (measured with charging at
+///    admission: 25.5k calls against 25.4k admitted, a ratio of 1.006).
 ///
 /// Admissions per node over time are bounded by the token bucket itself
 /// (`ring::contract_merge_budget` unit tests); this test does not re-derive
@@ -23130,6 +23147,24 @@ fn non_settling_contract_is_bounded_by_merge_budget() {
     if run_alone_in_child_process("non_settling_contract_is_bounded_by_merge_budget") {
         return;
     }
+    assert_non_settling_contract_is_bounded(None, true);
+}
+
+/// [`non_settling_contract_is_bounded_by_merge_budget`] with every state sent
+/// as a stream, so the streaming broadcast apply path (its own charge site) is
+/// exercised: its state-changing merges must be charged, and nothing may
+/// bypass the budget. The streamed loop is slower (measured ~4.7 merges per
+/// node per second against a budget of 20), so the budget does not have to
+/// engage here, and drops are not required.
+#[test_log::test]
+fn non_settling_contract_is_bounded_by_merge_budget_streaming() {
+    if run_alone_in_child_process("non_settling_contract_is_bounded_by_merge_budget_streaming") {
+        return;
+    }
+    assert_non_settling_contract_is_bounded(Some(1), false);
+}
+
+fn assert_non_settling_contract_is_bounded(streaming_threshold: Option<usize>, expect_drops: bool) {
     use freenet::dev_tool::sim_merge_budget::*;
     const BAD_MODULUS: u8 = 4;
 
@@ -23141,7 +23176,7 @@ fn non_settling_contract_is_bounded_by_merge_budget() {
     }
     let _disarm = Disarm;
     arm(BAD_MODULUS);
-    let res = TestConfig::medium("merge-budget-non-settling", 0x4D31_0001)
+    let mut config = TestConfig::medium("merge-budget-non-settling", 0x4D31_0001)
         .with_nodes(12)
         .with_gateways(2)
         .with_iterations(300)
@@ -23149,8 +23184,11 @@ fn non_settling_contract_is_bounded_by_merge_budget() {
         .with_connections(4, 10)
         .with_event_wait(Duration::from_millis(200))
         .with_mock_wasm()
-        .no_convergence_wait()
-        .run_direct();
+        .no_convergence_wait();
+    if let Some(bytes) = streaming_threshold {
+        config = config.with_streaming_threshold(bytes);
+    }
+    let res = config.run_direct();
     let merges = take_merge_counts();
     let budget = take_merge_budget_counts();
     res.assert_ok();
@@ -23169,11 +23207,19 @@ fn non_settling_contract_is_bounded_by_merge_budget() {
 
     let hot: Vec<_> = budget
         .iter()
-        .filter(|(first, _, _, dropped, _)| is_bad(*first) && *dropped > 0)
+        .filter(|(first, _, _, dropped, charged)| {
+            is_bad(*first)
+                && if expect_drops {
+                    *dropped > 0
+                } else {
+                    *charged > 0
+                }
+        })
         .collect();
     assert!(
         !hot.is_empty(),
-        "the budget never engaged on any non-settling contract: {budget:?}"
+        "the budget never engaged on any non-settling contract (expect_drops: \
+         {expect_drops}): {budget:?}"
     );
     for (first, id, admitted, dropped, _) in &budget {
         assert!(
@@ -23184,11 +23230,15 @@ fn non_settling_contract_is_bounded_by_merge_budget() {
     }
     for (_, id, admitted, _, charged) in hot {
         let calls = merges.iter().find(|(_, m, _)| m == id).map_or(0, |m| m.2);
-        assert!(
-            (calls as f64) <= 1.5 * *admitted as f64,
-            "non-settling contract {id}: {calls} update_state calls against {admitted} \
-             admitted broadcasts; something bypasses the budget"
-        );
         assert!(*charged > 0, "{id}: state-changing merges must be charged");
+        assert!(
+            charged <= admitted,
+            "{id}: charged {charged} > admitted {admitted}"
+        );
+        assert!(
+            (calls as f64) <= 1.1 * *charged as f64,
+            "non-settling contract {id}: {calls} update_state calls against {charged} \
+             charged merges ({admitted} admitted); something bypasses the budget"
+        );
     }
 }

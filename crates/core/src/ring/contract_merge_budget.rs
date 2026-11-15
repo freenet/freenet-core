@@ -9,11 +9,13 @@
 //! steps:
 //!
 //! 1. **Check** ([`ContractMergeBudget::admit`]) in `node.rs`, right after the
-//!    per-(sender, contract) [`crate::ring::update_rate_limit::UpdateRateLimiter`],
-//!    for a contract this node holds (`Ring::should_summarize_or_broadcast`).
-//!    An empty bucket drops the broadcast before any driver runs, and the drop
-//!    gets the same throttled `ResyncRequest` repair as a per-pair drop
-//!    (#5510). The check spends nothing.
+//!    per-(sender, contract) [`crate::ring::update_rate_limit::UpdateRateLimiter`].
+//!    An empty bucket drops the broadcast before any driver runs; for a
+//!    contract this node holds (`Ring::should_summarize_or_broadcast`) the
+//!    drop gets the same throttled `ResyncRequest` repair as a per-pair drop
+//!    (#5510). The check spends nothing and never creates an entry, so a
+//!    contract this node never merges is always admitted and an
+//!    attacker-chosen key costs nothing.
 //! 2. **Charge** ([`ContractMergeBudget::charge_changed`]) in the two broadcast
 //!    drivers (`op_ctx_task.rs`), only when the merge actually changed the
 //!    stored state.
@@ -61,11 +63,24 @@
 //!
 //! ## Known costs and limits
 //!
+//! - **One permitted writer can crowd out the others.** A sender that can
+//!   produce valid state changes (a member of an open-write contract) and
+//!   floods them from its own node (local UPDATEs are unbudgeted there) makes
+//!   each co-host spend its budget on that content and drop the excess,
+//!   honest writers' broadcasts included, roughly in proportion to arrivals.
+//!   Before this budget the same flood cost every co-host a merge per message
+//!   instead. Telling senders apart is possible only at the first hop, so a
+//!   per-sender share is not attempted here.
+//! - **Over budget, duplicates are dropped too.** The check runs before the
+//!   broadcast dedup, so an over-budget contract's duplicates are dropped
+//!   and each tries a (throttled) repair.
 //! - **It bounds merges, not their CPU.** A non-settling contract costs each
 //!   holder up to the steady rate in merges plus their fan-out, indefinitely:
-//!   it is throttled, never frozen. Expensive merges are bounded per call by
-//!   the WASM time limit, and a zero-demand storm contract is still shed by
-//!   cost-pressure eviction (#4861).
+//!   it is throttled, never frozen. Each merge is bounded by the WASM time
+//!   limit, the executor's fair queue keeps one contract from starving the
+//!   others (`contract::fair_queue`, at most `MAX_QUEUED_PER_CONTRACT` queued
+//!   per contract), and a zero-demand storm contract is shed by cost-pressure
+//!   eviction (#4861). A broken contract that has subscribers is not.
 //! - **Repair after a sustained over-budget period is slow.** Each drop asks
 //!   for a `ResyncRequest`, but those pass a per-(contract, sender) throttle
 //!   (one per 30 s) and a per-contract emit cap shared with the other repairs
@@ -84,7 +99,9 @@
 //! - **Charge follows check, not atomically.** Messages admitted while one
 //!   token is left all merge and are all charged; the bucket may go negative
 //!   (floored at minus the burst), which delays later admissions, so the
-//!   long-run rate still holds.
+//!   long-run rate still holds. In-flight merges per contract are bounded by
+//!   the executor queue, which a const assertion in `contract::fair_queue`
+//!   keeps below the burst, so the floor never forgives real debt.
 //!
 //! ## Bounded growth
 //!
@@ -252,10 +269,19 @@ impl ContractMergeBudget {
         if self.buckets.len() >= self.max_tracked {
             return;
         }
-        self.buckets.entry(contract).or_insert(Bucket {
-            tokens: self.capacity - 1.0,
-            last_refill: now,
-        });
+        // `and_modify` so two first charges racing past the `get_mut` above
+        // both count.
+        let (capacity, interval) = (self.capacity, self.refill_interval);
+        self.buckets
+            .entry(contract)
+            .and_modify(|bucket| {
+                bucket.refill(now, capacity, interval);
+                bucket.tokens = (bucket.tokens - 1.0).max(-capacity);
+            })
+            .or_insert(Bucket {
+                tokens: capacity - 1.0,
+                last_refill: now,
+            });
     }
 
     /// One `info!` line per [`DROP_LOG_INTERVAL`], naming the contract that
@@ -481,6 +507,10 @@ mod tests {
         let (b, _clock) = budget(1.0, Duration::from_secs(1), 1);
         assert!(admit_and_charge(&b, id(1)));
         assert_eq!(b.admit(id(2)), MergeBudgetDecision::Untracked);
+        assert!(
+            MergeBudgetDecision::Untracked.is_allowed(),
+            "a full map fails open"
+        );
         b.charge_changed(id(2));
         assert_eq!(b.admit(id(2)), MergeBudgetDecision::Untracked);
         assert_eq!(b.untracked_total(), 2);
@@ -489,11 +519,12 @@ mod tests {
     }
 
     /// Source pin: the budget is checked in exactly one place, the
-    /// `NetMessageV1::Update` dispatch for a message with a source address
-    /// (so never for a local client UPDATE), and charged in exactly the two
-    /// broadcast relay drivers. A check or charge on another path would
-    /// throttle traffic this budget must not touch: local client writes and
-    /// routed client writes.
+    /// `NetMessageV1::Update` dispatch for a broadcast with a source address
+    /// (so never for a local client UPDATE or a routed client write), and
+    /// charged in exactly the two broadcast apply paths, each directly inside
+    /// an `if <..>.changed {` block. A check or charge elsewhere would throttle
+    /// traffic this budget must not touch; a charge outside the `changed`
+    /// branch would let duplicates and no-op deltas empty a contract's bucket.
     #[test]
     fn budget_is_checked_on_network_broadcasts_and_charged_in_the_broadcast_drivers() {
         use crate::node::{collect_rs_files, strip_cfg_test_regions};
@@ -514,6 +545,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        let squash = |src: &str| -> String { src.chars().filter(|c| !c.is_whitespace()).collect() };
         let mut admits = Vec::new();
         let mut charges = Vec::new();
         for path in &files {
@@ -532,11 +564,14 @@ mod tests {
             let Ok(src) = std::fs::read_to_string(path) else {
                 continue;
             };
-            let prod = code(&src);
-            for _ in 0..prod.matches(".admit(*key.id())").count() {
+            let flat = squash(&code(&src));
+            for _ in 0..flat.matches("contract_merge_budget.admit(").count() {
                 admits.push(rel.clone());
             }
-            for _ in 0..prod.matches(".charge_changed(").count() {
+            for _ in 0..flat
+                .matches("contract_merge_budget.charge_changed(")
+                .count()
+            {
                 charges.push(rel.clone());
             }
         }
@@ -551,48 +586,71 @@ mod tests {
         );
 
         // The check sits in the network UPDATE arm, after the source-address
-        // match that local client UPDATEs never take, and is gated on the
-        // broadcast class.
-        let node = code(include_str!("../node.rs"));
+        // match that local client UPDATEs never take, gated on the broadcast
+        // class.
+        let node = squash(&code(include_str!("../node.rs")));
         let arm = node
-            .find("NetMessageV1::Update(ref op) => {")
+            .find("NetMessageV1::Update(refop)=>{")
             .expect("UPDATE dispatch arm");
         let source = arm
             + node[arm..]
-                .find("if let Some(sender_addr) = source_addr {")
+                .find("ifletSome(sender_addr)=source_addr{")
                 .expect("source-address match");
-        let check = node.find(".admit(*key.id())").expect("budget check");
+        let check = node
+            .find("contract_merge_budget.admit(")
+            .expect("budget check");
         assert!(
             arm < source && source < check,
             "check after the source match"
         );
         let gate = node[..check]
-            .rfind("if update_class == crate::ring::update_rate_limit::UpdateClass::Broadcast")
+            .rfind("ifupdate_class==crate::ring::update_rate_limit::UpdateClass::Broadcast&&")
             .expect("broadcast-class gate");
         assert!(gate > source, "the check is gated on the broadcast class");
+        assert!(
+            !node[gate..check].contains('{'),
+            "the broadcast-class gate is the condition of the check itself"
+        );
 
-        // Each charge is inside one of the two broadcast apply paths
-        // (non-streaming driver, streaming apply), gated on a state change.
-        let ops = code(include_str!("../operations/update/op_ctx_task.rs"));
+        // Each charge is directly inside an `if <..>.changed {` block of one
+        // of the two broadcast apply paths: find the `{` that opens the
+        // innermost block around the charge, and read the condition before it.
+        let ops = squash(&code(include_str!("../operations/update/op_ctx_task.rs")));
         for driver in [
-            "async fn drive_relay_broadcast_to(",
-            "async fn apply_streaming_broadcast(",
+            "asyncfndrive_relay_broadcast_to(",
+            "asyncfnapply_streaming_broadcast(",
         ] {
-            let start = ops.find(driver).expect("driver exists");
+            let start = ops
+                .find(driver)
+                .unwrap_or_else(|| panic!("{driver} exists"));
             let end = start
                 + 1
                 + ops[start + 1..]
-                    .find("\nasync fn ")
+                    .find("asyncfn")
                     .unwrap_or(ops.len() - start - 1);
             let body = &ops[start..end];
             let at = body
-                .find(".charge_changed(")
+                .find("contract_merge_budget.charge_changed(")
                 .unwrap_or_else(|| panic!("{driver} charges"));
-            let guard = &body[..at];
-            let guard = &guard[guard.rfind("if ").expect("guarded")..];
+            let mut depth = 0i32;
+            let mut open = None;
+            for (i, ch) in body[..at].char_indices().rev() {
+                match ch {
+                    '}' => depth += 1,
+                    '{' if depth == 0 => {
+                        open = Some(i);
+                        break;
+                    }
+                    '{' => depth -= 1,
+                    _ => {}
+                }
+            }
+            let open = open.expect("the charge is inside a block");
+            let cond_start = body[..open].rfind("if").expect("the block is an if");
+            let cond = &body[cond_start + 2..open];
             assert!(
-                guard.contains("changed"),
-                "{driver}: charge gated on a state change"
+                cond.ends_with(".changed") && !cond.contains('!') && !cond.contains("else"),
+                "{driver}: the charge must sit directly inside `if <..>.changed {{`, found `if {cond} {{`"
             );
         }
     }

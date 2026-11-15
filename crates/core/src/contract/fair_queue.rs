@@ -42,6 +42,14 @@ use super::handler::{ContractHandlerEvent, EventId};
 /// 100 allows burst headroom (5-10x) while catching abuse.
 pub(super) const MAX_QUEUED_PER_CONTRACT: usize = 100;
 
+// The per-contract merge budget (#6190) charges after the merge, so merges
+// admitted on the last token run up a debt it carries down to minus its burst.
+// That debt is bounded by what can be in flight for one contract, which this
+// queue bounds; keep it under the burst so the floor never forgives real debt.
+const _: () = assert!(
+    MAX_QUEUED_PER_CONTRACT < crate::ring::contract_merge_budget::MERGE_BUDGET_BURST as usize
+);
+
 /// Maximum total events across all queues.
 /// Global backpressure to bound total memory usage.
 /// Set below MAX_PENDING_REQUESTS (10,000) so backpressure propagates
