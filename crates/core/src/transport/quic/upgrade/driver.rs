@@ -674,7 +674,16 @@ impl QuicUpgrades {
         if self.policy.percent_set() {
             return None;
         }
-        let start = self.trace.as_ref()?.data_ramp_start()?;
+        let trace = self.trace.as_ref()?;
+        // The emergency-stop release has no ramp, whatever this build's
+        // `QUIC_DATA_RAMP_START` is, so the node reads the fixed share.
+        if trace.runs_without_ramp() {
+            return Some((
+                super::policy::DataShare::Fixed(super::policy::QUIC_DATA_PERCENT),
+                self.path_clock.wall_now(),
+            ));
+        }
+        let start = trace.data_ramp_start()?;
         let shift = Duration::from_secs(start.min(0).unsigned_abs());
         let share = super::policy::DataShare::Ramp {
             start_unix_secs: start.max(0).unsigned_abs(),

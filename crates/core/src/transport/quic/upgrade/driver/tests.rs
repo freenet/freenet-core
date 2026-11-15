@@ -746,22 +746,51 @@ fn ready_ack(session: &Session, attempt: u32, caps: u32) {
 /// The driver acts on every (own bit, peer bit): what the path accepts follows
 /// this node's bit from the moment the path exists, its `Ready` says so, and it
 /// may send only once the peer's frame has the bit too. Mode `shadow` sets no bit
-/// at any percentage, and neither does `prefer` at this release's share.
+/// at any percentage. With no `quic-data-percent`, `prefer` takes the release's
+/// share: 0 with no ramp start (the emergency-stop build), and with one set the
+/// ramp's 5% before T0, so the bit then depends on the pair's bucket.
 #[test]
 fn a_path_follows_the_data_bits() {
     use crate::transport::quic::control::{QuicControl, caps};
     use crate::transport::quic::path::QuicInboundOutcome;
+    use crate::transport::quic::upgrade::policy::RAMP_START_IS_SET;
+    use crate::transport::quic::upgrade::slice::bucket;
     bounded(|| async move {
-        let _seed = GlobalRng::seed_guard(SEED);
-        for (mode, percent, peer_caps, accepts, sends) in [
-            ("prefer", Some("100"), caps::DATA, true, true),
-            ("prefer", Some("100"), 0, true, false),
-            ("prefer", Some("0"), caps::DATA, false, false),
-            ("shadow", Some("100"), caps::DATA, false, false),
-            ("prefer", None, caps::DATA, false, false),
+        // (seed, the pair's bucket under it when the row depends on it, mode,
+        // quic-data-percent, peer caps, accepts, sends). Each row seeds its own
+        // keys, so its bucket does not depend on the rows before it.
+        for (seed, want_bucket, mode, percent, peer_caps, accepts, sends) in [
+            (SEED, None, "prefer", Some("100"), caps::DATA, true, true),
+            (SEED, None, "prefer", Some("100"), 0, true, false),
+            (SEED, None, "prefer", Some("0"), caps::DATA, false, false),
+            (SEED, None, "shadow", Some("100"), caps::DATA, false, false),
+            // No quic-data-percent: the release's share. This harness's virtual
+            // clock reads 1970, before any T0, and a time before T0 reads as
+            // T0, so with a ramp start the share is 5%. A pair with bucket 51
+            // is outside it, and one with bucket 2 is inside it. With no ramp
+            // start the share is 0 and neither gets the bit.
+            (SEED, Some(51), "prefer", None, caps::DATA, false, false),
+            (
+                4,
+                Some(2),
+                "prefer",
+                None,
+                caps::DATA,
+                RAMP_START_IS_SET,
+                RAMP_START_IS_SET,
+            ),
         ] {
-            let case = format!("{mode} {percent:?}, peer {peer_caps}");
+            let _seed = GlobalRng::seed_guard(seed);
+            let case = format!("seed {seed:#x}, {mode} {percent:?}, peer {peer_caps}");
             let h = Harness::server_with("quic-driver-bits", mode, percent).await;
+            if let Some(want) = want_bucket {
+                assert_eq!(
+                    bucket(h.pair.a_keys.public(), h.pair.b_keys.public()),
+                    want,
+                    "{case}: the seeded pair's bucket changed; pick a seed whose \
+                     bucket is on the same side of 5%"
+                );
+            }
             let (session, inbox) = h.session();
             let attempt = offered(&h, &session);
             let up = path_up(&h, &session, inbox);

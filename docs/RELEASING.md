@@ -491,13 +491,16 @@ Current wire-gated floors:
   and `ResponseNative` at indices 5 and 6 of
   `operations/connect/wire.rs::ConnectMsgWire`, #5940).
 
-  Set to **`(0, 2, 158)`**, the release intended to first ship the decoder,
+  Set to **`(0, 2, 159)`**, the release intended to first ship the decoder,
   and guarded by `QUIC_NATIVE_SHIPPED_IN`, currently `None`, checked by
   `p2p_protoc::quic_native_floor_tests::quic_native_floor_tracks_the_shipping_release`.
-  0.2.157 carries the decoder but was cut with the floor raised past it, so
-  it never emits the native variants. When the 0.2.158 bump fails that test,
-  set the marker to the literal `Some((0, 2, 158))` if the release carries
-  the decoder, otherwise raise the floor. Same failure mode as the
+  0.2.157 and 0.2.158 carry the decoder but were cut with the floor raised
+  past them, so they never emit the native variants. 0.2.158 is the QUIC data
+  ramp release (#6224), which raised the floor so that the native offer does
+  not start in the same release as the data ramp. When the 0.2.159 bump fails
+  that test, set the marker to the literal `Some((0, 2, 159))` if the release
+  carries the decoder and should start the native offer, otherwise raise the
+  floor. Same failure mode as the
   application-message floors above: a peer at
   or above the floor without the decoder closes the connection on the variant,
   so bias high. Only `connect::wire::encode_for_peer`, at the one peer-bound
@@ -615,13 +618,19 @@ Current wire-gated floors:
   can turn a pair's bit on a second time and recycle it again.
 
   Emergency stop: a parked release, built and soaked before the ramp release is
-  cut, is published through the normal auto-update stagger (0 to 4 h). It makes
-  two changes, and needs both. It sets the default mode to off, which turns QUIC
-  off on every node that did not set `transport-quic` itself (the default is
-  read, never written to `config.toml`). It also sets `QUIC_DATA_RAMP_START`
-  back to `None`, which gives every node that set `transport-quic = "prefer"`
-  itself (testers, possibly our own gateways) a share of 0, so none of its pairs
-  carries data; only a node that also set `quic-data-percent` keeps a share.
+  cut, is published through the normal auto-update stagger (0 to 4 h). It
+  restores the pre-ramp state with two changes, and needs both. It sets
+  `QUIC_DATA_RAMP_START` back to `None`, which gives every `prefer` node a
+  share of 0, so none of its pairs carries data; only a node that set
+  `quic-data-percent` keeps a share. It also sets the default mode back to
+  0.2.156's: shadow on Linux and macOS, off on Windows. An emergency release
+  should only go back to states the field has run, and Windows with QUIC off
+  is what every release through 0.2.156 ran. So a Linux or macOS node that did not set
+  `transport-quic` keeps its endpoint with shadow paths (off would tear down
+  every endpoint mid-incident), and a Windows node turns QUIC off (the default
+  is read, never written to `config.toml`). A node that set
+  `transport-quic = "prefer"` itself stays in prefer at a share of 0, which
+  acts as shadow on the wire.
   A node takes either change only when it restarts into the release (an
   auto-update restarts it, 0 to 4 h after publish). Until then its paths with
   data keep carrying data: a path with data is never rechecked.

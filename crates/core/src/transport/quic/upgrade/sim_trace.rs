@@ -243,10 +243,16 @@ impl NodeTrace {
     }
 
     pub(crate) fn data_ramp_start(&self) -> Option<i64> {
-        if self.trace.data.no_ramp.lock().contains(&self.addr) {
+        if self.runs_without_ramp() {
             return None;
         }
         *self.trace.data.ramp_start.lock()
+    }
+
+    /// Whether this node runs as the emergency-stop release
+    /// ([`QuicUpgradeTrace::run_without_ramp`]).
+    pub(crate) fn runs_without_ramp(&self) -> bool {
+        self.trace.data.no_ramp.lock().contains(&self.addr)
     }
 
     pub(crate) fn refuses_data_while_advertising(&self) -> bool {
