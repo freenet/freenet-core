@@ -1285,7 +1285,7 @@ impl P2pConnManager {
                     crate::operations::connect::native::DialTransport::Udp => {
                         IdentitySource::Dialled
                     }
-                    crate::operations::connect::native::DialTransport::Native => {
+                    crate::operations::connect::native::DialTransport::Native { .. } => {
                         self.bridge
                             .op_manager
                             .ring
@@ -1378,7 +1378,7 @@ impl P2pConnManager {
                     }
                 };
 
-                let native = transport == crate::operations::connect::native::DialTransport::Native;
+                let native = transport.is_native();
                 // A native setup can end after the pair connected another way:
                 // the server waits longer than the client, and the client's UDP
                 // fallback can connect the pair meanwhile. Its failure then

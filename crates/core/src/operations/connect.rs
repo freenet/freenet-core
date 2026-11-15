@@ -1574,7 +1574,7 @@ pub(super) async fn dispatch_expect_connection_from(
             callback,
             is_gw: false,
             origin: crate::transport::NatAttemptOrigin::ConnectAcceptor,
-            transport: native::DialTransport::Native,
+            transport: native::DialTransport::NATIVE,
         })
         .await?;
     let op_manager = op_manager.clone();

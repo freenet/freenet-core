@@ -547,11 +547,6 @@ fn spawn_outbound(
 /// [`OutboundConnector`]); that unbounded stage is #5947.
 const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a native dial may wait. The setup's own window is shorter and ends
-/// it first (`quic::native::setup`: 8 s for the client, 12 s for the server),
-/// so this only bounds a setup that never reports.
-const NATIVE_CONNECT_WITHIN: Duration = Duration::from_secs(20);
-
 /// Run one outbound connect to `peer` and report it as the event the driver
 /// emits. Sets `peer_ready` only on success.
 async fn connect_outbound(
@@ -578,15 +573,15 @@ async fn connect_outbound(
                 Err(_) => Err(ConnectionError::Timeout),
             }
         }
-        crate::operations::connect::native::DialTransport::Native => {
+        crate::operations::connect::native::DialTransport::Native { within } => {
             let dial = crate::transport::NativeDial {
                 addr,
                 key: peer.pub_key.clone(),
                 is_gateway: matches!(origin, crate::transport::NatAttemptOrigin::Gateway),
-                within: NATIVE_CONNECT_WITHIN,
+                within,
             };
             // Not a transport failure for the address: the connect op falls
-            // back to a UDP dial at once, which decides that.
+            // back to a UDP dial at its fallback time, which decides that.
             outbound.connect_native(dial).await.map_err(|outcome| {
                 tracing::debug!(%addr, label = outcome.label(), "native dial gave no connection");
                 native_outcome = Some(outcome);

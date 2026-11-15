@@ -3622,7 +3622,7 @@ async fn a_native_connection_binds_its_proven_key() {
     let mut result = pending_connect_peer_over(
         &mut h,
         PeerKeyLocation::new(peer.clone(), addr),
-        DialTransport::Native,
+        DialTransport::NATIVE,
     )
     .await;
     h.handshake_event(HandshakeEvent::OutboundEstablished {
@@ -3630,7 +3630,7 @@ async fn a_native_connection_binds_its_proven_key() {
         peer: PeerKeyLocation::new(peer.clone(), addr),
         connection: Box::new(IdleConnection::new(addr)),
         transient: false,
-        transport: DialTransport::Native,
+        transport: DialTransport::NATIVE,
     })
     .await;
     assert!(
@@ -3681,14 +3681,14 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
                 .unwrap();
             let peer = PeerKeyLocation::new(key(), addr);
             let mut result =
-                pending_connect_peer_over(&mut h, peer.clone(), DialTransport::Native).await;
+                pending_connect_peer_over(&mut h, peer.clone(), DialTransport::NATIVE).await;
             h.handshake_event(HandshakeEvent::OutboundFailed {
                 transaction: Transaction::new::<ConnectMsg>(),
                 peer,
                 // A transport-level error, which marks a UDP dial's address.
                 error: ConnectionError::Timeout,
                 transient: false,
-                transport: DialTransport::Native,
+                transport: DialTransport::NATIVE,
                 native_outcome: Some(outcome),
                 origin,
             })
@@ -3749,7 +3749,7 @@ async fn a_late_native_failure_keeps_the_connection_made_meanwhile() {
         peer: PeerKeyLocation::new(peer.clone(), addr),
         error: ConnectionError::FailedConnectOp,
         transient: false,
-        transport: DialTransport::Native,
+        transport: DialTransport::NATIVE,
         native_outcome: Some(NativeSetupOutcome::TimedOut),
         origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
     })
