@@ -35,11 +35,12 @@ use crate::transport::quic::breaker::{BreakerOutcome, Verdict};
 use crate::transport::quic::control::caps;
 use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 
-/// The share of pairs, in percent, that carry data on QUIC in this release
-/// when it sets no ramp ([`QUIC_DATA_RAMP_START`]), for a node in `prefer`
-/// mode: a fixed step (0, then 5 for the first data release). Both sides must
-/// set their bit, so a pair moves only once both run a release that puts it in
-/// the slice. `quic-data-percent` replaces it on one node.
+/// The share of pairs, in percent, that carry data on QUIC for a node in
+/// `prefer` mode. It applies only to a build with no ramp start
+/// ([`QUIC_DATA_RAMP_START`] = `None`), which is the emergency-stop build; while
+/// the ramp start is set, the ramp's share applies and this is not read. Both
+/// sides must set their bit, so a pair moves only once both run a release that
+/// puts it in the slice. `quic-data-percent` replaces it on one node.
 pub(in crate::transport) const QUIC_DATA_PERCENT: u8 = 0;
 
 /// Whether this node, as configured, may carry data on QUIC: `transport-quic`
@@ -74,9 +75,7 @@ fn may_carry_data_with(config: &NetworkApiConfig, ramp_start: Option<u64>) -> bo
 /// starts later. `quic-data-percent` replaces the ramp on one node.
 /// `scripts/check_quic_data_ramp_t0.sh` reads this line, so keep it on one line
 /// in this form.
-// 2026-11-16 02:30:00 UTC, for the 0.2.158 release (#6224). The release check
-// accepts a live cut of 0.2.158 within 3 h either side of it; the plan is to
-// dispatch between 2026-11-15 23:30 UTC and this time.
+// 2026-11-16 02:30:00 UTC: the ramp start of the 0.2.158 release (#6224).
 pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = Some(1_794_796_200);
 
 /// Whether this build sets a ramp start: for tests outside the transport

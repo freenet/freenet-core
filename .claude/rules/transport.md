@@ -1173,11 +1173,12 @@ elsewhere, since the breaker cannot trip without a boot identity) decides whethe
 `prefer` negotiates data with the share of pairs the ramp gives at the time ("Data
 slice" below; `upgrade::policy::log_startup` reports the share at INFO once per
 node, and each band the ramp enters is logged at INFO), and a pair with both bits
-sends its data on the path ("QUIC send route" below). With no ramp start and no
+sends its data on the path ("QUIC send route" below). The tree sets the ramp
+start for 0.2.158 (#6224), so `prefer` nodes, every Linux, macOS and Windows node
+that did not set the key, carry data with the ramp's share, and 0.2.158's release
+notes say so. With no ramp start (the emergency-stop build) and no
 `quic-data-percent` the share is 0, and `prefer` differs from `shadow` only by the
-bit, which stays 0. The release that sets the ramp start must say in its notes that
-`prefer` nodes, every Linux, macOS and Windows node that did not set the key, start
-carrying data. Off: no endpoint, no QUIC ingress, nothing
+bit, which stays 0. Off: no endpoint, no QUIC ingress, nothing
 changes, except that `off` set in the config is deprecated and logs a WARN at
 startup (`upgrade::policy::log_startup`); the endpoint state telemetry reports it
 as `off_config`. Windows has the same default since its crash-loop breaker was
@@ -1304,9 +1305,9 @@ pair is in the slice when its bucket is below the percentage, so 0 holds none,
   The percentage: a ramp over one release (`slice::ramp_percent`): 5% for the
   first 6 h, then linear 5 to 25% to 12 h and 25 to 100% to 24 h, 100% after,
   from `QUIC_DATA_RAMP_START` in `upgrade/policy.rs` (Unix seconds, or `None`:
-  no ramp, share 0). The start is `None` in tree and set in its own reviewed PR to
-  the planned publish time, just before the release's soak, and left set: past 24 h
-  it reads 100%, the steady state. A node whose clock reads before the start gets
+  no ramp, share 0). The start is set for 0.2.158 (#6224, 2026-11-16 02:30 UTC),
+  in its own reviewed PR at the planned publish time, and left set: past 24 h it
+  reads 100%, the steady state. Only an emergency stop sets it back to `None`. A node whose clock reads before the start gets
   5%. Slices nest, so a pair in the slice stays in as the share grows. The config
   key `quic-data-percent` (lenient text like `quic-max-paths`; anything but a whole
   number from 0 to 100 reads as unset, with a WARN when QUIC is on) replaces the
@@ -1547,15 +1548,17 @@ a test passes its own; tests read their own, never the global).
   `cap_held` is an episode ended by the egress cap holding this side's sends
   (the watch cannot tell then whether the peer is dark). The
   dark-path rule closes only a path that carries data (QuicPath::enable_data);
-  on every other path (all of them while QUIC_DATA_PERCENT is 0) it only
-  counts, so the field shows how long real dark spells last. A spell is read
+  on every other path (shadow paths, and pairs outside the ramp's share) it
+  only counts, so the field shows how long real dark spells last. A spell is read
   up to when the peer is next heard from, which waits for quinn's backed-off
   probes after the outage ends, so it reads longer than the outage (in
   a_path_without_data_is_not_closed_by_a_dark_spell a 30 s outage read about
   45 s and a 100 s one about 200 s), and an outage whose backoff runs past
   quinn's 120 s idle timeout ends the path and counts `unrecovered`. The dark
-  threshold (the 10 s window) is to be revisited from these numbers before the
-  data ramp passes 5%.
+  threshold (the 10 s window) was not revisited before 0.2.158: the ramp passes
+  5% at T0 + 6 h with it as is. The release watch reads carried against shadow
+  dark episodes (rule 14) through the 5% plateau, and the window is to be
+  revisited from those numbers.
   quic_gate_loss_<queue|share|persistent|ecn|no_sample|ignored> (congestion
   events by the loss gate's verdict, recycle::loss_gate, reported by the path's
   report at each tick; over a path's life they sum to its quic_congestion_events,
@@ -1994,8 +1997,9 @@ release goes out.
   QUIC's memory is bounded by the buffer budget ("QUIC memory" above) and summed
   in the node aggregate at the QUIC connection cap, to which the connection
   limit is lowered while the node may carry data. Pairs outside the slice are
-  the control while it grows. Needs identity PR3, the
-  quinn pin decision and #6027. Keep the stream limits if permit waits plus
+  the control while it grows. Started by 0.2.158 (#6224, T0 2026-11-16 02:30
+  UTC), with the release watch and the emergency-stop branch beside it. Keep
+  the stream limits if permit waits plus
   `quic_open_uni_waited` stay below 0.5% of sends and ge_48 below 0.2% of
   path-windows.
 - Going to 100% is default-on. Per slice against its control: fewer transfers
@@ -2891,7 +2895,8 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     the peer's only connection: the node reconnects to it, with the
     upgrade's backoff (60 s doubling to 1 h, +/-20%), and data to it waits
     or fails meanwhile. Not built; the dark-episode counts are what the
-    10 s window is to be checked against before the data ramp passes 5%.
+    10 s window is to be checked against. 0.2.158 passes 5% with the window
+    unchanged, so the check runs on the ramp's own carried episodes.
   e5 constraint: SEND_ABORT_LIMIT and PEER_NOT_ACKNOWLEDGING ask the peer to
   fall back to UDP for THIS connection only. They are not a permanent
   downgrade: e5 must allow a new upgrade after its normal backoff.
