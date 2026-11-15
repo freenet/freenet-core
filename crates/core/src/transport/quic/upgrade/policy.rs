@@ -74,11 +74,10 @@ fn may_carry_data_with(config: &NetworkApiConfig, ramp_start: Option<u64>) -> bo
 /// starts later. `quic-data-percent` replaces the ramp on one node.
 /// `scripts/check_quic_data_ramp_t0.sh` reads this line, so keep it on one line
 /// in this form.
-// PLACEHOLDER (2100-01-01): replace with the planned publish time before the
-// soak. Left as is, scripts/check_quic_data_ramp_t0.sh refuses a live cut, but
-// it is NOT inert: a binary built with it runs the ramp's first stage (5%, a
-// time before T0 reads as T0) until 2100. Never merge it without the real T0.
-pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = Some(4_102_444_800);
+// 2026-11-16 02:30:00 UTC, for the 0.2.158 release (#6224). The release check
+// accepts a live cut of 0.2.158 within 3 h either side of it; the plan is to
+// dispatch between 2026-11-15 23:30 UTC and this time.
+pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = Some(1_794_796_200);
 
 /// Whether this build sets a ramp start: for tests outside the transport
 /// module whose expectations change once [`QUIC_DATA_RAMP_START`] is set.
