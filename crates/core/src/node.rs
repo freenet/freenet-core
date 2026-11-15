@@ -8258,7 +8258,8 @@ mod tests {
         let broadcast_key = key_of(61);
         let request_key = key_of(63);
         let unheld_key = key_of(65);
-        for key in [broadcast_key, request_key] {
+        let control_key = key_of(69);
+        for key in [broadcast_key, request_key, control_key] {
             storage
                 .store_state_sync(
                     &key,
@@ -8267,7 +8268,7 @@ mod tests {
                 .expect("store state");
         }
         op_manager.ring.set_hosting_storage(storage);
-        for key in [broadcast_key, request_key] {
+        for key in [broadcast_key, request_key, control_key] {
             op_manager
                 .ring
                 .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
@@ -8460,15 +8461,22 @@ mod tests {
              broadcast is not also counted as a budget drop"
         );
 
-        // 5. Positive control: a held contract with tokens left is admitted
-        //    (it reaches a driver, so bound it as above).
-        let fresh_key = key_of(67);
+        // 5. Positive control: a held contract with a TRACKED, partly spent
+        //    bucket (tokens left) is admitted. It reaches a driver, so bound it
+        //    as above.
+        for _ in 0..(MERGE_BUDGET_BURST as usize - 5) {
+            budget.charge_changed(*control_key.id());
+        }
+        assert_eq!(
+            budget.admit(*control_key.id()),
+            MergeBudgetDecision::Allowed
+        );
+        let rejected_before = op_manager.ring.update_rate_limiter.rejected_total();
         let sender_e: SocketAddr = "127.0.0.1:15205".parse().unwrap();
-        assert_eq!(budget.admit(*fresh_key.id()), MergeBudgetDecision::Allowed);
         let _dispatched: Result<_, tokio::time::error::Elapsed> = tokio::time::timeout(
             short,
             handle_pure_network_message_v1(
-                broadcast(fresh_key, vec![5, 5, 5]),
+                broadcast(control_key, vec![5, 5, 5]),
                 Some(sender_e),
                 op_manager.clone(),
                 bridge.clone(),
@@ -8482,7 +8490,12 @@ mod tests {
             6,
             "a contract with tokens left is admitted"
         );
-        assert!(drain_resync_targets(&mut notification_rx, fresh_key).is_empty());
+        assert_eq!(
+            op_manager.ring.update_rate_limiter.rejected_total(),
+            rejected_before,
+            "premise: the per-pair limiter admitted it, so the budget decided"
+        );
+        assert!(drain_resync_targets(&mut notification_rx, control_key).is_empty());
     }
 
     /// #5510 gate A: a refusal that is NOT `Rejected` must emit NO repair.

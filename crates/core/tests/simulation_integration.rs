@@ -23129,8 +23129,10 @@ fn test_quic_native_zero_percent_forms_the_same_mesh() {
 ///    non-settling contract stay within 1.1x the state-changing merges the
 ///    budget charged. The rest is the idempotency probes' re-applies and the
 ///    merges of repair `ResyncResponse`s and anti-entropy, which ride other
-///    paths and are bounded by their own limiters (measured with charging at
-///    admission: 25.5k calls against 25.4k admitted, a ratio of 1.006).
+///    paths and are bounded by their own limiters. Measured at this seed:
+///    24,464 calls against 24,146 charged (1.013); streamed, 4,339 against
+///    4,308 (1.007), and deleting the streaming charge site makes the
+///    streaming variant fail (4,339 against 1,387).
 ///
 /// Admissions per node over time are bounded by the token bucket itself
 /// (`ring::contract_merge_budget` unit tests); this test does not re-derive

@@ -44,8 +44,9 @@ pub(super) const MAX_QUEUED_PER_CONTRACT: usize = 100;
 
 // The per-contract merge budget (#6190) charges after the merge, so merges
 // admitted on the last token run up a debt it carries down to minus its burst.
-// That debt is bounded by what can be in flight for one contract, which this
-// queue bounds; keep it under the burst so the floor never forgives real debt.
+// Keep this per-tier queue bound well under the burst so queued-but-uncharged
+// debt cannot reach the floor. Work admitted but not yet queued (a streamed
+// broadcast still assembling) is not bounded by this.
 const _: () = assert!(
     MAX_QUEUED_PER_CONTRACT < crate::ring::contract_merge_budget::MERGE_BUDGET_BURST as usize
 );

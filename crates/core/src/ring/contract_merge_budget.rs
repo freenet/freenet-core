@@ -99,9 +99,10 @@
 //! - **Charge follows check, not atomically.** Messages admitted while one
 //!   token is left all merge and are all charged; the bucket may go negative
 //!   (floored at minus the burst), which delays later admissions, so the
-//!   long-run rate still holds. In-flight merges per contract are bounded by
-//!   the executor queue, which a const assertion in `contract::fair_queue`
-//!   keeps below the burst, so the floor never forgives real debt.
+//!   long-run rate still holds. Queued merges per contract are bounded by the
+//!   executor queue, which a const assertion in `contract::fair_queue` keeps
+//!   well under the burst; streamed broadcasts still assembling are not, so
+//!   in a large burst of those the floor can forgive some debt.
 //!
 //! ## Bounded growth
 //!
@@ -326,6 +327,9 @@ impl ContractMergeBudget {
     }
 
     /// Broadcasts admitted unmetered because the map was full. Should be zero.
+    /// Once the map is full, any peer can move this by sending broadcasts for
+    /// keys that are not tracked, so read it as "the map is full", not as a
+    /// count of real contracts.
     pub(crate) fn untracked_total(&self) -> u64 {
         self.untracked_total.load(Ordering::Relaxed)
     }
@@ -607,9 +611,13 @@ mod tests {
             .rfind("ifupdate_class==crate::ring::update_rate_limit::UpdateClass::Broadcast&&")
             .expect("broadcast-class gate");
         assert!(gate > source, "the check is gated on the broadcast class");
-        assert!(
-            !node[gate..check].contains('{'),
-            "the broadcast-class gate is the condition of the check itself"
+        // The whole condition, exactly: the class gate and the check, with no
+        // other conjunct (a held check here would let a contract merged but
+        // not held bypass the budget).
+        assert_eq!(
+            &node[gate..check],
+            "ifupdate_class==crate::ring::update_rate_limit::UpdateClass::Broadcast&&!op_manager.ring.",
+            "the budget check's condition"
         );
 
         // Each charge is directly inside an `if <..>.changed {` block of one
@@ -646,7 +654,13 @@ mod tests {
                 }
             }
             let open = open.expect("the charge is inside a block");
-            let cond_start = body[..open].rfind("if").expect("the block is an if");
+            // A whole-word `if`: preceded by a statement or block boundary.
+            let cond_start = body[..open]
+                .match_indices("if")
+                .map(|(i, _)| i)
+                .filter(|&i| i > 0 && matches!(body.as_bytes()[i - 1], b';' | b'{' | b'}'))
+                .last()
+                .expect("the block is an if");
             let cond = &body[cond_start + 2..open];
             assert!(
                 cond.ends_with(".changed") && !cond.contains('!') && !cond.contains("else"),
