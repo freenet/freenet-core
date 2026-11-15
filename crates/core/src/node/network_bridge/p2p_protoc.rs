@@ -1171,7 +1171,7 @@ use crate::operations::connect::native::NativeWire;
 /// `docs/RELEASING.md`, this is the release that first ships the decoder, then
 /// frozen. Bias HIGH: too low closes connections to the release below it, too
 /// high only delays the offer.
-pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 157);
+pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 158);
 
 /// Has the decoder for the QUIC-native `ConnectMsg` variants shipped, and in
 /// which release?

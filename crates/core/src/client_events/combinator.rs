@@ -146,6 +146,13 @@ impl<const N: usize> super::ClientEventsProxy for ClientEventsCombinator<N> {
                                         internal
                                     });
                                 tracing::debug!("received request for proxy #{idx}; internal_id={id}; external_id={external}; req={request}");
+                                // `Disconnect` is the client's final message and
+                                // the node sends no reply, so nothing else would
+                                // ever remove the id mapping.
+                                if matches!(&*request, freenet_stdlib::client_api::ClientRequest::Disconnect { .. }) {
+                                    self.external_clients[idx].remove(&external);
+                                    self.internal_clients.remove(&id);
+                                }
                                 Ok(OpenRequest {
                                     client_id: id,
                                     request_id,
@@ -403,7 +410,7 @@ mod test {
                 assert_eq!(id, self.id);
                 Ok(OpenRequest::new(
                     ClientId::next(),
-                    Box::new(ClientRequest::Disconnect { cause: None }),
+                    Box::new(ClientRequest::Close),
                 ))
             })
         }
@@ -437,6 +444,48 @@ mod test {
             r
         });
         (clients, senders, receivers)
+    }
+
+    /// A forwarded `Disconnect` is never answered, so the combinator must drop
+    /// the id mapping for that client itself or both maps grow without bound.
+    #[tokio::test]
+    async fn disconnect_drops_id_mappings() {
+        struct DisconnectingProxy {
+            rx: Receiver<ClientId>,
+        }
+        impl ClientEventsProxy for DisconnectingProxy {
+            fn recv(&mut self) -> BoxFuture<'_, crate::client_events::HostIncomingMsg> {
+                Box::pin(async {
+                    let id = self
+                        .rx
+                        .recv()
+                        .await
+                        .ok_or_else::<ClientError, _>(|| ErrorKind::ChannelClosed.into())?;
+                    Ok(OpenRequest::new(
+                        id,
+                        Box::new(ClientRequest::Disconnect { cause: None }),
+                    ))
+                })
+            }
+            fn send(
+                &mut self,
+                _id: ClientId,
+                _response: Result<HostResponse, ClientError>,
+            ) -> BoxFuture<'_, Result<(), ClientError>> {
+                async { Ok(()) }.boxed()
+            }
+        }
+
+        let (tx, rx) = channel(1);
+        let mut combinator =
+            ClientEventsCombinator::new([Box::new(DisconnectingProxy { rx }) as BoxedClient]);
+        for _ in 0..25 {
+            tx.send(ClientId::next()).await.unwrap();
+            let req = combinator.recv().await.unwrap();
+            assert!(matches!(*req.request, ClientRequest::Disconnect { .. }));
+        }
+        assert!(combinator.internal_clients.is_empty());
+        assert!(combinator.external_clients[0].is_empty());
     }
 
     #[tokio::test]

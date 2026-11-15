@@ -491,12 +491,14 @@ Current wire-gated floors:
   and `ResponseNative` at indices 5 and 6 of
   `operations/connect/wire.rs::ConnectMsgWire`, #5940).
 
-  Set to **`(0, 2, 157)`**, the release intended to first ship the decoder,
+  Set to **`(0, 2, 158)`**, the release intended to first ship the decoder,
   and guarded by `QUIC_NATIVE_SHIPPED_IN`, currently `None`, checked by
   `p2p_protoc::quic_native_floor_tests::quic_native_floor_tracks_the_shipping_release`.
-  When the 0.2.157 bump fails that test, set the marker to the literal
-  `Some((0, 2, 157))` if the release carries the decoder, otherwise raise the
-  floor. Same failure mode as the application-message floors above: a peer at
+  0.2.157 carries the decoder but was cut with the floor raised past it, so
+  it never emits the native variants. When the 0.2.158 bump fails that test,
+  set the marker to the literal `Some((0, 2, 158))` if the release carries
+  the decoder, otherwise raise the floor. Same failure mode as the
+  application-message floors above: a peer at
   or above the floor without the decoder closes the connection on the variant,
   so bias high. Only `connect::wire::encode_for_peer`, at the one peer-bound
   serialize in `handle_peer_channel_message`, emits the variants; every other

@@ -2497,6 +2497,70 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
 /// `Instant` in the past (which can underflow on a freshly booted machine).
 fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
     let status = NETWORK_STATUS.get()?;
+    // Call every registered provider BEFORE taking the NETWORK_STATUS read
+    // guard. Providers lock ring/connection state (e.g. the ring-stats provider
+    // takes `ConnectionManager::own_addr`), while `set_own_addr` holds that
+    // lock and then takes the NETWORK_STATUS write lock. Calling them under
+    // the guard is a lock-order inversion that deadlocks the node.
+    // Read subscribed contracts from the registered provider, which in
+    // production points at the canonical lease map in `HostingManager`.
+    // Sort order is set inside the provider (most recently updated first;
+    // never-updated entries fall to the end with a deterministic key
+    // tie-break).
+    let contracts: Vec<ContractSnapshot> = SUBSCRIPTION_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| {
+            provider()
+                .into_iter()
+                .map(|c| {
+                    let key_full = c.key.to_string();
+                    let instance_id = c.key.id().to_string();
+                    // Use char boundary for safe truncation (contract keys
+                    // are base58/ASCII, but be defensive against future
+                    // encoding changes).
+                    let key_short = if key_full.chars().count() > 12 {
+                        let trunc: String = key_full.chars().take(12).collect();
+                        format!("{trunc}...")
+                    } else {
+                        key_full.clone()
+                    };
+                    ContractSnapshot {
+                        key_short,
+                        key_full,
+                        instance_id,
+                        subscribed_secs: c.subscribed_secs,
+                        last_updated_secs: c.last_updated_secs,
+                        is_receiving_updates: c.is_receiving_updates,
+                        in_use: c.in_use,
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let ring_stats = RING_STATS_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+        .unwrap_or_default();
+
+    let governance = GOVERNANCE_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+        .unwrap_or_default();
+    let ban_list = BAN_LIST_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+        .unwrap_or_default();
+    let hosting = HOSTING_PROVIDER
+        .read()
+        .as_ref()
+        .map(|provider| provider())
+        .unwrap_or_default();
+
     let s = status.read().ok()?;
 
     let failures = s
@@ -2577,43 +2641,6 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
     let gateway_only_persisting =
         gateway_only && gateway_only_is_persisting(s.gateway_only_since, now);
 
-    // Read subscribed contracts from the registered provider, which in
-    // production points at the canonical lease map in `HostingManager`.
-    // Sort order is set inside the provider (most recently updated first;
-    // never-updated entries fall to the end with a deterministic key
-    // tie-break).
-    let contracts: Vec<ContractSnapshot> = SUBSCRIPTION_PROVIDER
-        .read()
-        .as_ref()
-        .map(|provider| {
-            provider()
-                .into_iter()
-                .map(|c| {
-                    let key_full = c.key.to_string();
-                    let instance_id = c.key.id().to_string();
-                    // Use char boundary for safe truncation (contract keys
-                    // are base58/ASCII, but be defensive against future
-                    // encoding changes).
-                    let key_short = if key_full.chars().count() > 12 {
-                        let trunc: String = key_full.chars().take(12).collect();
-                        format!("{trunc}...")
-                    } else {
-                        key_full.clone()
-                    };
-                    ContractSnapshot {
-                        key_short,
-                        key_full,
-                        instance_id,
-                        subscribed_secs: c.subscribed_secs,
-                        last_updated_secs: c.last_updated_secs,
-                        is_receiving_updates: c.is_receiving_updates,
-                        in_use: c.in_use,
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
     let elapsed_secs = now.saturating_duration_since(s.started_at).as_secs();
     let has_version_mismatch = s
         .gateway_failures
@@ -2643,12 +2670,6 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
 
     let bytes_uploaded = TRANSPORT_METRICS.cumulative_bytes_sent();
     let bytes_downloaded = TRANSPORT_METRICS.cumulative_bytes_received();
-
-    let ring_stats = RING_STATS_PROVIDER
-        .read()
-        .as_ref()
-        .map(|provider| provider())
-        .unwrap_or_default();
 
     let transport_snapshot = TRANSPORT_METRICS.read_snapshot();
 
@@ -2681,21 +2702,9 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
         health,
         ring_stats,
         transport_snapshot,
-        governance: GOVERNANCE_PROVIDER
-            .read()
-            .as_ref()
-            .map(|provider| provider())
-            .unwrap_or_default(),
-        ban_list: BAN_LIST_PROVIDER
-            .read()
-            .as_ref()
-            .map(|provider| provider())
-            .unwrap_or_default(),
-        hosting: HOSTING_PROVIDER
-            .read()
-            .as_ref()
-            .map(|provider| provider())
-            .unwrap_or_default(),
+        governance,
+        ban_list,
+        hosting,
         // Read straight from the queue's gauge — no provider registration and
         // no mirrored counter to keep in sync (#4917).
         fair_queue: crate::contract::fair_queue_stats(),
@@ -3944,5 +3953,44 @@ mod tests {
 
         // 4. Clean up.
         clear_ring_stats_provider();
+    }
+
+    /// The ring-stats provider locks `ConnectionManager::own_addr`, while
+    /// `set_own_addr` holds `own_addr` and then takes the NETWORK_STATUS write
+    /// lock. A snapshot that calls providers while holding the NETWORK_STATUS
+    /// read guard therefore deadlocks against it. `own` stands in for
+    /// `own_addr`; under the old ordering this test hangs.
+    #[test]
+    fn snapshot_does_not_call_providers_under_status_lock() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        init(31340, HashSet::new(), "test".to_string());
+
+        let own = Arc::new(parking_lot::Mutex::new(()));
+        let provider_own = own.clone();
+        set_ring_stats_provider(Arc::new(move || {
+            let _g = provider_own.lock();
+            RingStatsSnapshot::default()
+        }));
+
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let writer_own = own.clone();
+        let writer = std::thread::spawn(move || {
+            let _g = writer_own.lock();
+            held_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            set_external_address("127.0.0.1:31340".parse().unwrap());
+        });
+        held_rx.recv().unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let _ = get_snapshot();
+            done_tx.send(()).unwrap();
+        });
+        let finished = done_rx.recv_timeout(Duration::from_secs(10)).is_ok();
+        clear_ring_stats_provider();
+        assert!(finished, "snapshot deadlocked against set_external_address");
+        reader.join().unwrap();
+        writer.join().unwrap();
     }
 }

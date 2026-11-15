@@ -1725,6 +1725,16 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         }
     }
 
+    /// Remove a `RecentlyClosed` entry so the address can start a new handshake.
+    fn remove_recently_closed(&mut self, addr: &SocketAddr) {
+        if matches!(
+            self.states.get(addr),
+            Some(ConnectionState::RecentlyClosed { .. })
+        ) {
+            self.states.remove(addr);
+        }
+    }
+
     /// Remove established connection and return the packet sender (for detection purposes).
     fn remove_established(&mut self, addr: &SocketAddr) -> Option<mpsc::Sender<InboundPacket>> {
         if matches!(
@@ -1792,16 +1802,33 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         }
     }
 
-    /// Clean up expired RecentlyClosed states and rate limit entries.
+    /// Clean up expired RecentlyClosed states and rate limit entries, and
+    /// move Established states whose connection has ended to RecentlyClosed.
+    ///
+    /// An `Established` entry is only replaced when the same address sends
+    /// again, so one whose `PeerConnection` is gone (receiver dropped, sender
+    /// closed) would otherwise hold its inbound channel buffer until process
+    /// exit. Replacing it with `RecentlyClosed` frees the buffer at once, keeps
+    /// the drain window for late packets of the old session (as `mark_closed`
+    /// does), and the next sweep removes the entry.
     fn cleanup_expired(&mut self) {
         let now = self.time_source.now_nanos();
 
-        self.states.retain(|_, state| {
-            if let ConnectionState::RecentlyClosed { closed_at_nanos } = state {
+        self.states.retain(|_, state| match state {
+            ConnectionState::RecentlyClosed { closed_at_nanos } => {
                 now.saturating_sub(*closed_at_nanos) < RECENTLY_CLOSED_DURATION.as_nanos() as u64
-            } else {
+            }
+            ConnectionState::Established {
+                inbound_packet_sender,
+            } => {
+                if inbound_packet_sender.is_closed() {
+                    *state = ConnectionState::RecentlyClosed {
+                        closed_at_nanos: now,
+                    };
+                }
                 true
             }
+            ConnectionState::GatewayHandshake { .. } | ConnectionState::NatTraversal { .. } => true,
         });
 
         self.last_asym_attempt.retain(|_, last_attempt_nanos| {
@@ -2053,31 +2080,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                         // an existing NAT hole). Tearing down the stale session
                                         // lets the new handshake proceed. Rate-limited to 1/sec per
                                         // IP to prevent asymmetric decryption DoS.
-                                        let is_new_identity = if packet_data.is_intro_packet() {
-                                            if self.connections.is_rate_limited(&remote_addr) {
-                                                false
-                                            } else {
-                                                self.connections.record_asym_attempt(remote_addr);
-                                                match packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
-                                                    Ok(decrypted) => {
-                                                        let decrypted_data = decrypted.data();
-                                                        let proto_len = PROTOC_VERSION.len();
-                                                        if decrypted_data.len() >= proto_len + 16 {
-                                                            decrypted_data[..proto_len].try_into().ok()
-                                                                .map(|remote_ver: [u8; 8]| {
-                                                                    version_cmp::is_compatible(&PROTOC_VERSION, &remote_ver).is_ok()
-                                                                })
-                                                                .unwrap_or(false)
-                                                        } else {
-                                                            false
-                                                        }
-                                                    }
-                                                    Err(_) => false,
-                                                }
-                                            }
-                                        } else {
-                                            false
-                                        };
+                                        let is_new_identity = self.is_restart_intro(remote_addr, &packet_data);
 
                                         if is_new_identity {
                                             tracing::info!(
@@ -2094,16 +2097,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                                 // This lets the restarted peer reconnect directly
                                                 // via an existing NAT hole without full gateway
                                                 // re-bootstrap.
-                                                let inbound_key_bytes = key_from_addr(&remote_addr);
-                                                let (gw_ongoing_connection, packets_sender) =
-                                                    self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
-                                                if self.connections.start_gateway_handshake(remote_addr, packets_sender) {
-                                                    let task = GlobalExecutor::spawn(gw_ongoing_connection
-                                                        .instrument(tracing::span!(tracing::Level::DEBUG, "reconnect_accept"))
-                                                        .map_err(move |error| {
-                                                            tracing::debug!(peer_addr = %remote_addr, error = %error, "Reconnect accept error");
-                                                            (error, remote_addr)
-                                                        }));
+                                                if let Some(task) = self.accept_restarted_peer(packet_data, remote_addr) {
                                                     gw_connection_tasks.push(task);
                                                 }
                                                 continue;
@@ -2188,6 +2182,29 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     }
 
                                     ConnectionState::RecentlyClosed { .. } => {
+                                        if !self.is_gateway
+                                            && self.is_restart_intro(remote_addr, &packet_data)
+                                        {
+                                            // The peer restarted after the session ended
+                                            // (the closed `Established` entry was swept to
+                                            // here). Accept it exactly as when the old
+                                            // session was still `Established`, so a
+                                            // reconnect through the existing NAT hole keeps
+                                            // working. Bounded: the entry is removed by the
+                                            // first sweep after `RECENTLY_CLOSED_DURATION`
+                                            // has passed (sweeps run every
+                                            // `RATE_LIMIT_CLEANUP_INTERVAL`).
+                                            tracing::info!(
+                                                peer_addr = %remote_addr,
+                                                "Detected peer restart (new intro on recently closed connection). Resetting session."
+                                            );
+                                            self.connections.clear_rate_limit(&remote_addr);
+                                            self.connections.remove_recently_closed(&remote_addr);
+                                            if let Some(task) = self.accept_restarted_peer(packet_data, remote_addr) {
+                                                gw_connection_tasks.push(task);
+                                            }
+                                            continue;
+                                        }
                                         if !packet_data.is_intro_packet() || !self.is_gateway {
                                             tracing::trace!(peer_addr = %remote_addr, "Dropping packet for recently closed connection");
                                             continue;
@@ -2537,6 +2554,69 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                 }
             }
         }
+    }
+
+    /// True if `packet_data` is a valid intro from a peer we hold (or just
+    /// held) a session with, which means the peer restarted and is
+    /// reconnecting, possibly through an existing NAT hole. Rate-limited to one
+    /// asymmetric decryption per second per IP.
+    fn is_restart_intro(
+        &mut self,
+        remote_addr: SocketAddr,
+        packet_data: &PacketData<UnknownEncryption>,
+    ) -> bool {
+        if !packet_data.is_intro_packet() || self.connections.is_rate_limited(&remote_addr) {
+            return false;
+        }
+        self.connections.record_asym_attempt(remote_addr);
+        match packet_data.try_decrypt_asym(&self.this_peer_keypair.secret) {
+            Ok(decrypted) => {
+                let decrypted_data = decrypted.data();
+                let proto_len = PROTOC_VERSION.len();
+                decrypted_data.len() >= proto_len + 16
+                    && decrypted_data[..proto_len]
+                        .try_into()
+                        .ok()
+                        .map(|remote_ver: [u8; 8]| {
+                            version_cmp::is_compatible(&PROTOC_VERSION, &remote_ver).is_ok()
+                        })
+                        .unwrap_or(false)
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Non-gateway: accept a restarted peer's intro with a server-side
+    /// handshake (as a gateway would), so it can reconnect directly through an
+    /// existing NAT hole without a full gateway re-bootstrap. Returns the
+    /// handshake task for the caller to track.
+    #[allow(clippy::type_complexity)]
+    fn accept_restarted_peer(
+        &mut self,
+        packet_data: PacketData<UnknownEncryption>,
+        remote_addr: SocketAddr,
+    ) -> Option<
+        tokio::task::JoinHandle<
+            Result<(RemoteConnection<S, T>, InboundRemoteConnection), (TransportError, SocketAddr)>,
+        >,
+    > {
+        let inbound_key_bytes = key_from_addr(&remote_addr);
+        let (gw_ongoing_connection, packets_sender) =
+            self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
+        if !self
+            .connections
+            .start_gateway_handshake(remote_addr, packets_sender)
+        {
+            return None;
+        }
+        Some(GlobalExecutor::spawn(
+            gw_ongoing_connection
+                .instrument(tracing::span!(tracing::Level::DEBUG, "reconnect_accept"))
+                .map_err(move |error| {
+                    tracing::debug!(peer_addr = %remote_addr, error = %error, "Reconnect accept error");
+                    (error, remote_addr)
+                }),
+        ))
     }
 
     /// Count an intro packet dropped because nothing exists for its exact
@@ -5667,6 +5747,95 @@ pub mod mock_transport {
             counts.iter().flatten().sum::<u64>(),
             0,
             "a non-gateway's reconnect handshake is not a gateway join"
+        );
+        Ok(())
+    }
+
+    /// A peer that restarts after our session to it ended is still accepted
+    /// through the existing NAT hole (#3673), also when the ended session's
+    /// entry has already been swept: the sweep turns it into `RecentlyClosed`,
+    /// and a valid restart intro on that entry is accepted like one on an
+    /// `Established` entry. Without that, the intro is dropped and the peer
+    /// needs a full NAT traversal.
+    #[tokio::test(start_paused = true)]
+    async fn a_non_gateway_accepts_a_restart_after_the_ended_session_was_swept()
+    -> anyhow::Result<()> {
+        let (logs, log_guard) = crate::util::test_log_capture::install();
+        let channels = Arc::new(DashMap::new());
+        let (listener_pub, (mut listener, mut listener_inbound), listener_addr) =
+            create_mock_peer_internal(
+                Default::default(),
+                PacketDelayPolicy::NoDelay,
+                false,
+                channels.clone(),
+                None,
+                None,
+            )
+            .await?;
+        let restarting_addr = crate::transport::test_net::subnet().addr(1);
+        let bystander_addr = crate::transport::test_net::subnet().addr(2);
+
+        let (first_pub, mut first, _) =
+            create_mock_peer_at_addr(Default::default(), restarting_addr, channels.clone()).await?;
+        let listener_pub_for_first = listener_pub.clone();
+        let first_side = GlobalExecutor::spawn(async move {
+            let pending = first.connect(listener_pub_for_first, listener_addr).await;
+            let conn = tokio::time::timeout(Duration::from_secs(60), pending).await??;
+            Ok::<_, anyhow::Error>((first, conn))
+        });
+        let pending = listener.connect(first_pub, restarting_addr).await;
+        let listener_side = tokio::time::timeout(Duration::from_secs(60), pending).await??;
+        let (first, first_conn) = first_side.await??;
+
+        // The session ends on our side (what the unanswered-ping and idle
+        // timeouts do): the entry stays `Established` with a closed channel.
+        drop(listener_side);
+        drop(first_conn);
+        drop(first);
+
+        // Time passes past the sweep interval. The sweep runs on the next
+        // iteration of the listener loop, which an unrelated stray intro from
+        // a bystander triggers; it must not be the restarted peer's own intro.
+        tokio::time::advance(RATE_LIMIT_CLEANUP_INTERVAL + Duration::from_secs(1)).await;
+        let (_bystander_pub, mut bystander, _) =
+            create_mock_peer_at_addr(Default::default(), bystander_addr, channels.clone()).await?;
+        let bystander_task = GlobalExecutor::spawn(async move {
+            let pending = bystander.connect(listener_pub.clone(), listener_addr).await;
+            drop(tokio::time::timeout(Duration::from_secs(5), pending).await);
+            (bystander, listener_pub)
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let (_restarted_pub, mut restarted, _) =
+            create_mock_peer_at_addr(Default::default(), restarting_addr, channels).await?;
+        let (_, listener_pub) = bystander_task.await?;
+        let pending = restarted.connect(listener_pub, listener_addr).await;
+        let _restarted_conn = tokio::time::timeout(Duration::from_secs(60), pending).await??;
+        let reconnect = tokio::time::timeout(Duration::from_secs(10), listener_inbound.recv())
+            .await?
+            .ok_or(anyhow::anyhow!("listener accepted no reconnect"))?;
+        assert_eq!(
+            reconnect.remote_addr(),
+            restarting_addr,
+            "the listener accepted the restarted peer's intro"
+        );
+
+        // Fail closed: if the sweep had not run, the intro would have been
+        // accepted by the `Established` restart path and this test would pass
+        // without touching the `RecentlyClosed` branch. Require the log of
+        // that branch, and none from the other one.
+        drop(log_guard);
+        let logs = logs.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("new intro on recently closed connection")),
+            "the restart must be accepted by the RecentlyClosed branch; captured: {logs:?}"
+        );
+        assert!(
+            !logs
+                .iter()
+                .any(|l| l.contains("new intro on established connection")),
+            "the Established restart path must not have handled it; captured: {logs:?}"
         );
         Ok(())
     }
