@@ -157,15 +157,43 @@ pub(crate) enum UpdateOverride {
 /// merge), `MockWasmRuntime` delegates to the same `bridged_*` methods that
 /// `Executor<Runtime>` uses, exercising init_tracker, validation, subscriber
 /// notification pipeline, corrupted state recovery, and contract key indexing.
-/// Simulation hook (#6190, `dev_tool::sim_merge_budget`): contracts whose first id byte is a
-/// multiple of this modulus merge non-idempotently (fresh bytes on every
-/// apply). 0 disables. Process-global because sim contract ids are random.
-pub static SIM_BAD_CONTRACT_MODULUS: std::sync::atomic::AtomicU8 =
-    std::sync::atomic::AtomicU8::new(0);
-/// Simulation hook: number of `update_state` calls per contract id.
-pub static SIM_MERGE_COUNTS: std::sync::Mutex<Option<HashMap<ContractInstanceId, u64>>> =
-    std::sync::Mutex::new(None);
-static SIM_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Simulation hooks (#6190, `dev_tool::sim_merge_budget`). Process-global
+/// because simulation contract ids are random; a test that arms them must run
+/// in its own process (it does: `run_alone_in_child_process`).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) mod sim_hooks {
+    use super::*;
+    use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+
+    /// Contracts whose first id byte is a multiple of this merge
+    /// non-idempotently (fresh bytes on every apply). 0 disables the hook and
+    /// the merge counter.
+    pub(crate) static BAD_CONTRACT_MODULUS: AtomicU8 = AtomicU8::new(0);
+    /// `update_state` calls per contract id while armed.
+    pub(crate) static MERGE_COUNTS: std::sync::Mutex<Option<HashMap<ContractInstanceId, u64>>> =
+        std::sync::Mutex::new(None);
+    static NONCE: AtomicU64 = AtomicU64::new(1);
+
+    /// Count the call and return the non-settling override for `key` if the
+    /// hook selects it. A no-op (one atomic load) while disarmed.
+    pub(crate) fn on_update_state(key: &ContractInstanceId) -> Option<UpdateOverride> {
+        let modulus = BAD_CONTRACT_MODULUS.load(Ordering::Relaxed);
+        if modulus == 0 {
+            return None;
+        }
+        *MERGE_COUNTS
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .entry(*key)
+            .or_insert(0) += 1;
+        (key.as_bytes()[0] % modulus == 0).then(|| {
+            UpdateOverride::NonIdempotent(std::sync::Arc::new(AtomicU64::new(
+                NONCE.fetch_add(1 << 20, Ordering::Relaxed),
+            )))
+        })
+    }
+}
 
 pub(crate) struct MockWasmRuntime {
     pub(crate) contract_store: InMemoryContractStore,
@@ -504,21 +532,11 @@ impl ContractRuntimeInterface for MockWasmRuntime {
         // update_data slice) returns `requires`; once the bridged path
         // re-attempts with `RelatedState` entries appended, fall through
         // to the default merge.
-        {
-            let mut g = SIM_MERGE_COUNTS.lock().unwrap();
-            *g.get_or_insert_with(HashMap::new)
-                .entry(*_key.id())
-                .or_insert(0) += 1;
-        }
-        let sim_mod = SIM_BAD_CONTRACT_MODULUS.load(std::sync::atomic::Ordering::Relaxed);
-        let sim_override = (sim_mod != 0
-            && _key.id().as_bytes()[0] % sim_mod == 0
-            && !self.update_overrides.contains_key(_key.id()))
-        .then(|| {
-            UpdateOverride::NonIdempotent(std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
-                SIM_NONCE.fetch_add(1 << 20, std::sync::atomic::Ordering::Relaxed),
-            )))
-        });
+        #[cfg(any(test, feature = "testing"))]
+        let sim_override = sim_hooks::on_update_state(_key.id())
+            .filter(|_| !self.update_overrides.contains_key(_key.id()));
+        #[cfg(not(any(test, feature = "testing")))]
+        let sim_override: Option<UpdateOverride> = None;
         if let Some(override_) = self
             .update_overrides
             .get(_key.id())

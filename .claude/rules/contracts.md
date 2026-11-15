@@ -317,12 +317,16 @@ State merging rules:
     bytes, as the verifier does, so a contract whose encoding depends on
     argument order and that also fails strict associativity can be flagged
     for byte order alone. Violators get flagged in
-    `Ring::broken_invariants`; while flagged, this node suppresses commit,
-    outbound `BroadcastStateChange` (including the retry/stash/flush
-    re-emissions through `handle_broadcast_state_change`), AND full-state
-    egress (`ResyncResponse`, `SyncStateToPeer` heal). The flag is
-    TTL-bounded (`BROKEN_INVARIANT_TTL`, swept by the Ring reaper) so a
-    false positive self-heals instead of bricking the contract forever; a
+    `Ring::broken_invariants`. Since #6190 the flag is DIAGNOSTIC ONLY (INFO
+    log, `freenet.contract.broken_invariant.detections` counter,
+    `broken_invariant_flagged` telemetry event): it must not gate a commit,
+    a broadcast or an egress path, and a source pin
+    (`broken_flag_gates_no_commit_broadcast_or_egress`) fails if one comes
+    back. The load a non-settling merge causes is bounded instead, for every
+    contract alike, by the per-contract merge budget on the broadcast receive
+    path (`ring::contract_merge_budget`). The flag is TTL-bounded
+    (`BROKEN_INVARIANT_TTL`, swept by the Ring reaper), which now bounds how
+    often a contract is re-probed and re-reported; a
     genuine violation is re-detected after expiry (deterministically by the
     identical-input probe when the echo re-pushes a payload this node has not
     already recorded as merged). A re-push of a payload the node already
@@ -336,8 +340,8 @@ State merging rules:
     by a different payload with the same bytes; otherwise, for 15 minutes the
     skip replaces it. When the record's precondition holds and when it does
     not is in that module's "Precondition" section. For a
-    contract that replays a fixed set of payloads, that skip is now the
-    defence, not the flag: such contracts are flagged less often, and a lower
+    contract that replays a fixed set of payloads, that skip is a defence
+    alongside the merge budget: such contracts are flagged less often, and a lower
     broken-flag count does NOT mean fewer broken contracts. There is deliberately NO
     automatic escalation to the contract ban list: a durable ban needs an
     aging/recovery story first (see PR #4902 review). Residual

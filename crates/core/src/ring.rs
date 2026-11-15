@@ -367,8 +367,8 @@ pub(crate) struct Ring {
     pub live_tx_tracker: LiveTransactionTracker,
     hosting_manager: hosting::HostingManager,
     /// Per-contract record of detected CRDT-invariant violations (e.g. a
-    /// non-idempotent `update_state`). Used to gate outbound broadcast
-    /// so a broken contract's state changes don't leave the node.
+    /// non-idempotent `update_state`). Diagnostic only since #6190: it gates
+    /// nothing; see `crate::ring::contract_merge_budget`.
     broken_invariants: BrokenInvariantsTracker,
     /// Detections that started, restarted or escalated a flag: the same set
     /// exported as a `broken_invariant_flagged` telemetry event. Diagnostic
@@ -1679,9 +1679,8 @@ impl Ring {
             // mid-window), cleanup catches it on the next tick.
             ring.contract_ban_list.cleanup();
 
-            // Sweep expired broken-invariant flags on the same cadence so a
-            // suppressed contract (especially a false-positive) recovers
-            // after BROKEN_INVARIANT_TTL instead of being bricked forever.
+            // Sweep expired broken-invariant flags on the same cadence, so a
+            // flagged contract is probed and reported again after its TTL.
             ring.broken_invariants.cleanup();
 
             // Network-norms summary at DEBUG — useful when debugging

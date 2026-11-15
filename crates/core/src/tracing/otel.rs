@@ -1735,6 +1735,10 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter, sources: RingSou
                     ring.updates_merge_budget_dropped,
                     &[KeyValue::new("result", "merge_budget_dropped")],
                 );
+                observer.observe(
+                    ring.updates_merge_budget_unmetered,
+                    &[KeyValue::new("result", "merge_budget_unmetered")],
+                );
             }
         })
         .build();
@@ -3211,6 +3215,7 @@ mod tests {
             ("freenet.contract.updates", "result=rate_limited"),
             ("freenet.contract.updates", "result=capacity_dropped"),
             ("freenet.contract.updates", "result=merge_budget_dropped"),
+            ("freenet.contract.updates", "result=merge_budget_unmetered"),
         ] {
             assert!(
                 attributes_of(name).iter().any(|a| a == attribute),

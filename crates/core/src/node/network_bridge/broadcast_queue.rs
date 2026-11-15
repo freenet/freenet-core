@@ -7236,8 +7236,8 @@ mod tests {
     /// #6143 review round 6: a targeted heal registers its leg
     /// (`heal_target`) once its peer resolves, so a heal's skip accounts for
     /// that leg and not for a fan-out's. An unknown peer starts no leg. And
-    /// `handle_sync_state_to_peer` resolves its peer through this, after the
-    /// broken-contract gate and before either send path.
+    /// `handle_sync_state_to_peer` resolves its peer through this, before
+    /// either send path.
     #[tokio::test(flavor = "current_thread")]
     async fn a_resolved_heal_registers_its_leg() {
         use freenet_stdlib::prelude::WrappedState;

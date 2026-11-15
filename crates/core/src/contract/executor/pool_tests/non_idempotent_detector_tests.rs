@@ -101,73 +101,90 @@ fn fixture_non_idempotent_override_produces_distinct_states() {
     );
 }
 
-/// Source-grep pin (#6190): the broken-invariant flag is DIAGNOSTIC ONLY.
+/// Source pin (#6190): the broken-invariant flag is DIAGNOSTIC ONLY.
 ///
 /// It used to gate the commit, the broadcast and three egress paths, so a
 /// flagged contract stopped advancing on this node, including the node's own
 /// client UPDATEs, which were answered `state_changed: false` and silently
 /// discarded. The harm the gates guarded against (a replay loop from a merge
-/// that never settles) is bounded instead by the per-contract merge budget on
-/// the network receive path (`ring::contract_merge_budget`), which applies to
-/// every contract by usage alone and never touches local client writes.
+/// that never settles) is bounded instead by the per-contract merge budget
+/// (`ring::contract_merge_budget`), which applies to every contract by usage
+/// alone and never touches local client writes.
 ///
-/// So the only production readers of `is_contract_broken` left are the two
-/// probe prechecks that skip re-probing an already-flagged contract
-/// (detection cost, not a gate on state). A new read anywhere else is a gate
-/// coming back; route it through the budget instead.
+/// Walks every production source file in the crate, so a gate added anywhere
+/// fails it. The only reads allowed are the method's definition in `ring.rs`
+/// and the two probe prechecks in `executor_impl.rs` that skip re-probing an
+/// already-flagged contract (detection cost, not a gate on state).
 #[test]
 fn broken_flag_gates_no_commit_broadcast_or_egress() {
-    const RUNTIME_RS: &str = include_str!("../runtime.rs");
-    const EXECUTOR_IMPL_RS: &str = include_str!("../runtime/executor_impl.rs");
-    const CONTRACT_OPS_RS: &str = include_str!("../runtime/contract_ops.rs");
-    const NODE_RS: &str = include_str!("../../../node.rs");
-    const BROADCAST_RS: &str = include_str!("../../../node/network_bridge/p2p_protoc/broadcast.rs");
+    use crate::node::{collect_rs_files, strip_cfg_test_regions};
+    use std::collections::BTreeMap;
 
-    fn production(src: &str) -> &str {
-        src.split_once("#[cfg(test)]").map_or(src, |(prod, _)| prod)
-    }
-    // Comment lines are dropped so prose that names the flag cannot count.
-    fn code_reads(src: &str) -> usize {
-        production(src)
+    let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    collect_rs_files(&src_root, &mut files);
+    assert!(
+        files.len() > 100,
+        "the source walk found {} files",
+        files.len()
+    );
+
+    let mut reads: BTreeMap<String, usize> = BTreeMap::new();
+    let mut probe_window_hits = 0;
+    for path in &files {
+        let rel = path
+            .strip_prefix(&src_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        // Whole test files are gated by a parent `#[cfg(test)] mod`, which
+        // `strip_cfg_test_regions` cannot see from inside the file.
+        if rel.ends_with("tests.rs") || rel.contains("/tests/") || rel.contains("pool_tests/") {
+            continue;
+        }
+        let Ok(src) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let prod: String = strip_cfg_test_regions(&src)
             .lines()
             .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
-            .filter(|code| code.contains("is_contract_broken("))
-            .count()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let n = prod.matches("is_contract_broken(").count();
+        if n > 0 {
+            reads.insert(rel.clone(), n);
+        }
+        if rel == "contract/executor/runtime/executor_impl.rs" {
+            for probe in [
+                "async fn maybe_probe_idempotency(",
+                "fn probe_identical_input_idempotency(",
+            ] {
+                let start = prod.find(probe).expect("probe function exists");
+                let window = &prod[start..(start + 1500).min(prod.len())];
+                if window.contains("is_contract_broken(") {
+                    probe_window_hits += 1;
+                }
+            }
+        }
     }
 
-    for (name, src) in [
-        ("runtime.rs", RUNTIME_RS),
-        ("contract_ops.rs", CONTRACT_OPS_RS),
-        ("node.rs", NODE_RS),
-        ("p2p_protoc/broadcast.rs", BROADCAST_RS),
-    ] {
-        assert_eq!(
-            code_reads(src),
-            0,
-            "{name} reads `is_contract_broken` in production code. The flag is \
-             diagnostic only (#6190); a read here is a commit/broadcast/egress \
-             gate coming back."
-        );
-    }
-
-    let impl_prod = production(EXECUTOR_IMPL_RS);
+    let expected: BTreeMap<String, usize> = [
+        ("contract/executor/runtime/executor_impl.rs".to_string(), 2),
+        ("ring.rs".to_string(), 1),
+    ]
+    .into_iter()
+    .collect();
     assert_eq!(
-        code_reads(EXECUTOR_IMPL_RS),
-        2,
-        "executor_impl.rs must read `is_contract_broken` exactly twice, in the \
-         two probe prechecks"
+        reads, expected,
+        "production reads of `is_contract_broken(` by file. The flag is \
+         diagnostic only (#6190); a read outside the definition and the two \
+         probe prechecks is a commit/broadcast/egress gate coming back. Route \
+         load protection through `ring::contract_merge_budget` instead."
     );
-    for probe in [
-        "async fn maybe_probe_idempotency(",
-        "fn probe_identical_input_idempotency(",
-    ] {
-        let start = impl_prod.find(probe).expect("probe function exists");
-        let window = &impl_prod[start..(start + 1200).min(impl_prod.len())];
-        assert!(
-            window.contains("is_contract_broken("),
-            "{probe} must keep its already-flagged precheck near its top"
-        );
-    }
+    assert_eq!(
+        probe_window_hits, 2,
+        "both probes must keep their already-flagged precheck near their top"
+    );
 }
 
 /// A healthy fixture — `UpdateOverride` unwired — must produce byte-equal

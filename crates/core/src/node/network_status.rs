@@ -103,12 +103,16 @@ pub struct RingStatsSnapshot {
     /// undersized for this node's peer churn, so those senders are not
     /// actually being bounded — the safety valve is firing.
     pub updates_sender_budget_unmetered: u64,
-    /// Total relayed UPDATEs dropped because their contract was over this
+    /// Total co-host broadcasts dropped because their contract was over this
     /// node's per-contract merge budget (#6190,
-    /// `ring::contract_merge_budget`). Non-zero means some contract is being
-    /// pushed harder than any healthy contract measured, typically one whose
+    /// `ring::contract_merge_budget`). Non-zero means some contract is
+    /// changing faster than any healthy contract measured, typically one whose
     /// merge never settles.
     pub updates_merge_budget_dropped: u64,
+    /// Broadcasts admitted WITHOUT a merge-budget check because the budget's
+    /// map was full. Should be zero; non-zero means the map is undersized for
+    /// the number of contracts this node holds.
+    pub updates_merge_budget_unmetered: u64,
     /// Broken-invariant detections that started, restarted or escalated a
     /// flag (`ring::broken_invariants`). Diagnostic only since #6190: a flag
     /// no longer changes how the contract is handled.

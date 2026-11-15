@@ -2072,6 +2072,15 @@ async fn drive_relay_broadcast_to(
         changed,
     } = match update_result {
         Ok(result) => {
+            // Per-contract merge budget (#6190): only a merge that changed the
+            // stored state spends a token, so duplicates and no-op deltas
+            // cannot empty the bucket. Checked in `node.rs` before this driver.
+            if result.changed {
+                op_manager
+                    .ring
+                    .contract_merge_budget
+                    .charge_changed(*key.id());
+            }
             // Reset the merge-failure backoff ONLY on a successful DELTA merge
             // (#4861): a delta that applies cleanly proves the incoming change
             // was compatible with local state — genuine convergence. A
@@ -3081,6 +3090,11 @@ async fn apply_streaming_broadcast(
                     .ring
                     .merge_backoff
                     .invalidate_payload_memo(key.id());
+                // Per-contract merge budget (#6190): see the non-streaming driver.
+                op_manager
+                    .ring
+                    .contract_merge_budget
+                    .charge_changed(*key.id());
             }
             exec
         }

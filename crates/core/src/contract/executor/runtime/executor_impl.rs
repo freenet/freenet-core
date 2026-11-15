@@ -497,8 +497,8 @@ where
         // commit points below: a merge that committed a changed state, and an
         // incoming state byte-identical to the stored one, are recorded. A
         // merge that left the state unchanged is NOT (it may be a silent
-        // refusal), nor is a refused, failed, deferred, init-queued or
-        // broken-suppressed merge, so all of those can be retried. A non-merge
+        // refusal), nor is a refused, failed, deferred or init-queued merge,
+        // so all of those can be retried. A non-merge
         // replacement (initial install, corrupted-state recovery) resets the
         // record instead. Local-mode paths without an `op_manager` skip all of
         // it.
@@ -2057,14 +2057,16 @@ where
             return;
         };
         if let Some(op_manager) = &self.op_manager {
-            tracing::warn!(
+            // INFO: diagnostic only since #6190, the flag changes nothing about
+            // how the contract is handled.
+            tracing::info!(
                 contract = %key,
                 post_merge_size = post_merge_state.size(),
                 verdict = non_settling.as_str(),
                 event = "non_idempotent_merge_detected",
                 "Contract merge does not settle on re-applying the same incoming \
-                 state. Flagging contract; commit, broadcast, and full-state \
-                 egress will be suppressed."
+                 state. Flagging contract (diagnostic only; load is bounded by \
+                 ring::contract_merge_budget)."
             );
             op_manager.ring.record_broken_invariant(
                 *key,
@@ -2205,8 +2207,7 @@ where
             return;
         };
         if op_manager.ring.is_contract_broken(key) {
-            // Already flagged; the NoChange fast path is itself the
-            // suppression. Nothing new to learn.
+            // Already flagged; re-probing would learn nothing new.
             return;
         }
         if !op_manager.ring.try_claim_identity_probe(key) {
@@ -2270,7 +2271,8 @@ where
             cur = probe_state;
         }
 
-        tracing::warn!(
+        // INFO: diagnostic only since #6190.
+        tracing::info!(
             contract = %key,
             state_size = current_state.size(),
             final_probe_size = cur.size(),
@@ -2278,9 +2280,9 @@ where
             event = "non_idempotent_identity_merge_detected",
             "Contract violates update_state idempotency on its OWN state: \
              every one of the successive identical-input re-applies changed \
-             the byte multiset (no fixpoint) — deterministic proof, no \
-             sampling. Flagging contract; commit, broadcast, and full-state \
-             egress will be suppressed."
+             the byte multiset (no fixpoint), deterministic proof, no \
+             sampling. Flagging contract (diagnostic only; load is bounded by \
+             ring::contract_merge_budget)."
         );
         op_manager.ring.record_broken_invariant(
             *key,
@@ -2402,9 +2404,8 @@ where
     /// 3. `send_delegate_contract_notifications` — locally-subscribed
     ///    delegates. Best-effort and lossy by design (`try_send`); see
     ///    that method.
-    /// 4. `broadcast_state_change` — the network. Suppressed for a
-    ///    contract flagged as violating a CRDT invariant, and emitted
-    ///    non-blocking (#4145).
+    /// 4. `broadcast_state_change` — the network. Emitted non-blocking
+    ///    (#4145).
     ///
     /// This exists because the legs kept getting dropped one at a time.
     /// All FOUR storing paths — the initial-state install in

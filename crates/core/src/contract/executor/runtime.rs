@@ -2609,13 +2609,6 @@ mod state_write_attribution_pin_tests {
     }
 }
 
-// NOTE: this module is placed at the END of the file on purpose. The
-// `production_gate_sites_consult_is_contract_broken` pin test in
-// `pool_tests/non_idempotent_detector_tests.rs` greps the production slice of
-// this file (everything before the FIRST `#[cfg(test)]`) for
-// `is_contract_broken`; a `#[cfg(test)]` placed above the gate sites would
-// truncate that slice and break the pin. Keep new test modules below all
-// production code.
 #[cfg(test)]
 mod idempotency_probe_convergence_tests {
     use super::byte_multiset_eq;

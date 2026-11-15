@@ -23099,30 +23099,48 @@ fn test_quic_native_zero_percent_forms_the_same_mesh() {
 /// A contract whose merge never settles (every apply yields fresh bytes, so
 /// the applied-payload skip cannot help) turns every broadcast into another
 /// state change. Since #6190 nothing freezes it; the per-contract merge
-/// budget on the network receive path bounds it, by usage alone, identically
-/// for every contract.
+/// budget bounds it, by usage alone, identically for every contract.
 ///
 /// One run with the PRODUCTION budget constants. Asserts:
 /// 1. the budget engaged on a non-settling contract (drops > 0). With the
-///    budget removed this fails: the loop then runs unthrottled;
-/// 2. it never dropped a message for a healthy contract;
+///    budget not binding this fails: a 100/s budget on this run dropped
+///    nothing;
+/// 2. it never dropped a broadcast for a healthy contract. This run's busiest
+///    healthy contract stays well under one node's burst, so this shows the
+///    budget leaves ordinary traffic alone, not where its edge is;
 /// 3. nothing bypasses it at scale: `update_state` calls for each hot
-///    non-settling contract stay within 1.5x the messages the budget
+///    non-settling contract stay within 1.5x the broadcasts the budget
 ///    admitted for it. The rest is the idempotency probes' re-applies and the
 ///    merges of repair `ResyncResponse`s and anti-entropy, which ride other
-///    paths and are bounded by their own limiters.
+///    paths and are bounded by their own limiters (measured: 25.5k calls
+///    against 25.4k admitted).
 ///
 /// Admissions per node over time are bounded by the token bucket itself
 /// (`ring::contract_merge_budget` unit tests); this test does not re-derive
-/// that from an estimate of virtual time.
+/// that from an estimate of virtual time. That a flagged contract still
+/// commits updates is pinned at the executor
+/// (`flagged_contract_subsequent_apply_is_committed`).
+///
+/// The hooks are process-global, so the body runs alone in a child process:
+/// armed in-process they would make a quarter of the contracts of every
+/// concurrently running mock-WASM simulation non-settling under plain
+/// `cargo test`, and fold those simulations' counts into these.
 #[test_log::test]
 fn non_settling_contract_is_bounded_by_merge_budget() {
+    if run_alone_in_child_process("non_settling_contract_is_bounded_by_merge_budget") {
+        return;
+    }
     use freenet::dev_tool::sim_merge_budget::*;
     const BAD_MODULUS: u8 = 4;
 
-    set_bad_contract_modulus(BAD_MODULUS);
-    let _ = take_merge_counts();
-    let _ = take_merge_budget_counts();
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            disarm();
+        }
+    }
+    let _disarm = Disarm;
+    arm(BAD_MODULUS);
     let res = TestConfig::medium("merge-budget-non-settling", 0x4D31_0001)
         .with_nodes(12)
         .with_gateways(2)
@@ -23135,12 +23153,15 @@ fn non_settling_contract_is_bounded_by_merge_budget() {
         .run_direct();
     let merges = take_merge_counts();
     let budget = take_merge_budget_counts();
-    set_bad_contract_modulus(0);
     res.assert_ok();
 
     let is_bad = |first: u8| first % BAD_MODULUS == 0;
     println!("merge-budget sim: update_state calls {merges:?}");
-    println!("merge-budget sim: (admitted, dropped) {budget:?}");
+    println!("merge-budget sim: (admitted, dropped, charged) {budget:?}");
+    assert!(
+        merges.iter().any(|(b, _, _)| is_bad(*b)),
+        "premise: the seed must produce a non-settling contract: {merges:?}"
+    );
     assert!(
         merges.iter().any(|(b, _, _)| !is_bad(*b)),
         "premise: healthy contracts were merged too"
@@ -23148,25 +23169,26 @@ fn non_settling_contract_is_bounded_by_merge_budget() {
 
     let hot: Vec<_> = budget
         .iter()
-        .filter(|(first, _, _, dropped)| is_bad(*first) && *dropped > 0)
+        .filter(|(first, _, _, dropped, _)| is_bad(*first) && *dropped > 0)
         .collect();
     assert!(
         !hot.is_empty(),
         "the budget never engaged on any non-settling contract: {budget:?}"
     );
-    for (first, id, admitted, dropped) in &budget {
+    for (first, id, admitted, dropped, _) in &budget {
         assert!(
             is_bad(*first) || *dropped == 0,
-            "the budget dropped {dropped} messages for healthy contract {id} \
+            "the budget dropped {dropped} broadcasts for healthy contract {id} \
              ({admitted} admitted)"
         );
     }
-    for (_, id, admitted, _) in hot {
+    for (_, id, admitted, _, charged) in hot {
         let calls = merges.iter().find(|(_, m, _)| m == id).map_or(0, |m| m.2);
         assert!(
             (calls as f64) <= 1.5 * *admitted as f64,
             "non-settling contract {id}: {calls} update_state calls against {admitted} \
-             admitted messages; something bypasses the budget"
+             admitted broadcasts; something bypasses the budget"
         );
+        assert!(*charged > 0, "{id}: state-changing merges must be charged");
     }
 }
