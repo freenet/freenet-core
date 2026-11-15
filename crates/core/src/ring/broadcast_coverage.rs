@@ -348,10 +348,11 @@ pub(crate) struct BroadcastCoverageStore {
 /// consumed stays forever. Two paths produce exactly that, and both fire
 /// hardest under load:
 ///
-/// * `handle_broadcast_state_change` returns early for a BANNED contract and
-///   for one with broken invariants, both BEFORE it takes the coverage — so
-///   every applying broadcast on such a contract leaks an entry, precisely
-///   during the storm conditions that set those flags (#4861 / #4903 shape);
+/// * `handle_broadcast_state_change` returns early for a BANNED contract
+///   BEFORE it takes the coverage, so every applying broadcast on such a
+///   contract leaks an entry, precisely during the storm conditions that set
+///   the ban (#4861 / #4903 shape; a broken-invariant flag had the same
+///   early return until #6190);
 /// * the `BroadcastStateChange` notification is best-effort by design (#4145),
 ///   so a dropped event leaves a kept entry with no consumer.
 ///
@@ -768,8 +769,7 @@ mod tests {
     /// `expires_at` governs validity on READ, but until the sweeper existed
     /// nothing governed RESIDENCY: `take`, `discard` and same-key replacement
     /// were the only removals, so a contract that registered coverage and then
-    /// never fanned out (banned contract, broken invariants, dropped
-    /// best-effort event) left an entry holding up to MAX_COVERED_PEERS keys
+    /// never fanned out (banned contract, dropped best-effort event) left an entry holding up to MAX_COVERED_PEERS keys
     /// forever — worst exactly under the storm conditions that cause it.
     ///
     /// Mutation that must make this red: make `sweep_expired` a no-op.

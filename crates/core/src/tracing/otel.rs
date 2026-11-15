@@ -1731,6 +1731,27 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter, sources: RingSou
                     ring.updates_capacity_dropped,
                     &[KeyValue::new("result", "capacity_dropped")],
                 );
+                observer.observe(
+                    ring.updates_merge_budget_dropped,
+                    &[KeyValue::new("result", "merge_budget_dropped")],
+                );
+                observer.observe(
+                    ring.updates_merge_budget_unmetered,
+                    &[KeyValue::new("result", "merge_budget_unmetered")],
+                );
+            }
+        })
+        .build();
+
+    let _broken = meter
+        .u64_observable_counter("freenet.contract.broken_invariant.detections")
+        .with_description(
+            "Broken-invariant detections that started, restarted or escalated a flag. \
+             Diagnostic only: a flag does not change how the contract is handled.",
+        )
+        .with_callback(move |observer| {
+            if let Some(ring) = (sources.ring_stats)() {
+                observer.observe(ring.broken_invariant_detections, &[]);
             }
         })
         .build();
@@ -3038,6 +3059,7 @@ mod tests {
             "freenet.ring.lattice.neighbor.distance",
             "freenet.ring.lattice.probes",
             "freenet.contract.updates",
+            "freenet.contract.broken_invariant.detections",
             // Bootstrap-acceptance-churn instrumentation (#4787).
             "freenet.bootstrap.churn",
             "freenet.bootstrap.time_to_min_connections_seconds",
@@ -3192,6 +3214,8 @@ mod tests {
             ("freenet.contract.updates", "result=accepted"),
             ("freenet.contract.updates", "result=rate_limited"),
             ("freenet.contract.updates", "result=capacity_dropped"),
+            ("freenet.contract.updates", "result=merge_budget_dropped"),
+            ("freenet.contract.updates", "result=merge_budget_unmetered"),
         ] {
             assert!(
                 attributes_of(name).iter().any(|a| a == attribute),

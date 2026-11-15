@@ -1270,6 +1270,9 @@ pub(crate) enum DroppedBroadcastReason {
     /// Refused by the per-(sender, contract) UPDATE dispatch rate limiter
     /// in `node.rs` before any driver ran (#5510).
     RateLimited,
+    /// Refused by the per-contract merge budget in `node.rs` before any
+    /// driver ran (#6190).
+    MergeBudget,
 }
 
 impl DroppedBroadcastReason {
@@ -1279,6 +1282,7 @@ impl DroppedBroadcastReason {
         match self {
             DroppedBroadcastReason::QueueFull => "queue_full",
             DroppedBroadcastReason::RateLimited => "rate_limited",
+            DroppedBroadcastReason::MergeBudget => "merge_budget",
         }
     }
 }
@@ -1287,14 +1291,17 @@ impl DroppedBroadcastReason {
 /// sender so it clears its poisoned summary cache of us and re-sends the change
 /// it believes we already have (#4857, #5510).
 ///
-/// Two distinct drops land here, and the reason they need the SAME repair is
+/// Three distinct drops land here, and the reason they need the SAME repair is
 /// the reason they are handled by one helper:
 ///
 /// - `ContractQueueFull` at the executor (#4857) — the delta / full state
 ///   reached this node but was never applied.
 /// - Refusal by the dispatch rate limiter in `node.rs` (#5510) — the payload
-///   never even reached a driver. `reason` distinguishes the two in telemetry;
-///   see `DroppedBroadcastReason`.
+///   never even reached a driver.
+/// - Refusal by the per-contract merge budget in `node.rs` (#6190), likewise
+///   before any driver ran.
+///
+/// `reason` distinguishes them in telemetry; see `DroppedBroadcastReason`.
 ///
 /// Both are SILENT to the sender: it cached its own summary as ours on send-Ok
 /// (`broadcast_queue.rs::record_delivery_to_interest`), so it believes we are
@@ -2065,6 +2072,15 @@ async fn drive_relay_broadcast_to(
         changed,
     } = match update_result {
         Ok(result) => {
+            // Per-contract merge budget (#6190): only a merge that changed the
+            // stored state spends a token, so duplicates and no-op deltas
+            // cannot empty the bucket. Checked in `node.rs` before this driver.
+            if result.changed {
+                op_manager
+                    .ring
+                    .contract_merge_budget
+                    .charge_changed(*key.id());
+            }
             // Reset the merge-failure backoff ONLY on a successful DELTA merge
             // (#4861): a delta that applies cleanly proves the incoming change
             // was compatible with local state — genuine convergence. A
@@ -3074,6 +3090,11 @@ async fn apply_streaming_broadcast(
                     .ring
                     .merge_backoff
                     .invalidate_payload_memo(key.id());
+                // Per-contract merge budget (#6190): see the non-streaming driver.
+                op_manager
+                    .ring
+                    .contract_merge_budget
+                    .charge_changed(*key.id());
             }
             exec
         }

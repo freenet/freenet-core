@@ -14,7 +14,7 @@ pub(crate) mod delegate_capabilities;
 mod delegate_lane;
 mod delegate_park;
 mod delegate_restore;
-mod executor;
+pub(crate) mod executor;
 mod fair_queue;
 #[cfg(all(test, feature = "wasmtime-backend", feature = "redb"))]
 mod wakeup_wasm_tests;
