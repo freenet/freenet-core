@@ -684,6 +684,11 @@ fn the_production_values_are_pinned() {
     assert_eq!(credit_floor_rate(Duration::from_secs(4)), 16 * 1024);
     assert_eq!(STREAM_CREDIT_WINDOW, Duration::from_secs(60));
     assert_eq!(STREAM_CREDIT_FREED, 9);
+    assert_eq!(ACK_WAIT_EXPIRY_LIMIT, 3);
+    assert_eq!(DARK_CLOSE_MAX, Duration::from_secs(75));
+    assert!(dark_close_bound(Duration::from_millis(800)) <= DARK_CLOSE_MAX);
+    assert_eq!(ACK_WAIT_EXPIRY_WINDOW, Duration::from_secs(30 * 60));
+    assert_eq!(super::super::path::SHORT_ACK_WAIT, Duration::from_secs(120));
     assert_eq!(
         crate::transport::peer_connection::streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC,
         32 * 1024
@@ -911,6 +916,7 @@ fn ack_counting_forwards_every_call_unchanged() {
             batches: 1,
             in_flight_after_acks: 2400,
             lost_since_acks: 1200,
+            last_batch_app_limited: true,
             ..AckState::default()
         }
     );
@@ -1637,6 +1643,90 @@ fn a_peer_that_withholds_a_small_stream_limit_is_closed() {
         )),
         None
     );
+}
+
+/// Feed a watch a busy conforming peer's readings (acknowledgements every
+/// tick, so no other rule closes it), one at each of `times` (seconds), with
+/// `expiries(i)` ack waits run out so far; the indices at which the
+/// ack-wait expiry rule would have closed the path, and whether anything
+/// closed it.
+fn run_expiries(times: &[u64], expiries: impl Fn(usize) -> u64) -> (Vec<usize>, bool) {
+    let record = Arc::default();
+    let sample = |i: usize| {
+        let t = i as u64;
+        AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
+            .with_ack_wait_expiries(expiries(i))
+    };
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+    let (mut would, mut closed) = (Vec::new(), false);
+    for (i, time) in times.iter().enumerate().skip(1) {
+        let before = watch.would_close();
+        closed |= watch.observe(time * SEC, sample(i));
+        if watch.would_close() > before {
+            would.push(i);
+        }
+    }
+    (would, closed)
+}
+
+/// The ack-wait expiry rule only observes (`ACK_WAITS_EXPIRED_CLOSES`), with
+/// literal times, on a peer that acknowledges everything else at every
+/// sample (acknowledgements never reset it). The path is never closed; a
+/// would-close is counted:
+/// - three expiries at 2, 10 and 20 min: at the third;
+/// - three at once: at that sample;
+/// - six at 2, 4, 6, 8, 10 and 12 min: at the third and the sixth (each count
+///   starts the window afresh);
+/// - two, then a third 31 min after the first: the first has left the 30 min
+///   window, so only two count, none;
+/// - two only: none.
+#[test]
+fn ack_wait_expiries_within_the_window_would_close_the_path() {
+    const _: () = assert!(!ACK_WAITS_EXPIRED_CLOSES, "the rule only observes");
+    // Samples every 2 s for 40 min.
+    let times: Vec<u64> = (0..=1200).map(|i| 2 * i).collect();
+    let at = |minutes: u64| (minutes * 60 / 2) as usize;
+    let counted =
+        |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
+    assert_eq!(
+        run_expiries(&times, counted(vec![at(2), at(10), at(20)])),
+        (vec![at(20)], false)
+    );
+    assert_eq!(
+        run_expiries(&times, |i| if i >= at(5) { 3 } else { 0 }),
+        (vec![at(5)], false)
+    );
+    assert_eq!(
+        run_expiries(&times, counted((1..=6).map(|m| at(2 * m)).collect())),
+        (vec![at(6), at(12)], false)
+    );
+    assert_eq!(
+        run_expiries(&times, counted(vec![at(2), at(10), at(33)])),
+        (vec![], false),
+        "the first left the window"
+    );
+    assert_eq!(
+        run_expiries(&times, counted(vec![at(2), at(10)])),
+        (vec![], false)
+    );
+}
+
+/// The labels `quic_stall_close_<label>` counts under are the stalls'
+/// labels, in their index order, so a close is counted under its own name.
+#[test]
+fn stall_close_labels_follow_the_stalls() {
+    for stall in [
+        Stall::NotAcknowledging,
+        Stall::Dark,
+        Stall::CreditStarved,
+        Stall::StreamCreditWithheld,
+        Stall::AckWaitsExpired,
+    ] {
+        assert_eq!(
+            crate::transport::metrics::STALL_CLOSE_LABELS[stall.index()],
+            stall.label()
+        );
+    }
 }
 
 /// The egress cap holds for most of each window and releases for one
