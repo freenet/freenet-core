@@ -462,7 +462,7 @@ def check(ci_text: str, warm_text: str, ci_name: str = "ci.yml",
               if needs_warm_twin(extract_job(ci_text, j) or [])]
     if not needed:
         errors.append(
-            f"{ci_name}: no job looks like it needs a warm twin (Ubicloud, "
+            f"{ci_name}: no job looks like it needs a warm twin (Ubicloud or macOS runner, "
             f"conditional rust-cache save-if, `if:` on event_name without "
             f"'push'). Either the discovery rule no longer matches {ci_name}, "
             f"or {warm_name} is dead weight; find out which before silencing this."
@@ -492,7 +492,7 @@ def check(ci_text: str, warm_text: str, ci_name: str = "ci.yml",
                 f"{warm_name}: job `{job_id}` warms a cache its {ci_name} twin "
                 f"does not need from it: the twin runs on pushes to main (so it "
                 f"saves its own entry), saves unconditionally, or is not on "
-                f"Ubicloud. Delete the warm job, or restore the twin's shape."
+                f"a Ubicloud or macOS runner. Delete the warm job, or restore the twin's shape."
             )
 
         ci_env, warm_env = _job_env(ci_job), _job_env(warm_job)
@@ -559,10 +559,10 @@ def check(ci_text: str, warm_text: str, ci_name: str = "ci.yml",
                 differ("runner label", job_id, _runs_on(ci_job), warm_ro, key_why)
         elif "ubicloud" not in warm_ro:
             errors.append(
-                f"{warm_name}: job `{job_id}` runs on `{warm_ro}`. Ubicloud "
-                f"serves its own cache backend, so an entry saved from any other "
-                f"runner is invisible to the Ubicloud PR job. Use a "
-                f"`ubicloud-standard-*` label."
+                f"{warm_name}: job `{job_id}` runs on `{warm_ro}`. Its "
+                f"`ci.yml` twin is on Ubicloud, which serves its own cache "
+                f"backend, so an entry saved from any other runner is invisible "
+                f"to that PR job. Use a `ubicloud-standard-*` label."
             )
         else:
             ci_sfx, warm_sfx = _label_suffixes(_runs_on(ci_job)), _label_suffixes(warm_ro)
@@ -829,7 +829,7 @@ def _cases() -> list[tuple[str, str, str, str | None]]:
      "apt-get install packages"),
     ("warm job on a GitHub-hosted runner",
      _CI, _sub(_WARM, "runs-on: ubicloud-standard-8", "runs-on: ubuntu-latest"),
-     "Ubicloud serves its own cache backend"),
+     "which serves its own cache backend"),
     ("CI job moved to arm",
      _sub(_CI, "runs-on: ubicloud-standard-16", "runs-on: ubicloud-standard-16-arm"), _WARM,
      "runner label suffix"),

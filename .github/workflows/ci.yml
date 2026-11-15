@@ -1136,6 +1136,8 @@ jobs:
     # file's hash; check_cache_warm_parity.py keeps the two in step). After a
     # lockfile change on main, or if the warm entry was evicted, a PR run is
     # cold again and the headroom is what keeps it from failing by cancellation.
+    # The warm entry covers dependencies only: rust-cache cleans workspace-member
+    # artifacts before saving, so `freenet` itself still compiles on every run.
     timeout-minutes: 45
     # Same skip conditions as test_unit (see test_unit comment for details).
     if: |
