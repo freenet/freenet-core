@@ -35,11 +35,12 @@ use crate::transport::quic::breaker::{BreakerOutcome, Verdict};
 use crate::transport::quic::control::caps;
 use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 
-/// The share of pairs, in percent, that carry data on QUIC in this release
-/// when it sets no ramp ([`QUIC_DATA_RAMP_START`]), for a node in `prefer`
-/// mode: a fixed step (0, then 5 for the first data release). Both sides must
-/// set their bit, so a pair moves only once both run a release that puts it in
-/// the slice. `quic-data-percent` replaces it on one node.
+/// The share of pairs, in percent, that carry data on QUIC for a node in
+/// `prefer` mode. It applies only to a build with no ramp start
+/// ([`QUIC_DATA_RAMP_START`] = `None`), which is the emergency-stop build; while
+/// the ramp start is set, the ramp's share applies and this is not read. Both
+/// sides must set their bit, so a pair moves only once both run a release that
+/// puts it in the slice. `quic-data-percent` replaces it on one node.
 pub(in crate::transport) const QUIC_DATA_PERCENT: u8 = 0;
 
 /// Whether this node, as configured, may carry data on QUIC: `transport-quic`
