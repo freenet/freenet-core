@@ -25,3 +25,7 @@ mod nat_traversal_by_ip;
 /// The node-wide egress cap never makes the listener, a handshake or the
 /// receive path wait.
 mod egress_cap;
+
+/// `ConnectionStateManager::cleanup_expired` drops `Established` entries whose
+/// connection has ended.
+mod established_cleanup;

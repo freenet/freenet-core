@@ -1727,7 +1727,10 @@ fn many_tasks_send_while_the_path_closes_and_nothing_goes_twice() {
     match finished.recv_timeout(Duration::from_secs(120)) {
         Ok(Ok(())) => {}
         Ok(Err(panic)) => std::panic::resume_unwind(panic),
-        Err(_) => panic!("the multi-thread test did not finish"),
+        Err(_) => panic!(
+            "the multi-thread test did not finish (a `drive_on_threads:` line above says whether \
+             the runtime never went idle or went idle with nothing to wake)"
+        ),
     }
 }
 

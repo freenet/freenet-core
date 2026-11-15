@@ -32,11 +32,35 @@ use ulid::Ulid;
 ///
 /// A transaction may span different messages sent across the network.
 #[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Clone, Copy)]
+#[serde(try_from = "TransactionWire")]
 pub struct Transaction {
     id: Ulid,
     /// Parent transaction ID for child operations spawned by this transaction.
     /// Enables atomicity tracking for composite operations (e.g., PUT with SUBSCRIBE).
     parent: Option<Ulid>,
+}
+
+/// Wire shape of [`Transaction`]. Identical field layout, so the encoding is
+/// unchanged; exists so decoding can validate the type byte, which a peer
+/// otherwise controls entirely.
+#[derive(Deserialize)]
+struct TransactionWire {
+    id: Ulid,
+    parent: Option<Ulid>,
+}
+
+impl TryFrom<TransactionWire> for Transaction {
+    type Error = String;
+
+    fn try_from(w: TransactionWire) -> Result<Self, Self::Error> {
+        let id_byte = (w.id.0 & 0xFFu128) as u8;
+        TransactionType::try_from(id_byte)
+            .map_err(|_| format!("invalid transaction type byte {id_byte}"))?;
+        Ok(Transaction {
+            id: w.id,
+            parent: w.parent,
+        })
+    }
 }
 
 impl Transaction {
@@ -71,9 +95,15 @@ impl Transaction {
 
     pub(crate) fn transaction_type(&self) -> TransactionType {
         let id_byte = (self.id.0 & 0xFFu128) as u8;
-        TransactionType::try_from(id_byte).expect(
-            "Transaction ID contains invalid type byte; this is a bug in Transaction construction",
-        )
+        // Deserialization rejects unknown type bytes and every constructor
+        // (including `ttl_transaction_with_multiplier`) sets a valid one, so
+        // the fallback is unreachable. It exists so that a value built some
+        // other way can never panic the network event loop; the debug_assert
+        // makes such a value visible in tests instead of silently
+        // misclassifying it.
+        let ty = TransactionType::try_from(id_byte);
+        debug_assert!(ty.is_ok(), "Transaction with invalid type byte {id_byte}");
+        ty.unwrap_or(TransactionType::Connect)
     }
 
     pub fn timed_out(&self) -> bool {
@@ -148,7 +178,10 @@ impl Transaction {
 
         // Clear the timestamp bits and replace with the cutoff timestamp.
         const TIMESTAMP_MASK: u128 = 0x00000000000000000000FFFFFFFFFFFFFFFF;
-        let new_ulid = (id.0 & TIMESTAMP_MASK) | ((ttl_epoch as u128) << 80);
+        // Keep the low byte a valid type byte (Connect = 0): the cutoff id is
+        // only compared against, but it must still satisfy the invariant that
+        // every Transaction carries a valid type.
+        let new_ulid = (id.0 & TIMESTAMP_MASK & !0xFFu128) | ((ttl_epoch as u128) << 80);
         Self {
             id: Ulid(new_ulid),
             parent: None,
@@ -1498,6 +1531,37 @@ mod tests {
         // consumer today; the live wire-compat gate is the negotiated build
         // version vs SUBSCRIBE_HINT_MIN_VERSION.)
         assert_eq!(msg.version(), semver::Version::new(1, 3, 0));
+    }
+
+    /// A peer chooses every bit of a decoded transaction id; an unknown type
+    /// byte must be a decode error, never a later panic.
+    #[test]
+    fn deserialize_rejects_unknown_transaction_type_byte() {
+        for byte in 0u8..=255 {
+            let id = Ulid((Ulid::generate().0 & !0xFFu128) | byte as u128);
+            let wire = bincode::serialize(&(id, None::<Ulid>)).unwrap();
+            let decoded = bincode::deserialize::<Transaction>(&wire);
+            if byte <= 4 {
+                let tx = decoded.expect("valid type byte must decode");
+                assert_eq!(tx.id, id);
+                assert_eq!(tx.transaction_type() as u8, byte);
+                // Encoding is unchanged by validation.
+                assert_eq!(bincode::serialize(&tx).unwrap(), wire);
+            } else {
+                assert!(decoded.is_err(), "type byte {byte} must be rejected");
+            }
+        }
+    }
+
+    #[test]
+    fn ttl_transactions_carry_a_valid_type_byte() {
+        for _ in 0..512 {
+            for m in [1u64, 2, 5] {
+                let tx = Transaction::ttl_transaction_with_multiplier(m);
+                assert!(TransactionType::try_from((tx.id.0 & 0xFF) as u8).is_ok());
+                let _ = tx.transaction_type();
+            }
+        }
     }
 
     #[test]

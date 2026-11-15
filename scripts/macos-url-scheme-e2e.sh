@@ -124,7 +124,7 @@ echo "ok - LaunchServices resolves freenet:// to the bundle"
 # build uses the platform directories); explicit directories sidestep that.
 # FREENET_TELEMETRY_ENABLED: the app starts a real node; keep it out of the
 # production telemetry. (Its auto-update is off because CI builds this binary
-# with FREENET_GIT_IS_DIRTY=1, so a newer release cannot swap the bundle out
+# with FREENET_GIT_IS_DIRTY=1 (set job-wide), so a newer release cannot swap the bundle out
 # mid-test.)
 mkdir -p "$OUT/data" "$OUT/config"
 launchctl setenv FREENET_OPEN_DRY_RUN 1

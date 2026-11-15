@@ -2594,8 +2594,8 @@ pub struct NetworkArgs {
     /// connections to peers that also run it to a QUIC path. The path carries
     /// control frames only, so all traffic stays on the existing transport.
     /// `prefer` also negotiates data with a share of pairs (`quic-data-percent`,
-    /// or this release's share, which is 0), and a pair where both sides did
-    /// sends its traffic on the path. `off` builds no endpoint. An unknown value is treated as `off`,
+    /// or this release's share: its data ramp, or 0 when it has none), and a
+    /// pair where both sides did sends its traffic on the path. `off` builds no endpoint. An unknown value is treated as `off`,
     /// with a warning in the log.
     #[arg(long, env = "FREENET_TRANSPORT_QUIC", value_name = "off|shadow|prefer")]
     #[serde(rename = "transport-quic", skip_serializing_if = "Option::is_none")]
