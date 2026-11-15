@@ -1129,8 +1129,15 @@ jobs:
   macos_unit:
     name: macOS Service Unit
     runs-on: macos-latest
-    # 45, not 30: the freenet:// LaunchServices e2e rebuilds the freenet crate
-    # (auto-update off) and waits for the app to launch and handle links.
+    # 45, not 30: the freenet:// LaunchServices e2e waits for the app to launch
+    # and handle links, and a cold build of this job takes ~35 min. Normally it
+    # is not cold: this job never runs on main, so ci-cache-warm.yml's
+    # `macos_unit` job writes the cache entry it restores (the key below is that
+    # file's hash; check_cache_warm_parity.py keeps the two in step). After a
+    # lockfile change on main, or if the warm entry was evicted, a PR run is
+    # cold again and the headroom is what keeps it from failing by cancellation.
+    # The warm entry covers dependencies only: rust-cache cleans workspace-member
+    # artifacts before saving, so `freenet` itself still compiles on every run.
     timeout-minutes: 45
     # Same skip conditions as test_unit (see test_unit comment for details).
     if: |
@@ -1144,6 +1151,16 @@ jobs:
       # Increase rustc stack size to prevent SIGSEGV during compilation
       # 256MB required for LLVM optimization passes on large workspaces (rustc suggests this value)
       RUST_MIN_STACK: 268435456
+      # Auto-update off for EVERY build in this job, not just the e2e step. The
+      # freenet:// LaunchServices e2e starts a real node from the built binary,
+      # and a newer release must not make it exit 42 and swap the test bundle.
+      # `build.rs` declares `rerun-if-env-changed=FREENET_GIT_IS_DIRTY`, so
+      # setting this only on the e2e step changed the build script's input and
+      # recompiled the whole freenet crate there (2m42s on a fast runner; it ran
+      # the job into its timeout on a slow one, #6214). Set once here, the e2e
+      # build is a no-op. The other steps are unaffected: the node tests already
+      # pass --disable-auto-update.
+      FREENET_GIT_IS_DIRTY: "1"
 
     steps:
       - uses: actions/checkout@v7
@@ -1168,6 +1185,7 @@ jobs:
         # `if:` here, and NOT a separate step.
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
 
       # nextest via the maintained action, not a hand-rolled download.
       # Rationale at the first of these in ci.yml (test_unit job); see #5296.
@@ -1203,14 +1221,10 @@ jobs:
       # login. It also checks that the menu bar icon is really on screen, which
       # needs macOS 26 or later to mean anything (#6093), and that Launch at
       # Login registers and repairs old agents. The app starts a real node, so
-      # this rebuilds the binary with
-      # FREENET_GIT_IS_DIRTY=1 (auto-update off; only the freenet crate
-      # recompiles): otherwise a release newer than this branch would make
-      # the node exit 42 and the DMG-swap updater replace the test bundle
-      # mid-run. Last step on purpose, since it changes target/debug/freenet.
+      # the binary must be built with FREENET_GIT_IS_DIRTY=1 (auto-update off;
+      # set job-wide above, so this `cargo build` is a no-op).
+      # Last step on purpose, since it changes target/debug/freenet.
       - name: freenet:// end to end through LaunchServices
-        env:
-          FREENET_GIT_IS_DIRTY: "1"
         run: |
           cargo build --locked -p freenet --bin freenet
           scripts/macos-url-scheme-e2e.sh target/debug/freenet
