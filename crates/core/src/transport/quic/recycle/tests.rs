@@ -1767,31 +1767,40 @@ fn a_peer_that_withholds_a_small_stream_limit_is_closed() {
 
 /// Feed a watch a busy conforming peer's readings (acknowledgements every
 /// tick, so no other rule closes it), one at each of `times` (seconds), with
-/// `expiries(i)` ack waits run out so far; the indices at which the
-/// ack-wait expiry rule would have closed the path, and whether anything
-/// closed it.
-fn run_expiries(times: &[u64], expiries: impl Fn(usize) -> u64) -> (Vec<usize>, bool) {
+/// `expiries(i)` ack waits run out so far, on a path with a UDP session or
+/// not (`AckWatch::with_udp_fallback`); the indices at which the ack-wait
+/// expiry rule would have closed the path, and the index at which anything
+/// closed it, where the run stops.
+fn run_expiries(
+    times: &[u64],
+    expiries: impl Fn(usize) -> u64,
+    udp_fallback: bool,
+) -> (Vec<usize>, Option<usize>) {
     let record = Arc::default();
     let sample = |i: usize| {
         let t = i as u64;
         AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
             .with_ack_wait_expiries(expiries(i))
     };
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
-    let (mut would, mut closed) = (Vec::new(), false);
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0)).with_udp_fallback(udp_fallback);
+    let mut would = Vec::new();
     for (i, time) in times.iter().enumerate().skip(1) {
         let before = watch.would_close();
-        closed |= watch.observe(time * SEC, sample(i));
+        if watch.observe(time * SEC, sample(i)) {
+            assert_eq!(watch.stall(), Some(Stall::AckWaitsExpired));
+            return (would, Some(i));
+        }
         if watch.would_close() > before {
             would.push(i);
         }
     }
-    (would, closed)
+    (would, None)
 }
 
-/// The ack-wait expiry rule only observes (`ACK_WAITS_EXPIRED_CLOSES`), with
-/// literal times, on a peer that acknowledges everything else at every
-/// sample (acknowledgements never reset it). The path is never closed; a
+/// The ack-wait expiry rule, with literal times, on a peer that acknowledges
+/// everything else at every sample (acknowledgements never reset it). On a
+/// path with a UDP session it only observes
+/// (`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`): the path is never closed, and a
 /// would-close is counted:
 /// - three expiries at 2, 10 and 20 min: at the third;
 /// - three at once: at that sample;
@@ -1800,35 +1809,43 @@ fn run_expiries(times: &[u64], expiries: impl Fn(usize) -> u64) -> (Vec<usize>, 
 /// - two, then a third 31 min after the first: the first has left the 30 min
 ///   window, so only two count, none;
 /// - two only: none.
+///
+/// On a path with no UDP session (a native connection's) the same cases
+/// close the path at the sample the would-close was counted at, and none
+/// that counted none.
 #[test]
-fn ack_wait_expiries_within_the_window_would_close_the_path() {
-    const _: () = assert!(!ACK_WAITS_EXPIRED_CLOSES, "the rule only observes");
+fn ack_wait_expiries_within_the_window_close_only_a_path_without_udp() {
+    const _: () = assert!(
+        !ACK_WAITS_EXPIRED_CLOSES_WITH_UDP,
+        "the rule only observes on a path with UDP"
+    );
     // Samples every 2 s for 40 min.
     let times: Vec<u64> = (0..=1200).map(|i| 2 * i).collect();
     let at = |minutes: u64| (minutes * 60 / 2) as usize;
     let counted =
         |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
-    assert_eq!(
-        run_expiries(&times, counted(vec![at(2), at(10), at(20)])),
-        (vec![at(20)], false)
-    );
-    assert_eq!(
-        run_expiries(&times, |i| if i >= at(5) { 3 } else { 0 }),
-        (vec![at(5)], false)
-    );
-    assert_eq!(
-        run_expiries(&times, counted((1..=6).map(|m| at(2 * m)).collect())),
-        (vec![at(6), at(12)], false)
-    );
-    assert_eq!(
-        run_expiries(&times, counted(vec![at(2), at(10), at(33)])),
-        (vec![], false),
-        "the first left the window"
-    );
-    assert_eq!(
-        run_expiries(&times, counted(vec![at(2), at(10)])),
-        (vec![], false)
-    );
+    let cases: Vec<(Box<dyn Fn(usize) -> u64>, Vec<usize>)> = vec![
+        (Box::new(counted(vec![at(2), at(10), at(20)])), vec![at(20)]),
+        (Box::new(|i| if i >= at(5) { 3 } else { 0 }), vec![at(5)]),
+        (
+            Box::new(counted((1..=6).map(|m| at(2 * m)).collect())),
+            vec![at(6), at(12)],
+        ),
+        (Box::new(counted(vec![at(2), at(10), at(33)])), vec![]),
+        (Box::new(counted(vec![at(2), at(10)])), vec![]),
+    ];
+    for (expiries, would) in &cases {
+        assert_eq!(
+            run_expiries(&times, expiries, true),
+            (would.clone(), None),
+            "with UDP: {would:?}"
+        );
+        assert_eq!(
+            run_expiries(&times, expiries, false),
+            (Vec::new(), would.first().copied()),
+            "without UDP: {would:?}"
+        );
+    }
 }
 
 /// The labels `quic_stall_close_<label>` counts under are the stalls'

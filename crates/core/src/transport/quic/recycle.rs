@@ -1467,7 +1467,7 @@ impl AckWatch {
         // Not judged against the peer's timing, so a cap hold does not
         // suspend it.
         if expired {
-            if ACK_WAITS_EXPIRED_CLOSES {
+            if !self.udp_fallback || ACK_WAITS_EXPIRED_CLOSES_WITH_UDP {
                 return Some(Stall::AckWaitsExpired);
             }
             // Observe only: count it, and start the window afresh so the
@@ -1789,15 +1789,18 @@ pub(crate) const STREAM_CREDIT_WINDOW: Duration = Duration::from_secs(60);
 pub(crate) const STREAM_CREDIT_FREED: u64 = super::config::MAX_UNI_STREAMS as u64 / 8 + 1;
 
 /// Whether the ack-wait expiry rule ([`Stall::AckWaitsExpired`]) closes a
-/// path. It does not yet: strikes are counted (`quic_ack_wait_expired_<label>`)
-/// and each time [`ACK_WAIT_EXPIRY_LIMIT`] come within
-/// [`ACK_WAIT_EXPIRY_WINDOW`] is counted as a would-close
-/// (`quic_stall_would_close_ack_waits_expired`), and the path stays open.
-/// The strike can still misjudge an honest path (the backlog ahead of a
-/// stream's end is read when the end is sent, so streams started after it
-/// are not counted), so the close waits for a follow-up calibrated from
-/// those counts (#6205).
-pub(crate) const ACK_WAITS_EXPIRED_CLOSES: bool = false;
+/// path that has a UDP session to fall back to. It does not: on such a path
+/// strikes are counted (`quic_ack_wait_expired_<label>`) and each time
+/// [`ACK_WAIT_EXPIRY_LIMIT`] come within [`ACK_WAIT_EXPIRY_WINDOW`] is counted
+/// as a would-close (`quic_stall_would_close_ack_waits_expired`), and the path
+/// stays open, so the field counts calibrate the rule before the UDP
+/// transport is removed without this node's own closes in them. A path with
+/// no UDP session (a native connection's) is closed, with
+/// `close_code::PEER_NOT_ACKNOWLEDGING`: there the peer's withheld
+/// acknowledgements would otherwise hold its permits and send epochs with
+/// nothing to fall back to (#6205), the same split as the dark rule
+/// ([`DARK_CLOSES_WITH_UDP`]).
+pub(crate) const ACK_WAITS_EXPIRED_CLOSES_WITH_UDP: bool = false;
 
 /// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that would close a
 /// path ([`Stall::AckWaitsExpired`]; counted only,

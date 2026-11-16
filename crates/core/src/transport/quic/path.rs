@@ -792,6 +792,10 @@ pub(crate) struct QuicPath {
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
     stream_slots: Arc<tokio::sync::Semaphore>,
+    /// Permits taken from `stream_slots` since the path was built: a
+    /// stream's ack wait reads it again at its end, to count the streamed
+    /// sends started after the stream's end was sent ([`Self::backlog_wait`]).
+    stream_opens: Arc<AtomicU64>,
     /// Sends with data still to write, for the credit rule
     /// (`recycle::CreditWatch`).
     writers: Arc<recycle::Writers>,
@@ -1132,6 +1136,7 @@ impl QuicPath {
                 ack_waits,
                 meter,
                 stream_slots: Arc::new(tokio::sync::Semaphore::new(STREAMED_SEND_LIMIT as usize)),
+                stream_opens: Arc::default(),
                 writers,
                 sleeper,
                 #[cfg(test)]
@@ -1407,18 +1412,43 @@ impl QuicPath {
     /// at a share of one in the streamed sends in flight (their permits).
     /// That is the sends in flight times the rest, at the credit floor at
     /// the path's round trip.
-    fn backlog_wait(&self, len: u64) -> Arc<dyn Fn() -> Duration + Send + Sync> {
-        let (slots, connection) = (self.stream_slots.clone(), self.connection.inner().clone());
+    ///
+    /// Streamed sends started after the end share the link with the rest
+    /// too, so the backlog is read again when the ack wait runs out
+    /// ([`bounded::LaterBacklog`]): the sends in flight when the end was
+    /// sent plus every permit taken since, each counted as sharing the link
+    /// for the whole wait (an upper bound: some may have ended), times the
+    /// rest, at the floor at the round trip then. Without it, a burst of
+    /// sends just after an end could make an honest peer's acknowledgement
+    /// of that end come after its wait (#6205).
+    fn backlog_wait(&self, len: u64) -> Arc<dyn Fn() -> Backlog + Send + Sync> {
+        let (slots, connection, opens) = (
+            self.stream_slots.clone(),
+            self.connection.inner().clone(),
+            self.stream_opens.clone(),
+        );
+        let rest = len.min(super::budget::MAX_WINDOW_BYTES);
         Arc::new(move || {
             let in_flight = (STREAMED_SEND_LIMIT as u64)
                 .saturating_sub(slots.available_permits() as u64)
                 .max(1);
-            let floor = recycle::credit_floor_rate(connection.stats().path.rtt).max(1);
-            Duration::from_secs(
-                in_flight
-                    .saturating_mul(len.min(super::budget::MAX_WINDOW_BYTES))
-                    .div_ceil(floor),
-            )
+            let at_floor = {
+                let connection = connection.clone();
+                move |sends: u64| {
+                    let floor = recycle::credit_floor_rate(connection.stats().path.rtt).max(1);
+                    Duration::from_secs(sends.saturating_mul(rest).div_ceil(floor))
+                }
+            };
+            let opened = opens.load(Ordering::Acquire);
+            let opens = opens.clone();
+            let wait = at_floor(in_flight);
+            Backlog {
+                wait,
+                later: Arc::new(move || {
+                    let since = opens.load(Ordering::Acquire).saturating_sub(opened);
+                    at_floor(in_flight.saturating_add(since))
+                }),
+            }
         })
     }
 
@@ -2012,16 +2042,21 @@ impl QuicPath {
     async fn stream_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QuicSendError> {
         if let Ok(permit) = Arc::clone(&self.stream_slots).try_acquire_owned() {
             self.stats.node.record_permit(false);
+            self.stream_opens.fetch_add(1, Ordering::AcqRel);
             return Ok(permit);
         }
         self.stats.node.record_permit(true);
         let connection = self.connection.inner();
-        tokio::select! {
+        let permit = tokio::select! {
             permit = Arc::clone(&self.stream_slots).acquire_owned() => {
                 permit.map_err(|_| QuicSendError::Closed)
             }
             error = connection.closed() => Err(error.into()),
+        };
+        if permit.is_ok() {
+            self.stream_opens.fetch_add(1, Ordering::AcqRel);
         }
+        permit
     }
 
     /// Open a uni stream and write the header and metadata. Waits for a
@@ -2360,7 +2395,15 @@ struct Outgoing {
     control: bool,
     /// How long the backlog ahead of this stream's end may take, read when
     /// the end is sent ([`QuicPath::backlog_wait`]).
-    backlog: Option<Arc<dyn Fn() -> Duration + Send + Sync>>,
+    backlog: Option<Arc<dyn Fn() -> Backlog + Send + Sync>>,
+}
+
+/// The backlog ahead of a stream's end ([`QuicPath::backlog_wait`]): how long
+/// it may take, read when the end is sent, and how to read it again at the
+/// ack wait's end.
+struct Backlog {
+    wait: Duration,
+    later: bounded::LaterBacklog,
 }
 
 /// A sleep on the path's clock.
@@ -2733,8 +2776,10 @@ impl Outgoing {
             .map_err(|_| QuicSendError::Closed)?;
         self.writing = None;
         self.finished_at = self.strike.as_ref().map(StrikeCheck::mark);
-        let backlog = self.backlog.as_ref().map_or(Duration::ZERO, |wait| wait());
-        self.progress.mark_finished_behind(backlog);
+        match self.backlog.as_ref().map(|backlog| backlog()) {
+            Some(Backlog { wait, later }) => self.progress.mark_finished_after(wait, Some(later)),
+            None => self.progress.mark_finished_behind(Duration::ZERO),
+        }
         self.awaiting_ack = true;
         let stopped = (&mut self.stopped).await;
         self.awaiting_ack = false;

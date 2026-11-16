@@ -284,9 +284,18 @@ struct ProgressState {
     /// loop arms; zero before ([`SendProgress::ack_wait_left`]).
     ack_wait_deadline: AtomicU64,
     /// The backlog ahead of the end when it was sent, in nanoseconds
-    /// ([`SendProgress::mark_finished_behind`]).
+    /// ([`SendProgress::mark_finished_behind`]), raised when it is read again
+    /// at the ack wait's end ([`LaterBacklog`]).
     backlog_wait: AtomicU64,
+    /// Reads the backlog again, counting the streamed sends started since
+    /// the end was sent ([`SendProgress::mark_finished_after`]).
+    later_backlog: std::sync::OnceLock<LaterBacklog>,
 }
+
+/// The backlog ahead of a stream's end read again, at the ack wait's end:
+/// with the streamed sends started since the end was sent counted as sharing
+/// the link with it for the whole wait (`QuicPath::backlog_wait`).
+pub(crate) type LaterBacklog = Arc<dyn Fn() -> Duration + Send + Sync>;
 
 impl SendProgress {
     /// For a send with no deadline, which reads no clock. Tests only.
@@ -309,6 +318,7 @@ impl SendProgress {
             ack_wait_due: AtomicU64::new(0),
             ack_wait_deadline: AtomicU64::new(0),
             backlog_wait: AtomicU64::new(0),
+            later_backlog: std::sync::OnceLock::new(),
         }))
     }
 
@@ -331,6 +341,7 @@ impl SendProgress {
             ack_wait_due: AtomicU64::new(0),
             ack_wait_deadline: AtomicU64::new(0),
             backlog_wait: AtomicU64::new(0),
+            later_backlog: std::sync::OnceLock::new(),
         }))
     }
 
@@ -438,6 +449,18 @@ impl SendProgress {
     /// ahead of the stream's end may take to go out, which extends its ack
     /// wait ([`SendDeadlines::ack_wait`]) to at least that, within its total.
     pub(super) fn mark_finished_behind(&self, backlog: Duration) {
+        self.mark_finished_after(backlog, None);
+    }
+
+    /// [`Self::mark_finished_behind`], with `later`, which reads the backlog
+    /// again at the ack wait's end: streamed sends started after the end
+    /// share the link with what is left of the stream, so its end may need
+    /// longer than the backlog read now. The wait is then extended to what
+    /// `later` reads, within its total, before it is judged to have run out.
+    pub(super) fn mark_finished_after(&self, backlog: Duration, later: Option<LaterBacklog>) {
+        if let Some(later) = later {
+            let _first = self.0.later_backlog.set(later);
+        }
         self.0.backlog_wait.store(nanos(backlog), Ordering::Release);
         self.0.finished_at.store((self.0.now)(), Ordering::Release);
         self.0.stage.store(STAGE_FINISHED, Ordering::Release);
@@ -914,6 +937,21 @@ where
                     watch.observe(now);
                 }
                 if now >= progress.deadline(&deadlines, started, until(&watch)) {
+                    // The ack wait ran out: read its backlog again, with the
+                    // streamed sends started since the end. If they moved
+                    // its deadline past now, wait on (`mark_finished_after`).
+                    if progress.stage() == STAGE_FINISHED
+                        && deadlines.ack_wait_covers_backlog
+                        && let Some(later) = progress.0.later_backlog.get()
+                    {
+                        let backlog = nanos(later());
+                        if backlog > progress.0.backlog_wait.load(Ordering::Acquire) {
+                            progress.0.backlog_wait.store(backlog, Ordering::Release);
+                            if now < progress.deadline(&deadlines, started, until(&watch)) {
+                                continue;
+                            }
+                        }
+                    }
                     if progress.stage() == STAGE_OPENED
                         && let Some(watch) = watch.as_ref()
                     {
