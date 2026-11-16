@@ -1175,10 +1175,11 @@ fn the_strike_check_needs_evidence_that_the_end_went_out() {
 /// cannot be met (1 s on a 4 s round trip), standing in for a peer that
 /// never acknowledges stream ends. A bulk transfer runs throughout, so the
 /// connection acknowledges well above the floor, as a peer that acknowledges
-/// every packet except stream ends does: each expiry is a strike. The rule
-/// only observes (`recycle::ACK_WAITS_EXPIRED_CLOSES`), so three strikes
-/// count a would-close (`quic_stall_would_close_ack_waits_expired`) and the
-/// path stays open:
+/// every packet except stream ends does: each expiry is a strike. On a path
+/// with a UDP session the rule only observes
+/// (`recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`), so three strikes count a
+/// would-close (`quic_stall_would_close_ack_waits_expired`) and the path
+/// stays open:
 /// - three such sends, with acknowledged multi-packet Shorts between them
 ///   (they have an ack wait of their own and were what reset round 4's
 ///   rule): three strikes, one would-close, not closed;
@@ -1192,6 +1193,9 @@ fn the_strike_check_needs_evidence_that_the_end_went_out() {
 ///   was application-limited, is tested on its own in
 ///   `the_strike_check_needs_evidence_that_the_end_went_out`: this harness's
 ///   peer acknowledges every packet it gets, so it cannot withhold an end.)
+///
+/// On a native path (no UDP session) the first two cases close the path at
+/// the third strike, under `ack_waits_expired`, with no would-close.
 #[test]
 fn ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged() {
     use crate::transport::in_memory_socket::{
@@ -1199,10 +1203,18 @@ fn ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged() {
     };
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        for (network, acked_between, bulk, strikes) in [
-            ("quic-path-expiries-shorts", false, true, true),
-            ("quic-path-expiries-one-in-three", true, true, true),
-            ("quic-path-expiries-quiet", false, false, false),
+        for (network, acked_between, bulk, strikes, native) in [
+            ("quic-path-expiries-shorts", false, true, true, false),
+            ("quic-path-expiries-one-in-three", true, true, true, false),
+            ("quic-path-expiries-quiet", false, false, false, false),
+            ("quic-path-expiries-shorts-native", false, true, true, true),
+            (
+                "quic-path-expiries-one-in-three-native",
+                true,
+                true,
+                true,
+                true,
+            ),
         ] {
             set_packet_delivery_callback(
                 network,
@@ -1215,7 +1227,21 @@ fn ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged() {
                 counters: Some(counters),
                 ..QuicPathLimits::DEFAULT
             };
-            let mut p = paths(network, limits).await;
+            let a_base = if native {
+                QuicPathLimits::NATIVE
+            } else {
+                QuicPathLimits::DEFAULT
+            };
+            let mut p = paths_built(
+                network,
+                limits,
+                a_base,
+                None,
+                None,
+                Windows::default(),
+                true,
+            )
+            .await;
             // Drain what `b` receives, as a node does.
             let mut streams =
                 std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
@@ -1322,9 +1348,21 @@ fn ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged() {
                 .await;
             drain.abort();
             set_packet_delivery_callback(network, None);
+            let snapshot = counters.snapshot(false);
+            if native {
+                assert_eq!(closed_at, Some(3), "{network}: closed at the third strike");
+                assert_eq!(
+                    recycle::stalls_to(b_addr),
+                    vec![recycle::Stall::AckWaitsExpired],
+                    "{network}"
+                );
+                assert_eq!(snapshot.stall_closes, vec![0, 0, 0, 0, 1], "{network}");
+                assert_eq!(snapshot.stall_would_close, vec![0; 5], "{network}");
+                assert_eq!(snapshot.ack_wait_expired, vec![3, 0, 0], "{network}");
+                continue;
+            }
             assert_eq!(closed_at, None, "{network}: not closed");
             assert_eq!(recycle::stalls_to(b_addr), vec![], "{network}");
-            let snapshot = counters.snapshot(false);
             assert_eq!(snapshot.stall_closes, vec![0; 5], "{network}");
             if strikes {
                 assert_eq!(snapshot.ack_wait_expired, vec![3, 0, 0], "{network}");
@@ -1586,6 +1624,106 @@ fn concurrent_large_streams_on_a_slow_path_see_no_expiry() {
         );
         assert_eq!(p.a.send_aborts(), 0, "no stream was reset");
         assert_eq!(p.a.writers().ack_wait_expiries(), 0);
+    })
+}
+
+/// A 1 MiB stream whose end goes out at once, then fifteen more started right
+/// after it, on a 40 KiB/s link (a 400 ms round trip, a 1 s queue): the first
+/// stream's rest drains at a sixteenth of the link (about 400 s), so its
+/// end is acknowledged long after the wait read when it was sent (one stream
+/// in flight then: its first age, 5 min). The ack wait reads its backlog again
+/// at its end, counting the fifteen started since
+/// (`bounded::LaterBacklog`), so an honest peer's late acknowledgement of that
+/// end is waited for: every send ends `Sent`, nothing is reset or struck.
+/// Reading the backlog only once, when the end is sent, fails this (#6205).
+#[test]
+fn streams_started_after_an_end_extend_its_ack_wait() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    use std::sync::atomic::Ordering::Relaxed;
+    const RATE: u64 = 40 * 1024;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-burst-after-end";
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(200))
+            })),
+        );
+        let counters = leaked_counters();
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        let mut p = paths(network, limits).await;
+        let (a_addr, time) = (p.pair.a_addr, p.time());
+        let free_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, sender, _, bytes: &[u8]| {
+                let now = time.now_nanos();
+                if sender != a_addr {
+                    return PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(200));
+                }
+                let start = free_at.load(Relaxed).max(now);
+                if start - now > 1_000_000_000 {
+                    return PacketDeliveryDecision::Drop;
+                }
+                let done = start + bytes.len() as u64 * 1_000_000_000 / RATE;
+                free_at.store(done, Relaxed);
+                PacketDeliveryDecision::DelayedDelivery(
+                    Duration::from_nanos(done - now) + Duration::from_millis(200),
+                )
+            })),
+        );
+        let len = MIB;
+        let mut b_in = std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+        let (a, time) = (p.a.clone(), p.time());
+        let outcomes = p
+            .drive(async move {
+                let start = |a: Arc<QuicPath>, time: VirtualTime| {
+                    tokio::spawn(async move {
+                        let deadlines = a.stream_deadlines(len as u64);
+                        a.send_stream_bounded(
+                            &time,
+                            deadlines,
+                            StreamId::next(),
+                            None,
+                            Bytes::from(payload(len)),
+                            None,
+                        )
+                        .await
+                    })
+                };
+                let first = start(a.clone(), time.clone());
+                // Its 1 MiB fits its send window: the end goes out at once.
+                time.sleep(Duration::from_secs(2)).await;
+                let mut sends = vec![first];
+                sends.extend((0..15).map(|_| start(a.clone(), time.clone())));
+                let mut kept = Vec::new();
+                let mut outcomes = Vec::new();
+                for send in sends {
+                    while !send.is_finished() {
+                        while let Ok(arrival) = b_in.try_recv() {
+                            kept.push(arrival);
+                        }
+                        time.sleep(Duration::from_millis(200)).await;
+                    }
+                    outcomes.push(send.await.expect("the send task ran"));
+                }
+                outcomes
+            })
+            .await;
+        set_packet_delivery_callback(network, None);
+        assert!(
+            outcomes.iter().all(|o| matches!(o, BoundedSend::Sent)),
+            "{outcomes:?}"
+        );
+        assert_eq!(p.a.send_aborts(), 0, "no stream was reset");
+        assert_eq!(p.a.writers().ack_wait_expiries(), 0);
+        assert_eq!(counters.snapshot(false).ack_wait_expired, vec![0, 0, 0]);
     })
 }
 

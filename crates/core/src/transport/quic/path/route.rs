@@ -184,10 +184,10 @@ pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, Qui
 /// UDP session, and by quinn's idle timeout if it has one; a peer that
 /// acknowledges other traffic but never a stream's end has the stream reset
 /// at its ack wait (`bounded::SendDeadlines::ack_wait`), and three strikes
-/// within 30 min are counted as a would-close
-/// (`recycle::ACK_WAIT_EXPIRY_LIMIT`); that rule only observes for now
-/// (`recycle::ACK_WAITS_EXPIRED_CLOSES`), so such a peer is bounded by
-/// `recycle::SEND_ABORT_LIMIT`; and a peer that withholds its stream limit is
+/// within 30 min close a path with no UDP session
+/// (`recycle::ACK_WAIT_EXPIRY_LIMIT`); on a path with one that rule only
+/// observes (`recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`), so such a peer is
+/// bounded there by `recycle::SEND_ABORT_LIMIT` and the fallback; and a peer that withholds its stream limit is
 /// closed by the stream-credit rule (`recycle::StreamCreditWatch`).
 fn timed_out(outcome: &BoundedSend) -> bool {
     match outcome {

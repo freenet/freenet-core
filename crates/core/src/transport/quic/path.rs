@@ -2432,8 +2432,11 @@ type Sleeper = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> 
 /// deadline (one of nearly the whole wait, about 118 s for a one-packet
 /// Short) still has its stale evidence judged.
 ///
-/// A strike only counts toward telemetry for now
-/// (`recycle::ACK_WAITS_EXPIRED_CLOSES`).
+/// Strikes close a path with no UDP session at `recycle::ACK_WAIT_EXPIRY_LIMIT`
+/// within its window, and only count toward telemetry on a path with one
+/// (`recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`). An ack wait reads its
+/// backlog again before it runs out, so streams started after the end do not
+/// make an honest peer's acknowledgement late (`bounded::LaterBacklog`).
 #[derive(Clone)]
 struct StrikeCheck {
     acks: recycle::AckProgress,

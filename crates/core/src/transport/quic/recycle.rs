@@ -62,11 +62,12 @@
 //!    [`STREAM_CREDIT_WINDOW`] while this side wanted streams, though enough
 //!    of this side's streams were wholly acknowledged that an honest peer
 //!    would have.
-//! 6. **Ack waits expired** ([`Stall::AckWaitsExpired`]), observe-only
-//!    ([`ACK_WAITS_EXPIRED_CLOSES`]): [`ACK_WAIT_EXPIRY_LIMIT`] sends had
-//!    their wait for the acknowledgement of their end run out within
-//!    [`ACK_WAIT_EXPIRY_WINDOW`]; counted (`quic_stall_would_close_<label>`),
-//!    and the path stays open.
+//! 6. **Ack waits expired** ([`Stall::AckWaitsExpired`]):
+//!    [`ACK_WAIT_EXPIRY_LIMIT`] sends had their wait for the acknowledgement
+//!    of their end run out within [`ACK_WAIT_EXPIRY_WINDOW`]. Closes a path
+//!    with no UDP session (a native one); on a path with one it only counts
+//!    (`quic_stall_would_close_<label>`) and the path stays open
+//!    ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
 //!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
 //! counter of packets the peer newly acknowledged: `frame_rx.acks` counts
@@ -1189,8 +1190,8 @@ pub(crate) struct AckWatch {
     /// seen, within [`ACK_WAIT_EXPIRY_WINDOW`].
     expiries_seen: u64,
     expiries_at: VecDeque<u64>,
-    /// Times the ack-wait expiry rule would have closed the path
-    /// ([`ACK_WAITS_EXPIRED_CLOSES`]).
+    /// Times the ack-wait expiry rule would have closed the path, which has
+    /// a UDP session ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
     would_close: u64,
     /// The path has a UDP session to fall back to, so the dark rule only
     /// counts ([`DARK_CLOSES_WITH_UDP`]).
@@ -1397,8 +1398,8 @@ impl AckWatch {
         }
     }
 
-    /// Times the ack-wait expiry rule would have closed the path
-    /// ([`ACK_WAITS_EXPIRED_CLOSES`]). Tests only.
+    /// Times the ack-wait expiry rule would have closed the path, which has
+    /// a UDP session ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]). Tests only.
     #[cfg(test)]
     pub(crate) fn would_close(&self) -> u64 {
         self.would_close
@@ -1603,8 +1604,9 @@ pub(crate) enum Stall {
     StreamCreditWithheld,
     /// [`ACK_WAIT_EXPIRY_LIMIT`] of this side's sends had their wait for the
     /// acknowledgement of their end run out within
-    /// [`ACK_WAIT_EXPIRY_WINDOW`] ([`AckWatch`]). Observe-only for now: counted
-    /// as a would-close, the path not closed ([`ACK_WAITS_EXPIRED_CLOSES`]).
+    /// [`ACK_WAIT_EXPIRY_WINDOW`] ([`AckWatch`]). Closes a path with no UDP
+    /// session; on one with a UDP session it is counted as a would-close and
+    /// the path is not closed ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
     AckWaitsExpired,
 }
 
@@ -1802,9 +1804,9 @@ pub(crate) const STREAM_CREDIT_FREED: u64 = super::config::MAX_UNI_STREAMS as u6
 /// ([`DARK_CLOSES_WITH_UDP`]).
 pub(crate) const ACK_WAITS_EXPIRED_CLOSES_WITH_UDP: bool = false;
 
-/// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that would close a
-/// path ([`Stall::AckWaitsExpired`]; counted only,
-/// [`ACK_WAITS_EXPIRED_CLOSES`]): sends whose wait for the acknowledgement of
+/// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that close a path with
+/// no UDP session ([`Stall::AckWaitsExpired`]; on one with a UDP session
+/// counted only, [`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]): sends whose wait for the acknowledgement of
 /// their end ran out (`bounded::SendDeadlines::ack_wait`, at least 5 min, or
 /// a one-packet Short's background wait, `path::SHORT_ACK_WAIT`, 150 s) and
 /// whose stream was reset. Counted only when the reset happened (an
