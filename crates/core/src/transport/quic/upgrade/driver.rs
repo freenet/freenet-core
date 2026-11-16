@@ -82,6 +82,7 @@ use super::policy::QuicPolicy;
 use crate::config::{GlobalExecutor, GlobalRng};
 use crate::node::background_task_monitor::LateRegistrar;
 use crate::simulation::{RealTime, TimeSource, VirtualTime};
+use crate::transport::boundary::QuicPathEnd;
 use crate::transport::crypto::TransportPublicKey;
 use crate::transport::metrics::{QuicCloseCode, QuicFallback, QuicUpgradeOutcome};
 use crate::transport::peer_connection::UdpSender;
@@ -397,6 +398,10 @@ struct SessionState {
     /// When this node sent its Offer or Accept, on the session clock, until
     /// the path is established.
     setup_started: Option<Duration>,
+    /// Why this node closed the latest path's connection, if it did: read when
+    /// the path's fallback is counted, which may be after the attempt that
+    /// held the path is gone.
+    close_record: Option<crate::transport::quic::CloseRecord>,
 }
 
 /// One UDP session's upgrade. The driver, the connection and a newer session of
@@ -611,6 +616,7 @@ impl QuicUpgrades {
                 peer_key: None,
                 ended: false,
                 setup_started: None,
+                close_record: None,
             }),
         });
         let driver = GlobalExecutor::spawn(report_panics(
@@ -718,11 +724,36 @@ impl QuicUpgrades {
     }
 }
 
-/// The counter label of a fallback cause.
-fn fallback_label(cause: FallbackCause) -> QuicFallback {
+/// Why this node closed the session's latest path, if it recorded why.
+fn closed_for(state: &SessionState) -> Option<QuicPathEnd> {
+    state.close_record.as_ref().and_then(|record| record.get())
+}
+
+/// The counter label of a fallback cause. A path this node closed itself
+/// (`closed_for`, recorded before the close is sent) ends for quinn as
+/// `LocallyClosed`, which reads as a lost connection (`Reset`) here, as does a
+/// send failing on it afterwards; it is counted by the recorded reason instead,
+/// so a peer's reset and this node's own close are told apart. Only `Reset` is
+/// relabelled: any other cause says the path ended some other way first.
+fn fallback_label(cause: FallbackCause, closed_for: Option<QuicPathEnd>) -> QuicFallback {
     match cause {
         FallbackCause::Idle => QuicFallback::Idle,
-        FallbackCause::Reset => QuicFallback::Reset,
+        FallbackCause::Reset => match closed_for {
+            None => QuicFallback::Reset,
+            Some(QuicPathEnd::Stalled | QuicPathEnd::NotAcknowledging) => {
+                QuicFallback::LivenessClosed
+            }
+            Some(
+                QuicPathEnd::SendAborts
+                | QuicPathEnd::PeerOverBudget
+                | QuicPathEnd::RefusedData
+                | QuicPathEnd::PeerRefusedData
+                | QuicPathEnd::ReceiveTaskPanicked
+                | QuicPathEnd::ClosedByPeer
+                | QuicPathEnd::ClosedLocally
+                | QuicPathEnd::Lost,
+            ) => QuicFallback::LocallyClosed,
+        },
         FallbackCause::Protocol => QuicFallback::Protocol,
         FallbackCause::DowngradeReceived => QuicFallback::DowngradeReceived,
         FallbackCause::EndpointDown => QuicFallback::EndpointDown,
@@ -917,15 +948,16 @@ impl Session {
             } else {
                 C::SessionEndedSetup
             }),
-            Outcome::Fallback(cause) => {
-                TRANSPORT_METRICS.record_quic_fallback(fallback_label(cause), self.remote)
-            }
-            Outcome::ChurnedFallback(cause) => {
-                TRANSPORT_METRICS.record_quic_churned_fallback(fallback_label(cause), self.remote)
-            }
-            Outcome::CarryingFallback(cause) => {
-                TRANSPORT_METRICS.record_quic_carried_fallback(fallback_label(cause), self.remote)
-            }
+            Outcome::Fallback(cause) => TRANSPORT_METRICS
+                .record_quic_fallback(fallback_label(cause, closed_for(state)), self.remote),
+            Outcome::ChurnedFallback(cause) => TRANSPORT_METRICS.record_quic_churned_fallback(
+                fallback_label(cause, closed_for(state)),
+                self.remote,
+            ),
+            Outcome::CarryingFallback(cause) => TRANSPORT_METRICS.record_quic_carried_fallback(
+                fallback_label(cause, closed_for(state)),
+                self.remote,
+            ),
         }
     }
 
@@ -1203,6 +1235,7 @@ impl Session {
         );
         if let Some(held) = state.attempt.as_mut() {
             held.tasks.push(pump);
+            state.close_record = Some(path.close_record());
             held.path = Some(Arc::new(path));
         }
     }

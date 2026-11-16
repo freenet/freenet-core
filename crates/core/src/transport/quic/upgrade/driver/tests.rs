@@ -193,6 +193,7 @@ impl Harness {
                 peer_key: None,
                 ended: false,
                 setup_started: None,
+                close_record: None,
             }),
         });
         (session, inbox_rx)
@@ -1784,7 +1785,9 @@ fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
                 QuicFallback::OverBudgetReceived,
             ),
         ];
-        assert_eq!(causes.len(), QuicFallback::COUNT);
+        // The other two labels come from `Reset` and a recorded close
+        // (`a_path_this_node_closed_falls_back_under_its_recorded_reason`).
+        assert_eq!(causes.len() + 2, QuicFallback::COUNT);
         let mut state = session.state.lock();
         session.apply(
             &mut state,
@@ -2153,5 +2156,125 @@ fn native_attempts_reach_only_native_waiters() {
         assert_eq!(handed.source(), h.remote);
         assert!(inbox.try_recv().is_err(), "not routed to the session");
         dial.abort();
+    });
+}
+
+/// A path this node closed is counted by the reason it recorded, not as a
+/// reset: quinn reports such an end as `LocallyClosed`, which reads as a lost
+/// connection. Every recorded reason has a label, and no other cause is
+/// relabelled. The count site is one function for every way the machine
+/// learns of the end (the path's close, a control send failing on it).
+#[test]
+fn fallback_label_counts_a_local_close_by_its_recorded_reason() {
+    use crate::transport::boundary::QuicPathEnd as E;
+    use crate::transport::quic::upgrade::machine::FallbackCause as F;
+    assert_eq!(fallback_label(F::Reset, None), QuicFallback::Reset);
+    for end in [E::Stalled, E::NotAcknowledging] {
+        assert_eq!(
+            fallback_label(F::Reset, Some(end)),
+            QuicFallback::LivenessClosed
+        );
+    }
+    for end in [
+        E::SendAborts,
+        E::PeerOverBudget,
+        E::RefusedData,
+        E::PeerRefusedData,
+        E::ReceiveTaskPanicked,
+        E::ClosedByPeer,
+        E::ClosedLocally,
+        E::Lost,
+    ] {
+        assert_eq!(
+            fallback_label(F::Reset, Some(end)),
+            QuicFallback::LocallyClosed,
+            "{end:?}"
+        );
+    }
+    // Another cause says the path ended another way first.
+    for (cause, label) in [
+        (F::Idle, QuicFallback::Idle),
+        (F::Protocol, QuicFallback::Protocol),
+        (F::DowngradeReceived, QuicFallback::DowngradeReceived),
+        (F::EndpointDown, QuicFallback::EndpointDown),
+        (F::SessionEndedReceived, QuicFallback::SessionEndedReceived),
+        (F::OverBudgetReceived, QuicFallback::OverBudgetReceived),
+    ] {
+        assert_eq!(fallback_label(cause, Some(E::NotAcknowledging)), label);
+        assert_eq!(fallback_label(cause, None), label);
+    }
+}
+
+/// End to end through the driver: a carrying path this node closes for a
+/// liveness rule falls back as `liveness_tx`, one it closes for another
+/// recorded reason as `closed_tx`, and one closed with no recorded reason
+/// still as `reset`, each in the carried count too.
+#[test]
+fn a_path_this_node_closed_falls_back_under_its_recorded_reason() {
+    use crate::transport::boundary::QuicPathEnd;
+    use crate::transport::quic::control::caps;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (cause, label) in [
+            (
+                Some(QuicPathEnd::NotAcknowledging),
+                QuicFallback::LivenessClosed,
+            ),
+            (Some(QuicPathEnd::Stalled), QuicFallback::LivenessClosed),
+            (Some(QuicPathEnd::SendAborts), QuicFallback::LocallyClosed),
+            (None, QuicFallback::Reset),
+        ] {
+            let h = Harness::server_with("quic-driver-local-close", "prefer", Some("100")).await;
+            let (session, inbox) = h.session();
+            let attempt = offered(&h, &session);
+            let up = path_up(&h, &session, inbox);
+            let time = h.pair.time.clone();
+            let (_peer_path, _peer_inbound, mut inbox) =
+                drive(&h.pair.time, Duration::from_secs(60), async move {
+                    let up = up.await;
+                    time.sleep(Duration::from_secs(1)).await;
+                    up
+                })
+                .await;
+            ready_ack(&session, attempt, caps::DATA);
+            let route = session.data_route().expect("both bits");
+            match cause {
+                Some(cause) => route
+                    .path()
+                    .close_for(QuicCloseCode::PeerNotAcknowledging, cause),
+                None => route
+                    .path()
+                    .quinn_connection()
+                    .close(QuicCloseCode::Downgrade.code().into(), b""),
+            }
+            drop(route);
+            let session_for_drive = Arc::clone(&session);
+            drive(&h.pair.time, Duration::from_secs(60), async move {
+                loop {
+                    let event = inbox.recv().await.expect("the session lives");
+                    let closed = matches!(event, SessionEvent::PathClosed { .. });
+                    session_for_drive.handle(event);
+                    if closed {
+                        break;
+                    }
+                }
+            })
+            .await;
+            let events = TRANSPORT_METRICS.quic_events_of(h.remote);
+            assert!(
+                events.contains(&format!("{label:?}")),
+                "{cause:?}: {events:?}"
+            );
+            assert!(
+                events.contains(&format!("{:?}", ("carrying", label))),
+                "{cause:?}: {events:?}"
+            );
+            if label != QuicFallback::Reset {
+                assert!(
+                    !events.contains(&format!("{:?}", QuicFallback::Reset)),
+                    "{cause:?}: {events:?}"
+                );
+            }
+        }
     });
 }

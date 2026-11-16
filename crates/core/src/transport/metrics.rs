@@ -537,6 +537,16 @@ labelled_counters! {
         /// peer's QUIC buffer budget than it allows. A peer on a release
         /// before the code does not send it.
         OverBudgetReceived => "over_budget_rx",
+        /// This node closed it because the peer stopped making progress on
+        /// it: an acknowledgement-watch rule (`quic_stall_close_<stall>`
+        /// says which) or the stalled-sends count. Counted as `reset` by
+        /// releases before the label.
+        LivenessClosed => "liveness_tx",
+        /// This node closed it for another recorded reason: too many reset
+        /// sends, the peer over its buffer budget, refused data, or a
+        /// panicked receive task. Counted as `reset` by releases before the
+        /// label.
+        LocallyClosed => "closed_tx",
     }
 }
 

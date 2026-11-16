@@ -1112,6 +1112,7 @@ impl QuicPath {
                     rtt: receiver_rtt,
                     heard: heard.clone(),
                     carries_data: carries_data.clone(),
+                    udp_fallback: limits.udp_fallback,
                 },
                 report,
             },
@@ -1175,6 +1176,11 @@ impl QuicPath {
         &self,
     ) -> Option<crate::transport::boundary::QuicPathEnd> {
         self.connection.closer().closed_for()
+    }
+
+    /// A handle on [`Self::closed_for`] that outlives the path.
+    pub(in crate::transport) fn close_record(&self) -> crate::transport::quic::CloseRecord {
+        self.connection.closer().close_record()
     }
 
     /// Pace this path's data sends with `pacer` (`pacer` module): the
@@ -2436,20 +2442,29 @@ fn nanos(duration: Duration) -> u64 {
 /// dark rule's close of a dark path. At the bound the stream is reset,
 /// freeing the epoch, and counted toward `recycle::ACK_WAIT_EXPIRY_LIMIT`.
 ///
-/// Its margin: through an outage the dark rule tolerates (at most
-/// `recycle::DARK_CLOSE_MAX`), an honest Short waits for the peer to be
-/// heard again, which a live peer's keepalive (`config::KEEPALIVE_INTERVAL`,
-/// 15 s) brings at the latest, and is then retransmitted and acknowledged
-/// within a couple of round trips: about 91 s at an 800 ms round trip.
-/// Asserted below with 15 s to spare. Virtual time runs no keepalive, so a
-/// simulation relies on quinn's probe backoff instead
+/// Its margin: on a path with a UDP session the dark rule does not close
+/// (`recycle::DARK_CLOSES_WITH_UDP`), so an outage lasts until quinn's idle
+/// timeout at the most (`recycle::UDP_PATH_DARK_END_MAX`, 120 s). Through one
+/// that ends sooner, an honest Short waits for the peer to be heard again,
+/// which a live peer's keepalive (`config::KEEPALIVE_INTERVAL`, 15 s) brings
+/// at the latest, and is then retransmitted and acknowledged within a couple
+/// of round trips. Asserted below with 15 s to spare. Virtual time runs no
+/// keepalive, so a simulation relies on quinn's probe backoff instead
 /// (`one_packet_shorts_through_a_tolerated_outage_do_not_expire`).
-pub(crate) const SHORT_ACK_WAIT: Duration = Duration::from_secs(120);
+pub(crate) const SHORT_ACK_WAIT: Duration = Duration::from_secs(150);
+
+const _: () = assert!(
+    SHORT_ACK_WAIT.as_secs()
+        >= recycle::UDP_PATH_DARK_END_MAX.as_secs()
+            + super::config::KEEPALIVE_INTERVAL.as_secs()
+            + 15,
+    "SHORT_ACK_WAIT must outlast an outage up to the idle timeout plus a keepalive"
+);
 
 const _: () = assert!(
     SHORT_ACK_WAIT.as_secs()
         >= recycle::DARK_CLOSE_MAX.as_secs() + super::config::KEEPALIVE_INTERVAL.as_secs() + 15,
-    "SHORT_ACK_WAIT must outlast a tolerated outage plus a keepalive"
+    "SHORT_ACK_WAIT must outlast an outage the dark rule tolerates plus a keepalive"
 );
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;
