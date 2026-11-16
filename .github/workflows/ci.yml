@@ -7,7 +7,8 @@ name: CI
 #    permanently unmergeable, so it is confined to the trigger where no
 #    required check is at stake.
 #    This is a REAL cost increase, not a relocation: since #5571 a docs-only PR
-#    pays the full PR suite (Clippy and NAT Validation on ubicloud-standard-8;
+#    pays the full PR suite (NAT Validation on ubicloud-standard-8; Clippy on
+#    ubuntu-latest;
 #    Unit & Integration and Simulation on ubicloud-standard-16; the macOS/Windows
 #    unit jobs) PLUS a paid Claude rule review, on top of the merge_group run it
 #    already paid. That was accepted because docs-only merges are rare (15 in
@@ -789,18 +790,24 @@ jobs:
 
           echo "Rule lint passed — no banned patterns in new code"
 
-  # Clippy runs in parallel with fmt_check (and with every heavy job)
-  # Using Ubicloud for faster builds with more cores
+  # Clippy runs in parallel with fmt_check (and with every heavy job).
+  # Only the failure-notification jobs `needs:` it, so its wall time gates
+  # nothing else.
   clippy_check:
     name: Clippy
-    runs-on: ubicloud-standard-8
-    # Raised from 15 for the two added all-targets steps, which compile the test
-    # and bench targets the other steps skip. Measured on a warm
-    # `Swatinem/rust-cache` hit: 46s + 41s + 2m09s = 4m26s for the job with one
-    # all-targets step, so the headroom is not for the warm case -- it is for a
-    # cold cache, where the first step absorbs the full dependency build and the
-    # later steps each add an incremental pass on top.
-    timeout-minutes: 30
+    # GitHub-hosted, not Ubicloud (#6244). Lint output does not depend on
+    # machine speed, so a 4-vCPU runner cannot make this check flaky, and on a
+    # public repo it is free; on ubicloud-standard-8 it cost about $33/month.
+    # The PR critical path is the Windows/macOS unit jobs (~37 min), so a
+    # slower Clippy does not delay the verdict. Its cache lives in GitHub's
+    # backend, which shares a 10 GB limit with the Windows/macOS jobs: hence
+    # `save-if` main below, and no warm twin is needed because this job runs
+    # on main pushes and saves its own entry.
+    runs-on: ubuntu-latest
+    # 30 was sized on ubicloud-standard-8. Measured here with a cold cache
+    # (2026-11-16, #6245): 11 min for the whole job, clippy steps 5m46s +
+    # 1m32s + 3m13s. 45 leaves room for a slow runner or a cache eviction.
+    timeout-minutes: 45
     # No dependencies - runs immediately in parallel with fmt_check
 
     env:
@@ -821,7 +828,11 @@ jobs:
           components: clippy
           targets: wasm32-unknown-unknown
 
+      # Save on main only: a 0.7-1 GB entry per PR would churn GitHub's 10 GB
+      # cache and evict the main entry every PR restores from.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # `--all-targets` (= --lib --bins --tests --benches --examples) is a strict
       # superset of the lib+bins this used to check, and it is what brings
@@ -887,6 +898,16 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      # This job builds three feature sets into one target dir. Record the
+      # headroom so a creeping disk-full is visible before it fails the check.
+      # First measurement (cold cache, 2026-11-16, #6245): target 2.6 GB,
+      # ~/.cargo 0.6 GB, 83 GB still free on /.
+      - name: Disk headroom
+        if: always()
+        run: |
+          df -h / || true
+          du -sh target ~/.cargo 2>/dev/null || true
 
   # Windows compile check - catches missing imports, feature flags, and
   # platform-specific errors that Linux CI misses. Added after #3685 where
