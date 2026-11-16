@@ -460,6 +460,11 @@ impl IncomingStream {
         self.0.fragment_gap_limit()
     }
 
+    /// Whether a QUIC path fills this stream, not the UDP transport.
+    pub(crate) fn is_quic_fed(&self) -> bool {
+        self.0.is_quic_fed()
+    }
+
     /// Abandon the stream: anyone waiting on it gets `StreamError::Cancelled`.
     pub(crate) fn cancel(&self) {
         self.0.cancel()

@@ -251,6 +251,10 @@ for step in "update_versions / Push the release branch" "update_versions / Creat
     check "live runs '$step'" "$(grep -cxF "$step" <<< "$LIVE_RUN")" "1"
     check "dry does not run '$step'" "$(grep -cxF "$step" <<< "$DRY_RUN")" "0"
 done
+# The ramp start check runs in both modes (a dry run reports, a live run
+# refuses), so a rehearsal shows what a live cut would hit.
+check "live runs the ramp start check" "$(grep -cxF "validate / Check the QUIC data ramp start is near now" <<< "$LIVE_RUN")" "1"
+check "dry runs the ramp start check" "$(grep -cxF "validate / Check the QUIC data ramp start is near now" <<< "$DRY_RUN")" "1"
 for step in "update_versions / Dry run: report what a live run would push" \
             "update_versions / Dry run: hand the bump commit to the rehearsal job"; do
     check "dry runs '$step'" "$(grep -cxF "$step" <<< "$DRY_RUN")" "1"
@@ -263,7 +267,7 @@ done
 # behaviour must change this list deliberately.
 step_seq() { grep "^$2 / " <<< "$1" | sed "s|^$2 / ||" | paste -sd'|' -; }
 check "live: validate step order" "$(step_seq "$LIVE_RUN" validate)" \
-    "Checkout code|Resolve run mode (live or dry run)|Warn if RELEASE_PAT is not configured|Verify the crates.io token before anything is created|Resolve + validate version"
+    "Checkout code|Resolve run mode (live or dry run)|Warn if RELEASE_PAT is not configured|Verify the crates.io token before anything is created|Resolve + validate version|Check the QUIC data ramp start is near now"
 check "live: update_versions step order" "$(step_seq "$LIVE_RUN" update_versions)" \
     "Checkout code|Configure git|Update freenet version|Update fdev version|Install Rust|Update Cargo.lock|Commit the version bump locally|Compose the release PR|Push the release branch|Create Pull Request|Enable auto-merge"
 check "live: wait_for_pr step order" "$(step_seq "$LIVE_RUN" wait_for_pr)" \

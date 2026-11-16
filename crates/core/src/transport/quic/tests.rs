@@ -138,10 +138,32 @@ where
     }
 }
 
-/// [`drive`] on a multi-thread runtime. There, a task can still be running on
-/// another worker when this one runs out of things to poll, so after its turns it
-/// pauses briefly in real time, and moves the clock only to a wakeup that is
-/// armed. A stuck test is caught by the caller's real-time limit.
+/// [`drive`] on a multi-thread runtime. The clock moves to the next wakeup
+/// only when the runtime is idle ([`idle_workers`]): every worker parked
+/// and nothing in the global queue, the same on two readings a real-time
+/// millisecond apart (a worker that ran in between changes its park count).
+/// Moving it while a worker is still busy (a handshake's crypto in a debug
+/// build, say) fires that work's timers before it has had a chance to run,
+/// up to quinn's idle timeout (#6220). A stuck test is caught by the
+/// caller's real-time limit.
+///
+/// Must run on the thread that called `block_on`, not on a worker: its own
+/// worker would never read as parked.
+///
+/// Limits: idleness is read from the workers only. Work elsewhere is
+/// invisible to it: `spawn_blocking` and `block_in_place` threads, a
+/// `std::thread` that wakes tasks, real I/O or real-time timers. So is a
+/// worker preempted between parking and taking a task another thread just
+/// queued for it, for as long as the global queue is not read. A caller with
+/// any of those can still have the clock advanced over busy work; the QUIC
+/// tests here use none (in-memory sockets on virtual time).
+///
+/// A run that cannot go on prints why once, so a caller's real-time watchdog
+/// failure shows it: the runtime never read as idle for
+/// [`DRIVE_DIAGNOSTIC_CHECKS`] checks in a row (busy work it cannot see the
+/// end of, or a task that never parks), or it was idle with no wakeup left
+/// to advance to for as many (a lost wakeup, or a task waiting on something
+/// no timer will bring).
 pub(in crate::transport) async fn drive_on_threads<F>(
     time: &VirtualTime,
     limit: Duration,
@@ -151,8 +173,16 @@ where
     F: std::future::Future + Send + 'static,
     F::Output: Send + 'static,
 {
+    assert_ne!(
+        std::thread::current().name(),
+        Some("tokio-rt-worker"),
+        "drive_on_threads runs on the block_on thread, not on a worker"
+    );
     let task = tokio::spawn(fut);
     let limit_ns = time.now_nanos() + limit.as_nanos() as u64;
+    // Checks in a row that found the runtime busy, and that found it idle
+    // with nothing to advance to.
+    let (mut busy, mut stuck) = (0u32, 0u32);
     loop {
         for _ in 0..64 {
             if task.is_finished() {
@@ -160,16 +190,63 @@ where
             }
             tokio::task::yield_now().await;
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        let before = idle_workers();
+        // Blocks only this thread (not a worker), and sets no runtime timer
+        // that would wake the worker holding the time driver and change its
+        // park count.
+        std::thread::sleep(Duration::from_millis(1));
         if task.is_finished() {
             return task.await.expect("the driven future panicked");
         }
-        time.advance_to_next_wakeup();
+        if before.is_none() || before != idle_workers() {
+            busy += 1;
+            if busy == DRIVE_DIAGNOSTIC_CHECKS {
+                eprintln!(
+                    "drive_on_threads: the runtime has not been idle for {busy} checks in a row \
+                     at {} ns: work it cannot see the end of, or a task that never parks",
+                    time.now_nanos()
+                );
+            }
+            continue;
+        }
+        busy = 0;
+        if time.advance_to_next_wakeup().is_none() {
+            stuck += 1;
+            if stuck == DRIVE_DIAGNOSTIC_CHECKS {
+                eprintln!(
+                    "drive_on_threads: the runtime is idle and no wakeup is left to advance to \
+                     at {} ns: a lost wakeup, or a task waiting on something no timer brings",
+                    time.now_nanos()
+                );
+            }
+            continue;
+        }
+        stuck = 0;
         assert!(
             time.now_nanos() <= limit_ns,
-            "virtual time passed {limit:?} before the future finished"
+            "virtual time passed {limit:?} before the future finished, advancing only while \
+             the runtime was idle"
         );
     }
+}
+
+/// Checks in a row of one kind after which [`drive_on_threads`] prints why
+/// it cannot go on: about a second or more of real time.
+const DRIVE_DIAGNOSTIC_CHECKS: u32 = 1000;
+
+/// Each worker's park count if the runtime is idle (every worker parked,
+/// none queued globally), else `None`. Two equal readings mean no worker
+/// ran between them.
+fn idle_workers() -> Option<Vec<u64>> {
+    let metrics = tokio::runtime::Handle::current().metrics();
+    if metrics.global_queue_depth() > 0 {
+        return None;
+    }
+    let counts: Vec<u64> = (0..metrics.num_workers())
+        .map(|worker| metrics.worker_park_unpark_count(worker))
+        .collect();
+    // Odd while the worker is parked.
+    counts.iter().all(|count| count % 2 == 1).then_some(counts)
 }
 
 /// How long a QUIC test may run, in real time, before it is failed.
@@ -1858,8 +1935,10 @@ fn transport_quic_values_and_unknown_ones() {
     assert_eq!(QuicMode::from_config_value(Some("force")), QuicMode::Off);
     assert_eq!(QuicMode::from_config_value(Some("")), QuicMode::Off);
     assert_eq!(QuicMode::default(), QuicMode::default_mode());
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    assert_eq!(QuicMode::from_config_value(None), QuicMode::Shadow);
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Prefer);
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Off);
 }
 
 /// The socket sends one datagram per transmit and receives one per call.
@@ -2780,6 +2859,9 @@ fn close_codes_reach_the_peer() {
             },
             QuicCloseCode::SessionEnded => QuicErrorKind::Refused {
                 reason: QuicRefusal::SessionEnded,
+            },
+            QuicCloseCode::RecycleForData => QuicErrorKind::Refused {
+                reason: QuicRefusal::RecycleForData,
             },
             QuicCloseCode::OverBudget => QuicErrorKind::Refused {
                 reason: QuicRefusal::OverBudget,

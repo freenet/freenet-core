@@ -28,12 +28,15 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
-use crate::tracing::{TransferDirection, TransferEvent};
+use crate::tracing::{TransferDirection, TransferEvent, TransferTransport};
 
 mod quic_data;
 pub use quic_data::QuicDataSnapshot;
+#[cfg(test)]
+pub(crate) use quic_data::STALL_CLOSE_LABELS;
 pub(crate) use quic_data::{
-    DarkEnd, PathGateWindow, PathLossWindow, QuicDataCounters, StreamsOpenPeak,
+    AckWaitKind, DarkEnd, PathGateWindow, PathLossWindow, PipeDropCause, QuicDataCounters,
+    ShareSource, StreamsOpenPeak,
 };
 
 /// Global transport metrics instance.
@@ -396,6 +399,9 @@ labelled_counters! {
         /// This node's UDP session to the peer ended, so the path went with
         /// it.
         SessionEnded => "session_ended",
+        /// A path with no data closed so the next attempt carries the data
+        /// bit that came on while it was up (the ramp). Not a fallback.
+        RecycleForData => "recycle_for_data",
         /// The peer held more of this node's QUIC buffer budget than it
         /// allows (its gaps past the cap a second time).
         OverBudget => "over_budget",
@@ -508,9 +514,9 @@ labelled_counters! {
     /// `quic_fallback_<label>`. An attempt that ended before it was active is
     /// not here; see `quic_upgrade_*`. The UDP session ending under a path is
     /// `quic_upgrade_session_ended_active`.
-    /// Not here: a close this node sent for `send_abort_limit` or
-    /// `peer_not_acknowledging` reaches the machine as a lost connection
-    /// (`reset`), and is counted by `quic_close_sent_*`; the same codes sent
+    /// A close this node sent reaches the machine as a lost connection; it is
+    /// counted by the reason the closer recorded (`liveness_tx`, `closed_tx`),
+    /// and its code by `quic_close_sent_*`; the codes sent
     /// by the peer are `downgrade_rx`, with the raw code in
     /// `quic_close_received_*`. A key mismatch is
     /// `quic_upgrade_identity_mismatch`.
@@ -534,6 +540,16 @@ labelled_counters! {
         /// peer's QUIC buffer budget than it allows. A peer on a release
         /// before the code does not send it.
         OverBudgetReceived => "over_budget_rx",
+        /// This node closed it because the peer stopped making progress on
+        /// it: an acknowledgement-watch rule (`quic_stall_close_<stall>`
+        /// says which) or the stalled-sends count. Counted as `reset` by
+        /// releases before the label.
+        LivenessClosed => "liveness_tx",
+        /// This node closed it for another recorded reason: too many reset
+        /// sends, the peer over its buffer budget, refused data, or a
+        /// panicked receive task. Counted as `reset` by releases before the
+        /// label.
+        LocallyClosed => "closed_tx",
     }
 }
 
@@ -983,6 +999,9 @@ pub struct TransportMetrics {
     /// Fallbacks this period that the UDP session's end followed, by the
     /// fallback's [`QuicFallback`].
     quic_churned_fallback: [AtomicU64; QuicFallback::COUNT],
+    /// Fallbacks this period of paths that carried data when they ended, by
+    /// [`QuicFallback`].
+    quic_carried_fallback: [AtomicU64; QuicFallback::COUNT],
     /// Active paths that ended this period, by [`QuicPathAge`].
     quic_path_age: [AtomicU64; QuicPathAge::COUNT],
     /// QUIC-native setups this period, by [`NativeSetupOutcome`].
@@ -1449,6 +1468,7 @@ impl TransportMetrics {
             quic_upgrade: Default::default(),
             quic_fallback: Default::default(),
             quic_churned_fallback: Default::default(),
+            quic_carried_fallback: Default::default(),
             quic_path_age: Default::default(),
             connect_native_setup: Default::default(),
             quic_establish_ms: Default::default(),
@@ -2111,6 +2131,16 @@ impl TransportMetrics {
         #[cfg(not(test))]
         let _ = remote;
         self.quic_fallback[cause as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The path to `remote` that `record_quic_fallback` counted for `cause`
+    /// carried data when it ended, as the upgrade machine decided.
+    pub(crate) fn record_quic_carried_fallback(&self, cause: QuicFallback, remote: SocketAddr) {
+        #[cfg(test)]
+        self.note_quic_event(remote, ("carrying", cause));
+        #[cfg(not(test))]
+        let _ = remote;
+        self.quic_carried_fallback[cause as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// The UDP session to `remote` ended within the upgrade machine's churn
@@ -2884,6 +2914,9 @@ impl TransportMetrics {
             quic_close_sent_session_ended: get64(
                 &self.quic_close_sent[QuicCloseCode::SessionEnded as usize],
             ),
+            quic_close_sent_recycle_for_data: get64(
+                &self.quic_close_sent[QuicCloseCode::RecycleForData as usize],
+            ),
             quic_close_sent_over_budget: get64(
                 &self.quic_close_sent[QuicCloseCode::OverBudget as usize],
             ),
@@ -2897,6 +2930,7 @@ impl TransportMetrics {
             quic_upgrade: std::array::from_fn(|i| get64(&self.quic_upgrade[i])),
             quic_fallback: std::array::from_fn(|i| get64(&self.quic_fallback[i])),
             quic_churned_fallback: std::array::from_fn(|i| get64(&self.quic_churned_fallback[i])),
+            quic_carried_fallback: std::array::from_fn(|i| get64(&self.quic_carried_fallback[i])),
             quic_path_age_at_close: std::array::from_fn(|i| get64(&self.quic_path_age[i])),
             connect_native_setup: std::array::from_fn(|i| get64(&self.connect_native_setup[i])),
             quic_establish_ms_p50: establish_p50,
@@ -3567,6 +3601,7 @@ pub struct TransportSnapshot {
     pub quic_close_sent_peer_not_acknowledging: u64,
     pub quic_close_sent_control_refused: u64,
     pub quic_close_sent_session_ended: u64,
+    pub quic_close_sent_recycle_for_data: u64,
     /// QUIC connections this node closed with `over_budget`.
     pub quic_close_sent_over_budget: u64,
     /// Native QUIC connections this node closed with `version_incompatible`.
@@ -3589,6 +3624,13 @@ pub struct TransportSnapshot {
     /// longer than 150 s. The rule docs ("Upgrade telemetry") give the gate
     /// formula.
     pub quic_churned_fallback: [u64; QuicFallback::COUNT],
+    /// The fallbacks of paths that carried data when they ended, by label
+    /// (`quic_carried_fallback_<label>`): a subset of `quic_fallback`, counted
+    /// by the same decision. Defaulted, so JSON from before it decodes; the
+    /// bincode event log is positional and skips older records once, with a
+    /// WARN (see `upload_json`).
+    #[serde(default)]
+    pub quic_carried_fallback: [u64; QuicFallback::COUNT],
     /// Active paths that ended, by [`QuicPathAge`]
     /// (`quic_path_age_at_close_<label>`).
     pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
@@ -3979,6 +4021,7 @@ impl TransportSnapshot {
             quic_close_sent_peer_not_acknowledging,
             quic_close_sent_control_refused,
             quic_close_sent_session_ended,
+            quic_close_sent_recycle_for_data,
             quic_close_sent_over_budget,
             quic_close_sent_version_incompatible,
             quic_close_sent_hello_refused,
@@ -3986,6 +4029,7 @@ impl TransportSnapshot {
             quic_upgrade,
             quic_fallback,
             quic_churned_fallback,
+            quic_carried_fallback,
             quic_path_age_at_close,
             connect_native_setup,
             quic_establish_ms_p50,
@@ -4144,6 +4188,7 @@ impl TransportSnapshot {
         self.quic_close_sent_peer_not_acknowledging = quic_close_sent_peer_not_acknowledging;
         self.quic_close_sent_control_refused = quic_close_sent_control_refused;
         self.quic_close_sent_session_ended = quic_close_sent_session_ended;
+        self.quic_close_sent_recycle_for_data = quic_close_sent_recycle_for_data;
         self.quic_close_sent_over_budget = quic_close_sent_over_budget;
         self.quic_close_sent_version_incompatible = quic_close_sent_version_incompatible;
         self.quic_close_sent_hello_refused = quic_close_sent_hello_refused;
@@ -4151,6 +4196,7 @@ impl TransportSnapshot {
         self.quic_upgrade = quic_upgrade;
         self.quic_fallback = quic_fallback;
         self.quic_churned_fallback = quic_churned_fallback;
+        self.quic_carried_fallback = quic_carried_fallback;
         self.quic_path_age_at_close = quic_path_age_at_close;
         self.connect_native_setup = connect_native_setup;
         self.quic_establish_ms_p50 = quic_establish_ms_p50;
@@ -4378,6 +4424,7 @@ struct SnapshotExtras {
     pub quic_close_sent_peer_not_acknowledging: u64,
     pub quic_close_sent_control_refused: u64,
     pub quic_close_sent_session_ended: u64,
+    pub quic_close_sent_recycle_for_data: u64,
     /// QUIC connections this node closed with `over_budget`.
     pub quic_close_sent_over_budget: u64,
     /// Native QUIC connections this node closed with `version_incompatible`.
@@ -4400,6 +4447,10 @@ struct SnapshotExtras {
     /// longer than 150 s. The rule docs ("Upgrade telemetry") give the gate
     /// formula.
     pub quic_churned_fallback: [u64; QuicFallback::COUNT],
+    /// The fallbacks of paths that carried data when they ended, by label
+    /// (`quic_carried_fallback_<label>`): a subset of `quic_fallback`, counted
+    /// by the same decision.
+    pub quic_carried_fallback: [u64; QuicFallback::COUNT],
     /// Active paths that ended, by [`QuicPathAge`]
     /// (`quic_path_age_at_close_<label>`).
     pub quic_path_age_at_close: [u64; QuicPathAge::COUNT],
@@ -4608,6 +4659,7 @@ impl SnapshotExtras {
             || self.quic_close_sent_peer_not_acknowledging != 0
             || self.quic_close_sent_control_refused != 0
             || self.quic_close_sent_session_ended != 0
+            || self.quic_close_sent_recycle_for_data != 0
             || self.quic_close_sent_over_budget != 0
             || self.quic_close_sent_version_incompatible != 0
             || self.quic_close_sent_hello_refused != 0
@@ -4616,6 +4668,10 @@ impl SnapshotExtras {
             || self.quic_fallback.iter().any(|n| *n != 0)
             || self
                 .quic_churned_fallback
+                .iter()
+                .any(|n| *n != 0)
+            || self
+                .quic_carried_fallback
                 .iter()
                 .any(|n| *n != 0)
             || self.quic_path_age_at_close.iter().any(|n| *n != 0)
@@ -4736,7 +4792,10 @@ pub fn emit_transfer_started(
     peer_addr: SocketAddr,
     expected_bytes: u64,
     direction: TransferDirection,
+    transport: TransferTransport,
 ) {
+    #[cfg(test)]
+    note_transfer_event(stream_id, "transfer_started", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Started {
@@ -4745,12 +4804,42 @@ pub fn emit_transfer_started(
             expected_bytes,
             direction,
             tx_id: None, // Transaction ID not available at transport layer
+            transport,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
         // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
         #[allow(clippy::let_underscore_must_use)]
         let _ = sender.try_send(event);
     }
+}
+
+// Test-only: the transfer events emitted on this thread, as (stream id, event,
+// transport), so a test finds its own: stream ids and transfers are per
+// thread in tests (`StreamId::next`, a current-thread runtime), and another
+// test's events never land here. Kept apart from the QUIC event log, which every
+// transfer would otherwise crowd.
+#[cfg(test)]
+thread_local! {
+    static TRANSFER_TEST_LOG: std::cell::RefCell<Vec<(u64, &'static str, TransferTransport)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn note_transfer_event(stream_id: u64, event: &'static str, transport: TransferTransport) {
+    TRANSFER_TEST_LOG.with(|log| log.borrow_mut().push((stream_id, event, transport)));
+}
+
+/// Test-only: the transfer events of `stream_id` emitted on this thread, in
+/// order.
+#[cfg(test)]
+pub(crate) fn transfer_events_of(stream_id: u64) -> Vec<(&'static str, TransferTransport)> {
+    TRANSFER_TEST_LOG.with(|log| {
+        log.borrow()
+            .iter()
+            .filter(|(id, _, _)| *id == stream_id)
+            .map(|(_, event, transport)| (*event, *transport))
+            .collect()
+    })
 }
 
 /// Emit a transfer completed event.
@@ -4772,7 +4861,10 @@ pub fn emit_transfer_completed(
     min_rtt_ms: Option<u32>,
     peak_flightsize_bytes: Option<u32>,
     direction: TransferDirection,
+    transport: TransferTransport,
 ) {
+    #[cfg(test)]
+    note_transfer_event(stream_id, "transfer_completed", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Completed {
@@ -4791,6 +4883,7 @@ pub fn emit_transfer_completed(
             min_rtt_ms,
             peak_flightsize_bytes,
             direction,
+            transport,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
         // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
@@ -4808,7 +4901,10 @@ pub fn emit_transfer_failed(
     reason: String,
     elapsed_ms: u64,
     direction: TransferDirection,
+    transport: TransferTransport,
 ) {
+    #[cfg(test)]
+    note_transfer_event(stream_id, "transfer_failed", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Failed {
@@ -4818,6 +4914,7 @@ pub fn emit_transfer_failed(
             reason,
             elapsed_ms,
             direction,
+            transport,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
         // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
@@ -5671,6 +5768,7 @@ mod tests {
                 lost_bytes: 8400,
                 congestion_events: 3,
             },
+            false,
         );
         let peek = metrics.read_snapshot();
         assert_eq!(peek.quic_data.lost_packets, 7);
@@ -5806,6 +5904,7 @@ mod tests {
             QuicCloseCode::PeerNotAcknowledging => snap.quic_close_sent_peer_not_acknowledging,
             QuicCloseCode::ControlRefused => snap.quic_close_sent_control_refused,
             QuicCloseCode::SessionEnded => snap.quic_close_sent_session_ended,
+            QuicCloseCode::RecycleForData => snap.quic_close_sent_recycle_for_data,
             QuicCloseCode::OverBudget => snap.quic_close_sent_over_budget,
             QuicCloseCode::VersionIncompatible => snap.quic_close_sent_version_incompatible,
             QuicCloseCode::HelloRefused => snap.quic_close_sent_hello_refused,
@@ -5873,6 +5972,14 @@ mod tests {
         check_quic_family(
             |m, slot, remote| m.record_quic_fallback(QuicFallback::ALL[slot], remote),
             |snap| snap.quic_fallback,
+        );
+    }
+
+    #[test]
+    fn quic_carried_fallbacks_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, remote| m.record_quic_carried_fallback(QuicFallback::ALL[slot], remote),
+            |snap| snap.quic_carried_fallback,
         );
     }
 
@@ -7115,6 +7222,7 @@ mod tests {
             "quic_close_sent_peer_not_acknowledging",
             "quic_close_sent_control_refused",
             "quic_close_sent_session_ended",
+            "quic_close_sent_recycle_for_data",
             "quic_close_sent_over_budget",
             "quic_close_sent_version_incompatible",
             "quic_close_sent_hello_refused",
@@ -7122,6 +7230,7 @@ mod tests {
             "quic_upgrade",
             "quic_fallback",
             "quic_churned_fallback",
+            "quic_carried_fallback",
             "quic_path_age_at_close",
             "connect_native_setup",
             "quic_establish_ms_p50",

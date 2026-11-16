@@ -106,7 +106,7 @@ pub(crate) use event_kind::{
 };
 pub use event_kind::{
     ConnectionType, DisconnectReason, EventKind, HostingStoppedReason, InterestSyncEvent,
-    OperationFailure, PeerLifecycleEvent, TransferDirection, TransferEvent,
+    OperationFailure, PeerLifecycleEvent, TransferDirection, TransferEvent, TransferTransport,
 };
 pub(crate) use metrics_client::{
     connect_to_metrics_server, received_from_metrics_server, send_to_metrics_server,

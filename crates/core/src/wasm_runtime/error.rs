@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use freenet_stdlib::prelude::{ContractKey, DelegateKey};
+use freenet_stdlib::prelude::{ContractKey, DelegateError, DelegateKey};
 
 use super::{delegate, engine, runtime, secrets_store};
 
@@ -161,4 +161,127 @@ pub(crate) enum RuntimeInnerError {
     // wasm engine errors (all backend-specific errors unified here)
     #[error(transparent)]
     WasmError(#[from] engine::WasmError),
+}
+
+/// Longest guest-supplied text kept in a host error, in bytes.
+///
+/// Contract and delegate WASM choose the text of the errors they return, and
+/// the host logs those errors (several times, to more than one sink) and
+/// forwards them to clients. Without a cap, the only bound is the guest's
+/// linear memory.
+pub(crate) const MAX_GUEST_ERROR_TEXT_BYTES: usize = 1024;
+
+/// Truncate guest-supplied text to [`MAX_GUEST_ERROR_TEXT_BYTES`] on a char
+/// boundary, appending a marker that records the original length. Text already
+/// within the limit is returned unchanged.
+pub(crate) fn truncate_guest_text(mut text: String) -> String {
+    if text.len() <= MAX_GUEST_ERROR_TEXT_BYTES {
+        return text;
+    }
+    let original_len = text.len();
+    let mut cut = MAX_GUEST_ERROR_TEXT_BYTES;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    text.push_str(&format!("... [truncated, {original_len} bytes total]"));
+    text
+}
+
+/// Bound every guest-supplied string in a contract error. This is the single
+/// point where the stdlib error returned by contract WASM becomes a host
+/// error (`ContractExecError`'s `From` impl).
+pub(crate) fn bound_contract_error(
+    err: freenet_stdlib::prelude::ContractError,
+) -> freenet_stdlib::prelude::ContractError {
+    use freenet_stdlib::prelude::ContractError as E;
+    // `ContractError` is `#[non_exhaustive]`; variants without text pass through.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match err {
+        E::Deser(s) => E::Deser(truncate_guest_text(s)),
+        E::InvalidUpdateWithInfo { reason } => E::InvalidUpdateWithInfo {
+            reason: truncate_guest_text(reason),
+        },
+        E::Other(s) => E::Other(truncate_guest_text(s)),
+        other => other,
+    }
+}
+
+/// Bound every guest-supplied string in a delegate error. This is the single
+/// point where the stdlib error returned by delegate WASM becomes a host
+/// error (`DelegateExecError`'s `From` impl).
+pub(crate) fn bound_delegate_error(err: DelegateError) -> DelegateError {
+    // `DelegateError` is `#[non_exhaustive]`.
+    #[allow(clippy::wildcard_enum_match_arm)]
+    match err {
+        DelegateError::Deser(s) => DelegateError::Deser(truncate_guest_text(s)),
+        DelegateError::Other(s) => DelegateError::Other(truncate_guest_text(s)),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod guest_text_tests {
+    use super::*;
+    use freenet_stdlib::prelude::ContractError as StdContractError;
+
+    #[test]
+    fn short_text_is_unchanged() {
+        assert_eq!(truncate_guest_text("boom".into()), "boom");
+        let exact = "a".repeat(MAX_GUEST_ERROR_TEXT_BYTES);
+        assert_eq!(truncate_guest_text(exact.clone()), exact);
+    }
+
+    #[test]
+    fn oversize_text_is_truncated_on_char_boundary() {
+        // 3-byte chars: 1024 is not a multiple of 3, so a naive cut would split one.
+        let big = "\u{20AC}".repeat(1_000_000);
+        let out = truncate_guest_text(big);
+        assert!(
+            out.len() < MAX_GUEST_ERROR_TEXT_BYTES + 64,
+            "len {}",
+            out.len()
+        );
+        assert!(out.contains("[truncated, 3000000 bytes total]"));
+    }
+
+    #[test]
+    fn contract_exec_error_from_guest_error_is_bounded() {
+        let big = "x".repeat(10_000_000);
+        for e in [
+            StdContractError::Other(big.clone()),
+            StdContractError::Deser(big.clone()),
+            StdContractError::InvalidUpdateWithInfo {
+                reason: big.clone(),
+            },
+        ] {
+            let exec: super::runtime::ContractExecError = e.into();
+            assert!(
+                exec.to_string().len() < 2048,
+                "len {}",
+                exec.to_string().len()
+            );
+        }
+        let short: super::runtime::ContractExecError =
+            StdContractError::Other("nope".into()).into();
+        assert_eq!(short.to_string(), "nope");
+    }
+
+    #[test]
+    fn delegate_exec_error_from_guest_error_is_bounded() {
+        let big = "y".repeat(10_000_000);
+        for e in [
+            DelegateError::Other(big.clone()),
+            DelegateError::Deser(big.clone()),
+        ] {
+            let exec: delegate::DelegateExecError = e.into();
+            assert!(
+                exec.to_string().len() < 2048,
+                "len {}",
+                exec.to_string().len()
+            );
+        }
+        let short: delegate::DelegateExecError = DelegateError::Other("nope".into()).into();
+        assert_eq!(short.to_string(), "nope");
+    }
 }

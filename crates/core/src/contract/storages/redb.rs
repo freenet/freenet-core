@@ -175,7 +175,7 @@ pub(crate) const DELEGATE_INDEX_TABLE: TableDefinition<&[u8], &[u8]> =
 
 /// Per-contract record of detected CRDT-invariant violations (e.g. a
 /// non-idempotent `update_state`). One row per offending contract; presence
-/// alone is the gate signal. See `ring::broken_invariants` for the in-memory
+/// alone is the flag (diagnostic only since #6190). See `ring::broken_invariants` for the in-memory
 /// tracker that hydrates from this table at startup.
 ///
 /// Key: ContractInstanceId (32 bytes)

@@ -2126,9 +2126,16 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_contract_io",
                 "__frnt__fill_buffer",
-                |mut caller: Caller<'_, HostState>, id: i64, buf_ptr: i64| -> u32 {
+                |mut caller: Caller<'_, HostState>,
+                 id: i64,
+                 buf_ptr: i64|
+                 -> wasmtime::Result<u32> {
                     refresh_mem_addr_from_caller(&mut caller, id);
+                    // A builder that no longer lies in guest memory traps the
+                    // guest instead of reporting EOF, which would silently
+                    // truncate the input the contract is reading.
                     native_api::fill_buffer_impl(id, buf_ptr)
+                        .map_err(|e| wasmtime::Error::msg(format!("__frnt__fill_buffer: {e}")))
                 },
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;

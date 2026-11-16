@@ -85,11 +85,11 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 
 /// Whether the node may use QUIC: the `transport-quic` config key.
 ///
-/// An unset key is [`QuicMode::default_mode`]: shadow on Linux, macOS and
+/// An unset key is [`QuicMode::default_mode`]: prefer on Linux, macOS and
 /// Windows, and off elsewhere, because the breaker reads no boot identity
 /// there and so cannot trip. The Windows breaker counts short runs that
 /// panicked in QUIC code instead of detecting crashes ([`breaker`]); it was
-/// confirmed on a real Windows machine before Windows defaulted to shadow
+/// confirmed on a real Windows machine before Windows defaulted to an endpoint
 /// (#6031). The default is decided when the value is read and
 /// never written to `config.toml`, so a later release can change it
 /// for every node that did not set the key, which is how a default-off
@@ -110,14 +110,12 @@ pub enum QuicMode {
     /// endpoint driver and one upgrade task per connection run; a promoted
     /// connection's higher key sends `Upgrade` messages on its UDP session; and
     /// the endpoint's memory. If the endpoint cannot be built the node logs a
-    /// warning and runs with QUIC off. The default on Linux, macOS and
-    /// Windows.
+    /// warning and runs with QUIC off.
     Shadow,
     /// Negotiates data on a path to a peer in the release's slice
-    /// (`upgrade::slice`), and sends its data on a path where both sides did. At a
-    /// share of 0, this release's, it acts as [`Self::Shadow`] on the wire. A node
-    /// that sets it early starts carrying data over QUIC once it runs a release
-    /// with a share above 0. That release's notes must say so.
+    /// (`upgrade::slice`, the release's ramp from `QUIC_DATA_RAMP_START`), and sends
+    /// its data on a path where both sides did. With no ramp start set it acts as
+    /// [`Self::Shadow`] on the wire. The default on Linux, macOS and Windows.
     Prefer,
 }
 
@@ -148,7 +146,7 @@ impl QuicMode {
     /// See [`QuicMode::Prefer`].
     pub const PREFER: &'static str = "prefer";
 
-    /// What an unset `transport-quic` means on this platform: shadow on Linux,
+    /// What an unset `transport-quic` means on this platform: prefer on Linux,
     /// macOS and Windows, and off elsewhere, because the crash-loop breaker
     /// cannot trip there. Windows joined once its breaker was confirmed on a
     /// real Windows machine (#6031).
@@ -158,7 +156,7 @@ impl QuicMode {
             target_os = "macos",
             target_os = "windows"
         )) {
-            Self::Shadow
+            Self::Prefer
         } else {
             Self::Off
         }
@@ -1241,6 +1239,27 @@ impl Drop for QuicConnection {
     }
 }
 
+/// Why this node closed a connection, if it said ([`QuicCloser::close_for`]),
+/// readable without holding the connection.
+#[derive(Clone, Default)]
+pub(crate) struct CloseRecord(Arc<std::sync::OnceLock<crate::transport::boundary::QuicPathEnd>>);
+
+impl CloseRecord {
+    /// A record of a close for `end`. Tests only.
+    #[cfg(test)]
+    pub(crate) fn of(end: crate::transport::boundary::QuicPathEnd) -> Self {
+        let record = Self::default();
+        let _first = record.0.set(end);
+        record
+    }
+
+    /// Why this node closed the connection, if it closed it with
+    /// [`QuicCloser::close_for`].
+    pub(crate) fn get(&self) -> Option<crate::transport::boundary::QuicPathEnd> {
+        self.0.get().copied()
+    }
+}
+
 /// Closes one QUIC connection at most once, from any number of clones.
 /// Every close the QUIC code sends goes through here.
 #[derive(Clone)]
@@ -1344,6 +1363,12 @@ impl QuicCloser {
     /// [`Self::close_for`].
     pub(crate) fn closed_for(&self) -> Option<crate::transport::boundary::QuicPathEnd> {
         self.closed_for.get().copied()
+    }
+
+    /// A handle on [`Self::closed_for`] that does not hold the connection,
+    /// for whoever must read why it was closed after letting it go.
+    pub(crate) fn close_record(&self) -> CloseRecord {
+        CloseRecord(Arc::clone(&self.closed_for))
     }
 
     /// Whether the connection is still open (quinn has no close reason).

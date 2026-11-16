@@ -587,6 +587,21 @@ run_cmd() {
     fi
 }
 
+# The QUIC data ramp start (T0) check (scripts/check_quic_data_ramp_t0.sh),
+# for $VERSION: refused in a live run unless the clock is near T0 for the ramp
+# release, a warning in a dry run. Called when the run starts and again just
+# before each publish, so a resumed run checks the clock it publishes at.
+check_quic_data_ramp_t0() {
+    local live=true
+    if [[ "$DRY_RUN" == "true" ]]; then
+        live=false
+    fi
+    if ! bash "$PROJECT_ROOT/scripts/check_quic_data_ramp_t0.sh" --version "$VERSION" --live "$live"; then
+        echo "  ✗ The QUIC data ramp start check refused release $VERSION; see above."
+        exit 1
+    fi
+}
+
 check_prerequisites() {
     echo "Checking prerequisites:"
     
@@ -1213,6 +1228,7 @@ See commit history for detailed changes.
 # only the resume flag, DRY_RUN and crates.io presence -- never the gate's
 # verdict. The main flow refuses instead; see the comment at that call site.
 publish_crates() {
+    check_quic_data_ramp_t0
     echo "Confirming crates.io publish (normally already done by cross-compile.yml):"
 
     # Skip if already completed
@@ -1451,6 +1467,7 @@ attach_job_state() {
 }
 
 publish_draft_release() {
+    check_quic_data_ramp_t0
     # Publish the draft release (idempotent -- no-op if already published).
     #
     # The cross-compile workflow publishes via `gh release edit --draft=false`
@@ -1881,6 +1898,7 @@ echo "Target version: freenet $VERSION, fdev $FDEV_VERSION"
 echo
 
 check_prerequisites
+check_quic_data_ramp_t0
 update_versions
 create_release_pr
 create_github_release

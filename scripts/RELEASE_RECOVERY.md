@@ -299,13 +299,26 @@ gh run view "$RUN_ID" --repo "$REPO" --json jobs --jq '
 
 **That must print `success`.** `failure`, `cancelled`, `skipped` — or no line
 at all, which means the step never ran — all mean Gate A did not pass. Stop and
-go to Step 4b. Only continue past this point on `success`:
+go to Step 4b. Only continue past this point on `success`.
+
+Gate A is not the only step that leaves a release in this state. The QUIC data
+ramp start check (`Check the QUIC data ramp start is near now (before
+publishing)`, just before the crates.io publish) refuses a release that would
+ship the ramp at the wrong time, and its refusal also leaves Gate A passed, the
+crates absent and the release a draft. So the publish below runs that check
+first, on the clock you publish at, and stops if it refuses. Do not publish
+around a refusal; follow the remedy it prints (docs/RELEASING.md).
 
 ```bash
 cd ~/code/freenet/freenet-core/main
 git fetch origin
 # Publish from the release commit, not from whatever main is now (see Step 2).
 git checkout "$RELEASE_SHA"
+
+# The QUIC data ramp start check, as attach-to-release runs it.
+if ! bash scripts/check_quic_data_ramp_t0.sh --version 0.1.X --live true; then
+  echo "STOP: the QUIC data ramp start check refused 0.1.X; do not publish"; exit 1
+fi
 
 # Per crate, because a partial publish is the usual reason to be here:
 # RELEASING.md routes "fdev failed but freenet succeeded" to this step, and an

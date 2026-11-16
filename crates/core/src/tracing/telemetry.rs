@@ -2687,6 +2687,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     expected_bytes,
                     direction,
                     tx_id,
+                    transport,
                     timestamp,
                 } => {
                     serde_json::json!({
@@ -2696,6 +2697,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "expected_bytes": expected_bytes,
                         "direction": format!("{:?}", direction),
                         "tx_id": tx_id.as_ref().map(|t| t.to_string()),
+                        "transport": transport.label(),
                         "timestamp": timestamp,
                     })
                 }
@@ -2715,6 +2717,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     min_rtt_ms,
                     peak_flightsize_bytes,
                     direction,
+                    transport,
                     timestamp,
                 } => {
                     serde_json::json!({
@@ -2734,6 +2737,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "min_rtt_ms": min_rtt_ms,
                         "peak_flightsize_bytes": peak_flightsize_bytes,
                         "direction": format!("{:?}", direction),
+                        "transport": transport.label(),
                         "timestamp": timestamp,
                     })
                 }
@@ -2744,6 +2748,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     reason,
                     elapsed_ms,
                     direction,
+                    transport,
                     timestamp,
                 } => {
                     serde_json::json!({
@@ -2754,6 +2759,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "reason": reason,
                         "elapsed_ms": elapsed_ms,
                         "direction": format!("{:?}", direction),
+                        "transport": transport.label(),
                         "timestamp": timestamp,
                     })
                 }
@@ -3136,6 +3142,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.quic_close_sent_session_ended),
             );
             m.insert(
+                "quic_close_sent_recycle_for_data".into(),
+                serde_json::json!(snapshot.quic_close_sent_recycle_for_data),
+            );
+            m.insert(
                 "quic_close_sent_over_budget".into(),
                 serde_json::json!(snapshot.quic_close_sent_over_budget),
             );
@@ -3163,6 +3173,12 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 }
                 for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_fallback) {
                     m.insert(format!("quic_fallback_{}", cause.label()), count.into());
+                }
+                for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_carried_fallback) {
+                    m.insert(
+                        format!("quic_carried_fallback_{}", cause.label()),
+                        count.into(),
+                    );
                 }
                 for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_churned_fallback) {
                     m.insert(
@@ -6265,6 +6281,7 @@ mod tests {
             reason: "cwnd wait timeout".to_string(),
             elapsed_ms: 3000,
             direction: crate::tracing::TransferDirection::Send,
+            transport: crate::tracing::TransferTransport::Udp,
             timestamp: 1_700_000_000_000,
         });
         assert_eq!(event.event_type, "transfer_failed");
@@ -6273,6 +6290,59 @@ mod tests {
             "transfer events must be attributed to the emitting node's \
              own peer id (#4345)"
         );
+    }
+
+    /// `transfer_started`, `transfer_failed` and `transfer_completed` say which
+    /// transport carries the transfer, as `transport`: `udp` or `quic`.
+    #[test]
+    fn transfer_events_carry_their_transport() {
+        use crate::tracing::{TransferDirection, TransferEvent, TransferTransport};
+        let addr: std::net::SocketAddr = "127.0.0.1:31337".parse().unwrap();
+        for transport in [TransferTransport::Udp, TransferTransport::Quic] {
+            let failed = event_kind_to_json(&EventKind::Transfer(TransferEvent::Failed {
+                stream_id: 1,
+                peer_addr: addr,
+                bytes_transferred: 0,
+                reason: String::new(),
+                elapsed_ms: 0,
+                direction: TransferDirection::Send,
+                transport,
+                timestamp: 0,
+            }));
+            let completed = event_kind_to_json(&EventKind::Transfer(TransferEvent::Completed {
+                stream_id: 1,
+                peer_addr: addr,
+                bytes_transferred: 0,
+                elapsed_ms: 0,
+                avg_throughput_bps: 0,
+                peak_cwnd_bytes: None,
+                final_cwnd_bytes: None,
+                slowdowns_triggered: None,
+                final_srtt_ms: None,
+                final_ssthresh_bytes: None,
+                min_ssthresh_floor_bytes: None,
+                total_timeouts: None,
+                min_rtt_ms: None,
+                peak_flightsize_bytes: None,
+                direction: TransferDirection::Send,
+                transport,
+                timestamp: 0,
+            }));
+            let started = event_kind_to_json(&EventKind::Transfer(TransferEvent::Started {
+                stream_id: 1,
+                peer_addr: addr,
+                expected_bytes: 0,
+                direction: TransferDirection::Send,
+                tx_id: None,
+                transport,
+                timestamp: 0,
+            }));
+            for json in [started, failed, completed] {
+                assert_eq!(json["transport"], serde_json::json!(transport.label()));
+            }
+        }
+        assert_eq!(TransferTransport::Udp.label(), "udp");
+        assert_eq!(TransferTransport::Quic.label(), "quic");
     }
 
     #[test]
@@ -7810,6 +7880,7 @@ mod tests {
         expected.insert("type".to_string());
         // The QUIC data gauge goes out in every snapshot, 0 included.
         expected.insert("quic_live_data_paths".to_string());
+        expected.insert("quic_ramp_share_pct".to_string());
         // The QUIC families are arrays in the snapshot and one key per label in
         // the event.
         use crate::transport::metrics::{
@@ -7820,6 +7891,7 @@ mod tests {
             "quic_upgrade",
             "quic_fallback",
             "quic_churned_fallback",
+            "quic_carried_fallback",
             "quic_path_age_at_close",
             "connect_native_setup",
         ] {
@@ -7846,6 +7918,11 @@ mod tests {
             QuicFallback::ALL
                 .iter()
                 .map(|cause| format!("quic_churned_fallback_{}", cause.label())),
+        );
+        expected.extend(
+            QuicFallback::ALL
+                .iter()
+                .map(|cause| format!("quic_carried_fallback_{}", cause.label())),
         );
         expected.extend(
             QuicPathAge::ALL
@@ -7922,7 +7999,19 @@ mod tests {
         data.staged_peak_pct = 1049;
         data.gate_loss = (1050..1056).collect();
         data.gate_ended_queue = (1056..1059).collect();
-        data.dark_episodes = (1059..1067).collect();
+        data.carrying_sent_packets = 1059;
+        data.carrying_lost_packets = 1060;
+        data.carrying_loss_rate = (1061..1069).collect();
+        data.carrying_ended_loss_rate = (1069..1077).collect();
+        data.carrying_ended_below_floor = 1077;
+        data.dark_episodes = (1078..1086).collect();
+        data.carried_dark_episodes = (1087..1095).collect();
+        data.ramp_share_pct = 1086;
+        data.ack_wait_expired = (1095..1098).collect();
+        data.stall_closes = (1098..1103).collect();
+        data.stall_would_close = (1103..1108).collect();
+        data.pipe_source = (1108..1112).collect();
+        data.pipe_dropped = (1112..1115).collect();
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));
@@ -8193,6 +8282,7 @@ mod tests {
             quic_close_sent_over_budget: 11,
             quic_close_sent_version_incompatible: 12,
             quic_close_sent_hello_refused: 13,
+            quic_close_sent_recycle_for_data: 14,
             quic_breaker_trips: 7,
             quic_send_refused: 9,
             quic_breaker_suppressed: true,
@@ -8215,6 +8305,7 @@ mod tests {
             ("quic_close_sent_over_budget", 11),
             ("quic_close_sent_version_incompatible", 12),
             ("quic_close_sent_hello_refused", 13),
+            ("quic_close_sent_recycle_for_data", 14),
             ("quic_breaker_trips", 7),
             ("quic_send_refused", 9),
         ] {
@@ -8247,6 +8338,7 @@ mod tests {
         fill(&mut snapshot.quic_upgrade);
         fill(&mut snapshot.quic_fallback);
         fill(&mut snapshot.quic_churned_fallback);
+        fill(&mut snapshot.quic_carried_fallback);
         fill(&mut snapshot.quic_path_age_at_close);
         fill(&mut snapshot.connect_native_setup);
         snapshot.quic_establish_ms_p50 = Some(901);
@@ -8270,6 +8362,9 @@ mod tests {
         }
         for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_fallback) {
             expected.push((format!("quic_fallback_{}", cause.label()), count));
+        }
+        for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_carried_fallback) {
+            expected.push((format!("quic_carried_fallback_{}", cause.label()), count));
         }
         for (cause, count) in QuicFallback::ALL.iter().zip(snapshot.quic_churned_fallback) {
             expected.push((format!("quic_churned_fallback_{}", cause.label()), count));
@@ -8298,7 +8393,7 @@ mod tests {
             QuicCloseCode::COUNT
                 + 1
                 + QuicUpgradeOutcome::COUNT
-                + 2 * QuicFallback::COUNT
+                + 3 * QuicFallback::COUNT
                 + QuicPathAge::COUNT
                 + NativeSetupOutcome::COUNT
                 + 6

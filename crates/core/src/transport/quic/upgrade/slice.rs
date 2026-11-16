@@ -12,9 +12,36 @@
 //! function moves pairs between releases that disagree on it, so it is pinned by
 //! a test vector.
 
+use std::time::Duration;
+
 use crate::transport::TransportPublicKey;
 
 const DOMAIN: &[u8] = b"freenet-quic-data-slice-v1";
+
+const HOUR: u64 = 3600;
+
+/// The share of pairs, in percent, carrying data `elapsed` after a release's ramp
+/// started (`policy::QUIC_DATA_RAMP_START`): 5% for the first 6 h, then linear to
+/// 25% at 12 h, then linear to 100% at 24 h, and 100% after. Rounded down, so a
+/// value is reached at or after its time and never before. It never falls as
+/// `elapsed` grows, so by [`in_slice`] a pair in the slice stays in. A node whose
+/// clock is before the start reads `elapsed` as 0 and gets the first value.
+/// Pure: the time is the caller's.
+pub(in crate::transport) fn ramp_percent(elapsed: Duration) -> u8 {
+    let secs = elapsed.as_secs();
+    let between = |from: u64, to: u64, low: u64, high: u64| {
+        let span = (to - from) * HOUR;
+        low + (high - low) * (secs - from * HOUR) / span
+    };
+    let percent = match secs {
+        s if s < 6 * HOUR => 5,
+        s if s < 12 * HOUR => between(6, 12, 5, 25),
+        s if s < 24 * HOUR => between(12, 24, 25, 100),
+        _ => 100,
+    };
+    // At most 100 by the arms above.
+    percent as u8
+}
 
 /// The bucket of a pair, in `0..100`, the same whichever key comes first.
 pub(in crate::transport) fn bucket(a: &TransportPublicKey, b: &TransportPublicKey) -> u8 {
@@ -42,6 +69,58 @@ pub(in crate::transport) fn in_slice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hours(h: u64) -> Duration {
+        Duration::from_secs(h * HOUR)
+    }
+
+    /// The curve at each breakpoint and between them.
+    #[test]
+    fn the_ramp_has_these_values() {
+        for (at, percent) in [
+            (Duration::ZERO, 5),
+            (hours(3), 5),
+            (hours(6) - Duration::from_secs(1), 5),
+            (hours(6), 5),
+            (hours(9), 15),
+            (hours(12) - Duration::from_secs(1), 24),
+            (hours(12), 25),
+            (hours(18), 62),
+            (hours(24) - Duration::from_secs(1), 99),
+            (hours(24), 100),
+            (hours(1000), 100),
+            (Duration::MAX, 100),
+        ] {
+            assert_eq!(ramp_percent(at), percent, "{at:?}");
+        }
+    }
+
+    /// It never falls, so a pair in the slice at one time is in at every later
+    /// time, and it covers 5 to 100.
+    #[test]
+    fn the_ramp_never_falls_and_pairs_stay_in() {
+        let mut last = 0;
+        for minute in 0..=(25 * 60) {
+            let percent = ramp_percent(Duration::from_secs(minute * 60));
+            assert!(percent >= last, "minute {minute}: {percent} after {last}");
+            last = percent;
+        }
+        assert_eq!(last, 100);
+        let pairs: Vec<_> = pairs().take(500).collect();
+        let mut was_in = vec![false; pairs.len()];
+        for minute in (0..=(25 * 60)).step_by(7) {
+            let percent = ramp_percent(Duration::from_secs(minute * 60));
+            for (i, (a, b)) in pairs.iter().enumerate() {
+                let now_in = in_slice(a, b, percent);
+                assert!(
+                    now_in || !was_in[i],
+                    "pair {i} left the slice at minute {minute}"
+                );
+                was_in[i] = now_in;
+            }
+        }
+        assert!(was_in.iter().all(|in_now| *in_now));
+    }
 
     fn key(seed: u32) -> TransportPublicKey {
         // Hashed, so the order of two keys is not the order of their seeds.

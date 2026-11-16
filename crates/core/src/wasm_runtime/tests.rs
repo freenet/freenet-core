@@ -7,6 +7,7 @@ mod cache;
 mod contract;
 mod contract_metering;
 mod execution_handling;
+mod guest_memory;
 // Gated because every test in it installs a `tracing` capture, and
 // `tracing_subscriber` is only a dependency under `trace`. Gating the module
 // rather than each test keeps its shared fixture from becoming dead code in a
