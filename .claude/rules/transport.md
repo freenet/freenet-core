@@ -2837,7 +2837,17 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     either when the expiry's timer woke more than LATE_WAKE_SLACK (2 s)
     past its deadline: this node's runtime stalled or its host slept, and
     acknowledgements already in the socket may not have been read
-    (an_expiry_whose_timer_woke_late_is_not_a_strike). A genuinely
+    (an_expiry_whose_timer_woke_late_is_not_a_strike). Nor when the path
+    was dark for at least the watch's window (10 s) at any sample since the
+    end was sent (AckWatch::publishing_long_dark, WatchShared::long_dark_at):
+    through an outage that ends, a send can outlast its wait with an honest
+    peer, because quinn resends only at its next backed-off probe; the
+    common case is a one-packet Short's 150 s bound on a path with a UDP
+    session, which the dark rule leaves to the idle timeout since #6239.
+    Short strikes per data path-hour rose about 4x from 0.2.158 to 0.2.159
+    (1.27 to 4.98 per 1000), consistent with that. A peer that withholds
+    acknowledgements while it keeps sending is heard at every sample, so the
+    exclusion never covers it. A genuinely
     slow path (every batch congestion-limited, under the floor) is not
     struck (the_strike_check_needs_evidence_that_the_end_went_out,
     ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes,
