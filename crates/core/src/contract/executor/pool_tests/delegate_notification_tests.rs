@@ -508,41 +508,6 @@ fn finalize_state_commit_is_the_only_post_store_fan_out_site() {
         );
     }
 
-    // The queued-operation replay loop inside the install branch must consume
-    // `commit_state_update`'s OUTCOME, not a bare `Ok`.
-    //
-    // `commit_state_update` returns `Ok(SuppressedBrokenContract)` — storing
-    // nothing and fanning out nothing — for a contract flagged in
-    // `ring::broken_invariants`. When it returned `Result<(), _>` the replay
-    // loop read that as "this replay committed", advanced `installed_state`,
-    // and skipped the branch's own trailing fan-out, so the state the branch
-    // HAD stored reached no delegate, no WebSocket client and no peer. #5481
-    // again, at the install-plus-flagged-contract corner, introduced by the fix
-    // for #5481 and caught by the repo's rule review.
-    //
-    // The enum makes the conflation uncompilable — there is no `Ok(())` left to
-    // misread — so what is worth pinning is that the loop still matches on the
-    // variant rather than being rewritten to discard it with `let _ =` or
-    // `.is_ok()`, which would restore the same bug through a different door.
-    // Scoped to `bridged_upsert_contract_state_inner`, NOT the whole file:
-    // `commit_state_update`'s own return sites mention both variants, so a
-    // file-wide check is satisfied by the enum's definition site and would
-    // stay green through the very rewrite it is meant to catch.
-    let replay_scope = upsert_inner_body(production);
-    assert!(
-        code_contains(replay_scope, "StateCommitOutcome::Committed"),
-        "the queued-operation replay loop must branch on \
-         `StateCommitOutcome::Committed`. Treating any `Ok` as a commit makes \
-         a broken-contract suppression look like a successful one, and the \
-         install branch then skips a fan-out it still owes."
-    );
-    assert!(
-        code_contains(replay_scope, "StateCommitOutcome::SuppressedBrokenContract"),
-        "the replay loop must handle the suppression case explicitly, so the \
-         install branch's own fan-out is still performed when a replay stored \
-         nothing."
-    );
-
     // And every storing path delegates to it.
     let calls = count_call_sites(production, ".finalize_state_commit(");
     assert_eq!(
@@ -650,39 +615,6 @@ fn brace_delimited_body(src: &str, start: usize) -> &str {
         }
     }
     panic!("unbalanced braces while scraping the item body starting at {start}");
-}
-
-/// The brace-delimited body of `bridged_upsert_contract_state_inner`, which is
-/// where the queued-operation replay loop lives.
-///
-/// Scoping matters here rather than being tidiness. `StateCommitOutcome::`
-/// appears FOUR times in `executor_impl.rs`: twice in the replay match, and
-/// twice in `commit_state_update`'s own `return` sites. An unscoped "does this
-/// token appear" check is therefore satisfied by the enum's DEFINITION SITE, so
-/// deleting the replay match entirely and writing `if ....await.is_ok()` would
-/// leave it green — restoring the exact bug the enum was introduced to close.
-/// Two reviewers found that independently on #5484.
-///
-/// The function body is the right scope rather than the loop itself: it
-/// excludes both `commit_state_update` sites, and it does not depend on the
-/// loop keeping any particular shape.
-fn upsert_inner_body(src: &str) -> &str {
-    const SIG: &str = "async fn bridged_upsert_contract_state_inner(";
-    let start = src
-        .find(SIG)
-        .expect("bridged_upsert_contract_state_inner must exist");
-    brace_delimited_body(src, start)
-}
-
-/// Whether `needle` appears in `src` as CODE — not in a comment, not inside a
-/// string literal.
-///
-/// Deliberately says nothing about scope: pass the region you mean. The
-/// previous name (`helper_free_production_contains`) promised a region
-/// excluding the fan-out helper and delivered a whole-file search, which is how
-/// the unscoped `StateCommitOutcome` assertions above came to pin nothing.
-fn code_contains(src: &str, needle: &str) -> bool {
-    count_call_sites(src, needle) > 0
 }
 
 /// Count `needle` occurrences, one per matching LINE (two calls on one line

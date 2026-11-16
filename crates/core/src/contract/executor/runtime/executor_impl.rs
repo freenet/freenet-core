@@ -1,25 +1,5 @@
 use super::*;
 
-/// What [`Executor::commit_state_update`] actually did.
-///
-/// It used to return `Result<(), _>`, which made "stored the state and ran the
-/// full fan-out" and "suppressed the whole thing because the contract is
-/// flagged as violating a CRDT invariant" indistinguishable at every call
-/// site. A caller that reads a bare `Ok` as "committed" then acts on a state
-/// that was never written — and the initial-install branch's replay loop did
-/// exactly that, concluding a replay had fanned out and skipping its own
-/// fan-out, so the state it HAD stored reached nobody. That is #5481 again,
-/// relocated to the install-plus-flagged-contract corner. The outcome is
-/// explicit so the compiler makes the next caller choose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::contract::executor) enum StateCommitOutcome {
-    /// The state was stored and `finalize_state_commit` ran.
-    Committed,
-    /// Nothing was stored and nothing was fanned out: the contract is flagged
-    /// in `ring::broken_invariants` (#4279).
-    SuppressedBrokenContract,
-}
-
 // ============================================================================
 // Single Executor Implementation
 // ============================================================================
@@ -517,8 +497,8 @@ where
         // commit points below: a merge that committed a changed state, and an
         // incoming state byte-identical to the stored one, are recorded. A
         // merge that left the state unchanged is NOT (it may be a silent
-        // refusal), nor is a refused, failed, deferred, init-queued or
-        // broken-suppressed merge, so all of those can be retried. A non-merge
+        // refusal), nor is a refused, failed, deferred or init-queued merge,
+        // so all of those can be retried. A non-merge
         // replacement (initial install, corrupted-state recovery) resets the
         // record instead. Local-mode paths without an `op_manager` skip all of
         // it.
@@ -829,26 +809,9 @@ where
                                                     .commit_state_update(&key, &params, &new_state)
                                                     .await
                                                 {
-                                                    Ok(StateCommitOutcome::Committed) => {
+                                                    Ok(()) => {
                                                         installed_state = new_state;
                                                         replay_committed = true;
-                                                    }
-                                                    Ok(
-                                                        StateCommitOutcome::SuppressedBrokenContract,
-                                                    ) => {
-                                                        // Nothing stored, nothing fanned out. The
-                                                        // state must NOT advance and the trailing
-                                                        // fan-out must NOT be skipped — treating
-                                                        // this as a commit would leave the state
-                                                        // this branch DID store reaching nobody,
-                                                        // which is #5481 again at the
-                                                        // install-plus-flagged-contract corner.
-                                                        tracing::debug!(
-                                                            contract = %key,
-                                                            "Replayed operation suppressed \
-                                                             (contract flagged broken); \
-                                                             install fan-out still owed"
-                                                        );
                                                     }
                                                     Err(e) => {
                                                         tracing::warn!(
@@ -1387,25 +1350,6 @@ where
                 .await;
         }
 
-        if self
-            .op_manager
-            .as_ref()
-            .map(|m| m.ring.is_contract_broken(&key))
-            .unwrap_or(false)
-        {
-            // Probe just flagged this contract (or it was already
-            // flagged). Skip the commit so we don't extend the
-            // problematic state, and surface the suppression to
-            // callers via NoChange — there is no state change the
-            // network should observe.
-            tracing::debug!(
-                contract = %key,
-                event = "merge_suppressed_broken_contract",
-                "Skipping commit_state_update for contract flagged as broken"
-            );
-            return Ok(UpsertResult::NoChange);
-        }
-
         // A corrupted-state recovery replaces the stored state with the
         // incoming one instead of merging, so the applied-payload record no
         // longer describes it. Reset BEFORE the commit, like the initial
@@ -1417,14 +1361,9 @@ where
                 set.reset(&key);
             }
         }
-        // A broken-contract suppression here is reported to the caller as
-        // `Updated` exactly as before (this path has no trailing fan-out to gate
-        // on it); the outcome is read only to decide the applied-payload
-        // record, which must not claim a payload that was never stored.
-        let commit_outcome = self
-            .commit_state_update(&key, &params, &updated_state)
+        self.commit_state_update(&key, &params, &updated_state)
             .await?;
-        if matches!(commit_outcome, StateCommitOutcome::Committed) && !recovery_performed {
+        if !recovery_performed {
             record_absorbed(&applied_payloads);
         }
         Ok(UpsertResult::Updated(updated_state))
@@ -2118,14 +2057,16 @@ where
             return;
         };
         if let Some(op_manager) = &self.op_manager {
-            tracing::warn!(
+            // INFO: diagnostic only since #6190, the flag changes nothing about
+            // how the contract is handled.
+            tracing::info!(
                 contract = %key,
                 post_merge_size = post_merge_state.size(),
                 verdict = non_settling.as_str(),
                 event = "non_idempotent_merge_detected",
                 "Contract merge does not settle on re-applying the same incoming \
-                 state. Flagging contract; commit, broadcast, and full-state \
-                 egress will be suppressed."
+                 state. Flagging contract (diagnostic only; load is bounded by \
+                 ring::contract_merge_budget)."
             );
             op_manager.ring.record_broken_invariant(
                 *key,
@@ -2266,8 +2207,7 @@ where
             return;
         };
         if op_manager.ring.is_contract_broken(key) {
-            // Already flagged; the NoChange fast path is itself the
-            // suppression. Nothing new to learn.
+            // Already flagged; re-probing would learn nothing new.
             return;
         }
         if !op_manager.ring.try_claim_identity_probe(key) {
@@ -2331,7 +2271,8 @@ where
             cur = probe_state;
         }
 
-        tracing::warn!(
+        // INFO: diagnostic only since #6190.
+        tracing::info!(
             contract = %key,
             state_size = current_state.size(),
             final_probe_size = cur.size(),
@@ -2339,9 +2280,9 @@ where
             event = "non_idempotent_identity_merge_detected",
             "Contract violates update_state idempotency on its OWN state: \
              every one of the successive identical-input re-applies changed \
-             the byte multiset (no fixpoint) — deterministic proof, no \
-             sampling. Flagging contract; commit, broadcast, and full-state \
-             egress will be suppressed."
+             the byte multiset (no fixpoint), deterministic proof, no \
+             sampling. Flagging contract (diagnostic only; load is bounded by \
+             ring::contract_merge_budget)."
         );
         op_manager.ring.record_broken_invariant(
             *key,
@@ -2363,33 +2304,7 @@ where
         key: &ContractKey,
         parameters: &Parameters<'_>,
         new_state: &WrappedState,
-    ) -> Result<StateCommitOutcome, ExecutorError> {
-        // Blanket gate: a contract flagged as violating a CRDT invariant
-        // (e.g. non-idempotent merge) must not have its state extended
-        // OR broadcast from this node. The merge in
-        // `bridged_upsert_contract_state` already short-circuits before
-        // reaching here on the probe-positive path, but
-        // `commit_state_update` has other call sites (related-contract
-        // retry, validation re-attempt) that don't run the probe first.
-        // Gating here covers all of them with one check. See
-        // `crate::ring::broken_invariants` for the tracker and #4279
-        // for the storm shape this defends against.
-        if let Some(op_manager) = &self.op_manager {
-            if op_manager.ring.is_contract_broken(key) {
-                tracing::debug!(
-                    contract = %key,
-                    event = "commit_suppressed_broken_contract",
-                    "Skipping commit_state_update for contract flagged as broken"
-                );
-                // NOT `Ok(())`. This path stores nothing and fans out
-                // nothing, and a caller that reads a bare `Ok` as "committed"
-                // will act on a state that was never written — which is
-                // exactly what happened to the initial-install branch's
-                // replay loop before the outcome was made explicit.
-                return Ok(StateCommitOutcome::SuppressedBrokenContract);
-            }
-        }
-
+    ) -> Result<(), ExecutorError> {
         let state_size = new_state.as_ref().len();
         if state_size > MAX_STATE_SIZE {
             crate::contract::record_state_size_rejection(
@@ -2457,7 +2372,7 @@ where
 
         self.finalize_state_commit(key, parameters, new_state).await;
 
-        Ok(StateCommitOutcome::Committed)
+        Ok(())
     }
 
     /// The complete post-store fan-out for a contract state this node has
@@ -2489,9 +2404,8 @@ where
     /// 3. `send_delegate_contract_notifications` — locally-subscribed
     ///    delegates. Best-effort and lossy by design (`try_send`); see
     ///    that method.
-    /// 4. `broadcast_state_change` — the network. Suppressed for a
-    ///    contract flagged as violating a CRDT invariant, and emitted
-    ///    non-blocking (#4145).
+    /// 4. `broadcast_state_change` — the network. Emitted non-blocking
+    ///    (#4145).
     ///
     /// This exists because the legs kept getting dropped one at a time.
     /// All FOUR storing paths — the initial-state install in
@@ -2989,22 +2903,6 @@ where
 
     pub(super) async fn broadcast_state_change(&self, key: ContractKey, new_state: WrappedState) {
         if let Some(op_manager) = &self.op_manager {
-            // Skip the broadcast entirely if this contract has been flagged
-            // as violating a CRDT invariant (e.g. non-idempotent
-            // `update_state`). The idempotency probe in
-            // `bridged_upsert_contract_state` sets this flag when it
-            // catches `update_state(update_state(S, U), U) != update_state(S, U)`.
-            // Once flagged, propagating this contract's state changes
-            // re-engages the broadcast storm we are trying to suppress.
-            // See `crate::ring::broken_invariants`.
-            if op_manager.ring.is_contract_broken(&key) {
-                tracing::debug!(
-                    contract = %key,
-                    event = "broadcast_suppressed_broken_contract",
-                    "Skipping BroadcastStateChange for contract flagged as broken"
-                );
-                return;
-            }
             // Non-blocking emit: a 30-second `notify_node_event(...).await`
             // on the commit path was the primary back-pressure source that
             // wedged both gateways on 2026-05-24 (#4145). Missed broadcasts

@@ -167,8 +167,8 @@ async fn sampled_probe_does_not_flag_merge_that_settles_after_one_reapply() {
     );
 }
 
-/// A merge that cycles under re-apply is still flagged, the commit is
-/// suppressed, and the flag is handed to telemetry.
+/// A merge that cycles under re-apply is still flagged and the flag is handed
+/// to telemetry. The flag is diagnostic only (#6190): the merge still commits.
 #[tokio::test(flavor = "current_thread")]
 async fn sampled_probe_flags_merge_that_cycles_and_emits_telemetry() {
     let (s, x) = ([0u8], [3u8]);
@@ -180,11 +180,14 @@ async fn sampled_probe_flags_merge_that_cycles_and_emits_telemetry() {
     )
     .await;
     assert!(broken, "a merge that cycles on re-apply must be flagged");
-    assert!(
-        matches!(result, UpsertResult::NoChange),
-        "the flagged merge must not commit, got {result:?}"
+    let UpsertResult::Updated(merged) = result else {
+        panic!("the flagged merge must still commit (#6190), got {result:?}");
+    };
+    assert_eq!(
+        stored,
+        Some(merged.as_ref().to_vec()),
+        "the stored state is the committed merge"
     );
-    assert_eq!(stored, Some(s.to_vec()), "stored state must be untouched");
 
     assert_eq!(events.len(), 1, "exactly one flag event: {events:?}");
     let event = &events[0];
@@ -218,7 +221,10 @@ async fn sampled_probe_flags_merge_that_mutates_on_every_apply() {
         broken,
         "a merge that mutates on every apply must be flagged"
     );
-    assert!(matches!(result, UpsertResult::NoChange));
+    assert!(
+        matches!(result, UpsertResult::Updated(_)),
+        "the flagged merge must still commit (#6190), got {result:?}"
+    );
     assert_eq!(events.len(), 1, "{events:?}");
 }
 
@@ -633,7 +639,7 @@ async fn a_slow_self_merge_does_not_hide_a_cycling_merge() {
     )
     .await;
     assert!(broken, "a slow merge(X, X) must not hide a cycling merge");
-    assert!(matches!(result, UpsertResult::NoChange), "{result:?}");
+    assert!(matches!(result, UpsertResult::Updated(_)), "{result:?}");
     assert_eq!(events.len(), 1, "{events:?}");
 }
 

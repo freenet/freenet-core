@@ -103,6 +103,55 @@ pub mod local_node {
 /// Exports for the dev tool.
 pub mod dev_tool {
     use super::*;
+    /// Simulation hooks for the per-contract merge budget (#6190): make some
+    /// contracts' merges never settle, and count merges and budget decisions.
+    /// Process-global: a test that arms them must run in its own process.
+    #[cfg(any(test, feature = "testing"))]
+    pub mod sim_merge_budget {
+        use std::sync::atomic::Ordering;
+
+        use crate::contract::executor::mock_wasm_runtime::sim_hooks;
+        use crate::ring::contract_merge_budget::sim;
+
+        /// Arm the hooks: contracts whose first id byte is a multiple of
+        /// `modulus` merge non-idempotently, and merges and budget decisions
+        /// are counted. `modulus` must be non-zero.
+        pub fn arm(modulus: u8) {
+            assert!(modulus != 0, "use disarm()");
+            sim_hooks::BAD_CONTRACT_MODULUS.store(modulus, Ordering::Relaxed);
+            sim::ARMED.store(true, Ordering::Relaxed);
+        }
+        /// Disarm the hooks and drop their counts.
+        pub fn disarm() {
+            sim_hooks::BAD_CONTRACT_MODULUS.store(0, Ordering::Relaxed);
+            sim::ARMED.store(false, Ordering::Relaxed);
+            let _ = take_merge_counts();
+            let _ = take_merge_budget_counts();
+        }
+        /// Take and reset per-contract merge-budget counts summed over all
+        /// nodes: (first id byte, id string, admitted, dropped, charged).
+        pub fn take_merge_budget_counts() -> Vec<(u8, String, u64, u64, u64)> {
+            sim::COUNTS
+                .lock()
+                .take()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, (a, d, c))| (id.as_bytes()[0], id.to_string(), a, d, c))
+                .collect()
+        }
+        /// Take and reset per-contract `update_state` call counts:
+        /// (first id byte, id string, count).
+        pub fn take_merge_counts() -> Vec<(u8, String, u64)> {
+            sim_hooks::MERGE_COUNTS
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, n)| (id.as_bytes()[0], id.to_string(), n))
+                .collect()
+        }
+    }
     pub use crate::config::{
         Config, GlobalTestMetrics, KEK_SIZE, KekBackend, KekBackendKind, KekError, Secrets,
         ensure_kek_loaded, load_from_backend, read_backend_marker, replace_backend_marker,
