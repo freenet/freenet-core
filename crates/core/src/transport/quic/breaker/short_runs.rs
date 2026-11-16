@@ -11,7 +11,8 @@
 //! transport ([`quic_attributed`]) in the run's marker. A run with QUIC
 //! enabled counts only if it lasted less than [`SHORT_RUN`] and recorded such
 //! a panic, and [`SHORT_RUNS_TO_TRIP`] of them in a row keep QUIC off for
-//! [`QUIC_BREAKER_COOLDOWN`]. A short run that recorded no QUIC panic (any
+//! the role's cooldown ([`BreakerRole::cooldown`]: 24 h on a peer, the short
+//! gateway cooldown on a gateway). A short run that recorded no QUIC panic (any
 //! ordinary stop) starts the count again. A run that started more than the
 //! cooldown after the one before it starts the count again too.
 //!
@@ -147,8 +148,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use super::{
-    BreakerOutcome, Gated, Marker, PENDING, Previous, QUIC_BREAKER_COOLDOWN, Verdict,
-    clear_if_owned, cooldown_end, marker_path, read_previous, unix_secs, write_marker,
+    BreakerOutcome, BreakerRole, Gated, Marker, PENDING, Previous, Verdict, clear_if_owned,
+    cooldown_end, marker_path, read_previous, unix_secs, write_marker,
 };
 use crate::config::{GlobalExecutor, GlobalRng};
 use crate::node::background_task_monitor::LateRegistrar;
@@ -181,7 +182,12 @@ pub(super) struct Decision {
 /// run counts only if it recorded a QUIC panic and started within the
 /// cooldown, so an ordinary stop, a clock gone back past its start and a run
 /// from long ago all start the count again.
-pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -> Decision {
+pub(super) fn decide(
+    previous: &Previous,
+    now_secs: u64,
+    ignore_breaker: bool,
+    role: BreakerRole,
+) -> Decision {
     let arm = |short_runs| Decision {
         verdict: Verdict::Arm,
         short_runs,
@@ -192,7 +198,7 @@ pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -
             started_at_secs,
             quic_panicked: true,
             ..
-        }) if within_cooldown(*started_at_secs, now_secs) => {
+        }) if within_cooldown(*started_at_secs, now_secs, role) => {
             let short_runs = short_runs.saturating_add(1);
             if short_runs >= SHORT_RUNS_TO_TRIP && !ignore_breaker {
                 Decision {
@@ -204,7 +210,7 @@ pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -
             }
         }
         Previous::Marker(Marker::Tripped { tripped_at_secs })
-            if !ignore_breaker && within_cooldown(*tripped_at_secs, now_secs) =>
+            if !ignore_breaker && within_cooldown(*tripped_at_secs, now_secs, role) =>
         {
             Decision {
                 verdict: Verdict::Cool {
@@ -227,8 +233,8 @@ pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -
 /// Whether `at_secs` is not ahead of `now_secs` and less than a cooldown before
 /// it. Stricter than the unix `cooling`: a time ahead of the clock does not
 /// count at all.
-fn within_cooldown(at_secs: u64, now_secs: u64) -> bool {
-    at_secs <= now_secs && now_secs < at_secs.saturating_add(QUIC_BREAKER_COOLDOWN.as_secs())
+fn within_cooldown(at_secs: u64, now_secs: u64, role: BreakerRole) -> bool {
+    at_secs <= now_secs && now_secs < at_secs.saturating_add(role.cooldown().as_secs())
 }
 
 /// The marker a decision leaves behind; `None` leaves the file as it is.
@@ -253,6 +259,7 @@ pub(super) fn gate<T>(
     data_dir: &Path,
     ignore_breaker: bool,
     now: SystemTime,
+    role: BreakerRole,
 ) -> Gated<T> {
     if settings.is_none() {
         return Gated {
@@ -270,11 +277,11 @@ pub(super) fn gate<T>(
         );
     }
     let now_secs = unix_secs(now);
-    let decision = decide(&previous, now_secs, ignore_breaker);
+    let decision = decide(&previous, now_secs, ignore_breaker, role);
     let marker = marker_after(decision, now_secs, GlobalRng::random_u64());
     let metrics = &crate::transport::TRANSPORT_METRICS;
     let until_utc = |tripped_at_secs: u64| {
-        chrono::DateTime::<chrono::Utc>::from(cooldown_end(tripped_at_secs)).to_rfc3339()
+        chrono::DateTime::<chrono::Utc>::from(cooldown_end(tripped_at_secs, role)).to_rfc3339()
     };
     match decision.verdict {
         Verdict::Arm => {
@@ -302,6 +309,8 @@ pub(super) fn gate<T>(
                 until = %until_utc(now_secs),
                 short_runs = decision.short_runs,
                 short_run_minutes = SHORT_RUN.as_secs() / 60,
+                cooldown_minutes = role.cooldown().as_secs() / 60,
+                ?role,
                 "Several runs in a row with QUIC enabled ended early, so QUIC stays off until \
                  the cooldown ends. Set `quic-ignore-crash-breaker = true` to run QUIC anyway"
             );
@@ -310,6 +319,7 @@ pub(super) fn gate<T>(
             metrics.set_quic_breaker_suppressed(true);
             tracing::warn!(
                 until = %until_utc(tripped_at_secs),
+                ?role,
                 "QUIC stays off: several runs in a row with QUIC enabled ended early and the \
                  cooldown has not ended. Set `quic-ignore-crash-breaker = true` to run QUIC \
                  anyway"
@@ -526,7 +536,38 @@ mod tests {
     const NONCE: u64 = 7;
 
     fn cooldown() -> u64 {
-        QUIC_BREAKER_COOLDOWN.as_secs()
+        super::super::QUIC_BREAKER_COOLDOWN.as_secs()
+    }
+
+    /// The peer decision; the gateway one is tested by name.
+    fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -> Decision {
+        super::decide(previous, now_secs, ignore_breaker, BreakerRole::Peer)
+    }
+
+    /// On Windows a gateway counts short runs and holds a trip only within
+    /// the gateway cooldown.
+    #[test]
+    fn a_gateway_counts_and_cools_within_the_gateway_cooldown() {
+        let g = super::super::GATEWAY_QUIC_BREAKER_COOLDOWN.as_secs();
+        let gw = |previous: &Previous, now_secs: u64| {
+            super::decide(previous, now_secs, false, BreakerRole::Gateway)
+        };
+        assert_eq!(gw(&panicked(2, T0), T0 + g - 1).verdict, Verdict::Trip);
+        assert_eq!(gw(&panicked(2, T0), T0 + g), arm(0));
+        assert_eq!(
+            gw(&tripped(T0), T0 + g - 1).verdict,
+            Verdict::Cool {
+                tripped_at_secs: T0
+            }
+        );
+        assert_eq!(gw(&tripped(T0), T0 + g), arm(0));
+        assert_eq!(
+            decide(&tripped(T0), T0 + g, false).verdict,
+            Verdict::Cool {
+                tripped_at_secs: T0
+            },
+            "a peer still cools for the peer cooldown"
+        );
     }
 
     fn running(short_runs: u32, started_at_secs: u64) -> Previous {
@@ -805,14 +846,14 @@ mod tests {
     fn quic_off_does_not_touch_the_marker() {
         let dir = tempfile::tempdir().unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0);
-        let empty = gate(None::<u8>, dir.path(), false, now);
+        let empty = gate(None::<u8>, dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(empty.settings, None);
         assert_eq!(empty.breaker, BreakerOutcome::NotConsulted);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 
         let path = marker_path(dir.path());
         std::fs::create_dir(&path).unwrap();
-        let gated = gate(None::<u8>, dir.path(), false, now);
+        let gated = gate(None::<u8>, dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(gated.breaker, BreakerOutcome::NotConsulted);
     }
 
@@ -833,12 +874,12 @@ mod tests {
         )
         .unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0 + 1);
-        let gated = gate(Some(7u8), dir.path(), false, now);
+        let gated = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(gated.settings, None);
         assert_eq!(gated.breaker, BreakerOutcome::Decided(Verdict::Trip));
         assert_eq!(read_previous(&path), tripped(T0 + 1));
 
-        let cooling = gate(Some(7u8), dir.path(), false, now);
+        let cooling = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(cooling.settings, None);
         assert_eq!(
             cooling.breaker,
@@ -872,7 +913,7 @@ mod tests {
         ));
         std::fs::create_dir(tmp).unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0 + 1);
-        let gated = gate(Some(7u8), dir.path(), false, now);
+        let gated = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(gated.settings, None);
         assert_eq!(
             read_previous(&path),
@@ -1025,6 +1066,7 @@ mod tests {
             stopped: &[],
             now_secs: T0,
             ignore_breaker: false,
+            role: BreakerRole::Peer,
         });
         assert_eq!(got, Verdict::Arm);
     }
