@@ -834,6 +834,10 @@ pub(crate) struct QuicPath {
     /// Set while the acknowledgement watch sees a dark episode
     /// (`recycle::WatchShared::dark`), read by the stall close.
     dark: Arc<std::sync::atomic::AtomicBool>,
+    /// The last sample of a long dark episode, on the path's clock
+    /// (`recycle::WatchShared::long_dark_at`): an ack-wait expiry whose wait
+    /// overlapped one is not a strike ([`StrikeCheck`]).
+    long_dark_at: Arc<AtomicU64>,
     /// The [`bounded::QuietProof`] sends that ran out of gap left, read (not
     /// taken) by every settle; a proof of the same counts is merged into it.
     quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>>,
@@ -1108,6 +1112,7 @@ impl QuicPath {
         let ack_waits = Arc::new(AckWaits::new(stats.clone()));
         let carries_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let dark = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let long_dark_at = Arc::new(AtomicU64::new(0));
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             connection.closer(),
@@ -1123,6 +1128,7 @@ impl QuicPath {
                     carries_data: carries_data.clone(),
                     udp_fallback: limits.udp_fallback,
                     dark: dark.clone(),
+                    long_dark_at: long_dark_at.clone(),
                 },
                 report,
             },
@@ -1152,6 +1158,7 @@ impl QuicPath {
                 udp_fallback: limits.udp_fallback,
                 stall: parking_lot::Mutex::new(stall),
                 dark,
+                long_dark_at,
                 quiet: Arc::default(),
                 last_acked: Arc::new(bounded::AckRecord::new(
                     ack_progress.as_ref().map_or(0, recycle::AckProgress::acked),
@@ -2127,6 +2134,7 @@ impl QuicPath {
                 Arc::new(move || connection.stats().path.rtt)
             },
             now: self.clock.clone(),
+            dark_at: self.long_dark_at.clone(),
         });
         send.node = Some(self.stats.node());
         send.ack_waits = Some(self.ack_waits.clone());
@@ -2429,8 +2437,17 @@ type Sleeper = Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> 
 /// its host slept), and acknowledgements already in the socket may not have
 /// been read yet. Lateness is measured against the deadline only, so a
 /// stall that began during the wait and ended within the slack of its
-/// deadline (one of nearly the whole wait, about 118 s for a one-packet
+/// deadline (one of nearly the whole wait, about 148 s for a one-packet
 /// Short) still has its stale evidence judged.
+///
+/// Nor does either count when the path was dark for at least the
+/// acknowledgement watch's window at any sample since the end was sent
+/// (`recycle::AckWatch::publishing_long_dark`): through an outage that ends,
+/// a send can outlast its wait with an honest peer, since quinn resends only
+/// at its next backed-off probe. A one-packet Short's 150 s bound is the
+/// common case, on a path with a UDP session, which the dark rule leaves to
+/// quinn's idle timeout (#6239). A peer that withholds acknowledgements while
+/// it keeps sending is heard at every sample, so this never excuses it.
 ///
 /// Strikes close a path with no UDP session at `recycle::ACK_WAIT_EXPIRY_LIMIT`
 /// within its window, and only count toward telemetry on a path with one
@@ -2443,6 +2460,9 @@ struct StrikeCheck {
     cap: Arc<super::socket::CapHolds>,
     rtt: Arc<dyn Fn() -> Duration + Send + Sync>,
     now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    /// The last sample of a long dark episode on the path, 0 for none
+    /// (`recycle::AckWatch::publishing_long_dark`).
+    dark_at: Arc<AtomicU64>,
 }
 
 /// The path's state when a send's end was sent ([`StrikeCheck::mark`]).
@@ -2474,6 +2494,12 @@ impl StrikeCheck {
     fn strikes(&self, mark: StrikeMark, due: u64) -> bool {
         let now = (self.now)();
         if now.saturating_sub(due) > nanos(LATE_WAKE_SLACK) || self.cap.read().held_now {
+            return false;
+        }
+        // A long dark episode during the wait: the outage, not the peer,
+        // may have kept the end from being acknowledged in time, and the
+        // dark rule judges darkness.
+        if self.dark_at.load(Ordering::Acquire) >= mark.at.max(1) {
             return false;
         }
         let (batches, app_limited) = self.acks.batches_app_limited();

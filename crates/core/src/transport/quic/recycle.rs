@@ -1201,6 +1201,9 @@ pub(crate) struct AckWatch {
     /// Where it is published whether the dark rule would have closed the path
     /// in the episode in progress, if anywhere ([`Self::publishing_dark`]).
     dark_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Where the last sample of a long dark episode is published, if
+    /// anywhere ([`Self::publishing_long_dark`]).
+    long_dark_at: Option<Arc<AtomicU64>>,
 }
 
 /// Whether the egress cap holds, or held since `previous` was read, a QUIC
@@ -1275,7 +1278,22 @@ impl AckWatch {
             udp_fallback: false,
             dark_would_closed: false,
             dark_flag: None,
+            long_dark_at: None,
         }
+    }
+
+    /// Publish in `at`, at each sample of a dark episode that has lasted at
+    /// least the window, the sample's time on the caller's clock (not the
+    /// watch's own, [`Self::watch_time`]); 0 until one has. An ack-wait
+    /// expiry whose wait overlapped one is not a strike (`path::StrikeCheck`):
+    /// a send through an outage can outlast its wait with an honest peer (a
+    /// one-packet Short's 150 s bound, on a path with a UDP session that the
+    /// dark rule leaves to the idle timeout), and darkness is the dark rule's
+    /// to judge. A peer that withholds acknowledgements while it sends is
+    /// heard, so its episodes end at once and publish nothing.
+    pub(crate) fn publishing_long_dark(mut self, at: Arc<AtomicU64>) -> Self {
+        self.long_dark_at = Some(at);
+        self
     }
 
     /// Publish in `flag`, after every sample, whether the dark rule would
@@ -1413,8 +1431,16 @@ impl AckWatch {
     /// Take `sample`, taken at `now_nanos`; whether the path must close
     /// ([`Self::stall`] says why).
     pub(crate) fn observe(&mut self, now_nanos: u64, sample: AckSample) -> bool {
+        let caller_now = now_nanos;
         let now_nanos = self.watch_time(now_nanos);
         self.stall = self.decide(now_nanos, sample);
+        if let Some(at) = &self.long_dark_at
+            && self
+                .dark_since
+                .is_some_and(|start| now_nanos.saturating_sub(start) >= self.window_nanos)
+        {
+            at.store(caller_now.max(1), Ordering::Release);
+        }
         if let Some(flag) = &self.dark_flag {
             flag.store(self.dark_would_closed, std::sync::atomic::Ordering::Release);
         }
@@ -1964,6 +1990,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         carries_data,
         udp_fallback,
         dark,
+        long_dark_at,
     } = shared;
     let Some(first) = AckSample::of(&connection, &cap_holds, &writers) else {
         tracing::warn!(
@@ -1977,7 +2004,8 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first)
         .observing(carries_data, report.node)
         .with_udp_fallback(udp_fallback)
-        .publishing_dark(dark);
+        .publishing_dark(dark)
+        .publishing_long_dark(long_dark_at);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
         rtt.set(connection.rtt());
@@ -2072,6 +2100,9 @@ pub(crate) struct WatchShared {
     /// progress ([`AckWatch::publishing_dark`]), so the path's stall close
     /// leaves such a path with a UDP session alone (`route`).
     pub(crate) dark: Arc<std::sync::atomic::AtomicBool>,
+    /// The last sample of a dark episode that lasted the window, on the
+    /// path's clock, 0 for none ([`AckWatch::publishing_long_dark`]).
+    pub(crate) long_dark_at: Arc<AtomicU64>,
 }
 
 /// Watch panics `PathReport::panic_once_bucketed` raised. Tests only; only

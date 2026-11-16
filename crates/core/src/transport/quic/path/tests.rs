@@ -1065,6 +1065,7 @@ fn the_strike_check_needs_evidence_that_the_end_went_out() {
     use super::super::socket::CapHolds;
     use std::sync::atomic::Ordering::Relaxed;
     let now = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dark_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let make = |cap: &Arc<CapHolds>| {
         let acks = recycle::AckProgress::detached();
         let clock = now.clone();
@@ -1073,6 +1074,7 @@ fn the_strike_check_needs_evidence_that_the_end_went_out() {
             cap: cap.clone(),
             rtt: Arc::new(|| Duration::from_millis(100)),
             now: Arc::new(move || clock.load(Relaxed)),
+            dark_at: dark_at.clone(),
         };
         (check, acks)
     };
@@ -1107,6 +1109,20 @@ fn the_strike_check_needs_evidence_that_the_end_went_out() {
         !run(&uncapped, &|_| {}),
         "nothing acknowledged since the end"
     );
+
+    // A long dark episode on the path during the wait excuses the expiry; one
+    // that ended before the end was sent does not.
+    dark_at.store(1_000 + wait / 2, Relaxed);
+    assert!(
+        !run(&uncapped, &|acks| acks.batch(100, true)),
+        "dark during the wait"
+    );
+    dark_at.store(500, Relaxed);
+    assert!(
+        run(&uncapped, &|acks| acks.batch(100, true)),
+        "dark only before the end"
+    );
+    dark_at.store(0, Relaxed);
 
     // Late wakes.
     let slack = u64::try_from(LATE_WAKE_SLACK.as_nanos()).unwrap();

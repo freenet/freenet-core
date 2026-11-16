@@ -346,6 +346,56 @@ fn the_watch_publishes_that_the_dark_rule_would_have_closed() {
     assert!(run(&one_way, 4).iter().all(|set| !set));
 }
 
+/// The watch publishes the last sample of a dark episode that has lasted at
+/// least the window (10 s), on the caller's clock, for the strike check
+/// (`path::StrikeCheck`): from the sample the episode reaches the window to
+/// its last; nothing for a spell shorter than the window, or while the peer
+/// keeps sending.
+#[test]
+fn the_watch_publishes_the_last_sample_of_a_long_dark_episode() {
+    let record = Arc::default();
+    let sample = |r: Reading| {
+        AckSample::synthetic(
+            &record,
+            r.acked,
+            r.batches,
+            r.outstanding,
+            r.sent,
+            r.received,
+            NO_CAP,
+        )
+    };
+    let run = |at: &dyn Fn(u64) -> Reading, ticks: u64| {
+        let published = Arc::new(AtomicU64::new(0));
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)))
+            .with_udp_fallback(true)
+            .publishing_long_dark(published.clone());
+        (1..=ticks)
+            .map(|tick| {
+                watch.observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(tick)));
+                published.load(Ordering::Acquire) / SEC
+            })
+            .collect::<Vec<_>>()
+    };
+    // Sends at ticks 1-20 (from 2 s), the peer heard again at tick 21: the
+    // episode starts at tick 1 and reaches 10 s at tick 6 (12 s).
+    let dark = |t: u64| reading(5, 1200, 10 + t.min(20), 100 + t.saturating_sub(20));
+    let expected: Vec<u64> = (1..=23u64)
+        .map(|t| match t {
+            ..=5 => 0,
+            6..=20 => 2 * t,
+            _ => 40,
+        })
+        .collect();
+    assert_eq!(run(&dark, 23), expected);
+    // A 6 s spell: never long.
+    let brief = |t: u64| reading(5, 1200, 10 + t.min(3), 100 + t.saturating_sub(3));
+    assert!(run(&brief, 8).iter().all(|at| *at == 0));
+    // This side's sends unanswered while the peer keeps sending: not dark.
+    let heard = |t: u64| reading(5, 1200, 10 + t, 100 + t);
+    assert!(run(&heard, 4).iter().all(|at| *at == 0));
+}
+
 /// On a data path with a UDP session, an outage of 90 s (sends from tick 1,
 /// the peer heard again at tick 46), longer than the dark rule's close, is
 /// survived: counted once as a would-close and then as recovered in under
