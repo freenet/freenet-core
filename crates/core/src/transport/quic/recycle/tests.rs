@@ -793,7 +793,7 @@ fn the_production_values_are_pinned() {
     assert!(dark_close_bound(Duration::from_millis(800)) <= DARK_CLOSE_MAX);
     assert_eq!(ACK_WAIT_EXPIRY_WINDOW, Duration::from_secs(30 * 60));
     assert_eq!(super::super::path::SHORT_ACK_WAIT, Duration::from_secs(150));
-    assert!(!DARK_CLOSES_WITH_UDP);
+    const { assert!(!DARK_CLOSES_WITH_UDP) };
     assert_eq!(UDP_PATH_DARK_END_MAX, Duration::from_secs(120));
     // The bound is quinn's idle timeout in production.
     assert_eq!(
