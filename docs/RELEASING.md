@@ -491,16 +491,16 @@ Current wire-gated floors:
   and `ResponseNative` at indices 5 and 6 of
   `operations/connect/wire.rs::ConnectMsgWire`, #5940).
 
-  Set to **`(0, 2, 160)`**, the release intended to first ship the decoder,
+  Set to **`(0, 2, 159)`**, the release intended to first ship the decoder,
   and guarded by `QUIC_NATIVE_SHIPPED_IN`, currently `None`, checked by
   `p2p_protoc::quic_native_floor_tests::quic_native_floor_tracks_the_shipping_release`.
-  0.2.157, 0.2.158 and 0.2.159 carry the decoder but were cut with the floor
-  raised past them, so they never emit the native variants. 0.2.158 is the
-  QUIC data ramp release (#6224) and 0.2.159 its emergency stop; each raised
-  the floor so that the native offer does not start in the same release. When
-  the 0.2.160 bump fails that test, set the marker to the literal
-  `Some((0, 2, 160))` if the release carries the decoder and should start the
-  native offer, otherwise raise the floor. Same failure mode as the
+  0.2.157 and 0.2.158 carry the decoder but were cut with the floor raised
+  past them, so they never emit the native variants. 0.2.158 is the QUIC data
+  ramp release (#6224), which raised the floor so that the native offer does
+  not start in the same release as the data ramp. When the 0.2.159 bump fails
+  that test, set the marker to the literal `Some((0, 2, 159))` if the release
+  carries the decoder and should start the native offer, otherwise raise the
+  floor. Same failure mode as the
   application-message floors above: a peer at
   or above the floor without the decoder closes the connection on the variant,
   so bias high. Only `connect::wire::encode_for_peer`, at the one peer-bound
@@ -593,12 +593,10 @@ Current wire-gated floors:
   Release notes. The release that sets T0 must say in its notes that `prefer`
   nodes, which is every Linux, macOS and Windows node that did not set `transport-quic`,
   start carrying data with a growing share of their pairs. A release cut from
-  main between the ramp code (#6138) and the T0 PR (0.2.157 was one) also
-  changed something: it made `prefer` the default on Linux, macOS and Windows,
-  at a share of 0. Its nodes then behave as shadow nodes (no pair carries
-  data, no path is recycled), but its notes should still say that the default
-  mode changed. Since the 0.2.159 emergency stop the default is shadow on
-  Linux and macOS and off on Windows again.
+  main between the ramp code (#6138) and the T0 PR also changes something: it
+  makes `prefer` the default on Linux, macOS and Windows, at a share of 0. Its nodes
+  then behave as shadow nodes (no pair carries data, no path is recycled), but
+  its notes should still say that the default mode changed.
 
   Reading the ramp: each node logs at INFO when its share enters a new band
   ("QUIC data: this node offers data to this share of its pairs", with
@@ -622,12 +620,9 @@ Current wire-gated floors:
   Emergency stop: a parked release, built and soaked before the ramp release is
   cut, is published through the normal auto-update stagger (0 to 4 h). It
   restores the pre-ramp state with two changes, and needs both. It sets
-  `QUIC_DATA_RAMP_START` back to `None` and keeps `QUIC_DATA_PERCENT` at 0
-  (both: with no ramp start the fixed share applies), which gives every
-  `prefer` node a share of 0, so none of its pairs carries data; only a node
-  that set `quic-data-percent` keeps a share.
-  `the_constants_are_in_a_shape_a_release_ships` fails a build whose default
-  on Linux and macOS is not `prefer` unless both are so. It also sets the default mode back to
+  `QUIC_DATA_RAMP_START` back to `None`, which gives every `prefer` node a
+  share of 0, so none of its pairs carries data; only a node that set
+  `quic-data-percent` keeps a share. It also sets the default mode back to
   0.2.156's: shadow on Linux and macOS, off on Windows. An emergency release
   should only go back to states the field has run, and Windows with QUIC off
   is what every release through 0.2.156 ran. So a Linux or macOS node that did not set
