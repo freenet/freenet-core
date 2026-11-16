@@ -1400,11 +1400,16 @@ snapshot except the two gauges.
   offered and declined_uncharged. Both sides count `established`; only the
   offerer's is the numerator. Counts are node-wide; there is no per-pair series.
   `quic_fallback_<label>` (`QuicFallback`): idle, reset, protocol, downgrade_rx,
-  endpoint_down, session_ended_rx, over_budget_rx. Paths that had been active only; an attempt
-  that ends in setup is counted in `quic_upgrade_*`. A close this node sent for
-  send_abort_limit or peer_not_acknowledging reaches the machine as a lost
-  connection, so it counts as `reset`; its count is `quic_close_sent_*`. A key
-  mismatch is `quic_upgrade_identity_mismatch`.
+  endpoint_down, session_ended_rx, over_budget_rx, liveness_tx, closed_tx. Paths that had been active only; an attempt
+  that ends in setup is counted in `quic_upgrade_*`. A close this node sent
+  reaches the machine as a lost connection; since 0.2.159 the driver counts it
+  by the reason the closer recorded (`QuicCloser::close_for`, read at the
+  count, `driver::fallback_label`): `liveness_tx` for the acknowledgement
+  watch's rules and the stalled-sends count (which rule: quic_stall_close_*),
+  `closed_tx` for every other recorded reason (send aborts, a peer over its
+  budget, refused data, a panicked receive task). A close with no recorded
+  reason, and a real reset, stay `reset`. Releases before 0.2.159 count all of
+  these as `reset`. A key mismatch is `quic_upgrade_identity_mismatch`.
   session_ended_rx is the peer closing with SESSION_ENDED (6): its UDP session
   to this node ended (a prune or a restart). It is charged like downgrade_rx.
   In setup this node counts the same close as `setup_downgrade_rx`, since
@@ -1431,7 +1436,8 @@ snapshot except the two gauges.
   negative. Subtract only over windows much longer than 150 s (an hour or a
   day). The Step 2 gate, fallbacks per path-day excluding endpoint and
   restart causes, is then
-    (sum over c in idle, reset, protocol, downgrade_rx, over_budget_rx of
+    (sum over c in idle, reset, protocol, downgrade_rx, over_budget_rx,
+       liveness_tx, closed_tx of
        quic_fallback_<c> - quic_churned_fallback_<c>) / path-days,
   with endpoint_down and session_ended_rx left out entirely (session_ended_rx
   is churn by definition). over_budget_rx is in the sum: it is a close that
@@ -1547,9 +1553,10 @@ a test passes its own; tests read their own, never the global).
   read at the watch's 2 s samples, so none recovers in under 2 s, and
   `cap_held` is an episode ended by the egress cap holding this side's sends
   (the watch cannot tell then whether the peer is dark). The
-  dark-path rule closes only a path that carries data (QuicPath::enable_data);
-  on every other path (shadow paths, and pairs outside the ramp's share) it
-  only counts, so the field shows how long real dark spells last. A spell is read
+  dark-path rule closes only a path that carries data (QuicPath::enable_data)
+  and has no UDP session (a native path, recycle::DARK_CLOSES_WITH_UDP);
+  on every other path (shadow paths, pairs outside the ramp's share, and data
+  paths with a UDP session) it only counts, so the field shows how long real dark spells last. A spell is read
   up to when the peer is next heard from, which waits for quinn's backed-off
   probes after the outage ends, so it reads longer than the outage (in
   a_path_without_data_is_not_closed_by_a_dark_spell a 30 s outage read about
@@ -2683,10 +2690,21 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     sooner: a send that times out with nothing acknowledged for 10 s makes
     the path suspect (route::StallCount), and new data then goes on UDP at
     once, about 10-15 s after the silence began
-    (a_dark_path_takes_no_new_data_long_before_the_watch_closes_it). So a
+    (a_dark_path_takes_no_new_data_and_the_watch_does_not_close_it). So a
     dead path costs new traffic seconds; the close only frees the path.
-    Closes only a path that carries data (QuicPath::enable_data); every
-    other path only counts its dark episodes (quic_dark_episode_*, above).
+    Closes only a path that carries data (QuicPath::enable_data) and has no
+    UDP session (a native path); every other path only counts its dark
+    episodes (quic_dark_episode_*, above). On a data path with a UDP session
+    (recycle::DARK_CLOSES_WITH_UDP false, since 0.2.159) it counts the close
+    it would make (quic_stall_would_close_dark, once per episode) and quinn's
+    idle timeout (120 s, recycle::UDP_PATH_DARK_END_MAX) ends a path that
+    stays dark, as fallback `idle`. Why: on 0.2.158's shadow paths about a
+    quarter of the dark episodes lasting past the rule's close (30-75 s)
+    recovered within 120 s, and the close dropped the one-packet Shorts still
+    waiting for their acknowledgement (MaybeDelivered is never resent), which
+    a path that recovers delivers
+    (a_data_path_with_udp_survives_outages_past_the_dark_close,
+    a_data_path_with_udp_that_stays_dark_ends_at_the_idle_timeout).
     A sample more than two ticks after the previous one counts as one tick
     for every rule of the watch (its own clock skips the rest), so a stall
     of this side's runtime or a suspended host, which stops quinn's driver
@@ -2843,10 +2861,10 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     a stream's slot while waiting for their consumer, which delays the
     peer's credit, not its acknowledgements. A one-packet Short's end is
     in its one packet, acknowledged on arrival in every version, so its
-    120 s bound does not fire on an honest peer: through an outage the
-    dark rule tolerates (at most DARK_CLOSE_MAX, 75 s) plus a keepalive
-    (15 s), it is acknowledged with 15 s to spare (asserted at compile
-    time; one_packet_shorts_through_a_tolerated_outage_do_not_expire covers
+    150 s bound does not fire on an honest peer: through an outage up to
+    quinn's idle timeout (UDP_PATH_DARK_END_MAX, 120 s, the longest a path
+    with a UDP session stays dark) plus a keepalive (15 s), it is
+    acknowledged with 15 s to spare (asserted at compile time; one_packet_shorts_through_a_tolerated_outage_do_not_expire covers
     virtual time, which has no keepalive). A peer that keeps this node
     congestion-limited at every acknowledgement, by pulling data and
     acknowledging it under the floor, looks like a slow path and is not
@@ -3034,9 +3052,9 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   within 15 s on a live path), the path takes data again (suspect_left). Without
   it every short into a dark path ends MaybeDelivered(TimedOut), is never resent
   and is lost, and an operation's retry lands in the same place until quinn's
-  idle timeout. A path that stays dark is closed by the acknowledgement
-  watch's dark rule (recycle::dark_close_bound, about 67-74 s), not on the
-  stall close: once suspect no new send
+  idle timeout. A path that stays dark is ended by quinn's idle timeout
+  (120 s; a native path by the acknowledgement watch's dark rule,
+  recycle::dark_close_bound, about 67-74 s), not by the stall close: once suspect no new send
   reaches it, so the stall close fires only when STALLED_SENDS_LIMIT sends were
   already on it. New data goes on UDP meanwhile, so nothing is lost. Entering
   and leaving are under one lock. Fallback is a testing-period crutch: this
