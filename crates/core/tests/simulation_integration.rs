@@ -21802,12 +21802,12 @@ fn test_quic_data_ramp_turns_on_every_pair_within_a_day() {
 
 /// The path goes dark in the middle of a transfer: after 384 KiB of QUIC
 /// datagrams have moved between the node and the gateway, every later one is
-/// lost, while their UDP session carries on. Each end's acknowledgement watch
-/// closes the dark path within its window (`recycle::AckWatch`: packets
-/// outstanding, nothing acknowledged and nothing heard), well before the
-/// idle timeout and before its sends' timeouts make it suspect; the path
-/// falls back with the UDP session up, the pair is offered a path again, and
-/// the gateway ends with the whole state.
+/// lost, while their UDP session carries on. The path has a UDP session, so
+/// neither end's acknowledgement watch (`recycle::DARK_CLOSES_WITH_UDP`) nor
+/// its stall count closes it while it is dark; each end's sends go suspect,
+/// so new data goes on UDP, and quinn's idle timeout ends the path. It falls
+/// back with the UDP session up, the pair is offered a path again, and the
+/// gateway ends with the whole state.
 #[test_log::test]
 fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
@@ -21900,9 +21900,9 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
         assert!(run.whats(*address, "DataEnabled") >= 1, "{}", run.dump());
     }
     let records = run.trace.records();
-    // Each end fell back once, on the close its own watch sent (the machine
-    // reads the connection loss that close causes as `Reset`), and sent no
-    // other close on the path.
+    // Each end fell back once, on the idle timeout, and sent no close of its
+    // own on the path (before 0.2.159 the watch's dark rule closed it, which
+    // the machine read as `Reset`).
     for address in &run.nodes {
         let of_node = |what: &str| {
             records
@@ -21914,22 +21914,20 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
             .iter()
             .map(|r| r.what.as_str())
             .collect();
-        let closed_by_watch = of_node("path stall-closed: ").iter().any(|r| {
-            r.what == "path stall-closed: 0, first closed by this node with: Some(PeerNotAcknowledging)"
-        });
+        let closed_by_none = of_node("path stall-closed: ")
+            .iter()
+            .any(|r| r.what == "path stall-closed: 0, first closed by this node with: None");
+        let went_suspect = !of_node("path was suspect: entered 1").is_empty();
         assert!(
-            causes == ["Fallback(Reset)"] && closed_by_watch,
-            "{address} fell back once, on its own watch's close of the dark path: {}",
+            causes == ["Fallback(Idle)"] && closed_by_none && went_suspect,
+            "{address} fell back once, on the idle timeout of the dark path, \
+             suspect before it: {}",
             run.dump()
         );
-        // Not before the window (10 s): an earlier fallback is a close by
-        // something else. In place of the suspect routing this test asserted before the
-        // watch: the watch closes first (neither end goes suspect here), so
-        // what bounds the data lost to the dark path is how soon the end falls
-        // back after the last data the path delivered to it: at most the dark
-        // rule's bound at this round trip (`recycle::dark_close_bound`, about
-        // 67 s: two probe rounds after the window must go unanswered) plus the
-        // time the close takes to reach the machine.
+        // The idle timeout (60 s here) runs from the last packet received, no
+        // earlier than the last data, so the fallback comes at least that long
+        // after it; at most that plus the time the end takes to reach the
+        // machine. New data left the path when it went suspect.
         let last_on_path = of_node("received a short on the path")
             .iter()
             .chain(of_node("received a stream on the path").iter())
@@ -21939,7 +21937,7 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
         let fell_back_at = of_node("Fallback(")[0].at;
         let dark_for = fell_back_at.saturating_sub(last_on_path);
         assert!(
-            dark_for >= std::time::Duration::from_secs(10)
+            dark_for >= std::time::Duration::from_secs(60)
                 && dark_for <= std::time::Duration::from_secs(75),
             "{address} fell back {dark_for:?} after the path last delivered to it: {}",
             run.dump()
