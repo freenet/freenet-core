@@ -1089,6 +1089,15 @@ enum CollectionEnd {
 /// How long a CONNECT that has stopped collecting keeps finishing the dials
 /// of acceptors it already took: ten hole-punch deadlines, room for the
 /// queued acceptors of a peer that dials one at a time.
+///
+/// Sized for UDP dials (3 s each). A failed native dial holds its slot until
+/// its UDP fallback ends, up to `NATIVE_FALLBACK_AFTER` plus one punch (15 s),
+/// so a drain that starts behind one leaves room for about five more UDP
+/// dials. Queued native acceptors whose setup is over are dialled over UDP
+/// directly (`plan_acceptor_dial`), so a native failure costs that time once
+/// per acceptor dialled native, not once per queued acceptor. Acceptors still
+/// queued at the limit are not dialled, as for UDP today. Revisit with the
+/// A5c soak's numbers before native is enabled.
 pub(crate) const DIAL_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(
     10 * crate::transport::connection_handler::NAT_TRAVERSAL_DEADLINE.as_secs(),
 );
@@ -3846,7 +3855,7 @@ mod driver_timing_tests {
             }
         });
         let mut connected = 0;
-        tokio::time::timeout(
+        let ended = tokio::time::timeout(
             Duration::from_secs(40),
             super::drive_client_connect(
                 tx,
@@ -3862,9 +3871,11 @@ mod driver_timing_tests {
                 &mut connected,
             ),
         )
-        .await
-        .expect("bounded")
-        .expect("driver result");
+        .await;
+        // The outcome first: with the old timing the CONNECT never reaches its
+        // target and runs until this timeout.
+        assert_eq!(connected, 1, "the pair connects over UDP");
+        ended.expect("bounded").expect("driver result");
 
         let transports = |log: &TransportLog| -> Vec<(DialTransport, Duration)> {
             log.lock().iter().map(|(_, t, at)| (*t, *at)).collect()
@@ -3886,7 +3897,6 @@ mod driver_timing_tests {
             ],
             "the joiner punches at the fallback time after the response"
         );
-        assert_eq!(connected, 1, "the pair connects over UDP");
     }
 
     /// A peer that already has a connection (#5858 leaves it unchanged):

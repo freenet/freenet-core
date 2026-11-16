@@ -1578,6 +1578,9 @@ pub(super) async fn dispatch_expect_connection_from(
         })
         .await?;
     let op_manager = op_manager.clone();
+    // Not registered with the task monitor, like the UDP branch's task above:
+    // it ends within `NATIVE_FALLBACK_AFTER` plus one dial, and an event loop
+    // that has gone fails its sends.
     GlobalExecutor::spawn(async move {
         // Demotion is recorded where the setup's end is known (the
         // connection lifecycle); this task only falls back.
@@ -1598,6 +1601,14 @@ pub(super) async fn dispatch_expect_connection_from(
                 );
                 tokio::time::sleep_until(decided_at + crate::transport::NATIVE_FALLBACK_AFTER)
                     .await;
+                // A node shutting down meanwhile starts no new dial.
+                if op_manager
+                    .shutting_down_handle()
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    tracing::debug!(%peer, tx = %tx, "connect: shutting down; no UDP fallback");
+                    return;
+                }
                 match acceptor_udp_dial(&op_manager, tx, &peer, addr).await {
                     Ok(mut rx) => log_acceptor_dial(&peer, tx, rx.recv().await),
                     Err(error) => tracing::warn!(

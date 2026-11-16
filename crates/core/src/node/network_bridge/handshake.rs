@@ -49,6 +49,9 @@ pub(crate) enum Event {
         /// The transport dialled: a native connection's key was proven in its
         /// handshake.
         transport: crate::operations::connect::native::DialTransport,
+        /// Who asked for the dial. Only a joiner's native successes reset
+        /// its demotion streak, as only its failures count toward it.
+        origin: crate::transport::NatAttemptOrigin,
     },
     /// An outbound connection attempt failed.
     OutboundFailed {
@@ -88,6 +91,7 @@ impl std::fmt::Debug for Event {
                 connection,
                 transient,
                 transport,
+                origin,
             } => f
                 .debug_struct("OutboundEstablished")
                 .field("transaction", transaction)
@@ -95,6 +99,7 @@ impl std::fmt::Debug for Event {
                 .field("remote_addr", &connection.remote_addr())
                 .field("transient", transient)
                 .field("transport", transport)
+                .field("origin", origin)
                 .finish(),
             Event::OutboundFailed {
                 transaction,
@@ -604,6 +609,7 @@ async fn connect_outbound(
             connection,
             transient,
             transport,
+            origin,
         },
         Err(error) => Event::OutboundFailed {
             transaction,
@@ -956,6 +962,7 @@ mod tests {
             connection,
             transient,
             transport: _,
+            origin,
         } = run.event
         else {
             panic!("expected OutboundEstablished, got {:?}", run.event);
@@ -965,6 +972,7 @@ mod tests {
         assert_eq!(connection.remote_addr(), run.peer.socket_addr().unwrap());
         assert!(transient);
         assert!(run.ready, "a successful connect marks the peer ready");
+        assert_eq!(origin, RUN_ORIGIN, "the event carries the dial's origin");
         assert_eq!(
             run.origins,
             vec![RUN_ORIGIN],

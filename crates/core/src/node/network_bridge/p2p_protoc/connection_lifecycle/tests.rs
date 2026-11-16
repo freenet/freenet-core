@@ -1132,6 +1132,7 @@ async fn matched_inbound_at_the_cap_is_refused_like_a_dial() {
                 connection,
                 transient: false,
                 transport: crate::operations::connect::native::DialTransport::Udp,
+                origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
             }
         })
         .await;
@@ -1628,6 +1629,7 @@ async fn successful_dial_drops_the_expectation_for_its_address() {
         connection: Box::new(IdleConnection::new(addr)),
         transient: false,
         transport: crate::operations::connect::native::DialTransport::Udp,
+        origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
     })
     .await;
     let mut dropped = false;
@@ -3631,6 +3633,7 @@ async fn a_native_connection_binds_its_proven_key() {
         connection: Box::new(IdleConnection::new(addr)),
         transient: false,
         transport: DialTransport::NATIVE,
+        origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
     })
     .await;
     assert!(
@@ -3717,6 +3720,63 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
     }
 }
 
+/// Review round 2: demotion is attributed by the same rule for successes as
+/// for failures. A native success as acceptor does not reset the joiner
+/// streak (its failures never count), so two joiner timeouts, an acceptor
+/// success and a third joiner timeout demote the node; a success as joiner
+/// in the same place resets the streak and the node is not demoted.
+#[tokio::test]
+async fn only_a_joiners_native_success_resets_its_demotion_streak() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::{NatAttemptOrigin, NativeSetupOutcome};
+    for (case, success_origin, demotions) in [
+        (0u16, NatAttemptOrigin::ConnectAcceptor, 1),
+        (1, NatAttemptOrigin::ConnectJoiner, 0),
+    ] {
+        let mut h = Harness::new(&format!("native-success-origin-{case}")).await;
+        let addr = |i: u16| -> SocketAddr {
+            format!("203.0.113.233:{}", 6240 + case * 10 + i)
+                .parse()
+                .unwrap()
+        };
+        let fail = |i: u16| HandshakeEvent::OutboundFailed {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: PeerKeyLocation::new(key(), addr(i)),
+            error: ConnectionError::FailedConnectOp,
+            transient: false,
+            transport: DialTransport::NATIVE,
+            native_outcome: Some(NativeSetupOutcome::TimedOut),
+            origin: NatAttemptOrigin::ConnectJoiner,
+        };
+        h.handshake_event(fail(0)).await;
+        h.handshake_event(fail(1)).await;
+        let winner = PeerKeyLocation::new(key(), addr(2));
+        let _result =
+            pending_connect_peer_over(&mut h, winner.clone(), DialTransport::NATIVE).await;
+        h.handshake_event(HandshakeEvent::OutboundEstablished {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: winner,
+            connection: Box::new(IdleConnection::new(addr(2))),
+            transient: false,
+            transport: DialTransport::NATIVE,
+            origin: success_origin,
+        })
+        .await;
+        h.handshake_event(fail(3)).await;
+        assert_eq!(
+            h.mgr
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .native_connect()
+                .demotions(),
+            demotions,
+            "a native success as {success_origin:?}"
+        );
+    }
+}
+
 /// The server of a native setup waits longer than its client, so the pair
 /// can connect by the client's UDP fallback before the server's setup ends.
 /// That late failure must leave the connection alone: it stays in the
@@ -3735,6 +3795,7 @@ async fn a_late_native_failure_keeps_the_connection_made_meanwhile() {
         connection: Box::new(IdleConnection::new(addr)),
         transient: false,
         transport: DialTransport::Udp,
+        origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
     })
     .await;
     assert!(matches!(result.try_recv(), Ok(Ok(_))), "premise: connected");

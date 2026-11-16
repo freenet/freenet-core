@@ -1233,6 +1233,7 @@ impl P2pConnManager {
                 connection,
                 transient,
                 transport,
+                origin,
             } => {
                 // Outbound peers must have known addresses - use type-safe conversion
                 // If conversion fails, log error but continue since connection is established
@@ -1286,12 +1287,16 @@ impl P2pConnManager {
                         IdentitySource::Dialled
                     }
                     crate::operations::connect::native::DialTransport::Native { .. } => {
-                        self.bridge
-                            .op_manager
-                            .ring
-                            .connection_manager
-                            .native_connect()
-                            .record_success();
+                        // Only a joiner's success resets the demotion streak,
+                        // as only a joiner's failures count toward it.
+                        if origin == crate::transport::NatAttemptOrigin::ConnectJoiner {
+                            self.bridge
+                                .op_manager
+                                .ring
+                                .connection_manager
+                                .native_connect()
+                                .record_success();
+                        }
                         if self.bridge.op_manager.ring.connection_manager.is_gateway() {
                             crate::transport::join_versions::record_gateway_join(
                                 self.bridge
@@ -1337,11 +1342,17 @@ impl P2pConnManager {
                 origin,
             } => {
                 // Demotion counts only an end that says native does not work
-                // on the path (`counts_toward_demotion`), and only as joiner:
-                // the acceptors a joiner dials are the ones its CONNECT was
-                // routed to, while an acceptor's joiner chose it, so a joiner
-                // that decided to fail (any number of free keys) could
-                // otherwise demote an honest acceptor. The connect op then
+                // on the path (`counts_toward_demotion`), and only as joiner
+                // (a success resets the streak only as joiner too). A joiner's
+                // acceptors come from responses routed back along its CONNECT,
+                // while an acceptor's joiner chose it, so a joiner that
+                // decided to fail (any number of free keys) could otherwise
+                // demote an honest acceptor. This narrows who can demote a
+                // joiner, not to no one: the acceptor in a response is named
+                // by whoever sent it, so a relay on the CONNECT's path can name
+                // acceptors that never serve. The effect is a downgrade to
+                // UDP. An acceptor's own failures never demote it, which is a
+                // gap to close before native is enabled. The connect op then
                 // falls back to UDP.
                 if origin == crate::transport::NatAttemptOrigin::ConnectJoiner
                     && native_outcome.is_some_and(|o| o.counts_toward_demotion())
