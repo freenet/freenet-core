@@ -333,7 +333,7 @@ pub(crate) struct QuicPathLimits {
     #[cfg(test)]
     pub(crate) staging_cap: Option<usize>,
     /// The bound on a one-packet Short's background ack wait, in place of
-    /// [`SHORT_ACK_WAIT`], for a test that cannot wait two minutes.
+    /// [`SHORT_ACK_WAIT`], for a test that cannot wait 150 s.
     #[cfg(test)]
     pub(crate) short_ack_wait: Option<Duration>,
     /// While the flag is set, the receive side cancels the handle of the
@@ -802,8 +802,9 @@ pub(crate) struct QuicPath {
     short_ack_wait: Duration,
     /// The path's clock, for judging expired ack waits ([`StrikeCheck`]).
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-    /// Set once the path may send data: only then does the acknowledgement
-    /// watch's dark-path rule close it (`recycle::AckWatch::observing`).
+    /// Set once the path may send data: only then may the acknowledgement
+    /// watch's dark-path rule close it, and only a path with no UDP session
+    /// (`recycle::AckWatch::observing`, `recycle::DARK_CLOSES_WITH_UDP`).
     carries_data: Arc<std::sync::atomic::AtomicBool>,
     /// Control frames taking their stream ([`Self::control_first`]); a data
     /// send opens no stream while any is.
@@ -826,6 +827,9 @@ pub(crate) struct QuicPath {
     udp_fallback: bool,
     /// Send timeouts while nothing is acknowledged ([`route::StallCount`]).
     stall: parking_lot::Mutex<route::StallCount>,
+    /// Set while the acknowledgement watch sees a dark episode
+    /// (`recycle::WatchShared::dark`), read by the stall close.
+    dark: Arc<std::sync::atomic::AtomicBool>,
     /// The [`bounded::QuietProof`] sends that ran out of gap left, read (not
     /// taken) by every settle; a proof of the same counts is merged into it.
     quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>>,
@@ -1099,6 +1103,7 @@ impl QuicPath {
         }
         let ack_waits = Arc::new(AckWaits::new(stats.clone()));
         let carries_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dark = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             connection.closer(),
@@ -1112,6 +1117,8 @@ impl QuicPath {
                     rtt: receiver_rtt,
                     heard: heard.clone(),
                     carries_data: carries_data.clone(),
+                    udp_fallback: limits.udp_fallback,
+                    dark: dark.clone(),
                 },
                 report,
             },
@@ -1139,6 +1146,7 @@ impl QuicPath {
                 ended_as_data_path,
                 udp_fallback: limits.udp_fallback,
                 stall: parking_lot::Mutex::new(stall),
+                dark,
                 quiet: Arc::default(),
                 last_acked: Arc::new(bounded::AckRecord::new(
                     ack_progress.as_ref().map_or(0, recycle::AckProgress::acked),
@@ -1175,6 +1183,11 @@ impl QuicPath {
         &self,
     ) -> Option<crate::transport::boundary::QuicPathEnd> {
         self.connection.closer().closed_for()
+    }
+
+    /// A handle on [`Self::closed_for`] that outlives the path.
+    pub(in crate::transport) fn close_record(&self) -> crate::transport::quic::CloseRecord {
+        self.connection.closer().close_record()
     }
 
     /// Pace this path's data sends with `pacer` (`pacer` module): the
@@ -1434,13 +1447,21 @@ impl QuicPath {
         self.connection.close(code);
     }
 
-    /// [`Self::close`], recording `cause` as why this node closed.
+    /// [`Self::close`], recording `cause` as why this node closed. Whether this
+    /// call closed the connection (not if it was closed or closing already).
     pub(in crate::transport) fn close_for(
         &self,
         code: QuicCloseCode,
         cause: crate::transport::boundary::QuicPathEnd,
-    ) {
-        self.connection.closer().close_for(code, cause);
+    ) -> bool {
+        self.connection.closer().close_for(code, cause)
+    }
+
+    /// Set the acknowledgement watch's dark flag (`recycle::WatchShared::dark`)
+    /// by hand. Tests only.
+    #[cfg(test)]
+    pub(crate) fn set_dark_for_test(&self, dark: bool) {
+        self.dark.store(dark, std::sync::atomic::Ordering::Release);
     }
 
     /// The quinn connection, to wait for its end.
@@ -1452,8 +1473,8 @@ impl QuicPath {
     /// separate, set by [`QuicPathLimits::accept_data`] when the path is built.
     pub(in crate::transport) fn enable_data(&self) {
         self.send_data.store(SEND_DATA_ON, Ordering::Release);
-        // From now on the dark-path rule closes the path
-        // (`recycle::AckWatch::observing`).
+        // From now on the dark-path rule closes the path if it has no UDP
+        // session (`recycle::AckWatch::observing`, `DARK_CLOSES_WITH_UDP`).
         self.carries_data.store(true, Ordering::Release);
     }
 
@@ -1568,8 +1589,9 @@ impl QuicPath {
     /// the first time this is asked after the connection acknowledged something
     /// new, which quinn's keepalive brings within its interval on a live path.
     ///
-    /// A path that stays dark is closed by the acknowledgement watch's dark
-    /// rule (`recycle::dark_close_bound`), not by the stall close: once it is suspect no new send
+    /// A path that stays dark is ended by quinn's idle timeout (a native path,
+    /// which is never suspect, by the acknowledgement watch's dark rule,
+    /// `recycle::dark_close_bound`), not by the stall close: once it is suspect no new send
     /// reaches it, so `route::STALLED_SENDS_LIMIT` timeouts in a row happen only
     /// if that many sends were already on it. Nothing is lost meanwhile, since
     /// new data goes on UDP.
@@ -2433,23 +2455,33 @@ fn nanos(duration: Duration) -> u64 {
 /// 5 s total, and the wait goes on in the background, holding the Short's
 /// send epoch. Far past any honest acknowledgement (the end is in the one
 /// packet, which the peer's QUIC stack acknowledges on arrival), and past the
-/// dark rule's close of a dark path. At the bound the stream is reset,
+/// end of a path that stays dark (the dark rule's close of a native path,
+/// quinn's idle timeout for one with a UDP session). At the bound the stream is reset,
 /// freeing the epoch, and counted toward `recycle::ACK_WAIT_EXPIRY_LIMIT`.
 ///
-/// Its margin: through an outage the dark rule tolerates (at most
-/// `recycle::DARK_CLOSE_MAX`), an honest Short waits for the peer to be
-/// heard again, which a live peer's keepalive (`config::KEEPALIVE_INTERVAL`,
-/// 15 s) brings at the latest, and is then retransmitted and acknowledged
-/// within a couple of round trips: about 91 s at an 800 ms round trip.
-/// Asserted below with 15 s to spare. Virtual time runs no keepalive, so a
-/// simulation relies on quinn's probe backoff instead
+/// Its margin: on a path with a UDP session the dark rule does not close
+/// (`recycle::DARK_CLOSES_WITH_UDP`), so an outage lasts until quinn's idle
+/// timeout at the most (`recycle::UDP_PATH_DARK_END_MAX`, 120 s). Through one
+/// that ends sooner, an honest Short waits for the peer to be heard again,
+/// which a live peer's keepalive (`config::KEEPALIVE_INTERVAL`, 15 s) brings
+/// at the latest, and is then retransmitted and acknowledged within a couple
+/// of round trips. Asserted below with 15 s to spare. Virtual time runs no
+/// keepalive, so a simulation relies on quinn's probe backoff instead
 /// (`one_packet_shorts_through_a_tolerated_outage_do_not_expire`).
-pub(crate) const SHORT_ACK_WAIT: Duration = Duration::from_secs(120);
+pub(crate) const SHORT_ACK_WAIT: Duration = Duration::from_secs(150);
+
+const _: () = assert!(
+    SHORT_ACK_WAIT.as_secs()
+        >= recycle::UDP_PATH_DARK_END_MAX.as_secs()
+            + super::config::KEEPALIVE_INTERVAL.as_secs()
+            + 15,
+    "SHORT_ACK_WAIT must outlast an outage up to the idle timeout plus a keepalive"
+);
 
 const _: () = assert!(
     SHORT_ACK_WAIT.as_secs()
         >= recycle::DARK_CLOSE_MAX.as_secs() + super::config::KEEPALIVE_INTERVAL.as_secs() + 15,
-    "SHORT_ACK_WAIT must outlast a tolerated outage plus a keepalive"
+    "SHORT_ACK_WAIT must outlast an outage the dark rule tolerates plus a keepalive"
 );
 
 type StoppedResult = Result<Option<quinn::VarInt>, quinn::StoppedError>;

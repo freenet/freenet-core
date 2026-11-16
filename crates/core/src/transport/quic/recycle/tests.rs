@@ -191,6 +191,20 @@ fn run_observed(
 fn run_observed_snapshot(
     ticks: u64,
     carries_data: bool,
+    at: impl FnMut(u64) -> Reading,
+) -> (
+    Option<(u64, Stall)>,
+    crate::transport::metrics::QuicDataSnapshot,
+) {
+    run_observed_snapshot_with(ticks, carries_data, false, at)
+}
+
+/// [`run_observed_snapshot`] on a path that has a UDP session to fall back to,
+/// or not (`AckWatch::with_udp_fallback`).
+fn run_observed_snapshot_with(
+    ticks: u64,
+    carries_data: bool,
+    udp_fallback: bool,
     mut at: impl FnMut(u64) -> Reading,
 ) -> (
     Option<(u64, Stall)>,
@@ -216,7 +230,9 @@ fn run_observed_snapshot(
         )
     };
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(carries_data));
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0))).observing(flag, counters);
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)))
+        .observing(flag, counters)
+        .with_udp_fallback(udp_fallback);
     let closed = (1..=ticks).find_map(|tick| {
         watch
             .observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(tick)))
@@ -245,7 +261,8 @@ fn a_dark_episode_on_a_data_path_is_also_counted_as_carried() {
 
 /// A dark spell of 30 s (sends from tick 1, the peer heard from again at tick
 /// 16) on a path that carries no data is not closed and is counted to its end:
-/// 30 s, in `recovered_lt_120s`. On a path that carries data the dark-path rule
+/// 30 s, in `recovered_lt_120s`. On a path that carries data (and, as a watch
+/// built without `with_udp_fallback` is, has no UDP session) the dark-path rule
 /// closes it at the window, counted `closed_at_window`.
 #[test]
 fn a_path_without_data_counts_a_dark_spell_to_its_end() {
@@ -256,6 +273,102 @@ fn a_path_without_data_counts_a_dark_spell_to_its_end() {
     let (closed, counts) = run_observed(40, true, spell);
     assert_eq!(closed, Some((dark_closes_at(1), Stall::Dark)));
     assert_eq!(counts, vec![0, 0, 0, 0, 0, 0, 0, 1]);
+}
+
+/// On a data path with a UDP session the dark rule does not close
+/// (`DARK_CLOSES_WITH_UDP`): a spell that stays dark for 150 s (past quinn's
+/// 120 s idle timeout, which ends such a path in production) is never closed,
+/// is counted once as a would-close, and runs to its end, `unrecovered`. The
+/// same spell on a path with no UDP session (a native path) still closes at
+/// the window.
+#[test]
+fn a_data_path_with_udp_is_not_closed_dark_and_counts_the_close_once() {
+    let dark = |t: u64| reading(5, 1200, 10 + t, 100);
+    let ticks = 150 / ACK_WATCH_TICK.as_secs();
+    let (closed, snap) = run_observed_snapshot_with(ticks, true, true, dark);
+    assert_eq!(
+        closed, None,
+        "a path with UDP is not closed by the dark rule"
+    );
+    assert_eq!(snap.stall_would_close[Stall::Dark.index()], 1);
+    assert_eq!(snap.stall_closes[Stall::Dark.index()], 0);
+    assert_eq!(snap.carried_dark_episodes, vec![0, 0, 0, 0, 0, 1, 0, 0]);
+    let (closed, snap) = run_observed_snapshot_with(ticks, true, false, dark);
+    assert_eq!(closed, Some((dark_closes_at(1), Stall::Dark)));
+    assert_eq!(snap.stall_would_close[Stall::Dark.index()], 0);
+}
+
+/// The watch publishes whether the dark rule would have closed the path in the
+/// episode in progress, for the stall close (`route`): on a path with a UDP
+/// session, set at the sample the rule would have closed at
+/// (`dark_closes_at`), kept while the episode lasts, cleared when the peer is
+/// heard again. A path whose peer keeps sending (a one-way break: only this
+/// side's packets are lost) never sets it, so the stall close stays available
+/// there.
+#[test]
+fn the_watch_publishes_that_the_dark_rule_would_have_closed() {
+    let record = Arc::default();
+    let sample = |r: Reading| {
+        AckSample::synthetic(
+            &record,
+            r.acked,
+            r.batches,
+            r.outstanding,
+            r.sent,
+            r.received,
+            NO_CAP,
+        )
+    };
+    let run = |at: &dyn Fn(u64) -> Reading, ticks: u64| {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)))
+            .with_udp_fallback(true)
+            .publishing_dark(flag.clone());
+        (1..=ticks)
+            .map(|tick| {
+                let closed = watch.observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(tick)));
+                assert!(!closed, "a path with UDP is not closed dark");
+                let published = flag.load(std::sync::atomic::Ordering::Acquire);
+                assert_eq!(published, watch.would_have_closed_dark());
+                published
+            })
+            .collect::<Vec<_>>()
+    };
+    // Sends at ticks 1-20, the peer heard again at tick 21.
+    let dark = |t: u64| reading(5, 1200, 10 + t.min(20), 100 + t.saturating_sub(20));
+    let seen = run(&dark, 23);
+    let expected: Vec<bool> = (1..=23u64)
+        .map(|t| t >= dark_closes_at(1) && t <= 20)
+        .collect();
+    assert_eq!(seen, expected);
+    // This side's sends go unanswered, the peer keeps sending.
+    let one_way = |t: u64| reading(5, 1200, 10 + t, 100 + t);
+    assert!(run(&one_way, 4).iter().all(|set| !set));
+}
+
+/// On a data path with a UDP session, an outage of 90 s (sends from tick 1,
+/// the peer heard again at tick 46), longer than the dark rule's close, is
+/// survived: counted once as a would-close and then as recovered in under
+/// 120 s. A second dark episode later counts its own would-close.
+#[test]
+fn a_data_path_with_udp_survives_a_long_outage_and_counts_each_episode() {
+    let spell = |t: u64| reading(5, 1200, 10 + t.min(45), 100 + t.saturating_sub(45));
+    let (closed, snap) = run_observed_snapshot_with(60, true, true, spell);
+    assert_eq!(closed, None);
+    assert_eq!(snap.stall_would_close[Stall::Dark.index()], 1);
+    assert_eq!(snap.carried_dark_episodes, vec![0, 0, 0, 1, 0, 0, 0, 0]);
+    // Two spells of 90 s, heard from between them.
+    let twice = |t: u64| {
+        if t <= 46 {
+            reading(5, 1200, 10 + t.min(45), 100 + t.saturating_sub(45))
+        } else {
+            let u = t - 46;
+            reading(5, 1200, 56 + u.min(45), 101 + u.saturating_sub(45))
+        }
+    };
+    let (closed, snap) = run_observed_snapshot_with(100, true, true, twice);
+    assert_eq!(closed, None);
+    assert_eq!(snap.stall_would_close[Stall::Dark.index()], 2);
 }
 
 /// Short spells land in the short buckets (4 s and 8 s, read at the ticks),
@@ -688,7 +801,14 @@ fn the_production_values_are_pinned() {
     assert_eq!(DARK_CLOSE_MAX, Duration::from_secs(75));
     assert!(dark_close_bound(Duration::from_millis(800)) <= DARK_CLOSE_MAX);
     assert_eq!(ACK_WAIT_EXPIRY_WINDOW, Duration::from_secs(30 * 60));
-    assert_eq!(super::super::path::SHORT_ACK_WAIT, Duration::from_secs(120));
+    assert_eq!(super::super::path::SHORT_ACK_WAIT, Duration::from_secs(150));
+    const { assert!(!DARK_CLOSES_WITH_UDP) };
+    assert_eq!(UDP_PATH_DARK_END_MAX, Duration::from_secs(120));
+    // The bound is quinn's idle timeout in production.
+    assert_eq!(
+        crate::simulation::TimeSource::connection_idle_timeout(&crate::simulation::RealTime::new()),
+        UDP_PATH_DARK_END_MAX
+    );
     assert_eq!(
         crate::transport::peer_connection::streaming::MIN_INBOUND_STREAM_RATE_BYTES_PER_SEC,
         32 * 1024

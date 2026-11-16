@@ -1239,6 +1239,27 @@ impl Drop for QuicConnection {
     }
 }
 
+/// Why this node closed a connection, if it said ([`QuicCloser::close_for`]),
+/// readable without holding the connection.
+#[derive(Clone, Default)]
+pub(crate) struct CloseRecord(Arc<std::sync::OnceLock<crate::transport::boundary::QuicPathEnd>>);
+
+impl CloseRecord {
+    /// A record of a close for `end`. Tests only.
+    #[cfg(test)]
+    pub(crate) fn of(end: crate::transport::boundary::QuicPathEnd) -> Self {
+        let record = Self::default();
+        let _first = record.0.set(end);
+        record
+    }
+
+    /// Why this node closed the connection, if it closed it with
+    /// [`QuicCloser::close_for`].
+    pub(crate) fn get(&self) -> Option<crate::transport::boundary::QuicPathEnd> {
+        self.0.get().copied()
+    }
+}
+
 /// Closes one QUIC connection at most once, from any number of clones.
 /// Every close the QUIC code sends goes through here.
 #[derive(Clone)]
@@ -1342,6 +1363,12 @@ impl QuicCloser {
     /// [`Self::close_for`].
     pub(crate) fn closed_for(&self) -> Option<crate::transport::boundary::QuicPathEnd> {
         self.closed_for.get().copied()
+    }
+
+    /// A handle on [`Self::closed_for`] that does not hold the connection,
+    /// for whoever must read why it was closed after letting it go.
+    pub(crate) fn close_record(&self) -> CloseRecord {
+        CloseRecord(Arc::clone(&self.closed_for))
     }
 
     /// Whether the connection is still open (quinn has no close reason).

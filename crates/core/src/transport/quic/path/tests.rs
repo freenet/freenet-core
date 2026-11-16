@@ -149,6 +149,21 @@ struct Windows {
     b: Option<Arc<super::super::budget::QuicBudget>>,
 }
 
+/// [`paths`] with `a`'s path a native connection's ([`QuicPathLimits::NATIVE`]):
+/// no UDP session, so its dark rule closes (`recycle::DARK_CLOSES_WITH_UDP`).
+async fn paths_native(network: &str) -> Paths {
+    paths_built(
+        network,
+        QuicPathLimits::DEFAULT,
+        QuicPathLimits::NATIVE,
+        None,
+        None,
+        Windows::default(),
+        true,
+    )
+    .await
+}
+
 /// [`paths`] with each side's path taking its windows from a buffer budget.
 async fn paths_metered(network: &str, windows: Windows) -> Paths {
     paths_built(
@@ -1407,7 +1422,7 @@ fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes() {
 /// A one-packet Short's acknowledgement is waited for in the background once
 /// its send has ended (here at its own 50 ms deadline, on a 200 ms round
 /// trip), holding its send epoch. The wait is bounded (here 10 ms in place of
-/// `SHORT_ACK_WAIT`, 120 s): past it the stream is reset and the epoch is
+/// `SHORT_ACK_WAIT`, 150 s): past it the stream is reset and the epoch is
 /// released. Nothing else was acknowledged meanwhile, so it is not a strike
 /// (`ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged` covers
 /// strikes). An honest peer acknowledges the Short's one packet on arrival,
@@ -1911,7 +1926,7 @@ fn ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes() {
 /// the dark rule tolerates (11 s on a fast path, 30 s at an 800 ms round
 /// trip), on virtual time, which runs no keepalive (as the simulations):
 /// after the outage quinn's probes bring the peer back and the Shorts are
-/// retransmitted and acknowledged within their 120 s background wait
+/// retransmitted and acknowledged within their 150 s background wait
 /// (`SHORT_ACK_WAIT`). None is reset and the path is not closed.
 #[test]
 fn one_packet_shorts_through_a_tolerated_outage_do_not_expire() {
@@ -4524,26 +4539,39 @@ impl Scripted {
     /// while no release sends data on QUIC: its watch counts dark spells and
     /// does not close on them.
     async fn connect_without_data(network: &str) -> Self {
-        Self::connect_built(network, None, false, None).await
+        Self::connect_built(network, None, QuicPathLimits::SHADOW, None).await
+    }
+
+    /// [`Self::connect`] with `a`'s path a native connection's
+    /// ([`QuicPathLimits::NATIVE`]): no UDP session to fall back to, so the
+    /// dark rule closes it (`recycle::DARK_CLOSES_WITH_UDP`).
+    async fn connect_native(network: &str) -> Self {
+        Self::connect_built(network, None, QuicPathLimits::NATIVE, None).await
+    }
+
+    /// [`Self::connect`] (a data path with a UDP session) with quinn's idle
+    /// timeout set to `idle` on both ends, as a node's is (120 s).
+    async fn connect_idle(network: &str, idle: Duration) -> Self {
+        Self::connect_built(network, None, QuicPathLimits::DEFAULT, Some(idle)).await
     }
 
     /// [`Self::connect_without_data`] with quinn's idle timeout set to
     /// `idle` on both ends, as a node's is (120 s), in place of virtual
     /// time's 24 h. Keepalives stay off: virtual time has none.
     async fn connect_without_data_idle(network: &str, idle: Duration) -> Self {
-        Self::connect_built(network, None, false, Some(idle)).await
+        Self::connect_built(network, None, QuicPathLimits::SHADOW, Some(idle)).await
     }
 
     /// [`Self::connect`] with a node-wide egress cap of `a_cap` bytes per
     /// second on `a`'s socket.
     async fn connect_capped(network: &str, a_cap: Option<u64>) -> Self {
-        Self::connect_built(network, a_cap, true, None).await
+        Self::connect_built(network, a_cap, QuicPathLimits::DEFAULT, None).await
     }
 
     async fn connect_built(
         network: &str,
         a_cap: Option<u64>,
-        data: bool,
+        a_limits: QuicPathLimits,
         idle_timeout: Option<Duration>,
     ) -> Self {
         use super::super::config::{self, QuicSettings};
@@ -4669,11 +4697,7 @@ impl Scripted {
         let counters = leaked_counters();
         let limits = QuicPathLimits {
             counters: Some(counters),
-            ..if data {
-                QuicPathLimits::DEFAULT
-            } else {
-                QuicPathLimits::SHADOW
-            }
+            ..a_limits
         };
         let (a, a_in) = QuicPath::with_limits(conn, time.clone(), limits);
         Self {
@@ -4814,7 +4838,8 @@ fn packets_left_outstanding_when_the_peer_stops_acknowledging_close_the_path() {
 
 /// #5940 step M6, guard 2 (review finding 2): an outage of 8 s in both
 /// directions in the middle of a transfer, then recovery (shorter than the
-/// window: a longer one is a dark path, closed by the dark-path rule). `b` sends all the
+/// window: a longer one is a dark path, which the dark-path rule closes on a
+/// native path and leaves to quinn's idle timeout on one with a UDP session). `b` sends all the
 /// time once it is back, but has nothing new to acknowledge, while `a`'s
 /// data waits for its backed-off probe timer; `b` acknowledges the probe
 /// when it comes. `b` is a conforming peer: `a` must not close.
@@ -4855,8 +4880,11 @@ fn recovery_from_an_outage_in_both_directions_does_not_close() {
     })
 }
 
-/// The dark-path rule on a real path: an outage in both directions in the
-/// middle of a transfer, with `a`'s data outstanding, closes the path within
+/// The dark-path rule on a real path with no UDP session (a native path; one
+/// with a UDP session is not closed dark, see
+/// `a_data_path_with_udp_survives_outages_past_the_dark_close`): an outage in
+/// both directions in the middle of a transfer, with `a`'s data outstanding,
+/// closes the path within
 /// `recycle::dark_close_bound` of the cut (the first probe after the window
 /// goes unanswered), as dark: nothing is acknowledged and
 /// nothing comes from `b`. The M6 rule cannot see it, since it needs the peer
@@ -4866,7 +4894,7 @@ fn a_path_dark_in_both_directions_is_closed_as_dark() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-ack-watch-dark";
-        let mut s = Scripted::connect(network).await;
+        let mut s = Scripted::connect_native(network).await;
         s.a_sends(IN_FLIGHT_AT_THE_CUT);
         s.wait(Duration::from_millis(100)).await;
         let _dark = DropFrom::new(network, &[s.a_addr, s.b_addr]);
@@ -4884,7 +4912,8 @@ fn a_path_dark_in_both_directions_is_closed_as_dark() {
     })
 }
 
-/// The dark-path rule against quinn's probe backoff, on a real path at an
+/// The dark-path rule against quinn's probe backoff, on a real native path
+/// (the rule closes only a path with no UDP session) at an
 /// 800 ms round trip whose peer only acknowledges (it sends nothing of its
 /// own, and virtual time runs no keepalive): `a` has data outstanding when
 /// both directions go dark. After an outage quinn sends again only at its
@@ -4935,7 +4964,7 @@ fn the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer() {
                     })),
                 );
             }
-            let mut s = Scripted::connect(network).await;
+            let mut s = Scripted::connect_native(network).await;
             clock.set(s.time.clone()).ok();
             s.a_sends(IN_FLIGHT_AT_THE_CUT);
             // About one round trip in: the transfer is still in flight.
@@ -4978,6 +5007,107 @@ fn the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer() {
     })
 }
 
+/// On a data path with a UDP session the dark rule does not close
+/// (`recycle::DARK_CLOSES_WITH_UDP`): outages in both directions of 60 s and
+/// 100 s in the middle of a transfer, each past the rule's close
+/// (`recycle::dark_close_bound`, about 67 s here at the latest, and as soon as
+/// about 35 s), are survived. No rule closes the path, the would-close is
+/// counted once, the transfer's data is acknowledged after the outage, and the
+/// episode is counted as recovered. On a native path the same 60 s outage is
+/// closed as dark.
+#[test]
+fn a_data_path_with_udp_survives_outages_past_the_dark_close() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (outage_secs, native) in [(60u64, false), (100, false), (60, true)] {
+            let network: &'static str =
+                Box::leak(format!("quic-path-dark-udp-{outage_secs}-{native}").into_boxed_str());
+            let mut s = if native {
+                Scripted::connect_native(network).await
+            } else {
+                Scripted::connect(network).await
+            };
+            // As in `a_path_dark_in_both_directions_is_closed_as_dark`; the
+            // would-close counted below shows data was outstanding.
+            s.a_sends(IN_FLIGHT_AT_THE_CUT);
+            s.wait(Duration::from_millis(100)).await;
+            let dark = DropFrom::new(network, &[s.a_addr, s.b_addr]);
+            let cut_at = s.time.now_nanos();
+            if native {
+                let waited = s.closed_after(cut_at).await;
+                assert!(waited < Duration::from_secs(outage_secs), "{waited:?}");
+                assert_eq!(recycle::stalls_to(s.b_addr), vec![recycle::Stall::Dark]);
+                continue;
+            }
+            s.wait(Duration::from_secs(outage_secs)).await;
+            drop(dark);
+            s.wait(Duration::from_secs(60)).await;
+            let case = format!("outage {outage_secs} s");
+            assert!(
+                s.a.connection().inner().close_reason().is_none(),
+                "{case}: {:?}",
+                s.a.connection().inner().close_reason()
+            );
+            assert!(recycle::stalls_to(s.b_addr).is_empty(), "{case}");
+            assert!(recycle_closes_to(s.b_addr).is_empty(), "{case}");
+            assert_eq!(
+                s.sample().outstanding_after_acks(),
+                0,
+                "{case}: the transfer was acknowledged after the outage"
+            );
+            let snap = s.counters.snapshot(false);
+            assert_eq!(
+                snap.stall_would_close[recycle::Stall::Dark.index()],
+                1,
+                "{case}"
+            );
+            let recovered: u64 = snap.carried_dark_episodes[..5].iter().sum();
+            assert_eq!(recovered, 1, "{case}: {:?}", snap.carried_dark_episodes);
+        }
+    })
+}
+
+/// A data path with a UDP session that stays dark is ended by quinn's idle
+/// timeout (120 s on a node, `recycle::UDP_PATH_DARK_END_MAX`), not by the
+/// dark rule: within the timeout and a tick of the cut, with no rule's close
+/// sent, the would-close counted once and the episode `unrecovered`.
+#[test]
+fn a_data_path_with_udp_that_stays_dark_ends_at_the_idle_timeout() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-dark-udp-idle";
+        let mut s = Scripted::connect_idle(network, recycle::UDP_PATH_DARK_END_MAX).await;
+        s.a_sends(IN_FLIGHT_AT_THE_CUT);
+        s.wait(Duration::from_millis(100)).await;
+        let _dark = DropFrom::new(network, &[s.a_addr, s.b_addr]);
+        let cut_at = s.time.now_nanos();
+        let waited = s.closed_after(cut_at).await;
+        assert!(
+            waited > recycle::DARK_CLOSE_MAX,
+            "past the dark rule's close: {waited:?}"
+        );
+        assert!(
+            waited <= recycle::UDP_PATH_DARK_END_MAX + recycle::ACK_WATCH_TICK,
+            "by the idle timeout: {waited:?}"
+        );
+        assert!(
+            matches!(
+                s.a.connection().inner().close_reason(),
+                Some(quinn::ConnectionError::TimedOut)
+            ),
+            "{:?}",
+            s.a.connection().inner().close_reason()
+        );
+        assert!(recycle::stalls_to(s.b_addr).is_empty());
+        assert!(recycle_closes_to(s.b_addr).is_empty());
+        // The watch reports when the path's task ends.
+        s.wait(Duration::from_secs(5)).await;
+        let snap = s.counters.snapshot(false);
+        assert_eq!(snap.stall_would_close[recycle::Stall::Dark.index()], 1);
+        assert_eq!(snap.carried_dark_episodes, vec![0, 0, 0, 0, 0, 1, 0, 0]);
+    })
+}
+
 /// A node's streamed send takes its write gap from the path, as its receiver
 /// does (#6186): 5 s on a fast path, and on a 1 s round trip the 24 round
 /// trips the receiver waits between pieces, never a flat 5 s.
@@ -5013,7 +5143,8 @@ fn a_streamed_sends_gap_follows_its_paths_round_trip() {
     })
 }
 
-/// The dark-path rule closes only a path that carries data. On one that
+/// The dark-path rule closes only a path that carries data (and has no UDP
+/// session, `recycle::DARK_CLOSES_WITH_UDP`). On one that
 /// does not (every path while no release sends data on QUIC), a dark spell
 /// in both directions, with a control frame sent into it, does not close
 /// the path, and the spell is counted when it ends. Its length is read up
@@ -10901,7 +11032,8 @@ fn a_waiting_one_packet_short_is_not_charged() {
     })
 }
 
-/// The interplay the `watch_closes` tests leave out, with the watch on: a send
+/// The interplay the `watch_closes` tests leave out, with the watch on, on a
+/// native path (where the dark rule closes): a send
 /// on a path whose peer is dark from the start (`b`'s packets stop reaching
 /// `a`: nothing is acknowledged and no credit returns) times out at its own
 /// gap. That comes inside the progress window of the setup's acknowledgements,
@@ -10913,7 +11045,7 @@ fn a_dark_path_is_closed_by_the_watch_not_by_its_send_timeouts() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-dark-watch-after";
-        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        let p = paths_native(network).await;
         let _dark = DropFrom::new(network, &[p.pair.b_addr]);
         let cut_at = p.time().now();
         let (a, time) = (p.a.clone(), p.time());
@@ -10957,7 +11089,8 @@ fn a_dark_path_is_closed_by_the_watch_not_by_its_send_timeouts() {
     })
 }
 
-/// The interplay for the receive side, with the watch on: `a`'s datagrams stop
+/// The interplay for the receive side, with the watch on, on a native path
+/// (where the dark rule closes): `a`'s datagrams stop
 /// reaching `b` mid-stream. That is an outage, not withheld credit: `a`'s
 /// blocked frame went out after the last batch of acknowledgements, so the
 /// silence is not "settled" waiting and the credit rule does not count it.
@@ -10969,7 +11102,7 @@ fn a_path_dark_mid_stream_is_closed_as_dark() {
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let network = "quic-path-dark-before-idle";
-        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        let p = paths_native(network).await;
         let settle = p.time();
         p.drive(async move { settle.sleep(Duration::from_millis(200)).await })
             .await;
