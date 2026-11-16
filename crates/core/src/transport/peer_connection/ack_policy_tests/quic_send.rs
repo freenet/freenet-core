@@ -996,43 +996,67 @@ fn permits_held_with_nothing_acknowledged_do_not_close_a_path_with_udp() {
 }
 
 /// Eight streams that open and then stop moving, with nothing acknowledged past the
-/// window, close the path.
+/// window, close a path that has no UDP session (a native path's). On a path with
+/// one, the acknowledgement watch sees the peer as dark (nothing heard from it),
+/// so the stall count leaves the close to quinn's idle timeout, as the dark rule
+/// does (`recycle::DARK_CLOSES_WITH_UDP`): the path is suspect, so new data goes
+/// on UDP, and it is not closed.
 #[test]
-fn eight_streams_that_stall_after_opening_close_the_path() {
-    run_with(
-        "quic-send-stall-close",
-        // The stall count's close, which the acknowledgement watch would
-        // otherwise preempt on this dark path (`recycle::AckWatch`).
-        QuicPathLimits {
-            watch_closes: false,
-            ..QuicPathLimits::DEFAULT
-        },
-        QuicPathLimits::DEFAULT,
-        |mut rig| async move {
-            let silenced = DropFrom::new("quic-send-stall-close", &[rig.path.peer_addr()]);
-            rig.path.settle(Duration::from_secs(6)).await;
-            for _ in 0..STALLED_SENDS_LIMIT {
-                rig.e
-                    .conn
-                    .outbound_stream_with_id(
-                        StreamId::next(),
-                        bytes_of(4 * 1024 * 1024),
-                        None,
-                        None,
-                        None,
-                    )
-                    .await;
-            }
-            rig.path.settle(Duration::from_secs(10)).await;
-            drop(silenced);
-            assert_eq!(
-                rig.stats().send_count(SendKind::Stream, R::Dropped),
-                u64::from(STALLED_SENDS_LIMIT)
-            );
-            assert_eq!(rig.stats().send_event_count(E::StalledClosed), 1);
-            assert!(rig.route.path().quinn_connection().close_reason().is_some());
-        },
-    );
+fn eight_streams_that_stall_after_opening_close_only_a_path_without_udp() {
+    for (network, udp_fallback) in [
+        ("quic-send-stall-close", false),
+        ("quic-send-stall-close-udp", true),
+    ] {
+        run_with(
+            network,
+            // The stall count's close, which the acknowledgement watch would
+            // otherwise preempt on this dark path (`recycle::AckWatch`). The
+            // watch still runs and publishes that the path is dark.
+            QuicPathLimits {
+                watch_closes: false,
+                udp_fallback,
+                ..QuicPathLimits::DEFAULT
+            },
+            QuicPathLimits::DEFAULT,
+            move |mut rig| async move {
+                let silenced = DropFrom::new(network, &[rig.path.peer_addr()]);
+                rig.path.settle(Duration::from_secs(6)).await;
+                for _ in 0..STALLED_SENDS_LIMIT {
+                    rig.e
+                        .conn
+                        .outbound_stream_with_id(
+                            StreamId::next(),
+                            bytes_of(4 * 1024 * 1024),
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                }
+                rig.path.settle(Duration::from_secs(10)).await;
+                drop(silenced);
+                assert_eq!(
+                    rig.stats().send_count(SendKind::Stream, R::Dropped),
+                    u64::from(STALLED_SENDS_LIMIT),
+                    "{network}"
+                );
+                let closed = !udp_fallback;
+                assert_eq!(
+                    rig.stats().send_event_count(E::StalledClosed),
+                    u64::from(closed),
+                    "{network}"
+                );
+                assert_eq!(
+                    rig.route.path().quinn_connection().close_reason().is_some(),
+                    closed,
+                    "{network}"
+                );
+                if udp_fallback {
+                    assert!(rig.route.path().is_suspect(), "{network}");
+                }
+            },
+        );
+    }
 }
 
 /// Every kind of message arrives once when its acknowledgement is lost and the

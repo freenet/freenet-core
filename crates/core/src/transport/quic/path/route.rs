@@ -474,7 +474,23 @@ impl QuicPath {
         if let (true, Some(acked), true) = (verdict.quiet_timeout, acked, self.udp_fallback) {
             self.become_suspect(acked);
         }
-        if verdict.close {
+        // A path the acknowledgement watch sees as dark (this side's packets
+        // outstanding, nothing acknowledged and nothing heard from the peer)
+        // is the dark rule's: on a path with a UDP session new sends already
+        // go there (suspect, above), and the close is left to quinn's idle
+        // timeout, as the dark rule leaves it (`recycle::DARK_CLOSES_WITH_UDP`).
+        // A native path still closes.
+        if verdict.close
+            && self.udp_fallback
+            && !recycle::DARK_CLOSES_WITH_UDP
+            && self.dark.load(std::sync::atomic::Ordering::Acquire)
+        {
+            tracing::debug!(
+                in_a_row = STALLED_SENDS_LIMIT,
+                "QUIC path: sends keep timing out and the peer is silent; the path is \
+                 left to the idle timeout, and new data goes on UDP"
+            );
+        } else if verdict.close {
             self.stats.record_send_event(QuicSendEvent::StalledClosed);
             if self.udp_fallback {
                 tracing::warn!(

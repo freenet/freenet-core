@@ -826,6 +826,9 @@ pub(crate) struct QuicPath {
     udp_fallback: bool,
     /// Send timeouts while nothing is acknowledged ([`route::StallCount`]).
     stall: parking_lot::Mutex<route::StallCount>,
+    /// Set while the acknowledgement watch sees a dark episode
+    /// (`recycle::WatchShared::dark`), read by the stall close.
+    dark: Arc<std::sync::atomic::AtomicBool>,
     /// The [`bounded::QuietProof`] sends that ran out of gap left, read (not
     /// taken) by every settle; a proof of the same counts is merged into it.
     quiet: Arc<parking_lot::Mutex<Option<bounded::QuietProof>>>,
@@ -1099,6 +1102,7 @@ impl QuicPath {
         }
         let ack_waits = Arc::new(AckWaits::new(stats.clone()));
         let carries_data = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dark = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let receive = GlobalExecutor::spawn(supervise_receive(
             connection.inner().clone(),
             connection.closer(),
@@ -1113,6 +1117,7 @@ impl QuicPath {
                     heard: heard.clone(),
                     carries_data: carries_data.clone(),
                     udp_fallback: limits.udp_fallback,
+                    dark: dark.clone(),
                 },
                 report,
             },
@@ -1140,6 +1145,7 @@ impl QuicPath {
                 ended_as_data_path,
                 udp_fallback: limits.udp_fallback,
                 stall: parking_lot::Mutex::new(stall),
+                dark,
                 quiet: Arc::default(),
                 last_acked: Arc::new(bounded::AckRecord::new(
                     ack_progress.as_ref().map_or(0, recycle::AckProgress::acked),

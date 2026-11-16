@@ -1196,6 +1196,8 @@ pub(crate) struct AckWatch {
     udp_fallback: bool,
     /// The dark episode in progress was already counted as a would-close.
     dark_would_closed: bool,
+    /// Where whether a dark episode is in progress is published, if anywhere.
+    dark_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 /// Whether the egress cap holds, or held since `previous` was read, a QUIC
@@ -1269,7 +1271,21 @@ impl AckWatch {
             would_close: 0,
             udp_fallback: false,
             dark_would_closed: false,
+            dark_flag: None,
         }
+    }
+
+    /// Publish in `flag` whether a dark episode is in progress, after every
+    /// sample.
+    pub(crate) fn publishing_dark(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        self.dark_flag = Some(flag);
+        self
+    }
+
+    /// Whether a dark episode is in progress. Tests only.
+    #[cfg(test)]
+    pub(crate) fn is_dark(&self) -> bool {
+        self.dark_since.is_some()
     }
 
     /// Whether the path has a UDP session to fall back to; on one the dark
@@ -1387,6 +1403,12 @@ impl AckWatch {
     pub(crate) fn observe(&mut self, now_nanos: u64, sample: AckSample) -> bool {
         let now_nanos = self.watch_time(now_nanos);
         self.stall = self.decide(now_nanos, sample);
+        if let Some(flag) = &self.dark_flag {
+            flag.store(
+                self.dark_since.is_some(),
+                std::sync::atomic::Ordering::Release,
+            );
+        }
         self.stall.is_some()
     }
 
@@ -1926,6 +1948,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         heard,
         carries_data,
         udp_fallback,
+        dark,
     } = shared;
     let Some(first) = AckSample::of(&connection, &cap_holds, &writers) else {
         tracing::warn!(
@@ -1938,7 +1961,8 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
     let mut received = first.received;
     let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first)
         .observing(carries_data, report.node)
-        .with_udp_fallback(udp_fallback);
+        .with_udp_fallback(udp_fallback)
+        .publishing_dark(dark);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
         rtt.set(connection.rtt());
@@ -2028,6 +2052,10 @@ pub(crate) struct WatchShared {
     /// (`QuicPathLimits::udp_fallback`), so the dark rule only counts
     /// ([`DARK_CLOSES_WITH_UDP`]).
     pub(crate) udp_fallback: bool,
+    /// Set while a dark episode is in progress ([`AckWatch::publishing_dark`]),
+    /// so the path's stall close leaves a dark path with a UDP session alone
+    /// (`route`).
+    pub(crate) dark: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Watch panics `PathReport::panic_once_bucketed` raised. Tests only; only

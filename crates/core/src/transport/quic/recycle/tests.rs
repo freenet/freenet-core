@@ -297,6 +297,46 @@ fn a_data_path_with_udp_is_not_closed_dark_and_counts_the_close_once() {
     assert_eq!(snap.stall_would_close[Stall::Dark.index()], 0);
 }
 
+/// The watch publishes whether a dark episode is in progress, for the stall
+/// close (`route`): set from the first sample that sees this side's sends go
+/// unanswered with nothing from the peer, cleared when the peer is heard again.
+#[test]
+fn the_watch_publishes_a_dark_episode_while_it_lasts() {
+    let record = Arc::default();
+    let sample = |r: Reading| {
+        AckSample::synthetic(
+            &record,
+            r.acked,
+            r.batches,
+            r.outstanding,
+            r.sent,
+            r.received,
+            NO_CAP,
+        )
+    };
+    // Sends at ticks 1-10, the peer heard again at tick 11.
+    let at = |t: u64| reading(5, 1200, 10 + t.min(10), 100 + t.saturating_sub(10));
+    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)))
+        .with_udp_fallback(true)
+        .publishing_dark(flag.clone());
+    let mut seen = Vec::new();
+    for tick in 1..=12 {
+        watch.observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(tick)));
+        assert_eq!(
+            flag.load(std::sync::atomic::Ordering::Acquire),
+            watch.is_dark()
+        );
+        seen.push(watch.is_dark());
+    }
+    assert_eq!(
+        seen,
+        [
+            true, true, true, true, true, true, true, true, true, true, false, false
+        ]
+    );
+}
+
 /// On a data path with a UDP session, an outage of 90 s (sends from tick 1,
 /// the peer heard again at tick 46), longer than the dark rule's close, is
 /// survived: counted once as a would-close and then as recovered in under
