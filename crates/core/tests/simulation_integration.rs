@@ -23113,6 +23113,8 @@ struct NativeConnectRun {
     wire: NativeWireRun,
     upgrades: freenet::dev_tool::QuicUpgradeTrace,
     gateways: std::collections::BTreeSet<SocketAddr>,
+    /// What the NATs dropped, by class, for a run behind NATs.
+    nat_filtered: std::collections::HashMap<freenet::dev_tool::NatFiltering, u64>,
 }
 
 /// Runs 2 gateways and 8 nodes on the direct runner with QUIC on (`prefer`),
@@ -23125,10 +23127,25 @@ fn run_native_connect_sim(
     iterations: usize,
     configure: impl FnOnce(&mut SimNetwork),
 ) -> NativeConnectRun {
+    run_native_connect_sim_with(name, seed, iterations, None, configure)
+}
+
+/// [`run_native_connect_sim`], with the regular nodes behind `nat` if given.
+fn run_native_connect_sim_with(
+    name: &str,
+    seed: u64,
+    iterations: usize,
+    nat: Option<freenet::dev_tool::SimNat>,
+    configure: impl FnOnce(&mut SimNetwork),
+) -> NativeConnectRun {
     setup_deterministic_state(seed);
     let rt = create_runtime();
-    let (sim, logs_handle, trace, upgrades, nodes, gateways) = rt.block_on(async {
-        let mut sim = SimNetwork::new(name, 2, 8, 10, 3, 10, 3, seed).await;
+    let (sim, logs_handle, trace, upgrades, nodes, gateways, nat_counts) = rt.block_on(async {
+        let mut sim = match nat {
+            Some(nat) => SimNetwork::new_with_nat(name, 2, 8, 10, 3, 10, 3, seed, nat).await,
+            None => SimNetwork::new(name, 2, 8, 10, 3, 10, 3, seed).await,
+        };
+        let nat_counts = sim.nat_filtered_handle();
         sim.enable_gateway_ack_version();
         sim.with_quic_native_floor(native_floor_for_tests());
         sim.with_transport_quic("prefer");
@@ -23143,7 +23160,15 @@ fn run_native_connect_sim(
             .map(|(_, addr)| *addr)
             .collect();
         let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle, trace, upgrades, nodes, gateways)
+        (
+            sim,
+            logs_handle,
+            trace,
+            upgrades,
+            nodes,
+            gateways,
+            nat_counts,
+        )
     });
     drop(rt);
     sim.run_simulation_direct::<rand::rngs::SmallRng>(
@@ -23165,6 +23190,9 @@ fn run_native_connect_sim(
         wire: NativeWireRun { trace, mesh, nodes },
         upgrades,
         gateways,
+        nat_filtered: nat_counts
+            .map(|counts| counts.lock().unwrap().clone())
+            .unwrap_or_default(),
     }
 }
 
@@ -23270,6 +23298,112 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
     // only while it is punching too, so the two sides' fallbacks must
     // overlap; a node joining through some other peer would hide a pair
     // that never connected.
+    let peer_pairs: Vec<_> = t
+        .native_failed_pairs()
+        .into_iter()
+        .filter(|(a, b)| !run.gateways.contains(a) && !run.gateways.contains(b))
+        .collect();
+    assert!(
+        !peer_pairs.is_empty(),
+        "premise: two non-gateway peers failed"
+    );
+    let unconnected: Vec<_> = peer_pairs
+        .iter()
+        .filter(|pair| !run.wire.mesh.contains(pair))
+        .collect();
+    assert!(
+        unconnected.is_empty(),
+        "pairs whose native setup failed and never connected: {unconnected:?}"
+    );
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined over UDP");
+    assert!(connected);
+}
+
+/// Behind each NAT filtering class, native connections form between peers
+/// (the setup's punches open both NATs), carry messages, and every node
+/// joins. Fails closed: native connections must have formed, and the
+/// restricted NATs must have dropped something (a first punch arrives before
+/// the receiver has sent toward its sender).
+#[test_log::test]
+fn test_quic_native_connections_form_behind_each_nat_class() {
+    use freenet::dev_tool::{NatFiltering, SimNat};
+    const SEED: u64 = 0x0059_40A5_00C1;
+    for filtering in NatFiltering::ALL {
+        let name = format!("native-nat-{}", filtering.label());
+        let run =
+            run_native_connect_sim_with(&name, SEED, 80, Some(SimNat::all(filtering)), |sim| {
+                sim.with_native_connect(100);
+            });
+        log_native_connect(&name, &run);
+        let t = &run.wire.trace;
+        assert!(
+            t.native_established() > 0,
+            "{filtering:?}: native connections formed"
+        );
+        assert!(
+            native_shorts_sent(&run.upgrades) > 0,
+            "{filtering:?}: messages went over native paths"
+        );
+        // A full-cone NAT admits anything once its node has sent anything,
+        // and every node's first datagram goes to a gateway, so only the
+        // restricted classes drop.
+        if filtering != NatFiltering::Full {
+            assert!(
+                run.nat_filtered.get(&filtering).copied().unwrap_or(0) > 0,
+                "{filtering:?}: premise: the NATs dropped unsolicited datagrams"
+            );
+        }
+        assert_eq!(
+            t.native_failures_without_fallback(),
+            Vec::<String>::new(),
+            "{filtering:?}: every failed native setup was followed by a UDP dial"
+        );
+        let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+        assert_eq!(
+            peers.len(),
+            run.wire.nodes,
+            "{filtering:?}: every node joined"
+        );
+        assert!(connected, "{filtering:?}");
+    }
+}
+
+/// Behind port-restricted NATs, with every QUIC datagram dropped, every
+/// native setup fails and each pair of peers must connect by the two UDP
+/// fallbacks. Behind a NAT a UDP punch gets through only once the receiver
+/// has punched toward the sender, and a node takes a UDP handshake only while
+/// it is punching itself, so the pair connects only if the two fallbacks run
+/// at the same time. Fails closed: native setups between peers must have
+/// failed, and the NATs must have dropped datagrams.
+#[test_log::test]
+fn test_quic_native_blocked_pairs_connect_over_udp_behind_nats() {
+    use freenet::dev_tool::{NatFiltering, NodeLabel, SimNat};
+    const SEED: u64 = 0x0059_40A5_00C2;
+    let name = "native-nat-blocked";
+    let nat = SimNat::all(NatFiltering::PortRestricted);
+    let run = run_native_connect_sim_with(name, SEED, 200, Some(nat), |sim| {
+        sim.with_native_connect(100);
+        let mut labels: Vec<NodeLabel> = sim.all_node_addresses().keys().cloned().collect();
+        labels.sort();
+        for (i, a) in labels.iter().enumerate() {
+            for b in &labels[i + 1..] {
+                sim.drop_quic_datagrams_between(a, b, Duration::ZERO);
+            }
+        }
+    });
+    log_native_connect(name, &run);
+    let t = &run.wire.trace;
+    assert!(t.native_failed() > 0, "premise: native setups failed");
+    assert_eq!(t.native_established(), 0, "premise: no native setup worked");
+    assert!(
+        run.nat_filtered
+            .get(&NatFiltering::PortRestricted)
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "premise: the NATs dropped unsolicited datagrams"
+    );
     let peer_pairs: Vec<_> = t
         .native_failed_pairs()
         .into_iter()

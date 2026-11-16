@@ -175,6 +175,7 @@ pub mod dev_tool {
     };
     pub use flatbuffers;
     pub use message::Transaction;
+    pub use node::testing_impl::SimNat;
     pub use node::{
         InitPeerNode, NetworkStats, NodeConfig, PeerId,
         testing_impl::{
@@ -188,6 +189,7 @@ pub mod dev_tool {
         },
     };
     pub use ring::Location;
+    pub use transport::nat_model::NatFiltering;
     pub use transport::{TransportKeypair, TransportPublicKey};
 
     // Nearest-neighbor ring lattice (successor+predecessor base edges). Always

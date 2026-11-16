@@ -609,9 +609,16 @@ fn get_registry(network_name: &str) -> Option<Arc<RwLock<SocketRegistry>>> {
 struct NatNetwork {
     time: VirtualTime,
     nats: HashMap<std::net::IpAddr, super::nat_model::NatModel>,
-    /// Inbound datagrams a NAT dropped, by the receiver's filtering.
-    filtered: HashMap<super::nat_model::NatFiltering, u64>,
+    /// Inbound datagrams a NAT dropped, by the receiver's filtering. Shared
+    /// with [`nat_filtered_handle`], so a test can read it after the network
+    /// is gone.
+    filtered: NatFilteredCounts,
 }
+
+/// Inbound datagrams a network's NATs dropped, by the receiver's filtering
+/// class.
+#[cfg(any(test, feature = "testing"))]
+pub type NatFilteredCounts = Arc<std::sync::Mutex<HashMap<super::nat_model::NatFiltering, u64>>>;
 
 /// NATs, keyed by the network that installed them (as the other harness
 /// registries are, so concurrent simulations do not share them).
@@ -642,7 +649,7 @@ pub fn set_network_nat(
         Arc::new(std::sync::Mutex::new(NatNetwork {
             time,
             nats,
-            filtered: HashMap::new(),
+            filtered: NatFilteredCounts::default(),
         })),
     );
 }
@@ -657,10 +664,17 @@ pub fn clear_network_nat(network_name: &str) {
 /// filtering class.
 #[cfg(any(test, feature = "testing"))]
 pub fn nat_filtered(network_name: &str) -> HashMap<super::nat_model::NatFiltering, u64> {
+    nat_filtered_handle(network_name)
+        .map(|counts| counts.lock().unwrap().clone())
+        .unwrap_or_default()
+}
+
+/// The network's NAT drop counts, readable after the network is gone.
+#[cfg(any(test, feature = "testing"))]
+pub fn nat_filtered_handle(network_name: &str) -> Option<NatFilteredCounts> {
     NAT_NETWORKS
         .get(network_name)
         .map(|n| n.lock().unwrap().filtered.clone())
-        .unwrap_or_default()
 }
 
 /// The sender's NAT, if it has one, opens or refreshes its binding to `to`.
@@ -692,7 +706,12 @@ fn nat_admits(network_name: &str, target: SocketAddr, from: SocketAddr) -> bool 
         return true;
     }
     let filtering = nat.filtering();
-    *network.filtered.entry(filtering).or_default() += 1;
+    *network
+        .filtered
+        .lock()
+        .unwrap()
+        .entry(filtering)
+        .or_default() += 1;
     false
 }
 
