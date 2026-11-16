@@ -28,12 +28,14 @@ use super::outbound_stream;
 use super::streaming::StreamError;
 use super::{OutboundStreamResult, StreamId};
 use crate::simulation::TimeSource;
-use crate::tracing::TransferDirection;
+use crate::tracing::{TransferDirection, TransferTransport};
 use crate::transport::congestion_control::CongestionController;
 use crate::transport::metrics::{
-    emit_transfer_completed, emit_transfer_failed, emit_transfer_started,
+    PipeDropCause, emit_transfer_completed, emit_transfer_failed, emit_transfer_started,
 };
-use crate::transport::quic::path::{BoundedSend, NextStep, SendDeadlines, SendKind};
+use crate::transport::quic::path::{
+    BoundedSend, NextStep, QuicSendError, SendDeadlines, SendFailure, SendKind,
+};
 use crate::transport::quic::upgrade::data_route::DataRoute;
 use crate::transport::sent_packet_tracker::SentPacketTracker;
 use crate::transport::token_bucket::TokenBucket;
@@ -218,6 +220,7 @@ impl<T: TimeSource> PathTransfer<T> {
             None,
             None,
             TransferDirection::Send,
+            TransferTransport::Quic,
         );
         Ok(TransferStats {
             stream_id,
@@ -246,6 +249,7 @@ impl<T: TimeSource> PathTransfer<T> {
             format!("QUIC send: {outcome:?}"),
             self.elapsed().as_millis() as u64,
             TransferDirection::Send,
+            TransferTransport::Quic,
         );
         Err(TransportError::OutboundStreamFailed(self.remote_addr))
     }
@@ -450,6 +454,7 @@ pub(super) async fn pipe_stream_with<T: TimeSource>(
     time_source: T,
 ) -> OutboundStreamResult {
     let bytes = inbound_handle.total_bytes();
+    let quic_fed = inbound_handle.is_quic_fed();
     let transfer = PathTransfer::start(stream_id, remote_addr, bytes, time_source);
     let mut source = WatchedSource::new(inbound_handle.chunks());
     // The source's own gap (5 s for a UDP-fed stream, the source path's gap
@@ -482,10 +487,11 @@ pub(super) async fn pipe_stream_with<T: TimeSource>(
         .await;
     route.note(|| format!("sent a pipe on the path: {outcome:?}"));
     let stalled = source.stalled();
-    match route
+    let step = route
         .path()
-        .settle(SendKind::Pipe, &outcome, stalled, route.clock().now_nanos())
-    {
+        .settle(SendKind::Pipe, &outcome, stalled, route.clock().now_nanos());
+    record_pipe_end(&route, quic_fed, &outcome, stalled, step);
+    match step {
         NextStep::Done => transfer.completed(),
         NextStep::SendOnUdp => match udp {
             Some(udp) => {
@@ -498,6 +504,38 @@ pub(super) async fn pipe_stream_with<T: TimeSource>(
             None => transfer.failed(&outcome),
         },
         NextStep::GiveUp => transfer.failed(&outcome),
+    }
+}
+
+/// Count a pipe that ended `sent` or `dropped` (as `QuicPath::settle` counted it
+/// in `quic_data_send_pipe_*`) by what fed its inbound stream, and a dropped one
+/// by cause (`quic_pipe_source_*`, `quic_pipe_dropped_*`). A pipe that went on
+/// UDP, or ended `MaybeDelivered`, is in neither.
+fn record_pipe_end(
+    route: &DataRoute,
+    quic_fed: bool,
+    outcome: &BoundedSend,
+    stalled: bool,
+    step: NextStep,
+) {
+    let node = route.path().stats().node();
+    match step {
+        NextStep::Done if matches!(outcome, BoundedSend::Sent) => node.record_pipe_sent(quic_fed),
+        NextStep::GiveUp => node.record_pipe_dropped(quic_fed, pipe_drop_cause(outcome, stalled)),
+        NextStep::Done | NextStep::SendOnUdp => {}
+    }
+}
+
+/// Why a pipe was dropped: its source failed, a deadline ran out while it
+/// waited for its source (`stalled`, as the stall count reads it), or anything
+/// else, which is this path's.
+fn pipe_drop_cause(outcome: &BoundedSend, stalled: bool) -> PipeDropCause {
+    match outcome {
+        BoundedSend::Failed(SendFailure::Error(
+            QuicSendError::Source(_) | QuicSendError::LengthMismatch { .. },
+        )) => PipeDropCause::SourceError,
+        BoundedSend::Failed(SendFailure::TimedOut) if stalled => PipeDropCause::SourceStallTimeout,
+        _ => PipeDropCause::OwnPath,
     }
 }
 

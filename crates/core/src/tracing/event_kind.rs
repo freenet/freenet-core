@@ -1739,6 +1739,25 @@ pub enum TransferDirection {
     Receive,
 }
 
+/// Which transport carried a transfer: the UDP transport's own streams, or a
+/// QUIC path.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(arbitrary::Arbitrary))]
+pub enum TransferTransport {
+    Udp,
+    Quic,
+}
+
+impl TransferTransport {
+    /// Its value in telemetry (`transport`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Udp => "udp",
+            Self::Quic => "quic",
+        }
+    }
+}
+
 /// Data transfer events for tracking stream-level transfers.
 ///
 /// These events track the start and completion of data transfers between peers,
@@ -1812,6 +1831,8 @@ pub enum TransferEvent {
         peak_flightsize_bytes: Option<u32>,
         /// Whether we were sending or receiving.
         direction: TransferDirection,
+        /// Which transport carried it.
+        transport: TransferTransport,
         timestamp: u64,
     },
     /// A data stream transfer failed.
@@ -1828,6 +1849,8 @@ pub enum TransferEvent {
         elapsed_ms: u64,
         /// Whether we were sending or receiving.
         direction: TransferDirection,
+        /// Which transport carried it.
+        transport: TransferTransport,
         timestamp: u64,
     },
 }

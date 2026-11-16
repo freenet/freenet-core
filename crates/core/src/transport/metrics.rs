@@ -28,15 +28,15 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
-use crate::tracing::{TransferDirection, TransferEvent};
+use crate::tracing::{TransferDirection, TransferEvent, TransferTransport};
 
 mod quic_data;
 pub use quic_data::QuicDataSnapshot;
 #[cfg(test)]
 pub(crate) use quic_data::STALL_CLOSE_LABELS;
 pub(crate) use quic_data::{
-    AckWaitKind, DarkEnd, PathGateWindow, PathLossWindow, QuicDataCounters, ShareSource,
-    StreamsOpenPeak,
+    AckWaitKind, DarkEnd, PathGateWindow, PathLossWindow, PipeDropCause, QuicDataCounters,
+    ShareSource, StreamsOpenPeak,
 };
 
 /// Global transport metrics instance.
@@ -4693,6 +4693,35 @@ pub fn emit_transfer_started(
     }
 }
 
+/// Test-only: the transfer ends emitted on this thread, as (stream id, event,
+/// transport), so a test finds its own: stream ids and transfers are per
+/// thread in tests (`StreamId::next`, a current-thread runtime), and another
+/// test's ends never land here. Kept apart from the QUIC event log, which every
+/// transfer would otherwise crowd.
+#[cfg(test)]
+thread_local! {
+    static TRANSFER_TEST_LOG: std::cell::RefCell<Vec<(u64, &'static str, TransferTransport)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn note_transfer_end(stream_id: u64, event: &'static str, transport: TransferTransport) {
+    TRANSFER_TEST_LOG.with(|log| log.borrow_mut().push((stream_id, event, transport)));
+}
+
+/// Test-only: how the transfer of `stream_id` was reported to end on this
+/// thread, if it was.
+#[cfg(test)]
+pub(crate) fn transfer_ends_of(stream_id: u64) -> Vec<(&'static str, TransferTransport)> {
+    TRANSFER_TEST_LOG.with(|log| {
+        log.borrow()
+            .iter()
+            .filter(|(id, _, _)| *id == stream_id)
+            .map(|(_, event, transport)| (*event, *transport))
+            .collect()
+    })
+}
+
 /// Emit a transfer completed event.
 /// Returns immediately if telemetry is not enabled (sender not initialized).
 #[allow(clippy::too_many_arguments)]
@@ -4712,7 +4741,10 @@ pub fn emit_transfer_completed(
     min_rtt_ms: Option<u32>,
     peak_flightsize_bytes: Option<u32>,
     direction: TransferDirection,
+    transport: TransferTransport,
 ) {
+    #[cfg(test)]
+    note_transfer_end(stream_id, "transfer_completed", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Completed {
@@ -4731,6 +4763,7 @@ pub fn emit_transfer_completed(
             min_rtt_ms,
             peak_flightsize_bytes,
             direction,
+            transport,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
         // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
@@ -4748,7 +4781,10 @@ pub fn emit_transfer_failed(
     reason: String,
     elapsed_ms: u64,
     direction: TransferDirection,
+    transport: TransferTransport,
 ) {
+    #[cfg(test)]
+    note_transfer_end(stream_id, "transfer_failed", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Failed {
@@ -4758,6 +4794,7 @@ pub fn emit_transfer_failed(
             reason,
             elapsed_ms,
             direction,
+            transport,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
         // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
