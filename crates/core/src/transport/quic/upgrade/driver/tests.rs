@@ -747,14 +747,23 @@ fn ready_ack(session: &Session, attempt: u32, caps: u32) {
 /// this node's bit from the moment the path exists, its `Ready` says so, and it
 /// may send only once the peer's frame has the bit too. Mode `shadow` sets no bit
 /// at any percentage. With no `quic-data-percent`, `prefer` takes the release's
-/// share: 0 with no ramp start (the emergency-stop build), and with one set the
-/// ramp's 5% before T0, so the bit then depends on the pair's bucket.
+/// share: with a ramp start the ramp's 5% before T0, and with none the fixed
+/// `QUIC_DATA_PERCENT` (5 for the hold, 0 for the emergency stop), so the bit
+/// then depends on the pair's bucket.
 #[test]
 fn a_path_follows_the_data_bits() {
     use crate::transport::quic::control::{QuicControl, caps};
     use crate::transport::quic::path::QuicInboundOutcome;
-    use crate::transport::quic::upgrade::policy::RAMP_START_IS_SET;
+    use crate::transport::quic::upgrade::policy::{QUIC_DATA_PERCENT, RAMP_START_IS_SET};
     use crate::transport::quic::upgrade::slice::bucket;
+    // The release's share at this harness's clock: its virtual clock reads
+    // 1970, before any T0, and a time before T0 reads as T0, so a ramp gives
+    // its first stage, 5%.
+    const RELEASE_SHARE: u8 = if RAMP_START_IS_SET {
+        5
+    } else {
+        QUIC_DATA_PERCENT
+    };
     bounded(|| async move {
         // (seed, the pair's bucket under it when the row depends on it, mode,
         // quic-data-percent, peer caps, accepts, sends). Each row seeds its own
@@ -764,20 +773,27 @@ fn a_path_follows_the_data_bits() {
             (SEED, None, "prefer", Some("100"), 0, true, false),
             (SEED, None, "prefer", Some("0"), caps::DATA, false, false),
             (SEED, None, "shadow", Some("100"), caps::DATA, false, false),
-            // No quic-data-percent: the release's share. This harness's virtual
-            // clock reads 1970, before any T0, and a time before T0 reads as
-            // T0, so with a ramp start the share is 5%. A pair with bucket 51
-            // is outside it, and one with bucket 2 is inside it. With no ramp
-            // start the share is 0 and neither gets the bit.
-            (SEED, Some(51), "prefer", None, caps::DATA, false, false),
+            // No quic-data-percent: the release's share (`RELEASE_SHARE`). A
+            // pair gets the bit when its bucket is below it: bucket 51 is
+            // outside any first-stage share, and bucket 2 is inside 5% and
+            // outside 0.
+            (
+                SEED,
+                Some(51),
+                "prefer",
+                None,
+                caps::DATA,
+                51 < RELEASE_SHARE,
+                51 < RELEASE_SHARE,
+            ),
             (
                 4,
                 Some(2),
                 "prefer",
                 None,
                 caps::DATA,
-                RAMP_START_IS_SET,
-                RAMP_START_IS_SET,
+                2 < RELEASE_SHARE,
+                2 < RELEASE_SHARE,
             ),
         ] {
             let _seed = GlobalRng::seed_guard(seed);
@@ -823,7 +839,7 @@ fn a_path_follows_the_data_bits() {
             // recycles; the others say nothing.
             let data_capable = match percent {
                 Some(p) => p != "0",
-                None => crate::transport::quic::upgrade::policy::QUIC_DATA_RAMP_START.is_some(),
+                None => crate::transport::quic::upgrade::policy::RELEASE_SHARE_CAN_CARRY_DATA,
             };
             let recycles = if mode == "prefer" && data_capable {
                 caps::RECYCLES

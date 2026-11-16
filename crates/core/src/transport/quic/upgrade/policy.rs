@@ -37,11 +37,12 @@ use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 
 /// The share of pairs, in percent, that carry data on QUIC for a node in
 /// `prefer` mode. It applies only to a build with no ramp start
-/// ([`QUIC_DATA_RAMP_START`] = `None`), which is the emergency-stop build; while
-/// the ramp start is set, the ramp's share applies and this is not read. Both
-/// sides must set their bit, so a pair moves only once both run a release that
-/// puts it in the slice. `quic-data-percent` replaces it on one node.
-pub(in crate::transport) const QUIC_DATA_PERCENT: u8 = 0;
+/// ([`QUIC_DATA_RAMP_START`] = `None`); while the ramp start is set, the ramp's
+/// share applies and this is not read. 5 holds the data ramp at its first
+/// stage (0.2.159, after 0.2.158's ramp); 0 is the emergency stop. Both sides
+/// must set their bit, so a pair moves only once both run a release that puts
+/// it in the slice. `quic-data-percent` replaces it on one node.
+pub(in crate::transport) const QUIC_DATA_PERCENT: u8 = 5;
 
 /// Whether this node, as configured, may carry data on QUIC: `transport-quic`
 /// is `prefer` and its share of pairs can be above 0 while it runs: a
@@ -75,13 +76,20 @@ fn may_carry_data_with(config: &NetworkApiConfig, ramp_start: Option<u64>) -> bo
 /// starts later. `quic-data-percent` replaces the ramp on one node.
 /// `scripts/check_quic_data_ramp_t0.sh` reads this line, so keep it on one line
 /// in this form.
-// 2026-11-16 02:30:00 UTC: the ramp start of the 0.2.158 release (#6224).
-pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = Some(1_794_796_200);
+// None: the hold at 5% after 0.2.158's ramp (start 2026-11-16 02:30:00 UTC,
+// #6224); QUIC_DATA_PERCENT gives the share. QUIC_DATA_RAMP_RELEASE stays named.
+pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = None;
 
 /// Whether this build sets a ramp start: for tests outside the transport
 /// module whose expectations change once [`QUIC_DATA_RAMP_START`] is set.
 #[cfg(test)]
 pub(crate) const RAMP_START_IS_SET: bool = QUIC_DATA_RAMP_START.is_some();
+
+/// Whether this build's own share (no `quic-data-percent`) can carry data: a
+/// ramp start, or a fixed [`QUIC_DATA_PERCENT`] above 0. False only in the
+/// emergency-stop build.
+#[cfg(test)]
+pub(crate) const RELEASE_SHARE_CAN_CARRY_DATA: bool = RAMP_START_IS_SET || QUIC_DATA_PERCENT > 0;
 
 /// The release whose cut must come within 3 h of [`QUIC_DATA_RAMP_START`], as
 /// `"X.Y.Z"`, or `None`. Set together with the ramp start, in the same reviewed
@@ -868,8 +876,9 @@ mod tests {
 
     /// With a ramp in the release, a `prefer` node may carry data from the
     /// ramp's first minute unless `quic-data-percent` overrides it, so the
-    /// connection limit is lowered for the whole ramp; without one (the
-    /// emergency-stop release) it may not, at this release's share of 0.
+    /// connection limit is lowered for the whole ramp; without one it may
+    /// exactly when the release's fixed share is above 0 (the hold at 5%), and
+    /// not at a share of 0 (the emergency stop).
     #[test]
     fn may_carry_data_follows_the_ramp() {
         let ramp = Some(1_700_000_000);
@@ -877,8 +886,9 @@ mod tests {
             ("prefer", None, ramp, true),
             ("prefer", Some("0"), ramp, false),
             ("prefer", Some("5"), ramp, true),
-            ("prefer", None, None, false),
+            ("prefer", None, None, QUIC_DATA_PERCENT > 0),
             ("prefer", Some("0"), None, false),
+            ("prefer", Some("5"), None, true),
             ("shadow", None, ramp, false),
             ("off", None, ramp, false),
         ] {
@@ -890,10 +900,6 @@ mod tests {
                 "{mode} {percent:?} {start:?}"
             );
         }
-        assert_eq!(
-            QUIC_DATA_PERCENT, 0,
-            "the emergency-stop case above reads false"
-        );
     }
 
     /// The share reported as `quic_ramp_share_pct`: the policy's share in

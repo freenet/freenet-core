@@ -50,8 +50,9 @@ struct TraceData {
     /// A data ramp start of the test's own, in seconds on the virtual clock;
     /// negative for one before the run began.
     ramp_start: Mutex<Option<i64>>,
-    /// Nodes that run the release's own share instead ([`QuicUpgradeTrace::run_without_ramp`]).
-    no_ramp: Mutex<BTreeSet<SocketAddr>>,
+    /// Nodes that run a fixed share with no ramp, and that share
+    /// ([`QuicUpgradeTrace::run_without_ramp`], [`QuicUpgradeTrace::run_as_stop_release`]).
+    no_ramp: Mutex<BTreeMap<SocketAddr, u8>>,
     /// Nodes that build their paths to refuse data while they advertise the bit.
     refuse_data: Mutex<BTreeSet<SocketAddr>>,
     /// The version a peer reports, and the release it then reads as.
@@ -138,10 +139,24 @@ impl QuicUpgradeTrace {
 
     /// `node` takes no ramp from [`Self::ramp_data_started_before`]: it runs the
     /// share this build gives with no ramp (`QUIC_DATA_RAMP_START = None`, so
-    /// the fixed `QUIC_DATA_PERCENT`), as a node on the emergency-stop release
-    /// does.
+    /// the fixed `QUIC_DATA_PERCENT`, [`Self::release_fixed_share`]).
     pub fn run_without_ramp(&self, node: SocketAddr) {
-        self.data.no_ramp.lock().insert(node);
+        self.data
+            .no_ramp
+            .lock()
+            .insert(node, super::policy::QUIC_DATA_PERCENT);
+    }
+
+    /// `node` runs as the emergency-stop release: no ramp and a share of 0,
+    /// whatever this build's `QUIC_DATA_RAMP_START` and `QUIC_DATA_PERCENT` are.
+    pub fn run_as_stop_release(&self, node: SocketAddr) {
+        self.data.no_ramp.lock().insert(node, 0);
+    }
+
+    /// The share, in percent, this build gives a `prefer` node with no ramp
+    /// start and no `quic-data-percent` (`QUIC_DATA_PERCENT`).
+    pub fn release_fixed_share() -> u8 {
+        super::policy::QUIC_DATA_PERCENT
     }
 
     /// `node` advertises its data bit but builds every path to refuse data, as a
@@ -243,16 +258,17 @@ impl NodeTrace {
     }
 
     pub(crate) fn data_ramp_start(&self) -> Option<i64> {
-        if self.runs_without_ramp() {
+        if self.fixed_share_without_ramp().is_some() {
             return None;
         }
         *self.trace.data.ramp_start.lock()
     }
 
-    /// Whether this node runs as the emergency-stop release
-    /// ([`QuicUpgradeTrace::run_without_ramp`]).
-    pub(crate) fn runs_without_ramp(&self) -> bool {
-        self.trace.data.no_ramp.lock().contains(&self.addr)
+    /// The fixed share this node runs with no ramp, if the test set one
+    /// ([`QuicUpgradeTrace::run_without_ramp`],
+    /// [`QuicUpgradeTrace::run_as_stop_release`]).
+    pub(crate) fn fixed_share_without_ramp(&self) -> Option<u8> {
+        self.trace.data.no_ramp.lock().get(&self.addr).copied()
     }
 
     pub(crate) fn refuses_data_while_advertising(&self) -> bool {

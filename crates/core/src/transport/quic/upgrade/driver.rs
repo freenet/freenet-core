@@ -675,11 +675,11 @@ impl QuicUpgrades {
             return None;
         }
         let trace = self.trace.as_ref()?;
-        // The emergency-stop release has no ramp, whatever this build's
-        // `QUIC_DATA_RAMP_START` is, so the node reads the fixed share.
-        if trace.runs_without_ramp() {
+        // A release with no ramp (the hold or the emergency stop), whatever
+        // this build's `QUIC_DATA_RAMP_START` is: the node reads its fixed share.
+        if let Some(percent) = trace.fixed_share_without_ramp() {
             return Some((
-                super::policy::DataShare::Fixed(super::policy::QUIC_DATA_PERCENT),
+                super::policy::DataShare::Fixed(percent),
                 self.path_clock.wall_now(),
             ));
         }

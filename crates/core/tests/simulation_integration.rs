@@ -21583,12 +21583,25 @@ fn assert_ramp_pairs_carry_data_by(run: &QuicShadowRun, full_at: Duration) {
 /// the ramp node never rechecks the path or recycles it, and the pair keeps a
 /// shadow path that carries no data. Two ramp nodes in the same run shape carry
 /// data (the positive control).
+///
+/// A third row runs the other node as this build's no-ramp release
+/// (`run_without_ramp`, the fixed `QUIC_DATA_PERCENT`): the hold at 5% when it
+/// is 5. A hold node sets its recycle bit, so the ramp node recycles the path
+/// once when its own bit comes on, but the pair's bucket is above the hold's
+/// share, so the pair still carries no data. With a fixed share of 0 that row
+/// is the stop again.
 #[test_log::test]
 fn test_quic_data_ramp_stops_against_a_node_on_the_default_off_release() {
-    for (name, stopped, carries) in [
-        ("quic-ramp-stop-mixed", true, false),
-        ("quic-ramp-stop-control", false, true),
+    let held = freenet::dev_tool::QuicUpgradeTrace::release_fixed_share();
+    // (name, how the second node runs, its fixed share or None for the ramp,
+    // whether the pair carries data)
+    for (name, other, other_share, carries) in [
+        ("quic-ramp-stop-mixed", "stop", Some(0), false),
+        ("quic-ramp-hold-mixed", "hold", Some(held), false),
+        ("quic-ramp-stop-control", "ramp", None, true),
     ] {
+        let stopped = other_share.is_some();
+        let recycles = other_share.is_none_or(|share| share > 0);
         let run = run_quic_shadow_sim_waiting(
             name,
             0x5940_7A00_0101,
@@ -21600,8 +21613,11 @@ fn test_quic_data_ramp_stops_against_a_node_on_the_default_off_release() {
                     sim.with_node_transport_quic(label, "prefer");
                 }
                 trace.ramp_data_started_before(17 * RAMP_HOUR);
-                if stopped {
-                    trace.run_without_ramp(sim.all_node_addresses()[&labels[1]]);
+                let node = sim.all_node_addresses()[&labels[1]];
+                match other {
+                    "stop" => trace.run_as_stop_release(node),
+                    "hold" => trace.run_without_ramp(node),
+                    _ => {}
                 }
                 run_as_first_negotiating_release(trace);
             },
@@ -21633,6 +21649,12 @@ fn test_quic_data_ramp_stops_against_a_node_on_the_default_off_release() {
             (25..100).contains(&bucket),
             "{name}: premise: bucket {bucket}"
         );
+        if let Some(share) = other_share {
+            assert!(
+                share <= bucket,
+                "{name}: premise: the other node's fixed share {share} leaves out bucket {bucket}"
+            );
+        }
         let reaches_at = Duration::from_secs(12 * 3600 + u64::from(bucket - 25) * 12 * 3600 / 75)
             .saturating_sub(17 * RAMP_HOUR);
         let ran_to = run
@@ -21648,9 +21670,10 @@ fn test_quic_data_ramp_stops_against_a_node_on_the_default_off_release() {
             run.dump()
         );
         // The stopped pair keeps its first path: exactly one. The control's
-        // path is recycled once and comes up again with data: exactly two. A
-        // churn loop fails either.
-        let paths = if stopped { 1 } else { 2 };
+        // path, and a hold pair's, is recycled once and comes up again:
+        // exactly two (with data only in the control). A churn loop fails
+        // either.
+        let paths = if recycles { 2 } else { 1 };
         for node in &run.nodes {
             assert_eq!(
                 run.whats(*node, "Established"),
@@ -21666,12 +21689,20 @@ fn test_quic_data_ramp_stops_against_a_node_on_the_default_off_release() {
             );
         }
         if stopped {
-            assert_eq!(
-                run.total("RecycledForData"),
-                0,
-                "{name}: no path is recycled toward a stopped node: {}",
-                run.dump()
-            );
+            if recycles {
+                assert!(
+                    run.total("RecycledForData") > 0,
+                    "{name}: the ramp node recycles the path toward a hold node: {}",
+                    run.dump()
+                );
+            } else {
+                assert_eq!(
+                    run.total("RecycledForData"),
+                    0,
+                    "{name}: no path is recycled toward a stopped node: {}",
+                    run.dump()
+                );
+            }
             assert_eq!(
                 run.total("sent a short on the path"),
                 0,
