@@ -793,14 +793,20 @@ jobs:
   # Using Ubicloud for faster builds with more cores
   clippy_check:
     name: Clippy
-    runs-on: ubicloud-standard-8
-    # Raised from 15 for the two added all-targets steps, which compile the test
-    # and bench targets the other steps skip. Measured on a warm
-    # `Swatinem/rust-cache` hit: 46s + 41s + 2m09s = 4m26s for the job with one
-    # all-targets step, so the headroom is not for the warm case -- it is for a
-    # cold cache, where the first step absorbs the full dependency build and the
-    # later steps each add an incremental pass on top.
-    timeout-minutes: 30
+    # GitHub-hosted, not Ubicloud (#6244). Lint output does not depend on
+    # machine speed, so a 4-vCPU runner cannot make this check flaky, and on a
+    # public repo it is free; on ubicloud-standard-8 it cost about $33/month.
+    # The PR critical path is the Windows/macOS unit jobs (~37 min), so a
+    # slower Clippy does not delay the verdict. Its cache lives in GitHub's
+    # backend, which shares a 10 GB limit with the Windows/macOS jobs: hence
+    # `save-if` main below, and no warm twin is needed because this job runs
+    # on main pushes and saves its own entry.
+    runs-on: ubuntu-latest
+    # 30 was sized on ubicloud-standard-8 (warm cache: 46s + 41s + 2m09s for
+    # the job with one all-targets step; the headroom was for a cold cache,
+    # where the first step absorbs the full dependency build). A cold cache on
+    # 4 vCPUs takes longer, hence 45.
+    timeout-minutes: 45
     # No dependencies - runs immediately in parallel with fmt_check
 
     env:
@@ -821,7 +827,11 @@ jobs:
           components: clippy
           targets: wasm32-unknown-unknown
 
+      # Save on main only: a 0.7-1 GB entry per PR would churn GitHub's 10 GB
+      # cache and evict the main entry every PR restores from.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # `--all-targets` (= --lib --bins --tests --benches --examples) is a strict
       # superset of the lib+bins this used to check, and it is what brings

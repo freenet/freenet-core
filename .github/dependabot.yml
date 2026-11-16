@@ -68,6 +68,12 @@ updates:
       default-days: 7
     # Set explicitly: omitting this caps at 5 and silently withholds the rest.
     open-pull-requests-limit: 50
+    # Do not rebase open PRs automatically. Every Cargo.lock change on main
+    # conflicts with every open cargo PR, and Dependabot rebased all of them
+    # each time: 141 full CI runs on 17 open PRs in two weeks of Nov 2026, 138
+    # of them red (#6244). A PR is rebuilt when someone comments
+    # `@dependabot rebase`; the merge queue still tests it on current main.
+    rebase-strategy: "disabled"
     # This workspace reaches a contract/delegate crate: a bump here can move a
     # contract address. Labelled so that shows on the PR, not just in this file.
     labels:
