@@ -643,6 +643,51 @@ fn quic_breaker_trips_after_an_abnormal_exit() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A gateway takes the short gateway cooldown, never the peer's 24 h: a trip
+/// 5 minutes old keeps QUIC off, one 20 minutes old does not. Every node these
+/// tests spawn is a gateway (`--is-gateway`).
+///
+/// FALSIFY: pass `BreakerRole::Peer` to `breaker::gate` in
+/// `P2pConnManager::build`; the 20-minute-old trip still holds and the second
+/// start does not build the endpoint.
+#[test]
+fn quic_breaker_on_a_gateway_holds_only_for_the_gateway_cooldown() -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    for (age_min, quic_on) in [(5u64, false), (20, true)] {
+        let dir = tempfile::tempdir()?;
+        let marker = serde_json::json!({
+            "state": "tripped",
+            "tripped_at_secs": now - age_min * 60,
+        });
+        std::fs::write(
+            dir.path().join(QUIC_MARKER_FILE),
+            serde_json::to_vec(&marker)?,
+        )?;
+        let mut node = spawn_quic_node(dir.path(), &dir.path().join("logs"))?;
+        let logs = node.logs();
+        assert_eq!(
+            logs.contains(QUIC_BUILT_MARKER),
+            quic_on,
+            "a gateway trip {age_min} min old: QUIC on must be {quic_on}. Logs:\n{logs}"
+        );
+        assert_eq!(
+            logs.contains(QUIC_COOLING_MARKER),
+            !quic_on,
+            "the cooling WARN must match. Logs:\n{logs}"
+        );
+        node.send_sigterm()?;
+        assert_eq!(
+            node.wait_for_exit(Duration::from_secs(45))?.code(),
+            Some(0),
+            "Logs:\n{}",
+            node.logs()
+        );
+    }
+    Ok(())
+}
+
 /// A SIGKILL whose pid is in the stop note (a deliberate hard kill, as the
 /// macOS tray does) is not a trip, and the start consumes the note; a note
 /// naming another pid does not excuse the kill. Drives `gate`'s reading of

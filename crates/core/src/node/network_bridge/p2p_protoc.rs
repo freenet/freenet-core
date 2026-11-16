@@ -1361,6 +1361,7 @@ impl P2pConnManager {
             config.config.network_api.quic_ignore_crash_breaker,
             config.config.shutdown_drain_secs,
             quic_breaker_now,
+            crate::transport::quic::breaker::BreakerRole::from_is_gateway(config.is_gateway),
         )
         .await;
         // The endpoint state telemetry reports, when QUIC is already off here;

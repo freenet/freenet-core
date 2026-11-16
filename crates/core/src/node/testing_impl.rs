@@ -8556,6 +8556,29 @@ mod tests {
         );
     }
 
+    /// `build` gives the breaker this node's role, so a gateway takes the
+    /// gateway cooldown and never the peer's 24 h (#5940, B prerequisite).
+    #[test]
+    fn build_passes_the_gateway_role_to_the_breaker_gate() {
+        let source = include_str!("network_bridge/p2p_protoc.rs");
+        let flat: String = method_body(source, "    pub async fn build(")
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<String>()
+            .split_whitespace()
+            .collect();
+        let gate = flat
+            .find("letquic=crate::transport::quic::breaker::gate(")
+            .expect("`build` runs the breaker gate");
+        let end = gate + flat[gate..].find(".await;").expect("awaited");
+        assert!(
+            flat[gate..end].contains(
+                "crate::transport::quic::breaker::BreakerRole::from_is_gateway(config.is_gateway),)"
+            ),
+            "the gate's last argument is the role from `config.is_gateway`"
+        );
+    }
+
     /// `build` records the QUIC endpoint state telemetry reports when QUIC is
     /// already off before the bind (#5940 UDP removal, phase A): from the
     /// breaker's result, after the gate, as code and not in a comment.

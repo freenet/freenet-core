@@ -1,9 +1,11 @@
 //! The QUIC crash-loop breaker (#5940).
 //!
 //! If a run with QUIC enabled ends abnormally, QUIC stays off for
-//! [`QUIC_BREAKER_COOLDOWN`]. Some failures inside quinn's own code end the
-//! process rather than a task, and the service manager restarts the node into
-//! the same failure; the breaker bounds that to one restart with QUIC per
+//! [`QUIC_BREAKER_COOLDOWN`] (24 h) on a peer and for
+//! [`GATEWAY_QUIC_BREAKER_COOLDOWN`] (15 min, provisional) on a gateway
+//! ([`BreakerRole`]). Some failures inside quinn's own code end the process
+//! rather than a task, and the service manager restarts the node into the
+//! same failure; the breaker bounds that to one restart with QUIC per
 //! cooldown.
 //!
 //! **This module doc describes unix.** Windows does not reliably tell a
@@ -139,8 +141,43 @@ use crate::node::background_task_monitor::LateRegistrar;
 mod short_runs;
 pub(crate) use short_runs::QuicCode;
 
-/// How long QUIC stays off after a run with QUIC enabled ended abnormally.
+/// How long QUIC stays off on a peer after a run with QUIC enabled ended
+/// abnormally.
 pub(crate) const QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How long QUIC stays off on a gateway after a run with QUIC enabled ended
+/// abnormally. Provisional value (a proposal, not measured).
+///
+/// A gateway never takes the peer cooldown: once joiners dial a gateway's
+/// QUIC endpoint directly (#5940 phase B), a gateway with QUIC off for a day
+/// would be unreachable over QUIC for that day. A short cooldown still bounds
+/// a crash loop to one restart with QUIC per cooldown.
+pub(crate) const GATEWAY_QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+/// Which cooldown applies: the node's role at this start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BreakerRole {
+    Peer,
+    Gateway,
+}
+
+impl BreakerRole {
+    pub(crate) fn from_is_gateway(is_gateway: bool) -> Self {
+        if is_gateway {
+            Self::Gateway
+        } else {
+            Self::Peer
+        }
+    }
+
+    /// How long QUIC stays off after a trip.
+    pub(crate) fn cooldown(self) -> Duration {
+        match self {
+            Self::Peer => QUIC_BREAKER_COOLDOWN,
+            Self::Gateway => GATEWAY_QUIC_BREAKER_COOLDOWN,
+        }
+    }
+}
 
 /// How much longer than the configured shutdown drain a start waits for a
 /// live process holding the marker to exit: the 2 s pause after the drain
@@ -283,6 +320,8 @@ pub(crate) struct Facts<'a> {
     pub stopped: &'a [u32],
     pub now_secs: u64,
     pub ignore_breaker: bool,
+    /// Decides how long a trip holds.
+    pub role: BreakerRole,
 }
 
 /// What a start does.
@@ -353,7 +392,7 @@ pub(crate) fn verdict(facts: &Facts<'_>) -> Verdict {
             Verdict::Trip
         }
         Previous::Marker(Marker::Tripped { tripped_at_secs })
-            if !facts.ignore_breaker && cooling(*tripped_at_secs, facts.now_secs) =>
+            if !facts.ignore_breaker && cooling(*tripped_at_secs, facts.now_secs, facts.role) =>
         {
             Verdict::Cool {
                 tripped_at_secs: *tripped_at_secs,
@@ -484,13 +523,15 @@ fn observe_with(
 /// Logs the outcome and updates the transport telemetry. `now` is the wall
 /// clock of the caller's `TimeSource`. May wait up to `drain_secs` plus
 /// [`HOLDER_EXIT_MARGIN`] for a previous node to exit. Windows decides by
-/// [`short_runs::gate`] instead, and does not wait.
+/// [`short_runs::gate`] instead, and does not wait. `role` picks the
+/// cooldown ([`BreakerRole::cooldown`]).
 pub(crate) async fn gate<T>(
     settings: Option<T>,
     data_dir: &Path,
     ignore_breaker: bool,
     drain_secs: u64,
     now: SystemTime,
+    role: BreakerRole,
 ) -> Gated<T> {
     let not_consulted = |settings| Gated {
         settings,
@@ -500,7 +541,7 @@ pub(crate) async fn gate<T>(
         return not_consulted(settings);
     }
     if cfg!(not(unix)) {
-        return short_runs::gate(settings, data_dir, ignore_breaker, now);
+        return short_runs::gate(settings, data_dir, ignore_breaker, now, role);
     }
     // The wrapper's note when it passed one; otherwise the note at its fixed
     // place, which may be meant for another node (`shared`).
@@ -562,11 +603,12 @@ pub(crate) async fn gate<T>(
         stopped: &stopped,
         now_secs,
         ignore_breaker,
+        role,
     });
 
     let metrics = &crate::transport::TRANSPORT_METRICS;
     let until_utc = |tripped_at_secs: u64| {
-        chrono::DateTime::<chrono::Utc>::from(cooldown_end(tripped_at_secs)).to_rfc3339()
+        chrono::DateTime::<chrono::Utc>::from(cooldown_end(tripped_at_secs, role)).to_rfc3339()
     };
     match decided {
         Verdict::Arm => {
@@ -597,7 +639,8 @@ pub(crate) async fn gate<T>(
             metrics.set_quic_breaker_suppressed(true);
             tracing::warn!(
                 until = %until_utc(now_secs),
-                cooldown_hours = QUIC_BREAKER_COOLDOWN.as_secs() / 3600,
+                cooldown_minutes = role.cooldown().as_secs() / 60,
+                ?role,
                 "The previous run with QUIC enabled ended abnormally, so QUIC stays off \
                  until the cooldown ends. Set `quic-ignore-crash-breaker = true` to run \
                  QUIC anyway"
@@ -607,6 +650,7 @@ pub(crate) async fn gate<T>(
             metrics.set_quic_breaker_suppressed(true);
             tracing::warn!(
                 until = %until_utc(tripped_at_secs),
+                ?role,
                 "QUIC stays off: a run with QUIC enabled ended abnormally and the \
                  cooldown has not ended. Set `quic-ignore-crash-breaker = true` to run \
                  QUIC anyway"
@@ -760,16 +804,16 @@ fn unix_secs(time: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-fn cooldown_end(tripped_at_secs: u64) -> SystemTime {
+fn cooldown_end(tripped_at_secs: u64, role: BreakerRole) -> SystemTime {
     SystemTime::UNIX_EPOCH
-        + Duration::from_secs(tripped_at_secs.saturating_add(QUIC_BREAKER_COOLDOWN.as_secs()))
+        + Duration::from_secs(tripped_at_secs.saturating_add(role.cooldown().as_secs()))
 }
 
 /// Whether a trip at `tripped_at_secs` still holds at `now_secs`. A trip time
 /// more than a cooldown in the future (a clock set back a long way) is not
 /// honoured, so it cannot hold QUIC off indefinitely.
-fn cooling(tripped_at_secs: u64, now_secs: u64) -> bool {
-    let cooldown = QUIC_BREAKER_COOLDOWN.as_secs();
+fn cooling(tripped_at_secs: u64, now_secs: u64, role: BreakerRole) -> bool {
+    let cooldown = role.cooldown().as_secs();
     now_secs < tripped_at_secs.saturating_add(cooldown)
         && tripped_at_secs <= now_secs.saturating_add(cooldown)
 }
@@ -928,6 +972,7 @@ mod tests {
             stopped: &[],
             now_secs: T0 + 30,
             ignore_breaker: false,
+            role: BreakerRole::Peer,
         }
     }
 
@@ -1034,6 +1079,58 @@ mod tests {
         assert_eq!(decide(&previous, alive), Verdict::Arm);
     }
 
+    /// A gateway's trip holds for the gateway cooldown, never the peer's
+    /// 24 h; a peer's trip still holds for the full peer cooldown.
+    #[test]
+    fn a_gateway_trip_holds_only_for_the_gateway_cooldown() {
+        let g = GATEWAY_QUIC_BREAKER_COOLDOWN.as_secs();
+        assert!(g < QUIC_BREAKER_COOLDOWN.as_secs());
+        let previous = Previous::Marker(Marker::Tripped {
+            tripped_at_secs: T0,
+        });
+        let at = |now_secs: u64, role: BreakerRole| {
+            verdict(&Facts {
+                now_secs,
+                role,
+                ..facts(&previous, Some(BOOT))
+            })
+        };
+        let cool = Verdict::Cool {
+            tripped_at_secs: T0,
+        };
+        assert_eq!(at(T0 + g - 1, BreakerRole::Gateway), cool);
+        assert_eq!(
+            at(T0 + g, BreakerRole::Gateway),
+            Verdict::Arm,
+            "a gateway runs QUIC again one gateway cooldown later"
+        );
+        assert_eq!(
+            at(T0 + g, BreakerRole::Peer),
+            cool,
+            "a peer still waits out the peer cooldown"
+        );
+        assert_eq!(
+            at(T0 + QUIC_BREAKER_COOLDOWN.as_secs() - 1, BreakerRole::Peer),
+            cool
+        );
+        assert_eq!(
+            at(T0 - g - 1, BreakerRole::Gateway),
+            Verdict::Arm,
+            "a gateway does not honour a trip further ahead than its cooldown"
+        );
+        // A crash on a gateway is still a trip: only how long it holds differs.
+        let armed = armed(PID, Some(BOOT));
+        assert_eq!(
+            verdict(&Facts {
+                role: BreakerRole::Gateway,
+                ..facts(&armed, Some(BOOT))
+            }),
+            Verdict::Trip
+        );
+        assert_eq!(BreakerRole::from_is_gateway(true), BreakerRole::Gateway);
+        assert_eq!(BreakerRole::from_is_gateway(false), BreakerRole::Peer);
+    }
+
     #[test]
     fn a_trip_holds_for_the_cooldown_unless_overridden() {
         let c = QUIC_BREAKER_COOLDOWN.as_secs();
@@ -1064,7 +1161,10 @@ mod tests {
             "further ahead does not"
         );
         assert_eq!(at(T0, true), Verdict::Arm, "the override");
-        assert!(!cooling(u64::MAX, 0), "saturation ends the cooldown");
+        assert!(
+            !cooling(u64::MAX, 0, BreakerRole::Peer),
+            "saturation ends the cooldown"
+        );
     }
 
     #[test]
@@ -1370,7 +1470,7 @@ mod tests {
         assert!(!ENABLED.load(Ordering::Relaxed));
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0);
         assert_eq!(
-            gate(Some(7u8), dir.path(), false, 30, now).await,
+            gate(Some(7u8), dir.path(), false, 30, now, BreakerRole::Peer).await,
             Gated {
                 settings: Some(7),
                 breaker: BreakerOutcome::NotConsulted,
@@ -1433,7 +1533,7 @@ mod tests {
             .expect("the enabled check");
         let windows = flat
             .find(
-                "ifcfg!(not(unix)){returnshort_runs::gate(settings,data_dir,ignore_breaker,now);}",
+                "ifcfg!(not(unix)){returnshort_runs::gate(settings,data_dir,ignore_breaker,now,role);}",
             )
             .expect("the Windows branch");
         assert!(enabled < windows);
