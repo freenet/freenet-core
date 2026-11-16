@@ -498,7 +498,7 @@ fn quic_breaker_marker_is_armed_and_cleared_by_a_clean_stop() -> anyhow::Result<
 }
 
 /// With no `transport-quic` flag, key or environment variable, the binary
-/// builds a QUIC endpoint and arms the breaker: prefer is the default on Linux
+/// builds a QUIC endpoint and arms the breaker: shadow is the default on Linux
 /// and macOS. Every other test here sets the mode, so this is the one that sees
 /// what a node that never set it runs.
 ///
@@ -506,7 +506,7 @@ fn quic_breaker_marker_is_armed_and_cleared_by_a_clean_stop() -> anyhow::Result<
 /// and this test fails.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn a_node_with_no_quic_setting_runs_prefer_and_arms_the_breaker() -> anyhow::Result<()> {
+fn a_node_with_no_quic_setting_runs_shadow_and_arms_the_breaker() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let log_dir = dir.path().join("logs");
     std::fs::create_dir_all(&log_dir)?;
@@ -526,8 +526,8 @@ fn a_node_with_no_quic_setting_runs_prefer_and_arms_the_breaker() -> anyhow::Res
         .find(|l| l.contains("QUIC transport mode configured"))
         .unwrap_or_else(|| panic!("no QUIC mode line. Logs:\n{logs}"));
     assert!(
-        mode_line.contains("Prefer") && mode_line.contains("default"),
-        "the mode line must say prefer, from the default: {mode_line}"
+        mode_line.contains("Shadow") && mode_line.contains("default"),
+        "the mode line must say shadow, from the default: {mode_line}"
     );
     wait_for_armed_marker(dir.path(), &node)?;
     node.send_sigterm()?;

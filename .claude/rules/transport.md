@@ -1168,21 +1168,20 @@ it must not wait unless it is a pacing point.
 #### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
 `transport-quic` (config key: `off`, `shadow` or `prefer`; unset is
-`QuicMode::default_mode`, prefer on Linux, macOS and Windows and off
-elsewhere, since the breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
+`QuicMode::default_mode`, shadow on Linux and macOS and off elsewhere, Windows
+included: the data ramp's emergency stop returned to 0.2.156's defaults, the last
+state the field ran) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
 `prefer` negotiates data with the share of pairs the ramp gives at the time ("Data
 slice" below; `upgrade::policy::log_startup` reports the share at INFO once per
 node, and each band the ramp enters is logged at INFO), and a pair with both bits
-sends its data on the path ("QUIC send route" below). The tree sets the ramp
-start for 0.2.158 (#6224), so `prefer` nodes, every Linux, macOS and Windows node
-that did not set the key, carry data with the ramp's share, and 0.2.158's release
-notes say so. With no ramp start (the emergency-stop build) and no
+sends its data on the path ("QUIC send route" below). 0.2.158 set the ramp
+start (#6224); this tree is its emergency stop, with no ramp start, so with no
 `quic-data-percent` the share is 0, and `prefer` differs from `shadow` only by the
 bit, which stays 0. Off: no endpoint, no QUIC ingress, nothing
 changes, except that `off` set in the config is deprecated and logs a WARN at
 startup (`upgrade::policy::log_startup`); the endpoint state telemetry reports it
-as `off_config`. Windows has the same default since its crash-loop breaker was
-confirmed on a real Windows machine (#6031). The default is
+as `off_config`. Windows had prefer by default from 0.2.157 (at a share of 0) until the stop (its
+crash-loop breaker was confirmed on a real Windows machine, #6031). The default is
 read, never written to config.toml: a node that did not set the key follows the
 release it runs, so a default-off release is the kill switch for QUIC as a
 whole. Stopping only the data ramp is smaller: `QUIC_DATA_RAMP_START = None`
@@ -1305,9 +1304,10 @@ pair is in the slice when its bucket is below the percentage, so 0 holds none,
   The percentage: a ramp over one release (`slice::ramp_percent`): 5% for the
   first 6 h, then linear 5 to 25% to 12 h and 25 to 100% to 24 h, 100% after,
   from `QUIC_DATA_RAMP_START` in `upgrade/policy.rs` (Unix seconds, or `None`:
-  no ramp, share 0). The start is set for 0.2.158 (#6224, 2026-11-16 02:30 UTC),
-  in its own reviewed PR at the planned publish time, and left set: past 24 h it
-  reads 100%, the steady state. Only an emergency stop sets it back to `None`. A node whose clock reads before the start gets
+  no ramp, share 0). It was set for 0.2.158 (#6224, 2026-11-16 02:30 UTC), in its
+  own reviewed PR at the planned publish time, to be left set (past 24 h it reads
+  100%, the steady state). This tree is the emergency stop, which sets it back to
+  `None`; a new ramp needs its own reviewed PR. A node whose clock reads before the start gets
   5%. Slices nest, so a pair in the slice stays in as the share grows. The config
   key `quic-data-percent` (lenient text like `quic-max-paths`; anything but a whole
   number from 0 to 100 reads as unset, with a WARN when QUIC is on) replaces the
@@ -1555,17 +1555,17 @@ a test passes its own; tests read their own, never the global).
   (the watch cannot tell then whether the peer is dark). The
   dark-path rule closes only a path that carries data (QuicPath::enable_data)
   and has no UDP session (a native path, recycle::DARK_CLOSES_WITH_UDP);
-  on every other path (shadow paths, pairs outside the ramp's share, and data
-  paths with a UDP session) it only counts, so the field shows how long real dark spells last. A spell is read
+  on every other path (all of them in the emergency-stop build, which has no
+  ramp, and data paths with a UDP session) it only counts, so the field shows how long real dark spells last. A spell is read
   up to when the peer is next heard from, which waits for quinn's backed-off
   probes after the outage ends, so it reads longer than the outage (in
   a_path_without_data_is_not_closed_by_a_dark_spell a 30 s outage read about
   45 s and a 100 s one about 200 s), and an outage whose backoff runs past
   quinn's 120 s idle timeout ends the path and counts `unrecovered`. The dark
-  threshold (the 10 s window) was not revisited before 0.2.158: the ramp passes
-  5% at T0 + 6 h with it as is. The release watch reads carried against shadow
-  dark episodes (rule 14) through the 5% plateau, and the window is to be
-  revisited from those numbers.
+  threshold (the 10 s window) was not revisited before 0.2.158, which ran the
+  ramp with it as is until this stop. The window is to be revisited from the
+  carried and shadow dark episodes 0.2.158 reported (watch rule 14) before any
+  new ramp.
   quic_gate_loss_<queue|share|persistent|ecn|no_sample|ignored> (congestion
   events by the loss gate's verdict, recycle::loss_gate, reported by the path's
   report at each tick; over a path's life they sum to its quic_congestion_events,
@@ -1969,11 +1969,13 @@ peer presents a key that is not its transport key.
 
 #### QUIC rollout (#5940)
 
-There are no opt-in stages; releases do the rollout. Windows is shadow by
-default since its breaker (a short run counts only if it panicked in QUIC code)
-was confirmed on a real Windows machine (#6031: Windows Server 2022, kills, a
+There are no opt-in stages; releases do the rollout. Windows ran QUIC by
+default (shadow, then `prefer`) in 0.2.157 and 0.2.158, after its breaker (a
+short run counts only if it panicked in QUIC code) was confirmed on a real
+Windows machine (#6031: Windows Server 2022, kills, a
 reboot, a logoff, `service restart`/`stop` never counted; injected aborts and a
-crash loop under the run wrapper tripped). Not run on a machine, covered by the
+crash loop under the run wrapper tripped). It is off by default again since
+the 0.2.159 emergency stop of the data ramp. Not run on a machine, covered by the
 rule that only a QUIC panic counts: Fast Startup, sleep, tray Restart/Stop/Quit
 and an update exit. What it never catches: a crash not preceded by a QUIC
 panic, a crash loop with runs of 10 minutes or more, and a fault that crashes
@@ -1981,8 +1983,8 @@ once a day. Every step watches: peers disappearing per version
 against the previous rollout (a node that dies before reporting is absent from
 every rate), endpoint-down, panics and breaker trips, RSS against
 `quic_paths_active`, CPU and egress, and NAT success, connections and transfers.
-From the first release with the Windows default, the release watch also reads
-Windows separately: `quic_adapter_panicked` and `quic_breaker_trips` by version
+In any release where Windows runs QUIC by default (0.2.157 and 0.2.158 did),
+the release watch also reads Windows separately: `quic_adapter_panicked` and `quic_breaker_trips` by version
 against the previous release, and peers with `quic_breaker_suppressed`. A
 Windows QUIC panic in the field is read (location, version) before the next
 release goes out.
@@ -1992,8 +1994,10 @@ release goes out.
   stays near 0 and UDP metrics do not change.
 - Step 1: nova gateways and framework in shadow for 24-48 h. The 24 h gateway
   A/B runs only if something looks odd. Rollback: set the key to off and restart.
-- Step 2: shadow on by default on Linux and macOS, then Windows once its
-  breaker was confirmed on a real machine (`QuicMode::default_mode`). Gate: at least 95% upgrade
+- Step 2: shadow on by default on Linux and macOS (`QuicMode::default_mode`).
+  Windows ran shadow, then `prefer`, in 0.2.157 and 0.2.158 once its breaker
+  was confirmed on a real machine, and is off by default again since the
+  0.2.159 emergency stop. Gate: at least 95% upgrade
   success by `established_as_offerer / accepted`; fewer than 1 fallback per
   path-day excluding endpoint and restart causes; memory within the measured
   terms (about 0.3 to 0.5 MiB per idle path). An abort spike stops the step.
@@ -2005,7 +2009,7 @@ release goes out.
   in the node aggregate at the QUIC connection cap, to which the connection
   limit is lowered while the node may carry data. Pairs outside the slice are
   the control while it grows. Started by 0.2.158 (#6224, T0 2026-11-16 02:30
-  UTC), with the release watch and the emergency-stop branch beside it. Keep
+  UTC) and stopped by this emergency-stop release. Keep
   the stream limits if permit waits plus
   `quic_open_uni_waited` stay below 0.5% of sends and ge_48 below 0.2% of
   path-windows.
@@ -2923,8 +2927,8 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     the peer's only connection: the node reconnects to it, with the
     upgrade's backoff (60 s doubling to 1 h, +/-20%), and data to it waits
     or fails meanwhile. Not built; the dark-episode counts are what the
-    10 s window is to be checked against. 0.2.158 passes 5% with the window
-    unchanged, so the check runs on the ramp's own carried episodes.
+    10 s window is to be checked against, including the carried episodes
+    0.2.158 reported before the stop.
   e5 constraint: SEND_ABORT_LIMIT and PEER_NOT_ACKNOWLEDGING ask the peer to
   fall back to UDP for THIS connection only. They are not a permanent
   downgrade: e5 must allow a new upgrade after its normal backoff.
@@ -3161,8 +3165,8 @@ QUIC receive flow (#5940 e5b-4):
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
 
-Live in production on Linux, macOS and Windows, where `prefer` is the default:
-until a release's share reaches a pair its path carries control frames only,
+Live in production on Linux and macOS, where `shadow` is the default since the
+data ramp's emergency stop (off on Windows): a path carries control frames only,
 but endpoints, connections and their errors are real. With `transport-quic` off no endpoint is built and the transport
 reports `Disabled`.
 
