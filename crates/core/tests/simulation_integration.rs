@@ -22751,7 +22751,7 @@ fn run_native_connect_sim(
         let gateways = sim
             .all_node_addresses()
             .iter()
-            .filter(|(label, _)| label.to_string().contains("-gateway-"))
+            .filter(|(label, _)| label.is_gateway())
             .map(|(_, addr)| *addr)
             .collect();
         let logs_handle = sim.event_logs_handle();

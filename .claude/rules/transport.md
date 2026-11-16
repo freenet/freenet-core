@@ -2176,7 +2176,14 @@ Fallback: a failed native setup is followed by today's UDP dial to the same
   (NAT_TRAVERSAL_DEADLINE, 3 s each) overlap. Falling back as each setup
   ended would not: the client's window ends 4 s before the server's. The
   simulation cannot show the difference (it has no NAT, and an expected
-  inbound is accepted for 100 s), so unit tests pin the timing. A native failure marks
+  inbound is accepted for 100 s), so unit tests pin the timing, including
+  a two-sided one where a UDP dial connects only if both sides punch
+  together. A joiner's native attempt is bounded by its fallback time
+  (DialTransport::Native carries the bound), and a queued native acceptor
+  with less than NATIVE_MIN_WINDOW_LEFT (4 s) left before it is dialled over
+  UDP at that time with no native attempt: a joiner with a connection dials
+  one acceptor at a time, and one behind a failed native dial would
+  otherwise time out (a demotion strike) and punch a client window late. A native failure marks
   no failed address and records no peer backoff, so the fallback is not
   refused. Until UDP is removed a failed native setup never costs the join
   (test_quic_native_failed_setups_fall_back_to_udp, which also checks that
@@ -2188,14 +2195,20 @@ Fallback: a failed native setup is followed by today's UDP dial to the same
 Success: the connection's key is bound as IdentitySource::Proven; a
   gateway records a JoinTransport::Native join.
 Demotion: recorded in the connection lifecycle, where the outcome is known,
-  and only for a dial the node made as joiner (OutboundFailed carries the
-  origin): a joiner's acceptors are the ones its CONNECT was routed to,
-  while an acceptor's joiner chose it and could fail on purpose. Only
+  and only for a dial the node made as joiner (OutboundEstablished and
+  OutboundFailed carry the origin), successes and failures alike. A joiner's
+  acceptors come from responses routed back along its CONNECT, while an
+  acceptor's joiner chose it and could fail on purpose with free keys. This
+  narrows who can drive a demotion; it does not exclude everyone: the
+  acceptor in a response is named by whoever sent it, so a relay on the
+  CONNECT's path can name acceptors that decide Native and never serve. The
+  effect is a 6 h downgrade to UDP, not a failed join. An acceptor's own
+  native failures never demote it (before-enabling item). Only
   timed_out, handshake_failed and hello_lost count
   (NativeSetupOutcome::counts_toward_demotion): a refusal by the node's own
   limits, or a Hello the peer answered, says nothing about the path. Three
   such failures with distinct peers turn native off for 6 h
-  (connect_native_demotions); a success resets the streak.
+  (connect_native_demotions); a success as joiner resets the streak.
 Existing transport: a native dial does not drop a connection the node
   already has to that peer; the joiner may have connected another way since
   the acceptor decided.
