@@ -29,7 +29,7 @@ mod node;
 pub use node::{
     EventLoopExitReason, Node, ShutdownHandle, enable_abort_on_fatal_listener_exit,
     enable_abort_on_redb_poison, enable_fast_crash_exit_code, listener_exit_is_graceful,
-    run_local_node, run_local_node_with_listener, run_network_node,
+    run_local_node, run_local_node_with_listener, run_network_node, set_auto_update_state,
 };
 pub use transport::quic::breaker::{
     STOP_NOTE_ENV_VAR as QUIC_BREAKER_STOP_NOTE_ENV_VAR,
@@ -78,6 +78,12 @@ pub mod simulation;
 #[cfg(test)]
 #[path = "../build/git_watch.rs"]
 mod build_git_watch;
+
+/// `build.rs`'s fallback for the commit of a crates.io package, tested here
+/// for the same reason.
+#[cfg(test)]
+#[path = "../build/vcs_info.rs"]
+mod build_vcs_info;
 
 /// Pin the process-start anchor used by the bootstrap-latency metric
 /// (`freenet.bootstrap.time_to_min_connections_seconds`, issue #4787).

@@ -109,6 +109,7 @@ pub use network_bridge::in_memory::{FaultInjectorState, get_fault_injector, set_
 pub(crate) mod background_task_monitor;
 pub(crate) mod neighbor_hosting;
 pub(crate) mod network_status;
+pub use network_status::set_auto_update_state;
 mod op_state_manager;
 mod p2p_impl;
 mod request_router;
