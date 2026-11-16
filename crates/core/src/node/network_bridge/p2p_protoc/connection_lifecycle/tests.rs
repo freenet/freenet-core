@@ -388,6 +388,7 @@ impl Harness {
                 &mut self.state,
                 true,
                 crate::transport::NatAttemptOrigin::ConnectAcceptor,
+                crate::operations::connect::native::DialTransport::Udp,
             )
             .await
             .expect("handle_connect_peer");
@@ -544,6 +545,7 @@ fn is_transport_kind(kind: ConnIdentity) -> bool {
 fn is_set(kind: ConnIdentity) -> bool {
     match kind {
         ConnIdentity::SetDialed
+        | ConnIdentity::SetProven
         | ConnIdentity::ExpectedInboundBound
         | ConnIdentity::ExpectedInboundUnbound
         | ConnIdentity::SetConnectRequest
@@ -1034,6 +1036,20 @@ async fn pending_connect_peer(
     h: &mut Harness,
     peer: PeerKeyLocation,
 ) -> mpsc::Receiver<Result<(SocketAddr, Option<usize>), ()>> {
+    pending_connect_peer_over(
+        h,
+        peer,
+        crate::operations::connect::native::DialTransport::Udp,
+    )
+    .await
+}
+
+/// As [`pending_connect_peer`], dialling over `transport`.
+async fn pending_connect_peer_over(
+    h: &mut Harness,
+    peer: PeerKeyLocation,
+    transport: crate::operations::connect::native::DialTransport,
+) -> mpsc::Receiver<Result<(SocketAddr, Option<usize>), ()>> {
     if let Some(addr) = peer.socket_addr() {
         h.use_addr(addr);
     }
@@ -1048,6 +1064,7 @@ async fn pending_connect_peer(
             &mut h.state,
             false,
             crate::transport::NatAttemptOrigin::ConnectAcceptor,
+            transport,
         )
         .await
         .expect("handle_connect_peer");
@@ -1114,6 +1131,8 @@ async fn matched_inbound_at_the_cap_is_refused_like_a_dial() {
                 peer: PeerKeyLocation::new(peer.clone(), addr),
                 connection,
                 transient: false,
+                transport: crate::operations::connect::native::DialTransport::Udp,
+                origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
             }
         })
         .await;
@@ -1321,6 +1340,7 @@ impl DriverRig {
                 &mut h.state,
                 false,
                 crate::transport::NatAttemptOrigin::ConnectAcceptor,
+                crate::operations::connect::native::DialTransport::Udp,
             )
             .await
             .expect("handle_connect_peer");
@@ -1608,6 +1628,8 @@ async fn successful_dial_drops_the_expectation_for_its_address() {
         peer: PeerKeyLocation::new(key(), addr),
         connection: Box::new(IdleConnection::new(addr)),
         transient: false,
+        transport: crate::operations::connect::native::DialTransport::Udp,
+        origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
     })
     .await;
     let mut dropped = false;
@@ -2140,6 +2162,7 @@ impl RestartRig {
                 &mut h.state,
                 false,
                 crate::transport::NatAttemptOrigin::ConnectJoiner,
+                crate::operations::connect::native::DialTransport::Udp,
             )
             .await
             .expect("handle_connect_peer");
@@ -3586,4 +3609,218 @@ async fn promoting_a_connection_already_in_the_ring_sends_no_second_key() {
         vec![ConnIdentity::TransportKeySent],
         "one key sent, at the dial's promotion"
     );
+}
+
+/// A native connection's key was proven in its QUIC handshake: the node binds
+/// it as `Proven` (counted `SetProven`), links the peer under it and answers
+/// the ConnectPeer.
+#[tokio::test]
+async fn a_native_connection_binds_its_proven_key() {
+    use crate::operations::connect::native::DialTransport;
+    let mut h = Harness::new("conn-identity-native-proven").await;
+    let addr: SocketAddr = "203.0.113.230:6201".parse().unwrap();
+    let peer = key();
+    h.watch(&[addr]);
+    let mut result = pending_connect_peer_over(
+        &mut h,
+        PeerKeyLocation::new(peer.clone(), addr),
+        DialTransport::NATIVE,
+    )
+    .await;
+    h.handshake_event(HandshakeEvent::OutboundEstablished {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: PeerKeyLocation::new(peer.clone(), addr),
+        connection: Box::new(IdleConnection::new(addr)),
+        transient: false,
+        transport: DialTransport::NATIVE,
+        origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
+    })
+    .await;
+    assert!(
+        matches!(result.try_recv(), Ok(Ok(_))),
+        "the dial is answered"
+    );
+    assert_eq!(seen(addr), vec![ConnIdentity::SetProven]);
+    assert_eq!(h.ring_key_at(addr).as_ref(), Some(&peer));
+    h.assert_own_key_absent();
+}
+
+/// A failed native setup: the connect op dials UDP next, so the address is
+/// not marked failed and the peer gets no backoff, either of which would
+/// refuse that dial. Only an outcome that says native does not work on the
+/// path, seen as joiner, counts toward demotion: three joiner timeouts with
+/// distinct peers demote the node; three refusals by its own punch budget do
+/// not, nor do three timeouts as acceptor (a joiner chose this node, and
+/// could fail on purpose).
+#[tokio::test]
+async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_path_failures() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::NativeSetupOutcome;
+    let mut h = Harness::new("native-failure").await;
+    use crate::transport::NatAttemptOrigin;
+    for (round, outcome, origin, demotions) in [
+        (
+            0u16,
+            NativeSetupOutcome::OverBudgetDestination,
+            NatAttemptOrigin::ConnectJoiner,
+            0,
+        ),
+        (
+            1,
+            NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::ConnectAcceptor,
+            0,
+        ),
+        (
+            2,
+            NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::ConnectJoiner,
+            1,
+        ),
+    ] {
+        for i in 0..3u16 {
+            let addr: SocketAddr = format!("203.0.113.231:{}", 6210 + round * 10 + i)
+                .parse()
+                .unwrap();
+            let peer = PeerKeyLocation::new(key(), addr);
+            let mut result =
+                pending_connect_peer_over(&mut h, peer.clone(), DialTransport::NATIVE).await;
+            h.handshake_event(HandshakeEvent::OutboundFailed {
+                transaction: Transaction::new::<ConnectMsg>(),
+                peer,
+                // A transport-level error, which marks a UDP dial's address.
+                error: ConnectionError::Timeout,
+                transient: false,
+                transport: DialTransport::NATIVE,
+                native_outcome: Some(outcome),
+                origin,
+            })
+            .await;
+            assert!(matches!(result.try_recv(), Ok(Err(()))), "the dial failed");
+            assert!(
+                !failed_addrs(&h).contains(&addr),
+                "a native failure does not mark the address"
+            );
+            assert!(
+                !h.state.peer_backoff.is_in_backoff(addr),
+                "a native failure gives no backoff"
+            );
+        }
+        assert_eq!(
+            h.mgr
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .native_connect()
+                .demotions(),
+            demotions,
+            "{outcome:?} as {origin:?}"
+        );
+    }
+}
+
+/// Review round 2: demotion is attributed by the same rule for successes as
+/// for failures. A native success as acceptor does not reset the joiner
+/// streak (its failures never count), so two joiner timeouts, an acceptor
+/// success and a third joiner timeout demote the node; a success as joiner
+/// in the same place resets the streak and the node is not demoted.
+#[tokio::test]
+async fn only_a_joiners_native_success_resets_its_demotion_streak() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::{NatAttemptOrigin, NativeSetupOutcome};
+    for (case, success_origin, demotions) in [
+        (0u16, NatAttemptOrigin::ConnectAcceptor, 1),
+        (1, NatAttemptOrigin::ConnectJoiner, 0),
+    ] {
+        let mut h = Harness::new(&format!("native-success-origin-{case}")).await;
+        let addr = |i: u16| -> SocketAddr {
+            format!("203.0.113.233:{}", 6240 + case * 10 + i)
+                .parse()
+                .unwrap()
+        };
+        let fail = |i: u16| HandshakeEvent::OutboundFailed {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: PeerKeyLocation::new(key(), addr(i)),
+            error: ConnectionError::FailedConnectOp,
+            transient: false,
+            transport: DialTransport::NATIVE,
+            native_outcome: Some(NativeSetupOutcome::TimedOut),
+            origin: NatAttemptOrigin::ConnectJoiner,
+        };
+        h.handshake_event(fail(0)).await;
+        h.handshake_event(fail(1)).await;
+        let winner = PeerKeyLocation::new(key(), addr(2));
+        let _result =
+            pending_connect_peer_over(&mut h, winner.clone(), DialTransport::NATIVE).await;
+        h.handshake_event(HandshakeEvent::OutboundEstablished {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: winner,
+            connection: Box::new(IdleConnection::new(addr(2))),
+            transient: false,
+            transport: DialTransport::NATIVE,
+            origin: success_origin,
+        })
+        .await;
+        h.handshake_event(fail(3)).await;
+        assert_eq!(
+            h.mgr
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .native_connect()
+                .demotions(),
+            demotions,
+            "a native success as {success_origin:?}"
+        );
+    }
+}
+
+/// The server of a native setup waits longer than its client, so the pair
+/// can connect by the client's UDP fallback before the server's setup ends.
+/// That late failure must leave the connection alone: it stays in the
+/// connection map and in the ring, and the address is not marked failed.
+#[tokio::test]
+async fn a_late_native_failure_keeps_the_connection_made_meanwhile() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::NativeSetupOutcome;
+    let mut h = Harness::new("native-late-failure").await;
+    let addr: SocketAddr = "203.0.113.232:6230".parse().unwrap();
+    let peer = key();
+    let mut result = pending_connect_peer(&mut h, PeerKeyLocation::new(peer.clone(), addr)).await;
+    h.handshake_event(HandshakeEvent::OutboundEstablished {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: PeerKeyLocation::new(peer.clone(), addr),
+        connection: Box::new(IdleConnection::new(addr)),
+        transient: false,
+        transport: DialTransport::Udp,
+        origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
+    })
+    .await;
+    assert!(matches!(result.try_recv(), Ok(Ok(_))), "premise: connected");
+    assert_eq!(
+        h.ring_key_at(addr).as_ref(),
+        Some(&peer),
+        "premise: in the ring"
+    );
+
+    h.handshake_event(HandshakeEvent::OutboundFailed {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: PeerKeyLocation::new(peer.clone(), addr),
+        error: ConnectionError::FailedConnectOp,
+        transient: false,
+        transport: DialTransport::NATIVE,
+        native_outcome: Some(NativeSetupOutcome::TimedOut),
+        origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
+    })
+    .await;
+    assert!(h.mgr.connections.contains_key(&addr), "still connected");
+    assert_eq!(
+        h.ring_key_at(addr).as_ref(),
+        Some(&peer),
+        "still in the ring"
+    );
+    assert!(!failed_addrs(&h).contains(&addr));
+    assert_eq!(h_count(&h), 1);
 }

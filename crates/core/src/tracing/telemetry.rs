@@ -3098,6 +3098,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.connect_native_decision_over_cap),
             );
             m.insert(
+                "connect_native_demotions".into(),
+                serde_json::json!(snapshot.connect_native_demotions),
+            );
+            m.insert(
                 "connect_native_offer_level".into(),
                 serde_json::json!(snapshot.connect_native_offer_level),
             );
@@ -3155,7 +3159,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
             );
             {
                 use crate::transport::metrics::{
-                    QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
+                    NativeSetupOutcome, QuicCloseCode, QuicFallback, QuicPathAge,
+                    QuicUpgradeOutcome,
                 };
                 for (i, count) in snapshot.quic_close_received.iter().enumerate() {
                     let label = QuicCloseCode::ALL
@@ -3184,6 +3189,15 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 for (age, count) in QuicPathAge::ALL.iter().zip(snapshot.quic_path_age_at_close) {
                     m.insert(
                         format!("quic_path_age_at_close_{}", age.label()),
+                        count.into(),
+                    );
+                }
+                for (outcome, count) in NativeSetupOutcome::ALL
+                    .iter()
+                    .zip(snapshot.connect_native_setup)
+                {
+                    m.insert(
+                        format!("connect_native_setup_{}", outcome.label()),
                         count.into(),
                     );
                 }
@@ -7870,7 +7884,7 @@ mod tests {
         // The QUIC families are arrays in the snapshot and one key per label in
         // the event.
         use crate::transport::metrics::{
-            QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
+            NativeSetupOutcome, QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
         };
         for family in [
             "quic_close_received",
@@ -7879,6 +7893,7 @@ mod tests {
             "quic_churned_fallback",
             "quic_carried_fallback",
             "quic_path_age_at_close",
+            "connect_native_setup",
         ] {
             assert!(expected.remove(family), "{family} is in the snapshot");
         }
@@ -7913,6 +7928,11 @@ mod tests {
             QuicPathAge::ALL
                 .iter()
                 .map(|age| format!("quic_path_age_at_close_{}", age.label())),
+        );
+        expected.extend(
+            NativeSetupOutcome::ALL
+                .iter()
+                .map(|outcome| format!("connect_native_setup_{}", outcome.label())),
         );
         let actual: std::collections::BTreeSet<String> = event_kind_to_json(
             &super::super::EventKind::TransportSnapshot(Box::new(snapshot)),
@@ -8179,6 +8199,7 @@ mod tests {
     fn transport_snapshot_json_carries_conn_identity_values() {
         let snapshot = crate::transport::metrics::TransportSnapshot {
             conn_identity_set_dialed: 61,
+            conn_identity_set_proven: 761,
             conn_identity_expected_inbound_bound: 62,
             conn_identity_expected_inbound_unbound: 80,
             conn_identity_set_connect_request: 63,
@@ -8212,6 +8233,7 @@ mod tests {
         )));
         for (key, expected) in [
             ("conn_identity_set_dialed", 61),
+            ("conn_identity_set_proven", 761),
             ("conn_identity_expected_inbound_bound", 62),
             ("conn_identity_expected_inbound_unbound", 80),
             ("conn_identity_set_connect_request", 63),
@@ -8302,7 +8324,7 @@ mod tests {
     #[test]
     fn transport_snapshot_json_carries_quic_upgrade_telemetry() {
         use crate::transport::metrics::{
-            QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
+            NativeSetupOutcome, QuicCloseCode, QuicFallback, QuicPathAge, QuicUpgradeOutcome,
         };
         let mut snapshot = crate::transport::metrics::TransportSnapshot::default();
         let mut next = 0u64;
@@ -8318,6 +8340,7 @@ mod tests {
         fill(&mut snapshot.quic_churned_fallback);
         fill(&mut snapshot.quic_carried_fallback);
         fill(&mut snapshot.quic_path_age_at_close);
+        fill(&mut snapshot.connect_native_setup);
         snapshot.quic_establish_ms_p50 = Some(901);
         snapshot.quic_establish_ms_p90 = Some(902);
         snapshot.quic_establish_samples = 903;
@@ -8349,6 +8372,12 @@ mod tests {
         for (age, count) in QuicPathAge::ALL.iter().zip(snapshot.quic_path_age_at_close) {
             expected.push((format!("quic_path_age_at_close_{}", age.label()), count));
         }
+        for (outcome, count) in NativeSetupOutcome::ALL
+            .iter()
+            .zip(snapshot.connect_native_setup)
+        {
+            expected.push((format!("connect_native_setup_{}", outcome.label()), count));
+        }
         for (key, value) in [
             ("quic_establish_ms_p50", 901),
             ("quic_establish_ms_p90", 902),
@@ -8366,6 +8395,7 @@ mod tests {
                 + QuicUpgradeOutcome::COUNT
                 + 3 * QuicFallback::COUNT
                 + QuicPathAge::COUNT
+                + NativeSetupOutcome::COUNT
                 + 6
         );
         for (key, value) in expected {

@@ -86,15 +86,21 @@ fn run<F, Fut>(
     F: FnOnce(Rig) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    run_with(network, peer_limits, idle_timeout, None, test);
+    run_with(
+        network,
+        peer_limits,
+        idle_timeout,
+        QuicRateLimit::new(None, None),
+        test,
+    );
 }
 
-/// [`run`], with the node's `bandwidth-limit` set to `bandwidth_limit`.
+/// [`run`], with the node's bandwidth settings `rate_limit`.
 fn run_with<F, Fut>(
     network: &'static str,
     peer_limits: QuicPathLimits,
     idle_timeout: Option<Duration>,
-    bandwidth_limit: Option<usize>,
+    rate_limit: QuicRateLimit,
     test: F,
 ) where
     F: FnOnce(Rig) -> Fut + Send + 'static,
@@ -108,7 +114,7 @@ fn run_with<F, Fut>(
             VERSION,
             PathClock::Virtual(time.clone()),
             None,
-            QuicRateLimit::new(bandwidth_limit, None),
+            rate_limit,
             RouteNote::default(),
         );
         let registry = Arc::new(OrphanStreamRegistry::new());
@@ -707,7 +713,7 @@ fn the_bandwidth_limit_paces_a_native_connections_data() {
         "native-conn-paced",
         QuicPathLimits::DEFAULT,
         None,
-        Some(100_000),
+        QuicRateLimit::new(Some(100_000), None),
         |mut rig| async move {
             assert!(rig.conn.path().is_paced());
             let start = rig.time().now();
@@ -852,6 +858,83 @@ fn a_close_reports_the_cause_it_was_given_first() {
                 rig.conn.close_reason(),
                 Some(CloseReason::QuicPath(QuicPathEnd::ClosedLocally))
             );
+        },
+    );
+}
+
+/// The peer's close reads as `ClosedByPeer` whether its application or its
+/// QUIC stack closed; a local close takes the recorded cause; the rest is a
+/// loss.
+#[test]
+fn close_reasons_follow_quinns_end() {
+    use quinn::ConnectionError as E;
+    let transport_close = E::ConnectionClosed(quinn::ConnectionClose {
+        error_code: quinn::TransportErrorCode::crypto(0x28),
+        frame_type: None,
+        reason: Bytes::new(),
+    });
+    let by_peer = CloseReason::QuicPath(QuicPathEnd::ClosedByPeer);
+    assert_eq!(reason_for(Some(&transport_close), None), by_peer);
+    assert_eq!(
+        reason_for(Some(&transport_close), Some(QuicPathEnd::Stalled)),
+        by_peer,
+        "a cause recorded locally does not override the peer's close"
+    );
+    assert_eq!(
+        reason_for(Some(&E::TimedOut), None),
+        CloseReason::IdleTimeout
+    );
+    assert_eq!(
+        reason_for(Some(&E::LocallyClosed), Some(QuicPathEnd::SendAborts)),
+        CloseReason::QuicPath(QuicPathEnd::SendAborts)
+    );
+    assert_eq!(
+        reason_for(Some(&E::Reset), None),
+        CloseReason::QuicPath(QuicPathEnd::Lost)
+    );
+}
+
+/// A panic in the route worker is counted on its path, then raised again.
+#[test]
+fn a_native_worker_panic_is_counted_and_raised() {
+    run(
+        "native-conn-worker-panic",
+        QuicPathLimits::DEFAULT,
+        None,
+        |rig| async move {
+            let stats = rig.conn.path().stats_handle();
+            let task = tokio::spawn(count_panics(stats.clone(), async {
+                panic!("a worker panic for the test");
+            }));
+            let joined = task.await;
+            assert!(joined.is_err_and(|error| error.is_panic()), "raised again");
+            assert_eq!(
+                stats.send_event_count(QuicSendEvent::NativeWorkerPanicked),
+                1
+            );
+        },
+    );
+}
+
+/// With `total-bandwidth-limit` set, a native connection counts in the shared
+/// manager's connections while it lives, as a UDP connection does, so every
+/// connection's share is computed over it too.
+#[test]
+fn a_native_connection_counts_in_the_shared_bandwidth_pool() {
+    use crate::transport::global_bandwidth::GlobalBandwidthManager;
+    let manager = Arc::new(GlobalBandwidthManager::new(1_000_000, Some(1000)));
+    let watched = Arc::clone(&manager);
+    run_with(
+        "native-conn-pool",
+        QuicPathLimits::DEFAULT,
+        None,
+        QuicRateLimit::new(None, Some(manager)),
+        move |rig| async move {
+            assert_eq!(watched.connection_count(), 1);
+            assert_eq!(watched.current_per_connection_rate(), 1_000_000);
+            assert!(rig.conn.path().is_paced(), "paced at its share");
+            drop(rig.conn);
+            assert_eq!(watched.connection_count(), 0, "unregistered on drop");
         },
     );
 }

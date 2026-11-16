@@ -438,9 +438,7 @@ pub(crate) trait RelayContext {
 
     /// This node's readiness for QUIC-native connections, read when it
     /// decides as acceptor.
-    fn native_readiness(&self) -> native::NativeReadiness {
-        native::NativeReadiness::current()
-    }
+    fn native_readiness(&self) -> native::NativeReadiness;
 
     /// Whether this node holds a transport to the joiner, by key or by
     /// address, read when it decides as acceptor. An existing transport is
@@ -998,6 +996,14 @@ impl RelayContext for RelayEnv<'_> {
         &self.self_location
     }
 
+    fn native_readiness(&self) -> native::NativeReadiness {
+        self.op_manager
+            .ring
+            .connection_manager
+            .native_connect()
+            .readiness()
+    }
+
     /// A ring connection to the joiner's key, or any transport the bridge
     /// holds open at its address: a ring connection, a transient one (a
     /// gateway holds one for every joiner it relays for), or one whose
@@ -1405,7 +1411,15 @@ impl ConnectOp {
         exclude_addrs: &[SocketAddr],
     ) -> (Transaction, Self, ConnectMsg) {
         let tx = Transaction::new::<ConnectMsg>();
-        let msg = prepare_join_request(tx, &own, &target, desired_location, ttl, exclude_addrs);
+        let msg = prepare_join_request(
+            tx,
+            &own,
+            &target,
+            desired_location,
+            ttl,
+            exclude_addrs,
+            native::NativeConnectState::new(None).readiness(),
+        );
 
         let op = ConnectOp::new_joiner(
             tx,
@@ -1510,6 +1524,7 @@ pub(super) async fn dispatch_expect_connection_from(
     op_manager: &OpManager,
     tx: Transaction,
     peer: PeerKeyLocation,
+    decision: Option<native::NativeDecision>,
 ) -> Result<(), OpError> {
     let Some(addr) = peer.socket_addr() else {
         // Protocol invariant violation: `handle_request` only sets
@@ -1525,19 +1540,32 @@ pub(super) async fn dispatch_expect_connection_from(
         return Ok(());
     };
 
+    if decision != Some(native::NativeDecision::Native) {
+        tracing::info!(
+            joiner_addr = %addr,
+            tx = %tx,
+            "connect: acceptor accepted joiner, initiating hole punch"
+        );
+        let mut rx = acceptor_udp_dial(op_manager, tx, &peer, addr).await?;
+        GlobalExecutor::spawn(async move {
+            log_acceptor_dial(&peer, tx, rx.recv().await);
+        });
+        return Ok(());
+    }
+
+    // Native: no UDP expectation, since the connection comes from the QUIC
+    // endpoint (the setup's waiter is registered when the dial runs, before
+    // the joiner's dial can arrive). A failed setup is followed by today's UDP
+    // dial, so until UDP is removed a failed native setup never costs the
+    // join. That dial starts `NATIVE_FALLBACK_AFTER` after this decision,
+    // never earlier, when the joiner starts its own (measured from the
+    // response's arrival), so the two hole punches overlap.
     tracing::info!(
         joiner_addr = %addr,
         tx = %tx,
-        "connect: acceptor accepted joiner, initiating hole punch"
+        "connect: acceptor accepted joiner, setting up a QUIC-native connection"
     );
-
-    op_manager
-        .notify_node_event(NodeEvent::ExpectPeerConnection {
-            addr,
-            peer_key: peer.pub_key().clone(),
-        })
-        .await?;
-
+    let decided_at = Instant::now();
     let (callback, mut rx) = mpsc::channel(1);
     op_manager
         .notify_node_event(NodeEvent::ConnectPeer {
@@ -1546,31 +1574,106 @@ pub(super) async fn dispatch_expect_connection_from(
             callback,
             is_gw: false,
             origin: crate::transport::NatAttemptOrigin::ConnectAcceptor,
+            transport: native::DialTransport::NATIVE,
         })
         .await?;
-
+    let op_manager = op_manager.clone();
+    // Not registered with the task monitor, like the UDP branch's task above:
+    // it ends within `NATIVE_FALLBACK_AFTER` plus one dial, and an event loop
+    // that has gone fails its sends.
     GlobalExecutor::spawn(async move {
-        if let Some(result) = rx.recv().await {
-            match result {
-                Ok((connected_peer, _)) => {
-                    tracing::info!(
-                        %connected_peer,
-                        tx=%tx,
-                        "connect: acceptor hole-punch connection succeeded"
-                    );
+        // Demotion is recorded where the setup's end is known (the
+        // connection lifecycle); this task only falls back.
+        match rx.recv().await {
+            Some(Ok((connected_peer, _))) => {
+                tracing::info!(
+                    %connected_peer,
+                    tx = %tx,
+                    "connect: acceptor connected to the joiner (natively, or by the joiner's UDP fallback)"
+                );
+            }
+            failed @ (Some(Err(_)) | None) => {
+                tracing::info!(
+                    %peer,
+                    tx = %tx,
+                    closed = failed.is_none(),
+                    "connect: acceptor's QUIC-native setup failed; falling back to UDP"
+                );
+                tokio::time::sleep_until(decided_at + crate::transport::NATIVE_FALLBACK_AFTER)
+                    .await;
+                // A node shutting down meanwhile starts no new dial.
+                if op_manager
+                    .shutting_down_handle()
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    tracing::debug!(%peer, tx = %tx, "connect: shutting down; no UDP fallback");
+                    return;
                 }
-                Err(_) => {
-                    tracing::debug!(
+                match acceptor_udp_dial(&op_manager, tx, &peer, addr).await {
+                    Ok(mut rx) => log_acceptor_dial(&peer, tx, rx.recv().await),
+                    Err(error) => tracing::warn!(
                         %peer,
-                        tx=%tx,
-                        "connect: acceptor hole-punch connection failed (joiner may connect to us instead)"
-                    );
+                        tx = %tx,
+                        %error,
+                        "connect: acceptor's UDP fallback could not be started"
+                    ),
                 }
             }
         }
     });
-
     Ok(())
+}
+
+/// The acceptor's UDP hole punch towards `peer` at `addr`: an expected-inbound
+/// registration, then a dial. Returns where the dial's result arrives.
+async fn acceptor_udp_dial(
+    op_manager: &OpManager,
+    tx: Transaction,
+    peer: &PeerKeyLocation,
+    addr: SocketAddr,
+) -> Result<mpsc::Receiver<crate::message::ConnectResult>, OpError> {
+    op_manager
+        .notify_node_event(NodeEvent::ExpectPeerConnection {
+            addr,
+            peer_key: peer.pub_key().clone(),
+        })
+        .await?;
+    let (callback, rx) = mpsc::channel(1);
+    op_manager
+        .notify_node_event(NodeEvent::ConnectPeer {
+            peer: peer.clone(),
+            tx,
+            callback,
+            is_gw: false,
+            origin: crate::transport::NatAttemptOrigin::ConnectAcceptor,
+            transport: native::DialTransport::Udp,
+        })
+        .await?;
+    Ok(rx)
+}
+
+fn log_acceptor_dial(
+    peer: &PeerKeyLocation,
+    tx: Transaction,
+    result: Option<crate::message::ConnectResult>,
+) {
+    match result {
+        Some(Ok((connected_peer, _))) => {
+            tracing::info!(
+                %connected_peer,
+                tx=%tx,
+                "connect: acceptor hole-punch connection succeeded"
+            );
+        }
+        Some(Err(_)) => {
+            tracing::debug!(
+                %peer,
+                tx=%tx,
+                "connect: acceptor hole-punch connection failed (joiner may connect to us instead)"
+            );
+        }
+        None => {}
+    }
 }
 
 /// Build a `ConnectMsg::Request` for a joiner-initiated CONNECT.
@@ -1594,6 +1697,7 @@ pub(crate) fn prepare_join_request(
     desired_location: Location,
     ttl: u8,
     exclude_addrs: &[SocketAddr],
+    readiness: native::NativeReadiness,
 ) -> ConnectMsg {
     let mut visited = VisitedPeers::new(&tx);
     if let Some(own_addr) = own.socket_addr() {
@@ -1618,7 +1722,6 @@ pub(crate) fn prepare_join_request(
     let joiner = PeerKeyLocation::with_unknown_addr(own.pub_key.clone());
     // Every request carries an offer, at percent 0 while this node cannot
     // dial native; the encoder drops it on a hop to a peer below the floor.
-    let readiness = native::NativeReadiness::current();
     let offer = readiness.offer();
     crate::transport::metrics::TRANSPORT_METRICS
         .record_connect_native_offered(offer, readiness.ready);
@@ -4254,6 +4357,7 @@ mod tests {
             Location::random(),
             3,
             &[],
+            native::NativeReadiness::current(),
         );
         let ConnectMsg::Request { payload, .. } = msg else {
             panic!("expected a request, got {msg:?}");

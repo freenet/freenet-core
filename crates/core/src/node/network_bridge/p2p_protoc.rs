@@ -1561,7 +1561,14 @@ impl P2pConnManager {
             expected_inbound,
             listener: mut listener_liveness,
             quic_endpoint: transport_has_quic,
+            quic_availability,
         } = transport;
+        bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .native_connect()
+            .set_endpoint(quic_availability);
 
         tracing::info!(
             listening_port,
@@ -2080,6 +2087,7 @@ impl P2pConnManager {
                                             callback,
                                             is_gw,
                                             origin: unconnected_dial_origin(is_gw),
+                                            transport: crate::operations::connect::native::DialTransport::Udp,
                                         }),
                                     ) {
                                         // `err` owns the ConnectPeer event (and thus the
@@ -2653,6 +2661,7 @@ impl P2pConnManager {
                                 callback,
                                 is_gw: transient,
                                 origin,
+                                transport,
                             } => {
                                 tracing::debug!(
                                     tx = %tx,
@@ -2670,6 +2679,7 @@ impl P2pConnManager {
                                     &mut state,
                                     transient,
                                     origin,
+                                    transport,
                                 )
                                 .await?;
                             }
@@ -3872,6 +3882,9 @@ async fn peer_connection_listener(
         "[CONN_LIFECYCLE] Starting peer_connection_listener task"
     );
 
+    // Transient send failures on this connection so far, for the warn's
+    // throttle (`warn_transient_send_failure`).
+    let mut transient_send_failures: u64 = 0;
     loop {
         // Yield to allow the tokio runtime to schedule other tasks.
         // This is critical for cooperative scheduling - without it, tokio's coop
@@ -3902,10 +3915,10 @@ async fn peer_connection_listener(
                     .await
                     {
                         if !error.closes_connection() {
-                            tracing::warn!(
-                                to = %remote_addr,
-                                ?error,
-                                "[CONN_LIFECYCLE] Transient send failure, continuing"
+                            warn_transient_send_failure(
+                                remote_addr,
+                                &error,
+                                &mut transient_send_failures,
                             );
                         } else {
                             tracing::debug!(
@@ -3971,10 +3984,10 @@ async fn peer_connection_listener(
                     Some(msg) => {
                         if let Err(error) = handle_peer_channel_message(&mut conn, msg, &outbound_mix, &propagation, native_wire).await {
                             if !error.closes_connection() {
-                                tracing::warn!(
-                                    to = %remote_addr,
-                                    ?error,
-                                    "[CONN_LIFECYCLE] Transient send failure, continuing"
+                                warn_transient_send_failure(
+                                    remote_addr,
+                                    &error,
+                                    &mut transient_send_failures,
                                 );
                             } else {
                                 tracing::debug!(
@@ -4106,6 +4119,32 @@ async fn peer_connection_listener(
             },
         }
     }
+}
+
+/// Log a send that failed without ending the connection, throttled per
+/// connection: at the 1st, 2nd, 4th, 8th ... failure, with the count so far.
+/// A connection whose sends keep failing (a QUIC-native connection with its
+/// short queue backed up refuses every send with `SendQueueFull`) then logs a
+/// few lines over its life, not one per message.
+fn warn_transient_send_failure(
+    remote_addr: std::net::SocketAddr,
+    error: &crate::transport::TransportError,
+    failures: &mut u64,
+) {
+    *failures = failures.saturating_add(1);
+    if transient_failure_warns(*failures) {
+        tracing::warn!(
+            to = %remote_addr,
+            ?error,
+            failures_so_far = *failures,
+            "[CONN_LIFECYCLE] Transient send failure, continuing"
+        );
+    }
+}
+
+/// Whether the `count`th transient send failure on a connection is logged.
+fn transient_failure_warns(count: u64) -> bool {
+    count.is_power_of_two()
 }
 
 /// The telemetry label for a connection that `recv` ended: the idle timeout
@@ -4475,6 +4514,17 @@ pub(crate) mod tests {
                 assert_eq!(new, old, "idle={idle} refusals={refusals}");
             }
         }
+    }
+
+    /// The transient-send warn fires at the 1st, 2nd, 4th ... failure only, so
+    /// 10,000 failures on one connection log 14 lines.
+    #[test]
+    fn transient_send_failures_log_at_powers_of_two() {
+        let logged: Vec<u64> = (1..=10_000)
+            .filter(|n| super::transient_failure_warns(*n))
+            .collect();
+        assert_eq!(logged.len(), 14);
+        assert_eq!(&logged[..5], &[1, 2, 4, 8, 16]);
     }
 
     /// Every `QuicPathEnd` label reaches telemetry as `Explicit(label)`, both
@@ -4866,7 +4916,15 @@ pub(crate) mod tests {
         let (me, other) = (peer(1), peer(4));
         let gateway = std::net::SocketAddr::from(([127, 0, 0, 1], 2));
         let tx = Transaction::new::<ConnectMsg>();
-        let own_request = prepare_join_request(tx, &me, &peer(2), Location::new(0.5), 10, &[]);
+        let own_request = prepare_join_request(
+            tx,
+            &me,
+            &peer(2),
+            Location::new(0.5),
+            10,
+            &[],
+            crate::operations::connect::native::NativeReadiness::current(),
+        );
         let notice = |msg: ConnectMsg| {
             super::unsent_message_notice(
                 &NetMessage::V1(NetMessageV1::Connect(msg)),
@@ -4881,7 +4939,15 @@ pub(crate) mod tests {
             }
             other => panic!("an unsent CONNECT request must end its driver, got {other:?}"),
         }
-        let relayed = prepare_join_request(tx, &other, &peer(2), Location::new(0.5), 10, &[]);
+        let relayed = prepare_join_request(
+            tx,
+            &other,
+            &peer(2),
+            Location::new(0.5),
+            10,
+            &[],
+            crate::operations::connect::native::NativeReadiness::current(),
+        );
         assert!(
             notice(relayed).is_none(),
             "a relayed request is not ours to end"
@@ -4974,7 +5040,8 @@ pub(crate) mod tests {
 
     /// Source pin: the event loop's dial for a message with no connection
     /// is tagged by `unconnected_dial_origin` (the event loop has no harness
-    /// here). The call must be the `origin:` field of that `ConnectPeer`.
+    /// here). The call must be the `origin:` field of that `ConnectPeer`,
+    /// and the dial is UDP: only the connect op asks for a native one.
     #[test]
     fn the_unconnected_dial_uses_unconnected_dial_origin() {
         let code = event_loop_code();
@@ -4983,7 +5050,7 @@ pub(crate) mod tests {
             .expect("the unconnected-dial ConnectPeer");
         assert!(
             code[dispatch..].starts_with(
-                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw),}),"
+                "P2pBridgeEvent::NodeAction(NodeEvent::ConnectPeer{peer:target_peer.clone(),tx,callback,is_gw,origin:unconnected_dial_origin(is_gw),transport:crate::operations::connect::native::DialTransport::Udp,}),"
             ),
             "the dial's origin must come from unconnected_dial_origin"
         );
