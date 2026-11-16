@@ -2687,6 +2687,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     expected_bytes,
                     direction,
                     tx_id,
+                    transport,
                     timestamp,
                 } => {
                     serde_json::json!({
@@ -2696,6 +2697,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "expected_bytes": expected_bytes,
                         "direction": format!("{:?}", direction),
                         "tx_id": tx_id.as_ref().map(|t| t.to_string()),
+                        "transport": transport.label(),
                         "timestamp": timestamp,
                     })
                 }
@@ -2715,6 +2717,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     min_rtt_ms,
                     peak_flightsize_bytes,
                     direction,
+                    transport,
                     timestamp,
                 } => {
                     serde_json::json!({
@@ -2734,6 +2737,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "min_rtt_ms": min_rtt_ms,
                         "peak_flightsize_bytes": peak_flightsize_bytes,
                         "direction": format!("{:?}", direction),
+                        "transport": transport.label(),
                         "timestamp": timestamp,
                     })
                 }
@@ -2744,6 +2748,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     reason,
                     elapsed_ms,
                     direction,
+                    transport,
                     timestamp,
                 } => {
                     serde_json::json!({
@@ -2754,6 +2759,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "reason": reason,
                         "elapsed_ms": elapsed_ms,
                         "direction": format!("{:?}", direction),
+                        "transport": transport.label(),
                         "timestamp": timestamp,
                     })
                 }
@@ -6261,6 +6267,7 @@ mod tests {
             reason: "cwnd wait timeout".to_string(),
             elapsed_ms: 3000,
             direction: crate::tracing::TransferDirection::Send,
+            transport: crate::tracing::TransferTransport::Udp,
             timestamp: 1_700_000_000_000,
         });
         assert_eq!(event.event_type, "transfer_failed");
@@ -6269,6 +6276,59 @@ mod tests {
             "transfer events must be attributed to the emitting node's \
              own peer id (#4345)"
         );
+    }
+
+    /// `transfer_started`, `transfer_failed` and `transfer_completed` say which
+    /// transport carries the transfer, as `transport`: `udp` or `quic`.
+    #[test]
+    fn transfer_events_carry_their_transport() {
+        use crate::tracing::{TransferDirection, TransferEvent, TransferTransport};
+        let addr: std::net::SocketAddr = "127.0.0.1:31337".parse().unwrap();
+        for transport in [TransferTransport::Udp, TransferTransport::Quic] {
+            let failed = event_kind_to_json(&EventKind::Transfer(TransferEvent::Failed {
+                stream_id: 1,
+                peer_addr: addr,
+                bytes_transferred: 0,
+                reason: String::new(),
+                elapsed_ms: 0,
+                direction: TransferDirection::Send,
+                transport,
+                timestamp: 0,
+            }));
+            let completed = event_kind_to_json(&EventKind::Transfer(TransferEvent::Completed {
+                stream_id: 1,
+                peer_addr: addr,
+                bytes_transferred: 0,
+                elapsed_ms: 0,
+                avg_throughput_bps: 0,
+                peak_cwnd_bytes: None,
+                final_cwnd_bytes: None,
+                slowdowns_triggered: None,
+                final_srtt_ms: None,
+                final_ssthresh_bytes: None,
+                min_ssthresh_floor_bytes: None,
+                total_timeouts: None,
+                min_rtt_ms: None,
+                peak_flightsize_bytes: None,
+                direction: TransferDirection::Send,
+                transport,
+                timestamp: 0,
+            }));
+            let started = event_kind_to_json(&EventKind::Transfer(TransferEvent::Started {
+                stream_id: 1,
+                peer_addr: addr,
+                expected_bytes: 0,
+                direction: TransferDirection::Send,
+                tx_id: None,
+                transport,
+                timestamp: 0,
+            }));
+            for json in [started, failed, completed] {
+                assert_eq!(json["transport"], serde_json::json!(transport.label()));
+            }
+        }
+        assert_eq!(TransferTransport::Udp.label(), "udp");
+        assert_eq!(TransferTransport::Quic.label(), "quic");
     }
 
     #[test]
@@ -7930,6 +7990,8 @@ mod tests {
         data.ack_wait_expired = (1095..1098).collect();
         data.stall_closes = (1098..1103).collect();
         data.stall_would_close = (1103..1108).collect();
+        data.pipe_source = (1108..1112).collect();
+        data.pipe_dropped = (1112..1115).collect();
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));

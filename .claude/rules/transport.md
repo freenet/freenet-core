@@ -1540,6 +1540,12 @@ a test passes its own; tests read their own, never the global).
   level in the period, and the highest count a reset in the period took a path
   to). They are for the fixed charge, which takes quinn's stopped map at
   SEND_ABORT_LIMIT x QUIC_STOPPED_ENTRY_BYTES until field data justifies less.
+  quic_pipe_source_<quic_fed_sent|quic_fed_dropped|udp_fed_sent|
+  udp_fed_dropped>: pipes that ended sent or dropped, by what fed the
+  inbound stream (each pair sums to quic_data_send_pipe_<result>), and
+  quic_pipe_dropped_<source_error|source_stall_timeout|own_path>: the
+  dropped ones by cause (quic_send::pipe_drop_cause). transfer_failed and
+  transfer_completed events carry `transport`: udp or quic.
   quic_ack_wait_expired_<stream|short|control>: ack-wait expiries that
   counted as strikes (path::StrikeCheck), by kind; expected 0 on honest
   paths. quic_stall_close_<not_acknowledging|dark|credit_starved|

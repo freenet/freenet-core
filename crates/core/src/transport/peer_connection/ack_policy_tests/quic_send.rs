@@ -1915,3 +1915,119 @@ fn a_fallback_that_fails_on_udp_leaves_no_debt() {
         },
     );
 }
+
+/// A pipe that ends `sent` or `dropped` is counted by what fed its inbound
+/// stream (`quic_pipe_source_*`), a dropped one by cause (`quic_pipe_dropped_*`),
+/// and its transfer start and end are reported as a QUIC transfer: a QUIC-fed pipe sent
+/// whole; a UDP-fed one whose source fails (`source_error`); a QUIC-fed one
+/// whose source stops past the 5 s gap (`source_stall_timeout`); and a UDP-fed
+/// one whose path closes under it (`own_path`).
+#[test]
+fn pipe_ends_are_counted_by_source_and_cause() {
+    use crate::tracing::TransferTransport;
+    use crate::transport::metrics::QuicDataCounters;
+    #[derive(Clone, Copy, Debug)]
+    enum Case {
+        QuicFedSent,
+        UdpFedSourceError,
+        QuicFedStall,
+        UdpFedPathClosed,
+    }
+    for (network, case, source, dropped, end) in [
+        (
+            "quic-send-pipe-attr-sent",
+            Case::QuicFedSent,
+            [1, 0, 0, 0],
+            [0, 0, 0],
+            "transfer_completed",
+        ),
+        (
+            "quic-send-pipe-attr-source",
+            Case::UdpFedSourceError,
+            [0, 0, 0, 1],
+            [1, 0, 0],
+            "transfer_failed",
+        ),
+        (
+            "quic-send-pipe-attr-stall",
+            Case::QuicFedStall,
+            [0, 1, 0, 0],
+            [0, 1, 0],
+            "transfer_failed",
+        ),
+        (
+            "quic-send-pipe-attr-path",
+            Case::UdpFedPathClosed,
+            [0, 0, 0, 1],
+            [0, 0, 1],
+            "transfer_failed",
+        ),
+    ] {
+        let node: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
+        run_with(
+            network,
+            QuicPathLimits {
+                counters: Some(node),
+                ..QuicPathLimits::DEFAULT
+            },
+            QuicPathLimits::DEFAULT,
+            move |mut rig| async move {
+                let total = 2 * FRAGMENT_PAYLOAD_SIZE as u64;
+                let handle = match case {
+                    Case::QuicFedSent | Case::QuicFedStall => {
+                        StreamHandle::new_quic(StreamId::next(), total)
+                    }
+                    Case::UdpFedSourceError | Case::UdpFedPathClosed => {
+                        StreamHandle::new(StreamId::next(), total)
+                    }
+                };
+                handle
+                    .push_fragment(1, bytes_of(FRAGMENT_PAYLOAD_SIZE))
+                    .unwrap();
+                if matches!(case, Case::QuicFedSent) {
+                    handle
+                        .push_fragment(2, bytes_of(FRAGMENT_PAYLOAD_SIZE))
+                        .unwrap();
+                }
+                let piped_id = StreamId::next();
+                rig.e
+                    .conn
+                    .pipe_stream_to_remote(
+                        piped_id,
+                        crate::transport::IncomingStream::from(handle.clone()),
+                        None,
+                        None,
+                    )
+                    .await;
+                rig.path.settle(Duration::from_millis(200)).await;
+                match case {
+                    Case::QuicFedSent => {}
+                    Case::UdpFedSourceError => handle.cancel(),
+                    Case::QuicFedStall => rig.path.settle(Duration::from_secs(7)).await,
+                    Case::UdpFedPathClosed => {
+                        rig.route
+                            .path()
+                            .close(crate::transport::metrics::QuicCloseCode::Downgrade);
+                        rig.path.settle(Duration::from_millis(100)).await;
+                        handle
+                            .push_fragment(2, bytes_of(FRAGMENT_PAYLOAD_SIZE))
+                            .unwrap();
+                    }
+                }
+                rig.path.settle(Duration::from_millis(500)).await;
+                rig.collect_tasks().await;
+                let snapshot = node.snapshot(false);
+                assert_eq!(snapshot.pipe_source, source, "{case:?}");
+                assert_eq!(snapshot.pipe_dropped, dropped, "{case:?}");
+                assert_eq!(
+                    crate::transport::metrics::transfer_events_of(piped_id.0 as u64),
+                    [
+                        ("transfer_started", TransferTransport::Quic),
+                        (end, TransferTransport::Quic)
+                    ],
+                    "{case:?}"
+                );
+            },
+        );
+    }
+}
