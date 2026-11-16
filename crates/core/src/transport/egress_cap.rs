@@ -721,11 +721,10 @@ impl AdmissionQueue {
         };
         let room = queue.wakers.len() < MAX_ADMISSION_WAKERS;
         match queue.wakers.get_mut(&t) {
-            Some(held) => {
-                if !held.will_wake(waker) {
-                    *held = waker.clone();
-                }
+            Some(held) if !held.will_wake(waker) => {
+                *held = waker.clone();
             }
+            Some(_) => {}
             None if room => {
                 queue.wakers.insert(t, waker.clone());
             }

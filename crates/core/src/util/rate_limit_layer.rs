@@ -402,7 +402,7 @@ impl PerCallsiteRateLimiter {
             let total = entry.total_dropped.load(Ordering::Relaxed);
             offenders.push((entry.name.to_string(), dropped, total));
         }
-        offenders.sort_by(|a, b| b.1.cmp(&a.1));
+        offenders.sort_by_key(|a| std::cmp::Reverse(a.1));
         for (site, dropped, total) in offenders {
             eprintln!(
                 "[RATE LIMIT per-callsite] {site}: dropped {dropped} in last {}s (cumulative: {total}). \

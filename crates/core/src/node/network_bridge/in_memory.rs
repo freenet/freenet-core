@@ -74,11 +74,9 @@ impl NetworkStats {
 
     /// Returns the average latency added per delayed message.
     pub fn average_latency(&self) -> Duration {
-        if self.messages_delayed_delivered == 0 {
-            Duration::ZERO
-        } else {
-            Duration::from_nanos(self.total_latency_nanos / self.messages_delayed_delivered)
-        }
+        self.total_latency_nanos
+            .checked_div(self.messages_delayed_delivered)
+            .map_or(Duration::ZERO, Duration::from_nanos)
     }
 }
 

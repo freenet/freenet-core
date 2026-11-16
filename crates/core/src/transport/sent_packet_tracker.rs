@@ -3328,14 +3328,12 @@ pub(in crate::transport) mod tests {
         abandon_all(&mut tracker);
         assert_eq!(tracker.abandoned_streams.len(), 1);
         // Fill past the bound: the oldest id is evicted.
-        let mut id = 10;
-        for _ in 0..MAX_STREAM_ACK_WATCHES {
+        for id in (10..).take(MAX_STREAM_ACK_WATCHES) {
             send_stream_packets(
                 &mut tracker,
                 StreamId::next_transport_internal(),
                 id..id + 1,
             );
-            id += 1;
         }
         abandon_all(&mut tracker);
         assert_eq!(tracker.abandoned_streams.len(), MAX_STREAM_ACK_WATCHES);

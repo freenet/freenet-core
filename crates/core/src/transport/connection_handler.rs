@@ -1702,6 +1702,10 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     }
 
     /// Mark connection as closed. Only established connections enter the grace period.
+    #[allow(
+        clippy::collapsible_match,
+        reason = "the suggested match guard would move `result_sender` out of the pattern"
+    )]
     fn mark_closed(&mut self, addr: &SocketAddr) {
         match self.states.remove(addr) {
             Some(ConnectionState::Established { .. }) => {

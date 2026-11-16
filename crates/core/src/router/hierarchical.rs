@@ -2867,7 +2867,7 @@ impl<K: Hash + Eq + Clone> Stage<K> {
         }
         // Only live peers were pushed, so one generation per slot: the key's
         // low half identifies the pair on its own.
-        events.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        events.sort_unstable_by_key(|a| a.0);
         let mut index = 0;
         while index < events.len() {
             let contract_slot = (events[index].0 >> 32) as usize;

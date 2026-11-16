@@ -1004,13 +1004,11 @@ mod tests {
         }
 
         // Push 1 event each for cold contracts
-        let mut event_id = MAX_QUEUED_PER_CONTRACT as u64;
-        for seed in 1..=num_cold as u8 {
+        for (event_id, seed) in (MAX_QUEUED_PER_CONTRACT as u64..).zip(1..=num_cold as u8) {
             let contract_id = make_contract_id(seed);
             queue
                 .try_push_default(make_event_id(event_id), make_get_event(contract_id))
                 .expect("push should succeed");
-            event_id += 1;
         }
 
         let total = MAX_QUEUED_PER_CONTRACT + num_cold;

@@ -894,11 +894,9 @@ impl DutyBucket {
         let per_sec_us = per_sec.as_micros();
         let product = elapsed_ns * per_sec_us;
         let add = product / 1_000_000_000;
-        self.carry_ns = if per_sec_us == 0 {
-            0
-        } else {
-            (product % 1_000_000_000) / per_sec_us
-        };
+        self.carry_ns = (product % 1_000_000_000)
+            .checked_div(per_sec_us)
+            .unwrap_or(0);
         let cap = burst.as_micros().min(i64::MAX as u128) as i64;
         let add = add.min(i64::MAX as u128) as i64;
         self.tokens_us = self.tokens_us.saturating_add(add).min(cap);
