@@ -866,6 +866,23 @@ mod tests {
         }
     }
 
+    /// The emergency-stop shape: a build whose default on Linux and macOS is not
+    /// `prefer` carries no data for a node that set `prefer` itself either, so
+    /// it has no ramp start and a fixed share of 0. Other platforms are left out
+    /// because their default is `off` in every release.
+    #[test]
+    fn the_constants_are_in_a_shape_a_release_ships() {
+        if cfg!(any(target_os = "linux", target_os = "macos"))
+            && QuicMode::default_mode() != QuicMode::Prefer
+        {
+            assert_eq!(
+                (QUIC_DATA_RAMP_START, QUIC_DATA_PERCENT),
+                (None, 0),
+                "the emergency stop sets both the ramp start to None and the fixed share to 0"
+            );
+        }
+    }
+
     /// With a ramp in the release, a `prefer` node may carry data from the
     /// ramp's first minute unless `quic-data-percent` overrides it, so the
     /// connection limit is lowered for the whole ramp; without one (the

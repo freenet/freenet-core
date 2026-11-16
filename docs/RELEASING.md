@@ -620,9 +620,12 @@ Current wire-gated floors:
   Emergency stop: a parked release, built and soaked before the ramp release is
   cut, is published through the normal auto-update stagger (0 to 4 h). It
   restores the pre-ramp state with two changes, and needs both. It sets
-  `QUIC_DATA_RAMP_START` back to `None`, which gives every `prefer` node a
-  share of 0, so none of its pairs carries data; only a node that set
-  `quic-data-percent` keeps a share. It also sets the default mode back to
+  `QUIC_DATA_RAMP_START` back to `None` and keeps `QUIC_DATA_PERCENT` at 0
+  (both: with no ramp start the fixed share applies), which gives every
+  `prefer` node a share of 0, so none of its pairs carries data; only a node
+  that set `quic-data-percent` keeps a share.
+  `the_constants_are_in_a_shape_a_release_ships` fails a build whose default
+  on Linux and macOS is not `prefer` unless both are so. It also sets the default mode back to
   0.2.156's: shadow on Linux and macOS, off on Windows. An emergency release
   should only go back to states the field has run, and Windows with QUIC off
   is what every release through 0.2.156 ran. So a Linux or macOS node that did not set
