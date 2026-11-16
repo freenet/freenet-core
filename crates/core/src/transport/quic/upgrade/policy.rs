@@ -928,7 +928,7 @@ mod tests {
 
     /// The data bit needs `prefer`, the peer in the slice, and the key or the
     /// release's share to say so. `shadow` never sets it, whatever the key says,
-    /// and at this release's share `prefer` does not either.
+    /// and neither does `prefer` at a release share of 0 (the emergency stop).
     #[test]
     fn own_caps_needs_prefer_and_the_peer_in_the_slice() {
         use crate::transport::TransportKeypair;
@@ -946,7 +946,19 @@ mod tests {
             )
         };
         if QUIC_DATA_RAMP_START.is_none() {
-            assert_eq!(caps_with("prefer", None), 0, "no ramp, no data");
+            // No ramp: the fixed QUIC_DATA_PERCENT decides. At 0 (the
+            // emergency stop) neither bit is set; above 0 the node recycles,
+            // and the data bit follows the pair's bucket.
+            let want = match QUIC_DATA_PERCENT {
+                0 => 0,
+                percent if bucket < percent => caps::DATA | caps::RECYCLES,
+                _ => caps::RECYCLES,
+            };
+            assert_eq!(
+                caps_with("prefer", None),
+                want,
+                "no ramp: the fixed share {QUIC_DATA_PERCENT}, bucket {bucket}"
+            );
         }
         // With no quic-data-percent the policy takes the release's ramp, and
         // own_caps asks with it, whether or not this build sets a start.
@@ -1282,10 +1294,10 @@ mod tests {
     fn startup_reports_prefer_and_max_paths() {
         const PREFER: &str = "negotiates data with this share of pairs";
         const NO_SHARE: &str = "with no data share";
-        let prefer = if QUIC_DATA_RAMP_START.is_none() {
-            NO_SHARE
-        } else {
+        let prefer = if RELEASE_SHARE_CAN_CARRY_DATA {
             PREFER
+        } else {
+            NO_SHARE
         };
         const INVALID: &str = "quic-max-paths is not a whole number";
         const LOWERED: &str = "quic-max-paths is above the connection limit";
