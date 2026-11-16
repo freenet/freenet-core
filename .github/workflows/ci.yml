@@ -804,10 +804,9 @@ jobs:
     # `save-if` main below, and no warm twin is needed because this job runs
     # on main pushes and saves its own entry.
     runs-on: ubuntu-latest
-    # 30 was sized on ubicloud-standard-8 (warm cache: 46s + 41s + 2m09s for
-    # the job with one all-targets step; the headroom was for a cold cache,
-    # where the first step absorbs the full dependency build). A cold cache on
-    # 4 vCPUs takes longer, hence 45.
+    # 30 was sized on ubicloud-standard-8. Measured here with a cold cache
+    # (2026-11-16, #6245): 11 min for the whole job, clippy steps 5m46s +
+    # 1m32s + 3m13s. 45 leaves room for a slow runner or a cache eviction.
     timeout-minutes: 45
     # No dependencies - runs immediately in parallel with fmt_check
 
@@ -900,9 +899,10 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
-      # GitHub-hosted runners have ~14 GB free; this job builds three feature
-      # sets into one target dir. Record the headroom so a creeping disk-full
-      # is visible before it fails the check (#6244).
+      # This job builds three feature sets into one target dir. Record the
+      # headroom so a creeping disk-full is visible before it fails the check.
+      # First measurement (cold cache, 2026-11-16, #6245): target 2.6 GB,
+      # ~/.cargo 0.6 GB, 83 GB still free on /.
       - name: Disk headroom
         if: always()
         run: |
