@@ -4693,11 +4693,11 @@ pub fn emit_transfer_started(
     }
 }
 
-/// Test-only: the transfer ends emitted on this thread, as (stream id, event,
-/// transport), so a test finds its own: stream ids and transfers are per
-/// thread in tests (`StreamId::next`, a current-thread runtime), and another
-/// test's ends never land here. Kept apart from the QUIC event log, which every
-/// transfer would otherwise crowd.
+// Test-only: the transfer ends emitted on this thread, as (stream id, event,
+// transport), so a test finds its own: stream ids and transfers are per
+// thread in tests (`StreamId::next`, a current-thread runtime), and another
+// test's ends never land here. Kept apart from the QUIC event log, which every
+// transfer would otherwise crowd.
 #[cfg(test)]
 thread_local! {
     static TRANSFER_TEST_LOG: std::cell::RefCell<Vec<(u64, &'static str, TransferTransport)>> =

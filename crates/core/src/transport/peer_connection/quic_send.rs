@@ -535,7 +535,9 @@ fn pipe_drop_cause(outcome: &BoundedSend, stalled: bool) -> PipeDropCause {
             QuicSendError::Source(_) | QuicSendError::LengthMismatch { .. },
         )) => PipeDropCause::SourceError,
         BoundedSend::Failed(SendFailure::TimedOut) if stalled => PipeDropCause::SourceStallTimeout,
-        _ => PipeDropCause::OwnPath,
+        BoundedSend::Sent | BoundedSend::MaybeDelivered(_) | BoundedSend::Failed(_) => {
+            PipeDropCause::OwnPath
+        }
     }
 }
 
