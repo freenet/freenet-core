@@ -1824,7 +1824,8 @@ fn ack_wait_expiries_within_the_window_close_only_a_path_without_udp() {
     let at = |minutes: u64| (minutes * 60 / 2) as usize;
     let counted =
         |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
-    let cases: Vec<(Box<dyn Fn(usize) -> u64>, Vec<usize>)> = vec![
+    type Expiries<'a> = Box<dyn Fn(usize) -> u64 + 'a>;
+    let cases: Vec<(Expiries<'_>, Vec<usize>)> = vec![
         (Box::new(counted(vec![at(2), at(10), at(20)])), vec![at(20)]),
         (Box::new(|i| if i >= at(5) { 3 } else { 0 }), vec![at(5)]),
         (
