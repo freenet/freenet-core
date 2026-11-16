@@ -4838,7 +4838,8 @@ fn packets_left_outstanding_when_the_peer_stops_acknowledging_close_the_path() {
 
 /// #5940 step M6, guard 2 (review finding 2): an outage of 8 s in both
 /// directions in the middle of a transfer, then recovery (shorter than the
-/// window: a longer one is a dark path, closed by the dark-path rule). `b` sends all the
+/// window: a longer one is a dark path, which the dark-path rule closes on a
+/// native path and leaves to quinn's idle timeout on one with a UDP session). `b` sends all the
 /// time once it is back, but has nothing new to acknowledge, while `a`'s
 /// data waits for its backed-off probe timer; `b` acknowledges the probe
 /// when it comes. `b` is a conforming peer: `a` must not close.
@@ -5142,7 +5143,8 @@ fn a_streamed_sends_gap_follows_its_paths_round_trip() {
     })
 }
 
-/// The dark-path rule closes only a path that carries data. On one that
+/// The dark-path rule closes only a path that carries data (and has no UDP
+/// session, `recycle::DARK_CLOSES_WITH_UDP`). On one that
 /// does not (every path while no release sends data on QUIC), a dark spell
 /// in both directions, with a control frame sent into it, does not close
 /// the path, and the spell is counted when it ends. Its length is read up

@@ -1589,8 +1589,9 @@ impl QuicPath {
     /// the first time this is asked after the connection acknowledged something
     /// new, which quinn's keepalive brings within its interval on a live path.
     ///
-    /// A path that stays dark is closed by the acknowledgement watch's dark
-    /// rule (`recycle::dark_close_bound`), not by the stall close: once it is suspect no new send
+    /// A path that stays dark is ended by quinn's idle timeout (a native path,
+    /// which is never suspect, by the acknowledgement watch's dark rule,
+    /// `recycle::dark_close_bound`), not by the stall close: once it is suspect no new send
     /// reaches it, so `route::STALLED_SENDS_LIMIT` timeouts in a row happen only
     /// if that many sends were already on it. Nothing is lost meanwhile, since
     /// new data goes on UDP.
@@ -2454,7 +2455,8 @@ fn nanos(duration: Duration) -> u64 {
 /// 5 s total, and the wait goes on in the background, holding the Short's
 /// send epoch. Far past any honest acknowledgement (the end is in the one
 /// packet, which the peer's QUIC stack acknowledges on arrival), and past the
-/// dark rule's close of a dark path. At the bound the stream is reset,
+/// end of a path that stays dark (the dark rule's close of a native path,
+/// quinn's idle timeout for one with a UDP session). At the bound the stream is reset,
 /// freeing the epoch, and counted toward `recycle::ACK_WAIT_EXPIRY_LIMIT`.
 ///
 /// Its margin: on a path with a UDP session the dark rule does not close

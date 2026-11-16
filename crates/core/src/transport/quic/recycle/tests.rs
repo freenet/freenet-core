@@ -261,7 +261,8 @@ fn a_dark_episode_on_a_data_path_is_also_counted_as_carried() {
 
 /// A dark spell of 30 s (sends from tick 1, the peer heard from again at tick
 /// 16) on a path that carries no data is not closed and is counted to its end:
-/// 30 s, in `recovered_lt_120s`. On a path that carries data the dark-path rule
+/// 30 s, in `recovered_lt_120s`. On a path that carries data (and, as a watch
+/// built without `with_udp_fallback` is, has no UDP session) the dark-path rule
 /// closes it at the window, counted `closed_at_window`.
 #[test]
 fn a_path_without_data_counts_a_dark_spell_to_its_end() {

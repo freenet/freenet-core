@@ -2764,8 +2764,11 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     streams reset by cancellation during an outage, before any send
     timeout counts (so the path never goes suspect), with sends still
     waiting to keep the spell alive, close the path as
-    StreamCreditWithheld at about 60 s, before the dark rule's 67-74 s:
-    the path should close, under the wrong label. Residual, recorded: with
+    StreamCreditWithheld at about 60 s: on a native path before the dark
+    rule's 67-74 s (the path should close, under the wrong label); on a
+    path with a UDP session, which the dark rule does not close
+    (DARK_CLOSES_WITH_UDP), where only quinn's idle timeout would have
+    ended it (residual, not gated). Residual, recorded: with
     streamed sends more than 20 s apart the spell ends between them
     (STREAM_CREDIT_DEMAND), so a withholding peer is never closed; each
     such send waits its 2 s open deadline and goes on UDP. 60 s, not 10 s: an honest
@@ -2998,11 +3001,16 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   DOWNGRADE (stalled_closed), but only timeouts while nothing on the connection was
   newly acknowledged within STALL_PROGRESS_WINDOW (ACK_WATCH_WINDOW, 10 s), read
   from CappedCubic's record (recycle::AckProgress) when a send settles
-  (route::StallCount). Any acknowledgement or any Sent starts the count again. All
+  (route::StallCount). On a path with a UDP session the close is left alone
+  once the dark rule would itself have closed the path (the watch's flag,
+  WatchShared::dark; the path is then ended by quinn's idle timeout), and the
+  verdict holds past the limit, so it is made at the next counted timeout
+  once the flag clears; counted once. Any acknowledgement or any Sent starts the count again. All
   kinds count: Failed(TimedOut) and MaybeDelivered(TimedOut).
   Failed(NotOpened(TimedOut)) does not (route::timed_out): a wait to open is
   back-pressure. What recycles the cases it used to: a path whose sends
-  nobody acknowledges is closed by the dark rule; a peer that never
+  nobody acknowledges is closed by the dark rule if it is native, and ended
+  by quinn's idle timeout if it has a UDP session; a peer that never
   acknowledges a stream's end has the stream reset at its ack wait, and
   three within 30 min are counted as a would-close (observe-only for now,
   ACK_WAITS_EXPIRED_CLOSES; until the close lands, such a peer is bounded
@@ -3063,7 +3071,8 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   (120 s; a native path by the acknowledgement watch's dark rule,
   recycle::dark_close_bound, about 67-74 s), not by the stall close: once suspect no new send
   reaches it, so the stall close fires only when STALLED_SENDS_LIMIT sends were
-  already on it. New data goes on UDP meanwhile, so nothing is lost. Entering
+  already on it, and on a path with a UDP session only before the dark rule
+  would have closed it. New data goes on UDP meanwhile, so nothing is lost. Entering
   and leaving are under one lock. Fallback is a testing-period crutch: this
   routing goes with it when the legacy transport is removed.
   Receiver side: a path whose own data bit is 0 stops the first data frame with

@@ -1160,9 +1160,10 @@ pub(crate) struct AckWatch {
     dark_second_at: Option<u64>,
     /// When the previous sample was taken, on the watch's clock.
     previous_now: Option<u64>,
-    /// Whether the path carries data, so the dark-path rule closes it; `None`
-    /// is a path that does. A path that carries none only counts its dark
-    /// episodes, to their end ([`Self::observing`]).
+    /// Whether the path carries data, so the dark-path rule may close it (only
+    /// one with no UDP session, [`Self::with_udp_fallback`]); `None` is a path
+    /// that does. A path that carries none only counts its dark episodes, to
+    /// their end ([`Self::observing`]).
     carries_data: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Where dark episodes are counted (`quic_dark_episode_<label>`), if
     /// anywhere.
@@ -1348,7 +1349,8 @@ impl AckWatch {
     }
 
     /// Count dark episodes in `node`, and let the dark-path rule close the
-    /// path only while `carries_data` is set. On a path that carries no data
+    /// path only while `carries_data` is set (and then only a path with no UDP
+    /// session, [`Self::with_udp_fallback`]). On a path that carries no data
     /// (every path while no release sends data on QUIC), an episode runs to
     /// its end, so the counts show how long real dark spells last against the
     /// rule's window. Durations are read at the samples, so they are good to
@@ -1845,8 +1847,11 @@ pub(crate) const STREAM_CREDIT_DEMAND: Duration = Duration::from_secs(20);
 /// counts as ended too, though the reset may never reach the peer (during
 /// an outage nothing does): in-flight streams reset by cancellation during
 /// an outage, before any send timeout makes the path suspect, with sends
-/// still waiting, close the path here at about 60 s, before the dark rule
-/// would, under this label instead of [`Stall::Dark`]. And with streamed
+/// still waiting, close the path here at about 60 s: on a native path before
+/// the dark rule would, under this label instead of [`Stall::Dark`], and on a
+/// path with a UDP session, which the dark rule does not close
+/// ([`DARK_CLOSES_WITH_UDP`]), where only quinn's idle timeout would have
+/// ended it (a recorded residual). And with streamed
 /// sends more than [`STREAM_CREDIT_DEMAND`] apart the spell ends between
 /// them, so a withholding peer is not closed; each such send waits its 2 s
 /// open deadline and goes on UDP.
@@ -2051,7 +2056,8 @@ pub(crate) struct WatchShared {
     pub(crate) rtt: Arc<crate::transport::peer_connection::streaming::PathRtt>,
     pub(crate) heard: Arc<PeerHeard>,
     /// Set once the path may send data (`QuicPath::enable_data`): only then
-    /// does the dark-path rule close it ([`AckWatch::observing`]).
+    /// may the dark-path rule close it, and only a path with no UDP session
+    /// ([`AckWatch::observing`], [`DARK_CLOSES_WITH_UDP`]).
     pub(crate) carries_data: Arc<std::sync::atomic::AtomicBool>,
     /// The path has a UDP session to fall back to
     /// (`QuicPathLimits::udp_fallback`), so the dark rule only counts
