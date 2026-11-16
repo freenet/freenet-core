@@ -593,6 +593,8 @@ impl QuicEndpoint {
             clock,
         )?);
         let health = EndpointHealth::new(local_addr);
+        #[cfg(feature = "quic-panic-injection")]
+        panic_injection::register_endpoint(&health);
         #[cfg(any(test, feature = "testing"))]
         let mut faults = None;
         let mut cap_holds = None;

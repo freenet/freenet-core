@@ -702,6 +702,7 @@ mod tests {
             boot_id: None,
             nonce: NONCE,
             armed_at_secs: T0,
+            endpoint_down_secs: Vec::new(),
         });
         for previous in [
             Previous::Nothing,

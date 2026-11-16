@@ -265,6 +265,10 @@ pub(crate) enum ListenerExit {
     Panicked(String),
     /// It was cancelled; the message is the join error's text.
     Cancelled(String),
+    /// The listener is still running, but this gateway's QUIC endpoint died
+    /// and the node is set to exit for its supervisor to restart it
+    /// (`quic::liveness::exit_on_endpoint_down`).
+    QuicEndpointDown,
 }
 
 impl ListenerExit {

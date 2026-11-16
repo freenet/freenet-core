@@ -263,6 +263,14 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     // is built, because only this binary marks its clean exits (see `main`).
     freenet::enable_quic_crash_breaker();
 
+    // #5940: a gateway whose QUIC endpoint dies exits through the fatal
+    // listener path, for its supervisor to restart it with a new endpoint.
+    // Only under a supervisor: a gateway started by hand would not come back,
+    // so it keeps running over UDP instead. Peers never exit on this.
+    if quic_endpoint_down_exit_allowed(commands::auto_update::supervisor_status()) {
+        freenet::enable_exit_on_quic_endpoint_down();
+    }
+
     let node_config = NodeConfig::new(config)
         .await
         .with_context(|| "failed while loading node config")?;
@@ -1240,6 +1248,16 @@ async fn run_network_node_with_signals(
     result
 }
 
+/// Whether a gateway may exit when its QUIC endpoint dies: only when
+/// something will restart it.
+fn quic_endpoint_down_exit_allowed(status: commands::auto_update::SupervisorStatus) -> bool {
+    use commands::auto_update::SupervisorStatus;
+    match status {
+        SupervisorStatus::Supervised | SupervisorStatus::SupervisedUnverified => true,
+        SupervisorStatus::Unsupervised => false,
+    }
+}
+
 /// Whether a finished run (after [`finish_run`]) ended cleanly for the QUIC
 /// crash-loop breaker (#5940): an operator stop, which `finish_run` made `Ok`,
 /// or an auto-update exit. Every other ending leaves the marker armed.
@@ -2030,6 +2048,21 @@ mod tests {
     ///
     /// Restoring the bug (`finish_run` returning `result`), broadening the guard
     /// to `Err(_) => Ok(())`, or dropping either conjunct fails this test.
+    /// #5940: only a supervised gateway exits on QUIC endpoint death.
+    #[test]
+    fn quic_endpoint_down_exit_needs_a_supervisor() {
+        use commands::auto_update::SupervisorStatus;
+        assert!(quic_endpoint_down_exit_allowed(
+            SupervisorStatus::Supervised
+        ));
+        assert!(quic_endpoint_down_exit_allowed(
+            SupervisorStatus::SupervisedUnverified
+        ));
+        assert!(!quic_endpoint_down_exit_allowed(
+            SupervisorStatus::Unsupervised
+        ));
+    }
+
     #[test]
     fn finish_run_maps_only_a_requested_graceful_stop_to_success() {
         use super::commands::auto_update::UpdateNeededError;

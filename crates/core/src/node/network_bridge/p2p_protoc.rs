@@ -4152,6 +4152,13 @@ fn listener_exit_error(exit: &ListenerExit) -> anyhow::Error {
                 "CRITICAL: UDP listen task failed: {join_err}"
             );
         }
+        ListenerExit::QuicEndpointDown => {
+            tracing::error!(
+                "CRITICAL: this gateway's QUIC endpoint died; exiting for the service \
+                 supervisor to restart the node with a new endpoint"
+            );
+            return anyhow!("QUIC endpoint died on a gateway — exiting for a supervised restart");
+        }
     }
     anyhow!(
         "UDP listen task exited unexpectedly — \

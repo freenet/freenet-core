@@ -37,6 +37,7 @@ pub use transport::quic::breaker::{
     quic_breaker_clean_exit, quic_breaker_signals_ready,
     record_deliberate_stop as record_quic_breaker_deliberate_stop,
 };
+pub use transport::quic::liveness::enable_exit_on_quic_endpoint_down;
 
 /// Network operation/transaction state machines.
 mod operations;

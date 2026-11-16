@@ -3285,7 +3285,15 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
   endpoint's QuicAvailability turns Down for good, once, with a WARN and
   quic_endpoint_down. Its connections end, accept() returns None and
   connect() fails as EndpointDown. The UDP transport is untouched.
-  → NEVER feed endpoint death to ListenerExit: that exits the node.
+  → NEVER feed endpoint death to ListenerExit: that exits the node. The
+    one exception is deliberate: a gateway in the `freenet` binary under a
+    service supervisor (liveness::exit_on_endpoint_down, enabled by
+    enable_exit_on_quic_endpoint_down) gets ListenerExit::QuicEndpointDown,
+    so its supervisor restarts it with a new endpoint. The exit is noted in
+    the breaker marker (breaker::note_endpoint_down_exit), so the next start
+    runs QUIC again until ENDPOINT_DOWN_EXITS_TO_TRIP exits in
+    ENDPOINT_DOWN_WINDOW trip it. Peers, and gateways started by hand,
+    keep running over UDP.
   → quinn's driver returns only on a receive I/O error. QuicSocket returns
     one only after it caught a panic (below); tests inject one
     (socket::SocketFaults::fail_receive).

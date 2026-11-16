@@ -66,7 +66,7 @@ async fn udp_handle_shares_one_expected_ip_set_and_reports_the_listener() {
         expected_inbound,
         listener,
         quic_endpoint: _,
-    } = udp_transport_handle(outbound, inbound, listen_task);
+    } = udp_transport_handle(outbound, inbound, listen_task, None);
 
     let inbound_addr: SocketAddr = "192.0.2.10:1000".parse().unwrap();
     expected_inbound.expect_incoming(inbound_addr);
@@ -128,7 +128,7 @@ async fn listener_outlives_a_dropped_connector_while_a_clone_remains() {
         expected_inbound: _expected,
         mut listener,
         quic_endpoint: _,
-    } = udp_transport_handle(outbound, inbound, listen_task);
+    } = udp_transport_handle(outbound, inbound, listen_task, None);
     let keepalive = Arc::clone(&connector);
 
     drop(connector);
@@ -193,4 +193,55 @@ async fn udp_transport_config_reaches_the_listener_by_name() {
         listener.congestion_config.is_some(),
         "an unset congestion config defaults, as before"
     );
+}
+
+/// With an endpoint to watch (a supervised gateway, #5940), the listener
+/// liveness also ends as `QuicEndpointDown` when that endpoint dies, and not
+/// when it is released; without one, endpoint death does not end it, and the
+/// listen task's own end is reported as before.
+#[tokio::test]
+async fn listener_liveness_reports_endpoint_death_only_when_watched() {
+    use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
+    use std::time::Duration;
+
+    let (down_tx, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+    let listen_task = tokio::spawn(std::future::pending::<TransportError>());
+    let liveness = tokio::spawn(listener_liveness(listen_task, Some(watch)));
+    tokio::task::yield_now().await;
+    assert!(!liveness.is_finished());
+    down_tx.send(QuicAvailability::Down).unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(5), liveness)
+        .await
+        .expect("endpoint death ends it")
+        .unwrap();
+    assert!(matches!(exit, ListenerExit::QuicEndpointDown), "{exit:?}");
+
+    let (released_tx, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let listen_task = tokio::spawn(async move {
+        drop(stop_rx.await);
+        TransportError::ChannelClosed
+    });
+    let liveness = tokio::spawn(listener_liveness(listen_task, Some(watch)));
+    released_tx.send(QuicAvailability::Released).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!liveness.is_finished(), "a release is not a death");
+    stop_tx.send(()).unwrap();
+    let exit = tokio::time::timeout(Duration::from_secs(5), liveness)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(exit, ListenerExit::Error(TransportError::ChannelClosed)),
+        "{exit:?}"
+    );
+
+    // Not watched: a death does not end it.
+    let (unwatched_tx, _watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+    let listen_task = tokio::spawn(std::future::pending::<TransportError>());
+    let liveness = tokio::spawn(listener_liveness(listen_task, None));
+    unwatched_tx.send(QuicAvailability::Down).unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!liveness.is_finished(), "an unwatched death is not an exit");
+    liveness.abort();
 }
