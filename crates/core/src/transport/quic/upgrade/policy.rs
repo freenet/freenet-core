@@ -879,6 +879,29 @@ mod tests {
     /// connection limit is lowered for the whole ramp; without one it may
     /// exactly when the release's fixed share is above 0 (the hold at 5%), and
     /// not at a share of 0 (the emergency stop).
+    /// The constants are in one of the shapes a release may ship: the hold's
+    /// fixed share is 0 (the stop) or 5 (the hold), so a typo fails here; and
+    /// the emergency-stop shape, whose default on Linux and macOS is not
+    /// `prefer`, carries no data for a node that set `prefer` itself either:
+    /// no ramp start and a fixed share of 0. Other platforms are left out
+    /// because their default is `off` in every release.
+    #[test]
+    fn the_constants_are_in_a_shape_a_release_ships() {
+        assert!(
+            matches!(QUIC_DATA_PERCENT, 0 | 5),
+            "QUIC_DATA_PERCENT {QUIC_DATA_PERCENT}: 0 (the stop) or 5 (the hold)"
+        );
+        if cfg!(any(target_os = "linux", target_os = "macos"))
+            && QuicMode::default_mode() != QuicMode::Prefer
+        {
+            assert_eq!(
+                (QUIC_DATA_RAMP_START, QUIC_DATA_PERCENT),
+                (None, 0),
+                "the emergency stop sets both the ramp start to None and the fixed share to 0"
+            );
+        }
+    }
+
     #[test]
     fn may_carry_data_follows_the_ramp() {
         let ramp = Some(1_700_000_000);

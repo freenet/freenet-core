@@ -21574,7 +21574,8 @@ fn assert_ramp_pairs_carry_data_by(run: &QuicShadowRun, full_at: Duration) {
 /// The emergency stop for the data ramp: a release with no ramp and a data
 /// share of 0 (`QUIC_DATA_RAMP_START = None`, `QUIC_DATA_PERCENT = 0`). The
 /// stopped node runs exactly that: no ramp from the test, no `quic-data-percent`
-/// (`QuicUpgradeTrace::run_without_ramp`). Its peer is still on the ramp, which
+/// (`QuicUpgradeTrace::run_as_stop_release`, a share of 0 whatever this build's
+/// constants are). Its peer is still on the ramp, which
 /// started 17 h before a 2 h run, so the ramp node's share grows from 56% to
 /// 69%; with this seed the pair's bucket is 61, so the ramp node's data bit
 /// for the pair is off when the path comes up and comes on during the run

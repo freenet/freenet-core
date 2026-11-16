@@ -600,9 +600,11 @@ Current wire-gated floors:
 
   Reading the ramp: each node logs at INFO when its share enters a new band
   ("QUIC data: this node offers data to this share of its pairs", with
-  `data_percent`; at 0% it logs "offers data to none of its pairs"). With T0
-  unset, a `prefer` node logs at startup that it has no data share and keeps
-  every pair's data on UDP. In telemetry, `quic_enabled_data_paths` and
+  `data_percent`; at 0% it logs "offers data to none of its pairs"). With no
+  ramp start and `QUIC_DATA_PERCENT` at 0 (the emergency stop), a `prefer` node
+  logs at startup that it has no data share and keeps every pair's data on
+  UDP; with no ramp start and a fixed share above 0 (the hold) it logs the
+  share. In telemetry, `quic_enabled_data_paths` and
   `quic_live_data_paths` count paths carrying data, the
   `quic_close_sent_recycle_for_data` / `quic_close_received_recycle_for_data`
   counts are paths recycled to take data as the share reaches them (expected,
@@ -620,9 +622,12 @@ Current wire-gated floors:
   Emergency stop: a parked release, built and soaked before the ramp release is
   cut, is published through the normal auto-update stagger (0 to 4 h). It
   restores the pre-ramp state with two changes, and needs both. It sets
-  `QUIC_DATA_RAMP_START` back to `None`, which gives every `prefer` node a
-  share of 0, so none of its pairs carries data; only a node that set
-  `quic-data-percent` keeps a share. It also sets the default mode back to
+  `QUIC_DATA_RAMP_START` back to `None` and `QUIC_DATA_PERCENT` to 0 (both:
+  with no ramp start the fixed share applies), which gives every `prefer` node
+  a share of 0, so none of its pairs carries data; only a node that set
+  `quic-data-percent` keeps a share. `the_constants_are_in_a_shape_a_release_ships`
+  fails a build whose default on Linux and macOS is not `prefer` unless both
+  are set. It also sets the default mode back to
   0.2.156's: shadow on Linux and macOS, off on Windows. An emergency release
   should only go back to states the field has run, and Windows with QUIC off
   is what every release through 0.2.156 ran. So a Linux or macOS node that did not set
@@ -634,8 +639,7 @@ Current wire-gated floors:
   A node takes either change only when it restarts into the release (an
   auto-update restarts it, 0 to 4 h after publish). Until then its paths with
   data keep carrying data: a path with data is never rechecked.
-  Per-path fallback to UDP needs no release. The stop relies on
-  `QUIC_DATA_PERCENT` being 0.
+  Per-path fallback to UDP needs no release.
 
   Hold at 5% (0.2.159): a smaller step than the stop, which keeps the data
   ramp at its first stage with no end date. It sets `QUIC_DATA_RAMP_START`
