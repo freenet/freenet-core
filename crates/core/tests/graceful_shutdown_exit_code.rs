@@ -121,17 +121,19 @@ impl NodeProcess {
 
     /// As [`Self::spawn`], logging to `log_dir` and passing `extra_args`.
     fn spawn_with(dir: &Path, log_dir: &Path, extra_args: &[&str]) -> anyhow::Result<Self> {
-        Self::spawn_full(dir, log_dir, extra_args, None)
+        Self::spawn_full(dir, log_dir, extra_args, None, &[])
     }
 
     /// As [`Self::spawn_with`]. With `home`, the node gets no stop-note
     /// variable and `HOME` set to `home`, so it uses the note at its default
-    /// place under `home`.
+    /// place under `home`. `env` is set last; the node otherwise never looks
+    /// supervised (the supervisor variables are removed).
     fn spawn_full(
         dir: &Path,
         log_dir: &Path,
         extra_args: &[&str],
         home: Option<&Path>,
+        env: &[(&str, &str)],
     ) -> anyhow::Result<Self> {
         let ws_port = reserve_port()?;
         let network_port = reserve_port()?;
@@ -194,6 +196,13 @@ impl NodeProcess {
                 .env_remove("FREENET_QUIC_BREAKER_STOP_NOTE")
                 .env("HOME", home);
         }
+        // A test runner under systemd would otherwise make every node look
+        // supervised (`supervisor_status`).
+        command
+            .env_remove("FREENET_SUPERVISED")
+            .env_remove("INVOCATION_ID")
+            .env_remove("FREENET_TEST_QUIC_PANIC");
+        command.envs(env.iter().copied());
         let child = command.spawn()?;
         Ok(Self {
             child,
@@ -409,7 +418,7 @@ fn spawn_quic_node_with(
     extra_args: &[&str],
 ) -> anyhow::Result<NodeProcess> {
     std::fs::create_dir_all(log_dir)?;
-    spawn_quic_node_full(dir, log_dir, extra_args, None)
+    spawn_quic_node_full(dir, log_dir, extra_args, None, &[])
 }
 
 /// As [`spawn_quic_node_with`], with `home` as in `NodeProcess::spawn_full`.
@@ -418,11 +427,12 @@ fn spawn_quic_node_full(
     log_dir: &Path,
     extra_args: &[&str],
     home: Option<&Path>,
+    env: &[(&str, &str)],
 ) -> anyhow::Result<NodeProcess> {
     std::fs::create_dir_all(log_dir)?;
     let mut args = vec!["--transport-quic", "prefer"];
     args.extend_from_slice(extra_args);
-    let mut node = NodeProcess::spawn_full(dir, log_dir, &args, home)?;
+    let mut node = NodeProcess::spawn_full(dir, log_dir, &args, home, env)?;
     node.wait_for_logs(
         &[READY_MARKER, TRANSPORT_BOUND_MARKER],
         Duration::from_secs(120),
@@ -510,7 +520,7 @@ fn a_node_with_no_quic_setting_runs_prefer_and_arms_the_breaker() -> anyhow::Res
     let dir = tempfile::tempdir()?;
     let log_dir = dir.path().join("logs");
     std::fs::create_dir_all(&log_dir)?;
-    let mut node = NodeProcess::spawn_full(dir.path(), &log_dir, &[], None)?;
+    let mut node = NodeProcess::spawn_full(dir.path(), &log_dir, &[], None, &[])?;
     node.wait_for_logs(
         &[READY_MARKER, TRANSPORT_BOUND_MARKER],
         Duration::from_secs(120),
@@ -688,6 +698,98 @@ fn quic_breaker_on_a_gateway_holds_only_for_the_gateway_cooldown() -> anyhow::Re
     Ok(())
 }
 
+/// Logged by a gateway that exits because its QUIC endpoint died.
+#[cfg(feature = "quic-panic-injection")]
+const ENDPOINT_DOWN_EXIT_MARKER: &str = "this gateway's QUIC endpoint died";
+
+/// Logged when the endpoint goes down after a caught adapter panic.
+#[cfg(feature = "quic-panic-injection")]
+const ENDPOINT_DOWN_MARKER: &str = "The QUIC endpoint is down";
+
+/// A supervised gateway whose QUIC endpoint dies exits through the fatal
+/// listener path (exit 42), having noted the exit in the breaker marker, and
+/// its next start runs QUIC again instead of tripping. After three such exits
+/// within the window the next start trips (the gateway cooldown). An
+/// unsupervised gateway keeps running over UDP.
+///
+/// Needs the `quic-panic-injection` feature (`down` mode: the outcome of a
+/// caught socket-adapter panic).
+///
+/// FALSIFY: drop the `note_endpoint_down_exit` call in
+/// `connection_handler::listener_liveness`; the second start trips.
+#[cfg(feature = "quic-panic-injection")]
+#[test]
+fn a_supervised_gateway_exits_on_endpoint_death_and_restarts_quic() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let down = [
+        ("FREENET_SUPERVISED", "1"),
+        ("FREENET_TEST_QUIC_PANIC", "down:2"),
+    ];
+    for run in 1..=3 {
+        let log_dir = dir.path().join(format!("logs-{run}"));
+        let mut node = spawn_quic_node_full(dir.path(), &log_dir, &[], None, &down)?;
+        let logs = node.logs();
+        assert!(
+            logs.contains(QUIC_BUILT_MARKER) && !logs.contains(QUIC_TRIP_MARKER),
+            "run {run}: an earlier endpoint-down exit must not trip. Logs:\n{logs}"
+        );
+        let status = node.wait_for_exit(Duration::from_secs(60))?;
+        let logs = node.logs();
+        assert_eq!(
+            status.code(),
+            Some(42),
+            "run {run}: the fatal-listener exit code. Logs:\n{logs}"
+        );
+        assert!(logs.contains(ENDPOINT_DOWN_EXIT_MARKER), "Logs:\n{logs}");
+        let marker = read_quic_marker(dir.path())?.expect("marker");
+        assert_eq!(
+            marker["endpoint_down_secs"].as_array().map(Vec::len),
+            Some(run),
+            "run {run}: the exit is noted. Marker: {marker}"
+        );
+    }
+    // The fourth start sees three in the window: a trip.
+    let mut node = spawn_quic_node_full(
+        dir.path(),
+        &dir.path().join("logs-4"),
+        &[],
+        None,
+        &[("FREENET_SUPERVISED", "1")],
+    )?;
+    let logs = node.logs();
+    assert!(
+        logs.contains(QUIC_TRIP_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
+        "three endpoint-down exits in the window trip. Logs:\n{logs}"
+    );
+    node.send_sigterm()?;
+    assert_eq!(node.wait_for_exit(Duration::from_secs(45))?.code(), Some(0));
+
+    // Unsupervised: the endpoint dies, the node keeps running.
+    let dir = tempfile::tempdir()?;
+    let mut node = spawn_quic_node_full(
+        dir.path(),
+        &dir.path().join("logs"),
+        &[],
+        None,
+        &[("FREENET_TEST_QUIC_PANIC", "down:1")],
+    )?;
+    node.wait_for_logs(&[ENDPOINT_DOWN_MARKER], Duration::from_secs(30))?;
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        !node.logs().contains(ENDPOINT_DOWN_EXIT_MARKER),
+        "an unsupervised gateway must not exit. Logs:\n{}",
+        node.logs()
+    );
+    node.send_sigterm()?;
+    assert_eq!(
+        node.wait_for_exit(Duration::from_secs(45))?.code(),
+        Some(0),
+        "Logs:\n{}",
+        node.logs()
+    );
+    Ok(())
+}
+
 /// A SIGKILL whose pid is in the stop note (a deliberate hard kill, as the
 /// macOS tray does) is not a trip, and the start consumes the note; a note
 /// naming another pid does not excuse the kill. Drives `gate`'s reading of
@@ -766,7 +868,13 @@ fn quic_breaker_default_path_note_keeps_other_entries() -> anyhow::Result<()> {
 
     // A note for another node only: this start leaves it as it is.
     std::fs::write(&note, format!("{OTHER}\n"))?;
-    let mut first = spawn_quic_node_full(dir.path(), &dir.path().join("logs-1"), &[], Some(&home))?;
+    let mut first = spawn_quic_node_full(
+        dir.path(),
+        &dir.path().join("logs-1"),
+        &[],
+        Some(&home),
+        &[],
+    )?;
     wait_for_armed_marker(dir.path(), &first)?;
     assert_eq!(entries(&note)?, vec![OTHER], "another node's entry is left");
 
@@ -775,8 +883,13 @@ fn quic_breaker_default_path_note_keeps_other_entries() -> anyhow::Result<()> {
     first.kill_abnormally()?;
     drop(first);
     std::fs::write(&note, format!("{OTHER}\n{pid}\n"))?;
-    let mut second =
-        spawn_quic_node_full(dir.path(), &dir.path().join("logs-2"), &[], Some(&home))?;
+    let mut second = spawn_quic_node_full(
+        dir.path(),
+        &dir.path().join("logs-2"),
+        &[],
+        Some(&home),
+        &[],
+    )?;
     let logs = second.logs();
     assert!(
         !logs.contains(QUIC_TRIP_MARKER) && logs.contains(QUIC_BUILT_MARKER),

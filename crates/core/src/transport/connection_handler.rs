@@ -570,16 +570,29 @@ pub(crate) async fn open_udp_transport<S: Socket>(
         outbound.quic_availability().get() == super::quic::liveness::QuicAvailability::Up,
         task_registrar.as_ref(),
     );
-    Ok(udp_transport_handle(outbound, inbound, listen_task))
+    // A supervised gateway exits when its endpoint dies (#5940), so its
+    // supervisor restarts it with a new one; every other node keeps running
+    // over UDP.
+    let exit_on_endpoint_down = super::quic::liveness::exit_on_endpoint_down(is_gateway)
+        .then(|| outbound.quic_availability());
+    Ok(udp_transport_handle(
+        outbound,
+        inbound,
+        listen_task,
+        exit_on_endpoint_down,
+    ))
 }
 
 /// Assemble the handle from the UDP transport's parts. Outbound connect and
 /// expected-inbound registration share one expected-IP set: the tracker is a
-/// view of the connector's set.
+/// view of the connector's set. With `exit_on_endpoint_down`, the listener
+/// also ends as [`super::ListenerExit::QuicEndpointDown`] when that endpoint
+/// dies.
 pub(crate) fn udp_transport_handle<S: Socket>(
     outbound: OutboundConnectionHandler<S>,
     inbound: InboundConnectionHandler<S>,
     listen_task: tokio::task::JoinHandle<TransportError>,
+    exit_on_endpoint_down: Option<super::quic::liveness::QuicAvailabilityWatch>,
 ) -> super::TransportHandle {
     super::TransportHandle {
         quic_endpoint: outbound.quic_availability().get()
@@ -588,7 +601,28 @@ pub(crate) fn udp_transport_handle<S: Socket>(
         expected_inbound: Arc::new(outbound.expected_inbound_tracker()),
         connector: Arc::new(outbound),
         acceptor: Box::new(inbound),
-        listener: Box::pin(async move { super::ListenerExit::from_join(listen_task.await) }),
+        listener: Box::pin(listener_liveness(listen_task, exit_on_endpoint_down)),
+    }
+}
+
+/// The transport's listener liveness: the listen task's end, or, with
+/// `exit_on_endpoint_down`, the death of that QUIC endpoint, whichever comes
+/// first. A death is first noted in the crash-loop breaker's marker, so the
+/// next start restarts QUIC rather than tripping.
+async fn listener_liveness(
+    mut listen_task: tokio::task::JoinHandle<TransportError>,
+    exit_on_endpoint_down: Option<super::quic::liveness::QuicAvailabilityWatch>,
+) -> super::ListenerExit {
+    let Some(availability) = exit_on_endpoint_down else {
+        return super::ListenerExit::from_join(listen_task.await);
+    };
+    crate::deterministic_select! {
+        ended = &mut listen_task => super::ListenerExit::from_join(ended),
+        () = availability.died() => {
+            // Only the binary enables this, so the wall clock is real here.
+            super::quic::breaker::note_endpoint_down_exit(std::time::SystemTime::now());
+            super::ListenerExit::QuicEndpointDown
+        },
     }
 }
 

@@ -154,6 +154,16 @@ pub(crate) const QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(24 * 60 *
 /// a crash loop to one restart with QUIC per cooldown.
 pub(crate) const GATEWAY_QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
+/// A node that exits on purpose because its QUIC endpoint died (a gateway,
+/// see `liveness::exit_on_endpoint_down`) is restarted by its supervisor
+/// with QUIC on, unless it has already done so this many times within
+/// [`ENDPOINT_DOWN_WINDOW`]: then that exit trips the breaker. Provisional
+/// value (a proposal, not measured).
+pub(crate) const ENDPOINT_DOWN_EXITS_TO_TRIP: usize = 3;
+
+/// The window [`ENDPOINT_DOWN_EXITS_TO_TRIP`] counts in. Provisional value.
+pub(crate) const ENDPOINT_DOWN_WINDOW: Duration = Duration::from_secs(60 * 60);
+
 /// Which cooldown applies: the node's role at this start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BreakerRole {
@@ -279,6 +289,13 @@ pub(crate) enum Marker {
         boot_id: Option<String>,
         nonce: u64,
         armed_at_secs: u64,
+        /// When this node recently exited on purpose because its QUIC
+        /// endpoint died ([`note_endpoint_down_exit`]), oldest first, at most
+        /// [`ENDPOINT_DOWN_EXITS_TO_TRIP`] entries within
+        /// [`ENDPOINT_DOWN_WINDOW`]. Carried from run to run. Absent in a
+        /// marker from an earlier release, and an earlier release ignores it.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        endpoint_down_secs: Vec<u64>,
     },
     /// The breaker tripped at this time (seconds since the Unix epoch).
     Tripped { tripped_at_secs: u64 },
@@ -383,13 +400,30 @@ pub(crate) fn verdict(facts: &Facts<'_>) -> Verdict {
     match facts.previous {
         Previous::Unreadable if facts.ignore_breaker => Verdict::RunUnarmed,
         Previous::Unreadable => Verdict::Unreadable,
-        Previous::Marker(Marker::Armed { pid, boot_id, .. })
-            if !facts.ignore_breaker
-                && same_boot(boot_id.as_deref(), facts.boot_id)
-                && !facts.armed_pid_alive
-                && !facts.stopped.contains(pid) =>
+        Previous::Marker(Marker::Armed {
+            pid,
+            boot_id,
+            armed_at_secs,
+            endpoint_down_secs,
+            ..
+        }) if !facts.ignore_breaker
+            && same_boot(boot_id.as_deref(), facts.boot_id)
+            && !facts.armed_pid_alive
+            && !facts.stopped.contains(pid) =>
         {
-            Verdict::Trip
+            // The run recorded that it exited because its endpoint died: a
+            // deliberate exit, restarted with QUIC on until it repeats.
+            let exited_on_endpoint_down = endpoint_down_secs
+                .last()
+                .is_some_and(|at| *at >= *armed_at_secs);
+            if exited_on_endpoint_down
+                && recent_endpoint_down_exits(endpoint_down_secs, facts.now_secs).len()
+                    < ENDPOINT_DOWN_EXITS_TO_TRIP
+            {
+                Verdict::Arm
+            } else {
+                Verdict::Trip
+            }
         }
         Previous::Marker(Marker::Tripped { tripped_at_secs })
             if !facts.ignore_breaker && cooling(*tripped_at_secs, facts.now_secs, facts.role) =>
@@ -406,6 +440,81 @@ pub(crate) fn verdict(facts: &Facts<'_>) -> Verdict {
             | Marker::Unknown,
         ) => Verdict::Arm,
     }
+}
+
+/// The entries of `endpoint_down_secs` within [`ENDPOINT_DOWN_WINDOW`] before
+/// `now_secs` (a time ahead of the clock does not count), oldest first, at
+/// most [`ENDPOINT_DOWN_EXITS_TO_TRIP`].
+pub(crate) fn recent_endpoint_down_exits(endpoint_down_secs: &[u64], now_secs: u64) -> Vec<u64> {
+    let window = ENDPOINT_DOWN_WINDOW.as_secs();
+    let recent: Vec<u64> = endpoint_down_secs
+        .iter()
+        .copied()
+        .filter(|at| *at <= now_secs && now_secs < at.saturating_add(window))
+        .collect();
+    let skip = recent.len().saturating_sub(ENDPOINT_DOWN_EXITS_TO_TRIP);
+    recent[skip..].to_vec()
+}
+
+/// The endpoint-down exits a new Armed marker carries from `previous`.
+fn carried_endpoint_down_exits(previous: &Previous, now_secs: u64) -> Vec<u64> {
+    match previous {
+        Previous::Marker(Marker::Armed {
+            endpoint_down_secs, ..
+        }) => recent_endpoint_down_exits(endpoint_down_secs, now_secs),
+        Previous::Nothing
+        | Previous::Unreadable
+        | Previous::Marker(Marker::Tripped { .. } | Marker::ShortRuns { .. } | Marker::Unknown) => {
+            Vec::new()
+        }
+    }
+}
+
+/// Record in this process's marker that the node is about to exit on
+/// purpose because its QUIC endpoint died, so the next start restarts QUIC
+/// rather than tripping (see [`ENDPOINT_DOWN_EXITS_TO_TRIP`]). Returns
+/// whether it was recorded: `false` when the breaker is off, nothing was
+/// armed, or the marker is no longer this process's (then the exit is
+/// treated as a crash, as before).
+pub(crate) fn note_endpoint_down_exit(now: SystemTime) -> bool {
+    let Some((path, nonce)) = ARMED.get() else {
+        return false;
+    };
+    match note_endpoint_down_exit_at(path, *nonce, unix_secs(now)) {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                path = %path.display(),
+                "Could not record the endpoint-down exit in the QUIC crash-breaker marker; \
+                 the next start treats this exit as a crash"
+            );
+            false
+        }
+    }
+}
+
+/// [`note_endpoint_down_exit`] for the marker at `path` armed with `nonce`.
+fn note_endpoint_down_exit_at(path: &Path, nonce: u64, now_secs: u64) -> std::io::Result<bool> {
+    let mut marker = match read_previous(path) {
+        Previous::Marker(marker) => marker,
+        Previous::Nothing => return Ok(false),
+        Previous::Unreadable => return Err(std::io::Error::other("the marker cannot be read")),
+    };
+    let Marker::Armed {
+        nonce: owner,
+        endpoint_down_secs,
+        ..
+    } = &mut marker
+    else {
+        return Ok(false);
+    };
+    if *owner != nonce {
+        return Ok(false);
+    }
+    endpoint_down_secs.push(now_secs);
+    *endpoint_down_secs = recent_endpoint_down_exits(endpoint_down_secs, now_secs);
+    write_marker(path, &marker).map(|()| true)
 }
 
 /// Whether two boot identities are both known and equal.
@@ -612,6 +721,16 @@ pub(crate) async fn gate<T>(
     };
     match decided {
         Verdict::Arm => {
+            let endpoint_down_secs = carried_endpoint_down_exits(&previous, now_secs);
+            if !endpoint_down_secs.is_empty() {
+                tracing::warn!(
+                    recent_exits = endpoint_down_secs.len(),
+                    trip_at = ENDPOINT_DOWN_EXITS_TO_TRIP,
+                    window_minutes = ENDPOINT_DOWN_WINDOW.as_secs() / 60,
+                    "This node recently exited because its QUIC endpoint died; QUIC runs \
+                     again, and the breaker trips if it happens too often"
+                );
+            }
             PENDING.lock().marker = Some((
                 path,
                 Marker::Armed {
@@ -619,6 +738,7 @@ pub(crate) async fn gate<T>(
                     boot_id,
                     nonce: crate::config::GlobalRng::random_u64(),
                     armed_at_secs: now_secs,
+                    endpoint_down_secs,
                 },
             ));
         }
@@ -954,6 +1074,7 @@ mod tests {
             boot_id: boot.map(str::to_string),
             nonce: 7,
             armed_at_secs: T0,
+            endpoint_down_secs: Vec::new(),
         })
     }
 
@@ -1077,6 +1198,150 @@ mod tests {
         let (previous, alive) = reread_after_wait(&path, Some(BOOT), OWN, |pid| pid == PID);
         assert!(alive);
         assert_eq!(decide(&previous, alive), Verdict::Arm);
+    }
+
+    fn armed_with_downs(armed_at_secs: u64, downs: &[u64]) -> Previous {
+        Previous::Marker(Marker::Armed {
+            pid: PID,
+            boot_id: Some(BOOT.to_string()),
+            nonce: 7,
+            armed_at_secs,
+            endpoint_down_secs: downs.to_vec(),
+        })
+    }
+
+    /// A run that recorded an endpoint-down exit restarts with QUIC on until
+    /// it has done so ENDPOINT_DOWN_EXITS_TO_TRIP times in the window; a
+    /// crash of a run that recorded none still trips, whatever earlier runs
+    /// recorded.
+    #[test]
+    fn an_endpoint_down_exit_restarts_quic_until_it_repeats() {
+        let w = ENDPOINT_DOWN_WINDOW.as_secs();
+        let now = T0 + 30;
+        let at = |previous: &Previous, now_secs: u64| {
+            verdict(&Facts {
+                now_secs,
+                ..facts(previous, Some(BOOT))
+            })
+        };
+        assert_eq!(at(&armed_with_downs(T0, &[T0 + 10]), now), Verdict::Arm);
+        assert_eq!(
+            at(&armed_with_downs(T0, &[T0 - 600, T0 + 10]), now),
+            Verdict::Arm,
+            "two in the window"
+        );
+        assert_eq!(
+            at(&armed_with_downs(T0, &[T0 - 1200, T0 - 600, T0 + 10]), now),
+            Verdict::Trip,
+            "the third in the window trips"
+        );
+        assert_eq!(
+            at(&armed_with_downs(T0, &[T0 - w - 1, T0 - 600, T0 + 10]), now),
+            Verdict::Arm,
+            "one outside the window does not count"
+        );
+        assert_eq!(
+            at(&armed_with_downs(T0, &[T0 - 600]), now),
+            Verdict::Trip,
+            "this run recorded no endpoint-down exit: a crash"
+        );
+        assert_eq!(
+            at(&armed_with_downs(T0, &[]), now),
+            Verdict::Trip,
+            "no record: a crash"
+        );
+        // Only the crash conditions decide whether it is evidence at all.
+        assert_eq!(
+            verdict(&Facts {
+                armed_pid_alive: true,
+                ..facts(&armed_with_downs(T0, &[T0 + 10]), Some(BOOT))
+            }),
+            Verdict::Arm
+        );
+    }
+
+    #[test]
+    fn recent_endpoint_down_exits_keeps_the_window_and_the_newest() {
+        let w = ENDPOINT_DOWN_WINDOW.as_secs();
+        assert_eq!(
+            recent_endpoint_down_exits(&[T0 - w, T0 - w + 1, T0, T0 + 1], T0),
+            vec![T0 - w + 1, T0],
+            "outside the window or ahead of the clock does not count"
+        );
+        assert_eq!(
+            recent_endpoint_down_exits(&[T0 - 4, T0 - 3, T0 - 2, T0 - 1], T0),
+            vec![T0 - 3, T0 - 2, T0 - 1],
+            "at most ENDPOINT_DOWN_EXITS_TO_TRIP, the newest"
+        );
+        assert_eq!(ENDPOINT_DOWN_EXITS_TO_TRIP, 3);
+        assert!(
+            recent_endpoint_down_exits(&[u64::MAX], u64::MAX).is_empty(),
+            "saturation ends the window"
+        );
+    }
+
+    /// The note is added only to this process's own Armed marker, and the
+    /// next start carries the recent ones into its new marker.
+    #[test]
+    fn an_endpoint_down_exit_is_noted_only_in_the_owners_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        assert!(
+            !note_endpoint_down_exit_at(&path, 7, T0).unwrap(),
+            "no marker"
+        );
+
+        write_marker(&path, &marker_of(armed_with_downs(T0, &[T0 - 30]))).unwrap();
+        assert!(
+            !note_endpoint_down_exit_at(&path, 8, T0 + 10).unwrap(),
+            "not ours"
+        );
+        assert_eq!(read_previous(&path), armed_with_downs(T0, &[T0 - 30]));
+
+        assert!(note_endpoint_down_exit_at(&path, 7, T0 + 10).unwrap());
+        let noted = read_previous(&path);
+        assert_eq!(noted, armed_with_downs(T0, &[T0 - 30, T0 + 10]));
+        assert_eq!(
+            carried_endpoint_down_exits(&noted, T0 + 20),
+            vec![T0 - 30, T0 + 10]
+        );
+        assert_eq!(
+            carried_endpoint_down_exits(&noted, T0 + 10 + ENDPOINT_DOWN_WINDOW.as_secs()),
+            Vec::<u64>::new(),
+            "all aged out"
+        );
+
+        write_marker(
+            &path,
+            &Marker::Tripped {
+                tripped_at_secs: T0,
+            },
+        )
+        .unwrap();
+        assert!(
+            !note_endpoint_down_exit_at(&path, 7, T0).unwrap(),
+            "not armed"
+        );
+    }
+
+    /// A marker from an earlier release (no field) still parses, and a marker
+    /// with no endpoint-down exits is written exactly as before, so a
+    /// rollback reads it.
+    #[test]
+    fn the_endpoint_down_field_is_compatible_both_ways() {
+        let old = r#"{"state":"armed","pid":5,"boot_id":"b","nonce":7,"armed_at_secs":9}"#;
+        let parsed: Marker = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            parsed,
+            Marker::Armed {
+                pid: 5,
+                boot_id: Some("b".into()),
+                nonce: 7,
+                armed_at_secs: 9,
+                endpoint_down_secs: Vec::new(),
+            }
+        );
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), old);
     }
 
     /// A gateway's trip holds for the gateway cooldown, never the peer's
