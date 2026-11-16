@@ -353,7 +353,7 @@ A packager working from a source tarball can supply the provenance that
 
 | Variable | Value | Effect |
 |---|---|---|
-| `FREENET_GIT_COMMIT_HASH` | up to 40 hex characters, or **empty** | Reported by `freenet --version`. Empty means "no override": build.rs probes `git`, and reports `unknown` if there is none. A non-hex value **fails the build** — never pass a placeholder like `unknown`. |
+| `FREENET_GIT_COMMIT_HASH` | up to 40 hex characters, or **empty** | Reported by `freenet --version`. Empty means "no override": build.rs probes `git`, then the `.cargo_vcs_info.json` a crates.io package carries, and reports `unknown` if neither has it. A non-hex value **fails the build** — never pass a placeholder like `unknown`. |
 | `FREENET_GIT_IS_DIRTY` | `1`/`true`, `0`/`false`, or empty | Empty means "no override" (probe `git`). Anything else fails the build. |
 | `SOURCE_DATE_EPOCH` | seconds since the epoch, or **empty** | Fixes `BUILD_TIMESTAMP`. Empty means "no override": build.rs uses the current time. A non-numeric value **fails the build**. |
 
