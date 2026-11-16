@@ -67,6 +67,9 @@ struct TestConfig {
     /// recovery). MockRuntime has its own independent implementation that can silently
     /// drift from production behavior. See issue #3141.
     use_mock_wasm: bool,
+    /// Send states larger than this many bytes as streams (`run_direct` only).
+    /// `None` keeps the simulation default (streaming off).
+    streaming_threshold: Option<usize>,
 }
 
 impl TestConfig {
@@ -90,6 +93,7 @@ impl TestConfig {
             latency_range: None,
             message_loss_rate: 0.0,
             use_mock_wasm: false,
+            streaming_threshold: None,
         }
     }
 
@@ -113,6 +117,7 @@ impl TestConfig {
             latency_range: None,
             message_loss_rate: 0.0,
             use_mock_wasm: false,
+            streaming_threshold: None,
         }
     }
 
@@ -136,6 +141,7 @@ impl TestConfig {
             latency_range: None,
             message_loss_rate: 0.0,
             use_mock_wasm: false,
+            streaming_threshold: None,
         }
     }
 
@@ -179,6 +185,7 @@ impl TestConfig {
             latency_range: Some(Duration::from_millis(10)..Duration::from_millis(50)),
             message_loss_rate: 0.0,
             use_mock_wasm: false,
+            streaming_threshold: None,
         }
     }
 
@@ -266,6 +273,12 @@ impl TestConfig {
     /// Use MockWasmRuntime (production ContractExecutor path) instead of MockRuntime.
     fn with_mock_wasm(mut self) -> Self {
         self.use_mock_wasm = true;
+        self
+    }
+
+    /// Stream states larger than `bytes` (`run_direct` only).
+    fn with_streaming_threshold(mut self, bytes: usize) -> Self {
+        self.streaming_threshold = Some(bytes);
         self
     }
 
@@ -388,6 +401,9 @@ impl TestConfig {
             .await;
             sim.use_mock_wasm = use_mock_wasm;
             sim.skip_convergence_wait = skip_convergence_wait;
+            if let Some(bytes) = self.streaming_threshold {
+                sim.with_streaming_threshold(bytes);
+            }
 
             // Apply fault injection if configured (latency and/or message loss)
             let has_latency = self.latency_range.is_some();
@@ -6579,6 +6595,7 @@ fn test_subscription_renewal_at_scale() {
         latency_range: None,
         message_loss_rate: 0.0,
         use_mock_wasm: false,
+        streaming_threshold: None,
     };
 
     let max_contracts = config.max_contracts; // Save before config.run() moves it
@@ -21785,12 +21802,12 @@ fn test_quic_data_ramp_turns_on_every_pair_within_a_day() {
 
 /// The path goes dark in the middle of a transfer: after 384 KiB of QUIC
 /// datagrams have moved between the node and the gateway, every later one is
-/// lost, while their UDP session carries on. Each end's acknowledgement watch
-/// closes the dark path within its window (`recycle::AckWatch`: packets
-/// outstanding, nothing acknowledged and nothing heard), well before the
-/// idle timeout and before its sends' timeouts make it suspect; the path
-/// falls back with the UDP session up, the pair is offered a path again, and
-/// the gateway ends with the whole state.
+/// lost, while their UDP session carries on. The path has a UDP session, so
+/// neither end's acknowledgement watch (`recycle::DARK_CLOSES_WITH_UDP`) nor
+/// its stall count closes it while it is dark; each end's sends go suspect,
+/// so new data goes on UDP, and quinn's idle timeout ends the path. It falls
+/// back with the UDP session up, the pair is offered a path again, and the
+/// gateway ends with the whole state.
 #[test_log::test]
 fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
     use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
@@ -21883,9 +21900,9 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
         assert!(run.whats(*address, "DataEnabled") >= 1, "{}", run.dump());
     }
     let records = run.trace.records();
-    // Each end fell back once, on the close its own watch sent (the machine
-    // reads the connection loss that close causes as `Reset`), and sent no
-    // other close on the path.
+    // Each end fell back once, on the idle timeout, and sent no close of its
+    // own on the path (before 0.2.159 the watch's dark rule closed it, which
+    // the machine read as `Reset`).
     for address in &run.nodes {
         let of_node = |what: &str| {
             records
@@ -21897,22 +21914,20 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
             .iter()
             .map(|r| r.what.as_str())
             .collect();
-        let closed_by_watch = of_node("path stall-closed: ").iter().any(|r| {
-            r.what == "path stall-closed: 0, first closed by this node with: Some(PeerNotAcknowledging)"
-        });
+        let closed_by_none = of_node("path stall-closed: ")
+            .iter()
+            .any(|r| r.what == "path stall-closed: 0, first closed by this node with: None");
+        let went_suspect = !of_node("path was suspect: entered 1").is_empty();
         assert!(
-            causes == ["Fallback(Reset)"] && closed_by_watch,
-            "{address} fell back once, on its own watch's close of the dark path: {}",
+            causes == ["Fallback(Idle)"] && closed_by_none && went_suspect,
+            "{address} fell back once, on the idle timeout of the dark path, \
+             suspect before it: {}",
             run.dump()
         );
-        // Not before the window (10 s): an earlier fallback is a close by
-        // something else. In place of the suspect routing this test asserted before the
-        // watch: the watch closes first (neither end goes suspect here), so
-        // what bounds the data lost to the dark path is how soon the end falls
-        // back after the last data the path delivered to it: at most the dark
-        // rule's bound at this round trip (`recycle::dark_close_bound`, about
-        // 67 s: two probe rounds after the window must go unanswered) plus the
-        // time the close takes to reach the machine.
+        // The idle timeout (60 s here) runs from the last packet received, no
+        // earlier than the last data, so the fallback comes at least that long
+        // after it; at most that plus the time the end takes to reach the
+        // machine. New data left the path when it went suspect.
         let last_on_path = of_node("received a short on the path")
             .iter()
             .chain(of_node("received a stream on the path").iter())
@@ -21922,7 +21937,7 @@ fn test_quic_data_path_cut_mid_transfer_falls_back_to_udp() {
         let fell_back_at = of_node("Fallback(")[0].at;
         let dark_for = fell_back_at.saturating_sub(last_on_path);
         assert!(
-            dark_for >= std::time::Duration::from_secs(10)
+            dark_for >= std::time::Duration::from_secs(60)
                 && dark_for <= std::time::Duration::from_secs(75),
             "{address} fell back {dark_for:?} after the path last delivered to it: {}",
             run.dump()
@@ -23090,4 +23105,140 @@ fn test_quic_native_zero_percent_forms_the_same_mesh() {
     assert!(on_connected);
     assert_eq!(on.mesh, off.mesh, "the same connections form");
     assert_eq!(on.trace.undecodable_closes(), 0);
+}
+
+// =============================================================================
+// Non-settling merge bounded by the per-contract merge budget (#6190)
+// =============================================================================
+
+/// A contract whose merge never settles (every apply yields fresh bytes, so
+/// the applied-payload skip cannot help) turns every broadcast into another
+/// state change. Since #6190 nothing freezes it; the per-contract merge
+/// budget bounds it, by usage alone, identically for every contract.
+///
+/// One run with the PRODUCTION budget constants. Asserts:
+/// 1. the budget engaged on a non-settling contract (drops > 0). With the
+///    budget not binding this fails: a 100/s budget on this run dropped
+///    nothing;
+/// 2. it never dropped a broadcast for a healthy contract. This run's busiest
+///    healthy contract stays well under one node's burst, so this shows the
+///    budget leaves ordinary traffic alone, not where its edge is;
+/// 3. nothing bypasses it at scale: `update_state` calls for each hot
+///    non-settling contract stay within 1.1x the state-changing merges the
+///    budget charged. The rest is the idempotency probes' re-applies and the
+///    merges of repair `ResyncResponse`s and anti-entropy, which ride other
+///    paths and are bounded by their own limiters. Measured at this seed:
+///    24,464 calls against 24,146 charged (1.013); streamed, 4,339 against
+///    4,308 (1.007), and deleting the streaming charge site makes the
+///    streaming variant fail (4,339 against 1,387).
+///
+/// Admissions per node over time are bounded by the token bucket itself
+/// (`ring::contract_merge_budget` unit tests); this test does not re-derive
+/// that from an estimate of virtual time. That a flagged contract still
+/// commits updates is pinned at the executor
+/// (`flagged_contract_subsequent_apply_is_committed`).
+///
+/// The hooks are process-global, so the body runs alone in a child process:
+/// armed in-process they would make a quarter of the contracts of every
+/// concurrently running mock-WASM simulation non-settling under plain
+/// `cargo test`, and fold those simulations' counts into these.
+#[test_log::test]
+fn non_settling_contract_is_bounded_by_merge_budget() {
+    if run_alone_in_child_process("non_settling_contract_is_bounded_by_merge_budget") {
+        return;
+    }
+    assert_non_settling_contract_is_bounded(None, true);
+}
+
+/// [`non_settling_contract_is_bounded_by_merge_budget`] with every state sent
+/// as a stream, so the streaming broadcast apply path (its own charge site) is
+/// exercised: its state-changing merges must be charged, and nothing may
+/// bypass the budget. The streamed loop is slower (measured ~4.7 merges per
+/// node per second against a budget of 20), so the budget does not have to
+/// engage here, and drops are not required.
+#[test_log::test]
+fn non_settling_contract_is_bounded_by_merge_budget_streaming() {
+    if run_alone_in_child_process("non_settling_contract_is_bounded_by_merge_budget_streaming") {
+        return;
+    }
+    assert_non_settling_contract_is_bounded(Some(1), false);
+}
+
+fn assert_non_settling_contract_is_bounded(streaming_threshold: Option<usize>, expect_drops: bool) {
+    use freenet::dev_tool::sim_merge_budget::*;
+    const BAD_MODULUS: u8 = 4;
+
+    struct Disarm;
+    impl Drop for Disarm {
+        fn drop(&mut self) {
+            disarm();
+        }
+    }
+    let _disarm = Disarm;
+    arm(BAD_MODULUS);
+    let mut config = TestConfig::medium("merge-budget-non-settling", 0x4D31_0001)
+        .with_nodes(12)
+        .with_gateways(2)
+        .with_iterations(300)
+        .with_max_contracts(8)
+        .with_connections(4, 10)
+        .with_event_wait(Duration::from_millis(200))
+        .with_mock_wasm()
+        .no_convergence_wait();
+    if let Some(bytes) = streaming_threshold {
+        config = config.with_streaming_threshold(bytes);
+    }
+    let res = config.run_direct();
+    let merges = take_merge_counts();
+    let budget = take_merge_budget_counts();
+    res.assert_ok();
+
+    let is_bad = |first: u8| first % BAD_MODULUS == 0;
+    println!("merge-budget sim: update_state calls {merges:?}");
+    println!("merge-budget sim: (admitted, dropped, charged) {budget:?}");
+    assert!(
+        merges.iter().any(|(b, _, _)| is_bad(*b)),
+        "premise: the seed must produce a non-settling contract: {merges:?}"
+    );
+    assert!(
+        merges.iter().any(|(b, _, _)| !is_bad(*b)),
+        "premise: healthy contracts were merged too"
+    );
+
+    let hot: Vec<_> = budget
+        .iter()
+        .filter(|(first, _, _, dropped, charged)| {
+            is_bad(*first)
+                && if expect_drops {
+                    *dropped > 0
+                } else {
+                    *charged > 0
+                }
+        })
+        .collect();
+    assert!(
+        !hot.is_empty(),
+        "the budget never engaged on any non-settling contract (expect_drops: \
+         {expect_drops}): {budget:?}"
+    );
+    for (first, id, admitted, dropped, _) in &budget {
+        assert!(
+            is_bad(*first) || *dropped == 0,
+            "the budget dropped {dropped} broadcasts for healthy contract {id} \
+             ({admitted} admitted)"
+        );
+    }
+    for (_, id, admitted, _, charged) in hot {
+        let calls = merges.iter().find(|(_, m, _)| m == id).map_or(0, |m| m.2);
+        assert!(*charged > 0, "{id}: state-changing merges must be charged");
+        assert!(
+            charged <= admitted,
+            "{id}: charged {charged} > admitted {admitted}"
+        );
+        assert!(
+            (calls as f64) <= 1.1 * *charged as f64,
+            "non-settling contract {id}: {calls} update_state calls against {charged} \
+             charged merges ({admitted} admitted); something bypasses the budget"
+        );
+    }
 }

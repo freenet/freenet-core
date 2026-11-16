@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     simulation::TimeSource,
-    tracing::TransferDirection,
+    tracing::{TransferDirection, TransferTransport},
     transport::{
         TransferStats, TransportError,
         congestion_control::{CongestionControl, CongestionController},
@@ -121,6 +121,7 @@ fn abandon_for_egress_wait<T: TimeSource>(
         reason,
         elapsed.as_millis() as u64,
         TransferDirection::Send,
+        TransferTransport::Udp,
     );
     release_aborted_stream_flightsize(stream_id, sent_packet_tracker, congestion_controller);
     TransportError::OutboundStreamFailed(destination_addr)
@@ -396,6 +397,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         destination_addr,
         bytes_to_send,
         TransferDirection::Send,
+        TransferTransport::Udp,
     );
 
     tracing::debug!(
@@ -542,6 +544,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                         ),
                         elapsed.as_millis() as u64,
                         TransferDirection::Send,
+                        TransferTransport::Udp,
                     );
                     // Aggregate sender-abort counter (Group B telemetry): the
                     // cwnd-wait timed out (ACKs stopped arriving) and this stream is
@@ -725,6 +728,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
                 e.to_string(),
                 elapsed.as_millis() as u64,
                 TransferDirection::Send,
+                TransferTransport::Udp,
             );
             // Release this stream's in-flight bytes (#4345). Two parts:
             // (1) drop_stream releases the already-sent, tracked fragments;
@@ -827,6 +831,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         end.min_rtt_ms,
         Some(peak_flightsize.min(u32::MAX as usize) as u32),
         TransferDirection::Send,
+        TransferTransport::Udp,
     );
 
     // Signal completion (success path) so broadcast queue can release the
@@ -1059,6 +1064,7 @@ where
         destination_addr,
         total_bytes,
         TransferDirection::Send,
+        TransferTransport::Udp,
     );
 
     tracing::debug!(
@@ -1116,6 +1122,7 @@ where
                     ),
                     elapsed.as_millis() as u64,
                     TransferDirection::Send,
+                    TransferTransport::Udp,
                 );
                 // Stall is in the UPSTREAM inbound feed, not the downstream
                 // connection — fail only this stream so other ops multiplexed
@@ -1142,6 +1149,7 @@ where
                     format!("inbound stream error: {e}"),
                     elapsed.as_millis() as u64,
                     TransferDirection::Send,
+                    TransferTransport::Udp,
                 );
                 // Error is on the UPSTREAM inbound stream, not the downstream
                 // connection — fail only this stream (#4345), same rationale as
@@ -1248,6 +1256,7 @@ where
                         ),
                         elapsed.as_millis() as u64,
                         TransferDirection::Send,
+                        TransferTransport::Udp,
                     );
                     // Fail only this stream, not the connection (#4345). See the
                     // matching site in send_stream for the rationale. Release the
@@ -1390,6 +1399,7 @@ where
                 e.to_string(),
                 elapsed.as_millis() as u64,
                 TransferDirection::Send,
+                TransferTransport::Udp,
             );
             // Release this stream's in-flight bytes (#4345): drop_stream for the
             // already-forwarded tracked fragments, plus packet_size for the
@@ -1452,6 +1462,7 @@ where
             format!("inbound stream ended short: forwarded {sent_so_far}/{total_bytes} bytes"),
             elapsed.as_millis() as u64,
             TransferDirection::Send,
+            TransferTransport::Udp,
         );
         release_aborted_stream_flightsize(
             outbound_stream_id,
@@ -1501,6 +1512,7 @@ where
         end.min_rtt_ms,
         Some(peak_flightsize.min(u32::MAX as usize) as u32),
         TransferDirection::Send,
+        TransferTransport::Udp,
     );
 
     Ok(TransferStats {
@@ -3334,9 +3346,10 @@ mod tests {
                 throttle: None,
             });
         assert!(source.fragment_gap_limit() > Duration::from_secs(6));
+        let piped_id = StreamId::next();
         let pipe_task = GlobalExecutor::spawn(pipe_stream(
             source.fork().into(),
-            StreamId::next(),
+            piped_id,
             Arc::new(AtomicU32::new(0)),
             Arc::new(TestSocket::new(outbound_sender)),
             remote_addr,
@@ -3360,6 +3373,14 @@ mod tests {
             .expect("join error")
             .expect_err("a 6 s gap fails a UDP pipe whatever its source");
         drain.abort();
+        // Reported as a UDP transfer, though its source is QUIC-fed.
+        assert_eq!(
+            crate::transport::metrics::transfer_events_of(piped_id.0 as u64),
+            [
+                ("transfer_started", crate::tracing::TransferTransport::Udp),
+                ("transfer_failed", crate::tracing::TransferTransport::Udp)
+            ]
+        );
     }
 
     /// Regression test for #4345 (relay-pipe inbound-stream-error path,

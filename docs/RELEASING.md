@@ -12,36 +12,39 @@
 > successful update.
 
 
-The release pipeline is fully automated. Any maintainer with workflow-run access
-can cut a release by triggering one workflow; everything else cascades:
-crates.io publish, GitHub release with binaries, gateway updates, and the
-Matrix/River announcements.
+The release pipeline is fully automated: one workflow trigger cascades into
+the crates.io publish, the GitHub release with binaries, gateway updates, and
+the Matrix/River announcements.
 
-This doc covers the developer-facing happy path and the few places things can
-go wrong.
+> **Cut releases only via the `freenet:release` skill.** Its mandatory
+> preconditions come first: the auto-update canaries, a 30-minute real-NAT
+> soak of the exact SHA, and a telemetry baseline. CI exercises neither a real
+> NATed peer nor the shipping binary's own updater. The trigger commands below
+> are the step that skill runs after its gates pass; they are not a standalone
+> procedure. A `dry_run=true` dispatch is safe only from a ref that contains
+> #5939. From an older ref it still pushes, opens and auto-merges the
+> version-bump PR (#5936), so it needs the same gates there.
+
+This doc covers how the pipeline works once triggered, and the few places
+things can go wrong.
 
 ## Quickstart
 
-For a routine patch release, just run the workflow with no input — it
-auto-bumps the patch from the latest crates.io version:
-
-```bash
-gh workflow run release.yml --repo freenet/freenet-core
-```
-
-For a minor or major bump (or to pin a specific version), pass `version`:
+Only after the `freenet:release` preconditions have passed (see above), the
+skill triggers the workflow, always with an explicit version:
 
 ```bash
 gh workflow run release.yml \
     --repo freenet/freenet-core \
-    --field version=0.3.0
+    --field version=X.Y.Z
 ```
 
-That's it. Watch progress at <https://github.com/freenet/freenet-core/actions/workflows/release.yml>.
+Watch progress at <https://github.com/freenet/freenet-core/actions/workflows/release.yml>.
 
-The auto-bump reads `https://crates.io/api/v1/crates/freenet` to find the
-highest released version and increments the patch. So after `0.2.59` ships,
-the next bare run cuts `0.2.60`. Minor / major bumps are intentionally
+Do not leave `version` blank. A blank input auto-bumps instead: it reads
+`https://crates.io/api/v1/crates/freenet` to find the highest released
+version and increments the patch, ignoring `Cargo.toml`. So after `0.2.59`
+ships, the next bare run cuts `0.2.60`. Minor / major bumps are intentionally
 explicit — they're not auto-decidable from commit history.
 
 Within ~30–60 minutes you should see:
@@ -491,13 +494,16 @@ Current wire-gated floors:
   and `ResponseNative` at indices 5 and 6 of
   `operations/connect/wire.rs::ConnectMsgWire`, #5940).
 
-  Set to **`(0, 2, 158)`**, the release intended to first ship the decoder,
+  Set to **`(0, 2, 160)`**, the release intended to first ship the decoder,
   and guarded by `QUIC_NATIVE_SHIPPED_IN`, currently `None`, checked by
   `p2p_protoc::quic_native_floor_tests::quic_native_floor_tracks_the_shipping_release`.
-  0.2.157 carries the decoder but was cut with the floor raised past it, so
-  it never emits the native variants. When the 0.2.158 bump fails that test,
-  set the marker to the literal `Some((0, 2, 158))` if the release carries
-  the decoder, otherwise raise the floor. Same failure mode as the
+  0.2.157, 0.2.158 and 0.2.159 carry the decoder but were cut with the floor
+  raised past them, so they never emit the native variants. 0.2.158 is the
+  QUIC data ramp release (#6224), and 0.2.159 ships while the ramp is still
+  under watch; each raised the floor so that the native offer does not start
+  in the same release. When the 0.2.160 bump fails that test, set the marker
+  to the literal `Some((0, 2, 160))` if the release carries the decoder and
+  should start the native offer, otherwise raise the floor. Same failure mode as the
   application-message floors above: a peer at
   or above the floor without the decoder closes the connection on the variant,
   so bias high. Only `connect::wire::encode_for_peer`, at the one peer-bound
@@ -507,8 +513,10 @@ Current wire-gated floors:
   floor being lowered.
 
 - `QUIC_DATA_RAMP_START` (T0) and `QUIC_DATA_RAMP_RELEASE` in
-  `crates/core/src/transport/quic/upgrade/policy.rs` (#5940): both `None` in
-  tree. The reviewed PR for the QUIC data ramp release sets T0 to the planned
+  `crates/core/src/transport/quic/upgrade/policy.rs` (#5940): set for the
+  0.2.158 ramp (#6224: T0 `1_794_796_200`, 2026-11-16 02:30 UTC, and
+  `Some("0.2.158")`), and they stay set; only an emergency stop returns T0 to
+  `None`. The reviewed PR for a QUIC data ramp release sets T0 to the planned
   publish time, in Unix seconds, and `QUIC_DATA_RAMP_RELEASE` to that release's
   version. `scripts/check_quic_data_ramp_t0.sh` then refuses a live cut of
   that version when the clock is more than 3 h from T0 either side (a dry run
@@ -566,7 +574,8 @@ Current wire-gated floors:
 
 - `QUIC_DATA_RAMP_START` in `crates/core/src/transport/quic/upgrade/policy.rs`
   (#5940): when the QUIC data ramp starts, in Unix seconds, or `None` (no pair
-  carries data). It is `None` in tree. For the ramp release, a small reviewed PR
+  carries data). It is set for the 0.2.158 ramp (#6224) and stays set; only an
+  emergency stop returns it to `None`. For a ramp release, a small reviewed PR
   sets it to the planned publish time (T0) just before the soak, and it stays set
   afterwards: from T0 the share of pairs carrying data is 5% for 6 h, then rises
   to 25% at 12 h and 100% at 24 h, and stays at 100% (see "Data slice" in
@@ -590,16 +599,18 @@ Current wire-gated floors:
   Release notes. The release that sets T0 must say in its notes that `prefer`
   nodes, which is every Linux, macOS and Windows node that did not set `transport-quic`,
   start carrying data with a growing share of their pairs. A release cut from
-  main between the ramp code (#6138) and the T0 PR also changes something: it
-  makes `prefer` the default on Linux, macOS and Windows, at a share of 0. Its nodes
-  then behave as shadow nodes (no pair carries data, no path is recycled), but
-  its notes should still say that the default mode changed.
+  main between the ramp code (#6138) and the T0 PR (0.2.157 was one) also
+  changed something: it made `prefer` the default on Linux, macOS and Windows,
+  at a share of 0. Its nodes then behave as shadow nodes (no pair carries
+  data, no path is recycled), but its notes should still say that the default
+  mode changed.
 
   Reading the ramp: each node logs at INFO when its share enters a new band
   ("QUIC data: this node offers data to this share of its pairs", with
-  `data_percent`; at 0% it logs "offers data to none of its pairs"). With T0
-  unset, a `prefer` node logs at startup that it has no data share and keeps
-  every pair's data on UDP. In telemetry, `quic_enabled_data_paths` and
+  `data_percent`; at 0% it logs "offers data to none of its pairs"). With no
+  ramp start and `QUIC_DATA_PERCENT` at 0 (before the ramp, or after an
+  emergency stop), a `prefer` node logs at startup that it has no data share
+  and keeps every pair's data on UDP. In telemetry, `quic_enabled_data_paths` and
   `quic_live_data_paths` count paths carrying data, the
   `quic_close_sent_recycle_for_data` / `quic_close_received_recycle_for_data`
   counts are paths recycled to take data as the share reaches them (expected,
@@ -615,13 +626,22 @@ Current wire-gated floors:
   can turn a pair's bit on a second time and recycle it again.
 
   Emergency stop: a parked release, built and soaked before the ramp release is
-  cut, is published through the normal auto-update stagger (0 to 4 h). It makes
-  two changes, and needs both. It sets the default mode to off, which turns QUIC
-  off on every node that did not set `transport-quic` itself (the default is
-  read, never written to `config.toml`). It also sets `QUIC_DATA_RAMP_START`
-  back to `None`, which gives every node that set `transport-quic = "prefer"`
-  itself (testers, possibly our own gateways) a share of 0, so none of its pairs
-  carries data; only a node that also set `quic-data-percent` keeps a share.
+  cut, is published through the normal auto-update stagger (0 to 4 h). It
+  restores the pre-ramp state with two changes, and needs both. It sets
+  `QUIC_DATA_RAMP_START` back to `None` and keeps `QUIC_DATA_PERCENT` at 0
+  (both: with no ramp start the fixed share applies), which gives every
+  `prefer` node a share of 0, so none of its pairs carries data; only a node
+  that set `quic-data-percent` keeps a share.
+  `the_constants_are_in_a_shape_a_release_ships` fails a build whose default
+  on Linux and macOS is not `prefer` unless both are so. It also sets the default mode back to
+  0.2.156's: shadow on Linux and macOS, off on Windows. An emergency release
+  should only go back to states the field has run, and Windows with QUIC off
+  is what every release through 0.2.156 ran. So a Linux or macOS node that did not set
+  `transport-quic` keeps its endpoint with shadow paths (off would tear down
+  every endpoint mid-incident), and a Windows node turns QUIC off (the default
+  is read, never written to `config.toml`). A node that set
+  `transport-quic = "prefer"` itself stays in prefer at a share of 0, which
+  acts as shadow on the wire.
   A node takes either change only when it restarts into the release (an
   auto-update restarts it, 0 to 4 h after publish). Until then its paths with
   data keep carrying data: a path with data is never rechecked.
@@ -1010,11 +1030,9 @@ Before raising it:
 ## Rollback
 
 The release-agent refuses downgrades by design (`X.Y.Z < installed` returns
-403). To recover from a botched release, cut a new patch with the fix:
-
-```bash
-gh workflow run release.yml --field version=X.Y.Z+1
-```
+403). To recover from a botched release, cut a new patch with the fix,
+through the `freenet:release` skill. Its preconditions still apply to a
+fix-forward release.
 
 For a serious regression that needs immediate rollback, the operator path
 is `ssh ian@<host> 'sudo gateway-auto-update.sh --force --target-version

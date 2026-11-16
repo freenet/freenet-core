@@ -28,12 +28,15 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
 
-use crate::tracing::{TransferDirection, TransferEvent};
+use crate::tracing::{TransferDirection, TransferEvent, TransferTransport};
 
 mod quic_data;
 pub use quic_data::QuicDataSnapshot;
+#[cfg(test)]
+pub(crate) use quic_data::STALL_CLOSE_LABELS;
 pub(crate) use quic_data::{
-    DarkEnd, PathGateWindow, PathLossWindow, QuicDataCounters, ShareSource, StreamsOpenPeak,
+    AckWaitKind, DarkEnd, PathGateWindow, PathLossWindow, PipeDropCause, QuicDataCounters,
+    ShareSource, StreamsOpenPeak,
 };
 
 /// Global transport metrics instance.
@@ -508,9 +511,9 @@ labelled_counters! {
     /// `quic_fallback_<label>`. An attempt that ended before it was active is
     /// not here; see `quic_upgrade_*`. The UDP session ending under a path is
     /// `quic_upgrade_session_ended_active`.
-    /// Not here: a close this node sent for `send_abort_limit` or
-    /// `peer_not_acknowledging` reaches the machine as a lost connection
-    /// (`reset`), and is counted by `quic_close_sent_*`; the same codes sent
+    /// A close this node sent reaches the machine as a lost connection; it is
+    /// counted by the reason the closer recorded (`liveness_tx`, `closed_tx`),
+    /// and its code by `quic_close_sent_*`; the codes sent
     /// by the peer are `downgrade_rx`, with the raw code in
     /// `quic_close_received_*`. A key mismatch is
     /// `quic_upgrade_identity_mismatch`.
@@ -534,6 +537,16 @@ labelled_counters! {
         /// peer's QUIC buffer budget than it allows. A peer on a release
         /// before the code does not send it.
         OverBudgetReceived => "over_budget_rx",
+        /// This node closed it because the peer stopped making progress on
+        /// it: an acknowledgement-watch rule (`quic_stall_close_<stall>`
+        /// says which) or the stalled-sends count. Counted as `reset` by
+        /// releases before the label.
+        LivenessClosed => "liveness_tx",
+        /// This node closed it for another recorded reason: too many reset
+        /// sends, the peer over its buffer budget, refused data, or a
+        /// panicked receive task. Counted as `reset` by releases before the
+        /// label.
+        LocallyClosed => "closed_tx",
     }
 }
 
@@ -4663,7 +4676,10 @@ pub fn emit_transfer_started(
     peer_addr: SocketAddr,
     expected_bytes: u64,
     direction: TransferDirection,
+    transport: TransferTransport,
 ) {
+    #[cfg(test)]
+    note_transfer_event(stream_id, "transfer_started", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Started {
@@ -4672,12 +4688,42 @@ pub fn emit_transfer_started(
             expected_bytes,
             direction,
             tx_id: None, // Transaction ID not available at transport layer
+            transport,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
         // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
         #[allow(clippy::let_underscore_must_use)]
         let _ = sender.try_send(event);
     }
+}
+
+// Test-only: the transfer events emitted on this thread, as (stream id, event,
+// transport), so a test finds its own: stream ids and transfers are per
+// thread in tests (`StreamId::next`, a current-thread runtime), and another
+// test's events never land here. Kept apart from the QUIC event log, which every
+// transfer would otherwise crowd.
+#[cfg(test)]
+thread_local! {
+    static TRANSFER_TEST_LOG: std::cell::RefCell<Vec<(u64, &'static str, TransferTransport)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn note_transfer_event(stream_id: u64, event: &'static str, transport: TransferTransport) {
+    TRANSFER_TEST_LOG.with(|log| log.borrow_mut().push((stream_id, event, transport)));
+}
+
+/// Test-only: the transfer events of `stream_id` emitted on this thread, in
+/// order.
+#[cfg(test)]
+pub(crate) fn transfer_events_of(stream_id: u64) -> Vec<(&'static str, TransferTransport)> {
+    TRANSFER_TEST_LOG.with(|log| {
+        log.borrow()
+            .iter()
+            .filter(|(id, _, _)| *id == stream_id)
+            .map(|(_, event, transport)| (*event, *transport))
+            .collect()
+    })
 }
 
 /// Emit a transfer completed event.
@@ -4699,7 +4745,10 @@ pub fn emit_transfer_completed(
     min_rtt_ms: Option<u32>,
     peak_flightsize_bytes: Option<u32>,
     direction: TransferDirection,
+    transport: TransferTransport,
 ) {
+    #[cfg(test)]
+    note_transfer_event(stream_id, "transfer_completed", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Completed {
@@ -4718,6 +4767,7 @@ pub fn emit_transfer_completed(
             min_rtt_ms,
             peak_flightsize_bytes,
             direction,
+            transport,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
         // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
@@ -4735,7 +4785,10 @@ pub fn emit_transfer_failed(
     reason: String,
     elapsed_ms: u64,
     direction: TransferDirection,
+    transport: TransferTransport,
 ) {
+    #[cfg(test)]
+    note_transfer_event(stream_id, "transfer_failed", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Failed {
@@ -4745,6 +4798,7 @@ pub fn emit_transfer_failed(
             reason,
             elapsed_ms,
             direction,
+            transport,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
         // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops

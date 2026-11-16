@@ -188,7 +188,7 @@ pub(in crate::transport) const FALLBACK_CHURN_WINDOW: Duration = Duration::from_
 /// The fallbacks a machine remembers for [`FALLBACK_CHURN_WINDOW`]. Each
 /// fallback is charged a backoff of at least 48 s before the next attempt, so
 /// at most four fit the window; this leaves room and keeps the memory fixed.
-const RECENT_FALLBACKS_MAX: usize = 8;
+pub(in crate::transport) const RECENT_FALLBACKS_MAX: usize = 8;
 /// The longest wait a carried [`BackoffSeed`] may impose: the longest delay with
 /// the most jitter. A seed read off a clock with another epoch cannot lock a
 /// peer out for longer than this.

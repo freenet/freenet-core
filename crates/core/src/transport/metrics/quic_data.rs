@@ -30,7 +30,12 @@
 //! | `quic_gate_loss_<verdict>` | congestion events by the loss gate's verdict (`recycle::loss_gate`): passed to Cubic as `queue`, `share` (loss share above the ceiling), `persistent`, `ecn` (a congestion mark), `no_sample`, or `ignored` as random loss; summed over the node's paths up to each path's last tick. Over a path's life they sum to its `quic_congestion_events`; within one period they can differ by the events between the two reads of a tick |
 //! | `quic_gate_ended_queue_<bucket>` | paths that ended in the period after at least 20 gate verdicts, by the share of them passed as `queue`: `lt_10pct`, `lt_50pct`, `ge_50pct`. A path whose losses mostly read as a queue runs as plain Cubic, whether the queue is real or jitter |
 //! | `quic_carried_dark_episode_<label>` | the same, for the episodes of paths that carried data when the episode ended: a subset of `quic_dark_episode_<label>`, counted by the same decision |
-//! | `quic_dark_episode_<label>` | dark episodes on QUIC paths (`recycle::AckWatch`: packets outstanding, nothing acknowledged and nothing heard) by how they ended: `recovered_lt_5s`, `lt_10s`, `lt_30s`, `lt_120s`, `recovered_ge_120s`, `unrecovered` (the path closed, or nothing was outstanding any more), `cap_held` (the egress cap held this side's sends, so darkness could no longer be told), `closed_at_window` (the dark-path rule closed a path that carries data). A path that carries no data is never closed by that rule, so its episodes run to their end; read at the watch's 2 s ticks |
+//! | `quic_dark_episode_<label>` | dark episodes on QUIC paths (`recycle::AckWatch`: packets outstanding, nothing acknowledged and nothing heard) by how they ended: `recovered_lt_5s`, `lt_10s`, `lt_30s`, `lt_120s`, `recovered_ge_120s`, `unrecovered` (the path closed, or nothing was outstanding any more), `cap_held` (the egress cap held this side's sends, so darkness could no longer be told), `closed_at_window` (the dark-path rule closed a path that carries data and has no UDP session, a native path). A path that carries no data, and since 0.2.159 a data path with a UDP session (`recycle::DARK_CLOSES_WITH_UDP`), is never closed by that rule, so its episodes run to their end (a data path with a UDP session counts the close the rule would have made in `quic_stall_would_close_dark`); read at the watch's 2 s ticks |
+//! | `quic_ack_wait_expired_<label>` | sends whose wait for the acknowledgement of their end ran out and whose stream was reset, by kind: `stream` (a send with an ack wait: a Stream, or a Short past one packet), `short` (a one-packet Short, past its 150 s bound) or `control` (a control frame, bounded as a one-packet Short); only those that count as strikes (`path::StrikeCheck`: evidence the end went out and the peer is alive). An honest peer acknowledges an end within a few round trips, so this should be 0 on every honest path (`recycle::ACK_WAIT_EXPIRY_LIMIT` in `ACK_WAIT_EXPIRY_WINDOW` counts a would-close; the rule does not close a path yet) |
+//! | `quic_stall_close_<label>` | paths the acknowledgement watch closed, by why: `not_acknowledging`, `dark`, `credit_starved`, `stream_credit_withheld`, `ack_waits_expired` (`recycle::Stall`) |
+//! | `quic_stall_would_close_<label>` | times a rule that only observes would have closed a path, by the same labels; each count starts the rule's window afresh. Two rules observe today. `ack_waits_expired` (`recycle::ACK_WAITS_EXPIRED_CLOSES` is false) counts each time `ACK_WAIT_EXPIRY_LIMIT` strikes came within `ACK_WAIT_EXPIRY_WINDOW`, for calibrating the close from the field (#6205). `dark` counts once per episode on a data path with a UDP session, where the dark rule does not close (`recycle::DARK_CLOSES_WITH_UDP` is false); the episode is counted to its end in `quic_carried_dark_episode_<label>` |
+//! | `quic_pipe_source_<label>` | pipes (an inbound stream forwarded on a path, `quic_data_send_pipe_*`) that ended `sent` or `dropped`, by what fed the inbound stream: `quic_fed_sent`, `quic_fed_dropped`, `udp_fed_sent`, `udp_fed_dropped`; each sums to its `quic_data_send_pipe_<result>` |
+//! | `quic_pipe_dropped_<label>` | the same dropped pipes by cause: `source_error` (the inbound stream failed or delivered the wrong length), `source_stall_timeout` (a deadline ran out while the pipe waited for its source), `own_path` (anything else: this path timed out, was lost, or the peer stopped the stream); sums to `quic_data_send_pipe_dropped` |
 //! | `quic_send_resets`, `quic_path_ms` | sends a path reset on this side, and the time QUIC paths were up, shadow paths included, up to each path's last tick: resets per connection-hour is their ratio |
 //! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
 //! | `quic_staged_peak_pct` | the most any connection staged in the period (bytes read for streams whose header its reader had not taken yet) as a percentage of its staging cap (`quic::path::inbound::ConnStaging`); streams stopped at the cap are `quic_inbound_evicted_staged` |
@@ -167,6 +172,57 @@ pub(crate) const GATE_MIN_VERDICTS: u64 = 20;
 /// queue: under 10%, under 50%, 50% or more.
 pub(crate) const GATE_QUEUE_LABELS: [&str; 3] = ["lt_10pct", "lt_50pct", "ge_50pct"];
 
+/// The labels of `quic_ack_wait_expired_<label>`: sends whose wait for the
+/// acknowledgement of their end ran out (`recycle::AckWatch`'s expiry rule),
+/// by kind: a send with an ack wait (a Stream, or a Short past one packet),
+/// a one-packet Short, or a control frame (whose background wait is bounded
+/// as a one-packet Short's).
+pub(crate) const ACK_WAIT_EXPIRED_LABELS: [&str; 3] = ["stream", "short", "control"];
+
+/// `quic_pipe_source_<label>`: a pipe's end by what fed its inbound stream.
+pub(crate) const PIPE_SOURCE_LABELS: [&str; 4] = [
+    "quic_fed_sent",
+    "quic_fed_dropped",
+    "udp_fed_sent",
+    "udp_fed_dropped",
+];
+
+/// `quic_pipe_dropped_<label>`: why a pipe was dropped ([`PipeDropCause`]).
+pub(crate) const PIPE_DROP_LABELS: [&str; 3] = ["source_error", "source_stall_timeout", "own_path"];
+
+/// Why a pipe was dropped, in the order of [`PIPE_DROP_LABELS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipeDropCause {
+    /// The inbound stream failed, or delivered other than its length.
+    SourceError,
+    /// A deadline ran out while the pipe waited for its source.
+    SourceStallTimeout,
+    /// Anything else: the path timed out or was lost, or the peer stopped it.
+    OwnPath,
+}
+
+/// What kind of send's ack wait ran out, for `quic_ack_wait_expired_<label>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AckWaitKind {
+    /// A send with an ack wait (`bounded::SendDeadlines::ack_wait`).
+    Stream = 0,
+    /// A one-packet Short, whose acknowledgement is waited for in the
+    /// background up to its bound.
+    Short = 1,
+    /// A control frame, waited for as a one-packet Short.
+    Control = 2,
+}
+
+/// The labels of `quic_stall_close_<label>`: paths the acknowledgement watch
+/// closed, by why (`recycle::Stall::label`, in its order).
+pub(crate) const STALL_CLOSE_LABELS: [&str; 5] = [
+    "not_acknowledging",
+    "dark",
+    "credit_starved",
+    "stream_credit_withheld",
+    "ack_waits_expired",
+];
+
 /// The labels of `quic_dark_episode_<label>`: dark episodes on QUIC paths
 /// (`recycle::AckWatch`: this side's packets outstanding, nothing
 /// acknowledged and nothing heard), by how they ended: the peer was heard
@@ -175,9 +231,11 @@ pub(crate) const GATE_QUEUE_LABELS: [&str; 3] = ["lt_10pct", "lt_50pct", "ge_50p
 /// (the path closed, at the latest on quinn's idle timeout, or nothing was
 /// outstanding any more); the egress cap held this side's sends, so whether
 /// the peer was dark could no longer be told; or the dark-path rule closed the path at its
-/// window, on a path that carries data. A path that carries no data is never
-/// closed by that rule, so its episodes run to their end and fill the longer
-/// buckets: that is what the dark-path threshold is to be checked against.
+/// window, on a path that carries data and has no UDP session (a native path).
+/// A path that carries no data, and a data path with a UDP session
+/// (`recycle::DARK_CLOSES_WITH_UDP`), is never closed by that rule, so its
+/// episodes run to their end and fill the longer buckets: that is what the
+/// dark-path threshold is to be checked against.
 pub(crate) const DARK_EPISODE_LABELS: [&str; 8] = [
     "recovered_lt_5s",
     "recovered_lt_10s",
@@ -211,7 +269,8 @@ pub(crate) enum DarkEnd {
     /// The egress cap held this side's sends, so whether the peer was dark
     /// could no longer be told.
     CapHeld,
-    /// The dark-path rule closed the path at its window.
+    /// The dark-path rule closed the path at its window (a native data path;
+    /// one with a UDP session it does not close).
     Closed,
 }
 
@@ -457,6 +516,11 @@ pub(crate) struct QuicDataCounters {
     /// Where this node's data share is read from, set when its upgrades are
     /// built; `None` unless it may carry data (`policy::QuicPolicy::share_source`).
     share: Mutex<Option<ShareSource>>,
+    ack_wait_expired: [AtomicU64; ACK_WAIT_EXPIRED_LABELS.len()],
+    stall_closes: [AtomicU64; STALL_CLOSE_LABELS.len()],
+    stall_would_close: [AtomicU64; STALL_CLOSE_LABELS.len()],
+    pipe_source: [AtomicU64; PIPE_SOURCE_LABELS.len()],
+    pipe_dropped: [AtomicU64; PIPE_DROP_LABELS.len()],
 }
 
 impl QuicDataCounters {
@@ -493,7 +557,25 @@ impl QuicDataCounters {
             dark_episodes: std::array::from_fn(|_| zero()),
             carried_dark_episodes: std::array::from_fn(|_| zero()),
             share: Mutex::new(None),
+            ack_wait_expired: std::array::from_fn(|_| zero()),
+            stall_closes: std::array::from_fn(|_| zero()),
+            stall_would_close: std::array::from_fn(|_| zero()),
+            pipe_source: std::array::from_fn(|_| zero()),
+            pipe_dropped: std::array::from_fn(|_| zero()),
         }
+    }
+
+    /// A pipe that ended `sent`, fed by a QUIC path or by UDP.
+    pub(crate) fn record_pipe_sent(&self, quic_fed: bool) {
+        let index = if quic_fed { 0 } else { 2 };
+        self.pipe_source[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A pipe that ended `dropped`, fed by a QUIC path or by UDP, for `cause`.
+    pub(crate) fn record_pipe_dropped(&self, quic_fed: bool, cause: PipeDropCause) {
+        let index = if quic_fed { 1 } else { 3 };
+        self.pipe_source[index].fetch_add(1, Ordering::Relaxed);
+        self.pipe_dropped[cause as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Where this node's data share is read from
@@ -686,6 +768,27 @@ impl QuicDataCounters {
         self.budget_bytes.store(bytes, Ordering::Relaxed);
     }
 
+    /// The acknowledgement watch closed a path, for the reason at `index` of
+    /// [`STALL_CLOSE_LABELS`].
+    pub(crate) fn record_stall_close(&self, index: usize) {
+        if let Some(count) = self.stall_closes.get(index) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A rule that only observes would have closed a path, for the reason
+    /// at `index` of [`STALL_CLOSE_LABELS`].
+    pub(crate) fn record_stall_would_close(&self, index: usize) {
+        if let Some(count) = self.stall_would_close.get(index) {
+            count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// A send's wait for the acknowledgement of its end ran out.
+    pub(crate) fn record_ack_wait_expired(&self, kind: AckWaitKind) {
+        self.ack_wait_expired[kind as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
     /// A dark episode ended as `ended` says, on a path that `carried` data
     /// when it ended (counted in `quic_carried_dark_episode_<label>` as well).
     pub(crate) fn record_dark_episode(&self, ended: DarkEnd, carried: bool) {
@@ -819,6 +922,11 @@ impl QuicDataCounters {
             dark_episodes: self.dark_episodes.iter().map(get).collect(),
             carried_dark_episodes: self.carried_dark_episodes.iter().map(get).collect(),
             ramp_share_pct: self.share.lock().as_ref().map_or(0, ShareSource::percent),
+            ack_wait_expired: self.ack_wait_expired.iter().map(get).collect(),
+            stall_closes: self.stall_closes.iter().map(get).collect(),
+            stall_would_close: self.stall_would_close.iter().map(get).collect(),
+            pipe_source: self.pipe_source.iter().map(get).collect(),
+            pipe_dropped: self.pipe_dropped.iter().map(get).collect(),
         }
     }
 }
@@ -918,6 +1026,24 @@ pub struct QuicDataSnapshot {
     /// percent: a gauge.
     #[serde(default)]
     pub ramp_share_pct: u64,
+    /// Ack waits that ran out in the period, by `ACK_WAIT_EXPIRED_LABELS`.
+    #[serde(default)]
+    pub ack_wait_expired: Vec<u64>,
+    /// Paths the acknowledgement watch closed in the period, by
+    /// `STALL_CLOSE_LABELS`.
+    #[serde(default)]
+    pub stall_closes: Vec<u64>,
+    /// Times a rule that only observes would have closed a path, in the
+    /// period, by `STALL_CLOSE_LABELS`.
+    #[serde(default)]
+    pub stall_would_close: Vec<u64>,
+    /// Pipes that ended sent or dropped in the period, by what fed them, by
+    /// `PIPE_SOURCE_LABELS`.
+    #[serde(default)]
+    pub pipe_source: Vec<u64>,
+    /// Pipes dropped in the period, by `PIPE_DROP_LABELS`.
+    #[serde(default)]
+    pub pipe_dropped: Vec<u64>,
 }
 
 impl QuicDataSnapshot {
@@ -981,6 +1107,11 @@ impl QuicDataSnapshot {
             dark_episodes,
             carried_dark_episodes,
             ramp_share_pct,
+            ack_wait_expired,
+            stall_closes,
+            stall_would_close,
+            pipe_source,
+            pipe_dropped,
         } = self;
         let mut keys = Vec::new();
         let mut family = |prefix: &'static str, labels: Vec<String>, values: Vec<u64>| {
@@ -1091,6 +1222,34 @@ impl QuicDataSnapshot {
             DARK_EPISODE_LABELS.iter().map(|l| l.to_string()).collect(),
             carried_dark_episodes.clone(),
         );
+        family(
+            "quic_ack_wait_expired_",
+            ACK_WAIT_EXPIRED_LABELS
+                .iter()
+                .map(|l| l.to_string())
+                .collect(),
+            ack_wait_expired.clone(),
+        );
+        family(
+            "quic_stall_close_",
+            STALL_CLOSE_LABELS.iter().map(|l| l.to_string()).collect(),
+            stall_closes.clone(),
+        );
+        family(
+            "quic_stall_would_close_",
+            STALL_CLOSE_LABELS.iter().map(|l| l.to_string()).collect(),
+            stall_would_close.clone(),
+        );
+        family(
+            "quic_pipe_source_",
+            PIPE_SOURCE_LABELS.iter().map(|l| l.to_string()).collect(),
+            pipe_source.clone(),
+        );
+        family(
+            "quic_pipe_dropped_",
+            PIPE_DROP_LABELS.iter().map(|l| l.to_string()).collect(),
+            pipe_dropped.clone(),
+        );
         for (key, value) in [
             ("quic_enabled_data_paths", *data_enabled),
             (LIVE_DATA_PATHS, *data_paths),
@@ -1199,6 +1358,11 @@ impl QuicDataSnapshot {
             dark_episodes,
             carried_dark_episodes,
             ramp_share_pct: _,
+            ack_wait_expired,
+            stall_closes,
+            stall_would_close,
+            pipe_source,
+            pipe_dropped,
         } = self;
         let any = |values: &[u64]| values.iter().any(|n| *n != 0);
         any(sends)
@@ -1213,6 +1377,11 @@ impl QuicDataSnapshot {
             || any(dark_episodes)
             || any(carried_dark_episodes)
             || any(carrying_ended_loss_rate)
+            || any(ack_wait_expired)
+            || any(stall_closes)
+            || any(stall_would_close)
+            || any(pipe_source)
+            || any(pipe_dropped)
             || [
                 *data_enabled,
                 *sends_opened,

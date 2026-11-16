@@ -174,6 +174,7 @@ pub(crate) use hosting::{GENUINE_ACCESS_RECENCY_BUCKETS, READ_COUNT_HIST_BUCKETS
 /// the `statvfs` FFI call or the walk.
 pub(crate) use hosting::{disk_available_bytes, disk_directory_size_bytes};
 pub(crate) mod applied_payloads;
+pub(crate) mod contract_merge_budget;
 pub mod interest;
 mod live_tx;
 mod location;
@@ -366,9 +367,13 @@ pub(crate) struct Ring {
     pub live_tx_tracker: LiveTransactionTracker,
     hosting_manager: hosting::HostingManager,
     /// Per-contract record of detected CRDT-invariant violations (e.g. a
-    /// non-idempotent `update_state`). Used to gate outbound broadcast
-    /// so a broken contract's state changes don't leave the node.
+    /// non-idempotent `update_state`). Diagnostic only since #6190: it gates
+    /// nothing; see `crate::ring::contract_merge_budget`.
     broken_invariants: BrokenInvariantsTracker,
+    /// Detections that started, restarted or escalated a flag: the same set
+    /// exported as a `broken_invariant_flagged` telemetry event. Diagnostic
+    /// only (#6190).
+    broken_invariant_detections: std::sync::atomic::AtomicU64,
     /// Per-contract governance scoring + reaper. Routes every
     /// per-contract resource report through `ingest_cost` so the
     /// governance state for a contract reflects what the meter
@@ -381,6 +386,11 @@ pub(crate) struct Ring {
     /// `crate::ring::update_rate_limit` and `docs/design/contract-hardening.md`
     /// Phase 2.
     pub(crate) update_rate_limiter: Arc<update_rate_limit::UpdateRateLimiter>,
+    /// Per-contract budget on network UPDATEs admitted toward a merge, summed
+    /// over all senders (#6190). Bounds a non-settling merge loop for every
+    /// contract alike; local client UPDATEs are never charged. See
+    /// `crate::ring::contract_merge_budget`.
+    pub(crate) contract_merge_budget: Arc<contract_merge_budget::ContractMergeBudget>,
     /// Per-contract merge-failure backoff (#4861). Quarantines "poison"
     /// contracts whose WASM merges reliably fail/time out: while a contract is
     /// in its exponential cooldown the UPDATE broadcast drivers skip the merge
@@ -857,7 +867,16 @@ impl Ring {
                     .unwrap_or_else(|| time_source.clone()),
             ),
             broken_invariants: BrokenInvariantsTracker::new(time_source.clone()),
+            broken_invariant_detections: std::sync::atomic::AtomicU64::new(0),
             governance,
+            contract_merge_budget: Arc::new(contract_merge_budget::ContractMergeBudget::new(
+                // Same clock override as the per-pair limiter, so a test can
+                // decide the budget's verdict instead of racing it.
+                config
+                    .update_rate_limit_time_source_override
+                    .clone()
+                    .unwrap_or_else(|| time_source.clone()),
+            )),
             update_rate_limiter: Arc::new(update_rate_limit::UpdateRateLimiter::new(
                 // Production passes `None` and gets `time_source` (the real
                 // clock). The override exists so a test can decide the
@@ -1618,6 +1637,7 @@ impl Ring {
             // bounded; CLEANUP_AGE is 5 minutes so this drops entries
             // for pairs that haven't tried an UPDATE since then.
             ring.update_rate_limiter.cleanup();
+            ring.contract_merge_budget.cleanup();
 
             // Sweep idle merge-failure backoff entries (#4861) on the same
             // cadence. Drops entries for contracts past their cooldown that
@@ -1659,9 +1679,8 @@ impl Ring {
             // mid-window), cleanup catches it on the next tick.
             ring.contract_ban_list.cleanup();
 
-            // Sweep expired broken-invariant flags on the same cadence so a
-            // suppressed contract (especially a false-positive) recovers
-            // after BROKEN_INVARIANT_TTL instead of being bricked forever.
+            // Sweep expired broken-invariant flags on the same cadence, so a
+            // flagged contract is probed and reported again after its TTL.
             ring.broken_invariants.cleanup();
 
             // Network-norms summary at DEBUG — useful when debugging
@@ -5577,16 +5596,18 @@ impl Ring {
     }
 
     /// True if `contract` has been flagged as violating a CRDT invariant
-    /// (e.g. non-idempotent `update_state`). Callers on the broadcast path
-    /// must skip emission when this returns true to prevent the broken
-    /// contract from generating a propagation storm.
+    /// (e.g. non-idempotent `update_state`). DIAGNOSTIC ONLY (#6190): it must
+    /// not gate a commit, a broadcast or an egress path. The harm a
+    /// non-settling merge causes is bounded by `contract_merge_budget`, which
+    /// applies to every contract alike. Its only production readers are the
+    /// probes, which skip re-probing a contract already flagged.
     pub fn is_contract_broken(&self, contract: &ContractKey) -> bool {
         self.broken_invariants.is_broken(contract.id())
     }
 
     /// Mark `contract` as broken with `kind`. Idempotent. See
     /// [`broken_invariants`] module docs. A detection that starts, restarts or
-    /// escalates suppression is also exported to telemetry, so flags are
+    /// escalates a flag is counted and also exported to telemetry, so flags are
     /// visible fleet-wide and not only in this node's log.
     pub(crate) fn record_broken_invariant(
         &self,
@@ -5599,11 +5620,19 @@ impl Ring {
         if let Some(data) =
             broken_invariants::flag_telemetry(contract.id(), kind, detector, verdict, outcome)
         {
+            self.broken_invariant_detections
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             broken_invariants::emit_flag_telemetry(
                 &self.connection_manager.own_location().to_string(),
                 data,
             );
         }
+    }
+
+    /// See the `broken_invariant_detections` field.
+    pub(crate) fn broken_invariant_detections(&self) -> u64 {
+        self.broken_invariant_detections
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Claim a slot for the deterministic identical-input idempotency probe

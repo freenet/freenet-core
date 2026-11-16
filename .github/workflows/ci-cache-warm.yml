@@ -21,7 +21,7 @@ name: CI Cache Warm
 # the PR jobs compile (which must be mirrored here) has to yield a new key for
 # this workflow to fill. So each job below MUST keep:
 #   - the SAME job id as its ci.yml counterpart (test_unit, test_simulation,
-#     nat_validation) -- the display `name:` is deliberately different, so
+#     nat_validation, macos_unit) -- the display `name:` is deliberately different, so
 #     these never masquerade as the required status contexts;
 #   - the SAME job-level `env:`, toolchain and toolchain targets;
 #   - the SAME linker env on its compile steps, and the same cargo features,
@@ -29,10 +29,12 @@ name: CI Cache Warm
 # .github/scripts/check_cache_warm_parity.py enforces this from Rule Lint.
 # When you change one of those jobs in ci.yml, change its twin here.
 #
-# It must run on a Ubicloud runner: Ubicloud serves its own cache backend, so
-# an entry saved from a GitHub-hosted runner is invisible to Ubicloud jobs.
-# Runner size does not enter the key (only OS and arch do), so the cheaper
-# standard-8 is used throughout.
+# The Linux jobs must run on a Ubicloud runner: Ubicloud serves its own cache
+# backend, so an entry saved from a GitHub-hosted runner is invisible to
+# Ubicloud jobs. Runner size does not enter the key (only OS and arch do), so
+# the cheaper standard-8 is used throughout. The reverse holds for macos_unit,
+# which ci.yml runs on GitHub-hosted `macos-latest`: only a GitHub-hosted runner
+# can write the entry it restores.
 
 on:
   # Daily backstop, for what no path filter sees: eviction (Ubicloud's policy
@@ -234,13 +236,61 @@ jobs:
           cargo nextest run -p freenet-ping-app --features testing \
             --profile ci --no-run
 
+  # Same job id as ci.yml's `macos_unit`, which runs on a GitHub-hosted macOS
+  # runner and so uses GitHub's own cache backend, not Ubicloud's: this job
+  # must run on the identical `macos-latest` label. It shares the repo's 10 GB
+  # GitHub cache pool with the release-build and benchmark entries, so a new
+  # macOS entry can evict older ones there; the Ubicloud entries above are in a
+  # different backend and are not affected.
+  macos_unit:
+    name: "Warm cache: macOS Service Unit"
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    # Must match ci.yml macos_unit's job-level env exactly (cache key input).
+    env:
+      RUST_LOG: error
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RUST_MIN_STACK: 268435456
+      FREENET_GIT_IS_DIRTY: "1"
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
+
+      - name: Build freenet bin
+        run: cargo build --locked -p freenet --bin freenet
+
+      # The three test invocations of ci.yml macos_unit, compiled but not run.
+      - name: Compile tests
+        run: |
+          cargo nextest run -p freenet --bin freenet --profile ci --no-run
+          cargo nextest run -p freenet --profile ci --test graceful_shutdown_exit_code --no-run
+          cargo nextest run -p freenet --profile ci --test url_scheme_handler --no-run
+
   # A failed warm leaves PRs building cold with every check green, so say so.
   # Named "Warm cache: ..." like the jobs above: scripts/release.sh ignores
   # main-branch check runs by that prefix, including this one while queued.
   notify_failure:
     name: "Warm cache: notify on failure"
     runs-on: ubuntu-latest
-    needs: [test_unit, test_simulation, nat_validation]
+    needs: [test_unit, test_simulation, nat_validation, macos_unit]
     if: failure() && github.ref == 'refs/heads/main'
     # Best-effort, like ci.yml's notify_dev_room_main_failure.
     continue-on-error: true

@@ -55,7 +55,10 @@ version: 2
 # 2. It does not touch SECURITY updates. `applies-to` defaults to
 #    `version-updates`, so Dependabot's security PRs ignore the grouping, the
 #    monthly schedule, the cooldown and the PR limit entirely, and keep arriving
-#    one per advisory, immediately. Do NOT "finish the job" by adding
+#    one per advisory, immediately. (One exception: the cargo entry's
+#    `rebase-strategy: "disabled"` does apply to them, so a security PR that
+#    conflicts with main waits for `@dependabot rebase`; see that entry.)
+#    Do NOT "finish the job" by adding
 #    `applies-to: security-updates` -- slowing security fixes down is precisely
 #    the outcome this configuration avoids.
 
@@ -68,6 +71,14 @@ updates:
       default-days: 7
     # Set explicitly: omitting this caps at 5 and silently withholds the rest.
     open-pull-requests-limit: 50
+    # Do not rebase open PRs automatically. Every Cargo.lock change on main
+    # conflicts with every open cargo PR, and Dependabot rebased all of them
+    # each time: 141 full CI runs on 17 open PRs in two weeks of Nov 2026, 138
+    # of them red (#6244). This applies to security updates for this
+    # ecosystem too: a conflicted PR, security fix included, cannot enter the
+    # merge queue until someone comments `@dependabot rebase`. Once queued,
+    # the merge queue still tests it on current main.
+    rebase-strategy: "disabled"
     # This workspace reaches a contract/delegate crate: a bump here can move a
     # contract address. Labelled so that shows on the PR, not just in this file.
     labels:

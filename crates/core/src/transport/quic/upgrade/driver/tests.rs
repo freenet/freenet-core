@@ -193,6 +193,8 @@ impl Harness {
                 peer_key: None,
                 ended: false,
                 setup_started: None,
+                close_record: None,
+                fallback_labels: VecDeque::new(),
             }),
         });
         (session, inbox_rx)
@@ -746,22 +748,51 @@ fn ready_ack(session: &Session, attempt: u32, caps: u32) {
 /// The driver acts on every (own bit, peer bit): what the path accepts follows
 /// this node's bit from the moment the path exists, its `Ready` says so, and it
 /// may send only once the peer's frame has the bit too. Mode `shadow` sets no bit
-/// at any percentage, and neither does `prefer` at this release's share.
+/// at any percentage. With no `quic-data-percent`, `prefer` takes the release's
+/// share: 0 with no ramp start (the emergency-stop build), and with one set the
+/// ramp's 5% before T0, so the bit then depends on the pair's bucket.
 #[test]
 fn a_path_follows_the_data_bits() {
     use crate::transport::quic::control::{QuicControl, caps};
     use crate::transport::quic::path::QuicInboundOutcome;
+    use crate::transport::quic::upgrade::policy::RAMP_START_IS_SET;
+    use crate::transport::quic::upgrade::slice::bucket;
     bounded(|| async move {
-        let _seed = GlobalRng::seed_guard(SEED);
-        for (mode, percent, peer_caps, accepts, sends) in [
-            ("prefer", Some("100"), caps::DATA, true, true),
-            ("prefer", Some("100"), 0, true, false),
-            ("prefer", Some("0"), caps::DATA, false, false),
-            ("shadow", Some("100"), caps::DATA, false, false),
-            ("prefer", None, caps::DATA, false, false),
+        // (seed, the pair's bucket under it when the row depends on it, mode,
+        // quic-data-percent, peer caps, accepts, sends). Each row seeds its own
+        // keys, so its bucket does not depend on the rows before it.
+        for (seed, want_bucket, mode, percent, peer_caps, accepts, sends) in [
+            (SEED, None, "prefer", Some("100"), caps::DATA, true, true),
+            (SEED, None, "prefer", Some("100"), 0, true, false),
+            (SEED, None, "prefer", Some("0"), caps::DATA, false, false),
+            (SEED, None, "shadow", Some("100"), caps::DATA, false, false),
+            // No quic-data-percent: the release's share. This harness's virtual
+            // clock reads 1970, before any T0, and a time before T0 reads as
+            // T0, so with a ramp start the share is 5%. A pair with bucket 51
+            // is outside it, and one with bucket 2 is inside it. With no ramp
+            // start the share is 0 and neither gets the bit.
+            (SEED, Some(51), "prefer", None, caps::DATA, false, false),
+            (
+                4,
+                Some(2),
+                "prefer",
+                None,
+                caps::DATA,
+                RAMP_START_IS_SET,
+                RAMP_START_IS_SET,
+            ),
         ] {
-            let case = format!("{mode} {percent:?}, peer {peer_caps}");
+            let _seed = GlobalRng::seed_guard(seed);
+            let case = format!("seed {seed:#x}, {mode} {percent:?}, peer {peer_caps}");
             let h = Harness::server_with("quic-driver-bits", mode, percent).await;
+            if let Some(want) = want_bucket {
+                assert_eq!(
+                    bucket(h.pair.a_keys.public(), h.pair.b_keys.public()),
+                    want,
+                    "{case}: the seeded pair's bucket changed; pick a seed whose \
+                     bucket is on the same side of 5%"
+                );
+            }
             let (session, inbox) = h.session();
             let attempt = offered(&h, &session);
             let up = path_up(&h, &session, inbox);
@@ -1755,7 +1786,9 @@ fn fallbacks_and_churned_fallbacks_reach_their_own_counters() {
                 QuicFallback::OverBudgetReceived,
             ),
         ];
-        assert_eq!(causes.len(), QuicFallback::COUNT);
+        // The other two labels come from `Reset` and a recorded close
+        // (`a_path_this_node_closed_falls_back_under_its_recorded_reason`).
+        assert_eq!(causes.len() + 2, QuicFallback::COUNT);
         let mut state = session.state.lock();
         session.apply(
             &mut state,
@@ -2124,5 +2157,187 @@ fn native_attempts_reach_only_native_waiters() {
         assert_eq!(handed.source(), h.remote);
         assert!(inbox.try_recv().is_err(), "not routed to the session");
         dial.abort();
+    });
+}
+
+/// A path this node closed is counted by the reason it recorded, not as a
+/// reset: quinn reports such an end as `LocallyClosed`, which reads as a lost
+/// connection. Every recorded reason has a label, and no other cause is
+/// relabelled. The count site is one function for every way the machine
+/// learns of the end (the path's close, a control send failing on it).
+#[test]
+fn fallback_label_counts_a_local_close_by_its_recorded_reason() {
+    use crate::transport::boundary::QuicPathEnd as E;
+    use crate::transport::quic::upgrade::machine::FallbackCause as F;
+    assert_eq!(fallback_label(F::Reset, None), QuicFallback::Reset);
+    for end in [E::Stalled, E::NotAcknowledging] {
+        assert_eq!(
+            fallback_label(F::Reset, Some(end)),
+            QuicFallback::LivenessClosed
+        );
+    }
+    for end in [
+        E::SendAborts,
+        E::PeerOverBudget,
+        E::RefusedData,
+        E::PeerRefusedData,
+        E::ReceiveTaskPanicked,
+        E::ClosedLocally,
+    ] {
+        assert_eq!(
+            fallback_label(F::Reset, Some(end)),
+            QuicFallback::LocallyClosed,
+            "{end:?}"
+        );
+    }
+    // No close of this node's.
+    for end in [E::ClosedByPeer, E::Lost] {
+        assert_eq!(fallback_label(F::Reset, Some(end)), QuicFallback::Reset);
+    }
+    // Another cause says the path ended another way first.
+    for (cause, label) in [
+        (F::Idle, QuicFallback::Idle),
+        (F::Protocol, QuicFallback::Protocol),
+        (F::DowngradeReceived, QuicFallback::DowngradeReceived),
+        (F::EndpointDown, QuicFallback::EndpointDown),
+        (F::SessionEndedReceived, QuicFallback::SessionEndedReceived),
+        (F::OverBudgetReceived, QuicFallback::OverBudgetReceived),
+    ] {
+        assert_eq!(fallback_label(cause, Some(E::NotAcknowledging)), label);
+        assert_eq!(fallback_label(cause, None), label);
+    }
+}
+
+/// End to end through the driver: a carrying path this node closes for a
+/// liveness rule falls back as `liveness_tx`, one it closes for another
+/// recorded reason as `closed_tx`, and one closed with no recorded reason
+/// still as `reset`, each in the carried count too.
+#[test]
+fn a_path_this_node_closed_falls_back_under_its_recorded_reason() {
+    use crate::transport::boundary::QuicPathEnd;
+    use crate::transport::quic::control::caps;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (cause, label) in [
+            (
+                Some(QuicPathEnd::NotAcknowledging),
+                QuicFallback::LivenessClosed,
+            ),
+            (Some(QuicPathEnd::Stalled), QuicFallback::LivenessClosed),
+            (Some(QuicPathEnd::SendAborts), QuicFallback::LocallyClosed),
+            (None, QuicFallback::Reset),
+            // The peer closes: no record on this side (`peer_path` below).
+            (Some(QuicPathEnd::ClosedByPeer), QuicFallback::Reset),
+        ] {
+            let h = Harness::server_with("quic-driver-local-close", "prefer", Some("100")).await;
+            let (session, inbox) = h.session();
+            let attempt = offered(&h, &session);
+            let up = path_up(&h, &session, inbox);
+            let time = h.pair.time.clone();
+            let (peer_path, _peer_inbound, mut inbox) =
+                drive(&h.pair.time, Duration::from_secs(60), async move {
+                    let up = up.await;
+                    time.sleep(Duration::from_secs(1)).await;
+                    up
+                })
+                .await;
+            ready_ack(&session, attempt, caps::DATA);
+            let route = session.data_route().expect("both bits");
+            match cause {
+                // The peer closes with a code this node has no name for: read
+                // as a lost connection, with nothing recorded here.
+                Some(QuicPathEnd::ClosedByPeer) => {
+                    peer_path.quinn_connection().close(0xdead_u32.into(), b"")
+                }
+                Some(cause) => {
+                    route
+                        .path()
+                        .close_for(QuicCloseCode::PeerNotAcknowledging, cause);
+                }
+                None => route
+                    .path()
+                    .quinn_connection()
+                    .close(QuicCloseCode::Downgrade.code().into(), b""),
+            }
+            drop(route);
+            let session_for_drive = Arc::clone(&session);
+            drive(&h.pair.time, Duration::from_secs(60), async move {
+                loop {
+                    let event = inbox.recv().await.expect("the session lives");
+                    let closed = matches!(event, SessionEvent::PathClosed { .. });
+                    session_for_drive.handle(event);
+                    if closed {
+                        break;
+                    }
+                }
+            })
+            .await;
+            let events = TRANSPORT_METRICS.quic_events_of(h.remote);
+            assert!(
+                events.contains(&format!("{label:?}")),
+                "{cause:?}: {events:?}"
+            );
+            assert!(
+                events.contains(&format!("{:?}", ("carrying", label))),
+                "{cause:?}: {events:?}"
+            );
+            if label != QuicFallback::Reset {
+                assert!(
+                    !events.contains(&format!("{:?}", QuicFallback::Reset)),
+                    "{cause:?}: {events:?}"
+                );
+            }
+        }
+    });
+}
+
+/// A churned fallback, counted when the UDP session ends, keeps the label its
+/// fallback was counted under, though a newer path's close record has replaced
+/// the one that labelled it; and only fallbacks within the machine's window
+/// are matched.
+#[test]
+fn a_churned_fallback_keeps_the_label_its_fallback_had() {
+    use crate::transport::boundary::QuicPathEnd;
+    use crate::transport::quic::CloseRecord;
+    use crate::transport::quic::upgrade::machine::{FallbackCause, Outcome};
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-churn-label").await;
+        let (session, _rx) = h.session();
+        let reset = || vec![Action::Record(Outcome::Fallback(FallbackCause::Reset))];
+        let mut state = session.state.lock();
+        // A liveness fallback outside the window by the session's end.
+        state.close_record = Some(CloseRecord::of(QuicPathEnd::NotAcknowledging));
+        session.apply(&mut state, reset());
+        // One with a different cause, then a liveness one within the window.
+        h.set_now(Duration::from_secs(200));
+        state.close_record = Some(CloseRecord::default());
+        session.apply(&mut state, reset());
+        state.close_record = Some(CloseRecord::of(QuicPathEnd::NotAcknowledging));
+        h.set_now(Duration::from_secs(250));
+        session.apply(&mut state, reset());
+        // A newer path with no close recorded.
+        state.close_record = Some(CloseRecord::default());
+        h.set_now(Duration::from_secs(310));
+        session.apply(
+            &mut state,
+            vec![
+                Action::Record(Outcome::ChurnedFallback(FallbackCause::Reset)),
+                Action::Record(Outcome::ChurnedFallback(FallbackCause::Reset)),
+            ],
+        );
+        drop(state);
+        let churned: Vec<_> = TRANSPORT_METRICS
+            .quic_events_of(h.remote)
+            .into_iter()
+            .filter(|e| e.contains("churned"))
+            .collect();
+        assert_eq!(
+            churned,
+            [
+                format!("{:?}", ("churned", QuicFallback::Reset)),
+                format!("{:?}", ("churned", QuicFallback::LivenessClosed)),
+            ]
+        );
     });
 }

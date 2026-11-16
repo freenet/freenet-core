@@ -35,11 +35,12 @@ use crate::transport::quic::breaker::{BreakerOutcome, Verdict};
 use crate::transport::quic::control::caps;
 use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 
-/// The share of pairs, in percent, that carry data on QUIC in this release
-/// when it sets no ramp ([`QUIC_DATA_RAMP_START`]), for a node in `prefer`
-/// mode: a fixed step (0, then 5 for the first data release). Both sides must
-/// set their bit, so a pair moves only once both run a release that puts it in
-/// the slice. `quic-data-percent` replaces it on one node.
+/// The share of pairs, in percent, that carry data on QUIC for a node in
+/// `prefer` mode. It applies only to a build with no ramp start
+/// ([`QUIC_DATA_RAMP_START`] = `None`), which is the emergency-stop build; while
+/// the ramp start is set, the ramp's share applies and this is not read. Both
+/// sides must set their bit, so a pair moves only once both run a release that
+/// puts it in the slice. `quic-data-percent` replaces it on one node.
 pub(in crate::transport) const QUIC_DATA_PERCENT: u8 = 0;
 
 /// Whether this node, as configured, may carry data on QUIC: `transport-quic`
@@ -74,7 +75,13 @@ fn may_carry_data_with(config: &NetworkApiConfig, ramp_start: Option<u64>) -> bo
 /// starts later. `quic-data-percent` replaces the ramp on one node.
 /// `scripts/check_quic_data_ramp_t0.sh` reads this line, so keep it on one line
 /// in this form.
-pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = None;
+// 2026-11-16 02:30:00 UTC: the ramp start of the 0.2.158 release (#6224).
+pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = Some(1_794_796_200);
+
+/// Whether this build sets a ramp start: for tests outside the transport
+/// module whose expectations change once [`QUIC_DATA_RAMP_START`] is set.
+#[cfg(test)]
+pub(crate) const RAMP_START_IS_SET: bool = QUIC_DATA_RAMP_START.is_some();
 
 /// The release whose cut must come within 3 h of [`QUIC_DATA_RAMP_START`], as
 /// `"X.Y.Z"`, or `None`. Set together with the ramp start, in the same reviewed
@@ -86,7 +93,7 @@ pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = None;
 /// ship the ramp unchecked (before this release, or skipping it) is refused. An
 /// emergency stop that sets the start back to `None` leaves this as it is.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(in crate::transport) const QUIC_DATA_RAMP_RELEASE: Option<&str> = None;
+pub(in crate::transport) const QUIC_DATA_RAMP_RELEASE: Option<&str> = Some("0.2.158");
 
 /// Whether this build reads data from a QUIC path. It does: `PeerConnection::recv`
 /// drains the session's data channels, so a node that says it accepts data delivers
@@ -859,6 +866,23 @@ mod tests {
         }
     }
 
+    /// The emergency-stop shape: a build whose default on Linux and macOS is not
+    /// `prefer` carries no data for a node that set `prefer` itself either, so
+    /// it has no ramp start and a fixed share of 0. Other platforms are left out
+    /// because their default is `off` in every release.
+    #[test]
+    fn the_constants_are_in_a_shape_a_release_ships() {
+        if cfg!(any(target_os = "linux", target_os = "macos"))
+            && QuicMode::default_mode() != QuicMode::Prefer
+        {
+            assert_eq!(
+                (QUIC_DATA_RAMP_START, QUIC_DATA_PERCENT),
+                (None, 0),
+                "the emergency stop sets both the ramp start to None and the fixed share to 0"
+            );
+        }
+    }
+
     /// With a ramp in the release, a `prefer` node may carry data from the
     /// ramp's first minute unless `quic-data-percent` overrides it, so the
     /// connection limit is lowered for the whole ramp; without one (the
@@ -949,7 +973,11 @@ mod tests {
                 policy.own_caps_with(policy.share(), &local, &peer, now)
             );
         }
-        assert_eq!(caps_with("prefer", Some("lots".to_string())), 0);
+        // An unreadable quic-data-percent reads as unset: the release's share.
+        assert_eq!(
+            caps_with("prefer", Some("lots".to_string())),
+            caps_with("prefer", None)
+        );
         assert_eq!(
             caps_with("prefer", Some("100".to_string())),
             caps::DATA | caps::RECYCLES

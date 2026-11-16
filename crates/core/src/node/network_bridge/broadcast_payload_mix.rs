@@ -500,19 +500,6 @@ impl PayloadArm {
 ///     LOAD-CORRELATED — it happens hardest under exactly the fan-out
 ///     pressure being measured, so it biases the multiplier DOWN when the
 ///     signal is strongest.
-///   * broken-invariant suppression (`ring::broken_invariants`) is gated in
-///     many places — grep `is_contract_broken` for the current set, it is
-///     comfortably more than the three described here — and several leave a
-///     `changed` apply with no fan-out. `commit_state_update`'s POST-commit
-///     gate suppresses the `BroadcastStateChange` emit outright. A gate at the
-///     handler (`p2p_protoc/broadcast.rs`) drops the fan-out after a successful
-///     commit, later still, and its own comment says it exists because the
-///     re-emission funnels bypass the executor's gates. `commit_state_update`'s
-///     PRE-commit gate returns `Ok(())` while the caller still reports
-///     `Updated` — but on the dominant UPDATE path the merge short-circuits to
-///     `NoChange` before reaching it, so that one bites only the
-///     related-contract-retry and validation-re-attempt callers.
-///     (Affects R/C and `total_sends` alike.)
 ///   * the contract-BAN egress gate (`p2p_protoc/broadcast.rs`) silently
 ///     returns the entire fan-out for a banned contract. Every
 ///     `update_contract` call site is ban-gated upstream and the executor has

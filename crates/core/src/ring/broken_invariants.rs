@@ -41,73 +41,45 @@
 //! 1. Inserts the flag into an in-memory `DashMap` keyed on the contract
 //!    instance id, so subsequent same-process reads see it immediately.
 //! 2. Persists the flag to the executor's ReDb storage so the detection
-//!    survives node restarts (a known-broken contract should not re-engage
-//!    the storm just because the process bounced).
+//!    survives node restarts (a known-broken contract is not re-probed and
+//!    re-reported just because the process bounced).
 //!
-//! A detection that starts, restarts or escalates suppression is also sent to
+//! A detection that starts, restarts or escalates a flag is also sent to
 //! telemetry as a [`FLAG_TELEMETRY_EVENT`] event (`Ring::record_broken_invariant`).
 //!
-//! Reads (via [`BrokenInvariantsTracker::is_broken`]) gate the executor's
-//! commit + broadcast-emission paths AND the full-state egress paths
-//! (`ResyncResponse` in node.rs, `SyncStateToPeer` and the
-//! `handle_broadcast_state_change` fan-out in p2p_protoc/broadcast.rs) so a
-//! flagged contract's state never leaves the node.
+//! ## The flag is diagnostic only (#6190)
+//!
+//! Until #6190 a flag gated the commit, the broadcast emission and three
+//! full-state egress paths, so a flagged contract stopped advancing on this
+//! node for the flag's TTL (300 s, doubling on re-detection up to 6 h,
+//! persisted across restarts), and the node's own client UPDATEs were
+//! answered `state_changed: false` and discarded. That froze a contract on a
+//! sampled verdict, and silently dropped users' writes.
+//!
+//! What the gates protected against is load: a merge that never settles
+//! turns every broadcast into another state change. That is now bounded for
+//! every contract alike, by usage alone, by
+//! [`crate::ring::contract_merge_budget`] on the network receive path. The
+//! flag is kept so operators (INFO log, `freenet.contract.broken_invariant.
+//! detections` counter) and app authors (the [`FLAG_TELEMETRY_EVENT`] event)
+//! learn that a contract's merge does not settle. Its only production readers
+//! are the two probes, which skip re-probing a contract already flagged; a
+//! source pin (`broken_flag_gates_no_commit_broadcast_or_egress`) fails if a
+//! gate comes back.
+//!
+//! The TTL and its escalation (below) now bound how often a broken contract
+//! is re-probed and re-reported, rather than how long it is suppressed.
 //!
 //! ## Why the flag is TTL-bounded, not permanent
 //!
-//! An earlier revision made the flag permanent on the theory that a "fixed"
-//! contract has a different code hash → different `ContractKey`, so an
-//! instance id flagged once is broken forever. That reasoning is sound for a
-//! *true* violation, but the probe is a sampled heuristic that can
-//! false-positive: it ultimately rests on a byte-level comparison, and a
-//! correct contract whose serialization is non-canonical (HashMap/HashSet
-//! iteration order, float formatting, embedded timestamps) can be flagged
-//! even though its merge is logically idempotent. A permanent, silent,
-//! cross-restart-persistent flag turns a single false positive into a
-//! contract that stops propagating *forever* with no recovery — exactly the
-//! failure mode behind issue #4295 (`test_ping_multi_node` froze because the
-//! ping contract's `HashMap`-backed state byte-fluttered on re-merge).
+//! A permanent flag would never let a false positive (the #4295 ping
+//! contract, whose `HashMap` state byte-fluttered on re-merge) clear, and the
+//! probe is a sampled heuristic. The flag expires after
+//! [`BROKEN_INVARIANT_TTL`]; each re-detection within the re-flag window
+//! doubles the TTL, capped at [`BROKEN_INVARIANT_TTL_CAP`]; a full quiet
+//! window resets it. See [`BrokenInvariantsTracker::record`].
 //!
-//! So the flag now expires after [`BROKEN_INVARIANT_TTL`]. The consequences:
-//!
-//! - **False positive:** self-heals within one TTL window. Combined with the
-//!   probe's own soundness hardening (it no longer flags benign byte-flutter
-//!   — see `Executor::maybe_probe_idempotency`), false positives should be
-//!   rare *and* recoverable rather than permanent.
-//! ## Escalating TTL on re-detection (#4903 review B-tweak)
-//!
-//! A fixed TTL turns a genuinely non-idempotent contract into a limit-cycle
-//! OSCILLATOR once #4902's egress gates suppress it: the flagged node goes
-//! dark for one TTL, the flag expires, the node re-enters the still-divergent
-//! mesh, a cascade burst (sized by the drift accumulated while it was dark)
-//! re-flags it, and the cycle repeats — raising per-peer emissions well above
-//! steady participation. To damp this, the TTL ESCALATES on re-detection:
-//! first detection stays at [`BROKEN_INVARIANT_TTL`], and each re-detection
-//! within the re-flag window doubles it (capped at
-//! [`BROKEN_INVARIANT_TTL_CAP`]). A genuinely-broken contract therefore
-//! converges to mostly-dark — its re-entry duty cycle collapses geometrically,
-//! drift shrinks as fewer peers advance it, and the oscillation dies out. A
-//! contract that stops being re-detected for a full quiet window resets to
-//! baseline, and a contract flagged exactly once (the #4295 false positive)
-//! never escalates at all. See [`BrokenInvariantsTracker::record`].
-//!
-//! - **True violation:** suppressed for a TTL, then re-detected and re-flagged
-//!   with an ESCALATED (doubled) TTL, so a continuously-oscillating violator's
-//!   dark window grows each cycle until it is effectively silent. Re-detection
-//!   is probabilistic: after expiry the probe samples
-//!   at [`crate::contract::executor`]'s `IDEMPOTENCY_PROBE_PROBABILITY` (1/32),
-//!   so the contract leaks the merges that occur between expiry and the next
-//!   sampled probe — in expectation ~32 merges, with a longer tail under a high
-//!   merge rate. That is a deliberately accepted, bounded periodic leak, not the
-//!   permanent re-engaged storm of the pre-#4279 baseline. We accept it because
-//!   the opposite failure — a permanent flag that a *false* positive can trigger,
-//!   silently bricking a correct contract forever (#4295) — is worse, and we
-//!   bias toward false-positive recovery. (A genuinely non-idempotent contract
-//!   has never been observed in production; the only flag ever seen fire was the
-//!   #4295 false positive.) To shorten the leak, raise `BROKEN_INVARIANT_TTL`
-//!   (fewer expiry windows) rather than lowering it.
-//!
-//! This also satisfies the project rule that GC/suppression exemptions must
+//! This also satisfies the project rule that GC exemptions must
 //! be bounded (see `.claude/rules/ring.md` "Cleanup Exemptions Must Be
 //! Bounded"); this one is bounded by a TTL. Expired entries are swept by
 //! [`BrokenInvariantsTracker::cleanup`], hooked into the same reaper tick as
@@ -123,26 +95,14 @@ use tokio::time::Instant;
 use crate::contract::storages::Storage;
 use crate::util::time_source::TimeSource;
 
-/// Baseline (FIRST-detection) suppression TTL: how long a freshly-flagged
-/// contract is suppressed before its flag expires and it is given a fresh
-/// chance (re-detected by the next sampled probe if genuinely still broken).
-///
-/// Chosen to be long enough that a genuinely non-convergent contract leaks at
-/// most ≈one merge per window (negligible amplification) yet short enough that
-/// a false positive recovers promptly rather than bricking the contract. A
-/// contract flagged exactly ONCE (the #4295 false-positive shape) is
-/// suppressed for exactly this long and then recovers — escalation (below)
-/// never touches it, so this preserves the pre-escalation false-positive
-/// conservatism unchanged.
+/// Baseline (FIRST-detection) flag TTL: how long a freshly-flagged contract
+/// stays flagged (and un-probed) before the next sampled probe may re-detect
+/// it. Diagnostic only since #6190; see the module docs.
 pub(crate) const BROKEN_INVARIANT_TTL: Duration = Duration::from_secs(300);
 
-/// Ceiling for the escalated suppression TTL (#4903 review B-tweak, stops the
-/// #4902 egress oscillation). A contract that keeps being RE-detected after
-/// each expiry doubles its TTL toward this cap; past it the TTL stops growing.
-/// Six hours: long enough that a genuinely-broken contract's re-entry
-/// oscillation collapses to a negligible duty cycle, bounded so even a
-/// (vanishingly unlikely) escalated false positive still self-heals within a
-/// working day.
+/// Ceiling for the escalated flag TTL (#4903). A contract that keeps being
+/// RE-detected after each expiry doubles its TTL toward this cap, so a
+/// genuinely broken contract is re-probed and re-reported rarely.
 pub(crate) const BROKEN_INVARIANT_TTL_CAP: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Re-flag window multiplier (#4903 review B-tweak). Measured from the last
@@ -460,11 +420,16 @@ impl BrokenInvariantsTracker {
 
         match outcome {
             Outcome::New => {
-                tracing::warn!(
+                // INFO, not WARN: since #6190 a flag changes nothing about how
+                // the contract is handled. It tells the operator, and through
+                // telemetry the app author, that the contract's merge does not
+                // settle.
+                tracing::info!(
                     contract = %id,
                     invariant = ?kind,
                     event = "broken_invariant_detected",
-                    "Marking contract as broken — gating outbound broadcast and merge propagation"
+                    "Contract merge does not settle (diagnostic only; load is bounded by \
+                     ring::contract_merge_budget)"
                 );
                 // Persistence is currently only wired for the redb backend;
                 // sqlite-only builds keep the in-memory flag but skip the
@@ -487,7 +452,7 @@ impl BrokenInvariantsTracker {
                     contract = %id,
                     escalated_ttl_secs = new_ttl.as_secs(),
                     event = "broken_invariant_ttl_escalated",
-                    "Re-detected broken contract — escalating suppression TTL (#4902 egress oscillation)"
+                    "Re-detected broken contract — escalating flag TTL"
                 );
             }
             Outcome::Reset | Outcome::Refreshed => {}
@@ -504,8 +469,8 @@ impl BrokenInvariantsTracker {
     /// this is the operator escape hatch for the rare case where the
     /// probe was a false positive (most plausibly a probe trap that
     /// shouldn't have been observed at all — see
-    /// `Executor::maybe_probe_idempotency`). Re-enables outbound
-    /// broadcast and commit for the contract. Does not unflag remotely.
+    /// `Executor::maybe_probe_idempotency`). Lets the probes run on the
+    /// contract again. Does not unflag remotely.
     ///
     /// Not currently exposed to a CLI / WS API by this PR — added so the
     /// debug-CLI follow-up has a stable surface to call into. Returns
@@ -518,7 +483,7 @@ impl BrokenInvariantsTracker {
             tracing::warn!(
                 contract = %id,
                 event = "broken_invariant_cleared",
-                "Operator cleared broken-invariant flag — outbound broadcast re-enabled"
+                "Operator cleared broken-invariant flag"
             );
         }
         previous

@@ -34,12 +34,14 @@ Against the ci.yml job with the SAME id it checks:
    filters, ``-j`` and nextest's test ``--profile`` are ignored, so a warm job
    that compiles without running matches a CI job that compiles and runs;
 5. ``apt-get install`` package sets are identical;
-6. the warm job runs on a Ubicloud runner with the same label suffix
-   (architecture, OS variant), and its display name starts with
+6. the warm job runs on the same kind of runner as its twin: a Ubicloud
+   runner with the same label suffix (architecture, OS variant), or, for a
+   GitHub-hosted twin (macOS), the identical label, since GitHub's cache
+   backend is only written by GitHub-hosted runners; its display name starts with
    ``Warm cache:`` -- scripts/release.sh excludes check runs by that prefix,
    and a name that matched a required context would impersonate it.
 
-It also DISCOVERS which ci.yml jobs need a twin: a Ubicloud job whose
+It also DISCOVERS which ci.yml jobs need a twin: a job (Ubicloud or macOS) whose
 rust-cache has a conditional ``save-if`` and whose ``if:`` gates on
 ``github.event_name`` without ever admitting ``== 'push'``. It fails if such a
 job has no twin, or if a warm job's twin no longer needs one.
@@ -277,15 +279,19 @@ def _restore_only_on_prs(job: list[str]) -> bool:
 
 
 def needs_warm_twin(job: list[str]) -> bool:
-    """A Ubicloud job that restores a cache it can never write itself.
+    """A job that restores a cache it can never write itself.
 
     Its rust-cache saves conditionally, and its ``if:`` gates on the event
     without admitting a push, so it never runs where it could save a
     main-scoped entry. Clippy (no ``if:``) runs on main pushes and saves its
-    own; a GitHub-hosted job uses a different cache backend, which a Ubicloud
-    warm job could not fill.
+    own. The runner may be Ubicloud or GitHub-hosted (macOS): each has its own
+    cache backend, so the warm job must run on the same kind of runner (see the
+    runner check in ``check``).
     """
-    if "ubicloud" not in _runs_on(job):
+    # windows_unit has the same shape (#6236) and no warm twin yet; widen this
+    # to GitHub-hosted runners generally when one is added.
+    ro = _runs_on(job)
+    if "ubicloud" not in ro and not ro.startswith("macos-"):
         return False
     steps = _cache_steps(job)
     if not steps or not any(w.get("save-if", "").strip() not in ("", "true")
@@ -456,7 +462,7 @@ def check(ci_text: str, warm_text: str, ci_name: str = "ci.yml",
               if needs_warm_twin(extract_job(ci_text, j) or [])]
     if not needed:
         errors.append(
-            f"{ci_name}: no job looks like it needs a warm twin (Ubicloud, "
+            f"{ci_name}: no job looks like it needs a warm twin (Ubicloud or macOS runner, "
             f"conditional rust-cache save-if, `if:` on event_name without "
             f"'push'). Either the discovery rule no longer matches {ci_name}, "
             f"or {warm_name} is dead weight; find out which before silencing this."
@@ -486,7 +492,7 @@ def check(ci_text: str, warm_text: str, ci_name: str = "ci.yml",
                 f"{warm_name}: job `{job_id}` warms a cache its {ci_name} twin "
                 f"does not need from it: the twin runs on pushes to main (so it "
                 f"saves its own entry), saves unconditionally, or is not on "
-                f"Ubicloud. Delete the warm job, or restore the twin's shape."
+                f"a Ubicloud or macOS runner. Delete the warm job, or restore the twin's shape."
             )
 
         ci_env, warm_env = _job_env(ci_job), _job_env(warm_job)
@@ -545,12 +551,18 @@ def check(ci_text: str, warm_text: str, ci_name: str = "ci.yml",
                 )
 
         warm_ro = _runs_on(warm_job)
-        if "ubicloud" not in warm_ro:
+        if "ubicloud" not in _runs_on(ci_job):
+            # GitHub-hosted twin: its cache lives in GitHub's backend, which
+            # only a GitHub-hosted runner can write, and the runner label
+            # decides OS and arch (so the key).
+            if _norm(_runs_on(ci_job)) != _norm(warm_ro):
+                differ("runner label", job_id, _runs_on(ci_job), warm_ro, key_why)
+        elif "ubicloud" not in warm_ro:
             errors.append(
-                f"{warm_name}: job `{job_id}` runs on `{warm_ro}`. Ubicloud "
-                f"serves its own cache backend, so an entry saved from any other "
-                f"runner is invisible to the Ubicloud PR job. Use a "
-                f"`ubicloud-standard-*` label."
+                f"{warm_name}: job `{job_id}` runs on `{warm_ro}`. Its "
+                f"`ci.yml` twin is on Ubicloud, which serves its own cache "
+                f"backend, so an entry saved from any other runner is invisible "
+                f"to that PR job. Use a `ubicloud-standard-*` label."
             )
         else:
             ci_sfx, warm_sfx = _label_suffixes(_runs_on(ci_job)), _label_suffixes(warm_ro)
@@ -817,7 +829,7 @@ def _cases() -> list[tuple[str, str, str, str | None]]:
      "apt-get install packages"),
     ("warm job on a GitHub-hosted runner",
      _CI, _sub(_WARM, "runs-on: ubicloud-standard-8", "runs-on: ubuntu-latest"),
-     "Ubicloud serves its own cache backend"),
+     "which serves its own cache backend"),
     ("CI job moved to arm",
      _sub(_CI, "runs-on: ubicloud-standard-16", "runs-on: ubicloud-standard-16-arm"), _WARM,
      "runner label suffix"),
@@ -841,8 +853,22 @@ def _cases() -> list[tuple[str, str, str, str | None]]:
           "      github.event_name != 'push' && github.event_name == 'pull_request'\n"),
      _WARM, None),
     ("no CI job needs a twin at all",
-     _sub(_CI, "runs-on: ubicloud-standard-16", "runs-on: ubuntu-latest"), _WARM,
+     _sub(_CI, "      github.event_name == 'pull_request'\n",
+          "      github.event_name == 'pull_request' || github.event_name == 'push'\n"), _WARM,
      "no job looks like it needs a warm twin"),
+    ("GitHub-hosted (macOS) twin with an identical runner label",
+     _sub(_CI, "runs-on: ubicloud-standard-16", "runs-on: macos-latest"),
+     _sub(_WARM, "runs-on: ubicloud-standard-8", "runs-on: macos-latest"), None),
+    ("GitHub-hosted twin warmed on another runner label",
+     _sub(_CI, "runs-on: ubicloud-standard-16", "runs-on: macos-latest"),
+     _sub(_WARM, "runs-on: ubicloud-standard-8", "runs-on: macos-14"), "runner label"),
+    ("GitHub-hosted twin warmed on Ubicloud",
+     _sub(_CI, "runs-on: ubicloud-standard-16", "runs-on: macos-latest"), _WARM,
+     "runner label"),
+    ("a GitHub-hosted CI job that needs a twin has none",
+     _CI + _TEST_UNIT_CI.replace("  test_unit:\n", "  test_mac:\n", 1)
+        .replace("runs-on: ubicloud-standard-16", "runs-on: macos-latest"), _WARM,
+     "has no warm job `test_mac`"),
     ("non-compile step env (FREENET_*) is ignored",
      _sub(_CI, 'FREENET_BACKOFF_BASE_SECS: "5"', 'FREENET_BACKOFF_BASE_SECS: "9"'),
      _WARM, None),
