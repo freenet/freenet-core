@@ -2806,7 +2806,7 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     and send epoch. A one-packet Short has no ack wait: its send reports
     MaybeDelivered at its 5 s total and its acknowledgement is waited for
     in the background, holding its send epoch, for at most SHORT_ACK_WAIT
-    (120 s), then its stream is reset, freeing the epoch; a control frame
+    (150 s), then its stream is reset, freeing the epoch; a control frame
     is waited for the same way. A send with a permit cancelled before its
     own deadline (no caller does this today) waits on in the background
     for at most the rest of its ack wait, then is reset and judged as one
