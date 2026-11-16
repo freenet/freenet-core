@@ -194,6 +194,7 @@ impl Harness {
                 ended: false,
                 setup_started: None,
                 close_record: None,
+                fallback_labels: VecDeque::new(),
             }),
         });
         (session, inbox_rx)
@@ -2181,15 +2182,17 @@ fn fallback_label_counts_a_local_close_by_its_recorded_reason() {
         E::RefusedData,
         E::PeerRefusedData,
         E::ReceiveTaskPanicked,
-        E::ClosedByPeer,
         E::ClosedLocally,
-        E::Lost,
     ] {
         assert_eq!(
             fallback_label(F::Reset, Some(end)),
             QuicFallback::LocallyClosed,
             "{end:?}"
         );
+    }
+    // No close of this node's.
+    for end in [E::ClosedByPeer, E::Lost] {
+        assert_eq!(fallback_label(F::Reset, Some(end)), QuicFallback::Reset);
     }
     // Another cause says the path ended another way first.
     for (cause, label) in [
@@ -2223,13 +2226,15 @@ fn a_path_this_node_closed_falls_back_under_its_recorded_reason() {
             (Some(QuicPathEnd::Stalled), QuicFallback::LivenessClosed),
             (Some(QuicPathEnd::SendAborts), QuicFallback::LocallyClosed),
             (None, QuicFallback::Reset),
+            // The peer closes: no record on this side (`peer_path` below).
+            (Some(QuicPathEnd::ClosedByPeer), QuicFallback::Reset),
         ] {
             let h = Harness::server_with("quic-driver-local-close", "prefer", Some("100")).await;
             let (session, inbox) = h.session();
             let attempt = offered(&h, &session);
             let up = path_up(&h, &session, inbox);
             let time = h.pair.time.clone();
-            let (_peer_path, _peer_inbound, mut inbox) =
+            let (peer_path, _peer_inbound, mut inbox) =
                 drive(&h.pair.time, Duration::from_secs(60), async move {
                     let up = up.await;
                     time.sleep(Duration::from_secs(1)).await;
@@ -2239,9 +2244,16 @@ fn a_path_this_node_closed_falls_back_under_its_recorded_reason() {
             ready_ack(&session, attempt, caps::DATA);
             let route = session.data_route().expect("both bits");
             match cause {
-                Some(cause) => route
-                    .path()
-                    .close_for(QuicCloseCode::PeerNotAcknowledging, cause),
+                // The peer closes with a code this node has no name for: read
+                // as a lost connection, with nothing recorded here.
+                Some(QuicPathEnd::ClosedByPeer) => {
+                    peer_path.quinn_connection().close(0xdead_u32.into(), b"")
+                }
+                Some(cause) => {
+                    route
+                        .path()
+                        .close_for(QuicCloseCode::PeerNotAcknowledging, cause);
+                }
                 None => route
                     .path()
                     .quinn_connection()
@@ -2276,5 +2288,56 @@ fn a_path_this_node_closed_falls_back_under_its_recorded_reason() {
                 );
             }
         }
+    });
+}
+
+/// A churned fallback, counted when the UDP session ends, keeps the label its
+/// fallback was counted under, though a newer path's close record has replaced
+/// the one that labelled it; and only fallbacks within the machine's window
+/// are matched.
+#[test]
+fn a_churned_fallback_keeps_the_label_its_fallback_had() {
+    use crate::transport::boundary::QuicPathEnd;
+    use crate::transport::quic::CloseRecord;
+    use crate::transport::quic::upgrade::machine::{FallbackCause, Outcome};
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let h = Harness::server("quic-driver-churn-label").await;
+        let (session, _rx) = h.session();
+        let reset = || vec![Action::Record(Outcome::Fallback(FallbackCause::Reset))];
+        let mut state = session.state.lock();
+        // A liveness fallback outside the window by the session's end.
+        state.close_record = Some(CloseRecord::of(QuicPathEnd::NotAcknowledging));
+        session.apply(&mut state, reset());
+        // One with a different cause, then a liveness one within the window.
+        h.set_now(Duration::from_secs(200));
+        state.close_record = Some(CloseRecord::default());
+        session.apply(&mut state, reset());
+        state.close_record = Some(CloseRecord::of(QuicPathEnd::NotAcknowledging));
+        h.set_now(Duration::from_secs(250));
+        session.apply(&mut state, reset());
+        // A newer path with no close recorded.
+        state.close_record = Some(CloseRecord::default());
+        h.set_now(Duration::from_secs(310));
+        session.apply(
+            &mut state,
+            vec![
+                Action::Record(Outcome::ChurnedFallback(FallbackCause::Reset)),
+                Action::Record(Outcome::ChurnedFallback(FallbackCause::Reset)),
+            ],
+        );
+        drop(state);
+        let churned: Vec<_> = TRANSPORT_METRICS
+            .quic_events_of(h.remote)
+            .into_iter()
+            .filter(|e| e.contains("churned"))
+            .collect();
+        assert_eq!(
+            churned,
+            [
+                format!("{:?}", ("churned", QuicFallback::Reset)),
+                format!("{:?}", ("churned", QuicFallback::LivenessClosed)),
+            ]
+        );
     });
 }

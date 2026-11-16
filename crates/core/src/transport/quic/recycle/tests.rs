@@ -297,11 +297,15 @@ fn a_data_path_with_udp_is_not_closed_dark_and_counts_the_close_once() {
     assert_eq!(snap.stall_would_close[Stall::Dark.index()], 0);
 }
 
-/// The watch publishes whether a dark episode is in progress, for the stall
-/// close (`route`): set from the first sample that sees this side's sends go
-/// unanswered with nothing from the peer, cleared when the peer is heard again.
+/// The watch publishes whether the dark rule would have closed the path in the
+/// episode in progress, for the stall close (`route`): on a path with a UDP
+/// session, set at the sample the rule would have closed at
+/// (`dark_closes_at`), kept while the episode lasts, cleared when the peer is
+/// heard again. A path whose peer keeps sending (a one-way break: only this
+/// side's packets are lost) never sets it, so the stall close stays available
+/// there.
 #[test]
-fn the_watch_publishes_a_dark_episode_while_it_lasts() {
+fn the_watch_publishes_that_the_dark_rule_would_have_closed() {
     let record = Arc::default();
     let sample = |r: Reading| {
         AckSample::synthetic(
@@ -314,27 +318,31 @@ fn the_watch_publishes_a_dark_episode_while_it_lasts() {
             NO_CAP,
         )
     };
-    // Sends at ticks 1-10, the peer heard again at tick 11.
-    let at = |t: u64| reading(5, 1200, 10 + t.min(10), 100 + t.saturating_sub(10));
-    let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)))
-        .with_udp_fallback(true)
-        .publishing_dark(flag.clone());
-    let mut seen = Vec::new();
-    for tick in 1..=12 {
-        watch.observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(tick)));
-        assert_eq!(
-            flag.load(std::sync::atomic::Ordering::Acquire),
-            watch.is_dark()
-        );
-        seen.push(watch.is_dark());
-    }
-    assert_eq!(
-        seen,
-        [
-            true, true, true, true, true, true, true, true, true, true, false, false
-        ]
-    );
+    let run = |at: &dyn Fn(u64) -> Reading, ticks: u64| {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)))
+            .with_udp_fallback(true)
+            .publishing_dark(flag.clone());
+        (1..=ticks)
+            .map(|tick| {
+                let closed = watch.observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(tick)));
+                assert!(!closed, "a path with UDP is not closed dark");
+                let published = flag.load(std::sync::atomic::Ordering::Acquire);
+                assert_eq!(published, watch.would_have_closed_dark());
+                published
+            })
+            .collect::<Vec<_>>()
+    };
+    // Sends at ticks 1-20, the peer heard again at tick 21.
+    let dark = |t: u64| reading(5, 1200, 10 + t.min(20), 100 + t.saturating_sub(20));
+    let seen = run(&dark, 23);
+    let expected: Vec<bool> = (1..=23u64)
+        .map(|t| t >= dark_closes_at(1) && t <= 20)
+        .collect();
+    assert_eq!(seen, expected);
+    // This side's sends go unanswered, the peer keeps sending.
+    let one_way = |t: u64| reading(5, 1200, 10 + t, 100 + t);
+    assert!(run(&one_way, 4).iter().all(|set| !set));
 }
 
 /// On a data path with a UDP session, an outage of 90 s (sends from tick 1,

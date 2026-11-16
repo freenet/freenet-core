@@ -268,11 +268,12 @@ pub(crate) fn dark_close_bound(rtt: Duration) -> Duration {
     first * 2 + pto + ACK_WATCH_TICK * 2 + grace
 }
 
-/// The latest the dark rule closes a path that stays dark, at round trips
-/// up to 800 ms ([`dark_close_bound`], about 74 s there). A send waiting for
-/// its acknowledgement through an outage the dark rule tolerates is acked
-/// after it, at the latest when the peer is next heard (`SHORT_ACK_WAIT` is
-/// sized from this).
+/// The latest the dark rule closes a path that stays dark (a native path;
+/// one with a UDP session it does not close, [`DARK_CLOSES_WITH_UDP`]), at
+/// round trips up to 800 ms ([`dark_close_bound`], about 74 s there). A send
+/// waiting for its acknowledgement through an outage the dark rule tolerates
+/// is acked after it, at the latest when the peer is next heard
+/// (`SHORT_ACK_WAIT` is sized from this and from [`UDP_PATH_DARK_END_MAX`]).
 pub(crate) const DARK_CLOSE_MAX: Duration = Duration::from_secs(75);
 
 /// Whether the dark-path rule ([`Stall::Dark`]) closes a path that has a UDP
@@ -1188,15 +1189,15 @@ pub(crate) struct AckWatch {
     expiries_seen: u64,
     expiries_at: VecDeque<u64>,
     /// Times the ack-wait expiry rule would have closed the path
-    /// ([`ACK_WAITS_EXPIRED_CLOSES`]) or the dark rule would have
-    /// ([`DARK_CLOSES_WITH_UDP`]).
+    /// ([`ACK_WAITS_EXPIRED_CLOSES`]).
     would_close: u64,
     /// The path has a UDP session to fall back to, so the dark rule only
     /// counts ([`DARK_CLOSES_WITH_UDP`]).
     udp_fallback: bool,
     /// The dark episode in progress was already counted as a would-close.
     dark_would_closed: bool,
-    /// Where whether a dark episode is in progress is published, if anywhere.
+    /// Where it is published whether the dark rule would have closed the path
+    /// in the episode in progress, if anywhere ([`Self::publishing_dark`]).
     dark_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
@@ -1275,17 +1276,25 @@ impl AckWatch {
         }
     }
 
-    /// Publish in `flag` whether a dark episode is in progress, after every
-    /// sample.
+    /// Publish in `flag`, after every sample, whether the dark rule would
+    /// have closed the path in the episode in progress: set at the sample the
+    /// rule would have closed at (on a path where it only counts,
+    /// [`DARK_CLOSES_WITH_UDP`]), cleared when the episode ends (the peer
+    /// heard, an acknowledgement, nothing outstanding, a cap hold). The stall
+    /// close (`route`) leaves the path alone while it is set, so it closes
+    /// no path the dark rule would not have closed, and none earlier than
+    /// the dark rule would have, except where it fired first on releases
+    /// before the dark rule observed too.
     pub(crate) fn publishing_dark(mut self, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
         self.dark_flag = Some(flag);
         self
     }
 
-    /// Whether a dark episode is in progress. Tests only.
+    /// Whether the dark rule would have closed the path in the episode in
+    /// progress. Tests only.
     #[cfg(test)]
-    pub(crate) fn is_dark(&self) -> bool {
-        self.dark_since.is_some()
+    pub(crate) fn would_have_closed_dark(&self) -> bool {
+        self.dark_would_closed
     }
 
     /// Whether the path has a UDP session to fall back to; on one the dark
@@ -1404,10 +1413,7 @@ impl AckWatch {
         let now_nanos = self.watch_time(now_nanos);
         self.stall = self.decide(now_nanos, sample);
         if let Some(flag) = &self.dark_flag {
-            flag.store(
-                self.dark_since.is_some(),
-                std::sync::atomic::Ordering::Release,
-            );
+            flag.store(self.dark_would_closed, std::sync::atomic::Ordering::Release);
         }
         self.stall.is_some()
     }
@@ -1549,7 +1555,6 @@ impl AckWatch {
                 if let Some(node) = self.dark_counts {
                     node.record_stall_would_close(Stall::Dark.index());
                 }
-                self.would_close += 1;
             }
         }
         if !outstanding || self.quiet_samples >= QUIET_SAMPLES_END_WINDOW {
@@ -2052,9 +2057,9 @@ pub(crate) struct WatchShared {
     /// (`QuicPathLimits::udp_fallback`), so the dark rule only counts
     /// ([`DARK_CLOSES_WITH_UDP`]).
     pub(crate) udp_fallback: bool,
-    /// Set while a dark episode is in progress ([`AckWatch::publishing_dark`]),
-    /// so the path's stall close leaves a dark path with a UDP session alone
-    /// (`route`).
+    /// Set while the dark rule would have closed the path in the episode in
+    /// progress ([`AckWatch::publishing_dark`]), so the path's stall close
+    /// leaves such a path with a UDP session alone (`route`).
     pub(crate) dark: Arc<std::sync::atomic::AtomicBool>,
 }
 

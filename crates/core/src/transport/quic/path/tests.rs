@@ -1422,7 +1422,7 @@ fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes() {
 /// A one-packet Short's acknowledgement is waited for in the background once
 /// its send has ended (here at its own 50 ms deadline, on a 200 ms round
 /// trip), holding its send epoch. The wait is bounded (here 10 ms in place of
-/// `SHORT_ACK_WAIT`, 120 s): past it the stream is reset and the epoch is
+/// `SHORT_ACK_WAIT`, 150 s): past it the stream is reset and the epoch is
 /// released. Nothing else was acknowledged meanwhile, so it is not a strike
 /// (`ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged` covers
 /// strikes). An honest peer acknowledges the Short's one packet on arrival,

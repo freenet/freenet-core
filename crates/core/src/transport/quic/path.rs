@@ -333,7 +333,7 @@ pub(crate) struct QuicPathLimits {
     #[cfg(test)]
     pub(crate) staging_cap: Option<usize>,
     /// The bound on a one-packet Short's background ack wait, in place of
-    /// [`SHORT_ACK_WAIT`], for a test that cannot wait two minutes.
+    /// [`SHORT_ACK_WAIT`], for a test that cannot wait 150 s.
     #[cfg(test)]
     pub(crate) short_ack_wait: Option<Duration>,
     /// While the flag is set, the receive side cancels the handle of the
@@ -802,8 +802,9 @@ pub(crate) struct QuicPath {
     short_ack_wait: Duration,
     /// The path's clock, for judging expired ack waits ([`StrikeCheck`]).
     clock: Arc<dyn Fn() -> u64 + Send + Sync>,
-    /// Set once the path may send data: only then does the acknowledgement
-    /// watch's dark-path rule close it (`recycle::AckWatch::observing`).
+    /// Set once the path may send data: only then may the acknowledgement
+    /// watch's dark-path rule close it, and only a path with no UDP session
+    /// (`recycle::AckWatch::observing`, `recycle::DARK_CLOSES_WITH_UDP`).
     carries_data: Arc<std::sync::atomic::AtomicBool>,
     /// Control frames taking their stream ([`Self::control_first`]); a data
     /// send opens no stream while any is.
@@ -1446,13 +1447,21 @@ impl QuicPath {
         self.connection.close(code);
     }
 
-    /// [`Self::close`], recording `cause` as why this node closed.
+    /// [`Self::close`], recording `cause` as why this node closed. Whether this
+    /// call closed the connection (not if it was closed or closing already).
     pub(in crate::transport) fn close_for(
         &self,
         code: QuicCloseCode,
         cause: crate::transport::boundary::QuicPathEnd,
-    ) {
-        self.connection.closer().close_for(code, cause);
+    ) -> bool {
+        self.connection.closer().close_for(code, cause)
+    }
+
+    /// Set the acknowledgement watch's dark flag (`recycle::WatchShared::dark`)
+    /// by hand. Tests only.
+    #[cfg(test)]
+    pub(crate) fn set_dark_for_test(&self, dark: bool) {
+        self.dark.store(dark, std::sync::atomic::Ordering::Release);
     }
 
     /// The quinn connection, to wait for its end.
@@ -1464,8 +1473,8 @@ impl QuicPath {
     /// separate, set by [`QuicPathLimits::accept_data`] when the path is built.
     pub(in crate::transport) fn enable_data(&self) {
         self.send_data.store(SEND_DATA_ON, Ordering::Release);
-        // From now on the dark-path rule closes the path
-        // (`recycle::AckWatch::observing`).
+        // From now on the dark-path rule closes the path if it has no UDP
+        // session (`recycle::AckWatch::observing`, `DARK_CLOSES_WITH_UDP`).
         self.carries_data.store(true, Ordering::Release);
     }
 

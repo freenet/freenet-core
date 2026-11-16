@@ -75,8 +75,8 @@ use tokio::task::JoinHandle;
 
 use super::data_route::{DataRoute, RouteNote, UdpShorts};
 use super::machine::{
-    Action, BackoffSeed, CONTROL_SEND_TIMEOUT, Event, FallbackCause, Inputs, Outcome, Role,
-    UpgradeMachine,
+    Action, BackoffSeed, CONTROL_SEND_TIMEOUT, Event, FALLBACK_CHURN_WINDOW, FallbackCause, Inputs,
+    Outcome, RECENT_FALLBACKS_MAX, Role, UpgradeMachine,
 };
 use super::policy::QuicPolicy;
 use crate::config::{GlobalExecutor, GlobalRng};
@@ -402,6 +402,11 @@ struct SessionState {
     /// the path's fallback is counted, which may be after the attempt that
     /// held the path is gone.
     close_record: Option<crate::transport::quic::CloseRecord>,
+    /// The label each recent fallback was counted under, oldest first, as
+    /// the machine keeps their causes (`machine::RECENT_FALLBACKS_MAX`): a
+    /// churned fallback is counted at the session's end under the label its
+    /// fallback had, not one resolved then against a later path's record.
+    fallback_labels: VecDeque<(Duration, FallbackCause, QuicFallback)>,
 }
 
 /// One UDP session's upgrade. The driver, the connection and a newer session of
@@ -617,6 +622,7 @@ impl QuicUpgrades {
                 ended: false,
                 setup_started: None,
                 close_record: None,
+                fallback_labels: VecDeque::new(),
             }),
         });
         let driver = GlobalExecutor::spawn(report_panics(
@@ -734,7 +740,10 @@ fn closed_for(state: &SessionState) -> Option<QuicPathEnd> {
 /// `LocallyClosed`, which reads as a lost connection (`Reset`) here, as does a
 /// send failing on it afterwards; it is counted by the recorded reason instead,
 /// so a peer's reset and this node's own close are told apart. Only `Reset` is
-/// relabelled: any other cause says the path ended some other way first.
+/// relabelled: any other cause says the path ended some other way first. Of the
+/// path ends, only the ones a closer records for this node's own close get a
+/// local label; `ClosedByPeer` and `Lost` describe no close of this node's and
+/// stay `reset` should one ever be recorded.
 fn fallback_label(cause: FallbackCause, closed_for: Option<QuicPathEnd>) -> QuicFallback {
     match cause {
         FallbackCause::Idle => QuicFallback::Idle,
@@ -749,10 +758,9 @@ fn fallback_label(cause: FallbackCause, closed_for: Option<QuicPathEnd>) -> Quic
                 | QuicPathEnd::RefusedData
                 | QuicPathEnd::PeerRefusedData
                 | QuicPathEnd::ReceiveTaskPanicked
-                | QuicPathEnd::ClosedByPeer
-                | QuicPathEnd::ClosedLocally
-                | QuicPathEnd::Lost,
+                | QuicPathEnd::ClosedLocally,
             ) => QuicFallback::LocallyClosed,
+            Some(QuicPathEnd::ClosedByPeer | QuicPathEnd::Lost) => QuicFallback::Reset,
         },
         FallbackCause::Protocol => QuicFallback::Protocol,
         FallbackCause::DowngradeReceived => QuicFallback::DowngradeReceived,
@@ -948,16 +956,39 @@ impl Session {
             } else {
                 C::SessionEndedSetup
             }),
-            Outcome::Fallback(cause) => TRANSPORT_METRICS
-                .record_quic_fallback(fallback_label(cause, closed_for(state)), self.remote),
-            Outcome::ChurnedFallback(cause) => TRANSPORT_METRICS.record_quic_churned_fallback(
-                fallback_label(cause, closed_for(state)),
-                self.remote,
-            ),
-            Outcome::CarryingFallback(cause) => TRANSPORT_METRICS.record_quic_carried_fallback(
-                fallback_label(cause, closed_for(state)),
-                self.remote,
-            ),
+            Outcome::Fallback(cause) => {
+                let label = fallback_label(cause, closed_for(state));
+                // As the machine keeps them (`note_fallback`).
+                state
+                    .fallback_labels
+                    .retain(|(at, _, _)| now.saturating_sub(*at) <= FALLBACK_CHURN_WINDOW);
+                if state.fallback_labels.len() == RECENT_FALLBACKS_MAX {
+                    state.fallback_labels.pop_front();
+                }
+                state.fallback_labels.push_back((now, cause, label));
+                TRANSPORT_METRICS.record_quic_fallback(label, self.remote)
+            }
+            // Recorded by the machine in the same step as its fallback.
+            Outcome::CarryingFallback(cause) => {
+                let label = match state.fallback_labels.back() {
+                    Some((_, counted, label)) if *counted == cause => *label,
+                    _ => fallback_label(cause, closed_for(state)),
+                };
+                TRANSPORT_METRICS.record_quic_carried_fallback(label, self.remote)
+            }
+            // The machine reports the fallbacks it remembers within its window
+            // oldest first, so the oldest remembered one of the same cause
+            // within the window is this one.
+            Outcome::ChurnedFallback(cause) => {
+                let label = match state.fallback_labels.iter().position(|(at, counted, _)| {
+                    *counted == cause && now.saturating_sub(*at) <= FALLBACK_CHURN_WINDOW
+                }) {
+                    Some(at) => state.fallback_labels.remove(at).map(|(_, _, label)| label),
+                    None => None,
+                }
+                .unwrap_or_else(|| fallback_label(cause, None));
+                TRANSPORT_METRICS.record_quic_churned_fallback(label, self.remote)
+            }
         }
     }
 

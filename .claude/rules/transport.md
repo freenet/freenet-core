@@ -2234,7 +2234,7 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   the wait to a small task (at most 48 per path, each ending with the
   connection). A one-packet Short holds no permit but its send epoch, and
   waits the same way, at most ACK_WAITS_WITHOUT_PERMIT (64) per path, each
-  for at most SHORT_ACK_WAIT (120 s), after which its stream is reset,
+  for at most SHORT_ACK_WAIT (150 s), after which its stream is reset,
   freeing the epoch, and may count as a strike (liveness rules, below); a
   control frame's wait is bounded the same way; past
   that its epoch is released at once and counted
@@ -2698,7 +2698,14 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     (recycle::DARK_CLOSES_WITH_UDP false, since 0.2.159) it counts the close
     it would make (quic_stall_would_close_dark, once per episode) and quinn's
     idle timeout (120 s, recycle::UDP_PATH_DARK_END_MAX) ends a path that
-    stays dark, as fallback `idle`. Why: on 0.2.158's shadow paths about a
+    stays dark, as fallback `idle`. The stalled-sends close (route::StallCount)
+    leaves such a path alone only once the dark rule would itself have closed
+    it (the watch publishes that, WatchShared::dark); a stall before that, or
+    one with the peer still heard, closes as before, so a busy path can still
+    close about 15-25 s into an outage, as on 0.2.158. The stream-credit rule
+    is not gated: in an outage where streams were cancelled while sends wait
+    for stream credit it can still close at about 60 s, as
+    stream_credit_withheld. Why: on 0.2.158's shadow paths about a
     quarter of the dark episodes lasting past the rule's close (30-75 s)
     recovered within 120 s, and the close dropped the one-packet Shorts still
     waiting for their acknowledgement (MaybeDelivered is never resent), which
@@ -2872,7 +2879,7 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     Residual, open (#6205, a gate before UDP removal): a peer that
     acknowledges each stream's end (or stops it) just before its ack wait
     runs out holds the 48 permits (each for at least 5 min) and the 64
-    one-packet Short epochs (about 120 s each) indefinitely, with no
+    one-packet Short epochs (about 150 s each) indefinitely, with no
     expiry and no abort; every further streamed send waits its 2 s open
     deadline and goes on UDP (after UDP removal, it fails). Not counted as
     a strike: the threshold for "acknowledged later than an honest peer

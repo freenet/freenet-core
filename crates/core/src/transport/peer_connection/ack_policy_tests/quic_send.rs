@@ -996,13 +996,14 @@ fn permits_held_with_nothing_acknowledged_do_not_close_a_path_with_udp() {
 }
 
 /// Eight streams that open and then stop moving, with nothing acknowledged past the
-/// window, close a path that has no UDP session (a native path's). On a path with
-/// one, the acknowledgement watch sees the peer as dark (nothing heard from it),
-/// so the stall count leaves the close to quinn's idle timeout, as the dark rule
-/// does (`recycle::DARK_CLOSES_WITH_UDP`): the path is suspect, so new data goes
-/// on UDP, and it is not closed.
+/// window, close the path, with or without a UDP session. On a path with one the
+/// stall close leaves alone only a path the dark rule would already have closed
+/// (`recycle::AckWatch::publishing_dark`); here the eighth timeout comes about
+/// 16 s into the silence, before the dark rule's close (at the earliest two
+/// probe rounds after its 10 s window), so the stall close is made as before.
+/// The skip itself is `the_stall_close_leaves_a_path_the_dark_rule_would_have_closed`.
 #[test]
-fn eight_streams_that_stall_after_opening_close_only_a_path_without_udp() {
+fn eight_streams_that_stall_after_opening_close_the_path() {
     for (network, udp_fallback) in [
         ("quic-send-stall-close", false),
         ("quic-send-stall-close-udp", true),
@@ -1040,20 +1041,15 @@ fn eight_streams_that_stall_after_opening_close_only_a_path_without_udp() {
                     u64::from(STALLED_SENDS_LIMIT),
                     "{network}"
                 );
-                let closed = !udp_fallback;
                 assert_eq!(
                     rig.stats().send_event_count(E::StalledClosed),
-                    u64::from(closed),
+                    1,
                     "{network}"
                 );
-                assert_eq!(
+                assert!(
                     rig.route.path().quinn_connection().close_reason().is_some(),
-                    closed,
                     "{network}"
                 );
-                if udp_fallback {
-                    assert!(rig.route.path().is_suspect(), "{network}");
-                }
             },
         );
     }

@@ -511,9 +511,9 @@ labelled_counters! {
     /// `quic_fallback_<label>`. An attempt that ended before it was active is
     /// not here; see `quic_upgrade_*`. The UDP session ending under a path is
     /// `quic_upgrade_session_ended_active`.
-    /// Not here: a close this node sent for `send_abort_limit` or
-    /// `peer_not_acknowledging` reaches the machine as a lost connection
-    /// (`reset`), and is counted by `quic_close_sent_*`; the same codes sent
+    /// A close this node sent reaches the machine as a lost connection; it is
+    /// counted by the reason the closer recorded (`liveness_tx`, `closed_tx`),
+    /// and its code by `quic_close_sent_*`; the codes sent
     /// by the peer are `downgrade_rx`, with the raw code in
     /// `quic_close_received_*`. A key mismatch is
     /// `quic_upgrade_identity_mismatch`.

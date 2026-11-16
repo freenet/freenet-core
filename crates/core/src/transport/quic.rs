@@ -1245,6 +1245,14 @@ impl Drop for QuicConnection {
 pub(crate) struct CloseRecord(Arc<std::sync::OnceLock<crate::transport::boundary::QuicPathEnd>>);
 
 impl CloseRecord {
+    /// A record of a close for `end`. Tests only.
+    #[cfg(test)]
+    pub(crate) fn of(end: crate::transport::boundary::QuicPathEnd) -> Self {
+        let record = Self::default();
+        let _first = record.0.set(end);
+        record
+    }
+
     /// Why this node closed the connection, if it closed it with
     /// [`QuicCloser::close_for`].
     pub(crate) fn get(&self) -> Option<crate::transport::boundary::QuicPathEnd> {
