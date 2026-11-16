@@ -196,30 +196,23 @@ fn parse_args(args: &[String]) -> Result<Vec<(PathBuf, Option<String>)>> {
 
     while i < args.len() {
         match args[i].as_str() {
-            "--gateway" | "-g" => {
-                if i + 1 < args.len() {
-                    log_paths.push((PathBuf::from(&args[i + 1]), Some("gateway".to_string())));
-                    i += 2;
-                } else {
-                    i += 1;
-                }
+            // A flag missing its value falls through to the `_` arm below.
+            "--gateway" | "-g" if i + 1 < args.len() => {
+                log_paths.push((PathBuf::from(&args[i + 1]), Some("gateway".to_string())));
+                i += 2;
             }
-            "--peer" | "-p" => {
-                if i + 1 < args.len() {
-                    let label = if i + 2 < args.len() && !args[i + 2].starts_with("--") {
-                        Some(args[i + 2].clone())
-                    } else {
-                        Some(format!("peer-{}", log_paths.len()))
-                    };
-                    let is_auto_label = label
-                        .as_ref()
-                        .map(|l| l.starts_with("peer-"))
-                        .unwrap_or(true);
-                    log_paths.push((PathBuf::from(&args[i + 1]), label));
-                    i += if is_auto_label { 2 } else { 3 };
+            "--peer" | "-p" if i + 1 < args.len() => {
+                let label = if i + 2 < args.len() && !args[i + 2].starts_with("--") {
+                    Some(args[i + 2].clone())
                 } else {
-                    i += 1;
-                }
+                    Some(format!("peer-{}", log_paths.len()))
+                };
+                let is_auto_label = label
+                    .as_ref()
+                    .map(|l| l.starts_with("peer-"))
+                    .unwrap_or(true);
+                log_paths.push((PathBuf::from(&args[i + 1]), label));
+                i += if is_auto_label { 2 } else { 3 };
             }
             "--paths" => {
                 i += 1;

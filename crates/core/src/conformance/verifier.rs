@@ -358,12 +358,11 @@ fn run<O: ConformanceOracle + ?Sized>(
             // Idempotence is already broken. Everything below only decides WHICH
             // kind, and must never turn the finding back into a pass.
             let mut current = once.clone();
-            let mut rewrites: u32 = 1;
             let mut settling = IdempotenceSettling::NeverSettled;
             let mut classification_failure: Option<Inconclusive> = None;
             // One merge is already spent above, so the remaining budget is
             // `MAX_CANONICALIZATION_APPLIES - 1` and the total is unchanged.
-            for _ in 1..MAX_CANONICALIZATION_APPLIES {
+            for rewrites in 1..MAX_CANONICALIZATION_APPLIES as u32 {
                 // Deliberately NOT `?`. Propagating here would return
                 // `Inconclusive` from the whole check and DISCARD the violation
                 // established above — reporting "we could not tell" about a
@@ -394,7 +393,6 @@ fn run<O: ConformanceOracle + ?Sized>(
                     break;
                 }
                 current = merged;
-                rewrites += 1;
             }
 
             let mut detail = match settling {
