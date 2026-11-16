@@ -7,7 +7,8 @@ name: CI
 #    permanently unmergeable, so it is confined to the trigger where no
 #    required check is at stake.
 #    This is a REAL cost increase, not a relocation: since #5571 a docs-only PR
-#    pays the full PR suite (Clippy and NAT Validation on ubicloud-standard-8;
+#    pays the full PR suite (NAT Validation on ubicloud-standard-8; Clippy on
+#    ubuntu-latest;
 #    Unit & Integration and Simulation on ubicloud-standard-16; the macOS/Windows
 #    unit jobs) PLUS a paid Claude rule review, on top of the merge_group run it
 #    already paid. That was accepted because docs-only merges are rare (15 in
@@ -789,8 +790,9 @@ jobs:
 
           echo "Rule lint passed — no banned patterns in new code"
 
-  # Clippy runs in parallel with fmt_check (and with every heavy job)
-  # Using Ubicloud for faster builds with more cores
+  # Clippy runs in parallel with fmt_check (and with every heavy job).
+  # Only the failure-notification jobs `needs:` it, so its wall time gates
+  # nothing else.
   clippy_check:
     name: Clippy
     # GitHub-hosted, not Ubicloud (#6244). Lint output does not depend on
@@ -897,6 +899,15 @@ jobs:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      # GitHub-hosted runners have ~14 GB free; this job builds three feature
+      # sets into one target dir. Record the headroom so a creeping disk-full
+      # is visible before it fails the check (#6244).
+      - name: Disk headroom
+        if: always()
+        run: |
+          df -h / || true
+          du -sh target ~/.cargo 2>/dev/null || true
 
   # Windows compile check - catches missing imports, feature flags, and
   # platform-specific errors that Linux CI misses. Added after #3685 where
