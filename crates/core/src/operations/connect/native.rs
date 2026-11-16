@@ -212,19 +212,23 @@ pub(crate) fn effective_native_percent(
 pub(crate) enum DialTransport {
     #[default]
     Udp,
-    /// `within`: how long the setup may take from when it starts. The
-    /// setup's own window (8 s for the client, 12 s for the server) cuts it
-    /// further, and a setup with less than 4 s left is not started. A joiner
-    /// passes what is left until its UDP fallback time, so its native attempt
-    /// never runs past it; an acceptor passes [`NATIVE_CONNECT_WITHIN`].
-    Native { within: std::time::Duration },
+    /// `deadline`: when the setup must have ended, on the tokio clock. The
+    /// setup turns it into what is left when it starts, so time the dial
+    /// spends reaching the transport comes out of it. The setup's own window
+    /// (8 s for the client, 12 s for the server) cuts it further, and a setup
+    /// with less than 4 s left is not started. A joiner passes its UDP
+    /// fallback time, so its native attempt never runs past it; an acceptor
+    /// passes [`NATIVE_CONNECT_WITHIN`] from its decision.
+    Native { deadline: tokio::time::Instant },
 }
 
 impl DialTransport {
     /// A native dial bounded only by the setup's own window.
-    pub(crate) const NATIVE: Self = Self::Native {
-        within: NATIVE_CONNECT_WITHIN,
-    };
+    pub(crate) fn native_now() -> Self {
+        Self::Native {
+            deadline: tokio::time::Instant::now() + NATIVE_CONNECT_WITHIN,
+        }
+    }
 
     pub(crate) fn is_native(self) -> bool {
         matches!(self, Self::Native { .. })
@@ -365,7 +369,7 @@ pub(crate) fn joiner_response_action(
             } else if !can_dial {
                 Err(JoinerDecisionFailure::NativeUnsupported)
             } else {
-                Ok(DialTransport::NATIVE)
+                Ok(DialTransport::native_now())
             }
         }
     }
@@ -705,10 +709,7 @@ mod tests {
             joiner_response_action(five, native, false),
             Err(NativeUnsupported)
         );
-        assert_eq!(
-            joiner_response_action(five, native, true),
-            Ok(DialTransport::NATIVE)
-        );
+        assert!(joiner_response_action(five, native, true).is_ok_and(DialTransport::is_native));
     }
 
     /// A node's state reads its own endpoint, its override and its demotion
