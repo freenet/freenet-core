@@ -593,10 +593,12 @@ Current wire-gated floors:
   Release notes. The release that sets T0 must say in its notes that `prefer`
   nodes, which is every Linux, macOS and Windows node that did not set `transport-quic`,
   start carrying data with a growing share of their pairs. A release cut from
-  main between the ramp code (#6138) and the T0 PR also changes something: it
-  makes `prefer` the default on Linux, macOS and Windows, at a share of 0. Its nodes
-  then behave as shadow nodes (no pair carries data, no path is recycled), but
-  its notes should still say that the default mode changed.
+  main between the ramp code (#6138) and the T0 PR (0.2.157 was one) also
+  changed something: it made `prefer` the default on Linux, macOS and Windows,
+  at a share of 0. Its nodes then behave as shadow nodes (no pair carries
+  data, no path is recycled), but its notes should still say that the default
+  mode changed. Since the 0.2.159 emergency stop the default is shadow on
+  Linux and macOS and off on Windows again.
 
   Reading the ramp: each node logs at INFO when its share enters a new band
   ("QUIC data: this node offers data to this share of its pairs", with

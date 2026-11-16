@@ -1969,11 +1969,13 @@ peer presents a key that is not its transport key.
 
 #### QUIC rollout (#5940)
 
-There are no opt-in stages; releases do the rollout. Windows is shadow by
-default since its breaker (a short run counts only if it panicked in QUIC code)
-was confirmed on a real Windows machine (#6031: Windows Server 2022, kills, a
+There are no opt-in stages; releases do the rollout. Windows ran QUIC by
+default (shadow, then `prefer`) in 0.2.157 and 0.2.158, after its breaker (a
+short run counts only if it panicked in QUIC code) was confirmed on a real
+Windows machine (#6031: Windows Server 2022, kills, a
 reboot, a logoff, `service restart`/`stop` never counted; injected aborts and a
-crash loop under the run wrapper tripped). Not run on a machine, covered by the
+crash loop under the run wrapper tripped). It is off by default again since
+the 0.2.159 emergency stop of the data ramp. Not run on a machine, covered by the
 rule that only a QUIC panic counts: Fast Startup, sleep, tray Restart/Stop/Quit
 and an update exit. What it never catches: a crash not preceded by a QUIC
 panic, a crash loop with runs of 10 minutes or more, and a fault that crashes
@@ -1981,8 +1983,8 @@ once a day. Every step watches: peers disappearing per version
 against the previous rollout (a node that dies before reporting is absent from
 every rate), endpoint-down, panics and breaker trips, RSS against
 `quic_paths_active`, CPU and egress, and NAT success, connections and transfers.
-From the first release with the Windows default, the release watch also reads
-Windows separately: `quic_adapter_panicked` and `quic_breaker_trips` by version
+In any release where Windows runs QUIC by default (0.2.157 and 0.2.158 did),
+the release watch also reads Windows separately: `quic_adapter_panicked` and `quic_breaker_trips` by version
 against the previous release, and peers with `quic_breaker_suppressed`. A
 Windows QUIC panic in the field is read (location, version) before the next
 release goes out.
@@ -1992,8 +1994,10 @@ release goes out.
   stays near 0 and UDP metrics do not change.
 - Step 1: nova gateways and framework in shadow for 24-48 h. The 24 h gateway
   A/B runs only if something looks odd. Rollback: set the key to off and restart.
-- Step 2: shadow on by default on Linux and macOS, then Windows once its
-  breaker was confirmed on a real machine (`QuicMode::default_mode`). Gate: at least 95% upgrade
+- Step 2: shadow on by default on Linux and macOS (`QuicMode::default_mode`).
+  Windows ran shadow, then `prefer`, in 0.2.157 and 0.2.158 once its breaker
+  was confirmed on a real machine, and is off by default again since the
+  0.2.159 emergency stop. Gate: at least 95% upgrade
   success by `established_as_offerer / accepted`; fewer than 1 fallback per
   path-day excluding endpoint and restart causes; memory within the measured
   terms (about 0.3 to 0.5 MiB per idle path). An abort spike stops the step.

@@ -89,8 +89,8 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 /// and off elsewhere (Windows included, since the ramp's emergency stop), because the breaker reads no boot identity
 /// there and so cannot trip. The Windows breaker counts short runs that
 /// panicked in QUIC code instead of detecting crashes ([`breaker`]); it was
-/// confirmed on a real Windows machine before Windows defaulted to shadow
-/// (#6031). The default is decided when the value is read and
+/// confirmed on a real Windows machine (#6031) before Windows ran QUIC by
+/// default (shadow, then `prefer`) in 0.2.157 and 0.2.158. The default is decided when the value is read and
 /// never written to `config.toml`, so a later release can change it
 /// for every node that did not set the key, which is how a default-off
 /// release turns QUIC off. A value given with `--transport-quic` or
