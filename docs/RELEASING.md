@@ -510,8 +510,10 @@ Current wire-gated floors:
   floor being lowered.
 
 - `QUIC_DATA_RAMP_START` (T0) and `QUIC_DATA_RAMP_RELEASE` in
-  `crates/core/src/transport/quic/upgrade/policy.rs` (#5940): both `None` in
-  tree. The reviewed PR for the QUIC data ramp release sets T0 to the planned
+  `crates/core/src/transport/quic/upgrade/policy.rs` (#5940): set for the
+  0.2.158 ramp (#6224: T0 `1_794_796_200`, 2026-11-16 02:30 UTC, and
+  `Some("0.2.158")`), and they stay set; only an emergency stop returns T0 to
+  `None`. The reviewed PR for a QUIC data ramp release sets T0 to the planned
   publish time, in Unix seconds, and `QUIC_DATA_RAMP_RELEASE` to that release's
   version. `scripts/check_quic_data_ramp_t0.sh` then refuses a live cut of
   that version when the clock is more than 3 h from T0 either side (a dry run
@@ -569,7 +571,8 @@ Current wire-gated floors:
 
 - `QUIC_DATA_RAMP_START` in `crates/core/src/transport/quic/upgrade/policy.rs`
   (#5940): when the QUIC data ramp starts, in Unix seconds, or `None` (no pair
-  carries data). It is `None` in tree. For the ramp release, a small reviewed PR
+  carries data). It is set for the 0.2.158 ramp (#6224) and stays set; only an
+  emergency stop returns it to `None`. For a ramp release, a small reviewed PR
   sets it to the planned publish time (T0) just before the soak, and it stays set
   afterwards: from T0 the share of pairs carrying data is 5% for 6 h, then rises
   to 25% at 12 h and 100% at 24 h, and stays at 100% (see "Data slice" in
@@ -593,16 +596,18 @@ Current wire-gated floors:
   Release notes. The release that sets T0 must say in its notes that `prefer`
   nodes, which is every Linux, macOS and Windows node that did not set `transport-quic`,
   start carrying data with a growing share of their pairs. A release cut from
-  main between the ramp code (#6138) and the T0 PR also changes something: it
-  makes `prefer` the default on Linux, macOS and Windows, at a share of 0. Its nodes
-  then behave as shadow nodes (no pair carries data, no path is recycled), but
-  its notes should still say that the default mode changed.
+  main between the ramp code (#6138) and the T0 PR (0.2.157 was one) also
+  changed something: it made `prefer` the default on Linux, macOS and Windows,
+  at a share of 0. Its nodes then behave as shadow nodes (no pair carries
+  data, no path is recycled), but its notes should still say that the default
+  mode changed.
 
   Reading the ramp: each node logs at INFO when its share enters a new band
   ("QUIC data: this node offers data to this share of its pairs", with
-  `data_percent`; at 0% it logs "offers data to none of its pairs"). With T0
-  unset, a `prefer` node logs at startup that it has no data share and keeps
-  every pair's data on UDP. In telemetry, `quic_enabled_data_paths` and
+  `data_percent`; at 0% it logs "offers data to none of its pairs"). With no
+  ramp start and `QUIC_DATA_PERCENT` at 0 (before the ramp, or after an
+  emergency stop), a `prefer` node logs at startup that it has no data share
+  and keeps every pair's data on UDP. In telemetry, `quic_enabled_data_paths` and
   `quic_live_data_paths` count paths carrying data, the
   `quic_close_sent_recycle_for_data` / `quic_close_received_recycle_for_data`
   counts are paths recycled to take data as the share reaches them (expected,
