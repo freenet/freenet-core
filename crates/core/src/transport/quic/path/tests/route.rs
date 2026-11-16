@@ -188,7 +188,9 @@ fn timeouts_on_a_quiet_path_close_it_and_a_sent_starts_again() {
     );
     let mut take = |outcome: &BoundedSend| count.take_uncapped(outcome, false, Some(5), QUIET);
     assert!(take(&timeouts()[0]), "the eighth");
-    assert!(!take(&timeouts()[1]), "the close comes once");
+    // Past the limit the verdict holds, so a close left alone at the limit
+    // (`QuicPath::settle`) is made at a later timeout; the path counts it once.
+    assert!(take(&timeouts()[1]), "past the limit");
 }
 
 /// While acknowledgements arrive, no timeout counts: a busy path is not a stalled
@@ -404,6 +406,57 @@ fn a_path_with_a_quiet_timeout_is_suspect_until_the_peer_acknowledges() {
         assert!(!p.a.is_suspect(), "acknowledged again");
         assert_eq!(p.a.stats().send_event_count(QuicSendEvent::SuspectLeft), 1);
         assert!(p.a.quinn_connection().close_reason().is_none());
+    });
+}
+
+/// The stall close on a path with a UDP session leaves alone a path the dark
+/// rule would have closed (the watch's flag, `recycle::AckWatch::publishing_dark`):
+/// with the flag set before the limit, timeouts past it close nothing; once the
+/// flag clears (the peer heard again) the next counted timeout closes it, the
+/// verdict holding past the limit, counted once. With the flag set only after
+/// the eighth timeout, or a stall the dark rule would not have closed (the peer
+/// still heard: the flag never set), the close comes at the eighth, as before.
+/// A native path closes whatever the flag says.
+#[test]
+fn the_stall_close_leaves_a_path_the_dark_rule_would_have_closed() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let closed = |p: &Paths| p.a.quinn_connection().close_reason().is_some();
+        let stalled = |p: &Paths| p.a.stats().send_event_count(QuicSendEvent::StalledClosed);
+
+        let p = paths("quic-route-stall-dark", QuicPathLimits::DEFAULT).await;
+        let later = p.time().now_nanos() + QUIET;
+        p.a.set_dark_for_test(true);
+        for _ in 0..STALLED_SENDS_LIMIT + 2 {
+            p.a.settle(SendKind::Stream, &timeouts()[1], false, later);
+        }
+        assert!(!closed(&p), "left to the idle timeout while dark");
+        assert!(p.a.is_suspect(), "new data goes on UDP");
+        assert_eq!(stalled(&p), 0);
+        p.a.set_dark_for_test(false);
+        p.a.settle(SendKind::Stream, &timeouts()[1], false, later);
+        assert!(closed(&p), "closed past the limit once the flag cleared");
+        p.a.settle(SendKind::Stream, &timeouts()[1], false, later);
+        assert_eq!(stalled(&p), 1);
+
+        let p = paths("quic-route-stall-dark-late", QuicPathLimits::DEFAULT).await;
+        let later = p.time().now_nanos() + QUIET;
+        for _ in 0..STALLED_SENDS_LIMIT {
+            p.a.settle(SendKind::Stream, &timeouts()[1], false, later);
+        }
+        assert!(closed(&p), "the dark rule would not have closed yet");
+        p.a.set_dark_for_test(true);
+        p.a.settle(SendKind::Stream, &timeouts()[1], false, later);
+        assert_eq!(stalled(&p), 1);
+
+        let p = paths_native("quic-route-stall-dark-native").await;
+        let later = p.time().now_nanos() + QUIET;
+        p.a.set_dark_for_test(true);
+        for _ in 0..STALLED_SENDS_LIMIT {
+            p.a.settle(SendKind::Stream, &timeouts()[1], false, later);
+        }
+        assert!(closed(&p), "a native path has no UDP to leave it to");
+        assert_eq!(stalled(&p), 1);
     });
 }
 

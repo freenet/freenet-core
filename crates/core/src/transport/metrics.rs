@@ -511,9 +511,9 @@ labelled_counters! {
     /// `quic_fallback_<label>`. An attempt that ended before it was active is
     /// not here; see `quic_upgrade_*`. The UDP session ending under a path is
     /// `quic_upgrade_session_ended_active`.
-    /// Not here: a close this node sent for `send_abort_limit` or
-    /// `peer_not_acknowledging` reaches the machine as a lost connection
-    /// (`reset`), and is counted by `quic_close_sent_*`; the same codes sent
+    /// A close this node sent reaches the machine as a lost connection; it is
+    /// counted by the reason the closer recorded (`liveness_tx`, `closed_tx`),
+    /// and its code by `quic_close_sent_*`; the codes sent
     /// by the peer are `downgrade_rx`, with the raw code in
     /// `quic_close_received_*`. A key mismatch is
     /// `quic_upgrade_identity_mismatch`.
@@ -537,6 +537,16 @@ labelled_counters! {
         /// peer's QUIC buffer budget than it allows. A peer on a release
         /// before the code does not send it.
         OverBudgetReceived => "over_budget_rx",
+        /// This node closed it because the peer stopped making progress on
+        /// it: an acknowledgement-watch rule (`quic_stall_close_<stall>`
+        /// says which) or the stalled-sends count. Counted as `reset` by
+        /// releases before the label.
+        LivenessClosed => "liveness_tx",
+        /// This node closed it for another recorded reason: too many reset
+        /// sends, the peer over its buffer budget, refused data, or a
+        /// panicked receive task. Counted as `reset` by releases before the
+        /// label.
+        LocallyClosed => "closed_tx",
     }
 }
 

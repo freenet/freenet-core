@@ -180,7 +180,8 @@ pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, Qui
 /// of this side's permits or for the peer's stream credit, which is
 /// back-pressure, not a stall. What ends the cases these timeouts no longer
 /// count: a path whose sends nothing acknowledges is closed by its
-/// acknowledgement watch's dark-path rule (`recycle::AckWatch`); a peer that
+/// acknowledgement watch's dark-path rule (`recycle::AckWatch`) if it has no
+/// UDP session, and by quinn's idle timeout if it has one; a peer that
 /// acknowledges other traffic but never a stream's end has the stream reset
 /// at its ack wait (`bounded::SendDeadlines::ack_wait`), and three strikes
 /// within 30 min are counted as a would-close
@@ -224,8 +225,11 @@ pub(crate) fn hold_credit(cap: &CapHoldReading) -> Duration {
 /// What [`StallCount::take`] decided.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct StallVerdict {
-    /// The eighth such timeout in a row: close the path.
+    /// The eighth such timeout in a row or a later one: close the path.
     pub(crate) close: bool,
+    /// The eighth exactly: the close is counted here even when the path was
+    /// already closed, as before a close could be left for a later timeout.
+    pub(crate) at_limit: bool,
     /// A timeout that counted: the path made no progress for the window.
     pub(crate) quiet_timeout: bool,
 }
@@ -248,8 +252,11 @@ pub(crate) struct StallVerdict {
 /// The first counted timeout also makes the path suspect
 /// ([`QuicPath::become_suspect`]), which keeps new sends off it. So on a path
 /// that went dark the close fires only if `STALLED_SENDS_LIMIT` sends were
-/// already on it; otherwise the acknowledgement watch's dark rule closes it
-/// (`recycle::dark_close_bound`), with its new data on UDP meanwhile.
+/// already on it, and on a path with a UDP session only before the dark rule
+/// would have closed it (`QuicPath::settle`); otherwise a native path is closed
+/// by the acknowledgement watch's dark rule (`recycle::dark_close_bound`) and
+/// one with a UDP session by quinn's idle timeout, with its new data on UDP
+/// meanwhile.
 ///
 /// The acknowledgement count is read when a send settles, so progress is seen at
 /// the next settle after it, within one send's deadline. A receiver whose
@@ -368,7 +375,12 @@ impl StallCount {
         }
         self.in_a_row += 1;
         StallVerdict {
-            close: self.in_a_row == STALLED_SENDS_LIMIT,
+            // At or past the limit: a close left alone at the limit (a dark
+            // path with a UDP session, `QuicPath::settle`) is tried again at
+            // the next counted timeout. Closing an already closed path sends
+            // and counts nothing.
+            close: self.in_a_row >= STALLED_SENDS_LIMIT,
+            at_limit: self.in_a_row == STALLED_SENDS_LIMIT,
             quiet_timeout: true,
         }
     }
@@ -474,7 +486,36 @@ impl QuicPath {
         if let (true, Some(acked), true) = (verdict.quiet_timeout, acked, self.udp_fallback) {
             self.become_suspect(acked);
         }
-        if verdict.close {
+        // A path the dark rule would have closed by now (the acknowledgement
+        // watch's flag, `recycle::AckWatch::publishing_dark`: two probe rounds
+        // after its window unanswered, nothing heard from the peer) is the
+        // dark rule's: on a path with a UDP session new sends already go on
+        // UDP (suspect, above), and the close is left to quinn's idle timeout,
+        // as the dark rule leaves it (`recycle::DARK_CLOSES_WITH_UDP`). A
+        // stall the dark rule would not have closed (the peer still heard, or
+        // before the rule's close) closes as before, and so does a native
+        // path. The flag moves at the watch's 2 s samples, the same samples the
+        // dark rule decides at, so a stall close before the flag is set is one
+        // the dark rule had not yet made either.
+        if verdict.close
+            && self.udp_fallback
+            && !recycle::DARK_CLOSES_WITH_UDP
+            && self.dark.load(std::sync::atomic::Ordering::Acquire)
+        {
+            tracing::debug!(
+                in_a_row = STALLED_SENDS_LIMIT,
+                "QUIC path: sends keep timing out and the peer is silent; the path is \
+                 left to the idle timeout, and new data goes on UDP"
+            );
+        } else if verdict.close
+            && (self.close_for(
+                QuicCloseCode::Downgrade,
+                crate::transport::boundary::QuicPathEnd::Stalled,
+            ) || verdict.at_limit)
+        {
+            // Counted once: at the limit, or at the later timeout that made a
+            // close left alone at the limit; a verdict after that finds the
+            // path closed.
             self.stats.record_send_event(QuicSendEvent::StalledClosed);
             if self.udp_fallback {
                 tracing::warn!(
@@ -489,10 +530,6 @@ impl QuicPath {
                      the native connection"
                 );
             }
-            self.close_for(
-                QuicCloseCode::Downgrade,
-                crate::transport::boundary::QuicPathEnd::Stalled,
-            );
         }
         step
     }
