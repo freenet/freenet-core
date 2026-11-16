@@ -193,6 +193,9 @@ pub(crate) mod demux;
 pub(crate) mod egress_cap;
 pub mod in_memory_socket;
 pub(crate) mod join_versions;
+/// A NAT for the in-memory network (filtering only), used by NAT simulations.
+#[cfg(any(test, feature = "testing"))]
+pub mod nat_model;
 pub(crate) mod quic;
 #[cfg(test)]
 pub(crate) mod test_net;
