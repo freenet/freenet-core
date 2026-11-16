@@ -397,6 +397,7 @@ pub(super) async fn send_stream<S: super::super::Socket, T: TimeSource>(
         destination_addr,
         bytes_to_send,
         TransferDirection::Send,
+        TransferTransport::Udp,
     );
 
     tracing::debug!(
@@ -1063,6 +1064,7 @@ where
         destination_addr,
         total_bytes,
         TransferDirection::Send,
+        TransferTransport::Udp,
     );
 
     tracing::debug!(
@@ -1091,51 +1093,51 @@ where
         // tokio::time::timeout uses real timers which don't advance in
         // VirtualTime simulation tests.
         let next_fragment = tokio::select! {
-                   result = stream.next() => {
-                       match result {
-                           Some(r) => r,
-                           None => break, // Stream complete
-                       }
-                   }
-                   _ = time_source.sleep(inactivity_timeout) => {
-                       // No fragment arrived within the inactivity timeout
-                       let elapsed = time_source.now().saturating_sub(start_time);
-                       tracing::warn!(
-                           stream_id = %outbound_stream_id.0,
-                           destination = %destination_addr,
-                           sent_so_far,
-                           total_bytes,
-                           fragment_number,
-                           elapsed_ms = elapsed.as_millis(),
-                           "pipe_stream stalled: no fragment received within {}s",
-                           inactivity_timeout.as_secs()
-                       );
-                       emit_transfer_failed(
-                           outbound_stream_id.0 as u64,
-                           destination_addr,
-                           sent_so_far,
-                           format!(
-                               "pipe stalled: no fragment for {}s (sent {sent_so_far}/{total_bytes} bytes)",
-                               inactivity_timeout.as_secs()
-                           ),
-                           elapsed.as_millis() as u64,
-                           TransferDirection::Send,
-        TransferTransport::Udp,
-                       );
-                       // Stall is in the UPSTREAM inbound feed, not the downstream
-                       // connection — fail only this stream so other ops multiplexed
-                       // on the downstream connection survive (#4345). The op layer
-                       // times out and retries; the idle timeout decides connection
-                       // liveness. Release the bytes already forwarded for this stream
-                       // so the frozen flight size doesn't starve the next stream.
-                       release_aborted_stream_flightsize(
-                           outbound_stream_id,
-                           sent_packet_tracker.as_ref(),
-                           congestion_controller.as_ref(),
-                       );
-                       return Err(TransportError::OutboundStreamFailed(destination_addr));
-                   }
-               };
+            result = stream.next() => {
+                match result {
+                    Some(r) => r,
+                    None => break, // Stream complete
+                }
+            }
+            _ = time_source.sleep(inactivity_timeout) => {
+                // No fragment arrived within the inactivity timeout
+                let elapsed = time_source.now().saturating_sub(start_time);
+                tracing::warn!(
+                    stream_id = %outbound_stream_id.0,
+                    destination = %destination_addr,
+                    sent_so_far,
+                    total_bytes,
+                    fragment_number,
+                    elapsed_ms = elapsed.as_millis(),
+                    "pipe_stream stalled: no fragment received within {}s",
+                    inactivity_timeout.as_secs()
+                );
+                emit_transfer_failed(
+                    outbound_stream_id.0 as u64,
+                    destination_addr,
+                    sent_so_far,
+                    format!(
+                        "pipe stalled: no fragment for {}s (sent {sent_so_far}/{total_bytes} bytes)",
+                        inactivity_timeout.as_secs()
+                    ),
+                    elapsed.as_millis() as u64,
+                    TransferDirection::Send,
+                    TransferTransport::Udp,
+                );
+                // Stall is in the UPSTREAM inbound feed, not the downstream
+                // connection — fail only this stream so other ops multiplexed
+                // on the downstream connection survive (#4345). The op layer
+                // times out and retries; the idle timeout decides connection
+                // liveness. Release the bytes already forwarded for this stream
+                // so the frozen flight size doesn't starve the next stream.
+                release_aborted_stream_flightsize(
+                    outbound_stream_id,
+                    sent_packet_tracker.as_ref(),
+                    congestion_controller.as_ref(),
+                );
+                return Err(TransportError::OutboundStreamFailed(destination_addr));
+            }
+        };
         let payload = match next_fragment {
             Ok(data) => data,
             Err(e) => {
@@ -3373,8 +3375,11 @@ mod tests {
         drain.abort();
         // Reported as a UDP transfer, though its source is QUIC-fed.
         assert_eq!(
-            crate::transport::metrics::transfer_ends_of(piped_id.0 as u64),
-            [("transfer_failed", crate::tracing::TransferTransport::Udp)]
+            crate::transport::metrics::transfer_events_of(piped_id.0 as u64),
+            [
+                ("transfer_started", crate::tracing::TransferTransport::Udp),
+                ("transfer_failed", crate::tracing::TransferTransport::Udp)
+            ]
         );
     }
 

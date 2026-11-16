@@ -4676,7 +4676,10 @@ pub fn emit_transfer_started(
     peer_addr: SocketAddr,
     expected_bytes: u64,
     direction: TransferDirection,
+    transport: TransferTransport,
 ) {
+    #[cfg(test)]
+    note_transfer_event(stream_id, "transfer_started", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Started {
@@ -4685,6 +4688,7 @@ pub fn emit_transfer_started(
             expected_bytes,
             direction,
             tx_id: None, // Transaction ID not available at transport layer
+            transport,
             timestamp: crate::tracing::telemetry::current_timestamp_ms(),
         };
         // Fire-and-forget: try_send avoids blocking the transport layer; channel full means telemetry drops
@@ -4693,10 +4697,10 @@ pub fn emit_transfer_started(
     }
 }
 
-// Test-only: the transfer ends emitted on this thread, as (stream id, event,
+// Test-only: the transfer events emitted on this thread, as (stream id, event,
 // transport), so a test finds its own: stream ids and transfers are per
 // thread in tests (`StreamId::next`, a current-thread runtime), and another
-// test's ends never land here. Kept apart from the QUIC event log, which every
+// test's events never land here. Kept apart from the QUIC event log, which every
 // transfer would otherwise crowd.
 #[cfg(test)]
 thread_local! {
@@ -4705,14 +4709,14 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn note_transfer_end(stream_id: u64, event: &'static str, transport: TransferTransport) {
+fn note_transfer_event(stream_id: u64, event: &'static str, transport: TransferTransport) {
     TRANSFER_TEST_LOG.with(|log| log.borrow_mut().push((stream_id, event, transport)));
 }
 
-/// Test-only: how the transfer of `stream_id` was reported to end on this
-/// thread, if it was.
+/// Test-only: the transfer events of `stream_id` emitted on this thread, in
+/// order.
 #[cfg(test)]
-pub(crate) fn transfer_ends_of(stream_id: u64) -> Vec<(&'static str, TransferTransport)> {
+pub(crate) fn transfer_events_of(stream_id: u64) -> Vec<(&'static str, TransferTransport)> {
     TRANSFER_TEST_LOG.with(|log| {
         log.borrow()
             .iter()
@@ -4744,7 +4748,7 @@ pub fn emit_transfer_completed(
     transport: TransferTransport,
 ) {
     #[cfg(test)]
-    note_transfer_end(stream_id, "transfer_completed", transport);
+    note_transfer_event(stream_id, "transfer_completed", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Completed {
@@ -4784,7 +4788,7 @@ pub fn emit_transfer_failed(
     transport: TransferTransport,
 ) {
     #[cfg(test)]
-    note_transfer_end(stream_id, "transfer_failed", transport);
+    note_transfer_event(stream_id, "transfer_failed", transport);
     let sender_guard = TRANSFER_EVENT_SENDER.read();
     if let Some(sender) = sender_guard.as_ref() {
         let event = TransferEvent::Failed {

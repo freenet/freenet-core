@@ -186,6 +186,7 @@ impl<T: TimeSource> PathTransfer<T> {
             remote_addr,
             bytes,
             TransferDirection::Send,
+            TransferTransport::Quic,
         );
         let started = time_source.now();
         Self {
@@ -519,10 +520,29 @@ fn record_pipe_end(
     step: NextStep,
 ) {
     let node = route.path().stats().node();
+    match pipe_end(step, outcome, stalled) {
+        Some(PipeEnd::Sent) => node.record_pipe_sent(quic_fed),
+        Some(PipeEnd::Dropped(cause)) => node.record_pipe_dropped(quic_fed, cause),
+        None => {}
+    }
+}
+
+/// How a pipe's end is counted in `quic_pipe_source_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipeEnd {
+    Sent,
+    Dropped(PipeDropCause),
+}
+
+/// The count a pipe that settled to `step` takes: `sent` for a `Sent` outcome
+/// that is done, `dropped` (with its cause) for one given up, and none for one
+/// that went on UDP or ended `MaybeDelivered`, as `quic_data_send_pipe_sent`
+/// and `quic_data_send_pipe_dropped` count them.
+fn pipe_end(step: NextStep, outcome: &BoundedSend, stalled: bool) -> Option<PipeEnd> {
     match step {
-        NextStep::Done if matches!(outcome, BoundedSend::Sent) => node.record_pipe_sent(quic_fed),
-        NextStep::GiveUp => node.record_pipe_dropped(quic_fed, pipe_drop_cause(outcome, stalled)),
-        NextStep::Done | NextStep::SendOnUdp => {}
+        NextStep::Done if matches!(outcome, BoundedSend::Sent) => Some(PipeEnd::Sent),
+        NextStep::GiveUp => Some(PipeEnd::Dropped(pipe_drop_cause(outcome, stalled))),
+        NextStep::Done | NextStep::SendOnUdp => None,
     }
 }
 
@@ -530,14 +550,25 @@ fn record_pipe_end(
 /// waited for its source (`stalled`, as the stall count reads it), or anything
 /// else, which is this path's.
 fn pipe_drop_cause(outcome: &BoundedSend, stalled: bool) -> PipeDropCause {
+    // Every variant named, so a new one does not compile until it has a cause.
     match outcome {
         BoundedSend::Failed(SendFailure::Error(
             QuicSendError::Source(_) | QuicSendError::LengthMismatch { .. },
         )) => PipeDropCause::SourceError,
         BoundedSend::Failed(SendFailure::TimedOut) if stalled => PipeDropCause::SourceStallTimeout,
-        BoundedSend::Sent | BoundedSend::MaybeDelivered(_) | BoundedSend::Failed(_) => {
-            PipeDropCause::OwnPath
-        }
+        BoundedSend::Failed(
+            SendFailure::TimedOut
+            | SendFailure::NotOpened(_)
+            | SendFailure::Paced
+            | SendFailure::Error(
+                QuicSendError::InvalidFrame(_)
+                | QuicSendError::Stopped(_)
+                | QuicSendError::ConnectionLost(_)
+                | QuicSendError::Closed,
+            ),
+        )
+        | BoundedSend::Sent
+        | BoundedSend::MaybeDelivered(_) => PipeDropCause::OwnPath,
     }
 }
 
@@ -589,5 +620,66 @@ where
         let polled = Pin::new(&mut this.inner).poll_next(cx);
         this.waiting.store(polled.is_pending(), Ordering::Relaxed);
         polled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::quic::path::{MaybeDelivered, NotOpened};
+
+    /// A pipe is counted in `quic_pipe_source_*` exactly when
+    /// `QuicPath::settle` counts it `sent` or `dropped`: one that went on UDP
+    /// (`SendOnUdp`, counted `not_opened_udp` or `failed_udp`) or ended
+    /// `MaybeDelivered` is in neither family, so each pair sums to its
+    /// `quic_data_send_pipe_<result>`.
+    #[test]
+    fn a_pipe_is_counted_only_when_it_ends_sent_or_dropped() {
+        let timed_out = BoundedSend::Failed(SendFailure::TimedOut);
+        let cases = [
+            (NextStep::Done, BoundedSend::Sent, Some(PipeEnd::Sent)),
+            (
+                NextStep::Done,
+                BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut),
+                None,
+            ),
+            (
+                NextStep::Done,
+                BoundedSend::MaybeDelivered(MaybeDelivered::ConnectionLost),
+                None,
+            ),
+            (
+                NextStep::SendOnUdp,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)),
+                None,
+            ),
+            (
+                NextStep::SendOnUdp,
+                BoundedSend::Failed(SendFailure::Error(QuicSendError::Stopped(u64::from(
+                    crate::transport::quic::path::stop_code::NOT_ACCEPTING_DATA,
+                )))),
+                None,
+            ),
+            (
+                NextStep::GiveUp,
+                timed_out,
+                Some(PipeEnd::Dropped(PipeDropCause::OwnPath)),
+            ),
+        ];
+        for (step, outcome, want) in cases {
+            assert_eq!(
+                pipe_end(step, &outcome, false),
+                want,
+                "{step:?} {outcome:?}"
+            );
+        }
+        assert_eq!(
+            pipe_end(
+                NextStep::GiveUp,
+                &BoundedSend::Failed(SendFailure::TimedOut),
+                true
+            ),
+            Some(PipeEnd::Dropped(PipeDropCause::SourceStallTimeout))
+        );
     }
 }

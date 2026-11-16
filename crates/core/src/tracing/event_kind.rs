@@ -1787,6 +1787,8 @@ pub enum TransferEvent {
         /// Transaction ID associated with this transfer (if available).
         /// May be None when the transport layer doesn't have transaction context.
         tx_id: Option<Transaction>,
+        /// Which transport carries it.
+        transport: TransferTransport,
         timestamp: u64,
     },
     /// A data stream transfer completed successfully.

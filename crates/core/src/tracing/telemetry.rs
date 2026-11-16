@@ -2687,6 +2687,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     expected_bytes,
                     direction,
                     tx_id,
+                    transport,
                     timestamp,
                 } => {
                     serde_json::json!({
@@ -2696,6 +2697,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "expected_bytes": expected_bytes,
                         "direction": format!("{:?}", direction),
                         "tx_id": tx_id.as_ref().map(|t| t.to_string()),
+                        "transport": transport.label(),
                         "timestamp": timestamp,
                     })
                 }
@@ -6276,8 +6278,8 @@ mod tests {
         );
     }
 
-    /// `transfer_failed` and `transfer_completed` say which transport carried
-    /// the transfer, as `transport`: `udp` or `quic`.
+    /// `transfer_started`, `transfer_failed` and `transfer_completed` say which
+    /// transport carries the transfer, as `transport`: `udp` or `quic`.
     #[test]
     fn transfer_events_carry_their_transport() {
         use crate::tracing::{TransferDirection, TransferEvent, TransferTransport};
@@ -6312,7 +6314,16 @@ mod tests {
                 transport,
                 timestamp: 0,
             }));
-            for json in [failed, completed] {
+            let started = event_kind_to_json(&EventKind::Transfer(TransferEvent::Started {
+                stream_id: 1,
+                peer_addr: addr,
+                expected_bytes: 0,
+                direction: TransferDirection::Send,
+                tx_id: None,
+                transport,
+                timestamp: 0,
+            }));
+            for json in [started, failed, completed] {
                 assert_eq!(json["transport"], serde_json::json!(transport.label()));
             }
         }

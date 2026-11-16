@@ -1918,7 +1918,7 @@ fn a_fallback_that_fails_on_udp_leaves_no_debt() {
 
 /// A pipe that ends `sent` or `dropped` is counted by what fed its inbound
 /// stream (`quic_pipe_source_*`), a dropped one by cause (`quic_pipe_dropped_*`),
-/// and its transfer end is reported as a QUIC transfer: a QUIC-fed pipe sent
+/// and its transfer start and end are reported as a QUIC transfer: a QUIC-fed pipe sent
 /// whole; a UDP-fed one whose source fails (`source_error`); a QUIC-fed one
 /// whose source stops past the 5 s gap (`source_stall_timeout`); and a UDP-fed
 /// one whose path closes under it (`own_path`).
@@ -2020,8 +2020,11 @@ fn pipe_ends_are_counted_by_source_and_cause() {
                 assert_eq!(snapshot.pipe_source, source, "{case:?}");
                 assert_eq!(snapshot.pipe_dropped, dropped, "{case:?}");
                 assert_eq!(
-                    crate::transport::metrics::transfer_ends_of(piped_id.0 as u64),
-                    [(end, TransferTransport::Quic)],
+                    crate::transport::metrics::transfer_events_of(piped_id.0 as u64),
+                    [
+                        ("transfer_started", TransferTransport::Quic),
+                        (end, TransferTransport::Quic)
+                    ],
                     "{case:?}"
                 );
             },
