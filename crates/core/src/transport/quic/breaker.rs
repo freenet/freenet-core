@@ -19,9 +19,8 @@
 //! **Windows is weaker than unix.** There, a crash not preceded by a panic in
 //! QUIC code is not counted, a crash loop whose runs each last ten minutes or
 //! more never trips, and neither does a fault that crashes once a day. QUIC
-//! became on by default on Windows (shadow, then `prefer` for the data ramp)
-//! after this breaker was confirmed on a real Windows machine (#6031), with
-//! those limits weighed. The ramp's emergency stop returned Windows to off.
+//! became on by default on Windows (shadow, now `prefer`) after this breaker
+//! was confirmed on a real Windows machine (#6031), with those limits weighed.
 //!
 //! # The marker
 //!

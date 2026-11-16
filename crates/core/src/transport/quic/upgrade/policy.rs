@@ -75,9 +75,8 @@ fn may_carry_data_with(config: &NetworkApiConfig, ramp_start: Option<u64>) -> bo
 /// starts later. `quic-data-percent` replaces the ramp on one node.
 /// `scripts/check_quic_data_ramp_t0.sh` reads this line, so keep it on one line
 /// in this form.
-// The emergency stop: no ramp, so a node that set `prefer` itself gets a
-// share of 0. QUIC_DATA_RAMP_RELEASE stays named (see its doc).
-pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = None;
+// 2026-11-16 02:30:00 UTC: the ramp start of the 0.2.158 release (#6224).
+pub(in crate::transport) const QUIC_DATA_RAMP_START: Option<u64> = Some(1_794_796_200);
 
 /// Whether this build sets a ramp start: for tests outside the transport
 /// module whose expectations change once [`QUIC_DATA_RAMP_START`] is set.

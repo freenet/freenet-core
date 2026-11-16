@@ -1173,9 +1173,8 @@ use crate::operations::connect::native::NativeWire;
 /// high only delays the offer.
 /// Raised from 0.2.158 to 0.2.159 by the QUIC data ramp PR (#6224): 0.2.158
 /// starts the data ramp, and turning on the native connect offer in the same
-/// release would change two things at once. Raised to 0.2.160 by the
-/// emergency stop of the ramp: a stop release goes back to states the field
-/// has run, and no release has emitted the native variants.
+/// release would change two things at once. Raised to 0.2.160 for 0.2.159,
+/// which ships while the data ramp is still under watch.
 pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 160);
 
 /// Has the decoder for the QUIC-native `ConnectMsg` variants shipped, and in
