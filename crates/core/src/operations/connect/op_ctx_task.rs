@@ -417,8 +417,8 @@ async fn drive_client_connect(
     // misbehaving relay cannot grow it or the `ConnectFailed` traffic.
     let refused_native_cap = acceptor_limit(target_connections);
     let mut refused_native: HashSet<PeerKeyLocation> = HashSet::new();
-    // Queued acceptors that decided `Native` and that this node dials native,
-    // taken out when their dial starts. A subset of `accepted`, so it stays
+    // Acceptors that decided `Native` and that this node dials native, taken
+    // out when their dial starts (`start_dials!`). A subset of `accepted`, so it stays
     // within `acceptor_limit`.
     let mut native_acceptors: HashSet<PeerKeyLocation> = HashSet::new();
     // `connected_dials`: acceptors actually connected. `accepted` also holds
@@ -473,6 +473,54 @@ async fn drive_client_connect(
         acceptor_limit(target_connections),
     );
     let mut dials = FuturesUnordered::new();
+    // Starts the dial to `$first`, an acceptor a dial slot was just taken for,
+    // as `plan_acceptor_dial` says. A UDP dial planned for later frees the
+    // slot at once (it waits outside the queue), so the next queued acceptor
+    // is started too, and so on.
+    macro_rules! start_dials {
+        ($first:expr) => {{
+            let mut next: Option<(PeerKeyLocation, Instant)> = $first;
+            while let Some((acceptor, answered_at)) = next.take() {
+                let window = if native_acceptors.remove(&acceptor) {
+                    crate::transport::native_setup_window(
+                        acceptor.pub_key(),
+                        &op_manager.ring.connection_manager.pub_key,
+                    )
+                    .or(Some(std::time::Duration::ZERO))
+                } else {
+                    None
+                };
+                match plan_acceptor_dial(answered_at, window, Instant::now()) {
+                    AcceptorDialPlan::Now(transport) => {
+                        dials.push(futures::future::Either::Left(
+                            begin_acceptor_dial(op_manager, tx, acceptor, answered_at, transport)
+                                .await?,
+                        ));
+                    }
+                    AcceptorDialPlan::UdpAt(at) => {
+                        let acceptor_addr =
+                            acceptor.socket_addr().ok_or(OpError::UnexpectedOpState)?;
+                        tracing::info!(
+                            tx = %tx,
+                            acceptor = %acceptor_addr,
+                            queued_ms = answered_at.elapsed().as_millis(),
+                            "connect driver: too late for this acceptor's QUIC-native setup; \
+                             dialling UDP"
+                        );
+                        dials.push(futures::future::Either::Right(udp_fallback_dial(
+                            op_manager.clone(),
+                            tx,
+                            acceptor,
+                            acceptor_addr,
+                            at,
+                            false,
+                        )));
+                        next = dial_queue.finish();
+                    }
+                }
+            }
+        }};
+    }
 
     loop {
         if collection_end.is_none() && should_exit_for_ttl(&tx) {
@@ -507,7 +555,11 @@ async fn drive_client_connect(
             }
         }
         if let Some((end, since)) = collection_end {
-            if !dial_queue.busy() || Instant::now() >= since + DIAL_DRAIN_LIMIT {
+            // A UDP dial waiting for its fallback time holds no slot, so the
+            // queue alone does not say the dials are done.
+            if (!dial_queue.busy() && dials.is_empty())
+                || Instant::now() >= since + DIAL_DRAIN_LIMIT
+            {
                 // Gateway rotation backoff (2c). A peer with a connection is
                 // always rotated, as before #5858; a bootstrapping one is
                 // spared only if a dial still in flight at the Rejected
@@ -563,15 +615,20 @@ async fn drive_client_connect(
                 result,
                 transport,
                 answered_at,
+                holds_slot,
+                rescues_native,
             })) => {
                 // A native dial that failed is followed by a UDP dial to the
-                // same acceptor, in the same dial slot, before anything counts
-                // it as failed: until UDP is removed a failed native setup must
-                // never cost the join. The UDP dial starts
-                // `NATIVE_FALLBACK_AFTER` after the response arrived, when the
-                // acceptor starts its own (`dispatch_expect_connection_from`),
-                // so the two hole punches overlap. Demotion is recorded where
-                // the setup's end is known (the connection lifecycle).
+                // same acceptor, before anything counts it as failed: until
+                // UDP is removed a failed native setup must never cost the
+                // join. The UDP dial starts `NATIVE_FALLBACK_AFTER` after the
+                // response arrived, when the acceptor starts its own
+                // (`dispatch_expect_connection_from`), so the two hole punches
+                // overlap. It waits outside the dial queue: the slot goes to
+                // the next acceptor at once, whose own punch window is already
+                // running, so a joiner with a connection can briefly have two
+                // dials in flight. Demotion is recorded where the setup's end
+                // is known (the connection lifecycle).
                 if transport.is_native() && !matches!(result, Some(Ok(_))) {
                     tracing::info!(
                         tx = %tx,
@@ -584,36 +641,18 @@ async fn drive_client_connect(
                         acceptor,
                         acceptor_addr,
                         answered_at + crate::transport::NATIVE_FALLBACK_AFTER,
+                        true,
                     )));
+                    start_dials!(dial_queue.finish());
                     continue;
                 }
-                if let Some((next, answered_at)) = dial_queue.finish() {
-                    let native = native_acceptors.remove(&next);
-                    match plan_acceptor_dial(answered_at, native, Instant::now()) {
-                        AcceptorDialPlan::Now(transport) => {
-                            dials.push(futures::future::Either::Left(
-                                begin_acceptor_dial(op_manager, tx, next, answered_at, transport)
-                                    .await?,
-                            ));
-                        }
-                        AcceptorDialPlan::UdpAt(at) => {
-                            let next_addr = next.socket_addr().ok_or(OpError::UnexpectedOpState)?;
-                            tracing::info!(
-                                tx = %tx,
-                                acceptor = %next_addr,
-                                queued_ms = answered_at.elapsed().as_millis(),
-                                "connect driver: too late for this acceptor's QUIC-native \
-                                 setup; dialling UDP"
-                            );
-                            dials.push(futures::future::Either::Right(udp_fallback_dial(
-                                op_manager.clone(),
-                                tx,
-                                next,
-                                next_addr,
-                                at,
-                            )));
-                        }
-                    }
+                if rescues_native && matches!(result, Some(Ok(_))) {
+                    crate::transport::TRANSPORT_METRICS.record_connect_native_rescued_by_udp(
+                        crate::transport::NativeConnectSide::Joiner,
+                    );
+                }
+                if holds_slot {
+                    start_dials!(dial_queue.finish());
                 }
                 // The address the connection was made to, which can differ from
                 // the advertised one when an existing transport is reused.
@@ -946,19 +985,10 @@ async fn drive_client_connect(
                 match dial_queue.offer((payload.acceptor.clone(), Instant::now())) {
                     Offer::Dial((acceptor, answered_at)) => {
                         accepted.insert(acceptor.clone());
-                        // Answered just now: a native acceptor gets the whole
-                        // time to the fallback (`plan_acceptor_dial`).
-                        let transport = if transport.is_native() {
-                            super::native::DialTransport::Native {
-                                within: crate::transport::NATIVE_FALLBACK_AFTER,
-                            }
-                        } else {
-                            transport
-                        };
-                        dials.push(futures::future::Either::Left(
-                            begin_acceptor_dial(op_manager, tx, acceptor, answered_at, transport)
-                                .await?,
-                        ));
+                        if transport.is_native() {
+                            native_acceptors.insert(acceptor.clone());
+                        }
+                        start_dials!(Some((acceptor, answered_at)));
                     }
                     Offer::Queued => {
                         accepted.insert(payload.acceptor.clone());
@@ -1139,12 +1169,20 @@ struct AcceptorDial {
     /// for its UDP fallback. For a UDP dial to a native acceptor, the
     /// fallback time it was started at.
     answered_at: Instant,
+    /// Whether this dial holds a slot in the dial queue. A UDP dial to a
+    /// native acceptor waits for the fallback time outside the queue.
+    holds_slot: bool,
+    /// Whether this is the UDP dial after a failed native setup, so its
+    /// success is a native setup rescued by UDP (`connect_native_rescued_by_udp`).
+    rescues_native: bool,
 }
 
 /// The joiner's UDP dial to an acceptor that decided native, after a failed
 /// native dial or in place of a late one: wait until `at`, the common fallback
 /// time, then dial as [`begin_acceptor_dial`] does. A dial that cannot be
-/// started ends as a failed one.
+/// started ends as a failed one. It holds no slot in the dial queue.
+/// `after_native_failure`: it follows a failed native setup, so its success
+/// is a rescue.
 ///
 /// The acceptor starts its own UDP punch at `at` (measured from its decision),
 /// so the dial-queue wait is recorded from `at`: how late this dial is
@@ -1155,9 +1193,10 @@ async fn udp_fallback_dial(
     acceptor: PeerKeyLocation,
     acceptor_addr: SocketAddr,
     at: Instant,
+    after_native_failure: bool,
 ) -> AcceptorDial {
     tokio::time::sleep_until(at).await;
-    match begin_acceptor_dial(
+    let dial = match begin_acceptor_dial(
         &op_manager,
         tx,
         acceptor.clone(),
@@ -1175,8 +1214,15 @@ async fn udp_fallback_dial(
                 result: None,
                 transport: super::native::DialTransport::Udp,
                 answered_at: at,
+                holds_slot: false,
+                rescues_native: false,
             }
         }
+    };
+    AcceptorDial {
+        holds_slot: false,
+        rescues_native: after_native_failure,
+        ..dial
     }
 }
 
@@ -1191,25 +1237,34 @@ enum AcceptorDialPlan {
 }
 
 /// Plans the dial to an acceptor whose response arrived at `answered_at`:
-/// UDP, or native if it decided native for this CONNECT (`native`).
+/// UDP now if it decided UDP (`acceptor_window` is `None`), or else native
+/// unless the acceptor's own setup has ended or is about to.
 ///
-/// A native attempt is bounded by the common fallback time
-/// (`answered_at + NATIVE_FALLBACK_AFTER`), when the acceptor starts its UDP
-/// fallback, so this node's own fallback is never later than the acceptor's.
-/// A queued acceptor whose dial starts with less than `NATIVE_MIN_WINDOW_LEFT`
-/// before that time is dialled over UDP at that time instead, with no native
-/// attempt: the acceptor's setup has ended or is about to, so the attempt
-/// would only time out, count toward this node's demotion, and push its UDP
-/// dial past the acceptor's.
-fn plan_acceptor_dial(answered_at: Instant, native: bool, now: Instant) -> AcceptorDialPlan {
+/// `acceptor_window` is the acceptor's setup window, by its role
+/// (`native_setup_window`: 8 s as client, 12 s as server). The acceptor
+/// started it when it decided, a little before `answered_at`, so
+/// `answered_at + acceptor_window` is a late estimate of its end, which errs
+/// toward trying native. With less than `NATIVE_MIN_WINDOW_LEFT` of it left,
+/// a native attempt could only time out, count toward this node's demotion and
+/// push its UDP dial past the acceptor's, so the acceptor is dialled over UDP
+/// at the common fallback time instead (`answered_at + NATIVE_FALLBACK_AFTER`,
+/// now if it has passed). A native attempt's deadline is that fallback time,
+/// so this node's own fallback is never later than the acceptor's.
+fn plan_acceptor_dial(
+    answered_at: Instant,
+    acceptor_window: Option<std::time::Duration>,
+    now: Instant,
+) -> AcceptorDialPlan {
     use super::native::DialTransport;
-    if !native {
+    let Some(acceptor_window) = acceptor_window else {
         return AcceptorDialPlan::Now(DialTransport::Udp);
-    }
+    };
     let fallback_at = answered_at + crate::transport::NATIVE_FALLBACK_AFTER;
-    let within = fallback_at.saturating_duration_since(now);
-    if within >= crate::transport::NATIVE_MIN_WINDOW_LEFT {
-        AcceptorDialPlan::Now(DialTransport::Native { within })
+    let acceptor_left = (answered_at + acceptor_window).saturating_duration_since(now);
+    if acceptor_left >= crate::transport::NATIVE_MIN_WINDOW_LEFT {
+        AcceptorDialPlan::Now(DialTransport::Native {
+            deadline: fallback_at,
+        })
     } else {
         AcceptorDialPlan::UdpAt(fallback_at)
     }
@@ -1287,6 +1342,8 @@ async fn begin_acceptor_dial(
             result,
             transport,
             answered_at,
+            holds_slot: true,
+            rescues_native: false,
         }
     })
 }
@@ -3613,6 +3670,7 @@ mod driver_timing_tests {
             acceptor,
             addr,
             at,
+            true,
         ));
         let NodeEvent::ExpectPeerConnection { addr: expected, .. } =
             next_node_event(&mut events).await
@@ -3632,7 +3690,7 @@ mod driver_timing_tests {
         let prod = &SOURCE[..SOURCE.find("\n#[cfg(test)]\n").expect("test module")];
         let flat: String = prod.split_whitespace().collect();
         assert!(flat.contains(
-            "dials.push(futures::future::Either::Right(udp_fallback_dial(op_manager.clone(),tx,acceptor,acceptor_addr,answered_at+crate::transport::NATIVE_FALLBACK_AFTER,)));"
+            "dials.push(futures::future::Either::Right(udp_fallback_dial(op_manager.clone(),tx,acceptor,acceptor_addr,answered_at+crate::transport::NATIVE_FALLBACK_AFTER,true,)));"
         ));
         const CONNECT: &str = include_str!("../connect.rs");
         let flat: String = CONNECT.split_whitespace().collect();
@@ -3641,36 +3699,77 @@ mod driver_timing_tests {
         ));
     }
 
-    /// The joiner plans a native acceptor's dial against the common fallback
-    /// time: native within what is left until then, or, with less than
-    /// `NATIVE_MIN_WINDOW_LEFT` left, UDP at that time with no native attempt.
+    /// The joiner plans a native acceptor's dial against the acceptor's own
+    /// window, by its role: native, bounded by the common fallback time, while
+    /// at least `NATIVE_MIN_WINDOW_LEFT` of the acceptor's window is left;
+    /// after that, UDP at the fallback time with no native attempt.
     #[test]
-    fn a_native_acceptors_dial_is_planned_against_the_fallback_time() {
+    fn a_native_acceptors_dial_is_planned_against_the_acceptors_window() {
         use super::super::native::DialTransport;
         use super::{AcceptorDialPlan, plan_acceptor_dial};
         let answered_at = Instant::now();
         let fallback_at = answered_at + crate::transport::NATIVE_FALLBACK_AFTER;
         let at = |secs: f64| answered_at + Duration::from_secs_f64(secs);
-        let native = |secs: u64| {
-            AcceptorDialPlan::Now(DialTransport::Native {
-                within: Duration::from_secs(secs),
-            })
-        };
-        assert_eq!(plan_acceptor_dial(answered_at, true, at(0.0)), native(12));
-        assert_eq!(plan_acceptor_dial(answered_at, true, at(3.0)), native(9));
-        assert_eq!(plan_acceptor_dial(answered_at, true, at(8.0)), native(4));
+        let native = AcceptorDialPlan::Now(DialTransport::Native {
+            deadline: fallback_at,
+        });
+        let late = AcceptorDialPlan::UdpAt(fallback_at);
+        let (client, server) = (Some(Duration::from_secs(8)), Some(Duration::from_secs(12)));
+        // The acceptor as client: its window ends 8 s after the response.
+        assert_eq!(plan_acceptor_dial(answered_at, client, at(0.0)), native);
+        assert_eq!(plan_acceptor_dial(answered_at, client, at(4.0)), native);
+        assert_eq!(plan_acceptor_dial(answered_at, client, at(4.001)), late);
+        // The acceptor as server: 12 s.
+        assert_eq!(plan_acceptor_dial(answered_at, server, at(8.0)), native);
+        assert_eq!(plan_acceptor_dial(answered_at, server, at(8.001)), late);
+        assert_eq!(plan_acceptor_dial(answered_at, server, at(15.0)), late);
+        // A UDP acceptor.
         assert_eq!(
-            plan_acceptor_dial(answered_at, true, at(8.001)),
-            AcceptorDialPlan::UdpAt(fallback_at)
-        );
-        assert_eq!(
-            plan_acceptor_dial(answered_at, true, at(15.0)),
-            AcceptorDialPlan::UdpAt(fallback_at)
-        );
-        assert_eq!(
-            plan_acceptor_dial(answered_at, false, at(15.0)),
+            plan_acceptor_dial(answered_at, None, at(15.0)),
             AcceptorDialPlan::Now(DialTransport::Udp)
         );
+    }
+
+    /// The window a node runs as each role in a native setup.
+    #[test]
+    fn the_native_setup_window_follows_the_role() {
+        let (low, high) = ordered_keys();
+        assert_eq!(
+            crate::transport::native_setup_window(&low, &high),
+            Some(Duration::from_secs(8))
+        );
+        assert_eq!(
+            crate::transport::native_setup_window(&high, &low),
+            Some(Duration::from_secs(12))
+        );
+        assert_eq!(crate::transport::native_setup_window(&low, &low), None);
+    }
+
+    /// Two distinct public keys, lower first.
+    fn ordered_keys() -> (
+        crate::transport::TransportPublicKey,
+        crate::transport::TransportPublicKey,
+    ) {
+        let (a, b) = (
+            TransportKeypair::new().public().clone(),
+            TransportKeypair::new().public().clone(),
+        );
+        if a < b { (a, b) } else { (b, a) }
+    }
+
+    /// A peer at `port` whose key is above `than` (a native server against
+    /// it) or below (a client).
+    fn peer_as(
+        port: u16,
+        than: &crate::transport::TransportPublicKey,
+        server: bool,
+    ) -> PeerKeyLocation {
+        loop {
+            let candidate = peer(port);
+            if (candidate.pub_key() > than) == server && candidate.pub_key() != than {
+                return candidate;
+            }
+        }
     }
 
     /// A joiner that can dial native, at percent 100.
@@ -3734,7 +3833,8 @@ mod driver_timing_tests {
                 let punches = punches.clone();
                 tokio::spawn(async move {
                     let result = match transport {
-                        DialTransport::Native { within } => {
+                        DialTransport::Native { deadline } => {
+                            let within = deadline.saturating_duration_since(Instant::now());
                             tokio::time::sleep(native_takes.min(within)).await;
                             Err(())
                         }
@@ -3763,31 +3863,40 @@ mod driver_timing_tests {
         });
     }
 
-    /// Review round 2, must-fix 1: a joiner with a connection dials its
-    /// acceptors one at a time, so a native acceptor queued behind a failed
-    /// native dial (12 s to the fallback time, then a 3 s punch) is dialled
-    /// after its own fallback time. It must be dialled over UDP at once, with
-    /// no native attempt: the acceptor's setup is over, so a native attempt
-    /// would only time out (a demotion strike) and push the UDP dial a full
-    /// client window past the acceptor's punch.
-    #[tokio::test(start_paused = true)]
-    async fn a_queued_native_acceptor_past_its_fallback_time_is_dialled_udp_at_once() {
-        use super::super::native::{DialTransport, NativeDecision, NativeOffer};
-        let (op_manager, events, _endpoint) = native_joiner("queued-native-late").await;
-        connect_existing_peer(&op_manager, 24970);
+    /// Runs a joiner with a connection (it dials one acceptor at a time)
+    /// against `acceptors`, all answering at once, each as (port, decided
+    /// native, its role is server); native dials fail after 8 s, UDP dials
+    /// connect after 3 s. Returns what it dialled, and when.
+    async fn queued_dials(
+        name: &str,
+        acceptors: &[(u16, bool, bool)],
+    ) -> (
+        Instant,
+        Vec<SocketAddr>,
+        Vec<(SocketAddr, super::super::native::DialTransport, Duration)>,
+    ) {
+        use super::super::native::{NativeDecision, NativeOffer};
+        let (op_manager, events, _endpoint) = native_joiner(name).await;
+        connect_existing_peer(&op_manager, acceptors[0].0 - 1);
         let log = TransportLog::default();
+        // The log's times and the responses are both from here.
+        let t0 = Instant::now();
         native_event_loop(events, Duration::from_secs(8), None, log.clone());
         let tx = Transaction::new::<ConnectMsg>();
-        let gateway = peer(24971);
-        let (first, second) = (peer(24972), peer(24973));
-        let (replies_tx, replies_rx) = mpsc::channel(4);
-        for acceptor in [&first, &second] {
+        let gateway = peer(acceptors[0].0 - 2);
+        let own = op_manager.ring.connection_manager.pub_key.clone();
+        let (replies_tx, replies_rx) = mpsc::channel(acceptors.len());
+        let mut addrs = Vec::new();
+        for &(port, native, server) in acceptors {
+            let acceptor = peer_as(port, &own, server);
+            addrs.push(acceptor.socket_addr().unwrap());
+            let decision = if native {
+                NativeDecision::Native
+            } else {
+                NativeDecision::Udp
+            };
             replies_tx
-                .send(response_deciding(
-                    tx,
-                    acceptor,
-                    Some(NativeDecision::Native),
-                ))
+                .send(response_deciding(tx, &acceptor, Some(decision)))
                 .await
                 .unwrap();
         }
@@ -3799,7 +3908,7 @@ mod driver_timing_tests {
                 gateway.clone(),
                 gateway.socket_addr().unwrap(),
                 Location::new(0.5),
-                2,
+                acceptors.len(),
                 false,
                 replies_rx,
                 &op_manager,
@@ -3811,27 +3920,89 @@ mod driver_timing_tests {
         .await
         .expect("bounded")
         .expect("driver result");
-        assert_eq!(connected, 2, "both acceptors connect");
-        let (first, second) = (first.socket_addr().unwrap(), second.socket_addr().unwrap());
-        let fallback = crate::transport::NATIVE_FALLBACK_AFTER;
-        assert_eq!(
-            *log.lock(),
-            vec![
-                (
-                    first,
-                    DialTransport::Native { within: fallback },
-                    Duration::ZERO
-                ),
-                (first, DialTransport::Udp, fallback),
-                (
-                    second,
-                    DialTransport::Udp,
-                    fallback + NAT_TRAVERSAL_DEADLINE
-                ),
-            ],
-            "the second acceptor is dialled UDP as soon as the first connects"
-        );
+        assert_eq!(connected, acceptors.len(), "every acceptor connects");
         drop(replies_tx);
+        let mut log = log.lock().clone();
+        log.sort_by_key(|(addr, _, at)| (*at, *addr));
+        (t0, addrs, log)
+    }
+
+    /// Native setups rescued by UDP on this thread: (as joiner, as acceptor).
+    fn rescues_here() -> (u64, u64) {
+        let [joiner, acceptor] =
+            crate::transport::metrics::NATIVE_RESCUES_ON_THIS_THREAD.with(|c| c.get());
+        (joiner, acceptor)
+    }
+
+    /// 10.2 items 9 and 10, the acceptors as clients: a joiner with a
+    /// connection dials one acceptor at a time. The first native dial fails at
+    /// 8 s, and its UDP fallback waits for the fallback time (12 s) outside
+    /// the dial queue, so the queue moves on at once. The second native
+    /// acceptor, a client whose window ended at 8 s, gets no native attempt (it
+    /// could only time out and count a strike): it waits for its own fallback
+    /// time too, also outside the queue. So the UDP acceptor queued behind
+    /// them is dialled at 8 s, inside its punch window, not after the
+    /// fallbacks.
+    #[tokio::test(start_paused = true)]
+    async fn a_queue_behind_a_failed_native_dial_moves_on_at_once() {
+        use super::super::native::DialTransport;
+        let before = rescues_here();
+        let (t0, addrs, log) = queued_dials(
+            "queued-native-clients",
+            &[
+                (24970, true, false),
+                (24971, true, false),
+                (24972, false, false),
+            ],
+        )
+        .await;
+        let fallback = crate::transport::NATIVE_FALLBACK_AFTER;
+        let s = Duration::from_secs;
+        let mut expected = vec![
+            (
+                addrs[0],
+                DialTransport::Native {
+                    deadline: t0 + fallback,
+                },
+                s(0),
+            ),
+            (addrs[2], DialTransport::Udp, s(8)),
+            (addrs[0], DialTransport::Udp, fallback),
+            (addrs[1], DialTransport::Udp, fallback),
+        ];
+        expected.sort_by_key(|(addr, _, at)| (*at, *addr));
+        assert_eq!(log, expected);
+        // Only the first had a native setup for UDP to rescue (R5).
+        assert_eq!(rescues_here(), (before.0 + 1, before.1));
+    }
+
+    /// 10.2 item 10, the acceptors as servers: a server's window runs 12 s,
+    /// so the second native acceptor, reached at 8 s, still has 4 s of it
+    /// left and is dialled native, bounded by its fallback time; it fails at
+    /// 12 s and falls back at once.
+    #[tokio::test(start_paused = true)]
+    async fn a_queued_server_acceptor_with_its_window_left_is_dialled_native() {
+        use super::super::native::DialTransport;
+        let before = rescues_here();
+        let (t0, addrs, log) = queued_dials(
+            "queued-native-servers",
+            &[(24975, true, true), (24976, true, true)],
+        )
+        .await;
+        let fallback = crate::transport::NATIVE_FALLBACK_AFTER;
+        let s = Duration::from_secs;
+        let native = DialTransport::Native {
+            deadline: t0 + fallback,
+        };
+        let mut expected = vec![
+            (addrs[0], native, s(0)),
+            (addrs[1], native, s(8)),
+            (addrs[0], DialTransport::Udp, fallback),
+            (addrs[1], DialTransport::Udp, fallback),
+        ];
+        expected.sort_by_key(|(addr, _, at)| (*at, *addr));
+        assert_eq!(log, expected);
+        assert_eq!(rescues_here(), (before.0 + 2, before.1));
     }
 
     /// Review round 2, must-fix 2: the two sides of one CONNECT, joiner as
@@ -3862,7 +4033,11 @@ mod driver_timing_tests {
             Some((punches.clone(), 1)),
             acceptor_log.clone(),
         );
-        let (joiner, acceptor, gateway) = (peer(24975), peer(24976), peer(24977));
+        let before = rescues_here();
+        let joiner = peer(24977);
+        let acceptor = peer_as(24978, &joiner_om.ring.connection_manager.pub_key, true);
+        let gateway = peer(24979);
+        let t0 = Instant::now();
         let tx = Transaction::new::<ConnectMsg>();
 
         // The acceptor decides native and starts its setup; its response
@@ -3920,22 +4095,31 @@ mod driver_timing_tests {
             log.lock().iter().map(|(_, t, at)| (*t, *at)).collect()
         };
         let fallback = crate::transport::NATIVE_FALLBACK_AFTER;
-        assert_eq!(
-            transports(&acceptor_log),
-            vec![
-                (DialTransport::NATIVE, Duration::ZERO),
-                (DialTransport::Udp, fallback),
-            ],
-            "the acceptor punches at the fallback time after its decision"
+        let acceptor_dials = transports(&acceptor_log);
+        assert!(
+            matches!(
+                acceptor_dials.as_slice(),
+                [(DialTransport::Native { .. }, start), (DialTransport::Udp, at)]
+                    if *start == Duration::ZERO && *at == fallback
+            ),
+            "the acceptor punches at the fallback time after its decision: {acceptor_dials:?}"
         );
         assert_eq!(
             transports(&joiner_log),
             vec![
-                (DialTransport::Native { within: fallback }, travel),
+                (
+                    DialTransport::Native {
+                        deadline: t0 + travel + fallback
+                    },
+                    travel
+                ),
                 (DialTransport::Udp, travel + fallback),
             ],
             "the joiner punches at the fallback time after the response"
         );
+        // Each side counts the rescue once (R5).
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(rescues_here(), (before.0 + 1, before.1 + 1));
     }
 
     /// A peer that already has a connection (#5858 leaves it unchanged):
