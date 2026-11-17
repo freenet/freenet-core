@@ -1543,7 +1543,7 @@ a test passes its own; tests read their own, never the global).
   quic_ack_wait_expired_<stream|short|control>: ack-wait expiries that
   counted as strikes (path::StrikeCheck), by kind; expected 0 on honest
   paths. quic_stall_close_<not_acknowledging|dark|credit_starved|
-  stream_credit_withheld|ack_waits_expired>: paths the acknowledgement
+  stream_credit_withheld|ack_waits_expired|late_ends>: paths the acknowledgement
   watch closed, by why (recycle::Stall). quic_stall_would_close_<same
   labels>: times a rule that only observes would have closed a path:
   ack_waits_expired and dark, each on paths with a UDP session
@@ -2911,9 +2911,28 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     runs out holds the 48 permits (each for at least 5 min) and the 64
     one-packet Short epochs (about 150 s each) indefinitely, with no
     expiry and no abort; every further streamed send waits its 2 s open
-    deadline and goes on UDP (after UDP removal, it fails). Not counted as
-    a strike: the threshold for "acknowledged later than an honest peer
-    could" is the same backlog-sized wait, hours on a busy slow path.
+    deadline and goes on UDP (after UDP removal, it fails). The ack wait
+    cannot judge it (its threshold is the backlog-sized wait, hours on a
+    busy slow path), so a separate check judges the end by the
+    connection's progress (path::LateEndCheck, late_end_verdict): once
+    the connection has acknowledged, since the end, the bytes ahead of the
+    end's last byte under quinn's round-robin (path::bytes_ahead) plus the
+    congestion window when the end was sent (at least 64 KiB), the last
+    packet has been sent, and an honest stack acknowledges it within
+    late_end_grace (9 round trips and 75 ms, at least 2 s). An end still
+    unacknowledged then is a LATE END: counted in
+    quic_late_end_<stream|short|control> (the stream is not reset), and
+    three within 30 min count a would-close under late_ends
+    (quic_stall_would_close_late_ends). OBSERVE-ONLY on every path
+    (recycle::LATE_ENDS_CLOSE is false) until the field counts calibrate
+    it. Not judged while the egress cap holds a transmit or after a late
+    wake (the proof restarts), nor once the path was dark for the watch's
+    window since the end. Honest paths see none
+    (concurrent_large_streams_on_a_slow_path_see_no_expiry,
+    a_slow_lossy_path_stays_within_its_consumer_gap and the other no-expiry
+    tests assert it); the check itself is tested with a scripted
+    acknowledgement count (the_late_end_check_polls_until_the_end_is_late),
+    since the test harness's peer acknowledges every packet.
     Closes by the watch are counted by why in quic_stall_close_<label>.
   → No false close at 800 ms round trip and 15% loss with the loss gate on
     (a_slow_lossy_path_stays_within_its_consumer_gap: the send ends Sent on

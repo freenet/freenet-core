@@ -68,6 +68,12 @@
 //!    with no UDP session (a native one); on a path with one it only counts
 //!    (`quic_stall_would_close_<label>`) and the path stays open
 //!    ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
+//! 7. **Late ends** ([`Stall::LateEnds`]), observe-only on every path
+//!    ([`LATE_ENDS_CLOSE`]): [`ACK_WAIT_EXPIRY_LIMIT`] sends had their end
+//!    acknowledged late, or not at all, though the connection had
+//!    acknowledged enough bytes since the end to have carried it
+//!    (`path::LateEndCheck`), within [`ACK_WAIT_EXPIRY_WINDOW`]; counted
+//!    (`quic_stall_would_close_late_ends`), and the path stays open.
 //!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
 //! counter of packets the peer newly acknowledged: `frame_rx.acks` counts
