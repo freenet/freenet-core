@@ -1372,24 +1372,24 @@ fn ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged() {
                     vec![recycle::Stall::AckWaitsExpired],
                     "{network}"
                 );
-                assert_eq!(snapshot.stall_closes, vec![0, 0, 0, 0, 1], "{network}");
-                assert_eq!(snapshot.stall_would_close, vec![0; 5], "{network}");
+                assert_eq!(snapshot.stall_closes, vec![0, 0, 0, 0, 1, 0], "{network}");
+                assert_eq!(snapshot.stall_would_close, vec![0; 6], "{network}");
                 assert_eq!(snapshot.ack_wait_expired, vec![3, 0, 0], "{network}");
                 continue;
             }
             assert_eq!(closed_at, None, "{network}: not closed");
             assert_eq!(recycle::stalls_to(b_addr), vec![], "{network}");
-            assert_eq!(snapshot.stall_closes, vec![0; 5], "{network}");
+            assert_eq!(snapshot.stall_closes, vec![0; 6], "{network}");
             if strikes {
                 assert_eq!(snapshot.ack_wait_expired, vec![3, 0, 0], "{network}");
                 assert_eq!(
                     snapshot.stall_would_close,
-                    vec![0, 0, 0, 0, 1],
+                    vec![0, 0, 0, 0, 1, 0],
                     "{network}: one would-close, under ack_waits_expired"
                 );
             } else {
                 assert_eq!(p.a.writers().ack_wait_expiries(), 0, "{network}");
-                assert_eq!(snapshot.stall_would_close, vec![0; 5], "{network}");
+                assert_eq!(snapshot.stall_would_close, vec![0; 6], "{network}");
                 assert_eq!(p.a.send_aborts(), 3, "{network}: still reset");
             }
         }
@@ -1469,6 +1469,11 @@ fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes() {
             "premise: an ack wait ran out and its stream was reset"
         );
         assert_eq!(p.a.writers().ack_wait_expiries(), 0);
+        assert_eq!(
+            p.a.writers().late_ends(),
+            0,
+            "no late end on an honest path"
+        );
         assert!(p.a.connection().inner().close_reason().is_none());
     })
 }
@@ -1640,7 +1645,476 @@ fn concurrent_large_streams_on_a_slow_path_see_no_expiry() {
         );
         assert_eq!(p.a.send_aborts(), 0, "no stream was reset");
         assert_eq!(p.a.writers().ack_wait_expiries(), 0);
+        assert_eq!(
+            p.a.writers().late_ends(),
+            0,
+            "no late end on an honest path"
+        );
     })
+}
+
+/// The late-end verdict (`late_end_verdict`), with literal values: the proof
+/// point is the first time the bytes acknowledged since the end reach the
+/// bytes ahead (with the window at the end added by the caller); late once `late_end_grace` (9 round
+/// trips and 75 ms, at least 2 s) has passed since then; never before the
+/// proof point, however long the end has waited.
+#[test]
+fn a_late_end_needs_the_bytes_ahead_acknowledged_and_the_grace() {
+    const S: u64 = 1_000_000_000;
+    let ahead = 100_000;
+    let proof = ahead;
+    assert_eq!(
+        late_end_grace(Duration::from_millis(50)),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        late_end_grace(Duration::from_millis(800)),
+        Duration::from_millis(7_275)
+    );
+    let rtt = || Duration::from_millis(50);
+    let mut crossed = None;
+    assert!(!late_end_verdict(
+        &mut crossed,
+        ahead,
+        proof - 1,
+        100 * S,
+        rtt
+    ));
+    assert_eq!(crossed, None, "one byte short: no proof point");
+    assert!(!late_end_verdict(&mut crossed, ahead, proof, 101 * S, rtt));
+    assert_eq!(crossed, Some(101 * S));
+    assert!(!late_end_verdict(
+        &mut crossed,
+        ahead,
+        proof * 2,
+        102 * S,
+        rtt
+    ));
+    assert_eq!(crossed, Some(101 * S), "the first crossing is kept");
+    assert!(late_end_verdict(
+        &mut crossed,
+        ahead,
+        proof * 2,
+        103 * S,
+        rtt
+    ));
+    // Waiting long without the proof point is not late.
+    let mut crossed = None;
+    assert!(!late_end_verdict(&mut crossed, ahead, 0, 10_000 * S, rtt));
+}
+
+/// The late-end check on virtual time (`LateEndCheck::late`), with a scripted
+/// acknowledgement count: the bytes ahead (64 KiB from one send in flight)
+/// plus the window at the end (64 KiB) are acknowledged at 10 s, so the end is late at the first
+/// tick at least 2 s later; an egress-cap hold at the proof point restarts the
+/// proof; a long dark episode since the end excuses it for good (the check
+/// never returns within 120 s).
+#[test]
+fn the_late_end_check_polls_until_the_end_is_late() {
+    use super::super::socket::CapHolds;
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let make_time = time.clone();
+        let make = move |acked: Arc<AtomicU64>, cap: Arc<CapHolds>, dark_at: Arc<AtomicU64>| {
+            let time = make_time.clone();
+            let clock = time.clone();
+            LateEndCheck {
+                reading: Arc::new(move || LaterReading {
+                    in_flight: 1,
+                    rest: 64 * 1024,
+                    started: 0,
+                    started_bytes: 0,
+                    acked_since_end: acked.load(Relaxed),
+                    window_at_end: 64 * 1024,
+                }),
+                rtt: Arc::new(|| Duration::from_millis(50)),
+                now: Arc::new(move || clock.now_nanos()),
+                cap,
+                dark_at,
+                end_at: time.now_nanos().max(1),
+                counted: Arc::default(),
+            }
+        };
+        let sleeper: Sleeper = {
+            let time = time.clone();
+            Arc::new(move |duration| time.sleep_cancelable(duration))
+        };
+        let proof = 128 * 1024;
+        let (clock, s2) = (time.clone(), sleeper.clone());
+        let took = drive(&time, LIMIT, async move {
+            let acked = Arc::new(AtomicU64::new(0));
+            let check = make(acked.clone(), Arc::new(CapHolds::new(None)), Arc::default());
+            let start = clock.now();
+            let feeder = {
+                let (acked, clock) = (acked.clone(), clock.clone());
+                tokio::spawn(async move {
+                    clock.sleep(Duration::from_secs(10)).await;
+                    acked.store(proof, Relaxed);
+                })
+            };
+            check.late(s2.clone()).await;
+            feeder.await.unwrap();
+            let plain = clock.now() - start;
+
+            // A long dark episode since the end: never late.
+            let dark_at = Arc::new(AtomicU64::new(0));
+            let check = make(
+                Arc::new(AtomicU64::new(proof)),
+                Arc::new(CapHolds::new(None)),
+                dark_at.clone(),
+            );
+            dark_at.store(clock.now_nanos() + 1, Relaxed);
+            let excused = tokio::select! {
+                () = check.late(s2.clone()) => false,
+                () = clock.sleep(Duration::from_secs(120)) => true,
+            };
+            (plain, excused)
+        })
+        .await;
+        let (plain, excused) = took;
+        assert_eq!(
+            plain,
+            Duration::from_secs(12),
+            "proof at 10 s, late at the 12 s tick"
+        );
+        assert!(excused, "dark since the end: not judged");
+        let _ = sleeper;
+    })
+}
+
+/// The real `QuicPath::backlog_wait` closure on a real path: read at an end
+/// with nothing in flight, it counts one send (this one) and the rest; the
+/// sends started since are counted with their bytes (at most a send window
+/// each); only data streams the peer wholly acknowledged since count as
+/// progress, not control frames or quinn's own packets (#6205); and the
+/// re-read follows `later_backlog` on those values.
+#[test]
+fn the_backlog_wait_closure_reads_the_path() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-backlog-closure", QuicPathLimits::DEFAULT).await;
+        let backlog = p.a.backlog_wait(1000)();
+        let read = || (backlog.reading)();
+        let at_end = read();
+        assert_eq!((at_end.in_flight, at_end.rest), (1, 1000));
+        assert_eq!((at_end.started, at_end.started_bytes), (0, 0));
+        assert_eq!(at_end.acked_since_end, 0);
+        assert!(at_end.window_at_end >= LATE_END_MARGIN_MIN);
+        let (a, time) = (p.a.clone(), p.time());
+        let (first, second, sent) = p
+            .drive(async move {
+                let first = a.stream_slot(5_000).await.expect("a permit");
+                let second = a
+                    .stream_slot(2 * super::super::budget::MAX_WINDOW_BYTES)
+                    .await
+                    .expect("a permit");
+                let sent = a
+                    .send_stream_bounded(
+                        &time,
+                        a.stream_deadlines(3_000),
+                        StreamId::next(),
+                        None,
+                        Bytes::from(payload(3_000)),
+                        None,
+                    )
+                    .await;
+                (first, second, sent)
+            })
+            .await;
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+        let later = read();
+        assert_eq!(later.started, 3, "two permits taken here, one by the send");
+        assert_eq!(
+            later.started_bytes,
+            5_000 + super::super::budget::MAX_WINDOW_BYTES + 3_000,
+            "each send's bytes, the window capping the large one"
+        );
+        assert_eq!(
+            later.acked_since_end, 3_000,
+            "the stream wholly acknowledged counts its own bytes only"
+        );
+        let floor = recycle::credit_floor_rate(p.a.connection().inner().stats().path.rtt).max(1);
+        assert_eq!((backlog.later)(), later_backlog(later, floor));
+        drop((first, second));
+    })
+}
+
+/// One end is counted late once, though the send's wait that counted it is
+/// cancelled and a background wait takes over with the same check
+/// (`Outgoing`'s drop): the second watch finds it counted and waits.
+#[test]
+fn a_late_end_is_counted_once_across_its_waits() {
+    use super::super::socket::CapHolds;
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let writers = Arc::new(recycle::Writers::default());
+        let node = leaked_counters();
+        let check = LateEndCheck {
+            reading: Arc::new(|| LaterReading {
+                in_flight: 1,
+                rest: 1000,
+                started: 0,
+                started_bytes: 0,
+                acked_since_end: 1 << 20,
+                window_at_end: 64 * 1024,
+            }),
+            rtt: Arc::new(|| Duration::from_millis(50)),
+            now: Arc::new(move || clock.now_nanos()),
+            cap: Arc::new(CapHolds::new(None)),
+            dark_at: Arc::default(),
+            end_at: time.now_nanos().max(1),
+            counted: Arc::default(),
+        };
+        let sleeper: Sleeper = {
+            let time = time.clone();
+            Arc::new(move |duration| time.sleep_cancelable(duration))
+        };
+        let (clock, w) = (time.clone(), writers.clone());
+        drive(&time, LIMIT, async move {
+            for _ in 0..2 {
+                let watch = late_end_watch(
+                    Some(check.clone()),
+                    Some(sleeper.clone()),
+                    Some(w.clone()),
+                    Some(node),
+                    crate::transport::metrics::AckWaitKind::Stream,
+                );
+                tokio::select! {
+                    () = watch => unreachable!("the watch never returns"),
+                    () = clock.sleep(Duration::from_secs(20)) => {}
+                }
+            }
+        })
+        .await;
+        assert_eq!(writers.late_ends(), 1);
+        assert_eq!(node.snapshot(false).late_end, vec![1, 0, 0]);
+    })
+}
+
+/// Progress past an end counts only data streams opened after it: a stream
+/// already open at the end (here one of 64 KiB, started just before) may have
+/// had most of its bytes acknowledged before the end, so its completion
+/// after the end is not counted, and the re-read keeps its extension; a
+/// stream opened after the end counts its whole length (#6205).
+#[test]
+fn a_stream_open_at_the_end_is_not_progress_past_it() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let network = "quic-path-backlog-open-at-end";
+        // A 400 ms round trip, so the early stream is still unacknowledged
+        // when the other end is sent.
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(200))
+            })),
+        );
+        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        let completions_before = p.a.stream_opens.completions_end();
+        let (a, time) = (p.a.clone(), p.time());
+        let (backlog, before, mid, after) = p
+            .drive(async move {
+                let early = {
+                    let (a, time) = (a.clone(), time.clone());
+                    tokio::spawn(async move {
+                        a.send_stream_bounded(
+                            &time,
+                            a.stream_deadlines(64 * 1024),
+                            StreamId::next(),
+                            None,
+                            Bytes::from(payload(64 * 1024)),
+                            None,
+                        )
+                        .await
+                    })
+                };
+                // Let the early stream open before the other end is sent.
+                time.sleep(Duration::from_millis(50)).await;
+                let backlog = a.backlog_wait(1000)();
+                assert_eq!(
+                    a.stream_opens.completions_end(),
+                    completions_before,
+                    "premise: the early stream is not acknowledged yet at the end"
+                );
+                let before = early.await.expect("the send ran");
+                let mid = ((backlog.reading)(), (backlog.later)());
+                let after = a
+                    .send_stream_bounded(
+                        &time,
+                        a.stream_deadlines(2_000),
+                        StreamId::next(),
+                        None,
+                        Bytes::from(payload(2_000)),
+                        None,
+                    )
+                    .await;
+                (backlog, before, mid, after)
+            })
+            .await;
+        assert!(matches!(before, BoundedSend::Sent), "{before:?}");
+        // The early stream completed after the end: no progress, so the
+        // re-read still gives the bytes ahead.
+        assert_eq!(mid.0.acked_since_end, 0);
+        assert!(mid.1 > Duration::ZERO, "the extension is kept");
+        assert!(matches!(after, BoundedSend::Sent), "{after:?}");
+        set_packet_delivery_callback(network, None);
+        let reading = (backlog.reading)();
+        assert_eq!(
+            reading.acked_since_end, 2_000,
+            "the stream open at the end is not counted, the later one is"
+        );
+    })
+}
+
+/// An egress-cap hold that begins and ends between two polls of the
+/// late-end check restarts the proof, as a hold seen at a poll does: the
+/// bytes ahead are acknowledged at 10 s, a hold comes and goes at 11 s, so
+/// the proof point is the 14 s poll and the end is late at 16 s, not 12 s.
+#[test]
+fn a_cap_hold_between_polls_restarts_the_late_end_proof() {
+    use super::super::socket::CapHolds;
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let acked = Arc::new(AtomicU64::new(0));
+        let cap = Arc::new(CapHolds::new(Some(1_000_000)));
+        let check = {
+            let (acked, clock) = (acked.clone(), clock.clone());
+            LateEndCheck {
+                reading: Arc::new(move || LaterReading {
+                    in_flight: 1,
+                    rest: 64 * 1024,
+                    started: 0,
+                    started_bytes: 0,
+                    acked_since_end: acked.load(Relaxed),
+                    window_at_end: 64 * 1024,
+                }),
+                rtt: Arc::new(|| Duration::from_millis(50)),
+                now: Arc::new(move || clock.now_nanos()),
+                cap: cap.clone(),
+                dark_at: Arc::default(),
+                end_at: time.now_nanos().max(1),
+                counted: Arc::default(),
+            }
+        };
+        let sleeper: Sleeper = {
+            let time = time.clone();
+            Arc::new(move |duration| time.sleep_cancelable(duration))
+        };
+        let took = drive(&time, LIMIT, async move {
+            let start = clock.now();
+            let feeder = {
+                let clock = clock.clone();
+                tokio::spawn(async move {
+                    clock.sleep(Duration::from_secs(10)).await;
+                    acked.store(128 * 1024, Relaxed);
+                    clock.sleep(Duration::from_secs(1)).await;
+                    cap.hold_one();
+                    cap.release_one();
+                })
+            };
+            check.late(sleeper).await;
+            feeder.await.unwrap();
+            clock.now() - start
+        })
+        .await;
+        assert_eq!(took, Duration::from_secs(16));
+    })
+}
+
+/// The completion log keeps the latest 4096 completions; a reader that
+/// falls further behind only under-counts. 5000 completions of one byte
+/// each, read once at the end: 4096. Read after 2000, then after 5000 more:
+/// 2000, then 2000 plus the 4096 still kept, never more than the 7000 that
+/// completed.
+#[test]
+fn the_completion_log_wraps_by_under_counting() {
+    let opens = StreamOpens::default();
+    let mut late = (opens.completions_end(), 0);
+    let mut early = late;
+    for seq in 1..=2000 {
+        opens.acked(seq, 1);
+    }
+    assert_eq!(opens.acked_after(0, &mut early), 2000);
+    for seq in 2001..=5000 {
+        opens.acked(seq, 1);
+    }
+    assert_eq!(opens.completions.lock().entries.len(), COMPLETIONS_KEPT);
+    assert_eq!(
+        opens.acked_after(0, &mut late),
+        4096,
+        "the oldest 904 are gone"
+    );
+    for seq in 5001..=7000 {
+        opens.acked(seq, 1);
+    }
+    let read = opens.acked_after(0, &mut early);
+    assert_eq!(read, 2000 + 4096);
+    assert!(read <= 7000);
+}
+
+/// The late-end check is polled wherever a sent end waits for its
+/// acknowledgement: in `Outgoing::finish` (Streams and multi-packet Shorts)
+/// and in both arms of the background wait in `Outgoing`'s drop (one-packet
+/// Shorts and control frames, bounded or not). A source pin, since the test
+/// harness's peer acknowledges every packet and so cannot make an end late
+/// on a real path: dropping any of these calls fails it, as does dropping
+/// the count of a completed stream's progress in either place.
+#[test]
+fn the_late_end_watch_runs_wherever_an_end_waits() {
+    // Comments stripped, so a commented-out call does not pass.
+    let source: String = include_str!("../path.rs")
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source = source.as_str();
+    let body = |from: &str, to: &str| {
+        let start = source
+            .find(from)
+            .unwrap_or_else(|| panic!("{from} not found"));
+        let end = start
+            + source[start..]
+                .find(to)
+                .unwrap_or_else(|| panic!("{to} not found"));
+        &source[start..end]
+    };
+    let finish = body("    async fn finish(mut self)", "\nimpl Outgoing {");
+    assert!(finish.contains("late_end_watch("), "finish polls the check");
+    assert!(
+        finish.contains("() = late => unreachable!"),
+        "finish selects the check against the acknowledgement"
+    );
+    let drop = body(
+        "impl Drop for Outgoing {",
+        "\npub(crate) const ACK_WAITS_WITHOUT_PERMIT",
+    );
+    assert!(
+        drop.contains("late_end_watch("),
+        "the background wait builds the check"
+    );
+    assert!(
+        finish.contains("opens.acked(*seq, *len);"),
+        "a completed stream counts as progress in finish"
+    );
+    assert!(
+        drop.contains("opens.acked(*seq, *len);"),
+        "and in the background wait"
+    );
+    assert_eq!(
+        drop.matches("() = late => unreachable!").count(),
+        2,
+        "both arms of the background wait select the check"
+    );
+    let watch = body("async fn late_end_watch(", "\nimpl Drop for Outgoing {");
+    assert!(watch.contains("late.late(sleeper).await;"));
+    assert!(watch.contains("writers.late_end(node, kind);"));
 }
 
 /// The backlog read again at an ack wait's end (`later_backlog`), with
@@ -1660,6 +2134,7 @@ fn the_later_backlog_counts_bytes_ahead_until_they_are_acknowledged() {
         started,
         started_bytes,
         acked_since_end: acked,
+        window_at_end: 0,
     };
     // 2 x 64 KiB in flight, nothing started since: 128 KiB, 4 s.
     assert_eq!(
@@ -1784,6 +2259,11 @@ fn streams_started_after_an_end_extend_its_ack_wait() {
         );
         assert_eq!(p.a.send_aborts(), 0, "no stream was reset");
         assert_eq!(p.a.writers().ack_wait_expiries(), 0);
+        assert_eq!(
+            p.a.writers().late_ends(),
+            0,
+            "no late end on an honest path"
+        );
         assert_eq!(counters.snapshot(false).ack_wait_expired, vec![0, 0, 0]);
     })
 }
@@ -2117,6 +2597,11 @@ fn ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes() {
             "premise: an ack wait ran out and its stream was reset"
         );
         assert_eq!(p.a.writers().ack_wait_expiries(), 0, "no strike");
+        assert_eq!(
+            p.a.writers().late_ends(),
+            0,
+            "no late end on an honest path"
+        );
         assert!(!closed);
     })
 }
@@ -2281,6 +2766,11 @@ fn a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry() {
         set_packet_delivery_callback(network, None);
         assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
         assert_eq!(p.a.writers().ack_wait_expiries(), 0);
+        assert_eq!(
+            p.a.writers().late_ends(),
+            0,
+            "no late end on an honest path"
+        );
     })
 }
 
@@ -11480,6 +11970,11 @@ fn a_slow_lossy_path_stays_within_its_consumer_gap() {
                     p.a.writers().ack_wait_expiries(),
                     0,
                     "len {len} seed {seed}: an honest path's ack wait ran out"
+                );
+                assert_eq!(
+                    p.a.writers().late_ends(),
+                    0,
+                    "len {len} seed {seed}: an honest path's end was judged late"
                 );
                 crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
             }

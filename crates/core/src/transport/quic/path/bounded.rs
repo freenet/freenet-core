@@ -297,7 +297,7 @@ struct ProgressState {
 /// The backlog ahead of a stream's end read again, once, when its ack wait
 /// first runs out: the bytes that can go before its last byte, counting the
 /// streamed sends started since the end, and nothing once the connection has
-/// acknowledged that many bytes since (`path::later_backlog`).
+/// wholly acknowledged that many data-stream bytes since (`path::later_backlog`).
 pub(crate) type LaterBacklog = Arc<dyn Fn() -> Duration + Send + Sync>;
 
 impl SendProgress {
