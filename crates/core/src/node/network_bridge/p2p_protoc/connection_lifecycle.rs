@@ -98,6 +98,34 @@ pub(super) enum Promotion {
 }
 
 impl P2pConnManager {
+    /// Report how this end's native setup ended, once per setup (gate 22).
+    /// Best effort: the event is dropped when telemetry is off or full, and
+    /// the collector's per-type admission counters say how often.
+    fn report_native_setup_outcome(
+        &self,
+        transaction: &Transaction,
+        peer: &PeerKeyLocation,
+        outcome: &str,
+        origin: crate::transport::NatAttemptOrigin,
+    ) {
+        crate::tracing::telemetry::send_standalone_event_with_peer_id(
+            "native_setup_outcome",
+            &self
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .own_location()
+                .to_string(),
+            crate::operations::connect::native::native_setup_outcome_body(
+                transaction,
+                peer.pub_key(),
+                outcome,
+                origin,
+            ),
+        );
+    }
+
     /// Bind `key`, from `source`, as the peer identity of the open connection
     /// at `addr` (see `identity::bind` for the rules). On
     /// [`BindOutcome::Held`] or [`BindOutcome::HeldByQuiet`], `pending`
@@ -1314,6 +1342,14 @@ impl P2pConnManager {
                 transport,
                 origin,
             } => {
+                if transport.is_native() {
+                    self.report_native_setup_outcome(
+                        &transaction,
+                        &peer,
+                        crate::transport::NativeSetupOutcome::Established.label(),
+                        origin,
+                    );
+                }
                 // Outbound peers must have known addresses - use type-safe conversion
                 // If conversion fails, log error but continue since connection is established
                 let peer_addr = match KnownPeerKeyLocation::try_from(&peer) {
@@ -1582,6 +1618,14 @@ impl P2pConnManager {
                 native_outcome,
                 origin,
             } => {
+                if transport.is_native() {
+                    self.report_native_setup_outcome(
+                        &transaction,
+                        &peer,
+                        native_outcome.map_or("unknown", |outcome| outcome.label()),
+                        origin,
+                    );
+                }
                 // Demotion counts only an end that says native does not work
                 // on the path (`counts_toward_demotion`), and only as joiner
                 // (a success resets the streak only as joiner too). A joiner's
