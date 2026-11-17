@@ -4054,17 +4054,19 @@ async fn native_success_then_a_failed_udp_dial_beside_it_keeps_the_connection() 
     beside::assert_clear(&h, addr);
 }
 
-/// #6253 review item 2: both dials connect, the native one first. The native
-/// connection is kept (both sides prefer native) and the UDP one is dropped
-/// without touching the ring.
+/// #6253 review item 2: both dials connect, the native one first. The first
+/// connection (native) is kept and the UDP one is dropped without touching
+/// the ring, and counted.
 #[tokio::test]
 async fn native_then_udp_both_connect_keeps_the_native_connection() {
     let mut h = Harness::new("beside-native-then-udp").await;
     let addr: SocketAddr = "203.0.113.236:6281".parse().unwrap();
+    let before = both_connected_here();
     let (peer, mut native, mut udp) = beside::dials(&mut h, addr).await;
     h.handshake_event(beside::established(&peer, true)).await;
     let id = h.mgr.connections[&addr].connection_id;
     h.handshake_event(beside::established(&peer, false)).await;
+    assert_eq!(both_connected_here(), (before.0, before.1 + 1));
     assert_eq!(native.try_recv(), Ok(Ok((addr, None))));
     assert_eq!(udp.try_recv(), Ok(Ok((addr, None))));
     assert_eq!(
@@ -4076,45 +4078,80 @@ async fn native_then_udp_both_connect_keeps_the_native_connection() {
     beside::assert_clear(&h, addr);
 }
 
-/// #6253 review item 2: both dials connect, the UDP one first. The native
-/// connection then takes the entry in place: the ring keeps the peer, and
-/// nothing is pruned.
+/// Both dials connected on this thread: (kept UDP, kept native).
+fn both_connected_here() -> (u64, u64) {
+    let [udp, native] =
+        crate::transport::metrics::BOTH_DIALS_CONNECTED_ON_THIS_THREAD.with(|c| c.get());
+    (udp, native)
+}
+
+/// #6253 review round 2: both dials connect, the UDP one first. The first
+/// connection is kept: the native one is closed without touching the ring
+/// (no prune, so no second DropConnection) and counted, and the native
+/// dial's requesters were answered by the UDP connection.
 #[tokio::test]
-async fn udp_then_native_both_connect_switches_to_native_in_place() {
+async fn udp_then_native_both_connect_keeps_the_udp_connection() {
     let mut h = Harness::new("beside-udp-then-native").await;
     let addr: SocketAddr = "203.0.113.236:6282".parse().unwrap();
+    let before = both_connected_here();
     let (peer, mut native, mut udp) = beside::dials(&mut h, addr).await;
     h.handshake_event(beside::established(&peer, false)).await;
     assert_eq!(native.try_recv(), Ok(Ok((addr, None))));
     assert_eq!(udp.try_recv(), Ok(Ok((addr, None))));
     let udp_id = h.mgr.connections[&addr].connection_id;
-    assert!(
-        h.state.beside_udp_connected.contains(&addr),
-        "premise: UDP connected first"
-    );
     while h.handshake_rx.try_recv().is_ok() {}
     h.handshake_event(beside::established(&peer, true)).await;
-    // Replacing a ring connection prunes it, which also tells the handshake
-    // driver to drop the address; the arm itself sends one drop for the
-    // expectation. In place, only that one.
+    assert_eq!(
+        h.mgr.connections[&addr].connection_id, udp_id,
+        "the UDP connection, established first, stays"
+    );
     let mut drops = 0;
     while let Ok(command) = h.handshake_rx.try_recv() {
         if matches!(command, HandshakeCommand::DropConnection { addr: a } if a == addr) {
             drops += 1;
         }
     }
-    assert_eq!(drops, 1, "the UDP connection was not pruned from the ring");
-    assert_ne!(
-        h.mgr.connections[&addr].connection_id, udp_id,
-        "the native connection took the entry"
-    );
-    assert_eq!(
-        h.ring_key_at(addr).as_ref(),
-        Some(peer.pub_key()),
-        "the ring keeps the peer"
-    );
+    // The arm drops the address's expectation once, as for any outbound
+    // connection; a replacement would prune and send a second.
+    assert_eq!(drops, 1, "nothing was pruned or replaced");
+    assert_eq!(h.ring_key_at(addr).as_ref(), Some(peer.pub_key()));
     assert_eq!(h_count(&h), 1);
+    assert_eq!(both_connected_here(), (before.0 + 1, before.1));
     beside::assert_clear(&h, addr);
+}
+
+/// #6253 review round 2 (M3): the native dial connects but its connection is
+/// not kept (the transient budget is spent), so the requesters of the UDP
+/// dial beside it are not told they are connected; they wait for their own
+/// dial.
+#[tokio::test]
+async fn beside_requesters_are_answered_only_with_a_kept_connection() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::NatAttemptOrigin;
+    let mut h = Harness::with_config("beside-native-not-kept", |config| {
+        config.transient_budget = 0;
+    })
+    .await;
+    let addr: SocketAddr = "203.0.113.236:6287".parse().unwrap();
+    let (peer, _native, mut udp) = beside::dials(&mut h, addr).await;
+    h.handshake_event(HandshakeEvent::OutboundEstablished {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: peer.clone(),
+        connection: Box::new(IdleConnection::new(addr)),
+        transient: true,
+        transport: DialTransport::native_now(),
+        origin: NatAttemptOrigin::ConnectJoiner,
+    })
+    .await;
+    assert!(!h.mgr.connections.contains_key(&addr), "premise: not kept");
+    assert!(
+        udp.try_recv().is_err(),
+        "not answered: no connection exists"
+    );
+    assert!(
+        h.state.udp_beside_native.contains_key(&addr),
+        "its dial still runs"
+    );
 }
 
 /// #6253 review item 3: the UDP dial beside a pending native one fails. No
@@ -4149,7 +4186,8 @@ async fn a_failed_udp_dial_beside_a_native_dial_takes_no_backoff() {
 
 /// The native dial fails while the UDP dial beside it runs, then the UDP
 /// dial fails too: the native failure leaves the in-transit slot to the UDP
-/// dial, and the last failure releases it; neither backs off.
+/// dial, and the last failure takes the ordinary failure path (in-transit
+/// release, failed address, diagnostics) all but the backoff.
 #[tokio::test]
 async fn native_failure_then_udp_failure_beside_it() {
     let mut h = Harness::new("beside-native-fails-udp-fails").await;
@@ -4160,7 +4198,11 @@ async fn native_failure_then_udp_failure_beside_it() {
     assert!(udp.try_recv().is_err(), "the UDP dial is still running");
     h.handshake_event(beside::failed(&peer, false)).await;
     assert_eq!(udp.try_recv(), Ok(Err(())));
-    assert!(!h.state.peer_backoff.is_in_backoff(addr));
+    assert!(!h.state.peer_backoff.is_in_backoff(addr), "no backoff");
+    assert!(
+        failed_addrs(&h).contains(&addr),
+        "the last dial's failure marks the address, as a UDP failure does"
+    );
     beside::assert_clear(&h, addr);
 }
 
