@@ -1556,7 +1556,12 @@ a test passes its own; tests read their own, never the global).
   watch closed, by why (recycle::Stall). quic_stall_would_close_<same
   labels>: times a rule that only observes would have closed a path:
   ack_waits_expired and dark, each on paths with a UDP session
-  (recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP, DARK_CLOSES_WITH_UDP).
+  (recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP, DARK_CLOSES_WITH_UDP), and
+  late_ends on every path (recycle::LATE_ENDS_CLOSE).
+  quic_late_end_<stream|short|control>: sends whose end was acknowledged
+  late, or not at all, though the peer had wholly acknowledged enough
+  data-stream bytes since the end to have carried it (path::LateEndCheck),
+  by kind; expected 0 on honest paths.
   quic_dark_episode_<recovered_lt_5s|lt_10s|lt_30s|lt_120s|recovered_ge_120s|
   unrecovered|cap_held|closed_at_window>: dark episodes (recycle::AckWatch:
   packets outstanding, nothing acknowledged, nothing heard) by how they ended;

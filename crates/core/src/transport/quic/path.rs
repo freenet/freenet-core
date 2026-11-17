@@ -3250,6 +3250,9 @@ impl Drop for Outgoing {
             }
             return;
         }
+        // One label for the expiry and the late end of the same send, read
+        // before the permit is taken out of the stream below.
+        let kind = self.kind();
         let (slot, epoch) = (self.slot.take(), self.epoch.take());
         // Nothing held (a send with neither a permit nor an epoch, which a
         // node's sends practically never are): the stream counts as ended
@@ -3309,14 +3312,6 @@ impl Drop for Outgoing {
         let (aborts, node) = (self.aborts.clone(), self.node);
         let strike = self.strike.clone().zip(self.finished_at).zip(due);
         let acked_into = self.acked_into.clone();
-        // One label for the expiry and the late end of the same send.
-        let kind = if bound_for.is_some() && slot.is_some() {
-            crate::transport::metrics::AckWaitKind::Stream
-        } else if self.control {
-            crate::transport::metrics::AckWaitKind::Control
-        } else {
-            crate::transport::metrics::AckWaitKind::Short
-        };
         let late = late_end_watch(
             self.late.clone(),
             self.sleep.as_ref().map(|(sleep, _)| sleep.clone()),
