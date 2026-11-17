@@ -31,7 +31,13 @@ pub(crate) fn published_commit(contents: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::published_commit;
+    use super::{VCS_INFO_FILE, published_commit};
+
+    /// The name is cargo's, and `build/git_watch.rs` watches the same file.
+    #[test]
+    fn the_file_is_the_one_cargo_publish_writes() {
+        assert_eq!(VCS_INFO_FILE, ".cargo_vcs_info.json");
+    }
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
