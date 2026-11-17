@@ -405,6 +405,61 @@ const QUIC_TRIP_MARKER: &str = "The previous run with QUIC enabled ended abnorma
 /// The breaker's WARN on a later start inside the cooldown.
 const QUIC_COOLING_MARKER: &str = "QUIC stays off: a run with QUIC enabled ended abnormally";
 
+/// The same WARN from the short-run rule, which every peer decides by
+/// (#6151).
+const QUIC_SHORT_RUNS_COOLING_MARKER: &str =
+    "QUIC stays off: several runs in a row with QUIC enabled ended early";
+
+/// The legacy exit-status rule's shadow marker on a unix peer (#6151).
+const LEGACY_SHADOW_FILE: &str = "quic-crash-breaker-legacy.json";
+
+/// The arguments that start a peer: it needs a gateway to start, and this
+/// one is never reached.
+fn peer_args(gateway: &str) -> [&str; 3] {
+    [AS_PEER, "--gateway", gateway]
+}
+
+/// An unreachable gateway for [`peer_args`].
+fn unreachable_gateway() -> String {
+    format!("127.0.0.1:9,{}", "11".repeat(32))
+}
+
+/// The JSON file `name` in `dir`, or `None` when there is none.
+fn read_json(dir: &Path, name: &str) -> anyhow::Result<Option<serde_json::Value>> {
+    match std::fs::read(dir.join(name)) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Wait until `node` has written both a peer's markers: the short-run marker
+/// and the legacy shadow armed with its pid.
+fn wait_for_peer_markers(dir: &Path, node: &NodeProcess) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let marker = read_quic_marker(dir)?;
+        let shadow = read_json(dir, LEGACY_SHADOW_FILE)?;
+        let short_runs = marker
+            .as_ref()
+            .is_some_and(|m| m["state"] == "short_runs" && m["quic_panicked"] == false);
+        let shadow_armed = shadow
+            .as_ref()
+            .is_some_and(|m| m["state"] == "armed" && m["pid"] == node.pid());
+        if short_runs && shadow_armed {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "the peer's markers were not written within 30 s: {marker:?}, shadow \
+                 {shadow:?}. Logs:\n{}",
+                node.logs()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The stop note every test node is given (see `NodeProcess::spawn_with`).
 fn stop_note(dir: &Path) -> PathBuf {
     dir.join("quic-breaker-stop-note")
@@ -810,16 +865,14 @@ fn quic_breaker_on_a_peer_holds_for_the_peer_cooldown() -> anyhow::Result<()> {
         .as_secs();
     let dir = tempfile::tempdir()?;
     write_tripped_marker(dir.path(), now - 20 * 60)?;
-    // A peer needs a gateway to start; this one is never reached.
-    let gateway = format!("127.0.0.1:9,{}", "11".repeat(32));
-    let mut node = spawn_quic_node_with(
-        dir.path(),
-        &dir.path().join("logs"),
-        &[AS_PEER, "--gateway", &gateway],
-    )?;
+    let gateway = unreachable_gateway();
+    let mut node =
+        spawn_quic_node_with(dir.path(), &dir.path().join("logs"), &peer_args(&gateway))?;
     let logs = node.logs();
+    // A peer decides by short runs (#6151), which holds an earlier release's
+    // trip for the peer cooldown too.
     assert!(
-        logs.contains(QUIC_COOLING_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
+        logs.contains(QUIC_SHORT_RUNS_COOLING_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
         "a peer trip 20 min old must keep QUIC off. Logs:\n{logs}"
     );
     node.send_sigterm()?;
@@ -829,6 +882,98 @@ fn quic_breaker_on_a_peer_holds_for_the_peer_cooldown() -> anyhow::Result<()> {
         "Logs:\n{}",
         node.logs()
     );
+    Ok(())
+}
+
+/// #6151: a unix peer decides by short runs that panicked in QUIC code, as
+/// Windows does, so a SIGKILL, which records no QUIC panic, never trips it,
+/// however often it repeats. The exit-status rule it used before runs
+/// beside it as a shadow with its own marker: it still reads each kill as a
+/// crash and trips (telemetry reports that as `legacy_verdict`), and holds
+/// that trip on the next start, with QUIC on throughout. A clean stop clears
+/// both markers. The first start also takes an earlier release's Armed
+/// marker as the shadow's evidence.
+///
+/// FALSIFY: make `decides_by_short_runs` return `!unix` (peers back on the
+/// exit-status rule): the second start trips and builds no endpoint. Drop
+/// the `legacy_shadow` call in `breaker::gate`: no shadow marker is written.
+#[test]
+fn a_unix_peer_decides_by_short_runs_with_the_exit_status_rule_as_a_shadow() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let gateway = unreachable_gateway();
+    // An earlier release's marker for a run that crashed on this boot: the
+    // shadow's first evidence. Pid 1 is alive, so use one that is not.
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok();
+    if let Some(boot_id) = boot_id.as_deref().map(str::trim) {
+        let dead_pid = i32::MAX - 1;
+        let armed = serde_json::json!({
+            "state": "armed", "pid": dead_pid, "boot_id": boot_id, "nonce": 1,
+            "armed_at_secs": 1,
+        });
+        std::fs::write(
+            dir.path().join(QUIC_MARKER_FILE),
+            serde_json::to_vec(&armed)?,
+        )?;
+    }
+
+    for run in 0..3 {
+        let mut node = spawn_quic_node_with(
+            dir.path(),
+            &dir.path().join(format!("logs-{run}")),
+            &peer_args(&gateway),
+        )?;
+        let logs = node.logs();
+        assert!(
+            logs.contains(QUIC_BUILT_MARKER)
+                && !logs.contains(QUIC_TRIP_MARKER)
+                && !logs.contains("Several runs in a row"),
+            "run {run}: a killed peer never trips. Logs:\n{logs}"
+        );
+        if run == 0 && boot_id.is_some() {
+            // The earlier release's crash: the shadow tripped at this start
+            // and holds, so it arms nothing this run.
+            let shadow = read_json(dir.path(), LEGACY_SHADOW_FILE)?;
+            assert_eq!(
+                shadow.as_ref().map(|m| m["state"].clone()),
+                Some("tripped".into()),
+                "{shadow:?}. Logs:\n{logs}"
+            );
+            node.send_sigterm()?;
+            assert_eq!(node.wait_for_exit(Duration::from_secs(45))?.code(), Some(0));
+            std::fs::remove_file(dir.path().join(LEGACY_SHADOW_FILE))?;
+            continue;
+        }
+        wait_for_peer_markers(dir.path(), &node)?;
+        node.kill_abnormally()?;
+        drop(node);
+        let after = spawn_quic_node_with(
+            dir.path(),
+            &dir.path().join(format!("logs-{run}-after")),
+            &peer_args(&gateway),
+        )?;
+        let shadow = read_json(dir.path(), LEGACY_SHADOW_FILE)?;
+        assert_eq!(
+            shadow.as_ref().map(|m| m["state"].clone()),
+            Some("tripped".into()),
+            "the exit-status rule reads a kill as a crash: {shadow:?}. Logs:\n{}",
+            after.logs()
+        );
+        assert!(after.logs().contains(QUIC_BUILT_MARKER), "{}", after.logs());
+        drop(after);
+        std::fs::remove_file(dir.path().join(LEGACY_SHADOW_FILE))?;
+    }
+
+    // A clean stop clears both markers.
+    let mut node = spawn_quic_node_with(
+        dir.path(),
+        &dir.path().join("logs-clean"),
+        &peer_args(&gateway),
+    )?;
+    wait_for_peer_markers(dir.path(), &node)?;
+    node.send_sigterm()?;
+    assert_eq!(node.wait_for_exit(Duration::from_secs(45))?.code(), Some(0));
+    assert_eq!(read_quic_marker(dir.path())?, None);
+    assert_eq!(read_json(dir.path(), LEGACY_SHADOW_FILE)?, None);
     Ok(())
 }
 
