@@ -613,6 +613,9 @@ struct NatNetwork {
     /// with [`nat_filtered_handle`], so a test can read it after the network
     /// is gone.
     filtered: NatFilteredCounts,
+    /// Of those, the ones dropped because a binding had EXPIRED (it was
+    /// opened, then not refreshed within its lifetime).
+    expired: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Inbound datagrams a network's NATs dropped, by the receiver's filtering
@@ -650,6 +653,7 @@ pub fn set_network_nat(
             time,
             nats,
             filtered: NatFilteredCounts::default(),
+            expired: Default::default(),
         })),
     );
 }
@@ -667,6 +671,21 @@ pub fn nat_filtered(network_name: &str) -> HashMap<super::nat_model::NatFilterin
     nat_filtered_handle(network_name)
         .map(|counts| counts.lock().unwrap().clone())
         .unwrap_or_default()
+}
+
+/// Inbound datagrams the network's NATs dropped because a binding had
+/// expired.
+#[cfg(any(test, feature = "testing"))]
+pub fn nat_expired(network_name: &str) -> u64 {
+    NAT_NETWORKS
+        .get(network_name)
+        .map(|n| {
+            n.lock()
+                .unwrap()
+                .expired
+                .load(std::sync::atomic::Ordering::Relaxed)
+        })
+        .unwrap_or(0)
 }
 
 /// The network's NAT drop counts, readable after the network is gone.
@@ -732,6 +751,11 @@ fn nat_inbound(network_name: &str, target: SocketAddr, from: SocketAddr) -> Opti
     };
     if let Some(to) = nat.map_inbound(target, from, now) {
         return Some(to);
+    }
+    if nat.expired_for(from, now) {
+        network
+            .expired
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let filtering = nat.filtering();
     *network

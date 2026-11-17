@@ -245,6 +245,20 @@ impl NatModel {
         }
     }
 
+    /// Whether a datagram from `from` that this NAT drops at `now` would have
+    /// been admitted through a binding that has since expired (as opposed to
+    /// one never opened).
+    pub fn expired_for(&self, from: SocketAddr, now: u64) -> bool {
+        let refreshed = match self.filtering {
+            NatFiltering::Full => self.last_any,
+            NatFiltering::AddressRestricted => self.by_ip.get(&from.ip()).copied(),
+            NatFiltering::PortRestricted | NatFiltering::Symmetric => {
+                self.by_addr.get(&from).copied()
+            }
+        };
+        refreshed.is_some_and(|at| now.saturating_sub(at) > self.lifetime)
+    }
+
     /// Whether a datagram from `from` arriving at `now` gets through.
     pub fn admits(&self, from: SocketAddr, now: u64) -> bool {
         let refreshed = match self.filtering {

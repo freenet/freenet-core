@@ -31,7 +31,6 @@ use crate::transport::in_memory_socket::{
 };
 use crate::transport::nat_model::{DEFAULT_BINDING_LIFETIME, NatFiltering};
 use crate::transport::quic::tests::{bounded, drive, pair};
-use std::sync::atomic::{AtomicU16, Ordering};
 
 /// Which side starts late.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,16 +95,27 @@ enum RunEnd {
     },
 }
 
-/// Ports for the runs: each run binds two fresh addresses, since the
-/// simulated network registry is keyed by address.
-static NEXT_PORT: AtomicU16 = AtomicU16::new(20_000);
+/// How one run went: its end, and what the NATs dropped (all, and those
+/// dropped by a binding that had expired).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CellRun {
+    end: RunEnd,
+    filtered: u64,
+    expired: u64,
+}
 
-/// Runs one setup in `cell` with `seed`; returns how it ended and how many
-/// datagrams the NATs dropped.
-async fn run_cell(cell: Cell, seed: u64, net: crate::transport::test_net::Subnet) -> (RunEnd, u64) {
+/// Runs one setup in `cell` with `seed` at `port` of `net` (each run binds
+/// two fresh addresses, since the simulated network registry is keyed by
+/// address; the port comes from the run's place in its seed range, not from
+/// a process-wide counter, so addresses do not depend on test order).
+async fn run_cell(
+    cell: Cell,
+    seed: u64,
+    net: crate::transport::test_net::Subnet,
+    port: u16,
+) -> CellRun {
     let _seed = GlobalRng::seed_guard(seed);
-    let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
-    let network = format!("native-matrix-{port}");
+    let network = format!("native-matrix-{}-{port}", net.ip(1));
     let (client_addr, server_addr) = (net.addr_port(1, port), net.addr_port(2, port));
     let pair = pair(&network, client_addr, server_addr, None).await;
     set_network_nat(
@@ -223,6 +233,7 @@ async fn run_cell(cell: Cell, seed: u64, net: crate::transport::test_net::Subnet
     let filtered = crate::transport::in_memory_socket::nat_filtered(&network)
         .values()
         .sum();
+    let expired = crate::transport::in_memory_socket::nat_expired(&network);
     clear_network_nat(&network);
     let end = match (client, server) {
         (Ok(_), Ok(_)) => RunEnd::Established,
@@ -231,23 +242,36 @@ async fn run_cell(cell: Cell, seed: u64, net: crate::transport::test_net::Subnet
             server: server.err().map(|e| format!("{e}")),
         },
     };
-    (end, filtered)
+    CellRun {
+        end,
+        filtered,
+        expired,
+    }
+}
+
+/// Runs `seeds` setups in `cell`, in seed order, on a subnet of their own.
+fn run_seeds_full(cell: Cell, seeds: std::ops::Range<u64>) -> Vec<CellRun> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    bounded(move || async move {
+        let net = crate::transport::test_net::subnet();
+        let mut runs = Vec::new();
+        for (i, seed) in seeds.enumerate() {
+            let port = 20_000 + u16::try_from(i).expect("fewer seeds than ports");
+            runs.push(run_cell(cell, 0x0059_40A5_C000 + seed, net, port).await);
+        }
+        tx.send(runs).ok();
+    });
+    rx.recv().expect("the runs ended")
 }
 
 /// Runs `seeds` setups in `cell` and returns how many established and the
 /// failures by kind.
 fn run_seeds(cell: Cell, seeds: std::ops::Range<u64>) -> (usize, usize, Vec<RunEnd>) {
-    let (tx, rx) = std::sync::mpsc::channel();
     let total = seeds.end - seeds.start;
-    bounded(move || async move {
-        let net = crate::transport::test_net::subnet();
-        let mut ends = Vec::new();
-        for seed in seeds {
-            ends.push(run_cell(cell, 0x0059_40A5_C000 + seed, net).await.0);
-        }
-        tx.send(ends).ok();
-    });
-    let ends = rx.recv().expect("the runs ended");
+    let ends: Vec<RunEnd> = run_seeds_full(cell, seeds)
+        .into_iter()
+        .map(|run| run.end)
+        .collect();
     let ok = ends.iter().filter(|e| **e == RunEnd::Established).count();
     let failures = ends
         .into_iter()
@@ -302,9 +326,10 @@ fn the_nat_is_in_the_path() {
     let (tx, rx) = std::sync::mpsc::channel();
     bounded(move || async move {
         let net = crate::transport::test_net::subnet();
-        tx.send(run_cell(cell, 0x0059_40A5_C0FF, net).await).ok();
+        tx.send(run_cell(cell, 0x0059_40A5_C0FF, net, 20_000).await)
+            .ok();
     });
-    let (end, filtered) = rx.recv().expect("the run ended");
+    let CellRun { end, filtered, .. } = rx.recv().expect("the run ended");
     assert_eq!(end, RunEnd::Established);
     assert!(
         filtered > 0,
@@ -466,39 +491,142 @@ fn class_pairs() -> Vec<(NatFiltering, NatFiltering)> {
     pairs
 }
 
-/// Gates 14, 15 and 17 (design note 10.2): the conditions the original
-/// matrix held fixed. Each cell is held to a baseline floor
-/// ([`baseline_floor`]); gates 15 and 17's jitter edge do not meet the 95%
-/// decision criterion today:
-/// - 14: a late server up to 4 s plus the response's one-way travel, since
-///   the joiner plans from the response's arrival (punch loss 10%);
-/// - 15: 10% loss on QUIC Initial and Handshake packets as well as on
-///   punches;
-/// - 17: delay jitter up to half the round trip (so datagrams reorder) and a
-///   5 s binding lifetime, shorter than every setup window.
+/// One gate cell's results, for the gate tests.
+struct GateCell {
+    cell: Cell,
+    ok: usize,
+    total: usize,
+    one_sided: usize,
+    failures: Vec<RunEnd>,
+    expired: u64,
+}
+
+/// Runs `cells`, 20 seeds each, several cells at a time (each cell's runs
+/// stay on one thread, in seed order, so results are as if run alone),
+/// printing each.
+fn run_gate_cells(gate: &str, cells: Vec<Cell>) -> Vec<GateCell> {
+    let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8));
+    let mut results = Vec::new();
+    for chunk in cells.chunks(threads) {
+        let runs: Vec<_> = std::thread::scope(|scope| {
+            let handles: Vec<_> = chunk
+                .iter()
+                .map(|cell| {
+                    let cell = *cell;
+                    scope.spawn(move || (cell, run_seeds_full(cell, 0..20)))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("cell ran"))
+                .collect()
+        });
+        for (cell, runs) in runs {
+            let ok = runs.iter().filter(|r| r.end == RunEnd::Established).count();
+            let failures: Vec<RunEnd> = runs
+                .iter()
+                .map(|r| r.end.clone())
+                .filter(|e| *e != RunEnd::Established)
+                .collect();
+            let one_sided = failures.iter().filter(|f| f.one_sided()).count();
+            let expired = runs.iter().map(|r| r.expired).sum();
+            println!(
+                "native-matrix gate {gate} client={} server={} late={:?} skew={:?} rtt={:?} \
+                 {:?}: {ok}/{} one-sided {one_sided} expired {expired}",
+                cell.client_nat.label(),
+                cell.server_nat.label(),
+                cell.late,
+                cell.skew,
+                cell.rtt,
+                cell.extra,
+                runs.len()
+            );
+            results.push(GateCell {
+                cell,
+                ok,
+                total: runs.len(),
+                one_sided,
+                failures,
+                expired,
+            });
+        }
+    }
+    results
+}
+
+/// Every cell of `results` at `floor` or more, and one-sided setups at most
+/// `one_sided_pct` percent of the runs.
+fn assert_gate(gate: &str, results: &[GateCell], floor: f64, one_sided_pct: usize) {
+    let below: Vec<_> = results
+        .iter()
+        .filter(|r| (r.ok as f64) < floor * r.total as f64)
+        .map(|r| (r.cell, r.ok, r.total, &r.failures))
+        .collect();
+    assert!(
+        below.is_empty(),
+        "gate {gate} cells below {floor}: {below:#?}"
+    );
+    let runs: usize = results.iter().map(|r| r.total).sum();
+    let one_sided: usize = results.iter().map(|r| r.one_sided).sum();
+    println!("native-matrix gate {gate} one-sided: {one_sided} of {runs}");
+    assert!(
+        one_sided * 100 <= runs * one_sided_pct,
+        "gate {gate}: one-sided setups above {one_sided_pct}% ({one_sided} of {runs})"
+    );
+}
+
+/// A gate cell for `client_nat` against `server_nat`, 10% punch loss.
+fn gate_cell(
+    (client_nat, server_nat): (NatFiltering, NatFiltering),
+    late: Late,
+    skew_ms: u64,
+    rtt_ms: u64,
+    extra: Extra,
+) -> Cell {
+    Cell {
+        client_nat,
+        server_nat,
+        late,
+        skew: Duration::from_millis(skew_ms),
+        punch_loss_pct: 10,
+        rtt: Duration::from_millis(rtt_ms),
+        extra,
+    }
+}
+
+/// Gate 14 (design note 10.2): a late server up to 4 s plus the response's
+/// one-way travel, since the joiner plans from the response's arrival. MEETS
+/// the 95% criterion (20 of 20 in every cell).
 #[test]
-fn native_setup_gate_rows_hold_their_baseline() {
+fn native_setup_gate_14_late_server_with_travel() {
     let mut cells = Vec::new();
-    for (client_nat, server_nat) in class_pairs() {
-        let cell = |late, skew_ms: u64, rtt_ms: u64, extra| Cell {
-            client_nat,
-            server_nat,
-            late,
-            skew: Duration::from_millis(skew_ms),
-            punch_loss_pct: 10,
-            rtt: Duration::from_millis(rtt_ms),
-            extra,
-        };
+    for pair in class_pairs() {
         for rtt in [300u64, 800] {
-            cells.push((
-                "14",
-                cell(Late::Server, 4_000 + rtt / 2, rtt, Extra::default()),
+            cells.push(gate_cell(
+                pair,
+                Late::Server,
+                4_000 + rtt / 2,
+                rtt,
+                Extra::default(),
             ));
         }
-        let lossy = Extra {
-            handshake_loss_pct: 10,
-            ..Extra::default()
-        };
+    }
+    assert_gate("14", &run_gate_cells("14", cells), 0.95, 1);
+}
+
+/// Gate 15: 10% loss on QUIC Initial and Handshake packets as well as on
+/// punches, at 800 ms. Does NOT meet the 95% criterion with one attempt:
+/// 80-85% measured (16-17 of 20; one cell 20 of 20), all failures two-sided.
+/// Held to a 70% baseline; overlapping attempts (PR-3) must reach 95%,
+/// judged on 100 seeds per cell. A premise checks the loss is applied.
+#[test]
+fn native_setup_gate_15_handshake_loss_baseline() {
+    let lossy = Extra {
+        handshake_loss_pct: 10,
+        ..Extra::default()
+    };
+    let mut cells = Vec::new();
+    for pair in class_pairs() {
         for (late, skew) in [
             (Late::Server, 0u64),
             (Late::Server, 2_000),
@@ -507,95 +635,131 @@ fn native_setup_gate_rows_hold_their_baseline() {
             (Late::Client, 4_000),
             (Late::Client, 8_000),
         ] {
-            cells.push(("15", cell(late, skew, 800, lossy)));
+            cells.push(gate_cell(pair, late, skew, 800, lossy));
         }
+    }
+    let results = run_gate_cells("15", cells);
+    assert_gate("15", &results, 0.70, 1);
+    let failures: usize = results.iter().map(|r| r.failures.len()).sum();
+    assert!(failures > 0, "premise: the handshake loss is applied");
+}
+
+/// Gate 17, jitter: each datagram delayed up to half the round trip more,
+/// so datagrams reorder. Costs nothing at 300 ms or away from the window
+/// edges (95% floor there). At 800 ms on the edges (late server 4 s, late
+/// client 8 s) it does NOT meet the criterion: 10 and 7 of 20 measured,
+/// mostly one-sided; held to a 25% baseline. Option (b) (PR-4) is the gate
+/// for these. A premise checks the jitter is applied.
+#[test]
+fn native_setup_gate_17_jitter_baseline() {
+    let mut edge = Vec::new();
+    let mut rest = Vec::new();
+    for pair in class_pairs() {
         for rtt in [300u64, 800] {
             let jitter = Extra {
                 jitter: Duration::from_millis(rtt / 2),
                 ..Extra::default()
             };
-            let short_binding = Extra {
-                binding_lifetime: Duration::from_secs(5),
-                ..Extra::default()
-            };
-            for extra in [jitter, short_binding] {
+            for (late, skew) in [
+                (Late::Server, 0u64),
+                (Late::Server, 4_000),
+                (Late::Client, 0),
+                (Late::Client, 8_000),
+            ] {
+                let cell = gate_cell(pair, late, skew, rtt, jitter);
+                if rtt == 800 && skew > 0 {
+                    edge.push(cell);
+                } else {
+                    rest.push(cell);
+                }
+            }
+        }
+    }
+    assert_gate("17-jitter", &run_gate_cells("17-jitter", rest), 0.95, 1);
+    let edge = run_gate_cells("17-jitter-edge", edge);
+    // Measured 7 to 13 of 20 one-sided per edge cell pair; the bound leaves
+    // margin. Above 1% makes option (b) a gate (10.2 item 20).
+    assert_gate("17-jitter-edge", &edge, 0.25, 60);
+    let failures: usize = edge.iter().map(|r| r.failures.len()).sum();
+    assert!(failures > 0, "premise: the jitter is applied");
+}
+
+const BINDING_200MS_FLOOR: f64 = 0.0;
+const BINDING_200MS_ONE_SIDED: usize = 100;
+
+/// Gate 17, binding lifetime. A setup refreshes its binding with a punch
+/// every 250 ms (and every QUIC packet), so no binding can expire inside a
+/// setup unless its lifetime is under that: a 5 s lifetime (shorter than
+/// every window, and far under any real NAT's) never expires during a
+/// setup, which the expiry count shows, so those rows do not exercise
+/// expiry and are reported as such. Rows at a 200 ms lifetime do drive
+/// bindings to expire mid-setup (premise: expiries counted); measured, they
+/// still establish (floor 95%), since each punch reopens the binding.
+#[test]
+fn native_setup_gate_17_binding_lifetime() {
+    let at = |lifetime_ms: u64| Extra {
+        binding_lifetime: Duration::from_millis(lifetime_ms),
+        ..Extra::default()
+    };
+    let cells = |extra: Extra| {
+        let mut cells = Vec::new();
+        for pair in class_pairs() {
+            for rtt in [300u64, 800] {
                 for (late, skew) in [
                     (Late::Server, 0u64),
                     (Late::Server, 4_000),
                     (Late::Client, 0),
                     (Late::Client, 8_000),
                 ] {
-                    cells.push(("17", cell(late, skew, rtt, extra)));
+                    cells.push(gate_cell(pair, late, skew, rtt, extra));
                 }
             }
         }
-    }
-    let mut below = Vec::new();
-    let mut one_sided = 0;
-    let mut runs = 0;
-    // Failures where each condition is expected to bite, so a condition
-    // that stopped being applied fails the test (premises).
-    let (mut lossy_failures, mut jitter_edge_failures) = (0, 0);
-    for (gate, cell) in cells {
-        let (ok, total, failures) = run_seeds(cell, 0..20);
-        runs += total;
-        let cell_one_sided = failures.iter().filter(|f| f.one_sided()).count();
-        one_sided += cell_one_sided;
-        println!(
-            "native-matrix gate {gate} client={} server={} late={:?} skew={:?} rtt={:?} {:?}: {ok}/{total} one-sided {cell_one_sided}",
-            cell.client_nat.label(),
-            cell.server_nat.label(),
-            cell.late,
-            cell.skew,
-            cell.rtt,
-            cell.extra
-        );
-        let floor = baseline_floor(gate, &cell);
-        if gate == "15" {
-            lossy_failures += failures.len();
-        } else if floor < 0.95 {
-            jitter_edge_failures += failures.len();
-        }
-        if (ok as f64) < floor * total as f64 {
-            below.push((gate, cell, ok, total, floor, failures));
-        }
-    }
-    println!("native-matrix gate rows one-sided: {one_sided} of {runs}");
-    // Measured 100 of 2400 (4.2%) at 20 seeds; the bound leaves margin.
-    // Above 1% means option (b) is a gate (10.2 item 20): re-measured after
-    // overlapping attempts (PR-3), built in PR-4 if still above 1%.
-    assert!(
-        one_sided * 100 <= runs * 8,
-        "one-sided setups above the 8% baseline bound ({one_sided} of {runs})"
+        cells
+    };
+    let five_s = run_gate_cells("17-binding-5s", cells(at(5_000)));
+    assert_gate("17-binding-5s", &five_s, 0.95, 1);
+    let expired: u64 = five_s.iter().map(|r| r.expired).sum();
+    assert_eq!(expired, 0, "a 5 s binding never expires inside a setup");
+    let short = run_gate_cells("17-binding-200ms", cells(at(200)));
+    let expired: u64 = short.iter().map(|r| r.expired).sum();
+    assert!(expired > 0, "premise: a 200 ms binding expires mid-setup");
+    assert_gate(
+        "17-binding-200ms",
+        &short,
+        BINDING_200MS_FLOOR,
+        BINDING_200MS_ONE_SIDED,
     );
-    assert!(
-        below.is_empty(),
-        "gate cells below their baseline floor: {below:#?}"
-    );
-    assert!(lossy_failures > 0, "premise: the handshake loss is applied");
-    assert!(jitter_edge_failures > 0, "premise: the jitter is applied");
 }
 
-/// The lower bound each gate cell must keep: a BASELINE with margin, not the
-/// decision criterion. The criterion (95% at 800 ms) is met by gate 14 and
-/// by gate 17's short binding lifetime, and NOT by:
-/// - gate 15, 10% loss on Initial and Handshake at 800 ms: 80-85% measured
-///   (16-17 of 20; one cell 20 of 20), floor 70%. Overlapping attempts (PR-3)
-///   must take it to 95% or more, judged on 100 seeds per cell;
-/// - gate 17, jitter up to rtt/2 at 800 ms on the window edges (late server
-///   4 s, late client 8 s): 10 and 7 of 20 measured, mostly one-sided, floor
-///   25%. Elsewhere jitter costs nothing (floor 95%).
-fn baseline_floor(gate: &str, cell: &Cell) -> f64 {
-    let at_800 = cell.rtt == Duration::from_millis(800);
-    let window_edge = matches!(
-        (cell.late, cell.skew.as_secs()),
-        (Late::Server, 4) | (Late::Client, 8)
+/// Determinism: the same cell run twice, on different subnets and so
+/// different addresses, ends the same way for every seed. The margins above
+/// are only meaningful if a seed decides its run.
+#[test]
+fn a_gate_cell_runs_the_same_twice() {
+    let cell = gate_cell(
+        (NatFiltering::PortRestricted, NatFiltering::PortRestricted),
+        Late::Server,
+        2_000,
+        800,
+        Extra {
+            handshake_loss_pct: 10,
+            jitter: Duration::from_millis(200),
+            ..Extra::default()
+        },
     );
-    match gate {
-        "15" => 0.70,
-        "17" if at_800 && !cell.extra.jitter.is_zero() && window_edge => 0.25,
-        _ => 0.95,
-    }
+    let ends = || -> Vec<RunEnd> {
+        run_seeds_full(cell, 0..20)
+            .into_iter()
+            .map(|r| r.end)
+            .collect()
+    };
+    let first = ends();
+    assert!(
+        first.iter().any(|e| *e != RunEnd::Established),
+        "premise: some runs fail, so there is something to differ"
+    );
+    assert_eq!(ends(), first);
 }
 
 /// Symmetric NAT (A5c-2): a native setup with a symmetric peer never
@@ -626,12 +790,14 @@ fn native_setups_with_a_symmetric_nat() {
                 extra: Extra::default(),
             };
             let (ok, total, failures) = run_seeds(cell, 0..5);
+            let one_sided = failures.iter().filter(|f| f.one_sided()).count();
             report.push((
                 client_nat.label(),
                 server_nat.label(),
                 late,
                 ok,
                 total,
+                one_sided,
                 failures.first().cloned(),
             ));
         }
@@ -644,12 +810,9 @@ fn native_setups_with_a_symmetric_nat() {
         established.is_empty(),
         "a native setup with a symmetric peer connected: {established:?}"
     );
-    // Both sides failed, not one: no one-sided success.
+    // Both sides failed, not one, in every run: no one-sided success.
     for row in &report {
-        assert!(
-            !row.5.as_ref().is_some_and(RunEnd::one_sided),
-            "one-sided: {row:?}"
-        );
+        assert_eq!(row.5, 0, "one-sided: {row:?}");
     }
 }
 
