@@ -138,10 +138,6 @@ impl Default for QuicMode {
     }
 }
 
-// The default is `prefer` on every target, so a platform cannot quietly lose it
-// to a `cfg` and the build fails on the target where it would.
-const _: () = assert!(matches!(QuicMode::default_mode(), QuicMode::Prefer));
-
 impl QuicMode {
     /// The value written in `config.toml` and accepted on the command line.
     pub const OFF: &'static str = "off";

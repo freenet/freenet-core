@@ -1206,8 +1206,9 @@ identity decides by short runs too (`breaker::decides_by_short_runs`).
 read, never written to config.toml: a node that did not set the key follows the
 release it runs, so a default-off release is the kill switch for QUIC as a
 whole. Stopping only the data ramp is smaller: `QUIC_DATA_RAMP_START = None`
-with the defaults back to 0.2.156's, shadow on Linux and macOS and off on
-Windows (RELEASING.md, "Emergency stop"), which keeps Linux and macOS
+with the default mode back to 0.2.156's shape, shadow on Linux and macOS and
+off on every other platform (RELEASING.md, "Emergency stop": the release edits
+`QuicMode::default_mode` and the test `the_default_mode_is_prefer`), which keeps Linux and macOS
 endpoints and shadow paths up. Neither reaches
 a node that ever ran with `--transport-quic` or `FREENET_TRANSPORT_QUIC`: those
 are saved to config.toml like any setting (the Step 1 gateways are such nodes). Shadow or prefer: the endpoint is built
@@ -2060,7 +2061,7 @@ release goes out.
   data, not loosened.
 - Rollback at any step is a release through auto-update's 0-4 h stagger: for
   the data ramp, no ramp and 0.2.156's defaults (shadow on Linux and macOS, off
-  on Windows); default-off when QUIC itself is at fault. Per-path fallback to UDP and the breaker work without a release. A
+  on every other platform, including Windows); default-off when QUIC itself is at fault. Per-path fallback to UDP and the breaker work without a release. A
   node in a broken state may not self-update.
 
 Simulation scenarios (`tests/simulation_integration.rs`, `test_quic_*`): two
