@@ -915,14 +915,24 @@ impl<'a> NetEventLog<'a> {
         Some(NetEventLog {
             tx: Transaction::NULL,
             peer_id,
-            kind: EventKind::Lifecycle(Self::startup_event(version, is_gateway)),
+            kind: EventKind::Lifecycle(Self::startup_event(
+                version,
+                is_gateway,
+                env!("GIT_COMMIT_HASH"),
+                env!("GIT_DIRTY"),
+            )),
         })
     }
 
     /// The `Startup` record for this build. Separate from [`Self::peer_startup`]
     /// so it can be tested without a `Ring`.
-    fn startup_event(version: String, is_gateway: bool) -> PeerLifecycleEvent {
-        let (git_commit, git_dirty) = build_git_fields(env!("GIT_COMMIT_HASH"), env!("GIT_DIRTY"));
+    fn startup_event(
+        version: String,
+        is_gateway: bool,
+        commit: &str,
+        dirty_suffix: &str,
+    ) -> PeerLifecycleEvent {
+        let (git_commit, git_dirty) = build_git_fields(commit, dirty_suffix);
         PeerLifecycleEvent::Startup {
             version,
             git_commit,
@@ -1908,7 +1918,9 @@ fn note_dropped_event_log() {
 /// `GIT_COMMIT_HASH` and `GIT_DIRTY`. `"unknown"` means the build found no
 /// commit (no repository, no override, no published `.cargo_vcs_info.json`),
 /// and the dirty flag is then unknown too: `build.rs` reads a missing
-/// repository as clean.
+/// repository as clean. A build with a commit but no repository (a nix build
+/// without `FREENET_GIT_IS_DIRTY`) reports `Some(false)` as a default, not as
+/// an observation.
 fn build_git_fields(commit: &str, dirty_suffix: &str) -> (Option<String>, Option<bool>) {
     if commit.is_empty() || commit == "unknown" {
         return (None, None);
@@ -1922,26 +1934,29 @@ mod startup_git_fields_tests {
 
     /// Every `peer_startup` event carried `None` for both fields, because the
     /// one caller passed `None` with a comment saying they were not available
-    /// in the library. They are: this test builds the record and requires the
-    /// commit this crate was built from.
+    /// in the library. The record now carries what it is given from the build.
     #[test]
-    fn the_startup_event_carries_the_build_s_commit() {
-        let PeerLifecycleEvent::Startup {
-            git_commit,
-            git_dirty,
-            ..
-        } = NetEventLog::startup_event("0.0.0".to_string(), false)
-        else {
-            panic!("not a Startup event");
+    fn the_startup_event_carries_the_commit_and_dirty_flag_it_is_given() {
+        let fields = |commit, suffix| {
+            let PeerLifecycleEvent::Startup {
+                git_commit,
+                git_dirty,
+                ..
+            } = NetEventLog::startup_event("0.0.0".to_string(), false, commit, suffix)
+            else {
+                panic!("not a Startup event");
+            };
+            (git_commit, git_dirty)
         };
-        let built = env!("GIT_COMMIT_HASH");
-        if built == "unknown" {
-            // A test build with no commit at all (no repository, no override).
-            assert_eq!((git_commit, git_dirty), (None, None));
-        } else {
-            assert_eq!(git_commit.as_deref(), Some(built));
-            assert_eq!(git_dirty, Some(!env!("GIT_DIRTY").is_empty()));
-        }
+        assert_eq!(
+            fields("0123456789ab", "-dirty"),
+            (Some("0123456789ab".to_string()), Some(true))
+        );
+        assert_eq!(
+            fields("0123456789ab", ""),
+            (Some("0123456789ab".to_string()), Some(false))
+        );
+        assert_eq!(fields("unknown", ""), (None, None));
     }
 
     #[test]

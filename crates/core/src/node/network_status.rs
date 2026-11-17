@@ -274,6 +274,8 @@ static AUTO_UPDATE_STATE: parking_lot::RwLock<Option<serde_json::Value>> =
 
 /// Record this node's auto-update summary for the `auto_update_state`
 /// telemetry event. Call before the node is built; replaces any earlier value.
+/// The state is read once at startup, so a hold set during this run shows in
+/// telemetry only after the next restart.
 pub fn set_auto_update_state(state: serde_json::Value) {
     *AUTO_UPDATE_STATE.write() = Some(state);
 }

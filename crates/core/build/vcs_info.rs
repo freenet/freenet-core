@@ -3,8 +3,8 @@
 //! `cargo publish` writes `.cargo_vcs_info.json` into every package it
 //! uploads, with the commit as `git.sha1`. A `cargo install freenet` builds
 //! from that package, which has no `.git`, so `git rev-parse` finds nothing;
-//! this file is the only record of the commit left. `build.rs` reads it after
-//! the git probe and before falling back to `"unknown"`.
+//! this file is the only record of the commit left. `build.rs` reads it, and when it
+//! is present it replaces both git probes (see [`resolve_git_provenance`]).
 //!
 //! Shared by `build.rs` (via `#[path]`) and a `#[cfg(test)]` module in
 //! `lib.rs`, so it must stay dependency-free: the build script sees only
@@ -13,25 +13,79 @@
 /// The name `cargo publish` gives the file, in the package root.
 pub(crate) const VCS_INFO_FILE: &str = ".cargo_vcs_info.json";
 
-/// The commit in `contents` (the text of [`VCS_INFO_FILE`]), shortened to the
-/// 12 characters `git rev-parse --short=12` gives, or `None` if there is no
-/// `"sha1"` holding exactly 40 hex characters.
+/// What `cargo publish` recorded about the source it packaged.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Published {
+    /// The commit, shortened to the 12 characters `git rev-parse --short=12`
+    /// gives.
+    pub(crate) commit: String,
+    /// `cargo publish --allow-dirty` records `"dirty": true`.
+    pub(crate) dirty: bool,
+}
+
+/// The commit and dirty flag in `contents` (the text of [`VCS_INFO_FILE`]), or
+/// `None` if there is no `"sha1"` holding exactly 40 hex characters.
 ///
-/// The value becomes a `cargo:rustc-env` directive, which is newline
+/// The commit becomes a `cargo:rustc-env` directive, which is newline
 /// delimited, so anything that is not plain hex is refused rather than
 /// trimmed into shape.
-pub(crate) fn published_commit(contents: &str) -> Option<String> {
-    let after_key = &contents[contents.find("\"sha1\"")? + "\"sha1\"".len()..];
-    let after_colon = after_key.trim_start().strip_prefix(':')?.trim_start();
-    let value = after_colon.strip_prefix('"')?;
-    let sha = &value[..value.find('"')?];
-    (sha.len() == 40 && sha.chars().all(|c| c.is_ascii_hexdigit()))
-        .then(|| sha[..12].to_ascii_lowercase())
+pub(crate) fn published(contents: &str) -> Option<Published> {
+    let sha = json_value(contents, "sha1")?;
+    let sha = sha.strip_prefix('"')?;
+    let sha = &sha[..sha.find('"')?];
+    if sha.len() != 40 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let dirty = json_value(contents, "dirty").is_some_and(|v| v.starts_with("true"));
+    Some(Published {
+        commit: sha[..12].to_ascii_lowercase(),
+        dirty,
+    })
+}
+
+/// The text after `"key":` in `contents`, leading whitespace removed. Enough
+/// for the two keys read here: the file is machine-written and flat.
+fn json_value<'a>(contents: &'a str, key: &str) -> Option<&'a str> {
+    let quoted = format!("\"{key}\"");
+    let after_key = &contents[contents.find(&quoted)? + quoted.len()..];
+    Some(after_key.trim_start().strip_prefix(':')?.trim_start())
+}
+
+/// The commit and dirty flag `build.rs` reports (`GIT_COMMIT_HASH`,
+/// `GIT_DIRTY`), decided from every source of them.
+///
+/// `GIT_DIRTY` is the auto-update kill switch (`auto_update_is_disabled` in
+/// `src/bin/freenet.rs`), so this order is load-bearing.
+/// - An override (`FREENET_GIT_COMMIT_HASH`, `FREENET_GIT_IS_DIRTY`) wins, per
+///   field.
+/// - Otherwise a packaged source (`published` is `Some`) takes both from the
+///   package and runs NEITHER git probe. A package has no `.git` of its own, so
+///   a probe finds only whatever repository happens to enclose the unpacked
+///   source (a `CARGO_HOME` inside a tracked home directory), and would stamp
+///   that repository's commit and untracked files on the binary.
+/// - Otherwise the probes run, and a missing commit is `"unknown"`.
+pub(crate) fn resolve_git_provenance(
+    commit_override: Option<String>,
+    dirty_override: Option<bool>,
+    published: Option<Published>,
+    probe_commit: impl FnOnce() -> Option<String>,
+    probe_dirty: impl FnOnce() -> bool,
+) -> (String, bool) {
+    let (commit, dirty) = match published {
+        Some(p) => (Some(p.commit), Some(p.dirty)),
+        None => (None, None),
+    };
+    let commit = commit_override
+        .or(commit)
+        .or_else(probe_commit)
+        .unwrap_or_else(|| "unknown".to_string());
+    let dirty = dirty_override.or(dirty).unwrap_or_else(probe_dirty);
+    (commit, dirty)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{VCS_INFO_FILE, published_commit};
+    use super::{Published, VCS_INFO_FILE, published, resolve_git_provenance};
 
     /// The name is cargo's, and `build/git_watch.rs` watches the same file.
     #[test]
@@ -41,15 +95,32 @@ mod tests {
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
 
+    fn pkg(dirty: bool) -> Option<Published> {
+        Some(Published {
+            commit: "0123456789ab".to_string(),
+            dirty,
+        })
+    }
+
     #[test]
     fn reads_the_commit_cargo_publish_writes() {
         let file = format!(
             "{{\n  \"git\": {{\n    \"sha1\": \"{SHA}\"\n  }},\n  \"path_in_vcs\": \"crates/core\"\n}}"
         );
-        assert_eq!(published_commit(&file).as_deref(), Some("0123456789ab"));
-        // Compact JSON and a dirty publish (`--allow-dirty` adds "dirty": true).
-        let compact = format!("{{\"git\":{{\"sha1\":\"{SHA}\",\"dirty\":true}}}}");
-        assert_eq!(published_commit(&compact).as_deref(), Some("0123456789ab"));
+        assert_eq!(published(&file), pkg(false));
+        // Compact JSON.
+        let compact = format!("{{\"git\":{{\"sha1\":\"{SHA}\"}}}}");
+        assert_eq!(published(&compact), pkg(false));
+    }
+
+    #[test]
+    fn reads_the_dirty_flag_of_an_allow_dirty_package() {
+        let dirty = format!("{{\"git\":{{\"sha1\":\"{SHA}\",\"dirty\":true}}}}");
+        assert_eq!(published(&dirty), pkg(true));
+        let spaced = format!("{{\"git\": {{\"sha1\": \"{SHA}\", \"dirty\" : true}}}}");
+        assert_eq!(published(&spaced), pkg(true));
+        let explicit_false = format!("{{\"git\":{{\"sha1\":\"{SHA}\",\"dirty\":false}}}}");
+        assert_eq!(published(&explicit_false), pkg(false));
     }
 
     #[test]
@@ -67,7 +138,64 @@ mod tests {
             format!("{{\"git\":{{\"sha1\":{SHA}}}}}"),
             "{\"git\":{\"sha1\":\"".to_string(),
         ] {
-            assert_eq!(published_commit(&bad), None, "{bad}");
+            assert_eq!(published(&bad), None, "{bad}");
         }
+    }
+
+    /// A packaged source unpacked inside someone else's dirty repository: the
+    /// probes would report that repository, so they must not run at all.
+    #[test]
+    fn a_packaged_clean_source_inside_a_dirty_repo_is_clean() {
+        let got = resolve_git_provenance(
+            None,
+            None,
+            pkg(false),
+            || panic!("commit probe ran"),
+            || panic!("dirty probe ran"),
+        );
+        assert_eq!(got, ("0123456789ab".to_string(), false));
+    }
+
+    #[test]
+    fn a_packaged_dirty_source_is_dirty() {
+        let got = resolve_git_provenance(
+            None,
+            None,
+            pkg(true),
+            || panic!("commit probe ran"),
+            || panic!("dirty probe ran"),
+        );
+        assert_eq!(got, ("0123456789ab".to_string(), true));
+    }
+
+    #[test]
+    fn without_a_vcs_file_the_git_probes_decide() {
+        let got = resolve_git_provenance(
+            None,
+            None,
+            None,
+            || Some("aaaaaaaaaaaa".to_string()),
+            || true,
+        );
+        assert_eq!(got, ("aaaaaaaaaaaa".to_string(), true));
+        let got = resolve_git_provenance(None, None, None, || None, || false);
+        assert_eq!(got, ("unknown".to_string(), false));
+    }
+
+    #[test]
+    fn the_overrides_win_over_the_vcs_file_per_field() {
+        let got = resolve_git_provenance(
+            Some("bbbbbbbbbbbb".to_string()),
+            Some(false),
+            pkg(true),
+            || panic!("commit probe ran"),
+            || panic!("dirty probe ran"),
+        );
+        assert_eq!(got, ("bbbbbbbbbbbb".to_string(), false));
+        // One override leaves the other field to the package.
+        let got = resolve_git_provenance(None, Some(true), pkg(false), || None, || false);
+        assert_eq!(got, ("0123456789ab".to_string(), true));
+        let got = resolve_git_provenance(Some("c".to_string()), None, pkg(true), || None, || false);
+        assert_eq!(got, ("c".to_string(), true));
     }
 }
