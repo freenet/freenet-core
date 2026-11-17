@@ -2462,13 +2462,23 @@ Simulation: every node shares [::1], so the per-destination punch budget
   (quic/native/setup/matrix_tests.rs) runs connect_native/accept_native
   behind NATs over classes, late side and skew, punch loss and round trip;
   every cell of that original matrix establishes. The gate rows added
-  beside it (gates 14, 15, 17) are a baseline: gate 15 (handshake loss) and
-  gate 17's jitter edges do not meet the 95% criterion with one attempt
-  (overlapping attempts and option (b) are the follow-ups). Gate 17's
-  binding-expiry half is NOT demonstrated: at a 5 s lifetime no binding
-  expires inside a setup (measured), and a lifetime short enough to expire
-  one (200 ms) is under the round trip, so it fails every setup whatever the
-  setup does and says nothing about it; those rows were dropped.
+  beside it (gates 14, 15, 17) follow. With 10% loss on Initial and Handshake packets too
+  (gate 15) one attempt established 72-91% at 800 ms (a lost late Handshake
+  packet leaves the next probe past the window), so the client makes
+  OVERLAPPING ATTEMPTS: a second dial (new connection, charged
+  CLIENT_BYTES_PER_DIAL again) OVERLAP_BEFORE_END (5 s) before its window's
+  end, at least OVERLAP_MIN_DELAY after the first; neither is cancelled, and
+  each attempt is the dial plus its Hello exchange, so a first attempt
+  established on the client but not on the server does not end the race.
+  The server takes up to MAX_IN_FLIGHT (2) attempts per waiter and runs
+  their handshakes at once. Gate 15 then 96-100% per cell (100 seeds). Cost:
+  a client setup can spend two charges, so about two overlapped setups per
+  destination per minute fit PUNCH_BUDGET_BYTES instead of four. Jitter at
+  the window edges (gate 17) still fails mostly one-sided (PR-4, option b).
+  Gate 17's binding-expiry half is NOT demonstrated: at a 5 s lifetime no
+  binding expires inside a setup (measured), and a lifetime short enough to
+  expire one (200 ms) is under the round trip, so it fails every setup
+  whatever the setup does and says nothing about it; those rows were dropped.
 Determinism: a plain tokio::select! draws its arm order from tokio's RNG,
   which the seed does not set. bounded_send's loop (every QUIC path, upgrade
   ones included: a send and its deadline ready together now resolve as the
