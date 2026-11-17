@@ -85,10 +85,9 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 
 /// Whether the node may use QUIC: the `transport-quic` config key.
 ///
-/// An unset key is [`QuicMode::default_mode`]: prefer on Linux, macOS and
-/// Windows, and off elsewhere, because a gateway's breaker reads no boot
-/// identity there and so cannot trip. Peers everywhere, and gateways on
-/// Windows, count short runs that panicked in QUIC code instead of detecting
+/// An unset key is [`QuicMode::default_mode`]: prefer on every platform. Peers
+/// everywhere, gateways on Windows and gateways on a unix platform with no boot
+/// identity count short runs that panicked in QUIC code instead of detecting
 /// crashes ([`breaker`]); that rule was confirmed on a real Windows machine
 /// before Windows defaulted to an endpoint (#6031), and peers on unix moved
 /// to it in #6151. The default is decided when the value is read and
@@ -99,8 +98,8 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 /// so a node that ever ran with one keeps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuicMode {
-    /// No QUIC endpoint is built and no QUIC datagram is read. The default on
-    /// platforms other than Linux, macOS and Windows.
+    /// No QUIC endpoint is built and no QUIC datagram is read. Set explicitly;
+    /// no platform defaults to it.
     Off,
     /// The node builds a QUIC endpoint on its UDP port and upgrades a UDP
     /// session to a QUIC path that carries only control frames: all
@@ -116,7 +115,7 @@ pub enum QuicMode {
     /// Negotiates data on a path to a peer in the release's slice
     /// (`upgrade::slice`, the release's ramp from `QUIC_DATA_RAMP_START`), and sends
     /// its data on a path where both sides did. With no ramp start set it acts as
-    /// [`Self::Shadow`] on the wire. The default on Linux, macOS and Windows.
+    /// [`Self::Shadow`] on the wire. The default on every platform.
     Prefer,
 }
 

@@ -3665,8 +3665,9 @@ pub struct TransportSnapshot {
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped, so this run started with
     /// QUIC off (#5940): on a peer (two while UDP exists) and a gateway on
-    /// Windows (three), runs in a row ended within ten minutes after a panic
-    /// in QUIC code; on a unix gateway a run with QUIC enabled ended
+    /// Windows or with no boot identity (three), runs in a row ended within ten
+    /// minutes after a panic in QUIC code; on a gateway on Linux or macOS a run
+    /// with QUIC enabled ended
     /// abnormally. The `quic_breaker_start` event says which rule decided.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
@@ -4515,8 +4516,9 @@ struct SnapshotExtras {
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped, so this run started with
     /// QUIC off (#5940): on a peer (two while UDP exists) and a gateway on
-    /// Windows (three), runs in a row ended within ten minutes after a panic
-    /// in QUIC code; on a unix gateway a run with QUIC enabled ended
+    /// Windows or with no boot identity (three), runs in a row ended within ten
+    /// minutes after a panic in QUIC code; on a gateway on Linux or macOS a run
+    /// with QUIC enabled ended
     /// abnormally. The `quic_breaker_start` event says which rule decided.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full

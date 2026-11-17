@@ -363,7 +363,7 @@ impl Default for ConfigArgs {
                 ledbat_min_ssthresh: None, // Uses default from NetworkApiConfig
                 congestion_control: None,  // Default: fixedrate (set in NetworkApiConfig)
                 bbr_startup_rate: None,    // Uses default from BBR config
-                transport_quic: None,      // Default: prefer on Linux, macOS and Windows
+                transport_quic: None,      // Default: prefer on every platform
                 quic_max_paths: None,      // Default: the node's connection limit
                 quic_data_percent: None,   // Default: this release's share of pairs
                 quic_ignore_crash_breaker: None,
@@ -2588,7 +2588,7 @@ pub struct NetworkArgs {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`. Unset means
-    /// `prefer` on Linux, macOS and Windows, and `off` elsewhere.
+    /// `prefer` on every platform.
     ///
     /// `shadow` builds a QUIC endpoint on the network port and upgrades
     /// connections to peers that also run it to a QUIC path. The path carries
@@ -2647,9 +2647,10 @@ pub struct NetworkArgs {
     /// Run QUIC even when the crash-loop breaker would keep it off.
     ///
     /// After two short runs in a row that each panicked in QUIC code, a
-    /// peer starts with QUIC off for 24 hours. A gateway on unix does so
+    /// peer starts with QUIC off for 24 hours. A gateway on Linux or macOS does so
     /// when a run with QUIC enabled ends abnormally, and a gateway on
-    /// Windows after three such short runs, in both cases for 15
+    /// Windows, or on any platform with no boot identity, after three such
+    /// short runs, in both cases for 15
     /// minutes, doubling on repeat trips up to 4 hours (a gateway whose
     /// service unit sets FREENET_SUPERVISED=1 restarts itself at the end).
     /// Set this to run QUIC anyway. A start with this
@@ -2979,7 +2980,7 @@ pub struct NetworkApiConfig {
     pub bbr_startup_rate: Option<u64>,
 
     /// QUIC transport (#5940): `off`, `shadow` or `prefer`; unset reads as
-    /// `QuicMode::default_mode` (prefer on Linux, macOS and Windows). Kept as written, so a value from a later release
+    /// `QuicMode::default_mode` (prefer on every platform). Kept as written, so a value from a later release
     /// round-trips; see [`Self::quic_settings`] for how it is read.
     #[serde(
         default,
@@ -7697,8 +7698,8 @@ shutdown-drain-secs = 42
         assert_seeded_values_bound(&cfg);
     }
 
-    /// An unset `transport-quic` is prefer on Linux, macOS and Windows; Windows
-    /// joined once its crash-loop breaker was confirmed on a real Windows
+    /// An unset `transport-quic` is prefer on every platform; Windows
+    /// joined first, once its crash-loop breaker was confirmed on a real Windows
     /// machine (#6031). The lib tests do not compile on Windows, so
     /// `tests/quic_breaker_windows.rs` pins the Windows half through the real
     /// binary. The default is not written into the config, so a default-off

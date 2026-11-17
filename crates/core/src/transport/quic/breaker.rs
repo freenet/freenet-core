@@ -57,7 +57,7 @@
 //! An older release reads no role: rolling a gateway back to one brings the
 //! peer cooldown back.
 //!
-//! **This module doc describes a unix gateway.** Windows does not reliably
+//! **This module doc describes a gateway on Linux or macOS.** Windows does not reliably
 //! tell a process that it is being stopped: every design that tried to tell a crash
 //! from a normal stop there (a logoff, a Fast Startup shutdown, a session end)
 //! got one of them wrong. So Windows does not ask how a run ended. A panic
@@ -1541,7 +1541,7 @@ pub(crate) fn legacy_shadow_path(data_dir: &Path) -> PathBuf {
 pub(crate) enum Rule {
     /// [`short_runs`]: runs that ended soon after a panic in QUIC code.
     ShortRuns,
-    /// [`verdict`]: how the last run ended (a unix gateway).
+    /// [`verdict`]: how the last run ended (a gateway on Linux or macOS).
     ExitStatus,
 }
 
@@ -3346,7 +3346,8 @@ mod tests {
     }
 
     /// #6151: every peer decides by short runs, and so does a gateway off
-    /// unix; a unix gateway decides by how its last run ended.
+    /// unix or on a unix platform with no boot identity; a gateway with a boot
+    /// identity decides by how its last run ended.
     #[test]
     fn who_decides_by_short_runs() {
         // (unix, role, boot identity known)
