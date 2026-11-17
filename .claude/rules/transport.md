@@ -518,7 +518,9 @@ dropped unanswered past the per-CONNECT cap on refused acceptors,
 turned its own native connects off,
 `connect_native_rescued_by_udp_{joiner,acceptor}` for each UDP dial after a
 failed native setup that connected (R5: a connection a node without UDP
-would not have made), and the last offer as states
+would not have made), `connect_native_both_dials_connected_kept_{udp,native}`
+for a native dial and the UDP dial beside it that both connected (the first
+kept), and the last offer as states
 `connect_native_offer_{level,percent,ready}`; see
 `operations/connect/native.rs`) and the shadow-mode upgrade
 telemetry (below, "Upgrade telemetry"). Each label set is declared once in a
@@ -2266,15 +2268,18 @@ Fallback: a failed native setup is followed by today's UDP dial to the same
   the same address is pending (another CONNECT's) runs BESIDE it
   (EventListenerState::udp_beside_native): not merged into it, which failed
   it with the native dial, and not held back, which punched late. An
-  outcome answers only its own transport's callbacks, except that a success
-  answers both dials' requesters, since all asked for a connection to that
-  peer. If both connect the native connection is kept on both sides: native
-  first, the UDP connection is dropped without touching the ring; UDP first,
-  the native connection takes the entry in place (beside_udp_connected) and
-  the ring keeps the peer. A UDP dial beside a native one that fails never
-  prunes, backs off or marks the address (a 30 s backoff would refuse the
-  native dial's own fallback); the last dial to the address to end releases
-  the in-transit slot. A native failure marks
+  outcome answers only its own transport's callbacks, except that a kept
+  connection answers both dials' requesters, since all asked for a
+  connection to that peer (never answered Ok without a kept connection). If
+  both connect, the one established first is kept and the later one is
+  closed without touching the ring or the transient budget
+  (connect_native_both_dials_connected_kept_{udp,native}); whether the two
+  sides can disagree on which survives is open (design note 10.2 item 18).
+  A UDP dial beside a native one that fails never backs off (a 30 s backoff
+  would refuse the native dial's own fallback); while the native dial is
+  pending it also marks nothing, and once the native dial has ended without
+  a connection it takes the ordinary failure path apart from the backoff. A
+  native failure marks
   no failed address and records no peer backoff, so the fallback is not
   refused. Until UDP is removed a failed native setup never costs the join
   (test_quic_native_failed_setups_fall_back_to_udp, which also checks that
