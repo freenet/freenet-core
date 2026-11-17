@@ -31,6 +31,15 @@ name: Claude PR Rule Review
 # purpose: nothing else can report it.
 # Covered by scripts/claude_pr_review_post_step_test.sh.
 #
+# The same rule applies one step earlier, where the review is decided against
+# rather than attempted (#6181). "Determine applicable rules" skips the review
+# when the PR changed nothing, and a `git diff` that FAILED used to produce that
+# same empty answer, so an unreviewed PR got the green "No relevant files
+# changed". The diff's exit status is now checked: a failure sets
+# `diff_failed=true`, which routes to the FAILURE status below instead of the
+# success one. The job still passes, as above, because only the status is
+# advisory. Covered by scripts/claude_pr_review_rules_step_test.sh.
+#
 # Triggers:
 # - pull_request_target: runs for all PRs (including forks) with base-repo
 #   secrets available. Safe because we only read the diff — we never execute
@@ -948,7 +957,7 @@ jobs:
         # failure-reads-as-pass shape #5628 and #6181 describe. Mirrors the
         # non-run status the post step sets for a reviewer that did not run
         # (#6180): red on the PR, the required job still green, not a merge gate.
-        if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.diff_failed == 'true'
+        if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip == 'true' && steps.rules.outputs.diff_failed == 'true'
         uses: actions/github-script@v9
         with:
           script: |
