@@ -1,0 +1,17 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+#
+# The case below is for `peer_key_presented_takes_any_point`. Its `key` is
+# the sign-bit-1 encoding of a valid node key: it decompresses to a
+# torsion-free point that `PeerKey::of` accepts, whose presented form is the
+# same bytes with bit 255 cleared. `peer_key_presented` must refuse it (the
+# sign-bit check, and the canonical-form check behind it). Proptest wrote it
+# during development when a mutation made that refusal fail. It is kept on
+# purpose: a random 32-byte array decodes to a point about half the time and
+# to a torsion-free one about one time in sixteen, so this fixed case makes
+# every run check the sign-bit twin of a real key.
+cc be6e71b1881c70cb424efce401d560980085dca6fdce0c14a4f4e2cbd678e866 # shrinks to key = [126, 175, 47, 4, 131, 230, 23, 17, 186, 196, 97, 107, 210, 3, 51, 38, 77, 234, 231, 33, 191, 184, 12, 143, 36, 34, 176, 23, 82, 207, 214, 216]

@@ -2133,6 +2133,18 @@ no extra message, no exporter proof.
     never as "any key". An inbound transport's key is the key the node
     bound from the peer's claim, not one the transport authenticated; the
     QUIC handshake is what checks it.
+  → A client nobody named (a gateway admitting a native join, A7b; no
+    production caller yet): ProvenClientKey takes the key the client
+    presents instead of pinning one. peer_key_presented accepts only an
+    exact Ed25519 SPKI (prefix + 32 bytes) with sign bit 0, no chain, a key
+    PeerKey::of accepts, in its canonical encoding; the signature must be
+    Ed25519 under that key (scheme and bytes checked before ring). The
+    verifier keeps no state, so one server_tls_proven configuration serves
+    any number of handshakes; the identity is read after the handshake from
+    the connection's peer_identity() (proven_client_key, which parses it
+    with peer_key_presented again), so it belongs to that connection and a
+    completed handshake. server_tls_proven offers freenet-quic/2 only. It
+    proves possession of the key's secret, nothing more.
 Tests: conversion vs curve25519-dalek 5 (random keys, bit 255 set, u = -1),
 signer key == verifier key over many keypairs with both natural sign bits,
 signatures verified by ed25519-dalek and refused with any bit flipped,

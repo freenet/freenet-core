@@ -682,8 +682,9 @@ impl QuicEndpoint {
 
     /// Panic in the socket adapter at the endpoint's next receive, caught as
     /// any adapter panic is: the endpoint goes `Down` with the node still
-    /// running (tests, including the real binary built with `testing`).
-    #[cfg(any(test, feature = "testing"))]
+    /// running. Only the real binary built with `testing` calls it
+    /// (`connection_handler::fail_endpoint_from_env`).
+    #[cfg(feature = "testing")]
     pub(crate) fn panic_adapter(&self) {
         self.faults.panic_receive();
     }
