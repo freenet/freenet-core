@@ -1085,6 +1085,43 @@ impl NodeP2P {
 mod tests {
     use super::*;
 
+    /// #5975: `NodeP2P::build` sends the `auto_update_state` event the binary
+    /// recorded at startup. Deleting the send, or sending a different event
+    /// name or payload, silently ends the report with every test still green.
+    #[test]
+    fn build_sends_the_recorded_auto_update_state() {
+        let all = include_str!("p2p_impl.rs");
+        let production = &all[..all
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module not located; this pin cannot verify anything")];
+        let code: String = production
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find("pub(crate) async fn build<")
+            .expect("NodeP2P::build not found");
+        let (build, _) = code[start..]
+            .split_once("\n    }\n")
+            .expect("could not locate the end of NodeP2P::build");
+        let squeezed: String = build.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squeezed.contains(
+                "iflet Some(state)=super::network_status::auto_update_state()"
+                    .replace(' ', "")
+                    .as_str()
+            ),
+            "build must read the state the binary recorded"
+        );
+        assert!(
+            squeezed.contains(
+                "send_standalone_event_with_peer_id(\"auto_update_state\",&config.local_peer_id_string(),state,)"
+            ),
+            "build must send it as the `auto_update_state` event with that state"
+        );
+    }
+
     /// #4549: the fast-exit watchdog (`process::exit(42)` on a fatal listener exit)
     /// is gated by `listener_exit_is_graceful`. A regression in this predicate is
     /// dangerous in BOTH directions: classifying a graceful shutdown as fatal would

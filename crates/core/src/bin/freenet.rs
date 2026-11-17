@@ -3120,6 +3120,31 @@ mod tests {
             .join("\n")
     }
 
+    /// #5975: `run_network` records the updater's state BEFORE the node is
+    /// built, because the node sends it as the `auto_update_state` event while
+    /// it is built. Deleting the call, or moving it after `.build(`, silently
+    /// ends the report.
+    #[test]
+    fn run_network_records_the_update_state_before_building_the_node() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let body = fn_body(&src, "async fn run_network(");
+        let record = body
+            .find("freenet::set_auto_update_state(")
+            .expect("run_network no longer records the auto-update state (#5975)");
+        let build = body
+            .find(".build(clients)")
+            .expect("could not locate the node build in run_network");
+        assert!(
+            record < build,
+            "the auto-update state must be recorded before the node is built (#5975)"
+        );
+        let call = &body[record..build];
+        assert!(
+            call.contains("update_state_summary_at("),
+            "the recorded value must be the updater's summary (#5975)"
+        );
+    }
+
     /// Source-scrape pin for issue #4580: the exit-42 handler in `main()` MUST
     /// branch on supervisor status and escalate to a loud `error!` on the
     /// unsupervised path. A bare `freenet network` run that detects an update,
