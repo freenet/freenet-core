@@ -497,7 +497,8 @@ inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 (`quic_adapter_panicked`, once per endpoint; the process keeps running
 and no breaker state is left), QUIC crash-loop breaker trips at startup
 (`quic_breaker_trips`; for every peer, and a gateway on Windows, counted for
-three runs in a row that ended
+runs in a row (two on a peer while UDP exists, so it trips before the
+post-update rollback's three crashes; three on a gateway) that ended
 within ten minutes after recording a panic in QUIC code (quinn, quinn-proto or
 transport/quic, by panic location), each starting within 24 h of the one before,
 and for a unix gateway for any abnormal end of a QUIC-enabled run, not only a
@@ -1182,7 +1183,7 @@ it must not wait unless it is a pacing point.
 
 `transport-quic` (config key: `off`, `shadow` or `prefer`; unset is
 `QuicMode::default_mode`, prefer on Linux, macOS and Windows and off
-elsewhere, since the breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
+elsewhere, since a gateway's breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
 `prefer` negotiates data with the share of pairs the ramp gives at the time ("Data
 slice" below; `upgrade::policy::log_startup` reports the share at INFO once per
 node, and each band the ramp enters is logged at INFO), and a pair with both bits
@@ -1950,7 +1951,8 @@ config value per node (off unless set, whatever the node default: the
 harness writes `off` into every node's config; an unknown value panics;
 tests that start nodes outside SimNetwork, in `crates/core/tests` and through
 freenet-test-network, get the platform default on purpose, as production does,
-except where a restart after SIGKILL would trip the breaker), and the
+except where a restart after SIGKILL would trip a unix gateway's breaker; a
+peer's short-run rule does not count a SIGKILL), and the
 endpoint runs on the network's VirtualTime (`get_socket_virtual_time`;
 RealTime in production, pinned by
 `the_transport_endpoint_runs_on_virtual_time_only_in_simulation`). Its
@@ -3611,8 +3613,10 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     decide by short runs instead: the
     breaker does not look at how a run ended: a panic hook records a panic located in QUIC
     code in the run's marker, and it counts runs that lasted under 10 minutes
-    and recorded one, so the fourth start after three such aborts in a row
-    trips it. An ordinary stop records no panic and never counts; an abort
+    and recorded one, so the start after two such aborts in a row trips a
+    peer while UDP exists (one below the rollback's three crashes, pinned by
+    the binary's peer_breaker_trips_before_the_crash_loop_rollback; back to
+    three when UDP is removed) and the start after three trips a gateway. An ordinary stop records no panic and never counts; an abort
     after 10 minutes or more never does, nor do aborts a day apart
     (quic/breaker/short_runs.rs). A panic counts as QUIC's when the thread
     is inside a QuicCode guard (quinn's driver polls in runtime.rs, the socket

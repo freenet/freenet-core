@@ -62,8 +62,8 @@
 //! got one of them wrong. So Windows does not ask how a run ended. A panic
 //! hook records a panic located in QUIC code (the failure this breaker is for
 //! always panics before it aborts), and runs that ended within ten minutes
-//! after recording one, three in a row, each starting within 24 h of the one
-//! before, keep QUIC off for the role's cooldown, with the same state and
+//! after recording one, three in a row (two on a peer while UDP exists),
+//! each starting within 24 h of the one before, keep QUIC off for the role's cooldown, with the same state and
 //! telemetry. [`short_runs`] describes it. Peers on every platform use it
 //! too (#6151): once UDP is removed a peer has no transport to fall back to,
 //! so the breaker must not trip on anything but a QUIC fault, and the exit
@@ -198,6 +198,7 @@ use serde::{Deserialize, Serialize};
 use crate::node::background_task_monitor::LateRegistrar;
 
 mod short_runs;
+pub use short_runs::PEER_SHORT_RUNS_TO_TRIP_WITH_UDP;
 pub(crate) use short_runs::QuicCode;
 
 /// How long QUIC stays off on a peer after a run with QUIC enabled ended
@@ -498,7 +499,7 @@ pub fn quic_breaker_clean_exit() {
         }
     }
     if let Some((path, nonce)) = LEGACY_ARMED.get() {
-        if let Err(error) = clear_if_owned(path, *nonce) {
+        if let Err(error) = clear_legacy_if_owned(path, *nonce) {
             tracing::debug!(%error, "Could not remove the legacy QUIC breaker shadow's marker");
         }
     }
@@ -980,18 +981,20 @@ pub(crate) fn observe(
         &marker_path(data_dir),
         note_path,
         shared,
+        read_previous,
         remove_if_exists,
     )
 }
 
 /// [`observe`] for the marker at `marker` (the breaker's own, or the legacy
-/// shadow's on a unix peer, [`legacy_shadow`]), with the marker removal
-/// injected, so a test can make it fail.
+/// shadow's on a unix peer, [`legacy_shadow`]) read with `read`, with the
+/// marker removal injected, so a test can make it fail.
 fn observe_with(
     quic_requested: bool,
     marker: &Path,
     note_path: Option<&Path>,
     shared: bool,
+    read: impl Fn(&Path) -> Previous,
     remove_marker: impl Fn(&Path) -> std::io::Result<()>,
 ) -> Option<Observed> {
     let stopped = note_path
@@ -999,7 +1002,7 @@ fn observe_with(
         .map(|content| parse_note(&content))
         .unwrap_or_default();
     if let Some(note) = note_path.filter(|_| !stopped.is_empty()) {
-        let noted = match read_previous(marker) {
+        let noted = match read(marker) {
             Previous::Marker(Marker::Armed { pid, .. }) if stopped.contains(&pid) => Some(pid),
             Previous::Nothing | Previous::Unreadable | Previous::Marker(_) => None,
         };
@@ -1022,7 +1025,7 @@ fn observe_with(
         }
     }
     quic_requested.then(|| Observed {
-        previous: read_previous(marker),
+        previous: read(marker),
         stopped,
     })
 }
@@ -1299,37 +1302,136 @@ fn legacy_shadow(
     now: SystemTime,
 ) -> Option<Verdict> {
     let (note_path, shared) = stop_note();
-    let path = legacy_shadow_path(data_dir);
-    let Observed { previous, stopped } = observe_with(
+    legacy_shadow_at(
         quic_requested,
-        &path,
+        data_dir,
         note_path.as_deref(),
         shared,
-        remove_if_exists,
-    )?;
-    let (decided, marker) = legacy_shadow_decide(
-        previous,
-        || read_previous(&marker_path(data_dir)),
-        &LegacyStart {
+        LegacyStart {
             boot_id: platform::boot_id(),
             own_pid: std::process::id(),
-            stopped,
+            stopped: Vec::new(),
             now_secs: unix_secs(now),
             ignore_breaker,
             nonce: crate::config::GlobalRng::random_u64(),
         },
         platform::pid_alive,
+        &PENDING,
+    )
+}
+
+/// [`legacy_shadow`] with the stop note, this start's facts, the platform's
+/// pid probe and the pending marker passed in, so a test can drive it. An
+/// Armed marker goes into `pending`, to be written once QUIC is up; a
+/// Tripped one is written now, and a failed write only loses the shadow's
+/// record (the next start decides again on what it finds).
+///
+/// The Armed marker it leaves is bounded like the breaker's own: a clean
+/// exit removes it, and the next start decides on it and replaces it. A
+/// process that stays up without QUIC never writes it.
+fn legacy_shadow_at(
+    quic_requested: bool,
+    data_dir: &Path,
+    note_path: Option<&Path>,
+    shared: bool,
+    mut start: LegacyStart,
+    pid_alive: impl Fn(u32) -> bool,
+    pending: &parking_lot::Mutex<Pending>,
+) -> Option<Verdict> {
+    let path = legacy_shadow_path(data_dir);
+    let version = crate::config::PCK_VERSION;
+    let boot_id = start.boot_id.clone();
+    let Observed { previous, stopped } = observe_with(
+        quic_requested,
+        &path,
+        note_path,
+        shared,
+        |path| read_legacy_shadow(path, version, boot_id.as_deref()),
+        remove_if_exists,
+    )?;
+    start.stopped = stopped;
+    let (decided, marker) = legacy_shadow_decide(
+        previous,
+        || read_previous(&marker_path(data_dir)),
+        &start,
+        pid_alive,
     );
+    let stamped = |marker| LegacyShadowFile {
+        version: version.to_string(),
+        boot_id: start.boot_id.clone(),
+        marker,
+    };
     match marker {
-        Some(armed @ Marker::Armed { .. }) => PENDING.lock().shadow = Some((path, armed)),
+        Some(armed @ Marker::Armed { .. }) => pending.lock().shadow = Some((path, stamped(armed))),
         Some(tripped) => {
-            if let Err(error) = write_marker(&path, &tripped) {
+            if let Err(error) = write_legacy_shadow(&path, &stamped(tripped)) {
                 tracing::debug!(%error, "Could not record the legacy QUIC breaker shadow's trip");
             }
         }
         None => {}
     }
     Some(decided)
+}
+
+/// The legacy shadow's file: its marker, stamped with the release and the
+/// machine boot it was written under ([`read_legacy_shadow`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct LegacyShadowFile {
+    pub version: String,
+    #[serde(default)]
+    pub boot_id: Option<String>,
+    pub marker: Marker,
+}
+
+/// The legacy shadow's marker at `path`, as evidence for this start of
+/// release `version` on boot `boot_id`. A file from another release is no
+/// evidence: after a rollback and a roll forward, an Armed marker left by
+/// the earlier run of this release would read as a crash that never
+/// happened. An Armed marker from another boot is no evidence either (the
+/// old rule never read one as a crash); a Tripped one still holds, as the
+/// old rule's trip did across a reboot. A file that does not parse is no
+/// evidence; one that cannot be read is [`Previous::Unreadable`].
+fn read_legacy_shadow(path: &Path, version: &str, boot_id: Option<&str>) -> Previous {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice::<LegacyShadowFile>(&bytes) {
+            Ok(file) if file.version != version => Previous::Nothing,
+            Ok(LegacyShadowFile {
+                marker: Marker::Armed { .. },
+                boot_id: stamped,
+                ..
+            }) if !same_boot(stamped.as_deref(), boot_id) => Previous::Nothing,
+            Ok(LegacyShadowFile {
+                marker: Marker::Unknown,
+                ..
+            })
+            | Err(_) => Previous::Nothing,
+            Ok(file) => Previous::Marker(file.marker),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Previous::Nothing,
+        Err(_) => Previous::Unreadable,
+    }
+}
+
+fn write_legacy_shadow(path: &Path, file: &LegacyShadowFile) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(file).map_err(std::io::Error::other)?;
+    write_atomic(path, &bytes)
+}
+
+/// Remove the legacy shadow's file if it holds the Armed marker with
+/// `nonce`; the clean exit's counterpart of [`clear_if_owned`].
+fn clear_legacy_if_owned(path: &Path, nonce: u64) -> std::io::Result<bool> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    match serde_json::from_slice::<LegacyShadowFile>(&bytes) {
+        Ok(LegacyShadowFile {
+            marker: Marker::Armed { nonce: owner, .. },
+            ..
+        }) if owner == nonce => remove_if_exists(path).map(|()| true),
+        Ok(_) | Err(_) => Ok(false),
+    }
 }
 
 /// What [`legacy_shadow_decide`] reads besides the markers.
@@ -1387,15 +1489,19 @@ fn legacy_shadow_decide(
     (decided, marker)
 }
 
-/// The earlier release's own marker, read as the legacy shadow's evidence
-/// when the shadow has none yet: an Armed or Tripped marker is what the old
-/// rule would have decided on. Anything else is no evidence.
+/// The breaker's own marker, read as the legacy shadow's evidence when the
+/// shadow has none (the first start after the upgrade from 0.2.159): only an
+/// Armed marker, which on a peer only 0.2.159's exit rule writes. A Tripped
+/// marker there may be the short-run rule's own trip, which the shadow must
+/// not take as the old rule's; anything else is no evidence.
 fn legacy_evidence(main: Previous) -> Previous {
     match main {
-        Previous::Marker(Marker::Armed { .. } | Marker::Tripped { .. }) => main,
+        Previous::Marker(Marker::Armed { .. }) => main,
         Previous::Nothing
         | Previous::Unreadable
-        | Previous::Marker(Marker::ShortRuns { .. } | Marker::Unknown) => Previous::Nothing,
+        | Previous::Marker(Marker::Tripped { .. } | Marker::ShortRuns { .. } | Marker::Unknown) => {
+            Previous::Nothing
+        }
     }
 }
 
@@ -1538,7 +1644,7 @@ fn note_transport_up(pending: &mut Pending, quic_up: bool, registrar: Option<&La
 struct Pending {
     marker: Option<(PathBuf, Marker)>,
     /// The legacy shadow's Armed marker, on a unix peer ([`legacy_shadow`]).
-    shadow: Option<(PathBuf, Marker)>,
+    shadow: Option<(PathBuf, LegacyShadowFile)>,
     quic_up: bool,
     signals_ready: bool,
     registrar: Option<LateRegistrar>,
@@ -1570,8 +1676,15 @@ fn arm_when_ready_into(
     if !(pending.quic_up && pending.signals_ready) {
         return;
     }
-    if let Some((path, marker @ Marker::Armed { nonce, .. })) = pending.shadow.take() {
-        match write_marker(&path, &marker) {
+    if let Some((
+        path,
+        file @ LegacyShadowFile {
+            marker: Marker::Armed { nonce, .. },
+            ..
+        },
+    )) = pending.shadow.take()
+    {
+        match write_legacy_shadow(&path, &file) {
             Ok(()) => {
                 let _first_wins = legacy_armed.set((path, nonce));
             }
@@ -2676,7 +2789,14 @@ mod tests {
         write_marker(&path, &marker_of(armed(PID, Some(BOOT)))).unwrap();
         record_deliberate_stop(&note, PID);
         let failing = |_: &Path| Err(std::io::Error::other("cannot remove"));
-        observe_with(false, &marker_path(dir.path()), Some(&note), false, failing);
+        observe_with(
+            false,
+            &marker_path(dir.path()),
+            Some(&note),
+            false,
+            read_previous,
+            failing,
+        );
         assert!(path.exists(), "removal failed");
         assert!(note.exists(), "so the note is kept");
         observe(false, dir.path(), Some(&note), false);
@@ -3277,16 +3397,11 @@ mod tests {
         let decide =
             |main: Previous| legacy_shadow_decide(Previous::Nothing, || main, &start, dead);
         assert_eq!(decide(armed(PID, Some(BOOT))).0, Verdict::Trip);
-        assert_eq!(
-            decide(Previous::Marker(Marker::Tripped {
-                tripped_at_secs: T0,
-                trips: 1
-            }))
-            .0,
-            Verdict::Cool {
-                tripped_at_secs: T0
-            }
-        );
+        // A Tripped marker there may be the short-run rule's own trip.
+        let tripped = Previous::Marker(Marker::Tripped {
+            tripped_at_secs: T0,
+            trips: 1,
+        });
         let short_runs = Previous::Marker(Marker::ShortRuns {
             short_runs: 2,
             started_at_secs: T0,
@@ -3297,6 +3412,7 @@ mod tests {
             prior_trip: None,
         });
         for main in [
+            tripped,
             short_runs,
             Previous::Nothing,
             Previous::Unreadable,
@@ -3308,6 +3424,139 @@ mod tests {
                 "{main:?}"
             );
         }
+    }
+
+    /// `marker` as this release writes the legacy shadow's file on boot
+    /// [`BOOT`].
+    fn stamped(marker: Marker) -> LegacyShadowFile {
+        LegacyShadowFile {
+            version: crate::config::PCK_VERSION.to_string(),
+            boot_id: Some(BOOT.to_string()),
+            marker,
+        }
+    }
+
+    /// The shadow's file is evidence only for the release that wrote it: a
+    /// file from another release (a rollback and a roll forward) is none, so
+    /// a stale Armed marker cannot produce a legacy trip. An Armed marker
+    /// from another boot is none either; a Tripped one holds across a
+    /// reboot, as the old rule's trip did.
+    #[test]
+    fn the_legacy_shadow_reads_only_its_own_releases_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = legacy_shadow_path(dir.path());
+        let read = || read_legacy_shadow(&path, crate::config::PCK_VERSION, Some(BOOT));
+        let armed_marker = marker_of(armed(PID, Some(BOOT)));
+        let tripped = Marker::Tripped {
+            tripped_at_secs: T0,
+            trips: 1,
+        };
+        assert_eq!(read(), Previous::Nothing, "no file");
+
+        write_legacy_shadow(&path, &stamped(armed_marker.clone())).unwrap();
+        assert_eq!(read(), Previous::Marker(armed_marker.clone()));
+
+        let mut other_release = stamped(armed_marker.clone());
+        other_release.version = "0.0.1".into();
+        write_legacy_shadow(&path, &other_release).unwrap();
+        assert_eq!(read(), Previous::Nothing, "another release's file");
+
+        let mut other_boot = stamped(armed_marker);
+        other_boot.boot_id = Some("boot-b".into());
+        write_legacy_shadow(&path, &other_boot).unwrap();
+        assert_eq!(
+            read(),
+            Previous::Nothing,
+            "an Armed marker from another boot"
+        );
+        other_boot.marker = tripped.clone();
+        write_legacy_shadow(&path, &other_boot).unwrap();
+        assert_eq!(
+            read(),
+            Previous::Marker(tripped),
+            "a trip holds across a reboot"
+        );
+
+        // The breaker's own format is not the shadow's.
+        write_marker(&path, &marker_of(armed(PID, Some(BOOT)))).unwrap();
+        assert_eq!(read(), Previous::Nothing);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(read(), Previous::Unreadable);
+    }
+
+    /// The shadow with QUIC off decides nothing and writes nothing, but still
+    /// reconciles the stop note, as the old rule did on every start; with
+    /// QUIC on, a crash it finds trips it, and a trip it cannot write is lost
+    /// without stopping the start.
+    #[test]
+    fn the_legacy_shadow_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = legacy_shadow_path(dir.path());
+        let note = dir.path().join("note");
+        let pending = parking_lot::Mutex::new(Pending {
+            marker: None,
+            shadow: None,
+            quic_up: false,
+            signals_ready: false,
+            registrar: None,
+        });
+        let start = || legacy_start(&[], false);
+        let dead = |_| false;
+
+        // QUIC off: the noted pid's marker is removed and the note consumed.
+        write_legacy_shadow(&path, &stamped(marker_of(armed(PID, Some(BOOT))))).unwrap();
+        std::fs::write(&note, PID.to_string()).unwrap();
+        let decided = legacy_shadow_at(
+            false,
+            dir.path(),
+            Some(&note),
+            false,
+            start(),
+            dead,
+            &pending,
+        );
+        assert_eq!(decided, None);
+        assert!(!path.exists(), "the noted run's marker is removed");
+        assert!(!note.exists(), "the note is consumed");
+        assert!(pending.lock().shadow.is_none());
+
+        // QUIC on, a crash: tripped and written at once.
+        write_legacy_shadow(&path, &stamped(marker_of(armed(PID, Some(BOOT))))).unwrap();
+        let decided = legacy_shadow_at(true, dir.path(), None, false, start(), dead, &pending);
+        assert_eq!(decided, Some(Verdict::Trip));
+        assert_eq!(
+            read_legacy_shadow(&path, crate::config::PCK_VERSION, Some(BOOT)),
+            Previous::Marker(Marker::Tripped {
+                tripped_at_secs: T0 + 60,
+                trips: 1
+            })
+        );
+        assert!(pending.lock().shadow.is_none());
+
+        // A trip that cannot be written: the start goes on, the file stays.
+        write_legacy_shadow(&path, &stamped(marker_of(armed(PID, Some(BOOT))))).unwrap();
+        let tmp = dir
+            .path()
+            .join(format!(".{LEGACY_SHADOW_FILE}.{}.tmp", std::process::id()));
+        std::fs::create_dir(&tmp).unwrap();
+        let decided = legacy_shadow_at(true, dir.path(), None, false, start(), dead, &pending);
+        assert_eq!(decided, Some(Verdict::Trip));
+        assert_eq!(
+            read_legacy_shadow(&path, crate::config::PCK_VERSION, Some(BOOT)),
+            Previous::Marker(marker_of(armed(PID, Some(BOOT))))
+        );
+        std::fs::remove_dir(&tmp).unwrap();
+
+        // No evidence: an Armed marker for this run waits in `pending`.
+        std::fs::remove_file(&path).unwrap();
+        let decided = legacy_shadow_at(true, dir.path(), None, false, start(), dead, &pending);
+        assert_eq!(decided, Some(Verdict::Arm));
+        assert_eq!(
+            pending.lock().shadow,
+            Some((path.clone(), stamped(legacy_armed().unwrap())))
+        );
+        assert!(!path.exists(), "written only once QUIC is up");
     }
 
     /// Arming writes the legacy shadow's marker beside the breaker's, records
@@ -3329,7 +3578,7 @@ mod tests {
         };
         let pending = |shadow_path: &Path| Pending {
             marker: Some((path.clone(), marker.clone())),
-            shadow: Some((shadow_path.to_path_buf(), legacy_armed().unwrap())),
+            shadow: Some((shadow_path.to_path_buf(), stamped(legacy_armed().unwrap()))),
             quic_up: true,
             signals_ready: true,
             registrar: None,
@@ -3339,11 +3588,15 @@ mod tests {
         assert_eq!(armed.get(), Some(&(path.clone(), 7)));
         assert_eq!(legacy.get(), Some(&(shadow.clone(), 11)));
         assert_eq!(
-            read_previous(&shadow),
+            read_legacy_shadow(&shadow, crate::config::PCK_VERSION, Some(BOOT)),
             Previous::Marker(legacy_armed().unwrap())
         );
-        assert!(!clear_if_owned(&shadow, 7).unwrap(), "the breaker's nonce");
-        assert!(clear_if_owned(&shadow, 11).unwrap());
+        assert!(
+            !clear_legacy_if_owned(&shadow, 7).unwrap(),
+            "the breaker's nonce"
+        );
+        assert!(clear_legacy_if_owned(&shadow, 11).unwrap());
+        assert!(!shadow.exists());
 
         std::fs::remove_file(&path).unwrap();
         let blocker = dir.path().join("a-file");

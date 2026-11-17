@@ -998,25 +998,31 @@ fn start_report(logs: &str) -> anyhow::Result<serde_json::Value> {
     Ok(serde_json::from_str(&json[..=end])?)
 }
 
-/// #6151: a unix peer that aborts on a QUIC panic three runs in a row trips
-/// the breaker at the fourth start and runs with QUIC off; the fifth stays
-/// off without moving the trip. The panic hook marks each run, with the
+/// #6151: a unix peer that aborts on a QUIC panic two runs in a row (its
+/// count while UDP exists, `PEER_SHORT_RUNS_TO_TRIP_WITH_UDP`, one below the
+/// post-update rollback's three crashes; the binary's
+/// `peer_breaker_trips_before_the_crash_loop_rollback` pins that order)
+/// trips the breaker at the third start and runs with QUIC off; the fourth
+/// stays off without moving the trip. The panic hook marks each run, with the
 /// panic's place, before the abort. The exit-status rule's shadow reads the
 /// first abort as a crash and holds that trip, which the start report gives
 /// as `legacy_verdict`, while QUIC stays on until the short-run rule trips.
 /// Linux CI builds this file with `quic-panic-injection`.
 ///
 /// FALSIFY: return early from `on_panic` in `breaker/short_runs.rs` (no run
-/// is marked, nothing counts, the fourth start runs QUIC); or make
+/// is marked, nothing counts, the third start runs QUIC); make
 /// `decides_by_short_runs` return `!unix` (the second start trips on the
-/// first abort).
+/// first abort, by exit status); or give a peer the gateway's three (the
+/// third start runs QUIC).
 #[cfg(feature = "quic-panic-injection")]
 #[test]
-fn a_unix_peer_trips_after_three_quic_panics_in_a_row() -> anyhow::Result<()> {
+fn a_unix_peer_trips_after_two_quic_panics_in_a_row() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let gateway = unreachable_gateway();
     let inject = [("FREENET_TEST_QUIC_PANIC", "abort:5")];
-    for run in 0..3u64 {
+    let trip_at = u64::from(freenet::PEER_SHORT_RUNS_TO_TRIP_WITH_UDP);
+    assert_eq!(trip_at, 2);
+    for run in 0..trip_at {
         let logs_dir = dir.path().join(format!("logs-{run}"));
         std::fs::create_dir_all(&logs_dir)?;
         let mut node =
@@ -1029,13 +1035,7 @@ fn a_unix_peer_trips_after_three_quic_panics_in_a_row() -> anyhow::Result<()> {
         assert_eq!(report["short_runs"], run, "{report}");
         // The shadow: no evidence at the first start; the first abort is a
         // crash to it, a trip it then holds.
-        let legacy = if run == 0 {
-            "arm"
-        } else if run == 1 {
-            "trip"
-        } else {
-            "cool"
-        };
+        let legacy = if run == 0 { "arm" } else { "trip" };
         assert_eq!(report["legacy_verdict"], legacy, "run {run}: {report}");
         if run > 0 {
             let at = report["quic_panic_at"].as_str().unwrap_or_default();
@@ -1060,39 +1060,40 @@ fn a_unix_peer_trips_after_three_quic_panics_in_a_row() -> anyhow::Result<()> {
         );
     }
 
-    let mut fourth = spawn_quic_node_with(
+    let mut third = spawn_quic_node_with(
         dir.path(),
         &dir.path().join("logs-trip"),
         &peer_args(&gateway),
     )?;
-    let logs = fourth.logs();
+    let logs = third.logs();
     assert!(
         logs.contains("Several runs in a row with QUIC enabled ended early")
             && !logs.contains(QUIC_BUILT_MARKER),
-        "three QUIC aborts in a row trip a peer. Logs:\n{logs}"
+        "two QUIC aborts in a row trip a peer. Logs:\n{logs}"
     );
     let report = start_report(&logs)?;
     assert_eq!(report["verdict"], "trip", "{report}");
     assert_eq!(report["quic_off"], true, "{report}");
-    assert_eq!(report["short_runs"], 3, "{report}");
+    assert_eq!(report["short_runs"], trip_at, "{report}");
+    assert_eq!(report["legacy_verdict"], "cool", "{report}");
     let tripped = read_quic_marker(dir.path())?;
     assert_eq!(
         tripped.as_ref().map(|m| m["state"].clone()),
         Some("tripped".into()),
         "{logs}"
     );
-    fourth.send_sigterm()?;
+    third.send_sigterm()?;
     assert_eq!(
-        fourth.wait_for_exit(Duration::from_secs(45))?.code(),
+        third.wait_for_exit(Duration::from_secs(45))?.code(),
         Some(0)
     );
 
-    let mut fifth = spawn_quic_node_with(
+    let mut fourth = spawn_quic_node_with(
         dir.path(),
         &dir.path().join("logs-cool"),
         &peer_args(&gateway),
     )?;
-    let logs = fifth.logs();
+    let logs = fourth.logs();
     assert!(
         logs.contains(QUIC_SHORT_RUNS_COOLING_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
         "{logs}"
@@ -1102,9 +1103,9 @@ fn a_unix_peer_trips_after_three_quic_panics_in_a_row() -> anyhow::Result<()> {
         tripped,
         "the trip does not move"
     );
-    fifth.send_sigterm()?;
+    fourth.send_sigterm()?;
     assert_eq!(
-        fifth.wait_for_exit(Duration::from_secs(45))?.code(),
+        fourth.wait_for_exit(Duration::from_secs(45))?.code(),
         Some(0)
     );
     Ok(())

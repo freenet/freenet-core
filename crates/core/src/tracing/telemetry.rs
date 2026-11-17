@@ -4664,12 +4664,16 @@ mod tests {
         // the 149 counters of `tel_t` and `tel`: measured 18629. Raised for
         // the 4 `recv_ap` counters (already-applied skips): measured 18725.
         // Raised by #6151 for the `quic_breaker_start` row of `tel_t` (2
-        // counters, 42 bytes at u64::MAX): measured 18857.
+        // counters, 42 bytes at u64::MAX): measured 18857. At #6151 the busy
+        // JSON block measured 6789, the empty one 2479, and the busy OTLP
+        // marginal 6865, all within their budgets.
         const MAX_WORST_CASE_JSON_BYTES: usize = 19_072;
         // Raised from 2_048 by #5647 for the same 7 new counters, about 2 bytes
         // each in an all-zero block (a digit and a comma): measured 2057.
         // Raised again by #6001 for `tel_t` and `tel`: measured 2515.
-        const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_560;
+        // Raised by #6151 for the `quic_breaker_start` row of `tel_t`
+        // (measured 2555 with that row, 5 bytes under the old 2_560).
+        const MAX_EMPTY_OTLP_MARGINAL_BYTES: usize = 2_816;
         // Raised from 5_120 (2026-08-07) to admit `ms_size` + `ms_unt_age`,
         // the two counters added for #5153. The budget exists to force this
         // arithmetic, not to forbid growth, so here it is:
@@ -4702,8 +4706,10 @@ mod tests {
         // MAX_WORST_CASE_JSON_BYTES (147 bytes at u64::MAX): measured 15414.
         // Raised by #6001 for `tel_t` and `tel`: measured 18703. Raised for the
         // `join_versions` row of `tel_t` (2 counters, 44 bytes at u64::MAX):
-        // measured 18845.
-        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 18_944;
+        // measured 18845. Raised by #6151 for the `quic_breaker_start` row
+        // (2 counters at u64::MAX): measured 18933, 11 bytes under the old
+        // 18_944.
+        const MAX_WORST_OTLP_MARGINAL_BYTES: usize = 19_200;
         const MAX_NULL_OTLP_MARGINAL_BYTES: usize = 64;
 
         let diagnostic = |value| crate::router::NetworkEfficiencyV1 {

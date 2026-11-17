@@ -3,17 +3,17 @@
 //! #6151).
 //!
 //! The unix gateway's breaker asks whether a run crashed. Windows gives no
-//! reliable way
-//! to answer that from the outside (a logoff, a Fast Startup shutdown, a
-//! session end and a `taskkill` all look alike), so this one asks the run
+//! reliable way to answer that from the outside (a logoff, a Fast Startup
+//! shutdown, a session end and a `taskkill` all look alike), so this one asks the run
 //! itself: the failure the breaker exists for, a panic inside quinn's driver
 //! or in the runtime adapter quinn calls under its lock, always panics before
 //! quinn's destructors abort the process. A panic hook ([`record_quic_panics`])
 //! records a panic located in quinn, quinn-proto or this crate's QUIC
 //! transport ([`quic_attributed`]) in the run's marker. A run with QUIC
 //! enabled counts only if it lasted less than [`SHORT_RUN`] and recorded such
-//! a panic, and [`SHORT_RUNS_TO_TRIP`] of them in a row keep QUIC off for
-//! the role's cooldown ([`BreakerRole::cooldown`]: 24 h on a peer; on a
+//! a panic, and [`short_runs_to_trip`] of them in a row (3 on a gateway, 2
+//! on a peer while UDP exists, [`PEER_SHORT_RUNS_TO_TRIP_WITH_UDP`]) keep
+//! QUIC off for the role's cooldown ([`BreakerRole::cooldown`]: 24 h on a peer; on a
 //! gateway 15 min, growing on repeat trips). A short run that recorded no
 //! QUIC panic (any ordinary stop) starts the count again. A run that started
 //! [`SHORT_RUN_WINDOW`] (24 h, for every role) or more after the one before
@@ -128,8 +128,8 @@
 //! - **A fatal listener or storage exit counts.** It also exits 42 under the
 //!   wrapper, but through `std::process::exit` in `p2p_impl.rs`, which does not
 //!   reach the clean exit.
-//! - **Known false trips** (one cooldown with QUIC off each): three short runs
-//!   in a row that each recorded a QUIC panic which did not stop the node and
+//! - **Known false trips** (one cooldown with QUIC off each): a trip's worth
+//!   of short runs in a row that each recorded a QUIC panic which did not stop the node and
 //!   were then stopped on purpose. Also a second node on the same data
 //!   directory that reaches [`gate`] while the first is under [`SHORT_RUN`]
 //!   with a recorded panic and the count one short of a trip. The preflight in
@@ -163,8 +163,29 @@ use crate::simulation::{RealTime, TimeSource};
 /// A run shorter than this counts toward a trip.
 pub(super) const SHORT_RUN: Duration = Duration::from_secs(10 * 60);
 
-/// The number of short runs in a row that keep QUIC off.
+/// The number of short runs in a row that keep QUIC off on a gateway, and on
+/// a peer once UDP is removed.
 pub(super) const SHORT_RUNS_TO_TRIP: u32 = 3;
+
+/// The number on a peer while UDP exists (#6151): one below the post-update
+/// crash-loop rollback's threshold (`ROLLBACK_CRASH_THRESHOLD`, 3, in the
+/// binary's `commands/rollback.rs`), so a release that panics in QUIC soon
+/// after it starts trips the breaker, and falls back to UDP, before the
+/// rollback counts enough crashes to restore the previous release and pin
+/// this one as bad. A start that trips runs with QUIC off, so it adds no
+/// crash. The binary pins the order
+/// (`peer_breaker_trips_before_the_crash_loop_rollback`). Goes back to
+/// [`SHORT_RUNS_TO_TRIP`] when UDP is removed, when there is no UDP to fall
+/// back to and a rollback is the better outcome.
+pub const PEER_SHORT_RUNS_TO_TRIP_WITH_UDP: u32 = 2;
+
+/// How many short runs in a row trip the breaker for `role`.
+pub(super) const fn short_runs_to_trip(role: BreakerRole) -> u32 {
+    match role {
+        BreakerRole::Peer => PEER_SHORT_RUNS_TO_TRIP_WITH_UDP,
+        BreakerRole::Gateway => SHORT_RUNS_TO_TRIP,
+    }
+}
 
 /// How many times the timer tries to clear the count, [`SHORT_RUN`] apart. A
 /// scanner holding the file open makes a removal fail on Windows, and the
@@ -234,7 +255,7 @@ pub(super) fn decide(
             ..
         }) if within(*started_at_secs, now_secs, SHORT_RUN_WINDOW) => {
             let short_runs = short_runs.saturating_add(1);
-            if short_runs >= SHORT_RUNS_TO_TRIP && !ignore_breaker {
+            if short_runs >= short_runs_to_trip(role) && !ignore_breaker {
                 Decision {
                     verdict: Verdict::Trip,
                     short_runs,
@@ -323,7 +344,7 @@ fn counted_panic_at(previous: &Previous, decision: Decision) -> Option<String> {
             quic_panicked: true,
             quic_panic_at,
             ..
-        }) if decision.short_runs > 0 => quic_panic_at.clone(),
+        }) if decision.short_runs > 0 => quic_panic_at.as_deref().map(cap_place),
         Previous::Nothing | Previous::Unreadable | Previous::Marker(_) => None,
     }
 }
@@ -373,7 +394,7 @@ pub(super) fn gate<T>(
             if decision.short_runs > 0 {
                 tracing::info!(
                     short_runs = decision.short_runs,
-                    trip_at = SHORT_RUNS_TO_TRIP,
+                    trip_at = short_runs_to_trip(role),
                     "The previous run with QUIC enabled lasted less than the short-run limit"
                 );
             }
@@ -651,28 +672,59 @@ fn on_panic(location: Option<(&str, u32)>, in_quic: bool) {
 /// The longest panic place recorded, in bytes.
 const MAX_PANIC_PLACE: usize = 160;
 
-/// A panic location as telemetry reports it: `file:line`, with the file cut
-/// to the crate directory and what follows (the component before its last
-/// `src` directory onward, `quinn-proto-0.11.9/src/connection/mod.rs`), so
-/// no home directory or build path leaves the machine, and at most
-/// [`MAX_PANIC_PLACE`] bytes. A file with no `src` directory keeps only its
-/// name.
+/// A panic location as telemetry reports it, `file:line`, with no path
+/// from the build machine: the file is cut at its last `src` directory,
+/// keeping the directory above it only when that names a crate
+/// ([`crate_dir`]: `quinn-proto-0.11.9/src/connection/mod.rs`,
+/// `core/src/transport/quic/socket.rs`) and dropping it otherwise
+/// (`/home/alice/src/x.rs` gives `src/x.rs`). A file under a `target`
+/// directory (generated code) and a file with no `src` directory keep only
+/// their name. At most [`MAX_PANIC_PLACE`] bytes ([`cap_place`]).
 pub(super) fn panic_place(file: &str, line: u32) -> String {
     let file = file.replace('\\', "/");
     let parts: Vec<&str> = file.split('/').filter(|part| !part.is_empty()).collect();
-    let from = parts
-        .iter()
-        .rposition(|part| *part == "src")
-        .map_or(parts.len().saturating_sub(1), |src| src.saturating_sub(1));
-    let mut place = format!("{}:{line}", parts[from..].join("/"));
-    if place.len() > MAX_PANIC_PLACE {
-        let cut = place.len() - MAX_PANIC_PLACE;
-        let start = (cut..place.len())
-            .find(|i| place.is_char_boundary(*i))
-            .unwrap_or(place.len());
-        place = place.split_off(start);
+    let name = parts.last().copied().unwrap_or_default();
+    let place = match parts.iter().rposition(|part| *part == "src") {
+        _ if parts.contains(&"target") => name.to_string(),
+        Some(src) => {
+            let from = match src.checked_sub(1) {
+                Some(above) if crate_dir(parts[above]) => above,
+                Some(_) | None => src,
+            };
+            parts[from..].join("/")
+        }
+        None => name.to_string(),
+    };
+    cap_place(&format!("{place}:{line}"))
+}
+
+/// Whether a directory name above `src` names a crate rather than a place on
+/// the build machine: a registry or vendored crate directory
+/// (`name-1.2.3`), quinn's crates, the standard library's (`core`, `alloc`,
+/// `std`), or this crate (`crates/core`).
+fn crate_dir(name: &str) -> bool {
+    const KNOWN: [&str; 6] = ["core", "alloc", "std", "quinn", "quinn-proto", "quinn-udp"];
+    let versioned = name.rsplit_once('-').is_some_and(|(crate_name, version)| {
+        !crate_name.is_empty()
+            && version.contains('.')
+            && version.starts_with(|c: char| c.is_ascii_digit())
+    });
+    versioned || KNOWN.contains(&name)
+}
+
+/// `place` cut to its last [`MAX_PANIC_PLACE`] bytes, on a character
+/// boundary. Applied when the place is recorded and again when it is read
+/// back from the marker for telemetry, since the marker is a file anyone with
+/// access to the data directory can edit.
+pub(super) fn cap_place(place: &str) -> String {
+    if place.len() <= MAX_PANIC_PLACE {
+        return place.to_string();
     }
-    place
+    let cut = place.len() - MAX_PANIC_PLACE;
+    let start = (cut..place.len())
+        .find(|i| place.is_char_boundary(*i))
+        .unwrap_or(place.len());
+    place[start..].to_string()
 }
 
 /// Mark the marker, unless `cleared` says the run removed it on purpose, and
@@ -718,6 +770,25 @@ mod tests {
     /// The peer decision; the gateway one is tested by name.
     fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -> Decision {
         super::decide(previous, now_secs, ignore_breaker, BreakerRole::Peer)
+    }
+
+    /// The trip count of the role these tests use, a peer.
+    const SHORT_RUNS_TO_TRIP: u32 = short_runs_to_trip(BreakerRole::Peer);
+
+    /// A peer trips at two while UDP exists, a gateway at three.
+    #[test]
+    fn a_peer_trips_one_run_sooner_than_a_gateway_while_udp_exists() {
+        let panicked_runs = |short_runs| panicked(short_runs, T0);
+        for role in [BreakerRole::Peer, BreakerRole::Gateway] {
+            let at = short_runs_to_trip(role);
+            let before = super::decide(&panicked_runs(at - 2), T0 + 1, false, role);
+            assert_eq!(before.verdict, Verdict::Arm, "{role:?}");
+            let trip = super::decide(&panicked_runs(at - 1), T0 + 1, false, role);
+            assert_eq!(trip.verdict, Verdict::Trip, "{role:?}");
+            assert_eq!(trip.short_runs, at, "{role:?}");
+        }
+        assert_eq!(short_runs_to_trip(BreakerRole::Peer), 2);
+        assert_eq!(short_runs_to_trip(BreakerRole::Gateway), 3);
     }
 
     /// The short-run clear and the endpoint-death record, in either order,
@@ -966,10 +1037,10 @@ mod tests {
         verdict
     }
 
-    /// Three short runs that panicked in QUIC code trip, not two: the fourth
-    /// start is the first one with QUIC off.
+    /// A peer's trip count of short runs that panicked in QUIC code trips,
+    /// not one fewer: the start after them is the first with QUIC off.
     #[test]
-    fn three_short_runs_in_a_row_trip() {
+    fn a_trips_worth_of_short_runs_in_a_row_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = marker_path(dir.path());
         for run in 0..SHORT_RUNS_TO_TRIP {
@@ -1006,7 +1077,10 @@ mod tests {
                 "start {run}"
             );
         }
-        assert_eq!(read_previous(&path), panicked(2, T0 + 10));
+        assert_eq!(
+            read_previous(&path),
+            panicked(SHORT_RUNS_TO_TRIP - 1, T0 + 10)
+        );
     }
 
     #[test]
@@ -1444,15 +1518,20 @@ mod tests {
             decide(&running(SHORT_RUNS_TO_TRIP - 1, T0), T0, false),
             arm(0)
         );
-        // Two panicked runs, then an ordinary stop: the count starts again.
+        // Panicked runs one short of a trip, then an ordinary stop: the count
+        // starts again.
         std::fs::remove_file(&path).unwrap();
-        for run in 0..2 {
+        let short = u64::from(SHORT_RUNS_TO_TRIP - 1);
+        for run in 0..short {
             assert_eq!(start_panicking(&path, T0 + run, false), Verdict::Arm);
         }
-        assert_eq!(start(&path, T0 + 2, false), Verdict::Arm);
-        assert_eq!(read_previous(&path), running(2, T0 + 2));
-        assert_eq!(start(&path, T0 + 3, false), Verdict::Arm);
-        assert_eq!(read_previous(&path), running(0, T0 + 3));
+        assert_eq!(start(&path, T0 + short, false), Verdict::Arm);
+        assert_eq!(
+            read_previous(&path),
+            running(SHORT_RUNS_TO_TRIP - 1, T0 + short)
+        );
+        assert_eq!(start(&path, T0 + short + 1, false), Verdict::Arm);
+        assert_eq!(read_previous(&path), running(0, T0 + short + 1));
     }
 
     /// Attribution is by the panic's file: quinn and quinn-proto, under any
@@ -1539,6 +1618,10 @@ mod tests {
                 "quinn-proto-0.11.9/src/connection/mod.rs:7",
             ),
             (
+                "/home/someone/.cargo/git/checkouts/quinn-0a1b2c/d3e4f5/quinn-proto/src/x.rs",
+                "quinn-proto/src/x.rs:7",
+            ),
+            (
                 "crates/core/src/transport/quic/socket.rs",
                 "core/src/transport/quic/socket.rs:7",
             ),
@@ -1550,16 +1633,24 @@ mod tests {
                 "/rustc/48a229ce/library/alloc/src/raw_vec/mod.rs",
                 "alloc/src/raw_vec/mod.rs:7",
             ),
+            // A user's own `src` directory: the name above it is dropped.
+            ("/home/alice/src/x.rs", "src/x.rs:7"),
+            (
+                "/home/alice/src/proj/target/debug/build/gen-1a2b/out/gen.rs",
+                "gen.rs:7",
+            ),
             ("/home/someone/build/generated.rs", "generated.rs:7"),
             ("", ":7"),
         ];
         for (file, place) in cases {
             assert_eq!(panic_place(file, 7), place, "{file}");
+            assert!(!panic_place(file, 7).contains("alice"), "{file}");
+            assert!(!panic_place(file, 7).contains("someone"), "{file}");
         }
-        let long = format!("{}/src/x.rs", "é".repeat(200));
+        let long = format!("/src/{}x.rs", "é/".repeat(200));
         let place = panic_place(&long, 7);
         assert!(place.len() <= MAX_PANIC_PLACE, "{}", place.len());
-        assert!(place.ends_with("/src/x.rs:7"), "{place}");
+        assert!(place.ends_with("/x.rs:7"), "{place}");
     }
 
     /// A start that counts the last run reports where its panic was; one
@@ -1589,6 +1680,12 @@ mod tests {
             )
         };
         assert_eq!(place(previous(T0, true)), Some(at.clone()));
+        // A place read back from the marker is capped again.
+        let mut long = previous(T0, true);
+        if let Previous::Marker(Marker::ShortRuns { quic_panic_at, .. }) = &mut long {
+            *quic_panic_at = Some("x".repeat(10 * MAX_PANIC_PLACE));
+        }
+        assert_eq!(place(long).map(|at| at.len()), Some(MAX_PANIC_PLACE));
         assert_eq!(place(previous(T0, false)), None);
         assert_eq!(
             place(previous(now - SHORT_RUN_WINDOW.as_secs(), true)),

@@ -3630,10 +3630,10 @@ pub struct TransportSnapshot {
     /// released it (#5940). Not counted: a panic in a path's receive task.
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped, so this run started with
-    /// QUIC off (#5940): on a peer, and a gateway on Windows, three runs in a
-    /// row ended within ten minutes after a panic in QUIC code; on a unix
-    /// gateway a run with QUIC enabled ended abnormally. The
-    /// `quic_breaker_start` event says which rule decided.
+    /// QUIC off (#5940): on a peer (two while UDP exists) and a gateway on
+    /// Windows (three), runs in a row ended within ten minutes after a panic
+    /// in QUIC code; on a unix gateway a run with QUIC enabled ended
+    /// abnormally. The `quic_breaker_start` event says which rule decided.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
     /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
@@ -4472,10 +4472,10 @@ struct SnapshotExtras {
     /// released it (#5940). Not counted: a panic in a path's receive task.
     pub quic_adapter_panicked: u64,
     /// Times the QUIC crash-loop breaker tripped, so this run started with
-    /// QUIC off (#5940): on a peer, and a gateway on Windows, three runs in a
-    /// row ended within ten minutes after a panic in QUIC code; on a unix
-    /// gateway a run with QUIC enabled ended abnormally. The
-    /// `quic_breaker_start` event says which rule decided.
+    /// QUIC off (#5940): on a peer (two while UDP exists) and a gateway on
+    /// Windows (three), runs in a row ended within ten minutes after a panic
+    /// in QUIC code; on a unix gateway a run with QUIC enabled ended
+    /// abnormally. The `quic_breaker_start` event says which rule decided.
     pub quic_breaker_trips: u64,
     /// Sends the QUIC socket refused with `WouldBlock` (egress cap or full
     /// socket buffer). Chiefly datagrams quinn's endpoint made on its own,
