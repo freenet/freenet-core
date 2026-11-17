@@ -1247,6 +1247,37 @@ impl P2pConnManager {
                     }
                 };
 
+                // The survivor rule (`native_holds_peer`): an inbound UDP
+                // connection from a peer a native connection holds is dropped,
+                // leaving the native entry, the ring and the transient budget
+                // untouched. The peer applies the same rule to its own copy
+                // of this pair, so it normally keeps the native connection
+                // too; see `native_holds_peer` for when the two ends can
+                // decide differently.
+                if let Some(holder) =
+                    self.native_holds_peer(remote_addr, peer.as_ref().map(|p| p.pub_key()))
+                {
+                    tracing::info!(
+                        remote = %remote_addr,
+                        %holder,
+                        transient,
+                        transaction = ?transaction,
+                        "Inbound UDP connection from a peer a native connection holds; \
+                         keeping the native connection"
+                    );
+                    TRANSPORT_METRICS.record_connect_native_survivor(false);
+                    #[cfg(any(test, feature = "testing"))]
+                    crate::operations::connect::native_wire_trace::record_at(
+                        remote_addr,
+                        crate::operations::connect::native_wire_trace::NativeWireEvent::Survivor {
+                            swapped: false,
+                            inbound: true,
+                        },
+                    );
+                    drop(connection);
+                    return Ok(());
+                }
+
                 tracing::info!(
                     remote = %remote_addr,
                     peer_known = peer.is_some(),
@@ -1304,30 +1335,70 @@ impl P2pConnManager {
                     transaction = %transaction,
                     "Outbound connection established"
                 );
-                // A UDP dial beside a native one connected.
                 if !transport.is_native() {
-                    if let Some(beside) = state.udp_beside_native.remove(&peer_addr) {
-                        // The native dial connected first: the connection
-                        // established first is kept. This one is closed (dropped)
-                        // without touching the ring or the transient budget, and
-                        // this dial's requesters are answered with the kept one.
-                        if self.connections.contains_key(&peer_addr) {
-                            tracing::info!(
-                                remote = %peer_addr,
-                                transaction = %transaction,
-                                "UDP dial beside a native dial connected after the native one; \
-                                 keeping the native connection"
-                            );
-                            TRANSPORT_METRICS.record_connect_native_both_dials_connected(true);
-                            answer_beside(peer_addr, beside, Ok((peer_addr, None))).await;
-                            drop(connection);
-                            return Ok(());
+                    let beside = state.udp_beside_native.remove(&peer_addr);
+                    // The survivor rule (`native_holds_peer`): a UDP dial to a
+                    // peer a native connection holds is dropped without
+                    // touching the ring or the transient budget, whether it
+                    // ran beside that native dial or not, and its requesters
+                    // are answered with the native connection.
+                    if let Some(holder) = self.native_holds_peer(peer_addr, Some(peer.pub_key())) {
+                        // The in-transit reservation this dial made at its
+                        // own address is not used: the peer is held at
+                        // `holder`. At the holder's own address it is the
+                        // ring entry, which stays.
+                        // Not while a native dial to that address is
+                        // pending: the reservation is that dial's too.
+                        if holder != peer_addr && !state.native_pending.contains(&peer_addr) {
+                            let cm = &self.bridge.op_manager.ring.connection_manager;
+                            if !cm.is_in_ring(peer_addr) && cm.has_connection_or_pending(peer_addr)
+                            {
+                                cm.prune_in_transit_connection(peer_addr);
+                            }
                         }
-                        // Otherwise its requesters join the native dial's, and
-                        // this connection answers them all, since every one of
-                        // them asked for a connection to this peer. If the native
-                        // dial then connects too, its connection is the one
-                        // closed.
+                        tracing::info!(
+                            %holder,
+                            remote = %peer_addr,
+                            transaction = %transaction,
+                            beside = beside.is_some(),
+                            "UDP dial connected to a peer a native connection holds; \
+                             keeping the native connection"
+                        );
+                        TRANSPORT_METRICS.record_connect_native_survivor(false);
+                        #[cfg(any(test, feature = "testing"))]
+                        crate::operations::connect::native_wire_trace::record_at(
+                            peer_addr,
+                            crate::operations::connect::native_wire_trace::NativeWireEvent::Survivor {
+                                swapped: false,
+ inbound: false,
+                            },
+                        );
+                        let mut requesters = Vec::new();
+                        if let Some(beside) = beside {
+                            // The pair's own native dial connected first.
+                            TRANSPORT_METRICS.record_connect_native_both_dials_connected(true);
+                            requesters = beside;
+                        }
+                        state.awaiting_connection_txs.remove(&peer_addr);
+                        if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
+                            requesters.extend(
+                                callbacks
+                                    .into_iter()
+                                    .map(|callback| (transaction, callback)),
+                            );
+                        }
+                        // Answered with the connection that holds the peer.
+                        answer_beside(peer_addr, requesters, Ok((holder, None))).await;
+                        drop(connection);
+                        return Ok(());
+                    }
+                    if let Some(beside) = beside {
+                        // A UDP dial beside a native one connected first: its
+                        // requesters join the native dial's, and this
+                        // connection answers them all, since every one of them
+                        // asked for a connection to this peer. If the native
+                        // dial then connects too, its connection is swapped in
+                        // for this one.
                         if state.native_pending.contains(&peer_addr) {
                             state.beside_udp_connected.insert(peer_addr);
                         }
@@ -1369,35 +1440,101 @@ impl P2pConnManager {
                 }
 
                 // A native dial ends here whatever follows, so it is no longer
-                // pending. If the pair is already connected (the UDP dial
-                // beside it connected first, or another connection did), the
-                // connection established first is kept: this one is closed
-                // (dropped) without touching the ring or the transient budget,
-                // and the native dial's requesters are answered with the kept
-                // one.
+                // pending, and its setup worked, so a joiner's success resets
+                // the demotion streak before anything decides which
+                // connection to keep (only a joiner's failures count toward
+                // it). Then, if the peer already has an entry under the same
+                // key:
+                // - a UDP one: the survivor rule (`native_holds_peer`) swaps
+                //   this native connection in for it, in place, without
+                //   promotion, prune or transient budget call;
+                // - a native one: the first is kept, and this one is closed
+                //   (dropped) without touching the ring or the budget.
+                // Either way the native dial's requesters are answered with
+                // the kept connection. An entry under another key is stale
+                // (the peer came back under a new key, e.g. after a suspend)
+                // and is replaced by the ordinary path below.
                 if transport.is_native() {
                     state.native_pending.remove(&peer_addr);
                     let after_beside_udp = state.beside_udp_connected.remove(&peer_addr);
-                    if self.connections.contains_key(&peer_addr) {
+                    if origin == crate::transport::NatAttemptOrigin::ConnectJoiner {
+                        self.bridge
+                            .op_manager
+                            .ring
+                            .connection_manager
+                            .native_connect()
+                            .record_success();
+                    }
+                    #[cfg(any(test, feature = "testing"))]
+                    {
+                        use crate::operations::connect::native_wire_trace::{
+                            NativeWireEvent, record_at,
+                        };
+                        record_at(peer_addr, NativeWireEvent::NativeDial { established: true });
+                        if let Some(own) = self
+                            .bridge
+                            .op_manager
+                            .ring
+                            .connection_manager
+                            .get_own_addr()
+                        {
+                            record_at(
+                                peer_addr,
+                                NativeWireEvent::NativeSetupEnded {
+                                    tx: transaction,
+                                    own,
+                                    established: true,
+                                },
+                            );
+                        }
+                    }
+                    let existing_native = self
+                        .connections
+                        .get(&peer_addr)
+                        .filter(|entry| entry.pub_key() == Some(peer.pub_key()))
+                        .map(|entry| entry.native);
+                    if let Some(existing_native) = existing_native {
                         tracing::info!(
                             remote = %peer_addr,
                             transaction = %transaction,
                             after_beside_udp,
-                            "native dial connected after the pair connected another way; \
-                             keeping the first connection"
+                            existing_native,
+                            "native dial connected after the pair connected another way"
                         );
-                        if after_beside_udp {
-                            TRANSPORT_METRICS.record_connect_native_both_dials_connected(false);
+                        if existing_native {
+                            drop(connection);
+                        } else {
+                            let remote_version = connection.remote_version();
+                            self.replace_transport_in_place(peer_addr, connection)
+                                .await?;
+                            TRANSPORT_METRICS.record_connect_native_survivor(true);
+                            #[cfg(any(test, feature = "testing"))]
+                            crate::operations::connect::native_wire_trace::record_at(
+                                peer_addr,
+                                crate::operations::connect::native_wire_trace::NativeWireEvent::Survivor {
+                                    swapped: true,
+ inbound: false,
+                                },
+                            );
+                            if after_beside_udp {
+                                TRANSPORT_METRICS.record_connect_native_both_dials_connected(false);
+                            }
+                            self.record_native_gateway_join(peer_addr, remote_version);
                         }
                         state.awaiting_connection_txs.remove(&peer_addr);
-                        if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
-                            let requesters = callbacks
-                                .into_iter()
-                                .map(|callback| (transaction, callback))
-                                .collect();
-                            answer_beside(peer_addr, requesters, Ok((peer_addr, None))).await;
+                        let mut requesters: Vec<_> = state
+                            .awaiting_connection
+                            .remove(&peer_addr)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|callback| (transaction, callback))
+                            .collect();
+                        // A UDP dial beside this one still runs; its outcome
+                        // ends the entry, which stays, empty.
+                        if let Some(beside) = state.udp_beside_native.get_mut(&peer_addr) {
+                            requesters.append(beside);
                         }
-                        drop(connection);
+                        answer_beside(peer_addr, requesters, Ok((peer_addr, None))).await;
                         return Ok(());
                     }
                 }
@@ -1409,35 +1546,7 @@ impl P2pConnManager {
                         IdentitySource::Dialled
                     }
                     crate::operations::connect::native::DialTransport::Native { .. } => {
-                        // Only a joiner's success resets the demotion streak,
-                        // as only a joiner's failures count toward it.
-                        if origin == crate::transport::NatAttemptOrigin::ConnectJoiner {
-                            self.bridge
-                                .op_manager
-                                .ring
-                                .connection_manager
-                                .native_connect()
-                                .record_success();
-                        }
-                        if self.bridge.op_manager.ring.connection_manager.is_gateway() {
-                            crate::transport::join_versions::record_gateway_join(
-                                self.bridge
-                                    .op_manager
-                                    .ring
-                                    .connection_manager
-                                    .get_own_addr()
-                                    .unwrap_or(peer_addr),
-                                crate::transport::join_versions::JoinTransport::Native,
-                                connection.remote_version(),
-                            );
-                        }
-                        #[cfg(any(test, feature = "testing"))]
-                        crate::operations::connect::native_wire_trace::record_at(
-                            peer_addr,
-                            crate::operations::connect::native_wire_trace::NativeWireEvent::NativeDial {
-                                established: true,
-                            },
-                        );
+                        self.record_native_gateway_join(peer_addr, connection.remote_version());
                         IdentitySource::Proven
                     }
                 };
@@ -1520,6 +1629,25 @@ impl P2pConnManager {
                         return Ok(());
                     }
                 };
+                #[cfg(any(test, feature = "testing"))]
+                if transport.is_native() {
+                    if let Some(own) = self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .get_own_addr()
+                    {
+                        crate::operations::connect::native_wire_trace::record_at(
+                            peer_addr,
+                            crate::operations::connect::native_wire_trace::NativeWireEvent::NativeSetupEnded {
+                                tx: transaction,
+                                own,
+                                established: false,
+                            },
+                        );
+                    }
+                }
 
                 let native = transport.is_native();
                 // A native dial ends here, so it is no longer pending.
@@ -1527,20 +1655,19 @@ impl P2pConnManager {
                     state.native_pending.remove(&peer_addr);
                     state.beside_udp_connected.remove(&peer_addr);
                 }
-                // A UDP dial beside a native one failed. It never backs off:
-                // the native dial's own UDP fallback, up to
-                // NATIVE_FALLBACK_AFTER later, still needs the peer, and a
-                // 30 s backoff would refuse it.
+                // A UDP dial beside a native one failed.
                 // - The pair is connected (the native dial won): its
                 //   requesters get that connection; nothing else.
                 // - The native dial is still pending: its requesters get the
-                //   failure; the native dial keeps the in-transit slot and the
-                //   address is not marked.
+                //   failure; the native dial keeps the in-transit slot, the
+                //   address is not marked, and there is no backoff, since the
+                //   native dial's own UDP fallback, up to
+                //   NATIVE_FALLBACK_AFTER later, still needs the peer and a
+                //   30 s backoff would refuse it.
                 // - The native dial has ended without a connection: this was
                 //   the last dial, so its requesters take the ordinary failure
                 //   path below (in-transit release, failed address,
-                //   diagnostics), all but the backoff.
-                let mut skip_backoff = false;
+                //   diagnostics, backoff).
                 if !native {
                     if let Some(beside) = state.udp_beside_native.remove(&peer_addr) {
                         let connected = self.connections.contains_key(&peer_addr);
@@ -1561,7 +1688,6 @@ impl P2pConnManager {
                             answer_beside(peer_addr, beside, Err(())).await;
                             return Ok(());
                         }
-                        skip_backoff = true;
                         for (tx, callback) in beside {
                             state
                                 .awaiting_connection
@@ -1684,7 +1810,7 @@ impl P2pConnManager {
                 crate::node::network_status::record_gateway_failure(peer_addr, failure_reason);
 
                 // Record failure for exponential backoff to prevent rapid retries
-                if !native && !skip_backoff && !peer_addr.ip().is_unspecified() {
+                if !native && !peer_addr.ip().is_unspecified() {
                     state.peer_backoff.record_failure(peer_addr);
                 }
 
@@ -1731,6 +1857,217 @@ impl P2pConnManager {
             }
         }
         Ok(())
+    }
+
+    /// A gateway counts a native join when a native connection is kept, as
+    /// the UDP listener counts a legacy one when its handshake completes.
+    fn record_native_gateway_join(
+        &self,
+        peer_addr: SocketAddr,
+        remote_version: Option<(u8, u8, u16)>,
+    ) {
+        let connection_manager = &self.bridge.op_manager.ring.connection_manager;
+        if connection_manager.is_gateway() {
+            crate::transport::join_versions::record_gateway_join(
+                connection_manager.get_own_addr().unwrap_or(peer_addr),
+                crate::transport::join_versions::JoinTransport::Native,
+                remote_version,
+            );
+        }
+    }
+
+    /// Starts the task that owns `connection` for the entry at `peer_addr`
+    /// whose sender feeds `rx` and whose id is `conn_id`.
+    async fn spawn_peer_connection_listener(
+        &self,
+        rx: PeerConnChannelRecv,
+        mut connection: Box<dyn PeerConnectionApi>,
+        peer_addr: SocketAddr,
+        conn_id: u64,
+        link_use: zombie_sweep::LinkUseStamp,
+    ) -> anyhow::Result<()> {
+        let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
+            anyhow::bail!("Connection event channel not initialized");
+        };
+
+        // Phase 4: Set orphan stream registry on connection for handling race conditions
+        // between stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
+        connection
+            .set_inbound_stream_registry(self.bridge.op_manager.orphan_stream_registry().clone());
+
+        // Use tokio::spawn directly instead of GlobalExecutor::spawn.
+        // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
+        // reliably poll tasks in certain test contexts (see issue #2709).
+        let outbound_mix = self.bridge.op_manager.outbound_mix.clone();
+        let propagation = crate::operations::update::propagation_stats::PropagationSink::of(
+            &self.bridge.op_manager,
+        );
+        let native_wire = self.bridge.op_manager.ring.connection_manager.native_wire();
+        tokio::spawn(async move {
+            peer_connection_listener(
+                rx,
+                connection,
+                peer_addr,
+                conn_events,
+                conn_id,
+                outbound_mix,
+                propagation,
+                link_use,
+                native_wire,
+            )
+            .await;
+        });
+        // Yield to allow the spawned peer_connection_listener task to start.
+        // This is important because on some runtimes (especially in tests with boxed_local
+        // futures), spawned tasks may not be scheduled immediately, causing messages
+        // sent to the channel to pile up without being processed.
+        tokio::task::yield_now().await;
+        Ok(())
+    }
+
+    /// The survivor rule: when this node holds, or is handed, a QUIC-native
+    /// and a UDP connection to the same peer, it keeps the native one,
+    /// whichever arrived first and whichever side dialled the UDP one. Both
+    /// ends of a pair apply the rule, so they normally keep the same
+    /// connection without exchanging anything. Two UDP connections to one
+    /// address keep the older behaviour (the later replaces the earlier).
+    ///
+    /// Residual: liveness is judged by each end on its own receipt stamp, so
+    /// a UDP connection arriving when one end's native connection has just
+    /// passed `identity::HOLD_WINDOW` and the other's has not can be kept at
+    /// one end and dropped at the other. That needs the native connection to
+    /// have been silent for about two keepalive intervals (the window is at
+    /// least twice the interval, asserted below), so about two lost
+    /// keepalives in a row; it is rare and tracked as a gate before native
+    /// connects are enabled.
+    ///
+    /// The address of the live native connection that holds the peer a UDP
+    /// connection at `addr` claims as `key`, if one does: the entry bound to
+    /// `key`, or, with no key, the entry at `addr`, when it is native and was
+    /// heard from within `identity::HOLD_WINDOW`. A native entry at `addr`
+    /// bound to another key is stale (the peer came back under a new key), so
+    /// it does not hold the peer. Nor does a native entry gone quiet: the
+    /// peer may have restarted, or its NAT rebound, and its native connection
+    /// will only end at the QUIC idle timeout. In both cases the UDP
+    /// connection takes the ordinary path, which replaces the stale entry.
+    fn native_holds_peer(
+        &self,
+        addr: SocketAddr,
+        key: Option<&TransportPublicKey>,
+    ) -> Option<SocketAddr> {
+        let at = match key {
+            Some(key) => *self.addr_by_pub_key.get(key)?,
+            None => addr,
+        };
+        self.connections
+            .get(&at)
+            .is_some_and(|entry| {
+                entry.native
+                    && key.is_none_or(|k| entry.pub_key() == Some(k))
+                    && identity::heard_from_recently(entry)
+            })
+            .then_some(at)
+    }
+
+    /// The survivor rule's swap (see [`Self::native_holds_peer`]): a native
+    /// connection to the peer whose UDP connection holds the entry at
+    /// `peer_addr`, under the same key, takes over the entry's transport in
+    /// place. Callers check that the entry exists; without one it warns
+    /// and does nothing (and asserts in debug builds).
+    ///
+    /// Replaced: the listener task, the sender to it, the connection id, the
+    /// receipt stamp, the remote version (on the entry and on the
+    /// `ConnectionManager`) and `native`.
+    ///
+    /// Kept: the identity binding (its source too: the key is the same), the
+    /// entry's `created_at` and link-use stamp, and everything the
+    /// `ConnectionManager` and ring hold for the address: ring membership,
+    /// transient registration, ReadyState, connected-since and the health
+    /// record. So there is no promotion, no prune and no transient budget
+    /// call. The UDP listener ends as its sender drops here, and its
+    /// TransportClosed carries the old connection id, so it is ignored.
+    async fn replace_transport_in_place(
+        &mut self,
+        peer_addr: SocketAddr,
+        connection: Box<dyn PeerConnectionApi>,
+    ) -> anyhow::Result<()> {
+        let conn_id = next_connection_id();
+        let remote_version = connection.remote_version();
+        let receipt = connection.receipt_stamp();
+        let (tx, rx) = mpsc::channel(10);
+        let Some(entry) = self.connections.get_mut(&peer_addr) else {
+            // Callers check the entry first; nothing to swap into.
+            tracing::warn!(
+                %peer_addr,
+                "No connection entry to swap a native connection into; dropping it"
+            );
+            debug_assert!(false, "replace_transport_in_place without an entry");
+            return Ok(());
+        };
+        let old_id = entry.connection_id;
+        let old_sender = std::mem::replace(&mut entry.sender, tx);
+        entry.connection_id = conn_id;
+        entry.receipt = receipt;
+        entry.remote_version = remote_version;
+        entry.native = true;
+        let link_use = entry.link_use.clone();
+        drop(old_sender);
+        // As `handle_successful_connection` keeps the two in step.
+        self.bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .record_remote_version(peer_addr, remote_version);
+        tracing::info!(
+            %peer_addr,
+            old_connection_id = old_id,
+            connection_id = conn_id,
+            "Native connection swapped in for the UDP one to the same peer"
+        );
+        #[cfg(any(test, feature = "testing"))]
+        self.trace_transport(peer_addr, Some(true));
+        self.spawn_peer_connection_listener(rx, connection, peer_addr, conn_id, link_use)
+            .await
+    }
+
+    /// Records, in the simulation's native wire trace, that a live native
+    /// entry for `peer_addr` was replaced by a UDP connection.
+    #[cfg(any(test, feature = "testing"))]
+    fn trace_native_replaced_by_udp(&self, peer_addr: SocketAddr) {
+        let own = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .get_own_addr()
+            .unwrap_or_else(|| SocketAddr::new(self.listening_ip, self.listening_port));
+        crate::operations::connect::native_wire_trace::record_at(
+            peer_addr,
+            crate::operations::connect::native_wire_trace::NativeWireEvent::NativeReplacedByUdp {
+                own,
+            },
+        );
+    }
+
+    /// Records, in the simulation's native wire trace, which transport this
+    /// node now holds for `peer_addr` (`None`: none), so a test can compare
+    /// the two ends of each pair.
+    #[cfg(any(test, feature = "testing"))]
+    pub(super) fn trace_transport(&self, peer_addr: SocketAddr, native: Option<bool>) {
+        let own = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .get_own_addr()
+            .unwrap_or_else(|| SocketAddr::new(self.listening_ip, self.listening_port));
+        crate::operations::connect::native_wire_trace::record_at(
+            peer_addr,
+            crate::operations::connect::native_wire_trace::NativeWireEvent::Transport {
+                own,
+                native,
+            },
+        );
     }
 
     pub(super) async fn handle_handshake_stream_closed(
@@ -1844,7 +2181,21 @@ impl P2pConnManager {
         // suspend/resume), replace it. Dropping the old sender causes its
         // peer_connection_listener to fire TransportClosed; the connection_id mechanism
         // ensures that stale event won't remove the new entry.
-        if let Some(old) = self.remove_connection(peer_addr) {
+        let removed = self.remove_connection(peer_addr);
+        // A live native entry replaced by a UDP connection is what the
+        // survivor rule forbids; the simulation's trace checks it. Recorded
+        // here, before the insert below, since the removal has already
+        // cleared the trace's entry.
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(old) = &removed {
+            if old.native
+                && !matches!(source, IdentitySource::Proven)
+                && identity::heard_from_recently(old)
+            {
+                self.trace_native_replaced_by_udp(peer_addr);
+            }
+        }
+        if let Some(old) = removed {
             self.record_identity_teardown(peer_addr, &old);
 
             // Full cleanup: handle both transient and ring-promoted connections.
@@ -1958,8 +2309,13 @@ impl P2pConnManager {
                 created_at: now,
                 link_use: link_use.clone(),
                 remote_version,
+                // Only a QUIC-native connection's key is proven in its
+                // handshake, so the source says which transport this is.
+                native: matches!(source, IdentitySource::Proven),
             },
         );
+        #[cfg(any(test, feature = "testing"))]
+        self.trace_transport(peer_addr, Some(matches!(source, IdentitySource::Proven)));
         // Mirror the same version onto `ConnectionManager` so op drivers
         // (reached via `op_manager.ring.connection_manager`, not this
         // network-bridge layer) can gate emission of version-sensitive wire
@@ -2039,44 +2395,9 @@ impl P2pConnManager {
             }
             None => None,
         };
+        self.spawn_peer_connection_listener(rx, connection, peer_addr, conn_id, link_use)
+            .await?;
         let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-        let Some(conn_events) = self.conn_event_tx.as_ref().cloned() else {
-            anyhow::bail!("Connection event channel not initialized");
-        };
-
-        // Phase 4: Set orphan stream registry on connection for handling race conditions
-        // between stream fragments and metadata messages (RequestStreaming/ResponseStreaming).
-        let mut connection = connection;
-        connection
-            .set_inbound_stream_registry(self.bridge.op_manager.orphan_stream_registry().clone());
-
-        // Use tokio::spawn directly instead of GlobalExecutor::spawn.
-        // GlobalExecutor::spawn uses Handle::try_current().spawn() which doesn't
-        // reliably poll tasks in certain test contexts (see issue #2709).
-        let outbound_mix = self.bridge.op_manager.outbound_mix.clone();
-        let propagation = crate::operations::update::propagation_stats::PropagationSink::of(
-            &self.bridge.op_manager,
-        );
-        let native_wire = self.bridge.op_manager.ring.connection_manager.native_wire();
-        tokio::spawn(async move {
-            peer_connection_listener(
-                rx,
-                connection,
-                peer_addr,
-                conn_events,
-                conn_id,
-                outbound_mix,
-                propagation,
-                link_use,
-                native_wire,
-            )
-            .await;
-        });
-        // Yield to allow the spawned peer_connection_listener task to start.
-        // This is important because on some runtimes (especially in tests with boxed_local
-        // futures), spawned tasks may not be scheduled immediately, causing messages
-        // sent to the channel to pile up without being processed.
-        tokio::task::yield_now().await;
         let newly_inserted = true;
 
         // Now safe to remove from awaiting_connection and notify callbacks.

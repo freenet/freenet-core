@@ -492,6 +492,22 @@ async fn drive_client_connect(
                 };
                 match plan_acceptor_dial(answered_at, window, Instant::now()) {
                     AcceptorDialPlan::Now(transport) => {
+                        // Test-only: a UDP dial beside the native one, at once.
+                        #[cfg(any(test, feature = "testing"))]
+                        if transport.is_native() {
+                            if let Some(addr) = acceptor.socket_addr().filter(|addr| {
+                                super::native_wire_trace::udp_beside_forced(*addr, false)
+                            }) {
+                                dials.push(futures::future::Either::Right(udp_fallback_dial(
+                                    op_manager.clone(),
+                                    tx,
+                                    acceptor.clone(),
+                                    addr,
+                                    Instant::now(),
+                                    false,
+                                )));
+                            }
+                        }
                         dials.push(futures::future::Either::Left(
                             begin_acceptor_dial(op_manager, tx, acceptor, answered_at, transport)
                                 .await?,

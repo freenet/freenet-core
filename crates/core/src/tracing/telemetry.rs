@@ -3111,12 +3111,20 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.connect_native_rescued_by_udp_acceptor),
             );
             m.insert(
-                "connect_native_both_dials_connected_kept_udp".into(),
-                serde_json::json!(snapshot.connect_native_both_dials_connected_kept_udp),
+                "connect_native_both_dials_connected_udp_first".into(),
+                serde_json::json!(snapshot.connect_native_both_dials_connected_udp_first),
             );
             m.insert(
-                "connect_native_both_dials_connected_kept_native".into(),
-                serde_json::json!(snapshot.connect_native_both_dials_connected_kept_native),
+                "connect_native_both_dials_connected_native_first".into(),
+                serde_json::json!(snapshot.connect_native_both_dials_connected_native_first),
+            );
+            m.insert(
+                "connect_native_survivor_swapped".into(),
+                serde_json::json!(snapshot.connect_native_survivor_swapped),
+            );
+            m.insert(
+                "connect_native_survivor_udp_dropped".into(),
+                serde_json::json!(snapshot.connect_native_survivor_udp_dropped),
             );
             m.insert(
                 "connect_native_offer_level".into(),

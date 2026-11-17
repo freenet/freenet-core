@@ -132,6 +132,7 @@ mod tests {
             created_at: now,
             link_use: LinkUseStamp::new(now),
             remote_version: None,
+            native: false,
         }
     }
 

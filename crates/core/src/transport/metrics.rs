@@ -988,10 +988,15 @@ pub struct TransportMetrics {
     /// this node had in the CONNECT (reset each snapshot).
     connect_native_rescued_by_udp_joiner: AtomicU64,
     connect_native_rescued_by_udp_acceptor: AtomicU64,
-    /// A native dial and the UDP dial beside it both connected; the one
-    /// established first was kept and the other closed (reset each snapshot).
-    connect_native_both_dials_connected_kept_udp: AtomicU64,
-    connect_native_both_dials_connected_kept_native: AtomicU64,
+    /// A native dial and the UDP dial beside it both connected, UDP first or
+    /// native first; the native connection was kept (reset each snapshot).
+    connect_native_both_dials_connected_udp_first: AtomicU64,
+    connect_native_both_dials_connected_native_first: AtomicU64,
+    /// Survivor-rule decisions, from any source: a native connection swapped
+    /// in for a UDP one to the same peer, or a UDP connection dropped because
+    /// a native one holds the peer (reset each snapshot).
+    connect_native_survivor_swapped: AtomicU64,
+    connect_native_survivor_udp_dropped: AtomicU64,
     /// The last offer this node built: level, percent and whether it was
     /// ready to dial native (a state, never reset).
     connect_native_offer_level: AtomicU8,
@@ -1379,9 +1384,14 @@ thread_local! {
     pub(crate) static NATIVE_RESCUES_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
         const { std::cell::Cell::new([0; 2]) };
 
-    /// Test-only: both dials connected on this thread, [kept UDP, kept
-    /// native], for the same reason.
+    /// Test-only: both dials connected on this thread, [UDP first, native
+    /// first], for the same reason.
     pub(crate) static BOTH_DIALS_CONNECTED_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
+
+    /// Test-only: survivor-rule decisions on this thread, [UDP dropped,
+    /// native swapped in], for the same reason.
+    pub(crate) static SURVIVOR_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
         const { std::cell::Cell::new([0; 2]) };
 }
 
@@ -1488,8 +1498,10 @@ impl TransportMetrics {
             connect_native_demotions: AtomicU64::new(0),
             connect_native_rescued_by_udp_joiner: AtomicU64::new(0),
             connect_native_rescued_by_udp_acceptor: AtomicU64::new(0),
-            connect_native_both_dials_connected_kept_udp: AtomicU64::new(0),
-            connect_native_both_dials_connected_kept_native: AtomicU64::new(0),
+            connect_native_both_dials_connected_udp_first: AtomicU64::new(0),
+            connect_native_both_dials_connected_native_first: AtomicU64::new(0),
+            connect_native_survivor_swapped: AtomicU64::new(0),
+            connect_native_survivor_udp_dropped: AtomicU64::new(0),
             connect_native_offer_level: AtomicU8::new(0),
             connect_native_offer_percent: AtomicU8::new(0),
             connect_native_offer_ready: AtomicBool::new(false),
@@ -2048,19 +2060,37 @@ impl TransportMetrics {
         });
     }
 
-    /// A native dial and the UDP dial beside it both connected, and the one
-    /// established first was kept: UDP (`kept_native` false) or native.
-    pub(crate) fn record_connect_native_both_dials_connected(&self, kept_native: bool) {
-        if kept_native {
-            &self.connect_native_both_dials_connected_kept_native
+    /// A native dial and the UDP dial beside it both connected, UDP first
+    /// (`native_first` false) or native first. The native one was kept.
+    pub(crate) fn record_connect_native_both_dials_connected(&self, native_first: bool) {
+        if native_first {
+            &self.connect_native_both_dials_connected_native_first
         } else {
-            &self.connect_native_both_dials_connected_kept_udp
+            &self.connect_native_both_dials_connected_udp_first
         }
         .fetch_add(1, Ordering::Relaxed);
         #[cfg(test)]
         BOTH_DIALS_CONNECTED_ON_THIS_THREAD.with(|count| {
             let mut counts = count.get();
-            counts[usize::from(kept_native)] += 1;
+            counts[usize::from(native_first)] += 1;
+            count.set(counts);
+        });
+    }
+
+    /// The survivor rule kept a native connection over a UDP one to the same
+    /// peer: the native one was swapped in for a UDP entry (`swapped`), or
+    /// the UDP connection was dropped.
+    pub(crate) fn record_connect_native_survivor(&self, swapped: bool) {
+        if swapped {
+            &self.connect_native_survivor_swapped
+        } else {
+            &self.connect_native_survivor_udp_dropped
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        SURVIVOR_ON_THIS_THREAD.with(|count| {
+            let mut counts = count.get();
+            counts[usize::from(swapped)] += 1;
             count.set(counts);
         });
     }
@@ -2960,12 +2990,14 @@ impl TransportMetrics {
             connect_native_rescued_by_udp_acceptor: get64(
                 &self.connect_native_rescued_by_udp_acceptor,
             ),
-            connect_native_both_dials_connected_kept_udp: get64(
-                &self.connect_native_both_dials_connected_kept_udp,
+            connect_native_both_dials_connected_udp_first: get64(
+                &self.connect_native_both_dials_connected_udp_first,
             ),
-            connect_native_both_dials_connected_kept_native: get64(
-                &self.connect_native_both_dials_connected_kept_native,
+            connect_native_both_dials_connected_native_first: get64(
+                &self.connect_native_both_dials_connected_native_first,
             ),
+            connect_native_survivor_swapped: get64(&self.connect_native_survivor_swapped),
+            connect_native_survivor_udp_dropped: get64(&self.connect_native_survivor_udp_dropped),
             connect_native_offer_level: self.connect_native_offer_level.load(Ordering::Relaxed),
             connect_native_offer_percent: self.connect_native_offer_percent.load(Ordering::Relaxed),
             connect_native_offer_ready: self.connect_native_offer_ready.load(Ordering::Relaxed),
@@ -3664,10 +3696,14 @@ pub struct TransportSnapshot {
     /// as acceptor (R5).
     pub connect_native_rescued_by_udp_joiner: u64,
     pub connect_native_rescued_by_udp_acceptor: u64,
-    /// A native dial and the UDP dial beside it both connected; the first
-    /// established was kept (UDP or native).
-    pub connect_native_both_dials_connected_kept_udp: u64,
-    pub connect_native_both_dials_connected_kept_native: u64,
+    /// A native dial and the UDP dial beside it both connected, UDP first or
+    /// native first; the native connection was kept.
+    pub connect_native_both_dials_connected_udp_first: u64,
+    pub connect_native_both_dials_connected_native_first: u64,
+    /// Survivor-rule decisions: a native connection swapped in for a UDP one,
+    /// or a UDP connection dropped because a native one holds the peer.
+    pub connect_native_survivor_swapped: u64,
+    pub connect_native_survivor_udp_dropped: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -4094,8 +4130,10 @@ impl TransportSnapshot {
             connect_native_demotions,
             connect_native_rescued_by_udp_joiner,
             connect_native_rescued_by_udp_acceptor,
-            connect_native_both_dials_connected_kept_udp,
-            connect_native_both_dials_connected_kept_native,
+            connect_native_both_dials_connected_udp_first,
+            connect_native_both_dials_connected_native_first,
+            connect_native_survivor_swapped,
+            connect_native_survivor_udp_dropped,
             connect_native_offer_level,
             connect_native_offer_percent,
             connect_native_offer_ready,
@@ -4265,10 +4303,12 @@ impl TransportSnapshot {
         self.connect_native_demotions = connect_native_demotions;
         self.connect_native_rescued_by_udp_joiner = connect_native_rescued_by_udp_joiner;
         self.connect_native_rescued_by_udp_acceptor = connect_native_rescued_by_udp_acceptor;
-        self.connect_native_both_dials_connected_kept_udp =
-            connect_native_both_dials_connected_kept_udp;
-        self.connect_native_both_dials_connected_kept_native =
-            connect_native_both_dials_connected_kept_native;
+        self.connect_native_both_dials_connected_udp_first =
+            connect_native_both_dials_connected_udp_first;
+        self.connect_native_both_dials_connected_native_first =
+            connect_native_both_dials_connected_native_first;
+        self.connect_native_survivor_swapped = connect_native_survivor_swapped;
+        self.connect_native_survivor_udp_dropped = connect_native_survivor_udp_dropped;
         self.connect_native_offer_level = connect_native_offer_level;
         self.connect_native_offer_percent = connect_native_offer_percent;
         self.connect_native_offer_ready = connect_native_offer_ready;
@@ -4505,10 +4545,14 @@ struct SnapshotExtras {
     /// as acceptor (R5).
     pub connect_native_rescued_by_udp_joiner: u64,
     pub connect_native_rescued_by_udp_acceptor: u64,
-    /// A native dial and the UDP dial beside it both connected; the first
-    /// established was kept (UDP or native).
-    pub connect_native_both_dials_connected_kept_udp: u64,
-    pub connect_native_both_dials_connected_kept_native: u64,
+    /// A native dial and the UDP dial beside it both connected, UDP first or
+    /// native first; the native connection was kept.
+    pub connect_native_both_dials_connected_udp_first: u64,
+    pub connect_native_both_dials_connected_native_first: u64,
+    /// Survivor-rule decisions: a native connection swapped in for a UDP one,
+    /// or a UDP connection dropped because a native one holds the peer.
+    pub connect_native_survivor_swapped: u64,
+    pub connect_native_survivor_udp_dropped: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -4753,8 +4797,10 @@ impl SnapshotExtras {
             || self.connect_native_demotions != 0
             || self.connect_native_rescued_by_udp_joiner != 0
             || self.connect_native_rescued_by_udp_acceptor != 0
-            || self.connect_native_both_dials_connected_kept_udp != 0
-            || self.connect_native_both_dials_connected_kept_native != 0
+            || self.connect_native_both_dials_connected_udp_first != 0
+            || self.connect_native_both_dials_connected_native_first != 0
+            || self.connect_native_survivor_swapped != 0
+            || self.connect_native_survivor_udp_dropped != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -7317,8 +7363,10 @@ mod tests {
             "connect_native_demotions",
             "connect_native_rescued_by_udp_joiner",
             "connect_native_rescued_by_udp_acceptor",
-            "connect_native_both_dials_connected_kept_udp",
-            "connect_native_both_dials_connected_kept_native",
+            "connect_native_both_dials_connected_udp_first",
+            "connect_native_both_dials_connected_native_first",
+            "connect_native_survivor_swapped",
+            "connect_native_survivor_udp_dropped",
             "connect_native_offer_level",
             "connect_native_offer_percent",
             "connect_native_offer_ready",

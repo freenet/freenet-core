@@ -1648,6 +1648,7 @@ mod tests {
                     created_at: created,
                     link_use: LinkUseStamp::new(created),
                     remote_version: None,
+                    native: false,
                 },
             );
         }
@@ -1716,6 +1717,7 @@ mod tests {
             created_at,
             link_use,
             remote_version: None,
+            native: false,
         }
     }
 
@@ -2511,6 +2513,7 @@ mod tests {
                 created_at: created,
                 link_use: link_use.clone(),
                 remote_version: None,
+                native: false,
             },
         );
 
