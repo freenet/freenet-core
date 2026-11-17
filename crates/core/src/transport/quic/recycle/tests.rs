@@ -347,8 +347,8 @@ fn the_watch_publishes_that_the_dark_rule_would_have_closed() {
 /// The watch publishes the last sample of a dark episode that has lasted at
 /// least the window (10 s), on the caller's clock, for the strike check
 /// (`path::StrikeCheck`): from the sample the episode reaches the window to
-/// its last; nothing for a spell shorter than the window, or while the peer
-/// keeps sending.
+/// the sample that ends it (the peer heard again at tick 21); nothing for a
+/// spell shorter than the window, or while the peer keeps sending.
 #[test]
 fn the_watch_publishes_the_last_sample_of_a_long_dark_episode() {
     let record = Arc::default();
@@ -380,8 +380,8 @@ fn the_watch_publishes_the_last_sample_of_a_long_dark_episode() {
     let expected: Vec<u64> = (1..=23u64)
         .map(|t| match t {
             ..=5 => 0,
-            6..=20 => 2 * t,
-            _ => 40,
+            6..=21 => 2 * t,
+            _ => 42,
         })
         .collect();
     assert_eq!(run(&dark, 23), expected);
@@ -1896,6 +1896,56 @@ fn ack_wait_expiries_within_the_window_close_only_a_path_without_udp() {
     }
 }
 
+/// The late-end rule only observes, on every path (`LATE_ENDS_CLOSE`): three
+/// late ends within 30 min count a would-close under `late_ends`, the window
+/// starting afresh, and the path is never closed, with a UDP session or
+/// without; two, or a third past the window, count none.
+#[test]
+fn late_ends_within_the_window_would_close_and_never_close() {
+    const _: () = assert!(!LATE_ENDS_CLOSE, "the late-end rule only observes");
+    let times: Vec<u64> = (0..=1200).map(|i| 2 * i).collect();
+    let at = |minutes: u64| (minutes * 60 / 2) as usize;
+    let counted =
+        |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
+    let run = |late: &dyn Fn(usize) -> u64, udp_fallback: bool| {
+        let record = Arc::default();
+        let sample = |i: usize| {
+            let t = i as u64;
+            AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
+                .with_late_ends(late(i))
+        };
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), udp_fallback);
+        let mut would = Vec::new();
+        for (i, time) in times.iter().enumerate().skip(1) {
+            let before = watch.late_would_close();
+            assert!(!watch.observe(time * SEC, sample(i)), "never closed");
+            if watch.late_would_close() > before {
+                would.push(i);
+            }
+        }
+        assert_eq!(watch.would_close(), 0, "not counted as ack-wait expiries");
+        would
+    };
+    for udp_fallback in [true, false] {
+        assert_eq!(
+            run(&counted(vec![at(2), at(10), at(20)]), udp_fallback),
+            vec![at(20)]
+        );
+        assert_eq!(
+            run(&counted((1..=6).map(|m| at(2 * m)).collect()), udp_fallback),
+            vec![at(6), at(12)]
+        );
+        assert_eq!(
+            run(&counted(vec![at(2), at(10), at(33)]), udp_fallback),
+            Vec::<usize>::new()
+        );
+        assert_eq!(
+            run(&counted(vec![at(2), at(10)]), udp_fallback),
+            Vec::<usize>::new()
+        );
+    }
+}
+
 /// The labels `quic_stall_close_<label>` counts under are the stalls'
 /// labels, in their index order, so a close is counted under its own name.
 #[test]
@@ -1906,6 +1956,7 @@ fn stall_close_labels_follow_the_stalls() {
         Stall::CreditStarved,
         Stall::StreamCreditWithheld,
         Stall::AckWaitsExpired,
+        Stall::LateEnds,
     ] {
         assert_eq!(
             crate::transport::metrics::STALL_CLOSE_LABELS[stall.index()],
