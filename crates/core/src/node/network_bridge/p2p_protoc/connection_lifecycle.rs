@@ -2614,6 +2614,28 @@ fn dial_origin(
     }
 }
 
+/// Fails every callback of the UDP dial beside a native one to `peer_addr`.
+async fn fail_udp_beside_native(state: &mut EventListenerState, peer_addr: SocketAddr) {
+    for (tx, mut callback) in state
+        .udp_beside_native
+        .remove(&peer_addr)
+        .unwrap_or_default()
+    {
+        callback
+            .send_result(Err(()))
+            .await
+            .inspect_err(|err| {
+                tracing::debug!(
+                    %tx,
+                    remote = %peer_addr,
+                    ?err,
+                    "Failed to deliver a failure to a UDP dial beside a native one"
+                );
+            })
+            .ok();
+    }
+}
+
 #[cfg(test)]
 mod tests;
 
@@ -2710,27 +2732,5 @@ mod dial_origin_tests {
                 "{origin:?}"
             );
         }
-    }
-}
-
-/// Fails every callback of the UDP dial beside a native one to `peer_addr`.
-async fn fail_udp_beside_native(state: &mut EventListenerState, peer_addr: SocketAddr) {
-    for (tx, mut callback) in state
-        .udp_beside_native
-        .remove(&peer_addr)
-        .unwrap_or_default()
-    {
-        callback
-            .send_result(Err(()))
-            .await
-            .inspect_err(|err| {
-                tracing::debug!(
-                    %tx,
-                    remote = %peer_addr,
-                    ?err,
-                    "Failed to deliver a failure to a UDP dial beside a native one"
-                );
-            })
-            .ok();
     }
 }

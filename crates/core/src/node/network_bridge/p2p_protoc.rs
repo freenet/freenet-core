@@ -3347,6 +3347,10 @@ async fn fail_awaiting_connection(
     // (3) Deliberately NO state.peer_backoff.record_failure() here.
 }
 
+/// One requester of a UDP dial running beside a native dial
+/// ([`EventListenerState::udp_beside_native`]): its transaction and callback.
+type BesideUdpRequester = (Transaction, Box<dyn ConnectResultSender>);
+
 struct EventListenerState {
     expected_inbound: Arc<dyn InboundExpectations>,
     pending_from_executor: HashSet<Transaction>,
@@ -3369,7 +3373,7 @@ struct EventListenerState {
     /// its transport, answers only these callbacks. A later UDP dial to the
     /// address joins it. An entry ends with its dial's outcome, as an
     /// `awaiting_connection` entry does.
-    udp_beside_native: HashMap<SocketAddr, Vec<(Transaction, Box<dyn ConnectResultSender>)>>,
+    udp_beside_native: HashMap<SocketAddr, Vec<BesideUdpRequester>>,
     pending_op_results: HashMap<Transaction, Sender<WaiterReply>>,
     /// Last time pending_op_results was scanned for closed senders.
     last_pending_op_cleanup: Instant,
