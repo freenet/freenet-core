@@ -515,7 +515,10 @@ decision a joiner could not use, `connect_native_decision_over_cap` for one
 dropped unanswered past the per-CONNECT cap on refused acceptors,
 `connect_native_setup_<label>` for how each native setup ended (one per
 `NativeSetupOutcome`), `connect_native_demotions` for each time the node
-turned its own native connects off, and the last offer as states
+turned its own native connects off,
+`connect_native_rescued_by_udp_{joiner,acceptor}` for each UDP dial after a
+failed native setup that connected (R5: a connection a node without UDP
+would not have made), and the last offer as states
 `connect_native_offer_{level,percent,ready}`; see
 `operations/connect/native.rs`) and the shadow-mode upgrade
 telemetry (below, "Upgrade telemetry"). Each label set is declared once in a
@@ -2239,23 +2242,33 @@ Joiner: joiner_response_action gives Native when it offered and can still
   dial. Acceptor: dispatch_expect_connection_from takes the response's
   decision; every accept site passes it (source-scrape pin).
 Fallback: a failed native setup is followed by today's UDP dial to the same
-  peer (joiner: in the same dial slot, before anything counts the acceptor
-  failed; acceptor: expectation plus dial). Both sides start it
-  NATIVE_FALLBACK_AFTER (12 s, the server's window) after their own
-  reference, never earlier: the acceptor's decision, the joiner's receipt of
-  the response. Both setups have ended by then, and the references are the
-  response's travel time apart, so the two hole punches
-  (NAT_TRAVERSAL_DEADLINE, 3 s each) overlap. Falling back as each setup
-  ended would not: the client's window ends 4 s before the server's. The
-  simulation cannot show the difference (it has no NAT, and an expected
-  inbound is accepted for 100 s), so unit tests pin the timing, including
-  a two-sided one where a UDP dial connects only if both sides punch
-  together. A joiner's native attempt is bounded by its fallback time
-  (DialTransport::Native carries the bound), and a queued native acceptor
-  with less than NATIVE_MIN_WINDOW_LEFT (4 s) left before it is dialled over
-  UDP at that time with no native attempt: a joiner with a connection dials
-  one acceptor at a time, and one behind a failed native dial would
-  otherwise time out (a demotion strike) and punch a client window late. A native failure marks
+  peer (joiner: before anything counts the acceptor failed; acceptor:
+  expectation plus dial). Both sides start it NATIVE_FALLBACK_AFTER (12 s,
+  the server's window) after their own reference, never earlier: the
+  acceptor's decision, the joiner's receipt of the response. Both setups
+  have ended by then, and the references are the response's travel time
+  apart, so the two hole punches (NAT_TRAVERSAL_DEADLINE, 3 s each) overlap.
+  Falling back as each setup ended would not: the client's window ends 4 s
+  before the server's (behind port-restricted NATs every peer fallback then
+  misses, test_quic_native_blocked_pairs_connect_over_udp_behind_nats).
+  The joiner plans each dial (op_ctx_task.rs plan_acceptor_dial): a native
+  dial carries an absolute deadline, the common fallback time
+  (DialTransport::Native { deadline }), and the setup takes what is left of
+  it when it starts, so time spent reaching the transport comes out of the
+  window. It dials native only while at least NATIVE_MIN_WINDOW_LEFT (4 s)
+  of the ACCEPTOR's window is left, by the acceptor's role
+  (native_setup_window: 8 s as client, 12 s as server, from the response's
+  arrival); otherwise it dials UDP at the fallback time with no native
+  attempt, which could only time out (a demotion strike). A UDP dial waiting
+  for its fallback time holds no dial slot: the queue moves on at once, so
+  a joiner with a connection can briefly have two dials in flight (the next
+  acceptor's and a fallback). A UDP dial asked for while a native dial to
+  the same address is pending (another CONNECT's) runs BESIDE it
+  (EventListenerState::udp_beside_native): not merged into it, which failed
+  it with the native dial, and not held back, which punched late. An
+  outcome answers only its own transport's callbacks, except that a UDP
+  success answers the native dial's too, since all asked for a connection to
+  that peer. A native failure marks
   no failed address and records no peer backoff, so the fallback is not
   refused. Until UDP is removed a failed native setup never costs the join
   (test_quic_native_failed_setups_fall_back_to_udp, which also checks that
@@ -2287,7 +2300,19 @@ Existing transport: a native dial does not drop a connection the node
 Simulation: every node shares [::1], so the per-destination punch budget
   is one bucket for all of a node's peers, and a joiner dialling several
   acceptors at once refuses some setups (over_budget_destination) and their
-  servers time out. The fallback covers them.
+  servers time out. The fallback covers them. SimNetwork::new_with_nat
+  (SimNat) instead gives every node an address of its own in a ULA prefix
+  (fd00:<network tag>:<node + 1>::1; the node number is in the third
+  segment, the last one Location::from_address reads) and puts the regular
+  nodes behind NATs (transport::nat_model: endpoint-independent mapping,
+  full, address-restricted or port-restricted filtering, bindings refreshed
+  by outbound datagrams, 30 s lifetime). The sender's NAT opens its binding
+  at send; the receiver's decides at DELIVERY (in_memory_socket
+  deliver_packet_to_network), so a punch crossing one the receiver sends is
+  admitted. Symmetric mapping is A5c-2. The 6.2 matrix
+  (quic/native/setup/matrix_tests.rs) runs connect_native/accept_native
+  behind NATs over classes, late side and skew, punch loss and round trip;
+  every cell establishes, so the single attempt stays.
 Determinism: a plain tokio::select! draws its arm order from tokio's RNG,
   which the seed does not set. bounded_send's loop (every QUIC path, upgrade
   ones included: a send and its deadline ready together now resolve as the

@@ -17,6 +17,11 @@
 //!
 //! Not measured here: in-flight attempts per waiter and half-open server
 //! states (the waiter takes one attempt by construction, `NativeWaiters`).
+//!
+//! A lost punch is lost between the two NATs: it has already opened its
+//! sender's binding (`nat_model`), as a real one has, so punch loss only
+//! costs the arrivals, and the punches every 250 ms cover them. That is why
+//! even 20% loss at 800 ms establishes every run.
 
 use super::*;
 use crate::config::GlobalRng;
@@ -60,8 +65,9 @@ enum RunEnd {
 /// simulated network registry is keyed by address.
 static NEXT_PORT: AtomicU16 = AtomicU16::new(20_000);
 
-/// Runs one setup in `cell` with `seed`.
-async fn run_cell(cell: Cell, seed: u64, net: crate::transport::test_net::Subnet) -> RunEnd {
+/// Runs one setup in `cell` with `seed`; returns how it ended and how many
+/// datagrams the NATs dropped.
+async fn run_cell(cell: Cell, seed: u64, net: crate::transport::test_net::Subnet) -> (RunEnd, u64) {
     let _seed = GlobalRng::seed_guard(seed);
     let port = NEXT_PORT.fetch_add(1, Ordering::Relaxed);
     let network = format!("native-matrix-{port}");
@@ -166,14 +172,18 @@ async fn run_cell(cell: Cell, seed: u64, net: crate::transport::test_net::Subnet
     })
     .await;
     set_packet_delivery_callback(&network, None);
+    let filtered = crate::transport::in_memory_socket::nat_filtered(&network)
+        .values()
+        .sum();
     clear_network_nat(&network);
-    match (client, server) {
+    let end = match (client, server) {
         (Ok(_), Ok(_)) => RunEnd::Established,
         (client, server) => RunEnd::Failed {
             client: client.err().map(|e| format!("{e}")),
             server: server.err().map(|e| format!("{e}")),
         },
-    }
+    };
+    (end, filtered)
 }
 
 /// Runs `seeds` setups in `cell` and returns how many established and the
@@ -185,7 +195,7 @@ fn run_seeds(cell: Cell, seeds: std::ops::Range<u64>) -> (usize, usize, Vec<RunE
         let net = crate::transport::test_net::subnet();
         let mut ends = Vec::new();
         for seed in seeds {
-            ends.push(run_cell(cell, 0x0059_40A5_C000 + seed, net).await);
+            ends.push(run_cell(cell, 0x0059_40A5_C000 + seed, net).await.0);
         }
         tx.send(ends).ok();
     });
@@ -225,22 +235,31 @@ fn native_setups_establish_behind_each_nat_class() {
     }
 }
 
-/// The premise that the NATs are in the path: with every punch dropped and
-/// the server starting late, the server sends nothing toward the client
-/// until its first punch, so its port-restricted NAT drops the client's
-/// Initials, and the runs fail. Without the NATs in the path they would not.
+/// The premise that the NATs are in the path: the client starts 2 s before
+/// the server, so its first punches and Initials reach the server's NAT
+/// before the server has sent anything toward it, and are dropped there; the
+/// setup still establishes once the server punches.
 #[test]
 fn the_nat_is_in_the_path() {
     let cell = Cell {
         client_nat: NatFiltering::PortRestricted,
         server_nat: NatFiltering::PortRestricted,
         late: Late::Server,
-        skew: Duration::from_secs(7),
-        punch_loss_pct: 100,
-        rtt: Duration::from_millis(800),
+        skew: Duration::from_secs(2),
+        punch_loss_pct: 0,
+        rtt: Duration::from_millis(300),
     };
-    let (ok, total, _) = run_seeds(cell, 0..3);
-    assert!(ok < total, "premise: a cell the NAT must break breaks");
+    let (tx, rx) = std::sync::mpsc::channel();
+    bounded(move || async move {
+        let net = crate::transport::test_net::subnet();
+        tx.send(run_cell(cell, 0x0059_40A5_C0FF, net).await).ok();
+    });
+    let (end, filtered) = rx.recv().expect("the run ended");
+    assert_eq!(end, RunEnd::Established);
+    assert!(
+        filtered > 0,
+        "premise: the server's NAT dropped the early datagrams"
+    );
 }
 
 /// The matrix and the 6.2 decision criterion.
