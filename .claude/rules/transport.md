@@ -2284,8 +2284,11 @@ Fallback: a failed native setup is followed by today's UDP dial to the same
   a native and a UDP connection to one peer key, it keeps the native one,
   whichever came first and whether the UDP one was dialled or arrived
   inbound (matched key looked up by key, else the address:
-  native_holds_peer). Both ends apply it to the same fact, so they agree
-  with no message. Native second: replace_transport_in_place swaps only the
+  native_holds_peer), as long as the native entry is LIVE (heard from within
+  identity::HOLD_WINDOW, 30 s). A quiet native entry (peer restarted, NAT
+  rebound) does not hold the peer: the UDP connection takes the ordinary
+  replace, or it would be refused until the 120 s QUIC idle timeout. Both
+  ends apply it to the same fact, so they agree with no message. Native second: replace_transport_in_place swaps only the
   transport (listener, sender, connection id, receipt, remote version) and
   keeps identity, ring membership, transient status, ReadyState,
   connected-since and health (no promotion, prune or budget call); the old
@@ -2293,11 +2296,14 @@ Fallback: a failed native setup is followed by today's UDP dial to the same
   nothing else touched. A native dial onto an entry bound to ANOTHER key
   takes the ordinary replace (the entry is stale). Two UDP connections keep
   the old later-replaces-earlier behaviour. record_success runs before any
-  keep/swap/drop. Counted: connect_native_survivor_{swapped,udp_dropped},
+  keep/swap/drop. A dropped UDP dial's requesters are answered with the
+  native holder's address, and an unused reservation at the dial's own
+  address is released. Counted: connect_native_survivor_{swapped,udp_dropped},
   connect_native_both_dials_connected_{udp,native}_first (beside pair only),
-  connect_native_one_sided_drop (accepted risk, 10.2 item 20: a client that
-  finished a native setup the server did not keeps native while the server
-  keeps UDP or nothing).
+  connect_native_one_sided_drop (a native entry that won, by swap or drop,
+  closing within 150 s; NOT a measure of one-sided setups: the simulation
+  shows it misses them when the server's UDP fallback cannot reach the
+  client and counts closes for other reasons; 10.2 item 20).
   A UDP dial beside a native one that fails while the native dial is
   pending neither backs off (a 30 s backoff would refuse the native dial's
   own fallback) nor marks anything; once the native dial has ended without
