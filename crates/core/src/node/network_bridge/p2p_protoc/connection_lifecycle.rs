@@ -1304,13 +1304,27 @@ impl P2pConnManager {
                     transaction = %transaction,
                     "Outbound connection established"
                 );
-                // The UDP dial beside a pending native one connected: answer its
-                // callbacks, not the native dial's, which stay pending.
-                let native_aside = if !transport.is_native() {
-                    take_udp_beside_native_as_awaiting(state, peer_addr)
-                } else {
-                    None
-                };
+                // The UDP dial beside a pending native one connected: its
+                // callbacks join the native dial's, and the connection answers
+                // them all, since every one of them asked for a connection to
+                // this peer. The native dial's own end then finds the
+                // connection (the late-failure rule below, or a replacement).
+                if !transport.is_native() {
+                    if let Some(beside) = state.udp_beside_native.remove(&peer_addr) {
+                        for (tx, callback) in beside {
+                            state
+                                .awaiting_connection
+                                .entry(peer_addr)
+                                .or_default()
+                                .push(callback);
+                            state
+                                .awaiting_connection_txs
+                                .entry(peer_addr)
+                                .or_default()
+                                .push(tx);
+                        }
+                    }
+                }
 
                 // Clear backoff and failed-addr tracking on successful connection
                 if !peer_addr.ip().is_unspecified() {
@@ -1386,9 +1400,6 @@ impl P2pConnManager {
                     source,
                 )
                 .await?;
-                if let Some(aside) = native_aside {
-                    restore_native_awaiting(state, peer_addr, aside);
-                }
                 if transport.is_native() {
                     state.native_pending.remove(&peer_addr);
                 }
@@ -1471,9 +1482,20 @@ impl P2pConnManager {
                     }
                 } else if !native {
                     // The native dial ended first: the UDP dial is the only one
-                    // left, so it takes the ordinary failure path below.
-                    if let Some(aside) = take_udp_beside_native_as_awaiting(state, peer_addr) {
-                        debug_assert!(aside.0.is_empty(), "no native dial is pending");
+                    // left, so its callbacks take the ordinary failure path below.
+                    if let Some(beside) = state.udp_beside_native.remove(&peer_addr) {
+                        for (tx, callback) in beside {
+                            state
+                                .awaiting_connection
+                                .entry(peer_addr)
+                                .or_default()
+                                .push(callback);
+                            state
+                                .awaiting_connection_txs
+                                .entry(peer_addr)
+                                .or_default()
+                                .push(tx);
+                        }
                     }
                 }
                 // A native setup can end after the pair connected another way:
@@ -2689,55 +2711,6 @@ mod dial_origin_tests {
             );
         }
     }
-}
-
-/// The native dial's callbacks and transactions, set aside while a UDP dial
-/// beside it is answered through `awaiting_connection`.
-pub(super) type NativeAwaiting = (Vec<Box<dyn ConnectResultSender>>, Vec<Transaction>);
-
-/// Moves the callbacks of the UDP dial beside a native one into
-/// `awaiting_connection`, so the ordinary outcome path answers them, and
-/// returns the native dial's entry set aside (`None` if no UDP dial was
-/// beside one).
-fn take_udp_beside_native_as_awaiting(
-    state: &mut EventListenerState,
-    peer_addr: SocketAddr,
-) -> Option<NativeAwaiting> {
-    let beside = state.udp_beside_native.remove(&peer_addr)?;
-    let native_callbacks = state
-        .awaiting_connection
-        .remove(&peer_addr)
-        .unwrap_or_default();
-    let native_txs = state
-        .awaiting_connection_txs
-        .remove(&peer_addr)
-        .unwrap_or_default();
-    let (txs, callbacks): (Vec<_>, Vec<_>) = beside.into_iter().unzip();
-    state.awaiting_connection.insert(peer_addr, callbacks);
-    state.awaiting_connection_txs.insert(peer_addr, txs);
-    Some((native_callbacks, native_txs))
-}
-
-/// Puts the native dial's entry back once the UDP dial's outcome has been
-/// handled.
-fn restore_native_awaiting(
-    state: &mut EventListenerState,
-    peer_addr: SocketAddr,
-    (callbacks, txs): NativeAwaiting,
-) {
-    if callbacks.is_empty() {
-        return;
-    }
-    state
-        .awaiting_connection
-        .entry(peer_addr)
-        .or_default()
-        .extend(callbacks);
-    state
-        .awaiting_connection_txs
-        .entry(peer_addr)
-        .or_default()
-        .extend(txs);
 }
 
 /// Fails every callback of the UDP dial beside a native one to `peer_addr`.
