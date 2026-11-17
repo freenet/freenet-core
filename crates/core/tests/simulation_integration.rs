@@ -23447,6 +23447,116 @@ fn test_quic_native_blocked_pairs_connect_over_udp_behind_nats() {
     assert!(connected);
 }
 
+/// Gate 18: both ends of a pair keep the same transport, and the rate of
+/// one-sided native setups (10.2 items 7 and 20). Behind port-restricted
+/// NATs with native on at 100%, in four runs: plain; with QUIC dropped
+/// between a third of the pairs, so their native setups fail while others
+/// succeed; and with every QUIC datagram delayed 600 ms and 1000 ms one way,
+/// so native setups take several seconds and end near their windows. The
+/// trace records which transport each node holds for each peer when the run
+/// ends; every pair held at both ends must hold the same one. It also
+/// records how each end's native setup in a CONNECT ended, and the test
+/// reports the setups where only one end got a connection.
+///
+/// In these runs the survivor rule itself rarely or never has to decide
+/// (a node is seldom handed a native and a UDP connection to one peer), so
+/// the rule's every order and direction is pinned at the lifecycle level
+/// (`survivor_rule_keeps_native_in_each_order_and_direction`,
+/// `both_ends_apply_the_survivor_rule_to_the_same_facts`); this run checks
+/// the whole network and measures. Fails closed: pairs must be held at both
+/// ends and native setups must have ended at both ends.
+#[test_log::test]
+fn test_quic_native_both_ends_keep_the_same_transport() {
+    use freenet::dev_tool::{NatFiltering, NodeLabel, SimNat};
+    let mut held_both = 0;
+    let mut setups = (0, 0);
+    for (run_id, seed, quic_delay, drop_some) in [
+        (0u8, 0x0059_40A5_00D1u64, None, false),
+        (1, 0x0059_40A5_00D2, None, true),
+        (2, 0x0059_40A5_00D3, Some(600), false),
+        (3, 0x0059_40A5_00D4, Some(1000), false),
+    ] {
+        let name = format!("native-survivor-{run_id}");
+        let nat = SimNat::all(NatFiltering::PortRestricted);
+        let run = run_native_connect_sim_with(&name, seed, 200, Some(nat), |sim| {
+            sim.with_native_connect(100);
+            if let Some(ms) = quic_delay {
+                sim.delay_quic_datagrams(Duration::from_millis(ms));
+            }
+            if drop_some {
+                let mut labels: Vec<NodeLabel> = sim.all_node_addresses().keys().cloned().collect();
+                labels.sort();
+                for (i, a) in labels.iter().enumerate() {
+                    for (j, b) in labels.iter().enumerate().skip(i + 1) {
+                        if (i + j) % 3 == 0 {
+                            sim.drop_quic_datagrams_between(a, b, Duration::ZERO);
+                        }
+                    }
+                }
+            }
+        });
+        log_native_connect(&name, &run);
+        let t = &run.wire.trace;
+        let transports = t.transports();
+        let mut mismatched = Vec::new();
+        let mut one_ended_native = Vec::new();
+        let mut both = 0;
+        for (&(own, peer), &native) in &transports {
+            match transports.get(&(peer, own)) {
+                Some(&other) => {
+                    if own < peer {
+                        both += 1;
+                        if other != native {
+                            mismatched.push((own, peer, native, other));
+                        }
+                    }
+                }
+                None if native => one_ended_native.push((own, peer)),
+                None => {}
+            }
+        }
+        tracing::info!(
+            name,
+            swapped = t.survivor_swapped(),
+            udp_dropped = t.survivor_udp_dropped(),
+            one_sided_drops = t.one_sided_drops(),
+            held_at_both_ends = both,
+            native_at_both_ends = transports
+                .iter()
+                .filter(|((own, peer), native)| **native
+                    && own < peer
+                    && transports.get(&(*peer, *own)) == Some(&true))
+                .count(),
+            one_ended_native = one_ended_native.len(),
+            entries = transports.len(),
+            "survivor rule"
+        );
+        println!(
+            "{name}: swapped={} udp_dropped={} one_sided_drops={} held_at_both_ends={both} \
+             one_ended_native={one_ended_native:?} entries={}",
+            t.survivor_swapped(),
+            t.survivor_udp_dropped(),
+            t.one_sided_drops(),
+            transports.len()
+        );
+        assert!(
+            mismatched.is_empty(),
+            "{name}: pairs whose ends keep different transports (own, peer, own native, \
+             peer native): {mismatched:?}"
+        );
+        held_both += both;
+        let (pairs, one_sided) = t.native_setup_pairs();
+        println!("{name}: native setups with both ends ended: {pairs}, one-sided: {one_sided}");
+        setups = (setups.0 + pairs, setups.1 + one_sided);
+    }
+    println!(
+        "one-sided native setups (10.2 item 20): {} of {} with both ends ended",
+        setups.1, setups.0
+    );
+    assert!(setups.0 > 0, "premise: native setups ended at both ends");
+    assert!(held_both > 0, "premise: pairs held at both ends");
+}
+
 /// The same seed gives the same native connects: the same counts, the same
 /// native messages, the same mesh. Compared within one process, since the
 /// harness picks its ports per process.

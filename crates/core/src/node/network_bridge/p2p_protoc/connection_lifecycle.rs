@@ -1368,8 +1368,11 @@ impl P2pConnManager {
                         }
                         state.awaiting_connection_txs.remove(&peer_addr);
                         if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
-                            requesters
-                                .extend(callbacks.into_iter().map(|callback| (transaction, callback)));
+                            requesters.extend(
+                                callbacks
+                                    .into_iter()
+                                    .map(|callback| (transaction, callback)),
+                            );
                         }
                         answer_beside(peer_addr, requesters, Ok((peer_addr, None))).await;
                         drop(connection);
@@ -1449,12 +1452,28 @@ impl P2pConnManager {
                             .record_success();
                     }
                     #[cfg(any(test, feature = "testing"))]
-                    crate::operations::connect::native_wire_trace::record_at(
-                        peer_addr,
-                        crate::operations::connect::native_wire_trace::NativeWireEvent::NativeDial {
-                            established: true,
-                        },
-                    );
+                    {
+                        use crate::operations::connect::native_wire_trace::{
+                            NativeWireEvent, record_at,
+                        };
+                        record_at(peer_addr, NativeWireEvent::NativeDial { established: true });
+                        if let Some(own) = self
+                            .bridge
+                            .op_manager
+                            .ring
+                            .connection_manager
+                            .get_own_addr()
+                        {
+                            record_at(
+                                peer_addr,
+                                NativeWireEvent::NativeSetupEnded {
+                                    tx: transaction,
+                                    own,
+                                    established: true,
+                                },
+                            );
+                        }
+                    }
                     let existing_native = self
                         .connections
                         .get(&peer_addr)
@@ -1595,6 +1614,25 @@ impl P2pConnManager {
                         return Ok(());
                     }
                 };
+                #[cfg(any(test, feature = "testing"))]
+                if transport.is_native() {
+                    if let Some(own) = self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .get_own_addr()
+                    {
+                        crate::operations::connect::native_wire_trace::record_at(
+                            peer_addr,
+                            crate::operations::connect::native_wire_trace::NativeWireEvent::NativeSetupEnded {
+                                tx: transaction,
+                                own,
+                                established: false,
+                            },
+                        );
+                    }
+                }
 
                 let native = transport.is_native();
                 // A native dial ends here, so it is no longer pending.

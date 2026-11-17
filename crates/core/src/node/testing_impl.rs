@@ -537,6 +537,13 @@ fn fault_injection_delivery_decision(
                 }
             }
         }
+        if let Some(delay) = inj.quic_datagram_delay {
+            use crate::transport::demux::classify;
+            use crate::transport::metrics::DemuxClass;
+            if classify(datagram) == DemuxClass::Quic {
+                return PacketDeliveryDecision::DelayedDelivery(delay);
+            }
+        }
     }
     PacketDeliveryDecision::Deliver
 }
@@ -1730,6 +1737,8 @@ pub struct SimNetwork {
     /// byte counts live in the fault injector; a replaced injector takes them
     /// over ([`Self::carry_quic_datagram_cuts`]).
     quic_datagram_cuts: Vec<crate::simulation::QuicDatagramCut>,
+    /// See [`Self::delay_quic_datagrams`].
+    quic_datagram_delay: Option<Duration>,
     /// When `probe_quic_endpoints_at` asked for it: the virtual time at which
     /// `run_simulation_direct` sends each node a stranger's QUIC datagram,
     /// with the node and stranger addresses.
@@ -1921,6 +1930,7 @@ impl SimNetwork {
             node_port_override,
             quic_datagram_drops: Vec::new(),
             quic_datagram_cuts: Vec::new(),
+            quic_datagram_delay: None,
             quic_endpoint_probe: None,
             nat,
         };
@@ -2453,7 +2463,24 @@ impl SimNetwork {
                 (cut.clone(), seen)
             })
             .collect();
+        state.quic_datagram_delay = self.quic_datagram_delay;
         state
+    }
+
+    /// Delays every QUIC-class datagram between any two nodes by `delay`,
+    /// one way; every other datagram is delivered as before. A test slows
+    /// native setups this way (each takes a few round trips) without slowing
+    /// UDP connects. Survives [`Self::with_fault_injection`] and
+    /// [`Self::clear_fault_injection`]. A datagram a drop rule or cut drops
+    /// is still dropped.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn delay_quic_datagrams(&mut self, delay: Duration) -> &mut Self {
+        self.quic_datagram_delay = Some(delay);
+        if let Some(injector) = crate::node::network_bridge::get_fault_injector(&self.name) {
+            injector.lock().unwrap().quic_datagram_delay = Some(delay);
+        }
+        self.install_fault_delivery_callback();
+        self
     }
 
     /// Makes `run_simulation_direct` send every node, at virtual time `at`,
@@ -6994,6 +7021,11 @@ impl SimNetwork {
                     );
                 }
             }
+
+            // The native wire trace keeps the connection state as the run
+            // left it: the teardown below closes connections node by node.
+            #[cfg(any(test, feature = "testing"))]
+            crate::operations::connect::native_wire_trace::freeze_transports(&self.name);
 
             // Shutdown: abort chaos driver, time driver, then check node tasks
             if let Some(chaos) = chaos_driver {

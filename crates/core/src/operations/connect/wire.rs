@@ -310,8 +310,18 @@ pub mod sim_trace {
         /// The transport each node holds for each peer, as (node, peer) ->
         /// native, kept up to date as entries are added, swapped and
         /// removed.
-        transports:
-            parking_lot::Mutex<std::collections::BTreeMap<(SocketAddr, SocketAddr), bool>>,
+        transports: parking_lot::Mutex<std::collections::BTreeMap<(SocketAddr, SocketAddr), bool>>,
+        /// Set when the run ends ([`freeze_transports`]): `transports` no
+        /// longer changes, so the teardown's closes do not reach it.
+        transports_frozen: std::sync::atomic::AtomicBool,
+        /// How each end's native setup in a CONNECT ended, by (transaction,
+        /// lower address, higher address): (node, established) per end.
+        native_setup_ends: parking_lot::Mutex<
+            std::collections::BTreeMap<
+                (crate::message::Transaction, SocketAddr, SocketAddr),
+                Vec<(SocketAddr, bool)>,
+            >,
+        >,
         survivor_swapped: AtomicU64,
         survivor_udp_dropped: AtomicU64,
         one_sided_drops: AtomicU64,
@@ -380,6 +390,13 @@ pub mod sim_trace {
         Survivor { swapped: bool },
         /// A native connection closed soon after it won the survivor rule.
         OneSidedDrop,
+        /// The node `own`'s native setup with the peer at the recorded
+        /// address in `tx` ended, with a connection or not.
+        NativeSetupEnded {
+            tx: crate::message::Transaction,
+            own: SocketAddr,
+            established: bool,
+        },
     }
 
     static TRACES: LazyLock<dashmap::DashMap<String, NativeWireTrace>> =
@@ -419,11 +436,26 @@ pub mod sim_trace {
                 return;
             }
             NativeWireEvent::Transport { own, native } => {
+                if c.transports_frozen.load(Ordering::Relaxed) {
+                    return;
+                }
                 let mut transports = c.transports.lock();
                 match native {
                     Some(native) => transports.insert((own, addr), native),
                     None => transports.remove(&(own, addr)),
                 };
+                return;
+            }
+            NativeWireEvent::NativeSetupEnded {
+                tx,
+                own,
+                established,
+            } => {
+                c.native_setup_ends
+                    .lock()
+                    .entry((tx, own.min(addr), own.max(addr)))
+                    .or_default()
+                    .push((own, established));
                 return;
             }
             NativeWireEvent::Survivor { swapped: true } => &c.survivor_swapped,
@@ -483,6 +515,14 @@ pub mod sim_trace {
     /// as offers dropped on the way.
     pub(crate) fn mark_pre_floor(network: &str, addr: SocketAddr) {
         trace(network).0.pre_floor.lock().insert(addr);
+    }
+
+    /// Stops recording which transport each node holds in `network`'s trace,
+    /// if it has one: the run is over and its teardown follows.
+    pub(crate) fn freeze_transports(network: &str) {
+        if let Some(trace) = TRACES.get(network) {
+            trace.0.transports_frozen.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Removes the trace of `network` (on `SimNetwork` drop).
@@ -581,8 +621,27 @@ pub mod sim_trace {
         pub fn one_sided_drops(&self) -> u64 {
             Self::get(&self.0.one_sided_drops)
         }
-        /// The transport each node holds now for each peer, as (node, peer)
-        /// -> native.
+        /// Native setups in one CONNECT whose two ends both ended, as (both
+        /// ends, ends where exactly one side got a connection): the
+        /// one-sided successes of 10.2 item 7.
+        pub fn native_setup_pairs(&self) -> (usize, usize) {
+            let ends = self.0.native_setup_ends.lock();
+            let mut both = 0;
+            let mut one_sided = 0;
+            for sides in ends.values() {
+                let distinct: std::collections::BTreeMap<SocketAddr, bool> =
+                    sides.iter().copied().collect();
+                if distinct.len() == 2 {
+                    both += 1;
+                    if distinct.values().filter(|ok| **ok).count() == 1 {
+                        one_sided += 1;
+                    }
+                }
+            }
+            (both, one_sided)
+        }
+        /// The transport each node held for each peer when the run ended
+        /// (before its teardown), as (node, peer) -> native.
         pub fn transports(&self) -> std::collections::BTreeMap<(SocketAddr, SocketAddr), bool> {
             self.0.transports.lock().clone()
         }

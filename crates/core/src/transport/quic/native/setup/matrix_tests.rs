@@ -286,6 +286,7 @@ fn native_setup_matrix_meets_the_decision_criterion() {
     };
     let seeds = 0..20;
     let mut criterion_failures = Vec::new();
+    let (mut runs, mut one_sided) = (0, Vec::new());
     for &(client_nat, server_nat) in &classes {
         for &rtt in rtts {
             for &loss in losses {
@@ -300,6 +301,13 @@ fn native_setup_matrix_meets_the_decision_criterion() {
                             rtt: Duration::from_millis(rtt),
                         };
                         let (ok, total, failures) = run_seeds(cell, seeds.clone());
+                        runs += total;
+                        one_sided.extend(
+                            failures
+                                .iter()
+                                .filter(|f| f.one_sided())
+                                .map(|f| (cell, f.clone())),
+                        );
                         let rate = ok as f64 / total as f64;
                         println!(
                             "native-matrix client={} server={} late={late:?} skew={skew}s \
@@ -319,6 +327,60 @@ fn native_setup_matrix_meets_the_decision_criterion() {
         criterion_failures.is_empty(),
         "cells below 95% at 800 ms, 10% punch loss: {criterion_failures:#?}"
     );
+    // 10.2 item 20: a one-sided success (one side holds a connection the
+    // other never finished) is accepted and counted while it is rare. If
+    // this fails, holding the UDP loser until the native connection has
+    // carried a frame becomes a gate before native goes above 0%.
+    println!("native-matrix one-sided: {} of {runs}", one_sided.len());
+    assert!(
+        one_sided.len() * 100 <= runs,
+        "one-sided setups above 1% ({} of {runs}): {one_sided:#?}",
+        one_sided.len()
+    );
+}
+
+impl RunEnd {
+    /// Exactly one side finished the setup.
+    fn one_sided(&self) -> bool {
+        matches!(self, Self::Failed { client, server } if client.is_some() != server.is_some())
+    }
+}
+
+/// 10.2 item 20: one-sided successes where they are likeliest, a late side
+/// near the edge of the other side's window at 800 ms and 10% punch loss.
+/// The matrix stops at 4 s (late server) and 8 s (late client); past that
+/// the late side has too little of the other's window left, and a setup
+/// could finish on one side only. Measured, not asserted beyond the premise
+/// that these cells fail: the rate is printed.
+#[test]
+fn one_sided_setups_at_the_window_edge() {
+    let mut report = Vec::new();
+    let mut failed = 0;
+    for (late, skew_ms) in [
+        (Late::Server, 4_500u64),
+        (Late::Server, 5_000),
+        (Late::Server, 5_500),
+        (Late::Server, 6_000),
+        (Late::Client, 8_500),
+        (Late::Client, 9_000),
+        (Late::Client, 10_000),
+        (Late::Client, 11_000),
+    ] {
+        let cell = Cell {
+            client_nat: NatFiltering::PortRestricted,
+            server_nat: NatFiltering::PortRestricted,
+            late,
+            skew: Duration::from_millis(skew_ms),
+            punch_loss_pct: 10,
+            rtt: Duration::from_millis(800),
+        };
+        let (ok, total, failures) = run_seeds(cell, 0..10);
+        failed += failures.len();
+        let one_sided = failures.iter().filter(|f| f.one_sided()).count();
+        report.push((late, skew_ms, ok, one_sided, total));
+    }
+    println!("native-matrix window edge (late, skew ms, established, one-sided, runs): {report:?}");
+    assert!(failed > 0, "premise: setups failed at the window edge");
 }
 
 /// The reason the joiner's plan keeps a late server within 4 s of its client

@@ -113,6 +113,9 @@ pub struct FaultInjectorState {
     /// each with the bytes it has let through so far. Kept here rather than in
     /// [`FaultConfig`], whose rules are values.
     pub quic_datagram_cuts: Vec<(crate::simulation::QuicDatagramCut, u64)>,
+    /// One-way delay added to every QUIC-class datagram
+    /// (`SimNetwork::delay_quic_datagrams`), if any.
+    pub quic_datagram_delay: Option<std::time::Duration>,
 }
 
 impl FaultInjectorState {
@@ -127,6 +130,7 @@ impl FaultInjectorState {
             network_name: None,
             enforce_fault_drops: false,
             quic_datagram_cuts: Vec::new(),
+            quic_datagram_delay: None,
         }
     }
 

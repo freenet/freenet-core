@@ -4115,7 +4115,10 @@ async fn udp_then_native_both_connect_swaps_in_the_native_connection() {
     while h.handshake_rx.try_recv().is_ok() {}
     h.handshake_event(beside::established(&peer, true)).await;
     let entry = &h.mgr.connections[&addr];
-    assert_ne!(entry.connection_id, udp_id, "the native connection took the entry");
+    assert_ne!(
+        entry.connection_id, udp_id,
+        "the native connection took the entry"
+    );
     assert!(entry.native);
     let mut drops = 0;
     while let Ok(command) = h.handshake_rx.try_recv() {
@@ -4144,7 +4147,10 @@ async fn udp_then_native_both_connect_swaps_in_the_native_connection() {
         )
         .await
         .expect("handle_transport_event");
-    assert!(h.mgr.connections[&addr].native, "the stale close is ignored");
+    assert!(
+        h.mgr.connections[&addr].native,
+        "the stale close is ignored"
+    );
     assert_eq!(PairState::of(&h, addr), pair);
 }
 
@@ -4186,8 +4192,7 @@ impl PairState {
 
 /// Survivor-rule decisions on this thread: (UDP dropped, native swapped in).
 fn survivor_here() -> (u64, u64) {
-    let [dropped, swapped] =
-        crate::transport::metrics::SURVIVOR_ON_THIS_THREAD.with(|c| c.get());
+    let [dropped, swapped] = crate::transport::metrics::SURVIVOR_ON_THIS_THREAD.with(|c| c.get());
     (dropped, swapped)
 }
 
@@ -4230,8 +4235,15 @@ async fn beside_requesters_are_answered_only_with_a_kept_connection() {
     );
     // Gate 19: followed through, the UDP dial's own outcome answers them.
     h.handshake_event(beside::established(&peer, false)).await;
-    assert_eq!(udp.try_recv(), Ok(Ok((addr, None))), "answered by its own dial");
-    assert!(!h.mgr.connections[&addr].native, "the UDP connection is kept");
+    assert_eq!(
+        udp.try_recv(),
+        Ok(Ok((addr, None))),
+        "answered by its own dial"
+    );
+    assert!(
+        !h.mgr.connections[&addr].native,
+        "the UDP connection is kept"
+    );
     assert_eq!(h.ring_key_at(addr).as_ref(), Some(peer.pub_key()));
     beside::assert_clear(&h, addr);
 }
@@ -4462,7 +4474,12 @@ async fn survivor_rule_keeps_native_in_each_order_and_direction() {
                 "{case}: premise"
             );
             assert_eq!(
-                h.mgr.bridge.op_manager.ring.connection_manager.is_transient(addr),
+                h.mgr
+                    .bridge
+                    .op_manager
+                    .ring
+                    .connection_manager
+                    .is_transient(addr),
                 transient,
                 "{case}: premise"
             );
@@ -4472,8 +4489,16 @@ async fn survivor_rule_keeps_native_in_each_order_and_direction() {
             let entry = &h.mgr.connections[&addr];
             assert!(entry.native, "{case}: the native connection is kept");
             let swapped = matches!(second, Arrival::Native);
-            assert_eq!(entry.connection_id != first_id, swapped, "{case}: connection id");
-            assert_eq!(PairState::of(&h, addr), pair, "{case}: nothing else changed");
+            assert_eq!(
+                entry.connection_id != first_id,
+                swapped,
+                "{case}: connection id"
+            );
+            assert_eq!(
+                PairState::of(&h, addr),
+                pair,
+                "{case}: nothing else changed"
+            );
             let expected = if swapped {
                 (survivors.0, survivors.1 + 1)
             } else {
@@ -4492,7 +4517,8 @@ async fn two_udp_connections_to_one_address_still_replace() {
     let mut h = Harness::new("survivor-udp-udp").await;
     let addr: SocketAddr = "203.0.113.241:6320".parse().unwrap();
     let peer = PeerKeyLocation::new(key(), addr);
-    h.handshake_event(Arrival::OutboundUdp.event(&peer, false)).await;
+    h.handshake_event(Arrival::OutboundUdp.event(&peer, false))
+        .await;
     let first_id = h.mgr.connections[&addr].connection_id;
     let survivors = survivor_here();
     h.handshake_event(Arrival::InboundUdpKeyed.event(&peer, false))
@@ -4511,7 +4537,8 @@ async fn a_native_dial_onto_a_stale_key_replaces_the_entry() {
     let mut h = Harness::new("survivor-stale-key").await;
     let addr: SocketAddr = "203.0.113.241:6321".parse().unwrap();
     let old = PeerKeyLocation::new(key(), addr);
-    h.handshake_event(Arrival::OutboundUdp.event(&old, false)).await;
+    h.handshake_event(Arrival::OutboundUdp.event(&old, false))
+        .await;
     let old_id = h.mgr.connections[&addr].connection_id;
     let survivors = survivor_here();
     let new = PeerKeyLocation::new(key(), addr);
@@ -4523,7 +4550,11 @@ async fn a_native_dial_onto_a_stale_key_replaces_the_entry() {
     .await;
     // The ConnectPeer for the new key meets the stale entry and is refused;
     // the native dial in flight (another CONNECT's) still lands.
-    assert_eq!(result.try_recv(), Ok(Err(())), "premise: refused on the stale entry");
+    assert_eq!(
+        result.try_recv(),
+        Ok(Err(())),
+        "premise: refused on the stale entry"
+    );
     h.handshake_event(Arrival::Native.event(&new, false)).await;
     let entry = &h.mgr.connections[&addr];
     assert_ne!(entry.connection_id, old_id, "the stale entry is replaced");
@@ -4562,7 +4593,8 @@ async fn a_native_success_resets_the_streak_whatever_is_kept() {
         h.handshake_event(fail(1)).await;
         let winner = PeerKeyLocation::new(key(), addr(2));
         h.handshake_event(existing.event(&winner, false)).await;
-        h.handshake_event(Arrival::Native.event(&winner, false)).await;
+        h.handshake_event(Arrival::Native.event(&winner, false))
+            .await;
         assert!(h.mgr.connections[&addr(2)].native, "{existing:?}: premise");
         h.handshake_event(fail(3)).await;
         assert_eq!(
@@ -4593,7 +4625,11 @@ async fn both_dials_counts_only_the_beside_pair() {
     let (peer, mut native, mut udp) = beside::dials(&mut h, addr).await;
     h.handshake_event(Arrival::InboundUdpKeyed.event(&peer, false))
         .await;
-    assert_eq!(native.try_recv(), Ok(Ok((addr, None))), "answered by the inbound");
+    assert_eq!(
+        native.try_recv(),
+        Ok(Ok((addr, None))),
+        "answered by the inbound"
+    );
     h.handshake_event(beside::established(&peer, false)).await;
     assert_eq!(udp.try_recv(), Ok(Ok((addr, None))));
     assert_eq!(both_connected_here(), before, "not the pair yet");
@@ -4616,7 +4652,8 @@ async fn a_native_connection_closing_soon_after_winning_is_counted_one_sided() {
     let alone_peer = PeerKeyLocation::new(key(), alone);
     h.handshake_event(Arrival::OutboundUdp.event(&won_peer, false))
         .await;
-    h.handshake_event(Arrival::Native.event(&won_peer, false)).await;
+    h.handshake_event(Arrival::Native.event(&won_peer, false))
+        .await;
     h.handshake_event(Arrival::Native.event(&alone_peer, false))
         .await;
     let before = one_sided_here();
@@ -4624,4 +4661,62 @@ async fn a_native_connection_closing_soon_after_winning_is_counted_one_sided() {
     assert_eq!(one_sided_here(), before, "never competed");
     h.transport_closed(won).await;
     assert_eq!(one_sided_here(), before + 1, "closed soon after winning");
+}
+
+/// Gate 18, both ends: the two nodes of a pair see the same two connections
+/// in different orders and directions, and each keeps the native one, so
+/// they agree without exchanging anything. The #6253 round-3 case: the
+/// joiner's native dial connects before its UDP dial beside it, while the
+/// acceptor sees that UDP dial arrive inbound before its own native setup
+/// ends. Keeping the first connection at each end, the joiner kept native
+/// and the acceptor kept UDP, and each closed the connection the other kept.
+/// Each scenario lists the arrivals at the joiner, then at the acceptor.
+#[tokio::test]
+async fn both_ends_apply_the_survivor_rule_to_the_same_facts() {
+    let scenarios = [
+        (
+            [Arrival::Native, Arrival::OutboundUdp],
+            [Arrival::InboundUdpKeyed, Arrival::Native],
+        ),
+        (
+            [Arrival::OutboundUdp, Arrival::Native],
+            [Arrival::Native, Arrival::InboundUdpKeyed],
+        ),
+        (
+            [Arrival::Native, Arrival::OutboundUdp],
+            [Arrival::InboundUdpUnkeyed, Arrival::Native],
+        ),
+        (
+            [Arrival::OutboundUdp, Arrival::Native],
+            [Arrival::Native, Arrival::InboundUdpUnkeyed],
+        ),
+    ];
+    for (i, (at_joiner, at_acceptor)) in scenarios.into_iter().enumerate() {
+        let i = i as u16;
+        let mut joiner = Harness::new(&format!("survivor-ends-j{i}")).await;
+        let mut acceptor = Harness::new(&format!("survivor-ends-a{i}")).await;
+        let joiner_addr: SocketAddr = format!("203.0.113.244:{}", 6370 + i).parse().unwrap();
+        let acceptor_addr: SocketAddr = format!("203.0.113.245:{}", 6370 + i).parse().unwrap();
+        let acceptor_seen = PeerKeyLocation::new(acceptor.own_key(), acceptor_addr);
+        let joiner_seen = PeerKeyLocation::new(joiner.own_key(), joiner_addr);
+        for arrival in at_joiner {
+            joiner
+                .handshake_event(arrival.event(&acceptor_seen, false))
+                .await;
+        }
+        for arrival in at_acceptor {
+            acceptor
+                .handshake_event(arrival.event(&joiner_seen, false))
+                .await;
+        }
+        let kept = (
+            joiner.mgr.connections[&acceptor_addr].native,
+            acceptor.mgr.connections[&joiner_addr].native,
+        );
+        assert_eq!(
+            kept,
+            (true, true),
+            "{at_joiner:?} at the joiner, {at_acceptor:?} at the acceptor: both keep native"
+        );
+    }
 }
