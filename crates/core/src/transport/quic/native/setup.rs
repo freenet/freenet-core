@@ -17,15 +17,16 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use futures::future::FusedFuture;
 use tokio::sync::mpsc;
 
 use super::exchange::{HelloFailure, PeerHello, exchange};
 use super::hello::Hello;
 use super::punch::{CLIENT_BYTES_PER_DIAL, PUNCH_BYTES_PER_DIAL, PunchBudget, PunchRefusal, punch};
-use super::waiters::{NativeAttempt, NativeWaiter, NativeWaiters, Slot};
+use super::waiters::{MAX_IN_FLIGHT, NativeAttempt, NativeWaiter, NativeWaiters, Slot};
 use crate::simulation::TimeSource;
 use crate::transport::connection_handler::native_version;
 use crate::transport::crypto::TransportPublicKey;
@@ -38,6 +39,27 @@ pub(crate) const NATIVE_WINDOW: Duration = Duration::from_secs(8);
 
 /// A setup with less than this left of its window is not started.
 pub(crate) const MIN_WINDOW_LEFT: Duration = Duration::from_secs(4);
+
+/// A client whose first attempt has not finished (handshake and Hello)
+/// starts a second, overlapping one (design 6.2's variant) when this much of
+/// its window is left, and no sooner than [`OVERLAP_MIN_DELAY`] after the
+/// first. The first is never cancelled for it: both run until one finishes
+/// or the window ends. A lost Handshake packet late in the first attempt
+/// leaves its next probe (backed off from a round trip inflated by the
+/// setup's own losses) past the window; the second attempt's fresh handshake
+/// does not wait on it. Timed from the window's END rather than its start so
+/// that a server starting late (up to `MIN_WINDOW_LEFT` into the client's
+/// window) is more likely listening when the second attempt begins, and a
+/// client starting late, with a short window, still gets its second attempt
+/// early. Chosen by the gate-15 rows (800 ms, 10% loss on punches, Initials
+/// and Handshakes; 400 seeds per cell): every cell 96% or more, against
+/// 72-91% for one attempt and 83% at the edges for a second attempt at a
+/// fixed 2.5 s.
+pub(crate) const OVERLAP_BEFORE_END: Duration = Duration::from_secs(5);
+
+/// The least time between a client's first attempt and its overlapping
+/// second ([`OVERLAP_BEFORE_END`]).
+pub(crate) const OVERLAP_MIN_DELAY: Duration = Duration::from_millis(500);
 
 /// What the server's window adds to [`NATIVE_WINDOW`]. The acceptor, the
 /// server when its key is higher, starts its window when it accepts, before
@@ -153,8 +175,8 @@ impl<A: NativeAttempt> NativeWaiters<A> {
     fn register(self: &Arc<Self>, addr: SocketAddr) -> Option<NativeWaiter<A>> {
         let addr = normalize_mapped_addr(addr);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::channel(1);
-        let busy = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel(MAX_IN_FLIGHT);
+        let busy = Arc::new(AtomicUsize::new(0));
         match self.by_addr.entry(addr) {
             dashmap::mapref::entry::Entry::Occupied(_) => None,
             dashmap::mapref::entry::Entry::Vacant(vacant) => {
@@ -222,17 +244,53 @@ pub(in crate::transport) async fn connect_native<T: TimeSource>(
     budget
         .charge(peer.addr, CLIENT_BYTES_PER_DIAL, clock.now())
         .map_err(NativeSetupError::OverBudget)?;
-    let left = end.saturating_sub(clock.now());
-    // `biased` (dial, window, punches): a fixed order so a simulation's seed
-    // decides the run, and a dial that completes as the window ends still
-    // counts. The punch arm never completes, so nothing starves.
-    let connection = tokio::select! {
-        biased;
-        dialled = endpoint.dial_native(peer.addr, peer.key) => dialled?,
-        () = clock.sleep_cancelable(left) => return Err(NativeSetupError::TimedOut),
-        never = punch_until(endpoint, peer.addr, clock, end) => match never {},
+    // One attempt: a dial with the native ALPN, then the Hello exchange on
+    // its connection. Each dial is a new connection (a new DCID).
+    let attempt = || {
+        futures::FutureExt::fuse(async {
+            let connection = endpoint.dial_native(peer.addr, peer.key).await?;
+            finish(connection, peer, caps, clock, end).await
+        })
     };
-    finish(connection, peer, caps, clock, end).await
+    let first = attempt();
+    tokio::pin!(first);
+    let mut second = std::pin::pin!(futures::future::OptionFuture::from(None));
+    let mut second_due = Some(overlap_at(clock.now(), end));
+    let mut first_failed: Option<NativeSetupError> = None;
+    loop {
+        let now = clock.now();
+        let left = end.saturating_sub(now);
+        let until_second = second_due.map(|at| at.saturating_sub(now));
+        // `biased` (attempts, overlap timer, window, punches): a fixed order
+        // so a simulation's seed decides the run, and an attempt that
+        // completes as the window ends still counts. The punch arm never
+        // completes, so nothing starves.
+        tokio::select! {
+            biased;
+            done = &mut first, if first_failed.is_none() => match done {
+                Ok(connection) => return Ok(connection),
+                // Without a second attempt running, the setup has failed.
+                Err(error) if second_due.is_some() || second.is_terminated() => return Err(error),
+                Err(error) => first_failed = Some(error),
+            },
+            Some(done) = &mut second, if !second.is_terminated() => match done {
+                Ok(connection) => return Ok(connection),
+                Err(error) => match first_failed.take() {
+                    Some(first) => return Err(first),
+                    None => tracing::debug!(addr = %peer.addr, %error, "the overlapping native attempt failed; the first continues"),
+                },
+            },
+            () = clock.sleep_cancelable(until_second.unwrap_or_default()), if until_second.is_some() => {
+                second_due = None;
+                match budget.charge(peer.addr, CLIENT_BYTES_PER_DIAL, clock.now()) {
+                    Ok(()) => second.set(Some(attempt()).into()),
+                    Err(refusal) => tracing::debug!(addr = %peer.addr, ?refusal, "no overlapping native attempt: the punch budget is spent"),
+                }
+            },
+            () = clock.sleep_cancelable(left) => return Err(NativeSetupError::TimedOut),
+            never = punch_until(endpoint, peer.addr, clock, end) => match never {},
+        }
+    }
 }
 
 /// Set up a native connection from `peer` as the server: allow the peer as
@@ -260,17 +318,32 @@ pub(in crate::transport) async fn accept_native<T: TimeSource>(
     budget
         .charge(peer.addr, PUNCH_BYTES_PER_DIAL, clock.now())
         .map_err(NativeSetupError::OverBudget)?;
+    // Up to MAX_IN_FLIGHT attempts' handshakes run at once (a client whose
+    // first attempt stalls starts a second, design 6.2); the first to
+    // complete is the connection, and the others are dropped with their
+    // guards.
     let accept = async {
+        let mut handshakes = futures::stream::FuturesUnordered::new();
+        let mut open = true;
         loop {
-            let Some((attempt, _in_flight)) = waiter.next().await else {
-                // The router holds the sender while the waiter lives.
-                return Err(NativeSetupError::TimedOut);
-            };
-            match attempt.establish().await {
-                Ok(connection) => return Ok(connection),
-                Err(error) => {
-                    tracing::debug!(addr = %peer.addr, %error, "A native QUIC handshake failed; waiting for the next attempt");
+            tokio::select! {
+                biased;
+                Some((done, _in_flight)) = futures::StreamExt::next(&mut handshakes), if !handshakes.is_empty() => {
+                    match done {
+                        Ok(connection) => return Ok(connection),
+                        Err(error) => {
+                            tracing::debug!(addr = %peer.addr, %error, "A native QUIC handshake failed; waiting for the next attempt");
+                        }
+                    }
                 }
+                next = waiter.next(), if open => match next {
+                    Some((attempt, in_flight)) => {
+                        handshakes.push(async move { (attempt.establish().await, in_flight) });
+                    }
+                    // The router holds the sender while the waiter lives.
+                    None => open = false,
+                },
+                else => return Err(NativeSetupError::TimedOut),
             }
         }
     };
@@ -284,6 +357,13 @@ pub(in crate::transport) async fn accept_native<T: TimeSource>(
     };
     drop(waiter);
     finish(connection, peer, caps, clock, end).await
+}
+
+/// When a client that started at `start` with its window ending at `end`
+/// starts its overlapping second attempt.
+fn overlap_at(start: Duration, end: Duration) -> Duration {
+    end.saturating_sub(OVERLAP_BEFORE_END)
+        .max(start + OVERLAP_MIN_DELAY)
 }
 
 /// The Hello exchange on a new connection, within what is left of the window.
@@ -370,6 +450,19 @@ mod tests {
                     accept_native(&b, &w, &budgets.1, to_a, 0, &clock, deadline),
                 );
                 router.abort();
+                // A setup that finished before OVERLAP_BEFORE_END's point
+                // started no second attempt, so the client was charged once:
+                // three more client charges fit the destination's budget, as
+                // they would with none taken (64 KiB holds four).
+                let mut more = 0;
+                while budgets
+                    .0
+                    .charge(b_addr, CLIENT_BYTES_PER_DIAL, clock.now())
+                    .is_ok()
+                {
+                    more += 1;
+                }
+                assert_eq!(more, 3, "charged for one attempt");
                 both
             })
             .await;
@@ -559,8 +652,10 @@ mod tests {
                     .filter(|sent| sent.from == from && sent.to == to)
                     .map(|sent| sent.bytes.len() as u64)
                     .sum();
+                // A silent server makes the client start its overlapping
+                // second attempt, charged again.
                 let charged = if client_side {
-                    CLIENT_BYTES_PER_DIAL
+                    2 * CLIENT_BYTES_PER_DIAL
                 } else {
                     PUNCH_BYTES_PER_DIAL
                 };
@@ -635,12 +730,31 @@ mod tests {
                 .collect();
             let padded = sent.iter().filter(|len| **len >= 1200).count();
             let bytes: u64 = sent.iter().map(|len| *len as u64).sum();
+            // Two attempts: the first, retried, and the overlapping second
+            // from 3 s on (OVERLAP_BEFORE_END before the 8 s window's end),
+            // each charged CLIENT_BYTES_PER_DIAL.
             assert!(
-                bytes <= CLIENT_BYTES_PER_DIAL,
-                "{bytes} B > {CLIENT_BYTES_PER_DIAL} B"
+                bytes <= 2 * CLIENT_BYTES_PER_DIAL,
+                "{bytes} B > 2 x {CLIENT_BYTES_PER_DIAL} B"
             );
-            assert_eq!(padded, 11, "10 Initials and the close");
+            assert_eq!(
+                padded, 21,
+                "the first attempt's 10 Initials and close, and the second's 9 \
+                 Initials (from 3 s, ignored) and close"
+            );
         });
+    }
+
+    /// The overlapping second attempt starts 5 s before the window's end (3 s
+    /// into a full 8 s window), and at least 0.5 s after the first (a 4 s
+    /// window, the shortest started), as literals.
+    #[test]
+    fn the_second_attempt_starts_five_seconds_before_the_end() {
+        let s = Duration::from_secs;
+        assert_eq!(overlap_at(s(10), s(18)), s(13));
+        assert_eq!(overlap_at(s(10), s(14)), s(10) + Duration::from_millis(500));
+        assert_eq!(overlap_at(s(10), s(15)), s(10) + Duration::from_millis(500));
+        assert_eq!(overlap_at(s(10), s(16)), s(11));
     }
 
     /// The window is 8 s for the client and 12 s for the server, cut to the

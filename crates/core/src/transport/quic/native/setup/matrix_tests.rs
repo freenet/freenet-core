@@ -501,19 +501,20 @@ struct GateCell {
     expired: u64,
 }
 
-/// Runs `cells`, 20 seeds each, several cells at a time (each cell's runs
+/// Runs `cells`, 20 seeds each (gate 15 is judged on 100), several cells at a time (each cell's runs
 /// stay on one thread, in seed order, so results are as if run alone),
 /// printing each.
 fn run_gate_cells(gate: &str, cells: Vec<Cell>) -> Vec<GateCell> {
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8));
+    let seeds = if gate == "15" { 0..100 } else { 0..20 };
     let mut results = Vec::new();
     for chunk in cells.chunks(threads) {
         let runs: Vec<_> = std::thread::scope(|scope| {
             let handles: Vec<_> = chunk
                 .iter()
                 .map(|cell| {
-                    let cell = *cell;
-                    scope.spawn(move || (cell, run_seeds_full(cell, 0..20)))
+                    let (cell, seeds) = (*cell, seeds.clone());
+                    scope.spawn(move || (cell, run_seeds_full(cell, seeds)))
                 })
                 .collect();
             handles
