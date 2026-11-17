@@ -14,7 +14,8 @@
 //!   node keeps running: endpoint death NEVER feeds `ListenerExit`, which
 //!   exits the node. e5 watches the availability and moves every QUIC path
 //!   back to UDP. The one exception is a gateway run by the `freenet`
-//!   binary under a service supervisor ([`enable_gateway_quic_restarts`]):
+//!   binary under a service supervisor ([`enable_gateway_quic_restarts`];
+//!   with no UDP to fall back to, #6151, a supervised peer too):
 //!   its transport listener then reports the death as
 //!   `ListenerExit::QuicEndpointDown`, the node's fatal-listener path exits
 //!   the process, and the supervisor restarts it with a new endpoint
@@ -113,7 +114,8 @@ static GATEWAY_QUIC_RESTARTS: AtomicBool = AtomicBool::new(false);
 /// unit marks it supervised (`FREENET_SUPERVISED`, set by the units
 /// `freenet service install` writes), so a gateway started by hand, or under
 /// a supervisor that may not restart it, keeps running over UDP, as before.
-/// Peers never exit for this while UDP remains.
+/// Peers never exit for this while UDP remains; with no UDP to fall back to
+/// (#6151) a supervised peer exits for an endpoint death too.
 pub fn enable_gateway_quic_restarts() {
     GATEWAY_QUIC_RESTARTS.store(true, Ordering::Relaxed);
 }
@@ -134,14 +136,30 @@ pub(crate) fn gateway_supervisor_unverified() -> bool {
     SUPERVISOR_UNVERIFIED.load(Ordering::Relaxed)
 }
 
-/// Whether a node in this role exits to restore QUIC: a gateway, and only
-/// when the binary enabled it ([`enable_gateway_quic_restarts`]).
+/// Whether a node in this role exits to restore QUIC, and only when the
+/// binary enabled it ([`enable_gateway_quic_restarts`]): a gateway, and, once
+/// there is no UDP to fall back to (#6151, `breaker::udp_fallback`), a peer
+/// too, since a peer whose endpoint died would otherwise have no transport.
 pub(crate) fn gateway_quic_restarts(is_gateway: bool) -> bool {
-    gateway_quic_restarts_with(is_gateway, GATEWAY_QUIC_RESTARTS.load(Ordering::Relaxed))
+    gateway_quic_restarts_with(
+        is_gateway,
+        GATEWAY_QUIC_RESTARTS.load(Ordering::Relaxed),
+        super::breaker::udp_fallback(),
+    )
 }
 
-fn gateway_quic_restarts_with(is_gateway: bool, enabled: bool) -> bool {
-    is_gateway && enabled
+/// Whether a node in this role restarts to restore QUIC at all, enabled or
+/// not: a gateway, or any node with no UDP to fall back to.
+pub(crate) fn restarts_for_quic(is_gateway: bool) -> bool {
+    restarts_for_quic_with(is_gateway, super::breaker::udp_fallback())
+}
+
+fn restarts_for_quic_with(is_gateway: bool, udp_fallback: bool) -> bool {
+    is_gateway || !udp_fallback
+}
+
+fn gateway_quic_restarts_with(is_gateway: bool, enabled: bool, udp_fallback: bool) -> bool {
+    enabled && restarts_for_quic_with(is_gateway, udp_fallback)
 }
 
 /// Whether this node can use QUIC.
@@ -417,13 +435,31 @@ pub(crate) async fn watch_endpoint_driver(
 mod tests {
     use super::*;
 
-    /// Only an enabled gateway exits on endpoint death.
+    /// While UDP exists only an enabled gateway exits on endpoint death;
+    /// with no UDP to fall back to (#6151) an enabled peer does too.
     #[test]
     fn only_an_enabled_gateway_exits_on_endpoint_death() {
-        assert!(gateway_quic_restarts_with(true, true));
-        assert!(!gateway_quic_restarts_with(false, true), "a peer never");
-        assert!(!gateway_quic_restarts_with(true, false), "not enabled");
-        assert!(!gateway_quic_restarts_with(false, false));
+        for udp in [true, false] {
+            assert!(gateway_quic_restarts_with(true, true, udp));
+            assert!(!gateway_quic_restarts_with(true, false, udp), "not enabled");
+            assert!(!gateway_quic_restarts_with(false, false, udp));
+        }
+        assert!(
+            !gateway_quic_restarts_with(false, true, true),
+            "a peer, with UDP"
+        );
+        assert!(
+            gateway_quic_restarts_with(false, true, false),
+            "a peer, no UDP"
+        );
+        assert!(restarts_for_quic_with(true, true));
+        assert!(!restarts_for_quic_with(false, true));
+        assert!(restarts_for_quic_with(false, false));
+        // While the switch says UDP exists, a peer never restarts.
+        assert_eq!(
+            restarts_for_quic(false),
+            !crate::transport::quic::breaker::UDP_FALLBACK
+        );
         // Nothing in the unit-test binary enables it.
         assert!(!gateway_quic_restarts(true));
     }

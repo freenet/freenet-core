@@ -3685,6 +3685,14 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     marker (quic-crash-breaker-legacy.json) and never changes whether QUIC
     runs. It tells what the switch loses (crash loops with no QUIC panic) and
     what it stops (kills read as crashes). The shadow goes with UDP (#6151).
+    With no UDP to fall back to (breaker::UDP_FALLBACK false, set by the
+    UDP-removal release; until then tests only, switched on in a
+    quic-panic-injection build by FREENET_TEST_BREAKER_NO_UDP_FALLBACK), a
+    peer trips at three again and its trip keeps QUIC on: a start delay of 1
+    minute doubling to 30 (Verdict::Backoff, waited out just before the
+    transport opens, cut short by a stop), the startup update check at once
+    (quic_crash_loop_update_now; the update claim still applies), and a
+    supervised peer exits on endpoint death like a gateway.
   → When the node drops its last handle, the availability is Released
     (final; the first final state stored wins, so a release and a
     driver return racing never overwrite each other) and the driver's

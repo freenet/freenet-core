@@ -583,10 +583,11 @@ pub(crate) async fn open_udp_transport<S: Socket>(
     );
     // A supervised gateway exits for its supervisor to restart it when that
     // restores QUIC (#5940): its endpoint died, or the crash-breaker
-    // cooldown that kept QUIC off for this run ended. Every other node keeps
-    // running over UDP.
+    // cooldown that kept QUIC off for this run ended. With no UDP to fall
+    // back to (#6151) a supervised peer exits for an endpoint death too.
+    // Every other node keeps running over UDP.
     let restart = gateway_quic_restart(
-        is_gateway,
+        super::quic::liveness::restarts_for_quic(is_gateway),
         super::quic::liveness::gateway_quic_restarts(is_gateway),
         super::quic::liveness::gateway_supervisor_unverified(),
         outbound.quic_availability(),

@@ -630,8 +630,13 @@ async fn run_network_node_with_signals(
                 "Startup update check skipped: {reason}. Run `freenet update` to update now."
             );
         }
-        let startup_jitter_secs =
-            freenet::config::GlobalRng::random_u64() % STARTUP_UPDATE_JITTER_MAX_SECS;
+        // #6151: a peer the crash-loop breaker found in a QUIC crash loop,
+        // with no UDP to fall back to, checks at once: it is broken, and a
+        // fixed release is what ends the loop. The claim below still applies.
+        let startup_jitter_secs = startup_update_jitter_secs(
+            freenet::quic_crash_loop_update_now(),
+            freenet::config::GlobalRng::random_u64(),
+        );
         // `startup_check_ran` is true only if the claim, made after the
         // jitter, allowed the check.
         let (startup_check_ran, latest) = match startup_attempt {
@@ -1288,6 +1293,17 @@ fn gateway_quic_restarts(status: commands::auto_update::SupervisorStatus) -> Gat
         SupervisorStatus::Supervised => GatewayQuicRestarts::Enabled,
         SupervisorStatus::SupervisedUnverified => GatewayQuicRestarts::OffUnverified,
         SupervisorStatus::Unsupervised => GatewayQuicRestarts::Off,
+    }
+}
+
+/// The startup update check's jitter: none when the QUIC crash-loop breaker
+/// found this start in a crash loop with no UDP to fall back to (#6151),
+/// otherwise `random` reduced to under [`STARTUP_UPDATE_JITTER_MAX_SECS`].
+fn startup_update_jitter_secs(crash_loop: bool, random: u64) -> u64 {
+    if crash_loop {
+        0
+    } else {
+        random % STARTUP_UPDATE_JITTER_MAX_SECS
     }
 }
 
@@ -2092,6 +2108,30 @@ mod tests {
         );
     }
 
+    /// #6151: the startup update check skips its jitter only in a QUIC crash
+    /// loop with no UDP to fall back to, and the update task takes its jitter
+    /// from that decision.
+    #[test]
+    fn a_crash_loop_checks_for_an_update_at_once() {
+        assert_eq!(super::startup_update_jitter_secs(true, 59), 0);
+        assert_eq!(super::startup_update_jitter_secs(true, u64::MAX), 0);
+        assert_eq!(super::startup_update_jitter_secs(false, 59), 59);
+        assert_eq!(
+            super::startup_update_jitter_secs(false, 60 + 7),
+            7,
+            "under the cap"
+        );
+        let src = include_str!("freenet.rs");
+        let task = fn_body(src, "async fn run_network_node_with_signals(");
+        let squeezed: String = task.split_whitespace().collect();
+        assert!(
+            squeezed.contains(
+                "letstartup_jitter_secs=startup_update_jitter_secs(freenet::quic_crash_loop_update_now(),freenet::config::GlobalRng::random_u64(),);"
+            ),
+            "the startup check takes its jitter from the crash-loop decision"
+        );
+    }
+
     /// #6151: while UDP exists, a peer's QUIC crash-loop breaker trips, and
     /// the peer falls back to UDP, before the post-update crash-loop rollback
     /// restores the previous release and pins this one as bad. Each run the
@@ -2103,6 +2143,12 @@ mod tests {
     /// before the panics lets the rollback act first.
     #[test]
     fn peer_breaker_trips_before_the_crash_loop_rollback() {
+        // With no UDP to fall back to the order is meant to reverse (a
+        // rollback is then the better outcome), and the library pins the
+        // count it goes back to.
+        if !freenet::QUIC_BREAKER_UDP_FALLBACK {
+            return;
+        }
         let crashes_when_the_breaker_trips = freenet::PEER_SHORT_RUNS_TO_TRIP_WITH_UDP;
         assert!(crashes_when_the_breaker_trips >= 1);
         assert!(

@@ -179,17 +179,25 @@ pub(super) const SHORT_RUNS_TO_TRIP: u32 = 3;
 /// every crash (an out-of-memory kill, a SIGKILL, a crash elsewhere), while
 /// the breaker counts consecutive short runs that panicked in QUIC code, so
 /// one unrelated crash followed by two QUIC panics still lets the rollback
-/// act first. Goes back to
-/// [`SHORT_RUNS_TO_TRIP`] when UDP is removed, when there is no UDP to fall
-/// back to and a rollback is the better outcome.
+/// act first. Goes back to [`SHORT_RUNS_TO_TRIP`] when UDP is removed
+/// ([`super::UDP_FALLBACK`] false, [`short_runs_to_trip`]), when there is no
+/// UDP to fall back to and a rollback is the better outcome.
 pub const PEER_SHORT_RUNS_TO_TRIP_WITH_UDP: u32 = 2;
 
-/// How many short runs in a row trip the breaker for `role`.
-pub(super) const fn short_runs_to_trip(role: BreakerRole) -> u32 {
+/// How many short runs in a row trip the breaker for `role`, with or without
+/// UDP to fall back to ([`super::udp_fallback`]).
+pub(crate) const fn short_runs_to_trip(role: BreakerRole, udp_fallback: bool) -> u32 {
     match role {
-        BreakerRole::Peer => PEER_SHORT_RUNS_TO_TRIP_WITH_UDP,
-        BreakerRole::Gateway => SHORT_RUNS_TO_TRIP,
+        BreakerRole::Peer if udp_fallback => PEER_SHORT_RUNS_TO_TRIP_WITH_UDP,
+        BreakerRole::Peer | BreakerRole::Gateway => SHORT_RUNS_TO_TRIP,
     }
+}
+
+/// Whether a trip keeps QUIC off for a cooldown, or, on a peer with no UDP
+/// to fall back to (#6151), delays its start instead and keeps QUIC on
+/// ([`Verdict::Backoff`]): with UDP removed, QUIC off is no transport at all.
+const fn trips_into_backoff(role: BreakerRole, udp_fallback: bool) -> bool {
+    matches!(role, BreakerRole::Peer) && !udp_fallback
 }
 
 /// How many times the timer tries to clear the count, [`SHORT_RUN`] apart. A
@@ -218,9 +226,27 @@ pub(super) fn decide(
     now_secs: u64,
     ignore_breaker: bool,
     role: BreakerRole,
+    udp_fallback: bool,
 ) -> Decision {
     let arm = |short_runs| Decision {
         verdict: Verdict::Arm,
+        short_runs,
+    };
+    let backoff = trips_into_backoff(role, udp_fallback);
+    // The backoff step the last run started at; a further counted run (or
+    // endpoint death) on a peer in a backoff goes one step further.
+    let previous_step = match previous {
+        Previous::Marker(Marker::ShortRuns { backoff_step, .. }) => *backoff_step,
+        Previous::Nothing | Previous::Unreadable | Previous::Marker(_) => 0,
+    };
+    let trip = |short_runs: u32| Decision {
+        verdict: if backoff {
+            Verdict::Backoff {
+                step: previous_step.saturating_add(1),
+            }
+        } else {
+            Verdict::Trip
+        },
         short_runs,
     };
     // A gateway's exit because its QUIC endpoint died is decided as on unix,
@@ -240,12 +266,10 @@ pub(super) fn decide(
             role,
         ) {
             return match verdict {
-                Verdict::Trip if !ignore_breaker => Decision {
-                    verdict,
-                    short_runs: *short_runs,
-                },
+                Verdict::Trip if !ignore_breaker => trip(*short_runs),
                 Verdict::Arm
                 | Verdict::Trip
+                | Verdict::Backoff { .. }
                 | Verdict::Cool { .. }
                 | Verdict::RunUnarmed
                 | Verdict::Unreadable => arm(0),
@@ -260,19 +284,25 @@ pub(super) fn decide(
             ..
         }) if within(*started_at_secs, now_secs, SHORT_RUN_WINDOW) => {
             let short_runs = short_runs.saturating_add(1);
-            if short_runs >= short_runs_to_trip(role) && !ignore_breaker {
-                Decision {
-                    verdict: Verdict::Trip,
-                    short_runs,
-                }
+            let in_backoff = backoff && previous_step > 0;
+            if (in_backoff || short_runs >= short_runs_to_trip(role, udp_fallback))
+                && !ignore_breaker
+            {
+                trip(short_runs)
             } else {
                 arm(short_runs)
             }
         }
+        // With no UDP to fall back to, a peer does not keep QUIC off for an
+        // earlier trip (one from a release that still had UDP): it starts
+        // again as if nothing had happened, and `gate` logs it once.
         Previous::Marker(Marker::Tripped {
             tripped_at_secs,
             trips,
-        }) if !ignore_breaker && within(*tripped_at_secs, now_secs, role.cooldown(*trips)) => {
+        }) if !ignore_breaker
+            && !backoff
+            && within(*tripped_at_secs, now_secs, role.cooldown(*trips)) =>
+        {
             Decision {
                 verdict: Verdict::Cool {
                     tripped_at_secs: *tripped_at_secs,
@@ -306,23 +336,26 @@ const SHORT_RUN_WINDOW: Duration = QUIC_BREAKER_COOLDOWN;
 
 /// The marker a decision on `previous` leaves behind; `None` leaves the file
 /// as it is. A gateway's trip history rides along ([`super::prior_trip`]).
-fn marker_after(
+pub(super) fn marker_after(
     decision: Decision,
     previous: &Previous,
     now_secs: u64,
     nonce: u64,
     role: BreakerRole,
 ) -> Option<Marker> {
+    let short_runs = |backoff_step| Marker::ShortRuns {
+        short_runs: decision.short_runs,
+        started_at_secs: now_secs,
+        nonce,
+        quic_panicked: false,
+        quic_panic_at: None,
+        backoff_step,
+        endpoint_down_secs: super::carried_endpoint_down_exits(previous, now_secs),
+        prior_trip: super::prior_trip(previous, now_secs, role),
+    };
     match decision.verdict {
-        Verdict::Arm => Some(Marker::ShortRuns {
-            short_runs: decision.short_runs,
-            started_at_secs: now_secs,
-            nonce,
-            quic_panicked: false,
-            quic_panic_at: None,
-            endpoint_down_secs: super::carried_endpoint_down_exits(previous, now_secs),
-            prior_trip: super::prior_trip(previous, now_secs, role),
-        }),
+        Verdict::Arm => Some(short_runs(0)),
+        Verdict::Backoff { step } => Some(short_runs(step)),
         Verdict::Trip => Some(Marker::Tripped {
             tripped_at_secs: now_secs,
             trips: super::trip_number(previous, now_secs, role),
@@ -363,6 +396,7 @@ pub(super) fn gate<T>(
     ignore_breaker: bool,
     now: SystemTime,
     role: BreakerRole,
+    udp_fallback: bool,
 ) -> (Gated<T>, Counted) {
     if settings.is_none() {
         return (
@@ -383,7 +417,15 @@ pub(super) fn gate<T>(
         );
     }
     let now_secs = unix_secs(now);
-    let decision = decide(&previous, now_secs, ignore_breaker, role);
+    let decision = decide(&previous, now_secs, ignore_breaker, role, udp_fallback);
+    if trips_into_backoff(role, udp_fallback)
+        && matches!(previous, Previous::Marker(Marker::Tripped { .. }))
+    {
+        tracing::warn!(
+            "An earlier run's QUIC crash-breaker trip keeps QUIC off only while UDP exists; \
+             this release has no UDP to fall back to, so QUIC runs and the trip is dropped"
+        );
+    }
     let counted = Counted {
         short_runs: decision.short_runs,
         quic_panic_at: counted_panic_at(&previous, decision),
@@ -399,11 +441,38 @@ pub(super) fn gate<T>(
             if decision.short_runs > 0 {
                 tracing::info!(
                     short_runs = decision.short_runs,
-                    trip_at = short_runs_to_trip(role),
+                    trip_at = short_runs_to_trip(role, udp_fallback),
                     "The previous run with QUIC enabled lasted less than the short-run limit"
                 );
             }
             PENDING.lock().marker = marker.map(|marker| (path, marker));
+        }
+        Verdict::Backoff { step } => {
+            let delay = super::backoff_delay(step);
+            // Written now, with no QUIC panic recorded, so a stop or a crash
+            // during the wait (QUIC is not up yet, so it cannot be a QUIC
+            // fault) ends the backoff instead of extending it; the run after
+            // the wait is armed with the same marker as usual.
+            if let Some(Err(error)) = marker.as_ref().map(|marker| write_marker(&path, marker)) {
+                tracing::warn!(
+                    %error,
+                    path = %path.display(),
+                    "Could not record the QUIC crash-loop backoff; the next start decides again"
+                );
+            }
+            PENDING.lock().marker = marker.map(|marker| (path, marker));
+            super::note_backoff(delay);
+            metrics.record_quic_breaker_trip();
+            tracing::warn!(
+                short_runs = decision.short_runs,
+                step,
+                delay_secs = delay.as_secs(),
+                short_run_minutes = SHORT_RUN.as_secs() / 60,
+                "Runs with QUIC enabled keep ending early after a panic in QUIC code, and this \
+                 node has no UDP to fall back to: QUIC stays on, the node checks for an update \
+                 now and waits before it opens the transport. A run that lasts longer than the \
+                 short-run limit ends the backoff"
+            );
         }
         Verdict::Trip => {
             let trips = match &marker {
@@ -616,6 +685,7 @@ fn mark_quic_panic(path: &Path, nonce: u64, at: Option<String>) -> std::io::Resu
             nonce: owner,
             quic_panicked: false,
             quic_panic_at: _,
+            backoff_step,
             endpoint_down_secs,
             prior_trip,
         }) if owner == nonce => {
@@ -625,6 +695,7 @@ fn mark_quic_panic(path: &Path, nonce: u64, at: Option<String>) -> std::io::Resu
                 nonce,
                 quic_panicked: true,
                 quic_panic_at: at,
+                backoff_step,
                 endpoint_down_secs,
                 prior_trip,
             };
@@ -781,26 +852,189 @@ mod tests {
 
     /// The peer decision; the gateway one is tested by name.
     fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -> Decision {
-        super::decide(previous, now_secs, ignore_breaker, BreakerRole::Peer)
+        super::decide(
+            previous,
+            now_secs,
+            ignore_breaker,
+            BreakerRole::Peer,
+            super::super::UDP_FALLBACK,
+        )
     }
 
     /// The trip count of the role these tests use, a peer.
-    const SHORT_RUNS_TO_TRIP: u32 = short_runs_to_trip(BreakerRole::Peer);
+    const SHORT_RUNS_TO_TRIP: u32 =
+        short_runs_to_trip(BreakerRole::Peer, super::super::UDP_FALLBACK);
+
+    /// The trip count follows the UDP switch: two on a peer while UDP exists,
+    /// three once it is removed, three on a gateway either way, so "back to
+    /// three at D" is the switch, not a comment.
+    #[test]
+    fn the_peer_trip_count_follows_the_udp_switch() {
+        assert_eq!(
+            short_runs_to_trip(BreakerRole::Peer, true),
+            PEER_SHORT_RUNS_TO_TRIP_WITH_UDP
+        );
+        assert_eq!(PEER_SHORT_RUNS_TO_TRIP_WITH_UDP, 2);
+        assert_eq!(
+            short_runs_to_trip(BreakerRole::Peer, false),
+            super::SHORT_RUNS_TO_TRIP
+        );
+        assert_eq!(super::SHORT_RUNS_TO_TRIP, 3);
+        for udp in [true, false] {
+            assert_eq!(short_runs_to_trip(BreakerRole::Gateway, udp), 3);
+        }
+        // UDP exists today; the UDP-removal release flips the switch.
+        const { assert!(super::super::UDP_FALLBACK) };
+    }
+
+    /// `marker` with a backoff step.
+    fn with_step(marker: Previous, step: u32) -> Previous {
+        let Previous::Marker(Marker::ShortRuns {
+            short_runs,
+            started_at_secs,
+            nonce,
+            quic_panicked,
+            quic_panic_at,
+            endpoint_down_secs,
+            prior_trip,
+            ..
+        }) = marker
+        else {
+            unreachable!()
+        };
+        Previous::Marker(Marker::ShortRuns {
+            short_runs,
+            started_at_secs,
+            nonce,
+            quic_panicked,
+            quic_panic_at,
+            backoff_step: step,
+            endpoint_down_secs,
+            prior_trip,
+        })
+    }
+
+    /// With no UDP to fall back to, a peer's trip keeps QUIC on and backs off
+    /// instead: the first at three counted runs, then one step further for
+    /// each further counted run; a run with no QUIC panic (a stop, or a crash
+    /// during the wait) ends the backoff; an earlier release's QUIC-off trip
+    /// is dropped; an endpoint-death trip backs off too; the override never
+    /// backs off; a gateway still trips.
+    #[test]
+    fn with_no_udp_a_peer_backs_off_instead_of_turning_quic_off() {
+        let peer = |previous: &Previous, ignore| {
+            super::decide(previous, T0 + 1, ignore, BreakerRole::Peer, false)
+        };
+        assert_eq!(peer(&panicked(1, T0), false).verdict, Verdict::Arm);
+        assert_eq!(
+            peer(&panicked(2, T0), false),
+            Decision {
+                verdict: Verdict::Backoff { step: 1 },
+                short_runs: 3
+            }
+        );
+        for step in 1..5 {
+            assert_eq!(
+                peer(&with_step(panicked(3, T0), step), false).verdict,
+                Verdict::Backoff { step: step + 1 },
+                "step {step}"
+            );
+        }
+        assert_eq!(
+            peer(&with_step(running(3, T0), 4), false),
+            arm(0),
+            "a run with no QUIC panic ends the backoff"
+        );
+        assert_eq!(
+            peer(&tripped(T0), false),
+            arm(0),
+            "an earlier trip is dropped"
+        );
+        assert_eq!(
+            peer(&with_step(panicked(3, T0), 2), true).verdict,
+            Verdict::Arm,
+            "the override never backs off"
+        );
+        let mut died = with_step(running(0, T0), 1);
+        if let Previous::Marker(Marker::ShortRuns {
+            endpoint_down_secs, ..
+        }) = &mut died
+        {
+            *endpoint_down_secs = vec![T0 - 60, T0 + 1];
+        }
+        assert_eq!(
+            peer(&died, false).verdict,
+            Verdict::Backoff { step: 2 },
+            "an endpoint-death trip backs off"
+        );
+        let gateway = super::decide(&panicked(2, T0), T0 + 1, false, BreakerRole::Gateway, false);
+        assert_eq!(gateway.verdict, Verdict::Trip);
+        // While UDP exists the same peer runs trip.
+        assert_eq!(
+            super::decide(&panicked(1, T0), T0 + 1, false, BreakerRole::Peer, true).verdict,
+            Verdict::Trip
+        );
+    }
+
+    /// The marker a backoff leaves records the step and no QUIC panic, keeps
+    /// QUIC on, and is written at once (`gate`): a start after a stop during
+    /// the wait reads it as a run with no QUIC panic and does not wait again.
+    #[test]
+    fn a_backoff_leaves_a_marker_that_ends_it_unless_quic_panics_again() {
+        let decision = Decision {
+            verdict: Verdict::Backoff { step: 2 },
+            short_runs: 4,
+        };
+        assert!(decision.verdict.quic_enabled());
+        let marker =
+            super::marker_after(decision, &Previous::Nothing, T0, NONCE, BreakerRole::Peer)
+                .unwrap();
+        assert_eq!(
+            Previous::Marker(marker.clone()),
+            with_step(running(4, T0), 2)
+        );
+        let after_stop = super::decide(
+            &Previous::Marker(marker),
+            T0 + 5,
+            false,
+            BreakerRole::Peer,
+            false,
+        );
+        assert_eq!(after_stop, arm(0));
+    }
 
     /// A peer trips at two while UDP exists, a gateway at three.
     #[test]
     fn a_peer_trips_one_run_sooner_than_a_gateway_while_udp_exists() {
         let panicked_runs = |short_runs| panicked(short_runs, T0);
         for role in [BreakerRole::Peer, BreakerRole::Gateway] {
-            let at = short_runs_to_trip(role);
-            let before = super::decide(&panicked_runs(at - 2), T0 + 1, false, role);
+            let at = short_runs_to_trip(role, super::super::UDP_FALLBACK);
+            let before = super::decide(
+                &panicked_runs(at - 2),
+                T0 + 1,
+                false,
+                role,
+                super::super::UDP_FALLBACK,
+            );
             assert_eq!(before.verdict, Verdict::Arm, "{role:?}");
-            let trip = super::decide(&panicked_runs(at - 1), T0 + 1, false, role);
+            let trip = super::decide(
+                &panicked_runs(at - 1),
+                T0 + 1,
+                false,
+                role,
+                super::super::UDP_FALLBACK,
+            );
             assert_eq!(trip.verdict, Verdict::Trip, "{role:?}");
             assert_eq!(trip.short_runs, at, "{role:?}");
         }
-        assert_eq!(short_runs_to_trip(BreakerRole::Peer), 2);
-        assert_eq!(short_runs_to_trip(BreakerRole::Gateway), 3);
+        assert_eq!(
+            short_runs_to_trip(BreakerRole::Peer, super::super::UDP_FALLBACK),
+            2
+        );
+        assert_eq!(
+            short_runs_to_trip(BreakerRole::Gateway, super::super::UDP_FALLBACK),
+            3
+        );
     }
 
     /// The short-run clear and the endpoint-death record, in either order,
@@ -816,6 +1050,7 @@ mod tests {
             nonce: NONCE,
             quic_panicked: false,
             quic_panic_at: None,
+            backoff_step: 0,
             endpoint_down_secs,
             prior_trip: None,
         };
@@ -867,13 +1102,20 @@ mod tests {
                 nonce: NONCE,
                 quic_panicked: false,
                 quic_panic_at: None,
+                backoff_step: 0,
                 endpoint_down_secs,
                 prior_trip: None,
             })
         };
         let long_after = T0 + 3 * SHORT_RUN.as_secs();
         let first = died(vec![long_after]);
-        let decision = super::decide(&first, long_after + 5, false, gw);
+        let decision = super::decide(
+            &first,
+            long_after + 5,
+            false,
+            gw,
+            super::super::UDP_FALLBACK,
+        );
         assert_eq!(decision, arm(0), "a long run's first death restarts QUIC");
         assert!(matches!(
             super::marker_after(decision, &first, long_after + 5, NONCE, gw),
@@ -881,17 +1123,36 @@ mod tests {
         ));
         let second = died(vec![T0 - 3600, long_after]);
         assert_eq!(
-            super::decide(&second, long_after + 5, false, gw).verdict,
+            super::decide(
+                &second,
+                long_after + 5,
+                false,
+                gw,
+                super::super::UDP_FALLBACK
+            )
+            .verdict,
             Verdict::Trip,
             "the second in the window trips, however long the runs"
         );
         assert_eq!(
-            super::decide(&second, long_after + 5, true, gw),
+            super::decide(
+                &second,
+                long_after + 5,
+                true,
+                gw,
+                super::super::UDP_FALLBACK
+            ),
             arm(0),
             "the override never trips"
         );
         assert_eq!(
-            super::decide(&died(vec![T0 - 60]), long_after + 5, false, gw),
+            super::decide(
+                &died(vec![T0 - 60]),
+                long_after + 5,
+                false,
+                gw,
+                super::super::UDP_FALLBACK
+            ),
             arm(0),
             "an exit before this run started is not this run's death"
         );
@@ -915,9 +1176,10 @@ mod tests {
             nonce: NONCE,
             quic_panicked: true,
             quic_panic_at: None,
+            backoff_step: 0,
             prior_trip: Some(prior),
         });
-        let decision = super::decide(&previous, T0, false, gw);
+        let decision = super::decide(&previous, T0, false, gw, super::super::UDP_FALLBACK);
         assert_eq!(decision.verdict, Verdict::Trip);
         assert_eq!(
             super::marker_after(decision, &previous, T0, NONCE, gw),
@@ -932,10 +1194,17 @@ mod tests {
         });
         let g = super::super::GATEWAY_QUIC_BREAKER_COOLDOWN.as_secs();
         assert!(matches!(
-            super::decide(&tripped, T0 + 2 * g - 1, false, gw).verdict,
+            super::decide(
+                &tripped,
+                T0 + 2 * g - 1,
+                false,
+                gw,
+                super::super::UDP_FALLBACK
+            )
+            .verdict,
             Verdict::Cool { .. }
         ));
-        let decision = super::decide(&tripped, T0 + 2 * g, false, gw);
+        let decision = super::decide(&tripped, T0 + 2 * g, false, gw, super::super::UDP_FALLBACK);
         assert_eq!(decision.verdict, Verdict::Arm);
         assert!(matches!(
             super::marker_after(decision, &tripped, T0 + 2 * g, NONCE, gw),
@@ -960,7 +1229,13 @@ mod tests {
     fn a_gateway_cools_for_the_gateway_cooldown_and_counts_like_a_peer() {
         let g = super::super::GATEWAY_QUIC_BREAKER_COOLDOWN.as_secs();
         let gw = |previous: &Previous, now_secs: u64| {
-            super::decide(previous, now_secs, false, BreakerRole::Gateway)
+            super::decide(
+                previous,
+                now_secs,
+                false,
+                BreakerRole::Gateway,
+                super::super::UDP_FALLBACK,
+            )
         };
         assert_eq!(gw(&panicked(2, T0), T0 + g - 1).verdict, Verdict::Trip);
         assert_eq!(
@@ -998,6 +1273,7 @@ mod tests {
             nonce: NONCE,
             quic_panicked: false,
             quic_panic_at: None,
+            backoff_step: 0,
         })
     }
 
@@ -1011,6 +1287,7 @@ mod tests {
             nonce: NONCE,
             quic_panicked: true,
             quic_panic_at: None,
+            backoff_step: 0,
         })
     }
 
@@ -1249,6 +1526,7 @@ mod tests {
                 nonce: NONCE,
                 quic_panicked: false,
                 quic_panic_at: None,
+                backoff_step: 0,
             }),
             "the override's start replaces the trip, so the trip is gone"
         );
@@ -1283,14 +1561,28 @@ mod tests {
     fn quic_off_does_not_touch_the_marker() {
         let dir = tempfile::tempdir().unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0);
-        let (empty, _) = gate(None::<u8>, dir.path(), false, now, BreakerRole::Peer);
+        let (empty, _) = gate(
+            None::<u8>,
+            dir.path(),
+            false,
+            now,
+            BreakerRole::Peer,
+            super::super::UDP_FALLBACK,
+        );
         assert_eq!(empty.settings, None);
         assert_eq!(empty.breaker, BreakerOutcome::NotConsulted);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 
         let path = marker_path(dir.path());
         std::fs::create_dir(&path).unwrap();
-        let (gated, _) = gate(None::<u8>, dir.path(), false, now, BreakerRole::Peer);
+        let (gated, _) = gate(
+            None::<u8>,
+            dir.path(),
+            false,
+            now,
+            BreakerRole::Peer,
+            super::super::UDP_FALLBACK,
+        );
         assert_eq!(gated.breaker, BreakerOutcome::NotConsulted);
     }
 
@@ -1310,17 +1602,32 @@ mod tests {
                 nonce: NONCE,
                 quic_panicked: true,
                 quic_panic_at: None,
+                backoff_step: 0,
             },
         )
         .unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0 + 1);
-        let (gated, counted) = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
+        let (gated, counted) = gate(
+            Some(7u8),
+            dir.path(),
+            false,
+            now,
+            BreakerRole::Peer,
+            super::super::UDP_FALLBACK,
+        );
         assert_eq!(gated.settings, None);
         assert_eq!(gated.breaker, BreakerOutcome::Decided(Verdict::Trip));
         assert_eq!(counted.short_runs, SHORT_RUNS_TO_TRIP);
         assert_eq!(read_previous(&path), tripped(T0 + 1));
 
-        let (cooling, _) = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
+        let (cooling, _) = gate(
+            Some(7u8),
+            dir.path(),
+            false,
+            now,
+            BreakerRole::Peer,
+            super::super::UDP_FALLBACK,
+        );
         assert_eq!(cooling.settings, None);
         assert_eq!(
             cooling.breaker,
@@ -1347,6 +1654,7 @@ mod tests {
                 nonce: NONCE,
                 quic_panicked: true,
                 quic_panic_at: None,
+                backoff_step: 0,
             },
         )
         .unwrap();
@@ -1357,7 +1665,14 @@ mod tests {
         ));
         std::fs::create_dir(tmp).unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0 + 1);
-        let (gated, _) = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
+        let (gated, _) = gate(
+            Some(7u8),
+            dir.path(),
+            false,
+            now,
+            BreakerRole::Peer,
+            super::super::UDP_FALLBACK,
+        );
         assert_eq!(gated.settings, None);
         assert_eq!(
             read_previous(&path),
@@ -1695,6 +2010,7 @@ mod tests {
                 nonce: NONCE,
                 quic_panicked,
                 quic_panic_at: quic_panicked.then(|| at.clone()),
+                backoff_step: 0,
                 endpoint_down_secs: Vec::new(),
                 prior_trip: None,
             })
@@ -1703,7 +2019,13 @@ mod tests {
         let place = |previous: Previous| {
             counted_panic_at(
                 &previous,
-                super::decide(&previous, now, false, BreakerRole::Peer),
+                super::decide(
+                    &previous,
+                    now,
+                    false,
+                    BreakerRole::Peer,
+                    super::super::UDP_FALLBACK,
+                ),
             )
         };
         assert_eq!(place(previous(T0, true)), Some(at.clone()));
