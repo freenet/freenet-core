@@ -3357,6 +3357,17 @@ struct EventListenerState {
     awaiting_connection:
         crate::util::DecisionHashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
     awaiting_connection_txs: HashMap<SocketAddr, Vec<Transaction>>,
+    /// Addresses whose pending dial (`awaiting_connection`) is a QUIC-native
+    /// one. Removed when that dial ends.
+    native_pending: HashSet<SocketAddr>,
+    /// UDP dials asked for while a native dial to the same address was
+    /// pending. They are not merged into it: a native failure is not theirs,
+    /// and a UDP fallback must not fail with the native dial of another
+    /// CONNECT. Each is issued when the native dial ends (it then finds the
+    /// connection, if the native dial made one). Bounded like
+    /// `awaiting_connection`: entries end with the native dial, whose setup
+    /// has a deadline.
+    udp_behind_native: HashMap<SocketAddr, Vec<connection_lifecycle::DeferredUdpDial>>,
     pending_op_results: HashMap<Transaction, Sender<WaiterReply>>,
     /// Last time pending_op_results was scanned for closed senders.
     last_pending_op_cleanup: Instant,
@@ -3378,6 +3389,8 @@ impl EventListenerState {
             pending_op_results: HashMap::new(),
             last_pending_op_cleanup: Instant::now(),
             awaiting_connection_txs: HashMap::new(),
+            native_pending: HashSet::new(),
+            udp_behind_native: HashMap::new(),
             peer_backoff: PeerConnectionBackoff::new(),
             last_backoff_cleanup: Instant::now(),
         }

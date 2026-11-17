@@ -646,9 +646,21 @@ async fn drive_client_connect(
                     start_dials!(dial_queue.finish());
                     continue;
                 }
-                if rescues_native && matches!(result, Some(Ok(_))) {
-                    crate::transport::TRANSPORT_METRICS.record_connect_native_rescued_by_udp(
-                        crate::transport::NativeConnectSide::Joiner,
+                if rescues_native {
+                    let connected = matches!(result, Some(Ok(_)));
+                    if connected {
+                        crate::transport::TRANSPORT_METRICS.record_connect_native_rescued_by_udp(
+                            crate::transport::NativeConnectSide::Joiner,
+                        );
+                    }
+                    #[cfg(any(test, feature = "testing"))]
+                    super::native_wire_trace::record_at(
+                        acceptor_addr,
+                        super::native_wire_trace::NativeWireEvent::UdpFallbackEnded {
+                            own: op_manager.ring.connection_manager.get_own_addr(),
+                            peer: acceptor_addr,
+                            connected,
+                        },
                     );
                 }
                 if holds_slot {

@@ -1612,12 +1612,22 @@ pub(super) async fn dispatch_expect_connection_from(
                 match acceptor_udp_dial(&op_manager, tx, &peer, addr).await {
                     Ok(mut rx) => {
                         let result = rx.recv().await;
-                        if matches!(result, Some(Ok(_))) {
+                        let connected = matches!(result, Some(Ok(_)));
+                        if connected {
                             crate::transport::TRANSPORT_METRICS
                                 .record_connect_native_rescued_by_udp(
                                     crate::transport::NativeConnectSide::Acceptor,
                                 );
                         }
+                        #[cfg(any(test, feature = "testing"))]
+                        native_wire_trace::record_at(
+                            addr,
+                            native_wire_trace::NativeWireEvent::UdpFallbackEnded {
+                                own: op_manager.ring.connection_manager.get_own_addr(),
+                                peer: addr,
+                                connected,
+                            },
+                        );
                         log_acceptor_dial(&peer, tx, result);
                     }
                     Err(error) => tracing::warn!(

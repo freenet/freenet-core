@@ -42,6 +42,16 @@ fn identity_kind(
 /// slices).
 pub(super) const MAX_PENDING_CLAIM_WORK_PER_PASS: usize = 8;
 
+/// A UDP dial asked for while a native dial to its address was pending; it
+/// is issued when that dial ends (`EventListenerState::udp_behind_native`).
+pub(super) struct DeferredUdpDial {
+    pub(super) peer: PeerKeyLocation,
+    pub(super) callback: Box<dyn ConnectResultSender>,
+    pub(super) tx: Transaction,
+    pub(super) transient: bool,
+    pub(super) origin: crate::transport::NatAttemptOrigin,
+}
+
 /// When the event loop runs [`P2pConnManager::retry_pending_claims`]: every
 /// `interval`, and only while a claim may be pending. The loop passes
 /// [`Self::deadline`] to its timer wake-up and calls [`Self::take_due`] on
@@ -1032,6 +1042,29 @@ impl P2pConnManager {
             }
         }
 
+        // A UDP dial is not merged into a pending native dial to the same
+        // address: it waits for that dial to end and is then issued.
+        if !transport.is_native() && state.native_pending.contains(&peer_addr) {
+            tracing::info!(
+                tx = %tx,
+                remote = %peer_addr,
+                transient,
+                "connect_peer: native dial pending; UDP dial waits for it to end"
+            );
+            state
+                .udp_behind_native
+                .entry(peer_addr)
+                .or_default()
+                .push(DeferredUdpDial {
+                    peer,
+                    callback,
+                    tx,
+                    transient,
+                    origin,
+                });
+            return Ok(());
+        }
+
         match state.awaiting_connection.entry(peer_addr) {
             std::collections::hash_map::Entry::Occupied(mut callbacks) => {
                 let txs_entry = state.awaiting_connection_txs.entry(peer_addr).or_default();
@@ -1077,7 +1110,9 @@ impl P2pConnManager {
                 // A native dial expects no UDP handshake: its connection comes
                 // from the QUIC endpoint, so a UDP intro from the address is
                 // not this dial's.
-                if transport == crate::operations::connect::native::DialTransport::Udp {
+                if transport.is_native() {
+                    state.native_pending.insert(peer_addr);
+                } else {
                     state.expected_inbound.expect_incoming(peer_addr);
                 }
             }
@@ -1118,6 +1153,7 @@ impl P2pConnManager {
                 .connection_manager
                 .prune_in_transit_connection(peer_addr);
             // Fail/clear the awaiting-connection state (callbacks + tx maps).
+            state.native_pending.remove(&peer_addr);
             fail_awaiting_connection(state, peer_addr, tx, transient).await;
         } else {
             tracing::debug!(
@@ -1331,6 +1367,10 @@ impl P2pConnManager {
                     source,
                 )
                 .await?;
+                if transport.is_native() {
+                    self.resume_udp_behind_native(peer_addr, state, handshake_commands)
+                        .await?;
+                }
             }
             HandshakeEvent::OutboundFailed {
                 transaction,
@@ -1409,7 +1449,9 @@ impl P2pConnManager {
                         peer_addr,
                         crate::operations::connect::native_wire_trace::NativeWireEvent::NativeSuperseded,
                     );
-                    return Ok(());
+                    return self
+                        .resume_udp_behind_native(peer_addr, state, handshake_commands)
+                        .await;
                 }
 
                 tracing::info!(
@@ -1538,7 +1580,46 @@ impl P2pConnManager {
                             .ok();
                     }
                 }
+                if native {
+                    self.resume_udp_behind_native(peer_addr, state, handshake_commands)
+                        .await?;
+                }
             }
+        }
+        Ok(())
+    }
+
+    /// The native dial to `peer_addr` ended: issue the UDP dials that waited
+    /// for it (`EventListenerState::udp_behind_native`). One that finds the
+    /// connection the native dial made is answered at once; the rest dial
+    /// UDP, merged into one pending dial as usual.
+    async fn resume_udp_behind_native(
+        &mut self,
+        peer_addr: SocketAddr,
+        state: &mut EventListenerState,
+        handshake_commands: &HandshakeCommandSender,
+    ) -> anyhow::Result<()> {
+        state.native_pending.remove(&peer_addr);
+        let Some(deferred) = state.udp_behind_native.remove(&peer_addr) else {
+            return Ok(());
+        };
+        tracing::info!(
+            remote = %peer_addr,
+            dials = deferred.len(),
+            "native dial ended; issuing the UDP dials that waited for it"
+        );
+        for dial in deferred {
+            self.handle_connect_peer(
+                dial.peer,
+                dial.callback,
+                dial.tx,
+                handshake_commands,
+                state,
+                dial.transient,
+                dial.origin,
+                crate::operations::connect::native::DialTransport::Udp,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1558,6 +1639,22 @@ impl P2pConnManager {
 
         let awaiting = std::mem::take(&mut state.awaiting_connection);
         let awaiting_txs = std::mem::take(&mut state.awaiting_connection_txs);
+        state.native_pending.clear();
+        for (addr, deferred) in std::mem::take(&mut state.udp_behind_native) {
+            for mut dial in deferred {
+                dial.callback
+                    .send_result(Err(()))
+                    .await
+                    .inspect_err(|err| {
+                        tracing::debug!(
+                            remote = %addr,
+                            ?err,
+                            "Failed to deliver handshake driver shutdown notification"
+                        );
+                    })
+                    .ok();
+            }
+        }
 
         for (addr, callbacks) in awaiting {
             let pending_txs = awaiting_txs.get(&addr).cloned().unwrap_or_default();
