@@ -23662,15 +23662,10 @@ fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
     let mut symmetric_ips = std::collections::BTreeSet::new();
     let run = run_native_connect_sim_with(name, SEED, 200, Some(nat), |sim| {
         sim.with_native_connect(100);
-        let mut regular: Vec<_> = sim
-            .all_node_addresses()
-            .iter()
-            .filter(|(label, _)| !label.is_gateway())
-            .map(|(label, addr)| (label.clone(), *addr))
-            .collect();
-        regular.sort();
-        for (i, (_, addr)) in regular.iter().enumerate() {
-            if i % 2 == 0 {
+        // Regular node `i` gets `classes[i % 2]`; regular nodes are numbered
+        // after the 2 gateways.
+        for (label, addr) in sim.all_node_addresses() {
+            if !label.is_gateway() && (label.number() - 2) % 2 == 0 {
                 symmetric_ips.insert(addr.ip());
             }
         }

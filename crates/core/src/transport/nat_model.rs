@@ -91,6 +91,12 @@ pub struct NatModel {
     port_for: HashMap<SocketAddr, u16>,
     dest_of: HashMap<u16, SocketAddr>,
     next_port: u16,
+    /// Prune expired bindings once a table grows past this
+    /// ([`PRUNE_ABOVE`], then twice the size left after a prune), or a
+    /// binding lifetime after the last prune while above [`PRUNE_ABOVE`].
+    prune_at: usize,
+    /// When the tables were last pruned.
+    pruned_at: u64,
     /// Symmetric only: the node's own address, learned from its first
     /// outbound datagram; where admitted inbound datagrams are delivered.
     internal: Option<SocketAddr>,
@@ -110,32 +116,82 @@ impl NatModel {
             dest_of: HashMap::new(),
             next_port: FIRST_MAPPED_PORT,
             internal: None,
+            prune_at: PRUNE_ABOVE,
+            pruned_at: 0,
         }
     }
 
     /// The source address a datagram from `internal` to `to` leaves the NAT
     /// with: `internal` itself, or for a symmetric NAT the external port
-    /// opened toward `to` (a new one for a new destination). Call before
-    /// [`Self::on_outbound`].
-    pub fn map_outbound(&mut self, internal: SocketAddr, to: SocketAddr) -> SocketAddr {
+    /// opened toward `to` (a new one for a new destination), or `None` if
+    /// every port is mapped to a live binding (the datagram is dropped).
+    /// Expired mappings are reclaimed when the range is full (the table is
+    /// bounded by the port range, about 25,500 entries). Call
+    /// before [`Self::on_outbound`].
+    pub fn map_outbound(
+        &mut self,
+        internal: SocketAddr,
+        to: SocketAddr,
+        now: u64,
+    ) -> Option<SocketAddr> {
         if self.filtering != NatFiltering::Symmetric {
-            return internal;
+            return Some(internal);
         }
         self.internal = Some(internal);
-        let port = match self.port_for.get(&to) {
-            Some(port) => *port,
+        if let Some(port) = self.port_for.get(&to) {
+            return Some(SocketAddr::new(internal.ip(), *port));
+        }
+        let port = match self.free_port(internal.port()) {
+            Some(port) => port,
             None => {
-                let mut port = self.next_port;
-                while port == internal.port() || self.dest_of.contains_key(&port) {
-                    port = port.wrapping_add(1).max(FIRST_MAPPED_PORT);
-                }
-                self.next_port = port.wrapping_add(1).max(FIRST_MAPPED_PORT);
-                self.port_for.insert(to, port);
-                self.dest_of.insert(port, to);
-                port
+                self.reclaim_expired(now);
+                self.free_port(internal.port())?
             }
         };
-        SocketAddr::new(internal.ip(), port)
+        self.next_port = if port == u16::MAX {
+            FIRST_MAPPED_PORT
+        } else {
+            port + 1
+        };
+        self.port_for.insert(to, port);
+        self.dest_of.insert(port, to);
+        Some(SocketAddr::new(internal.ip(), port))
+    }
+
+    /// The next unmapped external port from `next_port`, searching the whole
+    /// range once; `None` when every port is mapped.
+    fn free_port(&self, internal_port: u16) -> Option<u16> {
+        let range = u32::from(u16::MAX - FIRST_MAPPED_PORT) + 1;
+        (0..range)
+            .map(|i| {
+                let offset = (u32::from(self.next_port - FIRST_MAPPED_PORT) + i) % range;
+                FIRST_MAPPED_PORT + offset as u16
+            })
+            .find(|port| *port != internal_port && !self.dest_of.contains_key(port))
+    }
+
+    /// Forgets the mappings whose binding has expired, so their ports can be
+    /// handed out again. A real NAT also reuses a port once its binding
+    /// times out (some sooner, some later), so this is lenient, not exact.
+    fn reclaim_expired(&mut self, now: u64) {
+        let lifetime = self.lifetime;
+        let by_addr = &self.by_addr;
+        let live = |dest: &SocketAddr| {
+            by_addr
+                .get(dest)
+                .is_some_and(|at| now.saturating_sub(*at) <= lifetime)
+        };
+        self.dest_of.retain(|_, dest| live(dest));
+        self.port_for.retain(|dest, _| live(dest));
+    }
+
+    /// The node's own address, if `external` is a port this (symmetric) NAT
+    /// has mapped; for matching fault rules against the node that owns it.
+    pub fn owner_of(&self, external: SocketAddr) -> Option<SocketAddr> {
+        if self.filtering != NatFiltering::Symmetric || external.ip() != self.internal?.ip() {
+            return None;
+        }
+        self.dest_of.get(&external.port()).and(self.internal)
     }
 
     /// Where a datagram arriving at `target` from `from` at `now` is
@@ -175,10 +231,17 @@ impl NatModel {
         self.last_any = Some(now);
         self.by_ip.insert(to.ip(), now);
         self.by_addr.insert(to, now);
-        if self.by_addr.len() > PRUNE_ABOVE || self.by_ip.len() > PRUNE_ABOVE {
+        let size = self.by_addr.len().max(self.by_ip.len());
+        let stale = now.saturating_sub(self.pruned_at) > self.lifetime;
+        if size > PRUNE_ABOVE && (size > self.prune_at || stale) {
             let live = |at: &u64| now.saturating_sub(*at) <= self.lifetime;
             self.by_ip.retain(|_, at| live(at));
             self.by_addr.retain(|_, at| live(at));
+            // The next prune waits for the table to double or a binding
+            // lifetime to pass, so a table of live bindings is not rescanned
+            // on every datagram.
+            self.prune_at = PRUNE_ABOVE.max(2 * self.by_addr.len().max(self.by_ip.len()));
+            self.pruned_at = now;
         }
     }
 
@@ -258,14 +321,18 @@ mod tests {
         let a = addr("[fd00::a]:1000");
         let b = addr("[fd00::b]:1000");
         let mut nat = NatModel::new(NatFiltering::Symmetric, DEFAULT_BINDING_LIFETIME);
-        let to_a = nat.map_outbound(node, a);
+        let to_a = nat.map_outbound(node, a, 0).unwrap();
         nat.on_outbound(a, 0);
-        let to_b = nat.map_outbound(node, b);
+        let to_b = nat.map_outbound(node, b, 0).unwrap();
         nat.on_outbound(b, 0);
         assert_eq!(to_a.ip(), node.ip());
         assert_ne!(to_a, node, "translated");
         assert_ne!(to_a, to_b, "a port per destination");
-        assert_eq!(nat.map_outbound(node, a), to_a, "stable per destination");
+        assert_eq!(
+            nat.map_outbound(node, a, 0).unwrap(),
+            to_a,
+            "stable per destination"
+        );
         assert_eq!(
             nat.map_inbound(to_a, a, S),
             Some(node),
@@ -285,7 +352,40 @@ mod tests {
         // An endpoint-independent class translates nothing.
         let mut port_restricted =
             NatModel::new(NatFiltering::PortRestricted, DEFAULT_BINDING_LIFETIME);
-        assert_eq!(port_restricted.map_outbound(node, a), node);
+        assert_eq!(port_restricted.map_outbound(node, a, 0).unwrap(), node);
+    }
+
+    /// A symmetric NAT with every external port mapped to a live binding
+    /// maps nothing more (the datagram is dropped) rather than searching for
+    /// ever; once those bindings expire their ports are reclaimed. It names
+    /// the node that owns each of its mapped ports.
+    #[test]
+    fn a_symmetric_nat_runs_out_of_ports_and_reclaims_expired_ones() {
+        let node = addr("[fd00::1]:5000");
+        let mut nat = NatModel::new(NatFiltering::Symmetric, Duration::from_secs(30));
+        let ports = usize::from(u16::MAX - FIRST_MAPPED_PORT) + 1;
+        // Fewer than 30,000 destinations, all on one peer IP.
+        let dest =
+            |i: usize| SocketAddr::new("fd00::b".parse().unwrap(), u16::try_from(i + 1).unwrap());
+        let mut first = None;
+        for i in 0..ports {
+            let to = dest(i);
+            let mapped = nat.map_outbound(node, to, 0).expect("a free port");
+            nat.on_outbound(to, 0);
+            first.get_or_insert(mapped);
+        }
+        let first = first.unwrap();
+        assert_eq!(nat.owner_of(first), Some(node), "its owner");
+        assert_eq!(nat.owner_of(node), None, "not a mapped port");
+        // Every port is mapped and live: no mapping, and no endless search.
+        assert_eq!(nat.map_outbound(node, dest(ports), S), None);
+        // Once the bindings expire, a new destination gets a reclaimed port.
+        let later = 31 * S;
+        let fresh = nat
+            .map_outbound(node, dest(ports + 1), later)
+            .expect("reclaimed");
+        assert!(fresh.port() >= FIRST_MAPPED_PORT);
+        assert!(nat.dest_of.len() < ports, "expired mappings were forgotten");
     }
 
     /// Expired bindings are pruned once the table is large, and live ones

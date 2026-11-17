@@ -679,27 +679,42 @@ pub fn nat_filtered_handle(network_name: &str) -> Option<NatFilteredCounts> {
 
 /// The sender's NAT, if it has one, opens or refreshes its binding to `to`.
 /// Returns the source address the datagram leaves with: `from`, or the port
-/// a symmetric NAT opened toward `to`.
+/// a symmetric NAT opened toward `to`; `None` if a symmetric NAT has no port
+/// left, and the datagram is lost.
 #[cfg(any(test, feature = "testing"))]
-fn nat_on_send(network_name: &str, from: SocketAddr, to: SocketAddr) -> SocketAddr {
+fn nat_on_send(network_name: &str, from: SocketAddr, to: SocketAddr) -> Option<SocketAddr> {
     let Some(network) = NAT_NETWORKS.get(network_name).map(|n| n.value().clone()) else {
-        return from;
+        return Some(from);
     };
     let mut network = network.lock().unwrap();
     let now = network.time.now_nanos();
     match network.nats.get_mut(&from.ip()) {
         Some(nat) => {
-            let external = nat.map_outbound(from, to);
+            let external = nat.map_outbound(from, to, now)?;
             nat.on_outbound(to, now);
             if external != from {
                 // So a peer's harness hooks can find the network by the
                 // address it sees.
                 register_address_network(external, network_name);
             }
-            external
+            Some(external)
         }
-        None => from,
+        None => Some(from),
     }
+}
+
+/// The node an address belongs to, for matching fault rules (crashes,
+/// partitions, drop rules), which name nodes by their own address: the node
+/// behind a symmetric NAT for a port that NAT mapped, else `addr` itself.
+#[cfg(any(test, feature = "testing"))]
+fn nat_owner(network_name: &str, addr: SocketAddr) -> SocketAddr {
+    NAT_NETWORKS
+        .get(network_name)
+        .and_then(|network| {
+            let network = network.lock().unwrap();
+            network.nats.get(&addr.ip())?.owner_of(addr)
+        })
+        .unwrap_or(addr)
 }
 
 /// Where the receiver's NAT, if it has one, delivers a datagram from `from`
@@ -903,11 +918,19 @@ impl<T: TimeSource> InMemorySocket<T> {
         // The datagram left this host, so its NAT opens the binding whether
         // or not the network then loses it.
         #[cfg(any(test, feature = "testing"))]
-        let from = nat_on_send(&self.network_name, self.addr, target);
+        let Some(from) = nat_on_send(&self.network_name, self.addr, target) else {
+            return Ok(buf.len());
+        };
         #[cfg(not(any(test, feature = "testing")))]
         let from = self.addr;
+        // Fault rules name nodes by their own addresses, so a target behind a
+        // symmetric NAT is matched as its node; delivery uses `target`.
+        #[cfg(any(test, feature = "testing"))]
+        let fault_target = nat_owner(&self.network_name, target);
+        #[cfg(not(any(test, feature = "testing")))]
+        let fault_target = target;
 
-        match check_packet_delivery(&self.network_name, self.addr, target, buf) {
+        match check_packet_delivery(&self.network_name, self.addr, fault_target, buf) {
             PacketDeliveryDecision::Drop => {
                 // Silently drop - from sender's perspective, packet was sent
                 Ok(buf.len())
@@ -949,11 +972,19 @@ impl<T: TimeSource> InMemorySocket<T> {
         // The datagram left this host, so its NAT opens the binding whether
         // or not the network then loses it.
         #[cfg(any(test, feature = "testing"))]
-        let from = nat_on_send(&self.network_name, self.addr, target);
+        let Some(from) = nat_on_send(&self.network_name, self.addr, target) else {
+            return Ok(buf.len());
+        };
         #[cfg(not(any(test, feature = "testing")))]
         let from = self.addr;
+        // Fault rules name nodes by their own addresses, so a target behind a
+        // symmetric NAT is matched as its node; delivery uses `target`.
+        #[cfg(any(test, feature = "testing"))]
+        let fault_target = nat_owner(&self.network_name, target);
+        #[cfg(not(any(test, feature = "testing")))]
+        let fault_target = target;
 
-        match check_packet_delivery(&self.network_name, self.addr, target, buf) {
+        match check_packet_delivery(&self.network_name, self.addr, fault_target, buf) {
             PacketDeliveryDecision::Drop => Ok(buf.len()),
             PacketDeliveryDecision::DelayedDelivery(delay) => {
                 // For blocking context, just sleep and deliver
@@ -1241,6 +1272,63 @@ mod tests {
         );
         clear_network_nat(network);
         assert!(deliver(peer), "no NAT once cleared");
+    }
+
+    /// Behind a symmetric NAT: the node's datagrams leave from a port mapped
+    /// for their destination, a reply to that port reaches the node, and a
+    /// datagram to that port is matched against fault rules as sent to the
+    /// node itself (rules name nodes by their own addresses).
+    #[tokio::test]
+    async fn a_symmetric_nat_translates_and_faults_match_the_owning_node() {
+        use crate::transport::nat_model::NatFiltering;
+        let network = "test-nat-symmetric";
+        clear_network_sockets(network);
+        let natted: SocketAddr = "[fd00:6032::a]:5000".parse().unwrap();
+        let peer: SocketAddr = "[fd00:6032::b]:5000".parse().unwrap();
+        let time = VirtualTime::new();
+        for addr in [natted, peer] {
+            register_address_network(addr, network);
+        }
+        let socket = InMemorySocket::bind_with_time_source(natted, time.clone())
+            .await
+            .unwrap();
+        let peer_socket = InMemorySocket::bind_with_time_source(peer, time.clone())
+            .await
+            .unwrap();
+        set_network_nat(
+            network,
+            time.clone(),
+            [(natted.ip(), NatFiltering::Symmetric)],
+            Duration::from_secs(30),
+        );
+        socket.send_to(b"out", peer).await.unwrap();
+        let mut buf = [0u8; 16];
+        let (_, seen) = peer_socket.recv_from(&mut buf).await.unwrap();
+        assert_eq!(seen.ip(), natted.ip());
+        assert_ne!(seen, natted, "the source is translated");
+        assert_eq!(nat_owner(network, seen), natted, "owned by the node");
+        // A reply to the mapped port reaches the node.
+        peer_socket.send_to(b"back", seen).await.unwrap();
+        let (_, from) = socket.recv_from(&mut buf).await.unwrap();
+        assert_eq!(from, peer);
+        // A rule against the node matches a datagram to its mapped port.
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = dropped.clone();
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(move |_, _, to, _: &[u8]| {
+                if to == natted {
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    PacketDeliveryDecision::Drop
+                } else {
+                    PacketDeliveryDecision::Deliver
+                }
+            })),
+        );
+        peer_socket.send_to(b"dropped", seen).await.unwrap();
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+        set_packet_delivery_callback(network, None);
+        clear_network_nat(network);
     }
 
     #[tokio::test]
