@@ -385,11 +385,25 @@ static PENDING: parking_lot::Mutex<Pending> = parking_lot::Mutex::new(Pending {
 /// start would restart the node without bound.
 static OVERRIDDEN: AtomicBool = AtomicBool::new(false);
 
-/// Held across each read-and-change of this run's marker by the Windows
-/// short-run clear ([`short_runs`]) and by [`note_endpoint_down_exit`], so
-/// in either order the death record survives: a clear that comes first is
-/// followed by the record written again, and a record written first makes
-/// the clear leave the marker.
+/// Orders exactly two writers of this run's marker: the Windows short-run
+/// clear (`short_runs::clear_short_run`) and the endpoint-death record
+/// ([`note_endpoint_down_exit_with`]). Each holds it across its
+/// read-and-change, so in either order the death record survives: a clear
+/// that comes first is followed by the record written again, and a record
+/// written first makes the clear leave the marker. Pinned by
+/// `the_marker_update_lock_is_taken_by_the_clear_and_the_record`.
+///
+/// The other writers do not take it, and it does not order them:
+/// - arming ([`arm`]) runs under [`PENDING`], as does the record of a death
+///   before arming, so those two are ordered by that lock instead, and the
+///   clear timer starts only after arming;
+/// - the Windows panic hook (`short_runs::mark_quic_panic`) takes no lock,
+///   since it runs inside a panic. A caught socket-adapter panic marks the
+///   marker before the endpoint goes down, so its write lands before the
+///   death record; an unrelated QUIC panic on another thread at the same
+///   moment could overwrite the record, which then costs one free restart;
+/// - a clean exit's removal ([`clear_if_owned`]) does not run on a death,
+///   which ends the process without a clean exit.
 pub(super) static MARKER_UPDATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// The marker this process armed, as armed, for a Windows run that must
@@ -1911,6 +1925,46 @@ mod tests {
                 String::from_utf8_lossy(&json)
             );
         }
+    }
+
+    /// Both writers [`MARKER_UPDATE`] orders take it before they read the
+    /// marker. Deleting either lock leaves every behaviour test green (a
+    /// single-threaded test cannot interleave them), so this pins the lines.
+    #[test]
+    fn the_marker_update_lock_is_taken_by_the_clear_and_the_record() {
+        let flat = |src: &str, signature: &str| -> String {
+            production_fn_body(src, signature)
+                .lines()
+                .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+                .collect::<String>()
+                .split_whitespace()
+                .collect()
+        };
+        let clear = flat(include_str!("breaker/short_runs.rs"), "fn clear_short_run(");
+        let lock = clear
+            .find("let_update=super::MARKER_UPDATE.lock();")
+            .expect("the clear takes the lock");
+        let read = clear.find("read_previous(path)").expect("the read");
+        assert!(lock < read, "before it reads the marker: {clear}");
+        assert!(clear[lock..].contains("clear_if_owned(path,nonce)"));
+
+        let record = flat(
+            include_str!("breaker.rs"),
+            "fn note_endpoint_down_exit_with(",
+        );
+        let lock = record
+            .find("let_update=MARKER_UPDATE.lock();")
+            .expect("the record takes the lock");
+        let armed = record
+            .find("ifletSome((path,nonce))=armed{")
+            .expect("the armed-marker path");
+        let pending = record
+            .find("letmutpending=pending.lock();")
+            .expect("the pending-marker path");
+        assert!(
+            lock < armed && lock < pending,
+            "before either write path: {record}"
+        );
     }
 
     /// The Windows rewrite of a cleared marker is wired end to end: arming
