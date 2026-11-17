@@ -49,6 +49,41 @@ struct Cell {
     skew: Duration,
     punch_loss_pct: u64,
     rtt: Duration,
+    /// Conditions beyond the original matrix (gates 15 and 17).
+    extra: Extra,
+}
+
+/// Conditions the original matrix held fixed: no loss on QUIC handshake
+/// packets, a constant delay, and the default binding lifetime.
+#[derive(Debug, Clone, Copy)]
+struct Extra {
+    /// Loss on QUIC long-header Initial and Handshake packets (gate 15).
+    handshake_loss_pct: u64,
+    /// Each datagram's one-way delay is `rtt / 2` plus a uniform draw in
+    /// `[0, jitter)`, so datagrams can arrive out of order (gate 17).
+    jitter: Duration,
+    /// How long a NAT binding lasts after its last refresh (gate 17).
+    binding_lifetime: Duration,
+}
+
+impl Default for Extra {
+    fn default() -> Self {
+        Self {
+            handshake_loss_pct: 0,
+            jitter: Duration::ZERO,
+            binding_lifetime: DEFAULT_BINDING_LIFETIME,
+        }
+    }
+}
+
+/// Whether `datagram` is a QUIC long-header Initial or Handshake packet.
+fn is_quic_handshake(datagram: &[u8]) -> bool {
+    match datagram.first() {
+        // Long header (0x80) with the fixed bit (0x40); the packet type is
+        // bits 4-5: 0 Initial, 2 Handshake.
+        Some(first) if first & 0xC0 == 0xC0 => matches!((first >> 4) & 0x3, 0 | 2),
+        _ => false,
+    }
 }
 
 /// How one run ended, by side.
@@ -80,28 +115,41 @@ async fn run_cell(cell: Cell, seed: u64, net: crate::transport::test_net::Subnet
             (client_addr.ip(), cell.client_nat),
             (server_addr.ip(), cell.server_nat),
         ],
-        DEFAULT_BINDING_LIFETIME,
+        cell.extra.binding_lifetime,
     );
     let rng = std::sync::Mutex::new(seed ^ 0x9E37_79B9_7F4A_7C15);
+    // splitmix64, so the losses and delays repeat from the seed.
+    let draw = move || {
+        let mut state = rng.lock().unwrap();
+        *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    };
     let one_way = cell.rtt / 2;
     let loss = cell.punch_loss_pct;
+    let extra = cell.extra;
     set_packet_delivery_callback(
         &network,
         Some(Arc::new(move |_, _, _, datagram: &[u8]| {
             let punch = datagram.len() == PUNCH_LEN && datagram.first() == Some(&PUNCH_FIRST_BYTE);
-            if punch && loss > 0 {
-                // splitmix64, so the losses repeat from the seed.
-                let mut state = rng.lock().unwrap();
-                *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-                let mut z = *state;
-                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-                z ^= z >> 31;
-                if z % 100 < loss {
-                    return PacketDeliveryDecision::Drop;
-                }
+            if punch && loss > 0 && draw() % 100 < loss {
+                return PacketDeliveryDecision::Drop;
             }
-            PacketDeliveryDecision::DelayedDelivery(one_way)
+            if extra.handshake_loss_pct > 0
+                && is_quic_handshake(datagram)
+                && draw() % 100 < extra.handshake_loss_pct
+            {
+                return PacketDeliveryDecision::Drop;
+            }
+            let jitter_nanos = u64::try_from(extra.jitter.as_nanos()).unwrap_or(u64::MAX);
+            let jitter = if jitter_nanos > 0 {
+                Duration::from_nanos(draw() % jitter_nanos)
+            } else {
+                Duration::ZERO
+            };
+            PacketDeliveryDecision::DelayedDelivery(one_way + jitter)
         })),
     );
     let waiters = Arc::new(NativeWaiters::default());
@@ -221,6 +269,7 @@ fn pr_rows() -> Vec<Cell> {
                 skew: Duration::from_secs(1),
                 punch_loss_pct: 0,
                 rtt: Duration::from_millis(300),
+                extra: Extra::default(),
             });
         }
     }
@@ -248,6 +297,7 @@ fn the_nat_is_in_the_path() {
         skew: Duration::from_secs(2),
         punch_loss_pct: 0,
         rtt: Duration::from_millis(300),
+        extra: Extra::default(),
     };
     let (tx, rx) = std::sync::mpsc::channel();
     bounded(move || async move {
@@ -299,6 +349,7 @@ fn native_setup_matrix_meets_the_decision_criterion() {
                             skew: Duration::from_secs(skew),
                             punch_loss_pct: loss,
                             rtt: Duration::from_millis(rtt),
+                            extra: Extra::default(),
                         };
                         let (ok, total, failures) = run_seeds(cell, seeds.clone());
                         runs += total;
@@ -373,6 +424,7 @@ fn one_sided_setups_at_the_window_edge() {
             skew: Duration::from_millis(skew_ms),
             punch_loss_pct: 10,
             rtt: Duration::from_millis(800),
+            extra: Extra::default(),
         };
         let (ok, total, failures) = run_seeds(cell, 0..10);
         failed += failures.len();
@@ -396,10 +448,155 @@ fn a_server_starting_more_than_four_seconds_late_misses_the_client() {
         skew: Duration::from_secs(6),
         punch_loss_pct: 10,
         rtt: Duration::from_millis(800),
+        extra: Extra::default(),
     };
     let (ok, total, _) = run_seeds(cell, 0..4);
     assert_eq!(
         ok, 0,
         "a server 6 s late misses the client ({ok}/{total} established)"
     );
+}
+
+/// The class pairs every gate row runs: each endpoint-independent class on
+/// both sides, and full cone against port-restricted both ways.
+fn class_pairs() -> Vec<(NatFiltering, NatFiltering)> {
+    let mut pairs: Vec<_> = NatFiltering::ALL.iter().map(|n| (*n, *n)).collect();
+    pairs.push((NatFiltering::Full, NatFiltering::PortRestricted));
+    pairs.push((NatFiltering::PortRestricted, NatFiltering::Full));
+    pairs
+}
+
+/// Gates 14, 15 and 17 (design note 10.2): the conditions the original
+/// matrix held fixed, each against the decision criterion (95% at 800 ms):
+/// - 14: a late server up to 4 s plus the response's one-way travel, since
+///   the joiner plans from the response's arrival (punch loss 10%);
+/// - 15: 10% loss on QUIC Initial and Handshake packets as well as on
+///   punches;
+/// - 17: delay jitter up to half the round trip (so datagrams reorder) and a
+///   5 s binding lifetime, shorter than every setup window.
+#[test]
+fn native_setup_gate_rows_meet_the_decision_criterion() {
+    let mut cells = Vec::new();
+    for (client_nat, server_nat) in class_pairs() {
+        let cell = |late, skew_ms: u64, rtt_ms: u64, extra| Cell {
+            client_nat,
+            server_nat,
+            late,
+            skew: Duration::from_millis(skew_ms),
+            punch_loss_pct: 10,
+            rtt: Duration::from_millis(rtt_ms),
+            extra,
+        };
+        for rtt in [300u64, 800] {
+            cells.push((
+                "14",
+                cell(Late::Server, 4_000 + rtt / 2, rtt, Extra::default()),
+            ));
+        }
+        let lossy = Extra {
+            handshake_loss_pct: 10,
+            ..Extra::default()
+        };
+        for (late, skew) in [
+            (Late::Server, 0u64),
+            (Late::Server, 2_000),
+            (Late::Server, 4_000),
+            (Late::Client, 0),
+            (Late::Client, 4_000),
+            (Late::Client, 8_000),
+        ] {
+            cells.push(("15", cell(late, skew, 800, lossy)));
+        }
+        for rtt in [300u64, 800] {
+            let jitter = Extra {
+                jitter: Duration::from_millis(rtt / 2),
+                ..Extra::default()
+            };
+            let short_binding = Extra {
+                binding_lifetime: Duration::from_secs(5),
+                ..Extra::default()
+            };
+            for extra in [jitter, short_binding] {
+                for (late, skew) in [
+                    (Late::Server, 0u64),
+                    (Late::Server, 4_000),
+                    (Late::Client, 0),
+                    (Late::Client, 8_000),
+                ] {
+                    cells.push(("17", cell(late, skew, rtt, extra)));
+                }
+            }
+        }
+    }
+    let mut below = Vec::new();
+    let mut one_sided = 0;
+    let mut runs = 0;
+    for (gate, cell) in cells {
+        let (ok, total, failures) = run_seeds(cell, 0..20);
+        runs += total;
+        let cell_one_sided = failures.iter().filter(|f| f.one_sided()).count();
+        one_sided += cell_one_sided;
+        println!(
+            "native-matrix gate {gate} client={} server={} late={:?} skew={:?} rtt={:?} {:?}: {ok}/{total} one-sided {cell_one_sided}",
+            cell.client_nat.label(),
+            cell.server_nat.label(),
+            cell.late,
+            cell.skew,
+            cell.rtt,
+            cell.extra
+        );
+        if cell.rtt == Duration::from_millis(800) && (ok as f64) < 0.95 * total as f64 {
+            below.push((gate, cell, ok, total, failures));
+        }
+    }
+    println!("native-matrix gate rows one-sided: {one_sided} of {runs}");
+    assert!(
+        one_sided * 100 <= runs,
+        "one-sided setups above 1% ({one_sided} of {runs})"
+    );
+    assert!(
+        below.is_empty(),
+        "gate cells below 95% at 800 ms: {below:#?}"
+    );
+}
+
+/// Symmetric NAT (A5c-2): which pairs a single native setup connects. Each
+/// side dials the other's own address, the stand-in for what a peer learns
+/// of a symmetric node (the port its NAT opened toward a gateway, which
+/// admits nobody else). Measured, then pinned below.
+#[test]
+fn native_setups_with_a_symmetric_nat() {
+    let sym = NatFiltering::Symmetric;
+    let mut report = Vec::new();
+    for (client_nat, server_nat) in [
+        (sym, sym),
+        (sym, NatFiltering::PortRestricted),
+        (NatFiltering::PortRestricted, sym),
+        (sym, NatFiltering::Full),
+        (NatFiltering::Full, sym),
+    ] {
+        for late in [Late::Client, Late::Server] {
+            let cell = Cell {
+                client_nat,
+                server_nat,
+                late,
+                skew: Duration::from_secs(1),
+                punch_loss_pct: 0,
+                rtt: Duration::from_millis(300),
+                extra: Extra::default(),
+            };
+            let (ok, total, failures) = run_seeds(cell, 0..5);
+            report.push((
+                client_nat.label(),
+                server_nat.label(),
+                late,
+                ok,
+                total,
+                failures.first().cloned(),
+            ));
+        }
+    }
+    for row in &report {
+        println!("native-matrix symmetric {row:?}");
+    }
 }
