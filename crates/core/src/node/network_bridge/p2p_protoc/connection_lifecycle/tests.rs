@@ -4720,3 +4720,28 @@ async fn both_ends_apply_the_survivor_rule_to_the_same_facts() {
         );
     }
 }
+
+/// The survivor rule looks a claimed key up by key, not only at the
+/// connection's address: an inbound UDP connection matched to an expectation
+/// for a peer whose key a native connection holds at another address (its
+/// UDP traffic seen from another port) is dropped too, and the native entry
+/// stays as it was.
+#[tokio::test]
+async fn a_keyed_udp_connection_from_another_address_is_dropped_against_native() {
+    let mut h = Harness::new("survivor-key-elsewhere").await;
+    let native_addr: SocketAddr = "203.0.113.246:6380".parse().unwrap();
+    let udp_addr: SocketAddr = "203.0.113.246:6381".parse().unwrap();
+    let peer_key = key();
+    let native_peer = PeerKeyLocation::new(peer_key.clone(), native_addr);
+    h.handshake_event(Arrival::Native.event(&native_peer, false))
+        .await;
+    let pair = PairState::of(&h, native_addr);
+    let survivors = survivor_here();
+    h.handshake_event(
+        Arrival::InboundUdpKeyed.event(&PeerKeyLocation::new(peer_key, udp_addr), false),
+    )
+    .await;
+    assert!(!h.mgr.connections.contains_key(&udp_addr), "dropped");
+    assert_eq!(PairState::of(&h, native_addr), pair);
+    assert_eq!(survivor_here(), (survivors.0 + 1, survivors.1));
+}
