@@ -1274,6 +1274,7 @@ impl P2pConnManager {
                         remote_addr,
                         crate::operations::connect::native_wire_trace::NativeWireEvent::Survivor {
                             swapped: false,
+                            inbound: true,
                         },
                     );
                     drop(connection);
@@ -1358,6 +1359,7 @@ impl P2pConnManager {
                             peer_addr,
                             crate::operations::connect::native_wire_trace::NativeWireEvent::Survivor {
                                 swapped: false,
+ inbound: false,
                             },
                         );
                         let mut requesters = Vec::new();
@@ -1499,6 +1501,7 @@ impl P2pConnManager {
                                 peer_addr,
                                 crate::operations::connect::native_wire_trace::NativeWireEvent::Survivor {
                                     swapped: true,
+ inbound: false,
                                 },
                             );
                             if after_beside_udp {

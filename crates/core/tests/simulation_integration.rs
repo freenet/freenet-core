@@ -23454,17 +23454,22 @@ enum SurvivorOrder {
     UdpFirst,
     /// Native connects first, the UDP connection is dropped.
     NativeFirst,
+    /// Native connects first, and the UDP connection that is dropped arrives
+    /// inbound (only the joiner dials UDP beside its native dial).
+    NativeFirstInbound,
 }
 
 /// Gate 18: both ends of a pair keep the same transport, the native one, and
 /// the rate of one-sided native setups (10.2 items 7 and 20). Behind
 /// port-restricted NATs with native on at 100%.
 ///
-/// Two runs make the survivor rule choose: every native dial gets a UDP dial
+/// Three runs make the survivor rule choose: every native dial gets a UDP dial
 /// beside it at once, at both ends (`with_udp_dial_beside_every_native_dial`),
 /// so pairs are handed both connections, as dialler or inbound. With QUIC
 /// delayed the UDP connection lands first and native must be swapped in; with
-/// UDP intros delayed native lands first and UDP must be dropped. Each run
+/// UDP intros delayed native lands first and UDP must be dropped; a third run
+/// forces the UDP dial at the joiner only, so the acceptor (a gateway, which
+/// takes inbound UDP) sees it arrive inbound and must drop it. Each run
 /// must make that decision (fails closed), and every pair whose two ends both
 /// got a native connection and are held at both ends must hold native at both
 /// (a keep-first rule keeps UDP in the first run). Four more runs (plain, QUIC
@@ -23501,6 +23506,14 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
             Some(SurvivorOrder::NativeFirst),
             false,
         ),
+        (
+            6,
+            0x0059_40A5_00D8,
+            None,
+            Some(600),
+            Some(SurvivorOrder::NativeFirstInbound),
+            false,
+        ),
     ] {
         let name = format!("native-survivor-{run_id}");
         let nat = SimNat::all(NatFiltering::PortRestricted);
@@ -23512,8 +23525,11 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
             if let Some(ms) = intro_delay {
                 sim.delay_udp_intros(Duration::from_millis(ms));
             }
-            if order.is_some() {
-                sim.with_udp_dial_beside_every_native_dial();
+            if let Some(order) = order {
+                sim.with_udp_dial_beside_every_native_dial(matches!(
+                    order,
+                    SurvivorOrder::NativeFirstInbound
+                ));
             }
             if drop_some {
                 let mut labels: Vec<NodeLabel> = sim.all_node_addresses().keys().cloned().collect();
@@ -23580,30 +23596,37 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
             let decided = match order {
                 SurvivorOrder::UdpFirst => t.survivor_swapped(),
                 SurvivorOrder::NativeFirst => t.survivor_udp_dropped(),
+                SurvivorOrder::NativeFirstInbound => t.survivor_inbound_dropped(),
             };
             assert!(decided > 0, "{name}: premise: the rule chose {order:?}");
-            let not_native: Vec<_> = t
-                .native_established_at_both_ends()
-                .into_iter()
-                .filter(|(a, b)| {
-                    matches!(
-                        (transports.get(&(*a, *b)), transports.get(&(*b, *a))),
-                        (Some(x), Some(y)) if !(*x && *y)
-                    )
-                })
-                .collect();
-            let checked = t
-                .native_established_at_both_ends()
-                .into_iter()
-                .filter(|(a, b)| {
-                    transports.contains_key(&(*a, *b)) && transports.contains_key(&(*b, *a))
-                })
-                .count();
-            println!("{name}: native at both ends and held at both: {checked}");
+            // Keep-first instead of native-wins shows as a pair that holds
+            // UDP at both ends although a native setup completed at both
+            // ends after both UDP entries were made; an inbound UDP
+            // connection replacing a native entry shows directly.
+            let seqs = t.transport_seqs();
+            let mut checked = 0;
+            let mut kept_udp = Vec::new();
+            for (a, b, native_at) in t.native_established_at_both_ends() {
+                let (Some(x), Some(y)) = (seqs.get(&(a, b)), seqs.get(&(b, a))) else {
+                    continue;
+                };
+                checked += 1;
+                let udp_at_both = transports.get(&(a, b)) == Some(&false)
+                    && transports.get(&(b, a)) == Some(&false);
+                if udp_at_both && native_at > *x.max(y) {
+                    kept_udp.push((a, b));
+                }
+            }
+            println!("{name}: pairs with native at both ends, held at both: {checked}");
             assert!(checked > 0, "{name}: premise: such pairs exist");
             assert!(
-                not_native.is_empty(),
-                "{name}: pairs that got native at both ends but keep UDP: {not_native:?}"
+                kept_udp.is_empty(),
+                "{name}: pairs that kept UDP after native connected at both ends: {kept_udp:?}"
+            );
+            assert_eq!(
+                t.native_replaced_by_udp(),
+                Vec::new(),
+                "{name}: native entries a UDP connection replaced"
             );
         }
         let (pairs, one_sided) = t.native_setup_pairs();

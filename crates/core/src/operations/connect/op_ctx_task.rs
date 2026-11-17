@@ -496,7 +496,7 @@ async fn drive_client_connect(
                         #[cfg(any(test, feature = "testing"))]
                         if transport.is_native() {
                             if let Some(addr) = acceptor.socket_addr().filter(|addr| {
-                                super::native_wire_trace::udp_beside_forced(*addr)
+                                super::native_wire_trace::udp_beside_forced(*addr, false)
                             }) {
                                 dials.push(futures::future::Either::Right(udp_fallback_dial(
                                     op_manager.clone(),

@@ -2492,11 +2492,16 @@ impl SimNetwork {
     }
 
     /// Makes every node start a UDP dial at once beside each QUIC-native
-    /// dial, as joiner and as acceptor, so a pair is often handed both a
-    /// native and a UDP connection and the survivor rule has to choose.
+    /// dial, as joiner and, unless `joiner_only`, as acceptor, so a pair is
+    /// often handed both a native and a UDP connection and the survivor rule
+    /// has to choose. As joiner only, an acceptor that takes inbound UDP
+    /// (a gateway) sees the joiner's UDP dial arrive inbound.
     #[cfg(any(test, feature = "testing"))]
-    pub fn with_udp_dial_beside_every_native_dial(&mut self) -> &mut Self {
-        crate::operations::connect::native_wire_trace::force_udp_beside_native(&self.name);
+    pub fn with_udp_dial_beside_every_native_dial(&mut self, joiner_only: bool) -> &mut Self {
+        crate::operations::connect::native_wire_trace::force_udp_beside_native(
+            &self.name,
+            joiner_only,
+        );
         self
     }
 

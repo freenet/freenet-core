@@ -317,16 +317,25 @@ pub mod sim_trace {
         /// How each end's native setup in a CONNECT ended, by (transaction,
         /// lower address, higher address): (node, established) per end.
         native_setup_ends: parking_lot::Mutex<SetupEnds>,
+        /// Orders transport changes and native setup ends within a network.
+        seq: AtomicU64,
+        /// When (by `seq`) each (node, peer) entry in `transports` was set.
+        transport_seqs:
+            parking_lot::Mutex<std::collections::BTreeMap<(SocketAddr, SocketAddr), u64>>,
+        /// (node, peer) entries where a UDP connection replaced a native one
+        /// in place, which the survivor rule never does.
+        native_replaced_by_udp: parking_lot::Mutex<Vec<(SocketAddr, SocketAddr)>>,
         survivor_swapped: AtomicU64,
         survivor_udp_dropped: AtomicU64,
+        survivor_inbound_dropped: AtomicU64,
         one_sided_drops: AtomicU64,
     }
 
     /// How each end's native setup in a CONNECT ended: by (transaction, lower
-    /// address, higher address), (node, established) per end.
+    /// address, higher address), (node, established, `seq`) per end.
     type SetupEnds = std::collections::BTreeMap<
         (crate::message::Transaction, SocketAddr, SocketAddr),
-        Vec<(SocketAddr, bool)>,
+        Vec<(SocketAddr, bool, u64)>,
     >;
 
     /// What the connect op saw, for [`record_at`].
@@ -388,8 +397,9 @@ pub mod sim_trace {
             native: Option<bool>,
         },
         /// The survivor rule kept a native connection over a UDP one: swapped
-        /// it in for a UDP entry, or dropped the UDP connection.
-        Survivor { swapped: bool },
+        /// it in for a UDP entry, or dropped the UDP connection, which
+        /// arrived `inbound` or was this node's dial.
+        Survivor { swapped: bool, inbound: bool },
         /// A native connection closed soon after it won the survivor rule.
         OneSidedDrop,
         /// The node `own`'s native setup with the peer at the recorded
@@ -441,11 +451,21 @@ pub mod sim_trace {
                 if c.transports_frozen.load(Ordering::Relaxed) {
                     return;
                 }
+                let seq = c.seq.fetch_add(1, Ordering::Relaxed);
                 let mut transports = c.transports.lock();
                 match native {
-                    Some(native) => transports.insert((own, addr), native),
-                    None => transports.remove(&(own, addr)),
-                };
+                    Some(native) => {
+                        if !native && transports.get(&(own, addr)) == Some(&true) {
+                            c.native_replaced_by_udp.lock().push((own, addr));
+                        }
+                        transports.insert((own, addr), native);
+                        c.transport_seqs.lock().insert((own, addr), seq);
+                    }
+                    None => {
+                        transports.remove(&(own, addr));
+                        c.transport_seqs.lock().remove(&(own, addr));
+                    }
+                }
                 return;
             }
             NativeWireEvent::NativeSetupEnded {
@@ -453,15 +473,24 @@ pub mod sim_trace {
                 own,
                 established,
             } => {
+                let seq = c.seq.fetch_add(1, Ordering::Relaxed);
                 c.native_setup_ends
                     .lock()
                     .entry((tx, own.min(addr), own.max(addr)))
                     .or_default()
-                    .push((own, established));
+                    .push((own, established, seq));
                 return;
             }
-            NativeWireEvent::Survivor { swapped: true } => &c.survivor_swapped,
-            NativeWireEvent::Survivor { swapped: false } => &c.survivor_udp_dropped,
+            NativeWireEvent::Survivor { swapped: true, .. } => &c.survivor_swapped,
+            NativeWireEvent::Survivor {
+                swapped: false,
+                inbound,
+            } => {
+                if inbound {
+                    c.survivor_inbound_dropped.fetch_add(1, Ordering::Relaxed);
+                }
+                &c.survivor_udp_dropped
+            }
             NativeWireEvent::OneSidedDrop => &c.one_sided_drops,
             NativeWireEvent::UdpDialFor { tx, own, peer } => {
                 if c.fallbacks_pending.lock().remove(&(tx, own, peer)) {
@@ -528,22 +557,28 @@ pub mod sim_trace {
     }
 
     /// Networks whose nodes start a UDP dial beside every native dial
-    /// ([`force_udp_beside_native`]).
-    static UDP_BESIDE_FORCED: LazyLock<dashmap::DashSet<String>> =
-        LazyLock::new(dashmap::DashSet::new);
+    /// ([`force_udp_beside_native`]): `true` as joiner only, `false` as
+    /// joiner and acceptor.
+    static UDP_BESIDE_FORCED: LazyLock<dashmap::DashMap<String, bool>> =
+        LazyLock::new(dashmap::DashMap::new);
 
     /// Makes every node of `network` start a UDP dial to the peer at once
-    /// beside each native dial, as joiner and as acceptor, so both connect
-    /// and the survivor rule has to choose. Test-only.
-    pub(crate) fn force_udp_beside_native(network: &str) {
-        UDP_BESIDE_FORCED.insert(network.to_string());
+    /// beside each native dial, as joiner, and also as acceptor unless
+    /// `joiner_only`, so a pair is handed both connections and the survivor
+    /// rule has to choose. As joiner only, the acceptor sees the joiner's UDP
+    /// dial arrive inbound. Test-only.
+    pub(crate) fn force_udp_beside_native(network: &str, joiner_only: bool) {
+        UDP_BESIDE_FORCED.insert(network.to_string(), joiner_only);
     }
 
     /// Whether the network the peer at `addr` belongs to forces a UDP dial
-    /// beside each native dial.
-    pub(crate) fn udp_beside_forced(addr: SocketAddr) -> bool {
-        crate::transport::in_memory_socket::network_of(&addr)
-            .is_some_and(|network| UDP_BESIDE_FORCED.contains(&network))
+    /// beside each native dial made `as_acceptor` or as joiner.
+    pub(crate) fn udp_beside_forced(addr: SocketAddr, as_acceptor: bool) -> bool {
+        crate::transport::in_memory_socket::network_of(&addr).is_some_and(|network| {
+            UDP_BESIDE_FORCED
+                .get(&network)
+                .is_some_and(|joiner_only| !(as_acceptor && *joiner_only))
+        })
     }
 
     /// Removes the trace of `network` (on `SimNetwork` drop).
@@ -638,6 +673,11 @@ pub mod sim_trace {
         pub fn survivor_udp_dropped(&self) -> u64 {
             Self::get(&self.0.survivor_udp_dropped)
         }
+        /// Of [`Self::survivor_udp_dropped`], the UDP connections that
+        /// arrived inbound.
+        pub fn survivor_inbound_dropped(&self) -> u64 {
+            Self::get(&self.0.survivor_inbound_dropped)
+        }
         /// Native connections that closed soon after winning the survivor
         /// rule.
         pub fn one_sided_drops(&self) -> u64 {
@@ -651,8 +691,10 @@ pub mod sim_trace {
             let mut both = 0;
             let mut one_sided = 0;
             for sides in ends.values() {
-                let distinct: std::collections::BTreeMap<SocketAddr, bool> =
-                    sides.iter().copied().collect();
+                let distinct: std::collections::BTreeMap<SocketAddr, bool> = sides
+                    .iter()
+                    .map(|(own, established, _)| (*own, *established))
+                    .collect();
                 if distinct.len() == 2 {
                     both += 1;
                     if distinct.values().filter(|ok| **ok).count() == 1 {
@@ -662,25 +704,34 @@ pub mod sim_trace {
             }
             (both, one_sided)
         }
-        /// Pairs `(lower, higher address)` whose two ends both got a native
-        /// connection from one CONNECT's setup.
-        pub fn native_established_at_both_ends(&self) -> Vec<(SocketAddr, SocketAddr)> {
+        /// Native setups in one CONNECT whose two ends both got a
+        /// connection, as (lower address, higher address, when the later end
+        /// got it, by the trace's order).
+        pub fn native_established_at_both_ends(&self) -> Vec<(SocketAddr, SocketAddr, u64)> {
             let ends = self.0.native_setup_ends.lock();
             let mut pairs: Vec<_> = ends
                 .iter()
-                .filter(|(_, sides)| {
-                    let ok: std::collections::BTreeSet<SocketAddr> = sides
+                .filter_map(|((_, lo, hi), sides)| {
+                    let ok: std::collections::BTreeMap<SocketAddr, u64> = sides
                         .iter()
-                        .filter(|(_, established)| *established)
-                        .map(|(own, _)| *own)
+                        .filter(|(_, established, _)| *established)
+                        .map(|(own, _, seq)| (*own, *seq))
                         .collect();
-                    ok.len() == 2
+                    (ok.len() == 2).then(|| (*lo, *hi, ok.values().copied().max().unwrap_or(0)))
                 })
-                .map(|((_, lo, hi), _)| (*lo, *hi))
                 .collect();
             pairs.sort();
-            pairs.dedup();
             pairs
+        }
+        /// When (by the trace's order) each (node, peer) entry of
+        /// [`Self::transports`] was set.
+        pub fn transport_seqs(&self) -> std::collections::BTreeMap<(SocketAddr, SocketAddr), u64> {
+            self.0.transport_seqs.lock().clone()
+        }
+        /// (node, peer) entries where a UDP connection replaced a native one
+        /// in place.
+        pub fn native_replaced_by_udp(&self) -> Vec<(SocketAddr, SocketAddr)> {
+            self.0.native_replaced_by_udp.lock().clone()
         }
         /// The transport each node held for each peer when the run ended
         /// (before its teardown), as (node, peer) -> native.

@@ -1579,7 +1579,7 @@ pub(super) async fn dispatch_expect_connection_from(
         .await?;
     // Test-only: a UDP dial beside the native one, at once.
     #[cfg(any(test, feature = "testing"))]
-    if native_wire_trace::udp_beside_forced(addr) {
+    if native_wire_trace::udp_beside_forced(addr, true) {
         let mut beside = acceptor_udp_dial(op_manager, tx, &peer, addr).await?;
         let peer = peer.clone();
         GlobalExecutor::spawn(async move {
