@@ -1103,12 +1103,17 @@ jobs:
         # feature, breaking test code that uses Ping::insert().
         # Skip blocked_peers tests (run serially below — they spin up 3 real
         # nodes each and timeout under parallel resource contention).
+        # `quic-panic-injection` (test builds only; it refuses to build without
+        # debug assertions) lets graceful_shutdown_exit_code abort a unix peer
+        # on an injected QUIC panic, the only real-process test of the peer
+        # crash-loop breaker on unix (#6151). It does nothing unless a test
+        # sets FREENET_TEST_QUIC_PANIC.
         # nextest retries only failed tests (via .config/nextest.toml [profile.ci]),
         # avoiding the 10-15 min penalty of re-running the entire workspace.
         run: |
           cargo nextest run --workspace --exclude freenet-ping-types \
             --no-default-features \
-            --features trace,websocket,redb,wasmtime-backend,testing \
+            --features trace,websocket,redb,wasmtime-backend,testing,freenet/quic-panic-injection \
             --profile ci -E 'not test(blocked_peers)'
 
       - name: Test blocked-peers (serial)

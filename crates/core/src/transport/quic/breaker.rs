@@ -1468,7 +1468,14 @@ impl StartReport {
 /// This start's [`StartReport`], until the node sends it.
 static START_REPORT: parking_lot::Mutex<Option<StartReport>> = parking_lot::Mutex::new(None);
 
+/// Record this start's report, and log it once at INFO with the payload
+/// the event carries, so an operator (and a real-process test, which runs
+/// with telemetry off) can read it.
 fn set_start_report(report: StartReport) {
+    tracing::info!(
+        report = %report.to_json(),
+        "QUIC crash-loop breaker start report"
+    );
     *START_REPORT.lock() = Some(report);
 }
 
