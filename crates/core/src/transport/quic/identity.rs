@@ -25,8 +25,16 @@
 //! A man in the middle that terminates the handshake cannot sign as the
 //! expected key, and the TLS 1.3 signature covers the transcript, so a
 //! relayed handshake cannot be completed with a different peer either.
+//!
+//! **A client no one named** ([`ProvenClientKey`]). A gateway accepting a
+//! native join from an address it was not told about has no key to pin. It
+//! takes the key the client presents instead, under the same rules: exactly
+//! an Ed25519 SubjectPublicKeyInfo with sign bit 0, no chain, a key
+//! [`PeerKey::of`] accepts, and an Ed25519 signature checked with ring
+//! against that key. The key is then the connection's identity. This proves
+//! only that the client holds the secret of the key it presents.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use ring_crypto::signature;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -118,6 +126,39 @@ fn spki_of(ed25519: &[u8; 32]) -> [u8; ED25519_SPKI_LEN] {
     spki[..ED25519_SPKI_PREFIX.len()].copy_from_slice(&ED25519_SPKI_PREFIX);
     spki[ED25519_SPKI_PREFIX.len()..].copy_from_slice(ed25519);
     spki
+}
+
+/// The identity a raw public key `presented` proves, if it is one a node can
+/// hold: exactly an Ed25519 SubjectPublicKeyInfo ([`ED25519_SPKI_PREFIX`]
+/// and 32 bytes) whose key has sign bit 0 (XEdDSA's convention, so one
+/// transport key has one presented form) and is the Edwards form of a
+/// transport key [`PeerKey::of`] accepts, in its canonical encoding. Every
+/// other input is refused, before any signature is looked at.
+pub(crate) fn peer_key_presented(presented: &[u8]) -> Result<PeerKey, UnusableKey> {
+    let Some(key) = presented.strip_prefix(&ED25519_SPKI_PREFIX[..]) else {
+        return Err(UnusableKey);
+    };
+    let Ok(ed25519) = <[u8; 32]>::try_from(key) else {
+        return Err(UnusableKey);
+    };
+    if ed25519[31] >> 7 != XEDDSA_SIGN_BIT {
+        return Err(UnusableKey);
+    }
+    let point = curve25519_dalek_v4::edwards::CompressedEdwardsY(ed25519)
+        .decompress()
+        .ok_or(UnusableKey)?;
+    let transport = TransportPublicKey::from_bytes(point.to_montgomery().to_bytes());
+    let peer = PeerKey::of(&transport)?;
+    // A backstop: only the canonical encoding is the key's presented form.
+    // Not reachable today: a non-canonical encoding is y + p with y < 19,
+    // and every such point is small-order or has a torsion component, so
+    // `PeerKey::of` refuses it first (`only_a_node_keys_exact_presented_form_is_accepted`
+    // checks all 19). It keeps the output's presented form equal to the input
+    // whatever that fact.
+    if peer.ed25519 != ed25519 {
+        return Err(UnusableKey);
+    }
+    Ok(peer)
 }
 
 /// The raw public key a peer is expected to present: the Edwards form of its
@@ -320,6 +361,25 @@ impl QuicIdentity {
             Arc::new(PinnedClientKey::new(client)),
             alpn,
         )
+    }
+
+    /// TLS for accepting a native connection from a client this node has no
+    /// key for: it offers only [`Alpn::Native`] and accepts the key the
+    /// client proves ([`ProvenClientKey`], returned beside the configuration
+    /// so the caller can read the key after the handshake).
+    #[cfg_attr(not(test), allow(dead_code))] // Used by gateway admission (A7b), dark until then.
+    pub(crate) fn server_tls_proven(
+        &self,
+    ) -> Result<
+        (
+            quinn::crypto::rustls::QuicServerConfig,
+            Arc<ProvenClientKey>,
+        ),
+        TlsConfigError,
+    > {
+        let verifier = Arc::new(ProvenClientKey::new());
+        let tls = config::tls_server_config(self.certified_key(), verifier.clone(), Alpn::Native)?;
+        Ok((tls, verifier))
     }
 
     /// TLS that completes no handshake: the endpoint's default server
@@ -596,6 +656,110 @@ impl ClientCertVerifier for PinnedClientKey {
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
         self.expected.verify(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::ED25519]
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        true
+    }
+}
+
+/// A server's check of a client it has no key for (a gateway admitting a
+/// native join, #5940): the client may present any key [`peer_key_presented`]
+/// accepts, and its handshake signature must verify under that key. One per
+/// handshake: it records the key, and [`Self::proven`] returns it once the
+/// signature has verified.
+#[cfg_attr(not(test), allow(dead_code))] // Used by gateway admission (A7b), dark until then.
+#[derive(Debug, Default)]
+pub(crate) struct ProvenClientKey {
+    /// The key the client presented, recorded by `verify_client_cert`.
+    presented: OnceLock<PeerKey>,
+    /// Set once a handshake signature verified under `presented`.
+    proven: OnceLock<()>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Used by gateway admission (A7b), dark until then.
+impl ProvenClientKey {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The client's key, once its handshake signature verified under it.
+    pub(crate) fn proven(&self) -> Option<&PeerKey> {
+        self.proven.get()?;
+        self.presented.get()
+    }
+
+    /// Check the handshake signature over the parts of a
+    /// `DigitallySignedStruct`, and record the key as proven if it holds.
+    /// The presented bytes and the scheme are checked before ring verifies
+    /// anything (`PeerKey::verify_signature`).
+    fn verify_signature(
+        &self,
+        message: &[u8],
+        presented: &CertificateDer<'_>,
+        scheme: SignatureScheme,
+        signature: &[u8],
+    ) -> Result<(), Error> {
+        let Some(key) = self.presented.get() else {
+            return Err(unexpected_key());
+        };
+        key.verify_signature(message, presented, scheme, signature)?;
+        let _first = self.proven.set(());
+        Ok(())
+    }
+}
+
+impl ClientCertVerifier for ProvenClientKey {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, Error> {
+        if !intermediates.is_empty() {
+            return Err(unexpected_key());
+        }
+        let key = peer_key_presented(end_entity.as_ref()).map_err(|_| unexpected_key())?;
+        // One key per handshake: a second, different one is refused.
+        if *self.presented.get_or_init(|| key.clone()) != key {
+            return Err(unexpected_key());
+        }
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        Err(no_tls12())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.verify_signature(message, cert, dss.scheme, dss.signature())?;
+        Ok(HandshakeSignatureValid::assertion())
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
