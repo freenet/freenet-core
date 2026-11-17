@@ -258,6 +258,17 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     // update-check task so an operator opt-out (#4690) can park it.
     let disable_auto_update = config.disable_auto_update;
 
+    // The updater's state as of this start, for the `auto_update_state`
+    // telemetry event (#5975). Recorded before the node is built, which is
+    // where the event is sent.
+    if let Some(dir) = commands::auto_update::state_dir() {
+        freenet::set_auto_update_state(commands::auto_update::update_state_summary_at(
+            &dir,
+            std::time::SystemTime::now(),
+            auto_update_is_disabled(build_info::GIT_DIRTY, disable_auto_update),
+        ));
+    }
+
     // The QUIC crash-loop breaker (#5940): if a run with QUIC enabled ended
     // abnormally, QUIC stays off for a cooldown. Enabled here, before the node
     // is built, because only this binary marks its clean exits (see `main`).

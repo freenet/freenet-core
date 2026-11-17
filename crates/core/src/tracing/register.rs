@@ -905,32 +905,34 @@ impl<'a> NetEventLog<'a> {
     ///
     /// This should be called once when the node starts and is ready to participate in the network.
     /// The event captures version info, platform details, and gateway status.
-    pub fn peer_startup(
-        ring: &'a Ring,
-        version: String,
-        git_commit: Option<String>,
-        git_dirty: Option<bool>,
-    ) -> Option<Self> {
+    ///
+    /// The commit and dirty flag come from this crate's build
+    /// (`GIT_COMMIT_HASH` and `GIT_DIRTY`, set by `build.rs` for the library
+    /// as well as the binary), never from the caller.
+    pub fn peer_startup(ring: &'a Ring, version: String) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let is_gateway = ring.connection_manager.is_gateway();
-
-        // Get OS version info
-        let os_version = Self::get_os_version();
-
         Some(NetEventLog {
             tx: Transaction::NULL,
             peer_id,
-            kind: EventKind::Lifecycle(PeerLifecycleEvent::Startup {
-                version,
-                git_commit,
-                git_dirty,
-                arch: std::env::consts::ARCH.to_string(),
-                os: std::env::consts::OS.to_string(),
-                os_version,
-                is_gateway,
-                timestamp: chrono::Utc::now().timestamp() as u64,
-            }),
+            kind: EventKind::Lifecycle(Self::startup_event(version, is_gateway)),
         })
+    }
+
+    /// The `Startup` record for this build. Separate from [`Self::peer_startup`]
+    /// so it can be tested without a `Ring`.
+    fn startup_event(version: String, is_gateway: bool) -> PeerLifecycleEvent {
+        let (git_commit, git_dirty) = build_git_fields(env!("GIT_COMMIT_HASH"), env!("GIT_DIRTY"));
+        PeerLifecycleEvent::Startup {
+            version,
+            git_commit,
+            git_dirty,
+            arch: std::env::consts::ARCH.to_string(),
+            os: std::env::consts::OS.to_string(),
+            os_version: Self::get_os_version(),
+            is_gateway,
+            timestamp: chrono::Utc::now().timestamp() as u64,
+        }
     }
 
     /// Create a peer shutdown event.
@@ -1899,6 +1901,62 @@ fn note_dropped_event_log() {
              healthy — telemetry is intentionally lossy under load rather than \
              blocking the event loop (see .claude/rules/channel-safety.md)."
         );
+    }
+}
+
+/// The `Startup` event's commit and dirty flag from `build.rs`'s
+/// `GIT_COMMIT_HASH` and `GIT_DIRTY`. `"unknown"` means the build found no
+/// commit (no repository, no override, no published `.cargo_vcs_info.json`),
+/// and the dirty flag is then unknown too: `build.rs` reads a missing
+/// repository as clean.
+fn build_git_fields(commit: &str, dirty_suffix: &str) -> (Option<String>, Option<bool>) {
+    if commit.is_empty() || commit == "unknown" {
+        return (None, None);
+    }
+    (Some(commit.to_string()), Some(!dirty_suffix.is_empty()))
+}
+
+#[cfg(test)]
+mod startup_git_fields_tests {
+    use super::*;
+
+    /// Every `peer_startup` event carried `None` for both fields, because the
+    /// one caller passed `None` with a comment saying they were not available
+    /// in the library. They are: this test builds the record and requires the
+    /// commit this crate was built from.
+    #[test]
+    fn the_startup_event_carries_the_build_s_commit() {
+        let PeerLifecycleEvent::Startup {
+            git_commit,
+            git_dirty,
+            ..
+        } = NetEventLog::startup_event("0.0.0".to_string(), false)
+        else {
+            panic!("not a Startup event");
+        };
+        let built = env!("GIT_COMMIT_HASH");
+        if built == "unknown" {
+            // A test build with no commit at all (no repository, no override).
+            assert_eq!((git_commit, git_dirty), (None, None));
+        } else {
+            assert_eq!(git_commit.as_deref(), Some(built));
+            assert_eq!(git_dirty, Some(!env!("GIT_DIRTY").is_empty()));
+        }
+    }
+
+    #[test]
+    fn git_fields_from_the_build_variables() {
+        assert_eq!(
+            build_git_fields("0123456789ab", ""),
+            (Some("0123456789ab".to_string()), Some(false))
+        );
+        assert_eq!(
+            build_git_fields("0123456789ab", "-dirty"),
+            (Some("0123456789ab".to_string()), Some(true))
+        );
+        assert_eq!(build_git_fields("unknown", ""), (None, None));
+        assert_eq!(build_git_fields("unknown", "-dirty"), (None, None));
+        assert_eq!(build_git_fields("", ""), (None, None));
     }
 }
 

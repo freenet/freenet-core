@@ -4,6 +4,8 @@ use std::process::Command;
 // Unit-tested from the library via a `#[cfg(test)]` module in `src/lib.rs`.
 #[path = "build/git_watch.rs"]
 mod git_watch;
+#[path = "build/vcs_info.rs"]
+mod vcs_info;
 #[path = "build/version_floor.rs"]
 mod version_floor;
 
@@ -151,6 +153,13 @@ fn emit_build_metadata() {
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
+            // A crates.io package has no `.git`; `cargo publish` recorded the
+            // commit in `.cargo_vcs_info.json` instead (`build/vcs_info.rs`).
+            .or_else(|| {
+                let dir = std::env::var("CARGO_MANIFEST_DIR").ok()?;
+                let file = std::path::Path::new(&dir).join(vcs_info::VCS_INFO_FILE);
+                vcs_info::published_commit(&std::fs::read_to_string(file).ok()?)
+            })
             .unwrap_or_else(|| "unknown".to_string()),
     };
     println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");

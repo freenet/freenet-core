@@ -577,8 +577,6 @@ impl NodeP2P {
         if let Some(event) = crate::tracing::NetEventLog::peer_startup(
             &self.op_manager.ring,
             crate::config::PCK_VERSION.to_string(),
-            None, // git_commit - not available in library, only in binary
-            None, // git_dirty - not available in library, only in binary
         ) {
             use either::Either;
             self.op_manager
@@ -951,6 +949,17 @@ impl NodeP2P {
             payload_mix_peer_id,
             &background_task_monitor,
         );
+
+        // `auto_update_state` (#5975): the updater's state as the binary read
+        // it at startup, once per start. Sending is a no-op unless the
+        // telemetry reporter (built with the node config) is enabled.
+        if let Some(state) = super::network_status::auto_update_state() {
+            crate::tracing::telemetry::send_standalone_event_with_peer_id(
+                "auto_update_state",
+                &config.local_peer_id_string(),
+                state,
+            );
+        }
 
         // `join_versions` (#5940): hourly versions of gateway joiners and live
         // neighbours. Only with telemetry on, since it exists to be uploaded.
