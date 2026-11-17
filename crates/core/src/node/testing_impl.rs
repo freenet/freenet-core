@@ -2121,6 +2121,28 @@ impl SimNetwork {
         self
     }
 
+    /// Turns QUIC-native connects on for every node, at `percent` (the share
+    /// of joins an acceptor decides native), in place of this release's
+    /// `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, which are off. Pair it
+    /// with [`Self::with_quic_native_floor`], since without the native wire
+    /// variants no decision reaches a joiner, and with
+    /// [`Self::with_transport_quic`], since a node without a QUIC endpoint
+    /// cannot set one up. Call before the simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_native_connect(&mut self, percent: u8) -> &mut Self {
+        for label in self.pending_labels() {
+            self.node_config_mut(&label).native_connect_override = Some(percent);
+        }
+        self
+    }
+
+    /// As [`Self::with_native_connect`], for the node `label` only.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_node_native_connect(&mut self, label: &NodeLabel, percent: u8) -> &mut Self {
+        self.node_config_mut(label).native_connect_override = Some(percent);
+        self
+    }
+
     /// Makes the node `label` decode the QUIC-native connect variants as a
     /// release below their floor does: such a message fails to decode and the
     /// connection is closed. It also never sends them. Pair it with

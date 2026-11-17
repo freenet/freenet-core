@@ -284,6 +284,23 @@ pub mod sim_trace {
         retry_accepts_with_offer: AtomicU64,
         joiner_decisions: AtomicU64,
         joiner_responses_without_decision: AtomicU64,
+        native_established: AtomicU64,
+        native_failed: AtomicU64,
+        native_demotions: AtomicU64,
+        /// Native failures, as (transaction, node, peer), whose node has not
+        /// yet asked for a UDP dial to that peer in that transaction.
+        fallbacks_pending: parking_lot::Mutex<
+            std::collections::HashSet<(
+                crate::message::Transaction,
+                Option<SocketAddr>,
+                SocketAddr,
+            )>,
+        >,
+        fallbacks_dialled: AtomicU64,
+        native_superseded: AtomicU64,
+        /// Pairs `(lower, higher address)` where a node's native setup failed.
+        native_failed_pairs:
+            parking_lot::Mutex<std::collections::BTreeSet<(SocketAddr, SocketAddr)>>,
         /// Nodes standing in for a release below the floor
         /// ([`mark_pre_floor`]).
         pre_floor: parking_lot::Mutex<std::collections::HashSet<SocketAddr>>,
@@ -313,6 +330,26 @@ pub mod sim_trace {
         },
         /// A joiner received a response.
         JoinerResponse { with_decision: bool },
+        /// A node's QUIC-native dial ended, as joiner or acceptor.
+        NativeDial { established: bool },
+        /// A node turned its own native connects off.
+        NativeDemoted,
+        /// The node `own` failed a native setup with `peer` in `tx`; the
+        /// connect op must dial UDP to that peer next.
+        NativeFailedFor {
+            tx: crate::message::Transaction,
+            own: Option<SocketAddr>,
+            peer: SocketAddr,
+        },
+        /// A native setup failed after its pair had connected another way, so
+        /// it needs no fallback. Also counted as a failed native dial.
+        NativeSuperseded,
+        /// The node `own` was asked for a UDP dial to `peer` in `tx`.
+        UdpDialFor {
+            tx: crate::message::Transaction,
+            own: Option<SocketAddr>,
+            peer: SocketAddr,
+        },
     }
 
     static TRACES: LazyLock<dashmap::DashMap<String, NativeWireTrace>> =
@@ -334,6 +371,21 @@ pub mod sim_trace {
         };
         let c = &trace.0;
         let counter = match event {
+            NativeWireEvent::NativeFailedFor { tx, own, peer } => {
+                if let Some(own) = own {
+                    c.native_failed_pairs
+                        .lock()
+                        .insert((own.min(peer), own.max(peer)));
+                }
+                c.fallbacks_pending.lock().insert((tx, own, peer));
+                return;
+            }
+            NativeWireEvent::UdpDialFor { tx, own, peer } => {
+                if c.fallbacks_pending.lock().remove(&(tx, own, peer)) {
+                    c.fallbacks_dialled.fetch_add(1, Ordering::Relaxed);
+                }
+                return;
+            }
             NativeWireEvent::Sent(index) => match c.sent.get(index as usize) {
                 Some(counter) => counter,
                 None => return,
@@ -366,6 +418,13 @@ pub mod sim_trace {
             NativeWireEvent::JoinerResponse {
                 with_decision: false,
             } => &c.joiner_responses_without_decision,
+            NativeWireEvent::NativeDial { established: true } => &c.native_established,
+            NativeWireEvent::NativeDial { established: false } => &c.native_failed,
+            NativeWireEvent::NativeDemoted => &c.native_demotions,
+            NativeWireEvent::NativeSuperseded => {
+                c.native_failed.fetch_add(1, Ordering::Relaxed);
+                &c.native_superseded
+            }
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -427,6 +486,45 @@ pub mod sim_trace {
         /// Responses a joiner received without one.
         pub fn joiner_responses_without_decision(&self) -> u64 {
             Self::get(&self.0.joiner_responses_without_decision)
+        }
+        /// QUIC-native dials that gave a connection (each side of a pair
+        /// counts its own).
+        pub fn native_established(&self) -> u64 {
+            Self::get(&self.0.native_established)
+        }
+        /// QUIC-native dials that failed, each followed by a UDP dial.
+        pub fn native_failed(&self) -> u64 {
+            Self::get(&self.0.native_failed)
+        }
+        /// Times a node demoted itself.
+        pub fn native_demotions(&self) -> u64 {
+            Self::get(&self.0.native_demotions)
+        }
+        /// Native failures followed by a UDP dial from the same node to the
+        /// same peer in the same transaction.
+        pub fn native_fallbacks_dialled(&self) -> u64 {
+            Self::get(&self.0.fallbacks_dialled)
+        }
+        /// The pairs `(lower, higher address)` where a native setup failed.
+        pub fn native_failed_pairs(&self) -> Vec<(SocketAddr, SocketAddr)> {
+            self.0.native_failed_pairs.lock().iter().copied().collect()
+        }
+        /// Native failures after the pair had connected another way.
+        pub fn native_superseded(&self) -> u64 {
+            Self::get(&self.0.native_superseded)
+        }
+        /// Native failures with no UDP dial after them (yet), as
+        /// `transaction node -> peer`.
+        pub fn native_failures_without_fallback(&self) -> Vec<String> {
+            let mut out: Vec<String> = self
+                .0
+                .fallbacks_pending
+                .lock()
+                .iter()
+                .map(|(tx, own, peer)| format!("{tx} {own:?} -> {peer}"))
+                .collect();
+            out.sort();
+            out
         }
     }
 }

@@ -1301,7 +1301,7 @@ impl Ring {
         let my_distance = my_location.distance(contract_location);
 
         let connections = self.connection_manager.get_connections_by_location();
-        let neighbors = connections.iter().flat_map(|(_loc, conns)| {
+        let neighbors = connections.values().flat_map(|conns| {
             conns.iter().map(|conn| {
                 // A peer counts as a "closer routable neighbor" (so I'm NOT the
                 // root) only if a renewal could actually route to it. Match the

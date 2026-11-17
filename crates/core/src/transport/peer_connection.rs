@@ -27,8 +27,7 @@ mod inbound_dispatch;
 mod inbound_stream;
 mod outbound_stream;
 // Built only by its tests until the connect op uses it (#5940, A5b).
-#[cfg_attr(not(test), allow(dead_code))]
-mod native_connection;
+pub(in crate::transport) mod native_connection;
 pub(super) use outbound_stream::embeds_metadata;
 mod peer_identity;
 pub(crate) mod piped_stream;

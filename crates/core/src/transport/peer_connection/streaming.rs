@@ -465,6 +465,12 @@ impl StreamHandle {
             .map_or(STREAM_INACTIVITY_TIMEOUT, |quic| quic.gap())
     }
 
+    /// Whether a QUIC path fills this stream (one made by `new_quic`), not
+    /// the UDP transport.
+    pub(crate) fn is_quic_fed(&self) -> bool {
+        self.quic.is_some()
+    }
+
     fn from_buffer(stream_id: StreamId, buffer: LockFreeStreamBuffer) -> Self {
         let total_bytes = buffer.total_bytes();
         Self {

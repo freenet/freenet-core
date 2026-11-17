@@ -7,10 +7,13 @@
 //! forms of `ConnectMsg` that only peers at or above
 //! [`crate::node::QUIC_NATIVE_MIN_VERSION`] receive (`connect::wire`).
 //!
-//! Nothing here changes how a connection is set up yet: [`NATIVE_DIAL_READY`]
-//! is false, so every offer carries percent 0 and every decision is
-//! [`NativeDecision::Udp`]. A response that says `Native` cannot be honoured,
-//! and the joiner fails that attempt ([`joiner_response_action`]).
+//! On `Native` the joiner and the acceptor each dial a native connection
+//! ([`DialTransport::Native`]), and a failed setup falls back to today's UDP
+//! dial. In production nothing changes yet: [`NATIVE_DIAL_READY`] is false,
+//! so every offer carries percent 0 and every decision is
+//! [`NativeDecision::Udp`]; a simulation turns it on per node
+//! ([`NativeConnectState`]). A `Native` the joiner cannot honour fails that
+//! attempt ([`joiner_response_action`]).
 //!
 //! The pair slice:
 //!
@@ -30,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use crate::transport::TransportPublicKey;
-use crate::transport::metrics::{QuicEndpointState, TRANSPORT_METRICS};
+use crate::transport::metrics::TRANSPORT_METRICS;
 
 /// Whether this build can dial a native connection. False until the native
 /// connection exists and is wired into the connect op; while false, every offer
@@ -202,6 +205,38 @@ pub(crate) fn effective_native_percent(
     node_override.map_or(release_percent, |o| o.min(release_percent))
 }
 
+/// Which transport a `ConnectPeer` dials. `Native` sets up a QUIC-native
+/// connection through `OutboundConnector::connect_native`, with no UDP
+/// expectation; `Udp` is today's hole punch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum DialTransport {
+    #[default]
+    Udp,
+    /// `within`: how long the setup may take from when it starts. The
+    /// setup's own window (8 s for the client, 12 s for the server) cuts it
+    /// further, and a setup with less than 4 s left is not started. A joiner
+    /// passes what is left until its UDP fallback time, so its native attempt
+    /// never runs past it; an acceptor passes [`NATIVE_CONNECT_WITHIN`].
+    Native { within: std::time::Duration },
+}
+
+impl DialTransport {
+    /// A native dial bounded only by the setup's own window.
+    pub(crate) const NATIVE: Self = Self::Native {
+        within: NATIVE_CONNECT_WITHIN,
+    };
+
+    pub(crate) fn is_native(self) -> bool {
+        matches!(self, Self::Native { .. })
+    }
+}
+
+/// How long a native dial may wait when its caller has no deadline of its
+/// own. The setup's own window is shorter and ends it first (8 s for the
+/// client, 12 s for the server), so this only bounds a setup that never
+/// reports.
+pub(crate) const NATIVE_CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// This node's readiness for native connections, as both joiner and acceptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeReadiness {
@@ -213,21 +248,34 @@ pub(crate) struct NativeReadiness {
 }
 
 impl NativeReadiness {
-    /// Readiness from this process's QUIC endpoint state. Demotion is not
-    /// wired yet ([`NativeDemotion`]), so it never lowers this.
+    /// Readiness of a node in this release with no transport open yet: never
+    /// ready, offering 0. A node reads its own through
+    /// [`NativeConnectState::readiness`].
+    #[cfg(test)]
     pub(crate) fn current() -> Self {
-        let endpoint_up = TRANSPORT_METRICS.quic_endpoint_state() == QuicEndpointState::Up;
-        Self::from_inputs(NATIVE_DIAL_READY, endpoint_up, false)
+        NativeConnectState::new(None).readiness()
     }
 
+    #[cfg(test)]
     pub(crate) fn from_inputs(dial_ready: bool, endpoint_up: bool, demoted: bool) -> Self {
+        Self::from_parts(dial_ready, endpoint_up, demoted, QUIC_NATIVE_PERCENT)
+    }
+
+    /// As [`Self::from_inputs`], at `release_percent` in place of
+    /// [`QUIC_NATIVE_PERCENT`].
+    pub(crate) fn from_parts(
+        dial_ready: bool,
+        endpoint_up: bool,
+        demoted: bool,
+        release_percent: u8,
+    ) -> Self {
         Self {
             ready: dial_ready && endpoint_up && !demoted,
             percent: effective_native_percent(
                 dial_ready,
                 endpoint_up,
                 demoted,
-                QUIC_NATIVE_PERCENT,
+                release_percent,
                 None,
             ),
         }
@@ -294,40 +342,118 @@ pub(crate) enum JoinerDecisionFailure {
     /// `Native` answered a request that carried no offer, or percent 0. Only a
     /// bug or a misbehaving relay produces it.
     DecisionWithoutOffer,
-    /// `Native` answered a real offer, but this build has no native dial.
+    /// `Native` answered a real offer, but the joiner can no longer dial
+    /// native (demoted, or its QUIC endpoint is not up).
     NativeUnsupported,
 }
 
-/// What the joiner does with a response's decision, given the offer it sent.
-/// `None`, `Udp` and a decision this release does not know keep today's
-/// behaviour; `Native` fails the attempt, since this build cannot set up a
-/// native connection.
+/// How the joiner dials an acceptor, given the offer it sent, the response's
+/// decision and whether it can dial native now (`can_dial`, its current
+/// readiness). `None`, `Udp` and a decision this release does not know keep
+/// today's UDP dial; `Native` dials native when the joiner offered and can
+/// still dial, and fails the attempt otherwise.
 pub(crate) fn joiner_response_action(
     sent: Option<NativeOffer>,
     decision: Option<NativeDecision>,
-) -> Result<(), JoinerDecisionFailure> {
+    can_dial: bool,
+) -> Result<DialTransport, JoinerDecisionFailure> {
     match decision {
-        None | Some(NativeDecision::Udp | NativeDecision::Unknown(_)) => Ok(()),
+        None | Some(NativeDecision::Udp | NativeDecision::Unknown(_)) => Ok(DialTransport::Udp),
         Some(NativeDecision::Native) => {
             if sent.is_none_or(|o| o.effective_percent() == 0) {
                 Err(JoinerDecisionFailure::DecisionWithoutOffer)
-            } else {
+            } else if !can_dial {
                 Err(JoinerDecisionFailure::NativeUnsupported)
+            } else {
+                Ok(DialTransport::NATIVE)
             }
         }
     }
 }
 
+/// A node's QUIC-native connect state: whether it may dial native and at what
+/// percent, and the demotion its native failures drive. One per node, in the
+/// `ConnectionManager`.
+#[derive(Debug)]
+pub(crate) struct NativeConnectState {
+    /// Simulation only: native dials on, at this release percent, in place of
+    /// [`NATIVE_DIAL_READY`] and [`QUIC_NATIVE_PERCENT`]
+    /// (`NodeConfig::native_connect_override`). `None` in production.
+    release_override: Option<u8>,
+    demotion: parking_lot::Mutex<NativeDemotion>,
+    /// This node's QUIC endpoint, set when its transport opens. Until then,
+    /// and when it is not up, the node cannot dial native. Read per node, not
+    /// from the process-wide endpoint metric, which several simulated nodes
+    /// in one process share.
+    endpoint: std::sync::OnceLock<crate::transport::QuicAvailabilityWatch>,
+}
+
+impl NativeConnectState {
+    pub(crate) fn new(release_override: Option<u8>) -> Self {
+        Self {
+            release_override,
+            demotion: parking_lot::Mutex::new(NativeDemotion::new()),
+            endpoint: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The node's transport opened with this QUIC endpoint. Only the first
+    /// call counts: a node opens one transport.
+    pub(crate) fn set_endpoint(&self, endpoint: crate::transport::QuicAvailabilityWatch) {
+        self.endpoint.get_or_init(|| endpoint);
+    }
+
+    /// This node's readiness now, as joiner and as acceptor.
+    pub(crate) fn readiness(&self) -> NativeReadiness {
+        let endpoint_up = self
+            .endpoint
+            .get()
+            .is_some_and(|e| e.get() == crate::transport::QuicAvailability::Up);
+        let (dial_ready, release_percent) = match self.release_override {
+            Some(percent) => (true, percent),
+            None => (NATIVE_DIAL_READY, QUIC_NATIVE_PERCENT),
+        };
+        let demoted = self.demotion.lock().is_demoted(Instant::now());
+        NativeReadiness::from_parts(dial_ready, endpoint_up, demoted, release_percent)
+    }
+
+    /// A native setup with `peer` failed in a way that says native does not
+    /// work on that path; the caller falls back to UDP. Returns whether this
+    /// failure demoted the node, which is counted.
+    pub(crate) fn record_failure(&self, peer: &TransportPublicKey) -> bool {
+        let demoted = self.demotion.lock().record_failure(peer, Instant::now());
+        if demoted {
+            TRANSPORT_METRICS.record_connect_native_demotion();
+            tracing::info!(
+                cooldown_secs = DEMOTION_COOLDOWN.as_secs(),
+                "QUIC-native connects off after native failures with distinct peers"
+            );
+        }
+        demoted
+    }
+
+    /// A native setup succeeded.
+    pub(crate) fn record_success(&self) {
+        self.demotion.lock().record_success();
+    }
+
+    /// How many times this node was demoted.
+    #[cfg(test)]
+    pub(crate) fn demotions(&self) -> u64 {
+        self.demotion.lock().demotions()
+    }
+}
+
 /// Lowers a node's native offer (or, on an acceptor, its decisions) after
-/// repeated native failures. Not wired yet: the native dial it counts does not
-/// exist in this release; the connect op wires it when it gains one.
+/// repeated native failures, as joiner or as acceptor
+/// ([`NativeConnectState`]). A failure is always followed by a UDP dial to
+/// the same peer, so demotion only stops new native attempts.
 ///
 /// [`DEMOTION_FAILURES`] failures in a row, each with a different acceptor,
 /// demote the node for [`DEMOTION_COOLDOWN`]; a success resets the streak.
 /// Repeated failures with one acceptor count once, so one broken peer cannot
 /// demote a node. It only ever lowers: it can make a node offer 0, never more.
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct NativeDemotion {
     /// Distinct acceptors in the current failure streak, at most
     /// [`DEMOTION_FAILURES`].
@@ -336,7 +462,6 @@ pub(crate) struct NativeDemotion {
     demotions: u64,
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 impl NativeDemotion {
     pub(crate) fn new() -> Self {
         Self {
@@ -346,10 +471,11 @@ impl NativeDemotion {
         }
     }
 
-    /// A native attempt with `acceptor` failed.
-    pub(crate) fn record_failure(&mut self, acceptor: &TransportPublicKey, now: Instant) {
+    /// A native attempt with `acceptor` failed. Returns whether it demoted
+    /// the node.
+    pub(crate) fn record_failure(&mut self, acceptor: &TransportPublicKey, now: Instant) -> bool {
         if self.is_demoted(now) {
-            return;
+            return false;
         }
         if !self.streak.contains(acceptor) {
             self.streak.push(acceptor.clone());
@@ -358,7 +484,9 @@ impl NativeDemotion {
             self.streak.clear();
             self.demoted_until = Some(now + DEMOTION_COOLDOWN);
             self.demotions += 1;
+            return true;
         }
+        false
     }
 
     /// A native attempt succeeded: the streak starts over.
@@ -371,6 +499,7 @@ impl NativeDemotion {
     }
 
     /// How many times the node was demoted.
+    #[cfg(test)]
     pub(crate) fn demotions(&self) -> u64 {
         self.demotions
     }
@@ -542,28 +671,74 @@ mod tests {
         assert_eq!(no_udp_acceptor_answer(offer, true), Decide);
     }
 
+    /// `None`, `Udp` and an unknown decision dial UDP whatever was offered.
+    /// `Native` dials native only when the joiner offered a percent above 0
+    /// and can still dial; it fails otherwise, naming which.
     #[test]
-    fn joiner_fails_only_on_native() {
+    fn joiner_dials_native_only_when_it_offered_and_can() {
         use JoinerDecisionFailure::*;
         let zero = Some(NativeOffer::capable(0));
         let five = Some(NativeOffer::capable(5));
-        for sent in [None, zero, five] {
-            assert_eq!(joiner_response_action(sent, None), Ok(()));
+        for can_dial in [false, true] {
+            for sent in [None, zero, five] {
+                assert_eq!(
+                    joiner_response_action(sent, None, can_dial),
+                    Ok(DialTransport::Udp)
+                );
+                assert_eq!(
+                    joiner_response_action(sent, Some(NativeDecision::Udp), can_dial),
+                    Ok(DialTransport::Udp)
+                );
+            }
+            let native = Some(NativeDecision::Native);
             assert_eq!(
-                joiner_response_action(sent, Some(NativeDecision::Udp)),
-                Ok(())
+                joiner_response_action(None, native, can_dial),
+                Err(DecisionWithoutOffer)
+            );
+            assert_eq!(
+                joiner_response_action(zero, native, can_dial),
+                Err(DecisionWithoutOffer)
             );
         }
         let native = Some(NativeDecision::Native);
         assert_eq!(
-            joiner_response_action(None, native),
-            Err(DecisionWithoutOffer)
+            joiner_response_action(five, native, false),
+            Err(NativeUnsupported)
         );
         assert_eq!(
-            joiner_response_action(zero, native),
-            Err(DecisionWithoutOffer)
+            joiner_response_action(five, native, true),
+            Ok(DialTransport::NATIVE)
         );
-        assert_eq!(joiner_response_action(five, native), Err(NativeUnsupported));
+    }
+
+    /// A node's state reads its own endpoint, its override and its demotion
+    /// into its readiness: it can dial only once its transport opened with
+    /// an endpoint that is up, a simulation override turns dialling on at
+    /// its percent, and three native failures with distinct peers stop it
+    /// offering.
+    #[test]
+    fn native_connect_state_reads_its_endpoint_override_and_demotion() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let off = NativeConnectState::new(None);
+        off.set_endpoint(watch.clone());
+        assert!(!off.readiness().ready, "production: not ready to dial");
+        let on = NativeConnectState::new(Some(100));
+        assert!(!on.readiness().ready, "no transport yet");
+        assert_eq!(on.readiness().percent, 0);
+        on.set_endpoint(watch);
+        assert!(on.readiness().ready);
+        assert_eq!(on.readiness().percent, 100);
+        endpoint.send(QuicAvailability::Down).unwrap();
+        assert!(!on.readiness().ready, "the endpoint went down");
+        endpoint.send(QuicAvailability::Up).unwrap();
+        assert!(on.readiness().ready);
+        for i in 1..=3 {
+            on.record_failure(&key(i));
+        }
+        assert_eq!(on.demotions(), 1);
+        assert!(!on.readiness().ready, "demoted");
+        assert_eq!(on.readiness().percent, 0);
     }
 
     /// Every level and percent decodes and re-encodes to the same bytes, so a
@@ -611,7 +786,10 @@ mod tests {
             if wire > 1 {
                 assert_eq!(decision, NativeDecision::Unknown(wire));
                 let offer = Some(NativeOffer::capable(50));
-                assert_eq!(joiner_response_action(offer, Some(decision)), Ok(()));
+                assert_eq!(
+                    joiner_response_action(offer, Some(decision), true),
+                    Ok(DialTransport::Udp)
+                );
             }
         }
     }

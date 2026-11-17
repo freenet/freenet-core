@@ -2185,13 +2185,7 @@ mod tests {
                 .iter()
                 .map(|&i| &peers[i])
                 .collect();
-            router.select_k_best_peers_capturing(
-                window.into_iter(),
-                Location::random(),
-                1,
-                false,
-                true,
-            );
+            router.select_k_best_peers_capturing(window, Location::random(), 1, false, true);
         }
         let selection = router.peer_snapshot(&peers[0]).selection.unwrap();
         assert_eq!((selection.eligible, selection.chosen), (40, 0.0));

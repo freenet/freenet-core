@@ -35,6 +35,8 @@
 //! | `quic_late_end_<label>` | sends whose end was acknowledged late, or not at all, though the connection had acknowledged enough bytes since the end to have carried it (`path::LateEndCheck`), by the same kinds as `quic_ack_wait_expired_<label>`; expected 0 on every honest path. Each time `recycle::ACK_WAIT_EXPIRY_LIMIT` come within `ACK_WAIT_EXPIRY_WINDOW` a would-close is counted under `late_ends` (observe-only, `recycle::LATE_ENDS_CLOSE`) |
 //! | `quic_stall_close_<label>` | paths the acknowledgement watch closed, by why: `not_acknowledging`, `dark`, `credit_starved`, `stream_credit_withheld`, `ack_waits_expired` (`recycle::Stall`) |
 //! | `quic_stall_would_close_<label>` | times a rule that only observes would have closed a path, by the same labels; each count starts the rule's window afresh. Two rules observe today. `ack_waits_expired` counts, on a path with a UDP session (`recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP` is false; a native path is closed), each time `ACK_WAIT_EXPIRY_LIMIT` strikes came within `ACK_WAIT_EXPIRY_WINDOW`, for calibrating the rule before UDP removal (#6205). `dark` counts once per episode on a data path with a UDP session, where the dark rule does not close (`recycle::DARK_CLOSES_WITH_UDP` is false); the episode is counted to its end in `quic_carried_dark_episode_<label>` |
+//! | `quic_pipe_source_<label>` | pipes (an inbound stream forwarded on a path, `quic_data_send_pipe_*`) that ended `sent` or `dropped`, by what fed the inbound stream: `quic_fed_sent`, `quic_fed_dropped`, `udp_fed_sent`, `udp_fed_dropped`; each sums to its `quic_data_send_pipe_<result>` |
+//! | `quic_pipe_dropped_<label>` | the same dropped pipes by cause: `source_error` (the inbound stream failed or delivered the wrong length), `source_stall_timeout` (a deadline ran out while the pipe waited for its source), `own_path` (anything else: this path timed out, was lost, or the peer stopped the stream); sums to `quic_data_send_pipe_dropped` |
 //! | `quic_send_resets`, `quic_path_ms` | sends a path reset on this side, and the time QUIC paths were up, shadow paths included, up to each path's last tick: resets per connection-hour is their ratio |
 //! | `quic_budget_bytes`, `quic_budget_charged_bytes`, `quic_budget_charged_peak_bytes` | the node's QUIC buffer budget, what its data paths' windows have grown above their floor grants now (the floor grants are each path's fixed charge, not the budget's, so a node with every path at the floor reports 0 and uploads nothing; gauges, not reset, uploaded when not 0), and the most charged at once in the period (`quic::budget`) |
 //! | `quic_staged_peak_pct` | the most any connection staged in the period (bytes read for streams whose header its reader had not taken yet) as a percentage of its staging cap (`quic::path::inbound::ConnStaging`); streams stopped at the cap are `quic_inbound_evicted_staged` |
@@ -177,6 +179,28 @@ pub(crate) const GATE_QUEUE_LABELS: [&str; 3] = ["lt_10pct", "lt_50pct", "ge_50p
 /// a one-packet Short, or a control frame (whose background wait is bounded
 /// as a one-packet Short's).
 pub(crate) const ACK_WAIT_EXPIRED_LABELS: [&str; 3] = ["stream", "short", "control"];
+
+/// `quic_pipe_source_<label>`: a pipe's end by what fed its inbound stream.
+pub(crate) const PIPE_SOURCE_LABELS: [&str; 4] = [
+    "quic_fed_sent",
+    "quic_fed_dropped",
+    "udp_fed_sent",
+    "udp_fed_dropped",
+];
+
+/// `quic_pipe_dropped_<label>`: why a pipe was dropped ([`PipeDropCause`]).
+pub(crate) const PIPE_DROP_LABELS: [&str; 3] = ["source_error", "source_stall_timeout", "own_path"];
+
+/// Why a pipe was dropped, in the order of [`PIPE_DROP_LABELS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PipeDropCause {
+    /// The inbound stream failed, or delivered other than its length.
+    SourceError,
+    /// A deadline ran out while the pipe waited for its source.
+    SourceStallTimeout,
+    /// Anything else: the path timed out or was lost, or the peer stopped it.
+    OwnPath,
+}
 
 /// What kind of send's ack wait ran out, for `quic_ack_wait_expired_<label>`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -498,6 +522,8 @@ pub(crate) struct QuicDataCounters {
     late_end: [AtomicU64; ACK_WAIT_EXPIRED_LABELS.len()],
     stall_closes: [AtomicU64; STALL_CLOSE_LABELS.len()],
     stall_would_close: [AtomicU64; STALL_CLOSE_LABELS.len()],
+    pipe_source: [AtomicU64; PIPE_SOURCE_LABELS.len()],
+    pipe_dropped: [AtomicU64; PIPE_DROP_LABELS.len()],
 }
 
 impl QuicDataCounters {
@@ -538,7 +564,22 @@ impl QuicDataCounters {
             late_end: std::array::from_fn(|_| zero()),
             stall_closes: std::array::from_fn(|_| zero()),
             stall_would_close: std::array::from_fn(|_| zero()),
+            pipe_source: std::array::from_fn(|_| zero()),
+            pipe_dropped: std::array::from_fn(|_| zero()),
         }
+    }
+
+    /// A pipe that ended `sent`, fed by a QUIC path or by UDP.
+    pub(crate) fn record_pipe_sent(&self, quic_fed: bool) {
+        let index = if quic_fed { 0 } else { 2 };
+        self.pipe_source[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A pipe that ended `dropped`, fed by a QUIC path or by UDP, for `cause`.
+    pub(crate) fn record_pipe_dropped(&self, quic_fed: bool, cause: PipeDropCause) {
+        let index = if quic_fed { 1 } else { 3 };
+        self.pipe_source[index].fetch_add(1, Ordering::Relaxed);
+        self.pipe_dropped[cause as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Where this node's data share is read from
@@ -893,6 +934,8 @@ impl QuicDataCounters {
             late_end: self.late_end.iter().map(get).collect(),
             stall_closes: self.stall_closes.iter().map(get).collect(),
             stall_would_close: self.stall_would_close.iter().map(get).collect(),
+            pipe_source: self.pipe_source.iter().map(get).collect(),
+            pipe_dropped: self.pipe_dropped.iter().map(get).collect(),
         }
     }
 }
@@ -1003,6 +1046,13 @@ pub struct QuicDataSnapshot {
     /// period, by `STALL_CLOSE_LABELS`.
     #[serde(default)]
     pub stall_would_close: Vec<u64>,
+    /// Pipes that ended sent or dropped in the period, by what fed them, by
+    /// `PIPE_SOURCE_LABELS`.
+    #[serde(default)]
+    pub pipe_source: Vec<u64>,
+    /// Pipes dropped in the period, by `PIPE_DROP_LABELS`.
+    #[serde(default)]
+    pub pipe_dropped: Vec<u64>,
     /// Sends whose end was late in the period (`path::LateEndCheck`), by
     /// `ACK_WAIT_EXPIRED_LABELS`.
     #[serde(default)]
@@ -1073,6 +1123,8 @@ impl QuicDataSnapshot {
             ack_wait_expired,
             stall_closes,
             stall_would_close,
+            pipe_source,
+            pipe_dropped,
             late_end,
         } = self;
         let mut keys = Vec::new();
@@ -1203,6 +1255,16 @@ impl QuicDataSnapshot {
             stall_would_close.clone(),
         );
         family(
+            "quic_pipe_source_",
+            PIPE_SOURCE_LABELS.iter().map(|l| l.to_string()).collect(),
+            pipe_source.clone(),
+        );
+        family(
+            "quic_pipe_dropped_",
+            PIPE_DROP_LABELS.iter().map(|l| l.to_string()).collect(),
+            pipe_dropped.clone(),
+        );
+        family(
             "quic_late_end_",
             ACK_WAIT_EXPIRED_LABELS
                 .iter()
@@ -1321,6 +1383,8 @@ impl QuicDataSnapshot {
             ack_wait_expired,
             stall_closes,
             stall_would_close,
+            pipe_source,
+            pipe_dropped,
             late_end,
         } = self;
         let any = |values: &[u64]| values.iter().any(|n| *n != 0);
@@ -1339,6 +1403,8 @@ impl QuicDataSnapshot {
             || any(ack_wait_expired)
             || any(stall_closes)
             || any(stall_would_close)
+            || any(pipe_source)
+            || any(pipe_dropped)
             || any(late_end)
             || [
                 *data_enabled,
