@@ -73,7 +73,7 @@ const FATAL_LISTENER_EXIT_CODE: i32 = 42;
 const FAST_CRASH_EXIT_CODE: i32 = 45;
 
 /// Minimum uptime for a fatal listener exit to be treated as a "ran healthily,
-/// then died" event eligible for the burst-exempt auto-update self-heal path
+/// then died" event eligible for the non-failure auto-update self-heal path
 /// (exit [`FATAL_LISTENER_EXIT_CODE`] = 42). A fatal exit BELOW this threshold is
 /// classified as a fast crash / boot-wedge and uses the counted
 /// [`FAST_CRASH_EXIT_CODE`] instead so a tight loop is rate-limited.
@@ -95,7 +95,7 @@ const MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT: Duration = Duration::from_secs(60);
 ///   [`FAST_CRASH_EXIT_CODE`] (45): a counted failure, so a tight boot-wedge loop
 ///   trips `StartLimitBurst` and the unit stops. The unit's `ExecStopPost` still
 ///   runs `freenet update` on 45, so a fixable boot-crash self-heals.
-/// - otherwise → [`FATAL_LISTENER_EXIT_CODE`] (42): burst-exempt, fires the
+/// - otherwise → [`FATAL_LISTENER_EXIT_CODE`] (42): non-failure, fires the
 ///   `freenet update` self-heal hook.
 ///
 /// `fast_crash_enabled` comes from [`EMIT_FAST_CRASH_EXIT_CODE`], which the binary
@@ -197,7 +197,7 @@ pub fn enable_abort_on_redb_poison() {
 /// #4549 / #4551 fatal-listener path, so the poison exit integrates with the
 /// existing crash-loop protection without adding a second policy:
 /// - poison after a healthy uptime (>= [`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`]) →
-///   [`FATAL_LISTENER_EXIT_CODE`] (42): burst-exempt, fires the `freenet update`
+///   [`FATAL_LISTENER_EXIT_CODE`] (42): non-failure, fires the `freenet update`
 ///   self-heal hook. A genuinely transient I/O blip (the #4604 case: a node that
 ///   ran healthily for hours) restarts cleanly without tripping `StartLimitBurst`.
 /// - poison within the healthy-uptime window, when the supervisor understands it →
@@ -697,7 +697,7 @@ impl NodeP2P {
                if !listener_exit_is_graceful(&e)
                    && ABORT_ON_FATAL_LISTENER_EXIT.load(std::sync::atomic::Ordering::Relaxed)
                {
-                   // #4551: pick 42 (burst-exempt, fires the auto-update self-heal
+                   // #4551: pick 42 (non-failure, fires the auto-update self-heal
                    // hook) for a node that ran healthily before dying, vs the counted
                    // FAST_CRASH_EXIT_CODE for a fast crash / boot-wedge so a tight loop
                    // trips the unit's StartLimitBurst and is stopped instead of looping.
@@ -1241,7 +1241,7 @@ mod tests {
         );
         assert_ne!(
             FAST_CRASH_EXIT_CODE, FATAL_LISTENER_EXIT_CODE,
-            "a fast crash must NOT reuse the burst-exempt update code 42"
+            "a fast crash must NOT reuse the non-failure update code 42"
         );
         // 43 = EXIT_CODE_ALREADY_RUNNING (RestartPreventExitStatus), 44 =
         // EXIT_CODE_BUNDLE_UPDATE_STAGED. The fast-crash code must avoid both.
@@ -1283,7 +1283,7 @@ mod tests {
     /// #4551: with fast-crash enabled (a 45-aware systemd unit), a fatal listener exit
     /// that happens *soon* after start is a fast crash / boot-wedge — it must use the
     /// counted [`FAST_CRASH_EXIT_CODE`] so a tight loop trips the limiter. An exit after
-    /// a *healthy* uptime keeps the burst-exempt update code 42 so a real fault/update
+    /// a *healthy* uptime keeps the non-failure update code 42 so a real fault/update
     /// self-heals and is never rate-limited.
     #[test]
     fn fatal_listener_exit_code_distinguishes_fast_crash_from_healthy_uptime() {
@@ -1307,7 +1307,7 @@ mod tests {
             assert_eq!(
                 fatal_listener_exit_code(Duration::from_secs(secs), true),
                 FATAL_LISTENER_EXIT_CODE,
-                "a fatal exit after {secs}s uptime keeps the burst-exempt update code"
+                "a fatal exit after {secs}s uptime keeps the non-failure update code"
             );
         }
     }
@@ -1340,7 +1340,7 @@ mod tests {
 
     /// #4604: the redb-poison fast-exit reuses [`fatal_listener_exit_code`], so it
     /// inherits the crash-loop protection exactly:
-    /// - A poison after a *healthy* uptime exits 42 (burst-exempt, fires the
+    /// - A poison after a *healthy* uptime exits 42 (non-failure, fires the
     ///   auto-update hook): a one-off transient I/O blip restarts cleanly.
     /// - A poison *within* the healthy window, under a supervisor that understands
     ///   it, exits the COUNTED code 45 — so a database that re-poisons on every boot
@@ -1359,12 +1359,12 @@ mod tests {
                  code so a corrupt node does not restart-loop forever (#4604/#4591)"
             );
         }
-        // A genuinely transient poison after a healthy run → burst-exempt update
+        // A genuinely transient poison after a healthy run → non-failure update
         // code so the restart self-heals and is never rate-limited.
         assert_eq!(
             fatal_listener_exit_code(MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT, true),
             FATAL_LISTENER_EXIT_CODE,
-            "a transient poison after a healthy uptime restarts via the burst-exempt \
+            "a transient poison after a healthy uptime restarts via the non-failure \
              update code (the #4604 real-world case: ran healthily for hours)"
         );
         // Both codes are ones the supervisor already handles (declared in the

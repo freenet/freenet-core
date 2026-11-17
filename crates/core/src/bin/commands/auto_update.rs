@@ -54,7 +54,7 @@ pub const SUPERVISED_ENV_VAR: &str = "FREENET_SUPERVISED";
 /// marker. Unlike [`SUPERVISED_ENV_VAR`], the macOS/Windows run-wrapper does NOT set
 /// it (the wrapper only understands exit 42), and an OLD systemd unit (e.g. a node
 /// auto-updated to a 45-aware binary but whose unit file was never regenerated) won't
-/// have it either — so in those cases the node keeps emitting the burst-exempt
+/// have it either — so in those cases the node keeps emitting the non-failure
 /// self-healing exit 42 rather than a 45 the supervisor would mishandle.
 pub const SYSTEMD_FAST_CRASH_ENV_VAR: &str = "FREENET_SYSTEMD_FAST_CRASH";
 
