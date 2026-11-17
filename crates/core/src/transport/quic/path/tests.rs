@@ -1643,6 +1643,51 @@ fn concurrent_large_streams_on_a_slow_path_see_no_expiry() {
     })
 }
 
+/// The backlog read again at an ack wait's end (`later_backlog`), with
+/// literal values at a 32 KiB/s floor:
+/// - nothing acknowledged since the end: the bytes ahead at the floor, from
+///   each send in flight at the end its rest, and from the sends started
+///   since their own bytes but at most the rest each;
+/// - the connection acknowledged at least the bytes ahead: nothing more, so a
+///   busy path that acknowledges quickly is judged at its first wait;
+/// - one byte short of that: the bytes ahead are given.
+#[test]
+fn the_later_backlog_counts_bytes_ahead_until_they_are_acknowledged() {
+    const FLOOR: u64 = 32 * 1024;
+    let reading = |started: u64, started_bytes: u64, acked: u64| LaterReading {
+        in_flight: 2,
+        rest: 64 * 1024,
+        started,
+        started_bytes,
+        acked_since_end: acked,
+    };
+    // 2 x 64 KiB in flight, nothing started since: 128 KiB, 4 s.
+    assert_eq!(
+        later_backlog(reading(0, 0, 0), FLOOR),
+        Duration::from_secs(4)
+    );
+    // Ten started since, 1 MiB each but at most the rest each: +640 KiB.
+    assert_eq!(
+        later_backlog(reading(10, 10 * MIB as u64, 0), FLOOR),
+        Duration::from_secs(24)
+    );
+    // Ten started since, 1 KiB each: their own bytes, +10 KiB.
+    assert_eq!(
+        later_backlog(reading(10, 10 * 1024, 0), FLOOR),
+        Duration::from_secs(5)
+    );
+    // The bytes ahead (768 KiB) acknowledged since the end: nothing more.
+    let ahead = 768 * 1024;
+    assert_eq!(
+        later_backlog(reading(10, 10 * MIB as u64, ahead), FLOOR),
+        Duration::ZERO
+    );
+    assert_eq!(
+        later_backlog(reading(10, 10 * MIB as u64, ahead - 1), FLOOR),
+        Duration::from_secs(24)
+    );
+}
+
 /// A 1 MiB stream whose end goes out at once, then fifteen more started right
 /// after it, on a 40 KiB/s link (a 400 ms round trip, a 1 s queue): the first
 /// stream's rest drains at a sixteenth of the link (about 400 s), so its
@@ -6158,6 +6203,60 @@ fn stalls_after_first_chunk()
 /// peer.
 async fn never() -> Result<(), QuicSendError> {
     futures::future::pending().await
+}
+
+/// An ack wait that covers the backlog reads it again once, when it first
+/// runs out (`SendProgress::mark_finished_after`), on virtual time with an
+/// end never acknowledged (the send blocks after it), first wait 10 s:
+/// - the re-read gives nothing (the bytes ahead were acknowledged,
+///   `later_backlog`): the wait ends at 10 s, so a peer that withholds the
+///   end on a busy path is judged at the first wait;
+/// - it gives 40 s: the wait ends at 40 s;
+/// - it gives 40 s at the first read and more after: read once, so 40 s;
+/// - without the re-read (`later` None): 10 s.
+#[test]
+fn an_ack_wait_reads_its_backlog_again_once() {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let took = drive(&time, LIMIT, async move {
+            let deadlines = SendDeadlines {
+                ack_wait: Some(Duration::from_secs(10)),
+                ack_wait_covers_backlog: true,
+                ..SendDeadlines::stream(1000)
+            };
+            let mut took = Vec::new();
+            for gives in [vec![0u64], vec![40], vec![40, 80, 160], vec![]] {
+                let reads = Arc::new(AtomicU64::new(0));
+                let later: Option<super::bounded::LaterBacklog> = (!gives.is_empty()).then(|| {
+                    let reads = reads.clone();
+                    Arc::new(move || {
+                        let n = reads.fetch_add(1, Relaxed) as usize;
+                        Duration::from_secs(gives[n.min(gives.len() - 1)])
+                    }) as super::bounded::LaterBacklog
+                });
+                let start = clock.now();
+                let outcome = bounded_send(&clock, deadlines, None, |progress| async move {
+                    progress.mark_opened();
+                    progress.mark_finished_after(Duration::from_secs(1), later);
+                    never().await
+                })
+                .await;
+                assert!(
+                    matches!(
+                        outcome,
+                        BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
+                    ),
+                    "{outcome:?}"
+                );
+                took.push(((clock.now() - start).as_secs(), reads.load(Relaxed)));
+            }
+            took
+        })
+        .await;
+        assert_eq!(took, vec![(10, 1), (40, 1), (40, 1), (10, 0)]);
+    })
 }
 
 /// `bounded_send`'s classification, on virtual time with sends that block: a

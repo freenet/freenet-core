@@ -167,7 +167,7 @@ fn run_why(ticks: u64, mut at: impl FnMut(u64) -> Reading) -> Option<(u64, Stall
         )
         .with_rtt(r.rtt)
     };
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)), false);
     (1..=ticks).find_map(|tick| {
         watch
             .observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(tick)))
@@ -200,7 +200,7 @@ fn run_observed_snapshot(
 }
 
 /// [`run_observed_snapshot`] on a path that has a UDP session to fall back to,
-/// or not (`AckWatch::with_udp_fallback`).
+/// or not (the `udp_fallback` of `AckWatch::new`).
 fn run_observed_snapshot_with(
     ticks: u64,
     carries_data: bool,
@@ -230,9 +230,8 @@ fn run_observed_snapshot_with(
         )
     };
     let flag = Arc::new(std::sync::atomic::AtomicBool::new(carries_data));
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)))
-        .observing(flag, counters)
-        .with_udp_fallback(udp_fallback);
+    let mut watch =
+        AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)), udp_fallback).observing(flag, counters);
     let closed = (1..=ticks).find_map(|tick| {
         watch
             .observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(tick)))
@@ -262,7 +261,7 @@ fn a_dark_episode_on_a_data_path_is_also_counted_as_carried() {
 /// A dark spell of 30 s (sends from tick 1, the peer heard from again at tick
 /// 16) on a path that carries no data is not closed and is counted to its end:
 /// 30 s, in `recovered_lt_120s`. On a path that carries data (and, as a watch
-/// built without `with_udp_fallback` is, has no UDP session) the dark-path rule
+/// built with `udp_fallback` false is, has no UDP session) the dark-path rule
 /// closes it at the window, counted `closed_at_window`.
 #[test]
 fn a_path_without_data_counts_a_dark_spell_to_its_end() {
@@ -321,9 +320,8 @@ fn the_watch_publishes_that_the_dark_rule_would_have_closed() {
     };
     let run = |at: &dyn Fn(u64) -> Reading, ticks: u64| {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)))
-            .with_udp_fallback(true)
-            .publishing_dark(flag.clone());
+        let mut watch =
+            AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)), true).publishing_dark(flag.clone());
         (1..=ticks)
             .map(|tick| {
                 let closed = watch.observe(tick * ACK_WATCH_TICK.as_secs() * SEC, sample(at(tick)));
@@ -367,8 +365,7 @@ fn the_watch_publishes_the_last_sample_of_a_long_dark_episode() {
     };
     let run = |at: &dyn Fn(u64) -> Reading, ticks: u64| {
         let published = Arc::new(AtomicU64::new(0));
-        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)))
-            .with_udp_fallback(true)
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)), true)
             .publishing_long_dark(published.clone());
         (1..=ticks)
             .map(|tick| {
@@ -473,7 +470,7 @@ fn run_at(times: &[u64], mut at: impl FnMut(usize) -> Reading) -> Option<(usize,
             NO_CAP,
         )
     };
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(at(0)), false);
     (1..times.len()).find_map(|i| {
         watch
             .observe(times[i] * SEC, sample(at(i)))
@@ -571,7 +568,7 @@ fn a_dark_spell_survives_a_lost_post_window_probe_round() {
             )
             .with_rtt(rtt)
         };
-        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), false);
         (1..=40u64).find_map(|t| {
             watch
                 .observe(t * 2 * SEC, sample(t))
@@ -802,7 +799,7 @@ fn a_new_controller_restarts_the_window() {
     let first: Arc<Mutex<AckState>> = Arc::default();
     let second: Arc<Mutex<AckState>> = Arc::default();
     let s = |record, sent, received| AckSample::synthetic(record, 0, 0, 0, sent, received, NO_CAP);
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, s(&first, 0, 0));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, s(&first, 0, 0), false);
     assert!(!watch.observe(2 * SEC, s(&first, 1, 1)));
     assert!(!watch.observe(4 * SEC, s(&second, 2, 2)));
     assert!(!watch.observe(6 * SEC, s(&second, 3, 3)));
@@ -1642,7 +1639,7 @@ fn a_stall_of_this_sides_runtime_does_not_starve_the_credit_rule() {
             1,
         )
     };
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), false);
     let closed = (1..times.len()).find_map(|i| {
         watch
             .observe(times[i] * SEC, sample(i as u64))
@@ -1704,7 +1701,7 @@ fn run_stream_credit(ticks: u64, at: impl Fn(u64) -> (usize, u64, u64)) -> Optio
         AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
             .with_stream_credit(waiting, acked, opened)
     };
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), false);
     (1..=ticks).find_map(|t| {
         watch
             .observe(t * 2 * SEC, sample(t))
@@ -1818,7 +1815,7 @@ fn a_peer_that_withholds_a_small_stream_limit_is_closed() {
 /// Feed a watch a busy conforming peer's readings (acknowledgements every
 /// tick, so no other rule closes it), one at each of `times` (seconds), with
 /// `expiries(i)` ack waits run out so far, on a path with a UDP session or
-/// not (`AckWatch::with_udp_fallback`); the indices at which the ack-wait
+/// not (the `udp_fallback` of `AckWatch::new`); the indices at which the ack-wait
 /// expiry rule would have closed the path, and the index at which anything
 /// closed it, where the run stops.
 fn run_expiries(
@@ -1832,7 +1829,7 @@ fn run_expiries(
         AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
             .with_ack_wait_expiries(expiries(i))
     };
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0)).with_udp_fallback(udp_fallback);
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), udp_fallback);
     let mut would = Vec::new();
     for (i, time) in times.iter().enumerate().skip(1) {
         let before = watch.would_close();

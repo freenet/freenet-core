@@ -1162,7 +1162,7 @@ pub(crate) struct AckWatch {
     /// When the previous sample was taken, on the watch's clock.
     previous_now: Option<u64>,
     /// Whether the path carries data, so the dark-path rule may close it (only
-    /// one with no UDP session, [`Self::with_udp_fallback`]); `None` is a path
+    /// one with no UDP session, `udp_fallback` of [`Self::new`]); `None` is a path
     /// that does. A path that carries none only counts its dark episodes, to
     /// their end ([`Self::observing`]).
     carries_data: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -1247,7 +1247,11 @@ impl AckWatch {
         cap_held(&mut self.hold_unchanged_since, now_nanos, cap, previous)
     }
 
-    pub(crate) fn new(window: Duration, first: AckSample) -> Self {
+    /// A watch over `window` from the sample `first`, on a path with a UDP
+    /// session to fall back to or not: the dark rule and the ack-wait expiry
+    /// rule close only a path without one ([`DARK_CLOSES_WITH_UDP`],
+    /// [`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]), and only count on one with one.
+    pub(crate) fn new(window: Duration, first: AckSample, udp_fallback: bool) -> Self {
         let expiries_seen = first.ack_wait_expiries;
         let window_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
         Self {
@@ -1275,7 +1279,7 @@ impl AckWatch {
             expiries_seen,
             expiries_at: VecDeque::new(),
             would_close: 0,
-            udp_fallback: false,
+            udp_fallback,
             dark_would_closed: false,
             dark_flag: None,
             long_dark_at: None,
@@ -1315,13 +1319,6 @@ impl AckWatch {
     #[cfg(test)]
     pub(crate) fn would_have_closed_dark(&self) -> bool {
         self.dark_would_closed
-    }
-
-    /// Whether the path has a UDP session to fall back to; on one the dark
-    /// rule counts and does not close ([`DARK_CLOSES_WITH_UDP`]).
-    pub(crate) fn with_udp_fallback(mut self, udp_fallback: bool) -> Self {
-        self.udp_fallback = udp_fallback;
-        self
     }
 
     /// `now_nanos` on the watch's own clock, which leaves out the time a late
@@ -1369,7 +1366,7 @@ impl AckWatch {
 
     /// Count dark episodes in `node`, and let the dark-path rule close the
     /// path only while `carries_data` is set (and then only a path with no UDP
-    /// session, [`Self::with_udp_fallback`]). On a path that carries no data
+    /// session, `udp_fallback` of [`Self::new`]). On a path that carries no data
     /// (every path while no release sends data on QUIC), an episode runs to
     /// its end, so the counts show how long real dark spells last against the
     /// rule's window. Durations are read at the samples, so they are good to
@@ -2001,9 +1998,8 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         return;
     };
     let mut received = first.received;
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first)
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first, udp_fallback)
         .observing(carries_data, report.node)
-        .with_udp_fallback(udp_fallback)
         .publishing_dark(dark)
         .publishing_long_dark(long_dark_at);
     loop {

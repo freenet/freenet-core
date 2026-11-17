@@ -792,10 +792,11 @@ pub(crate) struct QuicPath {
     /// ([`STREAMED_SEND_LIMIT`]), so the remaining uni stream slots stay
     /// for short messages and control frames. Never closed.
     stream_slots: Arc<tokio::sync::Semaphore>,
-    /// Permits taken from `stream_slots` since the path was built: a
-    /// stream's ack wait reads it again at its end, to count the streamed
+    /// Permits taken from `stream_slots` since the path was built, and the
+    /// bytes of the sends that took them (each at most the send window): a
+    /// stream's ack wait reads both again at its end, to count the streamed
     /// sends started after the stream's end was sent ([`Self::backlog_wait`]).
-    stream_opens: Arc<AtomicU64>,
+    stream_opens: Arc<StreamOpens>,
     /// Sends with data still to write, for the credit rule
     /// (`recycle::CreditWatch`).
     writers: Arc<recycle::Writers>,
@@ -1422,38 +1423,53 @@ impl QuicPath {
     ///
     /// Streamed sends started after the end share the link with the rest
     /// too, so the backlog is read again when the ack wait runs out
-    /// ([`bounded::LaterBacklog`]): the sends in flight when the end was
-    /// sent plus every permit taken since, each counted as sharing the link
-    /// for the whole wait (an upper bound: some may have ended), times the
-    /// rest, at the floor at the round trip then. Without it, a burst of
-    /// sends just after an end could make an honest peer's acknowledgement
-    /// of that end come after its wait (#6205).
+    /// ([`bounded::LaterBacklog`], [`later_backlog`]). Without it, a burst of
+    /// sends just after an end could make an honest peer's acknowledgement of
+    /// that end come after its wait (#6205).
     fn backlog_wait(&self, len: u64) -> Arc<dyn Fn() -> Backlog + Send + Sync> {
-        let (slots, connection, opens) = (
+        let (slots, connection, opens, acks) = (
             self.stream_slots.clone(),
             self.connection.inner().clone(),
             self.stream_opens.clone(),
+            self.ack_progress.clone(),
         );
         let rest = len.min(super::budget::MAX_WINDOW_BYTES);
         Arc::new(move || {
+            // The opens are read before the permits in use: an open between
+            // the two reads is then counted twice (in flight now, and as
+            // started since), which only lengthens the wait, never misses a
+            // send that shares the link.
+            let (opened, opened_bytes) = opens.read();
             let in_flight = (STREAMED_SEND_LIMIT as u64)
                 .saturating_sub(slots.available_permits() as u64)
                 .max(1);
-            let at_floor = {
+            let acked_at_end = acks.as_ref().map(recycle::AckProgress::acked_bytes);
+            let floor_now = {
                 let connection = connection.clone();
-                move |sends: u64| {
-                    let floor = recycle::credit_floor_rate(connection.stats().path.rtt).max(1);
-                    Duration::from_secs(sends.saturating_mul(rest).div_ceil(floor))
-                }
+                move || recycle::credit_floor_rate(connection.stats().path.rtt).max(1)
             };
-            let opened = opens.load(Ordering::Acquire);
-            let opens = opens.clone();
-            let wait = at_floor(in_flight);
+            let wait = Duration::from_secs(in_flight.saturating_mul(rest).div_ceil(floor_now()));
+            let (opens, acks) = (opens.clone(), acks.clone());
             Backlog {
                 wait,
                 later: Arc::new(move || {
-                    let since = opens.load(Ordering::Acquire).saturating_sub(opened);
-                    at_floor(in_flight.saturating_add(since))
+                    let (now_opened, now_bytes) = opens.read();
+                    let acked = match (&acks, acked_at_end) {
+                        (Some(acks), Some(at_end)) => acks.acked_bytes().saturating_sub(at_end),
+                        // No acknowledgement record: nothing is known to have
+                        // gone out, so the bound is the bytes alone.
+                        _ => 0,
+                    };
+                    later_backlog(
+                        LaterReading {
+                            in_flight,
+                            rest,
+                            started: now_opened.saturating_sub(opened),
+                            started_bytes: now_bytes.saturating_sub(opened_bytes),
+                            acked_since_end: acked,
+                        },
+                        floor_now(),
+                    )
                 }),
             }
         })
@@ -1717,7 +1733,10 @@ impl QuicPath {
         let (slot, pacing) = if fits_one_packet(payload.len() as u64) {
             (None, None)
         } else {
-            (Some(self.stream_slot().await?), self.pacing())
+            (
+                Some(self.stream_slot(payload.len() as u64).await?),
+                self.pacing(),
+            )
         };
         let mut send = self
             .open(&header, &[], slot, pacing, progress, Opener::Data)
@@ -1851,7 +1870,7 @@ impl QuicPath {
         self.debug_assert_carries_data();
         let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, payload.len() as u64, metadata.len())?;
-        let slot = self.stream_slot().await?;
+        let slot = self.stream_slot(header.total_len()).await?;
         let mut send = self
             .open(
                 &header,
@@ -1979,7 +1998,7 @@ impl QuicPath {
         self.debug_assert_carries_data();
         let metadata = frame_metadata(metadata);
         let header = FrameHeader::stream(stream_id, total_len, metadata.len())?;
-        let slot = self.stream_slot().await?;
+        let slot = self.stream_slot(header.total_len()).await?;
         let source_wait = progress.clone();
         let mut send = self
             .open(
@@ -2046,10 +2065,13 @@ impl QuicPath {
     /// [`STREAMED_SEND_LIMIT`]; waits while all are taken, or until the
     /// connection ends: the semaphore is never closed, so a waiter would
     /// otherwise sit out its deadline holding on to a path that has ended.
-    async fn stream_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QuicSendError> {
+    async fn stream_slot(
+        &self,
+        len: u64,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, QuicSendError> {
         if let Ok(permit) = Arc::clone(&self.stream_slots).try_acquire_owned() {
             self.stats.node.record_permit(false);
-            self.stream_opens.fetch_add(1, Ordering::AcqRel);
+            self.stream_opens.record(len);
             return Ok(permit);
         }
         self.stats.node.record_permit(true);
@@ -2061,7 +2083,7 @@ impl QuicPath {
             error = connection.closed() => Err(error.into()),
         };
         if permit.is_ok() {
-            self.stream_opens.fetch_add(1, Ordering::AcqRel);
+            self.stream_opens.record(len);
         }
         permit
     }
@@ -2404,6 +2426,80 @@ struct Outgoing {
     /// How long the backlog ahead of this stream's end may take, read when
     /// the end is sent ([`QuicPath::backlog_wait`]).
     backlog: Option<Arc<dyn Fn() -> Backlog + Send + Sync>>,
+}
+
+/// Permits taken from a path's `stream_slots` and the bytes of the sends that
+/// took them, each at most the send window ([`QuicPath::backlog_wait`]).
+#[derive(Default)]
+pub(crate) struct StreamOpens {
+    count: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl StreamOpens {
+    fn record(&self, len: u64) {
+        self.bytes
+            .fetch_add(len.min(super::budget::MAX_WINDOW_BYTES), Ordering::AcqRel);
+        self.count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The count, then the bytes. Each is read once; the count first, since
+    /// a send records its bytes first.
+    fn read(&self) -> (u64, u64) {
+        let count = self.count.load(Ordering::Acquire);
+        (count, self.bytes.load(Ordering::Acquire))
+    }
+}
+
+/// What a stream's ack wait reads again at its end ([`later_backlog`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LaterReading {
+    /// Streamed sends in flight when the end was sent, this one included.
+    pub(crate) in_flight: u64,
+    /// What was left of the stream then, at most its send window.
+    pub(crate) rest: u64,
+    /// Streamed sends started since, and their bytes (each at most a send
+    /// window).
+    pub(crate) started: u64,
+    pub(crate) started_bytes: u64,
+    /// Bytes the connection has acknowledged since the end was sent.
+    pub(crate) acked_since_end: u64,
+}
+
+/// How long a stream's end may take from when it was sent, read again when
+/// its ack wait runs out (`bounded::LaterBacklog`); the wait is extended to
+/// it only if it is longer than what was read at the end.
+///
+/// quinn shares the link round-robin among the streams with data, so while
+/// this stream has data each other stream sends at most as much as it does.
+/// What can go before this stream's last byte is therefore at most `rest`
+/// from each send in flight at the end (this one included), and from the
+/// sends started since, their own bytes but at most `rest` each:
+/// `min(started_bytes, started x rest)`. That is the bytes ahead, given at
+/// the credit floor.
+///
+/// Once the connection has acknowledged at least the bytes ahead since the
+/// end, this stream's last byte has gone out with them, and its end is late
+/// whatever else is still in flight: nothing more is given (zero). So a busy
+/// path that acknowledges quickly gains nothing from the re-read, and a peer
+/// that withholds stream ends while this node keeps sending is judged at the
+/// first wait, not at the 2 h total; a slow path, which acknowledges the
+/// bytes ahead slowly, is given their time at the floor.
+pub(crate) fn later_backlog(reading: LaterReading, floor: u64) -> Duration {
+    let LaterReading {
+        in_flight,
+        rest,
+        started,
+        started_bytes,
+        acked_since_end,
+    } = reading;
+    let ahead = in_flight
+        .saturating_mul(rest)
+        .saturating_add(started_bytes.min(started.saturating_mul(rest)));
+    if acked_since_end >= ahead {
+        return Duration::ZERO;
+    }
+    Duration::from_secs(ahead.div_ceil(floor.max(1)))
 }
 
 /// The backlog ahead of a stream's end ([`QuicPath::backlog_wait`]): how long

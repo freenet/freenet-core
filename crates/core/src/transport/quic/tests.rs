@@ -2334,7 +2334,7 @@ fn a_hold_left_by_an_ended_connection_stops_pausing_the_ack_watch() {
     let record = Arc::default();
     let tick = ACK_WATCH_TICK.as_secs();
     let sample = |t: u64| AckSample::synthetic(&record, 5, 5, 0, 10 + t, 100 + t, holds.read());
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), false);
     let closed = (1..=200u64)
         .find(|t| watch.observe(t * tick * 1_000_000_000, sample(*t)))
         .map(|t| Duration::from_secs(t * tick));
@@ -2387,7 +2387,7 @@ fn a_held_connection_does_not_pause_another_connections_ack_watch() {
     let tick = ACK_WATCH_TICK.as_secs();
     let sample_other =
         |t: u64| AckSample::synthetic(&record, 5, 5, 0, 10 + t, 100 + t, other.read());
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample_other(0));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample_other(0), false);
     let closed = (1..=50u64).find(|t| {
         // The held connection's poller is polled every tick and still waits.
         assert!(held_poller.as_mut().poll_writable(&mut cx).is_pending());
@@ -4974,7 +4974,7 @@ async fn watch_for(
     ticks: u32,
 ) -> Option<(u32, super::recycle::Stall)> {
     use super::recycle::{ACK_WATCH_TICK, ACK_WATCH_WINDOW, AckWatch};
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, ack_sample(connection, writers));
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, ack_sample(connection, writers), false);
     for tick in 1..=ticks {
         time.sleep(ACK_WATCH_TICK).await;
         if watch.observe(time.now_nanos(), ack_sample(connection, writers)) {

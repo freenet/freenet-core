@@ -290,6 +290,8 @@ struct ProgressState {
     /// Reads the backlog again, counting the streamed sends started since
     /// the end was sent ([`SendProgress::mark_finished_after`]).
     later_backlog: std::sync::OnceLock<LaterBacklog>,
+    /// The backlog was read again ([`LaterBacklog`]); it is read once.
+    later_read: AtomicBool,
 }
 
 /// The backlog ahead of a stream's end read again, at the ack wait's end:
@@ -319,6 +321,7 @@ impl SendProgress {
             ack_wait_deadline: AtomicU64::new(0),
             backlog_wait: AtomicU64::new(0),
             later_backlog: std::sync::OnceLock::new(),
+            later_read: AtomicBool::new(false),
         }))
     }
 
@@ -342,6 +345,7 @@ impl SendProgress {
             ack_wait_deadline: AtomicU64::new(0),
             backlog_wait: AtomicU64::new(0),
             later_backlog: std::sync::OnceLock::new(),
+            later_read: AtomicBool::new(false),
         }))
     }
 
@@ -457,6 +461,8 @@ impl SendProgress {
     /// share the link with what is left of the stream, so its end may need
     /// longer than the backlog read now. The wait is then extended to what
     /// `later` reads, within its total, before it is judged to have run out.
+    /// `later` is read once, when the wait first runs out, so the extension
+    /// is bounded by what was started by then.
     pub(super) fn mark_finished_after(&self, backlog: Duration, later: Option<LaterBacklog>) {
         if let Some(later) = later {
             let _first = self.0.later_backlog.set(later);
@@ -940,8 +946,11 @@ where
                     // The ack wait ran out: read its backlog again, with the
                     // streamed sends started since the end. If they moved
                     // its deadline past now, wait on (`mark_finished_after`).
+                    // Read once: the wait it gives is judged, so a path that
+                    // keeps starting sends cannot keep extending it.
                     if progress.stage() == STAGE_FINISHED
                         && deadlines.ack_wait_covers_backlog
+                        && !progress.0.later_read.swap(true, Ordering::AcqRel)
                         && let Some(later) = progress.0.later_backlog.get()
                     {
                         let backlog = nanos(later());
