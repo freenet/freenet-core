@@ -3777,6 +3777,56 @@ async fn only_a_joiners_native_success_resets_its_demotion_streak() {
     }
 }
 
+/// With native connects off (production today) only UDP dials exist, and
+/// they merge by address exactly as before the beside-dial change: one
+/// handshake command, every requester answered by its outcome, nothing
+/// beside. Both outcomes.
+#[tokio::test]
+async fn udp_only_dials_still_merge_by_address() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::NatAttemptOrigin;
+    for (case, connects) in [(0u16, true), (1, false)] {
+        let mut h = Harness::new(&format!("udp-only-merge-{case}")).await;
+        let addr: SocketAddr = format!("203.0.113.235:{}", 6270 + case).parse().unwrap();
+        let peer = PeerKeyLocation::new(key(), addr);
+        let mut first = pending_connect_peer_over(&mut h, peer.clone(), DialTransport::Udp).await;
+        let mut second = pending_connect_peer_over(&mut h, peer.clone(), DialTransport::Udp).await;
+        let mut dialled = 0;
+        while let Ok(command) = h.handshake_rx.try_recv() {
+            if matches!(command, HandshakeCommand::Connect { .. }) {
+                dialled += 1;
+            }
+        }
+        assert_eq!(dialled, 1, "the second request joins the first dial");
+        assert!(h.state.udp_beside_native.is_empty());
+        assert!(h.state.native_pending.is_empty());
+        let event = if connects {
+            HandshakeEvent::OutboundEstablished {
+                transaction: Transaction::new::<ConnectMsg>(),
+                peer: peer.clone(),
+                connection: Box::new(IdleConnection::new(addr)),
+                transient: false,
+                transport: DialTransport::Udp,
+                origin: NatAttemptOrigin::ConnectJoiner,
+            }
+        } else {
+            HandshakeEvent::OutboundFailed {
+                transaction: Transaction::new::<ConnectMsg>(),
+                peer: peer.clone(),
+                error: ConnectionError::Timeout,
+                transient: false,
+                transport: DialTransport::Udp,
+                native_outcome: None,
+                origin: NatAttemptOrigin::ConnectJoiner,
+            }
+        };
+        h.handshake_event(event).await;
+        let expected = if connects { Ok((addr, None)) } else { Err(()) };
+        assert_eq!(first.try_recv(), Ok(expected));
+        assert_eq!(second.try_recv(), Ok(expected));
+    }
+}
+
 /// A UDP dial asked for while a native dial to the same address is pending
 /// (another CONNECT's) starts at once BESIDE it, and a later UDP dial joins
 /// it. The native dial's failure answers only its own callbacks; the UDP
