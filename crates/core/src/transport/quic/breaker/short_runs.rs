@@ -2,7 +2,7 @@
 //! count short runs that panicked in QUIC code (#6031, peers on unix since
 //! #6151).
 //!
-//! The unix gateway's breaker asks whether a run crashed. Windows gives no
+//! The breaker of a gateway on Linux or macOS asks whether a run crashed. Windows gives no
 //! reliable way to answer that from the outside (a logoff, a Fast Startup
 //! shutdown, a session end and a `taskkill` all look alike), so this one asks the run
 //! itself: the failure the breaker exists for, a panic inside quinn's driver

@@ -496,14 +496,15 @@ inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 (`quic_endpoint_down`), panics the QUIC socket adapter caught
 (`quic_adapter_panicked`, once per endpoint; the process keeps running
 and no breaker state is left), QUIC crash-loop breaker trips at startup
-(`quic_breaker_trips`; for every peer, and a gateway on Windows, counted for
+(`quic_breaker_trips`; for every peer, a gateway on Windows and a gateway on a
+unix platform with no boot identity (anything but Linux and macOS), counted for
 runs in a row (two on a peer while UDP exists, so that when a release's
 crashes are all QUIC panics it trips before the post-update rollback's three
 crashes, which count any crash; three on a gateway) that ended
 within ten minutes after recording a panic in QUIC code (quinn, quinn-proto or
 transport/quic, by panic location), each starting within 24 h of the one before,
-and for a unix gateway for any abnormal end of a QUIC-enabled run, not only a
-QUIC fault;
+and for a gateway on Linux or macOS for any abnormal end of a QUIC-enabled run,
+not only a QUIC fault;
 a trip keeps QUIC off for 24 h on a peer and 15 min on a gateway (`BreakerRole`),
 doubling on repeat trips up to 4 h, and a gateway run with FREENET_SUPERVISED=1
 restarts itself at the cooldown's end; see
@@ -1184,26 +1185,30 @@ it must not wait unless it is a pacing point.
 #### QUIC endpoint (`transport/quic.rs`, #5940 step c2)
 
 `transport-quic` (config key: `off`, `shadow` or `prefer`; unset is
-`QuicMode::default_mode`, prefer on Linux, macOS and Windows and off
-elsewhere, since a gateway's breaker cannot trip without a boot identity) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
+`QuicMode::default_mode`, prefer on every platform: the breaker needs no boot
+identity, because peers and a gateway without one count short runs) decides whether `bind_udp_listener` builds a quinn endpoint over the DemuxSocket.
 `prefer` negotiates data with the share of pairs the ramp gives at the time ("Data
 slice" below; `upgrade::policy::log_startup` reports the share at INFO once per
 node, and each band the ramp enters is logged at INFO), and a pair with both bits
 sends its data on the path ("QUIC send route" below). The tree sets the ramp
-start for 0.2.158 (#6224), so `prefer` nodes, every Linux, macOS and Windows node
+start for 0.2.158 (#6224), so `prefer` nodes, every node on any platform
 that did not set the key, carry data with the ramp's share, and 0.2.158's release
 notes say so. With no ramp start (the emergency-stop build) and no
 `quic-data-percent` the share is 0, and `prefer` differs from `shadow` only by the
 bit, which stays 0. Off: no endpoint, no QUIC ingress, nothing
 changes, except that `off` set in the config is deprecated and logs a WARN at
 startup (`upgrade::policy::log_startup`); the endpoint state telemetry reports it
-as `off_config`. Windows has the same default since its crash-loop breaker was
-confirmed on a real Windows machine (#6031). The default is
+as `off_config`. Windows had the default first, once its crash-loop breaker was
+confirmed on a real Windows machine (#6031); every other platform (in practice
+Android and FreeBSD, self-built) has it since a gateway there with no boot
+identity decides by short runs too (`breaker::decides_by_short_runs`).
+`off_platform` is kept for telemetry stability and no build reports it. The default is
 read, never written to config.toml: a node that did not set the key follows the
 release it runs, so a default-off release is the kill switch for QUIC as a
 whole. Stopping only the data ramp is smaller: `QUIC_DATA_RAMP_START = None`
-with the defaults back to 0.2.156's, shadow on Linux and macOS and off on
-Windows (RELEASING.md, "Emergency stop"), which keeps Linux and macOS
+with the default mode back to 0.2.156's shape, shadow on Linux and macOS and
+off on every other platform (RELEASING.md, "Emergency stop": the release edits
+`QuicMode::default_mode` and the test `the_default_mode_is_prefer`), which keeps Linux and macOS
 endpoints and shadow paths up. Neither reaches
 a node that ever ran with `--transport-quic` or `FREENET_TRANSPORT_QUIC`: those
 are saved to config.toml like any setting (the Step 1 gateways are such nodes). Shadow or prefer: the endpoint is built
@@ -1958,7 +1963,7 @@ config value per node (off unless set, whatever the node default: the
 harness writes `off` into every node's config; an unknown value panics;
 tests that start nodes outside SimNetwork, in `crates/core/tests` and through
 freenet-test-network, get the platform default on purpose, as production does,
-except where a restart after SIGKILL would trip a unix gateway's breaker; a
+except where a restart after SIGKILL would trip a gateway's breaker on Linux or macOS; a
 peer's short-run rule does not count a SIGKILL), and the
 endpoint runs on the network's VirtualTime (`get_socket_virtual_time`;
 RealTime in production, pinned by
@@ -2030,7 +2035,8 @@ release goes out.
 - Step 1: nova gateways and framework in shadow for 24-48 h. The 24 h gateway
   A/B runs only if something looks odd. Rollback: set the key to off and restart.
 - Step 2: shadow on by default on Linux and macOS, then Windows once its
-  breaker was confirmed on a real machine (`QuicMode::default_mode`). Gate: at least 95% upgrade
+  breaker was confirmed on a real machine, then every other platform once no
+  platform lacked a breaker (`QuicMode::default_mode`). Gate: at least 95% upgrade
   success by `established_as_offerer / accepted`; fewer than 1 fallback per
   path-day excluding endpoint and restart causes; memory within the measured
   terms (about 0.3 to 0.5 MiB per idle path). An abort spike stops the step.
@@ -2055,7 +2061,7 @@ release goes out.
   data, not loosened.
 - Rollback at any step is a release through auto-update's 0-4 h stagger: for
   the data ramp, no ramp and 0.2.156's defaults (shadow on Linux and macOS, off
-  on Windows); default-off when QUIC itself is at fault. Per-path fallback to UDP and the breaker work without a release. A
+  on every other platform, including Windows); default-off when QUIC itself is at fault. Per-path fallback to UDP and the breaker work without a release. A
   node in a broken state may not self-update.
 
 Simulation scenarios (`tests/simulation_integration.rs`, `test_quic_*`): two
@@ -3423,7 +3429,7 @@ QUIC receive flow (#5940 e5b-4):
 
 #### QUIC errors, close codes and liveness (`quic/error.rs`, `quic/liveness.rs`, #5940 step e4)
 
-Live in production on Linux, macOS and Windows, where `prefer` is the default:
+Live in production on every platform, where `prefer` is the default:
 until a release's share reaches a pair its path carries control frames only,
 but endpoints, connections and their errors are real. With `transport-quic` off no endpoint is built and the transport
 reports `Disabled`.
@@ -3653,12 +3659,12 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     deterministic fault recurs once per start. The exception is a
     supervised gateway, which records the death in the breaker marker and
     exits (see above). A panic that is not
-    contained aborts the process. On a unix gateway the next start trips the
+    contained aborts the process. On a gateway on Linux or macOS the next start trips the
     breaker (quic_breaker_trips, see quic/breaker.rs): QUIC off for 15 min
     (doubling on repeat trips up to 4 h), and a supervised gateway restarts
     itself with exit 42 at the cooldown's end (breaker::quic_restore_at).
-    Every peer (24 h cooldown; on unix since #6151) and a Windows gateway
-    decide by short runs instead: the
+    Every peer (24 h cooldown; on unix since #6151), a Windows gateway and a
+    gateway on a unix platform with no boot identity decide by short runs instead: the
     breaker does not look at how a run ended: a panic hook records a panic located in QUIC
     code in the run's marker, and it counts runs that lasted under 10 minutes
     and recorded one, so the start after two such aborts in a row trips a

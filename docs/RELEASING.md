@@ -597,7 +597,7 @@ Current wire-gated floors:
   branch that only runs then has run.
 
   Release notes. The release that sets T0 must say in its notes that `prefer`
-  nodes, which is every Linux, macOS and Windows node that did not set `transport-quic`,
+  nodes, which is every node on any platform that did not set `transport-quic`,
   start carrying data with a growing share of their pairs. A release cut from
   main between the ramp code (#6138) and the T0 PR (0.2.157 was one) also
   changed something: it made `prefer` the default on Linux, macOS and Windows,
@@ -633,13 +633,18 @@ Current wire-gated floors:
   `prefer` node a share of 0, so none of its pairs carries data; only a node
   that set `quic-data-percent` keeps a share.
   `the_constants_are_in_a_shape_a_release_ships` fails a build whose default
-  on Linux and macOS is not `prefer` unless both are so. It also sets the default mode back to
-  0.2.156's: shadow on Linux and macOS, off on Windows. An emergency release
-  should only go back to states the field has run, and Windows with QUIC off
-  is what every release through 0.2.156 ran. So a Linux or macOS node that did not set
-  `transport-quic` keeps its endpoint with shadow paths (off would tear down
-  every endpoint mid-incident), and a Windows node turns QUIC off (the default
-  is read, never written to `config.toml`). A node that set
+  mode is not `prefer` unless both are so, on every platform.
+  The stop release also changes `QuicMode::default_mode` back to 0.2.156's
+  per-platform shape: shadow on Linux and macOS, off on Windows and on every
+  other platform. `default_mode` is `prefer` everywhere in the tree, so that
+  change goes with an edit of `the_default_mode_is_prefer` (in
+  `transport/quic/tests.rs`), which would otherwise fail; there is no compile
+  guard on the default, so the stop release needs no extra step to build. An
+  emergency release should only go back to states the field has run, and
+  every release through 0.2.156 ran those. So a Linux or macOS node that did
+  not set `transport-quic` keeps its endpoint with shadow paths (off would
+  tear down every endpoint mid-incident), and a node on any other platform
+  turns QUIC off (the default is read, never written to `config.toml`). A node that set
   `transport-quic = "prefer"` itself stays in prefer at a share of 0, which
   acts as shadow on the wire.
   A node takes either change only when it restarts into the release (an

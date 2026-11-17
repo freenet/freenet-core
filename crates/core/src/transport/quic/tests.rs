@@ -1941,10 +1941,20 @@ fn transport_quic_values_and_unknown_ones() {
     assert_eq!(QuicMode::from_config_value(Some("force")), QuicMode::Off);
     assert_eq!(QuicMode::from_config_value(Some("")), QuicMode::Off);
     assert_eq!(QuicMode::default(), QuicMode::default_mode());
-    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    // Prefer on every platform, not only the three that ship binaries.
     assert_eq!(QuicMode::from_config_value(None), QuicMode::Prefer);
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    assert_eq!(QuicMode::from_config_value(None), QuicMode::Off);
+}
+
+/// The default is `prefer` on every platform, not only the three that ship
+/// binaries. A test, not a const assertion, so the emergency-stop release
+/// (docs/RELEASING.md) can change this test alongside `default_mode` without
+/// a compile error. It runs on the host only, so a `cfg` that brought `off`
+/// back for another platform is not seen by it on a Linux host.
+#[test]
+fn the_default_mode_is_prefer() {
+    assert_eq!(QuicMode::default_mode(), QuicMode::Prefer);
+    assert_eq!(QuicMode::from_config_value(None), QuicMode::Prefer);
+    assert!(QuicMode::default_mode().builds_endpoint());
 }
 
 /// The socket sends one datagram per transmit and receives one per call.

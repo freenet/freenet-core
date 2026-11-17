@@ -518,7 +518,7 @@ fn configured_mode(config: &NetworkApiConfig) -> QuicMode {
 
 /// The QUIC endpoint state of a node that will not build an endpoint, decided
 /// before it binds: off by its `transport-quic` setting, off by this
-/// platform's default, or kept off by the crash-loop breaker (`gated_on` is
+/// build's default (none today), or kept off by the crash-loop breaker (`gated_on` is
 /// false although the mode builds one). `None` when the node goes on to build
 /// the endpoint; the bind then records `Up` or why it failed.
 pub(crate) fn endpoint_state_before_bind(
@@ -668,8 +668,9 @@ mod tests {
     ];
 
     /// Before the bind, a node reports off by config for `off` or an unknown
-    /// value, off by platform for an unset key on a platform whose default is
-    /// off, and off by the breaker when the breaker took the settings away;
+    /// value, off by platform for an unset key on a build whose default is
+    /// off (none today: the default is `prefer` on every platform, so only the
+    /// `else` arm below runs), and off by the breaker when the breaker took the settings away;
     /// otherwise it leaves the state to the bind.
     #[test]
     fn the_endpoint_state_before_bind_names_why_quic_is_off() {
@@ -879,15 +880,13 @@ mod tests {
         }
     }
 
-    /// The emergency-stop shape: a build whose default on Linux and macOS is not
-    /// `prefer` carries no data for a node that set `prefer` itself either, so
-    /// it has no ramp start and a fixed share of 0. Other platforms are left out
-    /// because their default is `off` in every release.
+    /// The emergency-stop shape: a build whose default is not `prefer`
+    /// carries no data for a node that set `prefer` itself either, so it has
+    /// no ramp start and a fixed share of 0. The default is `prefer` on every
+    /// platform, so this holds on all of them.
     #[test]
     fn the_constants_are_in_a_shape_a_release_ships() {
-        if cfg!(any(target_os = "linux", target_os = "macos"))
-            && QuicMode::default_mode() != QuicMode::Prefer
-        {
+        if QuicMode::default_mode() != QuicMode::Prefer {
             assert_eq!(
                 (QUIC_DATA_RAMP_START, QUIC_DATA_PERCENT),
                 (None, 0),
