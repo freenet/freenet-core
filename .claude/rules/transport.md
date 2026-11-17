@@ -521,9 +521,7 @@ failed native setup that connected (R5: a connection a node without UDP
 would not have made), `connect_native_both_dials_connected_{udp,native}_first`
 for a native dial and the UDP dial beside it that both connected (the native
 one kept), `connect_native_survivor_{swapped,udp_dropped}` for each
-survivor-rule decision, `connect_native_one_sided_drop` for a native
-connection that closed within `ONE_SIDED_DROP_WINDOW` (150 s) of winning the
-rule, and the last offer as states
+survivor-rule decision, and the last offer as states
 `connect_native_offer_{level,percent,ready}`; see
 `operations/connect/native.rs`) and the shadow-mode upgrade
 telemetry (below, "Upgrade telemetry"). Each label set is declared once in a
@@ -2299,11 +2297,13 @@ Fallback: a failed native setup is followed by today's UDP dial to the same
   keep/swap/drop. A dropped UDP dial's requesters are answered with the
   native holder's address, and an unused reservation at the dial's own
   address is released. Counted: connect_native_survivor_{swapped,udp_dropped},
-  connect_native_both_dials_connected_{udp,native}_first (beside pair only),
-  connect_native_one_sided_drop (a native entry that won, by swap or drop,
-  closing within 150 s; NOT a measure of one-sided setups: the simulation
-  shows it misses them when the server's UDP fallback cannot reach the
-  client and counts closes for other reasons; 10.2 item 20).
+  connect_native_both_dials_connected_{udp,native}_first (beside pair only).
+  One-sided native setups (one end connected, the other's setup failed;
+  10.2 item 20) are NOT counted locally: no counter at one end can see them
+  (a "native won then closed soon" counter was tried in #6255 and both
+  missed them and counted unrelated closes). They are measured by joining
+  both ends' setup outcomes by the CONNECT transaction (in simulation, the
+  native wire trace's native_setup_pairs).
   A UDP dial beside a native one that fails while the native dial is
   pending neither backs off (a 30 s backoff would refuse the native dial's
   own fallback) nor marks anything; once the native dial has ended without

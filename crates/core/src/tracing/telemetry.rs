@@ -3126,10 +3126,6 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.connect_native_survivor_udp_dropped),
             );
             m.insert(
-                "connect_native_one_sided_drop".into(),
-                serde_json::json!(snapshot.connect_native_one_sided_drop),
-            );
-            m.insert(
                 "connect_native_offer_level".into(),
                 serde_json::json!(snapshot.connect_native_offer_level),
             );

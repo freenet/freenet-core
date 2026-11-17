@@ -328,7 +328,6 @@ pub mod sim_trace {
         survivor_swapped: AtomicU64,
         survivor_udp_dropped: AtomicU64,
         survivor_inbound_dropped: AtomicU64,
-        one_sided_drops: AtomicU64,
     }
 
     /// How each end's native setup in a CONNECT ended: by (transaction, lower
@@ -400,8 +399,6 @@ pub mod sim_trace {
         /// it in for a UDP entry, or dropped the UDP connection, which
         /// arrived `inbound` or was this node's dial.
         Survivor { swapped: bool, inbound: bool },
-        /// A native connection closed soon after it won the survivor rule.
-        OneSidedDrop,
         /// The node `own`'s native setup with the peer at the recorded
         /// address in `tx` ended, with a connection or not.
         NativeSetupEnded {
@@ -491,7 +488,6 @@ pub mod sim_trace {
                 }
                 &c.survivor_udp_dropped
             }
-            NativeWireEvent::OneSidedDrop => &c.one_sided_drops,
             NativeWireEvent::UdpDialFor { tx, own, peer } => {
                 if c.fallbacks_pending.lock().remove(&(tx, own, peer)) {
                     c.fallbacks_dialled.fetch_add(1, Ordering::Relaxed);
@@ -677,11 +673,6 @@ pub mod sim_trace {
         /// arrived inbound.
         pub fn survivor_inbound_dropped(&self) -> u64 {
             Self::get(&self.0.survivor_inbound_dropped)
-        }
-        /// Native connections that closed soon after winning the survivor
-        /// rule.
-        pub fn one_sided_drops(&self) -> u64 {
-            Self::get(&self.0.one_sided_drops)
         }
         /// Native setups in one CONNECT whose two ends both ended, as (both
         /// ends, ends where exactly one side got a connection): the

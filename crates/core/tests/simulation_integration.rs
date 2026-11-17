@@ -23521,13 +23521,6 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
             sim.with_native_connect(100);
             if let Some(ms) = quic_delay {
                 sim.delay_quic_datagrams(Duration::from_millis(ms));
-                // A native connection the peer never finished then idles out
-                // within the run, as it would in the field (keepalives are
-                // off in simulation), so `connect_native_one_sided_drop` can
-                // be compared with the one-sided setups.
-                if order.is_none() {
-                    sim.with_quic_idle_timeout(Duration::from_secs(30));
-                }
             }
             if let Some(ms) = intro_delay {
                 sim.delay_udp_intros(Duration::from_millis(ms));
@@ -23573,7 +23566,6 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
             name,
             swapped = t.survivor_swapped(),
             udp_dropped = t.survivor_udp_dropped(),
-            one_sided_drops = t.one_sided_drops(),
             held_at_both_ends = both,
             native_at_both_ends = transports
                 .iter()
@@ -23586,11 +23578,10 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
             "survivor rule"
         );
         println!(
-            "{name}: swapped={} udp_dropped={} one_sided_drops={} held_at_both_ends={both} \
+            "{name}: swapped={} udp_dropped={} held_at_both_ends={both} \
              one_ended_native={one_ended_native:?} entries={}",
             t.survivor_swapped(),
             t.survivor_udp_dropped(),
-            t.one_sided_drops(),
             transports.len()
         );
         assert!(
@@ -23637,11 +23628,7 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
             );
         }
         let (pairs, one_sided) = t.native_setup_pairs();
-        println!(
-            "{name}: native setups with both ends ended: {pairs}, one-sided: {one_sided}, \
-             counted one_sided_drop: {}",
-            t.one_sided_drops()
-        );
+        println!("{name}: native setups with both ends ended: {pairs}, one-sided: {one_sided}");
         setups = (setups.0 + pairs, setups.1 + one_sided);
     }
     println!(

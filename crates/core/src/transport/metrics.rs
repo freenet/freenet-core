@@ -997,9 +997,6 @@ pub struct TransportMetrics {
     /// a native one holds the peer (reset each snapshot).
     connect_native_survivor_swapped: AtomicU64,
     connect_native_survivor_udp_dropped: AtomicU64,
-    /// A native connection that won the survivor rule closed within
-    /// `ONE_SIDED_DROP_WINDOW` of winning (reset each snapshot).
-    connect_native_one_sided_drop: AtomicU64,
     /// The last offer this node built: level, percent and whether it was
     /// ready to dial native (a state, never reset).
     connect_native_offer_level: AtomicU8,
@@ -1396,10 +1393,6 @@ thread_local! {
     /// native swapped in], for the same reason.
     pub(crate) static SURVIVOR_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
         const { std::cell::Cell::new([0; 2]) };
-
-    /// Test-only: one-sided drops on this thread, for the same reason.
-    pub(crate) static ONE_SIDED_DROPS_ON_THIS_THREAD: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -1509,7 +1502,6 @@ impl TransportMetrics {
             connect_native_both_dials_connected_native_first: AtomicU64::new(0),
             connect_native_survivor_swapped: AtomicU64::new(0),
             connect_native_survivor_udp_dropped: AtomicU64::new(0),
-            connect_native_one_sided_drop: AtomicU64::new(0),
             connect_native_offer_level: AtomicU8::new(0),
             connect_native_offer_percent: AtomicU8::new(0),
             connect_native_offer_ready: AtomicBool::new(false),
@@ -2101,14 +2093,6 @@ impl TransportMetrics {
             counts[usize::from(swapped)] += 1;
             count.set(counts);
         });
-    }
-
-    /// A native connection that won the survivor rule closed soon after.
-    pub(crate) fn record_connect_native_one_sided_drop(&self) {
-        self.connect_native_one_sided_drop
-            .fetch_add(1, Ordering::Relaxed);
-        #[cfg(test)]
-        ONE_SIDED_DROPS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     }
 
     /// This node turned its own QUIC-native connects off.
@@ -3014,7 +2998,6 @@ impl TransportMetrics {
             ),
             connect_native_survivor_swapped: get64(&self.connect_native_survivor_swapped),
             connect_native_survivor_udp_dropped: get64(&self.connect_native_survivor_udp_dropped),
-            connect_native_one_sided_drop: get64(&self.connect_native_one_sided_drop),
             connect_native_offer_level: self.connect_native_offer_level.load(Ordering::Relaxed),
             connect_native_offer_percent: self.connect_native_offer_percent.load(Ordering::Relaxed),
             connect_native_offer_ready: self.connect_native_offer_ready.load(Ordering::Relaxed),
@@ -3721,8 +3704,6 @@ pub struct TransportSnapshot {
     /// or a UDP connection dropped because a native one holds the peer.
     pub connect_native_survivor_swapped: u64,
     pub connect_native_survivor_udp_dropped: u64,
-    /// Native connections that closed soon after winning the survivor rule.
-    pub connect_native_one_sided_drop: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -4153,7 +4134,6 @@ impl TransportSnapshot {
             connect_native_both_dials_connected_native_first,
             connect_native_survivor_swapped,
             connect_native_survivor_udp_dropped,
-            connect_native_one_sided_drop,
             connect_native_offer_level,
             connect_native_offer_percent,
             connect_native_offer_ready,
@@ -4329,7 +4309,6 @@ impl TransportSnapshot {
             connect_native_both_dials_connected_native_first;
         self.connect_native_survivor_swapped = connect_native_survivor_swapped;
         self.connect_native_survivor_udp_dropped = connect_native_survivor_udp_dropped;
-        self.connect_native_one_sided_drop = connect_native_one_sided_drop;
         self.connect_native_offer_level = connect_native_offer_level;
         self.connect_native_offer_percent = connect_native_offer_percent;
         self.connect_native_offer_ready = connect_native_offer_ready;
@@ -4574,8 +4553,6 @@ struct SnapshotExtras {
     /// or a UDP connection dropped because a native one holds the peer.
     pub connect_native_survivor_swapped: u64,
     pub connect_native_survivor_udp_dropped: u64,
-    /// Native connections that closed soon after winning the survivor rule.
-    pub connect_native_one_sided_drop: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -4824,7 +4801,6 @@ impl SnapshotExtras {
             || self.connect_native_both_dials_connected_native_first != 0
             || self.connect_native_survivor_swapped != 0
             || self.connect_native_survivor_udp_dropped != 0
-            || self.connect_native_one_sided_drop != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -7391,7 +7367,6 @@ mod tests {
             "connect_native_both_dials_connected_native_first",
             "connect_native_survivor_swapped",
             "connect_native_survivor_udp_dropped",
-            "connect_native_one_sided_drop",
             "connect_native_offer_level",
             "connect_native_offer_percent",
             "connect_native_offer_ready",

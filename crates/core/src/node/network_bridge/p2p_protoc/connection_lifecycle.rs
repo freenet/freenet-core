@@ -5,14 +5,6 @@
 use super::*;
 use crate::transport::{ConnIdentity, TRANSPORT_METRICS};
 
-/// A native connection that won the survivor rule and closes within this
-/// long is counted as `connect_native_one_sided_drop`: likely the peer's
-/// native setup never finished, so the peer kept the UDP connection this
-/// node dropped. Longer than the QUIC idle timeout (120 s), so a native
-/// connection the peer never held, and that therefore ends only by idling
-/// out, is still counted.
-pub(super) const ONE_SIDED_DROP_WINDOW: Duration = Duration::from_secs(150);
-
 /// The identity telemetry kinds of a ConnectPeer for an existing connection.
 const CONNECT_PEER_KINDS: [ConnIdentity; 3] = [
     ConnIdentity::SetConnectPeer,
@@ -1263,7 +1255,6 @@ impl P2pConnManager {
                 if let Some(holder) =
                     self.native_holds_peer(remote_addr, peer.as_ref().map(|p| p.pub_key()))
                 {
-                    self.stamp_survivor_win(holder);
                     tracing::info!(
                         remote = %remote_addr,
                         %holder,
@@ -1350,7 +1341,6 @@ impl P2pConnManager {
                     // ran beside that native dial or not, and its requesters
                     // are answered with the native connection.
                     if let Some(holder) = self.native_holds_peer(peer_addr, Some(peer.pub_key())) {
-                        self.stamp_survivor_win(holder);
                         // The in-transit reservation this dial made at its
                         // own address is not used: the peer is held at
                         // `holder`. At the holder's own address it is the
@@ -1967,14 +1957,6 @@ impl P2pConnManager {
             .then_some(at)
     }
 
-    /// Notes that the native connection at `holder` just won the survivor
-    /// rule, for `connect_native_one_sided_drop`.
-    fn stamp_survivor_win(&mut self, holder: SocketAddr) {
-        if let Some(entry) = self.connections.get_mut(&holder) {
-            entry.won_over_udp_at = Some(Instant::now());
-        }
-    }
-
     /// The survivor rule's swap (see [`Self::native_holds_peer`]): a native
     /// connection to the peer whose UDP connection holds the entry at
     /// `peer_addr`, under the same key, takes over the entry's transport in
@@ -1983,7 +1965,7 @@ impl P2pConnManager {
     ///
     /// Replaced: the listener task, the sender to it, the connection id, the
     /// receipt stamp, the remote version (on the entry and on the
-    /// `ConnectionManager`), `native` and `won_over_udp_at`.
+    /// `ConnectionManager`) and `native`.
     ///
     /// Kept: the identity binding (its source too: the key is the same), the
     /// entry's `created_at` and link-use stamp, and everything the
@@ -2016,7 +1998,6 @@ impl P2pConnManager {
         entry.receipt = receipt;
         entry.remote_version = remote_version;
         entry.native = true;
-        entry.won_over_udp_at = Some(Instant::now());
         let link_use = entry.link_use.clone();
         drop(old_sender);
         // As `handle_successful_connection` keeps the two in step.
@@ -2286,7 +2267,6 @@ impl P2pConnManager {
                 // Only a QUIC-native connection's key is proven in its
                 // handshake, so the source says which transport this is.
                 native: matches!(source, IdentitySource::Proven),
-                won_over_udp_at: None,
             },
         );
         #[cfg(any(test, feature = "testing"))]
@@ -2831,28 +2811,6 @@ impl P2pConnManager {
                 // Look up the connection directly by address
                 if let Some(entry) = self.remove_connection(remote_addr) {
                     self.record_identity_teardown(remote_addr, &entry);
-                    // A native connection that won the survivor rule and closed
-                    // soon after: likely one-sided (the peer's native setup did
-                    // not finish, so it kept the UDP connection this node
-                    // dropped), which leaves the pair with no connection until
-                    // maintenance reconnects it.
-                    if entry.native
-                        && entry
-                            .won_over_udp_at
-                            .is_some_and(|at| at.elapsed() <= ONE_SIDED_DROP_WINDOW)
-                    {
-                        tracing::info!(
-                            remote = %remote_addr,
-                            %reason,
-                            "Native connection closed soon after it won the survivor rule"
-                        );
-                        TRANSPORT_METRICS.record_connect_native_one_sided_drop();
-                        #[cfg(any(test, feature = "testing"))]
-                        crate::operations::connect::native_wire_trace::record_at(
-                            remote_addr,
-                            crate::operations::connect::native_wire_trace::NativeWireEvent::OneSidedDrop,
-                        );
-                    }
                     tracing::debug!(self_peer = %self.bridge.op_manager.ring.connection_manager.pub_key, peer = ?entry.pub_key(), socket_addr = %remote_addr, conn_map_size = self.connections.len(), "[CONN_TRACK] REMOVE: TransportClosed - removing from connections HashMap");
                     let prune_result = self
                         .bridge

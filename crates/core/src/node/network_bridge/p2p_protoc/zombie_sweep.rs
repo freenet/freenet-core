@@ -1649,7 +1649,6 @@ mod tests {
                     link_use: LinkUseStamp::new(created),
                     remote_version: None,
                     native: false,
-                    won_over_udp_at: None,
                 },
             );
         }
@@ -1719,7 +1718,6 @@ mod tests {
             link_use,
             remote_version: None,
             native: false,
-            won_over_udp_at: None,
         }
     }
 
@@ -2516,7 +2514,6 @@ mod tests {
                 link_use: link_use.clone(),
                 remote_version: None,
                 native: false,
-                won_over_udp_at: None,
             },
         );
 

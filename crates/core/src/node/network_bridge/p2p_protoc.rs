@@ -569,11 +569,6 @@ struct ConnectionEntry {
     /// handed, a native and a UDP connection to one peer, it keeps the
     /// native one (`P2pConnManager::replace_transport_in_place`).
     native: bool,
-    /// When this native connection won the survivor rule against a UDP
-    /// connection to the same peer. Its close within
-    /// `ONE_SIDED_DROP_WINDOW` of that is counted as
-    /// `connect_native_one_sided_drop`.
-    won_over_udp_at: Option<Instant>,
 }
 
 impl ConnectionEntry {
@@ -5868,7 +5863,6 @@ pub(crate) mod tests {
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
                 native: false,
-                won_over_udp_at: None,
             },
         );
         let (tx2, _rx2) = mpsc::channel(1);
@@ -5883,7 +5877,6 @@ pub(crate) mod tests {
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
                 native: false,
-                won_over_udp_at: None,
             },
         );
 

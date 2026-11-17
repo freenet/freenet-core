@@ -4213,11 +4213,6 @@ fn survivor_here() -> (u64, u64) {
     (dropped, swapped)
 }
 
-/// One-sided drops on this thread.
-fn one_sided_here() -> u64 {
-    crate::transport::metrics::ONE_SIDED_DROPS_ON_THIS_THREAD.with(|c| c.get())
-}
-
 /// #6253 review round 2 (M3): the native dial connects but its connection is
 /// not kept (the transient budget is spent), so the requesters of the UDP
 /// dial beside it are not told they are connected; they wait for their own
@@ -4684,29 +4679,6 @@ async fn both_dials_counts_only_the_beside_pair() {
     beside::assert_clear(&h, addr);
 }
 
-/// A native connection that won the survivor rule and closes soon after is
-/// counted as a one-sided drop (the peer likely never held it); one that
-/// never competed with a UDP connection is not.
-#[tokio::test]
-async fn a_native_connection_closing_soon_after_winning_is_counted_one_sided() {
-    let mut h = Harness::new("survivor-one-sided").await;
-    let won: SocketAddr = "203.0.113.243:6360".parse().unwrap();
-    let alone: SocketAddr = "203.0.113.243:6361".parse().unwrap();
-    let won_peer = PeerKeyLocation::new(key(), won);
-    let alone_peer = PeerKeyLocation::new(key(), alone);
-    h.handshake_event(Arrival::OutboundUdp.event(&won_peer, false))
-        .await;
-    h.handshake_event(Arrival::Native.event(&won_peer, false))
-        .await;
-    h.handshake_event(Arrival::Native.event(&alone_peer, false))
-        .await;
-    let before = one_sided_here();
-    h.transport_closed(alone).await;
-    assert_eq!(one_sided_here(), before, "never competed");
-    h.transport_closed(won).await;
-    assert_eq!(one_sided_here(), before + 1, "closed soon after winning");
-}
-
 /// Gate 18, both ends: the two nodes of a pair see the same two connections
 /// in different orders and directions, and each keeps the native one, so
 /// they agree without exchanging anything. The #6253 round-3 case: the
@@ -4899,24 +4871,6 @@ async fn a_dropped_udp_dial_answers_with_the_holders_address() {
         "the reservation at the dialled address is released"
     );
     assert!(cm.is_in_ring(holder), "the holder stays in the ring");
-}
-
-/// #6255 review item 3: a native connection that won by having a UDP
-/// connection dropped (native first), inbound or dialled, and closes soon
-/// after is counted one-sided, as one that won by a swap is.
-#[tokio::test]
-async fn a_native_entry_that_won_by_a_drop_is_counted_one_sided() {
-    for (case, udp) in [(0u16, Arrival::InboundUdpKeyed), (1, Arrival::OutboundUdp)] {
-        let mut h = Harness::new(&format!("survivor-one-sided-drop-{case}")).await;
-        let addr: SocketAddr = format!("203.0.113.249:{}", 6430 + case).parse().unwrap();
-        let peer = PeerKeyLocation::new(key(), addr);
-        h.handshake_event(Arrival::Native.event(&peer, false)).await;
-        h.handshake_event(udp.event(&peer, false)).await;
-        assert!(h.mgr.connections[&addr].native, "premise: UDP dropped");
-        let before = one_sided_here();
-        h.transport_closed(addr).await;
-        assert_eq!(one_sided_here(), before + 1, "{udp:?}");
-    }
 }
 
 /// #6255 review L5: a swap with no entry to swap into is a caller bug; it
