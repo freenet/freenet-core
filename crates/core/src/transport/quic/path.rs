@@ -1444,6 +1444,7 @@ impl QuicPath {
                 .saturating_sub(slots.available_permits() as u64)
                 .max(1);
             let acked_at_end = acks.as_ref().map(recycle::AckProgress::acked_bytes);
+            let window_at_end = connection.stats().path.cwnd.max(LATE_END_MARGIN_MIN);
             let floor_now = {
                 let connection = connection.clone();
                 move || recycle::credit_floor_rate(connection.stats().path.rtt).max(1)
@@ -1464,6 +1465,7 @@ impl QuicPath {
                     started: now_opened.saturating_sub(opened),
                     started_bytes: now_bytes.saturating_sub(opened_bytes),
                     acked_since_end: acked,
+                    window_at_end,
                 }
             });
             let for_later = reading.clone();
@@ -2466,6 +2468,9 @@ pub(crate) struct LaterReading {
     pub(crate) started_bytes: u64,
     /// Bytes the connection has acknowledged since the end was sent.
     pub(crate) acked_since_end: u64,
+    /// The congestion window when the end was sent, at least
+    /// [`LATE_END_MARGIN_MIN`] ([`late_end_verdict`]).
+    pub(crate) window_at_end: u64,
 }
 
 /// How long a stream's end may take from when it was sent, read again when
@@ -2522,16 +2527,18 @@ pub(crate) fn late_end_grace(rtt: Duration) -> Duration {
 /// The least [`late_end_grace`].
 pub(crate) const LATE_END_GRACE_MIN: Duration = Duration::from_secs(2);
 
-/// Bytes past [`bytes_ahead`] the connection must have acknowledged since a
-/// stream's end before the end can be late: what was already in flight when
-/// it was sent is not ordered by the round-robin, and is at most a send
-/// window.
-pub(crate) const LATE_END_MARGIN: u64 = super::budget::MAX_WINDOW_BYTES;
+/// The least margin past [`bytes_ahead`] the connection must have
+/// acknowledged since a stream's end before the end can be late
+/// ([`LaterReading::window_at_end`]): what was already in flight when the end
+/// was sent, retransmissions included, is not ordered by the round-robin, and
+/// is at most the congestion window then.
+pub(crate) const LATE_END_MARGIN_MIN: u64 = 64 * 1024;
 
 /// Whether a stream's end, still unacknowledged at `now`, is late, given
-/// `ahead` ([`bytes_ahead`]) and `acked` (bytes the connection acknowledged
-/// since the end), with `crossed` the time `acked` first reached `ahead`
-/// plus [`LATE_END_MARGIN`] (set here). quinn shares the link round-robin, so
+/// `ahead` ([`bytes_ahead`] plus the congestion window when the end was sent,
+/// [`LaterReading::window_at_end`]) and `acked` (bytes the connection
+/// acknowledged since the end), with `crossed` the time `acked` first reached
+/// `ahead` (set here). quinn shares the link round-robin, so
 /// by then the end's last packet had been sent; an honest peer's QUIC stack
 /// acknowledges it like every other packet, within [`late_end_grace`] even
 /// when a copy is lost. Late once the grace has passed since `crossed`.
@@ -2542,7 +2549,7 @@ pub(crate) fn late_end_verdict(
     now: u64,
     rtt: Duration,
 ) -> bool {
-    if crossed.is_none() && acked >= ahead.saturating_add(LATE_END_MARGIN) {
+    if crossed.is_none() && acked >= ahead {
         *crossed = Some(now);
     }
     crossed.is_some_and(|at| now.saturating_sub(at) >= nanos(late_end_grace(rtt)))
@@ -2591,7 +2598,7 @@ impl LateEndCheck {
             let reading = (self.reading)();
             if late_end_verdict(
                 &mut crossed,
-                bytes_ahead(&reading),
+                bytes_ahead(&reading).saturating_add(reading.window_at_end),
                 reading.acked_since_end,
                 now,
                 (self.rtt)(),

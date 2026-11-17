@@ -1469,6 +1469,11 @@ fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes() {
             "premise: an ack wait ran out and its stream was reset"
         );
         assert_eq!(p.a.writers().ack_wait_expiries(), 0);
+        assert_eq!(
+            p.a.writers().late_ends(),
+            0,
+            "no late end on an honest path"
+        );
         assert!(p.a.connection().inner().close_reason().is_none());
     })
 }
@@ -1640,6 +1645,140 @@ fn concurrent_large_streams_on_a_slow_path_see_no_expiry() {
         );
         assert_eq!(p.a.send_aborts(), 0, "no stream was reset");
         assert_eq!(p.a.writers().ack_wait_expiries(), 0);
+        assert_eq!(
+            p.a.writers().late_ends(),
+            0,
+            "no late end on an honest path"
+        );
+    })
+}
+
+/// The late-end verdict (`late_end_verdict`), with literal values: the proof
+/// point is the first time the bytes acknowledged since the end reach the
+/// bytes ahead (with the window at the end added by the caller); late once `late_end_grace` (9 round
+/// trips and 75 ms, at least 2 s) has passed since then; never before the
+/// proof point, however long the end has waited.
+#[test]
+fn a_late_end_needs_the_bytes_ahead_acknowledged_and_the_grace() {
+    const S: u64 = 1_000_000_000;
+    let ahead = 100_000;
+    let proof = ahead;
+    assert_eq!(
+        late_end_grace(Duration::from_millis(50)),
+        Duration::from_secs(2)
+    );
+    assert_eq!(
+        late_end_grace(Duration::from_millis(800)),
+        Duration::from_millis(7_275)
+    );
+    let rtt = Duration::from_millis(50);
+    let mut crossed = None;
+    assert!(!late_end_verdict(
+        &mut crossed,
+        ahead,
+        proof - 1,
+        100 * S,
+        rtt
+    ));
+    assert_eq!(crossed, None, "one byte short: no proof point");
+    assert!(!late_end_verdict(&mut crossed, ahead, proof, 101 * S, rtt));
+    assert_eq!(crossed, Some(101 * S));
+    assert!(!late_end_verdict(
+        &mut crossed,
+        ahead,
+        proof * 2,
+        102 * S,
+        rtt
+    ));
+    assert_eq!(crossed, Some(101 * S), "the first crossing is kept");
+    assert!(late_end_verdict(
+        &mut crossed,
+        ahead,
+        proof * 2,
+        103 * S,
+        rtt
+    ));
+    // Waiting long without the proof point is not late.
+    let mut crossed = None;
+    assert!(!late_end_verdict(&mut crossed, ahead, 0, 10_000 * S, rtt));
+}
+
+/// The late-end check on virtual time (`LateEndCheck::late`), with a scripted
+/// acknowledgement count: the bytes ahead (64 KiB from one send in flight)
+/// plus the window at the end (64 KiB) are acknowledged at 10 s, so the end is late at the first
+/// tick at least 2 s later; an egress-cap hold at the proof point restarts the
+/// proof; a long dark episode since the end excuses it for good (the check
+/// never returns within 120 s).
+#[test]
+fn the_late_end_check_polls_until_the_end_is_late() {
+    use super::super::socket::CapHolds;
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let make_time = time.clone();
+        let make = move |acked: Arc<AtomicU64>, cap: Arc<CapHolds>, dark_at: Arc<AtomicU64>| {
+            let time = make_time.clone();
+            let clock = time.clone();
+            LateEndCheck {
+                reading: Arc::new(move || LaterReading {
+                    in_flight: 1,
+                    rest: 64 * 1024,
+                    started: 0,
+                    started_bytes: 0,
+                    acked_since_end: acked.load(Relaxed),
+                    window_at_end: 64 * 1024,
+                }),
+                rtt: Arc::new(|| Duration::from_millis(50)),
+                now: Arc::new(move || clock.now_nanos()),
+                cap,
+                dark_at,
+                end_at: time.now_nanos().max(1),
+            }
+        };
+        let sleeper: Sleeper = {
+            let time = time.clone();
+            Arc::new(move |duration| time.sleep_cancelable(duration))
+        };
+        let proof = 128 * 1024;
+        let (clock, s2) = (time.clone(), sleeper.clone());
+        let took = drive(&time, LIMIT, async move {
+            let acked = Arc::new(AtomicU64::new(0));
+            let check = make(acked.clone(), Arc::new(CapHolds::new(None)), Arc::default());
+            let start = clock.now();
+            let feeder = {
+                let (acked, clock) = (acked.clone(), clock.clone());
+                tokio::spawn(async move {
+                    clock.sleep(Duration::from_secs(10)).await;
+                    acked.store(proof, Relaxed);
+                })
+            };
+            check.late(s2.clone()).await;
+            feeder.await.unwrap();
+            let plain = clock.now() - start;
+
+            // A long dark episode since the end: never late.
+            let dark_at = Arc::new(AtomicU64::new(0));
+            let check = make(
+                Arc::new(AtomicU64::new(proof)),
+                Arc::new(CapHolds::new(None)),
+                dark_at.clone(),
+            );
+            dark_at.store(clock.now_nanos() + 1, Relaxed);
+            let excused = tokio::select! {
+                () = check.late(s2.clone()) => false,
+                () = clock.sleep(Duration::from_secs(120)) => true,
+            };
+            (plain, excused)
+        })
+        .await;
+        let (plain, excused) = took;
+        assert_eq!(
+            plain,
+            Duration::from_secs(12),
+            "proof at 10 s, late at the 12 s tick"
+        );
+        assert!(excused, "dark since the end: not judged");
+        let _ = sleeper;
     })
 }
 
@@ -1660,6 +1799,7 @@ fn the_later_backlog_counts_bytes_ahead_until_they_are_acknowledged() {
         started,
         started_bytes,
         acked_since_end: acked,
+        window_at_end: 0,
     };
     // 2 x 64 KiB in flight, nothing started since: 128 KiB, 4 s.
     assert_eq!(
@@ -1784,6 +1924,11 @@ fn streams_started_after_an_end_extend_its_ack_wait() {
         );
         assert_eq!(p.a.send_aborts(), 0, "no stream was reset");
         assert_eq!(p.a.writers().ack_wait_expiries(), 0);
+        assert_eq!(
+            p.a.writers().late_ends(),
+            0,
+            "no late end on an honest path"
+        );
         assert_eq!(counters.snapshot(false).ack_wait_expired, vec![0, 0, 0]);
     })
 }
@@ -2117,6 +2262,11 @@ fn ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes() {
             "premise: an ack wait ran out and its stream was reset"
         );
         assert_eq!(p.a.writers().ack_wait_expiries(), 0, "no strike");
+        assert_eq!(
+            p.a.writers().late_ends(),
+            0,
+            "no late end on an honest path"
+        );
         assert!(!closed);
     })
 }
@@ -2281,6 +2431,11 @@ fn a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry() {
         set_packet_delivery_callback(network, None);
         assert!(matches!(outcome, BoundedSend::Sent), "{outcome:?}");
         assert_eq!(p.a.writers().ack_wait_expiries(), 0);
+        assert_eq!(
+            p.a.writers().late_ends(),
+            0,
+            "no late end on an honest path"
+        );
     })
 }
 
@@ -11480,6 +11635,11 @@ fn a_slow_lossy_path_stays_within_its_consumer_gap() {
                     p.a.writers().ack_wait_expiries(),
                     0,
                     "len {len} seed {seed}: an honest path's ack wait ran out"
+                );
+                assert_eq!(
+                    p.a.writers().late_ends(),
+                    0,
+                    "len {len} seed {seed}: an honest path's end was judged late"
                 );
                 crate::transport::in_memory_socket::set_packet_delivery_callback(network, None);
             }
