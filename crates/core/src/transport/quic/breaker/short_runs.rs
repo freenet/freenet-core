@@ -1,7 +1,9 @@
-//! The QUIC crash-loop breaker on Windows: count short runs that panicked in
-//! QUIC code (#6031).
+//! The QUIC crash-loop breaker for every peer and for a gateway on Windows:
+//! count short runs that panicked in QUIC code (#6031, peers on unix since
+//! #6151).
 //!
-//! The unix breaker asks whether a run crashed. Windows gives no reliable way
+//! The unix gateway's breaker asks whether a run crashed. Windows gives no
+//! reliable way
 //! to answer that from the outside (a logoff, a Fast Startup shutdown, a
 //! session end and a `taskkill` all look alike), so this one asks the run
 //! itself: the failure the breaker exists for, a panic inside quinn's driver
@@ -32,17 +34,17 @@
 //!
 //! # The marker
 //!
-//! [`Marker::ShortRuns`] in the unix marker's file: the short runs in a row
-//! before this run, when this run started, a nonce, and whether this run has
-//! recorded a QUIC panic.
+//! [`Marker::ShortRuns`] in the breaker's marker file: the short runs in a
+//! row before this run, when this run started, a nonce, whether this run has
+//! recorded a QUIC panic, and where ([`panic_place`], for telemetry).
 //!
-//! - **Written** once the endpoint is up, as on unix, so a start that cannot
+//! - **Written** once the endpoint is up, as the exit rule's marker is, so a start that cannot
 //!   bind (a second node on the same port) changes nothing.
 //! - **Removed** after the run has lasted [`SHORT_RUN`], by a task registered
 //!   as [`TIMER_TASK`] ([`start_clear_timer`]), or by a clean exit
 //!   ([`super::quic_breaker_clean_exit`]). The clean exit is the update exit
 //!   (code 42 from `run_network_node`) and a Ctrl+C. An abort or a kill does
-//!   not reach it. A panic in the update-check task does, as on unix: the run
+//!   not reach it. A panic in the update-check task does, as in the exit rule: the run
 //!   then ends `Ok`. The Ctrl+C path is untested in a real process on Windows:
 //!   a test would have to send the console event, which can reach the runner.
 //! - **Marked** by the panic hook on the first panic attributed to QUIC code,
@@ -56,7 +58,7 @@
 //!
 //! # The panic hook
 //!
-//! Process-global, installed once, when the first Windows marker is written.
+//! Process-global, installed once, when the first short-run marker is written.
 //! It calls the hook that was installed before it, so the default panic output
 //! (or any other hook) still runs. A panic counts as QUIC's if the thread is
 //! inside a [`QuicCode`] guard (quinn's driver polls and the socket adapter's
@@ -68,9 +70,8 @@
 //! the breaker is for, whether or not it ends the process.
 //!
 //! [`decide`] is a pure function of what was read and the clock. Everything
-//! here compiles and is tested on every platform: the one thing that is
-//! Windows only is the `cfg!(not(unix))` in [`super::gate`] that calls
-//! [`gate`].
+//! here compiles and is tested on every platform. Which starts come here is
+//! [`super::decides_by_short_runs`]: every peer, and a gateway on Windows.
 //!
 //! # Where the timer lives
 //!
@@ -91,8 +92,9 @@
 //! node from starting.
 //!
 //! An older release's binary does not read the marker on Windows, so a
-//! rollback ignores it. An older release on unix would read the new state as
-//! a later release's and replace it.
+//! rollback ignores it. On unix, 0.2.159 knows this state and its exit rule
+//! takes it as no evidence, so a peer rolled back to it replaces the marker
+//! at its next start. That release ignores the `quic_panic_at` field.
 //!
 //! # Other inputs
 //!

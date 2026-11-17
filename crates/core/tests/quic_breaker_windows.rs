@@ -14,8 +14,9 @@
 //!
 //! The `windows_unit` CI job runs it, with the feature.
 //!
-//! Windows only: on unix the same process path is the crash-detecting breaker,
-//! tested in `graceful_shutdown_exit_code.rs`.
+//! Windows only: on unix a gateway takes the crash-detecting breaker, and a
+//! peer takes this short-run rule (#6151); both are tested through the real
+//! process in `graceful_shutdown_exit_code.rs`, without injected panics.
 
 #![cfg(windows)]
 

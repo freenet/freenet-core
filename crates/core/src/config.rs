@@ -2646,12 +2646,13 @@ pub struct NetworkArgs {
 
     /// Run QUIC even when the crash-loop breaker would keep it off.
     ///
-    /// On unix, if a run with QUIC enabled ends abnormally, the node starts
-    /// with QUIC off for 24 hours (15 minutes on a gateway, doubling on
-    /// repeat trips up to 4 hours; a gateway whose service unit sets
-    /// FREENET_SUPERVISED=1 restarts itself at the end). On
-    /// Windows the same happens after three short runs in a row that each
-    /// panicked in QUIC code. Set this to run QUIC anyway. A start with this
+    /// After three short runs in a row that each panicked in QUIC code, a
+    /// peer starts with QUIC off for 24 hours. A gateway on unix does so
+    /// when a run with QUIC enabled ends abnormally, and a gateway on
+    /// Windows after the same three short runs, in both cases for 15
+    /// minutes, doubling on repeat trips up to 4 hours (a gateway whose
+    /// service unit sets FREENET_SUPERVISED=1 restarts itself at the end).
+    /// Set this to run QUIC anyway. A start with this
     /// set erases the trip: removing it later does not bring the cooldown
     /// back. Default: false.
     ///

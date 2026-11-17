@@ -269,8 +269,8 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
         ));
     }
 
-    // The QUIC crash-loop breaker (#5940): if a run with QUIC enabled ended
-    // abnormally, QUIC stays off for a cooldown. Enabled here, before the node
+    // The QUIC crash-loop breaker (#5940): if runs with QUIC enabled keep
+    // ending in a QUIC fault, QUIC stays off for a cooldown. Enabled here, before the node
     // is built, because only this binary marks its clean exits (see `main`).
     freenet::enable_quic_crash_breaker();
 

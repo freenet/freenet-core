@@ -1,12 +1,18 @@
 //! The QUIC crash-loop breaker (#5940).
 //!
-//! If a run with QUIC enabled ends abnormally, QUIC stays off for
-//! [`QUIC_BREAKER_COOLDOWN`] (24 h) on a peer and for
+//! When runs with QUIC enabled keep ending in a QUIC fault, QUIC stays off
+//! for [`QUIC_BREAKER_COOLDOWN`] (24 h) on a peer and for
 //! [`GATEWAY_QUIC_BREAKER_COOLDOWN`] (15 min, provisional) on a gateway
 //! ([`BreakerRole`]). Some failures inside quinn's own code end the process
 //! rather than a task, and the service manager restarts the node into the
-//! same failure; the breaker bounds that to one restart with QUIC per
-//! cooldown.
+//! same failure; the breaker bounds those restarts with QUIC per cooldown.
+//!
+//! Two rules decide it ([`decides_by_short_runs`]). Every peer, and a
+//! gateway on Windows, counts short runs that panicked in QUIC code
+//! ([`short_runs`]). A gateway on unix asks how its last run ended, which
+//! the rest of this doc describes. Peers on unix used that second rule until
+//! #6151; it still runs on them as a shadow ([`legacy_shadow`]) that only
+//! telemetry reads, until UDP is removed.
 //!
 //! # Gateways
 //!
@@ -50,21 +56,28 @@
 //! An older release reads no role: rolling a gateway back to one brings the
 //! peer cooldown back.
 //!
-//! **This module doc describes unix.** Windows does not reliably tell a
-//! process that it is being stopped: every design that tried to tell a crash
+//! **This module doc describes a unix gateway.** Windows does not reliably
+//! tell a process that it is being stopped: every design that tried to tell a crash
 //! from a normal stop there (a logoff, a Fast Startup shutdown, a session end)
 //! got one of them wrong. So Windows does not ask how a run ended. A panic
 //! hook records a panic located in QUIC code (the failure this breaker is for
 //! always panics before it aborts), and runs that ended within ten minutes
 //! after recording one, three in a row, each starting within 24 h of the one
 //! before, keep QUIC off for the role's cooldown, with the same state and
-//! telemetry. [`short_runs`] describes it.
+//! telemetry. [`short_runs`] describes it. Peers on every platform use it
+//! too (#6151): once UDP is removed a peer has no transport to fall back to,
+//! so the breaker must not trip on anything but a QUIC fault, and the exit
+//! rule's known false trips (a kill at stop, a closed terminal) cost a peer a
+//! day of QUIC already.
 //!
-//! **Windows is weaker than unix.** There, a crash not preceded by a panic in
-//! QUIC code is not counted, a crash loop whose runs each last ten minutes or
-//! more never trips, and neither does a fault that crashes once a day. QUIC
-//! became on by default on Windows (shadow, now `prefer`) after this breaker
-//! was confirmed on a real Windows machine (#6031), with those limits weighed.
+//! **The short-run rule is weaker than the exit rule.** A crash not preceded
+//! by a panic in QUIC code is not counted, a crash loop whose runs each last
+//! ten minutes or more never trips, and neither does a fault that crashes
+//! once a day. QUIC became on by default on Windows (shadow, now `prefer`)
+//! after this rule was confirmed on a real Windows machine (#6031), with
+//! those limits weighed. On a unix peer the shadow of the exit rule measures
+//! what they cost: the `quic_breaker_start` event reports what it would have
+//! decided ([`StartReport`]).
 //!
 //! # The marker
 //!

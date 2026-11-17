@@ -496,10 +496,12 @@ inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 (`quic_endpoint_down`), panics the QUIC socket adapter caught
 (`quic_adapter_panicked`, once per endpoint; the process keeps running
 and no breaker state is left), QUIC crash-loop breaker trips at startup
-(`quic_breaker_trips`, on unix counted for any abnormal end of a QUIC-enabled
-run, not only a QUIC fault, and on Windows for three runs in a row that ended
+(`quic_breaker_trips`; for every peer, and a gateway on Windows, counted for
+three runs in a row that ended
 within ten minutes after recording a panic in QUIC code (quinn, quinn-proto or
-transport/quic, by panic location), each starting within 24 h of the one before;
+transport/quic, by panic location), each starting within 24 h of the one before,
+and for a unix gateway for any abnormal end of a QUIC-enabled run, not only a
+QUIC fault;
 a trip keeps QUIC off for 24 h on a peer and 15 min on a gateway (`BreakerRole`),
 doubling on repeat trips up to 4 h, and a gateway run with FREENET_SUPERVISED=1
 restarts itself at the cooldown's end; see
@@ -2006,7 +2008,10 @@ every rate), endpoint-down, panics and breaker trips, RSS against
 `quic_paths_active`, CPU and egress, and NAT success, connections and transfers.
 From the first release with the Windows default, the release watch also reads
 Windows separately: `quic_adapter_panicked` and `quic_breaker_trips` by version
-against the previous release, and peers with `quic_breaker_suppressed`. A
+against the previous release, and peers with `quic_breaker_suppressed`. Since
+unix peers moved to the short-run rule (#6151), it also reads
+`quic_breaker_start` by version: trips with their `quic_panic_at`, and on unix
+peers how often `legacy_verdict` and `verdict` disagree. A
 Windows QUIC panic in the field is read (location, version) before the next
 release goes out.
 
@@ -3598,11 +3603,12 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     deterministic fault recurs once per start. The exception is a
     supervised gateway, which records the death in the breaker marker and
     exits (see above). A panic that is not
-    contained aborts the process. On unix the next start trips the breaker
-    (quic_breaker_trips, see quic/breaker.rs): QUIC off for 24 h on a peer,
-    15 min on a gateway (doubling on repeat trips up to 4 h), which, when
-    supervised, restarts itself with exit 42 at the cooldown's end
-    (breaker::quic_restore_at). On Windows the
+    contained aborts the process. On a unix gateway the next start trips the
+    breaker (quic_breaker_trips, see quic/breaker.rs): QUIC off for 15 min
+    (doubling on repeat trips up to 4 h), and a supervised gateway restarts
+    itself with exit 42 at the cooldown's end (breaker::quic_restore_at).
+    Every peer (24 h cooldown; on unix since #6151) and a Windows gateway
+    decide by short runs instead: the
     breaker does not look at how a run ended: a panic hook records a panic located in QUIC
     code in the run's marker, and it counts runs that lasted under 10 minutes
     and recorded one, so the fourth start after three such aborts in a row
@@ -3612,7 +3618,14 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     is inside a QuicCode guard (quinn's driver polls in runtime.rs, the socket
     adapter's catch_unwind calls) or, failing that, by location. The hook is
     process-global: only a child-process test installs it (the arming tests
-    pass a no-op installer).
+    pass a no-op installer). The hook also records where the panic was
+    (file:line, cut to the crate directory). Each start sends a
+    `quic_breaker_start` telemetry event (role, rule, verdict, short runs,
+    that place); on a unix peer it adds `legacy_verdict`, what the old
+    exit-status rule would have decided, from a shadow that keeps its own
+    marker (quic-crash-breaker-legacy.json) and never changes whether QUIC
+    runs. It tells what the switch loses (crash loops with no QUIC panic) and
+    what it stops (kills read as crashes). The shadow goes with UDP (#6151).
   → When the node drops its last handle, the availability is Released
     (final; the first final state stored wins, so a release and a
     driver return racing never overwrite each other) and the driver's
