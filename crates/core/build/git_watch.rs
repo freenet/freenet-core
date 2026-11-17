@@ -44,6 +44,9 @@ pub(crate) fn rerun_if_changed_paths(manifest_dir: &Path) -> Vec<PathBuf> {
         manifest_dir.join("scripts"),
         manifest_dir.join("Cargo.toml"),
         manifest_dir.join("Cargo.lock"),
+        // Present only in a crates.io package, where it is the source of
+        // `GIT_COMMIT_HASH` and `GIT_DIRTY` (`build/vcs_info.rs`).
+        manifest_dir.join(".cargo_vcs_info.json"),
     ];
     watched.extend(git_metadata_paths(manifest_dir).unwrap_or_default());
     watched.retain(|p| p.exists());
@@ -387,6 +390,18 @@ mod tests {
         assert_eq!(
             canonical(rerun_if_changed_paths(tmp.path())),
             canonical([tmp.path().join("src"), tmp.path().join("Cargo.toml")])
+        );
+
+        // A crates.io package also carries `.cargo_vcs_info.json`, the source
+        // of its commit hash, so a change to it reruns the script.
+        std::fs::write(tmp.path().join(".cargo_vcs_info.json"), "{}").unwrap();
+        assert_eq!(
+            canonical(rerun_if_changed_paths(tmp.path())),
+            canonical([
+                tmp.path().join("src"),
+                tmp.path().join("Cargo.toml"),
+                tmp.path().join(".cargo_vcs_info.json"),
+            ])
         );
     }
 

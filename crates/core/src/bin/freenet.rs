@@ -258,6 +258,17 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     // update-check task so an operator opt-out (#4690) can park it.
     let disable_auto_update = config.disable_auto_update;
 
+    // The updater's state as of this start, for the `auto_update_state`
+    // telemetry event (#5975). Recorded before the node is built, which is
+    // where the event is sent.
+    if let Some(dir) = commands::auto_update::state_dir() {
+        freenet::set_auto_update_state(commands::auto_update::update_state_summary_at(
+            &dir,
+            std::time::SystemTime::now(),
+            auto_update_is_disabled(build_info::GIT_DIRTY, disable_auto_update),
+        ));
+    }
+
     // The QUIC crash-loop breaker (#5940): if a run with QUIC enabled ended
     // abnormally, QUIC stays off for a cooldown. Enabled here, before the node
     // is built, because only this binary marks its clean exits (see `main`).
@@ -3107,6 +3118,31 @@ mod tests {
             .map(|line| line.split_once("//").map(|(code, _)| code).unwrap_or(line))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// #5975: `run_network` records the updater's state BEFORE the node is
+    /// built, because the node sends it as the `auto_update_state` event while
+    /// it is built. Deleting the call, or moving it after `.build(`, silently
+    /// ends the report.
+    #[test]
+    fn run_network_records_the_update_state_before_building_the_node() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let body = fn_body(&src, "async fn run_network(");
+        let record = body
+            .find("freenet::set_auto_update_state(")
+            .expect("run_network no longer records the auto-update state (#5975)");
+        let build = body
+            .find(".build(clients)")
+            .expect("could not locate the node build in run_network");
+        assert!(
+            record < build,
+            "the auto-update state must be recorded before the node is built (#5975)"
+        );
+        let call = &body[record..build];
+        assert!(
+            call.contains("update_state_summary_at("),
+            "the recorded value must be the updater's summary (#5975)"
+        );
     }
 
     /// Source-scrape pin for issue #4580: the exit-42 handler in `main()` MUST

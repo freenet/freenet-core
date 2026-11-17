@@ -265,6 +265,25 @@ pub fn set_governance_provider(provider: GovernanceProvider) {
     *GOVERNANCE_PROVIDER.write() = Some(provider);
 }
 
+/// The auto-update summary the `freenet` binary reads from its state
+/// directory at startup (#5975), sent once to the telemetry collector as the
+/// `auto_update_state` event. The library does not read the updater's files
+/// itself: they belong to the binary.
+static AUTO_UPDATE_STATE: parking_lot::RwLock<Option<serde_json::Value>> =
+    parking_lot::RwLock::new(None);
+
+/// Record this node's auto-update summary for the `auto_update_state`
+/// telemetry event. Call before the node is built; replaces any earlier value.
+/// The state is read once at startup, so a hold set during this run shows in
+/// telemetry only after the next restart.
+pub fn set_auto_update_state(state: serde_json::Value) {
+    *AUTO_UPDATE_STATE.write() = Some(state);
+}
+
+pub(crate) fn auto_update_state() -> Option<serde_json::Value> {
+    AUTO_UPDATE_STATE.read().clone()
+}
+
 static RING_STATS_PROVIDER: parking_lot::RwLock<Option<RingStatsProvider>> =
     parking_lot::RwLock::new(None);
 

@@ -4,6 +4,8 @@ use std::process::Command;
 // Unit-tested from the library via a `#[cfg(test)]` module in `src/lib.rs`.
 #[path = "build/git_watch.rs"]
 mod git_watch;
+#[path = "build/vcs_info.rs"]
+mod vcs_info;
 #[path = "build/version_floor.rs"]
 mod version_floor;
 
@@ -130,7 +132,7 @@ fn emit_build_metadata() {
     // A caller with no VCS information MUST pass empty rather than a placeholder
     // like "unknown": the validation below rejects a non-hex value outright, so
     // a placeholder turns "I have no commit hash" into a failed build.
-    let git_hash = match std::env::var("FREENET_GIT_COMMIT_HASH") {
+    let commit_override = match std::env::var("FREENET_GIT_COMMIT_HASH") {
         Ok(v) if !v.trim().is_empty() => {
             let v = v.trim().to_string();
             // Validated because a `cargo:` directive is newline-delimited: an
@@ -142,18 +144,10 @@ fn emit_build_metadata() {
                      Pass an EMPTY value when there is no VCS information."
                 );
             }
-            v
+            Some(v)
         }
-        _ => Command::new("git")
-            .args(["rev-parse", "--short=12", "HEAD"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "unknown".to_string()),
+        _ => None,
     };
-    println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
 
     // Git dirty flag. `GIT_OPTIONAL_LOCKS=0` stops `git status` from
     // rewriting the index to refresh stat info: the index is one of the
@@ -167,21 +161,50 @@ fn emit_build_metadata() {
     // would read `=false` as DIRTY and ship a binary that never updates itself.
     // An unrecognised value fails the build rather than being guessed at in
     // either direction.
-    let git_dirty = match std::env::var("FREENET_GIT_IS_DIRTY")
+    let dirty_override = match std::env::var("FREENET_GIT_IS_DIRTY")
         .as_deref()
         .map(str::trim)
     {
-        Ok("1") | Ok("true") => true,
-        Ok("0") | Ok("false") => false,
-        Ok("") | Err(_) => Command::new("git")
-            .args(["status", "--porcelain"])
-            .env("GIT_OPTIONAL_LOCKS", "0")
-            .output()
-            .ok()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false),
+        Ok("1") | Ok("true") => Some(true),
+        Ok("0") | Ok("false") => Some(false),
+        Ok("") | Err(_) => None,
         Ok(other) => panic!("FREENET_GIT_IS_DIRTY ({other}) must be 1, true, 0, false, or empty"),
     };
+
+    // A crates.io package has no `.git`; `cargo publish` recorded the commit
+    // and dirty flag in `.cargo_vcs_info.json` instead (`build/vcs_info.rs`),
+    // and when it is present it replaces both git probes.
+    let published = std::env::var("CARGO_MANIFEST_DIR")
+        .ok()
+        .and_then(|dir| {
+            std::fs::read_to_string(std::path::Path::new(&dir).join(vcs_info::VCS_INFO_FILE)).ok()
+        })
+        .and_then(|contents| vcs_info::published(&contents));
+
+    let (git_hash, git_dirty) = vcs_info::resolve_git_provenance(
+        commit_override,
+        dirty_override,
+        published,
+        || {
+            Command::new("git")
+                .args(["rev-parse", "--short=12", "HEAD"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        },
+        || {
+            Command::new("git")
+                .args(["status", "--porcelain"])
+                .env("GIT_OPTIONAL_LOCKS", "0")
+                .output()
+                .ok()
+                .map(|o| !o.stdout.is_empty())
+                .unwrap_or(false)
+        },
+    );
+    println!("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}");
     let dirty_suffix = if git_dirty { "-dirty" } else { "" };
     println!("cargo:rustc-env=GIT_DIRTY={dirty_suffix}");
 

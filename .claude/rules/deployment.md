@@ -70,7 +70,10 @@ silently never updates itself. Empty means "no override", NOT "clean".
 
 Its sibling `FREENET_GIT_COMMIT_HASH` has the same empty-means-no-override rule
 and must be <= 40 hex characters. Passing a placeholder such as `unknown` FAILS
-THE BUILD; pass empty instead and let build.rs's own fallback report `unknown`.
+THE BUILD; pass empty instead and let build.rs's own fallback (a crates.io
+package's `.cargo_vcs_info.json`, else the `git` probe) report `unknown`. A packaged source takes BOTH commit and dirty flag from that
+file and runs no git probe, so a `cargo install` unpacked inside an enclosing
+git repository is not stamped `-dirty`.
 See docs/nix.md.
 
 The daily retry of a locked-out node (`claim_update_attempt`) must be spent

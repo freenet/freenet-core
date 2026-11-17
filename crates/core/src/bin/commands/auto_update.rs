@@ -1282,6 +1282,71 @@ pub(crate) fn get_update_failure_count_at(dir: &std::path::Path) -> u32 {
     }
 }
 
+/// Longest version string or hold reason sent in [`update_state_summary_at`].
+/// The values are written by this binary, but the files are on the node's
+/// disk, so the telemetry event bounds them anyway.
+const SUMMARY_TEXT_MAX_CHARS: usize = 120;
+
+/// This node's auto-update state for the `auto_update_state` telemetry event
+/// (#5975): why a node stays on an old release is otherwise visible only in a
+/// `freenet service report` its operator chose to upload.
+///
+/// Read from the files in `dir` that the updater keeps, at `now`:
+/// - `update_failures`: the install-failure lockout counter
+///   ([`get_update_failure_count_at`]; the version-mismatch loop stops at
+///   `MAX_UPDATE_FAILURES`), and `update_lockout` whether it has;
+/// - the per-release cooldown (`update_cooldown.json`): the release, its
+///   consecutive fetch failures, the seconds left before the next attempt, and
+///   the last hold reason (text this binary writes, never an error message:
+///   `last_error` can name local paths and is left out);
+/// - `download_budget_spent`: today's download budget is used up, and
+///   `download_budget_blocks`: that it also blocks the next fetch (no staged
+///   archive to install instead);
+/// - the install-failure record (`install_failures.json`) and whether it gates
+///   that release.
+///
+/// `disabled` is the binary's own decision, passed in: an operator opt-out or
+/// a dirty build.
+pub(crate) fn update_state_summary_at(
+    dir: &std::path::Path,
+    now: SystemTime,
+    disabled: bool,
+) -> serde_json::Value {
+    use super::rollback::{
+        DOWNLOAD_BYTES_PER_DAY, INSTALL_FAILURE_GATE_THRESHOLD, download_bytes_at,
+        read_install_failures_at, read_update_cooldown_at,
+    };
+    let bounded = |text: &str| {
+        text.chars()
+            .take(SUMMARY_TEXT_MAX_CHARS)
+            .collect::<String>()
+    };
+    let now_secs = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let failures = get_update_failure_count_at(dir);
+    let cooldown = read_update_cooldown_at(dir);
+    let install = read_install_failures_at(dir);
+    serde_json::json!({
+        "disabled": disabled,
+        "update_failures": failures,
+        "update_lockout": failures >= MAX_UPDATE_FAILURES,
+        "cooldown_version": cooldown.as_ref().map(|c| bounded(&c.version)),
+        "cooldown_failures": cooldown.as_ref().map_or(0, |c| c.failures),
+        "cooldown_remaining_secs": cooldown
+            .as_ref()
+            .map_or(0, |c| c.retry_at_unix.saturating_sub(now_secs)),
+        "hold_reason": cooldown.as_ref().and_then(|c| c.hold_reason.as_deref().map(bounded)),
+        "download_budget_spent": download_bytes_at(dir, now) >= DOWNLOAD_BYTES_PER_DAY,
+        "download_budget_blocks": super::update::download_budget_blocks_at(dir, now),
+        "install_failures_version": install.as_ref().map(|i| bounded(&i.version)),
+        "install_failures": install.as_ref().map_or(0, |i| i.count),
+        "install_gated": install
+            .as_ref()
+            .is_some_and(|i| i.count >= INSTALL_FAILURE_GATE_THRESHOLD),
+    })
+}
+
 /// Record an update failure. Called by the update command when the install
 /// step fails (see `commands::update`). After `MAX_UPDATE_FAILURES`
 /// consecutive failures, [`should_attempt_update`] returns false and the
@@ -4963,5 +5028,124 @@ mod tests {
         .await;
         assert!(refused.is_err());
         assert!(!checked.get());
+    }
+}
+
+#[cfg(test)]
+mod update_state_summary_tests {
+    use super::super::rollback::{
+        DOWNLOAD_BYTES_PER_DAY, INSTALL_FAILURE_GATE_THRESHOLD, charge_download_bytes_at,
+        hold_update_until_at, record_install_failure_at,
+    };
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn at(secs: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    /// An empty state directory is a node with nothing holding it back, and
+    /// every key is present so a collector query never meets a missing one.
+    #[test]
+    fn a_fresh_node_reports_nothing_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let summary = update_state_summary_at(dir.path(), at(1_800_000_000), false);
+        assert_eq!(
+            summary,
+            serde_json::json!({
+                "disabled": false,
+                "update_failures": 0,
+                "update_lockout": false,
+                "cooldown_version": null,
+                "cooldown_failures": 0,
+                "cooldown_remaining_secs": 0,
+                "hold_reason": null,
+                "download_budget_spent": false,
+                "download_budget_blocks": false,
+                "install_failures_version": null,
+                "install_failures": 0,
+                "install_gated": false,
+            })
+        );
+    }
+
+    /// Each kind of hold the updater records shows up under its own key.
+    #[test]
+    fn every_hold_the_updater_records_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = at(1_800_000_000);
+        for _ in 0..MAX_UPDATE_FAILURES {
+            record_update_failure_at(dir.path());
+        }
+        hold_update_until_at(
+            dir.path(),
+            "0.2.200",
+            "today's download budget is spent (#5799)",
+            now + Duration::from_secs(3600),
+            now,
+        );
+        charge_download_bytes_at(dir.path(), DOWNLOAD_BYTES_PER_DAY, now);
+        for _ in 0..INSTALL_FAILURE_GATE_THRESHOLD {
+            record_install_failure_at(dir.path(), "0.2.199");
+        }
+
+        let summary = update_state_summary_at(dir.path(), now, true);
+
+        assert_eq!(summary["disabled"], true);
+        assert_eq!(summary["update_failures"], MAX_UPDATE_FAILURES);
+        assert_eq!(summary["update_lockout"], true);
+        assert_eq!(summary["cooldown_version"], "0.2.200");
+        assert_eq!(summary["cooldown_remaining_secs"], 3600);
+        assert_eq!(
+            summary["hold_reason"],
+            "today's download budget is spent (#5799)"
+        );
+        assert_eq!(summary["download_budget_spent"], true);
+        // No staged archive to install instead, so the budget blocks a fetch.
+        assert_eq!(summary["download_budget_blocks"], true);
+        assert_eq!(summary["install_failures_version"], "0.2.199");
+        assert_eq!(summary["install_failures"], INSTALL_FAILURE_GATE_THRESHOLD);
+        assert_eq!(summary["install_gated"], true);
+    }
+
+    /// One short of each threshold is reported as not held.
+    #[test]
+    fn counts_below_their_threshold_do_not_read_as_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = at(1_800_000_000);
+        for _ in 0..MAX_UPDATE_FAILURES - 1 {
+            record_update_failure_at(dir.path());
+        }
+        for _ in 0..INSTALL_FAILURE_GATE_THRESHOLD - 1 {
+            record_install_failure_at(dir.path(), "0.2.199");
+        }
+        charge_download_bytes_at(dir.path(), DOWNLOAD_BYTES_PER_DAY - 1, now);
+
+        let summary = update_state_summary_at(dir.path(), now, false);
+
+        assert_eq!(summary["update_lockout"], false);
+        assert_eq!(summary["install_gated"], false);
+        assert_eq!(summary["download_budget_spent"], false);
+        // A cooldown whose retry time has passed has none left.
+        hold_update_until_at(dir.path(), "0.2.200", "held", now, now);
+        let later = update_state_summary_at(dir.path(), now + Duration::from_secs(10), false);
+        assert_eq!(later["cooldown_remaining_secs"], 0);
+    }
+
+    /// Text from the state files is bounded.
+    #[test]
+    fn long_text_is_cut_to_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = at(1_800_000_000);
+        let long = "x".repeat(SUMMARY_TEXT_MAX_CHARS * 3);
+        hold_update_until_at(dir.path(), &long, &long, now + Duration::from_secs(60), now);
+        let summary = update_state_summary_at(dir.path(), now, false);
+        for key in ["cooldown_version", "hold_reason"] {
+            assert_eq!(
+                summary[key].as_str().unwrap().chars().count(),
+                SUMMARY_TEXT_MAX_CHARS,
+                "{key}"
+            );
+        }
     }
 }

@@ -577,8 +577,6 @@ impl NodeP2P {
         if let Some(event) = crate::tracing::NetEventLog::peer_startup(
             &self.op_manager.ring,
             crate::config::PCK_VERSION.to_string(),
-            None, // git_commit - not available in library, only in binary
-            None, // git_dirty - not available in library, only in binary
         ) {
             use either::Either;
             self.op_manager
@@ -952,6 +950,17 @@ impl NodeP2P {
             &background_task_monitor,
         );
 
+        // `auto_update_state` (#5975): the updater's state as the binary read
+        // it at startup, once per start. Sending is a no-op unless the
+        // telemetry reporter (built with the node config) is enabled.
+        if let Some(state) = super::network_status::auto_update_state() {
+            crate::tracing::telemetry::send_standalone_event_with_peer_id(
+                "auto_update_state",
+                &config.local_peer_id_string(),
+                state,
+            );
+        }
+
         // `join_versions` (#5940): hourly versions of gateway joiners and live
         // neighbours. Only with telemetry on, since it exists to be uploaded.
         crate::transport::join_versions::spawn_join_versions_reporter_if_enabled(
@@ -1075,6 +1084,43 @@ impl NodeP2P {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #5975: `NodeP2P::build` sends the `auto_update_state` event the binary
+    /// recorded at startup. Deleting the send, or sending a different event
+    /// name or payload, silently ends the report with every test still green.
+    #[test]
+    fn build_sends_the_recorded_auto_update_state() {
+        let all = include_str!("p2p_impl.rs");
+        let production = &all[..all
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module not located; this pin cannot verify anything")];
+        let code: String = production
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find("pub(crate) async fn build<")
+            .expect("NodeP2P::build not found");
+        let (build, _) = code[start..]
+            .split_once("\n    }\n")
+            .expect("could not locate the end of NodeP2P::build");
+        let squeezed: String = build.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            squeezed.contains(
+                "iflet Some(state)=super::network_status::auto_update_state()"
+                    .replace(' ', "")
+                    .as_str()
+            ),
+            "build must read the state the binary recorded"
+        );
+        assert!(
+            squeezed.contains(
+                "send_standalone_event_with_peer_id(\"auto_update_state\",&config.local_peer_id_string(),state,)"
+            ),
+            "build must send it as the `auto_update_state` event with that state"
+        );
+    }
 
     /// #4549: the fast-exit watchdog (`process::exit(42)` on a fatal listener exit)
     /// is gated by `listener_exit_is_graceful`. A regression in this predicate is

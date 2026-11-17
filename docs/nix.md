@@ -353,8 +353,8 @@ A packager working from a source tarball can supply the provenance that
 
 | Variable | Value | Effect |
 |---|---|---|
-| `FREENET_GIT_COMMIT_HASH` | up to 40 hex characters, or **empty** | Reported by `freenet --version`. Empty means "no override": build.rs probes `git`, and reports `unknown` if there is none. A non-hex value **fails the build** — never pass a placeholder like `unknown`. |
-| `FREENET_GIT_IS_DIRTY` | `1`/`true`, `0`/`false`, or empty | Empty means "no override" (probe `git`). Anything else fails the build. |
+| `FREENET_GIT_COMMIT_HASH` | up to 40 hex characters, or **empty** | Reported by `freenet --version`. Empty means "no override": a source with a `.cargo_vcs_info.json` (a crates.io package) takes its commit from that file; otherwise build.rs probes `git`, and reports `unknown` if neither has it. A non-hex value **fails the build** — never pass a placeholder like `unknown`. |
+| `FREENET_GIT_IS_DIRTY` | `1`/`true`, `0`/`false`, or empty | Empty means "no override": a source with a `.cargo_vcs_info.json` takes the dirty flag from it, otherwise build.rs probes `git`. With neither, the build reports clean, so the `git_dirty=false` in telemetry is then a default, not an observation. Anything else fails the build. |
 | `SOURCE_DATE_EPOCH` | seconds since the epoch, or **empty** | Fixes `BUILD_TIMESTAMP`. Empty means "no override": build.rs uses the current time. A non-numeric value **fails the build**. |
 
 `FREENET_GIT_IS_DIRTY` is **the third way to disable auto-update**, alongside a
