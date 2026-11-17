@@ -1900,9 +1900,22 @@ fn a_late_end_is_counted_once_across_its_waits() {
 /// stream opened after the end counts its whole length (#6205).
 #[test]
 fn a_stream_open_at_the_end_is_not_progress_past_it() {
+    use crate::transport::in_memory_socket::{
+        PacketDeliveryDecision, set_packet_delivery_callback,
+    };
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths("quic-path-backlog-open-at-end", QuicPathLimits::DEFAULT).await;
+        let network = "quic-path-backlog-open-at-end";
+        // A 400 ms round trip, so the early stream is still unacknowledged
+        // when the other end is sent.
+        set_packet_delivery_callback(
+            network,
+            Some(Arc::new(|_, _, _, _| {
+                PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(200))
+            })),
+        );
+        let p = paths(network, QuicPathLimits::DEFAULT).await;
+        let completions_before = p.a.stream_opens.completions_end();
         let (a, time) = (p.a.clone(), p.time());
         let (backlog, before, mid, after) = p
             .drive(async move {
@@ -1921,8 +1934,13 @@ fn a_stream_open_at_the_end_is_not_progress_past_it() {
                     })
                 };
                 // Let the early stream open before the other end is sent.
-                time.sleep(Duration::from_millis(1)).await;
+                time.sleep(Duration::from_millis(50)).await;
                 let backlog = a.backlog_wait(1000)();
+                assert_eq!(
+                    a.stream_opens.completions_end(),
+                    completions_before,
+                    "premise: the early stream is not acknowledged yet at the end"
+                );
                 let before = early.await.expect("the send ran");
                 let mid = ((backlog.reading)(), (backlog.later)());
                 let after = a
@@ -1944,6 +1962,7 @@ fn a_stream_open_at_the_end_is_not_progress_past_it() {
         assert_eq!(mid.0.acked_since_end, 0);
         assert!(mid.1 > Duration::ZERO, "the extension is kept");
         assert!(matches!(after, BoundedSend::Sent), "{after:?}");
+        set_packet_delivery_callback(network, None);
         let reading = (backlog.reading)();
         assert_eq!(
             reading.acked_since_end, 2_000,
