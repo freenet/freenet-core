@@ -2492,11 +2492,11 @@ impl StreamOpens {
     /// acknowledged.
     fn acked(&self, seq: u64, len: u64) {
         let mut completions = self.completions.lock();
-        completions.entries.push_back((seq, len));
-        if completions.entries.len() > COMPLETIONS_KEPT {
+        if completions.entries.len() >= COMPLETIONS_KEPT {
             completions.entries.pop_front();
             completions.base += 1;
         }
+        completions.entries.push_back((seq, len));
     }
 
     /// Where the next completion will be ([`Self::acked_after`]).
@@ -2645,6 +2645,9 @@ pub(crate) fn late_end_verdict(
 /// [`LATE_WAKE_SLACK`] past its tick (this node was not running, so the proof
 /// restarts), or once the path was dark for the watch's window since the end
 /// (`recycle::AckWatch::publishing_long_dark`): the outage is the dark rule's.
+/// A send's wait cancelled while it polls hands the check to the background
+/// wait, which starts the proof and the grace again: an end can only be
+/// judged later for it, never earlier.
 #[derive(Clone)]
 struct LateEndCheck {
     reading: Arc<dyn Fn() -> LaterReading + Send + Sync>,
@@ -2667,6 +2670,8 @@ impl LateEndCheck {
         let tick = recycle::ACK_WATCH_TICK;
         let mut crossed = None;
         let mut last = (self.now)();
+        let mut previous_cap = self.cap.read();
+        let mut hold_unchanged_since = None;
         loop {
             sleeper(tick).await;
             let now = (self.now)();
@@ -2675,7 +2680,13 @@ impl LateEndCheck {
             if self.dark_at.load(Ordering::Acquire) >= self.end_at.max(1) {
                 return std::future::pending().await;
             }
-            if woke_late || self.cap.read().held_now {
+            // A hold now, or one that began and ended since the last poll (a
+            // new hold event), as the acknowledgement watch reads them
+            // (`recycle::cap_held`).
+            let cap = self.cap.read();
+            let held = recycle::cap_held(&mut hold_unchanged_since, now, &cap, &previous_cap);
+            previous_cap = cap;
+            if woke_late || held {
                 crossed = None;
                 continue;
             }

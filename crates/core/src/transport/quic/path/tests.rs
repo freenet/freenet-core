@@ -1971,6 +1971,94 @@ fn a_stream_open_at_the_end_is_not_progress_past_it() {
     })
 }
 
+/// An egress-cap hold that begins and ends between two polls of the
+/// late-end check restarts the proof, as a hold seen at a poll does: the
+/// bytes ahead are acknowledged at 10 s, a hold comes and goes at 11 s, so
+/// the proof point is the 14 s poll and the end is late at 16 s, not 12 s.
+#[test]
+fn a_cap_hold_between_polls_restarts_the_late_end_proof() {
+    use super::super::socket::CapHolds;
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let acked = Arc::new(AtomicU64::new(0));
+        let cap = Arc::new(CapHolds::new(Some(1_000_000)));
+        let check = {
+            let (acked, clock) = (acked.clone(), clock.clone());
+            LateEndCheck {
+                reading: Arc::new(move || LaterReading {
+                    in_flight: 1,
+                    rest: 64 * 1024,
+                    started: 0,
+                    started_bytes: 0,
+                    acked_since_end: acked.load(Relaxed),
+                    window_at_end: 64 * 1024,
+                }),
+                rtt: Arc::new(|| Duration::from_millis(50)),
+                now: Arc::new(move || clock.now_nanos()),
+                cap: cap.clone(),
+                dark_at: Arc::default(),
+                end_at: time.now_nanos().max(1),
+                counted: Arc::default(),
+            }
+        };
+        let sleeper: Sleeper = {
+            let time = time.clone();
+            Arc::new(move |duration| time.sleep_cancelable(duration))
+        };
+        let took = drive(&time, LIMIT, async move {
+            let start = clock.now();
+            let feeder = {
+                let clock = clock.clone();
+                tokio::spawn(async move {
+                    clock.sleep(Duration::from_secs(10)).await;
+                    acked.store(128 * 1024, Relaxed);
+                    clock.sleep(Duration::from_secs(1)).await;
+                    cap.hold_one();
+                    cap.release_one();
+                })
+            };
+            check.late(sleeper).await;
+            feeder.await.unwrap();
+            clock.now() - start
+        })
+        .await;
+        assert_eq!(took, Duration::from_secs(16));
+    })
+}
+
+/// The completion log keeps the latest 4096 completions; a reader that
+/// falls further behind only under-counts. 5000 completions of one byte
+/// each, read once at the end: 4096. Read after 2000, then after 5000 more:
+/// 2000, then 2000 plus the 4096 still kept, never more than the 7000 that
+/// completed.
+#[test]
+fn the_completion_log_wraps_by_under_counting() {
+    let opens = StreamOpens::default();
+    let mut late = (opens.completions_end(), 0);
+    let mut early = late;
+    for seq in 1..=2000 {
+        opens.acked(seq, 1);
+    }
+    assert_eq!(opens.acked_after(0, &mut early), 2000);
+    for seq in 2001..=5000 {
+        opens.acked(seq, 1);
+    }
+    assert_eq!(opens.completions.lock().entries.len(), COMPLETIONS_KEPT);
+    assert_eq!(
+        opens.acked_after(0, &mut late),
+        4096,
+        "the oldest 904 are gone"
+    );
+    for seq in 5001..=7000 {
+        opens.acked(seq, 1);
+    }
+    let read = opens.acked_after(0, &mut early);
+    assert_eq!(read, 2000 + 4096);
+    assert!(read <= 7000);
+}
+
 /// The late-end check is polled wherever a sent end waits for its
 /// acknowledgement: in `Outgoing::finish` (Streams and multi-packet Shorts)
 /// and in both arms of the background wait in `Outgoing`'s drop (one-packet
