@@ -1074,3 +1074,146 @@ fn quic_breaker_default_path_note_keeps_other_entries() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A deliberate endpoint-death exit takes 42 even in the first minute under a
+/// unit that understands the fast-crash code (`FREENET_SYSTEMD_FAST_CRASH`):
+/// 45 is counted by the post-update crash-loop rollback, so three early
+/// endpoint deaths would roll a fresh release back.
+///
+/// FALSIFY: in `node::p2p_impl::listener_exit_code`, return
+/// `fatal_listener_exit_code(..)` for a `GatewayQuicRestart` too; the exit is 45.
+#[cfg(feature = "testing")]
+#[test]
+fn an_early_endpoint_death_exit_is_42_under_a_fast_crash_unit() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let env = [
+        ("FREENET_SUPERVISED", "1"),
+        ("FREENET_SYSTEMD_FAST_CRASH", "1"),
+        (ENDPOINT_DOWN_ENV, "2"),
+    ];
+    let mut node = spawn_quic_node_full(dir.path(), &dir.path().join("logs"), &[], None, &env)?;
+    let started = Instant::now();
+    let status = node.wait_for_exit(Duration::from_secs(60))?;
+    let logs = node.logs();
+    assert!(
+        started.elapsed() < Duration::from_secs(55),
+        "the death must come inside the fast-crash window. Logs:\n{logs}"
+    );
+    assert!(logs.contains(ENDPOINT_DOWN_EXIT_MARKER), "Logs:\n{logs}");
+    assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
+    Ok(())
+}
+
+/// Only our own unit's marker turns gateway restarts on. Under systemd alone
+/// (`INVOCATION_ID`), a gateway logs a WARN and, when its endpoint dies,
+/// keeps running over UDP; so does a supervised peer.
+///
+/// FALSIFY: map `SupervisorStatus::SupervisedUnverified` to
+/// `GatewayQuicRestarts::Enabled` in `bin/freenet.rs`; the first node exits.
+#[cfg(feature = "testing")]
+#[test]
+fn an_endpoint_death_without_our_supervisor_or_on_a_peer_does_not_exit() -> anyhow::Result<()> {
+    let unverified_dir = tempfile::tempdir()?;
+    let peer_dir = tempfile::tempdir()?;
+    // A peer needs a gateway to start; this one is never reached.
+    let gateway = format!("127.0.0.1:9,{}", "11".repeat(32));
+    let cases: [(&Path, Vec<&str>, Vec<(&str, &str)>); 2] = [
+        (
+            unverified_dir.path(),
+            vec![],
+            vec![
+                ("INVOCATION_ID", "0123456789abcdef"),
+                (ENDPOINT_DOWN_ENV, "1"),
+            ],
+        ),
+        (
+            peer_dir.path(),
+            vec![AS_PEER, "--gateway", &gateway],
+            vec![("FREENET_SUPERVISED", "1"), (ENDPOINT_DOWN_ENV, "1")],
+        ),
+    ];
+    for (index, (dir, args, env)) in cases.iter().enumerate() {
+        let mut node = spawn_quic_node_full(dir, &dir.join("logs"), args, None, env)?;
+        node.wait_for_logs(&[ENDPOINT_DOWN_MARKER], Duration::from_secs(30))?;
+        std::thread::sleep(Duration::from_secs(3));
+        let logs = node.logs();
+        assert!(
+            !logs.contains(GATEWAY_RESTART_MARKER),
+            "case {index}: must not exit. Logs:\n{logs}"
+        );
+        if index == 0 {
+            assert!(
+                logs.contains("does not set FREENET_SUPERVISED=1"),
+                "the unverified-supervisor WARN. Logs:\n{logs}"
+            );
+        }
+        node.send_sigterm()?;
+        assert_eq!(
+            node.wait_for_exit(Duration::from_secs(45))?.code(),
+            Some(0),
+            "case {index}. Logs:\n{}",
+            node.logs()
+        );
+    }
+    Ok(())
+}
+
+/// A gateway's cooldown doubles on a repeat trip: a crash of a run whose
+/// marker carries a trip from 20 minutes ago trips again with a 30-minute
+/// cooldown, recorded in the marker, and a start inside it keeps QUIC off
+/// where a first trip's 15 minutes would have ended.
+///
+/// FALSIFY: return 1 from `breaker::trip_number`; the marker records no
+/// repeat and the third start runs QUIC.
+#[test]
+fn a_gateway_cooldown_grows_on_a_repeat_trip() -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let dir = tempfile::tempdir()?;
+    let mut first = spawn_quic_node(dir.path(), &dir.path().join("logs-1"))?;
+    let mut armed = wait_for_armed_marker(dir.path(), &first)?;
+    first.kill_abnormally()?;
+    drop(first);
+    // The crashed run had restarted after a first trip 20 minutes ago.
+    armed["prior_trip"] = serde_json::json!({ "tripped_at_secs": now - 20 * 60, "trips": 1 });
+    std::fs::write(
+        dir.path().join(QUIC_MARKER_FILE),
+        serde_json::to_vec(&armed)?,
+    )?;
+
+    let mut second = spawn_quic_node(dir.path(), &dir.path().join("logs-2"))?;
+    let logs = second.logs();
+    assert!(
+        logs.contains(QUIC_TRIP_MARKER) && logs.contains("cooldown_minutes=30"),
+        "a repeat trip doubles the cooldown. Logs:\n{logs}"
+    );
+    let marker = read_quic_marker(dir.path())?.expect("marker");
+    assert_eq!(marker["trips"], 2, "Marker: {marker}");
+    second.send_sigterm()?;
+    assert_eq!(
+        second.wait_for_exit(Duration::from_secs(45))?.code(),
+        Some(0)
+    );
+
+    // That trip, 20 minutes on: a first trip would be over, a second is not.
+    write_tripped_marker(dir.path(), now - 20 * 60)?;
+    let mut marker = read_quic_marker(dir.path())?.expect("marker");
+    marker["trips"] = 2.into();
+    std::fs::write(
+        dir.path().join(QUIC_MARKER_FILE),
+        serde_json::to_vec(&marker)?,
+    )?;
+    let mut third = spawn_quic_node(dir.path(), &dir.path().join("logs-3"))?;
+    let logs = third.logs();
+    assert!(
+        logs.contains(QUIC_COOLING_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
+        "a second trip holds for 30 minutes. Logs:\n{logs}"
+    );
+    third.send_sigterm()?;
+    assert_eq!(
+        third.wait_for_exit(Duration::from_secs(45))?.code(),
+        Some(0)
+    );
+    Ok(())
+}

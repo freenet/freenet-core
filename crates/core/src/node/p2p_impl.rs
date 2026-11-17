@@ -112,6 +112,25 @@ fn fatal_listener_exit_code(uptime: Duration, fast_crash_enabled: bool) -> i32 {
     }
 }
 
+/// The exit code for the fatal listener exit that ends with `error`. A
+/// gateway's deliberate restart to restore QUIC
+/// ([`crate::transport::GatewayQuicRestart`], #5940) always takes
+/// [`FATAL_LISTENER_EXIT_CODE`], whatever the uptime: it is not a crash, and
+/// the fast-crash code is counted by the unit's start limit and by the
+/// post-update crash-loop rollback, so three early endpoint deaths would roll
+/// a release back. The breaker bounds those restarts instead
+/// (`breaker::ENDPOINT_DOWN_EXITS_TO_TRIP`).
+fn listener_exit_code(error: &anyhow::Error, uptime: Duration, fast_crash_enabled: bool) -> i32 {
+    if error
+        .downcast_ref::<crate::transport::GatewayQuicRestart>()
+        .is_some()
+    {
+        FATAL_LISTENER_EXIT_CODE
+    } else {
+        fatal_listener_exit_code(uptime, fast_crash_enabled)
+    }
+}
+
 /// When `true`, a sub-[`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`] fatal listener exit
 /// uses the distinct [`FAST_CRASH_EXIT_CODE`] (45) instead of the default
 /// [`FATAL_LISTENER_EXIT_CODE`] (42). Off by default; the binary opts in (via
@@ -688,7 +707,8 @@ impl NodeP2P {
                    // regenerated systemd unit that handles 45); otherwise 42 is kept so
                    // an old unit / the mac/Windows run-wrapper still self-heals.
                    let uptime = start_time.elapsed();
-                   let exit_code = fatal_listener_exit_code(
+                   let exit_code = listener_exit_code(
+                       &e,
                        uptime,
                        EMIT_FAST_CRASH_EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed),
                    );
@@ -711,7 +731,8 @@ impl NodeP2P {
                        );
                        // The file log is written by a background worker that
                        // `process::exit` does not wait for; give it a moment
-                       // so the line above reaches the log.
+                       // so the line above reaches the log. Blocking this
+                       // worker thread is harmless: the process exits next.
                        std::thread::sleep(std::time::Duration::from_millis(500));
                        std::process::exit(exit_code);
                    }
@@ -1186,6 +1207,31 @@ mod tests {
             FAST_CRASH_EXIT_CODE, 44,
             "must not collide with bundle-update-staged (44)"
         );
+    }
+
+    /// #5940: a gateway's deliberate restart to restore QUIC takes 42 at any
+    /// uptime, even under a 45-aware unit; every other fatal listener exit is
+    /// unchanged.
+    #[test]
+    fn a_gateway_quic_restart_always_exits_with_42() {
+        for secs in [0u64, 1, 59, 60, 3600] {
+            let uptime = Duration::from_secs(secs);
+            for fast_crash in [true, false] {
+                let restart =
+                    anyhow::Error::new(crate::transport::GatewayQuicRestart { reason: "test" });
+                assert_eq!(
+                    listener_exit_code(&restart, uptime, fast_crash),
+                    FATAL_LISTENER_EXIT_CODE,
+                    "{secs}s, fast_crash={fast_crash}"
+                );
+                let other = anyhow::anyhow!("listener died");
+                assert_eq!(
+                    listener_exit_code(&other, uptime, fast_crash),
+                    fatal_listener_exit_code(uptime, fast_crash),
+                    "{secs}s, fast_crash={fast_crash}"
+                );
+            }
+        }
     }
 
     /// #4551: with fast-crash enabled (a 45-aware systemd unit), a fatal listener exit

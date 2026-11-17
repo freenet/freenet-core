@@ -197,6 +197,65 @@ async fn udp_transport_config_reaches_the_listener_by_name() {
     );
 }
 
+/// A death the breaker marker recorded.
+fn recorded(_: std::time::SystemTime) -> bool {
+    true
+}
+
+/// A death the breaker marker could not record.
+fn not_recorded(_: std::time::SystemTime) -> bool {
+    false
+}
+
+/// An endpoint death that cannot be recorded in the breaker marker does not
+/// end the listener liveness: the next start could not count the exit, so a
+/// death at every start would restart the node without bound. The cooldown
+/// end and the listen task still end it.
+#[tokio::test(start_paused = true)]
+async fn an_unrecorded_endpoint_death_does_not_end_the_listener() {
+    use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
+    use std::time::Duration;
+    let (down_tx, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+    let listen_task = tokio::spawn(std::future::pending::<TransportError>());
+    let liveness = tokio::spawn(listener_liveness(
+        listen_task,
+        Some(GatewayQuicRestartWatch {
+            endpoint: Some(watch),
+            restore_after: Some(Duration::from_secs(600)),
+        }),
+        not_recorded,
+    ));
+    down_tx.send(QuicAvailability::Down).unwrap();
+    tokio::time::sleep(Duration::from_secs(599)).await;
+    assert!(
+        !liveness.is_finished(),
+        "an unrecorded death is not an exit"
+    );
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let exit = liveness.await.unwrap();
+    assert!(matches!(exit, ListenerExit::QuicCooldownEnded), "{exit:?}");
+}
+
+/// An endpoint already down when the transport opens is watched like a
+/// live one, and its death ends the listener liveness at once.
+#[tokio::test]
+async fn an_endpoint_down_at_open_is_watched() {
+    use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
+    use std::time::{Duration, SystemTime};
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+    let (_down_tx, down) = QuicAvailabilityWatch::for_test(QuicAvailability::Down);
+    let watch = gateway_quic_restart(true, true, false, down, None, now).expect("watched");
+    assert!(watch.endpoint.is_some());
+    let listen_task = tokio::spawn(std::future::pending::<TransportError>());
+    let exit = tokio::time::timeout(
+        Duration::from_secs(5),
+        listener_liveness(listen_task, Some(watch), recorded),
+    )
+    .await
+    .expect("an earlier death ends it");
+    assert!(matches!(exit, ListenerExit::QuicEndpointDown), "{exit:?}");
+}
+
 /// With an endpoint to watch (a supervised gateway, #5940), the listener
 /// liveness also ends as `QuicEndpointDown` when that endpoint dies, and not
 /// when it is released; without one, endpoint death does not end it, and the
@@ -214,7 +273,7 @@ async fn listener_liveness_reports_endpoint_death_only_when_watched() {
 
     let (down_tx, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
     let listen_task = tokio::spawn(std::future::pending::<TransportError>());
-    let liveness = tokio::spawn(listener_liveness(listen_task, watching(watch)));
+    let liveness = tokio::spawn(listener_liveness(listen_task, watching(watch), recorded));
     tokio::task::yield_now().await;
     assert!(!liveness.is_finished());
     down_tx.send(QuicAvailability::Down).unwrap();
@@ -230,7 +289,7 @@ async fn listener_liveness_reports_endpoint_death_only_when_watched() {
         drop(stop_rx.await);
         TransportError::ChannelClosed
     });
-    let liveness = tokio::spawn(listener_liveness(listen_task, watching(watch)));
+    let liveness = tokio::spawn(listener_liveness(listen_task, watching(watch), recorded));
     released_tx.send(QuicAvailability::Released).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!liveness.is_finished(), "a release is not a death");
@@ -247,7 +306,7 @@ async fn listener_liveness_reports_endpoint_death_only_when_watched() {
     // Not watched: a death does not end it.
     let (unwatched_tx, _watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
     let listen_task = tokio::spawn(std::future::pending::<TransportError>());
-    let liveness = tokio::spawn(listener_liveness(listen_task, None));
+    let liveness = tokio::spawn(listener_liveness(listen_task, None, recorded));
     unwatched_tx.send(QuicAvailability::Down).unwrap();
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!liveness.is_finished(), "an unwatched death is not an exit");
@@ -266,6 +325,7 @@ async fn listener_liveness_ends_when_the_cooldown_ends() {
             endpoint: None,
             restore_after: Some(Duration::from_secs(600)),
         }),
+        recorded,
     ));
     tokio::time::sleep(Duration::from_secs(599)).await;
     assert!(!liveness.is_finished(), "not before the cooldown ends");
@@ -286,37 +346,62 @@ fn only_a_supervised_gateway_restarts_for_quic() {
     let at = Some(now + Duration::from_secs(600));
 
     assert!(
-        gateway_quic_restart(false, true, up(), at, now).is_none(),
+        gateway_quic_restart(false, true, false, up(), at, now).is_none(),
         "a peer"
     );
     assert!(
-        gateway_quic_restart(true, false, up(), at, now).is_none(),
+        gateway_quic_restart(true, false, false, up(), at, now).is_none(),
         "unsupervised"
     );
-    let watch = gateway_quic_restart(true, true, up(), None, now).expect("endpoint");
+    let watch = gateway_quic_restart(true, true, false, up(), None, now).expect("endpoint");
     assert!(watch.endpoint.is_some() && watch.restore_after.is_none());
 
     let off = QuicAvailabilityWatch::disabled();
-    let watch = gateway_quic_restart(true, true, off, at, now).expect("cooldown");
+    let watch = gateway_quic_restart(true, true, false, off, at, now).expect("cooldown");
     assert!(watch.endpoint.is_none());
     assert_eq!(watch.restore_after, Some(Duration::from_secs(600)));
 
     let soon = Some(now + Duration::from_secs(5));
-    let watch = gateway_quic_restart(true, true, QuicAvailabilityWatch::disabled(), soon, now)
-        .expect("cooldown");
+    let watch = gateway_quic_restart(
+        true,
+        true,
+        false,
+        QuicAvailabilityWatch::disabled(),
+        soon,
+        now,
+    )
+    .expect("cooldown");
     assert_eq!(
         watch.restore_after,
         Some(QUIC_RESTORE_MIN_UPTIME),
         "floored"
     );
-    assert!(QUIC_RESTORE_MIN_UPTIME > Duration::from_secs(60));
     let past = Some(now - Duration::from_secs(5));
-    let watch = gateway_quic_restart(true, true, QuicAvailabilityWatch::disabled(), past, now)
-        .expect("cooldown");
+    let watch = gateway_quic_restart(
+        true,
+        true,
+        false,
+        QuicAvailabilityWatch::disabled(),
+        past,
+        now,
+    )
+    .expect("cooldown");
     assert_eq!(watch.restore_after, Some(QUIC_RESTORE_MIN_UPTIME));
 
     assert!(
-        gateway_quic_restart(true, true, QuicAvailabilityWatch::disabled(), None, now).is_none(),
+        gateway_quic_restart(
+            true,
+            true,
+            false,
+            QuicAvailabilityWatch::disabled(),
+            None,
+            now
+        )
+        .is_none(),
         "QUIC off by config: nothing to restore"
+    );
+    assert!(
+        gateway_quic_restart(true, false, true, up(), at, now).is_none(),
+        "an unverified supervisor does not turn restarts on"
     );
 }
