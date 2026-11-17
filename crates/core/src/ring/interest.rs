@@ -4610,7 +4610,14 @@ impl<T: TimeSource + Sync> InterestManager<T> {
                     //    re-applies the same gate — a consistent NotEfficient
                     //    verdict with zero further WASM work, instead of
                     //    re-running the contract on every fan-out target.
-                    self.cache_delta(key, their_summary_bytes, our_summary_bytes, d.clone());
+                    //
+                    // Offering it costs a full copy, so skip that when the cache
+                    // would refuse the delta as larger than an entry may be: a
+                    // delta of a multi-megabyte state would otherwise be held
+                    // twice for nothing.
+                    if self.delta_cache.lock().would_admit(&d) {
+                        self.cache_delta(key, their_summary_bytes, our_summary_bytes, d.clone());
+                    }
                     Self::gate_delta_size(d, their_summary_bytes.len(), our_state_size)
                 }
             }

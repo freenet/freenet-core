@@ -216,6 +216,13 @@ impl<K: std::hash::Hash + Eq, V> ByteBoundedLruCache<K, V> {
         (self.weigh)(value).saturating_add(CACHE_ENTRY_OVERHEAD_BYTES)
     }
 
+    /// Whether [`Self::put`] would keep `value` rather than refuse it as
+    /// larger than one entry may be. Lets a caller that must copy a value to
+    /// offer it skip the copy when the cache would discard it anyway.
+    pub(crate) fn would_admit(&self, value: &V) -> bool {
+        self.entry_weight(value) <= self.max_entry_bytes
+    }
+
     /// Look up a key, marking it most-recently-used on a hit.
     pub(crate) fn get(&mut self, key: &K) -> Option<&V> {
         self.inner.get(key)
@@ -691,6 +698,7 @@ mod tests {
         let bytes_before = cache.total_bytes();
 
         // Fits the budget (~half of it) but exceeds the per-entry cap.
+        assert!(!cache.would_admit(&vec![0u8; budget / 2]));
         cache.put(999, vec![0u8; budget / 2]);
         assert!(cache.get(&999).is_none(), "over-cap value must be refused");
         assert_eq!(cache.len(), 50, "nothing resident may be evicted");
@@ -698,6 +706,8 @@ mod tests {
         assert_eq!(cache.evictions(), 0);
 
         // Exactly at the cap is admitted.
+        assert!(cache.would_admit(&vec![0u8; cap - CACHE_ENTRY_OVERHEAD_BYTES]));
+        assert!(!cache.would_admit(&vec![0u8; cap - CACHE_ENTRY_OVERHEAD_BYTES + 1]));
         cache.put(1000, vec![0u8; cap - CACHE_ENTRY_OVERHEAD_BYTES]);
         assert!(cache.get(&1000).is_some(), "an at-cap value must be cached");
 

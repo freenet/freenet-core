@@ -444,6 +444,12 @@ impl DiskUsageTracker {
         self.refresh_webapp_cache();
     }
 
+    /// The size last recorded for `key` by [`Self::record_state_write`] (or
+    /// the seed), or `None` if none is recorded.
+    pub(crate) fn committed_state_size(&self, key: &ContractKey) -> Option<u64> {
+        self.state_sizes.lock().get(key)
+    }
+
     /// Apply a state-write at a chokepoint: set `key`'s tracked size to
     /// `new_size` and adjust `state_bytes` by the signed delta against the
     /// previous size for that key (0 if unseen).

@@ -15,7 +15,9 @@ pub(crate) mod propagation_stats;
 
 use freenet_stdlib::prelude::*;
 
-pub(crate) use self::messages::{BroadcastStreamingPayload, UpdateMsg, UpdateStreamingPayload};
+pub(crate) use self::messages::{
+    BroadcastStreamingPayload, BroadcastStreamingPayloadRef, UpdateMsg, UpdateStreamingPayload,
+};
 use super::OpError;
 use crate::contract::{ContractHandlerEvent, ExecutorError, StoreResponse};
 use crate::message::{NodeEvent, Transaction};
@@ -1648,6 +1650,18 @@ mod messages {
         pub sender_summary_bytes: Vec<u8>,
     }
 
+    /// The sender's borrowed form of [`BroadcastStreamingPayload`].
+    ///
+    /// Serializes to the same bytes (serde writes a `&[u8]` and a `Vec<u8>` the
+    /// same way), so a sender can serialize from a state it shares with other
+    /// broadcast legs without first copying it into a `Vec`. Pinned by
+    /// `broadcast_streaming_payload_ref_serializes_like_the_owned_payload`.
+    #[derive(Serialize)]
+    pub(crate) struct BroadcastStreamingPayloadRef<'a> {
+        pub state_bytes: &'a [u8],
+        pub sender_summary_bytes: &'a [u8],
+    }
+
     #[derive(Debug, Serialize, Deserialize, Clone)]
     /// Update operation messages.
     ///
@@ -1823,6 +1837,35 @@ mod messages {
 mod tests {
     use super::*;
     use crate::operations::test_utils::make_contract_key;
+
+    /// The borrowed payload a broadcast sender serializes must decode as the
+    /// owned payload a receiver deserializes, byte for byte, including the
+    /// empty summary a sender without one sends.
+    #[test]
+    fn broadcast_streaming_payload_ref_serializes_like_the_owned_payload() {
+        for (state, summary) in [
+            (vec![1u8, 2, 3, 250], vec![9u8, 8]),
+            (vec![0u8; 70_000], Vec::new()),
+            (Vec::new(), Vec::new()),
+        ] {
+            let borrowed = bincode::serialize(&BroadcastStreamingPayloadRef {
+                state_bytes: &state,
+                sender_summary_bytes: &summary,
+            })
+            .unwrap();
+            let owned = bincode::serialize(&BroadcastStreamingPayload {
+                state_bytes: state.clone(),
+                sender_summary_bytes: summary.clone(),
+            })
+            .unwrap();
+            assert_eq!(borrowed, owned);
+            let decoded: BroadcastStreamingPayload = bincode::deserialize(&borrowed).unwrap();
+            assert_eq!(
+                (decoded.state_bytes, decoded.sender_summary_bytes),
+                (state, summary)
+            );
+        }
+    }
 
     /// Wire-compatibility guard for #5147, in two independent halves.
     ///

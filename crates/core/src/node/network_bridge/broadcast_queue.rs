@@ -175,6 +175,28 @@ pub(super) async fn await_stream_completion_releasing_permit<T>(
 /// old state-size classification had it too) and is not what #4961 was about.
 const BROADCAST_QUEUE_PAYLOAD_SIZE_THRESHOLD: usize = 64 * 1024;
 
+/// State size, in bytes, at or above which a broadcast is queued in the large
+/// lane even when a delta is expected.
+///
+/// The delta prediction only says that a summary is cached for the target, not
+/// how big the delta will be, and a contract's delta against a peer that holds
+/// little of its state is about the size of the state. For a small state a
+/// wrong prediction costs one large payload, corrected by
+/// [`SendLanePermit::ensure_capacity_for`]. For a multi-megabyte state it does
+/// not: every leg of the fan-out runs the summarize and delta work and builds
+/// its payload under one of the 12 small-lane permits before the correction
+/// applies, so a whole fan-out builds state-sized payloads at once. Queueing
+/// these legs in the large lane from the start means a leg does no work at all
+/// until it holds one of the large lane's permits.
+///
+/// The cost is that the small deltas of a state this large share the large
+/// lane's two permits. That is the pre-#4961 behaviour, kept only for states
+/// this size.
+// Only read by the production queue, which is cfg'd out under
+// `simulation_tests`.
+#[cfg_attr(feature = "simulation_tests", allow(dead_code))]
+const LARGE_STATE_LANE_THRESHOLD: usize = 4 * 1024 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 // The simulation feature replaces the production queue, but keeps the shared
 // payload-selection path and its public signature compiled.
@@ -848,7 +870,7 @@ mod queue {
 
     /// Maximum concurrent outbound broadcast streams for large payloads (>= 64KB).
     /// Large payloads (full state) are rate-limited to avoid uplink saturation.
-    const DEFAULT_LARGE_PAYLOAD_CONCURRENCY: usize = 2;
+    pub(super) const DEFAULT_LARGE_PAYLOAD_CONCURRENCY: usize = 2;
 
     /// Maximum entries in the queue before oldest are dropped.
     const DEFAULT_MAX_QUEUE_DEPTH: usize = 256;
@@ -872,11 +894,16 @@ mod queue {
     /// send full state anyway — so it decides SCHEDULING only. The uplink bound
     /// is enforced against the real payload by
     /// [`SendLanePermit::ensure_capacity_for`].
+    ///
+    /// A state at or above [`super::LARGE_STATE_LANE_THRESHOLD`] is queued
+    /// large whatever the prediction; see that constant.
     pub(super) fn classify_payload_lane(
         state_size: usize,
         delta_expected: bool,
     ) -> QueuedPayloadClass {
-        if state_size < super::BROADCAST_QUEUE_PAYLOAD_SIZE_THRESHOLD || delta_expected {
+        if state_size < super::BROADCAST_QUEUE_PAYLOAD_SIZE_THRESHOLD
+            || (delta_expected && state_size < super::LARGE_STATE_LANE_THRESHOLD)
+        {
             QueuedPayloadClass::Small
         } else {
             QueuedPayloadClass::Large
@@ -3412,6 +3439,18 @@ mod queue {
                 QueuedPayloadClass::Small,
                 "a state below the threshold is small whatever the payload shape"
             );
+            const HUGE: usize = super::super::LARGE_STATE_LANE_THRESHOLD;
+            assert_eq!(
+                classify_payload_lane(HUGE - 1, true),
+                QueuedPayloadClass::Small,
+                "an expected delta stays small up to the large-state threshold"
+            );
+            assert_eq!(
+                classify_payload_lane(HUGE, true),
+                QueuedPayloadClass::Large,
+                "a state at the large-state threshold is queued large even when \
+                 a delta is expected: its delta may be as large as the state"
+            );
 
             let queue = BroadcastQueue::new();
             let mut lanes = spawn_lanes(&queue, 12, 2);
@@ -4147,6 +4186,11 @@ mod queue {
                 "THE #4961 CASE: a >64 KiB contract sending a delta to a peer whose \
                  summary we hold must not spend one of the 2 large-lane permits"
             );
+            assert_eq!(
+                lane(super::super::LARGE_STATE_LANE_THRESHOLD),
+                QueuedPayloadClass::Large,
+                "a multi-megabyte state is queued large even with a cached summary"
+            );
 
             let addr = |port: u16| -> std::net::SocketAddr {
                 format!("127.0.0.1:{port}").parse().unwrap()
@@ -4167,6 +4211,11 @@ mod queue {
 
 #[cfg(not(feature = "simulation_tests"))]
 pub(crate) use queue::BroadcastQueue;
+
+/// The large lane's permit count, for the fan-out memory test in
+/// `p2p_protoc`, which derives its bound from it.
+#[cfg(all(test, not(feature = "simulation_tests")))]
+pub(super) const LARGE_LANE_PERMITS: usize = queue::DEFAULT_LARGE_PAYLOAD_CONCURRENCY;
 
 /// Classify the result of awaiting the streaming completion oneshot into
 /// "the message was actually delivered" vs "the permit can be released but the
@@ -4408,6 +4457,83 @@ pub(crate) fn target_list_for(
     ))
 }
 
+/// Whether a computed delta of `delta_len` bytes is sent as the full state,
+/// by stream, rather than as an inline message, for a stored state of
+/// `state_len` bytes.
+///
+/// An inline message is handed to the bridge and the leg returns, releasing
+/// its lane permit while the message waits in the transport's queue, so the
+/// lanes limit how many inline payloads are built at once, not how many are
+/// resident. A stream holds its lane permit while it is sent, for up to
+/// [`STREAM_PERMIT_HOLD`]. The stream payload can only carry a full state, so
+/// for a state of at least [`LARGE_STATE_LANE_THRESHOLD`] every delta over
+/// the streaming threshold (the same comparison as `should_use_streaming`) is
+/// replaced by the state. A large-state fan-out then sends inline only
+/// payloads of at most the threshold.
+///
+/// The cost is bandwidth: a large contract with medium-sized deltas sends its
+/// whole state to every co-host. Smaller states, and a state at or under the
+/// streaming threshold (an operator can raise it), are not swapped.
+fn delta_sent_as_full_state(
+    delta_len: usize,
+    state_len: usize,
+    streaming_threshold: usize,
+) -> bool {
+    state_len >= LARGE_STATE_LANE_THRESHOLD
+        && crate::operations::should_use_streaming(streaming_threshold, state_len)
+        && crate::operations::should_use_streaming(streaming_threshold, delta_len)
+}
+
+/// The size of the state the contract handler will summarize and diff for
+/// this leg: the larger of the queued state and the last state committed to
+/// the store for `key`.
+///
+/// The queued state can be stale: a write committed after this leg was
+/// queued replaces the stored state, and the handler works on the stored
+/// one. The committed size comes from the disk tracker's per-contract index
+/// (`Ring::committed_state_size`), which every state write updates; it is
+/// absent until the tracker is installed, which is why the queued size is
+/// the floor.
+fn leg_state_size(op_manager: &OpManager, key: &ContractKey, new_state: &WrappedState) -> usize {
+    let committed = op_manager
+        .ring
+        .committed_state_size(key)
+        .map_or(0, |size| usize::try_from(size).unwrap_or(usize::MAX));
+    new_state.size().max(committed)
+}
+
+/// The payload one broadcast leg selected, held until the leg has lane
+/// capacity to send it.
+///
+/// The full state is held as the `WrappedState` itself, a reference count
+/// shared by every leg of the fan-out, so a leg waiting for capacity holds no
+/// copy of the state. A leg makes its own wire copy only once it may send:
+/// the stream buffer, or the inline message (see [`Self::into_wire`]).
+enum LegPayload {
+    Delta(Vec<u8>),
+    FullState(WrappedState),
+}
+
+impl LegPayload {
+    fn size(&self) -> usize {
+        match self {
+            Self::Delta(delta) => delta.len(),
+            Self::FullState(state) => state.size(),
+        }
+    }
+
+    /// The wire form, for an inline message. Copies a full state, so it is
+    /// called only after the leg holds lane capacity.
+    fn into_wire(self) -> crate::message::DeltaOrFullState {
+        match self {
+            Self::Delta(delta) => crate::message::DeltaOrFullState::Delta(delta),
+            Self::FullState(state) => {
+                crate::message::DeltaOrFullState::FullState(state.as_ref().to_vec())
+            }
+        }
+    }
+}
+
 /// Send a state change broadcast to a single peer.
 ///
 /// This is the per-target body extracted from `broadcast_state_to_peers`.
@@ -4433,9 +4559,9 @@ pub(super) async fn broadcast_to_single_peer(
     // originator target list attached to this leg, minus the recipient itself.
     fanout: FanoutTargets,
 ) {
-    use crate::message::{DeltaOrFullState, NetMessage};
+    use crate::message::NetMessage;
     use crate::node::network_bridge::NetworkBridge;
-    use crate::operations::update::{BroadcastStreamingPayload, UpdateMsg};
+    use crate::operations::update::{BroadcastStreamingPayloadRef, UpdateMsg};
     use crate::ring::PeerKey;
     use crate::transport::StreamId;
 
@@ -4474,6 +4600,20 @@ pub(super) async fn broadcast_to_single_peer(
     }
 
     let peer_key = PeerKey::from(target.pub_key().clone());
+
+    // A leg queued in the small lane may find the stored state has since grown
+    // past `LARGE_STATE_LANE_THRESHOLD` (a later write replaced it). The
+    // summary and delta below run against the stored state, so take a
+    // large-lane permit BEFORE them, as the queue would have for a state this
+    // size, rather than building a state-sized delta under one of the small
+    // lane's 12 permits. Above the CPU clock start, so the wait is not billed
+    // as contract CPU (see the `report_send_cpu` comment below).
+    let leg_state_size = leg_state_size(op_manager, &key, &new_state);
+    if leg_state_size >= LARGE_STATE_LANE_THRESHOLD {
+        if let Some(permit) = lane_permit.as_mut() {
+            permit.ensure_capacity_for(leg_state_size).await;
+        }
+    }
 
     // Cost telemetry (cost-aware eviction, #4861): attribute this per-peer
     // send's two costs to the contract:
@@ -4656,18 +4796,34 @@ pub(super) async fn broadcast_to_single_peer(
         // send full state and also never reach `compute_delta`), so this is
         // purely about attributing the bytes to the right cause.
         (Some(_), Some(_)) if deltas_suppressed => (
-            DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
+            LegPayload::FullState(new_state.clone()),
             false,
             PayloadArm::FullDeltaSuppressed,
         ),
         (Some(ours), Some(theirs)) => {
             match op_manager
                 .interest_manager
-                .compute_delta(op_manager, &key, theirs, ours, new_state.size())
+                .compute_delta(op_manager, &key, theirs, ours, leg_state_size)
                 .await
             {
+                // A delta too large to go inline for a large state goes out
+                // as a full-state stream; see `delta_sent_as_full_state`.
+                Ok(Some(delta))
+                    if delta_sent_as_full_state(
+                        delta.as_ref().len(),
+                        leg_state_size,
+                        op_manager.streaming_threshold,
+                    ) =>
+                {
+                    drop(delta);
+                    (
+                        LegPayload::FullState(new_state.clone()),
+                        false,
+                        PayloadArm::FullLargeDeltaStreamed,
+                    )
+                }
                 Ok(Some(delta)) => (
-                    DeltaOrFullState::Delta(delta.as_ref().to_vec()),
+                    LegPayload::Delta(delta.into_bytes()),
                     true,
                     PayloadArm::Delta,
                 ),
@@ -4729,11 +4885,7 @@ pub(super) async fn broadcast_to_single_peer(
                             PayloadArm::FullComputeFailed
                         }
                     };
-                    (
-                        DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
-                        false,
-                        arm,
-                    )
+                    (LegPayload::FullState(new_state.clone()), false, arm)
                 }
             }
         }
@@ -4769,7 +4921,7 @@ pub(super) async fn broadcast_to_single_peer(
         // handler round-trip — so this classification costs nothing on a path
         // that has already decided to put a whole state on the wire.
         (None, _) => (
-            DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
+            LegPayload::FullState(new_state.clone()),
             false,
             PayloadArm::FullNoOurSummary,
         ),
@@ -4779,11 +4931,7 @@ pub(super) async fn broadcast_to_single_peer(
             } else {
                 PayloadArm::FullNoTheirSummaryUntracked
             };
-            (
-                DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
-                false,
-                arm,
-            )
+            (LegPayload::FullState(new_state.clone()), false, arm)
         }
     };
     // #5842: a FULL-STATE payload and the summary we send and record with it
@@ -4806,32 +4954,30 @@ pub(super) async fn broadcast_to_single_peer(
         // hold this leg's permit for a second timeout; there is no summary to
         // record either way.
         //
-        // Every full-state arm binds the queued copy (`queued`) and either
-        // sends it or drops it. A `FullState(_)` pattern would leave that copy
-        // alive until this function returns, which is after the completion
-        // wait below: a full private copy of the state per waiting send.
-        DeltaOrFullState::FullState(queued) if our_summary.is_none() => {
-            (DeltaOrFullState::FullState(queued), None, new_state.size())
+        // A full-state arm holds the state as a `WrappedState`, a reference
+        // count shared with every other leg of the fan-out, not a copy. Every
+        // arm still binds it (`queued`) and either sends it or drops it, so a
+        // state the snapshot replaces is released at once rather than after
+        // the completion wait below.
+        LegPayload::FullState(queued) if our_summary.is_none() => {
+            (LegPayload::FullState(queued), None, new_state.size())
         }
-        DeltaOrFullState::FullState(queued) => {
+        LegPayload::FullState(queued) => {
             match get_contract_snapshot(op_manager, &key).await {
                 Some((state, summary)) => {
                     drop(queued);
-                    (
-                        DeltaOrFullState::FullState(state.as_ref().to_vec()),
-                        Some(summary),
-                        state.size(),
-                    )
+                    let size = state.size();
+                    (LegPayload::FullState(state), Some(summary), size)
                 }
                 // Without a snapshot we cannot say which state a summary describes,
                 // so send the queued state and record no summary for the peer. If
                 // the handler is too loaded to answer, the peer stays on full state
                 // until it is not; the previous fallback, recording a summary we
                 // could not vouch for, is the loss this replaces.
-                None => (DeltaOrFullState::FullState(queued), None, new_state.size()),
+                None => (LegPayload::FullState(queued), None, new_state.size()),
             }
         }
-        delta @ DeltaOrFullState::Delta(_) => (delta, our_summary.take(), new_state.size()),
+        delta @ LegPayload::Delta(_) => (delta, our_summary.take(), new_state.size()),
     };
     // Neither summary is needed past this point (`sent_summary` is what the
     // bookkeeping records), and the peer's has no size bound. Free both before
@@ -4885,7 +5031,7 @@ pub(super) async fn broadcast_to_single_peer(
     let update_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
 
     // Check if we should use streaming for full state broadcasts
-    let use_streaming = matches!(&payload, DeltaOrFullState::FullState(_))
+    let use_streaming = matches!(&payload, LegPayload::FullState(_))
         && crate::operations::should_use_streaming(op_manager.streaming_threshold, payload_size);
 
     // Each branch below tracks whether the message was *actually delivered* to
@@ -4900,17 +5046,16 @@ pub(super) async fn broadcast_to_single_peer(
     // summary — treating a drop as a delivery defeats the next summary-mismatch
     // round that would re-send the state.
     let send_result = if use_streaming {
-        let sender_summary_bytes = sent_summary
-            .as_ref()
-            .map(|s| s.as_ref().to_vec())
-            .unwrap_or_default();
-        let state_bytes = match payload {
-            DeltaOrFullState::FullState(data) => data,
-            _ => unreachable!("checked above"),
+        let state = match payload {
+            LegPayload::FullState(state) => state,
+            LegPayload::Delta(_) => unreachable!("checked above"),
         };
-        let streaming_payload = BroadcastStreamingPayload {
-            state_bytes,
-            sender_summary_bytes,
+        // Serialized straight from the shared state: the stream buffer is the
+        // only copy of the state this leg makes, and it is made only now that
+        // the leg holds lane capacity for it.
+        let streaming_payload = BroadcastStreamingPayloadRef {
+            state_bytes: state.as_ref(),
+            sender_summary_bytes: sent_summary.as_ref().map_or(&[], |s| s.as_ref()),
         };
         let payload_bytes = match bincode::serialize(&streaming_payload) {
             Ok(b) => b,
@@ -4924,14 +5069,14 @@ pub(super) async fn broadcast_to_single_peer(
                 return;
             }
         };
-        // The serialized bytes are all the stream needs. Free this send's copy
-        // of the state and of its summary now: the completion wait below can
-        // last up to `stream_completion_timeout` (over 24 minutes for the
-        // largest state), and every send still waiting would otherwise hold a
-        // private copy for that long. What stays alive across the wait is the
-        // bincoded `payload_bytes` the stream sends from (moved into the
-        // stream) and `sent_summary`, which the bookkeeping records.
-        drop(streaming_payload);
+        // The serialized bytes are all the stream needs. Release this send's
+        // references to the state now: the completion wait below can last up
+        // to `stream_completion_timeout` (over 24 minutes for the largest
+        // state), and the state is freed only once the last leg lets go of it.
+        // What stays alive across the wait is the bincoded `payload_bytes` the
+        // stream sends from (moved into the stream) and `sent_summary`, which
+        // the bookkeeping records.
+        drop(state);
         drop(new_state);
         let sid = StreamId::next();
         tracing::debug!(
@@ -5112,7 +5257,7 @@ pub(super) async fn broadcast_to_single_peer(
             Some(covered) => UpdateMsg::BroadcastToV2 {
                 id: update_tx,
                 key,
-                payload,
+                payload: payload.into_wire(),
                 sender_summary_bytes: sent_summary
                     .as_ref()
                     .map(|s| s.as_ref().to_vec())
@@ -5124,7 +5269,7 @@ pub(super) async fn broadcast_to_single_peer(
             None => UpdateMsg::BroadcastTo {
                 id: update_tx,
                 key,
-                payload,
+                payload: payload.into_wire(),
                 sender_summary_bytes: sent_summary
                     .as_ref()
                     .map(|s| s.as_ref().to_vec())
@@ -5436,26 +5581,23 @@ mod stream_completion_timeout_tests {
             "the wait hands the lane permit to the helper that returns it early"
         );
         let wait_at = compact.find(wait).expect("counted above");
-        // The queued full-state copy built while choosing the payload must be
-        // moved in every arm: a `FullState(_)` pattern binds nothing, so that
-        // copy would live until the function returns, after the wait.
-        for arm in [
-            "DeltaOrFullState::FullState(_)=>",
-            "DeltaOrFullState::FullState(_)if",
-        ] {
+        // The queued state reference taken while choosing the payload must be
+        // moved in every arm: a `FullState(_)` pattern binds nothing, so the
+        // reference would live until the function returns, after the wait,
+        // and keep a state the snapshot replaced alive with it.
+        for arm in ["LegPayload::FullState(_)=>", "LegPayload::FullState(_)if"] {
             assert!(
                 !compact.contains(arm),
-                "a FullState(_) match arm leaves the queued copy alive across the wait"
+                "a FullState(_) match arm leaves the queued state alive across the wait"
             );
         }
         assert!(
-            compact.contains("DeltaOrFullState::FullState(queued)ifour_summary.is_none()=>")
-                && compact
-                    .contains("DeltaOrFullState::FullState(queued)=>{matchget_contract_snapshot("),
-            "both full-state arms bind the queued copy"
+            compact.contains("LegPayload::FullState(queued)ifour_summary.is_none()=>")
+                && compact.contains("LegPayload::FullState(queued)=>{matchget_contract_snapshot("),
+            "both full-state arms bind the queued state"
         );
         for drop_call in [
-            "drop(streaming_payload);",
+            "drop(state);",
             "drop(new_state);",
             "drop(our_summary);",
             "drop(their_summary);",
@@ -5502,6 +5644,42 @@ mod tests {
         BroadcastStreamMetrics, FanoutSendPlan, SummaryPair, plan_fanout_send,
         record_streaming_delivery, streaming_completion_delivered,
     };
+
+    /// For a state of at least `LARGE_STATE_LANE_THRESHOLD`, any delta that
+    /// would have to stream goes out as the full state by stream, whatever its
+    /// ratio to the state; smaller states and inline-sized deltas are never
+    /// swapped.
+    #[test]
+    fn a_large_state_streams_every_delta_over_the_streaming_threshold() {
+        use super::{LARGE_STATE_LANE_THRESHOLD as LARGE, delta_sent_as_full_state as swap};
+        const T: usize = 64 * 1024;
+        const STATE: usize = 30 * 1024 * 1024;
+        assert!(
+            swap(STATE, STATE, T),
+            "a state-sized delta streams the state"
+        );
+        assert!(
+            swap(STATE / 2 - 1, STATE, T),
+            "about half the state streams too"
+        );
+        assert!(swap(T + 1, STATE, T), "just over the threshold streams");
+        assert!(
+            !swap(T, STATE, T),
+            "at the threshold it goes inline, as should_use_streaming does"
+        );
+        assert!(
+            swap(T + 1, LARGE, T),
+            "the large-state boundary is inclusive"
+        );
+        assert!(
+            !swap(LARGE - 1, LARGE - 1, T),
+            "below the large-state threshold nothing is swapped"
+        );
+        assert!(
+            !swap(STATE, STATE, STATE),
+            "a state that would itself go inline is not swapped"
+        );
+    }
 
     /// `BroadcastStreamMetrics` counts every attempt and, separately, only the
     /// non-`delivered` attempts (#4440). Tests a LOCAL instance so it stays
@@ -6693,6 +6871,7 @@ mod tests {
             "PayloadArm::Delta",
             "PayloadArm::FullDeltaSuppressed",
             "PayloadArm::FullNotEfficient",
+            "PayloadArm::FullLargeDeltaStreamed",
             "PayloadArm::FullComputeFailed",
             "PayloadArm::FullNoOurSummary",
             "PayloadArm::FullNoTheirSummaryUntracked",
@@ -6795,6 +6974,9 @@ mod tests {
     /// A peer summary for which `one_peer_node`'s stand-in returns a small,
     /// non-empty delta, so the leg sends a delta.
     const DELTA_PEER: &[u8] = &[0xCC];
+    /// A peer summary for which `one_peer_node`'s stand-in returns a delta as
+    /// large as the stored state.
+    const STATE_SIZED_DELTA_PEER: &[u8] = &[0xF1];
 
     struct OnePeerNode {
         op_manager: std::sync::Arc<crate::node::OpManager>,
@@ -6802,6 +6984,11 @@ mod tests {
         target: crate::ring::PeerKeyLocation,
         peer_key: PeerKey,
         handler: tokio::task::JoinHandle<()>,
+        /// How many queries the stand-in contract handler has received.
+        // Read only by a test that needs the production queue, which the
+        // `simulation_tests` feature compiles out.
+        #[cfg_attr(feature = "simulation_tests", allow(dead_code))]
+        queries: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         /// Receivers and monitors whose drop would close a channel the node
         /// still writes to; held for the test's lifetime.
         _keep_alive: Box<dyn std::any::Any>,
@@ -6887,8 +7074,11 @@ mod tests {
         let peer_key = PeerKey::from(peer_pub);
 
         let probe_failed = std::sync::atomic::AtomicBool::new(false);
+        let queries = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = queries.clone();
         let handler = tokio::spawn(async move {
             while let Ok((id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 #[allow(
                     clippy::wildcard_enum_match_arm,
                     reason = "stand-in executor serving only the queries a \
@@ -6917,6 +7107,11 @@ mod tests {
                     ContractHandlerEvent::GetDeltaQuery { key, their_summary } => {
                         let delta = if their_summary.as_ref() == DELTA_PEER {
                             Ok(freenet_stdlib::prelude::StateDelta::from(vec![0xD1, 0xD2]))
+                        } else if their_summary.as_ref() == STATE_SIZED_DELTA_PEER {
+                            Ok(freenet_stdlib::prelude::StateDelta::from(vec![
+                                0xD3;
+                                stored.size()
+                            ]))
                         } else if their_summary.as_ref() == PROBE_FAILS_ONCE
                             && !probe_failed.swap(true, std::sync::atomic::Ordering::Relaxed)
                         {
@@ -6954,6 +7149,7 @@ mod tests {
             target,
             peer_key,
             handler,
+            queries,
             _keep_alive: Box::new((
                 notifications,
                 result_router_rx,
@@ -6995,6 +7191,7 @@ mod tests {
             peer_key,
             handler,
             _keep_alive,
+            ..
         } = one_peer_node(
             &format!("bq-5842-snapshot-{snapshot_ok}"),
             s2.clone(),
@@ -7821,6 +8018,186 @@ mod tests {
 
         assert!(bridge_rx.try_recv().is_err(), "no peer was sent anything");
         assert_eq!(events().sent(), 0);
+        node.handler.abort();
+    }
+
+    /// A leg the queue put in the small lane, whose stored state has since
+    /// grown past `LARGE_STATE_LANE_THRESHOLD`, must take a large-lane permit
+    /// BEFORE it asks the contract for anything. The summary and delta run
+    /// against the stored state, so a leg that queried first would build a
+    /// state-sized delta under one of the small lane's 12 permits.
+    ///
+    /// Decisive: the large lane is held full, and the stand-in contract counts
+    /// queries. Without the upgrade the leg's first act is a summary query,
+    /// answered at once, so the count is non-zero while the lane is still full.
+    #[cfg(not(feature = "simulation_tests"))]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_small_lane_leg_waits_for_a_large_permit_before_touching_a_grown_state() {
+        use std::sync::Arc;
+        use std::sync::atomic::Ordering;
+
+        use freenet_stdlib::prelude::WrappedState;
+        use tokio::sync::Semaphore;
+
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+
+        let grown = super::LARGE_STATE_LANE_THRESHOLD;
+        let stored = WrappedState::new(vec![4u8; grown]);
+        let node = one_peer_node("bq-grown-state-lane", stored, true).await;
+        let op_manager = &node.op_manager;
+        // The store's record of the contract: the grown size, as the disk
+        // tracker holds it after the later write.
+        op_manager
+            .ring
+            .seed_disk_tracker_for_test([(node.key, grown as u64)]);
+        assert_eq!(
+            op_manager.ring.committed_state_size(&node.key),
+            Some(grown as u64),
+            "premise: the committed size is visible to the leg"
+        );
+
+        let large_pool = Arc::new(Semaphore::new(1));
+        let lane_full = large_pool.clone().acquire_owned().await.expect("open");
+        let small_pool = Arc::new(Semaphore::new(1));
+        let scheduling = super::QueueScheduling {
+            queued_class: super::QueuedPayloadClass::Small,
+            permit: super::SendLanePermit::new(
+                super::QueuedPayloadClass::Small,
+                small_pool.acquire_owned().await.expect("open"),
+                large_pool.clone(),
+                Arc::new(Semaphore::new(super::MAX_PARKED_LANE_UPGRADES)),
+            ),
+        };
+
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(16);
+        let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
+        // The state the leg was queued with: small, from before the write.
+        let queued = WrappedState::new(vec![4u8; 1024]);
+        let leg = super::broadcast_to_single_peer(
+            &bridge,
+            op_manager,
+            node.key,
+            queued,
+            node.target.clone(),
+            Some(scheduling),
+            Arc::new(vec![node.target.pub_key().clone()]),
+        );
+        tokio::pin!(leg);
+        tokio::select! {
+            () = &mut leg => panic!("the leg finished while the large lane was full"),
+            () = tokio::time::sleep(Duration::from_millis(500)) => {}
+        }
+        assert_eq!(
+            node.queries.load(Ordering::Relaxed),
+            0,
+            "the leg queried the contract before it held a large-lane permit"
+        );
+
+        drop(lane_full);
+        let transport = async {
+            while let Some(event) = bridge_rx.recv().await {
+                if let P2pBridgeEvent::StreamSend { completion_tx, .. } = event {
+                    if let Some(done) = completion_tx {
+                        let _ignored = done.send(StreamSendOutcome::Delivered);
+                    }
+                    break;
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), async {
+            tokio::join!(leg, transport)
+        })
+        .await
+        .expect("the leg completes once the large lane has room");
+        assert!(
+            node.queries.load(Ordering::Relaxed) > 0,
+            "the leg did its work after the wait"
+        );
+        node.handler.abort();
+    }
+
+    /// A leg of a large state whose delta is too large to go inline sends the
+    /// full state by stream, is counted under its own payload arm (not
+    /// `FullNotEfficient`, which means the delta was not smaller than the
+    /// state), and records for the peer the summary of the state it sent.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_streamed_large_delta_leg_is_counted_and_records_its_summary() {
+        use std::sync::Arc;
+
+        use freenet_stdlib::prelude::WrappedState;
+
+        use crate::node::network_bridge::broadcast_payload_mix::PayloadArm;
+        use crate::node::network_bridge::p2p_protoc::{P2pBridge, P2pBridgeEvent};
+        use crate::operations::update::BroadcastStreamingPayload;
+        use crate::ring::interest::SummaryPopulationSource;
+
+        let stored = WrappedState::new(vec![8u8; super::LARGE_STATE_LANE_THRESHOLD]);
+        let node = one_peer_node("bq-large-delta-arm", stored.clone(), true).await;
+        let op_manager = &node.op_manager;
+        op_manager.interest_manager.upsert_peer_summary_from(
+            &node.key,
+            &node.peer_key,
+            StateSummary::from(STATE_SIZED_DELTA_PEER.to_vec()),
+            SummaryPopulationSource::Delivery,
+        );
+        let (bridge_tx, mut bridge_rx) = tokio::sync::mpsc::channel::<P2pBridgeEvent>(16);
+        let bridge = P2pBridge::new_for_test(bridge_tx, op_manager.clone());
+        let leg = super::broadcast_to_single_peer(
+            &bridge,
+            op_manager,
+            node.key,
+            stored.clone(),
+            node.target.clone(),
+            None,
+            Arc::new(vec![node.target.pub_key().clone()]),
+        );
+        let transport = async {
+            loop {
+                let Some(event) = bridge_rx.recv().await else {
+                    panic!("the leg never streamed");
+                };
+                if let P2pBridgeEvent::StreamSend {
+                    data,
+                    completion_tx,
+                    ..
+                } = event
+                {
+                    let sent: BroadcastStreamingPayload =
+                        bincode::deserialize(&data).expect("a broadcast stream payload");
+                    if let Some(done) = completion_tx {
+                        let _ignored = done.send(StreamSendOutcome::Delivered);
+                    }
+                    return sent;
+                }
+            }
+        };
+        let ((), sent) = tokio::join!(leg, transport);
+
+        assert!(
+            sent.state_bytes == stored.as_ref(),
+            "the stream carries the stored state"
+        );
+        assert_eq!(
+            sent.sender_summary_bytes,
+            summary_of(stored.as_ref()).as_ref()
+        );
+        assert_eq!(
+            op_manager
+                .payload_mix
+                .arm_for_test(PayloadArm::FullLargeDeltaStreamed),
+            (1, stored.size() as u64),
+            "counted under its own arm"
+        );
+        for arm in [PayloadArm::FullNotEfficient, PayloadArm::Delta] {
+            assert_eq!(op_manager.payload_mix.arm_for_test(arm), (0, 0), "{arm:?}");
+        }
+        assert_eq!(
+            op_manager
+                .interest_manager
+                .get_peer_summary(&node.key, &node.peer_key),
+            Some(summary_of(stored.as_ref())),
+            "the peer is recorded as holding the state it was sent"
+        );
         node.handler.abort();
     }
 }

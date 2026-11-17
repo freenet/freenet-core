@@ -56,6 +56,8 @@ mod connection_lifecycle;
 mod connection_map;
 mod dispatch;
 mod identity;
+#[cfg(all(test, not(feature = "simulation_tests")))]
+mod large_state_fanout_tests;
 mod migration;
 mod zombie_sweep;
 
