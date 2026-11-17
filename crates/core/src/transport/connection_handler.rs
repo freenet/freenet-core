@@ -456,10 +456,13 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         }
     });
 
-    // Test builds only (`testing`, which no release build enables): kill the
-    // endpoint after the delay this variable names, through a caught socket
-    // adapter panic, so a real-process test can drive the node's reaction to
-    // endpoint death (`tests/graceful_shutdown_exit_code.rs`).
+    // Test builds only: kill the endpoint after the delay this variable
+    // names, through a caught socket adapter panic, so a real-process test can
+    // drive the node's reaction to endpoint death
+    // (`tests/graceful_shutdown_exit_code.rs`). `testing` is not a release
+    // feature: the release workflows build `-p freenet` without it. A
+    // workspace-wide build does get it, because fdev enables it, so such a
+    // binary obeys this variable too; nothing sets it outside the tests.
     #[cfg(feature = "testing")]
     if let Some(endpoint) = &quic_endpoint {
         fail_endpoint_from_env(endpoint);
@@ -585,6 +588,7 @@ pub(crate) async fn open_udp_transport<S: Socket>(
     let restart = gateway_quic_restart(
         is_gateway,
         super::quic::liveness::gateway_quic_restarts(is_gateway),
+        super::quic::liveness::gateway_supervisor_unverified(),
         outbound.quic_availability(),
         super::quic::breaker::quic_restore_at(),
         std::time::SystemTime::now(),
@@ -619,10 +623,12 @@ fn fail_endpoint_from_env(endpoint: &super::quic::QuicEndpoint) {
 }
 
 /// The least time a gateway runs before it restarts at the end of a
-/// crash-breaker cooldown. Above the node's healthy-uptime threshold
-/// (`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`, 60 s), so the restart always takes
-/// the non-crash exit code 42, never the counted fast-crash code.
-pub(crate) const QUIC_RESTORE_MIN_UPTIME: Duration = Duration::from_secs(90);
+/// crash-breaker cooldown. Longer than the binary's startup update-check
+/// jitter (up to 60 s, `bin/freenet.rs`), so that check has run before the
+/// exit; the binary pins the ordering in a test. The exit code is 42 at any
+/// uptime (`node::p2p_impl::listener_exit_code`).
+#[doc(hidden)]
+pub const QUIC_RESTORE_MIN_UPTIME: Duration = Duration::from_secs(90);
 
 /// When a gateway exits to restore QUIC.
 #[derive(Debug, Default)]
@@ -634,13 +640,18 @@ pub(crate) struct GatewayQuicRestartWatch {
 }
 
 /// What the listener of this node watches to restore QUIC. `enabled` is the
-/// binary's switch (`liveness::gateway_quic_restarts`), `restore_at` the end
-/// of a cooldown that keeps QUIC off for this run (`breaker::quic_restore_at`).
-/// `None` for a peer and for an unsupervised gateway, which logs an ERROR
-/// when its QUIC stays off until it restarts.
+/// binary's switch (`liveness::gateway_quic_restarts`), `unverified` whether
+/// the binary runs under systemd without its own unit's marker
+/// (`liveness::gateway_supervisor_unverified`), `restore_at` the end of a
+/// cooldown that keeps QUIC off for this run (`breaker::quic_restore_at`).
+/// `None` for a peer and for a gateway without the switch, which logs a WARN
+/// when its supervisor is unverified and an ERROR when its QUIC stays off
+/// until it restarts. The endpoint is watched when it is up, and when it is
+/// already down at open (a death between the bind and here).
 fn gateway_quic_restart(
     is_gateway: bool,
     enabled: bool,
+    unverified: bool,
     availability: super::quic::liveness::QuicAvailabilityWatch,
     restore_at: Option<std::time::SystemTime>,
     now: std::time::SystemTime,
@@ -649,18 +660,32 @@ fn gateway_quic_restart(
     if !is_gateway {
         return None;
     }
+    if !enabled && unverified {
+        tracing::warn!(
+            "This gateway runs under systemd, but its unit does not set FREENET_SUPERVISED=1, \
+             so it does not restart itself to restore QUIC: if its QUIC endpoint dies or a \
+             crash-breaker cooldown keeps QUIC off, it keeps running over UDP until it is \
+             restarted. Set FREENET_SUPERVISED=1 in the unit if it restarts the node on exit \
+             code 42 (units written by `freenet service install` do)"
+        );
+    }
     if !enabled {
         if let Some(at) = restore_at {
             tracing::error!(
                 cooldown_end = %chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339(),
                 "QUIC is off on this gateway until it restarts: the crash-breaker cooldown \
-                 ends at the time shown, but this gateway is not run by a service supervisor, \
-                 so it does not restart itself. Restart it after that time to turn QUIC back on"
+                 ends at the time shown, but this gateway is not run with \
+                 FREENET_SUPERVISED=1, so it does not restart itself. Restart it after that time \
+                 to turn QUIC back on"
             );
         }
         return None;
     }
-    let endpoint = (availability.get() == QuicAvailability::Up).then_some(availability);
+    let endpoint = matches!(
+        availability.get(),
+        QuicAvailability::Up | QuicAvailability::Down
+    )
+    .then_some(availability);
     let restore_after = restore_at.map(|at| {
         at.duration_since(now)
             .unwrap_or(Duration::ZERO)
@@ -689,7 +714,11 @@ pub(crate) fn udp_transport_handle<S: Socket>(
         expected_inbound: Arc::new(outbound.expected_inbound_tracker()),
         connector: Arc::new(outbound),
         acceptor: Box::new(inbound),
-        listener: Box::pin(listener_liveness(listen_task, restart)),
+        listener: Box::pin(listener_liveness(
+            listen_task,
+            restart,
+            super::quic::breaker::note_endpoint_down_exit,
+        )),
     }
 }
 
@@ -697,11 +726,13 @@ pub(crate) fn udp_transport_handle<S: Socket>(
 /// `restart`, the death of the watched QUIC endpoint
 /// ([`super::ListenerExit::QuicEndpointDown`]) or the end of the breaker
 /// cooldown ([`super::ListenerExit::QuicCooldownEnded`]), whichever comes
-/// first. A death is first noted in the crash-loop breaker's marker, so the
-/// next start restarts QUIC rather than tripping.
+/// first. A death ends it only once `record` noted it in the crash-loop
+/// breaker's marker (`breaker::note_endpoint_down_exit`), so the next start
+/// can count it; a death that cannot be noted leaves the node running.
 async fn listener_liveness(
     mut listen_task: tokio::task::JoinHandle<TransportError>,
     restart: Option<GatewayQuicRestartWatch>,
+    record: fn(std::time::SystemTime) -> bool,
 ) -> super::ListenerExit {
     let Some(GatewayQuicRestartWatch {
         endpoint,
@@ -710,11 +741,24 @@ async fn listener_liveness(
     else {
         return super::ListenerExit::from_join(listen_task.await);
     };
+    // Resolves when the endpoint died and the exit is recorded in the
+    // crash-breaker marker. Unrecorded, the next start could not count the
+    // exit, and a death that repeats at every start would restart the node
+    // without bound, so the node keeps running over UDP instead.
     let died = async move {
         match endpoint {
             Some(availability) => availability.died().await,
             None => std::future::pending().await,
         }
+        if record(std::time::SystemTime::now()) {
+            return;
+        }
+        tracing::warn!(
+            "The QUIC endpoint died, but the exit could not be recorded in the QUIC \
+             crash-breaker marker, so this gateway does not restart itself: it keeps running \
+             over UDP, with QUIC off until it is restarted"
+        );
+        std::future::pending::<()>().await
     };
     let cooled = async move {
         match restore_after {
@@ -725,10 +769,7 @@ async fn listener_liveness(
     };
     crate::deterministic_select! {
         ended = &mut listen_task => super::ListenerExit::from_join(ended),
-        () = died => {
-            super::quic::breaker::note_endpoint_down_exit(std::time::SystemTime::now());
-            super::ListenerExit::QuicEndpointDown
-        },
+        () = died => super::ListenerExit::QuicEndpointDown,
         () = cooled => super::ListenerExit::QuicCooldownEnded,
     }
 }

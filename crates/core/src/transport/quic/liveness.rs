@@ -107,11 +107,29 @@ static GATEWAY_QUIC_RESTARTS: AtomicBool = AtomicBool::new(false);
 /// Let a gateway exit for its supervisor to restart it when that restores
 /// QUIC (#5940, a prerequisite of native gateway joins): when its QUIC
 /// endpoint dies, and when a crash-breaker cooldown that kept QUIC off for
-/// the run ends. The `freenet` binary calls this only when it runs under a
-/// service supervisor, so a gateway started by hand keeps running over UDP,
-/// as before. Peers never exit for this while UDP remains.
+/// the run ends. The `freenet` binary calls this only when its own service
+/// unit marks it supervised (`FREENET_SUPERVISED`, set by the units
+/// `freenet service install` writes), so a gateway started by hand, or under
+/// a supervisor that may not restart it, keeps running over UDP, as before.
+/// Peers never exit for this while UDP remains.
 pub fn enable_gateway_quic_restarts() {
     GATEWAY_QUIC_RESTARTS.store(true, Ordering::Relaxed);
+}
+
+/// Set by [`note_gateway_supervisor_unverified`].
+static SUPERVISOR_UNVERIFIED: AtomicBool = AtomicBool::new(false);
+
+/// Record that the binary runs under systemd (`INVOCATION_ID`) without the
+/// `FREENET_SUPERVISED` marker. Such a unit may not restart the node (a
+/// `systemd-run` command, a unit with `Restart=no`), so gateway restarts
+/// stay off and a gateway logs a WARN saying how to turn them on.
+pub fn note_gateway_supervisor_unverified() {
+    SUPERVISOR_UNVERIFIED.store(true, Ordering::Relaxed);
+}
+
+/// Whether [`note_gateway_supervisor_unverified`] was called.
+pub(crate) fn gateway_supervisor_unverified() -> bool {
+    SUPERVISOR_UNVERIFIED.load(Ordering::Relaxed)
 }
 
 /// Whether a node in this role exits to restore QUIC: a gateway, and only

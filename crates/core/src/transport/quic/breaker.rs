@@ -11,21 +11,32 @@
 //! # Gateways
 //!
 //! The cooldown is decided once, at startup ([`gate`]). So that a gateway is
-//! never QUIC-off for longer than its cooldown, a gateway run by a service
-//! supervisor (`liveness::gateway_quic_restarts`) whose run starts with QUIC
-//! kept off by a trip or a cooldown exits when the cooldown ends
-//! ([`quic_restore_at`]), with exit 42, and its supervisor restarts it with
-//! QUIC on. 42 is the code the crash-loop rollback and systemd's start limit
-//! do not count; under a unit installed by `freenet service install` it also
-//! runs `freenet update`, which only checks for a newer release and changes
-//! nothing when there is none. The restart comes at least
-//! `QUIC_RESTORE_MIN_UPTIME` (90 s) after the start, so it is never taken
-//! for a fast crash. A gateway also replaces a marker it cannot read, and
-//! runs armed, instead of staying off. Two cases keep QUIC off on a gateway
-//! until it restarts, with an ERROR: a marker that can be neither read nor
-//! removed, and a trip that cannot be written; in both the data directory is
-//! not writable, and a restart would find the same marker. An unsupervised
-//! gateway logs an ERROR naming the cooldown end instead of restarting.
+//! never QUIC-off for longer than its cooldown, a gateway whose service unit
+//! marks it supervised (`FREENET_SUPERVISED`, `liveness::gateway_quic_restarts`)
+//! and whose run starts with QUIC kept off by a trip or a cooldown exits when
+//! the cooldown ends ([`quic_restore_at`]), and its supervisor restarts it
+//! with QUIC on. The same gateway exits when its QUIC endpoint dies, once the
+//! exit is recorded in the marker ([`note_endpoint_down_exit`]). Both exits
+//! use code 42 at any uptime (never the fast-crash code 45, which the
+//! crash-loop rollback counts): 42 is the code the rollback and systemd's
+//! start limit do not count; under a unit installed by
+//! `freenet service install` it also runs `freenet update`, which changes
+//! nothing when there is no newer release. The cooldown restart comes at
+//! least `QUIC_RESTORE_MIN_UPTIME` (90 s) after the start, after the
+//! startup update check. A gateway's cooldown doubles on each repeat trip
+//! (a trip less than [`GATEWAY_TRIP_STREAK_RESET`], a day, after the last
+//! cooldown ended), up to [`GATEWAY_QUIC_BREAKER_COOLDOWN_MAX`] (4 h), so a
+//! fault that recurs at every start does not restart it every 15 minutes
+//! forever; the markers carry the last trip ([`PriorTrip`]), and a clean
+//! stop, which removes the marker, starts the count again.
+//!
+//! A gateway also replaces a marker it cannot read, and runs armed, instead
+//! of staying off. Two cases keep QUIC off on a gateway until it restarts,
+//! with an ERROR: a marker that can be neither read nor removed, and a trip
+//! that cannot be written; in both the data directory is not writable, and a
+//! restart would find the same marker. A gateway without the supervisor
+//! marker logs that it does not restart itself (a WARN under systemd without
+//! `FREENET_SUPERVISED`, an ERROR naming the cooldown end when QUIC is off).
 //! An older release reads no role: rolling a gateway back to one brings the
 //! peer cooldown back.
 //!
@@ -178,6 +189,15 @@ pub(crate) const QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(24 * 60 *
 /// a crash loop to one restart with QUIC per cooldown.
 pub(crate) const GATEWAY_QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
+/// The longest a gateway's cooldown grows to on repeated trips
+/// ([`BreakerRole::cooldown`]). Provisional value (a proposal, not measured).
+pub(crate) const GATEWAY_QUIC_BREAKER_COOLDOWN_MAX: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// A gateway's trip counts as a repeat of the one before, and doubles the
+/// cooldown, when it comes less than this long after that one's cooldown
+/// ended; a clean stretch this long starts the count again. Provisional.
+pub(crate) const GATEWAY_TRIP_STREAK_RESET: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// A node that exits on purpose because its QUIC endpoint died (a gateway,
 /// see `liveness::gateway_quic_restarts`) is restarted by its supervisor
 /// with QUIC on, unless it has already done so this many times within
@@ -193,7 +213,9 @@ pub(crate) const ENDPOINT_DOWN_WINDOW: Duration = Duration::from_secs(60 * 60);
 pub(crate) enum BreakerRole {
     /// A peer: a trip holds for [`QUIC_BREAKER_COOLDOWN`].
     Peer,
-    /// A gateway: a trip holds for [`GATEWAY_QUIC_BREAKER_COOLDOWN`].
+    /// A gateway: a trip holds for [`GATEWAY_QUIC_BREAKER_COOLDOWN`],
+    /// doubling on each repeat trip up to
+    /// [`GATEWAY_QUIC_BREAKER_COOLDOWN_MAX`].
     Gateway,
 }
 
@@ -206,13 +228,98 @@ impl BreakerRole {
         }
     }
 
-    /// How long QUIC stays off after a trip.
-    pub(crate) fn cooldown(self) -> Duration {
+    /// How long QUIC stays off after the `trips`-th trip in a row (0 and 1
+    /// both mean the first). A peer always waits [`QUIC_BREAKER_COOLDOWN`].
+    /// A gateway waits [`GATEWAY_QUIC_BREAKER_COOLDOWN`] doubled for each
+    /// repeat, at most [`GATEWAY_QUIC_BREAKER_COOLDOWN_MAX`], so a fault that
+    /// recurs at every start does not restart a gateway every 15 minutes
+    /// forever.
+    pub(crate) fn cooldown(self, trips: u32) -> Duration {
         match self {
             Self::Peer => QUIC_BREAKER_COOLDOWN,
-            Self::Gateway => GATEWAY_QUIC_BREAKER_COOLDOWN,
+            Self::Gateway => {
+                let doublings = trips.max(1) - 1;
+                GATEWAY_QUIC_BREAKER_COOLDOWN
+                    .checked_mul(2u32.saturating_pow(doublings))
+                    .unwrap_or(GATEWAY_QUIC_BREAKER_COOLDOWN_MAX)
+                    .min(GATEWAY_QUIC_BREAKER_COOLDOWN_MAX)
+            }
         }
     }
+}
+
+/// A gateway's most recent trip, carried in the markers that follow it so a
+/// repeat trip can grow the cooldown ([`BreakerRole::cooldown`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PriorTrip {
+    pub tripped_at_secs: u64,
+    /// The trips in a row it ended, itself included.
+    pub trips: u32,
+}
+
+impl PriorTrip {
+    /// Whether a trip at `now_secs` repeats this one: it comes less than
+    /// [`GATEWAY_TRIP_STREAK_RESET`] after this one's cooldown ended. A trip
+    /// time further ahead of the clock than the longest cooldown is ignored.
+    fn repeats_at(self, now_secs: u64) -> bool {
+        let cooldown_end = self
+            .tripped_at_secs
+            .saturating_add(BreakerRole::Gateway.cooldown(self.trips).as_secs());
+        self.tripped_at_secs <= now_secs.saturating_add(GATEWAY_QUIC_BREAKER_COOLDOWN_MAX.as_secs())
+            && now_secs < cooldown_end.saturating_add(GATEWAY_TRIP_STREAK_RESET.as_secs())
+    }
+}
+
+/// The gateway trip a new marker carries from `previous`, if it still counts
+/// at `now_secs`. Always `None` on a peer, whose markers stay as before.
+pub(crate) fn prior_trip(
+    previous: &Previous,
+    now_secs: u64,
+    role: BreakerRole,
+) -> Option<PriorTrip> {
+    if role != BreakerRole::Gateway {
+        return None;
+    }
+    let prior = match previous {
+        Previous::Marker(Marker::Tripped {
+            tripped_at_secs,
+            trips,
+        }) => Some(PriorTrip {
+            tripped_at_secs: *tripped_at_secs,
+            trips: (*trips).max(1),
+        }),
+        Previous::Marker(
+            Marker::Armed { prior_trip, .. } | Marker::ShortRuns { prior_trip, .. },
+        ) => *prior_trip,
+        Previous::Nothing | Previous::Unreadable | Previous::Marker(Marker::Unknown) => None,
+    };
+    prior.filter(|prior| prior.repeats_at(now_secs))
+}
+
+/// Which trip in a row a trip at `now_secs` after `previous` is: one more
+/// than a prior gateway trip that still counts, otherwise the first.
+pub(crate) fn trip_number(previous: &Previous, now_secs: u64, role: BreakerRole) -> u32 {
+    prior_trip(previous, now_secs, role).map_or(1, |prior| prior.trips.saturating_add(1))
+}
+
+/// The trips-in-a-row count of a Tripped marker in `previous` (1 otherwise).
+pub(crate) fn tripped_trips(previous: &Previous) -> u32 {
+    match previous {
+        Previous::Marker(Marker::Tripped { trips, .. }) => (*trips).max(1),
+        Previous::Nothing
+        | Previous::Unreadable
+        | Previous::Marker(Marker::Armed { .. } | Marker::ShortRuns { .. } | Marker::Unknown) => 1,
+    }
+}
+
+/// Serde: a first trip is written as before, without the count.
+fn is_first_trip(trips: &u32) -> bool {
+    *trips <= 1
+}
+
+/// Serde: a marker without the count records a first trip.
+fn first_trip() -> u32 {
+    1
 }
 
 /// How much longer than the configured shutdown drain a start waits for a
@@ -267,18 +374,32 @@ pub(crate) fn quic_restore_at() -> Option<SystemTime> {
 }
 
 /// Record the cooldown end a gateway restarts at; nothing on a peer.
-fn set_quic_restore_at(role: BreakerRole, tripped_at_secs: u64) {
+fn set_quic_restore_at(role: BreakerRole, tripped_at_secs: u64, trips: u32) {
     if role == BreakerRole::Gateway {
-        *QUIC_RESTORE_AT.lock() = Some(cooldown_end(tripped_at_secs, role));
+        *QUIC_RESTORE_AT.lock() = Some(cooldown_end(tripped_at_secs, role.cooldown(trips)));
     }
 }
 
-/// What a gateway's trip or cooldown WARN adds about the restart.
+/// What a trip or cooldown WARN says about when QUIC comes back: a peer at
+/// its next start after the cooldown; a gateway that restarts itself
+/// (`liveness::gateway_quic_restarts`) at the cooldown's end; any other
+/// gateway at a restart after it.
 fn restart_note(role: BreakerRole) -> &'static str {
-    match role {
-        BreakerRole::Peer => "",
-        BreakerRole::Gateway => {
-            " A gateway run by a service supervisor restarts itself then to turn QUIC back on."
+    restart_note_for(
+        role,
+        super::liveness::gateway_quic_restarts(role == BreakerRole::Gateway),
+    )
+}
+
+fn restart_note_for(role: BreakerRole, restarts_itself: bool) -> &'static str {
+    match (role, restarts_itself) {
+        (BreakerRole::Peer, _) => "The first start after the cooldown ends runs QUIC again.",
+        (BreakerRole::Gateway, true) => {
+            "This gateway restarts itself when the cooldown ends, to turn QUIC back on."
+        }
+        (BreakerRole::Gateway, false) => {
+            "This gateway does not restart itself (it is not run with FREENET_SUPERVISED=1): \
+             restart it after the cooldown ends to turn QUIC back on."
         }
     }
 }
@@ -351,9 +472,21 @@ pub(crate) enum Marker {
         /// marker from an earlier release, and an earlier release ignores it.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         endpoint_down_secs: Vec<u64>,
+        /// A gateway's last trip, while a repeat of it would still grow the
+        /// cooldown ([`PriorTrip`]). Absent otherwise, on a peer, and in a
+        /// marker from an earlier release, which ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prior_trip: Option<PriorTrip>,
     },
     /// The breaker tripped at this time (seconds since the Unix epoch).
-    Tripped { tripped_at_secs: u64 },
+    Tripped {
+        tripped_at_secs: u64,
+        /// The gateway trips in a row this one ends (1 for a first trip, and
+        /// on a peer; then absent, as in a marker from an earlier release,
+        /// which ignores it). Sets the cooldown ([`BreakerRole::cooldown`]).
+        #[serde(default = "first_trip", skip_serializing_if = "is_first_trip")]
+        trips: u32,
+    },
     /// Windows: a run with QUIC enabled started at this time, after
     /// `short_runs` short runs in a row. See [`short_runs`].
     ShortRuns {
@@ -365,6 +498,9 @@ pub(crate) enum Marker {
         /// counts. Absent in a marker from an earlier release.
         #[serde(default)]
         quic_panicked: bool,
+        /// As in [`Marker::Armed`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prior_trip: Option<PriorTrip>,
     },
     /// A state this binary does not know, written by a later release.
     #[serde(other)]
@@ -480,8 +616,15 @@ pub(crate) fn verdict(facts: &Facts<'_>) -> Verdict {
                 Verdict::Trip
             }
         }
-        Previous::Marker(Marker::Tripped { tripped_at_secs })
-            if !facts.ignore_breaker && cooling(*tripped_at_secs, facts.now_secs, facts.role) =>
+        Previous::Marker(Marker::Tripped {
+            tripped_at_secs,
+            trips,
+        }) if !facts.ignore_breaker
+            && cooling(
+                *tripped_at_secs,
+                facts.now_secs,
+                facts.role.cooldown(*trips),
+            ) =>
         {
             Verdict::Cool {
                 tripped_at_secs: *tripped_at_secs,
@@ -526,49 +669,102 @@ fn carried_endpoint_down_exits(previous: &Previous, now_secs: u64) -> Vec<u64> {
 }
 
 /// Record in this process's marker that the node is about to exit on
-/// purpose because its QUIC endpoint died, so the next start restarts QUIC
-/// rather than tripping (see [`ENDPOINT_DOWN_EXITS_TO_TRIP`]). Returns
-/// whether it was recorded: `false` when the breaker is off, nothing was
-/// armed, or the marker is no longer this process's (then the exit is
-/// treated as a crash, as before).
+/// purpose because its QUIC endpoint died, so the next start can count it:
+/// on unix the exit restarts QUIC until it repeats
+/// [`ENDPOINT_DOWN_EXITS_TO_TRIP`] times; on Windows it counts as a short run
+/// that recorded a QUIC failure ([`short_runs`]). A marker not written yet
+/// (the death came before arming) is written now, with the exit noted.
+/// Returns whether it was recorded: `false` when the breaker is off or was
+/// overridden, or the marker is no longer this process's. The node does not
+/// exit for an unrecorded death, since a death at every start would then
+/// restart it without bound.
 pub(crate) fn note_endpoint_down_exit(now: SystemTime) -> bool {
-    let Some((path, nonce)) = ARMED.get() else {
-        return false;
-    };
-    match note_endpoint_down_exit_at(path, *nonce, unix_secs(now)) {
+    match note_endpoint_down_exit_with(ARMED.get(), &PENDING, unix_secs(now), cfg!(not(unix))) {
         Ok(recorded) => recorded,
-        Err(error) => {
+        Err((path, error)) => {
             tracing::warn!(
                 %error,
                 path = %path.display(),
-                "Could not record the endpoint-down exit in the QUIC crash-breaker marker; \
-                 the next start treats this exit as a crash"
+                "Could not record the endpoint-down exit in the QUIC crash-breaker marker"
             );
             false
         }
     }
 }
 
+/// [`note_endpoint_down_exit`] with the armed marker `armed` (the static
+/// [`ARMED`] outside tests) and the not-yet-written marker in `pending`.
+fn note_endpoint_down_exit_with(
+    armed: Option<&(PathBuf, u64)>,
+    pending: &parking_lot::Mutex<Pending>,
+    now_secs: u64,
+    recreate_short_runs: bool,
+) -> Result<bool, (PathBuf, std::io::Error)> {
+    if let Some((path, nonce)) = armed {
+        return note_endpoint_down_exit_at(path, *nonce, now_secs, recreate_short_runs)
+            .map_err(|error| (path.clone(), error));
+    }
+    let mut pending = pending.lock();
+    let Some((path, marker)) = pending.marker.as_mut() else {
+        return Ok(false);
+    };
+    if !note_in(marker, now_secs) {
+        return Ok(false);
+    }
+    write_marker(path, marker)
+        .map(|()| true)
+        .map_err(|error| (path.clone(), error))
+}
+
+/// Note an endpoint-down exit at `now_secs` in `marker`; whether it could.
+fn note_in(marker: &mut Marker, now_secs: u64) -> bool {
+    match marker {
+        Marker::Armed {
+            endpoint_down_secs, ..
+        } => {
+            endpoint_down_secs.push(now_secs);
+            *endpoint_down_secs = recent_endpoint_down_exits(endpoint_down_secs, now_secs);
+            true
+        }
+        Marker::ShortRuns { quic_panicked, .. } => {
+            *quic_panicked = true;
+            true
+        }
+        Marker::Tripped { .. } | Marker::Unknown => false,
+    }
+}
+
 /// [`note_endpoint_down_exit`] for the marker at `path` armed with `nonce`.
-fn note_endpoint_down_exit_at(path: &Path, nonce: u64, now_secs: u64) -> std::io::Result<bool> {
+/// With `recreate_short_runs` (Windows), a marker the run already cleared
+/// after [`short_runs::SHORT_RUN`] is written again as a fresh one, so the
+/// exit counts as the first short run of a new series: runs that each last
+/// longer still never trip. Such a marker carries no [`PriorTrip`], so a
+/// Windows gateway's cooldown grows only across short runs.
+fn note_endpoint_down_exit_at(
+    path: &Path,
+    nonce: u64,
+    now_secs: u64,
+    recreate_short_runs: bool,
+) -> std::io::Result<bool> {
     let mut marker = match read_previous(path) {
         Previous::Marker(marker) => marker,
+        Previous::Nothing if recreate_short_runs => Marker::ShortRuns {
+            short_runs: 0,
+            started_at_secs: now_secs,
+            nonce,
+            quic_panicked: false,
+            prior_trip: None,
+        },
         Previous::Nothing => return Ok(false),
         Previous::Unreadable => return Err(std::io::Error::other("the marker cannot be read")),
     };
-    let Marker::Armed {
-        nonce: owner,
-        endpoint_down_secs,
-        ..
-    } = &mut marker
-    else {
-        return Ok(false);
+    let owner = match &marker {
+        Marker::Armed { nonce, .. } | Marker::ShortRuns { nonce, .. } => *nonce,
+        Marker::Tripped { .. } | Marker::Unknown => return Ok(false),
     };
-    if *owner != nonce {
+    if owner != nonce || !note_in(&mut marker, now_secs) {
         return Ok(false);
     }
-    endpoint_down_secs.push(now_secs);
-    *endpoint_down_secs = recent_endpoint_down_exits(endpoint_down_secs, now_secs);
     write_marker(path, &marker).map(|()| true)
 }
 
@@ -794,8 +990,9 @@ pub(crate) async fn gate<T>(
     }
 
     let metrics = &crate::transport::TRANSPORT_METRICS;
-    let until_utc = |tripped_at_secs: u64| {
-        chrono::DateTime::<chrono::Utc>::from(cooldown_end(tripped_at_secs, role)).to_rfc3339()
+    let until_utc = |tripped_at_secs: u64, trips: u32| {
+        chrono::DateTime::<chrono::Utc>::from(cooldown_end(tripped_at_secs, role.cooldown(trips)))
+            .to_rfc3339()
     };
     match decided {
         Verdict::Arm => {
@@ -817,6 +1014,7 @@ pub(crate) async fn gate<T>(
                     nonce: crate::config::GlobalRng::random_u64(),
                     armed_at_secs: now_secs,
                     endpoint_down_secs,
+                    prior_trip: prior_trip(&previous, now_secs, role),
                 },
             ));
         }
@@ -826,26 +1024,28 @@ pub(crate) async fn gate<T>(
              because quic-ignore-crash-breaker is set"
         ),
         Verdict::Trip => {
+            let trips = trip_number(&previous, now_secs, role);
             // Off even if the write fails: the evidence is in hand now.
             let written = write_marker(
                 &path,
                 &Marker::Tripped {
                     tripped_at_secs: now_secs,
+                    trips,
                 },
             );
             metrics.record_quic_breaker_trip();
             metrics.set_quic_breaker_suppressed(true);
             tracing::warn!(
-                until = %until_utc(now_secs),
-                cooldown_minutes = role.cooldown().as_secs() / 60,
+                until = %until_utc(now_secs, trips),
+                cooldown_minutes = role.cooldown(trips).as_secs() / 60,
+                trips,
                 ?role,
-                "The previous run with QUIC enabled ended abnormally, so QUIC stays off \
-                 until the cooldown ends.{} Set `quic-ignore-crash-breaker = true` to run \
-                 QUIC anyway",
+                "The previous run with QUIC enabled ended abnormally, so QUIC is off for \
+                 this run. {} Set `quic-ignore-crash-breaker = true` to run QUIC anyway",
                 restart_note(role)
             );
             match written {
-                Ok(()) => set_quic_restore_at(role, now_secs),
+                Ok(()) => set_quic_restore_at(role, now_secs, trips),
                 // A restart would find the old marker and trip again, so a
                 // gateway does not restart for a trip it could not record.
                 Err(error) if role == BreakerRole::Gateway => tracing::error!(
@@ -858,16 +1058,18 @@ pub(crate) async fn gate<T>(
             }
         }
         Verdict::Cool { tripped_at_secs } => {
+            let trips = tripped_trips(&previous);
             metrics.set_quic_breaker_suppressed(true);
             tracing::warn!(
-                until = %until_utc(tripped_at_secs),
+                until = %until_utc(tripped_at_secs, trips),
+                trips,
                 ?role,
                 "QUIC stays off: a run with QUIC enabled ended abnormally and the \
-                 cooldown has not ended.{} Set `quic-ignore-crash-breaker = true` to run \
+                 cooldown has not ended. {} Set `quic-ignore-crash-breaker = true` to run \
                  QUIC anyway",
                 restart_note(role)
             );
-            set_quic_restore_at(role, tripped_at_secs);
+            set_quic_restore_at(role, tripped_at_secs, trips);
         }
         Verdict::Unreadable => {
             metrics.set_quic_breaker_suppressed(true);
@@ -1017,16 +1219,15 @@ fn unix_secs(time: SystemTime) -> u64 {
         .unwrap_or(0)
 }
 
-fn cooldown_end(tripped_at_secs: u64, role: BreakerRole) -> SystemTime {
-    SystemTime::UNIX_EPOCH
-        + Duration::from_secs(tripped_at_secs.saturating_add(role.cooldown().as_secs()))
+fn cooldown_end(tripped_at_secs: u64, cooldown: Duration) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_secs(tripped_at_secs.saturating_add(cooldown.as_secs()))
 }
 
-/// Whether a trip at `tripped_at_secs` still holds at `now_secs`. A trip time
-/// more than a cooldown in the future (a clock set back a long way) is not
-/// honoured, so it cannot hold QUIC off indefinitely.
-fn cooling(tripped_at_secs: u64, now_secs: u64, role: BreakerRole) -> bool {
-    let cooldown = role.cooldown().as_secs();
+/// Whether a trip at `tripped_at_secs` still holds at `now_secs` for
+/// `cooldown`. A trip time more than a cooldown in the future (a clock set
+/// back a long way) is not honoured, so it cannot hold QUIC off indefinitely.
+fn cooling(tripped_at_secs: u64, now_secs: u64, cooldown: Duration) -> bool {
+    let cooldown = cooldown.as_secs();
     now_secs < tripped_at_secs.saturating_add(cooldown)
         && tripped_at_secs <= now_secs.saturating_add(cooldown)
 }
@@ -1163,6 +1364,7 @@ mod tests {
 
     fn armed(pid: u32, boot: Option<&str>) -> Previous {
         Previous::Marker(Marker::Armed {
+            prior_trip: None,
             pid,
             boot_id: boot.map(str::to_string),
             nonce: 7,
@@ -1253,6 +1455,7 @@ mod tests {
         );
         assert_eq!(holder(&armed(0, Some(BOOT)), Some(BOOT)), None, "pid 0");
         let tripped = Previous::Marker(Marker::Tripped {
+            trips: 1,
             tripped_at_secs: T0,
         });
         for previous in [Previous::Nothing, Previous::Unreadable, tripped] {
@@ -1295,6 +1498,7 @@ mod tests {
 
     fn armed_with_downs(armed_at_secs: u64, downs: &[u64]) -> Previous {
         Previous::Marker(Marker::Armed {
+            prior_trip: None,
             pid: PID,
             boot_id: Some(BOOT.to_string()),
             nonce: 7,
@@ -1380,18 +1584,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = marker_path(dir.path());
         assert!(
-            !note_endpoint_down_exit_at(&path, 7, T0).unwrap(),
+            !note_endpoint_down_exit_at(&path, 7, T0, false).unwrap(),
             "no marker"
         );
 
         write_marker(&path, &marker_of(armed_with_downs(T0, &[T0 - 30]))).unwrap();
         assert!(
-            !note_endpoint_down_exit_at(&path, 8, T0 + 10).unwrap(),
+            !note_endpoint_down_exit_at(&path, 8, T0 + 10, false).unwrap(),
             "not ours"
         );
         assert_eq!(read_previous(&path), armed_with_downs(T0, &[T0 - 30]));
 
-        assert!(note_endpoint_down_exit_at(&path, 7, T0 + 10).unwrap());
+        assert!(note_endpoint_down_exit_at(&path, 7, T0 + 10, false).unwrap());
         let noted = read_previous(&path);
         assert_eq!(noted, armed_with_downs(T0, &[T0 - 30, T0 + 10]));
         assert_eq!(
@@ -1407,13 +1611,259 @@ mod tests {
         write_marker(
             &path,
             &Marker::Tripped {
+                trips: 1,
                 tripped_at_secs: T0,
             },
         )
         .unwrap();
         assert!(
-            !note_endpoint_down_exit_at(&path, 7, T0).unwrap(),
+            !note_endpoint_down_exit_at(&path, 7, T0, false).unwrap(),
             "not armed"
+        );
+    }
+
+    /// The trip and cooldown WARNs say when QUIC comes back, and promise a
+    /// restart only to a gateway that restarts itself.
+    #[test]
+    fn the_restart_note_promises_a_restart_only_when_one_comes() {
+        assert!(restart_note_for(BreakerRole::Gateway, true).contains("restarts itself"));
+        let unsupervised = restart_note_for(BreakerRole::Gateway, false);
+        assert!(unsupervised.contains("does not restart itself"));
+        assert!(unsupervised.contains("FREENET_SUPERVISED=1"));
+        for restarts in [true, false] {
+            assert!(restart_note_for(BreakerRole::Peer, restarts).contains("first start"));
+        }
+        // Nothing in the unit-test binary enables restarts.
+        assert_eq!(
+            restart_note(BreakerRole::Gateway),
+            restart_note_for(BreakerRole::Gateway, false)
+        );
+    }
+
+    /// A death before arming writes the pending marker with the exit noted,
+    /// so the next start counts it; with nothing pending (the breaker off or
+    /// overridden) nothing is recorded, and an armed marker is used as is.
+    #[test]
+    fn a_death_before_arming_writes_the_pending_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        let pending = |marker| {
+            parking_lot::Mutex::new(Pending {
+                marker,
+                quic_up: false,
+                signals_ready: false,
+                registrar: None,
+            })
+        };
+        let nothing = pending(None);
+        assert!(!note_endpoint_down_exit_with(None, &nothing, T0, false).unwrap());
+        assert_eq!(read_previous(&path), Previous::Nothing);
+
+        let armed_marker = marker_of(armed_with_downs(T0, &[]));
+        let waiting = pending(Some((path.clone(), armed_marker)));
+        assert!(note_endpoint_down_exit_with(None, &waiting, T0 + 3, false).unwrap());
+        assert_eq!(read_previous(&path), armed_with_downs(T0, &[T0 + 3]));
+        assert_eq!(
+            verdict(&Facts {
+                now_secs: T0 + 30,
+                ..facts(&read_previous(&path), Some(BOOT))
+            }),
+            Verdict::Arm,
+            "the next start counts it as an endpoint-down exit, not a crash"
+        );
+
+        let owner = (path.clone(), 7);
+        assert!(note_endpoint_down_exit_with(Some(&owner), &nothing, T0 + 9, false).unwrap());
+        assert_eq!(
+            read_previous(&path),
+            armed_with_downs(T0, &[T0 + 3, T0 + 9])
+        );
+    }
+
+    /// A gateway's cooldown doubles per repeat trip up to the cap; a peer's
+    /// never changes.
+    #[test]
+    fn a_gateway_cooldown_doubles_up_to_the_cap() {
+        let min = |m: u64| Duration::from_secs(m * 60);
+        let gw = |trips| BreakerRole::Gateway.cooldown(trips);
+        assert_eq!(gw(0), min(15));
+        assert_eq!(gw(1), min(15));
+        assert_eq!(gw(2), min(30));
+        assert_eq!(gw(3), min(60));
+        assert_eq!(gw(4), min(120));
+        assert_eq!(gw(5), min(240));
+        assert_eq!(gw(6), min(240), "capped");
+        assert_eq!(
+            gw(u32::MAX),
+            GATEWAY_QUIC_BREAKER_COOLDOWN_MAX,
+            "no overflow"
+        );
+        assert_eq!(GATEWAY_QUIC_BREAKER_COOLDOWN_MAX, min(240));
+        for trips in [0, 1, 2, 9, u32::MAX] {
+            assert_eq!(BreakerRole::Peer.cooldown(trips), QUIC_BREAKER_COOLDOWN);
+        }
+    }
+
+    /// A trip counts as a repeat while it comes less than a day after the
+    /// previous trip's cooldown ended; the markers in between carry that
+    /// trip; a peer never carries one.
+    #[test]
+    fn a_repeat_trip_is_one_within_a_day_of_the_last_cooldown() {
+        let day = GATEWAY_TRIP_STREAK_RESET.as_secs();
+        let tripped = |trips| {
+            Previous::Marker(Marker::Tripped {
+                tripped_at_secs: T0,
+                trips,
+            })
+        };
+        let gw = BreakerRole::Gateway;
+        // The second trip's cooldown, 30 min, ends at T0 + 1800.
+        let end2 = T0 + 1800;
+        assert_eq!(trip_number(&tripped(2), end2 + day - 1, gw), 3);
+        assert_eq!(trip_number(&tripped(2), end2 + day, gw), 1, "a clean day");
+        assert_eq!(
+            trip_number(&tripped(0), T0 + 60, gw),
+            2,
+            "0 reads as a first trip"
+        );
+        assert_eq!(trip_number(&tripped(2), T0 + 60, BreakerRole::Peer), 1);
+        assert_eq!(prior_trip(&tripped(2), T0 + 60, BreakerRole::Peer), None);
+        assert_eq!(trip_number(&Previous::Nothing, T0, gw), 1);
+        // Carried through the markers that follow, until it stops counting.
+        let prior = PriorTrip {
+            tripped_at_secs: T0,
+            trips: 2,
+        };
+        assert_eq!(prior_trip(&tripped(2), T0 + 3600, gw), Some(prior));
+        let armed = Previous::Marker(Marker::Armed {
+            pid: PID,
+            boot_id: None,
+            nonce: 7,
+            armed_at_secs: T0 + 3600,
+            endpoint_down_secs: Vec::new(),
+            prior_trip: Some(prior),
+        });
+        assert_eq!(trip_number(&armed, T0 + 7200, gw), 3);
+        assert_eq!(prior_trip(&armed, end2 + day, gw), None);
+        let short_runs = Previous::Marker(Marker::ShortRuns {
+            short_runs: 1,
+            started_at_secs: T0 + 3600,
+            nonce: 7,
+            quic_panicked: true,
+            prior_trip: Some(prior),
+        });
+        assert_eq!(trip_number(&short_runs, T0 + 7200, gw), 3);
+        // A trip time far ahead of the clock is not honoured.
+        let ahead = GATEWAY_QUIC_BREAKER_COOLDOWN_MAX.as_secs() + 1;
+        assert_eq!(trip_number(&tripped(2), T0 - ahead, gw), 1);
+        // The streak sets how long a Tripped marker cools.
+        let facts_at = |previous: &Previous, now_secs| {
+            verdict(&Facts {
+                now_secs,
+                role: gw,
+                ..facts(previous, Some(BOOT))
+            })
+        };
+        assert_eq!(
+            facts_at(&tripped(2), T0 + 1799),
+            Verdict::Cool {
+                tripped_at_secs: T0
+            }
+        );
+        assert_eq!(facts_at(&tripped(2), T0 + 1800), Verdict::Arm);
+        assert_eq!(tripped_trips(&tripped(3)), 3);
+        assert_eq!(tripped_trips(&tripped(0)), 1);
+        assert_eq!(tripped_trips(&Previous::Nothing), 1);
+    }
+
+    /// A first trip, and a marker with no prior trip, are written exactly as
+    /// an earlier release writes them, and its markers parse.
+    #[test]
+    fn the_trip_count_fields_are_compatible_both_ways() {
+        let first = Marker::Tripped {
+            tripped_at_secs: 3,
+            trips: 1,
+        };
+        let old = r#"{"state":"tripped","tripped_at_secs":3}"#;
+        assert_eq!(serde_json::to_string(&first).unwrap(), old);
+        assert_eq!(
+            serde_json::from_str::<Marker>(old).unwrap(),
+            first,
+            "a marker without the count reads back as the same first trip"
+        );
+        let repeat = Marker::Tripped {
+            tripped_at_secs: 3,
+            trips: 2,
+        };
+        let json = serde_json::to_string(&repeat).unwrap();
+        assert_eq!(json, r#"{"state":"tripped","tripped_at_secs":3,"trips":2}"#);
+        assert_eq!(serde_json::from_str::<Marker>(&json).unwrap(), repeat);
+        let armed = Marker::Armed {
+            pid: 5,
+            boot_id: Some("b".into()),
+            nonce: 7,
+            armed_at_secs: 9,
+            endpoint_down_secs: Vec::new(),
+            prior_trip: Some(PriorTrip {
+                tripped_at_secs: 1,
+                trips: 2,
+            }),
+        };
+        let json = serde_json::to_string(&armed).unwrap();
+        assert_eq!(serde_json::from_str::<Marker>(&json).unwrap(), armed);
+    }
+
+    /// A death before the marker is armed is recorded by writing the pending
+    /// marker now; a Windows marker records it as a QUIC failure, and one the
+    /// run already cleared is written again as a fresh short run.
+    #[test]
+    fn an_endpoint_down_exit_is_recorded_in_every_marker_kind() {
+        let mut armed = marker_of(armed_with_downs(T0, &[]));
+        assert!(note_in(&mut armed, T0 + 5));
+        assert_eq!(armed, marker_of(armed_with_downs(T0, &[T0 + 5])));
+        let mut short_runs = Marker::ShortRuns {
+            short_runs: 1,
+            started_at_secs: T0,
+            nonce: 7,
+            quic_panicked: false,
+            prior_trip: None,
+        };
+        assert!(note_in(&mut short_runs, T0 + 5));
+        assert!(matches!(
+            short_runs,
+            Marker::ShortRuns {
+                quic_panicked: true,
+                short_runs: 1,
+                ..
+            }
+        ));
+        let mut tripped = Marker::Tripped {
+            tripped_at_secs: T0,
+            trips: 1,
+        };
+        assert!(!note_in(&mut tripped, T0 + 5));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        assert!(
+            !note_endpoint_down_exit_at(&path, 7, T0, false).unwrap(),
+            "unix: a cleared marker is not recreated"
+        );
+        assert!(note_endpoint_down_exit_at(&path, 7, T0, true).unwrap());
+        assert_eq!(
+            read_previous(&path),
+            Previous::Marker(Marker::ShortRuns {
+                short_runs: 0,
+                started_at_secs: T0,
+                nonce: 7,
+                quic_panicked: true,
+                prior_trip: None,
+            }),
+            "Windows: recreated as the first short run of a new series"
+        );
+        assert!(
+            !note_endpoint_down_exit_at(&path, 8, T0, true).unwrap(),
+            "not ours"
         );
     }
 
@@ -1427,6 +1877,7 @@ mod tests {
         assert_eq!(
             parsed,
             Marker::Armed {
+                prior_trip: None,
                 pid: 5,
                 boot_id: Some("b".into()),
                 nonce: 7,
@@ -1444,6 +1895,7 @@ mod tests {
         let g = GATEWAY_QUIC_BREAKER_COOLDOWN.as_secs();
         assert!(g < QUIC_BREAKER_COOLDOWN.as_secs());
         let previous = Previous::Marker(Marker::Tripped {
+            trips: 1,
             tripped_at_secs: T0,
         });
         let at = |now_secs: u64, role: BreakerRole| {
@@ -1493,6 +1945,7 @@ mod tests {
     fn a_trip_holds_for_the_cooldown_unless_overridden() {
         let c = QUIC_BREAKER_COOLDOWN.as_secs();
         let previous = Previous::Marker(Marker::Tripped {
+            trips: 1,
             tripped_at_secs: T0,
         });
         let at = |now_secs: u64, ignore_breaker: bool| {
@@ -1520,7 +1973,7 @@ mod tests {
         );
         assert_eq!(at(T0, true), Verdict::Arm, "the override");
         assert!(
-            !cooling(u64::MAX, 0, BreakerRole::Peer),
+            !cooling(u64::MAX, 0, QUIC_BREAKER_COOLDOWN),
             "saturation ends the cooldown"
         );
     }
@@ -1638,7 +2091,10 @@ mod tests {
         assert_eq!(read_previous(&path), Previous::Nothing, "damaged");
         std::fs::write(&path, br#"{"state":"something_new","x":1}"#).unwrap();
         assert_eq!(read_previous(&path), Previous::Nothing, "a later release");
-        let marker = Marker::Tripped { tripped_at_secs: 3 };
+        let marker = Marker::Tripped {
+            trips: 1,
+            tripped_at_secs: 3,
+        };
         write_marker(&path, &marker).unwrap();
         assert_eq!(read_previous(&path), Previous::Marker(marker));
         std::fs::remove_file(&path).unwrap();
@@ -1656,7 +2112,14 @@ mod tests {
         assert!(path.exists(), "another nonce is left in place");
         assert!(clear_if_owned(&path, 7).unwrap());
         assert!(!path.exists());
-        write_marker(&path, &Marker::Tripped { tripped_at_secs: 1 }).unwrap();
+        write_marker(
+            &path,
+            &Marker::Tripped {
+                trips: 1,
+                tripped_at_secs: 1,
+            },
+        )
+        .unwrap();
         assert!(!clear_if_owned(&path, 7).unwrap());
         assert!(path.exists(), "a trip is never removed by a clean exit");
     }
@@ -1708,6 +2171,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = marker_path(dir.path());
         let marker = Marker::ShortRuns {
+            prior_trip: None,
             short_runs: 1,
             started_at_secs: T0,
             nonce: 7,
@@ -1742,6 +2206,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = marker_path(dir.path());
         let short_run_marker = Marker::ShortRuns {
+            prior_trip: None,
             short_runs: 0,
             started_at_secs: T0,
             nonce: 7,
@@ -1784,6 +2249,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = marker_path(dir.path());
         let short_run_marker = Marker::ShortRuns {
+            prior_trip: None,
             short_runs: 1,
             started_at_secs: T0,
             nonce: 7,
@@ -2033,7 +2499,11 @@ mod tests {
             })
         );
         assert_eq!(
-            serde_json::to_value(Marker::Tripped { tripped_at_secs: 3 }).unwrap(),
+            serde_json::to_value(Marker::Tripped {
+                trips: 1,
+                tripped_at_secs: 3
+            })
+            .unwrap(),
             serde_json::json!({"state": "tripped", "tripped_at_secs": 3})
         );
     }

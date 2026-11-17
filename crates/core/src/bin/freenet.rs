@@ -266,10 +266,13 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     // #5940: a gateway exits through the fatal listener path, for its
     // supervisor to restart it, when that restores QUIC: its QUIC endpoint
     // died, or a crash-breaker cooldown that kept QUIC off for the run ended.
-    // Only under a supervisor: a gateway started by hand would not come back,
-    // so it keeps running over UDP instead. Peers never exit for this.
-    if gateway_quic_restarts_allowed(commands::auto_update::supervisor_status()) {
-        freenet::enable_gateway_quic_restarts();
+    // Only under our own unit's marker: a gateway started by hand, or by a
+    // systemd unit that may not restart it, would stay down, so it keeps
+    // running over UDP instead. Peers never exit for this.
+    match gateway_quic_restarts(commands::auto_update::supervisor_status()) {
+        GatewayQuicRestarts::Enabled => freenet::enable_gateway_quic_restarts(),
+        GatewayQuicRestarts::OffUnverified => freenet::note_gateway_supervisor_unverified(),
+        GatewayQuicRestarts::Off => {}
     }
 
     let node_config = NodeConfig::new(config)
@@ -616,7 +619,8 @@ async fn run_network_node_with_signals(
                 "Startup update check skipped: {reason}. Run `freenet update` to update now."
             );
         }
-        let startup_jitter_secs = freenet::config::GlobalRng::random_u64() % 60;
+        let startup_jitter_secs =
+            freenet::config::GlobalRng::random_u64() % STARTUP_UPDATE_JITTER_MAX_SECS;
         // `startup_check_ran` is true only if the claim, made after the
         // jitter, allowed the check.
         let (startup_check_ran, latest) = match startup_attempt {
@@ -1249,13 +1253,30 @@ async fn run_network_node_with_signals(
     result
 }
 
-/// Whether a gateway may exit to restore QUIC: only when something will
-/// restart it.
-fn gateway_quic_restarts_allowed(status: commands::auto_update::SupervisorStatus) -> bool {
+/// The startup update check waits a random 0 to this many seconds first
+/// (thundering-herd jitter). A gateway's QUIC restore restart waits longer
+/// (`freenet::QUIC_RESTORE_MIN_UPTIME`).
+const STARTUP_UPDATE_JITTER_MAX_SECS: u64 = 60;
+
+/// Whether a gateway may exit to restore QUIC (#5940).
+#[derive(Debug, PartialEq, Eq)]
+enum GatewayQuicRestarts {
+    /// Our own unit's marker (`FREENET_SUPERVISED`): it restarts the node.
+    Enabled,
+    /// systemd without our marker: it may not restart the node (a
+    /// `systemd-run` command, `Restart=no`), so off, with a WARN.
+    OffUnverified,
+    /// No supervisor.
+    Off,
+}
+
+/// Only a supervisor known to restart the node turns gateway restarts on.
+fn gateway_quic_restarts(status: commands::auto_update::SupervisorStatus) -> GatewayQuicRestarts {
     use commands::auto_update::SupervisorStatus;
     match status {
-        SupervisorStatus::Supervised | SupervisorStatus::SupervisedUnverified => true,
-        SupervisorStatus::Unsupervised => false,
+        SupervisorStatus::Supervised => GatewayQuicRestarts::Enabled,
+        SupervisorStatus::SupervisedUnverified => GatewayQuicRestarts::OffUnverified,
+        SupervisorStatus::Unsupervised => GatewayQuicRestarts::Off,
     }
 }
 
@@ -2040,18 +2061,36 @@ mod tests {
     #[cfg(target_os = "linux")]
     use super::parse_listening_inode;
 
-    /// #5940: only a supervised gateway exits to restore QUIC.
+    /// #5940: only our own unit's marker turns gateway restarts on; systemd
+    /// alone (`INVOCATION_ID`) leaves them off, with a WARN.
     #[test]
-    fn gateway_quic_restarts_need_a_supervisor() {
+    fn gateway_quic_restarts_need_our_supervisor_marker() {
         use super::commands::auto_update::SupervisorStatus;
-        use super::gateway_quic_restarts_allowed;
-        assert!(gateway_quic_restarts_allowed(SupervisorStatus::Supervised));
-        assert!(gateway_quic_restarts_allowed(
-            SupervisorStatus::SupervisedUnverified
-        ));
-        assert!(!gateway_quic_restarts_allowed(
-            SupervisorStatus::Unsupervised
-        ));
+        use super::{GatewayQuicRestarts, gateway_quic_restarts};
+        assert_eq!(
+            gateway_quic_restarts(SupervisorStatus::Supervised),
+            GatewayQuicRestarts::Enabled
+        );
+        assert_eq!(
+            gateway_quic_restarts(SupervisorStatus::SupervisedUnverified),
+            GatewayQuicRestarts::OffUnverified
+        );
+        assert_eq!(
+            gateway_quic_restarts(SupervisorStatus::Unsupervised),
+            GatewayQuicRestarts::Off
+        );
+    }
+
+    /// #5940: a gateway's restart at the end of a breaker cooldown comes at
+    /// least `QUIC_RESTORE_MIN_UPTIME` after the start, which must be later
+    /// than the startup update check, so the restart never pre-empts it.
+    #[test]
+    fn the_quic_restore_floor_follows_the_startup_update_check() {
+        assert!(
+            freenet::QUIC_RESTORE_MIN_UPTIME
+                > std::time::Duration::from_secs(super::STARTUP_UPDATE_JITTER_MAX_SECS + 20),
+            "the floor leaves time for the check after the longest jitter"
+        );
     }
 
     /// #5227 truth table for the process exit code. The end-to-end proof is
