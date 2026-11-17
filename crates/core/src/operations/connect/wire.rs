@@ -301,6 +301,9 @@ pub mod sim_trace {
         /// Pairs `(lower, higher address)` where a node's native setup failed.
         native_failed_pairs:
             parking_lot::Mutex<std::collections::BTreeSet<(SocketAddr, SocketAddr)>>,
+        /// UDP dials that followed a failed native setup and ended, as
+        /// (node, peer, connected).
+        fallbacks_ended: parking_lot::Mutex<Vec<(Option<SocketAddr>, SocketAddr, bool)>>,
         /// Nodes standing in for a release below the floor
         /// ([`mark_pre_floor`]).
         pre_floor: parking_lot::Mutex<std::collections::HashSet<SocketAddr>>,
@@ -350,6 +353,13 @@ pub mod sim_trace {
             own: Option<SocketAddr>,
             peer: SocketAddr,
         },
+        /// The node `own`'s UDP dial to `peer` after a failed native setup
+        /// ended, connected or not.
+        UdpFallbackEnded {
+            own: Option<SocketAddr>,
+            peer: SocketAddr,
+            connected: bool,
+        },
     }
 
     static TRACES: LazyLock<dashmap::DashMap<String, NativeWireTrace>> =
@@ -378,6 +388,14 @@ pub mod sim_trace {
                         .insert((own.min(peer), own.max(peer)));
                 }
                 c.fallbacks_pending.lock().insert((tx, own, peer));
+                return;
+            }
+            NativeWireEvent::UdpFallbackEnded {
+                own,
+                peer,
+                connected,
+            } => {
+                c.fallbacks_ended.lock().push((own, peer, connected));
                 return;
             }
             NativeWireEvent::UdpDialFor { tx, own, peer } => {
@@ -508,6 +526,11 @@ pub mod sim_trace {
         /// The pairs `(lower, higher address)` where a native setup failed.
         pub fn native_failed_pairs(&self) -> Vec<(SocketAddr, SocketAddr)> {
             self.0.native_failed_pairs.lock().iter().copied().collect()
+        }
+        /// UDP dials after a failed native setup that ended, as (node, peer,
+        /// connected), in the order they ended.
+        pub fn udp_fallbacks_ended(&self) -> Vec<(Option<SocketAddr>, SocketAddr, bool)> {
+            self.0.fallbacks_ended.lock().clone()
         }
         /// Native failures after the pair had connected another way.
         pub fn native_superseded(&self) -> u64 {

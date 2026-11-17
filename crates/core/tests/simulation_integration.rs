@@ -23421,6 +23421,27 @@ fn test_quic_native_blocked_pairs_connect_over_udp_behind_nats() {
         unconnected.is_empty(),
         "pairs whose native setup failed and never connected: {unconnected:?}"
     );
+    // The fallbacks themselves connect: a pair can also connect by a later
+    // CONNECT, so the mesh alone would hide fallbacks that never meet. Each
+    // side's fallback dial between two peers behind NATs must connect.
+    let between_peers: Vec<_> = t
+        .udp_fallbacks_ended()
+        .into_iter()
+        .filter(|(own, peer, _)| {
+            own.is_some_and(|own| !run.gateways.contains(&own)) && !run.gateways.contains(peer)
+        })
+        .collect();
+    assert!(
+        !between_peers.is_empty(),
+        "premise: fallbacks between peers ended"
+    );
+    let missed: Vec<_> = between_peers.iter().filter(|(_, _, ok)| !ok).collect();
+    assert!(
+        missed.is_empty(),
+        "UDP fallbacks between peers that did not connect ({} of {}): {missed:?}",
+        missed.len(),
+        between_peers.len()
+    );
     let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
     assert_eq!(peers.len(), run.wire.nodes, "every node joined over UDP");
     assert!(connected);

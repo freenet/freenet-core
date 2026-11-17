@@ -697,7 +697,7 @@ fn nat_admits(network_name: &str, target: SocketAddr, from: SocketAddr) -> bool 
     let Some(network) = NAT_NETWORKS.get(network_name).map(|n| n.value().clone()) else {
         return true;
     };
-    let mut network = network.lock().unwrap();
+    let network = network.lock().unwrap();
     let now = network.time.now_nanos();
     let Some(nat) = network.nats.get(&target.ip()) else {
         return true;
