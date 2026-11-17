@@ -88,6 +88,49 @@ mod tests {
     use super::{Published, VCS_INFO_FILE, published, resolve_git_provenance};
 
     /// The name is cargo's, and `build/git_watch.rs` watches the same file.
+    /// `build.rs` has no test harness, and the decision above only matters if
+    /// the script feeds it and uses its result for BOTH stamps. Deleting the
+    /// call, or going back to a direct git probe, would pass every other test
+    /// while `GIT_DIRTY` (the auto-update kill switch) came from the wrong repo.
+    #[test]
+    fn build_rs_stamps_both_values_from_the_resolver() {
+        let code: String = include_str!("../build.rs")
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find("fn emit_build_metadata()")
+            .expect("emit_build_metadata not found");
+        let (body, _) = code[start..]
+            .split_once("\n}")
+            .expect("could not locate the end of emit_build_metadata");
+        let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        let call = body
+            .find("let(git_hash,git_dirty)=vcs_info::resolve_git_provenance(")
+            .expect("build.rs must take both values from resolve_git_provenance");
+        let stamp_commit = body
+            .find("cargo:rustc-env=GIT_COMMIT_HASH={git_hash}")
+            .expect("GIT_COMMIT_HASH must be stamped from the resolver's commit");
+        let suffix = body
+            .find("letdirty_suffix=ifgit_dirty{\"-dirty\"}else{\"\"};")
+            .expect("the dirty suffix must come from the resolver's flag");
+        let stamp_dirty = body
+            .find("cargo:rustc-env=GIT_DIRTY={dirty_suffix}")
+            .expect("GIT_DIRTY must be stamped from the dirty suffix");
+        assert!(call < stamp_commit && call < suffix && suffix < stamp_dirty);
+        // Both git probes live inside the resolver's arguments, nowhere else.
+        let probes: Vec<usize> = body
+            .match_indices("Command::new(\"git\")")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(probes.len(), 2, "expected the two git probes");
+        assert!(
+            probes.iter().all(|&at| at > call && at < stamp_commit),
+            "a git probe runs outside the resolver"
+        );
+    }
+
     #[test]
     fn the_file_is_the_one_cargo_publish_writes() {
         assert_eq!(VCS_INFO_FILE, ".cargo_vcs_info.json");
