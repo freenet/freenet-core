@@ -1782,6 +1782,103 @@ fn the_late_end_check_polls_until_the_end_is_late() {
     })
 }
 
+/// The real `QuicPath::backlog_wait` closure on a real path: read at an end
+/// with nothing in flight, it counts one send (this one) and the rest; the
+/// sends started since are counted with their bytes (at most a send window
+/// each); only data streams the peer wholly acknowledged since count as
+/// progress, not control frames or quinn's own packets (#6205); and the
+/// re-read follows `later_backlog` on those values.
+#[test]
+fn the_backlog_wait_closure_reads_the_path() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-backlog-closure", QuicPathLimits::DEFAULT).await;
+        let backlog = p.a.backlog_wait(1000)();
+        let read = || (backlog.reading)();
+        let at_end = read();
+        assert_eq!((at_end.in_flight, at_end.rest), (1, 1000));
+        assert_eq!((at_end.started, at_end.started_bytes), (0, 0));
+        assert_eq!(at_end.acked_since_end, 0);
+        assert!(at_end.window_at_end >= LATE_END_MARGIN_MIN);
+        let (a, time) = (p.a.clone(), p.time());
+        let (first, second, sent) = p
+            .drive(async move {
+                let first = a.stream_slot(5_000).await.expect("a permit");
+                let second = a
+                    .stream_slot(2 * super::super::budget::MAX_WINDOW_BYTES)
+                    .await
+                    .expect("a permit");
+                let sent = a
+                    .send_stream_bounded(
+                        &time,
+                        a.stream_deadlines(3_000),
+                        StreamId::next(),
+                        None,
+                        Bytes::from(payload(3_000)),
+                        None,
+                    )
+                    .await;
+                (first, second, sent)
+            })
+            .await;
+        assert!(matches!(sent, BoundedSend::Sent), "{sent:?}");
+        let later = read();
+        assert_eq!(later.started, 3, "two permits taken here, one by the send");
+        assert_eq!(
+            later.started_bytes,
+            5_000 + super::super::budget::MAX_WINDOW_BYTES + 3_000,
+            "each send's bytes, the window capping the large one"
+        );
+        assert_eq!(
+            later.acked_since_end, 3_000,
+            "the stream wholly acknowledged counts its own bytes only"
+        );
+        let floor = recycle::credit_floor_rate(p.a.connection().inner().stats().path.rtt).max(1);
+        assert_eq!((backlog.later)(), later_backlog(later, floor));
+        drop((first, second));
+    })
+}
+
+/// The late-end check is polled wherever a sent end waits for its
+/// acknowledgement: in `Outgoing::finish` (Streams and multi-packet Shorts)
+/// and in both arms of the background wait in `Outgoing`'s drop (one-packet
+/// Shorts and control frames, bounded or not). A source pin, since the test
+/// harness's peer acknowledges every packet and so cannot make an end late
+/// on a real path: dropping any of these calls fails it.
+#[test]
+fn the_late_end_watch_runs_wherever_an_end_waits() {
+    let source = include_str!("../path.rs");
+    let body = |from: &str, to: &str| {
+        let start = source
+            .find(from)
+            .unwrap_or_else(|| panic!("{from} not found"));
+        let end = start
+            + source[start..]
+                .find(to)
+                .unwrap_or_else(|| panic!("{to} not found"));
+        &source[start..end]
+    };
+    let finish = body("    async fn finish(mut self)", "\nimpl Outgoing {");
+    assert!(finish.contains("late_end_watch("), "finish polls the check");
+    assert!(
+        finish.contains("() = late => unreachable!"),
+        "finish selects the check against the acknowledgement"
+    );
+    let drop = body("impl Drop for Outgoing {", "\n/// The most cancelled sends");
+    assert!(
+        drop.contains("late_end_watch("),
+        "the background wait builds the check"
+    );
+    assert_eq!(
+        drop.matches("() = late => unreachable!").count(),
+        2,
+        "both arms of the background wait select the check"
+    );
+    let watch = body("async fn late_end_watch(", "\nimpl Drop for Outgoing {");
+    assert!(watch.contains("late.late(sleeper).await;"));
+    assert!(watch.contains("writers.late_end(node, kind);"));
+}
+
 /// The backlog read again at an ack wait's end (`later_backlog`), with
 /// literal values at a 32 KiB/s floor:
 /// - nothing acknowledged since the end: the bytes ahead at the floor, from

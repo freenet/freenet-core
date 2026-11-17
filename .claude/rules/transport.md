@@ -2986,7 +2986,9 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     each send started since at its own bytes but at most the rest, from
     QuicPath::stream_opens, read before the permits in use so a concurrent
     open is counted twice rather than missed), at the floor; nothing once
-    the connection has acknowledged that many bytes since the end (the last
+    the peer has wholly acknowledged that many bytes of data streams since
+    the end (StreamOpens::acked: stream-only progress, not control frames
+    or quinn's own packets; the last
     byte went out with them, so a busy path that acknowledges quickly is
     judged at its first wait). If that moves the deadline past now, the
     wait goes on, within its total, and is then judged
@@ -3021,7 +3023,8 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     cannot judge it (its threshold is the backlog-sized wait, hours on a
     busy slow path), so a separate check judges the end by the
     connection's progress (path::LateEndCheck, late_end_verdict): once
-    the connection has acknowledged, since the end, the bytes ahead of the
+    the peer has wholly acknowledged, since the end, data streams totalling
+    the bytes ahead of the
     end's last byte under quinn's round-robin (path::bytes_ahead) plus the
     congestion window when the end was sent (at least 64 KiB), the last
     packet has been sent, and an honest stack acknowledges it within
@@ -3038,7 +3041,12 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     a_slow_lossy_path_stays_within_its_consumer_gap and the other no-expiry
     tests assert it); the check itself is tested with a scripted
     acknowledgement count (the_late_end_check_polls_until_the_end_is_late),
-    since the test harness's peer acknowledges every packet.
+    since the test harness's peer acknowledges every packet, and the calls
+    that run it are pinned (the_late_end_watch_runs_wherever_an_end_waits).
+    Residual: a peer that goes fully silent for at least the watch's window
+    (10 s) after each end excuses that end from both the expiry strike and
+    the late-end check, and on a path with a UDP session no dark close
+    follows; it stops all of its own traffic for each spell.
     Closes by the watch are counted by why in quic_stall_close_<label>.
   → No false close at 800 ms round trip and 15% loss with the loss gate on
     (a_slow_lossy_path_stays_within_its_consumer_gap: the send ends Sent on

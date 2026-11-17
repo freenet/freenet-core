@@ -347,8 +347,8 @@ fn the_watch_publishes_that_the_dark_rule_would_have_closed() {
 /// The watch publishes the last sample of a dark episode that has lasted at
 /// least the window (10 s), on the caller's clock, for the strike check
 /// (`path::StrikeCheck`): from the sample the episode reaches the window to
-/// its last; nothing for a spell shorter than the window, or while the peer
-/// keeps sending.
+/// the sample that ends it (the peer heard again at tick 21); nothing for a
+/// spell shorter than the window, or while the peer keeps sending.
 #[test]
 fn the_watch_publishes_the_last_sample_of_a_long_dark_episode() {
     let record = Arc::default();
@@ -380,8 +380,8 @@ fn the_watch_publishes_the_last_sample_of_a_long_dark_episode() {
     let expected: Vec<u64> = (1..=23u64)
         .map(|t| match t {
             ..=5 => 0,
-            6..=20 => 2 * t,
-            _ => 40,
+            6..=21 => 2 * t,
+            _ => 42,
         })
         .collect();
     assert_eq!(run(&dark, 23), expected);

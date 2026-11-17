@@ -1015,7 +1015,8 @@ pub(crate) struct Writers {
     /// whose stream was reset, so far ([`ACK_WAIT_EXPIRY_LIMIT`]).
     ack_wait_expiries: AtomicU64,
     /// Sends whose end was acknowledged late, or not at all, though the
-    /// connection had acknowledged enough bytes since to have carried it
+    /// peer had wholly acknowledged enough data-stream bytes since to have
+    /// carried it
     /// (`path::LateEndCheck`), so far.
     late_ends: AtomicU64,
 }
@@ -1505,11 +1506,17 @@ impl AckWatch {
     pub(crate) fn observe(&mut self, now_nanos: u64, sample: AckSample) -> bool {
         let caller_now = now_nanos;
         let now_nanos = self.watch_time(now_nanos);
-        self.stall = self.decide(now_nanos, sample);
-        if let Some(at) = &self.long_dark_at
-            && self
+        let long = |watch: &Self| {
+            watch
                 .dark_since
-                .is_some_and(|start| now_nanos.saturating_sub(start) >= self.window_nanos)
+                .is_some_and(|start| now_nanos.saturating_sub(start) >= watch.window_nanos)
+        };
+        let was_long = long(self);
+        self.stall = self.decide(now_nanos, sample);
+        // Each sample of a long episode, and the sample that ends one: the
+        // outage may have held an acknowledgement until then.
+        if let Some(at) = &self.long_dark_at
+            && (long(self) || (was_long && self.dark_since.is_none()))
         {
             at.store(caller_now.max(1), Ordering::Release);
         }

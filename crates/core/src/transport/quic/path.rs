@@ -1427,11 +1427,10 @@ impl QuicPath {
     /// sends just after an end could make an honest peer's acknowledgement of
     /// that end come after its wait (#6205).
     fn backlog_wait(&self, len: u64) -> Arc<dyn Fn() -> Backlog + Send + Sync> {
-        let (slots, connection, opens, acks) = (
+        let (slots, connection, opens) = (
             self.stream_slots.clone(),
             self.connection.inner().clone(),
             self.stream_opens.clone(),
-            self.ack_progress.clone(),
         );
         let rest = len.min(super::budget::MAX_WINDOW_BYTES);
         Arc::new(move || {
@@ -1443,22 +1442,17 @@ impl QuicPath {
             let in_flight = (STREAMED_SEND_LIMIT as u64)
                 .saturating_sub(slots.available_permits() as u64)
                 .max(1);
-            let acked_at_end = acks.as_ref().map(recycle::AckProgress::acked_bytes);
+            let acked_at_end = opens.acked_bytes();
             let window_at_end = connection.stats().path.cwnd.max(LATE_END_MARGIN_MIN);
             let floor_now = {
                 let connection = connection.clone();
                 move || recycle::credit_floor_rate(connection.stats().path.rtt).max(1)
             };
             let wait = Duration::from_secs(in_flight.saturating_mul(rest).div_ceil(floor_now()));
-            let (opens, acks) = (opens.clone(), acks.clone());
+            let opens = opens.clone();
             let reading: Arc<dyn Fn() -> LaterReading + Send + Sync> = Arc::new(move || {
                 let (now_opened, now_bytes) = opens.read();
-                let acked = match (&acks, acked_at_end) {
-                    (Some(acks), Some(at_end)) => acks.acked_bytes().saturating_sub(at_end),
-                    // No acknowledgement record: nothing is known to have
-                    // gone out, so the bound is the bytes alone.
-                    _ => 0,
-                };
+                let acked = opens.acked_bytes().saturating_sub(acked_at_end);
                 LaterReading {
                     in_flight,
                     rest,
@@ -2146,6 +2140,12 @@ impl QuicPath {
         send.sleep = Some((self.sleeper.clone(), self.short_ack_wait));
         send.control = opener == Opener::Control;
         send.backlog = Some(self.backlog_wait(header.total_len()));
+        // A data stream's completed acknowledgement is the progress the
+        // backlog re-read and the late-end check judge by; a control frame's
+        // is not counted.
+        if opener != Opener::Control {
+            send.acked_into = Some((self.stream_opens.clone(), header.total_len()));
+        }
         debug_assert!(
             self.ack_progress.is_some(),
             "a data path's controller is CappedCubic; without its record no expiry can strike"
@@ -2430,6 +2430,9 @@ struct Outgoing {
     /// How long the backlog ahead of this stream's end may take, read when
     /// the end is sent ([`QuicPath::backlog_wait`]).
     backlog: Option<Arc<dyn Fn() -> Backlog + Send + Sync>>,
+    /// Where this data stream's bytes are counted once the peer wholly
+    /// acknowledges it ([`StreamOpens::acked`]), and how many.
+    acked_into: Option<(Arc<StreamOpens>, u64)>,
 }
 
 /// Permits taken from a path's `stream_slots` and the bytes of the sends that
@@ -2438,6 +2441,11 @@ struct Outgoing {
 pub(crate) struct StreamOpens {
     count: AtomicU64,
     bytes: AtomicU64,
+    /// Bytes of data streams the peer has wholly acknowledged (each counted
+    /// when its acknowledgement completes): the stream-only progress an
+    /// ack wait's re-read and the late-end check judge by, so control frames
+    /// and quinn's own packets do not count (#6205).
+    acked: AtomicU64,
 }
 
 impl StreamOpens {
@@ -2453,6 +2461,16 @@ impl StreamOpens {
         let count = self.count.load(Ordering::Acquire);
         (count, self.bytes.load(Ordering::Acquire))
     }
+
+    /// A data stream of `len` bytes was wholly acknowledged.
+    fn acked(&self, len: u64) {
+        self.acked.fetch_add(len, Ordering::AcqRel);
+    }
+
+    /// Bytes of data streams wholly acknowledged so far.
+    fn acked_bytes(&self) -> u64 {
+        self.acked.load(Ordering::Acquire)
+    }
 }
 
 /// What a stream's ack wait reads again at its end ([`later_backlog`]).
@@ -2466,7 +2484,9 @@ pub(crate) struct LaterReading {
     /// window).
     pub(crate) started: u64,
     pub(crate) started_bytes: u64,
-    /// Bytes the connection has acknowledged since the end was sent.
+    /// Bytes of data streams the peer wholly acknowledged since the end was
+    /// sent (stream-only progress: not control frames, not quinn's own
+    /// packets).
     pub(crate) acked_since_end: u64,
     /// The congestion window when the end was sent, at least
     /// [`LATE_END_MARGIN_MIN`] ([`late_end_verdict`]).
@@ -2485,8 +2505,11 @@ pub(crate) struct LaterReading {
 /// `min(started_bytes, started x rest)`. That is the bytes ahead, given at
 /// the credit floor.
 ///
-/// Once the connection has acknowledged at least the bytes ahead since the
-/// end, this stream's last byte has gone out with them, and its end is late
+/// Progress is counted in data streams the peer wholly acknowledged since the
+/// end ([`StreamOpens::acked`]), not the connection's acknowledged bytes,
+/// which include control frames and quinn's own packets. Once at least the
+/// bytes ahead are acknowledged that way, this stream's last byte has gone
+/// out with them, and its end is late
 /// whatever else is still in flight: nothing more is given (zero). So a busy
 /// path that acknowledges quickly gains nothing from the re-read, and a peer
 /// that withholds stream ends while this node keeps sending is judged at the
@@ -2536,8 +2559,8 @@ pub(crate) const LATE_END_MARGIN_MIN: u64 = 64 * 1024;
 
 /// Whether a stream's end, still unacknowledged at `now`, is late, given
 /// `ahead` ([`bytes_ahead`] plus the congestion window when the end was sent,
-/// [`LaterReading::window_at_end`]) and `acked` (bytes the connection
-/// acknowledged since the end), with `crossed` the time `acked` first reached
+/// [`LaterReading::window_at_end`]) and `acked` (bytes of data streams the
+/// peer wholly acknowledged since the end), with `crossed` the time `acked` first reached
 /// `ahead` (set here). quinn shares the link round-robin, so
 /// by then the end's last packet had been sent; an honest peer's QUIC stack
 /// acknowledges it like every other packet, within [`late_end_grace`] even
@@ -2555,8 +2578,9 @@ pub(crate) fn late_end_verdict(
     crossed.is_some_and(|at| now.saturating_sub(at) >= nanos(late_end_grace(rtt)))
 }
 
-/// Judges whether a sent stream's end is late (#6205): the connection has
-/// acknowledged enough bytes since the end to have carried its last packet,
+/// Judges whether a sent stream's end is late (#6205): the peer has wholly
+/// acknowledged enough data-stream bytes since the end to have carried its
+/// last packet,
 /// and the end is still unacknowledged past the grace ([`late_end_verdict`]).
 /// A late end is counted (`quic_late_end_<label>`) and the send waits on as
 /// before: the stream is not reset. Nothing is judged while the egress cap
@@ -2796,6 +2820,7 @@ impl Outgoing {
             late: None,
             control: false,
             backlog: None,
+            acked_into: None,
         }
     }
 
@@ -3048,7 +3073,12 @@ impl Outgoing {
         };
         self.awaiting_ack = false;
         match stopped {
-            Ok(None) => Ok(()),
+            Ok(None) => {
+                if let Some((opens, len)) = &self.acked_into {
+                    opens.acked(*len);
+                }
+                Ok(())
+            }
             Ok(Some(code)) => Err(QuicSendError::Stopped(code.into_inner())),
             Err(quinn::StoppedError::ConnectionLost(error)) => {
                 Err(QuicSendError::ConnectionLost(error))
@@ -3199,6 +3229,7 @@ impl Drop for Outgoing {
         let send = if bounded { self.send.take() } else { None };
         let (aborts, node) = (self.aborts.clone(), self.node);
         let strike = self.strike.clone().zip(self.finished_at).zip(due);
+        let acked_into = self.acked_into.clone();
         let late = late_end_watch(
             self.late.clone(),
             self.sleep.as_ref().map(|(sleep, _)| sleep.clone()),
@@ -3222,14 +3253,20 @@ impl Drop for Outgoing {
         // Bounded as above, and ending with the acknowledgement or the
         // connection, so the handle is not monitored.
         drop(GlobalExecutor::spawn(async move {
+            let ended = |ended: StoppedResult| {
+                if let (Ok(None), Some((opens, len))) = (ended, &acked_into) {
+                    opens.acked(*len);
+                }
+                false
+            };
             let timed_out = match bound {
                 Some(bound) => tokio::select! {
-                    _ended = stopped => false,
+                    stopped = stopped => ended(stopped),
                     () = bound => true,
                     () = late => unreachable!("the late-end watch never returns"),
                 },
                 None => tokio::select! {
-                    _ended = stopped => false,
+                    stopped = stopped => ended(stopped),
                     () = late => unreachable!("the late-end watch never returns"),
                 },
             };
