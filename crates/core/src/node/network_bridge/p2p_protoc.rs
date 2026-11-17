@@ -3303,7 +3303,7 @@ fn unsent_message_notice(
 /// Extracted as a free function so its callback/state invariants are
 /// unit-testable without standing up a full `P2pConnManager`:
 ///
-/// 1. Every awaiting callback for `peer_addr` is resolved with `Err(())` — never
+/// 1. Every awaiting callback for `peer_addr` is resolved with `Err(None)` — never
 ///    left parked — so callers (including the SubscribeHint resend-waiter) fail
 ///    fast and the op can retry.
 /// 2. `awaiting_connection` AND `awaiting_connection_txs` are both drained for
@@ -7811,7 +7811,7 @@ pub(crate) mod tests {
     ///   (a) prune the in-transit connection slot — covered by the source pin
     ///       `connect_peer_full_handshake_channel_prunes_in_transit` below,
     ///       since the prune touches the live ring;
-    ///   (b) resolve EVERY awaiting callback with Err(()) — never park it;
+    ///   (b) resolve EVERY awaiting callback with Err(None) — never park it;
     ///   (c) drain BOTH awaiting_connection and awaiting_connection_txs;
     ///   (d) NOT record peer backoff (local channel contention, not a remote
     ///       failure).
@@ -7848,7 +7848,7 @@ pub(crate) mod tests {
 
         super::fail_awaiting_connection(&mut state, peer_addr, tx, false).await;
 
-        // (b) every callback resolved with Err(()), immediately (not parked).
+        // (b) every callback resolved with Err(None), immediately (not parked).
         let r1 = timeout(Duration::from_secs(1), rx1.recv())
             .await
             .expect("callback 1 must resolve immediately, not park");

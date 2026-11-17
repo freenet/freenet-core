@@ -988,6 +988,12 @@ pub struct TransportMetrics {
     /// this node had in the CONNECT (reset each snapshot).
     connect_native_rescued_by_udp_joiner: AtomicU64,
     connect_native_rescued_by_udp_acceptor: AtomicU64,
+    /// A UDP dial that followed ANY failed native setup (a path failure, a
+    /// local refusal, a Hello mismatch) connected, by side: every join a node
+    /// without UDP would lose, which phase D's gate reads (reset each
+    /// snapshot).
+    connect_native_fallback_connected_joiner: AtomicU64,
+    connect_native_fallback_connected_acceptor: AtomicU64,
     /// A native dial and the UDP dial beside it both connected, UDP first or
     /// native first; the native connection was kept (reset each snapshot).
     connect_native_both_dials_connected_udp_first: AtomicU64,
@@ -1384,6 +1390,11 @@ thread_local! {
     pub(crate) static NATIVE_RESCUES_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
         const { std::cell::Cell::new([0; 2]) };
 
+    /// Test-only: UDP dials that connected after any failed native setup on
+    /// this thread, as joiner and as acceptor, for the same reason.
+    pub(crate) static NATIVE_FALLBACKS_CONNECTED_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
+
     /// Test-only: both dials connected on this thread, [UDP first, native
     /// first], for the same reason.
     pub(crate) static BOTH_DIALS_CONNECTED_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
@@ -1498,6 +1509,8 @@ impl TransportMetrics {
             connect_native_demotions: AtomicU64::new(0),
             connect_native_rescued_by_udp_joiner: AtomicU64::new(0),
             connect_native_rescued_by_udp_acceptor: AtomicU64::new(0),
+            connect_native_fallback_connected_joiner: AtomicU64::new(0),
+            connect_native_fallback_connected_acceptor: AtomicU64::new(0),
             connect_native_both_dials_connected_udp_first: AtomicU64::new(0),
             connect_native_both_dials_connected_native_first: AtomicU64::new(0),
             connect_native_survivor_swapped: AtomicU64::new(0),
@@ -2044,8 +2057,27 @@ impl TransportMetrics {
         NATIVE_OFFERS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     }
 
-    /// A UDP dial that followed a failed native setup connected: a
-    /// connection that a node without UDP would not have made (R5).
+    /// A UDP dial that followed ANY failed native setup connected: a join a
+    /// node without UDP would lose, whatever the native failure was (the
+    /// phase-D gate's figure). A rescue (below) is the subset after a path
+    /// failure.
+    pub(crate) fn record_connect_native_fallback_connected(&self, side: NativeConnectSide) {
+        match side {
+            NativeConnectSide::Joiner => &self.connect_native_fallback_connected_joiner,
+            NativeConnectSide::Acceptor => &self.connect_native_fallback_connected_acceptor,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_FALLBACKS_CONNECTED_ON_THIS_THREAD.with(|count| {
+            let mut counts = count.get();
+            counts[side as usize] += 1;
+            count.set(counts);
+        });
+    }
+
+    /// A UDP dial that followed a native setup that failed ON THE PATH
+    /// connected: a connection that a node without UDP would not have made
+    /// because native does not work on that path (R5).
     pub(crate) fn record_connect_native_rescued_by_udp(&self, side: NativeConnectSide) {
         match side {
             NativeConnectSide::Joiner => &self.connect_native_rescued_by_udp_joiner,
@@ -2990,6 +3022,12 @@ impl TransportMetrics {
             connect_native_rescued_by_udp_acceptor: get64(
                 &self.connect_native_rescued_by_udp_acceptor,
             ),
+            connect_native_fallback_connected_joiner: get64(
+                &self.connect_native_fallback_connected_joiner,
+            ),
+            connect_native_fallback_connected_acceptor: get64(
+                &self.connect_native_fallback_connected_acceptor,
+            ),
             connect_native_both_dials_connected_udp_first: get64(
                 &self.connect_native_both_dials_connected_udp_first,
             ),
@@ -3692,10 +3730,14 @@ pub struct TransportSnapshot {
     pub connect_native_decision_over_cap: u64,
     /// Times the node turned its own native connects off after failures.
     pub connect_native_demotions: u64,
-    /// UDP dials after a failed native setup that connected, as joiner and
-    /// as acceptor (R5).
+    /// UDP dials that connected after a native setup that failed on the
+    /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
     pub connect_native_rescued_by_udp_acceptor: u64,
+    /// UDP dials that connected after ANY failed native setup, as joiner and
+    /// as acceptor: the joins phase D would lose (its gate reads these).
+    pub connect_native_fallback_connected_joiner: u64,
+    pub connect_native_fallback_connected_acceptor: u64,
     /// A native dial and the UDP dial beside it both connected, UDP first or
     /// native first; the native connection was kept.
     pub connect_native_both_dials_connected_udp_first: u64,
@@ -4130,6 +4172,8 @@ impl TransportSnapshot {
             connect_native_demotions,
             connect_native_rescued_by_udp_joiner,
             connect_native_rescued_by_udp_acceptor,
+            connect_native_fallback_connected_joiner,
+            connect_native_fallback_connected_acceptor,
             connect_native_both_dials_connected_udp_first,
             connect_native_both_dials_connected_native_first,
             connect_native_survivor_swapped,
@@ -4303,6 +4347,9 @@ impl TransportSnapshot {
         self.connect_native_demotions = connect_native_demotions;
         self.connect_native_rescued_by_udp_joiner = connect_native_rescued_by_udp_joiner;
         self.connect_native_rescued_by_udp_acceptor = connect_native_rescued_by_udp_acceptor;
+        self.connect_native_fallback_connected_joiner = connect_native_fallback_connected_joiner;
+        self.connect_native_fallback_connected_acceptor =
+            connect_native_fallback_connected_acceptor;
         self.connect_native_both_dials_connected_udp_first =
             connect_native_both_dials_connected_udp_first;
         self.connect_native_both_dials_connected_native_first =
@@ -4541,10 +4588,14 @@ struct SnapshotExtras {
     pub connect_native_decision_over_cap: u64,
     /// Times the node turned its own native connects off after failures.
     pub connect_native_demotions: u64,
-    /// UDP dials after a failed native setup that connected, as joiner and
-    /// as acceptor (R5).
+    /// UDP dials that connected after a native setup that failed on the
+    /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
     pub connect_native_rescued_by_udp_acceptor: u64,
+    /// UDP dials that connected after ANY failed native setup, as joiner and
+    /// as acceptor: the joins phase D would lose (its gate reads these).
+    pub connect_native_fallback_connected_joiner: u64,
+    pub connect_native_fallback_connected_acceptor: u64,
     /// A native dial and the UDP dial beside it both connected, UDP first or
     /// native first; the native connection was kept.
     pub connect_native_both_dials_connected_udp_first: u64,
@@ -4797,6 +4848,8 @@ impl SnapshotExtras {
             || self.connect_native_demotions != 0
             || self.connect_native_rescued_by_udp_joiner != 0
             || self.connect_native_rescued_by_udp_acceptor != 0
+            || self.connect_native_fallback_connected_joiner != 0
+            || self.connect_native_fallback_connected_acceptor != 0
             || self.connect_native_both_dials_connected_udp_first != 0
             || self.connect_native_both_dials_connected_native_first != 0
             || self.connect_native_survivor_swapped != 0
@@ -7363,6 +7416,8 @@ mod tests {
             "connect_native_demotions",
             "connect_native_rescued_by_udp_joiner",
             "connect_native_rescued_by_udp_acceptor",
+            "connect_native_fallback_connected_joiner",
+            "connect_native_fallback_connected_acceptor",
             "connect_native_both_dials_connected_udp_first",
             "connect_native_both_dials_connected_native_first",
             "connect_native_survivor_swapped",

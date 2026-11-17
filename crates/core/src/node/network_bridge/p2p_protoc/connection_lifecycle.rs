@@ -1135,7 +1135,7 @@ impl P2pConnManager {
         // back-pressures on the handshake command channel (cap 128) would stall
         // the loop. On Full/Closed we run the SAME cleanup the blocking error
         // path used: prune the in-transit connection slot and fail every
-        // awaiting callback with Err(()), so callers (including the SubscribeHint
+        // awaiting callback with Err(None), so callers (including the SubscribeHint
         // resend-waiter registered above) are notified immediately instead of
         // parking. The connect op can retry on a later attempt; this failure is
         // LOCAL channel contention, not a remote connection failure, so we do

@@ -3111,6 +3111,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.connect_native_rescued_by_udp_acceptor),
             );
             m.insert(
+                "connect_native_fallback_connected_joiner".into(),
+                serde_json::json!(snapshot.connect_native_fallback_connected_joiner),
+            );
+            m.insert(
+                "connect_native_fallback_connected_acceptor".into(),
+                serde_json::json!(snapshot.connect_native_fallback_connected_acceptor),
+            );
+            m.insert(
                 "connect_native_both_dials_connected_udp_first".into(),
                 serde_json::json!(snapshot.connect_native_both_dials_connected_udp_first),
             );

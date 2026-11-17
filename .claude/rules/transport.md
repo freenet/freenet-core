@@ -526,7 +526,12 @@ node without UDP would not have made). A local refusal (punch budget,
 setups full, too late) is not a rescue, on either side: the native outcome
 reaches the connect op as `ConnectResult`'s error (`Err(Some(outcome))`,
 `Err(None)` for UDP and local failures) and both sides test it with
-`op_ctx_task::native_path_failed`, `connect_native_both_dials_connected_{udp,native}_first`
+`op_ctx_task::native_path_failed`.
+`connect_native_fallback_connected_{joiner,acceptor}` counts every UDP dial
+that connected after ANY failed native setup (path failure, local refusal,
+Hello mismatch): the joins a node without UDP would lose. Phase D's gate
+reads THIS counter, not the rescue counter, which is only the path-failure
+subset, `connect_native_both_dials_connected_{udp,native}_first`
 for a native dial and the UDP dial beside it that both connected (the native
 one kept), `connect_native_survivor_{swapped,udp_dropped}` for each
 survivor-rule decision, and the last offer as states
@@ -2377,7 +2382,10 @@ Simulation: every node shares [::1], so the per-destination punch budget
   not it (test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join). The 6.2 matrix
   (quic/native/setup/matrix_tests.rs) runs connect_native/accept_native
   behind NATs over classes, late side and skew, punch loss and round trip;
-  every cell establishes, so the single attempt stays.
+  every cell of that original matrix establishes. The gate rows added
+  beside it (gates 14, 15, 17) are a baseline: gate 15 (handshake loss) and
+  gate 17's jitter edges do not meet the 95% criterion with one attempt
+  (overlapping attempts and option (b) are the follow-ups).
 Determinism: a plain tokio::select! draws its arm order from tokio's RNG,
   which the seed does not set. bounded_send's loop (every QUIC path, upgrade
   ones included: a send and its deadline ready together now resolve as the

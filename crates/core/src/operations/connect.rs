@@ -1626,6 +1626,12 @@ pub(super) async fn dispatch_expect_connection_from(
                     Ok(mut rx) => {
                         let result = rx.recv().await;
                         let connected = matches!(result, Some(Ok(_)));
+                        if connected {
+                            crate::transport::TRANSPORT_METRICS
+                                .record_connect_native_fallback_connected(
+                                    crate::transport::NativeConnectSide::Acceptor,
+                                );
+                        }
                         if connected && path_failed {
                             crate::transport::TRANSPORT_METRICS
                                 .record_connect_native_rescued_by_udp(
