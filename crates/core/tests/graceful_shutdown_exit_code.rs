@@ -410,7 +410,8 @@ const QUIC_COOLING_MARKER: &str = "QUIC stays off: a run with QUIC enabled ended
 const QUIC_SHORT_RUNS_COOLING_MARKER: &str =
     "QUIC stays off: several runs in a row with QUIC enabled ended early";
 
-/// The legacy exit-status rule's shadow marker on a unix peer (#6151).
+/// The legacy exit-status rule's shadow marker on a unix peer (#6151):
+/// `{"version", "boot_id", "marker"}`, the marker in the breaker's format.
 const LEGACY_SHADOW_FILE: &str = "quic-crash-breaker-legacy.json";
 
 /// The arguments that start a peer: it needs a gateway to start, and this
@@ -445,7 +446,7 @@ fn wait_for_peer_markers(dir: &Path, node: &NodeProcess) -> anyhow::Result<()> {
             .is_some_and(|m| m["state"] == "short_runs" && m["quic_panicked"] == false);
         let shadow_armed = shadow
             .as_ref()
-            .is_some_and(|m| m["state"] == "armed" && m["pid"] == node.pid());
+            .is_some_and(|m| m["marker"]["state"] == "armed" && m["marker"]["pid"] == node.pid());
         if short_runs && shadow_armed {
             return Ok(());
         }
@@ -934,7 +935,7 @@ fn a_unix_peer_decides_by_short_runs_with_the_exit_status_rule_as_a_shadow() -> 
             // and holds, so it arms nothing this run.
             let shadow = read_json(dir.path(), LEGACY_SHADOW_FILE)?;
             assert_eq!(
-                shadow.as_ref().map(|m| m["state"].clone()),
+                shadow.as_ref().map(|m| m["marker"]["state"].clone()),
                 Some("tripped".into()),
                 "{shadow:?}. Logs:\n{logs}"
             );
@@ -953,7 +954,7 @@ fn a_unix_peer_decides_by_short_runs_with_the_exit_status_rule_as_a_shadow() -> 
         )?;
         let shadow = read_json(dir.path(), LEGACY_SHADOW_FILE)?;
         assert_eq!(
-            shadow.as_ref().map(|m| m["state"].clone()),
+            shadow.as_ref().map(|m| m["marker"]["state"].clone()),
             Some("tripped".into()),
             "the exit-status rule reads a kill as a crash: {shadow:?}. Logs:\n{}",
             after.logs()
