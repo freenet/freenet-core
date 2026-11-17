@@ -268,7 +268,33 @@ pub(crate) enum ListenerExit {
     Panicked(String),
     /// It was cancelled; the message is the join error's text.
     Cancelled(String),
+    /// The listener is still running, but this gateway's QUIC endpoint died
+    /// and the node is set to exit for its supervisor to restart it
+    /// (`quic::liveness::gateway_quic_restarts`).
+    QuicEndpointDown,
+    /// The listener is still running, but this gateway started with QUIC
+    /// kept off by the crash-loop breaker and the cooldown has ended: the
+    /// node exits for its supervisor to restart it with QUIC on.
+    QuicCooldownEnded,
 }
+
+/// The error that ends the event loop when a gateway exits on purpose for
+/// its supervisor to restart it with a working QUIC endpoint
+/// ([`ListenerExit::QuicEndpointDown`], [`ListenerExit::QuicCooldownEnded`]).
+/// The node's fatal-listener path recognises it, so the exit is logged as
+/// the planned restart it is.
+#[derive(Debug)]
+pub(crate) struct GatewayQuicRestart {
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for GatewayQuicRestart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "gateway restart for QUIC: {}", self.reason)
+    }
+}
+
+impl std::error::Error for GatewayQuicRestart {}
 
 impl ListenerExit {
     /// Classify a listener task's join result.

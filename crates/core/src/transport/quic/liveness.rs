@@ -13,7 +13,17 @@
 //!   the `quic_endpoint_down` counter. The UDP transport is untouched and the
 //!   node keeps running: endpoint death NEVER feeds `ListenerExit`, which
 //!   exits the node. e5 watches the availability and moves every QUIC path
-//!   back to UDP.
+//!   back to UDP. The one exception is a gateway run by the `freenet`
+//!   binary under a service supervisor ([`enable_gateway_quic_restarts`]):
+//!   its transport listener then reports the death as
+//!   `ListenerExit::QuicEndpointDown`, the node's fatal-listener path exits
+//!   the process, and the supervisor restarts it with a new endpoint
+//!   ([`gateway_quic_restarts`]). The crash-loop breaker restarts QUIC after
+//!   the first such exit in a day and trips after later ones
+//!   (`breaker::ENDPOINT_DOWN_EXITS_TO_TRIP`); under its override the
+//!   gateway does not exit for a death.
+//!   The same switch restarts such a gateway when a breaker cooldown that
+//!   kept its QUIC off ends (`breaker::quic_restore_at`).
 //! - after the node dropped its last handle, the return is the normal
 //!   shutdown (quinn's driver ends once no handle and no connection is
 //!   left): the availability becomes `Released` and nothing is counted.
@@ -93,6 +103,47 @@ use tokio::sync::watch;
 
 use crate::transport::metrics::TRANSPORT_METRICS;
 
+/// Set by [`enable_gateway_quic_restarts`]; off in tests and embedders.
+static GATEWAY_QUIC_RESTARTS: AtomicBool = AtomicBool::new(false);
+
+/// Let a gateway exit for its supervisor to restart it when that restores
+/// QUIC (#5940, a prerequisite of native gateway joins): when its QUIC
+/// endpoint dies, and when a crash-breaker cooldown that kept QUIC off for
+/// the run ends. The `freenet` binary calls this only when its own service
+/// unit marks it supervised (`FREENET_SUPERVISED`, set by the units
+/// `freenet service install` writes), so a gateway started by hand, or under
+/// a supervisor that may not restart it, keeps running over UDP, as before.
+/// Peers never exit for this while UDP remains.
+pub fn enable_gateway_quic_restarts() {
+    GATEWAY_QUIC_RESTARTS.store(true, Ordering::Relaxed);
+}
+
+/// Set by [`note_gateway_supervisor_unverified`].
+static SUPERVISOR_UNVERIFIED: AtomicBool = AtomicBool::new(false);
+
+/// Record that the binary runs under systemd (`INVOCATION_ID`) without the
+/// `FREENET_SUPERVISED` marker. Such a unit may not restart the node (a
+/// `systemd-run` command, a unit with `Restart=no`), so gateway restarts
+/// stay off and a gateway logs a WARN saying how to turn them on.
+pub fn note_gateway_supervisor_unverified() {
+    SUPERVISOR_UNVERIFIED.store(true, Ordering::Relaxed);
+}
+
+/// Whether [`note_gateway_supervisor_unverified`] was called.
+pub(crate) fn gateway_supervisor_unverified() -> bool {
+    SUPERVISOR_UNVERIFIED.load(Ordering::Relaxed)
+}
+
+/// Whether a node in this role exits to restore QUIC: a gateway, and only
+/// when the binary enabled it ([`enable_gateway_quic_restarts`]).
+pub(crate) fn gateway_quic_restarts(is_gateway: bool) -> bool {
+    gateway_quic_restarts_with(is_gateway, GATEWAY_QUIC_RESTARTS.load(Ordering::Relaxed))
+}
+
+fn gateway_quic_restarts_with(is_gateway: bool, enabled: bool) -> bool {
+    is_gateway && enabled
+}
+
 /// Whether this node can use QUIC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QuicAvailability {
@@ -132,6 +183,15 @@ impl QuicAvailabilityWatch {
     /// The current value.
     pub(crate) fn get(&self) -> QuicAvailability {
         *self.0.borrow()
+    }
+
+    /// Resolve when the endpoint dies (`Down`); never resolve when it is
+    /// released, disabled or still up at the end. Cancel-safe.
+    pub(crate) async fn died(mut self) {
+        if self.not_up().await == QuicAvailability::Down {
+            return;
+        }
+        std::future::pending::<()>().await;
     }
 
     /// Wait until the availability is not `Up`, and return it. Every value
@@ -282,7 +342,8 @@ impl EndpointHealth {
                 call,
                 panic = message,
                 "The QUIC socket adapter panicked; the panic was caught. The QUIC endpoint is \
-                 down: the node keeps running on the UDP transport, with QUIC off until it restarts"
+                 down: the node keeps running on the UDP transport, with QUIC off until it restarts \
+                 (a supervised gateway exits for its supervisor to restart it)"
             );
         } else {
             tracing::error!(
@@ -319,7 +380,8 @@ impl EndpointHealth {
             tracing::warn!(
                 local_addr = %self.local_addr,
                 "QUIC endpoint is down: its driver ended while the node held it. \
-                 The node keeps running on the UDP transport, with QUIC off until it restarts"
+                 The node keeps running on the UDP transport, with QUIC off until it restarts \
+                 (a supervised gateway exits for its supervisor to restart it)"
             );
         }
     }
@@ -354,6 +416,53 @@ pub(crate) async fn watch_endpoint_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only an enabled gateway exits on endpoint death.
+    #[test]
+    fn only_an_enabled_gateway_exits_on_endpoint_death() {
+        assert!(gateway_quic_restarts_with(true, true));
+        assert!(!gateway_quic_restarts_with(false, true), "a peer never");
+        assert!(!gateway_quic_restarts_with(true, false), "not enabled");
+        assert!(!gateway_quic_restarts_with(false, false));
+        // Nothing in the unit-test binary enables it.
+        assert!(!gateway_quic_restarts(true));
+    }
+
+    /// `died` resolves on `Down` only: a release or a disabled endpoint is
+    /// not a death and never resolves it.
+    #[tokio::test]
+    async fn died_resolves_only_on_down() {
+        use std::time::Duration;
+        let (sender, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let died = tokio::spawn(watch.died());
+        tokio::task::yield_now().await;
+        assert!(!died.is_finished());
+        sender.send(QuicAvailability::Down).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), died)
+            .await
+            .expect("Down resolves it")
+            .unwrap();
+
+        for other in [QuicAvailability::Released, QuicAvailability::Disabled] {
+            let (sender, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+            let died = watch.died();
+            sender.send(other).unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), died)
+                    .await
+                    .is_err(),
+                "{other:?} is not a death"
+            );
+        }
+        // The sender gone while Up reads as released, not a death.
+        let (sender, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        drop(sender);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), watch.died())
+                .await
+                .is_err()
+        );
+    }
 
     /// The driver's return and the release race. Whichever stores first
     /// wins: a release already stored is not turned into `Down` (and

@@ -31,11 +31,18 @@ pub use node::{
     enable_abort_on_redb_poison, enable_fast_crash_exit_code, listener_exit_is_graceful,
     run_local_node, run_local_node_with_listener, run_network_node, set_auto_update_state,
 };
+#[doc(hidden)]
+pub use transport::connection_handler::QUIC_RESTORE_MIN_UPTIME;
+#[doc(hidden)]
+pub use transport::quic::breaker::ENDPOINT_DOWN_EXITS_TO_TRIP;
 pub use transport::quic::breaker::{
     STOP_NOTE_ENV_VAR as QUIC_BREAKER_STOP_NOTE_ENV_VAR,
     STOP_NOTE_FILE as QUIC_BREAKER_STOP_NOTE_FILE, enable_quic_crash_breaker,
     quic_breaker_clean_exit, quic_breaker_signals_ready,
     record_deliberate_stop as record_quic_breaker_deliberate_stop,
+};
+pub use transport::quic::liveness::{
+    enable_gateway_quic_restarts, note_gateway_supervisor_unverified,
 };
 
 /// Network operation/transaction state machines.

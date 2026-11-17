@@ -11,9 +11,13 @@
 //! transport ([`quic_attributed`]) in the run's marker. A run with QUIC
 //! enabled counts only if it lasted less than [`SHORT_RUN`] and recorded such
 //! a panic, and [`SHORT_RUNS_TO_TRIP`] of them in a row keep QUIC off for
-//! [`QUIC_BREAKER_COOLDOWN`]. A short run that recorded no QUIC panic (any
-//! ordinary stop) starts the count again. A run that started more than the
-//! cooldown after the one before it starts the count again too.
+//! the role's cooldown ([`BreakerRole::cooldown`]: 24 h on a peer; on a
+//! gateway 15 min, growing on repeat trips). A short run that recorded no
+//! QUIC panic (any ordinary stop) starts the count again. A run that started
+//! [`SHORT_RUN_WINDOW`] (24 h, for every role) or more after the one before
+//! it starts the count again too. A gateway's exit because its QUIC endpoint
+//! died is recorded in the marker (`note_endpoint_down_exit`) and decided as
+//! on unix (`endpoint_down_verdict`), whatever the run's length.
 //!
 //! The first version (#6101) counted every short run, whatever ended it.
 //! Replayed over 2.2 days of telemetry from 634 Windows peers, that would
@@ -105,7 +109,7 @@
 //!   uses no boot identity, so that shutdown is a stop like any other. A laptop
 //!   suspended during a run may read as a short run, or may clear the count
 //!   early, depending on whether the timer's clock counts suspended time. That
-//!   is unverified, and it costs at most a day on UDP.
+//!   is unverified, and it costs at most one cooldown on UDP.
 //! - **The marker path** is the node's own data directory. The start that
 //!   reads the marker and the run that writes it are the same process type
 //!   with the same configuration, so `freenet service`, which starts
@@ -147,7 +151,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use super::{
-    BreakerOutcome, Gated, Marker, PENDING, Previous, QUIC_BREAKER_COOLDOWN, Verdict,
+    BreakerOutcome, BreakerRole, Gated, Marker, PENDING, Previous, QUIC_BREAKER_COOLDOWN, Verdict,
     clear_if_owned, cooldown_end, marker_path, read_previous, unix_secs, write_marker,
 };
 use crate::config::{GlobalExecutor, GlobalRng};
@@ -178,21 +182,55 @@ pub(super) struct Decision {
 
 /// The whole decision, as described in the module docs. Only
 /// [`Verdict::Arm`], [`Verdict::Trip`] and [`Verdict::Cool`] come out of it. A
-/// run counts only if it recorded a QUIC panic and started within the
-/// cooldown, so an ordinary stop, a clock gone back past its start and a run
-/// from long ago all start the count again.
-pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -> Decision {
+/// run counts only if it recorded a QUIC panic and started within
+/// [`SHORT_RUN_WINDOW`] of now, so an ordinary stop, a clock gone back past
+/// its start and a run from long ago all start the count again.
+pub(super) fn decide(
+    previous: &Previous,
+    now_secs: u64,
+    ignore_breaker: bool,
+    role: BreakerRole,
+) -> Decision {
     let arm = |short_runs| Decision {
         verdict: Verdict::Arm,
         short_runs,
     };
+    // A gateway's exit because its QUIC endpoint died is decided as on unix,
+    // whatever the run's length, so the restarts per day stay bounded.
+    if let Previous::Marker(Marker::ShortRuns {
+        started_at_secs,
+        endpoint_down_secs,
+        short_runs,
+        ..
+    }) = previous
+    {
+        if let Some(verdict) = super::endpoint_down_verdict(
+            endpoint_down_secs,
+            *started_at_secs,
+            previous,
+            now_secs,
+            role,
+        ) {
+            return match verdict {
+                Verdict::Trip if !ignore_breaker => Decision {
+                    verdict,
+                    short_runs: *short_runs,
+                },
+                Verdict::Arm
+                | Verdict::Trip
+                | Verdict::Cool { .. }
+                | Verdict::RunUnarmed
+                | Verdict::Unreadable => arm(0),
+            };
+        }
+    }
     match previous {
         Previous::Marker(Marker::ShortRuns {
             short_runs,
             started_at_secs,
             quic_panicked: true,
             ..
-        }) if within_cooldown(*started_at_secs, now_secs) => {
+        }) if within(*started_at_secs, now_secs, SHORT_RUN_WINDOW) => {
             let short_runs = short_runs.saturating_add(1);
             if short_runs >= SHORT_RUNS_TO_TRIP && !ignore_breaker {
                 Decision {
@@ -203,9 +241,10 @@ pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -
                 arm(short_runs)
             }
         }
-        Previous::Marker(Marker::Tripped { tripped_at_secs })
-            if !ignore_breaker && within_cooldown(*tripped_at_secs, now_secs) =>
-        {
+        Previous::Marker(Marker::Tripped {
+            tripped_at_secs,
+            trips,
+        }) if !ignore_breaker && within(*tripped_at_secs, now_secs, role.cooldown(*trips)) => {
             Decision {
                 verdict: Verdict::Cool {
                     tripped_at_secs: *tripped_at_secs,
@@ -224,24 +263,40 @@ pub(super) fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -
     }
 }
 
-/// Whether `at_secs` is not ahead of `now_secs` and less than a cooldown before
+/// Whether `at_secs` is not ahead of `now_secs` and less than `window` before
 /// it. Stricter than the unix `cooling`: a time ahead of the clock does not
 /// count at all.
-fn within_cooldown(at_secs: u64, now_secs: u64) -> bool {
-    at_secs <= now_secs && now_secs < at_secs.saturating_add(QUIC_BREAKER_COOLDOWN.as_secs())
+fn within(at_secs: u64, now_secs: u64, window: Duration) -> bool {
+    at_secs <= now_secs && now_secs < at_secs.saturating_add(window.as_secs())
 }
 
-/// The marker a decision leaves behind; `None` leaves the file as it is.
-fn marker_after(decision: Decision, now_secs: u64, nonce: u64) -> Option<Marker> {
+/// How long after one counted short run the next still adds to the count:
+/// the peer cooldown, for every role. A gateway's shorter cooldown sets only
+/// how long a trip keeps QUIC off, so its short runs, which a wrapper's
+/// restart backoff spreads out, still add up.
+const SHORT_RUN_WINDOW: Duration = QUIC_BREAKER_COOLDOWN;
+
+/// The marker a decision on `previous` leaves behind; `None` leaves the file
+/// as it is. A gateway's trip history rides along ([`super::prior_trip`]).
+fn marker_after(
+    decision: Decision,
+    previous: &Previous,
+    now_secs: u64,
+    nonce: u64,
+    role: BreakerRole,
+) -> Option<Marker> {
     match decision.verdict {
         Verdict::Arm => Some(Marker::ShortRuns {
             short_runs: decision.short_runs,
             started_at_secs: now_secs,
             nonce,
             quic_panicked: false,
+            endpoint_down_secs: super::carried_endpoint_down_exits(previous, now_secs),
+            prior_trip: super::prior_trip(previous, now_secs, role),
         }),
         Verdict::Trip => Some(Marker::Tripped {
             tripped_at_secs: now_secs,
+            trips: super::trip_number(previous, now_secs, role),
         }),
         Verdict::RunUnarmed | Verdict::Cool { .. } | Verdict::Unreadable => None,
     }
@@ -253,6 +308,7 @@ pub(super) fn gate<T>(
     data_dir: &Path,
     ignore_breaker: bool,
     now: SystemTime,
+    role: BreakerRole,
 ) -> Gated<T> {
     if settings.is_none() {
         return Gated {
@@ -270,11 +326,12 @@ pub(super) fn gate<T>(
         );
     }
     let now_secs = unix_secs(now);
-    let decision = decide(&previous, now_secs, ignore_breaker);
-    let marker = marker_after(decision, now_secs, GlobalRng::random_u64());
+    let decision = decide(&previous, now_secs, ignore_breaker, role);
+    let marker = marker_after(decision, &previous, now_secs, GlobalRng::random_u64(), role);
     let metrics = &crate::transport::TRANSPORT_METRICS;
-    let until_utc = |tripped_at_secs: u64| {
-        chrono::DateTime::<chrono::Utc>::from(cooldown_end(tripped_at_secs)).to_rfc3339()
+    let until_utc = |tripped_at_secs: u64, trips: u32| {
+        chrono::DateTime::<chrono::Utc>::from(cooldown_end(tripped_at_secs, role.cooldown(trips)))
+            .to_rfc3339()
     };
     match decision.verdict {
         Verdict::Arm => {
@@ -288,32 +345,50 @@ pub(super) fn gate<T>(
             PENDING.lock().marker = marker.map(|marker| (path, marker));
         }
         Verdict::Trip => {
+            let trips = match &marker {
+                Some(Marker::Tripped { trips, .. }) => *trips,
+                Some(Marker::Armed { .. } | Marker::ShortRuns { .. } | Marker::Unknown) | None => 1,
+            };
             // Off even if the write fails: the evidence is in hand now.
-            if let Some(Err(error)) = marker.as_ref().map(|marker| write_marker(&path, marker)) {
-                tracing::warn!(
+            match marker.as_ref().map(|marker| write_marker(&path, marker)) {
+                Some(Err(error)) => tracing::warn!(
                     %error,
                     path = %path.display(),
                     "Could not record the QUIC crash-breaker trip; the next start decides again"
-                );
+                ),
+                // A gateway restarts at the cooldown's end only after a trip
+                // it recorded: a restart would otherwise decide again on the
+                // same short runs.
+                Some(Ok(())) => super::set_quic_restore_at(role, now_secs, trips),
+                None => {}
             }
             metrics.record_quic_breaker_trip();
             metrics.set_quic_breaker_suppressed(true);
             tracing::warn!(
-                until = %until_utc(now_secs),
+                until = %until_utc(now_secs, trips),
                 short_runs = decision.short_runs,
                 short_run_minutes = SHORT_RUN.as_secs() / 60,
-                "Several runs in a row with QUIC enabled ended early, so QUIC stays off until \
-                 the cooldown ends. Set `quic-ignore-crash-breaker = true` to run QUIC anyway"
+                cooldown_minutes = role.cooldown(trips).as_secs() / 60,
+                trips,
+                ?role,
+                "Several runs in a row with QUIC enabled ended early, so QUIC is off for this \
+                 run. {} Set `quic-ignore-crash-breaker = true` to run QUIC anyway",
+                super::restart_note(role)
             );
         }
         Verdict::Cool { tripped_at_secs } => {
+            let trips = super::tripped_trips(&previous);
             metrics.set_quic_breaker_suppressed(true);
             tracing::warn!(
-                until = %until_utc(tripped_at_secs),
+                until = %until_utc(tripped_at_secs, trips),
+                trips,
+                ?role,
                 "QUIC stays off: several runs in a row with QUIC enabled ended early and the \
-                 cooldown has not ended. Set `quic-ignore-crash-breaker = true` to run QUIC \
-                 anyway"
+                 cooldown has not ended. {} Set `quic-ignore-crash-breaker = true` to run QUIC \
+                 anyway",
+                super::restart_note(role)
             );
+            super::set_quic_restore_at(role, tripped_at_secs, trips);
         }
         Verdict::RunUnarmed | Verdict::Unreadable => {}
     }
@@ -446,12 +521,16 @@ fn mark_quic_panic(path: &Path, nonce: u64) -> std::io::Result<bool> {
             started_at_secs,
             nonce: owner,
             quic_panicked: false,
+            endpoint_down_secs,
+            prior_trip,
         }) if owner == nonce => {
             let marked = Marker::ShortRuns {
                 short_runs,
                 started_at_secs,
                 nonce,
                 quic_panicked: true,
+                endpoint_down_secs,
+                prior_trip,
             };
             write_marker(path, &marked).map(|()| true)
         }
@@ -526,11 +605,163 @@ mod tests {
     const NONCE: u64 = 7;
 
     fn cooldown() -> u64 {
-        QUIC_BREAKER_COOLDOWN.as_secs()
+        super::super::QUIC_BREAKER_COOLDOWN.as_secs()
+    }
+
+    /// The peer's marker after a decision on no earlier marker.
+    fn marker_after(decision: Decision, now_secs: u64, nonce: u64) -> Option<Marker> {
+        super::marker_after(
+            decision,
+            &Previous::Nothing,
+            now_secs,
+            nonce,
+            BreakerRole::Peer,
+        )
+    }
+
+    /// The peer decision; the gateway one is tested by name.
+    fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -> Decision {
+        super::decide(previous, now_secs, ignore_breaker, BreakerRole::Peer)
+    }
+
+    /// A Windows gateway's exit because its endpoint died is decided as on
+    /// unix, whatever the run's length: the first in the window restarts
+    /// QUIC and starts the short-run count again, the second trips, and the
+    /// override never trips. The exits ride along in the next marker.
+    #[test]
+    fn a_windows_endpoint_death_is_decided_as_on_unix() {
+        let gw = BreakerRole::Gateway;
+        let died = |endpoint_down_secs: Vec<u64>| {
+            Previous::Marker(Marker::ShortRuns {
+                short_runs: 2,
+                started_at_secs: T0,
+                nonce: NONCE,
+                quic_panicked: false,
+                endpoint_down_secs,
+                prior_trip: None,
+            })
+        };
+        let long_after = T0 + 3 * SHORT_RUN.as_secs();
+        let first = died(vec![long_after]);
+        let decision = super::decide(&first, long_after + 5, false, gw);
+        assert_eq!(decision, arm(0), "a long run's first death restarts QUIC");
+        assert!(matches!(
+            super::marker_after(decision, &first, long_after + 5, NONCE, gw),
+            Some(Marker::ShortRuns { ref endpoint_down_secs, .. }) if *endpoint_down_secs == vec![long_after]
+        ));
+        let second = died(vec![T0 - 3600, long_after]);
+        assert_eq!(
+            super::decide(&second, long_after + 5, false, gw).verdict,
+            Verdict::Trip,
+            "the second in the window trips, however long the runs"
+        );
+        assert_eq!(
+            super::decide(&second, long_after + 5, true, gw),
+            arm(0),
+            "the override never trips"
+        );
+        assert_eq!(
+            super::decide(&died(vec![T0 - 60]), long_after + 5, false, gw),
+            arm(0),
+            "an exit before this run started is not this run's death"
+        );
+    }
+
+    /// On Windows too, a gateway's trip history rides along in the markers:
+    /// a trip after a recent one records the repeat and cools for longer,
+    /// and an armed run carries the last trip. A peer's markers carry none.
+    #[test]
+    fn a_windows_gateway_carries_its_trip_history() {
+        use super::super::PriorTrip;
+        let gw = BreakerRole::Gateway;
+        let prior = PriorTrip {
+            tripped_at_secs: T0 - 3600,
+            trips: 1,
+        };
+        let previous = Previous::Marker(Marker::ShortRuns {
+            endpoint_down_secs: Vec::new(),
+            short_runs: 2,
+            started_at_secs: T0 - 60,
+            nonce: NONCE,
+            quic_panicked: true,
+            prior_trip: Some(prior),
+        });
+        let decision = super::decide(&previous, T0, false, gw);
+        assert_eq!(decision.verdict, Verdict::Trip);
+        assert_eq!(
+            super::marker_after(decision, &previous, T0, NONCE, gw),
+            Some(Marker::Tripped {
+                tripped_at_secs: T0,
+                trips: 2,
+            })
+        );
+        let tripped = Previous::Marker(Marker::Tripped {
+            tripped_at_secs: T0,
+            trips: 2,
+        });
+        let g = super::super::GATEWAY_QUIC_BREAKER_COOLDOWN.as_secs();
+        assert!(matches!(
+            super::decide(&tripped, T0 + 2 * g - 1, false, gw).verdict,
+            Verdict::Cool { .. }
+        ));
+        let decision = super::decide(&tripped, T0 + 2 * g, false, gw);
+        assert_eq!(decision.verdict, Verdict::Arm);
+        assert!(matches!(
+            super::marker_after(decision, &tripped, T0 + 2 * g, NONCE, gw),
+            Some(Marker::ShortRuns {
+                prior_trip: Some(PriorTrip { trips: 2, .. }),
+                ..
+            })
+        ));
+        assert!(matches!(
+            super::marker_after(decision, &tripped, T0 + 2 * g, NONCE, BreakerRole::Peer),
+            Some(Marker::ShortRuns {
+                prior_trip: None,
+                ..
+            })
+        ));
+    }
+
+    /// On Windows a gateway holds a trip only for the gateway cooldown, but
+    /// counts short runs over the same window as a peer, so runs spread out
+    /// by a wrapper's restart backoff still add up.
+    #[test]
+    fn a_gateway_cools_for_the_gateway_cooldown_and_counts_like_a_peer() {
+        let g = super::super::GATEWAY_QUIC_BREAKER_COOLDOWN.as_secs();
+        let gw = |previous: &Previous, now_secs: u64| {
+            super::decide(previous, now_secs, false, BreakerRole::Gateway)
+        };
+        assert_eq!(gw(&panicked(2, T0), T0 + g - 1).verdict, Verdict::Trip);
+        assert_eq!(
+            gw(&panicked(2, T0), T0 + g).verdict,
+            Verdict::Trip,
+            "the count is not cut at the gateway cooldown"
+        );
+        assert_eq!(
+            gw(&panicked(2, T0), T0 + cooldown() - 1).verdict,
+            Verdict::Trip
+        );
+        assert_eq!(gw(&panicked(2, T0), T0 + cooldown()), arm(0));
+        assert_eq!(
+            gw(&tripped(T0), T0 + g - 1).verdict,
+            Verdict::Cool {
+                tripped_at_secs: T0
+            }
+        );
+        assert_eq!(gw(&tripped(T0), T0 + g), arm(0));
+        assert_eq!(
+            decide(&tripped(T0), T0 + g, false).verdict,
+            Verdict::Cool {
+                tripped_at_secs: T0
+            },
+            "a peer still cools for the peer cooldown"
+        );
     }
 
     fn running(short_runs: u32, started_at_secs: u64) -> Previous {
         Previous::Marker(Marker::ShortRuns {
+            endpoint_down_secs: Vec::new(),
+            prior_trip: None,
             short_runs,
             started_at_secs,
             nonce: NONCE,
@@ -541,6 +772,8 @@ mod tests {
     /// A short run that recorded a QUIC panic: the kind that counts.
     fn panicked(short_runs: u32, started_at_secs: u64) -> Previous {
         Previous::Marker(Marker::ShortRuns {
+            endpoint_down_secs: Vec::new(),
+            prior_trip: None,
             short_runs,
             started_at_secs,
             nonce: NONCE,
@@ -549,7 +782,10 @@ mod tests {
     }
 
     fn tripped(tripped_at_secs: u64) -> Previous {
-        Previous::Marker(Marker::Tripped { tripped_at_secs })
+        Previous::Marker(Marker::Tripped {
+            trips: 1,
+            tripped_at_secs,
+        })
     }
 
     fn arm(short_runs: u32) -> Decision {
@@ -630,6 +866,7 @@ mod tests {
         write_marker(
             &path,
             &Marker::Tripped {
+                trips: 1,
                 tripped_at_secs: T0,
             },
         )
@@ -657,10 +894,12 @@ mod tests {
     #[test]
     fn a_marker_that_is_not_evidence_fails_open() {
         let unix_marker = Previous::Marker(Marker::Armed {
+            prior_trip: None,
             pid: 1,
             boot_id: None,
             nonce: NONCE,
             armed_at_secs: T0,
+            endpoint_down_secs: Vec::new(),
         });
         for previous in [
             Previous::Nothing,
@@ -767,6 +1006,8 @@ mod tests {
         assert_eq!(
             marker_after(decide(&tripped(T0), T0, true), T0, NONCE),
             Some(Marker::ShortRuns {
+                endpoint_down_secs: Vec::new(),
+                prior_trip: None,
                 short_runs: 0,
                 started_at_secs: T0,
                 nonce: NONCE,
@@ -805,14 +1046,14 @@ mod tests {
     fn quic_off_does_not_touch_the_marker() {
         let dir = tempfile::tempdir().unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0);
-        let empty = gate(None::<u8>, dir.path(), false, now);
+        let empty = gate(None::<u8>, dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(empty.settings, None);
         assert_eq!(empty.breaker, BreakerOutcome::NotConsulted);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 
         let path = marker_path(dir.path());
         std::fs::create_dir(&path).unwrap();
-        let gated = gate(None::<u8>, dir.path(), false, now);
+        let gated = gate(None::<u8>, dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(gated.breaker, BreakerOutcome::NotConsulted);
     }
 
@@ -825,6 +1066,8 @@ mod tests {
         write_marker(
             &path,
             &Marker::ShortRuns {
+                endpoint_down_secs: Vec::new(),
+                prior_trip: None,
                 short_runs: SHORT_RUNS_TO_TRIP - 1,
                 started_at_secs: T0,
                 nonce: NONCE,
@@ -833,12 +1076,12 @@ mod tests {
         )
         .unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0 + 1);
-        let gated = gate(Some(7u8), dir.path(), false, now);
+        let gated = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(gated.settings, None);
         assert_eq!(gated.breaker, BreakerOutcome::Decided(Verdict::Trip));
         assert_eq!(read_previous(&path), tripped(T0 + 1));
 
-        let cooling = gate(Some(7u8), dir.path(), false, now);
+        let cooling = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(cooling.settings, None);
         assert_eq!(
             cooling.breaker,
@@ -858,6 +1101,8 @@ mod tests {
         write_marker(
             &path,
             &Marker::ShortRuns {
+                endpoint_down_secs: Vec::new(),
+                prior_trip: None,
                 short_runs: SHORT_RUNS_TO_TRIP - 1,
                 started_at_secs: T0,
                 nonce: NONCE,
@@ -872,7 +1117,7 @@ mod tests {
         ));
         std::fs::create_dir(tmp).unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0 + 1);
-        let gated = gate(Some(7u8), dir.path(), false, now);
+        let gated = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(gated.settings, None);
         assert_eq!(
             read_previous(&path),
@@ -923,6 +1168,7 @@ mod tests {
         for marker in [
             marker_after(arm(1), T0, NONCE + 1).unwrap(),
             Marker::Tripped {
+                trips: 1,
                 tripped_at_secs: T0,
             },
         ] {
@@ -1025,6 +1271,7 @@ mod tests {
             stopped: &[],
             now_secs: T0,
             ignore_breaker: false,
+            role: BreakerRole::Peer,
         });
         assert_eq!(got, Verdict::Arm);
     }
@@ -1103,6 +1350,7 @@ mod tests {
         write_marker(
             &path,
             &Marker::Tripped {
+                trips: 1,
                 tripped_at_secs: T0,
             },
         )
