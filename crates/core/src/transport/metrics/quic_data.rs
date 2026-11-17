@@ -26,8 +26,8 @@
 //! | `quic_ended_paths_below_floor` | paths that ended in the period before sending 200 packets, so in no bucket |
 //! | `quic_carried_packets_sent`, `quic_carried_packets_lost` | the period's packets sent, and declared lost, while their path carried data (a subset of `quic_sent_packets` and `quic_lost_packets`; the shadow share is the difference, a reconciliation residual: both operands are recorded by `record_path_loss` under the one `loss` lock, the exception the bug-prevention rule "metric describing a filtering decision, re-derived at the call site" allows, as for `broadcast_payload_mix`) |
 //! | `quic_carrying_loss_rate_<bucket>`, `quic_carrying_ended_loss_rate_<bucket>`, `quic_carried_paths_ended_below_floor` | the same three as for every path, for paths that carry data, by their loss counted from the first report that found the path carrying (a path whose data bit came on after it started starts its carrying count then); every gauge bucket sent every period |
-//! | `quic_srtt_<bucket>` | live QUIC paths by their smoothed round-trip time (quinn's `PathStats::rtt`) at their last tick (a gauge, not reset, every bucket sent every period, 0 included): `lt_10ms`, `lt_25ms`, `lt_50ms`, `lt_100ms`, `lt_200ms`, `lt_400ms`, `ge_400ms`. A path is in a bucket from its first tick: it is built from an established connection, which has an RTT sample |
-//! | `quic_tx_bps_<bucket>` | live QUIC paths by the UDP payload bits per second they sent over their last tick (about 2 s; a gauge, not reset, every bucket sent every period, 0 included): `lt_10kbps`, `lt_100kbps`, `lt_1mbps`, `lt_10mbps`, `lt_100mbps`, `ge_100mbps`. Shadow paths (keepalives) are in the lowest bucket, so a data path's rate reads from the others. One tick's rate, sampled when the snapshot is taken, so it describes the fleet's distribution rather than one path's throughput |
+//! | `quic_srtt_<bucket>` | live QUIC paths that carry data, by their smoothed round-trip time (quinn's `PathStats::rtt`) at their last tick (a gauge, not reset, every bucket sent every period, 0 included): `lt_10ms`, `lt_25ms`, `lt_50ms`, `lt_100ms`, `lt_200ms`, `lt_400ms`, `ge_400ms`. A path is in a bucket from its first tick as a data path (it is built from an established connection, which has an RTT sample), and leaves when it stops carrying or ends; paths that carry no data are in none |
+//! | `quic_tx_bps_<bucket>` | live QUIC paths that carry data, by the datagram bits per second quinn built on them over their last tick (about 2 s; a gauge, not reset, every bucket sent every period, 0 included): `lt_10kbps`, `lt_100kbps`, `lt_1mbps`, `lt_10mbps`, `lt_100mbps`, `ge_100mbps`. The bytes are UDP payload as quinn counts them (`udp_tx.bytes`): retransmissions, acknowledgements, padding and keepalives included, so it is neither goodput nor capacity. These two gauges describe path conditions; the speed of QUIC against UDP is answered from transfer events (bytes over duration, by transport and release), not from them. One tick's rate, sampled when the snapshot is taken, so it describes the fleet's distribution rather than one path's throughput; a tick of 0 ms is not counted |
 //! | `quic_streams_sampled_paths`, `quic_streams_open_ge_<n>`, `quic_streams_peak_max` | per path and period, the peak of inbound streams read at once: the paths sampled, those whose peak reached each level, and the highest peak |
 //! | `quic_gate_loss_<verdict>` | congestion events by the loss gate's verdict (`recycle::loss_gate`): passed to Cubic as `queue`, `share` (loss share above the ceiling), `persistent`, `ecn` (a congestion mark), `no_sample`, or `ignored` as random loss; summed over the node's paths up to each path's last tick. Over a path's life they sum to its `quic_congestion_events`; within one period they can differ by the events between the two reads of a tick |
 //! | `quic_gate_ended_queue_<bucket>` | paths that ended in the period after at least 20 gate verdicts, by the share of them passed as `queue`: `lt_10pct`, `lt_50pct`, `ge_50pct`. A path whose losses mostly read as a queue runs as plain Cubic, whether the queue is real or jitter |
@@ -764,34 +764,46 @@ impl QuicDataCounters {
         }
     }
 
-    /// A tick of a path: move it to the bucket of its smoothed round-trip time
-    /// `srtt`, and, when `sent` bytes went out in the `ms` (not 0)
-    /// milliseconds since the last tick, to the bucket of that rate. A path is
-    /// in one bucket of each family while it is live ([`PathLossWindow`]'s
-    /// drop takes it out). A tick of 0 ms leaves the rate where it was.
+    /// A tick of a path. While the path `carrying` data, move it to the bucket
+    /// of its smoothed round-trip time `srtt` and, when `sent` bytes went out
+    /// in the `ms` (not 0) milliseconds since the last tick, to the bucket of
+    /// that rate; a path that is not carrying data is in neither (a path that
+    /// stops carrying leaves its buckets), so idle shadow paths do not fill the
+    /// lowest buckets. A tick of 0 ms leaves the rate where it was, and its
+    /// bytes are not counted in any rate. A path is in one bucket of each
+    /// family while it carries, and [`PathLossWindow`]'s drop takes it out.
+    /// `sent` is the datagram bytes quinn built (retransmissions,
+    /// acknowledgements, padding and keepalives included), not goodput.
+    ///
+    /// The buckets are moved under the `loss` lock, in a critical section of
+    /// their own: they are read by the same snapshot but not written with a
+    /// loss report's sums.
     pub(crate) fn record_path_rates(
         &self,
         window: &mut PathLossWindow,
         srtt: std::time::Duration,
         sent: u64,
         ms: u64,
+        carrying: bool,
     ) {
         debug_assert!(
             std::ptr::eq(window.node, self),
             "a window of these counters"
         );
-        let srtt_bucket = Some(path_srtt_bucket(srtt));
-        let tx_bps_bucket = if ms == 0 {
-            window.tx_bps_bucket
-        } else {
-            Some(path_tx_bps_bucket(sent, ms))
+        let srtt_bucket = carrying.then(|| path_srtt_bucket(srtt));
+        let tx_bps_bucket = match (carrying, ms) {
+            (false, _) => None,
+            (true, 0) => window.tx_bps_bucket,
+            (true, _) => Some(path_tx_bps_bucket(sent, ms)),
         };
         let mut counts = self.loss.lock();
         if srtt_bucket != window.srtt_bucket {
             if let Some(old) = window.srtt_bucket {
                 counts.path_srtt[old] = counts.path_srtt[old].saturating_sub(1);
             }
-            counts.path_srtt[path_srtt_bucket(srtt)] += 1;
+            if let Some(new) = srtt_bucket {
+                counts.path_srtt[new] += 1;
+            }
             window.srtt_bucket = srtt_bucket;
         }
         if tx_bps_bucket != window.tx_bps_bucket {
@@ -2103,14 +2115,14 @@ mod tests {
         let mut a = PathLossWindow::new(counters);
         let mut b = PathLossWindow::new(counters);
         assert_eq!(counters.snapshot(false).path_srtt.iter().sum::<u32>(), 0);
-        counters.record_path_rates(&mut a, Duration::from_millis(30), 0, 2000);
-        counters.record_path_rates(&mut b, Duration::from_millis(500), 250_000, 2000);
+        counters.record_path_rates(&mut a, Duration::from_millis(30), 0, 2000, true);
+        counters.record_path_rates(&mut b, Duration::from_millis(500), 250_000, 2000, true);
         let snap = counters.snapshot(true);
         assert_eq!(snap.path_srtt, vec![0, 0, 1, 0, 0, 0, 1]);
         assert_eq!(snap.path_tx_bps, vec![1, 0, 0, 1, 0, 0]);
         // `a` speeds up and its RTT falls; `b`'s tick has no time in it.
-        counters.record_path_rates(&mut a, Duration::from_millis(8), 2_500_000, 2000);
-        counters.record_path_rates(&mut b, Duration::from_millis(500), 9, 0);
+        counters.record_path_rates(&mut a, Duration::from_millis(8), 2_500_000, 2000, true);
+        counters.record_path_rates(&mut b, Duration::from_millis(500), 9, 0, true);
         let snap = counters.snapshot(true);
         assert_eq!(snap.path_srtt, vec![1, 0, 0, 0, 0, 0, 1]);
         assert_eq!(snap.path_tx_bps, vec![0, 0, 0, 1, 1, 0]);
@@ -2121,6 +2133,29 @@ mod tests {
         assert_eq!(snap.path_tx_bps, vec![0, 0, 0, 1, 0, 0]);
         drop(b);
         let snap = counters.snapshot(true);
+        assert_eq!(snap.path_srtt.iter().sum::<u32>(), 0);
+        assert_eq!(snap.path_tx_bps.iter().sum::<u32>(), 0);
+    }
+
+    /// Only a path that carries data is in the gauges: an idle shadow path is
+    /// in neither, and a path that stops carrying leaves its buckets.
+    #[test]
+    fn a_path_that_does_not_carry_data_is_in_neither_gauge() {
+        use std::time::Duration;
+        let counters: &'static QuicDataCounters = Box::leak(Box::new(QuicDataCounters::new()));
+        let mut shadow = PathLossWindow::new(counters);
+        let mut data = PathLossWindow::new(counters);
+        counters.record_path_rates(&mut shadow, Duration::from_millis(30), 100, 2000, false);
+        let snap = counters.snapshot(false);
+        assert_eq!(snap.path_srtt.iter().sum::<u32>(), 0);
+        assert_eq!(snap.path_tx_bps.iter().sum::<u32>(), 0);
+        counters.record_path_rates(&mut data, Duration::from_millis(30), 0, 2000, true);
+        let snap = counters.snapshot(false);
+        assert_eq!(snap.path_srtt.iter().sum::<u32>(), 1);
+        assert_eq!(snap.path_tx_bps.iter().sum::<u32>(), 1);
+        // The peer refused data: the path leaves both.
+        counters.record_path_rates(&mut data, Duration::from_millis(30), 0, 2000, false);
+        let snap = counters.snapshot(false);
         assert_eq!(snap.path_srtt.iter().sum::<u32>(), 0);
         assert_eq!(snap.path_tx_bps.iter().sum::<u32>(), 0);
     }

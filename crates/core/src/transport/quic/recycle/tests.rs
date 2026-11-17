@@ -1330,7 +1330,8 @@ fn ack_counting_implements_every_controller_method() {
 }
 
 /// Pin: each timed tick of a path's report passes the path's smoothed RTT, the
-/// bytes it sent since the last report, and the milliseconds since it to the
+/// bytes it sent since the last report, the milliseconds since it and whether
+/// it carries data to the
 /// per-path gauges (`quic_srtt_<bucket>`, `quic_tx_bps_<bucket>`), and the final
 /// report, which has no clock, does not. Deleting the call, or passing another
 /// RTT, leaves every unit test of the gauges green while the fleet reads 0.
@@ -1355,7 +1356,7 @@ fn a_timed_report_feeds_the_per_path_gauges() {
     );
     assert!(
         body.contains(
-            "iflet Some(ms)=tick_ms{self.node.record_path_rates(&mutself.window,stats.path.rtt,sent,ms);}"
+            "iflet Some(ms)=tick_ms{self.node.record_path_rates(&mutself.window,stats.path.rtt,sent,ms,carrying);}"
                 .replace(' ', "")
                 .as_str()
         ),

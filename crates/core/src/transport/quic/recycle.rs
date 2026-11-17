@@ -2312,14 +2312,6 @@ impl PathReport {
         let (next, sent, got) = self.bytes.step(UdpBytes::of(&stats));
         self.node.record_bytes(sent, got);
         self.bytes = next;
-        // The path's round-trip time and send rate gauges
-        // (`quic_path_srtt_<bucket>`, `quic_path_tx_bps_<bucket>`), at each
-        // tick; the final report has no clock, and the window's drop takes the
-        // path out of them.
-        if let Some(ms) = tick_ms {
-            self.node
-                .record_path_rates(&mut self.window, stats.path.rtt, sent, ms);
-        }
         let (next, delta) = self.loss.step(PathLoss::of(&stats));
         let carrying = self.carrying.now.load(std::sync::atomic::Ordering::Acquire)
             || (now.is_none()
@@ -2330,6 +2322,14 @@ impl PathReport {
         self.node
             .record_path_loss(&mut self.window, delta, carrying);
         self.loss = next;
+        // The round-trip time and send-rate gauges of data paths
+        // (`quic_srtt_<bucket>`, `quic_tx_bps_<bucket>`), at each timed tick.
+        // The final report has no clock, and the window's drop takes the path
+        // out of them.
+        if let Some(ms) = tick_ms {
+            self.node
+                .record_path_rates(&mut self.window, stats.path.rtt, sent, ms, carrying);
+        }
         if let Some((verdicts, seen)) = &mut self.gate {
             let now = verdicts.read();
             let delta: [u64; loss_gate::GATE_VERDICTS] =
