@@ -16,7 +16,8 @@
 //! QUIC panic (any ordinary stop) starts the count again. A run that started
 //! [`SHORT_RUN_WINDOW`] (24 h, for every role) or more after the one before
 //! it starts the count again too. A gateway's exit because its QUIC endpoint
-//! died counts as such a panic (`note_endpoint_down_exit`).
+//! died is recorded in the marker (`note_endpoint_down_exit`) and decided as
+//! on unix (`endpoint_down_verdict`), whatever the run's length.
 //!
 //! The first version (#6101) counted every short run, whatever ended it.
 //! Replayed over 2.2 days of telemetry from 634 Windows peers, that would
@@ -194,6 +195,35 @@ pub(super) fn decide(
         verdict: Verdict::Arm,
         short_runs,
     };
+    // A gateway's exit because its QUIC endpoint died is decided as on unix,
+    // whatever the run's length, so the restarts per day stay bounded.
+    if let Previous::Marker(Marker::ShortRuns {
+        started_at_secs,
+        endpoint_down_secs,
+        short_runs,
+        ..
+    }) = previous
+    {
+        if let Some(verdict) = super::endpoint_down_verdict(
+            endpoint_down_secs,
+            *started_at_secs,
+            previous,
+            now_secs,
+            role,
+        ) {
+            return match verdict {
+                Verdict::Trip if !ignore_breaker => Decision {
+                    verdict,
+                    short_runs: *short_runs,
+                },
+                Verdict::Arm
+                | Verdict::Trip
+                | Verdict::Cool { .. }
+                | Verdict::RunUnarmed
+                | Verdict::Unreadable => arm(0),
+            };
+        }
+    }
     match previous {
         Previous::Marker(Marker::ShortRuns {
             short_runs,
@@ -261,6 +291,7 @@ fn marker_after(
             started_at_secs: now_secs,
             nonce,
             quic_panicked: false,
+            endpoint_down_secs: super::carried_endpoint_down_exits(previous, now_secs),
             prior_trip: super::prior_trip(previous, now_secs, role),
         }),
         Verdict::Trip => Some(Marker::Tripped {
@@ -490,6 +521,7 @@ fn mark_quic_panic(path: &Path, nonce: u64) -> std::io::Result<bool> {
             started_at_secs,
             nonce: owner,
             quic_panicked: false,
+            endpoint_down_secs,
             prior_trip,
         }) if owner == nonce => {
             let marked = Marker::ShortRuns {
@@ -497,6 +529,7 @@ fn mark_quic_panic(path: &Path, nonce: u64) -> std::io::Result<bool> {
                 started_at_secs,
                 nonce,
                 quic_panicked: true,
+                endpoint_down_secs,
                 prior_trip,
             };
             write_marker(path, &marked).map(|()| true)
@@ -591,6 +624,49 @@ mod tests {
         super::decide(previous, now_secs, ignore_breaker, BreakerRole::Peer)
     }
 
+    /// A Windows gateway's exit because its endpoint died is decided as on
+    /// unix, whatever the run's length: the first in the window restarts
+    /// QUIC and starts the short-run count again, the second trips, and the
+    /// override never trips. The exits ride along in the next marker.
+    #[test]
+    fn a_windows_endpoint_death_is_decided_as_on_unix() {
+        let gw = BreakerRole::Gateway;
+        let died = |endpoint_down_secs: Vec<u64>| {
+            Previous::Marker(Marker::ShortRuns {
+                short_runs: 2,
+                started_at_secs: T0,
+                nonce: NONCE,
+                quic_panicked: false,
+                endpoint_down_secs,
+                prior_trip: None,
+            })
+        };
+        let long_after = T0 + 3 * SHORT_RUN.as_secs();
+        let first = died(vec![long_after]);
+        let decision = super::decide(&first, long_after + 5, false, gw);
+        assert_eq!(decision, arm(0), "a long run's first death restarts QUIC");
+        assert!(matches!(
+            super::marker_after(decision, &first, long_after + 5, NONCE, gw),
+            Some(Marker::ShortRuns { ref endpoint_down_secs, .. }) if *endpoint_down_secs == vec![long_after]
+        ));
+        let second = died(vec![T0 - 3600, long_after]);
+        assert_eq!(
+            super::decide(&second, long_after + 5, false, gw).verdict,
+            Verdict::Trip,
+            "the second in the window trips, however long the runs"
+        );
+        assert_eq!(
+            super::decide(&second, long_after + 5, true, gw),
+            arm(0),
+            "the override never trips"
+        );
+        assert_eq!(
+            super::decide(&died(vec![T0 - 60]), long_after + 5, false, gw),
+            arm(0),
+            "an exit before this run started is not this run's death"
+        );
+    }
+
     /// On Windows too, a gateway's trip history rides along in the markers:
     /// a trip after a recent one records the repeat and cools for longer,
     /// and an armed run carries the last trip. A peer's markers carry none.
@@ -603,6 +679,7 @@ mod tests {
             trips: 1,
         };
         let previous = Previous::Marker(Marker::ShortRuns {
+            endpoint_down_secs: Vec::new(),
             short_runs: 2,
             started_at_secs: T0 - 60,
             nonce: NONCE,
@@ -683,6 +760,7 @@ mod tests {
 
     fn running(short_runs: u32, started_at_secs: u64) -> Previous {
         Previous::Marker(Marker::ShortRuns {
+            endpoint_down_secs: Vec::new(),
             prior_trip: None,
             short_runs,
             started_at_secs,
@@ -694,6 +772,7 @@ mod tests {
     /// A short run that recorded a QUIC panic: the kind that counts.
     fn panicked(short_runs: u32, started_at_secs: u64) -> Previous {
         Previous::Marker(Marker::ShortRuns {
+            endpoint_down_secs: Vec::new(),
             prior_trip: None,
             short_runs,
             started_at_secs,
@@ -927,6 +1006,7 @@ mod tests {
         assert_eq!(
             marker_after(decide(&tripped(T0), T0, true), T0, NONCE),
             Some(Marker::ShortRuns {
+                endpoint_down_secs: Vec::new(),
                 prior_trip: None,
                 short_runs: 0,
                 started_at_secs: T0,
@@ -986,6 +1066,7 @@ mod tests {
         write_marker(
             &path,
             &Marker::ShortRuns {
+                endpoint_down_secs: Vec::new(),
                 prior_trip: None,
                 short_runs: SHORT_RUNS_TO_TRIP - 1,
                 started_at_secs: T0,
@@ -1020,6 +1101,7 @@ mod tests {
         write_marker(
             &path,
             &Marker::ShortRuns {
+                endpoint_down_secs: Vec::new(),
                 prior_trip: None,
                 short_runs: SHORT_RUNS_TO_TRIP - 1,
                 started_at_secs: T0,

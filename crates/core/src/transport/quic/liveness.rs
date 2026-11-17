@@ -19,7 +19,9 @@
 //!   `ListenerExit::QuicEndpointDown`, the node's fatal-listener path exits
 //!   the process, and the supervisor restarts it with a new endpoint
 //!   ([`gateway_quic_restarts`]). The crash-loop breaker restarts QUIC after
-//!   such an exit until it repeats (`breaker::ENDPOINT_DOWN_EXITS_TO_TRIP`).
+//!   the first such exit in a day and trips after later ones
+//!   (`breaker::ENDPOINT_DOWN_EXITS_TO_TRIP`); under its override the
+//!   gateway does not exit for a death.
 //!   The same switch restarts such a gateway when a breaker cooldown that
 //!   kept its QUIC off ends (`breaker::quic_restore_at`).
 //! - after the node dropped its last handle, the return is the normal

@@ -3503,10 +3503,13 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     Both exits use code 42 at any uptime, never the fast-crash 45, which
     the crash-loop rollback counts. The death is first recorded in the
     breaker marker (breaker::note_endpoint_down_exit, which writes a
-    marker not yet armed), so the next start runs QUIC again until
-    ENDPOINT_DOWN_EXITS_TO_TRIP exits in ENDPOINT_DOWN_WINDOW trip it; a
-    death it cannot record does not exit, or a death at every start would
-    restart the node without bound. Peers, and other gateways, keep
+    marker not yet armed). The first death in ENDPOINT_DOWN_WINDOW (24 h)
+    restarts QUIC at once; the next trips, as does every one while a recent
+    trip counts, so each death doubles the cooldown and restarts per day are
+    bounded (breaker::endpoint_down_verdict, the same on Windows). A death
+    it cannot record, or any death under quic-ignore-crash-breaker, does
+    not exit: otherwise a death at every start would restart the node
+    without bound. Peers, and other gateways, keep
     running over UDP.
   → quinn's driver returns only on a receive I/O error. QuicSocket returns
     one only after it caught a panic (below); tests inject one

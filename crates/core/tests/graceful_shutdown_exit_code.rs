@@ -719,8 +719,8 @@ const ENDPOINT_DOWN_ENV: &str = "FREENET_TEST_QUIC_ENDPOINT_DOWN_AFTER_SECS";
 
 /// A supervised gateway whose QUIC endpoint dies exits through the fatal
 /// listener path (exit 42), having noted the exit in the breaker marker, and
-/// its next start runs QUIC again instead of tripping. After three such exits
-/// within the window the next start trips (the gateway cooldown). An
+/// its next start runs QUIC again instead of tripping. The second such exit
+/// within the window trips the next start (the gateway cooldown). An
 /// unsupervised gateway keeps running over UDP.
 ///
 /// Needs the `testing` feature, which CI's Linux test job builds with: the
@@ -733,7 +733,7 @@ const ENDPOINT_DOWN_ENV: &str = "FREENET_TEST_QUIC_ENDPOINT_DOWN_AFTER_SECS";
 fn a_supervised_gateway_exits_on_endpoint_death_and_restarts_quic() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
     let down = [("FREENET_SUPERVISED", "1"), (ENDPOINT_DOWN_ENV, "2")];
-    for run in 1..=3 {
+    for run in 1..=freenet::ENDPOINT_DOWN_EXITS_TO_TRIP {
         let log_dir = dir.path().join(format!("logs-{run}"));
         let mut node = spawn_quic_node_full(dir.path(), &log_dir, &[], None, &down)?;
         let logs = node.logs();
@@ -756,10 +756,10 @@ fn a_supervised_gateway_exits_on_endpoint_death_and_restarts_quic() -> anyhow::R
             "run {run}: the exit is noted. Marker: {marker}"
         );
     }
-    // The fourth start sees three in the window: a trip.
+    // The next start sees them in the window: a trip.
     let mut node = spawn_quic_node_full(
         dir.path(),
-        &dir.path().join("logs-4"),
+        &dir.path().join("logs-trip"),
         &[],
         None,
         &[("FREENET_SUPERVISED", "1")],
@@ -767,7 +767,7 @@ fn a_supervised_gateway_exits_on_endpoint_death_and_restarts_quic() -> anyhow::R
     let logs = node.logs();
     assert!(
         logs.contains(QUIC_TRIP_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
-        "three endpoint-down exits in the window trip. Logs:\n{logs}"
+        "repeated endpoint-down exits in the window trip. Logs:\n{logs}"
     );
     node.send_sigterm()?;
     assert_eq!(node.wait_for_exit(Duration::from_secs(45))?.code(), Some(0));
@@ -1209,6 +1209,55 @@ fn a_gateway_cooldown_grows_on_a_repeat_trip() -> anyhow::Result<()> {
     assert_eq!(
         third.wait_for_exit(Duration::from_secs(45))?.code(),
         Some(0)
+    );
+    Ok(())
+}
+
+/// Under the breaker override (`quic-ignore-crash-breaker`) a supervised
+/// gateway does not exit when its endpoint dies: the next start would ignore
+/// the record, so a death at every start would restart it forever (and stop
+/// the unit at systemd's start limit). It keeps running over UDP, says why,
+/// and records nothing.
+///
+/// FALSIFY: drop the `overridden` check in
+/// `breaker::note_endpoint_down_exit_with`; the gateway exits 42.
+#[cfg(feature = "testing")]
+#[test]
+fn under_the_breaker_override_an_endpoint_death_does_not_exit() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let env = [("FREENET_SUPERVISED", "1"), (ENDPOINT_DOWN_ENV, "1")];
+    let mut node = spawn_quic_node_full(
+        dir.path(),
+        &dir.path().join("logs"),
+        &["--quic-ignore-crash-breaker"],
+        None,
+        &env,
+    )?;
+    node.wait_for_logs(&[ENDPOINT_DOWN_MARKER], Duration::from_secs(30))?;
+    std::thread::sleep(Duration::from_secs(3));
+    let logs = node.logs();
+    assert!(
+        !logs.contains(GATEWAY_RESTART_MARKER),
+        "must not exit under the override. Logs:\n{logs}"
+    );
+    assert!(
+        logs.contains("The crash-loop breaker is overridden"),
+        "the WARN names the override. Logs:\n{logs}"
+    );
+    let marker = read_quic_marker(dir.path())?;
+    assert!(
+        marker
+            .as_ref()
+            .and_then(|m| m.get("endpoint_down_secs"))
+            .is_none(),
+        "nothing recorded. Marker: {marker:?}"
+    );
+    node.send_sigterm()?;
+    assert_eq!(
+        node.wait_for_exit(Duration::from_secs(45))?.code(),
+        Some(0),
+        "Logs:\n{}",
+        node.logs()
     );
     Ok(())
 }

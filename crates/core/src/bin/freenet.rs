@@ -2081,6 +2081,51 @@ mod tests {
         );
     }
 
+    /// #5940: a gateway's restarts to restore QUIC stay under the start
+    /// limit of the units `freenet service install` writes, which counts
+    /// every start, exit 42 included. In any window of that length the
+    /// restarts are at most: the free restarts after the first
+    /// `ENDPOINT_DOWN_EXITS_TO_TRIP - 1` endpoint deaths, the start the next
+    /// death trips, and the cooldown-end restarts, which come at least
+    /// `QUIC_RESTORE_MIN_UPTIME` apart (a cooldown is 15 minutes or more,
+    /// the floor only shortens the wait for one already nearly over).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gateway_quic_restarts_stay_under_the_unit_start_limit() {
+        let units = [
+            super::commands::service::generate_user_service_file(
+                std::path::Path::new("/usr/bin/freenet"),
+                std::path::Path::new("/tmp/logs"),
+            ),
+            super::commands::service::generate_system_service_file(
+                std::path::Path::new("/usr/bin/freenet"),
+                std::path::Path::new("/tmp/logs"),
+                "freenet",
+                std::path::Path::new("/home/freenet"),
+            ),
+        ];
+        for unit in units {
+            let value = |key: &str| -> u64 {
+                unit.lines()
+                    .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+                    .unwrap_or_else(|| panic!("{key} in the unit"))
+                    .trim()
+                    .parse()
+                    .unwrap()
+            };
+            let burst = value("StartLimitBurst");
+            let interval = value("StartLimitIntervalSec");
+            assert!(unit.contains("Environment=FREENET_SUPERVISED=1"));
+            let worst_starts = freenet::ENDPOINT_DOWN_EXITS_TO_TRIP as u64
+                + interval / freenet::QUIC_RESTORE_MIN_UPTIME.as_secs()
+                + 1;
+            assert!(
+                worst_starts < burst,
+                "{worst_starts} restarts in {interval} s against a limit of {burst}"
+            );
+        }
+    }
+
     /// #5940: a gateway's restart at the end of a breaker cooldown comes at
     /// least `QUIC_RESTORE_MIN_UPTIME` after the start, which must be later
     /// than the startup update check, so the restart never pre-empts it.
