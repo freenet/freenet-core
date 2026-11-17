@@ -1251,7 +1251,9 @@ impl P2pConnManager {
                 // connection from a peer a native connection holds is dropped,
                 // leaving the native entry, the ring and the transient budget
                 // untouched. The peer applies the same rule to its own copy
-                // of this pair, so it keeps the native connection too.
+                // of this pair, so it normally keeps the native connection
+                // too; see `native_holds_peer` for when the two ends can
+                // decide differently.
                 if let Some(holder) =
                     self.native_holds_peer(remote_addr, peer.as_ref().map(|p| p.pub_key()))
                 {
@@ -1345,7 +1347,9 @@ impl P2pConnManager {
                         // own address is not used: the peer is held at
                         // `holder`. At the holder's own address it is the
                         // ring entry, which stays.
-                        if holder != peer_addr {
+                        // Not while a native dial to that address is
+                        // pending: the reservation is that dial's too.
+                        if holder != peer_addr && !state.native_pending.contains(&peer_addr) {
                             let cm = &self.bridge.op_manager.ring.connection_manager;
                             if !cm.is_in_ring(peer_addr) && cm.has_connection_or_pending(peer_addr)
                             {
@@ -1924,10 +1928,18 @@ impl P2pConnManager {
     /// The survivor rule: when this node holds, or is handed, a QUIC-native
     /// and a UDP connection to the same peer, it keeps the native one,
     /// whichever arrived first and whichever side dialled the UDP one. Both
-    /// ends of a pair apply the rule to the same fact (the pair has a native
-    /// connection), so they keep the same connection without exchanging
-    /// anything. Two UDP connections to one address keep the older
-    /// behaviour (the later replaces the earlier).
+    /// ends of a pair apply the rule, so they normally keep the same
+    /// connection without exchanging anything. Two UDP connections to one
+    /// address keep the older behaviour (the later replaces the earlier).
+    ///
+    /// Residual: liveness is judged by each end on its own receipt stamp, so
+    /// a UDP connection arriving when one end's native connection has just
+    /// passed `identity::HOLD_WINDOW` and the other's has not can be kept at
+    /// one end and dropped at the other. That needs the native connection to
+    /// have been silent for about two keepalive intervals (the window is at
+    /// least twice the interval, asserted below), so about two lost
+    /// keepalives in a row; it is rare and tracked as a gate before native
+    /// connects are enabled.
     ///
     /// The address of the live native connection that holds the peer a UDP
     /// connection at `addr` claims as `key`, if one does: the entry bound to
@@ -2016,6 +2028,25 @@ impl P2pConnManager {
         self.trace_transport(peer_addr, Some(true));
         self.spawn_peer_connection_listener(rx, connection, peer_addr, conn_id, link_use)
             .await
+    }
+
+    /// Records, in the simulation's native wire trace, that a live native
+    /// entry for `peer_addr` was replaced by a UDP connection.
+    #[cfg(any(test, feature = "testing"))]
+    fn trace_native_replaced_by_udp(&self, peer_addr: SocketAddr) {
+        let own = self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .get_own_addr()
+            .unwrap_or_else(|| SocketAddr::new(self.listening_ip, self.listening_port));
+        crate::operations::connect::native_wire_trace::record_at(
+            peer_addr,
+            crate::operations::connect::native_wire_trace::NativeWireEvent::NativeReplacedByUdp {
+                own,
+            },
+        );
     }
 
     /// Records, in the simulation's native wire trace, which transport this
@@ -2150,7 +2181,21 @@ impl P2pConnManager {
         // suspend/resume), replace it. Dropping the old sender causes its
         // peer_connection_listener to fire TransportClosed; the connection_id mechanism
         // ensures that stale event won't remove the new entry.
-        if let Some(old) = self.remove_connection(peer_addr) {
+        let removed = self.remove_connection(peer_addr);
+        // A live native entry replaced by a UDP connection is what the
+        // survivor rule forbids; the simulation's trace checks it. Recorded
+        // here, before the insert below, since the removal has already
+        // cleared the trace's entry.
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(old) = &removed {
+            if old.native
+                && !matches!(source, IdentitySource::Proven)
+                && identity::heard_from_recently(old)
+            {
+                self.trace_native_replaced_by_udp(peer_addr);
+            }
+        }
+        if let Some(old) = removed {
             self.record_identity_teardown(peer_addr, &old);
 
             // Full cleanup: handle both transient and ring-promoted connections.

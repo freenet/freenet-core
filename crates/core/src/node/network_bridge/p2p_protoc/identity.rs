@@ -188,6 +188,13 @@ pub(super) enum BindOutcome {
 /// count too, stamped at the path's next 2 s watch tick.
 pub(super) const HOLD_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
+// The survivor rule treats a native connection silent for HOLD_WINDOW as
+// gone; with keepalives at KEEPALIVE_INTERVAL that takes at least two lost
+// keepalives in a row, not one.
+const _: () = assert!(
+    HOLD_WINDOW.as_nanos() >= 2 * crate::transport::quic::config::KEEPALIVE_INTERVAL.as_nanos()
+);
+
 /// Whether `entry`'s transport received an authenticated packet within
 /// [`HOLD_WINDOW`]. A transport that does not report receipt (a test double)
 /// counts as heard from.

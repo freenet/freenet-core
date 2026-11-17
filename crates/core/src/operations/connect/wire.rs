@@ -322,8 +322,9 @@ pub mod sim_trace {
         /// When (by `seq`) each (node, peer) entry in `transports` was set.
         transport_seqs:
             parking_lot::Mutex<std::collections::BTreeMap<(SocketAddr, SocketAddr), u64>>,
-        /// (node, peer) entries where a UDP connection replaced a native one
-        /// in place, which the survivor rule never does.
+        /// (node, peer) entries where a UDP connection replaced a live native
+        /// one, which the survivor rule never does
+        /// ([`NativeWireEvent::NativeReplacedByUdp`]).
         native_replaced_by_udp: parking_lot::Mutex<Vec<(SocketAddr, SocketAddr)>>,
         survivor_swapped: AtomicU64,
         survivor_udp_dropped: AtomicU64,
@@ -395,6 +396,9 @@ pub mod sim_trace {
             own: SocketAddr,
             native: Option<bool>,
         },
+        /// The node `own` replaced its live native entry for the peer at the
+        /// recorded address with a UDP connection.
+        NativeReplacedByUdp { own: SocketAddr },
         /// The survivor rule kept a native connection over a UDP one: swapped
         /// it in for a UDP entry, or dropped the UDP connection, which
         /// arrived `inbound` or was this node's dial.
@@ -452,9 +456,6 @@ pub mod sim_trace {
                 let mut transports = c.transports.lock();
                 match native {
                     Some(native) => {
-                        if !native && transports.get(&(own, addr)) == Some(&true) {
-                            c.native_replaced_by_udp.lock().push((own, addr));
-                        }
                         transports.insert((own, addr), native);
                         c.transport_seqs.lock().insert((own, addr), seq);
                     }
@@ -462,6 +463,12 @@ pub mod sim_trace {
                         transports.remove(&(own, addr));
                         c.transport_seqs.lock().remove(&(own, addr));
                     }
+                }
+                return;
+            }
+            NativeWireEvent::NativeReplacedByUdp { own } => {
+                if !c.transports_frozen.load(Ordering::Relaxed) {
+                    c.native_replaced_by_udp.lock().push((own, addr));
                 }
                 return;
             }

@@ -23584,6 +23584,11 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
             t.survivor_udp_dropped(),
             transports.len()
         );
+        assert_eq!(
+            t.native_replaced_by_udp(),
+            Vec::new(),
+            "{name}: live native entries a UDP connection replaced"
+        );
         assert!(
             mismatched.is_empty(),
             "{name}: pairs whose ends keep different transports (own, peer, own native, \
@@ -23620,11 +23625,6 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
             assert!(
                 kept_udp.is_empty(),
                 "{name}: pairs that kept UDP after native connected at both ends: {kept_udp:?}"
-            );
-            assert_eq!(
-                t.native_replaced_by_udp(),
-                Vec::new(),
-                "{name}: native entries a UDP connection replaced"
             );
         }
         let (pairs, one_sided) = t.native_setup_pairs();

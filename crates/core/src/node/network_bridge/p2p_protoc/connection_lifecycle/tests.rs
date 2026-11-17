@@ -4875,6 +4875,7 @@ async fn a_dropped_udp_dial_answers_with_the_holders_address() {
 
 /// #6255 review L5: a swap with no entry to swap into is a caller bug; it
 /// asserts in debug builds.
+#[cfg(debug_assertions)]
 #[tokio::test]
 #[should_panic(expected = "replace_transport_in_place without an entry")]
 async fn a_swap_without_an_entry_asserts() {
@@ -4885,4 +4886,39 @@ async fn a_swap_without_an_entry_asserts() {
         .replace_transport_in_place(addr, Box::new(IdleConnection::new(addr)))
         .await
         .ok();
+}
+
+/// #6255 re-review L2: a dropped UDP dial does not release the reservation
+/// at its address while a native dial to that address is pending, since
+/// that dial holds the reservation too.
+#[tokio::test]
+async fn a_dropped_udp_dial_keeps_the_reservation_a_pending_native_dial_holds() {
+    use crate::operations::connect::native::DialTransport;
+    let mut h = Harness::new("survivor-holder-native-pending").await;
+    let holder: SocketAddr = "203.0.113.248:6422".parse().unwrap();
+    let dialled: SocketAddr = "203.0.113.248:6423".parse().unwrap();
+    let peer_key = key();
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    assert!(cm.should_accept(Location::from_address(&dialled), dialled));
+    let dialled_peer = PeerKeyLocation::new(peer_key.clone(), dialled);
+    let _native =
+        pending_connect_peer_over(&mut h, dialled_peer.clone(), DialTransport::native_now()).await;
+    let mut udp = pending_connect_peer_over(&mut h, dialled_peer.clone(), DialTransport::Udp).await;
+    assert!(
+        h.state.native_pending.contains(&dialled),
+        "premise: native dial pending"
+    );
+    h.handshake_event(Arrival::Native.event(&PeerKeyLocation::new(peer_key, holder), false))
+        .await;
+    h.handshake_event(Arrival::OutboundUdp.event(&dialled_peer, false))
+        .await;
+    assert_eq!(
+        udp.try_recv(),
+        Ok(Ok((holder, None))),
+        "the holder's address"
+    );
+    assert!(
+        cm.has_connection_or_pending(dialled),
+        "the pending native dial keeps the reservation"
+    );
 }

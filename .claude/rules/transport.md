@@ -2286,7 +2286,14 @@ Fallback: a failed native setup is followed by today's UDP dial to the same
   identity::HOLD_WINDOW, 30 s). A quiet native entry (peer restarted, NAT
   rebound) does not hold the peer: the UDP connection takes the ordinary
   replace, or it would be refused until the 120 s QUIC idle timeout. Both
-  ends apply it to the same fact, so they agree with no message. Native second: replace_transport_in_place swaps only the
+  ends apply the rule, so they normally agree with no message. Residual:
+  each end judges liveness on its OWN receipt stamp, so a UDP connection
+  arriving just as one end's native connection crosses HOLD_WINDOW can be
+  kept at one end and dropped at the other; that needs the native
+  connection silent for about two keepalive intervals (HOLD_WINDOW >= 2 x
+  KEEPALIVE_INTERVAL is a const assert in identity.rs), so about two lost
+  keepalives. Rare; a gate before native is enabled (design note 10.2 item
+  18). Native second: replace_transport_in_place swaps only the
   transport (listener, sender, connection id, receipt, remote version) and
   keeps identity, ring membership, transient status, ReadyState,
   connected-since and health (no promotion, prune or budget call); the old
