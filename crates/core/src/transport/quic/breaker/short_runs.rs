@@ -1526,6 +1526,74 @@ mod tests {
         assert_eq!(decide(&read_previous(&path), T0 + 1, false), arm(0));
     }
 
+    /// The place a panic is reported at keeps the crate directory and what
+    /// follows, never the build machine's paths, and is bounded.
+    #[test]
+    fn a_panic_place_drops_the_build_path() {
+        let cases = [
+            (
+                "/home/someone/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quinn-proto-0.11.9/src/connection/mod.rs",
+                "quinn-proto-0.11.9/src/connection/mod.rs:7",
+            ),
+            (
+                "crates/core/src/transport/quic/socket.rs",
+                "core/src/transport/quic/socket.rs:7",
+            ),
+            (
+                r"C:\Users\someone\.cargo\registry\src\x\quinn-0.11.12\src\endpoint.rs",
+                "quinn-0.11.12/src/endpoint.rs:7",
+            ),
+            (
+                "/rustc/48a229ce/library/alloc/src/raw_vec/mod.rs",
+                "alloc/src/raw_vec/mod.rs:7",
+            ),
+            ("/home/someone/build/generated.rs", "generated.rs:7"),
+            ("", ":7"),
+        ];
+        for (file, place) in cases {
+            assert_eq!(panic_place(file, 7), place, "{file}");
+        }
+        let long = format!("{}/src/x.rs", "é".repeat(200));
+        let place = panic_place(&long, 7);
+        assert!(place.len() <= MAX_PANIC_PLACE, "{}", place.len());
+        assert!(place.ends_with("/src/x.rs:7"), "{place}");
+    }
+
+    /// A start that counts the last run reports where its panic was; one
+    /// that does not count it (a run with no QUIC panic, a run from long
+    /// ago) reports none. Pure, because an arming `gate` writes the static
+    /// pending marker other tests read; `gate` passes it on in
+    /// `a_trip_and_a_cooldown_take_the_settings_away`.
+    #[test]
+    fn a_counted_run_reports_its_panic_place() {
+        let at = "quinn-0.11.12/src/endpoint.rs:403".to_string();
+        let previous = |started_at_secs, quic_panicked: bool| {
+            Previous::Marker(Marker::ShortRuns {
+                short_runs: 0,
+                started_at_secs,
+                nonce: NONCE,
+                quic_panicked,
+                quic_panic_at: quic_panicked.then(|| at.clone()),
+                endpoint_down_secs: Vec::new(),
+                prior_trip: None,
+            })
+        };
+        let now = T0 + 1;
+        let place = |previous: Previous| {
+            counted_panic_at(
+                &previous,
+                super::decide(&previous, now, false, BreakerRole::Peer),
+            )
+        };
+        assert_eq!(place(previous(T0, true)), Some(at.clone()));
+        assert_eq!(place(previous(T0, false)), None);
+        assert_eq!(
+            place(previous(now - SHORT_RUN_WINDOW.as_secs(), true)),
+            None
+        );
+        assert_eq!(place(Previous::Nothing), None);
+    }
+
     /// Set in the child process that runs [`the_panic_hook_marks_a_quic_panic_and_chains`]'s body.
     const HOOK_CHILD_ENV: &str = "FREENET_TEST_QUIC_PANIC_HOOK_CHILD";
 
@@ -1612,7 +1680,20 @@ mod tests {
         assert!(caught.is_err());
         assert!(!in_quic_code(), "the guard is released by the unwind");
         assert_eq!(EARLIER_HOOK_RUNS.load(Ordering::SeqCst), 2, "chained");
-        assert_eq!(read_previous(&path), panicked(1, T0), "marked");
+        // Marked with where the panic was, cut to the crate directory.
+        let Previous::Marker(Marker::ShortRuns {
+            quic_panic_at: Some(at),
+            ..
+        }) = read_previous(&path)
+        else {
+            panic!("marked with a place: {:?}", read_previous(&path));
+        };
+        assert!(at.starts_with("alloc/src/"), "{at}");
+        let mut marked = panicked(1, T0);
+        if let Previous::Marker(Marker::ShortRuns { quic_panic_at, .. }) = &mut marked {
+            *quic_panic_at = Some(at);
+        }
+        assert_eq!(read_previous(&path), marked, "marked");
 
         // A later panic in QUIC code does not touch the disk again.
         write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();

@@ -1287,34 +1287,27 @@ fn legacy_shadow(
 ) -> Option<Verdict> {
     let (note_path, shared) = stop_note();
     let path = legacy_shadow_path(data_dir);
-    let Observed {
-        mut previous,
-        stopped,
-    } = observe_with(
+    let Observed { previous, stopped } = observe_with(
         quic_requested,
         &path,
         note_path.as_deref(),
         shared,
         remove_if_exists,
     )?;
-    let boot_id = platform::boot_id();
-    let own_pid = std::process::id();
-    if previous == Previous::Nothing {
-        previous = legacy_evidence(read_previous(&marker_path(data_dir)));
-    }
-    let armed_pid_alive =
-        holder_of(&previous, boot_id.as_deref(), own_pid).is_some_and(platform::pid_alive);
-    let now_secs = unix_secs(now);
-    let decided = verdict(&Facts {
-        previous: &previous,
-        boot_id: boot_id.as_deref(),
-        armed_pid_alive,
-        stopped: &stopped,
-        now_secs,
-        ignore_breaker,
-        role: BreakerRole::Peer,
-    });
-    match legacy_shadow_marker(decided, own_pid, boot_id, now_secs) {
+    let (decided, marker) = legacy_shadow_decide(
+        previous,
+        || read_previous(&marker_path(data_dir)),
+        &LegacyStart {
+            boot_id: platform::boot_id(),
+            own_pid: std::process::id(),
+            stopped,
+            now_secs: unix_secs(now),
+            ignore_breaker,
+            nonce: crate::config::GlobalRng::random_u64(),
+        },
+        platform::pid_alive,
+    );
+    match marker {
         Some(armed @ Marker::Armed { .. }) => PENDING.lock().shadow = Some((path, armed)),
         Some(tripped) => {
             if let Err(error) = write_marker(&path, &tripped) {
@@ -1326,6 +1319,61 @@ fn legacy_shadow(
     Some(decided)
 }
 
+/// What [`legacy_shadow_decide`] reads besides the markers.
+struct LegacyStart {
+    boot_id: Option<String>,
+    own_pid: u32,
+    /// The pids the stop note lists.
+    stopped: Vec<u32>,
+    now_secs: u64,
+    ignore_breaker: bool,
+    /// For the marker it arms.
+    nonce: u64,
+}
+
+/// The legacy shadow's decision on its own marker `shadow`, or, when it has
+/// none, on the breaker's marker (`main`, read only then), and the marker it
+/// leaves: Armed, to write once QUIC is up, or Tripped, to write now.
+/// `pid_alive` is the platform probe.
+fn legacy_shadow_decide(
+    shadow: Previous,
+    main: impl FnOnce() -> Previous,
+    start: &LegacyStart,
+    pid_alive: impl Fn(u32) -> bool,
+) -> (Verdict, Option<Marker>) {
+    let previous = match shadow {
+        Previous::Nothing => legacy_evidence(main()),
+        shadow => shadow,
+    };
+    let armed_pid_alive =
+        holder_of(&previous, start.boot_id.as_deref(), start.own_pid).is_some_and(pid_alive);
+    let decided = verdict(&Facts {
+        previous: &previous,
+        boot_id: start.boot_id.as_deref(),
+        armed_pid_alive,
+        stopped: &start.stopped,
+        now_secs: start.now_secs,
+        ignore_breaker: start.ignore_breaker,
+        role: BreakerRole::Peer,
+    });
+    let marker = match decided {
+        Verdict::Arm => Some(Marker::Armed {
+            pid: start.own_pid,
+            boot_id: start.boot_id.clone(),
+            nonce: start.nonce,
+            armed_at_secs: start.now_secs,
+            endpoint_down_secs: Vec::new(),
+            prior_trip: None,
+        }),
+        Verdict::Trip => Some(Marker::Tripped {
+            tripped_at_secs: start.now_secs,
+            trips: 1,
+        }),
+        Verdict::RunUnarmed | Verdict::Cool { .. } | Verdict::Unreadable => None,
+    };
+    (decided, marker)
+}
+
 /// The earlier release's own marker, read as the legacy shadow's evidence
 /// when the shadow has none yet: an Armed or Tripped marker is what the old
 /// rule would have decided on. Anything else is no evidence.
@@ -1335,31 +1383,6 @@ fn legacy_evidence(main: Previous) -> Previous {
         Previous::Nothing
         | Previous::Unreadable
         | Previous::Marker(Marker::ShortRuns { .. } | Marker::Unknown) => Previous::Nothing,
-    }
-}
-
-/// The marker the legacy shadow arms (Armed, written once QUIC is up) or
-/// writes at once (Tripped) after `decided`; `None` leaves its file alone.
-fn legacy_shadow_marker(
-    decided: Verdict,
-    pid: u32,
-    boot_id: Option<String>,
-    now_secs: u64,
-) -> Option<Marker> {
-    match decided {
-        Verdict::Arm => Some(Marker::Armed {
-            pid,
-            boot_id,
-            nonce: crate::config::GlobalRng::random_u64(),
-            armed_at_secs: now_secs,
-            endpoint_down_secs: Vec::new(),
-            prior_trip: None,
-        }),
-        Verdict::Trip => Some(Marker::Tripped {
-            tripped_at_secs: now_secs,
-            trips: 1,
-        }),
-        Verdict::RunUnarmed | Verdict::Cool { .. } | Verdict::Unreadable => None,
     }
 }
 
@@ -2099,7 +2122,10 @@ mod tests {
     /// docs dropped) parses every new-format marker, extra fields ignored,
     /// as the same state with the same values. A Tripped marker with a count
     /// reads as a plain trip, which the older release holds for its 24 h.
-    /// The other direction (old markers into the new type) is
+    /// A unix peer now writes short-run markers (#6151); 0.2.159 reads one
+    /// as a known state and replaces it at its next start. The other
+    /// direction (old markers into the new type) is
+    /// `this_release_reads_the_markers_of_0_2_159`,
     /// `the_trip_count_fields_are_compatible_both_ways` and
     /// `the_endpoint_down_field_is_compatible_both_ways`.
     #[test]
@@ -2162,7 +2188,7 @@ mod tests {
                     started_at_secs: 4,
                     nonce: 7,
                     quic_panicked: true,
-                    quic_panic_at: None,
+                    quic_panic_at: Some("quinn-0.11.12/src/endpoint.rs:403".into()),
                     prior_trip,
                 },
                 MarkerV0_2_159::ShortRuns {
@@ -2957,26 +2983,33 @@ mod tests {
         );
     }
 
-    /// Windows is the one platform that decides by short runs (those that
-    /// panicked in QUIC code), and it does so
-    /// only when the breaker is enabled. `gate` is inert in unit tests and the
-    /// branch cannot be taken on unix, so this pins the two lines; the
-    /// real-process test is `tests/quic_breaker_windows.rs`.
+    /// Every peer, and a gateway on Windows, decides by short runs (those that
+    /// panicked in QUIC code), and only when the breaker is enabled. `gate` is
+    /// inert in unit tests, so this pins the lines: the enabled check, then
+    /// the dispatch on [`decides_by_short_runs`] for this platform and role,
+    /// which runs the legacy shadow on unix before the short-run decision.
+    /// The real-process tests are `tests/quic_breaker_windows.rs` and, for a
+    /// unix peer, `tests/graceful_shutdown_exit_code.rs`.
     #[test]
-    fn gate_sends_windows_to_the_short_run_decision_after_the_enabled_check() {
+    fn gate_sends_peers_and_windows_to_the_short_run_decision_after_the_enabled_check() {
         let flat: String =
             production_fn_body(include_str!("breaker.rs"), "pub(crate) async fn gate<T>(")
                 .split_whitespace()
                 .collect();
-        let enabled = flat
-            .find("if!ENABLED.load(Ordering::Relaxed){returnnot_consulted(settings);}")
-            .expect("the enabled check");
-        let windows = flat
-            .find(
-                "ifcfg!(not(unix)){returnshort_runs::gate(settings,data_dir,ignore_breaker,now,role);}",
-            )
-            .expect("the Windows branch");
-        assert!(enabled < windows);
+        let at = |needle: &str| {
+            flat.find(needle)
+                .unwrap_or_else(|| panic!("not found: {needle}"))
+        };
+        let enabled = at("if!ENABLED.load(Ordering::Relaxed){returnnot_consulted(settings);}");
+        let dispatch = at("ifdecides_by_short_runs(cfg!(unix),role){");
+        let shadow = at(
+            "letlegacy=ifcfg!(unix){legacy_shadow(settings.is_some(),data_dir,ignore_breaker,now)}else{None};",
+        );
+        let short_runs =
+            at("let(gated,counted)=short_runs::gate(settings,data_dir,ignore_breaker,now,role);");
+        let returned = at("returngated;}");
+        assert!(enabled < dispatch && dispatch < shadow && shadow < short_runs);
+        assert!(short_runs < returned);
     }
 
     /// The body of the production function whose definition starts with
@@ -3101,6 +3134,307 @@ mod tests {
         assert!(!platform::pid_alive(child.id()), "a reaped child is not");
         assert!(!platform::pid_alive(0), "pid 0 is never alive");
         assert!(!platform::pid_alive(u32::MAX));
+    }
+
+    /// #6151: every peer decides by short runs, and so does a gateway off
+    /// unix; a unix gateway decides by how its last run ended.
+    #[test]
+    fn who_decides_by_short_runs() {
+        assert!(decides_by_short_runs(true, BreakerRole::Peer));
+        assert!(!decides_by_short_runs(true, BreakerRole::Gateway));
+        assert!(decides_by_short_runs(false, BreakerRole::Peer));
+        assert!(decides_by_short_runs(false, BreakerRole::Gateway));
+    }
+
+    fn legacy_start(stopped: &[u32], ignore_breaker: bool) -> LegacyStart {
+        LegacyStart {
+            boot_id: Some(BOOT.to_string()),
+            own_pid: OWN,
+            stopped: stopped.to_vec(),
+            now_secs: T0 + 60,
+            ignore_breaker,
+            nonce: 11,
+        }
+    }
+
+    /// The marker the legacy shadow arms at `T0 + 60`.
+    fn legacy_armed() -> Option<Marker> {
+        Some(Marker::Armed {
+            pid: OWN,
+            boot_id: Some(BOOT.to_string()),
+            nonce: 11,
+            armed_at_secs: T0 + 60,
+            endpoint_down_secs: Vec::new(),
+            prior_trip: None,
+        })
+    }
+
+    /// The legacy shadow decides as the exit-status rule did on a unix peer:
+    /// a run that died on this boot without a clean exit or a note trips,
+    /// for the peer cooldown; anything else arms its own marker.
+    #[test]
+    fn the_legacy_shadow_decides_as_the_exit_status_rule() {
+        let no_main = || -> Previous { panic!("a shadow of its own is decided on alone") };
+        let dead = |_| false;
+        let start = legacy_start(&[], false);
+
+        let (crash, marker) = legacy_shadow_decide(armed(PID, Some(BOOT)), no_main, &start, dead);
+        assert_eq!(crash, Verdict::Trip);
+        assert_eq!(
+            marker,
+            Some(Marker::Tripped {
+                tripped_at_secs: T0 + 60,
+                trips: 1
+            })
+        );
+
+        let not_crashes = [
+            (
+                "noted",
+                armed(PID, Some(BOOT)),
+                legacy_start(&[PID], false),
+                false,
+            ),
+            (
+                "rebooted",
+                armed(PID, Some("boot-b")),
+                legacy_start(&[], false),
+                false,
+            ),
+            (
+                "alive",
+                armed(PID, Some(BOOT)),
+                legacy_start(&[], false),
+                true,
+            ),
+            (
+                "override",
+                armed(PID, Some(BOOT)),
+                legacy_start(&[], true),
+                false,
+            ),
+        ];
+        for (case, shadow, start, alive) in not_crashes {
+            let decided = legacy_shadow_decide(shadow, no_main, &start, |_| alive);
+            assert_eq!(decided, (Verdict::Arm, legacy_armed()), "{case}");
+        }
+
+        let tripped = Previous::Marker(Marker::Tripped {
+            tripped_at_secs: T0,
+            trips: 1,
+        });
+        assert_eq!(
+            legacy_shadow_decide(tripped, no_main, &start, dead),
+            (
+                Verdict::Cool {
+                    tripped_at_secs: T0
+                },
+                None
+            ),
+            "a trip holds for the peer cooldown and leaves its marker"
+        );
+        let expired = Previous::Marker(Marker::Tripped {
+            tripped_at_secs: T0 + 60 - QUIC_BREAKER_COOLDOWN.as_secs(),
+            trips: 1,
+        });
+        assert_eq!(
+            legacy_shadow_decide(expired, no_main, &start, dead),
+            (Verdict::Arm, legacy_armed())
+        );
+        assert_eq!(
+            legacy_shadow_decide(Previous::Unreadable, no_main, &start, dead),
+            (Verdict::Unreadable, None)
+        );
+    }
+
+    /// With no marker of its own, the shadow decides on the one the earlier
+    /// release left in the breaker's file, so a crash just before the upgrade
+    /// is not lost; a short-run marker there is no evidence.
+    #[test]
+    fn the_legacy_shadow_starts_from_the_earlier_releases_marker() {
+        let dead = |_| false;
+        let start = legacy_start(&[], false);
+        let decide =
+            |main: Previous| legacy_shadow_decide(Previous::Nothing, || main, &start, dead);
+        assert_eq!(decide(armed(PID, Some(BOOT))).0, Verdict::Trip);
+        assert_eq!(
+            decide(Previous::Marker(Marker::Tripped {
+                tripped_at_secs: T0,
+                trips: 1
+            }))
+            .0,
+            Verdict::Cool {
+                tripped_at_secs: T0
+            }
+        );
+        let short_runs = Previous::Marker(Marker::ShortRuns {
+            short_runs: 2,
+            started_at_secs: T0,
+            nonce: 3,
+            quic_panicked: true,
+            quic_panic_at: None,
+            endpoint_down_secs: Vec::new(),
+            prior_trip: None,
+        });
+        for main in [
+            short_runs,
+            Previous::Nothing,
+            Previous::Unreadable,
+            Previous::Marker(Marker::Unknown),
+        ] {
+            assert_eq!(
+                decide(main.clone()),
+                (Verdict::Arm, legacy_armed()),
+                "{main:?}"
+            );
+        }
+    }
+
+    /// Arming writes the legacy shadow's marker beside the breaker's, records
+    /// it for the clean exit, and a shadow that cannot be written changes
+    /// nothing else; the clean exit's removal takes only that nonce.
+    #[test]
+    fn arming_writes_the_legacy_shadow_beside_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        let shadow = legacy_shadow_path(dir.path());
+        let marker = Marker::ShortRuns {
+            short_runs: 0,
+            started_at_secs: T0,
+            nonce: 7,
+            quic_panicked: false,
+            quic_panic_at: None,
+            endpoint_down_secs: Vec::new(),
+            prior_trip: None,
+        };
+        let pending = |shadow_path: &Path| Pending {
+            marker: Some((path.clone(), marker.clone())),
+            shadow: Some((shadow_path.to_path_buf(), legacy_armed().unwrap())),
+            quic_up: true,
+            signals_ready: true,
+            registrar: None,
+        };
+        let (armed, legacy) = (OnceLock::new(), OnceLock::new());
+        arm_when_ready_into(&mut pending(&shadow), &armed, &legacy, no_hook);
+        assert_eq!(armed.get(), Some(&(path.clone(), 7)));
+        assert_eq!(legacy.get(), Some(&(shadow.clone(), 11)));
+        assert_eq!(
+            read_previous(&shadow),
+            Previous::Marker(legacy_armed().unwrap())
+        );
+        assert!(!clear_if_owned(&shadow, 7).unwrap(), "the breaker's nonce");
+        assert!(clear_if_owned(&shadow, 11).unwrap());
+
+        std::fs::remove_file(&path).unwrap();
+        let blocker = dir.path().join("a-file");
+        std::fs::write(&blocker, b"").unwrap();
+        let (armed, legacy) = (OnceLock::new(), OnceLock::new());
+        arm_when_ready_into(
+            &mut pending(&legacy_shadow_path(&blocker)),
+            &armed,
+            &legacy,
+            no_hook,
+        );
+        assert_eq!(legacy.get(), None, "the shadow's write failed");
+        assert_eq!(armed.get(), Some(&(path.clone(), 7)), "the breaker armed");
+        assert_eq!(read_previous(&path), Previous::Marker(marker));
+    }
+
+    /// The `quic_breaker_start` payload, pinned: the dashboard and the release
+    /// watch read these names.
+    #[test]
+    fn the_start_report_payload() {
+        let peer = StartReport {
+            role: BreakerRole::Peer,
+            rule: Rule::ShortRuns,
+            verdict: Verdict::Trip,
+            ignore_breaker: false,
+            short_runs: Some(3),
+            quic_panic_at: Some("quinn-proto-0.11.9/src/connection/mod.rs:42".into()),
+            legacy_verdict: Some(Verdict::Arm),
+        };
+        assert_eq!(
+            peer.to_json(),
+            serde_json::json!({
+                "role": "peer", "rule": "short_runs", "verdict": "trip",
+                "quic_off": true, "overridden": false, "short_runs": 3,
+                "quic_panic_at": "quinn-proto-0.11.9/src/connection/mod.rs:42",
+                "legacy_verdict": "arm", "legacy_quic_off": false
+            })
+        );
+        let gateway = StartReport {
+            role: BreakerRole::Gateway,
+            rule: Rule::ExitStatus,
+            verdict: Verdict::Cool { tripped_at_secs: 1 },
+            ignore_breaker: true,
+            short_runs: None,
+            quic_panic_at: None,
+            legacy_verdict: None,
+        };
+        assert_eq!(
+            gateway.to_json(),
+            serde_json::json!({
+                "role": "gateway", "rule": "exit_status", "verdict": "cool",
+                "quic_off": true, "overridden": true
+            })
+        );
+        for verdict in [
+            Verdict::Arm,
+            Verdict::RunUnarmed,
+            Verdict::Trip,
+            Verdict::Cool { tripped_at_secs: 0 },
+            Verdict::Unreadable,
+        ] {
+            assert!(!verdict.label().is_empty());
+        }
+    }
+
+    /// This release reads every marker 0.2.159 wrote, as written: a unix
+    /// peer upgrading with an Armed or Tripped marker keeps that evidence
+    /// (the legacy shadow takes the Armed one, the short-run decision holds
+    /// the Tripped one for its cooldown). The other direction is
+    /// `a_release_before_this_change_reads_the_new_markers`.
+    #[test]
+    fn this_release_reads_the_markers_of_0_2_159() {
+        let cases = [
+            (
+                r#"{"state":"armed","pid":5,"boot_id":"b","nonce":7,"armed_at_secs":9}"#,
+                Marker::Armed {
+                    pid: 5,
+                    boot_id: Some("b".into()),
+                    nonce: 7,
+                    armed_at_secs: 9,
+                    endpoint_down_secs: Vec::new(),
+                    prior_trip: None,
+                },
+            ),
+            (
+                r#"{"state":"tripped","tripped_at_secs":3}"#,
+                Marker::Tripped {
+                    tripped_at_secs: 3,
+                    trips: 1,
+                },
+            ),
+            (
+                r#"{"state":"short_runs","short_runs":2,"started_at_secs":4,"nonce":7,"quic_panicked":true}"#,
+                Marker::ShortRuns {
+                    short_runs: 2,
+                    started_at_secs: 4,
+                    nonce: 7,
+                    quic_panicked: true,
+                    quic_panic_at: None,
+                    endpoint_down_secs: Vec::new(),
+                    prior_trip: None,
+                },
+            ),
+        ];
+        for (json, marker) in cases {
+            assert_eq!(
+                serde_json::from_str::<Marker>(json).unwrap(),
+                marker,
+                "{json}"
+            );
+        }
     }
 
     /// The format is plain JSON with a `state` tag; pinned so a later release

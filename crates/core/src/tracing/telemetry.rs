@@ -4663,7 +4663,9 @@ mod tests {
         // = 147: measured 15342, still within this limit. Raised by #6001 for
         // the 149 counters of `tel_t` and `tel`: measured 18629. Raised for
         // the 4 `recv_ap` counters (already-applied skips): measured 18725.
-        const MAX_WORST_CASE_JSON_BYTES: usize = 18_816;
+        // Raised by #6151 for the `quic_breaker_start` row of `tel_t` (2
+        // counters, 42 bytes at u64::MAX): measured 18857.
+        const MAX_WORST_CASE_JSON_BYTES: usize = 19_072;
         // Raised from 2_048 by #5647 for the same 7 new counters, about 2 bytes
         // each in an all-zero block (a digit and a comma): measured 2057.
         // Raised again by #6001 for `tel_t` and `tel`: measured 2515.
