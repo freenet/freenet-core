@@ -3360,14 +3360,16 @@ struct EventListenerState {
     /// Addresses whose pending dial (`awaiting_connection`) is a QUIC-native
     /// one. Removed when that dial ends.
     native_pending: HashSet<SocketAddr>,
-    /// UDP dials asked for while a native dial to the same address was
-    /// pending. They are not merged into it: a native failure is not theirs,
-    /// and a UDP fallback must not fail with the native dial of another
-    /// CONNECT. Each is issued when the native dial ends (it then finds the
-    /// connection, if the native dial made one). Bounded like
-    /// `awaiting_connection`: entries end with the native dial, whose setup
-    /// has a deadline.
-    udp_behind_native: HashMap<SocketAddr, Vec<connection_lifecycle::DeferredUdpDial>>,
+    /// The callbacks of a UDP dial running BESIDE a native dial to the same
+    /// address. A UDP dial asked for while a native dial is pending is not
+    /// merged into it (the native dial's failure is not its failure, and a
+    /// UDP fallback must not fail with another CONNECT's native dial), and it
+    /// is not held back until the native dial ends (its hole punch must
+    /// overlap the peer's). It starts at once and its outcome, which carries
+    /// its transport, answers only these callbacks. A later UDP dial to the
+    /// address joins it. An entry ends with its dial's outcome, as an
+    /// `awaiting_connection` entry does.
+    udp_beside_native: HashMap<SocketAddr, Vec<(Transaction, Box<dyn ConnectResultSender>)>>,
     pending_op_results: HashMap<Transaction, Sender<WaiterReply>>,
     /// Last time pending_op_results was scanned for closed senders.
     last_pending_op_cleanup: Instant,
@@ -3390,7 +3392,7 @@ impl EventListenerState {
             last_pending_op_cleanup: Instant::now(),
             awaiting_connection_txs: HashMap::new(),
             native_pending: HashSet::new(),
-            udp_behind_native: HashMap::new(),
+            udp_beside_native: HashMap::new(),
             peer_backoff: PeerConnectionBackoff::new(),
             last_backoff_cleanup: Instant::now(),
         }
