@@ -497,8 +497,9 @@ inbound session key (`handshake_unauthenticated_dropped`), QUIC endpoint deaths
 (`quic_adapter_panicked`, once per endpoint; the process keeps running
 and no breaker state is left), QUIC crash-loop breaker trips at startup
 (`quic_breaker_trips`; for every peer, and a gateway on Windows, counted for
-runs in a row (two on a peer while UDP exists, so it trips before the
-post-update rollback's three crashes; three on a gateway) that ended
+runs in a row (two on a peer while UDP exists, so that when a release's
+crashes are all QUIC panics it trips before the post-update rollback's three
+crashes, which count any crash; three on a gateway) that ended
 within ten minutes after recording a panic in QUIC code (quinn, quinn-proto or
 transport/quic, by panic location), each starting within 24 h of the one before,
 and for a unix gateway for any abnormal end of a QUIC-enabled run, not only a
@@ -3650,8 +3651,9 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     code in the run's marker, and it counts runs that lasted under 10 minutes
     and recorded one, so the start after two such aborts in a row trips a
     peer while UDP exists (one below the rollback's three crashes, pinned by
-    the binary's peer_breaker_trips_before_the_crash_loop_rollback; back to
-    three when UDP is removed) and the start after three trips a gateway. An ordinary stop records no panic and never counts; an abort
+    the binary's peer_breaker_trips_before_the_crash_loop_rollback; the
+    rollback counts any crash, so an unrelated crash before two QUIC panics
+    still lets it act first; back to three when UDP is removed) and the start after three trips a gateway. An ordinary stop records no panic and never counts; an abort
     after 10 minutes or more never does, nor do aborts a day apart
     (quic/breaker/short_runs.rs). A panic counts as QUIC's when the thread
     is inside a QuicCode guard (quinn's driver polls in runtime.rs, the socket

@@ -174,7 +174,12 @@ pub(super) const SHORT_RUNS_TO_TRIP: u32 = 3;
 /// rollback counts enough crashes to restore the previous release and pin
 /// this one as bad. A start that trips runs with QUIC off, so it adds no
 /// crash. The binary pins the order
-/// (`peer_breaker_trips_before_the_crash_loop_rollback`). Goes back to
+/// (`peer_breaker_trips_before_the_crash_loop_rollback`). The order holds
+/// only when the release's crashes are all QUIC panics: the rollback counts
+/// every crash (an out-of-memory kill, a SIGKILL, a crash elsewhere), while
+/// the breaker counts consecutive short runs that panicked in QUIC code, so
+/// one unrelated crash followed by two QUIC panics still lets the rollback
+/// act first. Goes back to
 /// [`SHORT_RUNS_TO_TRIP`] when UDP is removed, when there is no UDP to fall
 /// back to and a rollback is the better outcome.
 pub const PEER_SHORT_RUNS_TO_TRIP_WITH_UDP: u32 = 2;
@@ -679,10 +684,11 @@ const MAX_PANIC_PLACE: usize = 160;
 
 /// A panic location as telemetry reports it, `file:line`, with no path
 /// from the build machine: the file is cut at its last `src` directory,
-/// keeping the directory above it only when that names a crate
-/// ([`crate_dir`]: `quinn-proto-0.11.9/src/connection/mod.rs`,
-/// `core/src/transport/quic/socket.rs`) and dropping it otherwise
-/// (`/home/alice/src/x.rs` gives `src/x.rs`). A file under a `target`
+/// keeping the directory above it only when that is known to name a crate
+/// ([`crate_dir`]: `quinn-proto-0.11.9/src/connection/mod.rs` from the
+/// cargo registry, `core/src/transport/quic/socket.rs`) and dropping it
+/// otherwise (`/home/alice/src/x.rs` and `/home/bob-2.0/src/x.rs` give
+/// `src/x.rs`). A file under a `target`
 /// directory (generated code) and a file with no `src` directory keep only
 /// their name. At most [`MAX_PANIC_PLACE`] bytes ([`cap_place`]).
 pub(super) fn panic_place(file: &str, line: u32) -> String {
@@ -693,7 +699,7 @@ pub(super) fn panic_place(file: &str, line: u32) -> String {
         _ if parts.contains(&"target") => name.to_string(),
         Some(src) => {
             let from = match src.checked_sub(1) {
-                Some(above) if crate_dir(parts[above]) => above,
+                Some(above) if crate_dir(&parts, above) => above,
                 Some(_) | None => src,
             };
             parts[from..].join("/")
@@ -703,18 +709,19 @@ pub(super) fn panic_place(file: &str, line: u32) -> String {
     cap_place(&format!("{place}:{line}"))
 }
 
-/// Whether a directory name above `src` names a crate rather than a place on
-/// the build machine: a registry or vendored crate directory
-/// (`name-1.2.3`), quinn's crates, the standard library's (`core`, `alloc`,
-/// `std`), or this crate (`crates/core`).
-fn crate_dir(name: &str) -> bool {
+/// Whether `parts[at]`, the directory above a `src`, names a crate rather
+/// than a place on the build machine. Only two things are trusted, never the
+/// shape of the name (a home directory may be called `bob-2.0`): a known
+/// name (quinn's crates, the standard library's `core`, `alloc` and `std`,
+/// and this crate, `crates/core`), or a crate directory in cargo's registry
+/// (`.cargo/registry/src/<index>/<crate>`) or its git checkouts
+/// (`.cargo/git/checkouts/...`), whose layout cargo chooses.
+fn crate_dir(parts: &[&str], at: usize) -> bool {
     const KNOWN: [&str; 6] = ["core", "alloc", "std", "quinn", "quinn-proto", "quinn-udp"];
-    let versioned = name.rsplit_once('-').is_some_and(|(crate_name, version)| {
-        !crate_name.is_empty()
-            && version.contains('.')
-            && version.starts_with(|c: char| c.is_ascii_digit())
-    });
-    versioned || KNOWN.contains(&name)
+    let before = &parts[..at];
+    let registry = before.len() >= 3 && before[before.len() - 3..][..2] == ["registry", "src"];
+    let git_checkout = before.windows(2).any(|pair| pair == ["git", "checkouts"]);
+    KNOWN.contains(&parts[at]) || registry || git_checkout
 }
 
 /// `place` cut to its last [`MAX_PANIC_PLACE`] bytes, on a character
@@ -1638,8 +1645,22 @@ mod tests {
                 "/rustc/48a229ce/library/alloc/src/raw_vec/mod.rs",
                 "alloc/src/raw_vec/mod.rs:7",
             ),
-            // A user's own `src` directory: the name above it is dropped.
+            // A user's own `src` directory: the name above it is dropped,
+            // whatever it looks like.
             ("/home/alice/src/x.rs", "src/x.rs:7"),
+            ("/home/bob-2.0/src/x.rs", "src/x.rs:7"),
+            ("/Users/bob-2.0/src/x.rs", "src/x.rs:7"),
+            (r"C:\Users\bob-2.0\src\x.rs", "src/x.rs:7"),
+            ("/home/someone/projects/bob-2.0/src/x.rs", "src/x.rs:7"),
+            // macOS and Windows cargo registries.
+            (
+                "/Users/someone/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/quinn-0.11.12/src/endpoint.rs",
+                "quinn-0.11.12/src/endpoint.rs:7",
+            ),
+            (
+                r"C:\Users\someone\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\bytes-1.10.1\src\buf.rs",
+                "bytes-1.10.1/src/buf.rs:7",
+            ),
             (
                 "/home/alice/src/proj/target/debug/build/gen-1a2b/out/gen.rs",
                 "gen.rs:7",
@@ -1651,6 +1672,7 @@ mod tests {
             assert_eq!(panic_place(file, 7), place, "{file}");
             assert!(!panic_place(file, 7).contains("alice"), "{file}");
             assert!(!panic_place(file, 7).contains("someone"), "{file}");
+            assert!(!panic_place(file, 7).contains("bob"), "{file}");
         }
         let long = format!("/src/{}x.rs", "é/".repeat(200));
         let place = panic_place(&long, 7);

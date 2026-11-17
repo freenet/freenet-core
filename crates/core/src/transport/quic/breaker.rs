@@ -1405,6 +1405,15 @@ pub(crate) struct LegacyShadowFile {
 /// old rule never read one as a crash); a Tripped one still holds, as the
 /// old rule's trip did across a reboot. A file that does not parse is no
 /// evidence; one that cannot be read is [`Previous::Unreadable`].
+///
+/// Known inaccuracy, telemetry only: a rollback to an earlier release and a
+/// return to this same release on the same boot is not detected. An Armed
+/// marker this release left before the rollback then passes both checks,
+/// and the next start reports a legacy trip for that run, whether or not it
+/// crashed. It is rare (a rollback and return within one boot) and changes
+/// nothing but `legacy_verdict`. Tying the file to the run before it would
+/// need the main marker to outlive a long run, which the short-run timer
+/// deletes on purpose.
 fn read_legacy_shadow(path: &Path, version: &str, boot_id: Option<&str>) -> Previous {
     match std::fs::read(path) {
         Ok(bytes) => match serde_json::from_slice::<LegacyShadowFile>(&bytes) {
@@ -3537,6 +3546,66 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert_eq!(read(), Previous::Unreadable);
+    }
+
+    /// On disk, at the first start with no shadow file: a Tripped marker in
+    /// the breaker's own file (which may be the short-run rule's own trip)
+    /// is not the shadow's evidence, so the shadow arms rather than cooling
+    /// or tripping, and the breaker's file is left as it was; an Armed one
+    /// there (0.2.159's) is, and trips the shadow.
+    #[test]
+    fn the_legacy_shadow_ignores_a_tripped_main_marker_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let main = marker_path(dir.path());
+        let shadow = legacy_shadow_path(dir.path());
+        let pending = parking_lot::Mutex::new(Pending {
+            marker: None,
+            shadow: None,
+            quic_up: false,
+            signals_ready: false,
+            registrar: None,
+        });
+        let dead = |_| false;
+        let tripped = Marker::Tripped {
+            tripped_at_secs: T0 + 30,
+            trips: 1,
+        };
+        write_marker(&main, &tripped).unwrap();
+        let decided = legacy_shadow_at(
+            true,
+            dir.path(),
+            None,
+            false,
+            legacy_start(&[], false),
+            dead,
+            &pending,
+        );
+        assert_eq!(decided, Some(Verdict::Arm));
+        assert!(!shadow.exists(), "nothing written before QUIC is up");
+        assert_eq!(
+            pending.lock().shadow.take(),
+            Some((shadow.clone(), stamped(legacy_armed().unwrap())))
+        );
+        assert_eq!(read_previous(&main), Previous::Marker(tripped));
+
+        write_marker(&main, &marker_of(armed(PID, Some(BOOT)))).unwrap();
+        let decided = legacy_shadow_at(
+            true,
+            dir.path(),
+            None,
+            false,
+            legacy_start(&[], false),
+            dead,
+            &pending,
+        );
+        assert_eq!(decided, Some(Verdict::Trip));
+        assert_eq!(
+            read_legacy_shadow(&shadow, crate::config::PCK_VERSION, Some(BOOT)),
+            Previous::Marker(Marker::Tripped {
+                tripped_at_secs: T0 + 60,
+                trips: 1
+            })
+        );
     }
 
     /// The shadow with QUIC off decides nothing and writes nothing, but still
