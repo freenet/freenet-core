@@ -1640,6 +1640,94 @@ mod tests {
         );
     }
 
+    /// A rollback reads this release's markers: the marker type of v0.2.159
+    /// and of main before this change (identical; copied verbatim below,
+    /// docs dropped) parses every new-format marker, extra fields ignored,
+    /// as the same state with the same values. A Tripped marker with a count
+    /// reads as a plain trip, which the older release holds for its 24 h.
+    /// The other direction (old markers into the new type) is
+    /// `the_trip_count_fields_are_compatible_both_ways` and
+    /// `the_endpoint_down_field_is_compatible_both_ways`.
+    #[test]
+    fn a_release_before_this_change_reads_the_new_markers() {
+        #[derive(Debug, PartialEq, Eq, Deserialize)]
+        #[serde(tag = "state", rename_all = "snake_case")]
+        enum MarkerV0_2_159 {
+            Armed {
+                pid: u32,
+                #[serde(default)]
+                boot_id: Option<String>,
+                nonce: u64,
+                armed_at_secs: u64,
+            },
+            Tripped {
+                tripped_at_secs: u64,
+            },
+            ShortRuns {
+                short_runs: u32,
+                started_at_secs: u64,
+                nonce: u64,
+                #[serde(default)]
+                quic_panicked: bool,
+            },
+            #[serde(other)]
+            Unknown,
+        }
+        let prior_trip = Some(PriorTrip {
+            tripped_at_secs: 1,
+            trips: 3,
+        });
+        let cases = [
+            (
+                Marker::Armed {
+                    pid: 5,
+                    boot_id: Some("b".into()),
+                    nonce: 7,
+                    armed_at_secs: 9,
+                    endpoint_down_secs: vec![8, 9],
+                    prior_trip,
+                },
+                MarkerV0_2_159::Armed {
+                    pid: 5,
+                    boot_id: Some("b".into()),
+                    nonce: 7,
+                    armed_at_secs: 9,
+                },
+            ),
+            (
+                Marker::Tripped {
+                    tripped_at_secs: 3,
+                    trips: 4,
+                },
+                MarkerV0_2_159::Tripped { tripped_at_secs: 3 },
+            ),
+            (
+                Marker::ShortRuns {
+                    short_runs: 2,
+                    started_at_secs: 4,
+                    nonce: 7,
+                    quic_panicked: true,
+                    prior_trip,
+                },
+                MarkerV0_2_159::ShortRuns {
+                    short_runs: 2,
+                    started_at_secs: 4,
+                    nonce: 7,
+                    quic_panicked: true,
+                },
+            ),
+        ];
+        for (new, old) in cases {
+            let json = serde_json::to_vec(&new).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<MarkerV0_2_159>(&json).unwrap(),
+                old,
+                "{}",
+                String::from_utf8_lossy(&json)
+            );
+        }
+    }
+
     /// A death before arming writes the pending marker with the exit noted,
     /// so the next start counts it; with nothing pending (the breaker off or
     /// overridden) nothing is recorded, and an armed marker is used as is.
