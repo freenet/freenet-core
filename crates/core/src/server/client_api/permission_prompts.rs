@@ -2619,11 +2619,19 @@ mod tests {
         origin: Option<&str>,
         sec_fetch_site: Option<&str>,
     ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = bytes::Bytes> + Send>> {
+        // What a browser on the node's own origin sends.
+        open_sse_with_host("127.0.0.1:7509", origin, sec_fetch_site).await
+    }
+
+    async fn open_sse_with_host(
+        host: &str,
+        origin: Option<&str>,
+        sec_fetch_site: Option<&str>,
+    ) -> std::pin::Pin<Box<dyn futures::stream::Stream<Item = bytes::Bytes> + Send>> {
         use axum::response::IntoResponse;
         let pending = crate::contract::user_input::pending_prompts();
         let mut headers = HeaderMap::new();
-        // What a browser on the node's own origin sends.
-        headers.insert("host", "127.0.0.1:7509".parse().unwrap());
+        headers.insert("host", host.parse().unwrap());
         if let Some(o) = origin {
             headers.insert("origin", o.parse().unwrap());
         }
@@ -2920,6 +2928,47 @@ mod tests {
         let (status, value) = call_pending(headers, pending).await;
         assert_eq!(status, axum::http::StatusCode::OK);
         assert_eq!(value.as_array().unwrap().len(), 1);
+    }
+
+    /// A page whose own hostname was re-pointed at this node sends a
+    /// same-origin `EventSource` request: no `Origin`, no `Sec-Fetch-Site:
+    /// cross-site`, and a `Host` that is the page's own name. It must receive
+    /// no prompt events, while the same request under a loopback `Host` does.
+    #[tokio::test]
+    #[serial_test::serial(permission_subscriber_counter)]
+    async fn test_sse_refuses_a_foreign_host_without_origin() {
+        let pending = crate::contract::user_input::pending_prompts();
+        let nonce = "ssetest_foreign_host_004".to_string();
+        let _rx = insert_prompt(
+            &pending,
+            &nonce,
+            "host-test",
+            vec!["OK"],
+            "dkey-host",
+            webapp_caller("cid-host"),
+        );
+        let _cleanup = cleanup_on_drop(pending.clone(), nonce.clone());
+
+        for host in ["evil.example:7509", "localhost.evil.example"] {
+            for site in [None, Some("same-origin")] {
+                let mut body = open_sse_with_host(host, None, site).await;
+                let frame = next_event_frame(&mut body, 200).await;
+                assert!(
+                    frame.is_none(),
+                    "Host {host} (Sec-Fetch-Site {site:?}) must receive no events, got: {frame:?}"
+                );
+            }
+        }
+
+        let mut body = open_sse_with_host("localhost:7509", None, Some("same-origin")).await;
+        let frame = frame_matching(
+            &mut body,
+            |f| f.contains("event: prompt_added") && f.contains(&nonce),
+            32,
+            500,
+        )
+        .await;
+        assert!(frame.is_some(), "a loopback Host must still see {nonce}");
     }
 
     /// `Sec-Fetch-Site` values that indicate same-origin or no-initiator
