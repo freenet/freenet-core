@@ -742,9 +742,10 @@ async fn listener_liveness(
         return super::ListenerExit::from_join(listen_task.await);
     };
     // Resolves when the endpoint died and the exit is recorded in the
-    // crash-breaker marker. Unrecorded, the next start could not count the
-    // exit, and a death that repeats at every start would restart the node
-    // without bound, so the node keeps running over UDP instead.
+    // crash-breaker marker. Unrecorded (the breaker overridden, or no marker
+    // to write), the next start could not count the exit, and a death that
+    // repeats at every start would restart the node without bound, so the
+    // node keeps running over UDP instead. `record` logs which case it is.
     let died = async move {
         match endpoint {
             Some(availability) => availability.died().await,
@@ -753,11 +754,6 @@ async fn listener_liveness(
         if record(std::time::SystemTime::now()) {
             return;
         }
-        tracing::warn!(
-            "The QUIC endpoint died, but the exit could not be recorded in the QUIC \
-             crash-breaker marker, so this gateway does not restart itself: it keeps running \
-             over UDP, with QUIC off until it is restarted"
-        );
         std::future::pending::<()>().await
     };
     let cooled = async move {

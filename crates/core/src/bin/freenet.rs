@@ -2094,12 +2094,13 @@ mod tests {
 
     /// #5940: a gateway's restarts to restore QUIC stay under the start
     /// limit of the units `freenet service install` writes, which counts
-    /// every start, exit 42 included. In any window of that length the
-    /// restarts are at most: the free restarts after the first
-    /// `ENDPOINT_DOWN_EXITS_TO_TRIP - 1` endpoint deaths, the start the next
-    /// death trips, and the cooldown-end restarts, which come at least
-    /// `QUIC_RESTORE_MIN_UPTIME` apart (a cooldown is 15 minutes or more,
-    /// the floor only shortens the wait for one already nearly over).
+    /// every start, exit 42 included, and the first start too. In any window
+    /// of that length the starts are at most: one start, the free restarts
+    /// after the first `ENDPOINT_DOWN_EXITS_TO_TRIP - 1` endpoint deaths, the
+    /// start the next death trips, and one cooldown-end restart. Only one
+    /// fits: every gateway cooldown is longer than the window, and the
+    /// `QUIC_RESTORE_MIN_UPTIME` floor shortens only the wait for a cooldown
+    /// already nearly over when the node started.
     #[cfg(target_os = "linux")]
     #[test]
     fn gateway_quic_restarts_stay_under_the_unit_start_limit() {
@@ -2127,9 +2128,16 @@ mod tests {
             let burst = value("StartLimitBurst");
             let interval = value("StartLimitIntervalSec");
             assert!(unit.contains("Environment=FREENET_SUPERVISED=1"));
-            let worst_starts = freenet::ENDPOINT_DOWN_EXITS_TO_TRIP as u64
-                + interval / freenet::QUIC_RESTORE_MIN_UPTIME.as_secs()
-                + 1;
+            assert!(
+                freenet::GATEWAY_QUIC_BREAKER_COOLDOWN.as_secs() > interval,
+                "one cooldown-end restart per window"
+            );
+            let initial_start = 1;
+            let free_restarts = freenet::ENDPOINT_DOWN_EXITS_TO_TRIP as u64 - 1;
+            let tripping_start = 1;
+            let cooldown_end_restarts = 1;
+            let worst_starts =
+                initial_start + free_restarts + tripping_start + cooldown_end_restarts;
             assert!(
                 worst_starts < burst,
                 "{worst_starts} restarts in {interval} s against a limit of {burst}"

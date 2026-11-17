@@ -34,7 +34,7 @@ pub use node::{
 #[doc(hidden)]
 pub use transport::connection_handler::QUIC_RESTORE_MIN_UPTIME;
 #[doc(hidden)]
-pub use transport::quic::breaker::ENDPOINT_DOWN_EXITS_TO_TRIP;
+pub use transport::quic::breaker::{ENDPOINT_DOWN_EXITS_TO_TRIP, GATEWAY_QUIC_BREAKER_COOLDOWN};
 pub use transport::quic::breaker::{
     STOP_NOTE_ENV_VAR as QUIC_BREAKER_STOP_NOTE_ENV_VAR,
     STOP_NOTE_FILE as QUIC_BREAKER_STOP_NOTE_FILE, enable_quic_crash_breaker,

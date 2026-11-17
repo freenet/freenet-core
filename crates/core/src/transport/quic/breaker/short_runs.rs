@@ -424,7 +424,7 @@ async fn clear_after_short_run(time: &impl TimeSource, path: PathBuf, nonce: u64
         let target = path.clone();
         note_marker_cleared();
         // The disk can be slow on Windows; this task must not hold a worker.
-        let outcome = tokio::task::spawn_blocking(move || clear_if_owned(&target, nonce)).await;
+        let outcome = tokio::task::spawn_blocking(move || clear_short_run(&target, nonce)).await;
         match outcome {
             Ok(Ok(true)) => {
                 tracing::info!("The run has passed the QUIC short-run limit; the count is clear");
@@ -433,7 +433,7 @@ async fn clear_after_short_run(time: &impl TimeSource, path: PathBuf, nonce: u64
             Ok(Ok(false)) => {
                 tracing::info!(
                     "The run has passed the QUIC short-run limit; the marker is no longer this \
-                     run's, so it stays"
+                     run's, or records this run's exit for a QUIC endpoint death, so it stays"
                 );
                 return;
             }
@@ -493,6 +493,31 @@ fn in_quic_code() -> bool {
     IN_QUIC_CODE
         .try_with(|depth| depth.get() > 0)
         .unwrap_or(false)
+}
+
+/// The short-run timer's clear: remove this run's marker, unless it records
+/// that this run is exiting because its QUIC endpoint died. That record must
+/// reach the next start, or every death would restart the gateway for free
+/// (`super::endpoint_down_verdict`). Runs under [`super::MARKER_UPDATE`],
+/// which the record is written under too, so the two cannot interleave.
+/// Returns whether it removed the marker.
+fn clear_short_run(path: &Path, nonce: u64) -> std::io::Result<bool> {
+    let _update = super::MARKER_UPDATE.lock();
+    if let Previous::Marker(Marker::ShortRuns {
+        nonce: owner,
+        started_at_secs,
+        endpoint_down_secs,
+        ..
+    }) = read_previous(path)
+    {
+        let died = endpoint_down_secs
+            .last()
+            .is_some_and(|at| *at >= started_at_secs);
+        if owner == nonce && died {
+            return Ok(false);
+        }
+    }
+    clear_if_owned(path, nonce)
 }
 
 /// Set by a clean exit or the short-run timer before it removes the marker,
@@ -622,6 +647,55 @@ mod tests {
     /// The peer decision; the gateway one is tested by name.
     fn decide(previous: &Previous, now_secs: u64, ignore_breaker: bool) -> Decision {
         super::decide(previous, now_secs, ignore_breaker, BreakerRole::Peer)
+    }
+
+    /// The short-run clear and the endpoint-death record, in either order,
+    /// leave the record for the next start: a record written first makes the
+    /// clear leave the marker; a clear that comes first is followed by the
+    /// marker written again from the one armed, with the record. A marker
+    /// that only carries an earlier run's death is cleared as before.
+    #[test]
+    fn the_short_run_clear_and_a_death_record_in_either_order_keep_the_record() {
+        let marker = |endpoint_down_secs: Vec<u64>| Marker::ShortRuns {
+            short_runs: 1,
+            started_at_secs: T0,
+            nonce: NONCE,
+            quic_panicked: false,
+            endpoint_down_secs,
+            prior_trip: None,
+        };
+        let as_armed = marker(vec![T0 - 7200]);
+        let died_at = T0 + SHORT_RUN.as_secs();
+        let recorded = marker(vec![T0 - 7200, died_at]);
+
+        // The death is recorded, then the timer fires.
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        write_marker(&path, &as_armed).unwrap();
+        assert!(
+            super::super::note_endpoint_down_exit_at(&path, NONCE, died_at, Some(&as_armed))
+                .unwrap()
+        );
+        assert!(
+            !clear_short_run(&path, NONCE).unwrap(),
+            "the clear leaves it"
+        );
+        assert_eq!(read_previous(&path), Previous::Marker(recorded.clone()));
+
+        // The timer fires, then the death is recorded.
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        write_marker(&path, &as_armed).unwrap();
+        assert!(
+            clear_short_run(&path, NONCE).unwrap(),
+            "an earlier run's death alone does not keep the marker"
+        );
+        assert_eq!(read_previous(&path), Previous::Nothing);
+        assert!(
+            super::super::note_endpoint_down_exit_at(&path, NONCE, died_at, Some(&as_armed))
+                .unwrap()
+        );
+        assert_eq!(read_previous(&path), Previous::Marker(recorded));
     }
 
     /// A Windows gateway's exit because its endpoint died is decided as on

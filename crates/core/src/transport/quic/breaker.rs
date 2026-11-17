@@ -198,7 +198,8 @@ pub(crate) const QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(24 * 60 *
 /// QUIC endpoint directly (#5940 phase B), a gateway with QUIC off for a day
 /// would be unreachable over QUIC for that day. A short cooldown still bounds
 /// a crash loop to one restart with QUIC per cooldown.
-pub(crate) const GATEWAY_QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+#[doc(hidden)]
+pub const GATEWAY_QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
 /// The longest a gateway's cooldown grows to on repeated trips
 /// ([`BreakerRole::cooldown`]). Provisional value (a proposal, not measured).
@@ -383,6 +384,13 @@ static PENDING: parking_lot::Mutex<Pending> = parking_lot::Mutex::new(Pending {
 /// exit for it: the next start would ignore the record, so a death at every
 /// start would restart the node without bound.
 static OVERRIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Held across each read-and-change of this run's marker by the Windows
+/// short-run clear ([`short_runs`]) and by [`note_endpoint_down_exit`], so
+/// in either order the death record survives: a clear that comes first is
+/// followed by the record written again, and a record written first makes
+/// the clear leave the marker.
+pub(super) static MARKER_UPDATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// The marker this process armed, as armed, for a Windows run that must
 /// write it again after clearing it ([`note_endpoint_down_exit`]).
@@ -794,6 +802,7 @@ fn note_endpoint_down_exit_with(
     if overridden {
         return Ok(EndpointDownNote::Overridden);
     }
+    let _update = MARKER_UPDATE.lock();
     let recorded = |recorded: bool| {
         if recorded {
             EndpointDownNote::Recorded
@@ -1902,6 +1911,44 @@ mod tests {
                 String::from_utf8_lossy(&json)
             );
         }
+    }
+
+    /// The Windows rewrite of a cleared marker is wired end to end: arming
+    /// keeps the marker as armed, and the endpoint-death record passes it on
+    /// off unix. Neither runs in a unix unit test (arming writes through
+    /// statics and the branch is Windows-only), so this pins the lines;
+    /// `an_endpoint_down_exit_is_recorded_in_every_marker_kind` tests the
+    /// rewrite itself.
+    #[test]
+    fn the_windows_marker_rewrite_is_wired() {
+        let src = include_str!("breaker.rs");
+        let flat = |signature: &str| -> String {
+            production_fn_body(src, signature)
+                .lines()
+                .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+                .collect::<String>()
+                .split_whitespace()
+                .collect()
+        };
+        let arming = flat("fn arm_when_ready_into(");
+        let kept = arming
+            .find("letas_armed=pending.marker.as_ref().map(|(_,marker)|marker.clone());")
+            .expect("arming keeps the marker before writing it");
+        let written = arming
+            .find(
+                "ifletSome((path,nonce))=arm(pending.marker.take()){*ARMED_MARKER.lock()=as_armed;",
+            )
+            .expect("and stores it once written");
+        assert!(kept < written);
+        let note = flat("pub(crate) fn note_endpoint_down_exit(");
+        assert!(
+            note.contains("letrecreate=ifcfg!(unix){None}else{ARMED_MARKER.lock().clone()};"),
+            "off unix the record gets the marker as armed: {note}"
+        );
+        assert!(
+            note.contains("unix_secs(now),recreate.as_ref(),);"),
+            "and passes it on: {note}"
+        );
     }
 
     /// A death before arming writes the pending marker with the exit noted,

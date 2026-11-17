@@ -470,10 +470,12 @@ Wants=network-online.target
 #
 # Only a RAPID loop trips this: more than 5 starts within 120s. A legitimate
 # single restart (auto-update, an occasional reboot, a one-off crash) is nowhere
-# near 5-in-120s and is never penalised. A boot-wedge / fast crash exits 45 (a
-# counted failure — see SuccessExitStatus in [Service]), so a tight no-fix loop of
-# those trips the limiter and the unit stops; a node that ran healthily first
-# exits the burst-exempt code 42 (see crate::node::p2p_impl). BOTH 42 and 45 still
+# near 5-in-120s and is never penalised. The limit counts every start, whatever
+# the exit code. A boot-wedge / fast crash exits 45 within its first minute (a
+# failure: 45 is kept out of SuccessExitStatus in [Service]), so a tight no-fix
+# loop of those trips the limiter and the unit stops. A node that ran healthily
+# first exits 42 (see crate::node::p2p_impl), which is not a failure; it ran a
+# minute or more, so a loop of those stays under the limit. BOTH 42 and 45 still
 # fire the ExecStopPost `freenet update` self-heal in [Service], so a boot-crash
 # that a newer release fixes recovers even though exit 45 is counted.
 #
@@ -751,8 +753,9 @@ After=network-online.target
 Wants=network-online.target
 # Crash-loop rate limiting (issue #4551) — see the matching comment in the user
 # unit. StartLimit* live in [Unit] (#4570); systemd silently ignores them in
-# [Service]. Only a rapid loop (>5 starts / 120s) trips; a fast crash exits the
-# counted code 45 while a healthy-then-died node exits the burst-exempt 42.
+# [Service]. Only a rapid loop (>5 starts / 120s) trips, and every start counts,
+# whatever the exit code; a fast crash exits 45 (a failure), while a
+# healthy-then-died node exits 42 (not a failure) after a minute or more.
 # StartLimitAction=none stops the unit (it does NOT reboot the host) on trip.
 StartLimitBurst=5
 StartLimitIntervalSec=120
