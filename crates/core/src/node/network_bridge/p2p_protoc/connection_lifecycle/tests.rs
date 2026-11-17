@@ -4092,7 +4092,18 @@ async fn udp_then_native_both_connect_switches_to_native_in_place() {
         h.state.beside_udp_connected.contains(&addr),
         "premise: UDP connected first"
     );
+    while h.handshake_rx.try_recv().is_ok() {}
     h.handshake_event(beside::established(&peer, true)).await;
+    // Replacing a ring connection prunes it, which also tells the handshake
+    // driver to drop the address; the arm itself sends one drop for the
+    // expectation. In place, only that one.
+    let mut drops = 0;
+    while let Ok(command) = h.handshake_rx.try_recv() {
+        if matches!(command, HandshakeCommand::DropConnection { addr: a } if a == addr) {
+            drops += 1;
+        }
+    }
+    assert_eq!(drops, 1, "the UDP connection was not pruned from the ring");
     assert_ne!(
         h.mgr.connections[&addr].connection_id, udp_id,
         "the native connection took the entry"

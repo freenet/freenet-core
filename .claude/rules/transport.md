@@ -2266,9 +2266,15 @@ Fallback: a failed native setup is followed by today's UDP dial to the same
   the same address is pending (another CONNECT's) runs BESIDE it
   (EventListenerState::udp_beside_native): not merged into it, which failed
   it with the native dial, and not held back, which punched late. An
-  outcome answers only its own transport's callbacks, except that a UDP
-  success answers the native dial's too, since all asked for a connection to
-  that peer. A native failure marks
+  outcome answers only its own transport's callbacks, except that a success
+  answers both dials' requesters, since all asked for a connection to that
+  peer. If both connect the native connection is kept on both sides: native
+  first, the UDP connection is dropped without touching the ring; UDP first,
+  the native connection takes the entry in place (beside_udp_connected) and
+  the ring keeps the peer. A UDP dial beside a native one that fails never
+  prunes, backs off or marks the address (a 30 s backoff would refuse the
+  native dial's own fallback); the last dial to the address to end releases
+  the in-transit slot. A native failure marks
   no failed address and records no peer backoff, so the fallback is not
   refused. Until UDP is removed a failed native setup never costs the join
   (test_quic_native_failed_setups_fall_back_to_udp, which also checks that
