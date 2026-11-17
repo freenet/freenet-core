@@ -2986,9 +2986,11 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     each send started since at its own bytes but at most the rest, from
     QuicPath::stream_opens, read before the permits in use so a concurrent
     open is counted twice rather than missed), at the floor; nothing once
-    the peer has wholly acknowledged that many bytes of data streams since
-    the end (StreamOpens::acked: stream-only progress, not control frames
-    or quinn's own packets; the last
+    the peer has wholly acknowledged that many bytes of data streams
+    opened after the end (StreamOpens::acked_after: stream-only progress,
+    not control frames or quinn's own packets, and not a stream already
+    open at the end, which may have had most of its bytes acknowledged
+    before it; the last
     byte went out with them, so a busy path that acknowledges quickly is
     judged at its first wait). If that moves the deadline past now, the
     wait goes on, within its total, and is then judged
@@ -3023,8 +3025,8 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     cannot judge it (its threshold is the backlog-sized wait, hours on a
     busy slow path), so a separate check judges the end by the
     connection's progress (path::LateEndCheck, late_end_verdict): once
-    the peer has wholly acknowledged, since the end, data streams totalling
-    the bytes ahead of the
+    the peer has wholly acknowledged data streams opened after the end
+    totalling the bytes ahead of the
     end's last byte under quinn's round-robin (path::bytes_ahead) plus the
     congestion window when the end was sent (at least 64 KiB), the last
     packet has been sent, and an honest stack acknowledges it within

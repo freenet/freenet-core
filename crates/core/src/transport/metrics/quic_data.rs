@@ -788,11 +788,12 @@ impl QuicDataCounters {
         }
     }
 
-    /// A send's wait for the acknowledgement of its end ran out.
+    /// A send's end was late (`path::LateEndCheck`).
     pub(crate) fn record_late_end(&self, kind: AckWaitKind) {
         self.late_end[kind as usize].fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A send's wait for the acknowledgement of its end ran out.
     pub(crate) fn record_ack_wait_expired(&self, kind: AckWaitKind) {
         self.ack_wait_expired[kind as usize].fetch_add(1, Ordering::Relaxed);
     }

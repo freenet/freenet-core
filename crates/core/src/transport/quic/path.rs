@@ -142,7 +142,7 @@ pub(in crate::transport) mod pacer;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -1442,7 +1442,8 @@ impl QuicPath {
             let in_flight = (STREAMED_SEND_LIMIT as u64)
                 .saturating_sub(slots.available_permits() as u64)
                 .max(1);
-            let acked_at_end = opens.acked_bytes();
+            let seq_at_end = opens.last_seq();
+            let cursor = parking_lot::Mutex::new((opens.completions_end(), 0u64));
             let window_at_end = connection.stats().path.cwnd.max(LATE_END_MARGIN_MIN);
             let floor_now = {
                 let connection = connection.clone();
@@ -1452,7 +1453,7 @@ impl QuicPath {
             let opens = opens.clone();
             let reading: Arc<dyn Fn() -> LaterReading + Send + Sync> = Arc::new(move || {
                 let (now_opened, now_bytes) = opens.read();
-                let acked = opens.acked_bytes().saturating_sub(acked_at_end);
+                let acked = opens.acked_after(seq_at_end, &mut cursor.lock());
                 LaterReading {
                     in_flight,
                     rest,
@@ -2144,7 +2145,8 @@ impl QuicPath {
         // backlog re-read and the late-end check judge by; a control frame's
         // is not counted.
         if opener != Opener::Control {
-            send.acked_into = Some((self.stream_opens.clone(), header.total_len()));
+            let seq = self.stream_opens.next_seq();
+            send.acked_into = Some((self.stream_opens.clone(), seq, header.total_len()));
         }
         debug_assert!(
             self.ack_progress.is_some(),
@@ -2430,9 +2432,9 @@ struct Outgoing {
     /// How long the backlog ahead of this stream's end may take, read when
     /// the end is sent ([`QuicPath::backlog_wait`]).
     backlog: Option<Arc<dyn Fn() -> Backlog + Send + Sync>>,
-    /// Where this data stream's bytes are counted once the peer wholly
-    /// acknowledges it ([`StreamOpens::acked`]), and how many.
-    acked_into: Option<(Arc<StreamOpens>, u64)>,
+    /// Where this data stream is counted once the peer wholly acknowledges
+    /// it ([`StreamOpens::acked`]), with its number and its bytes.
+    acked_into: Option<(Arc<StreamOpens>, u64, u64)>,
 }
 
 /// Permits taken from a path's `stream_slots` and the bytes of the sends that
@@ -2441,11 +2443,25 @@ struct Outgoing {
 pub(crate) struct StreamOpens {
     count: AtomicU64,
     bytes: AtomicU64,
-    /// Bytes of data streams the peer has wholly acknowledged (each counted
-    /// when its acknowledgement completes): the stream-only progress an
-    /// ack wait's re-read and the late-end check judge by, so control frames
-    /// and quinn's own packets do not count (#6205).
-    acked: AtomicU64,
+    /// Data streams opened so far, permit or not, control frames excluded:
+    /// each takes the next number when it opens ([`Self::next_seq`]).
+    seq: AtomicU64,
+    /// Data streams the peer wholly acknowledged, as (number, bytes), in the
+    /// order their acknowledgements completed, the latest
+    /// [`COMPLETIONS_KEPT`] ([`Self::acked_after`]).
+    completions: parking_lot::Mutex<Completions>,
+}
+
+/// Completed data streams a path remembers for [`StreamOpens::acked_after`].
+/// A reader that falls further behind misses the oldest, which only
+/// undercounts its progress.
+const COMPLETIONS_KEPT: usize = 4096;
+
+#[derive(Default)]
+struct Completions {
+    /// The index of the first entry kept.
+    base: u64,
+    entries: std::collections::VecDeque<(u64, u64)>,
 }
 
 impl StreamOpens {
@@ -2462,14 +2478,50 @@ impl StreamOpens {
         (count, self.bytes.load(Ordering::Acquire))
     }
 
-    /// A data stream of `len` bytes was wholly acknowledged.
-    fn acked(&self, len: u64) {
-        self.acked.fetch_add(len, Ordering::AcqRel);
+    /// The number of the data stream opening now.
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    /// Bytes of data streams wholly acknowledged so far.
-    fn acked_bytes(&self) -> u64 {
-        self.acked.load(Ordering::Acquire)
+    /// The number of the latest data stream opened.
+    fn last_seq(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
+    }
+
+    /// The data stream numbered `seq`, of `len` bytes, was wholly
+    /// acknowledged.
+    fn acked(&self, seq: u64, len: u64) {
+        let mut completions = self.completions.lock();
+        completions.entries.push_back((seq, len));
+        if completions.entries.len() > COMPLETIONS_KEPT {
+            completions.entries.pop_front();
+            completions.base += 1;
+        }
+    }
+
+    /// Where the next completion will be ([`Self::acked_after`]).
+    fn completions_end(&self) -> u64 {
+        let completions = self.completions.lock();
+        completions.base + completions.entries.len() as u64
+    }
+
+    /// Bytes of data streams numbered after `after` (opened after a stream's
+    /// end was sent) wholly acknowledged since `cursor` (an index and a sum,
+    /// moved on here). Every byte of such a stream went out after the end,
+    /// so it is progress past it; a stream already open at the end may have
+    /// had most of its bytes acknowledged before it, so it is not counted
+    /// (#6205).
+    fn acked_after(&self, after: u64, cursor: &mut (u64, u64)) -> u64 {
+        let completions = self.completions.lock();
+        let from = cursor.0.max(completions.base);
+        let skip = usize::try_from(from - completions.base).unwrap_or(usize::MAX);
+        for &(seq, len) in completions.entries.iter().skip(skip) {
+            if seq > after {
+                cursor.1 = cursor.1.saturating_add(len);
+            }
+        }
+        cursor.0 = completions.base + completions.entries.len() as u64;
+        cursor.1
     }
 }
 
@@ -2484,9 +2536,10 @@ pub(crate) struct LaterReading {
     /// window).
     pub(crate) started: u64,
     pub(crate) started_bytes: u64,
-    /// Bytes of data streams the peer wholly acknowledged since the end was
-    /// sent (stream-only progress: not control frames, not quinn's own
-    /// packets).
+    /// Bytes of data streams opened after the end was sent that the peer has
+    /// wholly acknowledged since ([`StreamOpens::acked_after`]: stream-only
+    /// progress past the end, not control frames, not quinn's own packets,
+    /// and not streams already open at the end).
     pub(crate) acked_since_end: u64,
     /// The congestion window when the end was sent, at least
     /// [`LATE_END_MARGIN_MIN`] ([`late_end_verdict`]).
@@ -2505,9 +2558,11 @@ pub(crate) struct LaterReading {
 /// `min(started_bytes, started x rest)`. That is the bytes ahead, given at
 /// the credit floor.
 ///
-/// Progress is counted in data streams the peer wholly acknowledged since the
-/// end ([`StreamOpens::acked`]), not the connection's acknowledged bytes,
-/// which include control frames and quinn's own packets. Once at least the
+/// Progress is counted in data streams opened after the end that the peer
+/// has wholly acknowledged ([`StreamOpens::acked_after`]), not the
+/// connection's acknowledged bytes, which include control frames and quinn's
+/// own packets; a stream already open at the end may have had most of its
+/// bytes acknowledged before it, so it is not counted. Once at least the
 /// bytes ahead are acknowledged that way, this stream's last byte has gone
 /// out with them, and its end is late
 /// whatever else is still in flight: nothing more is given (zero). So a busy
@@ -2559,8 +2614,8 @@ pub(crate) const LATE_END_MARGIN_MIN: u64 = 64 * 1024;
 
 /// Whether a stream's end, still unacknowledged at `now`, is late, given
 /// `ahead` ([`bytes_ahead`] plus the congestion window when the end was sent,
-/// [`LaterReading::window_at_end`]) and `acked` (bytes of data streams the
-/// peer wholly acknowledged since the end), with `crossed` the time `acked` first reached
+/// [`LaterReading::window_at_end`]) and `acked` (bytes of data streams
+/// opened after the end that the peer has wholly acknowledged), with `crossed` the time `acked` first reached
 /// `ahead` (set here). quinn shares the link round-robin, so
 /// by then the end's last packet had been sent; an honest peer's QUIC stack
 /// acknowledges it like every other packet, within [`late_end_grace`] even
@@ -2570,12 +2625,14 @@ pub(crate) fn late_end_verdict(
     ahead: u64,
     acked: u64,
     now: u64,
-    rtt: Duration,
+    rtt: impl FnOnce() -> Duration,
 ) -> bool {
     if crossed.is_none() && acked >= ahead {
         *crossed = Some(now);
     }
-    crossed.is_some_and(|at| now.saturating_sub(at) >= nanos(late_end_grace(rtt)))
+    // The round trip (a read of quinn's connection state) only once the
+    // proof point is passed.
+    crossed.is_some_and(|at| now.saturating_sub(at) >= nanos(late_end_grace(rtt())))
 }
 
 /// Judges whether a sent stream's end is late (#6205): the peer has wholly
@@ -2597,6 +2654,9 @@ struct LateEndCheck {
     dark_at: Arc<AtomicU64>,
     /// When the end was sent, on `now`.
     end_at: u64,
+    /// The end was counted late: shared by the send's wait and the
+    /// background wait that may take over from it, so one end counts once.
+    counted: Arc<AtomicBool>,
 }
 
 impl LateEndCheck {
@@ -2625,7 +2685,7 @@ impl LateEndCheck {
                 bytes_ahead(&reading).saturating_add(reading.window_at_end),
                 reading.acked_since_end,
                 now,
-                (self.rtt)(),
+                || (self.rtt)(),
             ) {
                 return;
             }
@@ -3054,6 +3114,7 @@ impl Outgoing {
                         cap: check.cap.clone(),
                         dark_at: check.dark_at.clone(),
                         end_at: mark.at,
+                        counted: Arc::default(),
                     });
                 self.progress.mark_finished_after(wait, Some(later));
             }
@@ -3074,8 +3135,8 @@ impl Outgoing {
         self.awaiting_ack = false;
         match stopped {
             Ok(None) => {
-                if let Some((opens, len)) = &self.acked_into {
-                    opens.acked(*len);
+                if let Some((opens, seq, len)) = &self.acked_into {
+                    opens.acked(*seq, *len);
                 }
                 Ok(())
             }
@@ -3114,8 +3175,15 @@ async fn late_end_watch(
     kind: crate::transport::metrics::AckWaitKind,
 ) {
     if let (Some(late), Some(sleeper), Some(writers), Some(node)) = (late, sleeper, writers, node) {
-        late.late(sleeper).await;
-        writers.late_end(node, kind);
+        let counted = late.counted.clone();
+        if !counted.load(Ordering::Acquire) {
+            late.late(sleeper).await;
+            // Once per end, though the send's wait may have been cancelled
+            // and a background wait taken over (`Outgoing`'s drop).
+            if !counted.swap(true, Ordering::AcqRel) {
+                writers.late_end(node, kind);
+            }
+        }
     }
     std::future::pending().await
 }
@@ -3230,19 +3298,7 @@ impl Drop for Outgoing {
         let (aborts, node) = (self.aborts.clone(), self.node);
         let strike = self.strike.clone().zip(self.finished_at).zip(due);
         let acked_into = self.acked_into.clone();
-        let late = late_end_watch(
-            self.late.clone(),
-            self.sleep.as_ref().map(|(sleep, _)| sleep.clone()),
-            live.as_ref().map(recycle::LiveStream::writers_arc),
-            self.node,
-            if slot.is_some() {
-                crate::transport::metrics::AckWaitKind::Stream
-            } else if self.control {
-                crate::transport::metrics::AckWaitKind::Control
-            } else {
-                crate::transport::metrics::AckWaitKind::Short
-            },
-        );
+        // One label for the expiry and the late end of the same send.
         let kind = if bound_for.is_some() && slot.is_some() {
             crate::transport::metrics::AckWaitKind::Stream
         } else if self.control {
@@ -3250,12 +3306,19 @@ impl Drop for Outgoing {
         } else {
             crate::transport::metrics::AckWaitKind::Short
         };
+        let late = late_end_watch(
+            self.late.clone(),
+            self.sleep.as_ref().map(|(sleep, _)| sleep.clone()),
+            live.as_ref().map(recycle::LiveStream::writers_arc),
+            self.node,
+            kind,
+        );
         // Bounded as above, and ending with the acknowledgement or the
         // connection, so the handle is not monitored.
         drop(GlobalExecutor::spawn(async move {
             let ended = |ended: StoppedResult| {
-                if let (Ok(None), Some((opens, len))) = (ended, &acked_into) {
-                    opens.acked(*len);
+                if let (Ok(None), Some((opens, seq, len))) = (ended, &acked_into) {
+                    opens.acked(*seq, *len);
                 }
                 false
             };
