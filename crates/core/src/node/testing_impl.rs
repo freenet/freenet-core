@@ -1503,6 +1503,29 @@ pub fn loopback_ports_for_locations(targets: &[f64]) -> Vec<u16> {
     out
 }
 
+/// NATs for a simulated network ([`SimNetwork::new_with_nat`]): the
+/// filtering class of each regular node, cycled, and how long a binding
+/// lasts after its last refresh.
+#[derive(Debug, Clone)]
+pub struct SimNat {
+    /// The filtering class of each regular node, in regular-node order,
+    /// cycled when there are fewer classes than nodes.
+    pub classes: Vec<crate::transport::nat_model::NatFiltering>,
+    /// How long a binding lasts after its last refresh.
+    pub lifetime: Duration,
+}
+
+impl SimNat {
+    /// Every regular node behind a NAT of `filtering`, with the default
+    /// binding lifetime.
+    pub fn all(filtering: crate::transport::nat_model::NatFiltering) -> Self {
+        Self {
+            classes: vec![filtering],
+            lifetime: crate::transport::nat_model::DEFAULT_BINDING_LIFETIME,
+        }
+    }
+}
+
 /// A simulated in-memory network topology.
 pub struct SimNetwork {
     name: String,
@@ -1711,6 +1734,10 @@ pub struct SimNetwork {
     /// `run_simulation_direct` sends each node a stranger's QUIC datagram,
     /// with the node and stranger addresses.
     quic_endpoint_probe: Option<(Duration, Vec<(SocketAddr, SocketAddr)>)>,
+    /// NATs in front of the regular nodes, set by [`Self::new_with_nat`].
+    /// With them, every node (gateways included) gets an address of its own
+    /// ([`Self::sim_ip`]) rather than `[::1]`.
+    nat: Option<SimNat>,
 }
 
 impl SimNetwork {
@@ -1750,6 +1777,7 @@ impl SimNetwork {
             max_connections,
             min_connections,
             seed,
+            None,
             None,
         )
         .await
@@ -1793,6 +1821,7 @@ impl SimNetwork {
             min_connections,
             seed,
             Some(ports),
+            None,
         )
         .await
     }
@@ -1808,6 +1837,7 @@ impl SimNetwork {
         min_connections: usize,
         seed: u64,
         node_port_override: Option<Vec<u16>>,
+        nat: Option<SimNat>,
     ) -> Self {
         assert!(nodes > 0);
 
@@ -1892,6 +1922,7 @@ impl SimNetwork {
             quic_datagram_drops: Vec::new(),
             quic_datagram_cuts: Vec::new(),
             quic_endpoint_probe: None,
+            nat,
         };
         net.config_gateways(
             gateways
@@ -1904,8 +1935,98 @@ impl SimNetwork {
         // Auto-configure fault injection with VirtualTime enabled
         // Users can call with_fault_injection() to customize
         net.init_default_fault_injection();
+        #[cfg(any(test, feature = "testing"))]
+        net.install_nat();
 
         net
+    }
+
+    /// Like [`new`](Self::new), with the regular nodes behind NATs
+    /// ([`SimNat`]): node `i` (in regular-node order) gets
+    /// `nat.classes[i % nat.classes.len()]`. Gateways are public. Every node,
+    /// gateways included, gets an address of its own in a ULA prefix, so
+    /// address-restricted filtering differs from full cone and a node's
+    /// per-destination budgets are per peer.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn new_with_nat(
+        name: &str,
+        gateways: usize,
+        nodes: usize,
+        ring_max_htl: usize,
+        rnd_if_htl_above: usize,
+        max_connections: usize,
+        min_connections: usize,
+        seed: u64,
+        nat: SimNat,
+    ) -> Self {
+        assert!(!nat.classes.is_empty(), "a NAT network needs a class");
+        Self::new_inner(
+            name,
+            gateways,
+            nodes,
+            ring_max_htl,
+            rnd_if_htl_above,
+            max_connections,
+            min_connections,
+            seed,
+            None,
+            Some(nat),
+        )
+        .await
+    }
+
+    /// The IP of node `node_no` (gateways first): `[::1]`, or with NATs a
+    /// ULA address of its own, `fd00:<network tag>:<node_no + 1>::1`. The
+    /// node number is in the third segment because `Location::from_address`
+    /// reads only the first three, so each node keeps a location of its own.
+    fn sim_ip(&self, node_no: usize) -> Ipv6Addr {
+        if self.nat.is_some() {
+            let tag = self
+                .name
+                .bytes()
+                .fold(0u16, |h, b| h.wrapping_mul(31).wrapping_add(u16::from(b)));
+            let index = u16::try_from(node_no + 1).expect("fewer than 65535 nodes");
+            return Ipv6Addr::new(0xfd00, tag, index, 0, 0, 0, 0, 1);
+        }
+        Ipv6Addr::LOCALHOST
+    }
+
+    /// Puts each regular node behind its NAT ([`Self::new_with_nat`]).
+    #[cfg(any(test, feature = "testing"))]
+    fn install_nat(&self) {
+        let Some(nat) = &self.nat else {
+            return;
+        };
+        let nats: Vec<_> = (0..self.number_of_nodes)
+            .map(|i| {
+                let node_no = self.number_of_gateways + i;
+                (
+                    std::net::IpAddr::V6(self.sim_ip(node_no)),
+                    nat.classes[i % nat.classes.len()],
+                )
+            })
+            .collect();
+        crate::transport::in_memory_socket::set_network_nat(
+            &self.name,
+            self.virtual_time.clone(),
+            nats,
+            nat.lifetime,
+        );
+    }
+
+    /// The NATs' drop counts by filtering class, readable after the run
+    /// (`None` without NATs).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn nat_filtered_handle(
+        &self,
+    ) -> Option<crate::transport::in_memory_socket::NatFilteredCounts> {
+        crate::transport::in_memory_socket::nat_filtered_handle(&self.name)
+    }
+
+    /// Inbound datagrams the NATs dropped, by filtering class.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn nat_filtered(&self) -> HashMap<crate::transport::nat_model::NatFiltering, u64> {
+        crate::transport::in_memory_socket::nat_filtered(&self.name)
     }
 
     /// Initializes the default fault injection with VirtualTime but no faults.
@@ -3530,7 +3651,8 @@ impl SimNetwork {
             // Use deterministic port for simulation instead of querying system
             let port = self.allocate_deterministic_port(node_no);
             let keypair = crate::transport::TransportKeypair::new();
-            let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
+            let ip = self.sim_ip(node_no);
+            let addr: SocketAddr = (ip, port).into();
             let peer_key_location = PeerKeyLocation::new(keypair.public().clone(), addr);
             // Use location computed from address for consistency with PeerKeyLocation::location()
             let location = Location::from_address(&addr);
@@ -3571,7 +3693,7 @@ impl SimNetwork {
                 std::sync::Arc::make_mut(&mut config.config).max_hosting_storage = budget;
             }
             config.key_pair = keypair;
-            config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
+            config.network_listener_ip = ip.into();
             config.network_listener_port = port;
             config.with_own_addr(addr);
             config
@@ -3694,12 +3816,13 @@ impl SimNetwork {
                 Some(ports) => ports[node_no - self.number_of_gateways],
                 None => self.allocate_deterministic_port(node_no),
             };
-            let addr: SocketAddr = (Ipv6Addr::LOCALHOST, port).into();
+            let ip = self.sim_ip(node_no);
+            let addr: SocketAddr = (ip, port).into();
             // Use location computed from address for consistency with PeerKeyLocation::location().
             // This ensures the stored location matches what other peers compute when looking at our address.
             let location = Location::from_address(&addr);
             config.network_listener_port = port;
-            config.network_listener_ip = Ipv6Addr::LOCALHOST.into();
+            config.network_listener_ip = ip.into();
             config.key_pair = crate::transport::TransportKeypair::new();
             config.with_own_addr(addr);
             config
@@ -7281,6 +7404,8 @@ impl Drop for SimNetwork {
         clear_zombie_sweep_observations(&self.name);
         remove_network_socket_registry(&self.name);
         clear_network_address_mappings(&self.name);
+        #[cfg(any(test, feature = "testing"))]
+        crate::transport::in_memory_socket::clear_network_nat(&self.name);
 
         // Remove only THIS network's callbacks. Clearing a process-global slot
         // here turned off crash enforcement for every other simulation still

@@ -57,6 +57,18 @@ pub(crate) const SERVER_WINDOW_ALLOWANCE: Duration = Duration::from_secs(4);
 pub(crate) const NATIVE_FALLBACK_AFTER: Duration =
     Duration::from_secs(NATIVE_WINDOW.as_secs() + SERVER_WINDOW_ALLOWANCE.as_secs());
 
+/// The window `local` runs in a native setup with `peer`: [`NATIVE_WINDOW`]
+/// as the client (the lower key), plus [`SERVER_WINDOW_ALLOWANCE`] as the
+/// server (the higher). `None` for equal keys, which have no role and no
+/// setup.
+pub(crate) fn window_of(local: &TransportPublicKey, peer: &TransportPublicKey) -> Option<Duration> {
+    use crate::transport::quic::upgrade::machine::Role;
+    Some(match Role::of(local, peer)? {
+        Role::Client => NATIVE_WINDOW,
+        Role::Server => NATIVE_WINDOW + SERVER_WINDOW_ALLOWANCE,
+    })
+}
+
 /// The most native setups a node runs at once, before the node's connection
 /// limit lowers it (`QuicPolicy::native_setups_max`). Each holds an allow-set
 /// slot for up to its window. Provisional.
@@ -290,6 +302,9 @@ async fn finish<T: TimeSource>(
         peer: hello,
     })
 }
+
+#[cfg(test)]
+mod matrix_tests;
 
 #[cfg(test)]
 mod tests {

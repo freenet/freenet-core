@@ -3347,6 +3347,10 @@ async fn fail_awaiting_connection(
     // (3) Deliberately NO state.peer_backoff.record_failure() here.
 }
 
+/// One requester of a UDP dial running beside a native dial
+/// ([`EventListenerState::udp_beside_native`]): its transaction and callback.
+type BesideUdpRequester = (Transaction, Box<dyn ConnectResultSender>);
+
 struct EventListenerState {
     expected_inbound: Arc<dyn InboundExpectations>,
     pending_from_executor: HashSet<Transaction>,
@@ -3357,6 +3361,28 @@ struct EventListenerState {
     awaiting_connection:
         crate::util::DecisionHashMap<SocketAddr, Vec<Box<dyn ConnectResultSender>>>,
     awaiting_connection_txs: HashMap<SocketAddr, Vec<Transaction>>,
+    /// Addresses whose pending dial (`awaiting_connection`) is a QUIC-native
+    /// one. Removed when that dial ends.
+    native_pending: HashSet<SocketAddr>,
+    /// The callbacks of a UDP dial running BESIDE a native dial to the same
+    /// address. A UDP dial asked for while a native dial is pending is not
+    /// merged into it (the native dial's failure is not its failure, and a
+    /// UDP fallback must not fail with another CONNECT's native dial), and it
+    /// is not held back until the native dial ends (its hole punch must
+    /// overlap the peer's). It starts at once and its outcome, which carries
+    /// its transport, answers only these callbacks. A later UDP dial to the
+    /// address joins it. An entry ends with its dial's outcome, as an
+    /// `awaiting_connection` entry does; its requesters may be answered
+    /// earlier (the native dial connected first), leaving it empty until the
+    /// outcome arrives. Requesters are this node's own CONNECT ops, never a
+    /// remote peer's, so the bound is the dial's.
+    udp_beside_native: HashMap<SocketAddr, Vec<BesideUdpRequester>>,
+    /// Addresses whose UDP dial beside a still-pending native dial connected
+    /// first. If the native dial then connects too, its connection is closed
+    /// (the first established is kept) and counted as
+    /// `connect_native_both_dials_connected_kept_udp`. Cleared when the native
+    /// dial ends.
+    beside_udp_connected: HashSet<SocketAddr>,
     pending_op_results: HashMap<Transaction, Sender<WaiterReply>>,
     /// Last time pending_op_results was scanned for closed senders.
     last_pending_op_cleanup: Instant,
@@ -3378,6 +3404,9 @@ impl EventListenerState {
             pending_op_results: HashMap::new(),
             last_pending_op_cleanup: Instant::now(),
             awaiting_connection_txs: HashMap::new(),
+            native_pending: HashSet::new(),
+            udp_beside_native: HashMap::new(),
+            beside_udp_connected: HashSet::new(),
             peer_backoff: PeerConnectionBackoff::new(),
             last_backoff_cleanup: Instant::now(),
         }
@@ -7799,22 +7828,27 @@ pub(crate) mod tests {
     #[test]
     fn connect_peer_full_handshake_channel_prunes_in_transit() {
         let src = production_src();
-        // Locate the Connect-command try_send and bound a window over its
-        // failure branch (the `fail_awaiting_connection` call is the tail).
-        let from = src
-            .find("try_send(HandshakeCommand::Connect {")
-            .expect("connect_peer must enqueue HandshakeCommand::Connect via try_send");
-        let end = (from + 1200).min(src.len());
-        let branch = &src[from..end];
+        // Two sites enqueue a Connect: the ordinary dial and the UDP dial
+        // beside a pending native one. Bound a window over each failure branch.
+        let sites: Vec<&str> = src
+            .match_indices("try_send(HandshakeCommand::Connect {")
+            .map(|(from, _)| &src[from..(from + 1200).min(src.len())])
+            .collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "connect_peer enqueues HandshakeCommand::Connect via try_send at two sites"
+        );
+        let (ordinary, beside): (Vec<&str>, Vec<&str>) = sites
+            .into_iter()
+            .partition(|branch| branch.contains("fail_awaiting_connection("));
+        let [branch] = ordinary[..] else {
+            panic!("exactly one site fails awaiting callbacks via fail_awaiting_connection()");
+        };
         assert!(
             branch.contains("prune_in_transit_connection(peer_addr)"),
             "#4145 SITE 6: the connect-command-drop branch must prune the in-transit \
              connection slot so the dropped attempt does not leak a reservation."
-        );
-        assert!(
-            branch.contains("fail_awaiting_connection("),
-            "#4145 SITE 6: the connect-command-drop branch must fail awaiting callbacks \
-             via fail_awaiting_connection()."
         );
         // Must NOT record backoff on this local-contention path.
         assert!(
@@ -7822,6 +7856,17 @@ pub(crate) mod tests {
             "#4145 SITE 6: the connect-command-drop branch must NOT record peer backoff \
              (local channel contention is not a remote connection failure)."
         );
+        // The UDP dial beside a native one fails only its own callbacks: the
+        // native dial still holds the in-transit slot, so nothing is pruned.
+        let [branch] = beside[..] else {
+            panic!("exactly one site is the UDP dial beside a native one");
+        };
+        let failure = &branch[..branch
+            .find("return Ok(());")
+            .expect("the beside site returns after its send")];
+        assert!(failure.contains("fail_udp_beside_native("));
+        assert!(!failure.contains("prune_in_transit_connection"));
+        assert!(!failure.contains("record_failure"));
     }
 
     /// Source-scrape regression guard for #5154: the periodic 30s

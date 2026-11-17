@@ -570,6 +570,14 @@ labelled_counters! {
     }
 }
 
+/// The side a node had in a CONNECT: the joiner dials the acceptors its
+/// request was routed to; the acceptor dials back the joiner it accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeConnectSide {
+    Joiner,
+    Acceptor,
+}
+
 labelled_counters! {
     /// How a QUIC-native connection setup ended, counted where the setup
     /// decides it (`QuicUpgrades::setup_native`), one per setup. Exported per
@@ -976,6 +984,14 @@ pub struct TransportMetrics {
     /// failures with distinct peers (`connect::native::NativeDemotion`)
     /// (reset each snapshot).
     connect_native_demotions: AtomicU64,
+    /// A UDP dial that followed a failed native setup connected, by the side
+    /// this node had in the CONNECT (reset each snapshot).
+    connect_native_rescued_by_udp_joiner: AtomicU64,
+    connect_native_rescued_by_udp_acceptor: AtomicU64,
+    /// A native dial and the UDP dial beside it both connected; the one
+    /// established first was kept and the other closed (reset each snapshot).
+    connect_native_both_dials_connected_kept_udp: AtomicU64,
+    connect_native_both_dials_connected_kept_native: AtomicU64,
     /// The last offer this node built: level, percent and whether it was
     /// ready to dial native (a state, never reset).
     connect_native_offer_level: AtomicU8,
@@ -1357,6 +1373,16 @@ thread_local! {
     /// reason.
     pub(crate) static NATIVE_OFFERS_ON_THIS_THREAD: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+
+    /// Test-only: native setups rescued by UDP on this thread, as joiner and
+    /// as acceptor, for the same reason.
+    pub(crate) static NATIVE_RESCUES_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
+
+    /// Test-only: both dials connected on this thread, [kept UDP, kept
+    /// native], for the same reason.
+    pub(crate) static BOTH_DIALS_CONNECTED_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
+        const { std::cell::Cell::new([0; 2]) };
 }
 
 #[cfg(test)]
@@ -1460,6 +1486,10 @@ impl TransportMetrics {
             connect_native_decision_native_unsupported: AtomicU64::new(0),
             connect_native_decision_over_cap: AtomicU64::new(0),
             connect_native_demotions: AtomicU64::new(0),
+            connect_native_rescued_by_udp_joiner: AtomicU64::new(0),
+            connect_native_rescued_by_udp_acceptor: AtomicU64::new(0),
+            connect_native_both_dials_connected_kept_udp: AtomicU64::new(0),
+            connect_native_both_dials_connected_kept_native: AtomicU64::new(0),
             connect_native_offer_level: AtomicU8::new(0),
             connect_native_offer_percent: AtomicU8::new(0),
             connect_native_offer_ready: AtomicBool::new(false),
@@ -2000,6 +2030,39 @@ impl TransportMetrics {
             .store(ready, Ordering::Relaxed);
         #[cfg(test)]
         NATIVE_OFFERS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    }
+
+    /// A UDP dial that followed a failed native setup connected: a
+    /// connection that a node without UDP would not have made (R5).
+    pub(crate) fn record_connect_native_rescued_by_udp(&self, side: NativeConnectSide) {
+        match side {
+            NativeConnectSide::Joiner => &self.connect_native_rescued_by_udp_joiner,
+            NativeConnectSide::Acceptor => &self.connect_native_rescued_by_udp_acceptor,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_RESCUES_ON_THIS_THREAD.with(|count| {
+            let mut counts = count.get();
+            counts[side as usize] += 1;
+            count.set(counts);
+        });
+    }
+
+    /// A native dial and the UDP dial beside it both connected, and the one
+    /// established first was kept: UDP (`kept_native` false) or native.
+    pub(crate) fn record_connect_native_both_dials_connected(&self, kept_native: bool) {
+        if kept_native {
+            &self.connect_native_both_dials_connected_kept_native
+        } else {
+            &self.connect_native_both_dials_connected_kept_udp
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        BOTH_DIALS_CONNECTED_ON_THIS_THREAD.with(|count| {
+            let mut counts = count.get();
+            counts[usize::from(kept_native)] += 1;
+            count.set(counts);
+        });
     }
 
     /// This node turned its own QUIC-native connects off.
@@ -2893,6 +2956,16 @@ impl TransportMetrics {
             ),
             connect_native_decision_over_cap: get64(&self.connect_native_decision_over_cap),
             connect_native_demotions: get64(&self.connect_native_demotions),
+            connect_native_rescued_by_udp_joiner: get64(&self.connect_native_rescued_by_udp_joiner),
+            connect_native_rescued_by_udp_acceptor: get64(
+                &self.connect_native_rescued_by_udp_acceptor,
+            ),
+            connect_native_both_dials_connected_kept_udp: get64(
+                &self.connect_native_both_dials_connected_kept_udp,
+            ),
+            connect_native_both_dials_connected_kept_native: get64(
+                &self.connect_native_both_dials_connected_kept_native,
+            ),
             connect_native_offer_level: self.connect_native_offer_level.load(Ordering::Relaxed),
             connect_native_offer_percent: self.connect_native_offer_percent.load(Ordering::Relaxed),
             connect_native_offer_ready: self.connect_native_offer_ready.load(Ordering::Relaxed),
@@ -3587,6 +3660,14 @@ pub struct TransportSnapshot {
     pub connect_native_decision_over_cap: u64,
     /// Times the node turned its own native connects off after failures.
     pub connect_native_demotions: u64,
+    /// UDP dials after a failed native setup that connected, as joiner and
+    /// as acceptor (R5).
+    pub connect_native_rescued_by_udp_joiner: u64,
+    pub connect_native_rescued_by_udp_acceptor: u64,
+    /// A native dial and the UDP dial beside it both connected; the first
+    /// established was kept (UDP or native).
+    pub connect_native_both_dials_connected_kept_udp: u64,
+    pub connect_native_both_dials_connected_kept_native: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -4011,6 +4092,10 @@ impl TransportSnapshot {
             connect_native_decision_native_unsupported,
             connect_native_decision_over_cap,
             connect_native_demotions,
+            connect_native_rescued_by_udp_joiner,
+            connect_native_rescued_by_udp_acceptor,
+            connect_native_both_dials_connected_kept_udp,
+            connect_native_both_dials_connected_kept_native,
             connect_native_offer_level,
             connect_native_offer_percent,
             connect_native_offer_ready,
@@ -4178,6 +4263,12 @@ impl TransportSnapshot {
             connect_native_decision_native_unsupported;
         self.connect_native_decision_over_cap = connect_native_decision_over_cap;
         self.connect_native_demotions = connect_native_demotions;
+        self.connect_native_rescued_by_udp_joiner = connect_native_rescued_by_udp_joiner;
+        self.connect_native_rescued_by_udp_acceptor = connect_native_rescued_by_udp_acceptor;
+        self.connect_native_both_dials_connected_kept_udp =
+            connect_native_both_dials_connected_kept_udp;
+        self.connect_native_both_dials_connected_kept_native =
+            connect_native_both_dials_connected_kept_native;
         self.connect_native_offer_level = connect_native_offer_level;
         self.connect_native_offer_percent = connect_native_offer_percent;
         self.connect_native_offer_ready = connect_native_offer_ready;
@@ -4410,6 +4501,14 @@ struct SnapshotExtras {
     pub connect_native_decision_over_cap: u64,
     /// Times the node turned its own native connects off after failures.
     pub connect_native_demotions: u64,
+    /// UDP dials after a failed native setup that connected, as joiner and
+    /// as acceptor (R5).
+    pub connect_native_rescued_by_udp_joiner: u64,
+    pub connect_native_rescued_by_udp_acceptor: u64,
+    /// A native dial and the UDP dial beside it both connected; the first
+    /// established was kept (UDP or native).
+    pub connect_native_both_dials_connected_kept_udp: u64,
+    pub connect_native_both_dials_connected_kept_native: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -4652,6 +4751,10 @@ impl SnapshotExtras {
             || self.connect_native_decision_native_unsupported != 0
             || self.connect_native_decision_over_cap != 0
             || self.connect_native_demotions != 0
+            || self.connect_native_rescued_by_udp_joiner != 0
+            || self.connect_native_rescued_by_udp_acceptor != 0
+            || self.connect_native_both_dials_connected_kept_udp != 0
+            || self.connect_native_both_dials_connected_kept_native != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -7212,6 +7315,10 @@ mod tests {
             "connect_native_decision_native_unsupported",
             "connect_native_decision_over_cap",
             "connect_native_demotions",
+            "connect_native_rescued_by_udp_joiner",
+            "connect_native_rescued_by_udp_acceptor",
+            "connect_native_both_dials_connected_kept_udp",
+            "connect_native_both_dials_connected_kept_native",
             "connect_native_offer_level",
             "connect_native_offer_percent",
             "connect_native_offer_ready",

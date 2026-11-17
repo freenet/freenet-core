@@ -578,12 +578,13 @@ async fn connect_outbound(
                 Err(_) => Err(ConnectionError::Timeout),
             }
         }
-        crate::operations::connect::native::DialTransport::Native { within } => {
+        crate::operations::connect::native::DialTransport::Native { deadline } => {
             let dial = crate::transport::NativeDial {
                 addr,
                 key: peer.pub_key.clone(),
                 is_gateway: matches!(origin, crate::transport::NatAttemptOrigin::Gateway),
-                within,
+                // What is left of the dial's deadline now, as the setup starts.
+                within: deadline.saturating_duration_since(tokio::time::Instant::now()),
             };
             // Not a transport failure for the address: the connect op falls
             // back to a UDP dial at its fallback time, which decides that.
@@ -722,6 +723,7 @@ mod tests {
             enqueue: Duration::ZERO,
             handshake: Handshake::Succeeds,
             origins: Default::default(),
+            native_dials: Default::default(),
         });
         let driver = GlobalExecutor::spawn(run_driver(
             Box::new(ChannelAcceptor(conn_rx)),
@@ -768,6 +770,7 @@ mod tests {
                 enqueue: Duration::ZERO,
                 handshake: Handshake::Hangs,
                 origins: Default::default(),
+                native_dials: Default::default(),
             }),
             cmd_rx,
             event_tx,
@@ -862,6 +865,8 @@ mod tests {
         handshake: Handshake,
         /// The origin each `connect` was called with.
         origins: parking_lot::Mutex<Vec<crate::transport::NatAttemptOrigin>>,
+        /// Each native dial `connect_native` was called with.
+        native_dials: parking_lot::Mutex<Vec<crate::transport::NativeDial>>,
     }
 
     impl OutboundConnector for ScriptedConnector {
@@ -896,9 +901,9 @@ mod tests {
 
         fn connect_native(
             &self,
-            _dial: crate::transport::NativeDial,
+            dial: crate::transport::NativeDial,
         ) -> crate::transport::NativeConnectFuture<'_> {
-            // The handshake tests dial UDP only.
+            self.native_dials.lock().push(dial);
             Box::pin(async { Err(crate::transport::NativeSetupOutcome::Unavailable) })
         }
     }
@@ -924,6 +929,7 @@ mod tests {
             enqueue,
             handshake,
             origins: Default::default(),
+            native_dials: Default::default(),
         };
         let ready = std::sync::atomic::AtomicBool::new(false);
         let peer = make_peer(4200);
@@ -949,6 +955,40 @@ mod tests {
             elapsed: start.elapsed(),
             origins: connector.origins.into_inner(),
         }
+    }
+
+    /// A native dial hands the setup what is left of its deadline when the
+    /// setup starts (10.2 items 11 and 12): the time the dial took to get
+    /// here comes out of the window.
+    #[tokio::test(start_paused = true)]
+    async fn a_native_dial_hands_the_setup_what_is_left_of_its_deadline() {
+        let connector = ScriptedConnector {
+            enqueue: Duration::ZERO,
+            handshake: Handshake::Succeeds,
+            origins: Default::default(),
+            native_dials: Default::default(),
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(7);
+        // The dial waited 2 s on its way to the transport.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let peer = make_peer(4201);
+        let event = connect_outbound(
+            &connector,
+            super::OutboundDial {
+                peer: peer.clone(),
+                transaction: Transaction::new::<ConnectMsg>(),
+                transient: false,
+                origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
+                transport: crate::operations::connect::native::DialTransport::Native { deadline },
+            },
+            None,
+        )
+        .await;
+        assert!(matches!(event, Event::OutboundFailed { .. }));
+        let dials = connector.native_dials.lock();
+        assert_eq!(dials.len(), 1, "one native dial");
+        assert_eq!(dials[0].within, Duration::from_secs(5));
+        assert_eq!(Some(dials[0].addr), peer.socket_addr());
     }
 
     /// A completed handshake becomes `OutboundEstablished` carrying the peer,
@@ -1103,6 +1143,7 @@ mod tests {
                 enqueue: Duration::ZERO,
                 handshake: Handshake::Hangs,
                 origins: Default::default(),
+                native_dials: Default::default(),
             }),
             cmd_rx,
             event_tx,

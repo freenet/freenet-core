@@ -193,6 +193,8 @@ pub(crate) mod demux;
 pub(crate) mod egress_cap;
 pub mod in_memory_socket;
 pub(crate) mod join_versions;
+/// A NAT for the in-memory network (filtering only), used by NAT simulations.
+pub mod nat_model;
 pub(crate) mod quic;
 #[cfg(test)]
 pub(crate) mod test_net;
@@ -352,9 +354,10 @@ impl From<SocketAddr> for ObservedAddr {
 #[cfg(test)]
 pub(crate) use self::boundary::NativeConnectFuture;
 pub(crate) use self::boundary::TransportHandle;
-pub(crate) use self::metrics::NativeSetupOutcome;
+pub(crate) use self::metrics::{NativeConnectSide, NativeSetupOutcome};
 pub(crate) use self::quic::native::setup::{
     MIN_WINDOW_LEFT as NATIVE_MIN_WINDOW_LEFT, NATIVE_FALLBACK_AFTER,
+    window_of as native_setup_window,
 };
 pub(crate) use self::quic::upgrade::driver::NativeDial;
 pub(crate) use self::quic::{QuicAvailability, QuicAvailabilityWatch};

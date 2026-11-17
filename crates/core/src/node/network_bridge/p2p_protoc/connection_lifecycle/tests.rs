@@ -3624,7 +3624,7 @@ async fn a_native_connection_binds_its_proven_key() {
     let mut result = pending_connect_peer_over(
         &mut h,
         PeerKeyLocation::new(peer.clone(), addr),
-        DialTransport::NATIVE,
+        DialTransport::native_now(),
     )
     .await;
     h.handshake_event(HandshakeEvent::OutboundEstablished {
@@ -3632,7 +3632,7 @@ async fn a_native_connection_binds_its_proven_key() {
         peer: PeerKeyLocation::new(peer.clone(), addr),
         connection: Box::new(IdleConnection::new(addr)),
         transient: false,
-        transport: DialTransport::NATIVE,
+        transport: DialTransport::native_now(),
         origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
     })
     .await;
@@ -3684,14 +3684,14 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
                 .unwrap();
             let peer = PeerKeyLocation::new(key(), addr);
             let mut result =
-                pending_connect_peer_over(&mut h, peer.clone(), DialTransport::NATIVE).await;
+                pending_connect_peer_over(&mut h, peer.clone(), DialTransport::native_now()).await;
             h.handshake_event(HandshakeEvent::OutboundFailed {
                 transaction: Transaction::new::<ConnectMsg>(),
                 peer,
                 // A transport-level error, which marks a UDP dial's address.
                 error: ConnectionError::Timeout,
                 transient: false,
-                transport: DialTransport::NATIVE,
+                transport: DialTransport::native_now(),
                 native_outcome: Some(outcome),
                 origin,
             })
@@ -3744,7 +3744,7 @@ async fn only_a_joiners_native_success_resets_its_demotion_streak() {
             peer: PeerKeyLocation::new(key(), addr(i)),
             error: ConnectionError::FailedConnectOp,
             transient: false,
-            transport: DialTransport::NATIVE,
+            transport: DialTransport::native_now(),
             native_outcome: Some(NativeSetupOutcome::TimedOut),
             origin: NatAttemptOrigin::ConnectJoiner,
         };
@@ -3752,13 +3752,13 @@ async fn only_a_joiners_native_success_resets_its_demotion_streak() {
         h.handshake_event(fail(1)).await;
         let winner = PeerKeyLocation::new(key(), addr(2));
         let _result =
-            pending_connect_peer_over(&mut h, winner.clone(), DialTransport::NATIVE).await;
+            pending_connect_peer_over(&mut h, winner.clone(), DialTransport::native_now()).await;
         h.handshake_event(HandshakeEvent::OutboundEstablished {
             transaction: Transaction::new::<ConnectMsg>(),
             peer: winner,
             connection: Box::new(IdleConnection::new(addr(2))),
             transient: false,
-            transport: DialTransport::NATIVE,
+            transport: DialTransport::native_now(),
             origin: success_origin,
         })
         .await;
@@ -3775,6 +3775,473 @@ async fn only_a_joiners_native_success_resets_its_demotion_streak() {
             "a native success as {success_origin:?}"
         );
     }
+}
+
+/// With native connects off (production today) only UDP dials exist, and
+/// they merge by address exactly as before the beside-dial change: one
+/// handshake command, every requester answered by its outcome, nothing
+/// beside. Both outcomes.
+#[tokio::test]
+async fn udp_only_dials_still_merge_by_address() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::NatAttemptOrigin;
+    for (case, connects) in [(0u16, true), (1, false)] {
+        let mut h = Harness::new(&format!("udp-only-merge-{case}")).await;
+        let addr: SocketAddr = format!("203.0.113.235:{}", 6270 + case).parse().unwrap();
+        let peer = PeerKeyLocation::new(key(), addr);
+        let mut first = pending_connect_peer_over(&mut h, peer.clone(), DialTransport::Udp).await;
+        let mut second = pending_connect_peer_over(&mut h, peer.clone(), DialTransport::Udp).await;
+        let mut dialled = 0;
+        while let Ok(command) = h.handshake_rx.try_recv() {
+            if matches!(command, HandshakeCommand::Connect { .. }) {
+                dialled += 1;
+            }
+        }
+        assert_eq!(dialled, 1, "the second request joins the first dial");
+        assert!(h.state.udp_beside_native.is_empty());
+        assert!(h.state.native_pending.is_empty());
+        let event = if connects {
+            HandshakeEvent::OutboundEstablished {
+                transaction: Transaction::new::<ConnectMsg>(),
+                peer: peer.clone(),
+                connection: Box::new(IdleConnection::new(addr)),
+                transient: false,
+                transport: DialTransport::Udp,
+                origin: NatAttemptOrigin::ConnectJoiner,
+            }
+        } else {
+            HandshakeEvent::OutboundFailed {
+                transaction: Transaction::new::<ConnectMsg>(),
+                peer: peer.clone(),
+                error: ConnectionError::Timeout,
+                transient: false,
+                transport: DialTransport::Udp,
+                native_outcome: None,
+                origin: NatAttemptOrigin::ConnectJoiner,
+            }
+        };
+        h.handshake_event(event).await;
+        let expected = if connects { Ok((addr, None)) } else { Err(()) };
+        assert_eq!(first.try_recv(), Ok(expected));
+        assert_eq!(second.try_recv(), Ok(expected));
+    }
+}
+
+/// A UDP dial asked for while a native dial to the same address is pending
+/// (another CONNECT's) starts at once BESIDE it, and a later UDP dial joins
+/// it. The native dial's failure answers only its own callbacks; the UDP
+/// dial's success answers everyone, since all of them asked for a connection
+/// to this peer. Merged into the native dial, a UDP fallback failed with it;
+/// held back until it ended, it punched late (found by
+/// test_quic_native_blocked_pairs_connect_over_udp_behind_nats).
+#[tokio::test]
+async fn a_udp_dial_runs_beside_a_pending_native_dial() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::{NatAttemptOrigin, NativeSetupOutcome};
+    for (case, native_fails_first) in [(0u16, true), (1, false)] {
+        let mut h = Harness::new(&format!("udp-beside-native-{case}")).await;
+        let addr: SocketAddr = format!("203.0.113.234:{}", 6250 + case).parse().unwrap();
+        let peer = PeerKeyLocation::new(key(), addr);
+        let mut native =
+            pending_connect_peer_over(&mut h, peer.clone(), DialTransport::native_now()).await;
+        let mut udp = pending_connect_peer_over(&mut h, peer.clone(), DialTransport::Udp).await;
+        let mut joined = pending_connect_peer_over(&mut h, peer.clone(), DialTransport::Udp).await;
+        let mut dialled = Vec::new();
+        while let Ok(command) = h.handshake_rx.try_recv() {
+            if let HandshakeCommand::Connect { transport, .. } = command {
+                dialled.push(transport.is_native());
+            }
+        }
+        assert_eq!(
+            dialled,
+            vec![true, false],
+            "a native dial, then one UDP dial beside it; the third request joins the UDP dial"
+        );
+        for pending in [&mut native, &mut udp, &mut joined] {
+            assert!(pending.try_recv().is_err(), "premise: all pending");
+        }
+        let established = || HandshakeEvent::OutboundEstablished {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: peer.clone(),
+            connection: Box::new(IdleConnection::new(addr)),
+            transient: false,
+            transport: DialTransport::Udp,
+            origin: NatAttemptOrigin::ConnectJoiner,
+        };
+        let native_failed = HandshakeEvent::OutboundFailed {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: peer.clone(),
+            error: ConnectionError::FailedConnectOp,
+            transient: false,
+            transport: DialTransport::native_now(),
+            native_outcome: Some(NativeSetupOutcome::TimedOut),
+            origin: NatAttemptOrigin::ConnectJoiner,
+        };
+        if native_fails_first {
+            h.handshake_event(native_failed).await;
+            assert_eq!(native.try_recv(), Ok(Err(())), "the native dial failed");
+            assert!(udp.try_recv().is_err(), "the UDP dial is still running");
+            assert!(joined.try_recv().is_err(), "so is its joined request");
+            let event = established();
+            h.handshake_event(event).await;
+            assert_eq!(udp.try_recv(), Ok(Ok((addr, None))));
+            assert_eq!(joined.try_recv(), Ok(Ok((addr, None))));
+        } else {
+            let event = established();
+            h.handshake_event(event).await;
+            for pending in [&mut native, &mut udp, &mut joined] {
+                assert_eq!(pending.try_recv(), Ok(Ok((addr, None))));
+            }
+            // The native dial's late failure leaves the connection.
+            h.handshake_event(native_failed).await;
+            assert!(h.mgr.connections.contains_key(&addr), "still connected");
+        }
+    }
+}
+
+/// The UDP dial beside a native one fails: only its callbacks are failed,
+/// the native dial keeps running and its outcome still answers its own.
+#[tokio::test]
+async fn a_failed_udp_dial_beside_a_native_dial_leaves_the_native_dial() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::NatAttemptOrigin;
+    let mut h = Harness::new("udp-beside-native-fails").await;
+    let addr: SocketAddr = "203.0.113.234:6260".parse().unwrap();
+    let peer = PeerKeyLocation::new(key(), addr);
+    let mut native =
+        pending_connect_peer_over(&mut h, peer.clone(), DialTransport::native_now()).await;
+    let mut udp = pending_connect_peer_over(&mut h, peer.clone(), DialTransport::Udp).await;
+    h.handshake_event(HandshakeEvent::OutboundFailed {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: peer.clone(),
+        error: ConnectionError::Timeout,
+        transient: false,
+        transport: DialTransport::Udp,
+        native_outcome: None,
+        origin: NatAttemptOrigin::ConnectJoiner,
+    })
+    .await;
+    assert_eq!(udp.try_recv(), Ok(Err(())), "the UDP dial failed");
+    assert!(
+        native.try_recv().is_err(),
+        "the native dial is still pending"
+    );
+    h.handshake_event(HandshakeEvent::OutboundEstablished {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: peer.clone(),
+        connection: Box::new(IdleConnection::new(addr)),
+        transient: false,
+        transport: DialTransport::native_now(),
+        origin: NatAttemptOrigin::ConnectJoiner,
+    })
+    .await;
+    assert_eq!(
+        native.try_recv(),
+        Ok(Ok((addr, None))),
+        "the native dial connected"
+    );
+}
+
+/// Builders for the beside-dial tests: a native dial pending to `addr` and a
+/// UDP dial beside it, and the four outcomes.
+mod beside {
+    use super::*;
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::{NatAttemptOrigin, NativeSetupOutcome};
+
+    pub(super) type Pending = mpsc::Receiver<Result<(SocketAddr, Option<usize>), ()>>;
+
+    /// A native dial to `addr`, then a UDP dial beside it.
+    pub(super) async fn dials(
+        h: &mut Harness,
+        addr: SocketAddr,
+    ) -> (PeerKeyLocation, Pending, Pending) {
+        let peer = PeerKeyLocation::new(key(), addr);
+        let native = pending_connect_peer_over(h, peer.clone(), DialTransport::native_now()).await;
+        let udp = pending_connect_peer_over(h, peer.clone(), DialTransport::Udp).await;
+        assert!(
+            h.state.udp_beside_native.contains_key(&addr),
+            "premise: the UDP dial is beside"
+        );
+        (peer, native, udp)
+    }
+
+    pub(super) fn established(peer: &PeerKeyLocation, native: bool) -> HandshakeEvent {
+        let addr = peer.socket_addr().unwrap();
+        HandshakeEvent::OutboundEstablished {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: peer.clone(),
+            connection: Box::new(IdleConnection::new(addr)),
+            transient: false,
+            transport: if native {
+                DialTransport::native_now()
+            } else {
+                DialTransport::Udp
+            },
+            origin: NatAttemptOrigin::ConnectJoiner,
+        }
+    }
+
+    pub(super) fn failed(peer: &PeerKeyLocation, native: bool) -> HandshakeEvent {
+        HandshakeEvent::OutboundFailed {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: peer.clone(),
+            error: if native {
+                ConnectionError::FailedConnectOp
+            } else {
+                ConnectionError::Timeout
+            },
+            transient: false,
+            transport: if native {
+                DialTransport::native_now()
+            } else {
+                DialTransport::Udp
+            },
+            native_outcome: native.then_some(NativeSetupOutcome::TimedOut),
+            origin: NatAttemptOrigin::ConnectJoiner,
+        }
+    }
+
+    /// The bookkeeping holds nothing for `addr` once both dials ended.
+    pub(super) fn assert_clear(h: &Harness, addr: SocketAddr) {
+        assert!(
+            !h.state.native_pending.contains(&addr),
+            "native_pending cleared"
+        );
+        assert!(
+            !h.state.udp_beside_native.contains_key(&addr),
+            "beside entry cleared"
+        );
+        assert!(
+            !h.state.beside_udp_connected.contains(&addr),
+            "beside_udp_connected cleared"
+        );
+    }
+}
+
+/// #6253 review item 1: the native dial connects, then the UDP dial beside it
+/// fails. Its requesters are answered with the native connection (they asked
+/// for a connection to this peer and have one), and the failure prunes
+/// nothing, backs off nothing and leaves the peer in the ring.
+#[tokio::test]
+async fn native_success_then_a_failed_udp_dial_beside_it_keeps_the_connection() {
+    let mut h = Harness::new("beside-native-ok-udp-fails").await;
+    let addr: SocketAddr = "203.0.113.236:6280".parse().unwrap();
+    let (peer, mut native, mut udp) = beside::dials(&mut h, addr).await;
+    h.handshake_event(beside::established(&peer, true)).await;
+    assert_eq!(native.try_recv(), Ok(Ok((addr, None))));
+    assert_eq!(
+        udp.try_recv(),
+        Ok(Ok((addr, None))),
+        "answered with the native connection"
+    );
+    let id = h.mgr.connections[&addr].connection_id;
+    h.handshake_event(beside::failed(&peer, false)).await;
+    assert_eq!(
+        h.mgr.connections[&addr].connection_id, id,
+        "the native connection stays"
+    );
+    assert_eq!(
+        h.ring_key_at(addr).as_ref(),
+        Some(peer.pub_key()),
+        "still in the ring"
+    );
+    assert!(!h.state.peer_backoff.is_in_backoff(addr), "no backoff");
+    assert!(
+        !failed_addrs(&h).contains(&addr),
+        "the address is not marked failed"
+    );
+    beside::assert_clear(&h, addr);
+}
+
+/// #6253 review item 2: both dials connect, the native one first. The first
+/// connection (native) is kept and the UDP one is dropped without touching
+/// the ring, and counted.
+#[tokio::test]
+async fn native_then_udp_both_connect_keeps_the_native_connection() {
+    let mut h = Harness::new("beside-native-then-udp").await;
+    let addr: SocketAddr = "203.0.113.236:6281".parse().unwrap();
+    let before = both_connected_here();
+    let (peer, mut native, mut udp) = beside::dials(&mut h, addr).await;
+    h.handshake_event(beside::established(&peer, true)).await;
+    let id = h.mgr.connections[&addr].connection_id;
+    h.handshake_event(beside::established(&peer, false)).await;
+    assert_eq!(both_connected_here(), (before.0, before.1 + 1));
+    assert_eq!(native.try_recv(), Ok(Ok((addr, None))));
+    assert_eq!(udp.try_recv(), Ok(Ok((addr, None))));
+    assert_eq!(
+        h.mgr.connections[&addr].connection_id, id,
+        "the native connection stays"
+    );
+    assert_eq!(h.ring_key_at(addr).as_ref(), Some(peer.pub_key()));
+    assert_eq!(h_count(&h), 1);
+    beside::assert_clear(&h, addr);
+}
+
+/// Both dials connected on this thread: (kept UDP, kept native).
+fn both_connected_here() -> (u64, u64) {
+    let [udp, native] =
+        crate::transport::metrics::BOTH_DIALS_CONNECTED_ON_THIS_THREAD.with(|c| c.get());
+    (udp, native)
+}
+
+/// #6253 review round 2: both dials connect, the UDP one first. The first
+/// connection is kept: the native one is closed without touching the ring
+/// (no prune, so no second DropConnection) and counted, and the native
+/// dial's requesters were answered by the UDP connection.
+#[tokio::test]
+async fn udp_then_native_both_connect_keeps_the_udp_connection() {
+    let mut h = Harness::new("beside-udp-then-native").await;
+    let addr: SocketAddr = "203.0.113.236:6282".parse().unwrap();
+    let before = both_connected_here();
+    let (peer, mut native, mut udp) = beside::dials(&mut h, addr).await;
+    h.handshake_event(beside::established(&peer, false)).await;
+    assert_eq!(native.try_recv(), Ok(Ok((addr, None))));
+    assert_eq!(udp.try_recv(), Ok(Ok((addr, None))));
+    let udp_id = h.mgr.connections[&addr].connection_id;
+    while h.handshake_rx.try_recv().is_ok() {}
+    h.handshake_event(beside::established(&peer, true)).await;
+    assert_eq!(
+        h.mgr.connections[&addr].connection_id, udp_id,
+        "the UDP connection, established first, stays"
+    );
+    let mut drops = 0;
+    while let Ok(command) = h.handshake_rx.try_recv() {
+        if matches!(command, HandshakeCommand::DropConnection { addr: a } if a == addr) {
+            drops += 1;
+        }
+    }
+    // The arm drops the address's expectation once, as for any outbound
+    // connection; a replacement would prune and send a second.
+    assert_eq!(drops, 1, "nothing was pruned or replaced");
+    assert_eq!(h.ring_key_at(addr).as_ref(), Some(peer.pub_key()));
+    assert_eq!(h_count(&h), 1);
+    assert_eq!(both_connected_here(), (before.0 + 1, before.1));
+    beside::assert_clear(&h, addr);
+}
+
+/// #6253 review round 2 (M3): the native dial connects but its connection is
+/// not kept (the transient budget is spent), so the requesters of the UDP
+/// dial beside it are not told they are connected; they wait for their own
+/// dial.
+#[tokio::test]
+async fn beside_requesters_are_answered_only_with_a_kept_connection() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::NatAttemptOrigin;
+    let mut h = Harness::with_config("beside-native-not-kept", |config| {
+        config.transient_budget = 0;
+    })
+    .await;
+    let addr: SocketAddr = "203.0.113.236:6287".parse().unwrap();
+    let (peer, _native, mut udp) = beside::dials(&mut h, addr).await;
+    h.handshake_event(HandshakeEvent::OutboundEstablished {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: peer.clone(),
+        connection: Box::new(IdleConnection::new(addr)),
+        transient: true,
+        transport: DialTransport::native_now(),
+        origin: NatAttemptOrigin::ConnectJoiner,
+    })
+    .await;
+    assert!(!h.mgr.connections.contains_key(&addr), "premise: not kept");
+    assert!(
+        udp.try_recv().is_err(),
+        "not answered: no connection exists"
+    );
+    assert!(
+        h.state.udp_beside_native.contains_key(&addr),
+        "its dial still runs"
+    );
+}
+
+/// #6253 review item 3: the UDP dial beside a pending native one fails. No
+/// backoff is recorded, so the native dial's own UDP fallback, which comes
+/// after the native dial fails, is not refused.
+#[tokio::test]
+async fn a_failed_udp_dial_beside_a_native_dial_takes_no_backoff() {
+    use crate::operations::connect::native::DialTransport;
+    let mut h = Harness::new("beside-udp-fails-no-backoff").await;
+    let addr: SocketAddr = "203.0.113.236:6283".parse().unwrap();
+    let (peer, mut native, mut udp) = beside::dials(&mut h, addr).await;
+    h.handshake_event(beside::failed(&peer, false)).await;
+    assert_eq!(udp.try_recv(), Ok(Err(())));
+    assert!(!h.state.peer_backoff.is_in_backoff(addr), "no backoff");
+    h.handshake_event(beside::failed(&peer, true)).await;
+    assert_eq!(native.try_recv(), Ok(Err(())));
+    beside::assert_clear(&h, addr);
+    while h.handshake_rx.try_recv().is_ok() {}
+    let mut fallback = pending_connect_peer_over(&mut h, peer.clone(), DialTransport::Udp).await;
+    assert!(
+        fallback.try_recv().is_err(),
+        "the fallback is dialled, not refused"
+    );
+    assert!(
+        matches!(
+            h.handshake_rx.try_recv(),
+            Ok(HandshakeCommand::Connect { .. })
+        ),
+        "the fallback's dial was sent"
+    );
+}
+
+/// The native dial fails while the UDP dial beside it runs, then the UDP
+/// dial fails too: the native failure leaves the in-transit slot to the UDP
+/// dial, and the last failure takes the ordinary failure path (in-transit
+/// release, failed address, diagnostics) all but the backoff.
+#[tokio::test]
+async fn native_failure_then_udp_failure_beside_it() {
+    let mut h = Harness::new("beside-native-fails-udp-fails").await;
+    let addr: SocketAddr = "203.0.113.236:6284".parse().unwrap();
+    let (peer, mut native, mut udp) = beside::dials(&mut h, addr).await;
+    h.handshake_event(beside::failed(&peer, true)).await;
+    assert_eq!(native.try_recv(), Ok(Err(())));
+    assert!(udp.try_recv().is_err(), "the UDP dial is still running");
+    h.handshake_event(beside::failed(&peer, false)).await;
+    assert_eq!(udp.try_recv(), Ok(Err(())));
+    assert!(!h.state.peer_backoff.is_in_backoff(addr), "no backoff");
+    assert!(
+        failed_addrs(&h).contains(&addr),
+        "the last dial's failure marks the address, as a UDP failure does"
+    );
+    beside::assert_clear(&h, addr);
+}
+
+/// #6253 review item 4: the handshake driver closes while only a UDP dial
+/// beside a native one waits (the native dial's own requester was answered).
+/// Its requesters get the failure and nothing is left.
+#[tokio::test]
+async fn driver_shutdown_fails_requesters_of_a_udp_dial_beside_a_native_one() {
+    let mut h = Harness::new("beside-shutdown").await;
+    let addr: SocketAddr = "203.0.113.236:6285".parse().unwrap();
+    let (_peer, mut native, mut udp) = beside::dials(&mut h, addr).await;
+    // Leave only the beside dial waiting.
+    let native_callbacks = h.state.awaiting_connection.remove(&addr);
+    h.state.awaiting_connection_txs.remove(&addr);
+    drop(native_callbacks);
+    assert!(native.try_recv().is_err());
+    h.mgr
+        .handle_handshake_stream_closed(&mut h.state)
+        .await
+        .expect("shutdown");
+    assert_eq!(udp.try_recv(), Ok(Err(())));
+    beside::assert_clear(&h, addr);
+}
+
+/// The handshake command channel is closed when a UDP dial would start
+/// beside a native one: its requester gets the failure and no beside entry is
+/// left.
+#[tokio::test]
+async fn a_udp_dial_beside_a_native_one_that_cannot_be_sent_fails() {
+    use crate::operations::connect::native::DialTransport;
+    let mut h = Harness::new("beside-channel-closed").await;
+    let addr: SocketAddr = "203.0.113.236:6286".parse().unwrap();
+    let peer = PeerKeyLocation::new(key(), addr);
+    let _native =
+        pending_connect_peer_over(&mut h, peer.clone(), DialTransport::native_now()).await;
+    drop(std::mem::replace(&mut h.handshake_rx, mpsc::channel(1).1));
+    let mut udp = pending_connect_peer_over(&mut h, peer, DialTransport::Udp).await;
+    assert_eq!(udp.try_recv(), Ok(Err(())));
+    assert!(!h.state.udp_beside_native.contains_key(&addr));
 }
 
 /// The server of a native setup waits longer than its client, so the pair
@@ -3810,7 +4277,7 @@ async fn a_late_native_failure_keeps_the_connection_made_meanwhile() {
         peer: PeerKeyLocation::new(peer.clone(), addr),
         error: ConnectionError::FailedConnectOp,
         transient: false,
-        transport: DialTransport::NATIVE,
+        transport: DialTransport::native_now(),
         native_outcome: Some(NativeSetupOutcome::TimedOut),
         origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
     })

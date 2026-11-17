@@ -1574,7 +1574,7 @@ pub(super) async fn dispatch_expect_connection_from(
             callback,
             is_gw: false,
             origin: crate::transport::NatAttemptOrigin::ConnectAcceptor,
-            transport: native::DialTransport::NATIVE,
+            transport: native::DialTransport::native_now(),
         })
         .await?;
     let op_manager = op_manager.clone();
@@ -1610,7 +1610,26 @@ pub(super) async fn dispatch_expect_connection_from(
                     return;
                 }
                 match acceptor_udp_dial(&op_manager, tx, &peer, addr).await {
-                    Ok(mut rx) => log_acceptor_dial(&peer, tx, rx.recv().await),
+                    Ok(mut rx) => {
+                        let result = rx.recv().await;
+                        let connected = matches!(result, Some(Ok(_)));
+                        if connected {
+                            crate::transport::TRANSPORT_METRICS
+                                .record_connect_native_rescued_by_udp(
+                                    crate::transport::NativeConnectSide::Acceptor,
+                                );
+                        }
+                        #[cfg(any(test, feature = "testing"))]
+                        native_wire_trace::record_at(
+                            addr,
+                            native_wire_trace::NativeWireEvent::UdpFallbackEnded {
+                                own: op_manager.ring.connection_manager.get_own_addr(),
+                                peer: addr,
+                                connected,
+                            },
+                        );
+                        log_acceptor_dial(&peer, tx, result);
+                    }
                     Err(error) => tracing::warn!(
                         %peer,
                         tx = %tx,
