@@ -621,6 +621,20 @@ mod tests {
                         accept_native(&b, &w, &budget, to_a, 0, &clock, deadline).await
                     };
                     let ended = clock.now();
+                    // The client's overlapping second attempt was charged too.
+                    // The destination's 64 KiB refills about 8.7 KB over the
+                    // 8 s window, so three more client charges fit after two
+                    // were taken, and four after one.
+                    if client_side {
+                        let mut more = 0;
+                        while budget
+                            .charge(b_addr, CLIENT_BYTES_PER_DIAL, clock.now())
+                            .is_ok()
+                        {
+                            more += 1;
+                        }
+                        assert_eq!(more, 3, "charged for two attempts");
+                    }
                     // Let the dropped dial's close go out before counting.
                     clock.sleep(Duration::from_secs(2)).await;
                     router.abort();
