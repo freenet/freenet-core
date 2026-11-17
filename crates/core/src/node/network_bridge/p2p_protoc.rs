@@ -7818,22 +7818,27 @@ pub(crate) mod tests {
     #[test]
     fn connect_peer_full_handshake_channel_prunes_in_transit() {
         let src = production_src();
-        // Locate the Connect-command try_send and bound a window over its
-        // failure branch (the `fail_awaiting_connection` call is the tail).
-        let from = src
-            .find("try_send(HandshakeCommand::Connect {")
-            .expect("connect_peer must enqueue HandshakeCommand::Connect via try_send");
-        let end = (from + 1200).min(src.len());
-        let branch = &src[from..end];
+        // Two sites enqueue a Connect: the ordinary dial and the UDP dial
+        // beside a pending native one. Bound a window over each failure branch.
+        let sites: Vec<&str> = src
+            .match_indices("try_send(HandshakeCommand::Connect {")
+            .map(|(from, _)| &src[from..(from + 1200).min(src.len())])
+            .collect();
+        assert_eq!(
+            sites.len(),
+            2,
+            "connect_peer enqueues HandshakeCommand::Connect via try_send at two sites"
+        );
+        let (ordinary, beside): (Vec<&str>, Vec<&str>) = sites
+            .into_iter()
+            .partition(|branch| branch.contains("fail_awaiting_connection("));
+        let [branch] = ordinary[..] else {
+            panic!("exactly one site fails awaiting callbacks via fail_awaiting_connection()");
+        };
         assert!(
             branch.contains("prune_in_transit_connection(peer_addr)"),
             "#4145 SITE 6: the connect-command-drop branch must prune the in-transit \
              connection slot so the dropped attempt does not leak a reservation."
-        );
-        assert!(
-            branch.contains("fail_awaiting_connection("),
-            "#4145 SITE 6: the connect-command-drop branch must fail awaiting callbacks \
-             via fail_awaiting_connection()."
         );
         // Must NOT record backoff on this local-contention path.
         assert!(
@@ -7841,6 +7846,17 @@ pub(crate) mod tests {
             "#4145 SITE 6: the connect-command-drop branch must NOT record peer backoff \
              (local channel contention is not a remote connection failure)."
         );
+        // The UDP dial beside a native one fails only its own callbacks: the
+        // native dial still holds the in-transit slot, so nothing is pruned.
+        let [branch] = beside[..] else {
+            panic!("exactly one site is the UDP dial beside a native one");
+        };
+        let failure = &branch[..branch
+            .find("return Ok(());")
+            .expect("the beside site returns after its send")];
+        assert!(failure.contains("fail_udp_beside_native("));
+        assert!(!failure.contains("prune_in_transit_connection"));
+        assert!(!failure.contains("record_failure"));
     }
 
     /// Source-scrape regression guard for #5154: the periodic 30s
