@@ -8030,6 +8030,8 @@ mod tests {
         data.pipe_source = (1108..1112).collect();
         data.pipe_dropped = (1112..1115).collect();
         data.late_end = (1121..1124).collect();
+        data.path_srtt = (1124..1131).collect();
+        data.path_tx_bps = (1131..1137).collect();
         let want: std::collections::BTreeMap<String, u64> =
             snapshot.quic_data.keys().into_iter().collect();
         assert!(want.values().all(|value| *value != 0));
