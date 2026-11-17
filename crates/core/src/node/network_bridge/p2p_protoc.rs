@@ -564,6 +564,16 @@ struct ConnectionEntry {
     /// `None` when the version wasn't exchanged (e.g. joiner->gateway path).
     /// Used to gate version-dependent message types (e.g. SubscribeHint).
     remote_version: Option<(u8, u8, u16)>,
+    /// Whether this transport is a QUIC-native connection rather than a
+    /// legacy UDP one. The survivor rule reads it: when a node holds, or is
+    /// handed, a native and a UDP connection to one peer, it keeps the
+    /// native one (`P2pConnManager::replace_transport_in_place`).
+    native: bool,
+    /// When this native connection won the survivor rule against a UDP
+    /// connection to the same peer. Its close within
+    /// `ONE_SIDED_DROP_WINDOW` of that is counted as
+    /// `connect_native_one_sided_drop`.
+    won_over_udp_at: Option<Instant>,
 }
 
 impl ConnectionEntry {
@@ -1265,7 +1275,12 @@ impl P2pConnManager {
 
     /// Removes a transport from the connection map and the open-transport set.
     fn remove_connection(&mut self, addr: SocketAddr) -> Option<ConnectionEntry> {
-        self.connections.remove(addr)
+        let removed = self.connections.remove(addr);
+        #[cfg(any(test, feature = "testing"))]
+        if removed.is_some() {
+            self.trace_transport(addr, None);
+        }
+        removed
     }
 
     pub(in crate::node) fn listening_port(&self) -> u16 {
@@ -3380,7 +3395,7 @@ struct EventListenerState {
     /// Addresses whose UDP dial beside a still-pending native dial connected
     /// first. If the native dial then connects too, its connection is closed
     /// (the first established is kept) and counted as
-    /// `connect_native_both_dials_connected_kept_udp`. Cleared when the native
+    /// `connect_native_both_dials_connected_udp_first`. Cleared when the native
     /// dial ends.
     beside_udp_connected: HashSet<SocketAddr>,
     pending_op_results: HashMap<Transaction, Sender<WaiterReply>>,
@@ -5852,6 +5867,8 @@ pub(crate) mod tests {
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
+                native: false,
+                won_over_udp_at: None,
             },
         );
         let (tx2, _rx2) = mpsc::channel(1);
@@ -5865,6 +5882,8 @@ pub(crate) mod tests {
                 created_at: Instant::now(),
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
+                native: false,
+                won_over_udp_at: None,
             },
         );
 

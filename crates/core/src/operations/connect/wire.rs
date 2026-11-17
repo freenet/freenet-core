@@ -307,6 +307,14 @@ pub mod sim_trace {
         /// Nodes standing in for a release below the floor
         /// ([`mark_pre_floor`]).
         pre_floor: parking_lot::Mutex<std::collections::HashSet<SocketAddr>>,
+        /// The transport each node holds for each peer, as (node, peer) ->
+        /// native, kept up to date as entries are added, swapped and
+        /// removed.
+        transports:
+            parking_lot::Mutex<std::collections::BTreeMap<(SocketAddr, SocketAddr), bool>>,
+        survivor_swapped: AtomicU64,
+        survivor_udp_dropped: AtomicU64,
+        one_sided_drops: AtomicU64,
     }
 
     /// What the connect op saw, for [`record_at`].
@@ -360,6 +368,18 @@ pub mod sim_trace {
             peer: SocketAddr,
             connected: bool,
         },
+        /// The node `own` now holds a native (`Some(true)`), UDP
+        /// (`Some(false)`) or no (`None`) connection to the peer at the
+        /// recorded address.
+        Transport {
+            own: SocketAddr,
+            native: Option<bool>,
+        },
+        /// The survivor rule kept a native connection over a UDP one: swapped
+        /// it in for a UDP entry, or dropped the UDP connection.
+        Survivor { swapped: bool },
+        /// A native connection closed soon after it won the survivor rule.
+        OneSidedDrop,
     }
 
     static TRACES: LazyLock<dashmap::DashMap<String, NativeWireTrace>> =
@@ -398,6 +418,17 @@ pub mod sim_trace {
                 c.fallbacks_ended.lock().push((own, peer, connected));
                 return;
             }
+            NativeWireEvent::Transport { own, native } => {
+                let mut transports = c.transports.lock();
+                match native {
+                    Some(native) => transports.insert((own, addr), native),
+                    None => transports.remove(&(own, addr)),
+                };
+                return;
+            }
+            NativeWireEvent::Survivor { swapped: true } => &c.survivor_swapped,
+            NativeWireEvent::Survivor { swapped: false } => &c.survivor_udp_dropped,
+            NativeWireEvent::OneSidedDrop => &c.one_sided_drops,
             NativeWireEvent::UdpDialFor { tx, own, peer } => {
                 if c.fallbacks_pending.lock().remove(&(tx, own, peer)) {
                     c.fallbacks_dialled.fetch_add(1, Ordering::Relaxed);
@@ -535,6 +566,25 @@ pub mod sim_trace {
         /// Native failures after the pair had connected another way.
         pub fn native_superseded(&self) -> u64 {
             Self::get(&self.0.native_superseded)
+        }
+        /// Native connections swapped in for a UDP entry by the survivor rule.
+        pub fn survivor_swapped(&self) -> u64 {
+            Self::get(&self.0.survivor_swapped)
+        }
+        /// UDP connections dropped by the survivor rule because a native
+        /// connection held the peer.
+        pub fn survivor_udp_dropped(&self) -> u64 {
+            Self::get(&self.0.survivor_udp_dropped)
+        }
+        /// Native connections that closed soon after winning the survivor
+        /// rule.
+        pub fn one_sided_drops(&self) -> u64 {
+            Self::get(&self.0.one_sided_drops)
+        }
+        /// The transport each node holds now for each peer, as (node, peer)
+        /// -> native.
+        pub fn transports(&self) -> std::collections::BTreeMap<(SocketAddr, SocketAddr), bool> {
+            self.0.transports.lock().clone()
         }
         /// Native failures with no UDP dial after them (yet), as
         /// `transaction node -> peer`.
