@@ -3090,6 +3090,19 @@ impl ConnectionManager {
         self.ready_peers.remove(&addr);
     }
 
+    /// Whether the peer at `addr` sent a ReadyState (not the optimistic
+    /// timeout `is_peer_ready` also applies).
+    #[cfg(test)]
+    pub(crate) fn is_marked_ready(&self, addr: SocketAddr) -> bool {
+        self.ready_peers.contains(&addr)
+    }
+
+    /// When the connection to `addr` was added to the ring, if it is there.
+    #[cfg(test)]
+    pub(crate) fn connected_since(&self, addr: SocketAddr) -> Option<Instant> {
+        self.connected_since.read().get(&addr).copied()
+    }
+
     /// Duration after which a connected peer is optimistically treated as ready,
     /// even if no ReadyState message was received (handles lost messages).
     const OPTIMISTIC_READY_TIMEOUT: Duration = Duration::from_secs(60);
