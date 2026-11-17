@@ -5,9 +5,11 @@
 //! Roles follow key order and are the caller's decision: the server calls
 //! [`accept_native`], the client [`connect_native`]. Both punch toward the
 //! other every [`PUNCH_INTERVAL`](super::punch::PUNCH_INTERVAL) until the
-//! connection is up or the window ends. The client makes one dial for the
-//! whole window. The server accepts one attempt at a time
-//! ([`NativeWaiters`]) and takes the next if a handshake fails.
+//! connection is up or the window ends. The client dials once and, if that
+//! attempt (dial and Hello) has not finished [`OVERLAP_BEFORE_END`] before
+//! the window's end, dials again beside it (overlapping attempts, design
+//! 6.2). The server takes up to two attempts at a time ([`NativeWaiters`])
+//! and the first handshake to complete wins.
 //!
 //! The window is [`NATIVE_WINDOW`], cut to the caller's deadline; a setup with
 //! less than [`MIN_WINDOW_LEFT`] left is not started. What a setup may send

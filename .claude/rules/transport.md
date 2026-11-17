@@ -2377,7 +2377,19 @@ Simulation: every node shares [::1], so the per-destination punch budget
   not it (test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join). The 6.2 matrix
   (quic/native/setup/matrix_tests.rs) runs connect_native/accept_native
   behind NATs over classes, late side and skew, punch loss and round trip;
-  every cell establishes, so the single attempt stays.
+  every cell establishes. With 10% loss on Initial and Handshake packets too
+  (gate 15) one attempt established 72-91% at 800 ms (a lost late Handshake
+  packet leaves the next probe past the window), so the client makes
+  OVERLAPPING ATTEMPTS: a second dial (new connection, charged
+  CLIENT_BYTES_PER_DIAL again) OVERLAP_BEFORE_END (5 s) before its window's
+  end, at least OVERLAP_MIN_DELAY after the first; neither is cancelled, and
+  each attempt is the dial plus its Hello exchange, so a first attempt
+  established on the client but not on the server does not end the race.
+  The server takes up to MAX_IN_FLIGHT (2) attempts per waiter and runs
+  their handshakes at once. Gate 15 then 96-100% per cell (100 seeds). Cost:
+  a client setup can spend two charges, so about two overlapped setups per
+  destination per minute fit PUNCH_BUDGET_BYTES instead of four. Jitter at
+  the window edges (gate 17) still fails mostly one-sided (PR-4, option b).
 Determinism: a plain tokio::select! draws its arm order from tokio's RNG,
   which the seed does not set. bounded_send's loop (every QUIC path, upgrade
   ones included: a send and its deadline ready together now resolve as the
