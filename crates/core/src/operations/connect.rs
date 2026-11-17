@@ -1577,6 +1577,15 @@ pub(super) async fn dispatch_expect_connection_from(
             transport: native::DialTransport::native_now(),
         })
         .await?;
+    // Test-only: a UDP dial beside the native one, at once.
+    #[cfg(any(test, feature = "testing"))]
+    if native_wire_trace::udp_beside_forced(addr) {
+        let mut beside = acceptor_udp_dial(op_manager, tx, &peer, addr).await?;
+        let peer = peer.clone();
+        GlobalExecutor::spawn(async move {
+            log_acceptor_dial(&peer, tx, beside.recv().await);
+        });
+    }
     let op_manager = op_manager.clone();
     // Not registered with the task monitor, like the UDP branch's task above:
     // it ends within `NATIVE_FALLBACK_AFTER` plus one dial, and an event loop

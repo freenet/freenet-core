@@ -527,8 +527,28 @@ pub mod sim_trace {
         }
     }
 
+    /// Networks whose nodes start a UDP dial beside every native dial
+    /// ([`force_udp_beside_native`]).
+    static UDP_BESIDE_FORCED: LazyLock<dashmap::DashSet<String>> =
+        LazyLock::new(dashmap::DashSet::new);
+
+    /// Makes every node of `network` start a UDP dial to the peer at once
+    /// beside each native dial, as joiner and as acceptor, so both connect
+    /// and the survivor rule has to choose. Test-only.
+    pub(crate) fn force_udp_beside_native(network: &str) {
+        UDP_BESIDE_FORCED.insert(network.to_string());
+    }
+
+    /// Whether the network the peer at `addr` belongs to forces a UDP dial
+    /// beside each native dial.
+    pub(crate) fn udp_beside_forced(addr: SocketAddr) -> bool {
+        crate::transport::in_memory_socket::network_of(&addr)
+            .is_some_and(|network| UDP_BESIDE_FORCED.contains(&network))
+    }
+
     /// Removes the trace of `network` (on `SimNetwork` drop).
     pub(crate) fn remove(network: &str) {
+        UDP_BESIDE_FORCED.remove(network);
         TRACES.remove(network);
     }
 
@@ -641,6 +661,26 @@ pub mod sim_trace {
                 }
             }
             (both, one_sided)
+        }
+        /// Pairs `(lower, higher address)` whose two ends both got a native
+        /// connection from one CONNECT's setup.
+        pub fn native_established_at_both_ends(&self) -> Vec<(SocketAddr, SocketAddr)> {
+            let ends = self.0.native_setup_ends.lock();
+            let mut pairs: Vec<_> = ends
+                .iter()
+                .filter(|(_, sides)| {
+                    let ok: std::collections::BTreeSet<SocketAddr> = sides
+                        .iter()
+                        .filter(|(_, established)| *established)
+                        .map(|(own, _)| *own)
+                        .collect();
+                    ok.len() == 2
+                })
+                .map(|((_, lo, hi), _)| (*lo, *hi))
+                .collect();
+            pairs.sort();
+            pairs.dedup();
+            pairs
         }
         /// The transport each node held for each peer when the run ended
         /// (before its teardown), as (node, peer) -> native.

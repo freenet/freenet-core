@@ -544,6 +544,11 @@ fn fault_injection_delivery_decision(
                 return PacketDeliveryDecision::DelayedDelivery(delay);
             }
         }
+        if let Some(delay) = inj.udp_intro_delay {
+            if crate::transport::demux::is_legacy_intro(datagram) {
+                return PacketDeliveryDecision::DelayedDelivery(delay);
+            }
+        }
     }
     PacketDeliveryDecision::Deliver
 }
@@ -1739,6 +1744,8 @@ pub struct SimNetwork {
     quic_datagram_cuts: Vec<crate::simulation::QuicDatagramCut>,
     /// See [`Self::delay_quic_datagrams`].
     quic_datagram_delay: Option<Duration>,
+    /// See [`Self::delay_udp_intros`].
+    udp_intro_delay: Option<Duration>,
     /// When `probe_quic_endpoints_at` asked for it: the virtual time at which
     /// `run_simulation_direct` sends each node a stranger's QUIC datagram,
     /// with the node and stranger addresses.
@@ -1931,6 +1938,7 @@ impl SimNetwork {
             quic_datagram_drops: Vec::new(),
             quic_datagram_cuts: Vec::new(),
             quic_datagram_delay: None,
+            udp_intro_delay: None,
             quic_endpoint_probe: None,
             nat,
         };
@@ -2464,7 +2472,32 @@ impl SimNetwork {
             })
             .collect();
         state.quic_datagram_delay = self.quic_datagram_delay;
+        state.udp_intro_delay = self.udp_intro_delay;
         state
+    }
+
+    /// Delays every legacy UDP intro datagram (the packets that open a UDP
+    /// connection, `PACKET_TYPE_INTRO`) by `delay`, one way, so UDP connects
+    /// take longer while traffic on open connections, CONNECT messages
+    /// included, is delivered as before. Survives
+    /// [`Self::with_fault_injection`].
+    #[cfg(any(test, feature = "testing"))]
+    pub fn delay_udp_intros(&mut self, delay: Duration) -> &mut Self {
+        self.udp_intro_delay = Some(delay);
+        if let Some(injector) = crate::node::network_bridge::get_fault_injector(&self.name) {
+            injector.lock().unwrap().udp_intro_delay = Some(delay);
+        }
+        self.install_fault_delivery_callback();
+        self
+    }
+
+    /// Makes every node start a UDP dial at once beside each QUIC-native
+    /// dial, as joiner and as acceptor, so a pair is often handed both a
+    /// native and a UDP connection and the survivor rule has to choose.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_udp_dial_beside_every_native_dial(&mut self) -> &mut Self {
+        crate::operations::connect::native_wire_trace::force_udp_beside_native(&self.name);
+        self
     }
 
     /// Delays every QUIC-class datagram between any two nodes by `delay`,

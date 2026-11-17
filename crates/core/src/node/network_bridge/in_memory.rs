@@ -116,6 +116,9 @@ pub struct FaultInjectorState {
     /// One-way delay added to every QUIC-class datagram
     /// (`SimNetwork::delay_quic_datagrams`), if any.
     pub quic_datagram_delay: Option<std::time::Duration>,
+    /// One-way delay added to every legacy UDP intro datagram, the packets
+    /// that open a UDP connection (`SimNetwork::delay_udp_intros`), if any.
+    pub udp_intro_delay: Option<std::time::Duration>,
 }
 
 impl FaultInjectorState {
@@ -131,6 +134,7 @@ impl FaultInjectorState {
             enforce_fault_drops: false,
             quic_datagram_cuts: Vec::new(),
             quic_datagram_delay: None,
+            udp_intro_delay: None,
         }
     }
 

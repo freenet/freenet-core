@@ -232,6 +232,13 @@ const _: () = {
 
 /// Classify a datagram by its first byte. An empty datagram is
 /// [`DemuxClass::Other`].
+/// Whether `packet` is a legacy UDP intro, one of the packets that open a
+/// UDP connection. Test-only, for the simulation's intro delay.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn is_legacy_intro(packet: &[u8]) -> bool {
+    packet.first() == Some(&PACKET_TYPE_INTRO)
+}
+
 pub(crate) fn classify(packet: &[u8]) -> DemuxClass {
     match packet.first() {
         Some(&PACKET_TYPE_INTRO | &PACKET_TYPE_SYMMETRIC) => DemuxClass::Legacy,
