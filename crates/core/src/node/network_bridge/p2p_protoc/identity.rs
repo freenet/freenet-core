@@ -54,6 +54,10 @@ pub(super) enum IdentitySource {
     /// had none. Also any key bound after waiting for another connection to
     /// release it, whatever started the wait.
     Claimed,
+    /// The key a QUIC-native connection's peer proved in the TLS handshake
+    /// (the handshake is pinned to the key the node dialled or accepted), so
+    /// it is neither only dialled nor only claimed.
+    Proven,
 }
 
 /// A binding that was not made because another connection held the key. It

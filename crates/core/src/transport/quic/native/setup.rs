@@ -39,6 +39,29 @@ pub(crate) const NATIVE_WINDOW: Duration = Duration::from_secs(8);
 /// A setup with less than this left of its window is not started.
 pub(crate) const MIN_WINDOW_LEFT: Duration = Duration::from_secs(4);
 
+/// What the server's window adds to [`NATIVE_WINDOW`]. The acceptor, the
+/// server when its key is higher, starts its window when it accepts, before
+/// its response has travelled back to the joiner through the relays; the
+/// response carries no deadline, so the server waits this much longer for the
+/// client's attempt. Provisional: A5c measures the skew.
+pub(crate) const SERVER_WINDOW_ALLOWANCE: Duration = Duration::from_secs(4);
+
+/// When each side of a CONNECT whose native setup failed starts its UDP
+/// fallback: this long after its own reference point (the acceptor's
+/// decision, the joiner's receipt of the response), never earlier. Both
+/// native setups have ended by then, whichever role each side had, and the
+/// two references are the response's travel time apart, so the two UDP hole
+/// punches (each `NAT_TRAVERSAL_DEADLINE`, 3 s) overlap. A side that fell
+/// back as soon as its own setup failed would punch alone: the client's
+/// window ends 4 s before the server's.
+pub(crate) const NATIVE_FALLBACK_AFTER: Duration =
+    Duration::from_secs(NATIVE_WINDOW.as_secs() + SERVER_WINDOW_ALLOWANCE.as_secs());
+
+/// The most native setups a node runs at once, before the node's connection
+/// limit lowers it (`QuicPolicy::native_setups_max`). Each holds an allow-set
+/// slot for up to its window. Provisional.
+pub(crate) const NATIVE_SETUPS_MAX: usize = 64;
+
 /// The other side of a native setup, from the node's own record.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct NativePeer<'a> {
@@ -83,11 +106,15 @@ pub(crate) enum NativeSetupError {
     Hello(#[from] HelloFailure),
 }
 
-/// The end of the window on `clock`: [`NATIVE_WINDOW`] from now, or the
-/// caller's `deadline` if sooner, refused with less than [`MIN_WINDOW_LEFT`].
-fn window_end<T: TimeSource>(clock: &T, deadline: Duration) -> Result<Duration, NativeSetupError> {
+/// The end of the window on `clock`: `window` from now, or the caller's
+/// `deadline` if sooner, refused with less than [`MIN_WINDOW_LEFT`].
+fn window_end<T: TimeSource>(
+    clock: &T,
+    deadline: Duration,
+    window: Duration,
+) -> Result<Duration, NativeSetupError> {
     let now = clock.now();
-    let end = deadline.min(now + NATIVE_WINDOW);
+    let end = deadline.min(now + window);
     if end.saturating_sub(now) < MIN_WINDOW_LEFT {
         return Err(NativeSetupError::TooLate);
     }
@@ -170,7 +197,7 @@ async fn punch_until<T: TimeSource>(
 /// The budget is charged before anything is sent, after the checks that can
 /// fail without sending (the window, the peer's key). A dial that then fails
 /// still spends its charge, since its punches may already have gone.
-pub(in crate::transport::quic::native) async fn connect_native<T: TimeSource>(
+pub(in crate::transport) async fn connect_native<T: TimeSource>(
     endpoint: &QuicEndpoint,
     budget: &PunchBudget,
     peer: NativePeer<'_>,
@@ -178,13 +205,17 @@ pub(in crate::transport::quic::native) async fn connect_native<T: TimeSource>(
     clock: &T,
     deadline: Duration,
 ) -> Result<NativeConnection, NativeSetupError> {
-    let end = window_end(clock, deadline)?;
+    let end = window_end(clock, deadline, NATIVE_WINDOW)?;
     PeerKey::of(peer.key).map_err(QuicConnectError::from)?;
     budget
         .charge(peer.addr, CLIENT_BYTES_PER_DIAL, clock.now())
         .map_err(NativeSetupError::OverBudget)?;
     let left = end.saturating_sub(clock.now());
+    // `biased` (dial, window, punches): a fixed order so a simulation's seed
+    // decides the run, and a dial that completes as the window ends still
+    // counts. The punch arm never completes, so nothing starves.
     let connection = tokio::select! {
+        biased;
         dialled = endpoint.dial_native(peer.addr, peer.key) => dialled?,
         () = clock.sleep_cancelable(left) => return Err(NativeSetupError::TimedOut),
         never = punch_until(endpoint, peer.addr, clock, end) => match never {},
@@ -194,10 +225,12 @@ pub(in crate::transport::quic::native) async fn connect_native<T: TimeSource>(
 
 /// Set up a native connection from `peer` as the server: allow the peer as
 /// native, punch, and take its attempts one at a time until one completes
-/// its handshake, then exchange Hellos, all before the window ends. The
+/// its handshake, then exchange Hellos, all before the window ends
+/// (`deadline`, cut to [`NATIVE_WINDOW`] + [`SERVER_WINDOW_ALLOWANCE`] from
+/// now). The
 /// budget is charged after the waiter and the allow, which can fail without
 /// sending, and before the first punch.
-pub(in crate::transport::quic::native) async fn accept_native<T: TimeSource>(
+pub(in crate::transport) async fn accept_native<T: TimeSource>(
     endpoint: &QuicEndpoint,
     waiters: &Arc<NativeWaiters>,
     budget: &PunchBudget,
@@ -206,7 +239,7 @@ pub(in crate::transport::quic::native) async fn accept_native<T: TimeSource>(
     clock: &T,
     deadline: Duration,
 ) -> Result<NativeConnection, NativeSetupError> {
-    let end = window_end(clock, deadline)?;
+    let end = window_end(clock, deadline, NATIVE_WINDOW + SERVER_WINDOW_ALLOWANCE)?;
     let mut waiter = waiters
         .register(peer.addr)
         .ok_or(NativeSetupError::AlreadyWaiting)?;
@@ -230,7 +263,9 @@ pub(in crate::transport::quic::native) async fn accept_native<T: TimeSource>(
         }
     };
     let left = end.saturating_sub(clock.now());
+    // `biased`, as in `connect_native`.
     let connection = tokio::select! {
+        biased;
         accepted = accept => accepted?,
         () = clock.sleep_cancelable(left) => return Err(NativeSetupError::TimedOut),
         never = punch_until(endpoint, peer.addr, clock, end) => match never {},
@@ -488,11 +523,13 @@ mod tests {
                     matches!(result, Err(NativeSetupError::TimedOut)),
                     "client {client_side}: {result:?}"
                 );
-                assert_eq!(
-                    ended - started,
-                    Duration::from_secs(8),
-                    "client {client_side}"
-                );
+                // The server waits the client's window plus its allowance.
+                let window = if client_side {
+                    NATIVE_WINDOW
+                } else {
+                    NATIVE_WINDOW + SERVER_WINDOW_ALLOWANCE
+                };
+                assert_eq!(ended - started, window, "client {client_side}");
                 let (from, to) = if client_side {
                     (a_addr, b_addr)
                 } else {
@@ -591,20 +628,26 @@ mod tests {
         });
     }
 
-    /// The window is 8 s, cut to the deadline, and at least 4 s, as literals.
+    /// The window is 8 s for the client and 12 s for the server, cut to the
+    /// deadline, and at least 4 s, as literals.
     #[test]
     fn the_window_is_eight_seconds_and_at_least_four() {
         let clock = crate::simulation::VirtualTime::new();
         let now = clock.now();
         let far = now + Duration::from_secs(60);
         assert_eq!(
-            window_end(&clock, far).unwrap() - now,
+            window_end(&clock, far, NATIVE_WINDOW).unwrap() - now,
             Duration::from_secs(8)
         );
+        assert_eq!(
+            window_end(&clock, far, NATIVE_WINDOW + SERVER_WINDOW_ALLOWANCE).unwrap() - now,
+            Duration::from_secs(12),
+            "the server waits 4 s longer"
+        );
         let four = now + Duration::from_secs(4);
-        assert_eq!(window_end(&clock, four).unwrap(), four);
+        assert_eq!(window_end(&clock, four, NATIVE_WINDOW).unwrap(), four);
         assert!(matches!(
-            window_end(&clock, four - Duration::from_millis(1)),
+            window_end(&clock, four - Duration::from_millis(1), NATIVE_WINDOW),
             Err(NativeSetupError::TooLate)
         ));
     }

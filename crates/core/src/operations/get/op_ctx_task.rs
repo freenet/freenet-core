@@ -9804,7 +9804,7 @@ mod route_attempt_driver_tests {
     /// `entries` sorted by peer address, for assertions about which peers got
     /// which label regardless of the order they were recorded in.
     fn by_peer<T>(mut entries: Vec<(Option<SocketAddr>, T)>) -> Vec<(Option<SocketAddr>, T)> {
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries.sort_by_key(|a| a.0);
         entries
     }
 

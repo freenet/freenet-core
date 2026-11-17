@@ -437,11 +437,7 @@ async fn test_compiled_module_size_is_in_expected_range() -> Result<(), Box<dyn 
         measured as f64 / (1024.0 * 1024.0),
         default_budget,
         default_budget / (1024 * 1024),
-        if measured > 0 {
-            default_budget / measured
-        } else {
-            0
-        },
+        default_budget.checked_div(measured).unwrap_or(0),
     );
 
     assert!(
