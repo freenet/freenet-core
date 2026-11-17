@@ -304,6 +304,9 @@ async fn finish<T: TimeSource>(
 }
 
 #[cfg(test)]
+mod matrix_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::GlobalRng;
