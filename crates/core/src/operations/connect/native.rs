@@ -222,6 +222,40 @@ pub(crate) enum DialTransport {
     Native { deadline: tokio::time::Instant },
 }
 
+/// Which end of the CONNECT a native setup is: the joiner that dialled the
+/// acceptor, or the acceptor that punched back. Any other origin (a gateway
+/// dial, a ring peer) never dials native today and keeps its own label.
+fn native_setup_side(origin: crate::transport::NatAttemptOrigin) -> &'static str {
+    use crate::transport::NatAttemptOrigin::{
+        ConnectAcceptor, ConnectJoiner, Gateway, RingPeerNoTransport,
+    };
+    match origin {
+        ConnectJoiner => "joiner",
+        ConnectAcceptor => "acceptor",
+        Gateway | RingPeerNoTransport => origin.label(),
+    }
+}
+
+/// The body of the `native_setup_outcome` event, one per native setup at each
+/// end (gate 22), which the collector joins on `tx`: the CONNECT transaction both
+/// ends' native dials carry, the remote's key (in the form of the key before
+/// the `@` of a `peer_id`, so the two ends can be crossed), how this end's
+/// setup ended (a `NativeSetupOutcome` label) and which end this is. No
+/// address: the join needs keys only.
+pub(crate) fn native_setup_outcome_body(
+    transaction: &crate::message::Transaction,
+    peer_key: &TransportPublicKey,
+    outcome: &str,
+    origin: crate::transport::NatAttemptOrigin,
+) -> serde_json::Value {
+    serde_json::json!({
+        "tx": transaction.to_string(),
+        "peer": peer_key.to_string(),
+        "outcome": outcome,
+        "side": native_setup_side(origin),
+    })
+}
+
 impl DialTransport {
     /// A native dial bounded only by the setup's own window.
     pub(crate) fn native_now() -> Self {
@@ -519,6 +553,71 @@ mod tests {
 
     fn key(seed: u32) -> TransportPublicKey {
         TransportPublicKey::from_bytes(*blake3::hash(&seed.to_be_bytes()).as_bytes())
+    }
+
+    /// The body names the CONNECT transaction, the remote's key in the form
+    /// the collector crosses it by, the outcome and the side, and no address.
+    #[test]
+    fn the_setup_outcome_body_names_tx_peer_outcome_and_side() {
+        use crate::transport::NatAttemptOrigin::{ConnectAcceptor, ConnectJoiner, Gateway};
+        let tx = crate::message::Transaction::new::<crate::operations::connect::ConnectMsg>();
+        let peer = key(7);
+        let body = native_setup_outcome_body(&tx, &peer, "hello_lost", ConnectJoiner);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "tx": tx.to_string(),
+                "peer": peer.to_string(),
+                "outcome": "hello_lost",
+                "side": "joiner",
+            })
+        );
+        assert_eq!(
+            native_setup_outcome_body(&tx, &peer, "established", ConnectAcceptor)["side"],
+            "acceptor"
+        );
+        assert_eq!(
+            native_setup_outcome_body(&tx, &peer, "established", Gateway)["side"],
+            "gateway"
+        );
+        assert_eq!(body.as_object().unwrap().len(), 4, "keys only, no address");
+    }
+
+    /// Both lifecycle arms report a native setup's outcome, near the top of the
+    /// arm and only for a native dial; deleting either call, or reporting a UDP
+    /// dial, leaves the pair join one-sided with every other test green.
+    #[test]
+    fn both_outbound_arms_report_a_native_setup_outcome() {
+        let code: String =
+            include_str!("../../node/network_bridge/p2p_protoc/connection_lifecycle.rs")
+                .lines()
+                .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+                .collect::<Vec<_>>()
+                .join("\n");
+        let squeezed: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        for (arm, wants) in [
+            (
+                "HandshakeEvent::OutboundEstablished{transaction,peer,connection,transient,transport,origin,}=>{",
+                "iftransport.is_native(){self.report_native_setup_outcome(&transaction,&peer,crate::transport::NativeSetupOutcome::Established.label(),origin,);}",
+            ),
+            (
+                "HandshakeEvent::OutboundFailed{transaction,peer,error,transient,transport,native_outcome,origin,}=>{",
+                "iftransport.is_native(){self.report_native_setup_outcome(&transaction,&peer,native_outcome.map_or(\"unknown\",|outcome|outcome.label()),origin,);}",
+            ),
+        ] {
+            let at = squeezed
+                .find(arm)
+                .unwrap_or_else(|| panic!("arm not found: {arm}"));
+            let after = &squeezed[at + arm.len()..];
+            assert!(
+                after.starts_with(wants),
+                "the arm must open with the native-only report: {arm}"
+            );
+        }
+        assert!(
+            squeezed.contains("\"native_setup_outcome\","),
+            "the event name the collector reads"
+        );
     }
 
     fn pairs() -> impl Iterator<Item = (TransportPublicKey, TransportPublicKey)> {
