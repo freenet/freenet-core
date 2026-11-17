@@ -456,6 +456,14 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         }
     });
 
+    // Test builds only (`testing`, which no release build enables): kill the
+    // endpoint after the delay this variable names, through a caught socket
+    // adapter panic, so a real-process test can drive the node's reaction to
+    // endpoint death (`tests/graceful_shutdown_exit_code.rs`).
+    #[cfg(feature = "testing")]
+    if let Some(endpoint) = &quic_endpoint {
+        fail_endpoint_from_env(endpoint);
+    }
     if let (Some(_), Some(settings)) = (&quic_endpoint, &quic_settings) {
         super::TRANSPORT_METRICS.set_quic_flow_control_window_bytes(settings.window_bytes());
     }
@@ -570,29 +578,109 @@ pub(crate) async fn open_udp_transport<S: Socket>(
         outbound.quic_availability().get() == super::quic::liveness::QuicAvailability::Up,
         task_registrar.as_ref(),
     );
-    // A supervised gateway exits when its endpoint dies (#5940), so its
-    // supervisor restarts it with a new one; every other node keeps running
-    // over UDP.
-    let exit_on_endpoint_down = super::quic::liveness::exit_on_endpoint_down(is_gateway)
-        .then(|| outbound.quic_availability());
+    // A supervised gateway exits for its supervisor to restart it when that
+    // restores QUIC (#5940): its endpoint died, or the crash-breaker
+    // cooldown that kept QUIC off for this run ended. Every other node keeps
+    // running over UDP.
+    let restart = gateway_quic_restart(
+        is_gateway,
+        super::quic::liveness::gateway_quic_restarts(is_gateway),
+        outbound.quic_availability(),
+        super::quic::breaker::quic_restore_at(),
+        std::time::SystemTime::now(),
+    );
     Ok(udp_transport_handle(
         outbound,
         inbound,
         listen_task,
-        exit_on_endpoint_down,
+        restart,
     ))
+}
+
+/// The variable [`fail_endpoint_from_env`] reads: seconds after the bind.
+#[cfg(feature = "testing")]
+const TEST_QUIC_ENDPOINT_DOWN_ENV: &str = "FREENET_TEST_QUIC_ENDPOINT_DOWN_AFTER_SECS";
+
+/// Kill `endpoint` [`TEST_QUIC_ENDPOINT_DOWN_ENV`] seconds from now, if set.
+#[cfg(feature = "testing")]
+fn fail_endpoint_from_env(endpoint: &super::quic::QuicEndpoint) {
+    let Some(secs) = std::env::var(TEST_QUIC_ENDPOINT_DOWN_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    else {
+        return;
+    };
+    tracing::warn!(secs, "Test build: the QUIC endpoint will be failed");
+    let endpoint = endpoint.clone();
+    drop(GlobalExecutor::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        endpoint.panic_adapter();
+    }));
+}
+
+/// The least time a gateway runs before it restarts at the end of a
+/// crash-breaker cooldown. Above the node's healthy-uptime threshold
+/// (`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`, 60 s), so the restart always takes
+/// the non-crash exit code 42, never the counted fast-crash code.
+pub(crate) const QUIC_RESTORE_MIN_UPTIME: Duration = Duration::from_secs(90);
+
+/// When a gateway exits to restore QUIC.
+#[derive(Debug, Default)]
+pub(crate) struct GatewayQuicRestartWatch {
+    /// The endpoint whose death ends the run.
+    pub endpoint: Option<super::quic::liveness::QuicAvailabilityWatch>,
+    /// How long until the breaker cooldown that kept QUIC off ends.
+    pub restore_after: Option<Duration>,
+}
+
+/// What the listener of this node watches to restore QUIC. `enabled` is the
+/// binary's switch (`liveness::gateway_quic_restarts`), `restore_at` the end
+/// of a cooldown that keeps QUIC off for this run (`breaker::quic_restore_at`).
+/// `None` for a peer and for an unsupervised gateway, which logs an ERROR
+/// when its QUIC stays off until it restarts.
+fn gateway_quic_restart(
+    is_gateway: bool,
+    enabled: bool,
+    availability: super::quic::liveness::QuicAvailabilityWatch,
+    restore_at: Option<std::time::SystemTime>,
+    now: std::time::SystemTime,
+) -> Option<GatewayQuicRestartWatch> {
+    use super::quic::liveness::QuicAvailability;
+    if !is_gateway {
+        return None;
+    }
+    if !enabled {
+        if let Some(at) = restore_at {
+            tracing::error!(
+                cooldown_end = %chrono::DateTime::<chrono::Utc>::from(at).to_rfc3339(),
+                "QUIC is off on this gateway until it restarts: the crash-breaker cooldown \
+                 ends at the time shown, but this gateway is not run by a service supervisor, \
+                 so it does not restart itself. Restart it after that time to turn QUIC back on"
+            );
+        }
+        return None;
+    }
+    let endpoint = (availability.get() == QuicAvailability::Up).then_some(availability);
+    let restore_after = restore_at.map(|at| {
+        at.duration_since(now)
+            .unwrap_or(Duration::ZERO)
+            .max(QUIC_RESTORE_MIN_UPTIME)
+    });
+    (endpoint.is_some() || restore_after.is_some()).then_some(GatewayQuicRestartWatch {
+        endpoint,
+        restore_after,
+    })
 }
 
 /// Assemble the handle from the UDP transport's parts. Outbound connect and
 /// expected-inbound registration share one expected-IP set: the tracker is a
-/// view of the connector's set. With `exit_on_endpoint_down`, the listener
-/// also ends as [`super::ListenerExit::QuicEndpointDown`] when that endpoint
-/// dies.
+/// view of the connector's set. With `restart`, the listener also ends when
+/// the gateway should restart to restore QUIC ([`listener_liveness`]).
 pub(crate) fn udp_transport_handle<S: Socket>(
     outbound: OutboundConnectionHandler<S>,
     inbound: InboundConnectionHandler<S>,
     listen_task: tokio::task::JoinHandle<TransportError>,
-    exit_on_endpoint_down: Option<super::quic::liveness::QuicAvailabilityWatch>,
+    restart: Option<GatewayQuicRestartWatch>,
 ) -> super::TransportHandle {
     super::TransportHandle {
         quic_endpoint: outbound.quic_availability().get()
@@ -601,28 +689,47 @@ pub(crate) fn udp_transport_handle<S: Socket>(
         expected_inbound: Arc::new(outbound.expected_inbound_tracker()),
         connector: Arc::new(outbound),
         acceptor: Box::new(inbound),
-        listener: Box::pin(listener_liveness(listen_task, exit_on_endpoint_down)),
+        listener: Box::pin(listener_liveness(listen_task, restart)),
     }
 }
 
 /// The transport's listener liveness: the listen task's end, or, with
-/// `exit_on_endpoint_down`, the death of that QUIC endpoint, whichever comes
+/// `restart`, the death of the watched QUIC endpoint
+/// ([`super::ListenerExit::QuicEndpointDown`]) or the end of the breaker
+/// cooldown ([`super::ListenerExit::QuicCooldownEnded`]), whichever comes
 /// first. A death is first noted in the crash-loop breaker's marker, so the
 /// next start restarts QUIC rather than tripping.
 async fn listener_liveness(
     mut listen_task: tokio::task::JoinHandle<TransportError>,
-    exit_on_endpoint_down: Option<super::quic::liveness::QuicAvailabilityWatch>,
+    restart: Option<GatewayQuicRestartWatch>,
 ) -> super::ListenerExit {
-    let Some(availability) = exit_on_endpoint_down else {
+    let Some(GatewayQuicRestartWatch {
+        endpoint,
+        restore_after,
+    }) = restart
+    else {
         return super::ListenerExit::from_join(listen_task.await);
+    };
+    let died = async move {
+        match endpoint {
+            Some(availability) => availability.died().await,
+            None => std::future::pending().await,
+        }
+    };
+    let cooled = async move {
+        match restore_after {
+            // Only the binary enables this, so the clock is real here.
+            Some(after) => tokio::time::sleep(after).await,
+            None => std::future::pending().await,
+        }
     };
     crate::deterministic_select! {
         ended = &mut listen_task => super::ListenerExit::from_join(ended),
-        () = availability.died() => {
-            // Only the binary enables this, so the wall clock is real here.
+        () = died => {
             super::quic::breaker::note_endpoint_down_exit(std::time::SystemTime::now());
             super::ListenerExit::QuicEndpointDown
         },
+        () = cooled => super::ListenerExit::QuicCooldownEnded,
     }
 }
 

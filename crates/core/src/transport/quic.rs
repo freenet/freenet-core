@@ -593,8 +593,6 @@ impl QuicEndpoint {
             clock,
         )?);
         let health = EndpointHealth::new(local_addr);
-        #[cfg(feature = "quic-panic-injection")]
-        panic_injection::register_endpoint(&health);
         #[cfg(any(test, feature = "testing"))]
         let mut faults = None;
         let mut cap_holds = None;
@@ -679,6 +677,14 @@ impl QuicEndpoint {
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn fail_driver(&self) {
         self.faults.fail_receive();
+    }
+
+    /// Panic in the socket adapter at the endpoint's next receive, caught as
+    /// any adapter panic is: the endpoint goes `Down` with the node still
+    /// running (tests, including the real binary built with `testing`).
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn panic_adapter(&self) {
+        self.faults.panic_receive();
     }
 
     /// The hooks that inject faults into quinn's drivers (tests).

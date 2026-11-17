@@ -500,7 +500,9 @@ and no breaker state is left), QUIC crash-loop breaker trips at startup
 run, not only a QUIC fault, and on Windows for three runs in a row that ended
 within ten minutes after recording a panic in QUIC code (quinn, quinn-proto or
 transport/quic, by panic location), each starting within 24 h of the one before;
-see `quic/breaker.rs`) and whether the breaker keeps QUIC
+a trip keeps QUIC off for 24 h on a peer and 15 min on a gateway (`BreakerRole`),
+and a supervised gateway restarts itself at the cooldown's end; see
+`quic/breaker.rs`) and whether the breaker keeps QUIC
 off in this process (`quic_breaker_suppressed`, a state that is never reset and
 is not activity by itself) and the endpoint's state (`quic_endpoint`: `up`, or
 `off_config`, `off_platform`, `off_abort`, `off_bind`, `off_breaker`, or `died`;
@@ -3491,9 +3493,12 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
   connect() fails as EndpointDown. The UDP transport is untouched.
   → NEVER feed endpoint death to ListenerExit: that exits the node. The
     one exception is deliberate: a gateway in the `freenet` binary under a
-    service supervisor (liveness::exit_on_endpoint_down, enabled by
-    enable_exit_on_quic_endpoint_down) gets ListenerExit::QuicEndpointDown,
-    so its supervisor restarts it with a new endpoint. The exit is noted in
+    service supervisor (liveness::gateway_quic_restarts, enabled by
+    enable_gateway_quic_restarts) gets ListenerExit::QuicEndpointDown,
+    so its supervisor restarts it with a new endpoint. The same switch
+    (enable_gateway_quic_restarts) restarts such a gateway when a breaker
+    cooldown that kept its QUIC off ends (ListenerExit::QuicCooldownEnded).
+    The exit is noted in
     the breaker marker (breaker::note_endpoint_down_exit), so the next start
     runs QUIC again until ENDPOINT_DOWN_EXITS_TO_TRIP exits in
     ENDPOINT_DOWN_WINDOW trip it. Peers, and gateways started by hand,
@@ -3580,12 +3585,15 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     catch-and-leak machinery around quinn here: it cannot cover the
     stream and connection destructors, which run in the node's own tasks.
   → Telling them apart: a caught adapter panic leaves the process running
-    (ERROR log, quic_adapter_panicked, quic_endpoint_down) and leaves no
+    (a supervised gateway exits instead, noting it in the breaker marker;
+    see above) (ERROR log, quic_adapter_panicked, quic_endpoint_down) and leaves no
     crash-loop breaker state, so QUIC comes back on the next start, and a
     deterministic fault recurs once per start. A panic that is not
     contained aborts the process. On unix the next start trips the breaker
-    (quic_breaker_trips, see quic/breaker.rs). On Windows the breaker does
-    not look at how a run ended: a panic hook records a panic located in QUIC
+    (quic_breaker_trips, see quic/breaker.rs): QUIC off for 24 h on a peer,
+    15 min on a gateway, which, when supervised, restarts itself with exit
+    42 at the cooldown's end (breaker::quic_restore_at). On Windows the
+    breaker does not look at how a run ended: a panic hook records a panic located in QUIC
     code in the run's marker, and it counts runs that lasted under 10 minutes
     and recorded one, so the fourth start after three such aborts in a row
     trips it. An ordinary stop records no panic and never counts; an abort

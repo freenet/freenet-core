@@ -13,11 +13,6 @@
 //! - `abort`: a panic whose unwinding drops a value that panics again, so the
 //!   process aborts with "panic in a destructor during cleanup", the way a
 //!   panic inside quinn's endpoint driver does (#6027).
-//! - `down`: the outcome of a panic the socket adapter caught: the
-//!   endpoint built last is marked as having panicked
-//!   (`EndpointHealth::adapter_panicked`), so it goes `Down` with the node
-//!   still running. Tests the node's reaction to endpoint death (a gateway
-//!   exits for its supervisor, `liveness::exit_on_endpoint_down`).
 
 use std::time::Duration;
 
@@ -36,18 +31,6 @@ pub(crate) const ENV: &str = "FREENET_TEST_QUIC_PANIC";
 enum Injection {
     Caught(Duration),
     Abort(Duration),
-    Down(Duration),
-}
-
-/// The endpoint built last, for `down`.
-#[cfg(feature = "quic-panic-injection")]
-static ENDPOINT: parking_lot::Mutex<Option<std::sync::Weak<super::liveness::EndpointHealth>>> =
-    parking_lot::Mutex::new(None);
-
-/// Remember `health` as the endpoint `down` acts on.
-#[cfg(feature = "quic-panic-injection")]
-pub(crate) fn register_endpoint(health: &std::sync::Arc<super::liveness::EndpointHealth>) {
-    *ENDPOINT.lock() = Some(std::sync::Arc::downgrade(health));
 }
 
 fn parse(value: &str) -> Option<Injection> {
@@ -56,7 +39,6 @@ fn parse(value: &str) -> Option<Injection> {
     match mode.trim() {
         "caught" => Some(Injection::Caught(after)),
         "abort" => Some(Injection::Abort(after)),
-        "down" => Some(Injection::Down(after)),
         _ => None,
     }
 }
@@ -86,15 +68,6 @@ pub(crate) fn inject_from_env() {
                 let _armed = PanicsOnDrop;
                 panic!("injected QUIC panic (abort)");
             }
-            Injection::Down(after) => {
-                std::thread::sleep(after);
-                let health = ENDPOINT.lock().as_ref().and_then(std::sync::Weak::upgrade);
-                match health {
-                    Some(health) => health
-                        .adapter_panicked("injected", &"injected QUIC socket adapter panic (down)"),
-                    None => tracing::warn!("Test build: no QUIC endpoint to mark down"),
-                }
-            }
         });
     if let Err(error) = spawned {
         tracing::warn!(%error, "Test build: could not start the QUIC panic injection");
@@ -112,10 +85,6 @@ mod tests {
             Some(Injection::Caught(Duration::from_secs(5)))
         );
         assert_eq!(parse(" abort : 0 "), Some(Injection::Abort(Duration::ZERO)));
-        assert_eq!(
-            parse("down:2"),
-            Some(Injection::Down(Duration::from_secs(2)))
-        );
         for bad in ["", "caught", "abort:x", "other:1", "caught:-1"] {
             assert_eq!(parse(bad), None, "{bad}");
         }
