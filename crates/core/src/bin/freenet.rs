@@ -269,8 +269,8 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
         ));
     }
 
-    // The QUIC crash-loop breaker (#5940): if a run with QUIC enabled ended
-    // abnormally, QUIC stays off for a cooldown. Enabled here, before the node
+    // The QUIC crash-loop breaker (#5940): if runs with QUIC enabled keep
+    // ending in a QUIC fault, QUIC stays off for a cooldown. Enabled here, before the node
     // is built, because only this binary marks its clean exits (see `main`).
     freenet::enable_quic_crash_breaker();
 
@@ -2090,6 +2090,26 @@ mod tests {
             gateway_quic_restarts(SupervisorStatus::Unsupervised),
             GatewayQuicRestarts::Off
         );
+    }
+
+    /// #6151: while UDP exists, a peer's QUIC crash-loop breaker trips, and
+    /// the peer falls back to UDP, before the post-update crash-loop rollback
+    /// restores the previous release and pins this one as bad. Each run the
+    /// breaker counts ended in a crash the rollback also counts; the start
+    /// that trips runs with QUIC off, so it adds no QUIC crash. At that point
+    /// the rollback's count must still be short of its threshold.
+    #[test]
+    fn peer_breaker_trips_before_the_crash_loop_rollback() {
+        let crashes_when_the_breaker_trips = freenet::PEER_SHORT_RUNS_TO_TRIP_WITH_UDP;
+        assert!(crashes_when_the_breaker_trips >= 1);
+        assert!(
+            !crate::commands::rollback::should_rollback(crashes_when_the_breaker_trips),
+            "the rollback would act at {crashes_when_the_breaker_trips} crashes, no later than \
+             the peer breaker"
+        );
+        assert!(crate::commands::rollback::should_rollback(
+            crate::commands::rollback::ROLLBACK_CRASH_THRESHOLD
+        ));
     }
 
     /// #5940: a gateway's restarts to restore QUIC stay under the start

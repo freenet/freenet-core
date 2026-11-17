@@ -1026,6 +1026,18 @@ impl NodeP2P {
         )
         .await?;
 
+        // `quic_breaker_start` (#6151): what the QUIC crash-loop breaker
+        // decided at this start (`P2pConnManager::build` runs it), once per
+        // start, including, on a unix peer, what the legacy exit-status rule
+        // would have decided. Sending is a no-op unless telemetry is enabled.
+        if let Some(report) = crate::transport::quic::breaker::take_start_report() {
+            crate::tracing::telemetry::send_standalone_event_with_peer_id(
+                "quic_breaker_start",
+                &config.local_peer_id_string(),
+                report.to_json(),
+            );
+        }
+
         let parent_span = tracing::Span::current();
         let contract_executor_handle = GlobalExecutor::spawn({
             let task = async move {
@@ -1164,6 +1176,44 @@ mod tests {
             ),
             "build must send it as the `auto_update_state` event with that state"
         );
+    }
+
+    /// #6151: `NodeP2P::build` sends what the crash-loop breaker decided as
+    /// the `quic_breaker_start` event, after `P2pConnManager::build` (which
+    /// runs the breaker), so the report exists when it is taken.
+    #[test]
+    fn build_sends_the_quic_breaker_start_report_after_the_breaker_ran() {
+        let all = include_str!("p2p_impl.rs");
+        let production = &all[..all
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module not located; this pin cannot verify anything")];
+        let code: String = production
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find("pub(crate) async fn build<")
+            .expect("NodeP2P::build not found");
+        let (build, _) = code[start..]
+            .split_once("\n    }\n")
+            .expect("could not locate the end of NodeP2P::build");
+        let squeezed: String = build.chars().filter(|c| !c.is_whitespace()).collect();
+        let at = |needle: &str| {
+            squeezed
+                .find(needle)
+                .unwrap_or_else(|| panic!("NodeP2P::build must contain {needle}"))
+        };
+        let breaker_ran = at("letconn_manager=P2pConnManager::build(");
+        let taken = at(
+            "iflet Some(report)=crate::transport::quic::breaker::take_start_report()"
+                .replace(' ', "")
+                .as_str(),
+        );
+        let sent = at(
+            "send_standalone_event_with_peer_id(\"quic_breaker_start\",&config.local_peer_id_string(),report.to_json(),)",
+        );
+        assert!(breaker_ran < taken && taken < sent);
     }
 
     /// #4549: the fast-exit watchdog (`process::exit(42)` on a fatal listener exit)

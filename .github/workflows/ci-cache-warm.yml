@@ -128,7 +128,7 @@ jobs:
         run: |
           cargo nextest run --workspace --exclude freenet-ping-types \
             --no-default-features \
-            --features trace,websocket,redb,wasmtime-backend,testing \
+            --features trace,websocket,redb,wasmtime-backend,testing,freenet/quic-panic-injection \
             --profile ci --no-run
           cargo nextest run -p freenet-ping-app \
             --features testing --profile ci --no-run

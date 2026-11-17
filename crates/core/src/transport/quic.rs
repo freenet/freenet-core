@@ -86,11 +86,12 @@ pub(crate) use liveness::QuicAvailabilityWatch;
 /// Whether the node may use QUIC: the `transport-quic` config key.
 ///
 /// An unset key is [`QuicMode::default_mode`]: prefer on Linux, macOS and
-/// Windows, and off elsewhere, because the breaker reads no boot identity
-/// there and so cannot trip. The Windows breaker counts short runs that
-/// panicked in QUIC code instead of detecting crashes ([`breaker`]); it was
-/// confirmed on a real Windows machine before Windows defaulted to an endpoint
-/// (#6031). The default is decided when the value is read and
+/// Windows, and off elsewhere, because a gateway's breaker reads no boot
+/// identity there and so cannot trip. Peers everywhere, and gateways on
+/// Windows, count short runs that panicked in QUIC code instead of detecting
+/// crashes ([`breaker`]); that rule was confirmed on a real Windows machine
+/// before Windows defaulted to an endpoint (#6031), and peers on unix moved
+/// to it in #6151. The default is decided when the value is read and
 /// never written to `config.toml`, so a later release can change it
 /// for every node that did not set the key, which is how a default-off
 /// release turns QUIC off. A value given with `--transport-quic` or
@@ -147,8 +148,8 @@ impl QuicMode {
     pub const PREFER: &'static str = "prefer";
 
     /// What an unset `transport-quic` means on this platform: prefer on Linux,
-    /// macOS and Windows, and off elsewhere, because the crash-loop breaker
-    /// cannot trip there. Windows joined once its breaker was confirmed on a
+    /// macOS and Windows, and off elsewhere, because a gateway's crash-loop
+    /// breaker cannot trip there. Windows joined once its breaker was confirmed on a
     /// real Windows machine (#6031).
     pub const fn default_mode() -> Self {
         if cfg!(any(
