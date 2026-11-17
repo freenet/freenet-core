@@ -14,12 +14,14 @@
 //!   node keeps running: endpoint death NEVER feeds `ListenerExit`, which
 //!   exits the node. e5 watches the availability and moves every QUIC path
 //!   back to UDP. The one exception is a gateway run by the `freenet`
-//!   binary under a service supervisor ([`enable_exit_on_quic_endpoint_down`]):
+//!   binary under a service supervisor ([`enable_gateway_quic_restarts`]):
 //!   its transport listener then reports the death as
 //!   `ListenerExit::QuicEndpointDown`, the node's fatal-listener path exits
 //!   the process, and the supervisor restarts it with a new endpoint
-//!   ([`exit_on_endpoint_down`]). The crash-loop breaker restarts QUIC after
+//!   ([`gateway_quic_restarts`]). The crash-loop breaker restarts QUIC after
 //!   such an exit until it repeats (`breaker::ENDPOINT_DOWN_EXITS_TO_TRIP`).
+//!   The same switch restarts such a gateway when a breaker cooldown that
+//!   kept its QUIC off ends (`breaker::quic_restore_at`).
 //! - after the node dropped its last handle, the return is the normal
 //!   shutdown (quinn's driver ends once no handle and no connection is
 //!   left): the availability becomes `Released` and nothing is counted.
@@ -99,25 +101,26 @@ use tokio::sync::watch;
 
 use crate::transport::metrics::TRANSPORT_METRICS;
 
-/// Set by [`enable_exit_on_quic_endpoint_down`]; off in tests and embedders.
-static EXIT_ON_ENDPOINT_DOWN: AtomicBool = AtomicBool::new(false);
+/// Set by [`enable_gateway_quic_restarts`]; off in tests and embedders.
+static GATEWAY_QUIC_RESTARTS: AtomicBool = AtomicBool::new(false);
 
-/// Make a gateway exit when its QUIC endpoint dies, for its supervisor to
-/// restart it (#5940, a prerequisite of native gateway joins). The `freenet`
-/// binary calls this only when it runs under a service supervisor, so a
-/// gateway started by hand keeps running over UDP, as before. Peers never
-/// exit on endpoint death while UDP remains.
-pub fn enable_exit_on_quic_endpoint_down() {
-    EXIT_ON_ENDPOINT_DOWN.store(true, Ordering::Relaxed);
+/// Let a gateway exit for its supervisor to restart it when that restores
+/// QUIC (#5940, a prerequisite of native gateway joins): when its QUIC
+/// endpoint dies, and when a crash-breaker cooldown that kept QUIC off for
+/// the run ends. The `freenet` binary calls this only when it runs under a
+/// service supervisor, so a gateway started by hand keeps running over UDP,
+/// as before. Peers never exit for this while UDP remains.
+pub fn enable_gateway_quic_restarts() {
+    GATEWAY_QUIC_RESTARTS.store(true, Ordering::Relaxed);
 }
 
-/// Whether a node in this role exits when its endpoint dies: a gateway, and
-/// only when the binary enabled it ([`enable_exit_on_quic_endpoint_down`]).
-pub(crate) fn exit_on_endpoint_down(is_gateway: bool) -> bool {
-    exit_on_endpoint_down_with(is_gateway, EXIT_ON_ENDPOINT_DOWN.load(Ordering::Relaxed))
+/// Whether a node in this role exits to restore QUIC: a gateway, and only
+/// when the binary enabled it ([`enable_gateway_quic_restarts`]).
+pub(crate) fn gateway_quic_restarts(is_gateway: bool) -> bool {
+    gateway_quic_restarts_with(is_gateway, GATEWAY_QUIC_RESTARTS.load(Ordering::Relaxed))
 }
 
-fn exit_on_endpoint_down_with(is_gateway: bool, enabled: bool) -> bool {
+fn gateway_quic_restarts_with(is_gateway: bool, enabled: bool) -> bool {
     is_gateway && enabled
 }
 
@@ -397,12 +400,12 @@ mod tests {
     /// Only an enabled gateway exits on endpoint death.
     #[test]
     fn only_an_enabled_gateway_exits_on_endpoint_death() {
-        assert!(exit_on_endpoint_down_with(true, true));
-        assert!(!exit_on_endpoint_down_with(false, true), "a peer never");
-        assert!(!exit_on_endpoint_down_with(true, false), "not enabled");
-        assert!(!exit_on_endpoint_down_with(false, false));
+        assert!(gateway_quic_restarts_with(true, true));
+        assert!(!gateway_quic_restarts_with(false, true), "a peer never");
+        assert!(!gateway_quic_restarts_with(true, false), "not enabled");
+        assert!(!gateway_quic_restarts_with(false, false));
         // Nothing in the unit-test binary enables it.
-        assert!(!exit_on_endpoint_down(true));
+        assert!(!gateway_quic_restarts(true));
     }
 
     /// `died` resolves on `Down` only: a release or a disabled endpoint is

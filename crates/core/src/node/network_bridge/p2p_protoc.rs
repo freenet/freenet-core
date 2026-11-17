@@ -4131,7 +4131,10 @@ fn disconnect_reason_for_close(
 /// Log a stopped transport listener and return the error that ends the event
 /// loop. The log lines are the ones the node wrote when it read the listener
 /// task's `JoinHandle` itself: a returned error is logged with `error`, a
-/// panic or cancellation with `cause` and the join error's text.
+/// panic or cancellation with `cause` and the join error's text. A gateway
+/// restart for QUIC is not logged here: it returns
+/// [`crate::transport::GatewayQuicRestart`], which the node's fatal-listener
+/// path logs as the planned restart it is.
 fn listener_exit_error(exit: &ListenerExit) -> anyhow::Error {
     match exit {
         ListenerExit::Error(e) => {
@@ -4153,11 +4156,14 @@ fn listener_exit_error(exit: &ListenerExit) -> anyhow::Error {
             );
         }
         ListenerExit::QuicEndpointDown => {
-            tracing::error!(
-                "CRITICAL: this gateway's QUIC endpoint died; exiting for the service \
-                 supervisor to restart the node with a new endpoint"
-            );
-            return anyhow!("QUIC endpoint died on a gateway — exiting for a supervised restart");
+            return anyhow::Error::new(crate::transport::GatewayQuicRestart {
+                reason: "its QUIC endpoint died",
+            });
+        }
+        ListenerExit::QuicCooldownEnded => {
+            return anyhow::Error::new(crate::transport::GatewayQuicRestart {
+                reason: "the crash-breaker cooldown that kept QUIC off has ended",
+            });
         }
     }
     anyhow!(
@@ -4332,6 +4338,35 @@ pub(crate) mod tests {
                     "{exit:?}: {part:?} missing from {line:?}"
                 );
             }
+        }
+    }
+
+    /// A gateway restart for QUIC (#5940) ends the loop with the typed
+    /// error the fatal-listener path recognises, not the "transport layer is
+    /// dead" error, and is not logged as CRITICAL here.
+    #[test]
+    fn a_gateway_quic_restart_ends_the_loop_with_its_own_error() {
+        use crate::transport::{GatewayQuicRestart, ListenerExit};
+        let (logs, _guard) = crate::util::test_log_capture::install();
+        for exit in [
+            ListenerExit::QuicEndpointDown,
+            ListenerExit::QuicCooldownEnded,
+        ] {
+            logs.lock().unwrap().clear();
+            let err = super::listener_exit_error(&exit);
+            let restart = err
+                .downcast_ref::<GatewayQuicRestart>()
+                .unwrap_or_else(|| panic!("{exit:?}: {err}"));
+            assert!(!restart.reason.is_empty());
+            assert!(
+                !crate::listener_exit_is_graceful(&err),
+                "{exit:?} takes the fatal-listener exit"
+            );
+            let captured = logs.lock().unwrap().clone();
+            assert!(
+                !captured.iter().any(|l| l.contains("CRITICAL")),
+                "{exit:?}: {captured:?}"
+            );
         }
     }
 

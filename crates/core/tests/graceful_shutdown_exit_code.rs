@@ -56,6 +56,10 @@ use std::{
 /// `run_network` binds it several steps earlier, before the node is built.
 const READY_MARKER: &str = "Starting node";
 
+/// An `extra_args` entry that starts the node as a peer: it is not passed
+/// on, and `--is-gateway` is left out.
+const AS_PEER: &str = "<as-peer>";
+
 /// Emitted by the signal task in `run_network_node_with_signals` on SIGTERM /
 /// SIGINT. Asserted after exit so a status of 0 cannot be credited to some other
 /// clean-exit path (`run_disabled_idle`, an early return) — the test must prove
@@ -171,7 +175,7 @@ impl NodeProcess {
             .args(["--network-port", &network_port.to_string()])
             .args(["--public-network-address", "127.0.0.1"])
             .args(["--public-network-port", &network_port.to_string()])
-            .arg("--is-gateway")
+            .args((!extra_args.contains(&AS_PEER)).then_some("--is-gateway"))
             // No gateway-index fetch, so the node boots with no internet.
             .arg("--skip-load-from-network")
             .arg("--ignore-protocol-checking")
@@ -188,7 +192,7 @@ impl NodeProcess {
             .args(["--config-dir", &dir.to_string_lossy()])
             .args(["--data-dir", &dir.to_string_lossy()])
             .args(["--log-dir", &log_dir.to_string_lossy()])
-            .args(extra_args)
+            .args(extra_args.iter().filter(|arg| **arg != AS_PEER))
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if let Some(home) = home {
@@ -201,7 +205,8 @@ impl NodeProcess {
         command
             .env_remove("FREENET_SUPERVISED")
             .env_remove("INVOCATION_ID")
-            .env_remove("FREENET_TEST_QUIC_PANIC");
+            .env_remove("FREENET_TEST_QUIC_PANIC")
+            .env_remove("FREENET_TEST_QUIC_ENDPOINT_DOWN_AFTER_SECS");
         command.envs(env.iter().copied());
         let child = command.spawn()?;
         Ok(Self {
@@ -699,12 +704,18 @@ fn quic_breaker_on_a_gateway_holds_only_for_the_gateway_cooldown() -> anyhow::Re
 }
 
 /// Logged by a gateway that exits because its QUIC endpoint died.
-#[cfg(feature = "quic-panic-injection")]
-const ENDPOINT_DOWN_EXIT_MARKER: &str = "this gateway's QUIC endpoint died";
+#[cfg(feature = "testing")]
+const ENDPOINT_DOWN_EXIT_MARKER: &str =
+    "Gateway exiting for its service supervisor to restart it with QUIC on: its QUIC endpoint died";
 
 /// Logged when the endpoint goes down after a caught adapter panic.
-#[cfg(feature = "quic-panic-injection")]
+#[cfg(feature = "testing")]
 const ENDPOINT_DOWN_MARKER: &str = "The QUIC endpoint is down";
+
+/// Test builds (`testing`): fail the QUIC endpoint this many seconds after
+/// the bind (`connection_handler::fail_endpoint_from_env`).
+#[cfg(feature = "testing")]
+const ENDPOINT_DOWN_ENV: &str = "FREENET_TEST_QUIC_ENDPOINT_DOWN_AFTER_SECS";
 
 /// A supervised gateway whose QUIC endpoint dies exits through the fatal
 /// listener path (exit 42), having noted the exit in the breaker marker, and
@@ -712,19 +723,16 @@ const ENDPOINT_DOWN_MARKER: &str = "The QUIC endpoint is down";
 /// within the window the next start trips (the gateway cooldown). An
 /// unsupervised gateway keeps running over UDP.
 ///
-/// Needs the `quic-panic-injection` feature (`down` mode: the outcome of a
-/// caught socket-adapter panic).
+/// Needs the `testing` feature, which CI's Linux test job builds with: the
+/// endpoint is failed through a caught socket-adapter panic.
 ///
 /// FALSIFY: drop the `note_endpoint_down_exit` call in
 /// `connection_handler::listener_liveness`; the second start trips.
-#[cfg(feature = "quic-panic-injection")]
+#[cfg(feature = "testing")]
 #[test]
 fn a_supervised_gateway_exits_on_endpoint_death_and_restarts_quic() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let down = [
-        ("FREENET_SUPERVISED", "1"),
-        ("FREENET_TEST_QUIC_PANIC", "down:2"),
-    ];
+    let down = [("FREENET_SUPERVISED", "1"), (ENDPOINT_DOWN_ENV, "2")];
     for run in 1..=3 {
         let log_dir = dir.path().join(format!("logs-{run}"));
         let mut node = spawn_quic_node_full(dir.path(), &log_dir, &[], None, &down)?;
@@ -771,7 +779,7 @@ fn a_supervised_gateway_exits_on_endpoint_death_and_restarts_quic() -> anyhow::R
         &dir.path().join("logs"),
         &[],
         None,
-        &[("FREENET_TEST_QUIC_PANIC", "down:1")],
+        &[(ENDPOINT_DOWN_ENV, "1")],
     )?;
     node.wait_for_logs(&[ENDPOINT_DOWN_MARKER], Duration::from_secs(30))?;
     std::thread::sleep(Duration::from_secs(2));
@@ -787,6 +795,166 @@ fn a_supervised_gateway_exits_on_endpoint_death_and_restarts_quic() -> anyhow::R
         "Logs:\n{}",
         node.logs()
     );
+    Ok(())
+}
+
+/// A peer keeps the 24 h cooldown: a trip 20 minutes old, which a gateway
+/// would be past, still keeps QUIC off.
+///
+/// FALSIFY: make `BreakerRole::from_is_gateway` return `Gateway` for every
+/// node; the peer builds the endpoint.
+#[test]
+fn quic_breaker_on_a_peer_holds_for_the_peer_cooldown() -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let dir = tempfile::tempdir()?;
+    write_tripped_marker(dir.path(), now - 20 * 60)?;
+    // A peer needs a gateway to start; this one is never reached.
+    let gateway = format!("127.0.0.1:9,{}", "11".repeat(32));
+    let mut node = spawn_quic_node_with(
+        dir.path(),
+        &dir.path().join("logs"),
+        &[AS_PEER, "--gateway", &gateway],
+    )?;
+    let logs = node.logs();
+    assert!(
+        logs.contains(QUIC_COOLING_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
+        "a peer trip 20 min old must keep QUIC off. Logs:\n{logs}"
+    );
+    node.send_sigterm()?;
+    assert_eq!(
+        node.wait_for_exit(Duration::from_secs(45))?.code(),
+        Some(0),
+        "Logs:\n{}",
+        node.logs()
+    );
+    Ok(())
+}
+
+/// Write a Tripped breaker marker for `tripped_at_secs`.
+fn write_tripped_marker(dir: &Path, tripped_at_secs: u64) -> anyhow::Result<()> {
+    let marker = serde_json::json!({
+        "state": "tripped",
+        "tripped_at_secs": tripped_at_secs,
+    });
+    std::fs::write(dir.join(QUIC_MARKER_FILE), serde_json::to_vec(&marker)?)?;
+    Ok(())
+}
+
+/// Logged by a gateway that exits for its supervisor to restore QUIC.
+const GATEWAY_RESTART_MARKER: &str = "Gateway exiting for its service supervisor to restart it";
+
+/// A supervised gateway that starts with QUIC kept off by a cooldown exits
+/// when the cooldown ends (after at least `QUIC_RESTORE_MIN_UPTIME`, 90 s),
+/// with exit 42, which the crash counters and the rollback treat as no
+/// crash; its next start runs QUIC. An unsupervised one logs an ERROR and
+/// keeps running.
+///
+/// FALSIFY: drop the `set_quic_restore_at` call in `breaker::gate`'s Cool
+/// arm; the node never exits and the wait times out.
+#[test]
+fn a_supervised_gateway_restarts_when_its_breaker_cooldown_ends() -> anyhow::Result<()> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let dir = tempfile::tempdir()?;
+    // The cooldown has about a minute left; the restart waits the 90 s floor.
+    write_tripped_marker(dir.path(), now - 14 * 60)?;
+    let supervised = [("FREENET_SUPERVISED", "1")];
+    let mut node = spawn_quic_node_full(
+        dir.path(),
+        &dir.path().join("logs-1"),
+        &[],
+        None,
+        &supervised,
+    )?;
+    let logs = node.logs();
+    assert!(
+        logs.contains(QUIC_COOLING_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
+        "QUIC off during the cooldown. Logs:\n{logs}"
+    );
+    let started = Instant::now();
+    let status = node.wait_for_exit(Duration::from_secs(150))?;
+    let logs = node.logs();
+    assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
+    assert!(
+        started.elapsed() >= Duration::from_secs(80),
+        "not before the floor"
+    );
+    assert!(logs.contains(GATEWAY_RESTART_MARKER), "Logs:\n{logs}");
+    assert!(
+        !logs.contains("CRITICAL"),
+        "a planned restart. Logs:\n{logs}"
+    );
+
+    let mut node = spawn_quic_node_full(
+        dir.path(),
+        &dir.path().join("logs-2"),
+        &[],
+        None,
+        &supervised,
+    )?;
+    let logs = node.logs();
+    assert!(
+        logs.contains(QUIC_BUILT_MARKER),
+        "QUIC on after the restart. Logs:\n{logs}"
+    );
+    node.send_sigterm()?;
+    assert_eq!(node.wait_for_exit(Duration::from_secs(45))?.code(), Some(0));
+
+    // Unsupervised: an ERROR, and no exit.
+    let dir = tempfile::tempdir()?;
+    write_tripped_marker(dir.path(), now - 5 * 60)?;
+    let mut node = spawn_quic_node(dir.path(), &dir.path().join("logs"))?;
+    let logs = node.logs();
+    assert!(
+        logs.contains("QUIC is off on this gateway until it restarts"),
+        "Logs:\n{logs}"
+    );
+    node.send_sigterm()?;
+    assert_eq!(node.wait_for_exit(Duration::from_secs(45))?.code(), Some(0));
+    Ok(())
+}
+
+/// A gateway replaces a breaker marker it cannot read and runs QUIC armed;
+/// one it cannot replace (here a directory) keeps QUIC off for the run.
+///
+/// FALSIFY: remove the gateway branch for `Verdict::Unreadable` in
+/// `breaker::gate`; the unreadable file keeps QUIC off.
+#[cfg(unix)]
+#[test]
+fn a_gateway_replaces_an_unreadable_breaker_marker() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join(QUIC_MARKER_FILE);
+    std::fs::write(&path, b"{}")?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000))?;
+    if std::fs::read(&path).is_ok() {
+        // Root reads it anyway; nothing to test here.
+        return Ok(());
+    }
+    let mut node = spawn_quic_node(dir.path(), &dir.path().join("logs"))?;
+    let logs = node.logs();
+    assert!(
+        logs.contains(QUIC_BUILT_MARKER) && logs.contains("this gateway replaced it"),
+        "Logs:\n{logs}"
+    );
+    wait_for_armed_marker(dir.path(), &node)?;
+    node.send_sigterm()?;
+    assert_eq!(node.wait_for_exit(Duration::from_secs(45))?.code(), Some(0));
+
+    let dir = tempfile::tempdir()?;
+    std::fs::create_dir(dir.path().join(QUIC_MARKER_FILE))?;
+    let mut node = spawn_quic_node(dir.path(), &dir.path().join("logs"))?;
+    let logs = node.logs();
+    assert!(
+        !logs.contains(QUIC_BUILT_MARKER)
+            && logs.contains("Could not read or replace the QUIC crash-breaker marker"),
+        "Logs:\n{logs}"
+    );
+    node.send_sigterm()?;
+    assert_eq!(node.wait_for_exit(Duration::from_secs(45))?.code(), Some(0));
     Ok(())
 }
 

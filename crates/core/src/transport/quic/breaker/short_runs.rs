@@ -106,7 +106,7 @@
 //!   uses no boot identity, so that shutdown is a stop like any other. A laptop
 //!   suspended during a run may read as a short run, or may clear the count
 //!   early, depending on whether the timer's clock counts suspended time. That
-//!   is unverified, and it costs at most a day on UDP.
+//!   is unverified, and it costs at most one cooldown on UDP.
 //! - **The marker path** is the node's own data directory. The start that
 //!   reads the marker and the run that writes it are the same process type
 //!   with the same configuration, so `freenet service`, which starts
@@ -148,8 +148,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use super::{
-    BreakerOutcome, BreakerRole, Gated, Marker, PENDING, Previous, Verdict, clear_if_owned,
-    cooldown_end, marker_path, read_previous, unix_secs, write_marker,
+    BreakerOutcome, BreakerRole, Gated, Marker, PENDING, Previous, QUIC_BREAKER_COOLDOWN, Verdict,
+    clear_if_owned, cooldown_end, marker_path, read_previous, unix_secs, write_marker,
 };
 use crate::config::{GlobalExecutor, GlobalRng};
 use crate::node::background_task_monitor::LateRegistrar;
@@ -198,7 +198,7 @@ pub(super) fn decide(
             started_at_secs,
             quic_panicked: true,
             ..
-        }) if within_cooldown(*started_at_secs, now_secs, role) => {
+        }) if within(*started_at_secs, now_secs, SHORT_RUN_WINDOW) => {
             let short_runs = short_runs.saturating_add(1);
             if short_runs >= SHORT_RUNS_TO_TRIP && !ignore_breaker {
                 Decision {
@@ -210,7 +210,7 @@ pub(super) fn decide(
             }
         }
         Previous::Marker(Marker::Tripped { tripped_at_secs })
-            if !ignore_breaker && within_cooldown(*tripped_at_secs, now_secs, role) =>
+            if !ignore_breaker && within(*tripped_at_secs, now_secs, role.cooldown()) =>
         {
             Decision {
                 verdict: Verdict::Cool {
@@ -230,12 +230,18 @@ pub(super) fn decide(
     }
 }
 
-/// Whether `at_secs` is not ahead of `now_secs` and less than a cooldown before
+/// Whether `at_secs` is not ahead of `now_secs` and less than `window` before
 /// it. Stricter than the unix `cooling`: a time ahead of the clock does not
 /// count at all.
-fn within_cooldown(at_secs: u64, now_secs: u64, role: BreakerRole) -> bool {
-    at_secs <= now_secs && now_secs < at_secs.saturating_add(role.cooldown().as_secs())
+fn within(at_secs: u64, now_secs: u64, window: Duration) -> bool {
+    at_secs <= now_secs && now_secs < at_secs.saturating_add(window.as_secs())
 }
+
+/// How long after one counted short run the next still adds to the count:
+/// the peer cooldown, for every role. A gateway's shorter cooldown sets only
+/// how long a trip keeps QUIC off, so its short runs, which a wrapper's
+/// restart backoff spreads out, still add up.
+const SHORT_RUN_WINDOW: Duration = QUIC_BREAKER_COOLDOWN;
 
 /// The marker a decision leaves behind; `None` leaves the file as it is.
 fn marker_after(decision: Decision, now_secs: u64, nonce: u64) -> Option<Marker> {
@@ -296,12 +302,17 @@ pub(super) fn gate<T>(
         }
         Verdict::Trip => {
             // Off even if the write fails: the evidence is in hand now.
-            if let Some(Err(error)) = marker.as_ref().map(|marker| write_marker(&path, marker)) {
-                tracing::warn!(
+            match marker.as_ref().map(|marker| write_marker(&path, marker)) {
+                Some(Err(error)) => tracing::warn!(
                     %error,
                     path = %path.display(),
                     "Could not record the QUIC crash-breaker trip; the next start decides again"
-                );
+                ),
+                // A gateway restarts at the cooldown's end only after a trip
+                // it recorded: a restart would otherwise decide again on the
+                // same short runs.
+                Some(Ok(())) => super::set_quic_restore_at(role, now_secs),
+                None => {}
             }
             metrics.record_quic_breaker_trip();
             metrics.set_quic_breaker_suppressed(true);
@@ -312,7 +323,8 @@ pub(super) fn gate<T>(
                 cooldown_minutes = role.cooldown().as_secs() / 60,
                 ?role,
                 "Several runs in a row with QUIC enabled ended early, so QUIC stays off until \
-                 the cooldown ends. Set `quic-ignore-crash-breaker = true` to run QUIC anyway"
+                 the cooldown ends.{} Set `quic-ignore-crash-breaker = true` to run QUIC anyway",
+                super::restart_note(role)
             );
         }
         Verdict::Cool { tripped_at_secs } => {
@@ -321,9 +333,11 @@ pub(super) fn gate<T>(
                 until = %until_utc(tripped_at_secs),
                 ?role,
                 "QUIC stays off: several runs in a row with QUIC enabled ended early and the \
-                 cooldown has not ended. Set `quic-ignore-crash-breaker = true` to run QUIC \
-                 anyway"
+                 cooldown has not ended.{} Set `quic-ignore-crash-breaker = true` to run QUIC \
+                 anyway",
+                super::restart_note(role)
             );
+            super::set_quic_restore_at(role, tripped_at_secs);
         }
         Verdict::RunUnarmed | Verdict::Unreadable => {}
     }
@@ -544,16 +558,26 @@ mod tests {
         super::decide(previous, now_secs, ignore_breaker, BreakerRole::Peer)
     }
 
-    /// On Windows a gateway counts short runs and holds a trip only within
-    /// the gateway cooldown.
+    /// On Windows a gateway holds a trip only for the gateway cooldown, but
+    /// counts short runs over the same window as a peer, so runs spread out
+    /// by a wrapper's restart backoff still add up.
     #[test]
-    fn a_gateway_counts_and_cools_within_the_gateway_cooldown() {
+    fn a_gateway_cools_for_the_gateway_cooldown_and_counts_like_a_peer() {
         let g = super::super::GATEWAY_QUIC_BREAKER_COOLDOWN.as_secs();
         let gw = |previous: &Previous, now_secs: u64| {
             super::decide(previous, now_secs, false, BreakerRole::Gateway)
         };
         assert_eq!(gw(&panicked(2, T0), T0 + g - 1).verdict, Verdict::Trip);
-        assert_eq!(gw(&panicked(2, T0), T0 + g), arm(0));
+        assert_eq!(
+            gw(&panicked(2, T0), T0 + g).verdict,
+            Verdict::Trip,
+            "the count is not cut at the gateway cooldown"
+        );
+        assert_eq!(
+            gw(&panicked(2, T0), T0 + cooldown() - 1).verdict,
+            Verdict::Trip
+        );
+        assert_eq!(gw(&panicked(2, T0), T0 + cooldown()), arm(0));
         assert_eq!(
             gw(&tripped(T0), T0 + g - 1).verdict,
             Verdict::Cool {

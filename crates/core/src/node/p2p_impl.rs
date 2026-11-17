@@ -692,6 +692,29 @@ impl NodeP2P {
                        uptime,
                        EMIT_FAST_CRASH_EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed),
                    );
+                   // #5940: a supervised gateway restarting to restore QUIC
+                   // takes this same exit, but it is planned, so it is not
+                   // logged as a failure.
+                   if let Some(restart) = e.downcast_ref::<crate::transport::GatewayQuicRestart>() {
+                       tracing::warn!(
+                           reason = restart.reason,
+                           exit_code,
+                           uptime_secs = uptime.as_secs(),
+                           "Gateway exiting for its service supervisor to restart it with QUIC \
+                            on: {}",
+                           restart.reason
+                       );
+                       eprintln!(
+                           "Gateway exiting with code {exit_code} for its service supervisor to \
+                            restart it with QUIC on: {}",
+                           restart.reason
+                       );
+                       // The file log is written by a background worker that
+                       // `process::exit` does not wait for; give it a moment
+                       // so the line above reaches the log.
+                       std::thread::sleep(std::time::Duration::from_millis(500));
+                       std::process::exit(exit_code);
+                   }
                    eprintln!("CRITICAL: Network event listener exited (fatal): {e}");
                    tracing::error!(
                        error = %e,

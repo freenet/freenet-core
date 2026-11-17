@@ -354,9 +354,9 @@ pub(crate) use self::boundary::TransportHandle;
 #[cfg(test)]
 pub(crate) use self::boundary::QuicPathEnd;
 pub(crate) use self::boundary::{
-    CloseReason, InboundAcceptor, InboundExpectations, InboundStreamRegistry, ListenerExit,
-    NextConnection, ObservedSend, OutboundConnector, PeerConnectionApi, PendingConnection,
-    ReceiptStamp, StreamProgressObserver, StreamSendOutcome,
+    CloseReason, GatewayQuicRestart, InboundAcceptor, InboundExpectations, InboundStreamRegistry,
+    ListenerExit, NextConnection, ObservedSend, OutboundConnector, PeerConnectionApi,
+    PendingConnection, ReceiptStamp, StreamProgressObserver, StreamSendOutcome,
 };
 pub use self::boundary::{IncomingChunks, IncomingStream, StreamIdentity};
 #[cfg(test)]

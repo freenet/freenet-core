@@ -8,6 +8,27 @@
 //! same failure; the breaker bounds that to one restart with QUIC per
 //! cooldown.
 //!
+//! # Gateways
+//!
+//! The cooldown is decided once, at startup ([`gate`]). So that a gateway is
+//! never QUIC-off for longer than its cooldown, a gateway run by a service
+//! supervisor (`liveness::gateway_quic_restarts`) whose run starts with QUIC
+//! kept off by a trip or a cooldown exits when the cooldown ends
+//! ([`quic_restore_at`]), with exit 42, and its supervisor restarts it with
+//! QUIC on. 42 is the code the crash-loop rollback and systemd's start limit
+//! do not count; under a unit installed by `freenet service install` it also
+//! runs `freenet update`, which only checks for a newer release and changes
+//! nothing when there is none. The restart comes at least
+//! `QUIC_RESTORE_MIN_UPTIME` (90 s) after the start, so it is never taken
+//! for a fast crash. A gateway also replaces a marker it cannot read, and
+//! runs armed, instead of staying off. Two cases keep QUIC off on a gateway
+//! until it restarts, with an ERROR: a marker that can be neither read nor
+//! removed, and a trip that cannot be written; in both the data directory is
+//! not writable, and a restart would find the same marker. An unsupervised
+//! gateway logs an ERROR naming the cooldown end instead of restarting.
+//! An older release reads no role: rolling a gateway back to one brings the
+//! peer cooldown back.
+//!
 //! **This module doc describes unix.** Windows does not reliably tell a
 //! process that it is being stopped: every design that tried to tell a crash
 //! from a normal stop there (a logoff, a Fast Startup shutdown, a session end)
@@ -92,7 +113,10 @@
 //! - **Any abnormal exit trips, not only one caused by QUIC** (a forced exit
 //!   after a fatal listener or storage error, an out-of-memory kill), so
 //!   `quic_breaker_trips` counts abnormal ends of QUIC-enabled runs. The
-//!   breaker does not change exit codes, so it and the post-update crash-loop
+//!   exception is a gateway's exit on endpoint death, which it notes in the
+//!   marker first ([`note_endpoint_down_exit`]): that restarts QUIC until
+//!   it repeats [`ENDPOINT_DOWN_EXITS_TO_TRIP`] times. The breaker does not
+//!   change exit codes, so it and the post-update crash-loop
 //!   rollback (#4073) act independently.
 //! - **Known false trips** (one cooldown with QUIC off each): a stop ended
 //!   with SIGKILL, whether by the supervisor after its grace period (systemd
@@ -155,7 +179,7 @@ pub(crate) const QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(24 * 60 *
 pub(crate) const GATEWAY_QUIC_BREAKER_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
 /// A node that exits on purpose because its QUIC endpoint died (a gateway,
-/// see `liveness::exit_on_endpoint_down`) is restarted by its supervisor
+/// see `liveness::gateway_quic_restarts`) is restarted by its supervisor
 /// with QUIC on, unless it has already done so this many times within
 /// [`ENDPOINT_DOWN_WINDOW`]: then that exit trips the breaker. Provisional
 /// value (a proposal, not measured).
@@ -227,6 +251,35 @@ static PENDING: parking_lot::Mutex<Pending> = parking_lot::Mutex::new(Pending {
     signals_ready: false,
     registrar: None,
 });
+
+/// On a gateway whose run starts with QUIC kept off by a trip or a cooldown:
+/// when that cooldown ends. Read by the transport, which restarts a
+/// supervised gateway then ([`quic_restore_at`]).
+static QUIC_RESTORE_AT: parking_lot::Mutex<Option<SystemTime>> = parking_lot::Mutex::new(None);
+
+/// When the cooldown that keeps this gateway's QUIC off for the run ends, if
+/// one does. `None` on a peer, when QUIC runs, and when QUIC is off for a
+/// reason a restart would not cure (a marker that cannot be read or written).
+pub(crate) fn quic_restore_at() -> Option<SystemTime> {
+    *QUIC_RESTORE_AT.lock()
+}
+
+/// Record the cooldown end a gateway restarts at; nothing on a peer.
+fn set_quic_restore_at(role: BreakerRole, tripped_at_secs: u64) {
+    if role == BreakerRole::Gateway {
+        *QUIC_RESTORE_AT.lock() = Some(cooldown_end(tripped_at_secs, role));
+    }
+}
+
+/// What a gateway's trip or cooldown WARN adds about the restart.
+fn restart_note(role: BreakerRole) -> &'static str {
+    match role {
+        BreakerRole::Peer => "",
+        BreakerRole::Gateway => {
+            " A gateway run by a service supervisor restarts itself then to turn QUIC back on."
+        }
+    }
+}
 
 /// The marker this process armed and its nonce, for the clean exit.
 static ARMED: OnceLock<(PathBuf, u64)> = OnceLock::new();
@@ -705,7 +758,7 @@ pub(crate) async fn gate<T>(
         }
     }
 
-    let decided = verdict(&Facts {
+    let mut decided = verdict(&Facts {
         previous: &previous,
         boot_id: boot_id.as_deref(),
         armed_pid_alive,
@@ -714,6 +767,29 @@ pub(crate) async fn gate<T>(
         ignore_breaker,
         role,
     });
+    // A gateway does not keep QUIC off over a marker it cannot read: it
+    // replaces the marker and runs armed, so a real crash loop still trips.
+    // If the marker cannot be removed either, QUIC stays off for the run
+    // and no restart is scheduled (one would find the same marker).
+    if role == BreakerRole::Gateway && decided == Verdict::Unreadable {
+        match remove_if_exists(&path) {
+            Ok(()) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "Could not read the QUIC crash-breaker marker; this gateway replaced it \
+                     and runs QUIC with a new one"
+                );
+                previous = Previous::Nothing;
+                decided = Verdict::Arm;
+            }
+            Err(error) => tracing::error!(
+                %error,
+                path = %path.display(),
+                "Could not read or replace the QUIC crash-breaker marker, so QUIC stays off \
+                 on this gateway until it restarts. Fix the file's permissions or remove it"
+            ),
+        }
+    }
 
     let metrics = &crate::transport::TRANSPORT_METRICS;
     let until_utc = |tripped_at_secs: u64| {
@@ -749,7 +825,7 @@ pub(crate) async fn gate<T>(
         ),
         Verdict::Trip => {
             // Off even if the write fails: the evidence is in hand now.
-            let _best_effort = write_marker(
+            let written = write_marker(
                 &path,
                 &Marker::Tripped {
                     tripped_at_secs: now_secs,
@@ -762,9 +838,22 @@ pub(crate) async fn gate<T>(
                 cooldown_minutes = role.cooldown().as_secs() / 60,
                 ?role,
                 "The previous run with QUIC enabled ended abnormally, so QUIC stays off \
-                 until the cooldown ends. Set `quic-ignore-crash-breaker = true` to run \
-                 QUIC anyway"
+                 until the cooldown ends.{} Set `quic-ignore-crash-breaker = true` to run \
+                 QUIC anyway",
+                restart_note(role)
             );
+            match written {
+                Ok(()) => set_quic_restore_at(role, now_secs),
+                // A restart would find the old marker and trip again, so a
+                // gateway does not restart for a trip it could not record.
+                Err(error) if role == BreakerRole::Gateway => tracing::error!(
+                    %error,
+                    path = %path.display(),
+                    "Could not record the QUIC crash-breaker trip, so QUIC stays off on this \
+                     gateway until it restarts. Fix the data directory's permissions"
+                ),
+                Err(_) => {}
+            }
         }
         Verdict::Cool { tripped_at_secs } => {
             metrics.set_quic_breaker_suppressed(true);
@@ -772,9 +861,11 @@ pub(crate) async fn gate<T>(
                 until = %until_utc(tripped_at_secs),
                 ?role,
                 "QUIC stays off: a run with QUIC enabled ended abnormally and the \
-                 cooldown has not ended. Set `quic-ignore-crash-breaker = true` to run \
-                 QUIC anyway"
+                 cooldown has not ended.{} Set `quic-ignore-crash-breaker = true` to run \
+                 QUIC anyway",
+                restart_note(role)
             );
+            set_quic_restore_at(role, tripped_at_secs);
         }
         Verdict::Unreadable => {
             metrics.set_quic_breaker_suppressed(true);
