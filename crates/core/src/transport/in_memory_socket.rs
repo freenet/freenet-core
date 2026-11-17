@@ -678,32 +678,45 @@ pub fn nat_filtered_handle(network_name: &str) -> Option<NatFilteredCounts> {
 }
 
 /// The sender's NAT, if it has one, opens or refreshes its binding to `to`.
+/// Returns the source address the datagram leaves with: `from`, or the port
+/// a symmetric NAT opened toward `to`.
 #[cfg(any(test, feature = "testing"))]
-fn nat_on_send(network_name: &str, from: SocketAddr, to: SocketAddr) {
+fn nat_on_send(network_name: &str, from: SocketAddr, to: SocketAddr) -> SocketAddr {
     let Some(network) = NAT_NETWORKS.get(network_name).map(|n| n.value().clone()) else {
-        return;
+        return from;
     };
     let mut network = network.lock().unwrap();
     let now = network.time.now_nanos();
-    if let Some(nat) = network.nats.get_mut(&from.ip()) {
-        nat.on_outbound(to, now);
+    match network.nats.get_mut(&from.ip()) {
+        Some(nat) => {
+            let external = nat.map_outbound(from, to);
+            nat.on_outbound(to, now);
+            if external != from {
+                // So a peer's harness hooks can find the network by the
+                // address it sees.
+                register_address_network(external, network_name);
+            }
+            external
+        }
+        None => from,
     }
 }
 
-/// Whether the receiver's NAT, if it has one, admits a datagram from `from`
-/// arriving now. A refusal is counted.
+/// Where the receiver's NAT, if it has one, delivers a datagram from `from`
+/// arriving now at `target`: `target` itself, the node behind a symmetric
+/// NAT's port, or nowhere (`None`, counted).
 #[cfg(any(test, feature = "testing"))]
-fn nat_admits(network_name: &str, target: SocketAddr, from: SocketAddr) -> bool {
+fn nat_inbound(network_name: &str, target: SocketAddr, from: SocketAddr) -> Option<SocketAddr> {
     let Some(network) = NAT_NETWORKS.get(network_name).map(|n| n.value().clone()) else {
-        return true;
+        return Some(target);
     };
     let network = network.lock().unwrap();
     let now = network.time.now_nanos();
     let Some(nat) = network.nats.get(&target.ip()) else {
-        return true;
+        return Some(target);
     };
-    if nat.admits(from, now) {
-        return true;
+    if let Some(to) = nat.map_inbound(target, from, now) {
+        return Some(to);
     }
     let filtering = nat.filtering();
     *network
@@ -712,7 +725,7 @@ fn nat_admits(network_name: &str, target: SocketAddr, from: SocketAddr) -> bool 
         .unwrap()
         .entry(filtering)
         .or_default() += 1;
-    false
+    None
 }
 
 /// Delivers a packet to a target socket within a network.
@@ -727,10 +740,13 @@ pub fn deliver_packet_to_network(
     from: SocketAddr,
 ) -> bool {
     #[cfg(any(test, feature = "testing"))]
-    if !nat_admits(network_name, target, from) {
-        tracing::trace!(%target, %from, "NAT dropped an inbound datagram");
-        return false;
-    }
+    let target = match nat_inbound(network_name, target, from) {
+        Some(target) => target,
+        None => {
+            tracing::trace!(%target, %from, "NAT dropped an inbound datagram");
+            return false;
+        }
+    };
     if let Some(registry) = get_registry(network_name) {
         registry.read().unwrap().deliver_packet(target, data, from)
     } else {
@@ -887,7 +903,9 @@ impl<T: TimeSource> InMemorySocket<T> {
         // The datagram left this host, so its NAT opens the binding whether
         // or not the network then loses it.
         #[cfg(any(test, feature = "testing"))]
-        nat_on_send(&self.network_name, self.addr, target);
+        let from = nat_on_send(&self.network_name, self.addr, target);
+        #[cfg(not(any(test, feature = "testing")))]
+        let from = self.addr;
 
         match check_packet_delivery(&self.network_name, self.addr, target, buf) {
             PacketDeliveryDecision::Drop => {
@@ -897,7 +915,6 @@ impl<T: TimeSource> InMemorySocket<T> {
             PacketDeliveryDecision::DelayedDelivery(delay) => {
                 // Spawn task to deliver after delay using time source
                 let network_name = self.network_name.clone();
-                let from = self.addr;
                 let time_source = self.time_source.clone();
                 GlobalExecutor::spawn(async move {
                     time_source.sleep(delay).await;
@@ -907,12 +924,12 @@ impl<T: TimeSource> InMemorySocket<T> {
             }
             PacketDeliveryDecision::QueuedDelivery { deadline } => {
                 // Queue for virtual time delivery
-                queue_packet_for_delivery(&self.network_name, deadline, data, self.addr, target);
+                queue_packet_for_delivery(&self.network_name, deadline, data, from, target);
                 Ok(buf.len())
             }
             PacketDeliveryDecision::Deliver => {
                 // Immediate delivery
-                deliver_packet_to_network(&self.network_name, target, data, self.addr);
+                deliver_packet_to_network(&self.network_name, target, data, from);
                 Ok(buf.len())
             }
         }
@@ -932,7 +949,9 @@ impl<T: TimeSource> InMemorySocket<T> {
         // The datagram left this host, so its NAT opens the binding whether
         // or not the network then loses it.
         #[cfg(any(test, feature = "testing"))]
-        nat_on_send(&self.network_name, self.addr, target);
+        let from = nat_on_send(&self.network_name, self.addr, target);
+        #[cfg(not(any(test, feature = "testing")))]
+        let from = self.addr;
 
         match check_packet_delivery(&self.network_name, self.addr, target, buf) {
             PacketDeliveryDecision::Drop => Ok(buf.len()),
@@ -941,16 +960,16 @@ impl<T: TimeSource> InMemorySocket<T> {
                 // Note: For VirtualTime, this uses wall-clock sleep; consider using
                 // blocking simulation methods if deterministic tests require it.
                 std::thread::sleep(delay);
-                deliver_packet_to_network(&self.network_name, target, data, self.addr);
+                deliver_packet_to_network(&self.network_name, target, data, from);
                 Ok(buf.len())
             }
             PacketDeliveryDecision::QueuedDelivery { deadline } => {
                 // Queue for virtual time
-                queue_packet_for_delivery(&self.network_name, deadline, data, self.addr, target);
+                queue_packet_for_delivery(&self.network_name, deadline, data, from, target);
                 Ok(buf.len())
             }
             PacketDeliveryDecision::Deliver => {
-                deliver_packet_to_network(&self.network_name, target, data, self.addr);
+                deliver_packet_to_network(&self.network_name, target, data, from);
                 Ok(buf.len())
             }
         }
