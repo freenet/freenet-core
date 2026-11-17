@@ -355,6 +355,11 @@ const HOLDER_POLL: Duration = Duration::from_millis(250);
 /// The marker's file name in the node's data directory.
 pub(crate) const MARKER_FILE: &str = "quic-crash-breaker.json";
 
+/// The legacy exit-status rule's own marker on a unix peer
+/// ([`legacy_shadow`]), next to [`MARKER_FILE`]. Only telemetry reads what it
+/// decides.
+pub(crate) const LEGACY_SHADOW_FILE: &str = "quic-crash-breaker-legacy.json";
+
 /// Environment variable the macOS tray wrapper sets on its child: the path of
 /// the note where it records deliberate hard kills.
 pub const STOP_NOTE_ENV_VAR: &str = "FREENET_QUIC_BREAKER_STOP_NOTE";
@@ -374,6 +379,7 @@ static ENABLED: AtomicBool = AtomicBool::new(false);
 /// once both the endpoint is up and the signal handlers are installed.
 static PENDING: parking_lot::Mutex<Pending> = parking_lot::Mutex::new(Pending {
     marker: None,
+    shadow: None,
     quic_up: false,
     signals_ready: false,
     registrar: None,
@@ -442,6 +448,10 @@ fn restart_note_for(role: BreakerRole, restarts_itself: bool) -> &'static str {
 /// The marker this process armed and its nonce, for the clean exit.
 static ARMED: OnceLock<(PathBuf, u64)> = OnceLock::new();
 
+/// The legacy shadow marker this process armed and its nonce, for the clean
+/// exit ([`legacy_shadow`]).
+static LEGACY_ARMED: OnceLock<(PathBuf, u64)> = OnceLock::new();
+
 /// Turn the breaker on for this process. Called once by the `freenet` binary
 /// before the node is built, alongside the other process-level switches
 /// (`enable_abort_on_fatal_listener_exit`). A caller must also call
@@ -472,6 +482,11 @@ pub fn quic_breaker_clean_exit() {
                 path = %path.display(),
                 "Could not remove the QUIC crash-breaker marker on a clean exit"
             );
+        }
+    }
+    if let Some((path, nonce)) = LEGACY_ARMED.get() {
+        if let Err(error) = clear_if_owned(path, *nonce) {
+            tracing::debug!(%error, "Could not remove the legacy QUIC breaker shadow's marker");
         }
     }
 }
@@ -522,8 +537,9 @@ pub(crate) enum Marker {
         #[serde(default = "first_trip", skip_serializing_if = "is_first_trip")]
         trips: u32,
     },
-    /// Windows: a run with QUIC enabled started at this time, after
-    /// `short_runs` short runs in a row. See [`short_runs`].
+    /// A peer, or a gateway on Windows: a run with QUIC enabled started at
+    /// this time, after `short_runs` short runs in a row. See
+    /// [`short_runs`].
     ShortRuns {
         short_runs: u32,
         started_at_secs: u64,
@@ -533,6 +549,11 @@ pub(crate) enum Marker {
         /// counts. Absent in a marker from an earlier release.
         #[serde(default)]
         quic_panicked: bool,
+        /// Where that panic was (`file:line`), for telemetry. Absent when
+        /// none was recorded, and in a marker from an earlier release, which
+        /// ignores it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quic_panic_at: Option<String>,
         /// As in [`Marker::Armed`].
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         endpoint_down_secs: Vec<u64>,
@@ -590,6 +611,17 @@ impl Verdict {
     /// Whether QUIC runs.
     pub(crate) fn quic_enabled(self) -> bool {
         matches!(self, Self::Arm | Self::RunUnarmed)
+    }
+
+    /// The name telemetry reports ([`StartReport`]).
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Arm => "arm",
+            Self::RunUnarmed => "run_unarmed",
+            Self::Trip => "trip",
+            Self::Cool { .. } => "cool",
+            Self::Unreadable => "unreadable",
+        }
     }
 }
 
@@ -932,32 +964,33 @@ pub(crate) fn observe(
 ) -> Option<Observed> {
     observe_with(
         quic_requested,
-        data_dir,
+        &marker_path(data_dir),
         note_path,
         shared,
         remove_if_exists,
     )
 }
 
-/// [`observe`] with the marker removal injected, so a test can make it fail.
+/// [`observe`] for the marker at `marker` (the breaker's own, or the legacy
+/// shadow's on a unix peer, [`legacy_shadow`]), with the marker removal
+/// injected, so a test can make it fail.
 fn observe_with(
     quic_requested: bool,
-    data_dir: &Path,
+    marker: &Path,
     note_path: Option<&Path>,
     shared: bool,
     remove_marker: impl Fn(&Path) -> std::io::Result<()>,
 ) -> Option<Observed> {
-    let marker = marker_path(data_dir);
     let stopped = note_path
         .and_then(|note| std::fs::read_to_string(note).ok())
         .map(|content| parse_note(&content))
         .unwrap_or_default();
     if let Some(note) = note_path.filter(|_| !stopped.is_empty()) {
-        let noted = match read_previous(&marker) {
+        let noted = match read_previous(marker) {
             Previous::Marker(Marker::Armed { pid, .. }) if stopped.contains(&pid) => Some(pid),
             Previous::Nothing | Previous::Unreadable | Previous::Marker(_) => None,
         };
-        let removed = noted.is_some_and(|_| remove_marker(&marker).is_ok());
+        let removed = noted.is_some_and(|_| remove_marker(marker).is_ok());
         if shared {
             if let Some(pid) = noted.filter(|_| removed) {
                 let rest: Vec<String> = stopped
@@ -976,7 +1009,7 @@ fn observe_with(
         }
     }
     quic_requested.then(|| Observed {
-        previous: read_previous(&marker),
+        previous: read_previous(marker),
         stopped,
     })
 }
@@ -1005,18 +1038,29 @@ pub(crate) async fn gate<T>(
         return not_consulted(settings);
     }
     OVERRIDDEN.store(ignore_breaker, Ordering::Relaxed);
-    if cfg!(not(unix)) {
-        return short_runs::gate(settings, data_dir, ignore_breaker, now, role);
+    if decides_by_short_runs(cfg!(unix), role) {
+        // The legacy shadow reads its marker first: on the first start after
+        // an upgrade it takes the earlier release's marker as its evidence.
+        let legacy = if cfg!(unix) {
+            legacy_shadow(settings.is_some(), data_dir, ignore_breaker, now)
+        } else {
+            None
+        };
+        let (gated, counted) = short_runs::gate(settings, data_dir, ignore_breaker, now, role);
+        if let BreakerOutcome::Decided(verdict) = gated.breaker {
+            set_start_report(StartReport {
+                role,
+                rule: Rule::ShortRuns,
+                verdict,
+                ignore_breaker,
+                short_runs: Some(counted.short_runs),
+                quic_panic_at: counted.quic_panic_at,
+                legacy_verdict: legacy,
+            });
+        }
+        return gated;
     }
-    // The wrapper's note when it passed one; otherwise the note at its fixed
-    // place, which may be meant for another node (`shared`).
-    let (note_path, shared) = match std::env::var_os(STOP_NOTE_ENV_VAR) {
-        Some(path) => (Some(PathBuf::from(path)), false),
-        None => (
-            crate::tracing::tracer::get_log_dir().map(|dir| dir.join(STOP_NOTE_FILE)),
-            true,
-        ),
-    };
+    let (note_path, shared) = stop_note();
     let Some(Observed {
         mut previous,
         stopped,
@@ -1186,10 +1230,216 @@ pub(crate) async fn gate<T>(
             );
         }
     }
+    set_start_report(StartReport {
+        role,
+        rule: Rule::ExitStatus,
+        verdict: decided,
+        ignore_breaker,
+        short_runs: None,
+        quic_panic_at: None,
+        legacy_verdict: None,
+    });
     Gated {
         settings: settings.filter(|_| decided.quic_enabled()),
         breaker: BreakerOutcome::Decided(decided),
     }
+}
+
+/// Whether a start decides by short runs that panicked in QUIC code
+/// ([`short_runs`]): every peer (#6151), and a gateway on Windows. A gateway
+/// on `unix` decides by how its last run ended ([`verdict`]).
+pub(crate) fn decides_by_short_runs(unix: bool, role: BreakerRole) -> bool {
+    !unix || role == BreakerRole::Peer
+}
+
+/// The stop note: the wrapper's when it passed one; otherwise the note at
+/// its fixed place, which may be meant for another node (`shared`).
+fn stop_note() -> (Option<PathBuf>, bool) {
+    match std::env::var_os(STOP_NOTE_ENV_VAR) {
+        Some(path) => (Some(PathBuf::from(path)), false),
+        None => (
+            crate::tracing::tracer::get_log_dir().map(|dir| dir.join(STOP_NOTE_FILE)),
+            true,
+        ),
+    }
+}
+
+/// The exit-status rule, the unix peer's breaker before #6151, run on a unix
+/// peer as a shadow that never changes whether QUIC runs. It keeps its own
+/// marker ([`LEGACY_SHADOW_FILE`]) with the old states and decides on it with
+/// [`verdict`], so telemetry can say what the switch to short runs changed:
+/// a trip the old rule would have made and the new one did not (a crash
+/// loop with no QUIC panic, or a stop the old rule misread as a crash), and
+/// the reverse. Returns what the old rule decides, `None` with QUIC not
+/// requested (the stop note is still reconciled, as the old rule did).
+///
+/// Differences from the old rule, all in the shadow only: it does not wait
+/// for a live holder of its marker to exit (a holder still alive counts as no
+/// crash, as it did after the wait); it arms only when this run's QUIC
+/// endpoint comes up, so while the new rule keeps QUIC off it does not arm;
+/// and on the first start after the switch it reads the earlier release's
+/// marker as its own. Removed with UDP (#6151).
+fn legacy_shadow(
+    quic_requested: bool,
+    data_dir: &Path,
+    ignore_breaker: bool,
+    now: SystemTime,
+) -> Option<Verdict> {
+    let (note_path, shared) = stop_note();
+    let path = legacy_shadow_path(data_dir);
+    let Observed {
+        mut previous,
+        stopped,
+    } = observe_with(
+        quic_requested,
+        &path,
+        note_path.as_deref(),
+        shared,
+        remove_if_exists,
+    )?;
+    let boot_id = platform::boot_id();
+    let own_pid = std::process::id();
+    if previous == Previous::Nothing {
+        previous = legacy_evidence(read_previous(&marker_path(data_dir)));
+    }
+    let armed_pid_alive =
+        holder_of(&previous, boot_id.as_deref(), own_pid).is_some_and(platform::pid_alive);
+    let now_secs = unix_secs(now);
+    let decided = verdict(&Facts {
+        previous: &previous,
+        boot_id: boot_id.as_deref(),
+        armed_pid_alive,
+        stopped: &stopped,
+        now_secs,
+        ignore_breaker,
+        role: BreakerRole::Peer,
+    });
+    match legacy_shadow_marker(decided, own_pid, boot_id, now_secs) {
+        Some(armed @ Marker::Armed { .. }) => PENDING.lock().shadow = Some((path, armed)),
+        Some(tripped) => {
+            if let Err(error) = write_marker(&path, &tripped) {
+                tracing::debug!(%error, "Could not record the legacy QUIC breaker shadow's trip");
+            }
+        }
+        None => {}
+    }
+    Some(decided)
+}
+
+/// The earlier release's own marker, read as the legacy shadow's evidence
+/// when the shadow has none yet: an Armed or Tripped marker is what the old
+/// rule would have decided on. Anything else is no evidence.
+fn legacy_evidence(main: Previous) -> Previous {
+    match main {
+        Previous::Marker(Marker::Armed { .. } | Marker::Tripped { .. }) => main,
+        Previous::Nothing
+        | Previous::Unreadable
+        | Previous::Marker(Marker::ShortRuns { .. } | Marker::Unknown) => Previous::Nothing,
+    }
+}
+
+/// The marker the legacy shadow arms (Armed, written once QUIC is up) or
+/// writes at once (Tripped) after `decided`; `None` leaves its file alone.
+fn legacy_shadow_marker(
+    decided: Verdict,
+    pid: u32,
+    boot_id: Option<String>,
+    now_secs: u64,
+) -> Option<Marker> {
+    match decided {
+        Verdict::Arm => Some(Marker::Armed {
+            pid,
+            boot_id,
+            nonce: crate::config::GlobalRng::random_u64(),
+            armed_at_secs: now_secs,
+            endpoint_down_secs: Vec::new(),
+            prior_trip: None,
+        }),
+        Verdict::Trip => Some(Marker::Tripped {
+            tripped_at_secs: now_secs,
+            trips: 1,
+        }),
+        Verdict::RunUnarmed | Verdict::Cool { .. } | Verdict::Unreadable => None,
+    }
+}
+
+pub(crate) fn legacy_shadow_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(LEGACY_SHADOW_FILE)
+}
+
+/// Which rule decided a start ([`StartReport`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Rule {
+    /// [`short_runs`]: runs that ended soon after a panic in QUIC code.
+    ShortRuns,
+    /// [`verdict`]: how the last run ended (a unix gateway).
+    ExitStatus,
+}
+
+/// What the breaker decided at this start, for the `quic_breaker_start`
+/// telemetry event, which the node sends once per start
+/// ([`take_start_report`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartReport {
+    pub role: BreakerRole,
+    pub rule: Rule,
+    pub verdict: Verdict,
+    pub ignore_breaker: bool,
+    /// [`Rule::ShortRuns`]: the short runs in a row so far, the last run
+    /// included.
+    pub short_runs: Option<u32>,
+    /// [`Rule::ShortRuns`]: where the last run's QUIC panic was, when it
+    /// recorded one and counted.
+    pub quic_panic_at: Option<String>,
+    /// A unix peer: what the exit-status rule would have decided
+    /// ([`legacy_shadow`]).
+    pub legacy_verdict: Option<Verdict>,
+}
+
+impl StartReport {
+    /// The event's payload.
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        let mut event = serde_json::json!({
+            "role": match self.role {
+                BreakerRole::Peer => "peer",
+                BreakerRole::Gateway => "gateway",
+            },
+            "rule": match self.rule {
+                Rule::ShortRuns => "short_runs",
+                Rule::ExitStatus => "exit_status",
+            },
+            "verdict": self.verdict.label(),
+            "quic_off": !self.verdict.quic_enabled(),
+            "overridden": self.ignore_breaker,
+        });
+        let fields = event
+            .as_object_mut()
+            .expect("the payload is an object literal");
+        if let Some(short_runs) = self.short_runs {
+            fields.insert("short_runs".into(), short_runs.into());
+        }
+        if let Some(at) = &self.quic_panic_at {
+            fields.insert("quic_panic_at".into(), at.as_str().into());
+        }
+        if let Some(legacy) = self.legacy_verdict {
+            fields.insert("legacy_verdict".into(), legacy.label().into());
+            fields.insert("legacy_quic_off".into(), (!legacy.quic_enabled()).into());
+        }
+        event
+    }
+}
+
+/// This start's [`StartReport`], until the node sends it.
+static START_REPORT: parking_lot::Mutex<Option<StartReport>> = parking_lot::Mutex::new(None);
+
+fn set_start_report(report: StartReport) {
+    *START_REPORT.lock() = Some(report);
+}
+
+/// Take this start's report, to send as the `quic_breaker_start` event.
+/// `None` when the breaker did not run, or the report was already taken.
+pub(crate) fn take_start_report() -> Option<StartReport> {
+    START_REPORT.lock().take()
 }
 
 /// How long a start waits for a live holder: the configured drain plus
@@ -1244,6 +1494,8 @@ fn note_transport_up(pending: &mut Pending, quic_up: bool, registrar: Option<&La
 /// What arming waits for.
 struct Pending {
     marker: Option<(PathBuf, Marker)>,
+    /// The legacy shadow's Armed marker, on a unix peer ([`legacy_shadow`]).
+    shadow: Option<(PathBuf, Marker)>,
     quic_up: bool,
     signals_ready: bool,
     registrar: Option<LateRegistrar>,
@@ -1253,20 +1505,38 @@ struct Pending {
 /// are installed. Called under the `PENDING` lock from both events, so
 /// whichever comes second writes it, exactly once.
 fn arm_when_ready(pending: &mut Pending) {
-    arm_when_ready_into(pending, &ARMED, short_runs::record_quic_panics);
+    arm_when_ready_into(
+        pending,
+        &ARMED,
+        &LEGACY_ARMED,
+        short_runs::record_quic_panics,
+    );
 }
 
-/// [`arm_when_ready`], recording what was written in `armed`, which is the
-/// static [`ARMED`] outside tests, and installing the Windows panic hook with
-/// `record_panics`, which tests replace: the real hook is process-global, so
-/// only a test in a child process may install it.
+/// [`arm_when_ready`], recording what was written in `armed` and the legacy
+/// shadow's marker in `legacy_armed` (the statics [`ARMED`] and
+/// [`LEGACY_ARMED`] outside tests), and installing the short-run panic hook
+/// with `record_panics`, which tests replace: the real hook is
+/// process-global, so only a test in a child process may install it.
 fn arm_when_ready_into(
     pending: &mut Pending,
     armed: &OnceLock<(PathBuf, u64)>,
+    legacy_armed: &OnceLock<(PathBuf, u64)>,
     record_panics: fn(PathBuf, u64),
 ) {
     if !(pending.quic_up && pending.signals_ready) {
         return;
+    }
+    if let Some((path, marker @ Marker::Armed { nonce, .. })) = pending.shadow.take() {
+        match write_marker(&path, &marker) {
+            Ok(()) => {
+                let _first_wins = legacy_armed.set((path, nonce));
+            }
+            Err(error) => tracing::debug!(
+                %error,
+                "Could not write the legacy QUIC breaker shadow's marker"
+            ),
+        }
     }
     let registrar = pending.registrar.take();
     let counts_short_runs = matches!(pending.marker, Some((_, Marker::ShortRuns { .. })));
@@ -1892,6 +2162,7 @@ mod tests {
                     started_at_secs: 4,
                     nonce: 7,
                     quic_panicked: true,
+                    quic_panic_at: None,
                     prior_trip,
                 },
                 MarkerV0_2_159::ShortRuns {
@@ -1961,6 +2232,7 @@ mod tests {
         let pending = |marker| {
             parking_lot::Mutex::new(Pending {
                 marker,
+                shadow: None,
                 quic_up: false,
                 signals_ready: false,
                 registrar: None,
@@ -2081,6 +2353,7 @@ mod tests {
             started_at_secs: T0 + 3600,
             nonce: 7,
             quic_panicked: true,
+            quic_panic_at: None,
             prior_trip: Some(prior),
         });
         assert_eq!(trip_number(&short_runs, T0 + 7200, gw), 3);
@@ -2162,6 +2435,7 @@ mod tests {
             started_at_secs: T0,
             nonce: 7,
             quic_panicked: false,
+            quic_panic_at: None,
             endpoint_down_secs,
             prior_trip,
         };
@@ -2356,7 +2630,7 @@ mod tests {
         write_marker(&path, &marker_of(armed(PID, Some(BOOT)))).unwrap();
         record_deliberate_stop(&note, PID);
         let failing = |_: &Path| Err(std::io::Error::other("cannot remove"));
-        observe_with(false, dir.path(), Some(&note), false, failing);
+        observe_with(false, &marker_path(dir.path()), Some(&note), false, failing);
         assert!(path.exists(), "removal failed");
         assert!(note.exists(), "so the note is kept");
         observe(false, dir.path(), Some(&note), false);
@@ -2472,6 +2746,7 @@ mod tests {
         let marker = marker_of(armed(PID, Some(BOOT)));
         let pending = |quic_up, signals_ready| Pending {
             marker: Some((path.clone(), marker.clone())),
+            shadow: None,
             quic_up,
             signals_ready,
             registrar: None,
@@ -2503,23 +2778,30 @@ mod tests {
             started_at_secs: T0,
             nonce: 7,
             quic_panicked: false,
+            quic_panic_at: None,
         };
         let pending = |path: &Path| Pending {
             marker: Some((path.to_path_buf(), marker.clone())),
+            shadow: None,
             quic_up: true,
             signals_ready: true,
             registrar: None,
         };
 
         let armed = OnceLock::new();
-        arm_when_ready_into(&mut pending(&path), &armed, no_hook);
+        arm_when_ready_into(&mut pending(&path), &armed, &OnceLock::new(), no_hook);
         assert_eq!(armed.get(), Some(&(path.clone(), 7)));
         assert!(clear_if_owned(&path, armed.get().unwrap().1).unwrap());
 
         let blocker = dir.path().join("a-file");
         std::fs::write(&blocker, b"").unwrap();
         let armed = OnceLock::new();
-        arm_when_ready_into(&mut pending(&marker_path(&blocker)), &armed, no_hook);
+        arm_when_ready_into(
+            &mut pending(&marker_path(&blocker)),
+            &armed,
+            &OnceLock::new(),
+            no_hook,
+        );
         assert_eq!(armed.get(), None, "the write failed");
     }
 
@@ -2539,9 +2821,11 @@ mod tests {
             started_at_secs: T0,
             nonce: 7,
             quic_panicked: false,
+            quic_panic_at: None,
         };
         let pending = |marker: Option<Marker>, signals_ready| Pending {
             marker: marker.map(|marker| (path.clone(), marker)),
+            shadow: None,
             quic_up: false,
             signals_ready,
             registrar: None,
@@ -2561,10 +2845,10 @@ mod tests {
         note_transport_up(&mut p, true, Some(&registrar));
         assert!(p.registrar.is_some());
         let written = OnceLock::new();
-        arm_when_ready_into(&mut p, &written, no_hook);
+        arm_when_ready_into(&mut p, &written, &OnceLock::new(), no_hook);
         assert!(p.registrar.is_some(), "still waiting");
         p.signals_ready = true;
-        arm_when_ready_into(&mut p, &written, no_hook);
+        arm_when_ready_into(&mut p, &written, &OnceLock::new(), no_hook);
         assert!(p.registrar.is_none());
     }
 
@@ -2583,17 +2867,20 @@ mod tests {
             started_at_secs: T0,
             nonce: 7,
             quic_panicked: false,
+            quic_panic_at: None,
         };
         let written = OnceLock::new();
         let arm_now = |marker: Marker, registrar: Option<LateRegistrar>| {
             arm_when_ready_into(
                 &mut Pending {
                     marker: Some((path.clone(), marker)),
+                    shadow: None,
                     quic_up: true,
                     signals_ready: true,
                     registrar,
                 },
                 &written,
+                &OnceLock::new(),
                 no_hook,
             )
         };

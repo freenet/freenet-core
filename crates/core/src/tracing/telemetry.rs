@@ -541,7 +541,7 @@ fn priority_for_event_type(event_type: &str) -> EventPriority {
 /// final `other` row, so the exported cardinality never depends on what a
 /// producer names its event. A non-zero `other` means an event type is
 /// missing from this list.
-pub(crate) const KNOWN_EVENT_TYPES: [&str; 76] = [
+pub(crate) const KNOWN_EVENT_TYPES: [&str; 77] = [
     // `event_kind_to_string`, in its order.
     "connect_start",
     "connect_connected",
@@ -619,6 +619,7 @@ pub(crate) const KNOWN_EVENT_TYPES: [&str; 76] = [
     crate::ring::FLAG_TELEMETRY_EVENT,
     "join_versions",
     "auto_update_state",
+    "quic_breaker_start",
     // Must stay last.
     "other",
 ];
@@ -7429,7 +7430,7 @@ mod tests {
         // Exact count of call sites with a literal event type (production and
         // test). A new producer changes it: bump it deliberately after giving
         // the event its own `KNOWN_EVENT_TYPES` row.
-        const EXPECTED_LITERAL_STANDALONE_CALLS: usize = 18;
+        const EXPECTED_LITERAL_STANDALONE_CALLS: usize = 19;
         assert_eq!(
             literal_names.len(),
             EXPECTED_LITERAL_STANDALONE_CALLS,

@@ -291,6 +291,7 @@ fn marker_after(
             started_at_secs: now_secs,
             nonce,
             quic_panicked: false,
+            quic_panic_at: None,
             endpoint_down_secs: super::carried_endpoint_down_exits(previous, now_secs),
             prior_trip: super::prior_trip(previous, now_secs, role),
         }),
@@ -302,19 +303,47 @@ fn marker_after(
     }
 }
 
-/// [`super::gate`] on Windows. Reads the marker only with QUIC requested.
+/// What a start read about the runs it counted, for telemetry
+/// ([`super::StartReport`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Counted {
+    /// The short runs in a row so far, the last run included.
+    pub short_runs: u32,
+    /// Where the last run's QUIC panic was, when that run counted and the
+    /// hook recorded the place.
+    pub quic_panic_at: Option<String>,
+}
+
+/// Where the last run's QUIC panic was, if `decision` counted that run.
+fn counted_panic_at(previous: &Previous, decision: Decision) -> Option<String> {
+    match previous {
+        Previous::Marker(Marker::ShortRuns {
+            quic_panicked: true,
+            quic_panic_at,
+            ..
+        }) if decision.short_runs > 0 => quic_panic_at.clone(),
+        Previous::Nothing | Previous::Unreadable | Previous::Marker(_) => None,
+    }
+}
+
+/// [`super::gate`] for every peer and for a gateway on Windows
+/// ([`super::decides_by_short_runs`]). Reads the marker only with QUIC
+/// requested.
 pub(super) fn gate<T>(
     settings: Option<T>,
     data_dir: &Path,
     ignore_breaker: bool,
     now: SystemTime,
     role: BreakerRole,
-) -> Gated<T> {
+) -> (Gated<T>, Counted) {
     if settings.is_none() {
-        return Gated {
-            settings,
-            breaker: BreakerOutcome::NotConsulted,
-        };
+        return (
+            Gated {
+                settings,
+                breaker: BreakerOutcome::NotConsulted,
+            },
+            Counted::default(),
+        );
     }
     let path = marker_path(data_dir);
     let previous = read_previous(&path);
@@ -327,6 +356,10 @@ pub(super) fn gate<T>(
     }
     let now_secs = unix_secs(now);
     let decision = decide(&previous, now_secs, ignore_breaker, role);
+    let counted = Counted {
+        short_runs: decision.short_runs,
+        quic_panic_at: counted_panic_at(&previous, decision),
+    };
     let marker = marker_after(decision, &previous, now_secs, GlobalRng::random_u64(), role);
     let metrics = &crate::transport::TRANSPORT_METRICS;
     let until_utc = |tripped_at_secs: u64, trips: u32| {
@@ -392,10 +425,13 @@ pub(super) fn gate<T>(
         }
         Verdict::RunUnarmed | Verdict::Unreadable => {}
     }
-    Gated {
-        settings: settings.filter(|_| decision.verdict.quic_enabled()),
-        breaker: BreakerOutcome::Decided(decision.verdict),
-    }
+    (
+        Gated {
+            settings: settings.filter(|_| decision.verdict.quic_enabled()),
+            breaker: BreakerOutcome::Decided(decision.verdict),
+        },
+        counted,
+    )
 }
 
 /// Start the task that clears the count once this run has lasted
@@ -531,10 +567,10 @@ pub(super) fn note_marker_cleared() {
     MARKER_CLEARED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Mark the marker at `path` as having recorded a QUIC panic, if it is still
-/// the run's with `nonce` and not marked yet. Returns whether it wrote. Takes
-/// no lock and logs nothing: it runs inside the panic hook.
-fn mark_quic_panic(path: &Path, nonce: u64) -> std::io::Result<bool> {
+/// Mark the marker at `path` as having recorded a QUIC panic at `at`, if it
+/// is still the run's with `nonce` and not marked yet. Returns whether it
+/// wrote. Takes no lock and logs nothing: it runs inside the panic hook.
+fn mark_quic_panic(path: &Path, nonce: u64, at: Option<String>) -> std::io::Result<bool> {
     let bytes = match std::fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
@@ -546,6 +582,7 @@ fn mark_quic_panic(path: &Path, nonce: u64) -> std::io::Result<bool> {
             started_at_secs,
             nonce: owner,
             quic_panicked: false,
+            quic_panic_at: _,
             endpoint_down_secs,
             prior_trip,
         }) if owner == nonce => {
@@ -554,6 +591,7 @@ fn mark_quic_panic(path: &Path, nonce: u64) -> std::io::Result<bool> {
                 started_at_secs,
                 nonce,
                 quic_panicked: true,
+                quic_panic_at: at,
                 endpoint_down_secs,
                 prior_trip,
             };
@@ -578,7 +616,8 @@ pub(super) fn record_quic_panics(path: PathBuf, nonce: u64) {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             on_panic(
-                info.location().map(|location| location.file()),
+                info.location()
+                    .map(|location| (location.file(), location.line())),
                 in_quic_code(),
             );
             previous(info);
@@ -586,11 +625,11 @@ pub(super) fn record_quic_panics(path: PathBuf, nonce: u64) {
     });
 }
 
-/// What the hook does before calling the hook it replaced: `file` is the
-/// panic's location, `in_quic` whether the panicking thread is inside a
+/// What the hook does before calling the hook it replaced: `location` is the
+/// panic's file and line, `in_quic` whether the panicking thread is inside a
 /// [`QuicCode`] guard.
-fn on_panic(file: Option<&str>, in_quic: bool) {
-    if !(in_quic || file.is_some_and(quic_attributed)) {
+fn on_panic(location: Option<(&str, u32)>, in_quic: bool) {
+    if !(in_quic || location.is_some_and(|(file, _)| quic_attributed(file))) {
         return;
     }
     let Some((path, nonce)) = PANIC_TARGET.get() else {
@@ -599,9 +638,39 @@ fn on_panic(file: Option<&str>, in_quic: bool) {
     if PANIC_RECORDED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    record_quic_panic_at(path, *nonce, || {
-        MARKER_CLEARED.load(std::sync::atomic::Ordering::SeqCst)
-    });
+    record_quic_panic_at(
+        path,
+        *nonce,
+        location.map(|(file, line)| panic_place(file, line)),
+        || MARKER_CLEARED.load(std::sync::atomic::Ordering::SeqCst),
+    );
+}
+
+/// The longest panic place recorded, in bytes.
+const MAX_PANIC_PLACE: usize = 160;
+
+/// A panic location as telemetry reports it: `file:line`, with the file cut
+/// to the crate directory and what follows (the component before its last
+/// `src` directory onward, `quinn-proto-0.11.9/src/connection/mod.rs`), so
+/// no home directory or build path leaves the machine, and at most
+/// [`MAX_PANIC_PLACE`] bytes. A file with no `src` directory keeps only its
+/// name.
+pub(super) fn panic_place(file: &str, line: u32) -> String {
+    let file = file.replace('\\', "/");
+    let parts: Vec<&str> = file.split('/').filter(|part| !part.is_empty()).collect();
+    let from = parts
+        .iter()
+        .rposition(|part| *part == "src")
+        .map_or(parts.len().saturating_sub(1), |src| src.saturating_sub(1));
+    let mut place = format!("{}:{line}", parts[from..].join("/"));
+    if place.len() > MAX_PANIC_PLACE {
+        let cut = place.len() - MAX_PANIC_PLACE;
+        let start = (cut..place.len())
+            .find(|i| place.is_char_boundary(*i))
+            .unwrap_or(place.len());
+        place = place.split_off(start);
+    }
+    place
 }
 
 /// Mark the marker, unless `cleared` says the run removed it on purpose, and
@@ -609,11 +678,11 @@ fn on_panic(file: Option<&str>, in_quic: bool) {
 /// again: the clearer sets `cleared` before it removes the file, so either it
 /// removes the marked file or this sees `cleared` and removes it. Best effort:
 /// a mark that cannot be written leaves the run uncounted.
-fn record_quic_panic_at(path: &Path, nonce: u64, cleared: impl Fn() -> bool) {
+fn record_quic_panic_at(path: &Path, nonce: u64, at: Option<String>, cleared: impl Fn() -> bool) {
     if cleared() {
         return;
     }
-    if let Ok(true) = mark_quic_panic(path, nonce) {
+    if let Ok(true) = mark_quic_panic(path, nonce, at) {
         if cleared() {
             let _best_effort = clear_if_owned(path, nonce);
         }
@@ -711,6 +780,7 @@ mod tests {
                 started_at_secs: T0,
                 nonce: NONCE,
                 quic_panicked: false,
+                quic_panic_at: None,
                 endpoint_down_secs,
                 prior_trip: None,
             })
@@ -758,6 +828,7 @@ mod tests {
             started_at_secs: T0 - 60,
             nonce: NONCE,
             quic_panicked: true,
+            quic_panic_at: None,
             prior_trip: Some(prior),
         });
         let decision = super::decide(&previous, T0, false, gw);
@@ -840,6 +911,7 @@ mod tests {
             started_at_secs,
             nonce: NONCE,
             quic_panicked: false,
+            quic_panic_at: None,
         })
     }
 
@@ -852,6 +924,7 @@ mod tests {
             started_at_secs,
             nonce: NONCE,
             quic_panicked: true,
+            quic_panic_at: None,
         })
     }
 
@@ -885,7 +958,7 @@ mod tests {
     fn start_panicking(path: &Path, now_secs: u64, ignore: bool) -> Verdict {
         let verdict = start(path, now_secs, ignore);
         if verdict == Verdict::Arm {
-            assert!(mark_quic_panic(path, NONCE).unwrap(), "marked");
+            assert!(mark_quic_panic(path, NONCE, None).unwrap(), "marked");
         }
         verdict
     }
@@ -904,7 +977,7 @@ mod tests {
                 running(run, now),
                 "the marker records the runs so far and this start"
             );
-            assert!(mark_quic_panic(&path, NONCE).unwrap());
+            assert!(mark_quic_panic(&path, NONCE, None).unwrap());
             assert_eq!(read_previous(&path), panicked(run, now));
         }
         let now = T0 + u64::from(SHORT_RUNS_TO_TRIP);
@@ -1086,6 +1159,7 @@ mod tests {
                 started_at_secs: T0,
                 nonce: NONCE,
                 quic_panicked: false,
+                quic_panic_at: None,
             }),
             "the override's start replaces the trip, so the trip is gone"
         );
@@ -1120,14 +1194,14 @@ mod tests {
     fn quic_off_does_not_touch_the_marker() {
         let dir = tempfile::tempdir().unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0);
-        let empty = gate(None::<u8>, dir.path(), false, now, BreakerRole::Peer);
+        let (empty, _) = gate(None::<u8>, dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(empty.settings, None);
         assert_eq!(empty.breaker, BreakerOutcome::NotConsulted);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 
         let path = marker_path(dir.path());
         std::fs::create_dir(&path).unwrap();
-        let gated = gate(None::<u8>, dir.path(), false, now, BreakerRole::Peer);
+        let (gated, _) = gate(None::<u8>, dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(gated.breaker, BreakerOutcome::NotConsulted);
     }
 
@@ -1146,16 +1220,18 @@ mod tests {
                 started_at_secs: T0,
                 nonce: NONCE,
                 quic_panicked: true,
+                quic_panic_at: None,
             },
         )
         .unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0 + 1);
-        let gated = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
+        let (gated, counted) = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(gated.settings, None);
         assert_eq!(gated.breaker, BreakerOutcome::Decided(Verdict::Trip));
+        assert_eq!(counted.short_runs, SHORT_RUNS_TO_TRIP);
         assert_eq!(read_previous(&path), tripped(T0 + 1));
 
-        let cooling = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
+        let (cooling, _) = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(cooling.settings, None);
         assert_eq!(
             cooling.breaker,
@@ -1181,6 +1257,7 @@ mod tests {
                 started_at_secs: T0,
                 nonce: NONCE,
                 quic_panicked: true,
+                quic_panic_at: None,
             },
         )
         .unwrap();
@@ -1191,7 +1268,7 @@ mod tests {
         ));
         std::fs::create_dir(tmp).unwrap();
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0 + 1);
-        let gated = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
+        let (gated, _) = gate(Some(7u8), dir.path(), false, now, BreakerRole::Peer);
         assert_eq!(gated.settings, None);
         assert_eq!(
             read_previous(&path),
@@ -1412,10 +1489,13 @@ mod tests {
     fn a_panic_marks_only_this_short_run() {
         let dir = tempfile::tempdir().unwrap();
         let path = marker_path(dir.path());
-        assert!(!mark_quic_panic(&path, NONCE).unwrap(), "no marker");
+        assert!(!mark_quic_panic(&path, NONCE, None).unwrap(), "no marker");
 
         write_marker(&path, &marker_after(arm(1), T0, NONCE + 1).unwrap()).unwrap();
-        assert!(!mark_quic_panic(&path, NONCE).unwrap(), "another run's");
+        assert!(
+            !mark_quic_panic(&path, NONCE, None).unwrap(),
+            "another run's"
+        );
         assert_eq!(
             read_previous(&path),
             Previous::Marker(marker_after(arm(1), T0, NONCE + 1).unwrap())
@@ -1429,19 +1509,19 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(!mark_quic_panic(&path, NONCE).unwrap(), "a trip");
+        assert!(!mark_quic_panic(&path, NONCE, None).unwrap(), "a trip");
         assert_eq!(read_previous(&path), tripped(T0));
 
         write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
-        assert!(mark_quic_panic(&path, NONCE).unwrap());
+        assert!(mark_quic_panic(&path, NONCE, None).unwrap());
         assert_eq!(read_previous(&path), panicked(1, T0));
-        assert!(!mark_quic_panic(&path, NONCE).unwrap(), "once");
+        assert!(!mark_quic_panic(&path, NONCE, None).unwrap(), "once");
 
         // The run passed the limit: the timer removed it; a panic now finds
         // nothing to mark and the next start counts nothing.
         write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
         assert!(clear_if_owned(&path, NONCE).unwrap());
-        assert!(!mark_quic_panic(&path, NONCE).unwrap());
+        assert!(!mark_quic_panic(&path, NONCE, None).unwrap());
         assert!(!path.exists());
         assert_eq!(decide(&read_previous(&path), T0 + 1, false), arm(0));
     }
@@ -1506,7 +1586,7 @@ mod tests {
 
         // Not QUIC's: located elsewhere, or with no location, outside a
         // guard. Nothing is marked and nothing latches.
-        on_panic(Some("crates/core/src/node/p2p_impl.rs"), false);
+        on_panic(Some(("crates/core/src/node/p2p_impl.rs", 1)), false);
         on_panic(None, false);
         assert_eq!(read_previous(&path), running(1, T0), "not QUIC's");
         // A real panic located in a dependency (alloc), outside a guard.
@@ -1551,7 +1631,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = marker_path(dir.path());
         write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
-        record_quic_panic_at(&path, NONCE, || true);
+        record_quic_panic_at(&path, NONCE, None, || true);
         assert_eq!(
             read_previous(&path),
             running(1, T0),
@@ -1560,7 +1640,7 @@ mod tests {
 
         // Announced between the check and the write: the mark is removed.
         let asks = std::cell::Cell::new(0);
-        record_quic_panic_at(&path, NONCE, || {
+        record_quic_panic_at(&path, NONCE, None, || {
             asks.set(asks.get() + 1);
             asks.get() > 1
         });
@@ -1569,7 +1649,7 @@ mod tests {
 
         // Not announced: marked.
         write_marker(&path, &marker_after(arm(1), T0, NONCE).unwrap()).unwrap();
-        record_quic_panic_at(&path, NONCE, || false);
+        record_quic_panic_at(&path, NONCE, None, || false);
         assert_eq!(read_previous(&path), panicked(1, T0));
     }
 

@@ -1026,6 +1026,18 @@ impl NodeP2P {
         )
         .await?;
 
+        // `quic_breaker_start` (#6151): what the QUIC crash-loop breaker
+        // decided at this start (`P2pConnManager::build` runs it), once per
+        // start, including, on a unix peer, what the legacy exit-status rule
+        // would have decided. Sending is a no-op unless telemetry is enabled.
+        if let Some(report) = crate::transport::quic::breaker::take_start_report() {
+            crate::tracing::telemetry::send_standalone_event_with_peer_id(
+                "quic_breaker_start",
+                &config.local_peer_id_string(),
+                report.to_json(),
+            );
+        }
+
         let parent_span = tracing::Span::current();
         let contract_executor_handle = GlobalExecutor::spawn({
             let task = async move {
