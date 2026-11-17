@@ -23503,14 +23503,13 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
         let mut both = 0;
         for (&(own, peer), &native) in &transports {
             match transports.get(&(peer, own)) {
-                Some(&other) => {
-                    if own < peer {
-                        both += 1;
-                        if other != native {
-                            mismatched.push((own, peer, native, other));
-                        }
+                Some(&other) if own < peer => {
+                    both += 1;
+                    if other != native {
+                        mismatched.push((own, peer, native, other));
                     }
                 }
+                Some(_) => {}
                 None if native => one_ended_native.push((own, peer)),
                 None => {}
             }

@@ -4426,7 +4426,9 @@ impl Arrival {
                     Self::InboundUdpKeyed => {
                         HandshakeInboundMatch::Expected(Some(peer.pub_key().clone()))
                     }
-                    _ => HandshakeInboundMatch::Unexpected,
+                    Self::Native | Self::OutboundUdp | Self::InboundUdpUnkeyed => {
+                        HandshakeInboundMatch::Unexpected
+                    }
                 },
                 connection: Box::new(IdleConnection::new(addr)),
                 transient,

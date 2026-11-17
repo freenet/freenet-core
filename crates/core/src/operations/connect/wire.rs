@@ -316,16 +316,18 @@ pub mod sim_trace {
         transports_frozen: std::sync::atomic::AtomicBool,
         /// How each end's native setup in a CONNECT ended, by (transaction,
         /// lower address, higher address): (node, established) per end.
-        native_setup_ends: parking_lot::Mutex<
-            std::collections::BTreeMap<
-                (crate::message::Transaction, SocketAddr, SocketAddr),
-                Vec<(SocketAddr, bool)>,
-            >,
-        >,
+        native_setup_ends: parking_lot::Mutex<SetupEnds>,
         survivor_swapped: AtomicU64,
         survivor_udp_dropped: AtomicU64,
         one_sided_drops: AtomicU64,
     }
+
+    /// How each end's native setup in a CONNECT ended: by (transaction, lower
+    /// address, higher address), (node, established) per end.
+    type SetupEnds = std::collections::BTreeMap<
+        (crate::message::Transaction, SocketAddr, SocketAddr),
+        Vec<(SocketAddr, bool)>,
+    >;
 
     /// What the connect op saw, for [`record_at`].
     #[derive(Clone, Copy, Debug)]

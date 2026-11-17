@@ -3393,10 +3393,10 @@ struct EventListenerState {
     /// remote peer's, so the bound is the dial's.
     udp_beside_native: HashMap<SocketAddr, Vec<BesideUdpRequester>>,
     /// Addresses whose UDP dial beside a still-pending native dial connected
-    /// first. If the native dial then connects too, its connection is closed
-    /// (the first established is kept) and counted as
-    /// `connect_native_both_dials_connected_udp_first`. Cleared when the native
-    /// dial ends.
+    /// first. If the native dial then connects too, it is swapped in for the
+    /// UDP connection (the survivor rule keeps native) and counted as
+    /// `connect_native_both_dials_connected_udp_first`. Cleared when the
+    /// native dial ends.
     beside_udp_connected: HashSet<SocketAddr>,
     pending_op_results: HashMap<Transaction, Sender<WaiterReply>>,
     /// Last time pending_op_results was scanned for closed senders.
