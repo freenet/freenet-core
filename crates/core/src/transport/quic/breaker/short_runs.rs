@@ -501,6 +501,11 @@ fn in_quic_code() -> bool {
 /// (`super::endpoint_down_verdict`). Runs under [`super::MARKER_UPDATE`],
 /// which the record is written under too, so the two cannot interleave.
 /// Returns whether it removed the marker.
+///
+/// A clock stepped back during the run can date the death before
+/// `started_at_secs`; the clear then takes it for an earlier run's and
+/// removes the marker, so that death restarts the gateway once without
+/// counting (`super::endpoint_down_verdict` applies the same test).
 fn clear_short_run(path: &Path, nonce: u64) -> std::io::Result<bool> {
     let _update = super::MARKER_UPDATE.lock();
     if let Previous::Marker(Marker::ShortRuns {
