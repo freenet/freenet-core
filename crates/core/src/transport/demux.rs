@@ -87,12 +87,15 @@ pub(crate) const QUIC_ALLOWED_SOURCES_MAX: usize = 4096;
 /// `MAX_RECV_PACKET_SIZE`, so no read is longer), plus the slot itself.
 /// The bound assumes that buffer: a caller reading into a larger one could
 /// queue longer datagrams. One queue per node, and only while a QUIC ingress
-/// is enabled. The allow-set is not counted here; its size is up to the
-/// caller. Declared in `contract::executor::declared_cache_ceiling`, which
-/// only tests read.
+/// is enabled, with the queue for unknown sources beside it
+/// (`quic::admission::UNKNOWN_SOURCE_QUEUE_DATAGRAMS`, empty unless a
+/// gateway admits native joins). The allow-set is not counted here; its size
+/// is up to the caller. Declared in `contract::executor::declared_cache_ceiling`,
+/// which only tests read.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const QUIC_INGRESS_QUEUE_BYTES: usize =
-    QUIC_INGRESS_QUEUE_DATAGRAMS * (MAX_RECV_PACKET_SIZE + std::mem::size_of::<QuicDatagram>());
+pub(crate) const QUIC_INGRESS_QUEUE_BYTES: usize = (QUIC_INGRESS_QUEUE_DATAGRAMS
+    + super::quic::admission::UNKNOWN_SOURCE_QUEUE_DATAGRAMS)
+    * (MAX_RECV_PACKET_SIZE + std::mem::size_of::<QuicDatagram>());
 
 /// A QUIC-class datagram passed to the QUIC ingress: its bytes and its source
 /// address (IPv4-mapped IPv6 addresses already normalized to IPv4).
@@ -119,12 +122,19 @@ struct IngressShared {
     /// Set by [`DemuxSocket::disable_quic_ingress`]: nothing is allowed or
     /// queued any more, and every QUIC-class datagram is `no_ingress`.
     disabled: AtomicBool,
+    /// Set by [`DemuxSocket::enable_unknown_source_lane`]: a datagram from a
+    /// source not on the allow-set that can open a connection goes to the
+    /// unknown-source queue instead of being dropped (`quic::admission`).
+    unknown_lane: AtomicBool,
 }
 
 /// The QUIC ingress of one [`DemuxSocket`]: the queue's sending half and the
 /// state it shares with the receiving half.
 struct QuicIngress {
     queue: mpsc::Sender<QuicDatagram>,
+    /// Datagrams from sources not on the allow-set, while the unknown-source
+    /// lane is on (`quic::admission`).
+    unknown: mpsc::Sender<QuicDatagram>,
     shared: Arc<IngressShared>,
 }
 
@@ -133,18 +143,30 @@ struct QuicIngress {
 /// in its source's share of the queue.
 pub(crate) struct QuicIngressReceiver {
     queue: mpsc::Receiver<QuicDatagram>,
+    /// The unknown-source queue, read only when `queue` has nothing ready.
+    unknown: mpsc::Receiver<QuicDatagram>,
     shared: Arc<IngressShared>,
 }
 
 impl QuicIngressReceiver {
-    /// Poll for the next queued datagram. `Ready(None)` once the socket that
-    /// fills the queue is gone.
+    /// Poll for the next queued datagram: one from the established queue if
+    /// any is ready, else one from the unknown-source queue (empty unless a
+    /// gateway admits native joins), so established traffic is served first.
+    /// `Ready(None)` once the socket that fills the queues is gone.
     pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<QuicDatagram>> {
-        let polled = self.queue.poll_recv(cx);
-        if let Poll::Ready(Some(datagram)) = &polled {
-            self.release(datagram.from);
+        match self.queue.poll_recv(cx) {
+            Poll::Ready(Some(datagram)) => {
+                self.release(datagram.from);
+                Poll::Ready(Some(datagram))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            // Both queues register the waker, so a datagram on either wakes
+            // the reader. An unknown-source datagram holds no share.
+            Poll::Pending => match self.unknown.poll_recv(cx) {
+                Poll::Ready(Some(datagram)) => Poll::Ready(Some(datagram)),
+                Poll::Ready(None) | Poll::Pending => Poll::Pending,
+            },
         }
-        polled
     }
 
     fn release(&self, from: SocketAddr) {
@@ -159,6 +181,12 @@ impl QuicIngressReceiver {
         let datagram = self.queue.try_recv()?;
         self.release(datagram.from);
         Ok(datagram)
+    }
+
+    /// The next unknown-source datagram, if one is queued (tests).
+    #[cfg(test)]
+    pub(crate) fn try_recv_unknown(&mut self) -> Result<QuicDatagram, mpsc::error::TryRecvError> {
+        self.unknown.try_recv()
     }
 
     #[cfg(test)]
@@ -323,17 +351,35 @@ impl<S> DemuxSocket<S> {
     /// The allow-set starts empty. `None` if an ingress was already enabled.
     pub(crate) fn enable_quic_ingress(&self) -> Option<QuicIngressReceiver> {
         let (queue, receiver) = mpsc::channel(QUIC_INGRESS_QUEUE_DATAGRAMS);
+        let (unknown, unknown_receiver) =
+            mpsc::channel(super::quic::admission::UNKNOWN_SOURCE_QUEUE_DATAGRAMS);
         let shared = Arc::new(IngressShared::default());
         self.quic
             .set(QuicIngress {
                 queue,
+                unknown,
                 shared: shared.clone(),
             })
             .ok()?;
         Some(QuicIngressReceiver {
             queue: receiver,
+            unknown: unknown_receiver,
             shared,
         })
+    }
+
+    /// Pass a datagram from a source not on the allow-set to the ingress's
+    /// unknown-source queue when it can open a connection, instead of
+    /// dropping it (`quic::admission`, a gateway admitting native joins).
+    /// Whether an ingress was there to take it.
+    pub(crate) fn enable_unknown_source_lane(&self) -> bool {
+        match self.live_quic_ingress() {
+            Some(ingress) => {
+                ingress.shared.unknown_lane.store(true, Ordering::Release);
+                true
+            }
+            None => false,
+        }
     }
 
     /// [`Self::enable_quic_ingress`] and hand the receiver to `build`; if
@@ -435,7 +481,11 @@ impl<S> DemuxSocket<S> {
         let outcome = match self.live_quic_ingress() {
             None => QuicIngressOutcome::NoIngress,
             Some(ingress) if !ingress.shared.allowed.contains_key(&from) => {
-                QuicIngressOutcome::NotAllowed
+                if ingress.shared.unknown_lane.load(Ordering::Acquire) {
+                    ingress.queue_unknown(datagram, from)
+                } else {
+                    QuicIngressOutcome::NotAllowed
+                }
             }
             Some(ingress) => ingress.queue_from(datagram, from),
         };
@@ -459,6 +509,35 @@ impl<S> DemuxSocket<S> {
 }
 
 impl QuicIngress {
+    /// Queue a datagram from a source not on the allow-set if it can open a
+    /// connection and the unknown-source queue has room. It counts as
+    /// `forwarded` when queued and `not_allowed` otherwise, and its fate in
+    /// detail as `quic_gateway_admission_<label>`.
+    fn queue_unknown(&self, datagram: &[u8], from: SocketAddr) -> QuicIngressOutcome {
+        use super::metrics::GatewayAdmission;
+        let admitted = match super::quic::admission::unknown_source_datagram(datagram) {
+            Err(refused) => refused.outcome(),
+            Ok(()) => match self.unknown.try_reserve() {
+                Ok(permit) => {
+                    permit.send(QuicDatagram {
+                        bytes: datagram.to_vec(),
+                        from,
+                    });
+                    GatewayAdmission::Queued
+                }
+                Err(
+                    mpsc::error::TrySendError::Full(()) | mpsc::error::TrySendError::Closed(()),
+                ) => GatewayAdmission::QueueFull,
+            },
+        };
+        TRANSPORT_METRICS.record_gateway_admission(admitted);
+        if admitted == GatewayAdmission::Queued {
+            QuicIngressOutcome::Forwarded
+        } else {
+            QuicIngressOutcome::NotAllowed
+        }
+    }
+
     /// Queue a datagram from an allowed source, within the source's share
     /// and outside [`QUIC_INGRESS_QUIET_RESERVE`] unless the source is quiet.
     /// The share is counted before the slot is taken and given back if the
@@ -905,6 +984,133 @@ mod tests {
         }
         assert!(queue.try_recv().is_err(), "nothing else was queued");
         assert_eq!(outcomes(&socket), [3, 0, 0, 0, 0, 0]);
+    }
+
+    /// A long-header datagram of `len` bytes with QUIC version `version`.
+    fn initial(len: usize, version: u32) -> Vec<u8> {
+        let mut datagram = vec![0u8; len];
+        datagram[0] = 0xC3;
+        datagram[1..5].copy_from_slice(&version.to_be_bytes());
+        datagram
+    }
+
+    /// With the unknown-source lane on (a gateway admitting native joins),
+    /// a possible Initial from a source not on the allow-set goes to its own
+    /// queue and counts as `forwarded`; a short header, a runt or an unknown
+    /// version is still dropped as `not_allowed`. A datagram from an allowed
+    /// source takes the established queue as before. Without the lane every
+    /// one of them is `not_allowed`, as before.
+    #[tokio::test]
+    async fn the_unknown_source_lane_takes_only_possible_initials() {
+        let stranger: SocketAddr = "10.254.2.40:4140".parse().unwrap();
+        let known: SocketAddr = "10.254.2.41:4141".parse().unwrap();
+        let script = || {
+            vec![
+                Step::Packet(stranger, initial(1200, 1)),
+                Step::Packet(stranger, initial(1199, 1)),
+                Step::Packet(stranger, quic(9)),
+                Step::Packet(stranger, initial(1200, 2)),
+                Step::Packet(known, quic(1)),
+            ]
+        };
+        let mut buf = [0u8; 2048];
+
+        let off = DemuxSocket::wrap(ScriptedSocket::new(script()), None);
+        let mut queue = off.enable_quic_ingress().expect("first enable");
+        let _permit = off.allow_quic_source(known).expect("allowed");
+        for _ in 0..5 {
+            off.recv_classified(&mut buf).await.unwrap();
+        }
+        assert_eq!(outcomes(&off), [1, 4, 0, 0, 0, 0], "lane off");
+        assert!(queue.try_recv_unknown().is_err());
+
+        let on = DemuxSocket::wrap(ScriptedSocket::new(script()), None);
+        let mut queue = on.enable_quic_ingress().expect("first enable");
+        let _permit = on.allow_quic_source(known).expect("allowed");
+        assert!(on.enable_unknown_source_lane());
+        for _ in 0..5 {
+            on.recv_classified(&mut buf).await.unwrap();
+        }
+        assert_eq!(outcomes(&on), [2, 3, 0, 0, 0, 0], "lane on");
+        assert_eq!(
+            queue.try_recv_unknown().unwrap(),
+            QuicDatagram {
+                bytes: initial(1200, 1),
+                from: stranger
+            }
+        );
+        assert!(
+            queue.try_recv_unknown().is_err(),
+            "only the possible Initial"
+        );
+        assert_eq!(
+            queue.try_recv().unwrap().from,
+            known,
+            "established as before"
+        );
+    }
+
+    /// The lane needs a live ingress, and its queue holds at most
+    /// `UNKNOWN_SOURCE_QUEUE_DATAGRAMS`; the rest are dropped without
+    /// stalling the listener.
+    #[tokio::test(start_paused = true)]
+    async fn the_unknown_source_lane_is_bounded() {
+        let none = DemuxSocket::wrap(ScriptedSocket::new(vec![]), None);
+        assert!(!none.enable_unknown_source_lane(), "no ingress, no lane");
+
+        let limit = crate::transport::quic::admission::UNKNOWN_SOURCE_QUEUE_DATAGRAMS;
+        let steps = (0..limit + 5)
+            .map(|i| {
+                Step::Packet(
+                    SocketAddr::from(([10, 254, 3, (i % 250) as u8], 4200 + i as u16)),
+                    initial(1200, 1),
+                )
+            })
+            .collect();
+        let socket = DemuxSocket::wrap(ScriptedSocket::new(steps), None);
+        let _queue = socket.enable_quic_ingress().expect("first enable");
+        assert!(socket.enable_unknown_source_lane());
+        let mut buf = [0u8; 2048];
+        for _ in 0..limit + 5 {
+            socket.recv_classified(&mut buf).await.unwrap();
+        }
+        assert_eq!(outcomes(&socket), [limit as u64, 5, 0, 0, 0, 0]);
+    }
+
+    /// The endpoint is handed established traffic first: with datagrams in
+    /// both queues, `poll_recv` returns every established one before any
+    /// from an unknown source.
+    #[tokio::test]
+    async fn established_datagrams_are_served_before_unknown_ones() {
+        let stranger: SocketAddr = "10.254.2.42:4142".parse().unwrap();
+        let known: SocketAddr = "10.254.2.43:4143".parse().unwrap();
+        let socket = DemuxSocket::wrap(
+            ScriptedSocket::new(vec![
+                Step::Packet(stranger, initial(1200, 1)),
+                Step::Packet(known, quic(1)),
+                Step::Packet(stranger, initial(1300, 1)),
+                Step::Packet(known, quic(2)),
+            ]),
+            None,
+        );
+        let mut queue = socket.enable_quic_ingress().expect("first enable");
+        let _permit = socket.allow_quic_source(known).expect("allowed");
+        assert!(socket.enable_unknown_source_lane());
+        let mut buf = [0u8; 2048];
+        for _ in 0..4 {
+            socket.recv_classified(&mut buf).await.unwrap();
+        }
+        let mut order = Vec::new();
+        for _ in 0..4 {
+            let datagram = std::future::poll_fn(|cx| queue.poll_recv(cx))
+                .await
+                .expect("queued");
+            order.push((datagram.from, datagram.bytes.len()));
+        }
+        assert_eq!(
+            order,
+            vec![(known, 4), (known, 4), (stranger, 1200), (stranger, 1300)]
+        );
     }
 
     /// With the queue full and nobody reading it, QUIC-class datagrams are

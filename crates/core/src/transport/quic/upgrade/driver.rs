@@ -98,12 +98,57 @@ use crate::transport::quic::path::pacer::{LimitPacer, SendPacer};
 use crate::transport::quic::path::{
     BoundedSend, QuicDataInbox, QuicDataSenders, QuicPath, QuicPathLimits, data_channels,
 };
-use crate::transport::quic::{QuicConnection, QuicEndpoint, QuicIncoming, QuicPeerPermit};
+use crate::transport::quic::{
+    EndpointAttempt, JoinerIncoming, QuicConnection, QuicEndpoint, QuicIncoming, QuicPeerPermit,
+};
 use crate::transport::symmetric_message::DeclineReason;
 use crate::transport::symmetric_message::UpgradeControl;
 use crate::transport::{
     QuicErrorKind, QuicRefusal, Socket, TRANSPORT_METRICS, normalize_mapped_addr,
 };
+
+/// An admitted native join at a gateway (`quic::admission`): the handshake
+/// and the Hello exchange, within [`NATIVE_JOIN_WINDOW`] on `clock`. Until
+/// phase B hands the connection to the node, a join that gets this far is
+/// closed here and counted as `joined`. Returns what to count.
+pub(in crate::transport::quic) async fn join_gateway<T: TimeSource>(
+    joiner: JoinerIncoming,
+    clock: &T,
+) -> crate::transport::metrics::GatewayAdmission {
+    use crate::transport::metrics::GatewayAdmission;
+    use crate::transport::quic::JoinerError;
+    let start = clock.now();
+    let Some(established) = clock.timeout(NATIVE_JOIN_WINDOW, joiner.establish()).await else {
+        return GatewayAdmission::HandshakeFailed;
+    };
+    let connection = match established {
+        Ok(connection) => connection,
+        Err(JoinerError::Unproven) => return GatewayAdmission::Unproven,
+        Err(JoinerError::Handshake(error)) => {
+            tracing::debug!(%error, "An admitted native join's handshake failed");
+            return GatewayAdmission::HandshakeFailed;
+        }
+    };
+    let own =
+        crate::transport::quic::native::setup::own_hello(connection.inner().remote_address(), 0);
+    let left = NATIVE_JOIN_WINDOW.saturating_sub(clock.now().saturating_sub(start));
+    match crate::transport::quic::native::exchange::exchange(&connection, &own, false, clock, left)
+        .await
+    {
+        Ok(_) => {
+            connection.close(crate::transport::metrics::QuicCloseCode::NodeDroppedPeer);
+            GatewayAdmission::Joined
+        }
+        Err(error) => {
+            tracing::debug!(%error, "An admitted native join's Hello exchange failed");
+            GatewayAdmission::HelloFailed
+        }
+    }
+}
+
+/// How long an admitted native join has for its handshake and Hello: a
+/// native setup's window (`native::setup::NATIVE_WINDOW`).
+const NATIVE_JOIN_WINDOW: Duration = crate::transport::quic::native::setup::NATIVE_WINDOW;
 
 /// Pending events of one session. Peer-sent messages are dropped when it is full
 /// (`try_send`), and the session's own tasks wait for room.
@@ -526,7 +571,7 @@ impl QuicUpgrades {
     pub(in crate::transport) fn spawn_attempt_router(
         self: &Arc<Self>,
         registrar: &LateRegistrar,
-        mut attempts: mpsc::Receiver<QuicIncoming>,
+        mut attempts: mpsc::Receiver<EndpointAttempt>,
     ) {
         let hub = Arc::downgrade(self);
         let handle = GlobalExecutor::spawn(async move {
@@ -543,10 +588,23 @@ impl QuicUpgrades {
         registrar.register("quic_attempt_router", handle);
     }
 
-    /// Route one attempt: an attempt from an address allowed as native goes
-    /// only to a native waiter, never to an upgrade session; any other to the
+    /// Route one attempt: an admitted joiner to its own task
+    /// ([`join_gateway`]); an attempt from an address allowed as native only
+    /// to a native waiter, never to an upgrade session; any other to the
     /// session of its address.
-    fn dispatch(&self, incoming: QuicIncoming) {
+    fn dispatch(&self, attempt: EndpointAttempt) {
+        let incoming = match attempt {
+            EndpointAttempt::Allowed(incoming) => incoming,
+            EndpointAttempt::Joiner(joiner) => {
+                let clock = self.path_clock.clone();
+                // Short-lived: bounded by the join window.
+                drop(GlobalExecutor::spawn(async move {
+                    let outcome = join_gateway(joiner, &clock).await;
+                    TRANSPORT_METRICS.record_gateway_admission(outcome);
+                }));
+                return;
+            }
+        };
         if incoming.is_native() {
             let route = self.native.route(incoming);
             tracing::debug!(?route, "Routed a native QUIC connection attempt");

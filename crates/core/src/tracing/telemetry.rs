@@ -3227,6 +3227,15 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         count.into(),
                     );
                 }
+                for (outcome, count) in crate::transport::metrics::GatewayAdmission::ALL
+                    .iter()
+                    .zip(snapshot.quic_gateway_admission)
+                {
+                    m.insert(
+                        format!("quic_gateway_admission_{}", outcome.label()),
+                        count.into(),
+                    );
+                }
             }
             m.insert(
                 "quic_establish_ms_p50".into(),
@@ -7928,6 +7937,7 @@ mod tests {
             "quic_carried_fallback",
             "quic_path_age_at_close",
             "connect_native_setup",
+            "quic_gateway_admission",
         ] {
             assert!(expected.remove(family), "{family} is in the snapshot");
         }
@@ -7967,6 +7977,11 @@ mod tests {
             NativeSetupOutcome::ALL
                 .iter()
                 .map(|outcome| format!("connect_native_setup_{}", outcome.label())),
+        );
+        expected.extend(
+            crate::transport::metrics::GatewayAdmission::ALL
+                .iter()
+                .map(|outcome| format!("quic_gateway_admission_{}", outcome.label())),
         );
         let actual: std::collections::BTreeSet<String> = event_kind_to_json(
             &super::super::EventKind::TransportSnapshot(Box::new(snapshot)),
@@ -8378,6 +8393,7 @@ mod tests {
         fill(&mut snapshot.quic_carried_fallback);
         fill(&mut snapshot.quic_path_age_at_close);
         fill(&mut snapshot.connect_native_setup);
+        fill(&mut snapshot.quic_gateway_admission);
         snapshot.quic_establish_ms_p50 = Some(901);
         snapshot.quic_establish_ms_p90 = Some(902);
         snapshot.quic_establish_samples = 903;
@@ -8415,6 +8431,12 @@ mod tests {
         {
             expected.push((format!("connect_native_setup_{}", outcome.label()), count));
         }
+        for (outcome, count) in crate::transport::metrics::GatewayAdmission::ALL
+            .iter()
+            .zip(snapshot.quic_gateway_admission)
+        {
+            expected.push((format!("quic_gateway_admission_{}", outcome.label()), count));
+        }
         for (key, value) in [
             ("quic_establish_ms_p50", 901),
             ("quic_establish_ms_p90", 902),
@@ -8433,6 +8455,7 @@ mod tests {
                 + 3 * QuicFallback::COUNT
                 + QuicPathAge::COUNT
                 + NativeSetupOutcome::COUNT
+                + crate::transport::metrics::GatewayAdmission::COUNT
                 + 6
         );
         for (key, value) in expected {

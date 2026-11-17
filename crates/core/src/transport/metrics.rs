@@ -620,6 +620,47 @@ labelled_counters! {
     }
 }
 
+labelled_counters! {
+    /// What a gateway's admission of native joins from sources it was not
+    /// told about did (`quic::admission`, #5940 A7b): per datagram from such
+    /// a source, then per connection attempt, then per admitted connection.
+    /// Exported per period as `quic_gateway_admission_<label>`. Zero on every
+    /// node until admission is switched on (`admission::GATEWAY_NATIVE_ADMISSION`).
+    pub(crate) enum GatewayAdmission {
+        /// A datagram was queued for the endpoint.
+        Queued => "queued",
+        /// A datagram was dropped: the queue for unknown sources was full.
+        QueueFull => "queue_full",
+        /// A datagram was dropped: a short header.
+        ShortHeader => "short_header",
+        /// A datagram was dropped: shorter than a client Initial.
+        Runt => "runt",
+        /// A datagram was dropped: a QUIC version the endpoint does not speak.
+        UnknownVersion => "unknown_version",
+        /// An attempt without a Retry token was answered with a Retry.
+        Retried => "retried",
+        /// An attempt was ignored: its address had one admitted within a second.
+        ThrottledAddress => "throttled_address",
+        /// An attempt was ignored: the node's rate was spent.
+        ThrottledGlobal => "throttled_global",
+        /// An attempt was ignored: the allow-set was full.
+        AllowSetFull => "allow_set_full",
+        /// An attempt was ignored: its TLS configuration could not be built.
+        TlsConfigFailed => "tls_config_failed",
+        /// An attempt was admitted and accepted.
+        Admitted => "admitted",
+        /// An admitted attempt's handshake failed or timed out.
+        HandshakeFailed => "handshake_failed",
+        /// A handshake completed without a proven client key.
+        Unproven => "unproven",
+        /// The Hello exchange failed.
+        HelloFailed => "hello_failed",
+        /// A joiner connection reached the end of admission. Until phase B
+        /// hands it to the node, it is closed there.
+        Joined => "joined",
+    }
+}
+
 impl NativeSetupOutcome {
     /// Whether this end says native does not work on the path to that peer,
     /// so it counts toward the node's demotion. A refusal by this node's own
@@ -1027,6 +1068,8 @@ pub struct TransportMetrics {
     quic_path_age: [AtomicU64; QuicPathAge::COUNT],
     /// QUIC-native setups this period, by [`NativeSetupOutcome`].
     connect_native_setup: [AtomicU64; NativeSetupOutcome::COUNT],
+    /// Gateway admission of native joins this period, by [`GatewayAdmission`].
+    quic_gateway_admission: [AtomicU64; GatewayAdmission::COUNT],
     /// Establish latencies this period in ms (bounded), and how many there
     /// were.
     quic_establish_ms: parking_lot::Mutex<Vec<u64>>,
@@ -1513,6 +1556,7 @@ impl TransportMetrics {
             quic_carried_fallback: Default::default(),
             quic_path_age: Default::default(),
             connect_native_setup: Default::default(),
+            quic_gateway_admission: Default::default(),
             quic_establish_ms: Default::default(),
             quic_establish_samples: AtomicU64::new(0),
             quic_paths_offered_or_dialing: AtomicU64::new(0),
@@ -2165,6 +2209,11 @@ impl TransportMetrics {
     /// A QUIC-native setup ended with `outcome`.
     pub(crate) fn record_connect_native_setup(&self, outcome: NativeSetupOutcome) {
         self.connect_native_setup[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A gateway's admission of a native join did `outcome`.
+    pub(crate) fn record_gateway_admission(&self, outcome: GatewayAdmission) {
+        self.quic_gateway_admission[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_quic_close_sent(&self, code: QuicCloseCode, remote: SocketAddr) {
@@ -3038,6 +3087,7 @@ impl TransportMetrics {
             quic_carried_fallback: std::array::from_fn(|i| get64(&self.quic_carried_fallback[i])),
             quic_path_age_at_close: std::array::from_fn(|i| get64(&self.quic_path_age[i])),
             connect_native_setup: std::array::from_fn(|i| get64(&self.connect_native_setup[i])),
+            quic_gateway_admission: std::array::from_fn(|i| get64(&self.quic_gateway_admission[i])),
             quic_establish_ms_p50: establish_p50,
             quic_establish_ms_p90: establish_p90,
             quic_establish_samples: get64(&self.quic_establish_samples),
@@ -3755,6 +3805,9 @@ pub struct TransportSnapshot {
     /// QUIC-native setups, by [`NativeSetupOutcome`]
     /// (`connect_native_setup_<label>`).
     pub connect_native_setup: [u64; NativeSetupOutcome::COUNT],
+    /// Gateway admission of native joins, by [`GatewayAdmission`]
+    /// (`quic_gateway_admission_<label>`).
+    pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
     /// Median and p90 of this period's establish latencies, in ms (the
     /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
     /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
@@ -4156,6 +4209,7 @@ impl TransportSnapshot {
             quic_carried_fallback,
             quic_path_age_at_close,
             connect_native_setup,
+            quic_gateway_admission,
             quic_establish_ms_p50,
             quic_establish_ms_p90,
             quic_establish_samples,
@@ -4331,6 +4385,7 @@ impl TransportSnapshot {
         self.quic_carried_fallback = quic_carried_fallback;
         self.quic_path_age_at_close = quic_path_age_at_close;
         self.connect_native_setup = connect_native_setup;
+        self.quic_gateway_admission = quic_gateway_admission;
         self.quic_establish_ms_p50 = quic_establish_ms_p50;
         self.quic_establish_ms_p90 = quic_establish_ms_p90;
         self.quic_establish_samples = quic_establish_samples;
@@ -4602,6 +4657,9 @@ struct SnapshotExtras {
     /// QUIC-native setups, by [`NativeSetupOutcome`]
     /// (`connect_native_setup_<label>`).
     pub connect_native_setup: [u64; NativeSetupOutcome::COUNT],
+    /// Gateway admission of native joins, by [`GatewayAdmission`]
+    /// (`quic_gateway_admission_<label>`).
+    pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
     /// Median and p90 of this period's establish latencies, in ms (the
     /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
     /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
@@ -4827,6 +4885,7 @@ impl SnapshotExtras {
                 .any(|n| *n != 0)
             || self.quic_path_age_at_close.iter().any(|n| *n != 0)
             || self.connect_native_setup.iter().any(|n| *n != 0)
+            || self.quic_gateway_admission.iter().any(|n| *n != 0)
             || self.quic_establish_samples != 0
             || self.quic_paths_offered_or_dialing != 0
             || self.quic_paths_active != 0
@@ -6182,6 +6241,14 @@ mod tests {
     }
 
     #[test]
+    fn gateway_admission_outcomes_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, _| m.record_gateway_admission(GatewayAdmission::ALL[slot]),
+            |snap| snap.quic_gateway_admission,
+        );
+    }
+
+    #[test]
     fn quic_path_age_buckets_count_snapshot_and_reset() {
         let secs = [0, 59, 60, 599, 600, 3599, 3600, 86399, 86400];
         let want = [2, 2, 2, 2, 1];
@@ -7390,6 +7457,7 @@ mod tests {
             "quic_carried_fallback",
             "quic_path_age_at_close",
             "connect_native_setup",
+            "quic_gateway_admission",
             "quic_establish_ms_p50",
             "quic_establish_ms_p90",
             "quic_establish_samples",
