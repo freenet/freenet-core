@@ -46,6 +46,10 @@ const START_LIMIT: Duration = Duration::from_secs(40);
 /// What turns QUIC on for a test node.
 const QUIC_ON: &[&str] = &["--transport-quic", "prefer"];
 
+/// An `extra_args` entry that starts the node as a peer: it is not passed
+/// on, and `--is-gateway` is left out. A peer also needs `--gateway`.
+const AS_PEER: &str = "<as-peer>";
+
 /// A free TCP port, also free for UDP right now.
 fn free_port() -> anyhow::Result<u16> {
     for _ in 0..100 {
@@ -111,12 +115,12 @@ impl Node {
             .args(["--network-port", &network_port])
             .args(["--public-network-address", "127.0.0.1"])
             .args(["--public-network-port", &network_port])
-            .arg("--is-gateway")
+            .args((!extra_args.contains(&AS_PEER)).then_some("--is-gateway"))
             .arg("--skip-load-from-network")
             .arg("--ignore-protocol-checking")
             .arg("--disable-auto-update")
             .args(["--location", "0.5"])
-            .args(extra_args)
+            .args(extra_args.iter().filter(|arg| **arg != AS_PEER))
             .args(["--config-dir", &dir.to_string_lossy()])
             .args(["--data-dir", &dir.to_string_lossy()])
             .args(["--log-dir", &log_dir.to_string_lossy()])
@@ -311,6 +315,67 @@ fn three_quic_panics_keep_quic_off_for_the_cooldown() -> anyhow::Result<()> {
     assert!(logs.contains(COOLING_WARN), "{logs}");
     assert!(!logs.contains(QUIC_BUILT), "{logs}");
     assert_eq!(read_marker(dir.path())?, tripped, "the trip does not move");
+    Ok(())
+}
+
+/// #6151: a Windows peer trips at two runs that abort on a QUIC panic while
+/// UDP exists (`PEER_SHORT_RUNS_TO_TRIP_WITH_UDP`), one fewer than a
+/// gateway: the third start trips and runs with QUIC off. The other tests
+/// here start gateways.
+#[cfg(feature = "quic-panic-injection")]
+#[test]
+fn a_peer_trips_after_two_quic_panics_in_a_row() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    // A peer needs a gateway to start; this one is never reached.
+    let gateway = format!("127.0.0.1:9,{}", "11".repeat(32));
+    let peer = [
+        QUIC_ON[0],
+        QUIC_ON[1],
+        AS_PEER,
+        "--gateway",
+        gateway.as_str(),
+    ];
+    let trip_at = u64::from(freenet::PEER_SHORT_RUNS_TO_TRIP_WITH_UDP);
+    assert_eq!(trip_at, 2);
+    let inject = [("FREENET_TEST_QUIC_PANIC", "abort:2")];
+    for short_runs in 0..trip_at {
+        let logs = dir.path().join(format!("logs-{short_runs}"));
+        let mut node = Node::start_with_env(dir.path(), logs, &peer, &inject)?;
+        node.wait_for_log(QUIC_BUILT)?;
+        node.wait_for_marker(dir.path(), short_runs)?;
+        let status = loop {
+            if let Some(status) = node.child.try_wait()? {
+                break status;
+            }
+            anyhow::ensure!(
+                Instant::now() < node.deadline,
+                "the injected panic did not end the node:\n{}",
+                node.logs()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(!status.success(), "an abort: {status:?}");
+        let marker = read_marker(dir.path())?;
+        assert_eq!(
+            marker
+                .as_ref()
+                .map(|marker| marker["quic_panicked"].clone()),
+            Some(true.into()),
+            "the hook marked the run before the abort: {marker:?}\n{}",
+            node.logs()
+        );
+    }
+
+    let third = Node::start(dir.path(), dir.path().join("logs-trip"), &peer)?;
+    let logs = third.logs();
+    assert!(logs.contains(TRIP_WARN), "{logs}");
+    assert!(!logs.contains(QUIC_BUILT), "{logs}");
+    let tripped = read_marker(dir.path())?;
+    assert_eq!(
+        tripped.as_ref().map(|marker| marker["state"].clone()),
+        Some("tripped".into()),
+        "{logs}"
+    );
     Ok(())
 }
 

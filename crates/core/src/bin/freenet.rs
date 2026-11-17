@@ -2097,7 +2097,10 @@ mod tests {
     /// restores the previous release and pins this one as bad. Each run the
     /// breaker counts ended in a crash the rollback also counts; the start
     /// that trips runs with QUIC off, so it adds no QUIC crash. At that point
-    /// the rollback's count must still be short of its threshold.
+    /// the rollback's count must still be short of its threshold. This holds
+    /// for a release whose crashes are all QUIC panics; the rollback also
+    /// counts unrelated crashes, which the breaker does not, so one of those
+    /// before the panics lets the rollback act first.
     #[test]
     fn peer_breaker_trips_before_the_crash_loop_rollback() {
         let crashes_when_the_breaker_trips = freenet::PEER_SHORT_RUNS_TO_TRIP_WITH_UDP;
