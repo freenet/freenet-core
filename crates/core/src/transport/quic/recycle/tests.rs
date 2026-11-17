@@ -1329,6 +1329,41 @@ fn ack_counting_implements_every_controller_method() {
     assert_eq!(ours, trait_methods);
 }
 
+/// Pin: each timed tick of a path's report passes the path's smoothed RTT, the
+/// bytes it sent since the last report, the milliseconds since it and whether
+/// it carries data to the
+/// per-path gauges (`quic_srtt_<bucket>`, `quic_tx_bps_<bucket>`), and the final
+/// report, which has no clock, does not. Deleting the call, or passing another
+/// RTT, leaves every unit test of the gauges green while the fleet reads 0.
+#[test]
+fn a_timed_report_feeds_the_per_path_gauges() {
+    let code: String = include_str!("../recycle.rs")
+        .lines()
+        .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let start = code
+        .find("fn report(&mut self, now: Option<u64>)")
+        .expect("PathReport::report not found");
+    let (body, _) = code[start..]
+        .split_once("\n    }\n")
+        .expect("could not locate the end of PathReport::report");
+    let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        body.contains("iflet Some(now)=now{".replace(' ', "").as_str())
+            && body.contains("tick_ms=Some(ms);"),
+        "the timed tick must record the milliseconds it covers"
+    );
+    assert!(
+        body.contains(
+            "iflet Some(ms)=tick_ms{self.node.record_path_rates(&mutself.window,stats.path.rtt,sent,ms,carrying);}"
+                .replace(' ', "")
+                .as_str()
+        ),
+        "a timed report must pass the path's rtt, sent bytes and ms to record_path_rates"
+    );
+}
+
 /// Each report is the change since the last one, sent and received kept apart,
 /// and the next is taken from the state it hands back; a count that went down
 /// reports 0.

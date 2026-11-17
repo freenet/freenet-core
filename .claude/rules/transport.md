@@ -1526,7 +1526,12 @@ a test passes its own; tests read their own, never the global).
   both are recorded in one record_path_loss call under the one loss lock, the
   exception the bug-prevention rule on a metric re-derived at the call site
   allows (as for broadcast_payload_mix). The single keys are not under quic_carrying_, which the two carrying
-  families share. Packets in flight at close are dropped by quinn, not declared
+  families share.
+  Two more gauges of live paths, moved at each watch tick under the same lock and
+  left by the window's drop: quic_srtt_<bucket> (quinn's PathStats::rtt) and
+  quic_tx_bps_<bucket> (UDP payload bits per second over the last tick), every
+  bucket uploaded at 0; both are one tick's reading, so they describe the fleet's
+  distribution, not a path's throughput. Packets in flight at close are dropped by quinn, not declared
   lost, so a final bucket can understate the loss at the end. The rate is quinn's lost over
   sent (quinn-proto 0.11.19), not a measurement of the link: sent counts every
   packet quinn built, acknowledgement-only ones included; lost counts quinn's
