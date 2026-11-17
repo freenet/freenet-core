@@ -2712,6 +2712,39 @@ async fn a_legacy_stream_completed_by_its_task_is_remembered() {
     assert!(holds_no_state(&e, id), "not started again");
 }
 
+/// #6143: an oversized message sent from a thread whose index is past
+/// 21,475, which every node reaches after a few days of uptime, is still
+/// reassembled and delivered. Before the fix its transport-internal id carried
+/// the caller-named bit, so the receiver parked it as an operations stream
+/// nobody claims and the message was lost without a trace.
+#[tokio::test(start_paused = true)]
+async fn a_legacy_stream_from_a_long_running_sender_thread_is_delivered() {
+    let mut e = single(CAPABLE);
+    StreamId::reset_counter_as_thread(24_160);
+    let id = StreamId::next_transport_internal();
+    StreamId::reset_counter();
+    let f = super::MAX_DATA_SIZE;
+    let data: Vec<u8> = (0..(2 * f)).map(|i| i as u8).collect();
+    let total = data.len() as u64;
+    for (i, chunk) in data.chunks(f).enumerate() {
+        feed(
+            &mut e,
+            fragment_with(
+                id,
+                total,
+                i as u32 + 1,
+                bytes::Bytes::copy_from_slice(chunk),
+            ),
+        )
+        .await;
+    }
+    assert_eq!(
+        e.pump(Duration::from_millis(10)).await.as_deref(),
+        Some(&data[..]),
+        "stream {id:?} was not delivered as a message"
+    );
+}
+
 /// An evicted legacy stream delivers nothing even when the fragments that
 /// would complete it are already queued for its reassembly task.
 #[tokio::test(start_paused = true)]
