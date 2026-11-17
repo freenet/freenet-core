@@ -537,7 +537,9 @@ fn native_setup_gate_rows_hold_their_baseline() {
     // that stopped being applied fails the test (premises).
     let (mut lossy_failures, mut jitter_edge_failures) = (0, 0);
     for (gate, cell) in cells {
-        let (ok, total, failures) = run_seeds(cell, 0..20);
+        // Gate 15 is judged on 100 seeds per cell (PR-3's criterion).
+        let seeds = if gate == "15" { 0..100 } else { 0..20 };
+        let (ok, total, failures) = run_seeds(cell, seeds);
         runs += total;
         let cell_one_sided = failures.iter().filter(|f| f.one_sided()).count();
         one_sided += cell_one_sided;
@@ -561,9 +563,10 @@ fn native_setup_gate_rows_hold_their_baseline() {
         }
     }
     println!("native-matrix gate rows one-sided: {one_sided} of {runs}");
-    // Measured 100 of 2400 (4.2%) at 20 seeds; the bound leaves margin.
-    // Above 1% means option (b) is a gate (10.2 item 20): re-measured after
-    // overlapping attempts (PR-3), built in PR-4 if still above 1%.
+    // Measured 105 of 4800 (2.2%) with overlapping attempts (gate 15 on 100
+    // seeds per cell), 100 of 2400 (4.2%) with one attempt; nearly all at
+    // the jitter edges. The bound leaves margin. Above 1% means option (b)
+    // is a gate (10.2 item 20, PR-4).
     assert!(
         one_sided * 100 <= runs * 8,
         "one-sided setups above the 8% baseline bound ({one_sided} of {runs})"
@@ -576,15 +579,17 @@ fn native_setup_gate_rows_hold_their_baseline() {
     assert!(jitter_edge_failures > 0, "premise: the jitter is applied");
 }
 
-/// The lower bound each gate cell must keep: a BASELINE with margin, not the
-/// decision criterion. The criterion (95% at 800 ms) is met by gate 14 and
-/// by gate 17's short binding lifetime, and NOT by:
-/// - gate 15, 10% loss on Initial and Handshake at 800 ms: 80-85% measured
-///   (16-17 of 20; one cell 20 of 20), floor 70%. Overlapping attempts (PR-3)
-///   must take it to 95% or more, judged on 100 seeds per cell;
+/// The lower bound each gate cell must keep. The criterion (95% at 800 ms)
+/// is met by gates 14 and 15 and by gate 17's short binding lifetime; the
+/// one cell set NOT met is held to a baseline with margin:
+/// - gate 15, 10% loss on Initial and Handshake at 800 ms, judged on 100
+///   seeds per cell: MET by overlapping attempts (`OVERLAP_BEFORE_END`),
+///   96-100% per cell (one attempt measured 72-91% on 400 seeds), so its
+///   floor is the criterion itself;
 /// - gate 17, jitter up to rtt/2 at 800 ms on the window edges (late server
-///   4 s, late client 8 s): 10 and 7 of 20 measured, mostly one-sided, floor
-///   25%. Elsewhere jitter costs nothing (floor 95%).
+///   4 s, late client 8 s): 16 and 7 of 20 measured with overlapping attempts
+///   (10 and 7 with one), mostly one-sided, floor 25%. Elsewhere jitter costs
+///   nothing (floor 95%). Option (b) (PR-4) is the gate for these.
 fn baseline_floor(gate: &str, cell: &Cell) -> f64 {
     let at_800 = cell.rtt == Duration::from_millis(800);
     let window_edge = matches!(
@@ -592,7 +597,7 @@ fn baseline_floor(gate: &str, cell: &Cell) -> f64 {
         (Late::Server, 4) | (Late::Client, 8)
     );
     match gate {
-        "15" => 0.70,
+        "15" => 0.95,
         "17" if at_800 && !cell.extra.jitter.is_zero() && window_edge => 0.25,
         _ => 0.95,
     }
