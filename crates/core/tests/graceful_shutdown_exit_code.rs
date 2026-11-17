@@ -979,9 +979,11 @@ fn a_unix_peer_decides_by_short_runs_with_the_exit_status_rule_as_a_shadow() -> 
 
 /// The breaker's start report, as logged with the `quic_breaker_start`
 /// payload.
+#[cfg(feature = "quic-panic-injection")]
 const START_REPORT_MARKER: &str = "QUIC crash-loop breaker start report";
 
 /// The `quic_breaker_start` payload a run logged, parsed.
+#[cfg(feature = "quic-panic-injection")]
 fn start_report(logs: &str) -> anyhow::Result<serde_json::Value> {
     let line = logs
         .lines()
