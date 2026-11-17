@@ -2873,13 +2873,21 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     trip of the expiry, the batch acknowledging the bytes before the end
     can be application-limited while the end's own acknowledgement is
     still on its way. Streams started after an end slow its drain, so the
-    ack wait reads its backlog again when it runs out (bounded::LaterBacklog,
-    QuicPath::backlog_wait): the sends in flight when the end was sent plus
-    every permit taken since, each counted as sharing the link for the
-    whole wait, times the rest, at the floor; if that moves the deadline
-    past now, the wait goes on (within its total)
+    ack wait reads its backlog again once, when it first runs out
+    (bounded::LaterBacklog, QuicPath::backlog_wait, path::later_backlog):
+    the bytes ahead of the stream's last byte under quinn's round-robin
+    (the rest from each send in flight at the end, this one included, plus
+    each send started since at its own bytes but at most the rest, from
+    QuicPath::stream_opens, read before the permits in use so a concurrent
+    open is counted twice rather than missed), at the floor; nothing once
+    the connection has acknowledged that many bytes since the end (the last
+    byte went out with them, so a busy path that acknowledges quickly is
+    judged at its first wait). If that moves the deadline past now, the
+    wait goes on, within its total, and is then judged
     (streams_started_after_an_end_extend_its_ack_wait: before this, a 1 MiB
-    stream followed by fifteen more on a 40 KiB/s link expired). Lateness is
+    stream followed by fifteen more on a 40 KiB/s link expired;
+    an_ack_wait_reads_its_backlog_again_once,
+    the_later_backlog_counts_bytes_ahead_until_they_are_acknowledged). Lateness is
     measured against the deadline only: a stall that ended within the
     slack of the deadline still has its stale evidence judged. Merely slow
     paths do not expire

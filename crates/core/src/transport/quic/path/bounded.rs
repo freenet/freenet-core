@@ -294,9 +294,10 @@ struct ProgressState {
     later_read: AtomicBool,
 }
 
-/// The backlog ahead of a stream's end read again, at the ack wait's end:
-/// with the streamed sends started since the end was sent counted as sharing
-/// the link with it for the whole wait (`QuicPath::backlog_wait`).
+/// The backlog ahead of a stream's end read again, once, when its ack wait
+/// first runs out: the bytes that can go before its last byte, counting the
+/// streamed sends started since the end, and nothing once the connection has
+/// acknowledged that many bytes since (`path::later_backlog`).
 pub(crate) type LaterBacklog = Arc<dyn Fn() -> Duration + Send + Sync>;
 
 impl SendProgress {
