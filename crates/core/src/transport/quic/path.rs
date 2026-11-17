@@ -1450,27 +1450,27 @@ impl QuicPath {
             };
             let wait = Duration::from_secs(in_flight.saturating_mul(rest).div_ceil(floor_now()));
             let (opens, acks) = (opens.clone(), acks.clone());
+            let reading: Arc<dyn Fn() -> LaterReading + Send + Sync> = Arc::new(move || {
+                let (now_opened, now_bytes) = opens.read();
+                let acked = match (&acks, acked_at_end) {
+                    (Some(acks), Some(at_end)) => acks.acked_bytes().saturating_sub(at_end),
+                    // No acknowledgement record: nothing is known to have
+                    // gone out, so the bound is the bytes alone.
+                    _ => 0,
+                };
+                LaterReading {
+                    in_flight,
+                    rest,
+                    started: now_opened.saturating_sub(opened),
+                    started_bytes: now_bytes.saturating_sub(opened_bytes),
+                    acked_since_end: acked,
+                }
+            });
+            let for_later = reading.clone();
             Backlog {
                 wait,
-                later: Arc::new(move || {
-                    let (now_opened, now_bytes) = opens.read();
-                    let acked = match (&acks, acked_at_end) {
-                        (Some(acks), Some(at_end)) => acks.acked_bytes().saturating_sub(at_end),
-                        // No acknowledgement record: nothing is known to have
-                        // gone out, so the bound is the bytes alone.
-                        _ => 0,
-                    };
-                    later_backlog(
-                        LaterReading {
-                            in_flight,
-                            rest,
-                            started: now_opened.saturating_sub(opened),
-                            started_bytes: now_bytes.saturating_sub(opened_bytes),
-                            acked_since_end: acked,
-                        },
-                        floor_now(),
-                    )
-                }),
+                later: Arc::new(move || later_backlog(for_later(), floor_now())),
+                reading,
             }
         })
     }
@@ -2421,6 +2421,8 @@ struct Outgoing {
     /// path's state when the end was sent.
     strike: Option<StrikeCheck>,
     finished_at: Option<StrikeMark>,
+    /// Judges whether the end, once sent, is late ([`LateEndCheck`]).
+    late: Option<LateEndCheck>,
     /// A control frame's stream (`Opener::Control`).
     control: bool,
     /// How long the backlog ahead of this stream's end may take, read when
@@ -2486,20 +2488,118 @@ pub(crate) struct LaterReading {
 /// first wait, not at the 2 h total; a slow path, which acknowledges the
 /// bytes ahead slowly, is given their time at the floor.
 pub(crate) fn later_backlog(reading: LaterReading, floor: u64) -> Duration {
-    let LaterReading {
-        in_flight,
-        rest,
-        started,
-        started_bytes,
-        acked_since_end,
-    } = reading;
-    let ahead = in_flight
-        .saturating_mul(rest)
-        .saturating_add(started_bytes.min(started.saturating_mul(rest)));
+    let acked_since_end = reading.acked_since_end;
+    let ahead = bytes_ahead(&reading);
     if acked_since_end >= ahead {
         return Duration::ZERO;
     }
     Duration::from_secs(ahead.div_ceil(floor.max(1)))
+}
+
+/// The bytes that can go before a stream's last byte under quinn's
+/// round-robin ([`later_backlog`]): the rest from each send in flight at the
+/// end, this one included, and from each send started since its own bytes
+/// but at most the rest.
+pub(crate) fn bytes_ahead(reading: &LaterReading) -> u64 {
+    reading
+        .in_flight
+        .saturating_mul(reading.rest)
+        .saturating_add(
+            reading
+                .started_bytes
+                .min(reading.started.saturating_mul(reading.rest)),
+        )
+}
+
+/// How long after the proof point an honest peer's acknowledgement of a
+/// stream's end may still take ([`late_end_verdict`]): three probe timeouts
+/// (quinn's at most 3 round trips plus 25 ms each, so a lost copy is resent
+/// and acknowledged), at least [`LATE_END_GRACE_MIN`].
+pub(crate) fn late_end_grace(rtt: Duration) -> Duration {
+    (rtt * 9 + Duration::from_millis(75)).max(LATE_END_GRACE_MIN)
+}
+
+/// The least [`late_end_grace`].
+pub(crate) const LATE_END_GRACE_MIN: Duration = Duration::from_secs(2);
+
+/// Bytes past [`bytes_ahead`] the connection must have acknowledged since a
+/// stream's end before the end can be late: what was already in flight when
+/// it was sent is not ordered by the round-robin, and is at most a send
+/// window.
+pub(crate) const LATE_END_MARGIN: u64 = super::budget::MAX_WINDOW_BYTES;
+
+/// Whether a stream's end, still unacknowledged at `now`, is late, given
+/// `ahead` ([`bytes_ahead`]) and `acked` (bytes the connection acknowledged
+/// since the end), with `crossed` the time `acked` first reached `ahead`
+/// plus [`LATE_END_MARGIN`] (set here). quinn shares the link round-robin, so
+/// by then the end's last packet had been sent; an honest peer's QUIC stack
+/// acknowledges it like every other packet, within [`late_end_grace`] even
+/// when a copy is lost. Late once the grace has passed since `crossed`.
+pub(crate) fn late_end_verdict(
+    crossed: &mut Option<u64>,
+    ahead: u64,
+    acked: u64,
+    now: u64,
+    rtt: Duration,
+) -> bool {
+    if crossed.is_none() && acked >= ahead.saturating_add(LATE_END_MARGIN) {
+        *crossed = Some(now);
+    }
+    crossed.is_some_and(|at| now.saturating_sub(at) >= nanos(late_end_grace(rtt)))
+}
+
+/// Judges whether a sent stream's end is late (#6205): the connection has
+/// acknowledged enough bytes since the end to have carried its last packet,
+/// and the end is still unacknowledged past the grace ([`late_end_verdict`]).
+/// A late end is counted (`quic_late_end_<label>`) and the send waits on as
+/// before: the stream is not reset. Nothing is judged while the egress cap
+/// holds a transmit (the proof restarts), after a poll more than
+/// [`LATE_WAKE_SLACK`] past its tick (this node was not running, so the proof
+/// restarts), or once the path was dark for the watch's window since the end
+/// (`recycle::AckWatch::publishing_long_dark`): the outage is the dark rule's.
+#[derive(Clone)]
+struct LateEndCheck {
+    reading: Arc<dyn Fn() -> LaterReading + Send + Sync>,
+    rtt: Arc<dyn Fn() -> Duration + Send + Sync>,
+    now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    cap: Arc<super::socket::CapHolds>,
+    dark_at: Arc<AtomicU64>,
+    /// When the end was sent, on `now`.
+    end_at: u64,
+}
+
+impl LateEndCheck {
+    /// Poll at every [`recycle::ACK_WATCH_TICK`] until the end is late
+    /// (returns) or the path was dark since the end (never returns); the
+    /// caller drops it when the end is acknowledged.
+    async fn late(self, sleeper: Sleeper) {
+        let tick = recycle::ACK_WATCH_TICK;
+        let mut crossed = None;
+        let mut last = (self.now)();
+        loop {
+            sleeper(tick).await;
+            let now = (self.now)();
+            let woke_late = now.saturating_sub(last) > nanos(tick + LATE_WAKE_SLACK);
+            last = now;
+            if self.dark_at.load(Ordering::Acquire) >= self.end_at.max(1) {
+                return std::future::pending().await;
+            }
+            if woke_late || self.cap.read().held_now {
+                crossed = None;
+                continue;
+            }
+            let reading = (self.reading)();
+            if late_end_verdict(
+                &mut crossed,
+                bytes_ahead(&reading),
+                reading.acked_since_end,
+                now,
+                (self.rtt)(),
+            ) {
+                return;
+            }
+        }
+    }
 }
 
 /// The backlog ahead of a stream's end ([`QuicPath::backlog_wait`]): how long
@@ -2508,6 +2608,9 @@ pub(crate) fn later_backlog(reading: LaterReading, floor: u64) -> Duration {
 struct Backlog {
     wait: Duration,
     later: bounded::LaterBacklog,
+    /// The bytes ahead of the end and those acknowledged since, read at any
+    /// time after it ([`LateEndCheck`]).
+    reading: Arc<dyn Fn() -> LaterReading + Send + Sync>,
 }
 
 /// A sleep on the path's clock.
@@ -2683,6 +2786,7 @@ impl Outgoing {
             node: None,
             strike: None,
             finished_at: None,
+            late: None,
             control: false,
             backlog: None,
         }
@@ -2902,11 +3006,39 @@ impl Outgoing {
         self.writing = None;
         self.finished_at = self.strike.as_ref().map(StrikeCheck::mark);
         match self.backlog.as_ref().map(|backlog| backlog()) {
-            Some(Backlog { wait, later }) => self.progress.mark_finished_after(wait, Some(later)),
+            Some(Backlog {
+                wait,
+                later,
+                reading,
+            }) => {
+                self.late = self
+                    .strike
+                    .as_ref()
+                    .zip(self.finished_at)
+                    .map(|(check, mark)| LateEndCheck {
+                        reading,
+                        rtt: check.rtt.clone(),
+                        now: check.now.clone(),
+                        cap: check.cap.clone(),
+                        dark_at: check.dark_at.clone(),
+                        end_at: mark.at,
+                    });
+                self.progress.mark_finished_after(wait, Some(later));
+            }
             None => self.progress.mark_finished_behind(Duration::ZERO),
         }
         self.awaiting_ack = true;
-        let stopped = (&mut self.stopped).await;
+        let late = late_end_watch(
+            self.late.clone(),
+            self.sleep.as_ref().map(|(sleep, _)| sleep.clone()),
+            self.live.as_ref().map(recycle::LiveStream::writers_arc),
+            self.node,
+            self.kind(),
+        );
+        let stopped = tokio::select! {
+            stopped = &mut self.stopped => stopped,
+            () = late => unreachable!("the late-end watch never returns"),
+        };
         self.awaiting_ack = false;
         match stopped {
             Ok(None) => Ok(()),
@@ -2917,6 +3049,38 @@ impl Outgoing {
             Err(quinn::StoppedError::ZeroRttRejected) => Err(QuicSendError::Closed),
         }
     }
+}
+
+impl Outgoing {
+    /// The kind of send this is, for `quic_ack_wait_expired_<label>` and
+    /// `quic_late_end_<label>`: one with a permit, a control frame, or a
+    /// one-packet Short.
+    fn kind(&self) -> crate::transport::metrics::AckWaitKind {
+        if self.slot.is_some() {
+            crate::transport::metrics::AckWaitKind::Stream
+        } else if self.control {
+            crate::transport::metrics::AckWaitKind::Control
+        } else {
+            crate::transport::metrics::AckWaitKind::Short
+        }
+    }
+}
+
+/// Wait for a sent end to be late ([`LateEndCheck`]), count it once, then
+/// wait forever: the caller selects it against the acknowledgement. Without
+/// a check, a clock or the counts, it waits forever at once.
+async fn late_end_watch(
+    late: Option<LateEndCheck>,
+    sleeper: Option<Sleeper>,
+    writers: Option<Arc<recycle::Writers>>,
+    node: Option<&'static QuicDataCounters>,
+    kind: crate::transport::metrics::AckWaitKind,
+) {
+    if let (Some(late), Some(sleeper), Some(writers), Some(node)) = (late, sleeper, writers, node) {
+        late.late(sleeper).await;
+        writers.late_end(node, kind);
+    }
+    std::future::pending().await
 }
 
 impl Drop for Outgoing {
@@ -3028,6 +3192,19 @@ impl Drop for Outgoing {
         let send = if bounded { self.send.take() } else { None };
         let (aborts, node) = (self.aborts.clone(), self.node);
         let strike = self.strike.clone().zip(self.finished_at).zip(due);
+        let late = late_end_watch(
+            self.late.clone(),
+            self.sleep.as_ref().map(|(sleep, _)| sleep.clone()),
+            live.as_ref().map(recycle::LiveStream::writers_arc),
+            self.node,
+            if slot.is_some() {
+                crate::transport::metrics::AckWaitKind::Stream
+            } else if self.control {
+                crate::transport::metrics::AckWaitKind::Control
+            } else {
+                crate::transport::metrics::AckWaitKind::Short
+            },
+        );
         let kind = if bound_for.is_some() && slot.is_some() {
             crate::transport::metrics::AckWaitKind::Stream
         } else if self.control {
@@ -3042,11 +3219,12 @@ impl Drop for Outgoing {
                 Some(bound) => tokio::select! {
                     _ended = stopped => false,
                     () = bound => true,
+                    () = late => unreachable!("the late-end watch never returns"),
                 },
-                None => {
-                    let _ended = stopped.await;
-                    false
-                }
+                None => tokio::select! {
+                    _ended = stopped => false,
+                    () = late => unreachable!("the late-end watch never returns"),
+                },
             };
             if timed_out
                 && let Some(mut send) = send

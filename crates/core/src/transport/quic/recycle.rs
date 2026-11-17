@@ -1095,6 +1095,11 @@ impl Writers {
 pub(crate) struct LiveStream(Arc<Writers>);
 
 impl LiveStream {
+    /// The path's counts it is counted in, shared.
+    pub(crate) fn writers_arc(&self) -> Arc<Writers> {
+        self.0.clone()
+    }
+
     /// The path's counts it is counted in.
     pub(crate) fn writers(&self) -> &Writers {
         &self.0
