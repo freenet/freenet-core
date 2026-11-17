@@ -732,6 +732,7 @@ mod tests {
             started_at_secs: T0,
             nonce: NONCE,
             quic_panicked: false,
+            quic_panic_at: None,
             endpoint_down_secs,
             prior_trip: None,
         };

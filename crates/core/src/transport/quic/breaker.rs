@@ -1356,7 +1356,7 @@ fn legacy_shadow_decide(
 ) -> (Verdict, Option<Marker>) {
     let previous = match shadow {
         Previous::Nothing => legacy_evidence(main()),
-        shadow => shadow,
+        shadow @ (Previous::Unreadable | Previous::Marker(_)) => shadow,
     };
     let armed_pid_alive =
         holder_of(&previous, start.boot_id.as_deref(), start.own_pid).is_some_and(pid_alive);
