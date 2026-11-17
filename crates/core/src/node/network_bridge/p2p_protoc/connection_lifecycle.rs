@@ -1260,9 +1260,13 @@ impl P2pConnManager {
                 // leaving the native entry, the ring and the transient budget
                 // untouched. The peer applies the same rule to its own copy
                 // of this pair, so it keeps the native connection too.
-                if self.native_holds_peer(remote_addr, peer.as_ref().map(|p| p.pub_key())) {
+                if let Some(holder) =
+                    self.native_holds_peer(remote_addr, peer.as_ref().map(|p| p.pub_key()))
+                {
+                    self.stamp_survivor_win(holder);
                     tracing::info!(
                         remote = %remote_addr,
+                        %holder,
                         transient,
                         transaction = ?transaction,
                         "Inbound UDP connection from a peer a native connection holds; \
@@ -1345,8 +1349,21 @@ impl P2pConnManager {
                     // touching the ring or the transient budget, whether it
                     // ran beside that native dial or not, and its requesters
                     // are answered with the native connection.
-                    if self.native_holds_peer(peer_addr, Some(peer.pub_key())) {
+                    if let Some(holder) = self.native_holds_peer(peer_addr, Some(peer.pub_key())) {
+                        self.stamp_survivor_win(holder);
+                        // The in-transit reservation this dial made at its
+                        // own address is not used: the peer is held at
+                        // `holder`. At the holder's own address it is the
+                        // ring entry, which stays.
+                        if holder != peer_addr {
+                            let cm = &self.bridge.op_manager.ring.connection_manager;
+                            if !cm.is_in_ring(peer_addr) && cm.has_connection_or_pending(peer_addr)
+                            {
+                                cm.prune_in_transit_connection(peer_addr);
+                            }
+                        }
                         tracing::info!(
+                            %holder,
                             remote = %peer_addr,
                             transaction = %transaction,
                             beside = beside.is_some(),
@@ -1376,7 +1393,8 @@ impl P2pConnManager {
                                     .map(|callback| (transaction, callback)),
                             );
                         }
-                        answer_beside(peer_addr, requesters, Ok((peer_addr, None))).await;
+                        // Answered with the connection that holds the peer.
+                        answer_beside(peer_addr, requesters, Ok((holder, None))).await;
                         drop(connection);
                         return Ok(());
                     }
@@ -1921,28 +1939,47 @@ impl P2pConnManager {
     /// anything. Two UDP connections to one address keep the older
     /// behaviour (the later replaces the earlier).
     ///
-    /// Whether a native connection holds the peer a UDP connection at `addr`
-    /// claims as `key`: the entry bound to `key` is native, or, with no key,
-    /// the entry at `addr` is. A native entry at `addr` bound to another key
-    /// is stale (the peer came back under a new key), so it does not hold the
-    /// peer and the UDP connection takes the ordinary path.
-    fn native_holds_peer(&self, addr: SocketAddr, key: Option<&TransportPublicKey>) -> bool {
+    /// The address of the live native connection that holds the peer a UDP
+    /// connection at `addr` claims as `key`, if one does: the entry bound to
+    /// `key`, or, with no key, the entry at `addr`, when it is native and was
+    /// heard from within `identity::HOLD_WINDOW`. A native entry at `addr`
+    /// bound to another key is stale (the peer came back under a new key), so
+    /// it does not hold the peer. Nor does a native entry gone quiet: the
+    /// peer may have restarted, or its NAT rebound, and its native connection
+    /// will only end at the QUIC idle timeout. In both cases the UDP
+    /// connection takes the ordinary path, which replaces the stale entry.
+    fn native_holds_peer(
+        &self,
+        addr: SocketAddr,
+        key: Option<&TransportPublicKey>,
+    ) -> Option<SocketAddr> {
         let at = match key {
-            Some(key) => match self.addr_by_pub_key.get(key) {
-                Some(at) => *at,
-                None => return false,
-            },
+            Some(key) => *self.addr_by_pub_key.get(key)?,
             None => addr,
         };
         self.connections
             .get(&at)
-            .is_some_and(|entry| entry.native && key.is_none_or(|k| entry.pub_key() == Some(k)))
+            .is_some_and(|entry| {
+                entry.native
+                    && key.is_none_or(|k| entry.pub_key() == Some(k))
+                    && identity::heard_from_recently(entry)
+            })
+            .then_some(at)
+    }
+
+    /// Notes that the native connection at `holder` just won the survivor
+    /// rule, for `connect_native_one_sided_drop`.
+    fn stamp_survivor_win(&mut self, holder: SocketAddr) {
+        if let Some(entry) = self.connections.get_mut(&holder) {
+            entry.won_over_udp_at = Some(Instant::now());
+        }
     }
 
     /// The survivor rule's swap (see [`Self::native_holds_peer`]): a native
     /// connection to the peer whose UDP connection holds the entry at
     /// `peer_addr`, under the same key, takes over the entry's transport in
-    /// place. Does nothing when there is no entry.
+    /// place. Callers check that the entry exists; without one it warns
+    /// and does nothing (and asserts in debug builds).
     ///
     /// Replaced: the listener task, the sender to it, the connection id, the
     /// receipt stamp, the remote version (on the entry and on the
@@ -1965,6 +2002,12 @@ impl P2pConnManager {
         let receipt = connection.receipt_stamp();
         let (tx, rx) = mpsc::channel(10);
         let Some(entry) = self.connections.get_mut(&peer_addr) else {
+            // Callers check the entry first; nothing to swap into.
+            tracing::warn!(
+                %peer_addr,
+                "No connection entry to swap a native connection into; dropping it"
+            );
+            debug_assert!(false, "replace_transport_in_place without an entry");
             return Ok(());
         };
         let old_id = entry.connection_id;

@@ -188,6 +188,16 @@ pub(super) enum BindOutcome {
 /// count too, stamped at the path's next 2 s watch tick.
 pub(super) const HOLD_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Whether `entry`'s transport received an authenticated packet within
+/// [`HOLD_WINDOW`]. A transport that does not report receipt (a test double)
+/// counts as heard from.
+pub(super) fn heard_from_recently(entry: &ConnectionEntry) -> bool {
+    entry
+        .receipt
+        .as_ref()
+        .is_none_or(|stamp| stamp.since_last_receipt() <= HOLD_WINDOW)
+}
+
 /// The connection, other than `exclude`, bound to `key`, and whether it was
 /// heard from within [`HOLD_WINDOW`]. A connection whose transport does not
 /// report receipt (a test double) counts as heard from.
@@ -196,12 +206,7 @@ pub(super) fn key_holder(
     exclude: Option<SocketAddr>,
     key: &TransportPublicKey,
 ) -> Option<(SocketAddr, bool)> {
-    let live = |entry: &ConnectionEntry| {
-        entry
-            .receipt
-            .as_ref()
-            .is_none_or(|stamp| stamp.since_last_receipt() <= HOLD_WINDOW)
-    };
+    let live = heard_from_recently;
     let mut quiet = None;
     for (addr, entry) in connections {
         if Some(*addr) == exclude || entry.identity.key() != Some(key) {

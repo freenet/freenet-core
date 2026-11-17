@@ -23521,6 +23521,13 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
             sim.with_native_connect(100);
             if let Some(ms) = quic_delay {
                 sim.delay_quic_datagrams(Duration::from_millis(ms));
+                // A native connection the peer never finished then idles out
+                // within the run, as it would in the field (keepalives are
+                // off in simulation), so `connect_native_one_sided_drop` can
+                // be compared with the one-sided setups.
+                if order.is_none() {
+                    sim.with_quic_idle_timeout(Duration::from_secs(30));
+                }
             }
             if let Some(ms) = intro_delay {
                 sim.delay_udp_intros(Duration::from_millis(ms));
@@ -23630,7 +23637,11 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
             );
         }
         let (pairs, one_sided) = t.native_setup_pairs();
-        println!("{name}: native setups with both ends ended: {pairs}, one-sided: {one_sided}");
+        println!(
+            "{name}: native setups with both ends ended: {pairs}, one-sided: {one_sided}, \
+             counted one_sided_drop: {}",
+            t.one_sided_drops()
+        );
         setups = (setups.0 + pairs, setups.1 + one_sided);
     }
     println!(
