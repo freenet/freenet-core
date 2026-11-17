@@ -715,6 +715,8 @@ enum ServerTls {
     Pinned,
     /// With this rustls configuration instead (an impostor's).
     Custom(Box<rustls::ServerConfig>),
+    /// With this QUIC TLS configuration, which may serve several attempts.
+    Shared(Arc<quinn::crypto::rustls::QuicServerConfig>),
 }
 
 /// `client` connects to `server` at `server_addr` with `client_config`,
@@ -736,12 +738,16 @@ async fn attempt(
                 let incoming = server.accept().await.expect("an incoming attempt");
                 match server_tls {
                     ServerTls::Pinned => incoming.establish().await,
-                    ServerTls::Custom(tls) => {
+                    ServerTls::Custom(_) | ServerTls::Shared(_) => {
                         let mut config = (*server.server).clone();
-                        config.crypto = Arc::new(
-                            quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(*tls))
-                                .unwrap(),
-                        );
+                        config.crypto = match server_tls {
+                            ServerTls::Custom(tls) => Arc::new(
+                                quinn::crypto::rustls::QuicServerConfig::try_from(Arc::new(*tls))
+                                    .unwrap(),
+                            ),
+                            ServerTls::Shared(tls) => tls,
+                            ServerTls::Pinned => unreachable!("matched above"),
+                        };
                         let connection =
                             super::socket::with_poller_holds(&incoming.cap_holds, || {
                                 incoming.incoming.accept_with(Arc::new(config))
@@ -5269,4 +5275,56 @@ fn the_bind_records_its_endpoint_state() {
         record < branch,
         "recorded before the result is used, for both arms"
     );
+}
+
+/// A real QUIC handshake under `server_tls_proven`: two clients with
+/// different keys connect through ONE server configuration, each is
+/// accepted, the key read from each connection (`proven_client_key`) is that
+/// client's own, and the ALPN agreed is the native one. A verifier that kept
+/// the first client's key would refuse the second.
+#[test]
+fn a_proven_server_config_accepts_each_client_by_its_own_key() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-identity-proven", net.addr(1), net.addr(2), None).await;
+        // The attempt reaches `accept` only from an allowed address; the key
+        // it is allowed with is not used by this server configuration.
+        let _permit = pair.b.allow_peer(pair.a_addr, &pair.a_key()).unwrap();
+        let shared = Arc::new(pair.b.identity.server_tls_proven().unwrap());
+        let server_peer = PeerKey::of(pair.b_keys.public()).unwrap();
+        let second_keys = TransportKeypair::new();
+        let second = Arc::new(QuicIdentity::new(&second_keys).unwrap());
+        let clients = [
+            (&pair.a.identity, pair.a_keys.public()),
+            (&second, second_keys.public()),
+        ];
+        for (identity, expected) in clients {
+            let tls = identity
+                .client_tls_for(&server_peer, config::Alpn::Native)
+                .unwrap();
+            let (client, server) = attempt(
+                &pair.time,
+                &pair.a,
+                &pair.b,
+                pair.b_addr,
+                (pair.a.client_config(Arc::new(tls)), server_peer.clone()),
+                ServerTls::Shared(shared.clone()),
+            )
+            .await;
+            let client = client.expect("the client connects");
+            let server = server.expect("the server accepts");
+            let proven = super::identity::proven_client_key(server.inner())
+                .expect("the connection carries the proven key");
+            assert_eq!(proven.transport_key(), expected);
+            let protocol = server
+                .inner()
+                .handshake_data()
+                .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
+                .and_then(|data| data.protocol);
+            assert_eq!(protocol.as_deref(), Some(config::NATIVE_ALPN));
+            client.inner().close(0u32.into(), b"");
+            server.inner().close(0u32.into(), b"");
+        }
+    })
 }

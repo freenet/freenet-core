@@ -521,8 +521,8 @@ fn a_key_with_a_torsion_component_is_refused() {
 }
 
 /// Every node's presented key is accepted by `peer_key_presented` and gives
-/// back that node's transport key; `ProvenClientKey` reports it only once
-/// the handshake signature has verified under it.
+/// back that node's transport key, and `ProvenClientKey` accepts it and a
+/// handshake signature by that node under it.
 #[test]
 fn a_proven_key_is_the_presenting_nodes_transport_key() {
     let _seed = GlobalRng::seed_guard(SEED);
@@ -534,24 +534,21 @@ fn a_proven_key_is_the_presenting_nodes_transport_key() {
         assert_eq!(parsed.transport_key(), keys.public());
         assert_eq!(parsed, peer);
 
-        let verifier = ProvenClientKey::new();
         let presented = cert(peer.spki());
-        assert!(verifier.verify_client_cert(&presented, &[], now).is_ok());
-        assert!(verifier.proven().is_none(), "not before the signature");
-        let message = b"transcript";
         assert!(
-            verifier
-                .verify_signature(
-                    message,
-                    &presented,
-                    SignatureScheme::ED25519,
-                    &handshake_sign(&keys, message)
-                )
+            ProvenClientKey
+                .verify_client_cert(&presented, &[], now)
                 .is_ok()
         );
-        assert_eq!(
-            verifier.proven().map(PeerKey::transport_key),
-            Some(keys.public())
+        let message = b"transcript";
+        assert!(
+            ProvenClientKey::verify_signature(
+                message,
+                &presented,
+                SignatureScheme::ED25519,
+                &handshake_sign(&keys, message)
+            )
+            .is_ok()
         );
     }
 }
@@ -601,23 +598,34 @@ fn only_a_node_keys_exact_presented_form_is_accepted() {
     }
     // Every non-canonical encoding with sign bit 0: y + p for y < 19
     // (y + p < 2^255).
+    // Each is refused by `PeerKey::of` already (small order or a torsion
+    // component), before the canonical-encoding backstop in
+    // `peer_key_presented` is reached: shown here for every one of them, so
+    // the backstop's comment ("not reachable today") stays checked.
     for y in 0..19u8 {
         let mut encoded = FIELD_PRIME;
         encoded[0] += y;
+        if let Some(point) = CompressedEdwardsY(encoded).decompress() {
+            let transport = TransportPublicKey::from_bytes(point.to_montgomery().to_bytes());
+            assert!(
+                PeerKey::of(&transport).is_err(),
+                "y + p for y = {y}: PeerKey::of accepted it, so only the backstop refuses it"
+            );
+        }
         refused.push(("a non-canonical y", spki(&encoded)));
     }
     let now = rustls::pki_types::UnixTime::now();
     for (what, bytes) in &refused {
         assert!(peer_key_presented(bytes).is_err(), "{what} accepted");
-        let verifier = ProvenClientKey::new();
         assert!(
-            verifier.verify_client_cert(&cert(bytes), &[], now).is_err(),
+            ProvenClientKey
+                .verify_client_cert(&cert(bytes), &[], now)
+                .is_err(),
             "the verifier accepted {what}"
         );
-        assert!(verifier.proven().is_none());
     }
     // Not even an accepted key with a chain.
-    let verifier = ProvenClientKey::new();
+    let verifier = ProvenClientKey;
     let exact = cert(peer.spki());
     assert!(
         verifier
@@ -633,15 +641,13 @@ fn only_a_node_keys_exact_presented_form_is_accepted() {
     );
 }
 
-/// The signature counts only under the key the client presented, with the
-/// Ed25519 scheme, and after that key was accepted: a signature by another
-/// key, another scheme, a different certificate at the signature, a
-/// signature with no accepted key, and a second key in one handshake are
-/// all refused, and none of them proves anything.
+/// The signature counts only under the key presented at the signature, with
+/// the Ed25519 scheme: a signature by another key, a certificate other than
+/// the signer's, another scheme, and a certificate that is not a node's key
+/// are all refused.
 #[test]
 fn a_proven_key_needs_its_own_signature_under_ed25519() {
     let _seed = GlobalRng::seed_guard(SEED);
-    let now = rustls::pki_types::UnixTime::now();
     let keys = TransportKeypair::new();
     let intruder = TransportKeypair::new();
     let peer = PeerKey::of(keys.public()).unwrap();
@@ -650,86 +656,63 @@ fn a_proven_key_needs_its_own_signature_under_ed25519() {
     let good = handshake_sign(&keys, message);
     let forged = handshake_sign(&intruder, message);
     let presented = cert(peer.spki());
-    let fresh = || {
-        let verifier = ProvenClientKey::new();
-        verifier.verify_client_cert(&presented, &[], now).unwrap();
-        verifier
-    };
-    let cases: Vec<(
-        &str,
-        ProvenClientKey,
-        CertificateDer<'static>,
-        SignatureScheme,
-        &[u8],
-    )> = vec![
+    let mut twin = peer.spki().to_vec();
+    twin[ED25519_SPKI_LEN - 1] ^= 0x80;
+    let cases: Vec<(&str, CertificateDer<'static>, SignatureScheme, &[u8])> = vec![
         (
             "another key's signature",
-            fresh(),
             presented.clone(),
             SignatureScheme::ED25519,
             &forged,
         ),
         (
             "another certificate at the signature",
-            fresh(),
             cert(other.spki()),
             SignatureScheme::ED25519,
-            &forged,
-        ),
-        (
-            "Ed448",
-            fresh(),
-            presented.clone(),
-            SignatureScheme::ED448,
             &good,
         ),
+        ("Ed448", presented.clone(), SignatureScheme::ED448, &good),
         (
             "ECDSA",
-            fresh(),
             presented.clone(),
             SignatureScheme::ECDSA_NISTP256_SHA256,
             &good,
         ),
         (
-            "no accepted key",
-            ProvenClientKey::new(),
-            presented.clone(),
+            "a certificate that is not a node's key",
+            cert(&twin),
             SignatureScheme::ED25519,
             &good,
         ),
     ];
-    for (what, verifier, at, scheme, signature) in cases {
+    for (what, at, scheme, signature) in cases {
         assert!(
-            verifier
-                .verify_signature(message, &at, scheme, signature)
-                .is_err(),
+            ProvenClientKey::verify_signature(message, &at, scheme, signature).is_err(),
             "{what} accepted"
         );
-        assert!(verifier.proven().is_none(), "{what} proved a key");
     }
-    let verifier = fresh();
     assert!(
-        verifier
-            .verify_client_cert(&cert(other.spki()), &[], now)
-            .is_err(),
-        "a second key in one handshake"
+        ProvenClientKey::verify_signature(message, &presented, SignatureScheme::ED25519, &good)
+            .is_ok()
     );
-    assert!(verifier.proven().is_none());
-    assert!(
-        verifier
-            .verify_signature(message, &presented, SignatureScheme::ED25519, &good)
-            .is_ok(),
-        "the first key still verifies"
-    );
-    assert_eq!(verifier.proven(), Some(&peer));
 }
 
 proptest::proptest! {
     /// Any input to `peer_key_presented` is refused or gives back a key whose
-    /// presented form is exactly the input; it never panics. Inputs under the
-    /// prefix reach the point decoding.
+    /// presented form is exactly the input; it never panics. Half the inputs
+    /// are random bytes, which almost never start with the SPKI prefix and so
+    /// exercise the framing checks; the other half are the prefix followed by
+    /// 0 to 40 random bytes, which exercise the length check and, at exactly
+    /// 32, the point decoding (`peer_key_presented_takes_any_point` covers
+    /// that more fully).
     #[test]
-    fn peer_key_presented_takes_any_bytes(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..80)) {
+    fn peer_key_presented_takes_any_bytes(bytes in proptest::prop_oneof![
+        proptest::collection::vec(proptest::prelude::any::<u8>(), 0..80),
+        proptest::strategy::Strategy::prop_map(
+            proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=40),
+            |tail: Vec<u8>| -> Vec<u8> { [&ED25519_SPKI_PREFIX[..], &tail[..]].concat() },
+        ),
+    ]) {
         if let Ok(peer) = peer_key_presented(&bytes) {
             proptest::prop_assert_eq!(&peer.spki()[..], &bytes[..]);
         }
@@ -748,11 +731,13 @@ proptest::proptest! {
 }
 
 /// Drive a TLS 1.3 handshake between `client` and `server` in memory,
-/// to the end or the first error (either side's).
+/// to the end or the first error (either side's). On success, the key the
+/// server's connection holds for the client, parsed as `proven_client_key`
+/// parses it (`None` if it is not exactly one accepted key).
 fn tls_in_memory(
     client: rustls::ClientConfig,
     server: rustls::ServerConfig,
-) -> Result<(), rustls::Error> {
+) -> Result<Option<PeerKey>, rustls::Error> {
     let name = rustls::pki_types::ServerName::try_from("freenet").unwrap();
     let mut client = rustls::ClientConnection::new(Arc::new(client), name)?;
     let mut server = rustls::ServerConnection::new(Arc::new(server))?;
@@ -776,17 +761,20 @@ fn tls_in_memory(
             client.process_new_packets()?;
         }
         if !client.is_handshaking() && !server.is_handshaking() {
-            return Ok(());
+            return Ok(match server.peer_certificates() {
+                Some([presented]) => peer_key_presented(presented.as_ref()).ok(),
+                _ => None,
+            });
         }
     }
     panic!("the handshake did not finish");
 }
 
 /// A real TLS 1.3 handshake against a server using `ProvenClientKey`: a node
-/// connecting with its own identity is accepted and its transport key is
-/// what the verifier reports; an impostor presenting another node's key
-/// without its secret, and a plain Ed25519 key whose point has sign bit 1,
-/// are refused and prove nothing. A plain Ed25519 key with sign bit 0 is
+/// connecting with its own identity is accepted and its transport key is the
+/// one the finished connection holds; an impostor presenting another node's
+/// key without its secret, and a plain Ed25519 key whose point has sign bit
+/// 1, are refused. A plain Ed25519 key with sign bit 0 is
 /// accepted as the transport key it converts to: its holder has that key's
 /// secret, so possession is all it proves, as the module doc says.
 #[test]
@@ -796,14 +784,12 @@ fn a_handshake_proves_the_clients_own_key_only() {
     let server = QuicIdentity::new(&server_keys).unwrap();
     let server_peer = PeerKey::of(server_keys.public()).unwrap();
     let proven_server = || {
-        let verifier = Arc::new(ProvenClientKey::new());
-        let config = config::rustls_server_config_for(
+        config::rustls_server_config_for(
             server.certified_key(),
-            verifier.clone(),
+            Arc::new(ProvenClientKey),
             Alpn::Native,
         )
-        .unwrap();
-        (config, verifier)
+        .unwrap()
     };
     let client_presenting = |key: Arc<CertifiedKey>| {
         config::rustls_client_config_for(
@@ -816,12 +802,10 @@ fn a_handshake_proves_the_clients_own_key_only() {
 
     let client_keys = TransportKeypair::new();
     let client = QuicIdentity::new(&client_keys).unwrap();
-    let (config, verifier) = proven_server();
-    tls_in_memory(client_presenting(client.certified_key()), config).expect("a node");
-    assert_eq!(
-        verifier.proven().map(PeerKey::transport_key),
-        Some(client_keys.public())
-    );
+    let proven = tls_in_memory(client_presenting(client.certified_key()), proven_server())
+        .expect("a node")
+        .expect("one accepted key");
+    assert_eq!(proven.transport_key(), client_keys.public());
 
     // An impostor: another node's key, signed with its own secret.
     let victim = TransportKeypair::new();
@@ -829,23 +813,23 @@ fn a_handshake_proves_the_clients_own_key_only() {
         vec![cert(PeerKey::of(victim.public()).unwrap().spki())],
         Arc::new(XeddsaSigningKey::new(&client_keys).unwrap()),
     ));
-    let (config, verifier) = proven_server();
-    assert!(tls_in_memory(client_presenting(impostor), config).is_err());
-    assert!(verifier.proven().is_none(), "an impostor proved a key");
+    assert!(
+        tls_in_memory(client_presenting(impostor), proven_server()).is_err(),
+        "an impostor completed the handshake"
+    );
 
     let mut seen = [false; 2];
     for _ in 0..64 {
         let plain = super::super::test_tls::TestIdentity::generate();
         let sign_bit = plain.spki[ED25519_SPKI_LEN - 1] >> 7;
-        let (config, verifier) = proven_server();
-        let outcome = tls_in_memory(client_presenting(plain.key.clone()), config);
+        let outcome = tls_in_memory(client_presenting(plain.key.clone()), proven_server());
         if sign_bit == 0 {
-            outcome.expect("a plain key with sign bit 0");
-            let proven = verifier.proven().expect("proven");
+            let proven = outcome
+                .expect("a plain key with sign bit 0")
+                .expect("one accepted key");
             assert_eq!(&proven.spki()[..], &plain.spki[..]);
         } else {
             assert!(outcome.is_err(), "a sign-bit-1 key accepted");
-            assert!(verifier.proven().is_none());
         }
         seen[usize::from(sign_bit)] = true;
     }
@@ -858,11 +842,10 @@ fn a_handshake_proves_the_clients_own_key_only() {
 fn the_proven_server_tls_offers_the_native_alpn_only() {
     let _seed = GlobalRng::seed_guard(SEED);
     let identity = QuicIdentity::new(&TransportKeypair::new()).unwrap();
-    let (_tls, verifier) = identity.server_tls_proven().expect("quinn accepts it");
-    assert!(verifier.proven().is_none());
+    identity.server_tls_proven().expect("quinn accepts it");
     let rustls = config::rustls_server_config_for(
         identity.certified_key(),
-        Arc::new(ProvenClientKey::new()),
+        Arc::new(ProvenClientKey),
         Alpn::Native,
     )
     .unwrap();
