@@ -62,11 +62,12 @@
 //!    [`STREAM_CREDIT_WINDOW`] while this side wanted streams, though enough
 //!    of this side's streams were wholly acknowledged that an honest peer
 //!    would have.
-//! 6. **Ack waits expired** ([`Stall::AckWaitsExpired`]), observe-only
-//!    ([`ACK_WAITS_EXPIRED_CLOSES`]): [`ACK_WAIT_EXPIRY_LIMIT`] sends had
-//!    their wait for the acknowledgement of their end run out within
-//!    [`ACK_WAIT_EXPIRY_WINDOW`]; counted (`quic_stall_would_close_<label>`),
-//!    and the path stays open.
+//! 6. **Ack waits expired** ([`Stall::AckWaitsExpired`]):
+//!    [`ACK_WAIT_EXPIRY_LIMIT`] sends had their wait for the acknowledgement
+//!    of their end run out within [`ACK_WAIT_EXPIRY_WINDOW`]. Closes a path
+//!    with no UDP session (a native one); on a path with one it only counts
+//!    (`quic_stall_would_close_<label>`) and the path stays open
+//!    ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
 //!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
 //! counter of packets the peer newly acknowledged: `frame_rx.acks` counts
@@ -1161,7 +1162,7 @@ pub(crate) struct AckWatch {
     /// When the previous sample was taken, on the watch's clock.
     previous_now: Option<u64>,
     /// Whether the path carries data, so the dark-path rule may close it (only
-    /// one with no UDP session, [`Self::with_udp_fallback`]); `None` is a path
+    /// one with no UDP session, `udp_fallback` of [`Self::new`]); `None` is a path
     /// that does. A path that carries none only counts its dark episodes, to
     /// their end ([`Self::observing`]).
     carries_data: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -1189,8 +1190,8 @@ pub(crate) struct AckWatch {
     /// seen, within [`ACK_WAIT_EXPIRY_WINDOW`].
     expiries_seen: u64,
     expiries_at: VecDeque<u64>,
-    /// Times the ack-wait expiry rule would have closed the path
-    /// ([`ACK_WAITS_EXPIRED_CLOSES`]).
+    /// Times the ack-wait expiry rule would have closed the path, which has
+    /// a UDP session ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
     would_close: u64,
     /// The path has a UDP session to fall back to, so the dark rule only
     /// counts ([`DARK_CLOSES_WITH_UDP`]).
@@ -1200,6 +1201,9 @@ pub(crate) struct AckWatch {
     /// Where it is published whether the dark rule would have closed the path
     /// in the episode in progress, if anywhere ([`Self::publishing_dark`]).
     dark_flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Where the last sample of a long dark episode is published, if
+    /// anywhere ([`Self::publishing_long_dark`]).
+    long_dark_at: Option<Arc<AtomicU64>>,
 }
 
 /// Whether the egress cap holds, or held since `previous` was read, a QUIC
@@ -1243,7 +1247,11 @@ impl AckWatch {
         cap_held(&mut self.hold_unchanged_since, now_nanos, cap, previous)
     }
 
-    pub(crate) fn new(window: Duration, first: AckSample) -> Self {
+    /// A watch over `window` from the sample `first`, on a path with a UDP
+    /// session to fall back to or not: the dark rule and the ack-wait expiry
+    /// rule close only a path without one ([`DARK_CLOSES_WITH_UDP`],
+    /// [`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]), and only count on one with one.
+    pub(crate) fn new(window: Duration, first: AckSample, udp_fallback: bool) -> Self {
         let expiries_seen = first.ack_wait_expiries;
         let window_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
         Self {
@@ -1271,10 +1279,25 @@ impl AckWatch {
             expiries_seen,
             expiries_at: VecDeque::new(),
             would_close: 0,
-            udp_fallback: false,
+            udp_fallback,
             dark_would_closed: false,
             dark_flag: None,
+            long_dark_at: None,
         }
+    }
+
+    /// Publish in `at`, at each sample of a dark episode that has lasted at
+    /// least the window, the sample's time on the caller's clock (not the
+    /// watch's own, [`Self::watch_time`]); 0 until one has. An ack-wait
+    /// expiry whose wait overlapped one is not a strike (`path::StrikeCheck`):
+    /// a send through an outage can outlast its wait with an honest peer (a
+    /// one-packet Short's 150 s bound, on a path with a UDP session that the
+    /// dark rule leaves to the idle timeout), and darkness is the dark rule's
+    /// to judge. A peer that withholds acknowledgements while it sends is
+    /// heard, so its episodes end at once and publish nothing.
+    pub(crate) fn publishing_long_dark(mut self, at: Arc<AtomicU64>) -> Self {
+        self.long_dark_at = Some(at);
+        self
     }
 
     /// Publish in `flag`, after every sample, whether the dark rule would
@@ -1296,13 +1319,6 @@ impl AckWatch {
     #[cfg(test)]
     pub(crate) fn would_have_closed_dark(&self) -> bool {
         self.dark_would_closed
-    }
-
-    /// Whether the path has a UDP session to fall back to; on one the dark
-    /// rule counts and does not close ([`DARK_CLOSES_WITH_UDP`]).
-    pub(crate) fn with_udp_fallback(mut self, udp_fallback: bool) -> Self {
-        self.udp_fallback = udp_fallback;
-        self
     }
 
     /// `now_nanos` on the watch's own clock, which leaves out the time a late
@@ -1350,7 +1366,7 @@ impl AckWatch {
 
     /// Count dark episodes in `node`, and let the dark-path rule close the
     /// path only while `carries_data` is set (and then only a path with no UDP
-    /// session, [`Self::with_udp_fallback`]). On a path that carries no data
+    /// session, `udp_fallback` of [`Self::new`]). On a path that carries no data
     /// (every path while no release sends data on QUIC), an episode runs to
     /// its end, so the counts show how long real dark spells last against the
     /// rule's window. Durations are read at the samples, so they are good to
@@ -1397,8 +1413,8 @@ impl AckWatch {
         }
     }
 
-    /// Times the ack-wait expiry rule would have closed the path
-    /// ([`ACK_WAITS_EXPIRED_CLOSES`]). Tests only.
+    /// Times the ack-wait expiry rule would have closed the path, which has
+    /// a UDP session ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]). Tests only.
     #[cfg(test)]
     pub(crate) fn would_close(&self) -> u64 {
         self.would_close
@@ -1412,8 +1428,16 @@ impl AckWatch {
     /// Take `sample`, taken at `now_nanos`; whether the path must close
     /// ([`Self::stall`] says why).
     pub(crate) fn observe(&mut self, now_nanos: u64, sample: AckSample) -> bool {
+        let caller_now = now_nanos;
         let now_nanos = self.watch_time(now_nanos);
         self.stall = self.decide(now_nanos, sample);
+        if let Some(at) = &self.long_dark_at
+            && self
+                .dark_since
+                .is_some_and(|start| now_nanos.saturating_sub(start) >= self.window_nanos)
+        {
+            at.store(caller_now.max(1), Ordering::Release);
+        }
         if let Some(flag) = &self.dark_flag {
             flag.store(self.dark_would_closed, std::sync::atomic::Ordering::Release);
         }
@@ -1467,7 +1491,7 @@ impl AckWatch {
         // Not judged against the peer's timing, so a cap hold does not
         // suspend it.
         if expired {
-            if ACK_WAITS_EXPIRED_CLOSES {
+            if !self.udp_fallback || ACK_WAITS_EXPIRED_CLOSES_WITH_UDP {
                 return Some(Stall::AckWaitsExpired);
             }
             // Observe only: count it, and start the window afresh so the
@@ -1603,8 +1627,9 @@ pub(crate) enum Stall {
     StreamCreditWithheld,
     /// [`ACK_WAIT_EXPIRY_LIMIT`] of this side's sends had their wait for the
     /// acknowledgement of their end run out within
-    /// [`ACK_WAIT_EXPIRY_WINDOW`] ([`AckWatch`]). Observe-only for now: counted
-    /// as a would-close, the path not closed ([`ACK_WAITS_EXPIRED_CLOSES`]).
+    /// [`ACK_WAIT_EXPIRY_WINDOW`] ([`AckWatch`]). Closes a path with no UDP
+    /// session; on one with a UDP session it is counted as a would-close and
+    /// the path is not closed ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
     AckWaitsExpired,
 }
 
@@ -1789,19 +1814,22 @@ pub(crate) const STREAM_CREDIT_WINDOW: Duration = Duration::from_secs(60);
 pub(crate) const STREAM_CREDIT_FREED: u64 = super::config::MAX_UNI_STREAMS as u64 / 8 + 1;
 
 /// Whether the ack-wait expiry rule ([`Stall::AckWaitsExpired`]) closes a
-/// path. It does not yet: strikes are counted (`quic_ack_wait_expired_<label>`)
-/// and each time [`ACK_WAIT_EXPIRY_LIMIT`] come within
-/// [`ACK_WAIT_EXPIRY_WINDOW`] is counted as a would-close
-/// (`quic_stall_would_close_ack_waits_expired`), and the path stays open.
-/// The strike can still misjudge an honest path (the backlog ahead of a
-/// stream's end is read when the end is sent, so streams started after it
-/// are not counted), so the close waits for a follow-up calibrated from
-/// those counts (#6205).
-pub(crate) const ACK_WAITS_EXPIRED_CLOSES: bool = false;
+/// path that has a UDP session to fall back to. It does not: on such a path
+/// strikes are counted (`quic_ack_wait_expired_<label>`) and each time
+/// [`ACK_WAIT_EXPIRY_LIMIT`] come within [`ACK_WAIT_EXPIRY_WINDOW`] is counted
+/// as a would-close (`quic_stall_would_close_ack_waits_expired`), and the path
+/// stays open, so the field counts calibrate the rule before the UDP
+/// transport is removed without this node's own closes in them. A path with
+/// no UDP session (a native connection's) is closed, with
+/// `close_code::PEER_NOT_ACKNOWLEDGING`: there the peer's withheld
+/// acknowledgements would otherwise hold its permits and send epochs with
+/// nothing to fall back to (#6205), the same split as the dark rule
+/// ([`DARK_CLOSES_WITH_UDP`]).
+pub(crate) const ACK_WAITS_EXPIRED_CLOSES_WITH_UDP: bool = false;
 
-/// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that would close a
-/// path ([`Stall::AckWaitsExpired`]; counted only,
-/// [`ACK_WAITS_EXPIRED_CLOSES`]): sends whose wait for the acknowledgement of
+/// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that close a path with
+/// no UDP session ([`Stall::AckWaitsExpired`]; on one with a UDP session
+/// counted only, [`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]): sends whose wait for the acknowledgement of
 /// their end ran out (`bounded::SendDeadlines::ack_wait`, at least 5 min, or
 /// a one-packet Short's background wait, `path::SHORT_ACK_WAIT`, 150 s) and
 /// whose stream was reset. Counted only when the reset happened (an
@@ -1959,6 +1987,7 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         carries_data,
         udp_fallback,
         dark,
+        long_dark_at,
     } = shared;
     let Some(first) = AckSample::of(&connection, &cap_holds, &writers) else {
         tracing::warn!(
@@ -1969,10 +1998,10 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
         return;
     };
     let mut received = first.received;
-    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first)
+    let mut watch = AckWatch::new(ACK_WATCH_WINDOW, first, udp_fallback)
         .observing(carries_data, report.node)
-        .with_udp_fallback(udp_fallback)
-        .publishing_dark(dark);
+        .publishing_dark(dark)
+        .publishing_long_dark(long_dark_at);
     loop {
         time.sleep(ACK_WATCH_TICK).await;
         rtt.set(connection.rtt());
@@ -2067,6 +2096,9 @@ pub(crate) struct WatchShared {
     /// progress ([`AckWatch::publishing_dark`]), so the path's stall close
     /// leaves such a path with a UDP session alone (`route`).
     pub(crate) dark: Arc<std::sync::atomic::AtomicBool>,
+    /// The last sample of a dark episode that lasted the window, on the
+    /// path's clock, 0 for none ([`AckWatch::publishing_long_dark`]).
+    pub(crate) long_dark_at: Arc<AtomicU64>,
 }
 
 /// Watch panics `PathReport::panic_once_bucketed` raised. Tests only; only

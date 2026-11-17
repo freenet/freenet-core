@@ -1554,8 +1554,9 @@ a test passes its own; tests read their own, never the global).
   paths. quic_stall_close_<not_acknowledging|dark|credit_starved|
   stream_credit_withheld|ack_waits_expired>: paths the acknowledgement
   watch closed, by why (recycle::Stall). quic_stall_would_close_<same
-  labels>: times a rule that only observes would have closed a path; only
-  ack_waits_expired observes today (recycle::ACK_WAITS_EXPIRED_CLOSES).
+  labels>: times a rule that only observes would have closed a path:
+  ack_waits_expired and dark, each on paths with a UDP session
+  (recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP, DARK_CLOSES_WITH_UDP).
   quic_dark_episode_<recovered_lt_5s|lt_10s|lt_30s|lt_120s|recovered_ge_120s|
   unrecovered|cap_held|closed_at_window>: dark episodes (recycle::AckWatch:
   packets outstanding, nothing acknowledged, nothing heard) by how they ended;
@@ -2920,12 +2921,15 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     own deadline (no caller does this today) waits on in the background
     for at most the rest of its ack wait, then is reset and judged as one
     that ran out.
-  → Ack waits expired (#6205, recycle::AckWatch, Stall::AckWaitsExpired),
-    OBSERVE-ONLY (recycle::ACK_WAITS_EXPIRED_CLOSES is false): strikes and
-    would-closes are counted and the path is never closed by this rule;
-    the close is a follow-up calibrated from the field counts, which must
-    also count streams started after an end in its backlog (below). #6205
-    stays open as the gate before UDP removal. A reset at an expired wait (above) is a STRIKE when there is evidence
+  → Ack waits expired (#6205, recycle::AckWatch, Stall::AckWaitsExpired):
+    closes a path with no UDP session (a native one) with
+    PEER_NOT_ACKNOWLEDGING; on a path with a UDP session it only observes
+    (recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP is false): strikes and
+    would-closes are counted and the path is not closed, so the field
+    counts calibrate the rule before UDP removal without this node's own
+    closes in them (the same split as the dark rule). #6205 stays open as
+    the gate before UDP removal for the late-acknowledgement residual
+    (below). A reset at an expired wait (above) is a STRIKE when there is evidence
     the end went out and the peer is alive (path::StrikeCheck): ack batches
     came after the end was sent and the latest came while quinn was
     application-limited (quinn-proto app_limited = nothing built and not
@@ -2939,7 +2943,17 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     either when the expiry's timer woke more than LATE_WAKE_SLACK (2 s)
     past its deadline: this node's runtime stalled or its host slept, and
     acknowledgements already in the socket may not have been read
-    (an_expiry_whose_timer_woke_late_is_not_a_strike). A genuinely
+    (an_expiry_whose_timer_woke_late_is_not_a_strike). Nor when the path
+    was dark for at least the watch's window (10 s) at any sample since the
+    end was sent (AckWatch::publishing_long_dark, WatchShared::long_dark_at):
+    through an outage that ends, a send can outlast its wait with an honest
+    peer, because quinn resends only at its next backed-off probe; the
+    common case is a one-packet Short's 150 s bound on a path with a UDP
+    session, which the dark rule leaves to the idle timeout since #6239.
+    Short strikes per data path-hour rose about 4x from 0.2.158 to 0.2.159
+    (1.27 to 4.98 per 1000), consistent with that. A peer that withholds
+    acknowledgements while it keeps sending is heard at every sample, so the
+    exclusion never covers it. A genuinely
     slow path (every batch congestion-limited, under the floor) is not
     struck (the_strike_check_needs_evidence_that_the_end_went_out,
     ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes,
@@ -2955,7 +2969,8 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     acknowledgements are high), acknowledged multi-packet Shorts between
     included, or one end in three, would be closed at about its third ack
     wait, not after SEND_ABORT_LIMIT (4096) resets
-    (ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged). Flow
+    (ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged,
+    whose native cases close at the third strike). Flow
     control cannot hold bytes back after the end is sent (every byte
     written before it was within the peer's credit; a peer whose app stops
     reading blocks the write before the end, which the gap and credit
@@ -2963,10 +2978,22 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     congestion-limited path whose backlog drains within about a round
     trip of the expiry, the batch acknowledging the bytes before the end
     can be application-limited while the end's own acknowledgement is
-    still on its way. And the backlog is read once, when the end is sent:
-    streams started after it slow the end's drain and are not counted, so
-    a burst of large sends just after an end can make an honest path's
-    expiry a strike (the reason the rule only observes). Lateness is
+    still on its way. Streams started after an end slow its drain, so the
+    ack wait reads its backlog again once, when it first runs out
+    (bounded::LaterBacklog, QuicPath::backlog_wait, path::later_backlog):
+    the bytes ahead of the stream's last byte under quinn's round-robin
+    (the rest from each send in flight at the end, this one included, plus
+    each send started since at its own bytes but at most the rest, from
+    QuicPath::stream_opens, read before the permits in use so a concurrent
+    open is counted twice rather than missed), at the floor; nothing once
+    the connection has acknowledged that many bytes since the end (the last
+    byte went out with them, so a busy path that acknowledges quickly is
+    judged at its first wait). If that moves the deadline past now, the
+    wait goes on, within its total, and is then judged
+    (streams_started_after_an_end_extend_its_ack_wait: before this, a 1 MiB
+    stream followed by fifteen more on a 40 KiB/s link expired;
+    an_ack_wait_reads_its_backlog_again_once,
+    the_later_backlog_counts_bytes_ahead_until_they_are_acknowledged). Lateness is
     measured against the deadline only: a stall that ended within the
     slack of the deadline still has its stale evidence judged. Merely slow
     paths do not expire
@@ -3118,9 +3145,10 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   nobody acknowledges is closed by the dark rule if it is native, and ended
   by quinn's idle timeout if it has a UDP session; a peer that never
   acknowledges a stream's end has the stream reset at its ack wait, and
-  three within 30 min are counted as a would-close (observe-only for now,
-  ACK_WAITS_EXPIRED_CLOSES; until the close lands, such a peer is bounded
-  only by SEND_ABORT_LIMIT); a peer that
+  three within 30 min close a native path (on a path with a UDP session
+  they are counted as a would-close, ACK_WAITS_EXPIRED_CLOSES_WITH_UDP, and
+  such a peer is bounded there by SEND_ABORT_LIMIT and the fallback); a
+  peer that
   withholds its stream limit
   is closed by the stream-credit rule (liveness rules, above).
   The window must stay: without it a busy relay whose 48 permits hold transfers
