@@ -457,10 +457,13 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     });
 
     // Gateway admission of native joins from sources nobody named (#5940
-    // A7b), on the endpoint's clock. Dark: `admission::enabled` is false on
-    // every node until phase B, so nothing below changes.
+    // A7b), on the endpoint's clock. Dark: `admission::enabled_at` is false on
+    // every node until phase B (a test can turn it on for one listener), and
+    // with it off the only additions are an idle queue and its poll, one
+    // atomic load per datagram from a source not on the allow-set, and
+    // counters that stay 0.
     if let Some(endpoint) = &quic_endpoint {
-        if super::quic::admission::enabled(is_gateway) {
+        if super::quic::admission::enabled_at(is_gateway, bind_addr) {
             let enabled = match quic_virtual_time {
                 Some(time) => endpoint.enable_gateway_admission(time),
                 None => endpoint.enable_gateway_admission(RealTime::new()),

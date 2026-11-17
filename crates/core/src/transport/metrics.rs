@@ -637,6 +637,8 @@ labelled_counters! {
         Runt => "runt",
         /// A datagram was dropped: a QUIC version the endpoint does not speak.
         UnknownVersion => "unknown_version",
+        /// A datagram was dropped: a long header of a type other than Initial.
+        NotInitial => "not_initial",
         /// An attempt without a Retry token was answered with a Retry.
         Retried => "retried",
         /// An attempt was ignored: its address had one admitted within a second.
@@ -645,10 +647,15 @@ labelled_counters! {
         ThrottledGlobal => "throttled_global",
         /// An attempt was ignored: the allow-set was full.
         AllowSetFull => "allow_set_full",
-        /// An attempt was ignored: its TLS configuration could not be built.
-        TlsConfigFailed => "tls_config_failed",
-        /// An attempt was admitted and accepted.
+        /// An attempt was admitted: recorded against both limits.
         Admitted => "admitted",
+        /// An admission was given back before its handshake started (the
+        /// allow-set full, the attempt dropped on a full queue or at
+        /// shutdown); `admitted - refunded` is the admissions used.
+        Refunded => "refunded",
+        /// An admitted attempt was dropped: the queue of joins waiting to
+        /// start was full.
+        JoinQueueFull => "join_queue_full",
         /// An admitted attempt's handshake failed or timed out.
         HandshakeFailed => "handshake_failed",
         /// A handshake completed without a proven client key.
@@ -658,6 +665,8 @@ labelled_counters! {
         /// A joiner connection reached the end of admission. Until phase B
         /// hands it to the node, it is closed there.
         Joined => "joined",
+        /// A join panicked; its task's owner caught it and goes on.
+        JoinPanicked => "join_panicked",
     }
 }
 

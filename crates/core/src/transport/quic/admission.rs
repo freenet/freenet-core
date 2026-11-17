@@ -1,7 +1,8 @@
 //! Gateway admission of native joins from sources nobody named (#5940,
 //! phase B; A7b). **Dark**: [`GATEWAY_NATIVE_ADMISSION`] is false, so no
-//! node builds any of this in production; tests turn it on per endpoint
-//! ([`super::QuicEndpoint::enable_gateway_admission`]).
+//! node turns any of this on in production; tests turn it on per endpoint
+//! ([`super::QuicEndpoint::enable_gateway_admission`]) or per listener
+//! ([`force_on_for_test`]).
 //!
 //! Every other QUIC attempt a node accepts comes from an address it allowed
 //! first, with the key it expects there. A gateway admitting a joiner it
@@ -10,13 +11,13 @@
 //! 1. The demux passes a datagram from a source NOT on the allow-set to a
 //!    separate bounded queue only if it can open a connection: a long
 //!    header, at least [`MIN_INITIAL_DATAGRAM`] bytes (RFC 9000 14.1: a
-//!    client pads every datagram carrying an Initial to that size), and a
-//!    QUIC version this endpoint speaks ([`unknown_source_datagram`]). The
-//!    endpoint reads that queue only when the established queue is empty.
-//!    Classifying by source first leaves the established path exactly as it
-//!    is for sources on the allow-set.
+//!    client pads every datagram carrying an Initial to that size), a QUIC
+//!    version this endpoint speaks, and the Initial packet type
+//!    ([`unknown_source_datagram`]). The endpoint reads that queue only when
+//!    the established queue is empty. Classifying by source first leaves the
+//!    established path as it is for sources on the allow-set.
 //! 2. An attempt from such a source that has not returned a Retry token gets
-//!    a Retry ([`Verdict::Retry`]), which proves the source can receive at
+//!    a Retry ([`Refusal::Retry`]), which proves the source can receive at
 //!    its address and creates no state.
 //! 3. At most one validated attempt per second per source address (IP and
 //!    port), as the UDP transport limits intro decryption
@@ -25,8 +26,12 @@
 //!    node, a token bucket of one second's worth.
 //!
 //! An attempt over a limit is ignored, with no reason given. An admitted one
-//! puts its address on the allow-set (so the handshake's later, shorter
-//! datagrams take the established path) and is accepted with
+//! is recorded at once, against both limits, as an [`AdmissionTicket`]; the
+//! ticket gives the admission back (counted `refunded`) if it is dropped
+//! before the join's handshake starts (the allow-set full, the attempt
+//! dropped on a full queue or at shutdown). An admitted attempt puts its
+//! address on the allow-set (so the handshake's later, shorter datagrams take
+//! the established path) and is accepted with
 //! [`super::identity::ProvenClientKey`], offering the native ALPN only.
 //!
 //! The decision is synchronous and runs in the accept loop. Counted as
@@ -34,14 +39,23 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::transport::metrics::GatewayAdmission;
 use crate::transport::normalize_mapped_addr;
 
 /// Whether a gateway admits native joins from sources it was not told
-/// about. False until the B prerequisites hold (QUIC-NATIVE-CONNECT 3.7): the
-/// change that turns it on is a one-line change here.
+/// about. The change that turns it on is a one-line change here, and it
+/// waits for:
+///
+/// - joiners counted inside the node's connection cap (the next A7b PR),
+///   with the share of the QUIC ingress queue an admitted joiner may hold
+///   settled in the same PR;
+/// - phase B: the node takes the admitted connection (`ConnectRequest` on
+///   it, transient to promoted). Until then a join that completes is closed
+///   at the hook (`driver::join_gateway`);
+/// - the rest of the B prerequisites (QUIC-NATIVE-CONNECT 3.7).
 pub(crate) const GATEWAY_NATIVE_ADMISSION: bool = false;
 
 /// Whether a node in this role admits native joins from unknown sources: a
@@ -50,8 +64,45 @@ pub(crate) fn enabled(is_gateway: bool) -> bool {
     enabled_with(is_gateway, GATEWAY_NATIVE_ADMISSION)
 }
 
+/// [`enabled`] for the listener bound at `bind_addr`, which a test can turn
+/// on for that one listener ([`force_on_for_test`]); in a build without
+/// tests it is [`enabled`].
+pub(crate) fn enabled_at(is_gateway: bool, bind_addr: SocketAddr) -> bool {
+    #[cfg(test)]
+    if is_gateway && FORCED_ON.contains(&bind_addr) {
+        return true;
+    }
+    let _ = bind_addr;
+    enabled(is_gateway)
+}
+
 fn enabled_with(is_gateway: bool, switch: bool) -> bool {
     is_gateway && switch
+}
+
+/// Listener addresses a test turned admission on for, keyed by address so
+/// tests running in one process cannot turn it on for each other.
+#[cfg(test)]
+static FORCED_ON: std::sync::LazyLock<dashmap::DashSet<SocketAddr>> =
+    std::sync::LazyLock::new(dashmap::DashSet::new);
+
+/// Turn admission on for a gateway listener bound at `addr`, while the
+/// returned guard lives (tests).
+#[cfg(test)]
+pub(crate) fn force_on_for_test(addr: SocketAddr) -> ForcedOn {
+    FORCED_ON.insert(addr);
+    ForcedOn(addr)
+}
+
+/// Undoes [`force_on_for_test`] when dropped.
+#[cfg(test)]
+pub(crate) struct ForcedOn(SocketAddr);
+
+#[cfg(test)]
+impl Drop for ForcedOn {
+    fn drop(&mut self) {
+        FORCED_ON.remove(&self.0);
+    }
 }
 
 /// The smallest datagram that can carry a client's first Initial (RFC 9000
@@ -60,6 +111,11 @@ pub(crate) const MIN_INITIAL_DATAGRAM: usize = 1200;
 
 /// The QUIC versions this endpoint speaks (`config::endpoint_config`).
 const KNOWN_VERSIONS: [u32; 1] = [1];
+
+/// The long-header packet type bits (RFC 9000 17.2), and the value for an
+/// Initial in QUIC version 1.
+const LONG_PACKET_TYPE_MASK: u8 = 0x30;
+const INITIAL_PACKET_TYPE: u8 = 0x00;
 
 /// How many datagrams from unknown sources the demux holds for the endpoint
 /// (provisional).
@@ -87,6 +143,8 @@ pub(crate) enum NotAnInitial {
     Runt,
     /// A version this endpoint does not speak.
     UnknownVersion,
+    /// A long header of a type other than Initial.
+    NotInitial,
 }
 
 impl NotAnInitial {
@@ -96,13 +154,16 @@ impl NotAnInitial {
             Self::ShortHeader => GatewayAdmission::ShortHeader,
             Self::Runt => GatewayAdmission::Runt,
             Self::UnknownVersion => GatewayAdmission::UnknownVersion,
+            Self::NotInitial => GatewayAdmission::NotInitial,
         }
     }
 }
 
 /// Whether a QUIC-class datagram from a source not on the allow-set can
 /// open a connection: a long header (form bit set), at least
-/// [`MIN_INITIAL_DATAGRAM`] bytes, and a version this endpoint speaks.
+/// [`MIN_INITIAL_DATAGRAM`] bytes, a version this endpoint speaks, and, in
+/// that version, the Initial packet type. The type bits are read only after
+/// the version, since their meaning depends on it.
 pub(crate) fn unknown_source_datagram(datagram: &[u8]) -> Result<(), NotAnInitial> {
     let Some(&first) = datagram.first() else {
         return Err(NotAnInitial::ShortHeader);
@@ -114,16 +175,18 @@ pub(crate) fn unknown_source_datagram(datagram: &[u8]) -> Result<(), NotAnInitia
         return Err(NotAnInitial::Runt);
     }
     let version = u32::from_be_bytes([datagram[1], datagram[2], datagram[3], datagram[4]]);
-    if KNOWN_VERSIONS.contains(&version) {
-        Ok(())
-    } else {
-        Err(NotAnInitial::UnknownVersion)
+    if !KNOWN_VERSIONS.contains(&version) {
+        return Err(NotAnInitial::UnknownVersion);
     }
+    if first & LONG_PACKET_TYPE_MASK != INITIAL_PACKET_TYPE {
+        return Err(NotAnInitial::NotInitial);
+    }
+    Ok(())
 }
 
-/// What the accept loop does with an attempt from an unknown source.
+/// Why the accept loop does not admit an attempt from an unknown source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Verdict {
+pub(crate) enum Refusal {
     /// Answer with a Retry: the source has not shown it receives at its
     /// address.
     Retry,
@@ -132,18 +195,15 @@ pub(crate) enum Verdict {
     ThrottledAddress,
     /// Ignore: the node's rate is spent.
     ThrottledGlobal,
-    /// Accept, with the client's own key proven in the handshake.
-    Admit,
 }
 
-impl Verdict {
-    /// The counter the verdict is recorded under.
+impl Refusal {
+    /// The counter the refusal is recorded under.
     pub(crate) fn outcome(self) -> GatewayAdmission {
         match self {
             Self::Retry => GatewayAdmission::Retried,
             Self::ThrottledAddress => GatewayAdmission::ThrottledAddress,
             Self::ThrottledGlobal => GatewayAdmission::ThrottledGlobal,
-            Self::Admit => GatewayAdmission::Admitted,
         }
     }
 }
@@ -166,6 +226,7 @@ struct State {
 }
 
 const NANOS_PER_TOKEN: u64 = 1_000_000_000;
+const CREDIT_CAP: u64 = GLOBAL_RATE_PER_SEC * NANOS_PER_TOKEN;
 
 impl std::fmt::Debug for Admission {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -173,28 +234,70 @@ impl std::fmt::Debug for Admission {
     }
 }
 
+/// An admission recorded against both limits. Dropped without
+/// [`Self::keep`], it is given back: the address's previous record is
+/// restored (unless a later admission replaced it) and the token returned.
+#[must_use = "dropping a ticket gives the admission back"]
+pub(crate) struct AdmissionTicket {
+    admission: Arc<Admission>,
+    from: SocketAddr,
+    at: u64,
+    previous: Option<u64>,
+    kept: bool,
+}
+
+impl AdmissionTicket {
+    /// The admission is used: the join's handshake starts.
+    pub(crate) fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl std::fmt::Debug for AdmissionTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionTicket")
+            .field("from", &self.from)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for AdmissionTicket {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        self.admission.give_back(self.from, self.at, self.previous);
+        crate::transport::TRANSPORT_METRICS.record_gateway_admission(GatewayAdmission::Refunded);
+    }
+}
+
 impl Admission {
     /// Admission on the clock `now` (nanoseconds), starting with a full
     /// bucket.
-    pub(crate) fn new(now: impl Fn() -> u64 + Send + Sync + 'static) -> Self {
+    pub(crate) fn new(now: impl Fn() -> u64 + Send + Sync + 'static) -> Arc<Self> {
         let at = now();
-        Self {
+        Arc::new(Self {
             now: Box::new(now),
             state: parking_lot::Mutex::new(State {
                 last_admitted: HashMap::new(),
-                credit: GLOBAL_RATE_PER_SEC * NANOS_PER_TOKEN,
+                credit: CREDIT_CAP,
                 refilled_at: at,
             }),
-        }
+        })
     }
 
     /// Decide an attempt from `from` (an address not on the allow-set).
     /// `validated` is whether it returned a Retry token. The checks run in
-    /// order, Retry, address, global, and only an admission is recorded, so
-    /// a refused attempt costs its address and the node nothing.
-    pub(crate) fn decide(&self, from: SocketAddr, validated: bool) -> Verdict {
+    /// order, Retry, address, global. A refusal records nothing; an
+    /// admission is recorded against both limits and returned as a ticket,
+    /// which gives it back unless kept.
+    pub(crate) fn decide(
+        self: &Arc<Self>,
+        from: SocketAddr,
+        validated: bool,
+    ) -> Result<AdmissionTicket, Refusal> {
         if !validated {
-            return Verdict::Retry;
+            return Err(Refusal::Retry);
         }
         let from = normalize_mapped_addr(from);
         let now = (self.now)();
@@ -205,16 +308,16 @@ impl Admission {
             .get(&from)
             .is_some_and(|at| *at <= now && now - *at < interval)
         {
-            return Verdict::ThrottledAddress;
+            return Err(Refusal::ThrottledAddress);
         }
         let elapsed = now.saturating_sub(state.refilled_at);
         state.credit = state
             .credit
             .saturating_add(elapsed.saturating_mul(GLOBAL_RATE_PER_SEC))
-            .min(GLOBAL_RATE_PER_SEC * NANOS_PER_TOKEN);
+            .min(CREDIT_CAP);
         state.refilled_at = now;
         if state.credit < NANOS_PER_TOKEN {
-            return Verdict::ThrottledGlobal;
+            return Err(Refusal::ThrottledGlobal);
         }
         state.credit -= NANOS_PER_TOKEN;
         if state.last_admitted.len() >= PER_ADDRESS_PRUNE_AT {
@@ -222,28 +325,79 @@ impl Admission {
                 .last_admitted
                 .retain(|_, at| *at > now || now - *at < interval);
         }
-        state.last_admitted.insert(from, now);
-        Verdict::Admit
+        let previous = state.last_admitted.insert(from, now);
+        Ok(AdmissionTicket {
+            admission: self.clone(),
+            from,
+            at: now,
+            previous,
+            kept: false,
+        })
+    }
+
+    /// Undo an admission at `at` for `from`: the token goes back, and the
+    /// address's record goes back to `previous` if it is still this
+    /// admission's.
+    fn give_back(&self, from: SocketAddr, at: u64, previous: Option<u64>) {
+        let mut state = self.state.lock();
+        state.credit = state.credit.saturating_add(NANOS_PER_TOKEN).min(CREDIT_CAP);
+        if state.last_admitted.get(&from) == Some(&at) {
+            match previous {
+                Some(earlier) => {
+                    state.last_admitted.insert(from, earlier);
+                }
+                None => {
+                    state.last_admitted.remove(&from);
+                }
+            }
+        }
     }
 
     /// Entries in the per-address record (tests).
     #[cfg(test)]
-    fn tracked(&self) -> usize {
+    pub(crate) fn tracked(&self) -> usize {
         self.state.lock().last_admitted.len()
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::transport::quic) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
 
-    fn clock() -> (Arc<AtomicU64>, Admission) {
+    fn clock() -> (Arc<AtomicU64>, Arc<Admission>) {
         let now = Arc::new(AtomicU64::new(1_000_000_000_000));
         let reader = now.clone();
         (now, Admission::new(move || reader.load(Ordering::Relaxed)))
+    }
+
+    /// A decision as a value, with an admission kept (its handshake started).
+    #[derive(Debug, PartialEq, Eq)]
+    pub(in crate::transport::quic) enum Verdict {
+        Retry,
+        ThrottledAddress,
+        ThrottledGlobal,
+        Admit,
+    }
+
+    pub(in crate::transport::quic) trait DecideKept {
+        fn decide_kept(&self, from: SocketAddr, validated: bool) -> Verdict;
+    }
+
+    impl DecideKept for Arc<Admission> {
+        fn decide_kept(&self, from: SocketAddr, validated: bool) -> Verdict {
+            match self.decide(from, validated) {
+                Ok(ticket) => {
+                    ticket.keep();
+                    Verdict::Admit
+                }
+                Err(Refusal::Retry) => Verdict::Retry,
+                Err(Refusal::ThrottledAddress) => Verdict::ThrottledAddress,
+                Err(Refusal::ThrottledGlobal) => Verdict::ThrottledGlobal,
+            }
+        }
     }
 
     fn addr(port: u16) -> SocketAddr {
@@ -266,30 +420,71 @@ mod tests {
     }
 
     /// The node turns admission on in one place, `bind_udp_listener`, and
-    /// only inside the `enabled(is_gateway)` branch, so with the switch off
-    /// no endpoint gets the unknown-source lane or an admission decision.
+    /// only inside the `enabled_at(is_gateway, bind_addr)` branch, so with the
+    /// switch off no endpoint gets the unknown-source lane or an admission
+    /// decision. Every source file of the crate is read (test modules in
+    /// their own files are skipped), so a call added anywhere else fails.
     #[test]
     fn the_node_enables_admission_only_behind_the_switch() {
-        let source = include_str!("../connection_handler.rs");
-        let gate = "if super::quic::admission::enabled(is_gateway) {";
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("source dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        sources(&root, &mut files);
+        assert!(files.len() > 100, "read the crate's sources");
+        let mut production_calls = Vec::new();
+        for file in &files {
+            let is_test_file = file.file_name().is_some_and(|n| n == "tests.rs")
+                || file.components().any(|c| c.as_os_str() == "tests");
+            if is_test_file {
+                continue;
+            }
+            let source = std::fs::read_to_string(file).expect("source file");
+            // An inline test module (this pin's own needle is in one).
+            let tests_at = source
+                .match_indices("\n#[cfg(test)]\n")
+                .map(|(at, cfg)| at + cfg.len())
+                .find(|after| {
+                    let line = source[*after..].lines().next().unwrap_or("");
+                    line.ends_with("mod tests {")
+                })
+                .unwrap_or(source.len());
+            for (at, _) in source[..tests_at].match_indices(".enable_gateway_admission(") {
+                let line = source[..at].rfind('\n').map_or(0, |n| n + 1);
+                if !source[line..at].trim_start().starts_with("//") {
+                    production_calls.push((file.clone(), at));
+                }
+            }
+        }
+        let handler = root.join("transport").join("connection_handler.rs");
+        let source = std::fs::read_to_string(&handler).expect("connection_handler.rs");
+        let gate = "if super::quic::admission::enabled_at(is_gateway, bind_addr) {";
         let gates: Vec<usize> = source.match_indices(gate).map(|(at, _)| at).collect();
         assert_eq!(gates.len(), 1, "one gate");
-        let calls: Vec<usize> = source
-            .match_indices(".enable_gateway_admission(")
-            .map(|(at, _)| at)
-            .filter(|at| {
-                let line_start = source[..*at].rfind('\n').map_or(0, |n| n + 1);
-                !source[line_start..*at].trim_start().starts_with("//")
-            })
-            .collect();
-        assert_eq!(calls.len(), 2, "one call per clock");
         let gate_end = gates[0]
             + source[gates[0]..]
                 .find("\n        }\n")
                 .expect("gate block");
-        for call in calls {
+        assert_eq!(
+            production_calls.len(),
+            2,
+            "one call per clock: {production_calls:?}"
+        );
+        for (file, at) in production_calls {
+            assert_eq!(
+                file, handler,
+                "enable_gateway_admission called outside the gate"
+            );
             assert!(
-                (gates[0]..gate_end).contains(&call),
+                (gates[0]..gate_end).contains(&at),
                 "enable_gateway_admission called outside the gate"
             );
         }
@@ -371,6 +566,39 @@ mod tests {
             unknown_source_datagram(&initial(0xC3, 5, 7)),
             Err(NotAnInitial::Runt)
         );
+        // The other long-header types of version 1: 0-RTT, Handshake, Retry.
+        for first in [0xD3, 0xE3, 0xF3] {
+            assert_eq!(
+                unknown_source_datagram(&initial(first, 1200, 1)),
+                Err(NotAnInitial::NotInitial),
+                "{first:#x}"
+            );
+        }
+        // The type bits are not read for a version this endpoint does not
+        // speak: a version negotiation packet (version 0) is unknown.
+        assert_eq!(
+            unknown_source_datagram(&initial(0xE3, 1200, 0)),
+            Err(NotAnInitial::UnknownVersion)
+        );
+    }
+
+    /// A ticket dropped without being kept gives the admission back: the
+    /// address can be admitted again at once and the node's token returns.
+    #[test]
+    fn a_dropped_ticket_gives_the_admission_back() {
+        let (_now, admission) = clock();
+        let ticket = admission.decide(addr(1), true).expect("admitted");
+        assert_eq!(admission.tracked(), 1);
+        drop(ticket);
+        assert_eq!(admission.tracked(), 0, "the record is undone");
+        // All 50 tokens are there again: 50 more admissions, then the rate.
+        for port in 1..=50 {
+            assert_eq!(admission.decide_kept(addr(port), true), Verdict::Admit);
+        }
+        assert_eq!(
+            admission.decide_kept(addr(99), true),
+            Verdict::ThrottledGlobal
+        );
     }
 
     /// An attempt without a token is retried, and a retry records nothing.
@@ -378,10 +606,10 @@ mod tests {
     fn an_unvalidated_attempt_is_retried_and_costs_nothing() {
         let (_now, admission) = clock();
         for _ in 0..1000 {
-            assert_eq!(admission.decide(addr(1), false), Verdict::Retry);
+            assert_eq!(admission.decide_kept(addr(1), false), Verdict::Retry);
         }
         assert_eq!(admission.tracked(), 0);
-        assert_eq!(admission.decide(addr(1), true), Verdict::Admit);
+        assert_eq!(admission.decide_kept(addr(1), true), Verdict::Admit);
     }
 
     /// One validated attempt per second per address, keyed by IP and port;
@@ -389,23 +617,26 @@ mod tests {
     #[test]
     fn one_attempt_per_second_per_address() {
         let (now, admission) = clock();
-        assert_eq!(admission.decide(addr(1), true), Verdict::Admit);
+        assert_eq!(admission.decide_kept(addr(1), true), Verdict::Admit);
         now.fetch_add(SECOND - 1, Ordering::Relaxed);
-        assert_eq!(admission.decide(addr(1), true), Verdict::ThrottledAddress);
         assert_eq!(
-            admission.decide(addr(2), true),
+            admission.decide_kept(addr(1), true),
+            Verdict::ThrottledAddress
+        );
+        assert_eq!(
+            admission.decide_kept(addr(2), true),
             Verdict::Admit,
             "another port of the same IP is another address"
         );
         let v6_mapped =
             SocketAddr::from((std::net::Ipv4Addr::new(192, 0, 2, 1).to_ipv6_mapped(), 1));
         assert_eq!(
-            admission.decide(v6_mapped, true),
+            admission.decide_kept(v6_mapped, true),
             Verdict::ThrottledAddress,
             "an IPv4-mapped address is the same address"
         );
         now.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(admission.decide(addr(1), true), Verdict::Admit);
+        assert_eq!(admission.decide_kept(addr(1), true), Verdict::Admit);
     }
 
     /// The node admits a second's worth at once, then the rate.
@@ -417,7 +648,7 @@ mod tests {
             (0..n)
                 .filter(|_| {
                     port += 1;
-                    admission.decide(addr(port), true) == Verdict::Admit
+                    admission.decide_kept(addr(port), true) == Verdict::Admit
                 })
                 .count()
         };
@@ -437,12 +668,15 @@ mod tests {
     fn refusals_record_nothing_and_old_entries_are_pruned() {
         let (now, admission) = clock();
         for port in 0..50 {
-            assert_eq!(admission.decide(addr(port), true), Verdict::Admit);
+            assert_eq!(admission.decide_kept(addr(port), true), Verdict::Admit);
         }
-        assert_eq!(admission.decide(addr(100), true), Verdict::ThrottledGlobal);
+        assert_eq!(
+            admission.decide_kept(addr(100), true),
+            Verdict::ThrottledGlobal
+        );
         now.fetch_add(SECOND / 50, Ordering::Relaxed);
         assert_eq!(
-            admission.decide(addr(100), true),
+            admission.decide_kept(addr(100), true),
             Verdict::Admit,
             "a refusal by rate did not throttle the address"
         );
@@ -455,7 +689,7 @@ mod tests {
             for i in 0..50u16 {
                 let n = round * 50 + i;
                 let from = SocketAddr::from(([198, 51, (n >> 8) as u8, n as u8], 9));
-                if admission.decide(from, true) == Verdict::Admit {
+                if admission.decide_kept(from, true) == Verdict::Admit {
                     admitted += 1;
                 }
                 assert!(admission.tracked() <= PER_ADDRESS_PRUNE_AT);
@@ -469,8 +703,8 @@ mod tests {
     #[test]
     fn a_clock_going_back_does_not_hold_an_address() {
         let (now, admission) = clock();
-        assert_eq!(admission.decide(addr(1), true), Verdict::Admit);
+        assert_eq!(admission.decide_kept(addr(1), true), Verdict::Admit);
         now.fetch_sub(100 * SECOND, Ordering::Relaxed);
-        assert_eq!(admission.decide(addr(1), true), Verdict::Admit);
+        assert_eq!(admission.decide_kept(addr(1), true), Verdict::Admit);
     }
 }

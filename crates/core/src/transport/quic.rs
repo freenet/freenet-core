@@ -254,7 +254,7 @@ pub(crate) struct EndpointCore {
     /// Admission of native joins from sources nobody named, set on a gateway
     /// by [`QuicEndpoint::enable_gateway_admission`] (dark: see
     /// [`admission::GATEWAY_NATIVE_ADMISSION`]).
-    admission: Arc<OnceLock<admission::Admission>>,
+    admission: Arc<OnceLock<GatewayAdmission>>,
     /// Test hooks that inject faults into quinn's drivers.
     #[cfg(any(test, feature = "testing"))]
     faults: Arc<socket::SocketFaults>,
@@ -683,14 +683,30 @@ impl QuicEndpoint {
     /// Admit native joins from sources nobody named ([`admission`]): the
     /// demux passes their possible Initials to this endpoint, and the accept
     /// loop decides each attempt on `time`. Only a gateway, and only when
-    /// [`admission::enabled`] says so; tests call it directly. Whether it
-    /// took effect (once per endpoint).
+    /// [`admission::enabled_at`] says so; tests call it directly. Builds the
+    /// joiners' server configuration once ([`QuicIdentity::server_tls_proven`],
+    /// stateless, so one serves every join). Whether it took effect (once per
+    /// endpoint; not if that configuration cannot be built).
     pub(crate) fn enable_gateway_admission<T: TimeSource>(&self, time: T) -> bool {
-        let set = self
-            .admission
-            .set(admission::Admission::new(move || time.now_nanos()))
-            .is_ok();
-        set && self.sources.enable_unknown_source_lane()
+        let tls = match self.identity.server_tls_proven() {
+            Ok(tls) => tls,
+            Err(error) => {
+                tracing::warn!(%error, "Could not build the TLS configuration for native joins; admission stays off");
+                return false;
+            }
+        };
+        let mut config = (*self.server).clone();
+        config.crypto = Arc::new(tls);
+        let gate = GatewayAdmission {
+            decisions: admission::Admission::new(move || time.now_nanos()),
+            config: Arc::new(config),
+        };
+        self.admission.set(gate).is_ok() && self.sources.enable_unknown_source_lane()
+    }
+
+    /// Whether [`Self::enable_gateway_admission`] took effect.
+    pub(crate) fn gateway_admission_enabled(&self) -> bool {
+        self.admission.get().is_some()
     }
 
     /// Whether this endpoint is alive: `Up` until its driver dies, then
@@ -1078,59 +1094,58 @@ impl EndpointCore {
     /// Decide an attempt from a source nobody named, in order: Retry, the
     /// per-address and global limits, the allow-set, the TLS configuration.
     /// Every outcome is counted; `Some` only for an admitted joiner.
-    fn admit(
-        &self,
-        admission: &admission::Admission,
-        incoming: quinn::Incoming,
-    ) -> Option<JoinerIncoming> {
-        use crate::transport::metrics::GatewayAdmission;
+    fn admit(&self, gate: &GatewayAdmission, incoming: quinn::Incoming) -> Option<JoinerIncoming> {
+        use crate::transport::metrics::GatewayAdmission as Outcome;
         let remote = incoming.remote_address();
-        let verdict = admission.decide(remote, incoming.remote_address_validated());
-        let refuse = |outcome: GatewayAdmission, incoming: quinn::Incoming| {
-            super::TRANSPORT_METRICS.record_gateway_admission(outcome);
-            incoming.ignore();
-            None
-        };
-        match verdict {
-            admission::Verdict::Retry => {
-                super::TRANSPORT_METRICS.record_gateway_admission(verdict.outcome());
+        let ticket = match gate
+            .decisions
+            .decide(remote, incoming.remote_address_validated())
+        {
+            Ok(ticket) => ticket,
+            Err(refusal @ admission::Refusal::Retry) => {
+                super::TRANSPORT_METRICS.record_gateway_admission(refusal.outcome());
                 if let Err(refused) = incoming.retry() {
                     // quinn refuses only an attempt that carries a token,
                     // which reads as validated.
                     refused.into_incoming().ignore();
                 }
-                None
+                return None;
             }
-            admission::Verdict::ThrottledAddress | admission::Verdict::ThrottledGlobal => {
-                refuse(verdict.outcome(), incoming)
+            Err(
+                refusal @ (admission::Refusal::ThrottledAddress
+                | admission::Refusal::ThrottledGlobal),
+            ) => {
+                super::TRANSPORT_METRICS.record_gateway_admission(refusal.outcome());
+                incoming.ignore();
+                return None;
             }
-            admission::Verdict::Admit => {
-                // The handshake's later datagrams are shorter than an Initial
-                // and take the established path, so the address goes on the
-                // allow-set now, held by the connection.
-                let Some(permit) = self.sources.allow(remote) else {
-                    return refuse(GatewayAdmission::AllowSetFull, incoming);
-                };
-                let tls = match self.identity.server_tls_proven() {
-                    Ok(tls) => tls,
-                    Err(error) => {
-                        tracing::warn!(%error, "Could not build the TLS configuration for an admitted join");
-                        return refuse(GatewayAdmission::TlsConfigFailed, incoming);
-                    }
-                };
-                super::TRANSPORT_METRICS.record_gateway_admission(verdict.outcome());
-                let mut config = (*self.server).clone();
-                config.crypto = Arc::new(tls);
-                Some(JoinerIncoming {
-                    incoming,
-                    permit,
-                    config: Arc::new(config),
-                    health: self.health.clone(),
-                    cap_holds: Arc::new(self.cap_holds.like()),
-                })
-            }
-        }
+        };
+        super::TRANSPORT_METRICS.record_gateway_admission(Outcome::Admitted);
+        // The handshake's later datagrams are shorter than an Initial and
+        // take the established path, so the address goes on the allow-set
+        // now, held by the connection. A full set gives the admission back
+        // (the ticket drops).
+        let Some(permit) = self.sources.allow(remote) else {
+            super::TRANSPORT_METRICS.record_gateway_admission(Outcome::AllowSetFull);
+            incoming.ignore();
+            return None;
+        };
+        Some(JoinerIncoming {
+            incoming,
+            permit,
+            config: gate.config.clone(),
+            ticket,
+            health: self.health.clone(),
+            cap_holds: Arc::new(self.cap_holds.like()),
+        })
     }
+}
+
+/// An endpoint's admission of native joins: the decisions, and the one
+/// server configuration every join is accepted with.
+struct GatewayAdmission {
+    decisions: Arc<admission::Admission>,
+    config: Arc<quinn::ServerConfig>,
 }
 
 /// What [`EndpointCore::accept_attempt`] gives.
@@ -1154,7 +1169,7 @@ impl EndpointAttempt {
     pub(crate) fn source(&self) -> SocketAddr {
         match self {
             Self::Allowed(incoming) => incoming.source(),
-            Self::Joiner(joiner) => joiner.permit.addr(),
+            Self::Joiner(joiner) => joiner.source(),
         }
     }
 }
@@ -1166,6 +1181,8 @@ pub(crate) struct JoinerIncoming {
     incoming: quinn::Incoming,
     permit: QuicSourcePermit,
     config: Arc<quinn::ServerConfig>,
+    /// Given back if the attempt is dropped before its handshake starts.
+    ticket: admission::AdmissionTicket,
     health: Arc<EndpointHealth>,
     cap_holds: Arc<socket::CapHolds>,
 }
@@ -1184,14 +1201,21 @@ pub(crate) enum JoinerError {
 }
 
 impl JoinerIncoming {
-    /// Drop the attempt without answering it.
+    /// Drop the attempt without answering it; its admission is given back.
     pub(crate) fn ignore(self) {
         self.incoming.ignore();
     }
 
+    /// The address the attempt came from (normalized).
+    pub(crate) fn source(&self) -> SocketAddr {
+        self.permit.addr()
+    }
+
     /// Complete the handshake; the connection is bound to the key the client
-    /// proved. On failure the permit is dropped with it.
+    /// proved. The admission is used from here on, whatever the handshake
+    /// does. On failure the permit is dropped with it.
     pub(crate) async fn establish(self) -> Result<QuicConnection, JoinerError> {
+        self.ticket.keep();
         let connecting =
             socket::with_poller_holds(&self.cap_holds, || self.incoming.accept_with(self.config))?;
         let connection = connecting.await?;

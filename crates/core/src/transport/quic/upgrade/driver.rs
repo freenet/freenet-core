@@ -146,6 +146,55 @@ pub(in crate::transport::quic) async fn join_gateway<T: TimeSource>(
     }
 }
 
+/// Admitted joins waiting for [`run_gateway_joins`] to take them.
+const GATEWAY_JOIN_QUEUE: usize = 64;
+
+/// Gateway joins [`run_gateway_joins`] runs at once. At the global admission
+/// rate (`admission::GLOBAL_RATE_PER_SEC`, 50 a second plus a burst of 50)
+/// and the join window (8 s) at most about 450 run at once, so this binds only
+/// if joins outlive their window, which their own timeout prevents.
+const GATEWAY_JOINS_MAX: usize = 512;
+
+/// The registered task that runs every admitted gateway join
+/// ([`join_gateway`]) as a future of its own, at most [`GATEWAY_JOINS_MAX`]
+/// at once (the queue backs up past that, and a full queue gives admissions
+/// back). A join that panics is counted (`join_panicked`) and logged, and the
+/// task goes on. Once the queue's sender is gone (the hub dropped), it
+/// finishes the joins it holds and parks, as the attempt router does, so the
+/// monitor does not read its end as a failure.
+async fn run_gateway_joins(mut queue: mpsc::Receiver<JoinerIncoming>, clock: PathClock) {
+    use crate::transport::metrics::GatewayAdmission;
+    use futures::FutureExt;
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let mut running = FuturesUnordered::new();
+    let mut open = true;
+    loop {
+        tokio::select! {
+            joiner = queue.recv(), if open && running.len() < GATEWAY_JOINS_MAX => match joiner {
+                Some(joiner) => {
+                    let clock = clock.clone();
+                    running.push(
+                        std::panic::AssertUnwindSafe(async move { join_gateway(joiner, &clock).await })
+                            .catch_unwind(),
+                    );
+                }
+                None => open = false,
+            },
+            Some(ended) = running.next(), if !running.is_empty() => {
+                let outcome = ended.unwrap_or_else(|_| {
+                    tracing::error!("A gateway join panicked");
+                    GatewayAdmission::JoinPanicked
+                });
+                TRANSPORT_METRICS.record_gateway_admission(outcome);
+            }
+            else => break,
+        }
+    }
+    tracing::debug!("Gateway join task stopped; parking");
+    drop(queue);
+    std::future::pending::<()>().await;
+}
+
 /// How long an admitted native join has for its handshake and Hello: a
 /// native setup's window (`native::setup::NATIVE_WINDOW`).
 const NATIVE_JOIN_WINDOW: Duration = crate::transport::quic::native::setup::NATIVE_WINDOW;
@@ -518,6 +567,10 @@ pub(in crate::transport) struct QuicUpgrades {
     punch_budget: crate::transport::quic::native::punch::PunchBudget,
     /// Slots for native setups at once, `QuicPolicy::native_setups_max`.
     native_setups: Arc<tokio::sync::Semaphore>,
+    /// The queue of admitted gateway joins (`quic::admission`), read by the
+    /// registered task that runs them ([`run_gateway_joins`]). Set by
+    /// [`Self::spawn_attempt_router`] only when the endpoint admits joins.
+    gateway_joins: std::sync::OnceLock<mpsc::Sender<JoinerIncoming>>,
     /// The node's bandwidth settings, which pace a native connection's data
     /// as a session's settings pace an upgrade path's.
     native_rate: crate::transport::quic::config::QuicRateLimit,
@@ -556,6 +609,7 @@ impl QuicUpgrades {
             native: Arc::default(),
             punch_budget: crate::transport::quic::native::punch::PunchBudget::default(),
             native_setups,
+            gateway_joins: std::sync::OnceLock::new(),
             native_rate,
             #[cfg(any(test, feature = "testing"))]
             trace,
@@ -586,22 +640,25 @@ impl QuicUpgrades {
             std::future::pending::<()>().await;
         });
         registrar.register("quic_attempt_router", handle);
+        if self.endpoint.gateway_admission_enabled() {
+            let (joins, queue) = mpsc::channel(GATEWAY_JOIN_QUEUE);
+            if self.gateway_joins.set(joins).is_ok() {
+                let clock = self.path_clock.clone();
+                let handle = GlobalExecutor::spawn(run_gateway_joins(queue, clock));
+                registrar.register("quic_gateway_joins", handle);
+            }
+        }
     }
 
-    /// Route one attempt: an admitted joiner to its own task
-    /// ([`join_gateway`]); an attempt from an address allowed as native only
-    /// to a native waiter, never to an upgrade session; any other to the
+    /// Route one attempt: an admitted joiner to the queue of gateway joins
+    /// ([`run_gateway_joins`]); an attempt from an address allowed as native
+    /// only to a native waiter, never to an upgrade session; any other to the
     /// session of its address.
     fn dispatch(&self, attempt: EndpointAttempt) {
         let incoming = match attempt {
             EndpointAttempt::Allowed(incoming) => incoming,
             EndpointAttempt::Joiner(joiner) => {
-                let clock = self.path_clock.clone();
-                // Short-lived: bounded by the join window.
-                drop(GlobalExecutor::spawn(async move {
-                    let outcome = join_gateway(joiner, &clock).await;
-                    TRANSPORT_METRICS.record_gateway_admission(outcome);
-                }));
+                self.queue_gateway_join(joiner);
                 return;
             }
         };
@@ -622,6 +679,31 @@ impl QuicUpgrades {
     /// Hand `incoming` to the session of its address, without waiting. With no
     /// session, or one whose inbox is full, the attempt is ignored and counted:
     /// the client retransmits its Initial, as after a lost datagram.
+    /// Hand an admitted joiner to the task that runs gateway joins. A full
+    /// queue, or none (an endpoint that does not admit joins), drops it,
+    /// which gives its admission back.
+    fn queue_gateway_join(&self, joiner: JoinerIncoming) {
+        use crate::transport::metrics::GatewayAdmission;
+        let Some(joins) = self.gateway_joins.get() else {
+            joiner.ignore();
+            return;
+        };
+        if let Err(refused) = joins.try_send(joiner) {
+            let joiner = match refused {
+                mpsc::error::TrySendError::Full(joiner) => {
+                    TRANSPORT_METRICS.record_gateway_admission(GatewayAdmission::JoinQueueFull);
+                    tracing::debug!(
+                        source = %joiner.source(),
+                        "Gateway join queue full; dropping an admitted join"
+                    );
+                    joiner
+                }
+                mpsc::error::TrySendError::Closed(joiner) => joiner,
+            };
+            joiner.ignore();
+        }
+    }
+
     fn route(&self, incoming: QuicIncoming) {
         let addr = incoming.source();
         let sender = self.routes.get(&addr).map(|route| route.value().1.clone());

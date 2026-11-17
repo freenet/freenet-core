@@ -1172,32 +1172,44 @@ failed `shadow`/`prefer` bind leaves the socket as with QUIC off.
 Gateway admission of native joins (`quic/admission.rs`, #5940 A7b). DARK:
 `admission::GATEWAY_NATIVE_ADMISSION` is false, and `bind_udp_listener` calls
 `QuicEndpoint::enable_gateway_admission` only inside
-`admission::enabled(is_gateway)` (pinned by
-`the_node_enables_admission_only_behind_the_switch`), so no node runs any of
-this. When on, the demux gets an unknown-source lane
-(`enable_unknown_source_lane`): a QUIC-class datagram from a source not on
-the allow-set is queued on a separate queue of
-`UNKNOWN_SOURCE_QUEUE_DATAGRAMS` (128, in `QUIC_INGRESS_QUEUE_BYTES`) only if
-it can open a connection (`admission::unknown_source_datagram`: long header,
-at least 1200 bytes, a known version), and counted as `forwarded`; anything
-else stays `not_allowed`. The endpoint reads the established queue first and
-the unknown-source queue only when it is empty. `EndpointCore::accept_attempt`
-decides each attempt from a source not on the allow-set, in order: no Retry
-token yet → Retry; an address admitted within the last second → ignored;
-the node-wide rate (50 a second) spent → ignored; the allow-set full →
-ignored; otherwise accepted with `server_tls_proven`, the address put on the
-allow-set for the attempt and then the connection (the handshake's later,
-shorter datagrams take the established path). Only an admission is recorded,
-so a refused attempt costs its address nothing. The router runs each admitted
-join in its own short task (`driver::join_gateway`): handshake, the client's
-key read from the connection (`proven_client_key`), the native Hello
-exchange, all within `NATIVE_WINDOW`. Until phase B hands the connection to
-the node, a join that gets that far is closed (`node_dropped_peer`). Each
-outcome is counted under `quic_gateway_admission_*`: queued, queue_full,
-short_header, runt, unknown_version, retried, throttled_address,
-throttled_global, allow_set_full, tls_config_failed, admitted,
-handshake_failed, unproven, hello_failed, joined. Not yet: joiners inside the
-connection cap (A7b PR 6).
+`admission::enabled_at(is_gateway, bind_addr)` (pinned across every source
+file of the crate by `the_node_enables_admission_only_behind_the_switch`; a
+test can turn it on for one listener with `admission::force_on_for_test`).
+Off, a node behaves as before; what it still carries is an idle second
+ingress queue (128 slots) and its poll in the endpoint's receive, one atomic
+load per QUIC datagram from a source not on the allow-set, and the
+`quic_gateway_admission_*` counters at 0. The switch's doc names what turning
+it on waits for (joiners inside the connection cap, phase B). When on, the
+demux gets an unknown-source lane (`enable_unknown_source_lane`): a
+QUIC-class datagram from a source not on the allow-set is queued on a
+separate queue of `UNKNOWN_SOURCE_QUEUE_DATAGRAMS` (128, in
+`QUIC_INGRESS_QUEUE_BYTES`) only if it can open a connection
+(`admission::unknown_source_datagram`: long header, at least 1200 bytes, a
+known version, and the Initial packet type), and counted as `forwarded`;
+anything else stays `not_allowed`. The endpoint reads the established queue
+first and the unknown-source queue only when it is empty.
+`EndpointCore::accept_attempt` decides each attempt from a source not on the
+allow-set, in order: no Retry token yet → Retry; an address admitted within
+the last second → ignored; the node-wide rate (50 a second) spent → ignored;
+otherwise admitted, recorded against both limits as an `AdmissionTicket`;
+then the address is put on the allow-set for the attempt and then the
+connection (the handshake's later, shorter datagrams take the established
+path), and the attempt is accepted with one server configuration built at
+enable (`server_tls_proven`). A ticket dropped before the join's handshake
+starts gives the admission back (`refunded`): the allow-set full, the attempt
+dropped on a full accept or join queue, the node stopping. The attempt router
+hands each admitted join to one registered task, `quic_gateway_joins`
+(`driver::run_gateway_joins`, a 64-join queue, at most 512 joins at once),
+which runs each join (`driver::join_gateway`) as a future of its own:
+handshake, the client's key read from the connection (`proven_client_key`),
+the native Hello exchange, all within `NATIVE_WINDOW`. A join that panics is
+counted and the task goes on. Until phase B hands the connection to the node,
+a join that gets that far is closed (`node_dropped_peer`). Each outcome is
+counted under `quic_gateway_admission_*`: queued, queue_full, short_header,
+runt, unknown_version, not_initial, retried, throttled_address,
+throttled_global, allow_set_full, admitted, refunded, join_queue_full,
+handshake_failed, unproven, hello_failed, joined, join_panicked. Not yet:
+joiners inside the connection cap (A7b PR 6).
 
 Socket-health signal: the listener reads through `Socket::recv_classified`,
 which `DemuxSocket` answers with `Datagram` for a legacy datagram and
