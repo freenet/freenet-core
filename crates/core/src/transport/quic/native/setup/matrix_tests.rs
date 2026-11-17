@@ -533,6 +533,9 @@ fn native_setup_gate_rows_hold_their_baseline() {
     let mut below = Vec::new();
     let mut one_sided = 0;
     let mut runs = 0;
+    // Failures where each condition is expected to bite, so a condition
+    // that stopped being applied fails the test (premises).
+    let (mut lossy_failures, mut jitter_edge_failures) = (0, 0);
     for (gate, cell) in cells {
         let (ok, total, failures) = run_seeds(cell, 0..20);
         runs += total;
@@ -548,6 +551,11 @@ fn native_setup_gate_rows_hold_their_baseline() {
             cell.extra
         );
         let floor = baseline_floor(gate, &cell);
+        if gate == "15" {
+            lossy_failures += failures.len();
+        } else if floor < 0.95 {
+            jitter_edge_failures += failures.len();
+        }
         if (ok as f64) < floor * total as f64 {
             below.push((gate, cell, ok, total, floor, failures));
         }
@@ -564,6 +572,8 @@ fn native_setup_gate_rows_hold_their_baseline() {
         below.is_empty(),
         "gate cells below their baseline floor: {below:#?}"
     );
+    assert!(lossy_failures > 0, "premise: the handshake loss is applied");
+    assert!(jitter_edge_failures > 0, "premise: the jitter is applied");
 }
 
 /// The lower bound each gate cell must keep: a BASELINE with margin, not the
