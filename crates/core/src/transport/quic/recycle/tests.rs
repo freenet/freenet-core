@@ -1906,6 +1906,7 @@ fn stall_close_labels_follow_the_stalls() {
         Stall::CreditStarved,
         Stall::StreamCreditWithheld,
         Stall::AckWaitsExpired,
+        Stall::LateEnds,
     ] {
         assert_eq!(
             crate::transport::metrics::STALL_CLOSE_LABELS[stall.index()],

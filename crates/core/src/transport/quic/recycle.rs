@@ -814,6 +814,8 @@ pub(crate) struct AckSample {
     streams_opened: u64,
     /// This side's ack waits run out ([`Writers::ack_wait_expiries`]).
     ack_wait_expiries: u64,
+    /// This side's late ends ([`Writers::late_ends`]).
+    late_ends: u64,
 }
 
 impl AckSample {
@@ -859,6 +861,7 @@ impl AckSample {
             streams_ended: writers.streams_ended(),
             streams_opened: writers.streams_opened(),
             ack_wait_expiries: writers.ack_wait_expiries(),
+            late_ends: writers.late_ends(),
         })
     }
 
@@ -924,6 +927,7 @@ impl AckSample {
             streams_ended: 0,
             streams_opened: 0,
             ack_wait_expiries: 0,
+            late_ends: 0,
         }
     }
 
@@ -970,6 +974,13 @@ impl AckSample {
         self
     }
 
+    /// The same sample with `late` late ends so far. Tests only.
+    #[cfg(test)]
+    pub(crate) fn with_late_ends(mut self, late: u64) -> Self {
+        self.late_ends = late;
+        self
+    }
+
     /// The same sample with quinn's smoothed round trip at `rtt`. Tests only.
     #[cfg(test)]
     pub(crate) fn with_rtt(mut self, rtt: Duration) -> Self {
@@ -997,6 +1008,10 @@ pub(crate) struct Writers {
     /// Sends whose wait for the acknowledgement of their end ran out and
     /// whose stream was reset, so far ([`ACK_WAIT_EXPIRY_LIMIT`]).
     ack_wait_expiries: AtomicU64,
+    /// Sends whose end was acknowledged late, or not at all, though the
+    /// connection had acknowledged enough bytes since to have carried it
+    /// (`path::LateEndCheck`), so far.
+    late_ends: AtomicU64,
 }
 
 impl Writers {
@@ -1050,6 +1065,22 @@ impl Writers {
     /// The path's ack waits run out so far.
     pub(crate) fn ack_wait_expiries(&self) -> u64 {
         self.ack_wait_expiries.load(Ordering::Relaxed)
+    }
+
+    /// A send's end was late (`path::LateEndCheck`); counted in `node` by
+    /// `kind` too.
+    pub(crate) fn late_end(
+        &self,
+        node: &crate::transport::metrics::QuicDataCounters,
+        kind: crate::transport::metrics::AckWaitKind,
+    ) {
+        self.late_ends.fetch_add(1, Ordering::Relaxed);
+        node.record_late_end(kind);
+    }
+
+    /// The path's late ends so far.
+    pub(crate) fn late_ends(&self) -> u64 {
+        self.late_ends.load(Ordering::Relaxed)
     }
 
     /// The path's data streams that have ended so far, in any way.
@@ -1190,9 +1221,15 @@ pub(crate) struct AckWatch {
     /// seen, within [`ACK_WAIT_EXPIRY_WINDOW`].
     expiries_seen: u64,
     expiries_at: VecDeque<u64>,
+    /// The late ends seen so far, and when the latest ones were seen, within
+    /// [`ACK_WAIT_EXPIRY_WINDOW`] ([`Stall::LateEnds`]).
+    late_seen: u64,
+    late_at: VecDeque<u64>,
     /// Times the ack-wait expiry rule would have closed the path, which has
     /// a UDP session ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
     would_close: u64,
+    /// Times the late-end rule would have closed the path ([`LATE_ENDS_CLOSE`]).
+    late_would_close: u64,
     /// The path has a UDP session to fall back to, so the dark rule only
     /// counts ([`DARK_CLOSES_WITH_UDP`]).
     udp_fallback: bool,
@@ -1230,6 +1267,26 @@ pub(crate) fn cap_held(
     new_event || live_hold
 }
 
+/// Count the strikes new since `seen` (at most [`ACK_WAIT_EXPIRY_LIMIT`] at
+/// once) at `now_nanos` into `at`, forget those older than
+/// [`ACK_WAIT_EXPIRY_WINDOW`], and say whether [`ACK_WAIT_EXPIRY_LIMIT`] are
+/// within it. Acknowledgements never reset it.
+fn strikes_in_window(seen: &mut u64, at: &mut VecDeque<u64>, now_nanos: u64, total: u64) -> bool {
+    let new = total.saturating_sub(*seen);
+    *seen = total;
+    for _ in 0..new.min(u64::from(ACK_WAIT_EXPIRY_LIMIT)) {
+        at.push_back(now_nanos);
+    }
+    let window = u64::try_from(ACK_WAIT_EXPIRY_WINDOW.as_nanos()).unwrap_or(u64::MAX);
+    while at
+        .front()
+        .is_some_and(|&first| now_nanos.saturating_sub(first) > window)
+    {
+        at.pop_front();
+    }
+    at.len() >= ACK_WAIT_EXPIRY_LIMIT as usize
+}
+
 /// Samples in a row with nothing from the peer that end a window.
 const QUIET_SAMPLES_END_WINDOW: u32 = 2;
 
@@ -1253,6 +1310,7 @@ impl AckWatch {
     /// [`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]), and only count on one with one.
     pub(crate) fn new(window: Duration, first: AckSample, udp_fallback: bool) -> Self {
         let expiries_seen = first.ack_wait_expiries;
+        let late_seen = first.late_ends;
         let window_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
         Self {
             window_nanos,
@@ -1278,7 +1336,10 @@ impl AckWatch {
             skipped: 0,
             expiries_seen,
             expiries_at: VecDeque::new(),
+            late_seen,
+            late_at: VecDeque::new(),
             would_close: 0,
+            late_would_close: 0,
             udp_fallback,
             dark_would_closed: false,
             dark_flag: None,
@@ -1348,20 +1409,17 @@ impl AckWatch {
     /// is the dark rule's first, so an expiry on a live path is evidence on
     /// its own, whatever else the peer acknowledges.
     fn ack_waits_expired(&mut self, now_nanos: u64, expiries: u64) -> bool {
-        let new = expiries.saturating_sub(self.expiries_seen);
-        self.expiries_seen = expiries;
-        for _ in 0..new.min(u64::from(ACK_WAIT_EXPIRY_LIMIT)) {
-            self.expiries_at.push_back(now_nanos);
-        }
-        let window = u64::try_from(ACK_WAIT_EXPIRY_WINDOW.as_nanos()).unwrap_or(u64::MAX);
-        while self
-            .expiries_at
-            .front()
-            .is_some_and(|&at| now_nanos.saturating_sub(at) > window)
-        {
-            self.expiries_at.pop_front();
-        }
-        self.expiries_at.len() >= ACK_WAIT_EXPIRY_LIMIT as usize
+        strikes_in_window(
+            &mut self.expiries_seen,
+            &mut self.expiries_at,
+            now_nanos,
+            expiries,
+        )
+    }
+
+    /// The same for late ends ([`Stall::LateEnds`]), in a window of their own.
+    fn late_ends_reached(&mut self, now_nanos: u64, late: u64) -> bool {
+        strikes_in_window(&mut self.late_seen, &mut self.late_at, now_nanos, late)
     }
 
     /// Count dark episodes in `node`, and let the dark-path rule close the
@@ -1420,6 +1478,12 @@ impl AckWatch {
         self.would_close
     }
 
+    /// Times the late-end rule would have closed the path. Tests only.
+    #[cfg(test)]
+    pub(crate) fn late_would_close(&self) -> u64 {
+        self.late_would_close
+    }
+
     /// Why the path must close, once [`Self::observe`] said so.
     pub(crate) fn stall(&self) -> Option<Stall> {
         self.stall
@@ -1464,6 +1528,7 @@ impl AckWatch {
         let previous_now = self.previous_now.replace(dark_now);
         let withheld = same_controller && self.stream_credit.observe(now_nanos, &sample);
         let expired = self.ack_waits_expired(now_nanos, sample.ack_wait_expiries);
+        let late = self.late_ends_reached(now_nanos, sample.late_ends);
         let rtt = sample.rtt;
         // Packets this side sent after the latest batch of acknowledgements
         // are outstanding too, though no batch counted them: at the start of
@@ -1501,6 +1566,17 @@ impl AckWatch {
             }
             self.would_close += 1;
             self.expiries_at.clear();
+        }
+        // Observe only on every path until calibrated ([`LATE_ENDS_CLOSE`]).
+        if late {
+            if LATE_ENDS_CLOSE {
+                return Some(Stall::LateEnds);
+            }
+            if let Some(node) = self.dark_counts {
+                node.record_stall_would_close(Stall::LateEnds.index());
+            }
+            self.late_would_close += 1;
+            self.late_at.clear();
         }
         if cap_held {
             // A send counted in quinn's stats may still wait in the egress
@@ -1631,6 +1707,12 @@ pub(crate) enum Stall {
     /// session; on one with a UDP session it is counted as a would-close and
     /// the path is not closed ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
     AckWaitsExpired,
+    /// [`ACK_WAIT_EXPIRY_LIMIT`] of this side's sends had their end
+    /// acknowledged late, or not at all, though the connection had
+    /// acknowledged enough bytes since the end to have carried it
+    /// (`path::LateEndCheck`), within [`ACK_WAIT_EXPIRY_WINDOW`]. Observe-only
+    /// on every path ([`LATE_ENDS_CLOSE`]): counted as a would-close.
+    LateEnds,
 }
 
 impl Stall {
@@ -1642,6 +1724,7 @@ impl Stall {
             Self::CreditStarved => "credit_starved",
             Self::StreamCreditWithheld => "stream_credit_withheld",
             Self::AckWaitsExpired => "ack_waits_expired",
+            Self::LateEnds => "late_ends",
         }
     }
 
@@ -1653,6 +1736,7 @@ impl Stall {
             Self::CreditStarved => 2,
             Self::StreamCreditWithheld => 3,
             Self::AckWaitsExpired => 4,
+            Self::LateEnds => 5,
         }
     }
 }
@@ -1826,6 +1910,13 @@ pub(crate) const STREAM_CREDIT_FREED: u64 = super::config::MAX_UNI_STREAMS as u6
 /// nothing to fall back to (#6205), the same split as the dark rule
 /// ([`DARK_CLOSES_WITH_UDP`]).
 pub(crate) const ACK_WAITS_EXPIRED_CLOSES_WITH_UDP: bool = false;
+
+/// Whether the late-end rule ([`Stall::LateEnds`]) closes a path. It does
+/// not, on any path: each time [`ACK_WAIT_EXPIRY_LIMIT`] late ends come
+/// within [`ACK_WAIT_EXPIRY_WINDOW`] a would-close is counted
+/// (`quic_stall_would_close_late_ends`), until the field counts calibrate it
+/// (#6205).
+pub(crate) const LATE_ENDS_CLOSE: bool = false;
 
 /// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that close a path with
 /// no UDP session ([`Stall::AckWaitsExpired`]; on one with a UDP session

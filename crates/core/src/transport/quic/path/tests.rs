@@ -1372,24 +1372,24 @@ fn ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged() {
                     vec![recycle::Stall::AckWaitsExpired],
                     "{network}"
                 );
-                assert_eq!(snapshot.stall_closes, vec![0, 0, 0, 0, 1], "{network}");
-                assert_eq!(snapshot.stall_would_close, vec![0; 5], "{network}");
+                assert_eq!(snapshot.stall_closes, vec![0, 0, 0, 0, 1, 0], "{network}");
+                assert_eq!(snapshot.stall_would_close, vec![0; 6], "{network}");
                 assert_eq!(snapshot.ack_wait_expired, vec![3, 0, 0], "{network}");
                 continue;
             }
             assert_eq!(closed_at, None, "{network}: not closed");
             assert_eq!(recycle::stalls_to(b_addr), vec![], "{network}");
-            assert_eq!(snapshot.stall_closes, vec![0; 5], "{network}");
+            assert_eq!(snapshot.stall_closes, vec![0; 6], "{network}");
             if strikes {
                 assert_eq!(snapshot.ack_wait_expired, vec![3, 0, 0], "{network}");
                 assert_eq!(
                     snapshot.stall_would_close,
-                    vec![0, 0, 0, 0, 1],
+                    vec![0, 0, 0, 0, 1, 0],
                     "{network}: one would-close, under ack_waits_expired"
                 );
             } else {
                 assert_eq!(p.a.writers().ack_wait_expiries(), 0, "{network}");
-                assert_eq!(snapshot.stall_would_close, vec![0; 5], "{network}");
+                assert_eq!(snapshot.stall_would_close, vec![0; 6], "{network}");
                 assert_eq!(p.a.send_aborts(), 3, "{network}: still reset");
             }
         }
