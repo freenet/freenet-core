@@ -225,6 +225,10 @@ pub(crate) enum DialTransport {
 impl DialTransport {
     /// A native dial bounded only by the setup's own window.
     pub(crate) fn native_now() -> Self {
+        // The tokio clock, not a `TimeSource`: the deadline is read back on
+        // the same runtime (`connect_outbound`), and a simulation's paused
+        // runtime keeps it deterministic, as the connect op's other dial
+        // timing is.
         Self::Native {
             deadline: tokio::time::Instant::now() + NATIVE_CONNECT_WITHIN,
         }

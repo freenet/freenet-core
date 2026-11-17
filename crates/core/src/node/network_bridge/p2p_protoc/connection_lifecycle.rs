@@ -1304,13 +1304,31 @@ impl P2pConnManager {
                     transaction = %transaction,
                     "Outbound connection established"
                 );
-                // The UDP dial beside a pending native one connected: its
-                // callbacks join the native dial's, and the connection answers
-                // them all, since every one of them asked for a connection to
-                // this peer. The native dial's own end then finds the
-                // connection (the late-failure rule below, or a replacement).
+                // A UDP dial beside a native one connected.
                 if !transport.is_native() {
                     if let Some(beside) = state.udp_beside_native.remove(&peer_addr) {
+                        // The native dial connected first: keep its connection
+                        // (both sides prefer native), answer this dial's
+                        // requesters with it, and drop this connection without
+                        // touching the ring.
+                        if self.connections.contains_key(&peer_addr) {
+                            tracing::info!(
+                                remote = %peer_addr,
+                                transaction = %transaction,
+                                "UDP dial beside a native dial connected after the native one; \
+                                 keeping the native connection"
+                            );
+                            answer_beside(peer_addr, beside, Ok((peer_addr, None))).await;
+                            drop(connection);
+                            return Ok(());
+                        }
+                        // Otherwise its requesters join the native dial's, and
+                        // this connection answers them all, since every one of
+                        // them asked for a connection to this peer. A native
+                        // dial still pending may replace it in place.
+                        if state.native_pending.contains(&peer_addr) {
+                            state.beside_udp_connected.insert(peer_addr);
+                        }
                         for (tx, callback) in beside {
                             state
                                 .awaiting_connection
@@ -1388,6 +1406,25 @@ impl P2pConnManager {
                         IdentitySource::Proven
                     }
                 };
+                // A native dial ends here whatever follows, so it is no longer
+                // pending. If the UDP dial beside it connected first, the
+                // native connection takes that connection's entry in place:
+                // the ring keeps the peer, and the UDP connection closes as its
+                // sender drops (its listener's stale close is ignored by
+                // connection id).
+                if transport.is_native() {
+                    state.native_pending.remove(&peer_addr);
+                    if state.beside_udp_connected.remove(&peer_addr)
+                        && self.remove_connection(peer_addr).is_some()
+                    {
+                        tracing::info!(
+                            remote = %peer_addr,
+                            transaction = %transaction,
+                            "native dial connected after the UDP dial beside it; \
+                             the native connection takes the entry in place"
+                        );
+                    }
+                }
                 // For outbound connections, respect the transient flag from the handshake.
                 // Gateway connections should remain transient until CONNECT acceptance.
                 self.handle_successful_connection(
@@ -1400,8 +1437,15 @@ impl P2pConnManager {
                     source,
                 )
                 .await?;
+                // The native dial connected while the UDP dial beside it is
+                // still running: its requesters are answered with this
+                // connection now; the entry stays, empty, until that dial's
+                // outcome arrives.
                 if transport.is_native() {
-                    state.native_pending.remove(&peer_addr);
+                    if let Some(beside) = state.udp_beside_native.get_mut(&peer_addr) {
+                        let requesters = std::mem::take(beside);
+                        answer_beside(peer_addr, requesters, Ok((peer_addr, None))).await;
+                    }
                 }
             }
             HandshakeEvent::OutboundFailed {
@@ -1462,40 +1506,42 @@ impl P2pConnManager {
                 };
 
                 let native = transport.is_native();
-                // The UDP dial beside a pending native one failed: fail its
-                // callbacks only. The native dial keeps the in-transit slot
-                // and its own callbacks; this failure is UDP's, so it takes
-                // the peer backoff a UDP failure takes.
-                if !native && state.native_pending.contains(&peer_addr) {
-                    if state.udp_beside_native.contains_key(&peer_addr) {
+                // A native dial ends here, so it is no longer pending.
+                if native {
+                    state.native_pending.remove(&peer_addr);
+                    state.beside_udp_connected.remove(&peer_addr);
+                }
+                // A UDP dial beside a native one failed. It never prunes, backs
+                // off or marks the address: the native dial, or its own UDP
+                // fallback up to NATIVE_FALLBACK_AFTER later, still needs the
+                // peer, and a 30 s backoff would refuse that fallback. Its
+                // requesters get the connection if one is up (the native dial
+                // won), else the failure. The in-transit slot is released only
+                // once no dial to the address is left.
+                if !native {
+                    if let Some(beside) = state.udp_beside_native.remove(&peer_addr) {
+                        let connected = self.connections.contains_key(&peer_addr);
                         tracing::info!(
                             remote = %peer_addr,
                             transaction = %transaction,
                             ?error,
+                            connected,
                             "UDP dial beside a native dial failed"
                         );
-                        if !peer_addr.ip().is_unspecified() {
-                            state.peer_backoff.record_failure(peer_addr);
+                        if !connected && !state.native_pending.contains(&peer_addr) {
+                            self.bridge
+                                .op_manager
+                                .ring
+                                .connection_manager
+                                .prune_in_transit_connection(peer_addr);
                         }
-                        fail_udp_beside_native(state, peer_addr).await;
+                        let result = if connected {
+                            Ok((peer_addr, None))
+                        } else {
+                            Err(())
+                        };
+                        answer_beside(peer_addr, beside, result).await;
                         return Ok(());
-                    }
-                } else if !native {
-                    // The native dial ended first: the UDP dial is the only one
-                    // left, so its callbacks take the ordinary failure path below.
-                    if let Some(beside) = state.udp_beside_native.remove(&peer_addr) {
-                        for (tx, callback) in beside {
-                            state
-                                .awaiting_connection
-                                .entry(peer_addr)
-                                .or_default()
-                                .push(callback);
-                            state
-                                .awaiting_connection_txs
-                                .entry(peer_addr)
-                                .or_default()
-                                .push(tx);
-                        }
                     }
                 }
                 // A native setup can end after the pair connected another way:
@@ -1517,7 +1563,6 @@ impl P2pConnManager {
                         peer_addr,
                         crate::operations::connect::native_wire_trace::NativeWireEvent::NativeSuperseded,
                     );
-                    state.native_pending.remove(&peer_addr);
                     return Ok(());
                 }
 
@@ -1529,11 +1574,15 @@ impl P2pConnManager {
                     "Outbound connection failed"
                 );
 
-                self.bridge
-                    .op_manager
-                    .ring
-                    .connection_manager
-                    .prune_in_transit_connection(peer_addr);
+                // A UDP dial beside this native one still holds the in-transit
+                // slot; it releases it when it ends.
+                if !(native && state.udp_beside_native.contains_key(&peer_addr)) {
+                    self.bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .prune_in_transit_connection(peer_addr);
+                }
 
                 // Only record transport-level failures (NAT traversal, timeout, I/O)
                 // so future CONNECT requests avoid routing to this peer. Protocol
@@ -1647,9 +1696,6 @@ impl P2pConnManager {
                             .ok();
                     }
                 }
-                if native {
-                    state.native_pending.remove(&peer_addr);
-                }
             }
         }
         Ok(())
@@ -1659,18 +1705,20 @@ impl P2pConnManager {
         &mut self,
         state: &mut EventListenerState,
     ) -> anyhow::Result<()> {
-        if state.awaiting_connection.is_empty() {
+        state.native_pending.clear();
+        state.beside_udp_connected.clear();
+        if state.awaiting_connection.is_empty() && state.udp_beside_native.is_empty() {
             return Ok(());
         }
 
         tracing::warn!(
             awaiting = state.awaiting_connection.len(),
+            beside = state.udp_beside_native.len(),
             "Handshake driver closed; notifying pending callbacks"
         );
 
         let awaiting = std::mem::take(&mut state.awaiting_connection);
         let awaiting_txs = std::mem::take(&mut state.awaiting_connection_txs);
-        state.native_pending.clear();
         for (addr, beside) in std::mem::take(&mut state.udp_beside_native) {
             for (_, mut callback) in beside {
                 callback
@@ -2614,22 +2662,31 @@ fn dial_origin(
     }
 }
 
-/// Fails every callback of the UDP dial beside a native one to `peer_addr`.
+/// Fails every requester of the UDP dial beside a native one to `peer_addr`.
 async fn fail_udp_beside_native(state: &mut EventListenerState, peer_addr: SocketAddr) {
-    for (tx, mut callback) in state
+    let requesters = state
         .udp_beside_native
         .remove(&peer_addr)
-        .unwrap_or_default()
-    {
+        .unwrap_or_default();
+    answer_beside(peer_addr, requesters, Err(())).await;
+}
+
+/// Answers requesters of a UDP dial beside a native one with `result`.
+async fn answer_beside(
+    peer_addr: SocketAddr,
+    requesters: Vec<(Transaction, Box<dyn ConnectResultSender>)>,
+    result: crate::message::ConnectResult,
+) {
+    for (tx, mut callback) in requesters {
         callback
-            .send_result(Err(()))
+            .send_result(result)
             .await
             .inspect_err(|err| {
                 tracing::debug!(
                     %tx,
                     remote = %peer_addr,
                     ?err,
-                    "Failed to deliver a failure to a UDP dial beside a native one"
+                    "Failed to answer a UDP dial beside a native one"
                 );
             })
             .ok();

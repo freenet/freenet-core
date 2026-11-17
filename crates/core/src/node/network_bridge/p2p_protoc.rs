@@ -3372,8 +3372,17 @@ struct EventListenerState {
     /// overlap the peer's). It starts at once and its outcome, which carries
     /// its transport, answers only these callbacks. A later UDP dial to the
     /// address joins it. An entry ends with its dial's outcome, as an
-    /// `awaiting_connection` entry does.
+    /// `awaiting_connection` entry does; its requesters may be answered
+    /// earlier (the native dial connected first), leaving it empty until the
+    /// outcome arrives. Requesters are this node's own CONNECT ops, never a
+    /// remote peer's, so the bound is the dial's.
     udp_beside_native: HashMap<SocketAddr, Vec<BesideUdpRequester>>,
+    /// Addresses whose UDP dial beside a still-pending native dial connected
+    /// first. If the native dial then connects too, it takes the address's
+    /// connection entry in place, without touching the ring (both sides
+    /// prefer native, so they agree on which connection they keep). Cleared
+    /// when the native dial ends.
+    beside_udp_connected: HashSet<SocketAddr>,
     pending_op_results: HashMap<Transaction, Sender<WaiterReply>>,
     /// Last time pending_op_results was scanned for closed senders.
     last_pending_op_cleanup: Instant,
@@ -3397,6 +3406,7 @@ impl EventListenerState {
             awaiting_connection_txs: HashMap::new(),
             native_pending: HashSet::new(),
             udp_beside_native: HashMap::new(),
+            beside_udp_connected: HashSet::new(),
             peer_backoff: PeerConnectionBackoff::new(),
             last_backoff_cleanup: Instant::now(),
         }

@@ -30,8 +30,11 @@ use std::time::Duration;
 /// How a NAT filters inbound datagrams; see the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NatFiltering {
+    /// Any source, once the node has sent anything (full cone).
     Full,
+    /// A source whose IP the node has sent to.
     AddressRestricted,
+    /// A source whose IP and port the node has sent to.
     PortRestricted,
 }
 
@@ -72,6 +75,8 @@ pub struct NatModel {
 }
 
 impl NatModel {
+    /// A NAT of `filtering` whose bindings last `lifetime` after their last
+    /// refresh, with no binding open yet.
     pub fn new(filtering: NatFiltering, lifetime: Duration) -> Self {
         Self {
             filtering,
@@ -82,6 +87,7 @@ impl NatModel {
         }
     }
 
+    /// This NAT's filtering class.
     pub fn filtering(&self) -> NatFiltering {
         self.filtering
     }

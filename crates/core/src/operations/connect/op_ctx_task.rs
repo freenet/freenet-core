@@ -1227,6 +1227,8 @@ async fn udp_fallback_dial(
                 transport: super::native::DialTransport::Udp,
                 answered_at: at,
                 holds_slot: false,
+                // Set below; a dial that never started has no result, so it is
+                // never counted as a rescue.
                 rescues_native: false,
             }
         }

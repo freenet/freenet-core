@@ -1508,7 +1508,10 @@ pub fn loopback_ports_for_locations(targets: &[f64]) -> Vec<u16> {
 /// lasts after its last refresh.
 #[derive(Debug, Clone)]
 pub struct SimNat {
+    /// The filtering class of each regular node, in regular-node order,
+    /// cycled when there are fewer classes than nodes.
     pub classes: Vec<crate::transport::nat_model::NatFiltering>,
+    /// How long a binding lasts after its last refresh.
     pub lifetime: Duration,
 }
 
