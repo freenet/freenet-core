@@ -79,8 +79,9 @@ pub mod simulation;
 #[path = "../build/git_watch.rs"]
 mod build_git_watch;
 
-/// `build.rs`'s fallback for the commit of a crates.io package, tested here
-/// for the same reason.
+/// `build.rs`'s choice of commit and dirty flag, including the
+/// `.cargo_vcs_info.json` of a crates.io package, tested here for the same
+/// reason.
 #[cfg(test)]
 #[path = "../build/vcs_info.rs"]
 mod build_vcs_info;

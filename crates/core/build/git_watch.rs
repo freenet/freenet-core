@@ -45,7 +45,7 @@ pub(crate) fn rerun_if_changed_paths(manifest_dir: &Path) -> Vec<PathBuf> {
         manifest_dir.join("Cargo.toml"),
         manifest_dir.join("Cargo.lock"),
         // Present only in a crates.io package, where it is the source of
-        // `GIT_COMMIT_HASH` (`build/vcs_info.rs`).
+        // `GIT_COMMIT_HASH` and `GIT_DIRTY` (`build/vcs_info.rs`).
         manifest_dir.join(".cargo_vcs_info.json"),
     ];
     watched.extend(git_metadata_paths(manifest_dir).unwrap_or_default());

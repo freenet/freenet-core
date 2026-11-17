@@ -119,6 +119,21 @@ mod tests {
             .find("cargo:rustc-env=GIT_DIRTY={dirty_suffix}")
             .expect("GIT_DIRTY must be stamped from the dirty suffix");
         assert!(call < stamp_commit && call < suffix && suffix < stamp_dirty);
+        // The resolver is fed the package file build.rs read: passing `None`
+        // brings back the enclosing-repository stamp with every other test
+        // green.
+        assert!(
+            body.contains(
+                "vcs_info::resolve_git_provenance(commit_override,dirty_override,published,"
+            ),
+            "build.rs must pass the published file's contents to the resolver"
+        );
+        assert!(
+            body.contains("letpublished=")
+                && body.contains("join(vcs_info::VCS_INFO_FILE)")
+                && body.contains(".and_then(|contents|vcs_info::published(&contents));"),
+            "`published` must be read from the package's VCS_INFO_FILE"
+        );
         // Both git probes live inside the resolver's arguments, nowhere else.
         let probes: Vec<usize> = body
             .match_indices("Command::new(\"git\")")

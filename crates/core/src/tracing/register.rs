@@ -1959,6 +1959,30 @@ mod startup_git_fields_tests {
         assert_eq!(fields("unknown", ""), (None, None));
     }
 
+    /// `peer_startup` passes the real build variables to the record. The
+    /// fixture test above cannot see which values the caller hands it, and
+    /// `""` or `"unknown"` there would silently return the old `None, None`.
+    #[test]
+    fn peer_startup_passes_the_build_variables() {
+        let all = include_str!("register.rs");
+        let code: String = all
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let start = code
+            .find("pub fn peer_startup(")
+            .expect("peer_startup not found");
+        let (body, _) = code[start..]
+            .split_once("\n    }\n")
+            .expect("could not locate the end of peer_startup");
+        let body: String = body.chars().filter(|c| !c.is_whitespace()).collect();
+        assert!(
+            body.contains("Self::startup_event(version,is_gateway,env!(\"GIT_COMMIT_HASH\"),env!(\"GIT_DIRTY\"),)"),
+            "peer_startup must hand the record the build's GIT_COMMIT_HASH and GIT_DIRTY"
+        );
+    }
+
     #[test]
     fn git_fields_from_the_build_variables() {
         assert_eq!(
