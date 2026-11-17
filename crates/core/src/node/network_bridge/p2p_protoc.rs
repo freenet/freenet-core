@@ -2559,7 +2559,7 @@ impl P2pConnManager {
                                         // Best effort notification during shutdown - receiver may already be dropped
                                         for mut callback in callbacks {
                                             #[allow(clippy::let_underscore_must_use)]
-                                            let _ = callback.send_result(Err(())).await;
+                                            let _ = callback.send_result(Err(None)).await;
                                         }
                                     }
 
@@ -3219,14 +3219,14 @@ impl P2pConnManager {
 trait ConnectResultSender: Send {
     fn send_result(
         &mut self,
-        result: Result<(SocketAddr, Option<usize>), ()>,
+        result: crate::message::ConnectResult,
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>>;
 }
 
-impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()>> {
+impl ConnectResultSender for mpsc::Sender<crate::message::ConnectResult> {
     fn send_result(
         &mut self,
-        result: Result<(SocketAddr, Option<usize>), ()>,
+        result: crate::message::ConnectResult,
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
         async move { self.send(result).await.map_err(|_| ()) }.boxed()
     }
@@ -3336,7 +3336,7 @@ async fn fail_awaiting_connection(
             "Cleaning up callbacks after connect command failure"
         );
         for mut cb in callbacks {
-            cb.send_result(Err(()))
+            cb.send_result(Err(None))
                 .await
                 .inspect_err(|send_err| {
                     tracing::debug!(
@@ -7829,8 +7829,8 @@ pub(crate) mod tests {
         let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
 
         // Two callers queued on this peer (mirrors the Occupied-entry append).
-        let (cb1, mut rx1) = mpsc::channel::<Result<(SocketAddr, Option<usize>), ()>>(1);
-        let (cb2, mut rx2) = mpsc::channel::<Result<(SocketAddr, Option<usize>), ()>>(1);
+        let (cb1, mut rx1) = mpsc::channel::<crate::message::ConnectResult>(1);
+        let (cb2, mut rx2) = mpsc::channel::<crate::message::ConnectResult>(1);
         state.awaiting_connection.insert(
             peer_addr,
             vec![
@@ -7855,8 +7855,8 @@ pub(crate) mod tests {
         let r2 = timeout(Duration::from_secs(1), rx2.recv())
             .await
             .expect("callback 2 must resolve immediately, not park");
-        assert_eq!(r1, Some(Err(())), "callback 1 must receive Err(())");
-        assert_eq!(r2, Some(Err(())), "callback 2 must receive Err(())");
+        assert_eq!(r1, Some(Err(None)), "callback 1 must receive Err(None)");
+        assert_eq!(r2, Some(Err(None)), "callback 2 must receive Err(None)");
 
         // (c) both maps drained for this peer.
         assert!(

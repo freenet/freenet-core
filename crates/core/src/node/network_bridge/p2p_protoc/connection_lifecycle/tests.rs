@@ -378,7 +378,7 @@ impl Harness {
         if let Some(addr) = peer.socket_addr() {
             self.use_addr(addr);
         }
-        let (callback, mut result_rx) = mpsc::channel::<Result<(SocketAddr, Option<usize>), ()>>(1);
+        let (callback, mut result_rx) = mpsc::channel::<crate::message::ConnectResult>(1);
         self.mgr
             .handle_connect_peer(
                 peer,
@@ -1035,7 +1035,7 @@ async fn own_key_claim_beside_expected_inbound_connections_is_not_a_duplicate() 
 async fn pending_connect_peer(
     h: &mut Harness,
     peer: PeerKeyLocation,
-) -> mpsc::Receiver<Result<(SocketAddr, Option<usize>), ()>> {
+) -> mpsc::Receiver<crate::message::ConnectResult> {
     pending_connect_peer_over(
         h,
         peer,
@@ -1049,7 +1049,7 @@ async fn pending_connect_peer_over(
     h: &mut Harness,
     peer: PeerKeyLocation,
     transport: crate::operations::connect::native::DialTransport,
-) -> mpsc::Receiver<Result<(SocketAddr, Option<usize>), ()>> {
+) -> mpsc::Receiver<crate::message::ConnectResult> {
     if let Some(addr) = peer.socket_addr() {
         h.use_addr(addr);
     }
@@ -1325,10 +1325,7 @@ impl DriverRig {
 
     /// The connect op's ConnectPeer for the peer, as the event loop handles
     /// it; returns the callback's receiver.
-    async fn connect_peer(
-        &self,
-        h: &mut Harness,
-    ) -> mpsc::Receiver<Result<(SocketAddr, Option<usize>), ()>> {
+    async fn connect_peer(&self, h: &mut Harness) -> mpsc::Receiver<crate::message::ConnectResult> {
         h.use_addr(self.peer_addr);
         let (callback, result_rx) = mpsc::channel(1);
         h.mgr
@@ -1443,7 +1440,7 @@ async fn expected_inbound_after_a_failed_dial_is_promoted_under_the_dialled_key(
     let mut result = rig.connect_peer(&mut h).await;
     assert_eq!(rig.handle_next_event(&mut h).await, "outbound_failed");
     assert!(
-        matches!(result.try_recv(), Ok(Err(()))),
+        matches!(result.try_recv(), Ok(Err(None))),
         "the ConnectPeer callback reports the failed dial"
     );
     assert!(!h.mgr.connections.contains_key(&peer_addr));
@@ -3696,7 +3693,11 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
                 origin,
             })
             .await;
-            assert!(matches!(result.try_recv(), Ok(Err(()))), "the dial failed");
+            assert_eq!(
+                result.try_recv(),
+                Ok(Err(Some(outcome))),
+                "the dial failed, and its requester learns how (10.2 item 16)"
+            );
             assert!(
                 !failed_addrs(&h).contains(&addr),
                 "a native failure does not mark the address"
@@ -3821,7 +3822,11 @@ async fn udp_only_dials_still_merge_by_address() {
             }
         };
         h.handshake_event(event).await;
-        let expected = if connects { Ok((addr, None)) } else { Err(()) };
+        let expected = if connects {
+            Ok((addr, None))
+        } else {
+            Err(None)
+        };
         assert_eq!(first.try_recv(), Ok(expected));
         assert_eq!(second.try_recv(), Ok(expected));
     }
@@ -3879,7 +3884,11 @@ async fn a_udp_dial_runs_beside_a_pending_native_dial() {
         };
         if native_fails_first {
             h.handshake_event(native_failed).await;
-            assert_eq!(native.try_recv(), Ok(Err(())), "the native dial failed");
+            assert_eq!(
+                native.try_recv(),
+                Ok(Err(Some(crate::transport::NativeSetupOutcome::TimedOut))),
+                "the native dial failed"
+            );
             assert!(udp.try_recv().is_err(), "the UDP dial is still running");
             assert!(joined.try_recv().is_err(), "so is its joined request");
             let event = established();
@@ -3921,7 +3930,7 @@ async fn a_failed_udp_dial_beside_a_native_dial_leaves_the_native_dial() {
         origin: NatAttemptOrigin::ConnectJoiner,
     })
     .await;
-    assert_eq!(udp.try_recv(), Ok(Err(())), "the UDP dial failed");
+    assert_eq!(udp.try_recv(), Ok(Err(None)), "the UDP dial failed");
     assert!(
         native.try_recv().is_err(),
         "the native dial is still pending"
@@ -3949,7 +3958,7 @@ mod beside {
     use crate::operations::connect::native::DialTransport;
     use crate::transport::{NatAttemptOrigin, NativeSetupOutcome};
 
-    pub(super) type Pending = mpsc::Receiver<Result<(SocketAddr, Option<usize>), ()>>;
+    pub(super) type Pending = mpsc::Receiver<crate::message::ConnectResult>;
 
     /// A native dial to `addr`, then a UDP dial beside it.
     pub(super) async fn dials(
@@ -4270,10 +4279,13 @@ async fn a_failed_udp_dial_beside_a_native_dial_takes_no_backoff() {
     let addr: SocketAddr = "203.0.113.236:6283".parse().unwrap();
     let (peer, mut native, mut udp) = beside::dials(&mut h, addr).await;
     h.handshake_event(beside::failed(&peer, false)).await;
-    assert_eq!(udp.try_recv(), Ok(Err(())));
+    assert_eq!(udp.try_recv(), Ok(Err(None)));
     assert!(!h.state.peer_backoff.is_in_backoff(addr), "no backoff");
     h.handshake_event(beside::failed(&peer, true)).await;
-    assert_eq!(native.try_recv(), Ok(Err(())));
+    assert_eq!(
+        native.try_recv(),
+        Ok(Err(Some(crate::transport::NativeSetupOutcome::TimedOut)))
+    );
     beside::assert_clear(&h, addr);
     while h.handshake_rx.try_recv().is_ok() {}
     let mut fallback = pending_connect_peer_over(&mut h, peer.clone(), DialTransport::Udp).await;
@@ -4301,10 +4313,13 @@ async fn native_failure_then_udp_failure_beside_it() {
     let addr: SocketAddr = "203.0.113.236:6284".parse().unwrap();
     let (peer, mut native, mut udp) = beside::dials(&mut h, addr).await;
     h.handshake_event(beside::failed(&peer, true)).await;
-    assert_eq!(native.try_recv(), Ok(Err(())));
+    assert_eq!(
+        native.try_recv(),
+        Ok(Err(Some(crate::transport::NativeSetupOutcome::TimedOut)))
+    );
     assert!(udp.try_recv().is_err(), "the UDP dial is still running");
     h.handshake_event(beside::failed(&peer, false)).await;
-    assert_eq!(udp.try_recv(), Ok(Err(())));
+    assert_eq!(udp.try_recv(), Ok(Err(None)));
     assert!(
         h.state.peer_backoff.is_in_backoff(addr),
         "the last dial's failure backs off"
@@ -4333,7 +4348,7 @@ async fn driver_shutdown_fails_requesters_of_a_udp_dial_beside_a_native_one() {
         .handle_handshake_stream_closed(&mut h.state)
         .await
         .expect("shutdown");
-    assert_eq!(udp.try_recv(), Ok(Err(())));
+    assert_eq!(udp.try_recv(), Ok(Err(None)));
     beside::assert_clear(&h, addr);
 }
 
@@ -4350,7 +4365,7 @@ async fn a_udp_dial_beside_a_native_one_that_cannot_be_sent_fails() {
         pending_connect_peer_over(&mut h, peer.clone(), DialTransport::native_now()).await;
     drop(std::mem::replace(&mut h.handshake_rx, mpsc::channel(1).1));
     let mut udp = pending_connect_peer_over(&mut h, peer, DialTransport::Udp).await;
-    assert_eq!(udp.try_recv(), Ok(Err(())));
+    assert_eq!(udp.try_recv(), Ok(Err(None)));
     assert!(!h.state.udp_beside_native.contains_key(&addr));
 }
 
@@ -4591,7 +4606,7 @@ async fn a_native_dial_onto_a_stale_key_replaces_the_entry() {
     // the native dial in flight (another CONNECT's) still lands.
     assert_eq!(
         result.try_recv(),
-        Ok(Err(())),
+        Ok(Err(None)),
         "premise: refused on the stale entry"
     );
     h.handshake_event(Arrival::Native.event(&new, false)).await;
@@ -4920,5 +4935,45 @@ async fn a_dropped_udp_dial_keeps_the_reservation_a_pending_native_dial_holds() 
     assert!(
         cm.has_connection_or_pending(dialled),
         "the pending native dial keeps the reservation"
+    );
+}
+
+/// Gate 16: only a native setup's own end is carried to its requesters. A
+/// native dial that fails locally before any setup runs (here the handshake
+/// channel is closed) and a UDP dial's failure both answer `Err(None)`.
+#[tokio::test]
+async fn local_and_udp_failures_carry_no_native_outcome() {
+    use crate::operations::connect::native::DialTransport;
+    let mut h = Harness::new("native-outcome-local").await;
+    let native_addr: SocketAddr = "203.0.113.250:6450".parse().unwrap();
+    let udp_addr: SocketAddr = "203.0.113.250:6451".parse().unwrap();
+    let mut udp = pending_connect_peer_over(
+        &mut h,
+        PeerKeyLocation::new(key(), udp_addr),
+        DialTransport::Udp,
+    )
+    .await;
+    h.handshake_event(HandshakeEvent::OutboundFailed {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: PeerKeyLocation::new(key(), udp_addr),
+        error: ConnectionError::Timeout,
+        transient: false,
+        transport: DialTransport::Udp,
+        native_outcome: None,
+        origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
+    })
+    .await;
+    assert_eq!(udp.try_recv(), Ok(Err(None)), "a UDP failure");
+    drop(std::mem::replace(&mut h.handshake_rx, mpsc::channel(1).1));
+    let mut native = pending_connect_peer_over(
+        &mut h,
+        PeerKeyLocation::new(key(), native_addr),
+        DialTransport::native_now(),
+    )
+    .await;
+    assert_eq!(
+        native.try_recv(),
+        Ok(Err(None)),
+        "a local failure of a native dial"
     );
 }

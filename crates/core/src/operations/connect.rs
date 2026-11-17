@@ -1602,9 +1602,13 @@ pub(super) async fn dispatch_expect_connection_from(
                 );
             }
             failed @ (Some(Err(_)) | None) => {
+                // A UDP connect after this counts as a rescue only if the
+                // native setup failed on the path, as on the joiner's side.
+                let path_failed = op_ctx_task::native_path_failed(&failed);
                 tracing::info!(
                     %peer,
                     tx = %tx,
+                    path_failed,
                     closed = failed.is_none(),
                     "connect: acceptor's QUIC-native setup failed; falling back to UDP"
                 );
@@ -1622,7 +1626,7 @@ pub(super) async fn dispatch_expect_connection_from(
                     Ok(mut rx) => {
                         let result = rx.recv().await;
                         let connected = matches!(result, Some(Ok(_)));
-                        if connected {
+                        if connected && path_failed {
                             crate::transport::TRANSPORT_METRICS
                                 .record_connect_native_rescued_by_udp(
                                     crate::transport::NativeConnectSide::Acceptor,
