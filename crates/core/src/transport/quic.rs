@@ -139,6 +139,10 @@ impl Default for QuicMode {
     }
 }
 
+// The default is `prefer` on every target, so a platform cannot quietly lose it
+// to a `cfg` and the build fails on the target where it would.
+const _: () = assert!(matches!(QuicMode::default_mode(), QuicMode::Prefer));
+
 impl QuicMode {
     /// The value written in `config.toml` and accepted on the command line.
     pub const OFF: &'static str = "off";
@@ -147,20 +151,17 @@ impl QuicMode {
     /// See [`QuicMode::Prefer`].
     pub const PREFER: &'static str = "prefer";
 
-    /// What an unset `transport-quic` means on this platform: prefer on Linux,
-    /// macOS and Windows, and off elsewhere, because a gateway's crash-loop
-    /// breaker cannot trip there. Windows joined once its breaker was confirmed on a
-    /// real Windows machine (#6031).
+    /// What an unset `transport-quic` means: prefer, on every platform. It was
+    /// off where the crash-loop breaker could not trip (anything but Linux,
+    /// macOS and Windows), because it needed a boot identity there. Peers now
+    /// count short runs that panicked in QUIC code on every platform (#6259),
+    /// and a gateway with no boot identity does the same
+    /// (`breaker::decides_by_short_runs`), so no platform runs QUIC without a
+    /// breaker. Windows joined first, once its breaker was confirmed on a real
+    /// Windows machine (#6031). A node that must stay off sets
+    /// `transport-quic = "off"`.
     pub const fn default_mode() -> Self {
-        if cfg!(any(
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "windows"
-        )) {
-            Self::Prefer
-        } else {
-            Self::Off
-        }
+        Self::Prefer
     }
 
     /// The mode for a configured `transport-quic` value. Unset is

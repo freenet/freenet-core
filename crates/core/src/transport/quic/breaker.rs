@@ -7,10 +7,11 @@
 //! rather than a task, and the service manager restarts the node into the
 //! same failure; the breaker bounds those restarts with QUIC per cooldown.
 //!
-//! Two rules decide it ([`decides_by_short_runs`]). Every peer, and a
-//! gateway on Windows, counts short runs that panicked in QUIC code
-//! ([`short_runs`]). A gateway on unix asks how its last run ended, which
-//! the rest of this doc describes. Peers on unix used that second rule until
+//! Two rules decide it ([`decides_by_short_runs`]). Every peer, a gateway
+//! on Windows, and a gateway on a unix platform with no boot identity
+//! (`platform::boot_id`: anything but Linux and macOS), count short runs
+//! that panicked in QUIC code ([`short_runs`]). A gateway on Linux or macOS
+//! asks how its last run ended, which the rest of this doc describes. Peers on unix used that second rule until
 //! #6151; it still runs on them as a shadow ([`legacy_shadow`]) that only
 //! telemetry reads, until UDP is removed.
 //!
@@ -1068,7 +1069,7 @@ pub(crate) async fn gate<T>(
         return not_consulted(settings);
     }
     OVERRIDDEN.store(ignore_breaker, Ordering::Relaxed);
-    if decides_by_short_runs(cfg!(unix), role) {
+    if decides_by_short_runs(cfg!(unix), role, platform::boot_id().is_some()) {
         // The legacy shadow reads its marker first: on the first start after
         // an upgrade it takes the earlier release's marker as its evidence.
         let legacy = if cfg!(unix) {
@@ -1276,10 +1277,13 @@ pub(crate) async fn gate<T>(
 }
 
 /// Whether a start decides by short runs that panicked in QUIC code
-/// ([`short_runs`]): every peer (#6151), and a gateway on Windows. A gateway
-/// on `unix` decides by how its last run ended ([`verdict`]).
-pub(crate) fn decides_by_short_runs(unix: bool, role: BreakerRole) -> bool {
-    !unix || role == BreakerRole::Peer
+/// ([`short_runs`]): every peer (#6151), a gateway on Windows, and a gateway
+/// on a `unix` platform with no boot identity (`boot_id_known` false), where
+/// [`verdict`] cannot tell a reboot from a crash and would never trip. A
+/// gateway on `unix` with a boot identity decides by how its last run ended
+/// ([`verdict`]).
+pub(crate) fn decides_by_short_runs(unix: bool, role: BreakerRole, boot_id_known: bool) -> bool {
+    !unix || role == BreakerRole::Peer || !boot_id_known
 }
 
 /// The stop note: the wrapper's when it passed one; otherwise the note at
@@ -3186,7 +3190,8 @@ mod tests {
         );
     }
 
-    /// Every peer, and a gateway on Windows, decides by short runs (those that
+    /// Every peer, a gateway on Windows and a gateway on a unix platform with
+    /// no boot identity decide by short runs (those that
     /// panicked in QUIC code), and only when the breaker is enabled. `gate` is
     /// inert in unit tests, so this pins the lines: the enabled check, then
     /// the dispatch on [`decides_by_short_runs`] for this platform and role,
@@ -3204,7 +3209,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("not found: {needle}"))
         };
         let enabled = at("if!ENABLED.load(Ordering::Relaxed){returnnot_consulted(settings);}");
-        let dispatch = at("ifdecides_by_short_runs(cfg!(unix),role){");
+        let dispatch =
+            at("ifdecides_by_short_runs(cfg!(unix),role,platform::boot_id().is_some()){");
         let shadow = at(
             "letlegacy=ifcfg!(unix){legacy_shadow(settings.is_some(),data_dir,ignore_breaker,now)}else{None};",
         );
@@ -3343,10 +3349,15 @@ mod tests {
     /// unix; a unix gateway decides by how its last run ended.
     #[test]
     fn who_decides_by_short_runs() {
-        assert!(decides_by_short_runs(true, BreakerRole::Peer));
-        assert!(!decides_by_short_runs(true, BreakerRole::Gateway));
-        assert!(decides_by_short_runs(false, BreakerRole::Peer));
-        assert!(decides_by_short_runs(false, BreakerRole::Gateway));
+        // (unix, role, boot identity known)
+        assert!(decides_by_short_runs(true, BreakerRole::Peer, true));
+        assert!(decides_by_short_runs(true, BreakerRole::Peer, false));
+        assert!(!decides_by_short_runs(true, BreakerRole::Gateway, true));
+        assert!(decides_by_short_runs(false, BreakerRole::Peer, false));
+        assert!(decides_by_short_runs(false, BreakerRole::Gateway, false));
+        // A unix gateway with no boot identity cannot tell a reboot from a
+        // crash, so it counts short runs rather than never tripping.
+        assert!(decides_by_short_runs(true, BreakerRole::Gateway, false));
     }
 
     fn legacy_start(stopped: &[u32], ignore_breaker: bool) -> LegacyStart {

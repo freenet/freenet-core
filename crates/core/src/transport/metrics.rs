@@ -3483,7 +3483,9 @@ pub(crate) enum QuicEndpointState {
     /// `transport-quic` is set to `off`, or to a value this binary does not
     /// know.
     OffConfig = 2,
-    /// `transport-quic` is unset and this platform's default is off.
+    /// `transport-quic` is unset and this build's default is off. No build
+    /// has an off default today (it is `prefer` on every platform), so a
+    /// node reports this only if a later build restores one.
     OffPlatform = 3,
     /// The build aborts on panic, which the QUIC transport refuses.
     OffAbort = 4,

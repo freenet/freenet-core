@@ -597,7 +597,7 @@ Current wire-gated floors:
   branch that only runs then has run.
 
   Release notes. The release that sets T0 must say in its notes that `prefer`
-  nodes, which is every Linux, macOS and Windows node that did not set `transport-quic`,
+  nodes, which is every node on any platform that did not set `transport-quic`,
   start carrying data with a growing share of their pairs. A release cut from
   main between the ramp code (#6138) and the T0 PR (0.2.157 was one) also
   changed something: it made `prefer` the default on Linux, macOS and Windows,
@@ -634,7 +634,7 @@ Current wire-gated floors:
   that set `quic-data-percent` keeps a share.
   `the_constants_are_in_a_shape_a_release_ships` fails a build whose default
   on Linux and macOS is not `prefer` unless both are so. It also sets the default mode back to
-  0.2.156's: shadow on Linux and macOS, off on Windows. An emergency release
+  0.2.156's: shadow on Linux and macOS, off on Windows and on every other platform (which has `prefer` as its default otherwise). An emergency release
   should only go back to states the field has run, and Windows with QUIC off
   is what every release through 0.2.156 ran. So a Linux or macOS node that did not set
   `transport-quic` keeps its endpoint with shadow paths (off would tear down
