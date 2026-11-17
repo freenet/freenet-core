@@ -2092,17 +2092,6 @@ mod tests {
         );
     }
 
-    /// #5940: a gateway's restarts to restore QUIC stay under the start
-    /// limit of the units `freenet service install` writes, which counts
-    /// every start, exit 42 included, and the first start too. In any window
-    /// of that length the starts are at most: one start, the free restarts
-    /// after the first `ENDPOINT_DOWN_EXITS_TO_TRIP - 1` endpoint deaths, the
-    /// start the next death trips, and one cooldown-end restart. Only one
-    /// fits: every gateway cooldown is longer than the window, and the
-    /// `QUIC_RESTORE_MIN_UPTIME` floor shortens only the wait for a cooldown
-    /// already nearly over when the node started.
-    #[cfg(target_os = "linux")]
-
     /// #6151: while UDP exists, a peer's QUIC crash-loop breaker trips, and
     /// the peer falls back to UDP, before the post-update crash-loop rollback
     /// restores the previous release and pins this one as bad. Each run the
@@ -2114,14 +2103,25 @@ mod tests {
         let crashes_when_the_breaker_trips = freenet::PEER_SHORT_RUNS_TO_TRIP_WITH_UDP;
         assert!(crashes_when_the_breaker_trips >= 1);
         assert!(
-            !commands::rollback::should_rollback(crashes_when_the_breaker_trips),
+            !crate::commands::rollback::should_rollback(crashes_when_the_breaker_trips),
             "the rollback would act at {crashes_when_the_breaker_trips} crashes, no later than \
              the peer breaker"
         );
-        assert!(commands::rollback::should_rollback(
-            commands::rollback::ROLLBACK_CRASH_THRESHOLD
+        assert!(crate::commands::rollback::should_rollback(
+            crate::commands::rollback::ROLLBACK_CRASH_THRESHOLD
         ));
     }
+
+    /// #5940: a gateway's restarts to restore QUIC stay under the start
+    /// limit of the units `freenet service install` writes, which counts
+    /// every start, exit 42 included, and the first start too. In any window
+    /// of that length the starts are at most: one start, the free restarts
+    /// after the first `ENDPOINT_DOWN_EXITS_TO_TRIP - 1` endpoint deaths, the
+    /// start the next death trips, and one cooldown-end restart. Only one
+    /// fits: every gateway cooldown is longer than the window, and the
+    /// `QUIC_RESTORE_MIN_UPTIME` floor shortens only the wait for a cooldown
+    /// already nearly over when the node started.
+    #[cfg(target_os = "linux")]
     #[test]
     fn gateway_quic_restarts_stay_under_the_unit_start_limit() {
         let units = [
