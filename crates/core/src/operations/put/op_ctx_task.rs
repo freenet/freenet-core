@@ -3744,11 +3744,21 @@ where
     let registry = op_manager.orphan_stream_registry();
     let claim = registry.claim_or_wait(upstream_addr, stream_id, STREAM_CLAIM_TIMEOUT);
     // Wait for the stream, unless this driver is evicted to admit a newer one
-    // (the node-wide bound in `stream_admission`). Dropping the claim future
-    // mid-wait is allowed: `claim_or_wait` replaces a dead waiter on the next
-    // claim of the key.
+    // (the node-wide bound in `stream_admission`). On eviction the claim
+    // future is dropped mid-wait and `abandon_claim` below removes what it
+    // left registered.
+    //
+    // `biased;` with the claim arm FIRST: when the stream and the eviction
+    // are both ready in one poll, the stream wins, so a stream that has
+    // already been delivered is never thrown away by an eviction that came
+    // too late to matter. Two arms, each ready at most once, so neither can
+    // starve the other and no per-iteration cap is needed. Cancellation
+    // safety: losing the claim arm drops `claim_or_wait`, which leaves a
+    // dead waiter and its `claimed_streams` entry; `abandon_claim` handles
+    // both.
     let claim_result = match admission_permit.as_mut() {
         Some(permit) => tokio::select! {
+            biased;
             result = claim => Some(result),
             () = permit.evicted() => None,
         },
@@ -3757,6 +3767,10 @@ where
     // The unclaimed phase is over, whatever its outcome.
     drop(admission_permit);
     let Some(claim_result) = claim_result else {
+        // Remove the waiter the dropped claim left, and make sure the stream,
+        // if it still arrives, is cancelled at once rather than parked as an
+        // orphan nobody can claim until the orphan GC.
+        registry.abandon_claim(upstream_addr, stream_id);
         tracing::debug!(
             tx = %incoming_tx,
             %stream_id,
@@ -10309,8 +10323,9 @@ mod relay_sender_bound_tests {
             let source = u8::try_from(i / PER_SOURCE_CAP).expect("few sources");
             let from = SocketAddr::new([198, 51, 100, source].into(), 1000 + i as u16);
             let tx = Transaction::new::<PutMsg>();
-            announce(&op_manager, tx, StreamId::next(), key, from).await;
-            admitted.push((tx, from));
+            let stream_id = StreamId::next();
+            announce(&op_manager, tx, stream_id, key, from).await;
+            admitted.push((tx, from, stream_id));
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
@@ -10323,7 +10338,18 @@ mod relay_sender_bound_tests {
         announce(&op_manager, newcomer, StreamId::next(), key, newcomer_from).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let (oldest_tx, oldest_from) = admitted[0];
+        let (oldest_tx, oldest_from, oldest_stream) = admitted[0];
+        // The evicted driver deregistered its claim: its stream, arriving now,
+        // is cancelled at once instead of parking as an unclaimable orphan.
+        let registry = op_manager.orphan_stream_registry();
+        let orphans_before = registry.orphan_count();
+        let late = StreamHandle::new(oldest_stream, 64);
+        registry.register_test_orphan(oldest_from, oldest_stream, late.clone());
+        assert!(
+            late.is_cancelled(),
+            "the evicted driver's late stream is cancelled"
+        );
+        assert_eq!(registry.orphan_count(), orphans_before);
         assert_eq!(op_manager.relay_put_stream_admission.evicted_total(), 1);
         assert_eq!(
             op_manager.relay_put_stream_admission.unclaimed(),
@@ -10342,9 +10368,79 @@ mod relay_sender_bound_tests {
             1,
             "the evicted driver answers its upstream once"
         );
-        let (second_tx, second_from) = admitted[1];
+        let (second_tx, second_from, _) = admitted[1];
         assert!(op_manager.active_relay_put_txs.contains(&second_tx));
         assert_eq!(errors_to(&sent, second_tx, second_from), 0);
+    }
+
+    /// When a driver's stream and its eviction become ready together, the
+    /// stream wins: the driver goes on with it, and is not answered as
+    /// evicted. Repeated so an unordered select would be caught (each round
+    /// is a coin flip without `biased;`).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_stream_delivered_as_its_driver_is_evicted_is_kept() {
+        use super::super::stream_admission::{NODE_WIDE_CAP, PER_SOURCE_CAP};
+
+        let label = "relay-put-streaming-eviction-race";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let sent = record_sends(rx);
+        let key = crate::operations::test_utils::make_test_contract(label.as_bytes()).key();
+
+        let mut admitted = std::collections::VecDeque::new();
+        for i in 0..NODE_WIDE_CAP {
+            let source = u8::try_from(i / PER_SOURCE_CAP).expect("few sources");
+            let from = SocketAddr::new([198, 51, 100, source].into(), 1000 + i as u16);
+            let tx = Transaction::new::<PutMsg>();
+            let stream_id = StreamId::next();
+            announce(&op_manager, tx, stream_id, key, from).await;
+            admitted.push_back((tx, from, stream_id));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        const ROUNDS: usize = 24;
+        for round in 0..ROUNDS {
+            let (tx, from, stream_id) = admitted.pop_front().expect("an admitted driver");
+            // Deliver the oldest driver's stream and, before it runs again,
+            // admit a newcomer that evicts it. Its claim and its eviction are
+            // then both ready on its next poll.
+            let bytes = vec![0xABu8; 64];
+            let handle = StreamHandle::new(stream_id, bytes.len() as u64);
+            handle
+                .push_fragment(1, bytes::Bytes::from(bytes))
+                .expect("fragment accepted");
+            op_manager
+                .orphan_stream_registry()
+                .register_test_orphan(from, stream_id, handle);
+            let newcomer_from = SocketAddr::new(
+                [192, 0, 2, 200].into(),
+                2000 + u16::try_from(round).unwrap(),
+            );
+            let newcomer_stream = StreamId::next();
+            let newcomer = Transaction::new::<PutMsg>();
+            announce(&op_manager, newcomer, newcomer_stream, key, newcomer_from).await;
+            admitted.push_back((newcomer, newcomer_from, newcomer_stream));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let evicted_replies = sent
+                .lock()
+                .iter()
+                .filter(|(msg, target)| {
+                    *target == Some(from)
+                        && *msg.id() == tx
+                        && matches!(
+                            msg,
+                            NetMessage::V1(NetMessageV1::Put(PutMsg::Error { cause, .. }))
+                                if cause == STREAM_ADMISSION_REFUSED_CAUSE
+                        )
+                })
+                .count();
+            assert_eq!(
+                evicted_replies, 0,
+                "round {round}: a driver whose stream was already delivered must \
+                 take the stream, not be answered as evicted"
+            );
+        }
     }
 
     /// The permit covers only the unclaimed phase: once the stream is claimed

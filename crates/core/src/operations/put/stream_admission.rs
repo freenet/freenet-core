@@ -42,14 +42,32 @@ use tokio::sync::oneshot;
 ///
 /// Sized for an honest gateway relaying many joiners' PUTs, which all count
 /// against that gateway's address. A permit is held only from the
-/// announcement until the stream is claimed. The sender puts the stream on
-/// the wire right after its announcement (fragment 1 even carries a copy of
-/// it), so an honest permit lasts about one round trip: tens of
-/// milliseconds, up to a few hundred on a slow path. At 32 permits and
-/// 300 ms each, one previous hop can have 100 streaming PUTs per second
-/// announced through it before any is refused. A streaming PUT carries a
-/// payload above the streaming threshold (64 KiB), so 100 per second is
-/// at least 6.5 MB/s of PUT payload arriving over one link.
+/// announcement until the stream is claimed, i.e. until fragment 1 arrives.
+///
+/// # How long fragment 1 can lag its announcement on a busy link
+///
+/// Outbound streams on one connection are INTERLEAVED, not sent one after
+/// another. On the UDP session each stream is its own task
+/// (`PeerConnection::outbound_stream_with_id` / `pipe_stream_to_remote`
+/// push a spawned `send_stream` onto `outbound_stream_futures`), and each
+/// task admits its packets one at a time: wait for congestion-window
+/// space, then reserve that one packet from the connection's token bucket.
+/// On the QUIC path quinn multiplexes streams itself. So fragment 1 of a
+/// new stream does not wait for earlier transfers to finish. It waits for
+/// window space, which opens within about one round trip, and for the
+/// single packets the other active streams on the link have reserved ahead
+/// of it, about one packet per active stream. The sender emits fragment 1
+/// right after its announcement, and fragment 1 also carries a copy of it.
+///
+/// So the lag is about one round trip plus K packet times for K active
+/// streams on the link: at K = 32 and 1.25 MB/s, about 36 ms on top of
+/// the round trip. Taking 300 ms per permit as a generous figure, 32
+/// permits let one previous hop have about 100 streaming PUTs per second
+/// announced through it before any is refused. A streaming PUT carries
+/// more than the 64 KiB streaming threshold, so that is at least 6.5 MB/s
+/// of PUT payload over one link. If field data shows refusals from honest
+/// gateways, raise this constant: the node-wide cap with eviction is what
+/// bounds memory, not this one.
 pub(crate) const PER_SOURCE_CAP: usize = 32;
 
 /// Unclaimed streaming PUT relay drivers this node holds across all sources.

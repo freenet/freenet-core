@@ -92,7 +92,18 @@ pub struct OrphanStreamRegistry {
     /// both the embedded metadata (in fragment #1) and the separate metadata
     /// message arrive — only the first one should be processed.
     claimed_streams: DashMap<StreamKey, ()>,
+
+    /// Keys whose claimant gave up before the stream arrived
+    /// ([`Self::abandon_claim`]), with when. A stream that arrives for one is
+    /// cancelled instead of parked: its `claimed_streams` entry blocks every
+    /// new claim, so a parked orphan would only hold its buffer until GC.
+    /// Bounded by [`MAX_ABANDONED_CLAIMS`] and expired by `gc_expired`.
+    abandoned: DashMap<StreamKey, Instant>,
 }
+
+/// Most abandoned claims remembered at once. Past this an abandoned stream
+/// is parked and aged out by `gc_expired`, as before abandonment existed.
+const MAX_ABANDONED_CLAIMS: usize = 4096;
 
 impl OrphanStreamRegistry {
     /// Creates a new empty registry.
@@ -100,6 +111,35 @@ impl OrphanStreamRegistry {
         Self {
             slots: Default::default(),
             claimed_streams: DashMap::new(),
+            abandoned: DashMap::new(),
+        }
+    }
+
+    /// Give up a claim whose `claim_or_wait` future was dropped mid-wait (a
+    /// streaming PUT relay driver evicted by its admission bound).
+    ///
+    /// Removes the dead waiter the dropped future left, cancels the stream if
+    /// it already arrived in the meantime, and otherwise marks the key so the
+    /// stream is cancelled when it arrives. The key's `claimed_streams` entry
+    /// is kept, so no later claim can take the stream either. A live waiter
+    /// at the key belongs to another claimant and is left alone.
+    pub fn abandon_claim(&self, peer_addr: SocketAddr, stream_id: StreamId) {
+        let key = (peer_addr, stream_id);
+        let removed = self.slots.remove_if(&key, |_, slot| match slot {
+            Slot::Waiter(tx) => tx.is_closed(),
+            Slot::Orphan(..) => true,
+        });
+        match removed {
+            Some((_, Slot::Orphan(handle, _))) => handle.cancel(),
+            Some((_, Slot::Waiter(_))) | None => {
+                if self.slots.contains_key(&key) {
+                    // Another claimant's live waiter: it wants the stream.
+                    return;
+                }
+                if self.abandoned.len() < MAX_ABANDONED_CLAIMS {
+                    self.abandoned.insert(key, Instant::now());
+                }
+            }
         }
     }
 
@@ -118,6 +158,16 @@ impl OrphanStreamRegistry {
     ) {
         use dashmap::mapref::entry::Entry;
         let key = (peer_addr, stream_id);
+        // Its claimant gave up (`abandon_claim`) and no new claim can take it.
+        if self.abandoned.remove(&key).is_some() {
+            tracing::debug!(
+                %peer_addr,
+                stream_id = %stream_id,
+                "Stream arrived for an abandoned claim; cancelling it"
+            );
+            handle.cancel();
+            return;
+        }
         // Check and act under the key's entry lock, so a concurrent
         // `claim_or_wait` has either already parked the waiter we deliver to,
         // or will find our orphan (#5731).
@@ -401,6 +451,10 @@ impl OrphanStreamRegistry {
             self.claimed_streams.clear();
         }
 
+        // A stream not yet arrived for an abandoned claim is not coming.
+        self.abandoned
+            .retain(|_, at| now.duration_since(*at) <= ORPHAN_STREAM_TIMEOUT);
+
         if expired_count > 0 {
             tracing::info!(
                 expired_count,
@@ -520,6 +574,76 @@ impl std::error::Error for OrphanStreamError {}
 mod tests {
     use super::*;
     use crate::config::GlobalExecutor;
+
+    /// A claim dropped mid-wait and then abandoned leaves no waiter, and the
+    /// stream that arrives later is cancelled at once rather than parked as an
+    /// orphan no one can claim.
+    #[tokio::test]
+    async fn an_abandoned_claim_cancels_the_stream_when_it_arrives() {
+        let registry = std::sync::Arc::new(OrphanStreamRegistry::new());
+        let stream_id = StreamId::next();
+        let claim = {
+            let registry = std::sync::Arc::clone(&registry);
+            tokio::spawn(async move {
+                registry
+                    .claim_or_wait(dummy_addr(), stream_id, STREAM_CLAIM_TIMEOUT)
+                    .await
+            })
+        };
+        tokio::time::sleep(WAITER_REGISTRATION_DELAY).await;
+        assert_eq!(registry.waiter_count(), 1, "premise");
+        claim.abort();
+        assert!(
+            claim.await.expect_err("aborted").is_cancelled(),
+            "premise: the claim future was dropped mid-wait"
+        );
+
+        registry.abandon_claim(dummy_addr(), stream_id);
+        assert_eq!(registry.waiter_count(), 0, "the dead waiter is removed");
+
+        let late = make_test_handle(stream_id);
+        registry.register_test_orphan(dummy_addr(), stream_id, late.clone());
+        assert!(late.is_cancelled(), "the late stream is cancelled");
+        assert_eq!(registry.orphan_count(), 0, "and not parked as an orphan");
+
+        // The mark is used up: an unrelated later stream on the key parks.
+        let next = make_test_handle(stream_id);
+        registry.register_test_orphan(dummy_addr(), stream_id, next.clone());
+        assert!(!next.is_cancelled());
+    }
+
+    /// A stream that arrived between the dropped claim and the abandonment is
+    /// cancelled and removed; a live waiter of another claimant is left alone.
+    #[tokio::test]
+    async fn abandoning_cancels_an_arrived_orphan_and_spares_a_live_waiter() {
+        let registry = std::sync::Arc::new(OrphanStreamRegistry::new());
+        let arrived_id = StreamId::next();
+        let arrived = make_test_handle(arrived_id);
+        registry.register_test_orphan(dummy_addr(), arrived_id, arrived.clone());
+        registry.abandon_claim(dummy_addr(), arrived_id);
+        assert!(arrived.is_cancelled());
+        assert_eq!(registry.orphan_count(), 0);
+
+        let awaited_id = StreamId::next();
+        let waiter = {
+            let registry = std::sync::Arc::clone(&registry);
+            tokio::spawn(async move {
+                registry
+                    .claim_or_wait(dummy_addr(), awaited_id, STREAM_CLAIM_TIMEOUT)
+                    .await
+            })
+        };
+        tokio::time::sleep(WAITER_REGISTRATION_DELAY).await;
+        registry.abandon_claim(dummy_addr(), awaited_id);
+        assert_eq!(registry.waiter_count(), 1, "a live waiter is not removed");
+        let delivered = make_test_handle(awaited_id);
+        registry.register_test_orphan(dummy_addr(), awaited_id, delivered.clone());
+        let got = waiter
+            .await
+            .expect("join")
+            .expect("the live waiter gets its stream");
+        assert!(!got.is_cancelled());
+    }
 
     /// Small delay to allow async waiter registration before asserting.
     const WAITER_REGISTRATION_DELAY: Duration = Duration::from_millis(50);
