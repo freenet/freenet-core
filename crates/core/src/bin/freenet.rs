@@ -409,9 +409,13 @@ async fn run_network_node_with_signals(
     let commit_probation_task = {
         let version = build_info::VERSION.to_string();
         GlobalExecutor::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(
-                commands::rollback::COMMIT_HEALTHY_UPTIME_SECS,
-            ))
+            // #6151: a start the QUIC crash-loop breaker backed off does not
+            // count the wait, with the transport closed, as healthy uptime:
+            // the window starts again once the transport can open.
+            wait_for_healthy_window(
+                std::time::Duration::from_secs(commands::rollback::COMMIT_HEALTHY_UPTIME_SECS),
+                freenet::wait_for_quic_transport_open,
+            )
             .await;
             // `spawn_blocking`, not a direct call: `commit_probation` does
             // synchronous filesystem work (`read_to_string`, `remove_file`) and
@@ -630,8 +634,8 @@ async fn run_network_node_with_signals(
                 "Startup update check skipped: {reason}. Run `freenet update` to update now."
             );
         }
-        // #6151: a peer the crash-loop breaker found in a QUIC crash loop,
-        // with no UDP to fall back to, checks at once: it is broken, and a
+        // #6151: a node the crash-loop breaker found in a QUIC crash loop,
+        // with no UDP to fall back to, checks within seconds: it is broken, and a
         // fixed release is what ends the loop. The claim below still applies.
         let startup_jitter_secs = startup_update_jitter_secs(
             freenet::quic_crash_loop_update_now(),
@@ -1296,12 +1300,38 @@ fn gateway_quic_restarts(status: commands::auto_update::SupervisorStatus) -> Gat
     }
 }
 
-/// The startup update check's jitter: none when the QUIC crash-loop breaker
-/// found this start in a crash loop with no UDP to fall back to (#6151),
-/// otherwise `random` reduced to under [`STARTUP_UPDATE_JITTER_MAX_SECS`].
+/// Sleep `window`, then, if `wait_for_open` had to wait for the transport to
+/// open (a QUIC crash-loop backoff, #6151), sleep a whole `window` again, until
+/// it has not. The update probation commits after this, so the backoff's wait
+/// with the transport closed never counts as healthy uptime.
+// No upper bound on purpose: if a backoff flag were ever left pending, this
+// keeps the rollback armed rather than committing a probation for a node whose
+// transport never opened, which is the failure the wait exists to prevent.
+async fn wait_for_healthy_window<Fut: std::future::Future<Output = bool>>(
+    window: std::time::Duration,
+    wait_for_open: impl Fn() -> Fut,
+) {
+    loop {
+        tokio::time::sleep(window).await;
+        if !wait_for_open().await {
+            break;
+        }
+    }
+}
+
+/// The startup update check's jitter when the QUIC crash-loop breaker found
+/// this start in a crash loop with no UDP to fall back to (#6151): short, so
+/// the check is still prompt, but a fleet that crashes together does not send
+/// its checks to GitHub at the same second (peers behind one NAT share its
+/// unauthenticated rate limit).
+const CRASH_LOOP_UPDATE_JITTER_MAX_SECS: u64 = 5;
+
+/// The startup update check's jitter: under [`CRASH_LOOP_UPDATE_JITTER_MAX_SECS`]
+/// when the QUIC crash-loop breaker found this start in a crash loop with no
+/// UDP to fall back to (#6151), otherwise `random` reduced to under [`STARTUP_UPDATE_JITTER_MAX_SECS`].
 fn startup_update_jitter_secs(crash_loop: bool, random: u64) -> u64 {
     if crash_loop {
-        0
+        random % CRASH_LOOP_UPDATE_JITTER_MAX_SECS
     } else {
         random % STARTUP_UPDATE_JITTER_MAX_SECS
     }
@@ -2113,8 +2143,10 @@ mod tests {
     /// from that decision.
     #[test]
     fn a_crash_loop_checks_for_an_update_at_once() {
-        assert_eq!(super::startup_update_jitter_secs(true, 59), 0);
-        assert_eq!(super::startup_update_jitter_secs(true, u64::MAX), 0);
+        assert_eq!(super::startup_update_jitter_secs(true, 0), 0);
+        assert_eq!(super::startup_update_jitter_secs(true, 3), 3);
+        assert_eq!(super::startup_update_jitter_secs(true, 5), 0);
+        assert!(super::startup_update_jitter_secs(true, u64::MAX) < 5);
         assert_eq!(super::startup_update_jitter_secs(false, 59), 59);
         assert_eq!(
             super::startup_update_jitter_secs(false, 60 + 7),
@@ -2132,33 +2164,114 @@ mod tests {
         );
     }
 
-    /// #6151: while UDP exists, a peer's QUIC crash-loop breaker trips, and
-    /// the peer falls back to UDP, before the post-update crash-loop rollback
-    /// restores the previous release and pins this one as bad. Each run the
-    /// breaker counts ended in a crash the rollback also counts; the start
-    /// that trips runs with QUIC off, so it adds no QUIC crash. At that point
-    /// the rollback's count must still be short of its threshold. This holds
-    /// for a release whose crashes are all QUIC panics; the rollback also
-    /// counts unrelated crashes, which the breaker does not, so one of those
-    /// before the panics lets the rollback act first.
+    /// #6151: the breaker and the post-update crash-loop rollback are ordered,
+    /// with and without UDP, and both orders are asserted whatever
+    /// `UDP_FALLBACK` is, so flipping it cannot make this vacuous. Each run the
+    /// breaker counts ended in a crash the rollback also counts (a release
+    /// whose crashes are all QUIC panics; the rollback also counts unrelated
+    /// crashes, which the breaker does not, so one of those lets the rollback
+    /// act first).
+    ///
+    /// With UDP, a peer's breaker trips, and the peer falls back to UDP,
+    /// while the rollback's count is still short of its threshold: the start
+    /// that trips runs with QUIC off, so it adds no QUIC crash.
+    ///
+    /// With no UDP, the rollback acts first: the run that makes the breaker
+    /// back off ends in the crash that brings the rollback's count to its
+    /// threshold, and that happens before the next start, which is where
+    /// the backoff begins. A rollback is then the better outcome than a longer
+    /// wait. If the breaker needed fewer short runs than the rollback needs
+    /// crashes, the backoff would come first and this fails.
     #[test]
-    fn peer_breaker_trips_before_the_crash_loop_rollback() {
-        // With no UDP to fall back to the order is meant to reverse (a
-        // rollback is then the better outcome), and the library pins the
-        // count it goes back to.
-        if !freenet::QUIC_BREAKER_UDP_FALLBACK {
-            return;
-        }
-        let crashes_when_the_breaker_trips = freenet::PEER_SHORT_RUNS_TO_TRIP_WITH_UDP;
-        assert!(crashes_when_the_breaker_trips >= 1);
+    fn the_breaker_and_the_crash_loop_rollback_are_ordered_with_and_without_udp() {
+        let with_udp = freenet::quic_breaker_short_runs_to_trip(false, true);
+        assert!(with_udp >= 1);
         assert!(
-            !crate::commands::rollback::should_rollback(crashes_when_the_breaker_trips),
-            "the rollback would act at {crashes_when_the_breaker_trips} crashes, no later than \
-             the peer breaker"
+            !crate::commands::rollback::should_rollback(with_udp),
+            "the rollback would act at {with_udp} crashes, no later than the peer breaker"
         );
+        for is_gateway in [false, true] {
+            let without_udp = freenet::quic_breaker_short_runs_to_trip(is_gateway, false);
+            assert!(
+                crate::commands::rollback::should_rollback(without_udp),
+                "with no UDP the backoff (gateway: {is_gateway}) begins after {without_udp} \
+                 crashes, but the rollback needs {}: the backoff would come first",
+                crate::commands::rollback::ROLLBACK_CRASH_THRESHOLD
+            );
+        }
         assert!(crate::commands::rollback::should_rollback(
             crate::commands::rollback::ROLLBACK_CRASH_THRESHOLD
         ));
+    }
+
+    /// #6151: the update probation does not commit while a crash-loop backoff
+    /// holds the transport closed, and commits one window after it opens.
+    /// Counting the wait as healthy uptime would clear the probation marker
+    /// (and with it any rollback that is retrying, see
+    /// `commands::rollback`'s `a_rollback_that_could_not_run_is_retried_by_a_later_crash`).
+    #[tokio::test(start_paused = true)]
+    async fn a_backed_off_start_does_not_commit_the_probation_until_the_transport_opens() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let window = std::time::Duration::from_secs(60);
+        let committed = std::sync::Arc::new(AtomicBool::new(false));
+        let waits = std::sync::Arc::new(AtomicU32::new(0));
+        let backoff_over = std::sync::Arc::new(tokio::sync::Notify::new());
+        // The backoff wait: the first call waits (as the transport's 60 s
+        // wait does) for `backoff_over`, later calls find nothing pending.
+        let task = {
+            let (committed, waits, backoff_over) =
+                (committed.clone(), waits.clone(), backoff_over.clone());
+            tokio::spawn(async move {
+                super::wait_for_healthy_window(window, || {
+                    let (waits, backoff_over) = (waits.clone(), backoff_over.clone());
+                    async move {
+                        if waits.fetch_add(1, Ordering::SeqCst) == 0 {
+                            backoff_over.notified().await;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                })
+                .await;
+                committed.store(true, Ordering::SeqCst);
+            })
+        };
+        // Far past the window, with the backoff still running.
+        tokio::time::sleep(window * 10).await;
+        assert!(
+            !committed.load(Ordering::SeqCst),
+            "the backoff's wait counted as healthy uptime"
+        );
+        backoff_over.notify_one();
+        tokio::time::sleep(window - std::time::Duration::from_secs(1)).await;
+        assert!(
+            !committed.load(Ordering::SeqCst),
+            "the window did not start again at the end of the wait"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        task.await.unwrap();
+        assert!(committed.load(Ordering::SeqCst));
+        // A start with no backoff commits after one window, as before.
+        let start = tokio::time::Instant::now();
+        super::wait_for_healthy_window(window, || async { false }).await;
+        assert_eq!(start.elapsed(), window);
+    }
+
+    /// The commit task waits through `wait_for_healthy_window` and the
+    /// library's transport-open signal; reverting it to a bare sleep, which
+    /// counts a backoff's wait as uptime, fails this.
+    #[test]
+    fn the_probation_commit_task_waits_for_the_transport() {
+        let src = include_str!("freenet.rs");
+        let task = fn_body(src, "async fn run_network_node_with_signals(");
+        let squeezed: String = task.split_whitespace().collect();
+        assert!(
+            squeezed.contains(
+                "wait_for_healthy_window(std::time::Duration::from_secs(commands::rollback::COMMIT_HEALTHY_UPTIME_SECS),freenet::wait_for_quic_transport_open,).await;"
+            ),
+            "the probation commit must not run while the transport is closed"
+        );
     }
 
     /// #5940: a gateway's restarts to restore QUIC stay under the start

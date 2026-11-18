@@ -2701,6 +2701,47 @@ pub(crate) mod tests {
         assert!(read_probation_at(dir).is_none());
     }
 
+    /// A rollback that could not run for a transient reason (here the retained
+    /// known-good binary cannot be read) leaves the probation marker, so a
+    /// later crash retries it and succeeds once the cause is gone. Pinned
+    /// because the QUIC crash-loop backoff (#6151) must not clear the marker
+    /// meanwhile (`freenet.rs`'s `wait_for_healthy_window`): this is the case
+    /// a commit during the backoff's wait would have destroyed.
+    #[test]
+    fn a_rollback_that_could_not_run_is_retried_by_a_later_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let live = setup_probation(dir, "0.2.84", "0.2.83");
+        let known_good = known_good_path(dir);
+        let blob = std::fs::read(&known_good).unwrap();
+        // A directory where the blob should be: opening it works, reading fails.
+        std::fs::remove_file(&known_good).unwrap();
+        std::fs::create_dir(&known_good).unwrap();
+
+        for _ in 0..ROLLBACK_CRASH_THRESHOLD - 1 {
+            handle_post_stop_at(dir, "101", "0.2.84");
+        }
+        for attempt in 0..2 {
+            let PostStopOutcome::RollbackUnavailable { reason } =
+                handle_post_stop_at(dir, "101", "0.2.84")
+            else {
+                panic!("expected RollbackUnavailable at attempt {attempt}");
+            };
+            assert!(reason.contains("cannot read known-good"), "{reason}");
+            assert!(
+                read_probation_at(dir).is_some(),
+                "the marker must stay for a later crash to retry (attempt {attempt})"
+            );
+        }
+        std::fs::remove_dir(&known_good).unwrap();
+        std::fs::write(&known_good, &blob).unwrap();
+        assert!(matches!(
+            handle_post_stop_at(dir, "101", "0.2.84"),
+            PostStopOutcome::RolledBack { .. }
+        ));
+        assert_eq!(std::fs::read(&live).unwrap(), b"GOOD-BINARY");
+    }
+
     #[test]
     fn prepare_known_good_preserves_blob_and_label_for_genuine_chained_install() {
         // Genuine chained install (existing marker is for the running version,

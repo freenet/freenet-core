@@ -193,11 +193,14 @@ pub(crate) const fn short_runs_to_trip(role: BreakerRole, udp_fallback: bool) ->
     }
 }
 
-/// Whether a trip keeps QUIC off for a cooldown, or, on a peer with no UDP
-/// to fall back to (#6151), delays its start instead and keeps QUIC on
+/// Whether a trip keeps QUIC off for a cooldown, or, with no UDP to fall back
+/// to (#6151), delays the start instead and keeps QUIC on
 /// ([`Verdict::Backoff`]): with UDP removed, QUIC off is no transport at all.
-const fn trips_into_backoff(role: BreakerRole, udp_fallback: bool) -> bool {
-    matches!(role, BreakerRole::Peer) && !udp_fallback
+/// Gateways too: a gateway with QUIC off for 15 minutes to 4 hours would have
+/// no transport, and its backoff is no longer than a peer's. The role does not
+/// matter here; it still sets how many short runs trip ([`short_runs_to_trip`]).
+const fn trips_into_backoff(_role: BreakerRole, udp_fallback: bool) -> bool {
+    !udp_fallback
 }
 
 /// How many times the timer tries to clear the count, [`SHORT_RUN`] apart. A
@@ -967,8 +970,33 @@ mod tests {
             Verdict::Backoff { step: 2 },
             "an endpoint-death trip backs off"
         );
-        let gateway = super::decide(&panicked(2, T0), T0 + 1, false, BreakerRole::Gateway, false);
-        assert_eq!(gateway.verdict, Verdict::Trip);
+        // A gateway backs off too (#6151): QUIC off for its 15 minute to 4
+        // hour cooldown would leave it with no transport, and the backoff is
+        // no longer than a peer's. Pins that decision: `trips_into_backoff`
+        // does not look at the role. It still needs three short runs.
+        let gateway = |previous: &Previous, udp_fallback| {
+            super::decide(previous, T0 + 1, false, BreakerRole::Gateway, udp_fallback)
+        };
+        assert_eq!(
+            gateway(&panicked(2, T0), false).verdict,
+            Verdict::Backoff { step: 1 }
+        );
+        assert_eq!(
+            gateway(&panicked(1, T0), false).verdict,
+            Verdict::Arm,
+            "a gateway still needs three short runs"
+        );
+        assert_eq!(
+            gateway(&with_step(panicked(3, T0), 2), false).verdict,
+            Verdict::Backoff { step: 3 }
+        );
+        assert_eq!(
+            gateway(&died, false).verdict,
+            Verdict::Backoff { step: 2 },
+            "a gateway's endpoint-death trip backs off"
+        );
+        // While UDP exists a gateway's trip keeps QUIC off, as before.
+        assert_eq!(gateway(&panicked(2, T0), true).verdict, Verdict::Trip);
         // While UDP exists the same peer runs trip.
         assert_eq!(
             super::decide(&panicked(1, T0), T0 + 1, false, BreakerRole::Peer, true).verdict,

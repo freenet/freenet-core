@@ -663,10 +663,10 @@ fn gateway_quic_restart(
     }
     if !enabled && unverified {
         tracing::warn!(
-            "This gateway runs under systemd, but its unit does not set FREENET_SUPERVISED=1, \
+            "This node runs under systemd, but its unit does not set FREENET_SUPERVISED=1, \
              so it does not restart itself to restore QUIC: if its QUIC endpoint dies or a \
-             crash-breaker cooldown keeps QUIC off, it keeps running over UDP until it is \
-             restarted. Set FREENET_SUPERVISED=1 in the unit if it restarts the node on exit \
+             crash-breaker cooldown keeps QUIC off, it keeps running until it is restarted, \
+             over UDP while UDP exists and with no transport once it is gone. Set FREENET_SUPERVISED=1 in the unit if it restarts the node on exit \
              code 42 (units written by `freenet service install` do)"
         );
     }
