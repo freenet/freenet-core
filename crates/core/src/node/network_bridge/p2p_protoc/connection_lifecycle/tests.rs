@@ -4892,13 +4892,13 @@ async fn a_dropped_udp_dial_answers_with_the_holders_address() {
 /// asserts in debug builds.
 #[cfg(debug_assertions)]
 #[tokio::test]
-#[should_panic(expected = "replace_transport_in_place without an entry")]
+#[should_panic(expected = "swap_udp_in_beside_native without an entry")]
 async fn a_swap_without_an_entry_asserts() {
     let mut h = Harness::new("survivor-swap-no-entry").await;
     let addr: SocketAddr = "203.0.113.249:6440".parse().unwrap();
     h.use_addr(addr);
     h.mgr
-        .replace_transport_in_place(addr, Box::new(IdleConnection::new(addr)))
+        .swap_udp_in_beside_native(addr, Box::new(IdleConnection::new(addr)))
         .await
         .ok();
 }

@@ -1649,6 +1649,7 @@ mod tests {
                     link_use: LinkUseStamp::new(created),
                     remote_version: None,
                     native: false,
+                    frame_seen: true,
                 },
             );
         }
@@ -1718,6 +1719,7 @@ mod tests {
             link_use,
             remote_version: None,
             native: false,
+            frame_seen: true,
         }
     }
 
@@ -1870,7 +1872,7 @@ mod tests {
             "the connection entry must hold the stamp"
         );
         assert!(
-            squashed.contains("conn_id,outbound_mix,propagation,link_use,native_wire)"),
+            squashed.contains("conn_id,outbound_mix,propagation,link_use,native_wire,report_first_frame)"),
             "the listener must be given the same stamp"
         );
         assert!(
@@ -2514,6 +2516,7 @@ mod tests {
                 link_use: link_use.clone(),
                 remote_version: None,
                 native: false,
+                frame_seen: true,
             },
         );
 
@@ -2538,6 +2541,7 @@ mod tests {
             crate::operations::update::propagation_stats::PropagationSink::for_test().0,
             link_use,
             crate::operations::connect::native::NativeWire::new(None, false),
+            false,
         ));
 
         let request = every_variant()

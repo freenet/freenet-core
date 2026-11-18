@@ -571,7 +571,39 @@ struct ConnectionEntry {
     /// handed, a native and a UDP connection to one peer, it keeps the
     /// native one (`P2pConnManager::replace_transport_in_place`).
     native: bool,
+    /// Whether this transport has carried a frame from the peer. A UDP
+    /// entry is born with one (its handshake was a round trip). A native
+    /// entry gets it from the listener's first decoded message
+    /// (`ConnEvent::NativeFirstFrame`): until then a UDP connection that
+    /// arrives for the same peer is kept beside it (`HeldNative` mirrors
+    /// this for the native connection kept beside a UDP entry) rather than
+    /// dropped, because only one end may have finished the native setup.
+    frame_seen: bool,
 }
+
+/// A QUIC-native connection kept beside the UDP entry for the same peer
+/// until it has carried a frame from the peer (option (b), 10.4 answer 2).
+/// Its listener runs, but nothing is sent over it except the first-frame
+/// probe, and the peer's messages it receives are handled by address like
+/// any other. The entry swaps to it on `NativeFirstFrame`, or it is
+/// dropped when it closes, when `HELD_NATIVE_WINDOW` passes, or when no UDP
+/// entry for the same peer remains. Bounded: at most one per address.
+struct HeldNative {
+    sender: PeerConnChannelSender,
+    connection_id: u64,
+    receipt: Option<crate::transport::ReceiptStamp>,
+    remote_version: Option<(u8, u8, u16)>,
+    /// The key the connection proved, which the entry it would replace must
+    /// still be bound to.
+    key: TransportPublicKey,
+    since: Instant,
+}
+
+/// How long a native connection is kept beside the UDP entry waiting for a
+/// frame from the peer: past the native setup window's start skew, so the
+/// peer's own setup can finish and its probe arrive. On expiry the native
+/// connection is dropped and UDP stays.
+const HELD_NATIVE_WINDOW: Duration = Duration::from_secs(15);
 
 impl ConnectionEntry {
     /// The key bound to this connection, if any.
@@ -711,6 +743,9 @@ pub(in crate::node) struct P2pConnManager {
     /// Must be kept in sync with `connections`.
     /// Uses BTreeMap for deterministic iteration order in simulation tests.
     addr_by_pub_key: identity::KeyIndex,
+    /// Native connections kept beside a UDP entry until they carry a frame
+    /// from the peer (see [`HeldNative`]). Keyed by the entry's address.
+    held_native: HashMap<SocketAddr, HeldNative>,
     conn_event_tx: Option<Sender<ConnEvent>>,
     key_pair: TransportKeypair,
     listening_ip: IpAddr,
@@ -1404,6 +1439,7 @@ impl P2pConnManager {
             event_listener: Box::new(event_listener),
             connections,
             addr_by_pub_key: identity::KeyIndex::default(),
+            held_native: HashMap::new(),
             conn_event_tx: None,
             key_pair,
             listening_ip: listener_ip,
@@ -1556,6 +1592,7 @@ impl P2pConnManager {
             event_listener,
             connections,
             addr_by_pub_key,
+            held_native,
             conn_event_tx: _,
             key_pair,
             listening_ip,
@@ -1659,6 +1696,7 @@ impl P2pConnManager {
             event_listener,
             connections,
             addr_by_pub_key,
+            held_native,
             conn_event_tx: Some(conn_event_tx.clone()),
             key_pair,
             listening_ip,
@@ -1880,6 +1918,10 @@ impl P2pConnManager {
                 ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state, false)
                     .await;
             }
+
+            // Native connections kept beside a UDP entry that waited too long
+            // for a frame (`HeldNative`); a no-op when none is held.
+            ctx.expire_held_native(Instant::now());
 
             match event {
                 EventResult::Continue => continue,
@@ -2295,6 +2337,7 @@ impl P2pConnManager {
                                 "SetPeerIdentity reached the event loop; ignoring it"
                             );
                         }
+                        ConnEvent::NativeFirstFrame { .. } => {}
                         ConnEvent::TransportClosed {
                             remote_addr,
                             error,
@@ -3476,6 +3519,12 @@ pub(super) enum ConnEvent {
     },
     NodeAction(NodeEvent),
     ClosedChannel(ChannelCloseReason),
+    /// A native connection's listener decoded its first message from the
+    /// peer. Sent once per native connection, before that message.
+    NativeFirstFrame {
+        remote_addr: SocketAddr,
+        connection_id: u64,
+    },
     TransportClosed {
         remote_addr: SocketAddr,
         error: TransportError,
@@ -3831,6 +3880,7 @@ async fn handle_peer_channel_message(
                 | other @ ConnEvent::OutboundMessage(_)
                 | other @ ConnEvent::OutboundMessageWithTarget { .. }
                 | other @ ConnEvent::NodeAction(_)
+                | other @ ConnEvent::NativeFirstFrame { .. }
                 | other @ ConnEvent::TransportClosed { .. } => {
                     unreachable!(
                         "Unexpected action from peer_connection_listener channel: {:?}",
@@ -3930,8 +3980,12 @@ async fn peer_connection_listener(
     propagation: crate::operations::update::propagation_stats::PropagationSink,
     link_use: zombie_sweep::LinkUseStamp,
     native_wire: NativeWire,
+    report_first_frame: bool,
 ) {
     let remote_addr = conn.remote_addr();
+    // A native connection tells the event loop once when it first hears from
+    // the peer, for the survivor rule's hold (`HeldNative`).
+    let mut first_frame_pending = report_first_frame;
     tracing::debug!(
         to = %remote_addr,
         %peer_addr,
@@ -4101,6 +4155,19 @@ async fn peer_connection_listener(
                             // may not dequeue it for a while, and the zombie sweep
                             // must already see this transport as in use (#5654).
                             zombie_sweep::record_link_use_request(&link_use, &net_message, Instant::now());
+                            if first_frame_pending {
+                                first_frame_pending = false;
+                                if conn_events
+                                    .send(ConnEvent::NativeFirstFrame {
+                                        remote_addr,
+                                        connection_id,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                             if conn_events
                                 .send(ConnEvent::InboundMessage(IncomingMessage::with_remote(
                                     net_message,
@@ -5922,6 +5989,7 @@ pub(crate) mod tests {
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
                 native: false,
+                frame_seen: true,
             },
         );
         let (tx2, _rx2) = mpsc::channel(1);
@@ -5936,6 +6004,7 @@ pub(crate) mod tests {
                 link_use: super::zombie_sweep::LinkUseStamp::new(Instant::now()),
                 remote_version: None,
                 native: false,
+                frame_seen: true,
             },
         );
 
