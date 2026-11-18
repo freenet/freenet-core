@@ -1760,6 +1760,11 @@ async fn drive_relay_subscribe(
     is_renewal: bool,
     upstream_addr: std::net::SocketAddr,
 ) -> Result<(), OpError> {
+    // The sender writes `htl`, so bound it by this node's own limit before
+    // anything reads it, as the GET relay does (ANT-2026-QLQ8OSNJ). The visited
+    // bloom alone does not stop a long walk.
+    let htl = htl.min(op_manager.ring.max_hops_to_live);
+
     tracing::info!(
         tx = %incoming_tx,
         %instance_id,
@@ -6057,6 +6062,64 @@ mod bootstrap_subscription_tests {
                 [(to, SubscribeMsgResult::Subscribed { .. })] if *to == own
             ),
             "{responses:?}"
+        );
+    }
+}
+
+/// ANT-2026-QLQ8OSNJ: the SUBSCRIBE relay clamps the hops-to-live a sender
+/// writes to this node's own limit before it forwards. Drives the real
+/// `start_relay_subscribe` against a stubbed event loop.
+#[cfg(test)]
+mod relay_htl_clamp_tests {
+    use super::*;
+    use crate::operations::route_attempt::driver_test_support::op_manager_with_peers_and_store;
+    use std::time::Duration;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_subscribe_clamps_an_oversized_wire_htl() {
+        let (op_manager, mut rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store("relay-subscribe-htl-clamp", 3).await;
+        let forwarded = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let log = forwarded.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some((reply_tx, msg, _target)) = rx.recv().await {
+                if let NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Request {
+                    htl, ..
+                })) = &msg
+                {
+                    log.lock().push(*htl);
+                }
+                held.push(reply_tx);
+            }
+        });
+
+        let tx = Transaction::new::<SubscribeMsg>();
+        let upstream: std::net::SocketAddr = "10.0.0.42:31337".parse().unwrap();
+        start_relay_subscribe(
+            op_manager.clone(),
+            tx,
+            ContractInstanceId::new([0x5a; 32]),
+            usize::MAX,
+            VisitedPeers::new(&tx),
+            false,
+            upstream,
+        )
+        .await
+        .expect("the relay starts");
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if !forwarded.lock().is_empty() {
+                break;
+            }
+        }
+
+        let max_htl = op_manager.ring.max_hops_to_live;
+        assert_eq!(
+            forwarded.lock().first().copied(),
+            Some(max_htl - 1),
+            "a wire HTL above max_hops_to_live must be clamped before it is \
+             decremented and forwarded"
         );
     }
 }

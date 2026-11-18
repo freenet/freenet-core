@@ -1720,6 +1720,42 @@ where
                         htl,
                         skip_list,
                     } => {
+                        // A reconcile delivers a delta that is merged through
+                        // `update_contract`, the same path an UPDATE takes, so it
+                        // is charged to the UPDATE rate limiter
+                        // (ANT-2026-0ILTPRIJ), in its own class: a separate stamp
+                        // in the same (sender, contract) entry, at the request
+                        // interval. Sharing the Request stamp would refuse a
+                        // client's UPDATE that follows its PUT within the
+                        // interval through the same first hop, and a refused
+                        // `RequestUpdate` is lost until anti-entropy. A sender
+                        // alternating opcodes gains at most one extra bounded
+                        // budget. Only a remote sender is charged; `source_addr`
+                        // is `None` for this node's own loopback.
+                        //
+                        // A refused reconcile is not repaired: it is best-effort
+                        // by design (the originator holds the merged state and
+                        // anti-entropy heals the receiver, see
+                        // `drive_relay_probe_reconcile`), and the limiter records
+                        // the refusal in its counters and its once-a-minute log.
+                        if let Some(sender_addr) = source_addr {
+                            let decision = op_manager.ring.update_rate_limiter.check_and_record(
+                                sender_addr,
+                                *key.id(),
+                                crate::ring::update_rate_limit::UpdateClass::Reconcile,
+                            );
+                            if !decision.is_allowed() {
+                                tracing::debug!(
+                                    tx = %id,
+                                    contract = %key,
+                                    %sender_addr,
+                                    ?decision,
+                                    phase = "put_probe_reconcile_rate_limited",
+                                    "PUT dispatch: ProbeReconcile refused by the UPDATE rate limiter"
+                                );
+                                return Ok(());
+                            }
+                        }
                         if let Err(err) = put::op_ctx_task::start_relay_probe_reconcile(
                             op_manager.clone(),
                             *id,
@@ -8827,6 +8863,170 @@ mod tests {
             op_manager.interest_manager.outstanding_resync_retries(),
             0,
             "and it must take no node-wide follow-up slot"
+        );
+    }
+
+    /// ANT-2026-0ILTPRIJ: a `PutMsg::ProbeReconcile` delivers a delta that is
+    /// merged like an UPDATE, so it must be charged to the UPDATE rate limiter.
+    /// Before the fix the PUT dispatch went straight to the driver and the
+    /// limiter never saw it. The reconcile has its own class, so a
+    /// `RequestUpdate` right after it from the same sender is still admitted.
+    #[tokio::test]
+    async fn probe_reconcile_is_charged_to_the_update_rate_limiter() {
+        use crate::message::NetMessageV1;
+        use crate::operations::put::PutMsg;
+        use crate::operations::test_utils::MockNetworkBridge;
+        use crate::ring::update_rate_limit::UpdateClass;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let clock = SharedMockTimeSource::new();
+        let config_args = crate::config::ConfigArgs {
+            id: Some("probe-reconcile-rate-limit".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let mut node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        node_config.update_rate_limit_time_source_override =
+            Some(std::sync::Arc::new(clock.clone()));
+
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let crate::node::EventLoopNotificationsReceiver {
+            notifications_receiver: _notifications_receiver,
+            mut op_execution_receiver,
+        } = notification_rx;
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14401".parse().unwrap());
+
+        // One summary-capable neighbour: a reconcile that reaches its driver on
+        // this node (which does not hold the contract) is forwarded to it, and
+        // the forward is what this test observes.
+        let next_hop: SocketAddr = "127.0.0.1:15400".parse().unwrap();
+        let next_hop_key = crate::transport::TransportKeypair::new();
+        assert!(op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.5),
+            next_hop,
+            next_hop_key.public().clone(),
+            false,
+        ));
+        op_manager
+            .ring
+            .connection_manager
+            .record_remote_version(next_hop, Some((0, 2, 200)));
+
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([61u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([62u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:15301".parse().unwrap();
+        let bridge = MockNetworkBridge::new();
+        let mut listener: Box<dyn NetEventRegister> =
+            Box::new(crate::tracing::DynamicRegister::new(vec![]));
+
+        let reconcile = |tx: Transaction| {
+            NetMessageV1::Put(PutMsg::ProbeReconcile {
+                id: tx,
+                key,
+                delta: freenet_stdlib::prelude::StateDelta::from(vec![1u8, 2, 3]),
+                htl: 3,
+                skip_list: Default::default(),
+            })
+        };
+
+        // 1. The first reconcile from a fresh pair is admitted. On the frozen
+        //    clock the pair's reconcile budget then stays spent.
+        let allowed_tx = Transaction::new::<PutMsg>();
+        handle_pure_network_message_v1(
+            reconcile(allowed_tx),
+            Some(sender_addr),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch");
+
+        // 2. A second reconcile from the same sender for the same contract
+        //    inside the interval is refused before its driver.
+        let refused_tx = Transaction::new::<PutMsg>();
+        handle_pure_network_message_v1(
+            reconcile(refused_tx),
+            Some(sender_addr),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a rate-limited drop");
+        assert_eq!(
+            op_manager.ring.update_rate_limiter.rejected_total(),
+            1,
+            "a second ProbeReconcile inside the interval must be refused by \
+             the UPDATE rate limiter"
+        );
+
+        // 3. A routed RequestUpdate from the same sender for the same contract,
+        //    at the same instant, is still admitted: the reconcile did not
+        //    spend the request budget.
+        assert!(
+            op_manager
+                .ring
+                .update_rate_limiter
+                .check_and_record(sender_addr, *key.id(), UpdateClass::Request)
+                .is_allowed(),
+            "a client's UPDATE right after its PUT's reconcile must not be refused"
+        );
+
+        // What reached the event loop: the admitted reconcile was forwarded,
+        // the refused one never was.
+        let mut forwarded = Vec::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !forwarded.contains(&allowed_tx) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, op_execution_receiver.recv()).await {
+                Ok(Some((_reply, msg, _target))) => forwarded.push(*msg.id()),
+                Ok(None) | Err(_) => break,
+            }
+        }
+        while let Ok(Some((_reply, msg, _target))) = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            op_execution_receiver.recv(),
+        )
+        .await
+        {
+            forwarded.push(*msg.id());
+        }
+        assert!(
+            forwarded.contains(&allowed_tx),
+            "control: an admitted ProbeReconcile is forwarded by its driver, \
+             or this test observes nothing; forwarded {forwarded:?}"
+        );
+        assert!(
+            !forwarded.contains(&refused_tx),
+            "a refused ProbeReconcile must not reach its relay driver"
         );
     }
 

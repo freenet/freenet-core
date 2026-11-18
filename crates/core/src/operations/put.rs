@@ -10,6 +10,7 @@
 //! consume them.
 
 pub(crate) mod op_ctx_task;
+pub(crate) mod stream_admission;
 
 pub(crate) use self::messages::{PutMsg, PutStreamingPayload};
 use freenet_stdlib::prelude::*;

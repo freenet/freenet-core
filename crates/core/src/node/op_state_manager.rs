@@ -322,6 +322,16 @@ pub(crate) struct OpManager {
     /// exists primarily for robustness against GC-spawned re-entries
     /// and routing-bloom false-positive retransmissions.
     pub(crate) active_relay_update_txs: Arc<DashSet<Transaction>>,
+    /// `RequestUpdate*` transactions this node has relayed, remembered past
+    /// the driver's lifetime so a request that comes back around a routing
+    /// cycle is dropped (#3911). See
+    /// [`crate::operations::update::recent_requests`].
+    pub(crate) recent_relay_update_requests:
+        Arc<crate::operations::update::recent_requests::RecentRelayedRequests>,
+    /// Per-source and node-wide bound on streaming PUT relay drivers in
+    /// flight. See [`crate::operations::put::stream_admission`].
+    pub(crate) relay_put_stream_admission:
+        Arc<crate::operations::put::stream_admission::RelayStreamAdmission>,
     /// Same role as `active_relay_get_txs` but for PUT relay. PUT
     /// relay has req/response semantics like GET (but forwards once
     /// — no per-hop retry), so amplification risk is comparable.
@@ -411,6 +421,8 @@ impl Clone for OpManager {
             node_identity: self.node_identity,
             active_relay_get_txs: self.active_relay_get_txs.clone(),
             active_relay_update_txs: self.active_relay_update_txs.clone(),
+            recent_relay_update_requests: self.recent_relay_update_requests.clone(),
+            relay_put_stream_admission: self.relay_put_stream_admission.clone(),
             active_relay_put_txs: self.active_relay_put_txs.clone(),
             active_relay_subscribe_txs: self.active_relay_subscribe_txs.clone(),
             active_relay_connect_txs: self.active_relay_connect_txs.clone(),
@@ -855,6 +867,12 @@ impl OpManager {
             node_identity,
             active_relay_get_txs,
             active_relay_update_txs,
+            recent_relay_update_requests: Arc::new(
+                crate::operations::update::recent_requests::RecentRelayedRequests::new(),
+            ),
+            relay_put_stream_admission: Arc::new(
+                crate::operations::put::stream_admission::RelayStreamAdmission::new(),
+            ),
             active_relay_put_txs,
             active_relay_subscribe_txs,
             active_relay_connect_txs,

@@ -571,6 +571,14 @@ async fn drive_client_update(
                 value: updated_value,
             });
 
+            // Record our own request as relayed here, so a routing cycle that
+            // brings it back to this node ends here instead of being relayed
+            // once more (#3911). The return value is irrelevant: `client_tx`
+            // is fresh.
+            let _ = op_manager
+                .recent_relay_update_requests
+                .first_sighting(client_tx, op_manager.ring.time_source.now());
+
             // Fire-and-forget send to target peer.
             let mut ctx = op_manager.op_ctx(client_tx);
             ctx.send_fire_and_forget(target_addr, msg).await?;
@@ -675,6 +683,9 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
 //   3. No `ForwardingAck` → never had one.
 //   4. Per-node dedup gate (`active_relay_update_txs`) drops
 //      duplicate inbound Requests for an in-flight tx.
+//   5. `RequestUpdate*` carries no HTL, so a relay also remembers each
+//      request tx it relayed for at least `recent_requests::RETENTION`
+//      and drops one that returns, which ends a routing cycle (#3911).
 //
 // Migrated wire variants:
 //   - `UpdateMsg::RequestUpdate` (non-streaming relay arm).
@@ -706,11 +717,15 @@ pub(crate) async fn start_relay_request_update(
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    // Note: the Phase 2 per-(sender, contract) rate limit is applied
-    // UPSTREAM at the wire dispatch site in `node.rs` so the same
-    // gate covers all four UPDATE wire variants (RequestUpdate,
-    // BroadcastTo, RequestUpdateStreaming, BroadcastToStreaming)
-    // uniformly. Rejected messages never reach this driver.
+    // Note: the per-(sender, contract) rate limit is applied at the wire
+    // dispatch site in `node.rs`, before this driver, with a separate budget
+    // per `UpdateClass`: the two `RequestUpdate*` opcodes share the Request
+    // class and the four `BroadcastTo*` opcodes the Broadcast class.
+    // Rejected messages never reach this driver.
+
+    if request_already_relayed(&op_manager, incoming_tx, &key, sender_addr) {
+        return Ok(());
+    }
 
     if !op_manager.active_relay_update_txs.insert(incoming_tx) {
         RELAY_UPDATE_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -929,6 +944,51 @@ pub(crate) async fn start_relay_broadcast_to(
         covered,
     ));
     Ok(())
+}
+
+/// Loop bound for routed UPDATE requests (#3911, ANT-2026-B9HNLA3P).
+///
+/// Returns `true`, and the caller drops the message, when this node has
+/// already relayed a `RequestUpdate*` with this transaction id. The wire
+/// variants carry no hops-to-live, so this node-local record is what ends a
+/// request circling peers that do not host its contract. It must be checked
+/// before `active_relay_update_txs`, whose entry is gone by the time a cycle
+/// brings the request back. See [`super::recent_requests`].
+fn request_already_relayed(
+    op_manager: &OpManager,
+    incoming_tx: Transaction,
+    key: &ContractKey,
+    sender_addr: SocketAddr,
+) -> bool {
+    let now = op_manager.ring.time_source.now();
+    if op_manager
+        .recent_relay_update_requests
+        .first_sighting(incoming_tx, now)
+    {
+        return false;
+    }
+    let returned = op_manager.recent_relay_update_requests.returned_total();
+    // Release-visible, but logarithmic in the drop count so a sustained
+    // stream of returning requests does not become a log flood.
+    if returned.is_power_of_two() {
+        tracing::info!(
+            tx = %incoming_tx,
+            %key,
+            %sender_addr,
+            returned_total = returned,
+            phase = "relay_update_request_returned",
+            "UPDATE relay: request already relayed by this node, dropping"
+        );
+    } else {
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            %sender_addr,
+            phase = "relay_update_request_returned",
+            "UPDATE relay: request already relayed by this node, dropping"
+        );
+    }
+    true
 }
 
 /// RAII guard that decrements `RELAY_UPDATE_INFLIGHT`, bumps
@@ -2450,6 +2510,10 @@ pub(crate) async fn start_relay_request_update_streaming(
 ) -> Result<(), OpError> {
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_STREAMING_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    if request_already_relayed(&op_manager, incoming_tx, &key, sender_addr) {
+        return Ok(());
+    }
 
     if !op_manager.active_relay_update_txs.insert(incoming_tx) {
         RELAY_UPDATE_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -8075,5 +8139,143 @@ mod tests {
             Some(StateSummary::from(vec![0u8])),
             "a single zero byte is a real summary, not an absent one"
         );
+    }
+}
+
+/// #3911 / ANT-2026-B9HNLA3P: a `RequestUpdate` that comes back to a relay it
+/// already passed through must not be forwarded again. Drives the real
+/// `start_relay_request_update` against a stubbed event loop.
+#[cfg(test)]
+mod relay_request_loop_tests {
+    use super::*;
+    use crate::operations::route_attempt::driver_test_support::op_manager_with_peers_and_store;
+    use std::time::Duration;
+
+    type Forwards = Arc<parking_lot::Mutex<Vec<(Transaction, Option<SocketAddr>)>>>;
+
+    /// Every forwarded `RequestUpdate` the relay handed to the event loop.
+    fn record_forwards(
+        mut rx: tokio::sync::mpsc::Receiver<crate::node::OpExecutionPayload>,
+    ) -> Forwards {
+        let sent = Forwards::default();
+        let log = sent.clone();
+        tokio::spawn(async move {
+            while let Some((_reply, msg, target)) = rx.recv().await {
+                if let NetMessage::V1(crate::message::NetMessageV1::Update(
+                    UpdateMsg::RequestUpdate { id, .. },
+                )) = msg
+                {
+                    log.lock().push((id, target));
+                }
+            }
+        });
+        sent
+    }
+
+    fn unhosted_key() -> ContractKey {
+        ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([0x39; 32]),
+            freenet_stdlib::prelude::CodeHash::new([0x11; 32]),
+        )
+    }
+
+    async fn relay(op_manager: &Arc<OpManager>, tx: Transaction, from: SocketAddr) {
+        start_relay_request_update(
+            op_manager.clone(),
+            tx,
+            unhosted_key(),
+            RelatedContracts::default(),
+            WrappedState::new(vec![1, 2, 3]),
+            from,
+        )
+        .await
+        .expect("dispatch");
+        // Let the spawned driver finish, so its in-flight entry is released
+        // as it is in production before a cycle brings the request back.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_request_returning_around_a_cycle_is_not_forwarded_again() {
+        let (op_manager, rx, peers, _guards, _store) =
+            op_manager_with_peers_and_store("update-loop-3911", 3).await;
+        let sent = record_forwards(rx);
+        let a = peers[0].socket_addr().expect("addr");
+        let c = peers[2].socket_addr().expect("addr");
+        let tx = Transaction::new::<UpdateMsg>();
+
+        relay(&op_manager, tx, a).await;
+        assert_eq!(
+            sent.lock().len(),
+            1,
+            "precondition: an unhosted contract's request is forwarded once"
+        );
+        assert!(
+            !op_manager.active_relay_update_txs.contains(&tx),
+            "precondition: the driver has exited and released its in-flight entry"
+        );
+
+        // The same request arrives again from another neighbour, as it does
+        // when the forward went round A -> B -> C -> A.
+        relay(&op_manager, tx, c).await;
+        let forwards = sent.lock().clone();
+        assert_eq!(
+            forwards.len(),
+            1,
+            "a request this node already relayed must be dropped, or a cycle of \
+             relays forwards it forever: {forwards:?}"
+        );
+        assert_eq!(op_manager.recent_relay_update_requests.returned_total(), 1);
+
+        // A different request is still relayed.
+        relay(&op_manager, Transaction::new::<UpdateMsg>(), c).await;
+        assert_eq!(sent.lock().len(), 2);
+    }
+
+    /// The streaming variant shares the same record: a `RequestUpdateStreaming`
+    /// whose tx this node already relayed starts no second driver, even after
+    /// the first driver has exited.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_streaming_request_returning_around_a_cycle_starts_no_driver() {
+        let (op_manager, rx, peers, _guards, _store) =
+            op_manager_with_peers_and_store("update-streaming-loop-3911", 3).await;
+        let _sent = record_forwards(rx);
+        let a = peers[0].socket_addr().expect("addr");
+        let c = peers[2].socket_addr().expect("addr");
+        let tx = Transaction::new::<UpdateMsg>();
+
+        let announce = |from: SocketAddr| {
+            start_relay_request_update_streaming(
+                op_manager.clone(),
+                tx,
+                unhosted_key(),
+                crate::transport::peer_connection::StreamId::next(),
+                4096,
+                from,
+            )
+        };
+
+        announce(a).await.expect("dispatch");
+        assert!(
+            op_manager.active_relay_update_txs.contains(&tx),
+            "precondition: the first announcement starts a driver"
+        );
+        // No stream ever arrives: the driver gives up and exits.
+        tokio::time::sleep(Duration::from_secs(180)).await;
+        assert!(
+            !op_manager.active_relay_update_txs.contains(&tx),
+            "precondition: the first driver has exited"
+        );
+
+        announce(c).await.expect("dispatch");
+        // A started driver would still be waiting for its stream here.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !op_manager.active_relay_update_txs.contains(&tx),
+            "a streaming request this node already relayed must start no driver"
+        );
+        assert_eq!(op_manager.recent_relay_update_requests.returned_total(), 1);
     }
 }

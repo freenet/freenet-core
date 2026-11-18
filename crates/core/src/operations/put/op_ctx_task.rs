@@ -1945,6 +1945,11 @@ where
     CB: NetworkBridge + Clone + Send + 'static,
 {
     let key = contract.key();
+    // The sender writes `htl`, so bound it by this node's own limit before
+    // anything reads it, as the GET relay and `drive_relay_probe` do
+    // (ANT-2026-QLQ8OSNJ). Without the clamp the sender chooses how many
+    // nodes the PUT walks.
+    let htl = htl.min(op_manager.ring.max_hops_to_live);
 
     tracing::info!(
         tx = %incoming_tx,
@@ -3342,6 +3347,9 @@ where
     #[cfg(any(test, feature = "testing"))]
     RELAY_PUT_STREAMING_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+    let originator_loopback =
+        Some(upstream_addr) == op_manager.ring.connection_manager.get_own_addr();
+
     if !op_manager.active_relay_put_txs.insert(incoming_tx) {
         RELAY_PUT_STREAMING_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(
@@ -3362,14 +3370,76 @@ where
         return Ok(());
     }
 
+    // Bound how many drivers wait for a stream that has not arrived yet, per
+    // source and node-wide (ANT-2026-16KQ0AS7). The permit covers only the
+    // unclaimed phase; the driver releases it when its claim ends. This node's
+    // own streaming PUT is not counted. Taken after the dedup gate, so a
+    // duplicate neither takes a slot nor evicts anyone.
+    let admission_permit = if originator_loopback {
+        None
+    } else {
+        match op_manager
+            .relay_put_stream_admission
+            .try_admit(upstream_addr)
+        {
+            Ok(permit) => Some(permit),
+            Err(refusal) => {
+                op_manager.active_relay_put_txs.remove(&incoming_tx);
+                let refused = op_manager.relay_put_stream_admission.refused_total();
+                // Release-visible, but logarithmic in the refusal count so a
+                // sustained flood does not become a log flood.
+                if refused.is_power_of_two() {
+                    tracing::info!(
+                        tx = %incoming_tx,
+                        contract = %contract_key,
+                        %upstream_addr,
+                        ?refusal,
+                        refused_total = refused,
+                        unclaimed = op_manager.relay_put_stream_admission.unclaimed(),
+                        phase = "relay_put_streaming_admission_refused",
+                        "PUT streaming relay: too many unclaimed streaming PUTs from this \
+                         source, refusing"
+                    );
+                } else {
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        contract = %contract_key,
+                        %upstream_addr,
+                        ?refusal,
+                        phase = "relay_put_streaming_admission_refused",
+                        "PUT streaming relay: too many unclaimed streaming PUTs from this \
+                         source, refusing"
+                    );
+                }
+                // Answer the upstream, one reply per announcement, so a
+                // streaming originator (which cannot advance to another peer)
+                // fails now instead of waiting out its attempt (#5671).
+                if let Err(err) = relay_put_send_error(
+                    &op_manager,
+                    incoming_tx,
+                    STREAM_ADMISSION_REFUSED_CAUSE.to_string(),
+                    upstream_addr,
+                )
+                .await
+                {
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        %upstream_addr,
+                        error = %err,
+                        "PUT streaming relay: could not report the refusal upstream"
+                    );
+                }
+                return Ok(());
+            }
+        }
+    };
+
     // Routing/hosting attribution (Group C): count this as a genuine relayed
     // PUT, mirroring `start_relay_put`. A direct `PutMsg::RequestStreaming`
     // (or a `PutMsg::Request` that upgrades to streaming on forward) dispatches
     // here, so without this the largest PUT relays were undercounted. Exclude
     // the originator-loopback case (own streaming PUT mapped to
     // `upstream_addr=own_addr`), consistent with the non-streaming path.
-    let originator_loopback =
-        Some(upstream_addr) == op_manager.ring.connection_manager.get_own_addr();
     if !originator_loopback {
         crate::node::network_status::record_relayed_put();
     }
@@ -3394,6 +3464,7 @@ where
 
     GlobalExecutor::spawn(run_relay_put_streaming(
         guard,
+        admission_permit,
         op_manager,
         conn_manager,
         incoming_tx,
@@ -3415,6 +3486,11 @@ struct RelayPutStreamingInflightGuard {
     incoming_tx: Transaction,
 }
 
+/// Cause sent upstream when a streaming PUT announcement is refused, or its
+/// driver evicted, by `relay_put_stream_admission`.
+const STREAM_ADMISSION_REFUSED_CAUSE: &str =
+    "streaming PUT relay: too many streams awaited at this peer";
+
 impl Drop for RelayPutStreamingInflightGuard {
     fn drop(&mut self) {
         self.op_manager
@@ -3428,6 +3504,7 @@ impl Drop for RelayPutStreamingInflightGuard {
 #[allow(clippy::too_many_arguments)]
 async fn run_relay_put_streaming<CB>(
     guard: RelayPutStreamingInflightGuard,
+    admission_permit: Option<super::stream_admission::RelayStreamPermit>,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     incoming_tx: Transaction,
@@ -3446,6 +3523,7 @@ async fn run_relay_put_streaming<CB>(
     let drive_result = drive_relay_put_streaming(
         &op_manager,
         &conn_manager,
+        admission_permit,
         incoming_tx,
         stream_id,
         contract_key,
@@ -3616,6 +3694,10 @@ pub mod relay_stream_fault_injection {
 async fn drive_relay_put_streaming<CB>(
     op_manager: &Arc<OpManager>,
     conn_manager: &CB,
+    // This driver's slot among the drivers still waiting for their stream
+    // (`relay_put_stream_admission`). Released when the claim ends; `None`
+    // for this node's own streaming PUT.
+    mut admission_permit: Option<super::stream_admission::RelayStreamPermit>,
     incoming_tx: Transaction,
     stream_id: StreamId,
     contract_key: ContractKey,
@@ -3628,6 +3710,10 @@ async fn drive_relay_put_streaming<CB>(
 where
     CB: NetworkBridge + Clone + Send + 'static,
 {
+    // Bound the sender-written HTL by this node's limit (ANT-2026-QLQ8OSNJ);
+    // see `drive_relay_put`.
+    let htl = htl.min(op_manager.ring.max_hops_to_live);
+
     tracing::info!(
         tx = %incoming_tx,
         contract = %contract_key,
@@ -3655,11 +3741,66 @@ where
             OpError::OrphanStreamClaimFailed,
         ));
     }
-    let stream_handle = match op_manager
-        .orphan_stream_registry()
-        .claim_or_wait(upstream_addr, stream_id, STREAM_CLAIM_TIMEOUT)
+    let registry = op_manager.orphan_stream_registry();
+    let claim = registry.claim_or_wait(upstream_addr, stream_id, STREAM_CLAIM_TIMEOUT);
+    // Wait for the stream, unless this driver is evicted to admit a newer one
+    // (the node-wide bound in `stream_admission`). On eviction the claim
+    // future is dropped mid-wait and `abandon_claim` below removes what it
+    // left registered.
+    //
+    // `biased;` with the claim arm FIRST: when the stream and the eviction
+    // are both ready in one poll, the stream wins, so a stream that has
+    // already been delivered is never thrown away by an eviction that came
+    // too late to matter. Two arms, each ready at most once, so neither can
+    // starve the other and no per-iteration cap is needed. Cancellation
+    // safety: losing the claim arm drops `claim_or_wait`, which leaves a
+    // dead waiter and its `claimed_streams` entry; `abandon_claim` handles
+    // both.
+    let claim_result = match admission_permit.as_mut() {
+        Some(permit) => tokio::select! {
+            biased;
+            result = claim => Some(result),
+            () = permit.evicted() => None,
+        },
+        None => Some(claim.await),
+    };
+    // The unclaimed phase is over, whatever its outcome.
+    drop(admission_permit);
+    let Some(claim_result) = claim_result else {
+        // Remove the waiter the dropped claim left, and make sure the stream,
+        // if it still arrives, is cancelled at once rather than parked as an
+        // orphan nobody can claim until the orphan GC.
+        registry.abandon_claim(upstream_addr, stream_id);
+        tracing::debug!(
+            tx = %incoming_tx,
+            %stream_id,
+            %upstream_addr,
+            evicted_total = op_manager.relay_put_stream_admission.evicted_total(),
+            phase = "relay_put_streaming_evicted",
+            "PUT streaming relay: evicted while waiting for its stream"
+        );
+        // Answer the upstream now rather than leave it to time out (#5671).
+        // Returned as Ok: the failure is reported here, quietly, instead of by
+        // `run_relay_put_streaming`'s warn-level failure path, which an
+        // eviction flood would turn into a log flood.
+        if let Err(err) = relay_put_send_error(
+            op_manager,
+            incoming_tx,
+            STREAM_ADMISSION_REFUSED_CAUSE.to_string(),
+            upstream_addr,
+        )
         .await
-    {
+        {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %upstream_addr,
+                error = %err,
+                "PUT streaming relay: could not report the eviction upstream"
+            );
+        }
+        return Ok(());
+    };
+    let stream_handle = match claim_result {
         Ok(handle) => handle,
         Err(OrphanStreamError::AlreadyClaimed) => {
             tracing::debug!(
@@ -4855,6 +4996,10 @@ async fn drive_relay_probe_reconcile(
     skip_list: HashSet<SocketAddr>,
     upstream_addr: SocketAddr,
 ) -> Result<(), OpError> {
+    // Bound the sender-written HTL by this node's limit (ANT-2026-QLQ8OSNJ);
+    // see `drive_relay_put`.
+    let htl = htl.min(op_manager.ring.max_hops_to_live);
+
     if op_manager.ring.is_receiving_updates(&key) {
         // Merge via the same path an UPDATE uses; the contract executor
         // fans the change out to the rest of the subscriber mesh
@@ -9422,6 +9567,7 @@ mod streaming_relay_failure_tests {
         let result = drive_relay_put_streaming(
             &op_manager,
             &MockNetworkBridge::new(),
+            None,
             Transaction::new::<PutMsg>(),
             stream_id,
             announced.key(),
@@ -9879,5 +10025,545 @@ mod relay_probe_failure_tests {
             probe_round_trip_timeout(max_htl, max_htl),
             "a wire-supplied HTL must not stretch the wait"
         );
+    }
+}
+
+/// Bounds on what a remote sender controls in the PUT relay: the hops-to-live
+/// it writes (ANT-2026-QLQ8OSNJ) and how many streaming relay drivers its
+/// announcements start (ANT-2026-16KQ0AS7). Drives the real relay entry points
+/// against a stubbed event loop.
+#[cfg(test)]
+mod relay_sender_bound_tests {
+    use super::*;
+    use crate::message::MessageStats;
+    use crate::operations::route_attempt::driver_test_support::op_manager_with_peers_and_store;
+    use crate::operations::test_utils::MockNetworkBridge;
+    use crate::transport::peer_connection::streaming::StreamHandle;
+    use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+    use std::time::Duration;
+
+    type Sent = Arc<parking_lot::Mutex<Vec<(NetMessage, Option<SocketAddr>)>>>;
+
+    /// A version every summary-first gate accepts.
+    const PROBE_CAPABLE_VERSION: (u8, u8, u16) = (0, 2, 200);
+
+    /// Not one of the node's ring connections, so the terminus guard, which
+    /// needs the upstream's location, never ends the walk here.
+    fn upstream() -> SocketAddr {
+        "10.0.0.42:31337".parse().unwrap()
+    }
+
+    /// Record every PUT message handed to the event loop. No waiter is ever
+    /// answered.
+    fn record_sends(mut rx: tokio::sync::mpsc::Receiver<crate::node::OpExecutionPayload>) -> Sent {
+        let sent = Sent::default();
+        let log = sent.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some((reply_tx, msg, target)) = rx.recv().await {
+                if msg.id().transaction_type() == crate::message::TransactionType::Put {
+                    log.lock().push((msg.clone(), target));
+                }
+                held.push(reply_tx);
+            }
+        });
+        sent
+    }
+
+    /// The HTL of the first message for `tx` sent anywhere but upstream.
+    fn forwarded_htl(sent: &Sent, tx: Transaction) -> Option<usize> {
+        sent.lock().iter().find_map(|(msg, target)| {
+            if *target == Some(upstream()) || *msg.id() != tx {
+                return None;
+            }
+            match msg {
+                NetMessage::V1(NetMessageV1::Put(
+                    PutMsg::Request { htl, .. }
+                    | PutMsg::RequestStreaming { htl, .. }
+                    | PutMsg::ProbeReconcile { htl, .. },
+                )) => Some(*htl),
+                _ => None,
+            }
+        })
+    }
+
+    async fn settle() {
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn assert_clamped(label: &str, op_manager: &OpManager, forwarded: Option<usize>) {
+        let max_htl = op_manager.ring.max_hops_to_live;
+        assert!(max_htl > 0, "precondition: a non-zero HTL limit");
+        assert_eq!(
+            forwarded,
+            Some(max_htl - 1),
+            "{label}: a wire HTL above this node's max_hops_to_live must be clamped \
+             to it before it is decremented and forwarded"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_put_clamps_an_oversized_wire_htl() {
+        let label = "relay-put-htl-clamp";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let sent = record_sends(rx);
+        let tx = Transaction::new::<PutMsg>();
+        start_relay_put(
+            op_manager.clone(),
+            MockNetworkBridge::new(),
+            tx,
+            crate::operations::test_utils::make_test_contract(label.as_bytes()),
+            RelatedContracts::default(),
+            WrappedState::new(vec![7u8; 64]),
+            usize::MAX,
+            HashSet::new(),
+            upstream(),
+        )
+        .await
+        .expect("the relay starts");
+        settle().await;
+        assert_clamped("PUT relay", &op_manager, forwarded_htl(&sent, tx));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_put_streaming_clamps_an_oversized_wire_htl() {
+        let label = "relay-put-streaming-htl-clamp";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let sent = record_sends(rx);
+        let contract = crate::operations::test_utils::make_test_contract(label.as_bytes());
+        // Above the streaming threshold: a smaller payload is not piped onward.
+        let bytes = bincode::serialize(&PutStreamingPayload {
+            contract: contract.clone(),
+            related_contracts: RelatedContracts::default(),
+            value: WrappedState::new(vec![7u8; op_manager.streaming_threshold + 4096]),
+        })
+        .expect("serialize payload");
+        let stream_id = StreamId::next();
+        let handle = StreamHandle::new(stream_id, bytes.len() as u64);
+        for (i, chunk) in bytes.chunks(FRAGMENT_PAYLOAD_SIZE).enumerate() {
+            handle
+                .push_fragment(i as u32 + 1, bytes::Bytes::copy_from_slice(chunk))
+                .expect("fragment accepted");
+        }
+        op_manager
+            .orphan_stream_registry()
+            .register_test_orphan(upstream(), stream_id, handle);
+
+        let tx = Transaction::new::<PutMsg>();
+        start_relay_put_streaming(
+            op_manager.clone(),
+            MockNetworkBridge::new(),
+            tx,
+            stream_id,
+            contract.key(),
+            bytes.len() as u64,
+            usize::MAX,
+            HashSet::new(),
+            false,
+            upstream(),
+        )
+        .await
+        .expect("the relay starts");
+        settle().await;
+        assert_clamped("streaming PUT relay", &op_manager, forwarded_htl(&sent, tx));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_probe_reconcile_clamps_an_oversized_wire_htl() {
+        let label = "relay-reconcile-htl-clamp";
+        let (op_manager, rx, peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        for peer in &peers {
+            op_manager.ring.connection_manager.record_remote_version(
+                peer.socket_addr().expect("peer address"),
+                Some(PROBE_CAPABLE_VERSION),
+            );
+        }
+        let sent = record_sends(rx);
+        let key = crate::operations::test_utils::make_test_contract(label.as_bytes()).key();
+        assert!(
+            !op_manager.ring.is_receiving_updates(&key),
+            "precondition: this node does not merge, so it forwards"
+        );
+        let tx = Transaction::new::<PutMsg>();
+        drive_relay_probe_reconcile(
+            &op_manager,
+            tx,
+            key,
+            StateDelta::from(vec![1u8, 2, 3]),
+            usize::MAX,
+            HashSet::new(),
+            upstream(),
+        )
+        .await
+        .expect("the reconcile relay runs");
+        settle().await;
+        assert_clamped(
+            "ProbeReconcile relay",
+            &op_manager,
+            forwarded_htl(&sent, tx),
+        );
+    }
+
+    /// Announce a streaming PUT of `key` from `from` under `tx`; the stream is
+    /// never sent unless the caller registers it.
+    async fn announce(
+        op_manager: &Arc<OpManager>,
+        tx: Transaction,
+        stream_id: StreamId,
+        key: ContractKey,
+        from: SocketAddr,
+    ) {
+        start_relay_put_streaming(
+            op_manager.clone(),
+            MockNetworkBridge::new(),
+            tx,
+            stream_id,
+            key,
+            4096,
+            3,
+            HashSet::new(),
+            false,
+            from,
+        )
+        .await
+        .expect("an announcement is dispatched or refused quietly");
+    }
+
+    /// The `PutMsg::Error`s this node sent to `to` for `tx`.
+    fn errors_to(sent: &Sent, tx: Transaction, to: SocketAddr) -> usize {
+        sent.lock()
+            .iter()
+            .filter(|(msg, target)| {
+                *target == Some(to)
+                    && *msg.id() == tx
+                    && matches!(msg, NetMessage::V1(NetMessageV1::Put(PutMsg::Error { .. })))
+            })
+            .count()
+    }
+
+    /// Announcements whose streams never arrive must not start an unbounded
+    /// number of waiting drivers, however many ports the announcing host uses.
+    /// Each refused announcement is answered with one `PutMsg::Error`, so its
+    /// upstream does not wait out its attempt.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn streaming_announcements_from_one_host_are_bounded() {
+        use super::super::stream_admission::PER_SOURCE_CAP;
+
+        let label = "relay-put-streaming-admission";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let sent = record_sends(rx);
+        let key = crate::operations::test_utils::make_test_contract(label.as_bytes()).key();
+
+        let mut refused = Vec::new();
+        for port in 0..(PER_SOURCE_CAP as u16 + 20) {
+            let from = SocketAddr::new([203, 0, 113, 7].into(), 40_000 + port);
+            let tx = Transaction::new::<PutMsg>();
+            announce(&op_manager, tx, StreamId::next(), key, from).await;
+            if usize::from(port) >= PER_SOURCE_CAP {
+                refused.push((tx, from));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            op_manager.active_relay_put_txs.len(),
+            PER_SOURCE_CAP,
+            "one host may hold at most PER_SOURCE_CAP waiting streaming drivers"
+        );
+        assert_eq!(op_manager.relay_put_stream_admission.refused_total(), 20);
+        for (tx, from) in &refused {
+            assert_eq!(
+                errors_to(&sent, *tx, *from),
+                1,
+                "a refused announcement is answered with exactly one PutMsg::Error"
+            );
+        }
+
+        announce(
+            &op_manager,
+            Transaction::new::<PutMsg>(),
+            StreamId::next(),
+            key,
+            SocketAddr::new([203, 0, 113, 8].into(), 40_000),
+        )
+        .await;
+        assert_eq!(
+            op_manager.active_relay_put_txs.len(),
+            PER_SOURCE_CAP + 1,
+            "another host still gets a driver"
+        );
+
+        // When the claims time out the drivers end and their slots come back.
+        tokio::time::sleep(STREAM_CLAIM_TIMEOUT + Duration::from_secs(5)).await;
+        assert_eq!(op_manager.relay_put_stream_admission.unclaimed(), 0);
+        assert!(op_manager.active_relay_put_txs.is_empty());
+    }
+
+    /// At the node-wide cap a new announcement is admitted and the OLDEST
+    /// unclaimed driver is evicted: it ends, answers its upstream with one
+    /// `PutMsg::Error`, and frees its slot. A full set of announcements from
+    /// many sources therefore cannot lock out a newcomer.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn at_the_node_wide_cap_the_oldest_unclaimed_driver_is_evicted() {
+        use super::super::stream_admission::{NODE_WIDE_CAP, PER_SOURCE_CAP};
+
+        let label = "relay-put-streaming-eviction";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let sent = record_sends(rx);
+        let key = crate::operations::test_utils::make_test_contract(label.as_bytes()).key();
+
+        let mut admitted = Vec::new();
+        for i in 0..NODE_WIDE_CAP {
+            let source = u8::try_from(i / PER_SOURCE_CAP).expect("few sources");
+            let from = SocketAddr::new([198, 51, 100, source].into(), 1000 + i as u16);
+            let tx = Transaction::new::<PutMsg>();
+            let stream_id = StreamId::next();
+            announce(&op_manager, tx, stream_id, key, from).await;
+            admitted.push((tx, from, stream_id));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            op_manager.relay_put_stream_admission.unclaimed(),
+            NODE_WIDE_CAP
+        );
+
+        let newcomer = Transaction::new::<PutMsg>();
+        let newcomer_from: SocketAddr = "192.0.2.77:5000".parse().unwrap();
+        announce(&op_manager, newcomer, StreamId::next(), key, newcomer_from).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (oldest_tx, oldest_from, oldest_stream) = admitted[0];
+        // The evicted driver deregistered its claim: its stream, arriving now,
+        // is cancelled at once instead of parking as an unclaimable orphan.
+        let registry = op_manager.orphan_stream_registry();
+        let orphans_before = registry.orphan_count();
+        let late = StreamHandle::new(oldest_stream, 64);
+        registry.register_test_orphan(oldest_from, oldest_stream, late.clone());
+        assert!(
+            late.is_cancelled(),
+            "the evicted driver's late stream is cancelled"
+        );
+        assert_eq!(registry.orphan_count(), orphans_before);
+        assert_eq!(op_manager.relay_put_stream_admission.evicted_total(), 1);
+        assert_eq!(
+            op_manager.relay_put_stream_admission.unclaimed(),
+            NODE_WIDE_CAP
+        );
+        assert!(
+            op_manager.active_relay_put_txs.contains(&newcomer),
+            "the newcomer is admitted"
+        );
+        assert!(
+            !op_manager.active_relay_put_txs.contains(&oldest_tx),
+            "the evicted driver has ended"
+        );
+        assert_eq!(
+            errors_to(&sent, oldest_tx, oldest_from),
+            1,
+            "the evicted driver answers its upstream once"
+        );
+        let (second_tx, second_from, _) = admitted[1];
+        assert!(op_manager.active_relay_put_txs.contains(&second_tx));
+        assert_eq!(errors_to(&sent, second_tx, second_from), 0);
+    }
+
+    /// When a driver's stream and its eviction become ready together, the
+    /// stream wins: the driver goes on with it, and is not answered as
+    /// evicted. Repeated so an unordered select would be caught (each round
+    /// is a coin flip without `biased;`).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_stream_delivered_as_its_driver_is_evicted_is_kept() {
+        use super::super::stream_admission::{NODE_WIDE_CAP, PER_SOURCE_CAP};
+
+        let label = "relay-put-streaming-eviction-race";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let sent = record_sends(rx);
+        let key = crate::operations::test_utils::make_test_contract(label.as_bytes()).key();
+
+        let mut admitted = std::collections::VecDeque::new();
+        for i in 0..NODE_WIDE_CAP {
+            let source = u8::try_from(i / PER_SOURCE_CAP).expect("few sources");
+            let from = SocketAddr::new([198, 51, 100, source].into(), 1000 + i as u16);
+            let tx = Transaction::new::<PutMsg>();
+            let stream_id = StreamId::next();
+            announce(&op_manager, tx, stream_id, key, from).await;
+            admitted.push_back((tx, from, stream_id));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        const ROUNDS: usize = 24;
+        for round in 0..ROUNDS {
+            let (tx, from, stream_id) = admitted.pop_front().expect("an admitted driver");
+            // Deliver the oldest driver's stream and, before it runs again,
+            // admit a newcomer that evicts it. Its claim and its eviction are
+            // then both ready on its next poll.
+            let bytes = vec![0xABu8; 64];
+            let handle = StreamHandle::new(stream_id, bytes.len() as u64);
+            handle
+                .push_fragment(1, bytes::Bytes::from(bytes))
+                .expect("fragment accepted");
+            op_manager
+                .orphan_stream_registry()
+                .register_test_orphan(from, stream_id, handle);
+            let newcomer_from = SocketAddr::new(
+                [192, 0, 2, 200].into(),
+                2000 + u16::try_from(round).unwrap(),
+            );
+            let newcomer_stream = StreamId::next();
+            let newcomer = Transaction::new::<PutMsg>();
+            announce(&op_manager, newcomer, newcomer_stream, key, newcomer_from).await;
+            admitted.push_back((newcomer, newcomer_from, newcomer_stream));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            let evicted_replies = sent
+                .lock()
+                .iter()
+                .filter(|(msg, target)| {
+                    *target == Some(from)
+                        && *msg.id() == tx
+                        && matches!(
+                            msg,
+                            NetMessage::V1(NetMessageV1::Put(PutMsg::Error { cause, .. }))
+                                if cause == STREAM_ADMISSION_REFUSED_CAUSE
+                        )
+                })
+                .count();
+            assert_eq!(
+                evicted_replies, 0,
+                "round {round}: a driver whose stream was already delivered must \
+                 take the stream, not be answered as evicted"
+            );
+        }
+    }
+
+    /// The permit covers only the unclaimed phase: once the stream is claimed
+    /// the slot is free, while the driver goes on assembling and forwarding.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_admission_slot_is_released_when_the_stream_is_claimed() {
+        let label = "relay-put-streaming-claimed-release";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let _sent = record_sends(rx);
+        let contract = crate::operations::test_utils::make_test_contract(label.as_bytes());
+        let bytes = bincode::serialize(&PutStreamingPayload {
+            contract: contract.clone(),
+            related_contracts: RelatedContracts::default(),
+            value: WrappedState::new(vec![7u8; op_manager.streaming_threshold + 4096]),
+        })
+        .expect("serialize payload");
+        let stream_id = StreamId::next();
+        let handle = StreamHandle::new(stream_id, bytes.len() as u64);
+        for (i, chunk) in bytes.chunks(FRAGMENT_PAYLOAD_SIZE).enumerate() {
+            handle
+                .push_fragment(i as u32 + 1, bytes::Bytes::copy_from_slice(chunk))
+                .expect("fragment accepted");
+        }
+        op_manager
+            .orphan_stream_registry()
+            .register_test_orphan(upstream(), stream_id, handle);
+
+        let tx = Transaction::new::<PutMsg>();
+        start_relay_put_streaming(
+            op_manager.clone(),
+            MockNetworkBridge::new(),
+            tx,
+            stream_id,
+            contract.key(),
+            bytes.len() as u64,
+            3,
+            HashSet::new(),
+            false,
+            upstream(),
+        )
+        .await
+        .expect("the relay starts");
+        settle().await;
+        assert!(
+            op_manager.active_relay_put_txs.contains(&tx),
+            "precondition: the driver is still running (waiting for its downstream)"
+        );
+        assert_eq!(
+            op_manager.relay_put_stream_admission.unclaimed(),
+            0,
+            "a claimed stream no longer holds an admission slot"
+        );
+    }
+
+    /// A duplicate announcement for an in-flight transaction takes no slot,
+    /// and this node's own streaming PUT (originator loopback) is not counted.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn duplicates_and_this_nodes_own_puts_take_no_admission_slot() {
+        let label = "relay-put-streaming-exemptions";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let _sent = record_sends(rx);
+        let key = crate::operations::test_utils::make_test_contract(label.as_bytes()).key();
+
+        let tx = Transaction::new::<PutMsg>();
+        announce(&op_manager, tx, StreamId::next(), key, upstream()).await;
+        assert_eq!(op_manager.relay_put_stream_admission.unclaimed(), 1);
+        announce(&op_manager, tx, StreamId::next(), key, upstream()).await;
+        assert_eq!(
+            op_manager.relay_put_stream_admission.unclaimed(),
+            1,
+            "a duplicate of an in-flight tx is dropped by the dedup gate before \
+             admission"
+        );
+
+        let own = op_manager
+            .ring
+            .connection_manager
+            .get_own_addr()
+            .expect("own address");
+        let own_tx = Transaction::new::<PutMsg>();
+        announce(&op_manager, own_tx, StreamId::next(), key, own).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            op_manager.active_relay_put_txs.contains(&own_tx),
+            "precondition: the loopback driver is waiting for its stream"
+        );
+        assert_eq!(
+            op_manager.relay_put_stream_admission.unclaimed(),
+            1,
+            "this node's own streaming PUT takes no admission slot"
+        );
+
+        // The claim timeout ends the waiting drivers and frees the slot.
+        tokio::time::sleep(STREAM_CLAIM_TIMEOUT + Duration::from_secs(5)).await;
+        assert_eq!(op_manager.relay_put_stream_admission.unclaimed(), 0);
+    }
+
+    /// An HTL at or below this node's limit is forwarded decremented by one,
+    /// as before the clamp.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_put_forwards_an_htl_within_the_limit_unchanged_but_for_the_hop() {
+        let label = "relay-put-htl-within-limit";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let sent = record_sends(rx);
+        let htl = op_manager.ring.max_hops_to_live - 3;
+        let tx = Transaction::new::<PutMsg>();
+        start_relay_put(
+            op_manager.clone(),
+            MockNetworkBridge::new(),
+            tx,
+            crate::operations::test_utils::make_test_contract(label.as_bytes()),
+            RelatedContracts::default(),
+            WrappedState::new(vec![7u8; 64]),
+            htl,
+            HashSet::new(),
+            upstream(),
+        )
+        .await
+        .expect("the relay starts");
+        settle().await;
+        assert_eq!(forwarded_htl(&sent, tx), Some(htl - 1));
     }
 }
