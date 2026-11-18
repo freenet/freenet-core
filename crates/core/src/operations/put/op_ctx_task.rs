@@ -3374,6 +3374,7 @@ where
                         %upstream_addr,
                         ?refusal,
                         refused_total = refused,
+                        in_flight = op_manager.relay_put_stream_admission.in_flight(),
                         phase = "relay_put_streaming_admission_refused",
                         "PUT streaming relay: too many streaming PUTs in flight, dropping"
                     );

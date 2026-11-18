@@ -959,13 +959,27 @@ fn request_already_relayed(
     {
         return false;
     }
-    tracing::debug!(
-        tx = %incoming_tx,
-        %key,
-        %sender_addr,
-        phase = "relay_update_request_returned",
-        "UPDATE relay: request already relayed by this node, dropping"
-    );
+    let returned = op_manager.recent_relay_update_requests.returned_total();
+    // Release-visible, but logarithmic in the drop count so a sustained
+    // stream of returning requests does not become a log flood.
+    if returned.is_power_of_two() {
+        tracing::info!(
+            tx = %incoming_tx,
+            %key,
+            %sender_addr,
+            returned_total = returned,
+            phase = "relay_update_request_returned",
+            "UPDATE relay: request already relayed by this node, dropping"
+        );
+    } else {
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            %sender_addr,
+            phase = "relay_update_request_returned",
+            "UPDATE relay: request already relayed by this node, dropping"
+        );
+    }
     true
 }
 
@@ -8198,12 +8212,12 @@ mod relay_request_loop_tests {
         // The same request arrives again from another neighbour, as it does
         // when the forward went round A -> B -> C -> A.
         relay(&op_manager, tx, c).await;
+        let forwards = sent.lock().clone();
         assert_eq!(
-            sent.lock().len(),
+            forwards.len(),
             1,
             "a request this node already relayed must be dropped, or a cycle of \
-             relays forwards it forever: {:?}",
-            sent.lock()
+             relays forwards it forever: {forwards:?}"
         );
         assert_eq!(op_manager.recent_relay_update_requests.returned_total(), 1);
 

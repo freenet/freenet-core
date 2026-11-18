@@ -8926,14 +8926,23 @@ mod tests {
             "precondition: the first request for a fresh pair is allowed"
         );
 
-        handle_pure_network_message_v1(
+        // A dispatched reconcile starts its driver, which first claims the tx in
+        // `active_relay_put_txs`. On this current-thread runtime the spawned
+        // driver has not run yet when the dispatch returns, so the entry shows
+        // whether the dispatch started a driver.
+        let reconcile = |tx: Transaction| {
             NetMessageV1::Put(PutMsg::ProbeReconcile {
-                id: Transaction::new::<PutMsg>(),
+                id: tx,
                 key,
                 delta: freenet_stdlib::prelude::StateDelta::from(vec![1u8, 2, 3]),
                 htl: 3,
                 skip_list: Default::default(),
-            }),
+            })
+        };
+
+        let refused_tx = Transaction::new::<PutMsg>();
+        handle_pure_network_message_v1(
+            reconcile(refused_tx),
             Some(sender_addr),
             op_manager.clone(),
             bridge.clone(),
@@ -8942,12 +8951,33 @@ mod tests {
         )
         .await
         .expect("dispatch must not error on a rate-limited drop");
-
         assert_eq!(
             op_manager.ring.update_rate_limiter.rejected_total(),
             1,
             "a ProbeReconcile from a sender whose request budget for this \
-             contract is spent must be refused by the UPDATE rate limiter"
+             contract is spent must be charged to the UPDATE rate limiter"
+        );
+        assert!(
+            !op_manager.active_relay_put_txs.contains(&refused_tx),
+            "a refused ProbeReconcile must not reach its relay driver"
+        );
+
+        // Control: a sender with budget left is dispatched, so the observation
+        // above is about the refusal and not about the harness.
+        let allowed_tx = Transaction::new::<PutMsg>();
+        handle_pure_network_message_v1(
+            reconcile(allowed_tx),
+            Some("127.0.0.1:15302".parse().unwrap()),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch");
+        assert!(
+            op_manager.active_relay_put_txs.contains(&allowed_tx),
+            "an allowed ProbeReconcile starts its relay driver"
         );
     }
 
