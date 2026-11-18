@@ -610,7 +610,8 @@ state); `sent_delta` / `sent_full` (handed to the bridge); the skips
 `_egress_abandoned`, `wire_unobserved` (QUIC path), `wire_send_failed`;
 `fanout_event_dropped` / `heal_event_dropped` (`try_notify` refused); `heal_target` (a heal's leg,
 registered when its peer resolves); and the receiver's `rx_dedup`,
-`rx_already_applied`, `rx_backoff`.
+`rx_already_applied`, `rx_backoff`, `rx_not_hosted` (a broadcast for a
+contract this node does not host, skipped before the merge).
 
 `send_failed` is a leg the bridge refused (the send or stream dispatch
 returned `Err`, or the payload did not serialize); that leg has no `sent_*`.

@@ -200,12 +200,15 @@ pub(crate) enum PropagationEvent {
     /// Receiver: an inbound broadcast skipped by the merge-failure backoff
     /// (per-sender cooldown or a known-failed payload).
     RxBackoff,
+    /// Receiver: an inbound broadcast skipped because this node does not host
+    /// the contract (`Ring::may_merge_relayed_update`), so it was not merged.
+    RxNotHosted,
 }
 
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 25] = [
+    pub(crate) const ALL: [PropagationEvent; 26] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -231,6 +234,7 @@ impl PropagationEvent {
         PropagationEvent::RxDedup,
         PropagationEvent::RxAlreadyApplied,
         PropagationEvent::RxBackoff,
+        PropagationEvent::RxNotHosted,
     ];
 
     pub(crate) const COUNT: usize = Self::ALL.len();
@@ -262,6 +266,7 @@ impl PropagationEvent {
             PropagationEvent::RxDedup => 22,
             PropagationEvent::RxAlreadyApplied => 23,
             PropagationEvent::RxBackoff => 24,
+            PropagationEvent::RxNotHosted => 25,
         }
     }
 
@@ -275,6 +280,7 @@ impl PropagationEvent {
             PropagationEvent::RxDedup
                 | PropagationEvent::RxAlreadyApplied
                 | PropagationEvent::RxBackoff
+                | PropagationEvent::RxNotHosted
         )
     }
 
@@ -320,6 +326,7 @@ impl PropagationEvent {
             PropagationEvent::RxDedup => "rx_dedup",
             PropagationEvent::RxAlreadyApplied => "rx_already_applied",
             PropagationEvent::RxBackoff => "rx_backoff",
+            PropagationEvent::RxNotHosted => "rx_not_hosted",
         }
     }
 }
@@ -769,6 +776,7 @@ impl UpdatePropagationStats {
             rx_dedup = e.get(PropagationEvent::RxDedup),
             rx_already_applied = e.get(PropagationEvent::RxAlreadyApplied),
             rx_backoff = e.get(PropagationEvent::RxBackoff),
+            rx_not_hosted = e.get(PropagationEvent::RxNotHosted),
             window_s = SUMMARY_WINDOW.as_secs(),
             phase = "summary",
             "update_propagation_summary"
@@ -808,6 +816,7 @@ impl UpdatePropagationStats {
                 rx_dedup = e.get(PropagationEvent::RxDedup),
                 rx_already_applied = e.get(PropagationEvent::RxAlreadyApplied),
                 rx_backoff = e.get(PropagationEvent::RxBackoff),
+                rx_not_hosted = e.get(PropagationEvent::RxNotHosted),
                 phase = "summary_contract",
                 "update_propagation_summary contract detail"
             );
@@ -1598,6 +1607,7 @@ mod tests {
             PropagationEvent::RxDedup,
             PropagationEvent::RxAlreadyApplied,
             PropagationEvent::RxBackoff,
+            PropagationEvent::RxNotHosted,
         ] {
             assert!(rx.is_received());
             for i in 0..MAX_TRACKED_CONTRACTS + 1 {
@@ -1647,6 +1657,7 @@ mod tests {
                 PropagationEvent::RxDedup
                     | PropagationEvent::RxAlreadyApplied
                     | PropagationEvent::RxBackoff
+                    | PropagationEvent::RxNotHosted
             );
             assert_eq!(ev.is_received(), rx, "{ev:?}");
         }
