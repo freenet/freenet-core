@@ -5529,6 +5529,15 @@ impl GlobalRng {
         THREAD_INDEX.with(|idx| idx.set(Some(0)));
     }
 
+    /// Give the current thread index `idx`, as if it were the `idx`-th
+    /// thread to ask. Only for a fresh thread that has not asked yet: a
+    /// thread-local derived from the index (the stream-id counter, the nonce
+    /// counter) is initialized on first use and does not see a later change.
+    #[cfg(test)]
+    pub(crate) fn pin_thread_index_for_test(idx: u64) {
+        THREAD_INDEX.with(|c| c.set(Some(idx)));
+    }
+
     /// Clears the simulation seed, reverting to system RNG.
     pub fn clear_seed() {
         THREAD_SEED.with(|s| s.set(None));

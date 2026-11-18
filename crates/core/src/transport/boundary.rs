@@ -150,9 +150,10 @@ impl StreamId {
     }
 
     /// A fresh id for a stream a transport opens for its own purposes (the
-    /// UDP transport's oversized messages). Distinct from ids from
-    /// [`Self::next`] until the shared counter passes 2^31 (see the type
-    /// docs).
+    /// UDP transport's oversized messages). It never has the top bit, so it
+    /// is always distinct from ids from [`Self::next`]. The counter is
+    /// already kept below the bit; the mask here keeps that true at the one
+    /// place receivers depend on it, whatever the counter does.
     pub(crate) fn next_transport_internal() -> Self {
         Self(next_stream_counter() & COUNTER_MASK)
     }
@@ -855,7 +856,7 @@ mod stream_id_tests {
     #[test]
     fn stream_id_values_are_unchanged() {
         StreamId::reset_counter();
-        let base = (crate::config::GlobalRng::thread_index() as u32) * 100_000;
+        let base = super::block_start(crate::config::GlobalRng::thread_index());
         let internal = StreamId::next_transport_internal();
         let named = StreamId::next();
         let internal_again = StreamId::next_transport_internal();
@@ -875,6 +876,13 @@ mod stream_id_tests {
     /// logged stream ids.
     #[test]
     fn transport_internal_ids_never_carry_the_caller_named_bit() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                StreamId::reset_counter();
+            }
+        }
+        let _reset = Reset;
         for idx in [
             0u64,
             21_474,
@@ -895,9 +903,37 @@ mod stream_id_tests {
         }
         // The counter wraps inside the 31-bit space instead of into the bit.
         super::STREAM_ID_COUNTER.with(|c| c.set(super::COUNTER_MASK));
+        assert_eq!(StreamId::next_transport_internal().0, super::COUNTER_MASK);
+        assert_eq!(
+            super::STREAM_ID_COUNTER.with(|c| c.get()),
+            0,
+            "wrapped to 0"
+        );
         assert!(!StreamId::next_transport_internal().is_caller_named());
-        assert!(!StreamId::next_transport_internal().is_caller_named());
-        StreamId::reset_counter();
+    }
+
+    /// Every thread index below 21,475 keeps the block start it always had,
+    /// `idx * 100_000`, so ids from young nodes and simulations are unchanged.
+    #[test]
+    fn block_starts_below_the_old_overflow_are_unchanged() {
+        for idx in 0u64..21_475 {
+            assert_eq!(super::block_start(idx), idx as u32 * 100_000, "idx {idx}");
+        }
+    }
+
+    /// The counter a real thread starts with comes from the thread-local
+    /// initializer, not `reset_counter`. A fresh thread whose index is past
+    /// 21,475 must still start below the caller-named bit.
+    #[test]
+    fn a_new_thread_with_a_high_index_starts_below_the_caller_named_bit() {
+        std::thread::spawn(|| {
+            crate::config::GlobalRng::pin_thread_index_for_test(24_160);
+            let first = StreamId::next_transport_internal();
+            assert!(!first.is_caller_named(), "{first:?}");
+            assert_eq!(first.0, super::block_start(24_160));
+        })
+        .join()
+        .unwrap();
     }
 
     /// A `StreamId` is serialized as its bare `u32`, as before.

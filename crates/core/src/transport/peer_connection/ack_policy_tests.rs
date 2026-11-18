@@ -2712,6 +2712,35 @@ async fn a_legacy_stream_completed_by_its_task_is_remembered() {
     assert!(holds_no_state(&e, id), "not started again");
 }
 
+/// #6143, the sender's side: an oversized message sent on UDP from a thread
+/// whose index is past 21,475 goes out as fragments of a transport-internal
+/// stream, without the caller-named bit. Before the fix every such fragment
+/// carried the bit, so the receiver parked the message as an operations
+/// stream nobody claims.
+#[tokio::test(start_paused = true)]
+async fn an_oversized_send_from_a_long_running_thread_is_not_caller_named() {
+    let mut e = single(CAPABLE);
+    StreamId::reset_counter_as_thread(24_160);
+    let sent = e.conn.send_serialized(vec![7u8; 4000]).await;
+    StreamId::reset_counter();
+    sent.unwrap();
+    let mut ids = Vec::new();
+    for _ in 0..50 {
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        for message in e.drain_sent() {
+            if let SymmetricMessagePayload::StreamFragment { stream_id, .. } = message.payload {
+                ids.push(stream_id);
+            }
+        }
+        if !ids.is_empty() {
+            break;
+        }
+    }
+    assert!(!ids.is_empty(), "the message went out as a stream");
+    assert!(ids.iter().all(|id| !id.is_caller_named()), "{ids:?}");
+}
+
 /// #6143: an oversized message sent from a thread whose index is past
 /// 21,475, which every node reaches after a few days of uptime, is still
 /// reassembled and delivered. Before the fix its transport-internal id carried
