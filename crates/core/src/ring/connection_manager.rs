@@ -3794,6 +3794,21 @@ mod tests {
     /// Asserts the gate DISCRIMINATES rather than always-rejecting — an
     /// always-false gate would pass a test that only checked the unknown case,
     /// and the feature would be silently inert.
+    /// The send gate for the ack-requested variants (#6143): fail closed on an
+    /// unknown or pre-floor version, open at the floor.
+    #[test]
+    fn supports_confirmed_delivery_gate_discriminates_by_version() {
+        let cm = make_connection_manager(Some(make_addr(9300)), 1, 10, false);
+        let unknown = make_addr(9301);
+        assert!(!cm.supports_confirmed_delivery(unknown));
+        let pre_floor = make_addr(9302);
+        cm.record_remote_version(pre_floor, Some((0, 2, 160)));
+        assert!(!cm.supports_confirmed_delivery(pre_floor));
+        let at_floor = make_addr(9303);
+        cm.record_remote_version(at_floor, Some(crate::node::CONFIRMED_DELIVERY_MIN_VERSION));
+        assert!(cm.supports_confirmed_delivery(at_floor));
+    }
+
     #[test]
     fn supports_broadcast_target_list_gate_discriminates_by_version() {
         let cm = make_connection_manager(Some(make_addr(9200)), 1, 10, false);

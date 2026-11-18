@@ -67,6 +67,8 @@ pub(crate) use network_bridge::p2p_protoc::{
     version_supports_broadcast_target_list, version_supports_confirmed_delivery,
     version_supports_hash_first_summaries, version_supports_summary_first_put,
 };
+// The confirmed-delivery sweep resends a full state it reads here (#6143).
+pub(crate) use network_bridge::broadcast_queue::get_contract_snapshot as broadcast_contract_snapshot;
 // The visited-peers bloom gates its index check on the handshake floor (#5994).
 pub(crate) use network_bridge::p2p_protoc::parse_crate_version;
 // Test-only: the release-timing marker has no runtime reader by design (see
@@ -1930,8 +1932,17 @@ where
                     | update::UpdateMsg::RequestUpdateStreaming { key, .. }
                     | update::UpdateMsg::BroadcastToStreaming { key, .. }
                     | update::UpdateMsg::BroadcastToV2 { key, .. }
-                    | update::UpdateMsg::BroadcastToStreamingV2 { key, .. } => *key,
+                    | update::UpdateMsg::BroadcastToStreamingV2 { key, .. }
+                    | update::UpdateMsg::BroadcastToAckRequested { key, .. }
+                    | update::UpdateMsg::BroadcastToStreamingAckRequested { key, .. } => *key,
                 };
+                // #6143: the sender asked for a `BroadcastAck`. Read once so the
+                // two pre-driver drop paths below can answer it too.
+                let ack_requested = matches!(
+                    op,
+                    update::UpdateMsg::BroadcastToAckRequested { .. }
+                        | update::UpdateMsg::BroadcastToStreamingAckRequested { .. }
+                );
 
                 // Which budget this message is charged against (#5510).
                 // Matched exhaustively, and the four broadcast opcodes map
@@ -1955,7 +1966,9 @@ where
                     update::UpdateMsg::BroadcastTo { .. }
                     | update::UpdateMsg::BroadcastToV2 { .. }
                     | update::UpdateMsg::BroadcastToStreaming { .. }
-                    | update::UpdateMsg::BroadcastToStreamingV2 { .. } => {
+                    | update::UpdateMsg::BroadcastToStreamingV2 { .. }
+                    | update::UpdateMsg::BroadcastToAckRequested { .. }
+                    | update::UpdateMsg::BroadcastToStreamingAckRequested { .. } => {
                         crate::ring::update_rate_limit::UpdateClass::Broadcast
                     }
                 };
@@ -2167,6 +2180,20 @@ where
                                 // rather than leaving the weaker gate in place.
                                 && op_manager.ring.should_summarize_or_broadcast(&key)
                             {
+                                // #6143: a flagged leg learns of the drop at
+                                // once, with its reason, behind the same Gate B
+                                // as the repair: only for a contract we hold.
+                                if ack_requested {
+                                    update::confirmed_delivery::send_receiver_ack(
+                                        &op_manager,
+                                        sender_addr,
+                                        *key.id(),
+                                        *op.id(),
+                                        Some(crate::message::BroadcastAckOutcome::Dropped(
+                                            crate::message::BroadcastDropReason::RateLimited,
+                                        )),
+                                    );
+                                }
                                 update::op_ctx_task::send_dropped_broadcast_resync_request(
                                     &op_manager,
                                     key,
@@ -2226,6 +2253,18 @@ where
                     // needs the same repair, behind the same Gate B: only for a
                     // contract this node holds.
                     if op_manager.ring.should_summarize_or_broadcast(&key) {
+                        // #6143: answer a flagged leg with the drop, same gate.
+                        if ack_requested {
+                            update::confirmed_delivery::send_receiver_ack(
+                                &op_manager,
+                                sender_addr,
+                                *key.id(),
+                                *op.id(),
+                                Some(crate::message::BroadcastAckOutcome::Dropped(
+                                    crate::message::BroadcastDropReason::MergeBudget,
+                                )),
+                            );
+                        }
                         update::op_ctx_task::send_dropped_broadcast_resync_request(
                             &op_manager,
                             key,
@@ -2283,6 +2322,7 @@ where
                             sender_summary_bytes.clone(),
                             sender_addr,
                             crate::ring::broadcast_coverage::CoveredPeers::empty(),
+                            false,
                         )
                         .await
                         {
@@ -2336,6 +2376,7 @@ where
                             *total_size,
                             sender_addr,
                             crate::ring::broadcast_coverage::CoveredPeers::empty(),
+                            false,
                         )
                         .await
                         {
@@ -2372,6 +2413,7 @@ where
                             sender_summary_bytes.clone(),
                             sender_addr,
                             covered.clone(),
+                            false,
                         )
                         .await
                         {
@@ -2399,6 +2441,7 @@ where
                             *total_size,
                             sender_addr,
                             covered.clone(),
+                            false,
                         )
                         .await
                         {
@@ -2407,6 +2450,65 @@ where
                                 %key,
                                 error = %err,
                                 "UPDATE relay dispatch: start_relay_broadcast_to_streaming (v2) failed"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    // #6143: the V2 pair, plus a request for a `BroadcastAck`.
+                    // The target list is honoured exactly as on V2: these are
+                    // payload-bearing too.
+                    update::UpdateMsg::BroadcastToAckRequested {
+                        id,
+                        key,
+                        payload,
+                        sender_summary_bytes,
+                        covered,
+                    } => {
+                        if let Err(err) = update::op_ctx_task::start_relay_broadcast_to(
+                            op_manager.clone(),
+                            *id,
+                            *key,
+                            payload.clone(),
+                            sender_summary_bytes.clone(),
+                            sender_addr,
+                            covered.clone(),
+                            true,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %key,
+                                error = %err,
+                                "UPDATE relay dispatch: start_relay_broadcast_to (ack) failed"
+                            );
+                        }
+                        return Ok(());
+                    }
+                    update::UpdateMsg::BroadcastToStreamingAckRequested {
+                        id,
+                        key,
+                        stream_id,
+                        total_size,
+                        covered,
+                    } => {
+                        if let Err(err) = update::op_ctx_task::start_relay_broadcast_to_streaming(
+                            op_manager.clone(),
+                            *id,
+                            *key,
+                            *stream_id,
+                            *total_size,
+                            sender_addr,
+                            covered.clone(),
+                            true,
+                        )
+                        .await
+                        {
+                            tracing::error!(
+                                tx = %id,
+                                %key,
+                                error = %err,
+                                "UPDATE relay dispatch: start_relay_broadcast_to_streaming (ack) failed"
                             );
                         }
                         return Ok(());
@@ -5667,6 +5769,16 @@ async fn handle_interest_sync_message(
                     SummariesEmitter::SummaryRequestReply,
                 ))
             }
+        }
+
+        // #6143: a receiver confirming (or reporting a drop of) one of our
+        // originated legs. Never replied to. An ack we did not ask for, or
+        // for a superseded leg, matches nothing and is ignored.
+        InterestMessage::BroadcastAck { key, tx, outcome } => {
+            crate::operations::update::confirmed_delivery::handle_ack(
+                op_manager, source, key, tx, outcome,
+            );
+            None
         }
 
         InterestMessage::ChangeInterests { added, removed } => {

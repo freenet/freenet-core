@@ -388,13 +388,17 @@ pub(crate) enum PayloadArm {
     /// the state, this one is a memory bound chosen over a smaller payload.
     /// See `broadcast_queue::delta_sent_as_full_state`.
     FullLargeDeltaStreamed,
+    /// Full state: the one confirmed-delivery resend after an originated
+    /// update's first leg went unconfirmed (#6143). Full state by design: the
+    /// resend distrusts the belief a delta would be computed against.
+    FullConfirmedResend,
 }
 
 impl PayloadArm {
     /// Every arm, in reporting order. Exhaustive by construction: the
     /// `match` in [`PayloadArm::index`] fails to compile if a variant is
     /// added without being listed here.
-    pub(crate) const ALL: [PayloadArm; 8] = [
+    pub(crate) const ALL: [PayloadArm; 9] = [
         PayloadArm::Delta,
         PayloadArm::FullDeltaSuppressed,
         PayloadArm::FullNotEfficient,
@@ -403,6 +407,7 @@ impl PayloadArm {
         PayloadArm::FullNoTheirSummaryUntracked,
         PayloadArm::FullNoTheirSummaryTracked,
         PayloadArm::FullLargeDeltaStreamed,
+        PayloadArm::FullConfirmedResend,
     ];
 
     /// The three arms that together make up the legacy `full_no_summary`
@@ -426,6 +431,7 @@ impl PayloadArm {
             PayloadArm::FullNoTheirSummaryUntracked => 5,
             PayloadArm::FullNoTheirSummaryTracked => 6,
             PayloadArm::FullLargeDeltaStreamed => 7,
+            PayloadArm::FullConfirmedResend => 8,
         }
     }
 
@@ -441,6 +447,7 @@ impl PayloadArm {
             PayloadArm::FullNoTheirSummaryUntracked => "full_no_their_summary_untracked",
             PayloadArm::FullNoTheirSummaryTracked => "full_no_their_summary_tracked",
             PayloadArm::FullLargeDeltaStreamed => "full_large_delta_streamed",
+            PayloadArm::FullConfirmedResend => "full_confirmed_resend",
         }
     }
 

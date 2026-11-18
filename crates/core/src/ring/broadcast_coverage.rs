@@ -392,6 +392,11 @@ struct CoverageEntry {
 pub(crate) struct BroadcastOrigin {
     sender: Option<SocketAddr>,
     covered: HashSet<PeerKey>,
+    /// A local CLIENT update produced this write, so its fan-out legs ask
+    /// their receivers to confirm them (#6143). Not a suppression claim:
+    /// [`Self::local`] is also used by PUT apply paths whose content came from
+    /// the network, so "local" alone does not mean "originated here".
+    originated: bool,
 }
 
 impl BroadcastOrigin {
@@ -407,6 +412,7 @@ impl BroadcastOrigin {
         Self {
             sender: Some(sender),
             covered,
+            originated: false,
         }
     }
 
@@ -434,7 +440,20 @@ impl BroadcastOrigin {
         Self {
             sender: None,
             covered,
+            originated: false,
         }
+    }
+
+    /// Mark this as the apply of a local client update (#6143), whose
+    /// fan-out is the one with no redundancy behind it.
+    pub(crate) fn into_originated(mut self) -> Self {
+        self.originated = true;
+        self
+    }
+
+    /// Whether a local client update produced this write.
+    pub(crate) fn originated(&self) -> bool {
+        self.originated
     }
 
     /// The peer that delivered this update, if it came from the network.
@@ -461,11 +480,17 @@ impl BroadcastOrigin {
     /// * `sender` survives only if the two agree. Two different senders means
     ///   we cannot tell which delivery this fan-out belongs to, and excluding
     ///   the wrong one would withhold the update from a peer that needs it.
+    ///
+    /// `originated` WIDENS (either one), unlike the two suppression halves:
+    /// asking for confirmation is the safe direction, and dropping the flag
+    /// because a relayed apply raced a client one would leave the client's
+    /// update unconfirmed.
     fn narrow(&mut self, other: &BroadcastOrigin) {
         if self.sender != other.sender {
             self.sender = None;
         }
         self.covered.retain(|peer| other.covered.contains(peer));
+        self.originated |= other.originated;
     }
 }
 

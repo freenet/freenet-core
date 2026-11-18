@@ -1943,13 +1943,15 @@ mod tests {
             "UpdateMsg::BroadcastToV2{..}",
             "UpdateMsg::BroadcastToStreaming{..}",
             "UpdateMsg::BroadcastToStreamingV2{..}",
+            "UpdateMsg::BroadcastToAckRequested{..}",
+            "UpdateMsg::BroadcastToStreamingAckRequested{..}",
         ] {
             assert_eq!(
                 class_at(opcode),
                 "Broadcast",
                 "broadcast opcode `{opcode}` must be charged to the Broadcast \
-                 class — the four broadcast opcodes MUST share one budget so \
-                 switching between them gains nothing (#5510)"
+                 class — every broadcast opcode MUST share one budget so \
+                 switching between them gains nothing (#5510, #6143)"
             );
         }
 
@@ -1981,8 +1983,8 @@ mod tests {
 
         let variants = body.matches("UpdateMsg::").count();
         assert_eq!(
-            variants, 6,
-            "the classifier must name all six UpdateMsg variants explicitly, found \
+            variants, 8,
+            "the classifier must name all eight UpdateMsg variants explicitly, found \
              {variants}. Fewer means a variant is being matched by something other \
              than its own name — which is a catch-all however it is spelled"
         );

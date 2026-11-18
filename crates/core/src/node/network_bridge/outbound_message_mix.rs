@@ -661,6 +661,11 @@ impl OutboundClass {
                     | InterestMessage::ResyncResponse { .. } => {
                         Self::plain(OutboundKind::InterestSyncResync)
                     }
+                    // #6143: the confirmation of an UPDATE broadcast leg rides
+                    // InterestSync only because that enum is node-handled; it
+                    // is part of the UPDATE fan-out's cost, so it is counted
+                    // there. One small message per originated leg.
+                    InterestMessage::BroadcastAck { .. } => Self::plain(OutboundKind::Update),
                 },
                 NetMessageV1::NeighborHosting { .. } => Self::plain(OutboundKind::NeighborHosting),
                 // Exhaustive on purpose (no `_` arm): a new protocol message

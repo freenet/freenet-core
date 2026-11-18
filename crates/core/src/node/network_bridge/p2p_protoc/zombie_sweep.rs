@@ -240,7 +240,9 @@ pub(super) fn is_link_use_request(msg: &NetMessage) -> bool {
                 UpdateMsg::BroadcastTo { .. }
                 | UpdateMsg::BroadcastToStreaming { .. }
                 | UpdateMsg::BroadcastToV2 { .. }
-                | UpdateMsg::BroadcastToStreamingV2 { .. } => false,
+                | UpdateMsg::BroadcastToStreamingV2 { .. }
+                | UpdateMsg::BroadcastToAckRequested { .. }
+                | UpdateMsg::BroadcastToStreamingAckRequested { .. } => false,
             },
             NetMessageV1::Aborted(_)
             | NetMessageV1::NeighborHosting { .. }

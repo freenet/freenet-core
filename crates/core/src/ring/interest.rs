@@ -593,10 +593,16 @@ pub enum SummaryMissingReason {
     /// holding its summary for this contract. Appended last so existing
     /// telemetry positions do not move.
     ClearedOverSizeBound,
+
+    /// An update this node originated was not confirmed by the peer (no ack
+    /// after the full-state resend), or the peer acked that it dropped it
+    /// (#6143). Our belief that the peer holds our state is unproven, so it
+    /// is dropped. Appended last.
+    ClearedByUnconfirmedDelivery,
 }
 
 impl SummaryMissingReason {
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
 
     /// Every reason, in telemetry field order.
     pub const ALL: [SummaryMissingReason; Self::COUNT] = [
@@ -605,6 +611,7 @@ impl SummaryMissingReason {
         SummaryMissingReason::ClearedByResync,
         SummaryMissingReason::ClearedByDeltaApplyFailure,
         SummaryMissingReason::ClearedOverSizeBound,
+        SummaryMissingReason::ClearedByUnconfirmedDelivery,
     ];
 
     /// Dense index into a per-reason counter array.
@@ -615,6 +622,7 @@ impl SummaryMissingReason {
             SummaryMissingReason::ClearedByResync => 2,
             SummaryMissingReason::ClearedByDeltaApplyFailure => 3,
             SummaryMissingReason::ClearedOverSizeBound => 4,
+            SummaryMissingReason::ClearedByUnconfirmedDelivery => 5,
         }
     }
 
@@ -626,6 +634,7 @@ impl SummaryMissingReason {
             SummaryMissingReason::ClearedByResync => "resync",
             SummaryMissingReason::ClearedByDeltaApplyFailure => "delta_apply_failed",
             SummaryMissingReason::ClearedOverSizeBound => "over_size_bound",
+            SummaryMissingReason::ClearedByUnconfirmedDelivery => "unconfirmed_delivery",
         }
     }
 }

@@ -584,7 +584,7 @@ pub(super) fn should_broadcast_contract(op_manager: &Arc<OpManager>, key: &Contr
 /// turn so the summary describes exactly that state (#5842). `None` when the
 /// handler cannot produce both; the caller must then not record a summary for
 /// the state it sends.
-pub(super) async fn get_contract_snapshot(
+pub(crate) async fn get_contract_snapshot(
     op_manager: &OpManager,
     key: &ContractKey,
 ) -> Option<(WrappedState, freenet_stdlib::prelude::StateSummary<'static>)> {
@@ -4399,6 +4399,50 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
     }
 }
 
+use crate::operations::update::confirmed_delivery::LegDuty;
+
+/// A leg skipped as converged settles a just-armed confirmed-delivery entry
+/// (#6143): the peer itself told us it holds our state. Counted where decided.
+pub(crate) fn settle_converged_leg(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    peer_key: &crate::ring::PeerKey,
+    duty: LegDuty,
+) {
+    if duty == LegDuty::RequestAck
+        && op_manager
+            .confirmed_delivery
+            .settle_converged(key.id(), peer_key)
+    {
+        crate::operations::update::confirmed_delivery::count(
+            op_manager,
+            key.id(),
+            PropagationEvent::AckNotNeeded,
+        );
+    }
+}
+
+/// Record that a flagged leg with transaction `tx` is about to go (#6143),
+/// counting it as the first ask or the resend.
+pub(crate) fn record_flagged_leg(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    peer_key: &crate::ring::PeerKey,
+    tx: crate::message::Transaction,
+) {
+    use crate::operations::update::confirmed_delivery::{FlaggedSend, count};
+    match op_manager.confirmed_delivery.record_flagged_send(
+        key.id(),
+        peer_key,
+        tx,
+        op_manager.confirmed_delivery.now(),
+    ) {
+        FlaggedSend::First => count(op_manager, key.id(), PropagationEvent::AckRequested),
+        FlaggedSend::Resend => count(op_manager, key.id(), PropagationEvent::ResendFull),
+        FlaggedSend::Untracked => {}
+    }
+}
+
 /// Build the originator target list to attach to one leg of a fan-out (#5147),
 /// or `None` when the recipient is on a pre-floor release.
 ///
@@ -4601,6 +4645,13 @@ pub(super) async fn broadcast_to_single_peer(
 
     let peer_key = PeerKey::from(target.pub_key().clone());
 
+    // #6143: what this leg owes confirmed delivery. The table holds only
+    // pairs whose peer decodes the flag, so no version check is needed here.
+    // A resend is full state on the stream path and skips the converged
+    // check, because the belief that check reads is what the resend distrusts.
+    let duty = op_manager.confirmed_delivery.leg_duty(key.id(), &peer_key);
+    let resend_full = duty == LegDuty::ResendFull;
+
     // A leg queued in the small lane may find the stored state has since grown
     // past `LARGE_STATE_LANE_THRESHOLD` (a later write replaced it). The
     // summary and delta below run against the stored state, so take a
@@ -4693,7 +4744,7 @@ pub(super) async fn broadcast_to_single_peer(
     // fan-out is the nondeterministic-summary heal storm. `fanout_send_needed`
     // asks the shared delta cache / the contract itself (bounded probe)
     // whether the peer actually lacks state we hold.
-    if let (Some(ours), Some(theirs)) = (&our_summary, &their_summary) {
+    if let (false, Some(ours), Some(theirs)) = (resend_full, &our_summary, &their_summary) {
         // Per-invocation probe budget: one (contract, peer) pair per call, so
         // at most one WASM probe per queue entry (see `fanout_send_needed`).
         let mut staleness_probes_used = 0usize;
@@ -4745,6 +4796,7 @@ pub(super) async fn broadcast_to_single_peer(
             op_manager
                 .interest_manager
                 .refresh_peer_interest(&key, &peer_key);
+            settle_converged_leg(op_manager, &key, &peer_key, duty);
             report_send_cpu(op_manager);
             return;
         }
@@ -4786,6 +4838,13 @@ pub(super) async fn broadcast_to_single_peer(
     // #4961: WHY a tracked peer has no cached summary. Set only on the
     // `FullNoTheirSummaryTracked` arm below, where the entry exists to be read.
     let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
+        // #6143: the confirmed-delivery resend is full state whatever the
+        // summaries say. Checked first so it is attributed to its own arm.
+        _ if resend_full => (
+            LegPayload::FullState(new_state.clone()),
+            false,
+            PayloadArm::FullConfirmedResend,
+        ),
         // Scoped to the both-summaries-present case ON PURPOSE. When a summary
         // is missing a delta was impossible regardless of the memo, so letting
         // the suppression guard win there would credit the memo for a full
@@ -4850,6 +4909,7 @@ pub(super) async fn broadcast_to_single_peer(
                     op_manager
                         .interest_manager
                         .refresh_peer_interest(&key, &peer_key);
+                    settle_converged_leg(op_manager, &key, &peer_key, duty);
                     // #4903 review P2: the summarize + delta WASM already ran,
                     // so account for the CPU it burned even though nothing is
                     // sent (no bytes). Previously this exit returned without
@@ -5031,8 +5091,21 @@ pub(super) async fn broadcast_to_single_peer(
     let update_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
 
     // Check if we should use streaming for full state broadcasts
+    // A confirmed-delivery resend always streams, whatever its size: the
+    // caller-named stream is the path that kept working in #6143 while
+    // inline messages were lost.
     let use_streaming = matches!(&payload, LegPayload::FullState(_))
-        && crate::operations::should_use_streaming(op_manager.streaming_threshold, payload_size);
+        && (resend_full
+            || crate::operations::should_use_streaming(
+                op_manager.streaming_threshold,
+                payload_size,
+            ));
+    // #6143: a flagged leg records its transaction id BEFORE it is sent, so an
+    // ack that beats the bookkeeping below still matches.
+    let flagged = duty != LegDuty::None;
+    if flagged {
+        record_flagged_leg(op_manager, &key, &peer_key, update_tx);
+    }
 
     // Each branch below tracks whether the message was *actually delivered* to
     // the peer, as distinct from merely being enqueued for dispatch, and applies
@@ -5087,25 +5160,36 @@ pub(super) async fn broadcast_to_single_peer(
             payload_size,
             "Using streaming for BroadcastTo (via queue)"
         );
-        let msg = match target_list_for(op_manager, &update_tx, peer_addr, &peer_key, &fanout) {
-            Some(covered) => UpdateMsg::BroadcastToStreamingV2 {
+        let msg = if flagged {
+            UpdateMsg::BroadcastToStreamingAckRequested {
                 id: update_tx,
                 stream_id: sid,
                 key,
                 total_size: payload_bytes.len() as u64,
-                covered,
-            },
-            // Pre-floor peer: build the message through the SAME unchanged
-            // expression it has always been built with, rather than a shared
-            // constructor parameterised on an `Option`. Calling identical code
-            // is a stronger guarantee that a pre-floor peer's bytes are
-            // untouched than any amount of branch review (#5167's rationale).
-            None => UpdateMsg::BroadcastToStreaming {
-                id: update_tx,
-                stream_id: sid,
-                key,
-                total_size: payload_bytes.len() as u64,
-            },
+                covered: target_list_for(op_manager, &update_tx, peer_addr, &peer_key, &fanout)
+                    .unwrap_or_else(crate::ring::broadcast_coverage::CoveredPeers::empty),
+            }
+        } else {
+            match target_list_for(op_manager, &update_tx, peer_addr, &peer_key, &fanout) {
+                Some(covered) => UpdateMsg::BroadcastToStreamingV2 {
+                    id: update_tx,
+                    stream_id: sid,
+                    key,
+                    total_size: payload_bytes.len() as u64,
+                    covered,
+                },
+                // Pre-floor peer: build the message through the SAME unchanged
+                // expression it has always been built with, rather than a shared
+                // constructor parameterised on an `Option`. Calling identical code
+                // is a stronger guarantee that a pre-floor peer's bytes are
+                // untouched than any amount of branch review (#5167's rationale).
+                None => UpdateMsg::BroadcastToStreaming {
+                    id: update_tx,
+                    stream_id: sid,
+                    key,
+                    total_size: payload_bytes.len() as u64,
+                },
+            }
         };
         let net_msg: NetMessage = msg.into();
         // Serialize metadata for embedding in fragment #1 (fix #2757)
@@ -5253,8 +5337,8 @@ pub(super) async fn broadcast_to_single_peer(
         }
         send_res
     } else {
-        let msg = match target_list_for(op_manager, &update_tx, peer_addr, &peer_key, &fanout) {
-            Some(covered) => UpdateMsg::BroadcastToV2 {
+        let msg = if flagged {
+            UpdateMsg::BroadcastToAckRequested {
                 id: update_tx,
                 key,
                 payload: payload.into_wire(),
@@ -5262,19 +5346,33 @@ pub(super) async fn broadcast_to_single_peer(
                     .as_ref()
                     .map(|s| s.as_ref().to_vec())
                     .unwrap_or_default(),
-                covered,
-            },
-            // See the streaming twin: the legacy arm is the untouched original
-            // expression, deliberately duplicated rather than factored.
-            None => UpdateMsg::BroadcastTo {
-                id: update_tx,
-                key,
-                payload: payload.into_wire(),
-                sender_summary_bytes: sent_summary
-                    .as_ref()
-                    .map(|s| s.as_ref().to_vec())
-                    .unwrap_or_default(),
-            },
+                covered: target_list_for(op_manager, &update_tx, peer_addr, &peer_key, &fanout)
+                    .unwrap_or_else(crate::ring::broadcast_coverage::CoveredPeers::empty),
+            }
+        } else {
+            match target_list_for(op_manager, &update_tx, peer_addr, &peer_key, &fanout) {
+                Some(covered) => UpdateMsg::BroadcastToV2 {
+                    id: update_tx,
+                    key,
+                    payload: payload.into_wire(),
+                    sender_summary_bytes: sent_summary
+                        .as_ref()
+                        .map(|s| s.as_ref().to_vec())
+                        .unwrap_or_default(),
+                    covered,
+                },
+                // See the streaming twin: the legacy arm is the untouched original
+                // expression, deliberately duplicated rather than factored.
+                None => UpdateMsg::BroadcastTo {
+                    id: update_tx,
+                    key,
+                    payload: payload.into_wire(),
+                    sender_summary_bytes: sent_summary
+                        .as_ref()
+                        .map(|s| s.as_ref().to_vec())
+                        .unwrap_or_default(),
+                },
+            }
         };
         // Test seam for the #6143 failure class: the bridge "accepts" the
         // leg and it never arrives. No-op outside test builds.
@@ -5354,6 +5452,18 @@ pub(super) async fn broadcast_to_single_peer(
             peer = %peer_addr,
             error = %err,
             "Failed to send state change broadcast (queued)"
+        );
+    }
+
+    // #6143: the flagged leg's send is over (a stream's completion has been
+    // awaited above), so its ack deadline starts now. A failed send is left
+    // to the deadline: that is what it is for.
+    if flagged {
+        op_manager.confirmed_delivery.send_finished(
+            key.id(),
+            &peer_key,
+            update_tx,
+            op_manager.confirmed_delivery.now(),
         );
     }
 

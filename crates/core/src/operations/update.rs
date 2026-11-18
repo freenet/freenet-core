@@ -885,6 +885,14 @@ pub(crate) async fn update_contract(
     // what makes the ordering sound: the fan-out can only run after that query
     // commits, so the entry is always present when its own fan-out reads it.
     // The guard discards it again unless the apply actually changed state.
+    // #6143: a client update's fan-out asks its receivers to confirm it.
+    // Marked here, at the one function every apply goes through, rather than
+    // at each client call site.
+    let covered = if origin == crate::node::ApplyOrigin::ClientLocal {
+        covered.into_originated()
+    } else {
+        covered
+    };
     let coverage = crate::ring::broadcast_coverage::CoverageRegistration::new(
         &op_manager.broadcast_coverage,
         *key.id(),
@@ -1777,6 +1785,36 @@ mod messages {
             total_size: u64,
             covered: crate::ring::broadcast_coverage::CoveredPeers,
         },
+
+        /// [`Self::BroadcastToV2`], asking the receiver to confirm it with
+        /// `InterestMessage::BroadcastAck` (#6143).
+        ///
+        /// Sent only by the ORIGINATOR of a client update, only to a peer at
+        /// or above `CONFIRMED_DELIVERY_MIN_VERSION`, and only for a leg its
+        /// `ConfirmedDelivery` table tracks. A parallel variant rather than a
+        /// field for the reason written on `BroadcastToV2`: bincode cannot omit
+        /// a field for an older peer, and the variant's presence IS the flag.
+        /// `covered` is always present here because the confirmed-delivery
+        /// floor is above the target-list floor; it is empty when the
+        /// target-list rollout gate is closed for this peer.
+        BroadcastToAckRequested {
+            id: Transaction,
+            key: ContractKey,
+            payload: crate::message::DeltaOrFullState,
+            sender_summary_bytes: Vec<u8>,
+            covered: crate::ring::broadcast_coverage::CoveredPeers,
+        },
+
+        /// [`Self::BroadcastToStreamingV2`], asking for a `BroadcastAck`
+        /// (#6143). The full-state resend after an unconfirmed leg always
+        /// goes as this variant.
+        BroadcastToStreamingAckRequested {
+            id: Transaction,
+            stream_id: StreamId,
+            key: ContractKey,
+            total_size: u64,
+            covered: crate::ring::broadcast_coverage::CoveredPeers,
+        },
     }
 
     impl InnerMessage for UpdateMsg {
@@ -1787,7 +1825,9 @@ mod messages {
                 | UpdateMsg::RequestUpdateStreaming { id, .. }
                 | UpdateMsg::BroadcastToStreaming { id, .. }
                 | UpdateMsg::BroadcastToV2 { id, .. }
-                | UpdateMsg::BroadcastToStreamingV2 { id, .. } => id,
+                | UpdateMsg::BroadcastToStreamingV2 { id, .. }
+                | UpdateMsg::BroadcastToAckRequested { id, .. }
+                | UpdateMsg::BroadcastToStreamingAckRequested { id, .. } => id,
             }
         }
 
@@ -1798,7 +1838,11 @@ mod messages {
                 | UpdateMsg::RequestUpdateStreaming { key, .. }
                 | UpdateMsg::BroadcastToStreaming { key, .. }
                 | UpdateMsg::BroadcastToV2 { key, .. }
-                | UpdateMsg::BroadcastToStreamingV2 { key, .. } => Some(Location::from(key.id())),
+                | UpdateMsg::BroadcastToStreamingV2 { key, .. }
+                | UpdateMsg::BroadcastToAckRequested { key, .. }
+                | UpdateMsg::BroadcastToStreamingAckRequested { key, .. } => {
+                    Some(Location::from(key.id()))
+                }
             }
         }
     }
@@ -1826,6 +1870,26 @@ mod messages {
                     write!(
                         f,
                         "BroadcastToStreamingV2(id: {id}, stream: {stream_id}, covered: {})",
+                        covered.len()
+                    )
+                }
+                UpdateMsg::BroadcastToAckRequested { id, covered, .. } => {
+                    write!(
+                        f,
+                        "BroadcastToAckRequested(id: {id}, covered: {})",
+                        covered.len()
+                    )
+                }
+                UpdateMsg::BroadcastToStreamingAckRequested {
+                    id,
+                    stream_id,
+                    covered,
+                    ..
+                } => {
+                    write!(
+                        f,
+                        "BroadcastToStreamingAckRequested(id: {id}, stream: {stream_id}, \
+                         covered: {})",
                         covered.len()
                     )
                 }
@@ -1903,6 +1967,8 @@ mod tests {
                 UpdateMsg::BroadcastToStreaming { .. } => 3,
                 UpdateMsg::BroadcastToV2 { .. } => 4,
                 UpdateMsg::BroadcastToStreamingV2 { .. } => 5,
+                UpdateMsg::BroadcastToAckRequested { .. } => 6,
+                UpdateMsg::BroadcastToStreamingAckRequested { .. } => 7,
             }
         }
 
@@ -1917,7 +1983,7 @@ mod tests {
 
         let id = Transaction::new::<UpdateMsg>();
         let key = make_contract_key(1);
-        let expected: [(u32, UpdateMsg); 6] = [
+        let expected: [(u32, UpdateMsg); 8] = [
             (
                 0,
                 UpdateMsg::RequestUpdate {
@@ -1967,6 +2033,26 @@ mod tests {
             (
                 5,
                 UpdateMsg::BroadcastToStreamingV2 {
+                    id,
+                    stream_id: StreamId::next(),
+                    key,
+                    total_size: 1,
+                    covered: CoveredPeers::empty(),
+                },
+            ),
+            (
+                6,
+                UpdateMsg::BroadcastToAckRequested {
+                    id,
+                    key,
+                    payload: DeltaOrFullState::Delta(vec![1]),
+                    sender_summary_bytes: vec![],
+                    covered: CoveredPeers::empty(),
+                },
+            ),
+            (
+                7,
+                UpdateMsg::BroadcastToStreamingAckRequested {
                     id,
                     stream_id: StreamId::next(),
                     key,
@@ -2095,7 +2181,12 @@ mod tests {
 
         assert_eq!(
             carriers,
-            vec!["BroadcastToV2", "BroadcastToStreamingV2"],
+            vec![
+                "BroadcastToV2",
+                "BroadcastToStreamingV2",
+                "BroadcastToAckRequested",
+                "BroadcastToStreamingAckRequested"
+            ],
             "ONLY the payload-bearing broadcast variants may carry a `covered:` \
              target list (#5147). A list on a control message would let any \
              relayer fabricate an everyone-is-covered claim and suppress \

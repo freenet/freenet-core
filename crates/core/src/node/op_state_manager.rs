@@ -205,6 +205,10 @@ pub(crate) struct OpManager {
     /// than the receiver's rate limit allows (#5842). See
     /// [`crate::node::network_bridge::broadcast_spacing`].
     pub broadcast_spacing: Arc<crate::node::network_bridge::broadcast_spacing::BroadcastSpacing>,
+    /// Pending confirmations for this node's own originated broadcasts
+    /// (#6143). See [`crate::operations::update::confirmed_delivery`].
+    pub(crate) confirmed_delivery:
+        Arc<crate::operations::update::confirmed_delivery::ConfirmedDelivery>,
     /// Bounded per-contract UPDATE-propagation counters. Fed from the
     /// broadcast fan-out path and drained by a periodic background task that
     /// emits an INFO `update_propagation_summary` line per window. Restores
@@ -401,6 +405,7 @@ impl Clone for OpManager {
             broadcast_dedup_cache: self.broadcast_dedup_cache.clone(),
             broadcast_coverage: self.broadcast_coverage.clone(),
             broadcast_spacing: self.broadcast_spacing.clone(),
+            confirmed_delivery: self.confirmed_delivery.clone(),
             update_propagation_stats: self.update_propagation_stats.clone(),
             pending_broadcasts: self.pending_broadcasts.clone(),
             request_router: self.request_router.clone(),
@@ -832,6 +837,13 @@ impl OpManager {
             // sims advance by hand.
             broadcast_spacing: Arc::new(
                 crate::node::network_bridge::broadcast_spacing::BroadcastSpacing::new(Arc::new(
+                    InstantTimeSrc::new(),
+                )),
+            ),
+            // Deadlines are waited on by a tokio sleep, so the table reads the
+            // same tokio-backed clock as the spacing above.
+            confirmed_delivery: Arc::new(
+                crate::operations::update::confirmed_delivery::ConfirmedDelivery::new(Arc::new(
                     InstantTimeSrc::new(),
                 )),
             ),
@@ -2076,6 +2088,10 @@ impl OpManager {
         self.neighbor_hosting.on_peer_disconnected(pub_key);
         self.interest_manager
             .schedule_deferred_removal(&PeerKey::from(pub_key.clone()));
+        // #6143: a pending confirmation dies with the connection. The peer
+        // re-syncs through the connection-time interest exchange on return.
+        self.confirmed_delivery
+            .remove_peer(&PeerKey::from(pub_key.clone()));
 
         // FLIP: this site used to only RECORD a shadow ("production never re-roots
         // on a connection drop today"). It now DRIVES a storm-safe PROMPT re-root —
@@ -3881,6 +3897,62 @@ mod tests {
     /// The companion `legacy_broadcast_to_encoding_is_unchanged_by_the_v2_variants`
     /// pins the encoding itself against a literal; this one pins that the
     /// routing decision actually reaches it.
+    /// Confirmed delivery (#6143) arms only targets whose version decodes the
+    /// ack-requested variants: an older or unknown peer is never flagged, so
+    /// it can never be sent a variant it cannot decode, nor resent to.
+    #[tokio::test(flavor = "current_thread")]
+    async fn confirmed_delivery_arms_only_peers_that_decode_the_flag() {
+        use crate::operations::update::confirmed_delivery::{LegDuty, arm_fanout};
+
+        let (op_manager, _guards, key, _self_addr, kps) = cohost_fixture("6143-arm-gate", 3).await;
+        let targets: Vec<_> = kps
+            .iter()
+            .map(|kp| {
+                op_manager
+                    .ring
+                    .connection_manager
+                    .get_peer_by_pub_key(kp.public())
+                    .expect("fixture peer is connected")
+            })
+            .collect();
+        op_manager.ring.connection_manager.record_remote_version(
+            addr_of(&op_manager, &kps[0]),
+            Some(crate::node::CONFIRMED_DELIVERY_MIN_VERSION),
+        );
+        op_manager
+            .ring
+            .connection_manager
+            .record_remote_version(addr_of(&op_manager, &kps[1]), Some((0, 2, 160)));
+        // kps[2]: no recorded version.
+
+        arm_fanout(&op_manager, key, &targets);
+
+        let duty = |kp: &crate::transport::TransportKeypair| {
+            op_manager
+                .confirmed_delivery
+                .leg_duty(key.id(), &crate::ring::PeerKey::from(kp.public().clone()))
+        };
+        assert_eq!(
+            duty(&kps[0]),
+            LegDuty::RequestAck,
+            "an at-floor peer is armed"
+        );
+        assert_eq!(
+            duty(&kps[1]),
+            LegDuty::None,
+            "a pre-floor peer is never flagged"
+        );
+        assert_eq!(
+            duty(&kps[2]),
+            LegDuty::None,
+            "an unknown version fails closed"
+        );
+
+        // A disconnect discards the pending entry with the connection.
+        op_manager.on_ring_connection_lost(kps[0].public());
+        assert_eq!(duty(&kps[0]), LegDuty::None);
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn a_pre_floor_peer_receives_the_legacy_variant_index() {
         use crate::message::DeltaOrFullState;
@@ -5923,6 +5995,10 @@ mod tests {
         (
             "node/network_bridge/p2p_protoc/broadcast.rs",
             include_str!("network_bridge/p2p_protoc/broadcast.rs"),
+        ),
+        (
+            "operations/update/confirmed_delivery.rs",
+            include_str!("../operations/update/confirmed_delivery.rs"),
         ),
     ];
 

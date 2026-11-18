@@ -600,6 +600,17 @@ impl P2pConnManager {
             target_result.targets.len() as f64,
         );
 
+        // #6143: an ORIGINATED fan-out arms confirmed delivery for each target
+        // that decodes the flag, before any leg goes. Shared by both send
+        // paths below.
+        if origin.originated() {
+            crate::operations::update::confirmed_delivery::arm_fanout(
+                op_manager,
+                key,
+                &target_result.targets,
+            );
+        }
+
         // In production, enqueue each target into the broadcast queue.
         // The queue worker handles delta computation and streaming with bounded
         // concurrency (default: 2 concurrent streams) to prevent uplink saturation.
@@ -739,6 +750,32 @@ impl P2pConnManager {
             // interval is handed to the held-legs timer instead.
             let peer_key = crate::ring::PeerKey::from(target.pub_key().clone());
             match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
+                // #6143: a confirmed-delivery resend always streams, and a
+                // stream leg waits for its completion, which this event loop
+                // itself drives. Awaited inline it would stall the loop until
+                // the completion timeout. Production runs every leg on the
+                // queue's task; here only the resend gets its own task, so
+                // every other heal keeps its deterministic inline ordering.
+                Ok(claim)
+                    if op_manager.confirmed_delivery.leg_duty(key.id(), &peer_key)
+                        == crate::operations::update::confirmed_delivery::LegDuty::ResendFull =>
+                {
+                    let bridge = self.bridge.clone();
+                    let op_manager = op_manager.clone();
+                    GlobalExecutor::spawn(async move {
+                        let _claim = claim;
+                        super::super::broadcast_queue::broadcast_to_single_peer(
+                            &bridge,
+                            &op_manager,
+                            key,
+                            new_state,
+                            target,
+                            None,
+                            super::super::broadcast_queue::no_fanout(),
+                        )
+                        .await;
+                    });
+                }
                 Ok(_claim) => {
                     super::super::broadcast_queue::broadcast_to_single_peer(
                         &self.bridge,
@@ -912,6 +949,13 @@ impl P2pConnManager {
                 }
             };
 
+            // #6143: what this leg owes confirmed delivery. Mirrors the
+            // production `broadcast_to_single_peer`.
+            let duty = op_manager.confirmed_delivery.leg_duty(key.id(), &peer_key);
+            let resend_full =
+                duty == crate::operations::update::confirmed_delivery::LegDuty::ResendFull;
+            let flagged = duty != crate::operations::update::confirmed_delivery::LegDuty::None;
+
             // Get peer's cached summary
             let their_summary = op_manager
                 .interest_manager
@@ -922,7 +966,7 @@ impl P2pConnManager {
             // shared delta cache / a bounded contract probe so a
             // converged-but-nondeterministic-summary pair does not re-flood
             // full state. Mirrors production `broadcast_to_single_peer`.
-            if let (Some(ours), Some(theirs)) = (&our_summary, &their_summary) {
+            if let (false, Some(ours), Some(theirs)) = (resend_full, &our_summary, &their_summary) {
                 if let super::super::broadcast_queue::FanoutDecision::Skip(skip) =
                     super::super::broadcast_queue::fanout_send_needed(
                         op_manager,
@@ -952,6 +996,9 @@ impl P2pConnManager {
                     op_manager
                         .interest_manager
                         .refresh_peer_interest(&key, &peer_key);
+                    super::super::broadcast_queue::settle_converged_leg(
+                        op_manager, &key, &peer_key, duty,
+                    );
                     skipped_summary_match += 1;
                     continue;
                 }
@@ -960,6 +1007,11 @@ impl P2pConnManager {
             // Compute delta if we have their summary (uses memoization cache)
             // Track whether we successfully computed a delta vs sent full state
             let (payload, sent_delta) = match (&our_summary, &their_summary) {
+                // #6143: the confirmed-delivery resend is full state.
+                _ if resend_full => (
+                    crate::message::DeltaOrFullState::FullState(new_state.as_ref().to_vec()),
+                    false,
+                ),
                 (Some(ours), Some(theirs)) => {
                     match op_manager
                         .interest_manager
@@ -988,6 +1040,9 @@ impl P2pConnManager {
                             op_manager
                                 .interest_manager
                                 .refresh_peer_interest(&key, &peer_key);
+                            super::super::broadcast_queue::settle_converged_leg(
+                                op_manager, &key, &peer_key, duty,
+                            );
                             count(PropagationEvent::SkipEmptyDelta);
                             skipped_summary_match += 1;
                             continue;
@@ -1046,11 +1101,18 @@ impl P2pConnManager {
             let payload_size = payload.size();
 
             // Check if we should use streaming for full state broadcasts
+            // A confirmed-delivery resend always streams (see production).
             let use_streaming = matches!(&payload, crate::message::DeltaOrFullState::FullState(_))
-                && crate::operations::should_use_streaming(
-                    op_manager.streaming_threshold,
-                    payload_size,
+                && (resend_full
+                    || crate::operations::should_use_streaming(
+                        op_manager.streaming_threshold,
+                        payload_size,
+                    ));
+            if flagged {
+                super::super::broadcast_queue::record_flagged_leg(
+                    op_manager, &key, &peer_key, update_tx,
                 );
+            }
 
             let send_result = if use_streaming {
                 let sender_summary_bytes = sent_summary
@@ -1086,22 +1148,37 @@ impl P2pConnManager {
                     payload_size,
                     "Using streaming for BroadcastTo"
                 );
-                let msg = match super::super::broadcast_queue::target_list_for(
-                    op_manager, &update_tx, peer_addr, &peer_key, &fanout,
-                ) {
-                    Some(covered) => crate::operations::update::UpdateMsg::BroadcastToStreamingV2 {
+                let msg = if flagged {
+                    crate::operations::update::UpdateMsg::BroadcastToStreamingAckRequested {
                         id: update_tx,
                         stream_id: sid,
                         key,
                         total_size: payload_bytes.len() as u64,
-                        covered,
-                    },
-                    None => crate::operations::update::UpdateMsg::BroadcastToStreaming {
-                        id: update_tx,
-                        stream_id: sid,
-                        key,
-                        total_size: payload_bytes.len() as u64,
-                    },
+                        covered: super::super::broadcast_queue::target_list_for(
+                            op_manager, &update_tx, peer_addr, &peer_key, &fanout,
+                        )
+                        .unwrap_or_else(crate::ring::broadcast_coverage::CoveredPeers::empty),
+                    }
+                } else {
+                    match super::super::broadcast_queue::target_list_for(
+                        op_manager, &update_tx, peer_addr, &peer_key, &fanout,
+                    ) {
+                        Some(covered) => {
+                            crate::operations::update::UpdateMsg::BroadcastToStreamingV2 {
+                                id: update_tx,
+                                stream_id: sid,
+                                key,
+                                total_size: payload_bytes.len() as u64,
+                                covered,
+                            }
+                        }
+                        None => crate::operations::update::UpdateMsg::BroadcastToStreaming {
+                            id: update_tx,
+                            stream_id: sid,
+                            key,
+                            total_size: payload_bytes.len() as u64,
+                        },
+                    }
                 };
                 let net_msg: NetMessage = msg.into();
                 // Serialize metadata for embedding in fragment #1 (fix #2757)
@@ -1156,10 +1233,8 @@ impl P2pConnManager {
                     Err(err) => Err(err),
                 }
             } else {
-                let msg = match super::super::broadcast_queue::target_list_for(
-                    op_manager, &update_tx, peer_addr, &peer_key, &fanout,
-                ) {
-                    Some(covered) => crate::operations::update::UpdateMsg::BroadcastToV2 {
+                let msg = if flagged {
+                    crate::operations::update::UpdateMsg::BroadcastToAckRequested {
                         id: update_tx,
                         key,
                         payload,
@@ -1167,18 +1242,36 @@ impl P2pConnManager {
                             .as_ref()
                             .map(|s| s.as_ref().to_vec())
                             .unwrap_or_default(),
-                        covered,
-                    },
-                    None => crate::operations::update::UpdateMsg::BroadcastTo {
-                        id: update_tx,
-                        key,
-                        payload,
-                        // Include our summary so peer doesn't echo back
-                        sender_summary_bytes: sent_summary
-                            .as_ref()
-                            .map(|s| s.as_ref().to_vec())
-                            .unwrap_or_default(),
-                    },
+                        covered: super::super::broadcast_queue::target_list_for(
+                            op_manager, &update_tx, peer_addr, &peer_key, &fanout,
+                        )
+                        .unwrap_or_else(crate::ring::broadcast_coverage::CoveredPeers::empty),
+                    }
+                } else {
+                    match super::super::broadcast_queue::target_list_for(
+                        op_manager, &update_tx, peer_addr, &peer_key, &fanout,
+                    ) {
+                        Some(covered) => crate::operations::update::UpdateMsg::BroadcastToV2 {
+                            id: update_tx,
+                            key,
+                            payload,
+                            sender_summary_bytes: sent_summary
+                                .as_ref()
+                                .map(|s| s.as_ref().to_vec())
+                                .unwrap_or_default(),
+                            covered,
+                        },
+                        None => crate::operations::update::UpdateMsg::BroadcastTo {
+                            id: update_tx,
+                            key,
+                            payload,
+                            // Include our summary so peer doesn't echo back
+                            sender_summary_bytes: sent_summary
+                                .as_ref()
+                                .map(|s| s.as_ref().to_vec())
+                                .unwrap_or_default(),
+                        },
+                    }
                 };
                 // Test seam for the #6143 failure class: the bridge "accepts"
                 // the leg and it never arrives.
@@ -1193,6 +1286,15 @@ impl P2pConnManager {
                     bridge.send(peer_addr, msg.into()).await
                 }
             };
+
+            if flagged {
+                op_manager.confirmed_delivery.send_finished(
+                    key.id(),
+                    &peer_key,
+                    update_tx,
+                    op_manager.confirmed_delivery.now(),
+                );
+            }
 
             if let Err(err) = send_result {
                 send_failed += 1;

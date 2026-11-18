@@ -6097,6 +6097,11 @@ std::thread_local! {
     static GLOBAL_SUMMARY_MISMATCH_SINGLE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_SUMMARY_MISMATCH_MULTI: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_SUMMARY_BYTE_REQUESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // Confirmed delivery of originated updates (#6143), by propagation-event
+    // label (`ack_requested`, `resend_full`, ...). Counted by the code that
+    // makes each decision, via `confirmed_delivery::count`.
+    static GLOBAL_CONFIRMED_DELIVERY_EVENTS: std::cell::RefCell<std::collections::HashMap<&'static str, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 /// Global test metrics for tracking events across the simulation network.
@@ -6124,6 +6129,7 @@ impl GlobalTestMetrics {
     /// Resets all test metrics to zero (thread-local). Call at the start of each test.
     pub fn reset() {
         GLOBAL_RESYNC_REQUESTS.with(|c| c.set(0));
+        GLOBAL_CONFIRMED_DELIVERY_EVENTS.with(|c| c.borrow_mut().clear());
         GLOBAL_DELTA_FAILURE_RESYNCS.with(|c| c.set(0));
         GLOBAL_DELTA_SENDS.with(|c| c.set(0));
         GLOBAL_DELTA_SEND_BYTES.with(|c| c.set(0));
@@ -6309,6 +6315,19 @@ impl GlobalTestMetrics {
     /// amounts of work when they did not.
     pub fn record_broadcast_sender_skipped() {
         GLOBAL_BROADCAST_SENDER_SKIPS.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Records one confirmed-delivery event (#6143) under its propagation
+    /// label. Called only by `confirmed_delivery::count`, which also feeds
+    /// the per-contract propagation summary, so the two cannot disagree.
+    pub fn record_confirmed_delivery_event(label: &'static str) {
+        GLOBAL_CONFIRMED_DELIVERY_EVENTS.with(|c| *c.borrow_mut().entry(label).or_insert(0) += 1);
+    }
+
+    /// Confirmed-delivery events with `label` since reset (e.g.
+    /// `"ack_confirmed"`, `"resend_full"`).
+    pub fn confirmed_delivery_events(label: &str) -> u64 {
+        GLOBAL_CONFIRMED_DELIVERY_EVENTS.with(|c| c.borrow().get(label).copied().unwrap_or(0))
     }
 
     /// Records one simulation fan-out leg held back because its

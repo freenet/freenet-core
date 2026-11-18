@@ -5443,6 +5443,33 @@ struct LostInlineLegsOutcome {
     versions: Vec<(String, Option<u64>)>,
     /// Inline legs the fault seam swallowed during the run.
     swallowed: usize,
+    /// Every confirmed-delivery counter, by label, over the run.
+    events: Vec<(&'static str, u64)>,
+}
+
+/// The confirmed-delivery counters a scenario reports (#6143).
+const CONFIRMED_DELIVERY_LABELS: [&str; 12] = [
+    "ack_requested",
+    "ack_confirmed",
+    "ack_not_needed",
+    "ack_dropped_not_hosted",
+    "ack_dropped_backoff",
+    "ack_dropped_rate_limited",
+    "ack_dropped_merge_budget",
+    "ack_dropped_merge_failed",
+    "ack_timeout",
+    "resend_full",
+    "unconfirmed_giveup",
+    "pending_overflow",
+];
+
+impl LostInlineLegsOutcome {
+    fn event(&self, label: &str) -> u64 {
+        self.events
+            .iter()
+            .find(|(l, _)| *l == label)
+            .map_or(0, |(_, n)| *n)
+    }
 }
 
 /// The #6143 failure class, reproduced: node 1 originates a client UPDATE, and
@@ -5458,7 +5485,9 @@ struct LostInlineLegsOutcome {
 fn run_lost_inline_legs_scenario(
     network_name: &'static str,
     seed: u64,
+    contract_seed: u8,
     confirmed_delivery: bool,
+    lose_inline_legs: bool,
 ) -> LostInlineLegsOutcome {
     use freenet::dev_tool::{
         NodeLabel, ScheduledOperation, SimOperation, inline_leg_fault_injection,
@@ -5474,7 +5503,9 @@ fn run_lost_inline_legs_scenario(
     setup_deterministic_state(seed);
     let rt = create_runtime();
 
-    let contract = SimOperation::create_test_contract(0x6D);
+    // A contract per arm: the fault seam's rules and counts are process-wide
+    // and keyed by contract, and the arms run in parallel.
+    let contract = SimOperation::create_test_contract(contract_seed);
     let contract_id = *contract.key().id();
     let contract_key = contract.key();
     register_crdt_contract(contract_id);
@@ -5500,9 +5531,9 @@ fn run_lost_inline_legs_scenario(
     let originator_addr = sim
         .node_address(&originator)
         .expect("node 1 has an address");
-    inline_leg_fault_injection::drop_inline_legs_from(originator_addr, contract_key);
-    let swallowed_before =
-        inline_leg_fault_injection::DROPPED_INLINE_LEGS.load(std::sync::atomic::Ordering::SeqCst);
+    if lose_inline_legs {
+        inline_leg_fault_injection::drop_inline_legs_from(originator_addr, contract_key);
+    }
 
     let mut operations = vec![ScheduledOperation::new(
         NodeLabel::gateway(network_name, 0),
@@ -5528,6 +5559,7 @@ fn run_lost_inline_legs_scenario(
 
     let result =
         sim.run_controlled_simulation(seed, operations, Duration::from_secs(120), POST_UPDATE_WAIT);
+    let swallowed = inline_leg_fault_injection::swallowed(&contract_key);
     inline_leg_fault_injection::clear(&contract_key);
     assert!(
         result.turmoil_result.is_ok(),
@@ -5562,9 +5594,11 @@ fn run_lost_inline_legs_scenario(
     );
     LostInlineLegsOutcome {
         versions,
-        swallowed: inline_leg_fault_injection::DROPPED_INLINE_LEGS
-            .load(std::sync::atomic::Ordering::SeqCst)
-            - swallowed_before,
+        swallowed,
+        events: CONFIRMED_DELIVERY_LABELS
+            .iter()
+            .map(|label| (*label, GlobalTestMetrics::confirmed_delivery_events(label)))
+            .collect(),
     }
 }
 
@@ -5576,8 +5610,13 @@ fn run_lost_inline_legs_scenario(
 /// seam reproduces the failure, so a pass there is the mechanism's doing.
 #[test_log::test]
 fn test_lost_inline_legs_strand_an_originated_update_without_confirmation() {
-    let outcome =
-        run_lost_inline_legs_scenario("lost-inline-legs-control", 0x6143_C0DE_0001, false);
+    let outcome = run_lost_inline_legs_scenario(
+        "lost-inline-legs-control",
+        0x6143_C0DE_0001,
+        0x61,
+        false,
+        true,
+    );
     assert!(
         outcome.swallowed > 0,
         "the fault seam never fired, so this run says nothing about #6143"
@@ -5600,8 +5639,13 @@ fn test_lost_inline_legs_strand_an_originated_update_without_confirmation() {
 /// of virtual time, by the one full-state resend on the stream path.
 #[test_log::test]
 fn test_confirmed_delivery_recovers_an_originated_update_from_lost_inline_legs() {
-    let outcome =
-        run_lost_inline_legs_scenario("lost-inline-legs-treatment", 0x6143_C0DE_0001, true);
+    let outcome = run_lost_inline_legs_scenario(
+        "lost-inline-legs-treatment",
+        0x6143_C0DE_0001,
+        0x62,
+        true,
+        true,
+    );
     assert!(
         outcome.swallowed > 0,
         "the fault seam never fired, so this run says nothing about #6143"
@@ -5611,8 +5655,68 @@ fn test_confirmed_delivery_recovers_an_originated_update_from_lost_inline_legs()
             *version,
             Some(100),
             "{label} must hold node 1's update within 30 s despite every inline \
-             leg being lost; all: {:?}",
-            outcome.versions
+             leg being lost; all: {:?}; confirmed delivery: {:?}",
+            outcome.versions,
+            outcome.events
+        );
+    }
+    // The recovery is the mechanism's: unconfirmed first legs timed out, the
+    // full-state resends went, and receivers acknowledged them.
+    assert!(
+        outcome.event("ack_timeout") > 0
+            && outcome.event("resend_full") > 0
+            && outcome.event("ack_confirmed") > 0,
+        "expected timeouts, resends and acks; got {:?}",
+        outcome.events
+    );
+    assert_eq!(
+        outcome.event("unconfirmed_giveup"),
+        0,
+        "every resend should have been confirmed; got {:?}",
+        outcome.events
+    );
+}
+
+/// The healthy-network arm: with confirmed delivery ON and nothing lost, every
+/// flagged leg is acknowledged and the mechanism sends NOTHING extra (no
+/// timeout, no resend, no give-up). This is the cost bound the design commits
+/// to: confirmation costs one small ack per originated leg and no resends.
+#[test_log::test]
+fn test_confirmed_delivery_on_a_healthy_network_sends_no_resends() {
+    let outcome = run_lost_inline_legs_scenario(
+        "confirmed-delivery-healthy",
+        0x6143_C0DE_0002,
+        0x63,
+        true,
+        false,
+    );
+    assert_eq!(outcome.swallowed, 0, "nothing is lost in this arm");
+    for (label, version) in &outcome.versions {
+        assert_eq!(*version, Some(100), "{label}; all: {:?}", outcome.versions);
+    }
+    assert!(
+        outcome.event("ack_requested") > 0,
+        "the originator must have asked for confirmation, or this arm proves \
+         nothing; got {:?}",
+        outcome.events
+    );
+    assert_eq!(
+        outcome.event("ack_confirmed"),
+        outcome.event("ack_requested"),
+        "every flagged leg must be acknowledged; got {:?}",
+        outcome.events
+    );
+    for label in [
+        "ack_timeout",
+        "resend_full",
+        "unconfirmed_giveup",
+        "pending_overflow",
+    ] {
+        assert_eq!(
+            outcome.event(label),
+            0,
+            "{label} must be zero on a healthy network; got {:?}",
+            outcome.events
         );
     }
 }

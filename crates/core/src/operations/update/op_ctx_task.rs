@@ -899,6 +899,9 @@ pub(crate) async fn start_relay_broadcast_to(
     // Peers the sender says it already delivered to (#5147). Empty for the
     // legacy `BroadcastTo`, which names none.
     covered: crate::ring::broadcast_coverage::CoveredPeers,
+    // The sender asked for a `BroadcastAck` (#6143): it arrived as
+    // `BroadcastToAckRequested`.
+    ack_requested: bool,
 ) -> Result<(), OpError> {
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -946,6 +949,7 @@ pub(crate) async fn start_relay_broadcast_to(
         sender_summary_bytes,
         sender_addr,
         covered,
+        ack_requested,
     ));
     Ok(())
 }
@@ -1066,10 +1070,14 @@ async fn run_relay_broadcast_to(
     sender_summary_bytes: Vec<u8>,
     sender_addr: SocketAddr,
     covered: crate::ring::broadcast_coverage::CoveredPeers,
+    ack_requested: bool,
 ) {
     let _guard = guard;
 
-    if let Err(err) = drive_relay_broadcast_to(
+    // The driver notes its terminal outcome; a flagged leg is answered with
+    // it (#6143). An exit that notes nothing (a stream that never arrived)
+    // sends no ack, and the sender's deadline handles it.
+    let (result, outcome) = super::confirmed_delivery::with_receiver_ack(drive_relay_broadcast_to(
         &op_manager,
         incoming_tx,
         key,
@@ -1077,9 +1085,18 @@ async fn run_relay_broadcast_to(
         sender_summary_bytes,
         sender_addr,
         covered,
-    )
-    .await
-    {
+    ))
+    .await;
+    if ack_requested {
+        super::confirmed_delivery::send_receiver_ack(
+            &op_manager,
+            sender_addr,
+            *key.id(),
+            incoming_tx,
+            outcome,
+        );
+    }
+    if let Err(err) = result {
         if err.is_contract_queue_full() {
             tracing::debug!(
                 tx = %incoming_tx,
@@ -2000,6 +2017,11 @@ async fn drive_relay_broadcast_to(
 
     if !op_manager.ring.may_merge_relayed_update(&key) {
         record_unhosted_broadcast_skip(&incoming_tx, &key, "BroadcastTo");
+        super::confirmed_delivery::note_receiver_outcome(
+            crate::message::BroadcastAckOutcome::Dropped(
+                crate::message::BroadcastDropReason::NotHosted,
+            ),
+        );
         return Ok(());
     }
 
@@ -2063,6 +2085,9 @@ async fn drive_relay_broadcast_to(
         op_manager.interest_manager.now(),
     ) {
         receiver_terminal.mark_dedup();
+        super::confirmed_delivery::note_receiver_outcome(
+            crate::message::BroadcastAckOutcome::AlreadyHad,
+        );
         count_receiver_skip(
             op_manager,
             &key,
@@ -2095,6 +2120,9 @@ async fn drive_relay_broadcast_to(
             .payload_hash(is_delta, &payload_bytes),
     ) {
         receiver_terminal.mark_already_applied();
+        super::confirmed_delivery::note_receiver_outcome(
+            crate::message::BroadcastAckOutcome::AlreadyHad,
+        );
         count_receiver_skip(
             op_manager,
             &key,
@@ -2131,6 +2159,11 @@ async fn drive_relay_broadcast_to(
         decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
         | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
             receiver_terminal.mark_backoff();
+            super::confirmed_delivery::note_receiver_outcome(
+                crate::message::BroadcastAckOutcome::Dropped(
+                    crate::message::BroadcastDropReason::Backoff,
+                ),
+            );
             count_receiver_skip(
                 op_manager,
                 &key,
@@ -2223,6 +2256,11 @@ async fn drive_relay_broadcast_to(
             result
         }
         Err(err) => {
+            super::confirmed_delivery::note_receiver_outcome(
+                crate::message::BroadcastAckOutcome::Dropped(
+                    crate::message::BroadcastDropReason::MergeFailed,
+                ),
+            );
             // Record the merge failure for the per-contract backoff (#4861),
             // but ONLY for genuine contract-exec failures (the merge ran and the
             // contract rejected it or it timed out). `is_contract_exec_rejection`
@@ -2427,6 +2465,11 @@ async fn drive_relay_broadcast_to(
 
     // ── Step 5: telemetry — broadcast applied ─────────────────────────────
     receiver_terminal.mark_applied(changed, updated_value.len());
+    super::confirmed_delivery::note_receiver_outcome(if changed {
+        crate::message::BroadcastAckOutcome::Applied
+    } else {
+        crate::message::BroadcastAckOutcome::AlreadyHad
+    });
     if let Some(event) = NetEventLog::update_broadcast_applied(
         &incoming_tx,
         &op_manager.ring,
@@ -2611,6 +2654,8 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
     // Peers the sender says it already delivered to (#5147). Empty for the
     // legacy `BroadcastToStreaming`.
     covered: crate::ring::broadcast_coverage::CoveredPeers,
+    // The sender asked for a `BroadcastAck` (#6143).
+    ack_requested: bool,
 ) -> Result<(), OpError> {
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_STREAMING_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -2656,6 +2701,7 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
         total_size,
         sender_addr,
         covered,
+        ack_requested,
     ));
     Ok(())
 }
@@ -2730,20 +2776,32 @@ async fn run_relay_broadcast_to_streaming(
     total_size: u64,
     sender_addr: SocketAddr,
     covered: crate::ring::broadcast_coverage::CoveredPeers,
+    ack_requested: bool,
 ) {
     let _guard = guard;
 
-    if let Err(err) = drive_relay_broadcast_to_streaming(
-        &op_manager,
-        incoming_tx,
-        key,
-        stream_id,
-        total_size,
-        sender_addr,
-        covered,
-    )
-    .await
-    {
+    // See `run_relay_broadcast_to` (#6143).
+    let (result, outcome) =
+        super::confirmed_delivery::with_receiver_ack(drive_relay_broadcast_to_streaming(
+            &op_manager,
+            incoming_tx,
+            key,
+            stream_id,
+            total_size,
+            sender_addr,
+            covered,
+        ))
+        .await;
+    if ack_requested {
+        super::confirmed_delivery::send_receiver_ack(
+            &op_manager,
+            sender_addr,
+            *key.id(),
+            incoming_tx,
+            outcome,
+        );
+    }
+    if let Err(err) = result {
         if err.is_contract_queue_full() {
             tracing::debug!(
                 tx = %incoming_tx,
@@ -3066,6 +3124,11 @@ async fn apply_streaming_broadcast(
 ) -> Result<(), OpError> {
     if !op_manager.ring.may_merge_relayed_update(&key) {
         record_unhosted_broadcast_skip(&incoming_tx, &key, "BroadcastToStreaming");
+        super::confirmed_delivery::note_receiver_outcome(
+            crate::message::BroadcastAckOutcome::Dropped(
+                crate::message::BroadcastDropReason::NotHosted,
+            ),
+        );
         return Ok(());
     }
     let mut receiver_terminal = op_manager
@@ -3087,6 +3150,9 @@ async fn apply_streaming_broadcast(
         op_manager.interest_manager.now(),
     ) {
         receiver_terminal.mark_dedup();
+        super::confirmed_delivery::note_receiver_outcome(
+            crate::message::BroadcastAckOutcome::AlreadyHad,
+        );
         count_receiver_skip(
             op_manager,
             &key,
@@ -3110,6 +3176,9 @@ async fn apply_streaming_broadcast(
             .payload_hash(false, &state_bytes),
     ) {
         receiver_terminal.mark_already_applied();
+        super::confirmed_delivery::note_receiver_outcome(
+            crate::message::BroadcastAckOutcome::AlreadyHad,
+        );
         count_receiver_skip(
             op_manager,
             &key,
@@ -3136,6 +3205,11 @@ async fn apply_streaming_broadcast(
         decision @ (crate::ring::merge_backoff::MergeDecision::InBackoff
         | crate::ring::merge_backoff::MergeDecision::KnownFailedPayload) => {
             receiver_terminal.mark_backoff();
+            super::confirmed_delivery::note_receiver_outcome(
+                crate::message::BroadcastAckOutcome::Dropped(
+                    crate::message::BroadcastDropReason::Backoff,
+                ),
+            );
             count_receiver_skip(
                 op_manager,
                 &key,
@@ -3219,6 +3293,11 @@ async fn apply_streaming_broadcast(
             exec
         }
         Err(err) => {
+            super::confirmed_delivery::note_receiver_outcome(
+                crate::message::BroadcastAckOutcome::Dropped(
+                    crate::message::BroadcastDropReason::MergeFailed,
+                ),
+            );
             // Record poison-contract merge failures for the backoff (#4861),
             // same classification as the non-streaming driver: only genuine
             // contract-exec rejections, timeout → longer cooldown. #4864 round-6:
@@ -3295,6 +3374,11 @@ async fn apply_streaming_broadcast(
 
     // Step 8: telemetry — broadcast applied + proactive summary.
     receiver_terminal.mark_applied(changed, updated_value.len());
+    super::confirmed_delivery::note_receiver_outcome(if changed {
+        crate::message::BroadcastAckOutcome::Applied
+    } else {
+        crate::message::BroadcastAckOutcome::AlreadyHad
+    });
     if let Some(event) = NetEventLog::update_broadcast_applied(
         &incoming_tx,
         &op_manager.ring,

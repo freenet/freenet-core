@@ -581,6 +581,55 @@ pub enum InterestMessage {
         /// [`InterestMessage::Interests`]) whose summary bytes we need.
         hashes: Vec<u32>,
     },
+
+    /// The receiver's answer to an ack-requested broadcast leg
+    /// (`UpdateMsg::BroadcastToAckRequested` /
+    /// `BroadcastToStreamingAckRequested`, #6143). Appended.
+    ///
+    /// Sent only in reply to a flagged leg, so it only ever reaches a peer
+    /// that decodes it, and a peer cannot make us send one for traffic it did
+    /// not flag. Sent even when the receiver skipped the payload as a duplicate
+    /// or already applied, because "I already have it" is also a confirmation.
+    BroadcastAck {
+        /// The contract the acknowledged leg carried.
+        key: ContractInstanceId,
+        /// The acknowledged leg's transaction id, so a late ack for a
+        /// superseded leg cannot confirm a newer update.
+        tx: Transaction,
+        /// What the receiver did with it.
+        outcome: BroadcastAckOutcome,
+    },
+}
+
+/// What a receiver did with an ack-requested broadcast leg (#6143).
+///
+/// Wire type: bincode encodes the variant index, so append only. A new
+/// variant needs a new version floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BroadcastAckOutcome {
+    /// Merged; the receiver's state now includes the update.
+    Applied,
+    /// Skipped as a duplicate or an already-merged payload, or merged with no
+    /// change: the receiver already held it.
+    AlreadyHad,
+    /// Not merged. The sender does not resend (the receiver would drop the
+    /// resend for the same reason) and clears its belief about the receiver.
+    Dropped(BroadcastDropReason),
+}
+
+/// Why a receiver dropped an ack-requested leg (#6143). Append only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BroadcastDropReason {
+    /// The receiver does not host the contract.
+    NotHosted,
+    /// The contract is in merge-failure backoff for this sender.
+    Backoff,
+    /// The per-(sender, contract) rate limiter rejected it.
+    RateLimited,
+    /// The contract is over the receiver's per-contract merge budget.
+    MergeBudget,
+    /// The merge ran and failed, or the contract handler was saturated.
+    MergeFailed,
 }
 
 /// Which code path built an [`InterestMessage::Summaries`] — a NON-WIRE
@@ -1172,6 +1221,9 @@ impl Display for NodeEvent {
                     InterestMessage::SummaryRequest { hashes } => {
                         format!("SummaryRequest({} hashes)", hashes.len())
                     }
+                    InterestMessage::BroadcastAck { key, outcome, .. } => {
+                        format!("BroadcastAck({key}, {outcome:?})")
+                    }
                 };
                 write!(f, "SendInterestMessage (to: {target}, {msg_summary})")
             }
@@ -1386,6 +1438,69 @@ mod tests {
             variant_index(&InterestMessage::SummaryRequest { hashes: vec![] }),
             6,
             "SummaryRequest must stay variant 6 (appended, #4965)"
+        );
+        assert_eq!(
+            variant_index(&InterestMessage::BroadcastAck {
+                key: ContractInstanceId::new([7; 32]),
+                tx: Transaction::new::<crate::operations::update::UpdateMsg>(),
+                outcome: BroadcastAckOutcome::Applied,
+            }),
+            7,
+            "BroadcastAck must stay variant 7 (appended, #6143)"
+        );
+    }
+
+    /// The ack round-trips intact, and its outcome and reason enums keep
+    /// their wire indices: an older peer of this floor decodes them by index.
+    #[test]
+    fn broadcast_ack_wire_roundtrip_and_outcome_indices() {
+        let tx = Transaction::new::<crate::operations::update::UpdateMsg>();
+        let key = ContractInstanceId::new([9; 32]);
+        for outcome in [
+            BroadcastAckOutcome::Applied,
+            BroadcastAckOutcome::AlreadyHad,
+            BroadcastAckOutcome::Dropped(BroadcastDropReason::NotHosted),
+            BroadcastAckOutcome::Dropped(BroadcastDropReason::Backoff),
+            BroadcastAckOutcome::Dropped(BroadcastDropReason::RateLimited),
+            BroadcastAckOutcome::Dropped(BroadcastDropReason::MergeBudget),
+            BroadcastAckOutcome::Dropped(BroadcastDropReason::MergeFailed),
+        ] {
+            let msg = InterestMessage::BroadcastAck { key, tx, outcome };
+            let bytes = bincode::serialize(&msg).expect("serialize BroadcastAck");
+            let decoded: InterestMessage =
+                bincode::deserialize(&bytes).expect("deserialize BroadcastAck");
+            let InterestMessage::BroadcastAck {
+                key: k,
+                tx: t,
+                outcome: o,
+            } = decoded
+            else {
+                panic!("expected BroadcastAck, got {decoded:?}");
+            };
+            assert_eq!((k, t, o), (key, tx, outcome));
+        }
+        let index = |o: BroadcastAckOutcome| {
+            u32::from_le_bytes(bincode::serialize(&o).unwrap()[..4].try_into().unwrap())
+        };
+        assert_eq!(index(BroadcastAckOutcome::Applied), 0);
+        assert_eq!(index(BroadcastAckOutcome::AlreadyHad), 1);
+        assert_eq!(
+            index(BroadcastAckOutcome::Dropped(BroadcastDropReason::NotHosted)),
+            2
+        );
+        let reason = |r: BroadcastDropReason| {
+            u32::from_le_bytes(bincode::serialize(&r).unwrap()[..4].try_into().unwrap())
+        };
+        assert_eq!(
+            [
+                BroadcastDropReason::NotHosted,
+                BroadcastDropReason::Backoff,
+                BroadcastDropReason::RateLimited,
+                BroadcastDropReason::MergeBudget,
+                BroadcastDropReason::MergeFailed,
+            ]
+            .map(reason),
+            [0, 1, 2, 3, 4]
         );
     }
 

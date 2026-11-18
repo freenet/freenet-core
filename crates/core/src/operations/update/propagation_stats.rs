@@ -100,16 +100,16 @@ const TOP_K: usize = 8;
 /// capacity, rather than letting a key churn grow the map without bound.
 /// 4096 is comfortably above the active-contract count of a busy gateway.
 /// Each entry is at most [`MAX_COUNTERS_SIZE`] plus its key (pinned by
-/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.3 MB of
+/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.6 MB of
 /// entries at the cap. A hash table holds 4096 entries in 8192 buckets
 /// (hashbrown's 7/8 load factor rounds up to the next power of two), so the
-/// map is about 2.6 MB at the cap.
+/// map is about 3.3 MB at the cap.
 const MAX_TRACKED_CONTRACTS: usize = 4096;
 
 /// Upper bound on `size_of::<ContractCounters>()` and
 /// `size_of::<ContractSummary>()`, for the memory estimate above.
 #[cfg(test)]
-const MAX_COUNTERS_SIZE: usize = 288;
+const MAX_COUNTERS_SIZE: usize = 368;
 
 /// One countable thing that happened to an UPDATE's propagation for a
 /// contract, other than the fan-out target resolution `record_broadcast`
@@ -200,12 +200,47 @@ pub(crate) enum PropagationEvent {
     /// Receiver: an inbound broadcast skipped by the merge-failure backoff
     /// (per-sender cooldown or a known-failed payload).
     RxBackoff,
+    /// Confirmed delivery (#6143): an originated update's first leg went flagged,
+    /// asking the receiver to acknowledge it.
+    AckRequested,
+    /// Confirmed delivery: a receiver acknowledged a flagged leg (applied, or
+    /// already had it).
+    AckConfirmed,
+    /// Confirmed delivery: an armed leg was skipped because the peer already
+    /// reported holding our state, so no confirmation was asked.
+    AckNotNeeded,
+    /// Confirmed delivery: the receiver dropped a flagged leg, not hosting the
+    /// contract. No resend.
+    AckDroppedNotHosted,
+    /// Confirmed delivery: the receiver dropped a flagged leg in merge-failure
+    /// backoff. No resend.
+    AckDroppedBackoff,
+    /// Confirmed delivery: the receiver's rate limiter dropped a flagged leg.
+    /// No resend.
+    AckDroppedRateLimited,
+    /// Confirmed delivery: the receiver's per-contract merge budget dropped a
+    /// flagged leg. No resend.
+    AckDroppedMergeBudget,
+    /// Confirmed delivery: the receiver's merge of a flagged leg failed or its
+    /// contract handler was saturated. No resend.
+    AckDroppedMergeFailed,
+    /// Confirmed delivery: no ack for a flagged first leg within the timeout.
+    AckTimeout,
+    /// Confirmed delivery: the one full-state resend, on the stream path, after
+    /// an unconfirmed (or never sent) first leg.
+    ResendFull,
+    /// Confirmed delivery: the resend went unconfirmed too; the belief about the
+    /// peer was cleared and the node stopped.
+    UnconfirmedGiveup,
+    /// Confirmed delivery: a target was not tracked because the pending table
+    /// was full.
+    PendingOverflow,
 }
 
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 25] = [
+    pub(crate) const ALL: [PropagationEvent; 37] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -231,6 +266,18 @@ impl PropagationEvent {
         PropagationEvent::RxDedup,
         PropagationEvent::RxAlreadyApplied,
         PropagationEvent::RxBackoff,
+        PropagationEvent::AckRequested,
+        PropagationEvent::AckConfirmed,
+        PropagationEvent::AckNotNeeded,
+        PropagationEvent::AckDroppedNotHosted,
+        PropagationEvent::AckDroppedBackoff,
+        PropagationEvent::AckDroppedRateLimited,
+        PropagationEvent::AckDroppedMergeBudget,
+        PropagationEvent::AckDroppedMergeFailed,
+        PropagationEvent::AckTimeout,
+        PropagationEvent::ResendFull,
+        PropagationEvent::UnconfirmedGiveup,
+        PropagationEvent::PendingOverflow,
     ];
 
     pub(crate) const COUNT: usize = Self::ALL.len();
@@ -262,6 +309,18 @@ impl PropagationEvent {
             PropagationEvent::RxDedup => 22,
             PropagationEvent::RxAlreadyApplied => 23,
             PropagationEvent::RxBackoff => 24,
+            PropagationEvent::AckRequested => 25,
+            PropagationEvent::AckConfirmed => 26,
+            PropagationEvent::AckNotNeeded => 27,
+            PropagationEvent::AckDroppedNotHosted => 28,
+            PropagationEvent::AckDroppedBackoff => 29,
+            PropagationEvent::AckDroppedRateLimited => 30,
+            PropagationEvent::AckDroppedMergeBudget => 31,
+            PropagationEvent::AckDroppedMergeFailed => 32,
+            PropagationEvent::AckTimeout => 33,
+            PropagationEvent::ResendFull => 34,
+            PropagationEvent::UnconfirmedGiveup => 35,
+            PropagationEvent::PendingOverflow => 36,
         }
     }
 
@@ -320,13 +379,32 @@ impl PropagationEvent {
             PropagationEvent::RxDedup => "rx_dedup",
             PropagationEvent::RxAlreadyApplied => "rx_already_applied",
             PropagationEvent::RxBackoff => "rx_backoff",
+            PropagationEvent::AckRequested => "ack_requested",
+            PropagationEvent::AckConfirmed => "ack_confirmed",
+            PropagationEvent::AckNotNeeded => "ack_not_needed",
+            PropagationEvent::AckDroppedNotHosted => "ack_dropped_not_hosted",
+            PropagationEvent::AckDroppedBackoff => "ack_dropped_backoff",
+            PropagationEvent::AckDroppedRateLimited => "ack_dropped_rate_limited",
+            PropagationEvent::AckDroppedMergeBudget => "ack_dropped_merge_budget",
+            PropagationEvent::AckDroppedMergeFailed => "ack_dropped_merge_failed",
+            PropagationEvent::AckTimeout => "ack_timeout",
+            PropagationEvent::ResendFull => "resend_full",
+            PropagationEvent::UnconfirmedGiveup => "unconfirmed_giveup",
+            PropagationEvent::PendingOverflow => "pending_overflow",
         }
     }
 }
 
 /// Per-event counts, indexed by [`PropagationEvent::index`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+// `Default` by hand: arrays longer than 32 do not derive it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EventCounts([u64; PropagationEvent::COUNT]);
+
+impl Default for EventCounts {
+    fn default() -> Self {
+        Self([0; PropagationEvent::COUNT])
+    }
+}
 
 impl EventCounts {
     pub(crate) fn get(&self, ev: PropagationEvent) -> u64 {
@@ -1912,6 +1990,9 @@ mod tests {
             include_str!("../../node/op_state_manager.rs"),
             include_str!("../update.rs"),
             include_str!("op_ctx_task.rs"),
+            // The confirmed-delivery events (#6143) are recorded where each is
+            // decided: the table's callers in this file and broadcast_queue.rs.
+            include_str!("confirmed_delivery.rs"),
         ];
         // Production code only: everything above the first top-level test
         // module, whatever its visibility.
