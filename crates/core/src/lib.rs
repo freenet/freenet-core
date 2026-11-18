@@ -250,10 +250,13 @@ pub mod dev_tool {
     // the GET driver's assembly-retry path (#4345).
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::get::op_ctx_task::assembly_fault_injection as get_assembly_fault_injection;
+    // Silently lose a node's inline broadcast legs, the #6143 failure class.
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_DRIVER_CALL_COUNT;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_STREAMING_DRIVER_CALL_COUNT;
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::update::confirmed_delivery::inline_leg_fault_injection;
     // Deterministic streaming PUT relay stream-failure injection, and the
     // count of relay failures reported upstream (#5671).
     #[cfg(any(test, feature = "testing"))]

@@ -1699,6 +1699,11 @@ pub struct SimNetwork {
     /// subject and this suppression. Tests that want it call
     /// [`enable_broadcast_target_list`](Self::enable_broadcast_target_list).
     broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
+    /// Confirmed delivery of originated broadcasts (#6143). Defaults OFF, like
+    /// the target list: it adds acks and resends, so every sim asserting on
+    /// delivery counts would otherwise run a different protocol. Opt in via
+    /// [`enable_confirmed_delivery`](Self::enable_confirmed_delivery).
+    confirmed_delivery_floor_override: Option<(u8, u8, u16)>,
     /// Optional controllable hosting clock injected into every node's
     /// `HostingManager` (via `NodeConfig::hosting_time_source_override`). When
     /// set, hosting-cache TTL and subscription-lease eviction advance ONLY when
@@ -1931,6 +1936,7 @@ impl SimNetwork {
             // Fail-CLOSED by default, like the two behavioural gates above and
             // unlike hash-first (#5147). See the field's rustdoc.
             broadcast_target_list_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
+            confirmed_delivery_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
             hosting_clock: None,
             hosting_budget_override: None,
             shared_rings: HashMap::new(),
@@ -3011,6 +3017,22 @@ impl SimNetwork {
         self
     }
 
+    /// Turn confirmed delivery of originated broadcasts (#6143) ON for this
+    /// simulation, by pinning the per-node floor to the always-passing
+    /// [`Self::SIM_MIGRATION_ENABLED_FLOOR`]. Off by default; see the field.
+    #[allow(dead_code)]
+    pub fn enable_confirmed_delivery(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_ENABLED_FLOOR);
+        self.confirmed_delivery_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.confirmed_delivery_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.confirmed_delivery_floor_override = floor;
+        }
+        self
+    }
+
     /// Force the originator target list OFF for this simulation.
     ///
     /// Already the default (see `new_inner`); exists so the CONTROL arm of a
@@ -3750,6 +3772,7 @@ impl SimNetwork {
             config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
             config.ack_version_floor_override = self.ack_version_floor_override;
             config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
+            config.confirmed_delivery_floor_override = self.confirmed_delivery_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()
@@ -3857,6 +3880,7 @@ impl SimNetwork {
             config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
             config.ack_version_floor_override = self.ack_version_floor_override;
             config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
+            config.confirmed_delivery_floor_override = self.confirmed_delivery_floor_override;
             config.hosting_time_source_override = self
                 .hosting_clock
                 .clone()

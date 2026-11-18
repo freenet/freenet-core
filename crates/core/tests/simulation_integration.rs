@@ -5432,6 +5432,191 @@ fn test_subscription_broadcast_propagation() {
     );
 }
 
+// =============================================================================
+// Confirmed delivery of originated updates (#6143 part 2)
+// =============================================================================
+
+/// What one run of [`run_lost_inline_legs_scenario`] observed.
+struct LostInlineLegsOutcome {
+    /// The CRDT version each non-originator node stores at the end, keyed by
+    /// node label. `None` when the node stores nothing for the contract.
+    versions: Vec<(String, Option<u64>)>,
+    /// Inline legs the fault seam swallowed during the run.
+    swallowed: usize,
+}
+
+/// The #6143 failure class, reproduced: node 1 originates a client UPDATE, and
+/// every INLINE broadcast leg it sends for the contract is accepted by its
+/// bridge and then lost (the seam in `confirmed_delivery`). Streamed legs
+/// still arrive, which is what the field node in #6143 had: oversized inline
+/// messages were parked by receivers as unclaimed streams, while the explicit
+/// broadcast stream path worked.
+///
+/// Everyone hosts the contract before the update, so node 1's fan-out targets
+/// are the other hosts. The run then waits `POST_UPDATE_WAIT` of virtual time
+/// and reads each node's stored state.
+fn run_lost_inline_legs_scenario(
+    network_name: &'static str,
+    seed: u64,
+    confirmed_delivery: bool,
+) -> LostInlineLegsOutcome {
+    use freenet::dev_tool::{
+        NodeLabel, ScheduledOperation, SimOperation, inline_leg_fault_injection,
+        register_crdt_contract,
+    };
+
+    /// The objective in the design: an originated update reaches its direct
+    /// targets within 30 s or the node knows it did not.
+    const POST_UPDATE_WAIT: Duration = Duration::from_secs(30);
+    const UPDATE_VERSION: u64 = 100;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    let contract = SimOperation::create_test_contract(0x6D);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+
+    let mut sim = rt.block_on(async {
+        SimNetwork::new(
+            network_name,
+            1,  // gateway
+            3,  // nodes
+            7,  // max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            seed,
+        )
+        .await
+    });
+    if confirmed_delivery {
+        sim.enable_confirmed_delivery();
+    }
+
+    let originator = NodeLabel::node(network_name, 1);
+    let originator_addr = sim
+        .node_address(&originator)
+        .expect("node 1 has an address");
+    inline_leg_fault_injection::drop_inline_legs_from(originator_addr, contract_key);
+    let swallowed_before =
+        inline_leg_fault_injection::DROPPED_INLINE_LEGS.load(std::sync::atomic::Ordering::SeqCst);
+
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(network_name, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x01),
+            subscribe: true,
+        },
+    )];
+    for n in 1..=3 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(network_name, n),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+    operations.push(ScheduledOperation::new(
+        originator.clone(),
+        SimOperation::Update {
+            key: contract_key,
+            data: SimOperation::create_crdt_state(UPDATE_VERSION, 0x6D),
+        },
+    ));
+
+    let result =
+        sim.run_controlled_simulation(seed, operations, Duration::from_secs(120), POST_UPDATE_WAIT);
+    inline_leg_fault_injection::clear(&contract_key);
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation must complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let version_of = |label: &NodeLabel| {
+        result
+            .node_storages
+            .get(label)
+            .and_then(|s| s.get_stored_state(&contract_key))
+            .map(|state| {
+                let bytes: &[u8] = state.as_ref();
+                u64::from_le_bytes(bytes[..8].try_into().expect("CRDT state has a version"))
+            })
+    };
+    let mut versions = vec![(
+        "gateway-0".to_string(),
+        version_of(&NodeLabel::gateway(network_name, 0)),
+    )];
+    for n in [2, 3] {
+        versions.push((
+            format!("node-{n}"),
+            version_of(&NodeLabel::node(network_name, n)),
+        ));
+    }
+    assert_eq!(
+        version_of(&originator),
+        Some(UPDATE_VERSION),
+        "the originator must hold its own update"
+    );
+    LostInlineLegsOutcome {
+        versions,
+        swallowed: inline_leg_fault_injection::DROPPED_INLINE_LEGS
+            .load(std::sync::atomic::Ordering::SeqCst)
+            - swallowed_before,
+    }
+}
+
+/// The control arm: with confirmed delivery OFF, the injected #6143 fault
+/// strands node 1's update. Its legs are counted as sent, its belief about
+/// each peer advances, and nothing reaches the other hosts within 30 s.
+///
+/// This is what makes the treatment arm below meaningful: it proves the fault
+/// seam reproduces the failure, so a pass there is the mechanism's doing.
+#[test_log::test]
+fn test_lost_inline_legs_strand_an_originated_update_without_confirmation() {
+    let outcome =
+        run_lost_inline_legs_scenario("lost-inline-legs-control", 0x6143_C0DE_0001, false);
+    assert!(
+        outcome.swallowed > 0,
+        "the fault seam never fired, so this run says nothing about #6143"
+    );
+    let reached: Vec<_> = outcome
+        .versions
+        .iter()
+        .filter(|(_, v)| *v == Some(100))
+        .collect();
+    assert!(
+        reached.is_empty(),
+        "with every inline leg lost and no confirmation, no other host should \
+         hold node 1's update after 30 s; got {:?}",
+        outcome.versions
+    );
+}
+
+/// The treatment arm, the #6143 success criterion: with the same fault and
+/// confirmed delivery ON, node 1's update reaches every other host within 30 s
+/// of virtual time, by the one full-state resend on the stream path.
+#[test_log::test]
+fn test_confirmed_delivery_recovers_an_originated_update_from_lost_inline_legs() {
+    let outcome =
+        run_lost_inline_legs_scenario("lost-inline-legs-treatment", 0x6143_C0DE_0001, true);
+    assert!(
+        outcome.swallowed > 0,
+        "the fault seam never fired, so this run says nothing about #6143"
+    );
+    for (label, version) in &outcome.versions {
+        assert_eq!(
+            *version,
+            Some(100),
+            "{label} must hold node 1's update within 30 s despite every inline \
+             leg being lost; all: {:?}",
+            outcome.versions
+        );
+    }
+}
+
 /// Regression test for #3390: relay nodes must register upstream requester as
 /// downstream subscriber when forwarding a subscribe Response.
 ///

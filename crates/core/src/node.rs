@@ -62,8 +62,9 @@ pub(crate) use network_bridge::broadcast_queue_metrics::BROADCAST_QUEUE_EFFICIEN
 // re-export rather than a path through `network_bridge` directly. Mirrors
 // `BROADCAST_STREAM_METRICS` above.
 pub(crate) use network_bridge::p2p_protoc::{
-    BROADCAST_TARGET_LIST_MIN_VERSION, HASH_FIRST_SUMMARIES_MIN_VERSION, QUIC_NATIVE_MIN_VERSION,
-    SUMMARY_FIRST_PUT_MIN_VERSION, version_supports_broadcast_target_list,
+    BROADCAST_TARGET_LIST_MIN_VERSION, CONFIRMED_DELIVERY_MIN_VERSION,
+    HASH_FIRST_SUMMARIES_MIN_VERSION, QUIC_NATIVE_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
+    version_supports_broadcast_target_list, version_supports_confirmed_delivery,
     version_supports_hash_first_summaries, version_supports_summary_first_put,
 };
 // The visited-peers bloom gates its index check on the handshake floor (#5994).
@@ -518,6 +519,17 @@ pub struct NodeConfig {
     /// serialized.
     #[serde(skip)]
     pub(crate) broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the confirmed-delivery version floor
+    /// ([`CONFIRMED_DELIVERY_MIN_VERSION`], #6143), consulted as
+    /// `confirmed_delivery_floor_override.unwrap_or(CONFIRMED_DELIVERY_MIN_VERSION)`
+    /// by `ConnectionManager::supports_confirmed_delivery`.
+    ///
+    /// `None` in production. Simulations default it OFF, like the target
+    /// list: it changes behaviour (acks, resends), so a sim that asserts on
+    /// delivery counts must not silently run it. Opt in via
+    /// `SimNetwork::enable_confirmed_delivery`. `#[serde(skip)]`.
+    #[serde(skip)]
+    pub(crate) confirmed_delivery_floor_override: Option<(u8, u8, u16)>,
     /// Simulation-only: the protocol version this node advertises in its
     /// transport handshakes instead of the real one, so a simulation can
     /// emulate an older peer (`SimNetwork::with_node_advertised_version`).
@@ -907,6 +919,7 @@ impl NodeConfig {
             hash_first_summaries_floor_override: None,
             ack_version_floor_override: None,
             broadcast_target_list_floor_override: None,
+            confirmed_delivery_floor_override: None,
             advertised_version_override: None,
             quic_native_floor_override: None,
             native_connect_override: None,

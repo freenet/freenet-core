@@ -546,6 +546,9 @@ pub(crate) struct ConnectionManager {
     /// BEHAVIOUR, not just an encoding — so a sim opts in explicitly via
     /// `SimNetwork::enable_broadcast_target_list`. See `NodeConfig`.
     broadcast_target_list_floor_override: Option<(u8, u8, u16)>,
+    /// Test-only override for the confirmed-delivery floor (#6143). `None` in
+    /// production. See `NodeConfig::confirmed_delivery_floor_override`.
+    confirmed_delivery_floor_override: Option<(u8, u8, u16)>,
     /// Rotating start offset for the per-new-peer migration scan. The scan
     /// examines at most `MIGRATION_SCAN_CAP_PER_NEW_PEER` hosted contracts per
     /// event; advancing this cursor each event makes successive events cover
@@ -719,6 +722,7 @@ impl ConnectionManager {
             config.native_connect_override,
         ));
         cm.broadcast_target_list_floor_override = config.broadcast_target_list_floor_override;
+        cm.confirmed_delivery_floor_override = config.confirmed_delivery_floor_override;
         cm
     }
 
@@ -765,6 +769,7 @@ impl ConnectionManager {
             summary_first_put_declined_unknown_version: Arc::new(AtomicU64::new(0)),
             summary_first_put_declined_pre_floor: Arc::new(AtomicU64::new(0)),
             broadcast_target_list_floor_override: None,
+            confirmed_delivery_floor_override: None,
             migration_scan_cursor: Arc::new(AtomicUsize::new(0)),
             transient_connections: Arc::new(DashMap::new()),
             open_transports: Arc::new(dashmap::DashSet::new()),
@@ -1836,6 +1841,20 @@ impl ConnectionManager {
             .broadcast_target_list_floor_override
             .unwrap_or(crate::node::BROADCAST_TARGET_LIST_MIN_VERSION);
         crate::node::version_supports_broadcast_target_list(self.remote_version(addr), floor)
+    }
+
+    /// Whether the peer at `addr` reports a version new enough to decode the
+    /// ack-requested broadcast variants and to send the ack (#6143).
+    ///
+    /// Fail-closed on an unknown version, like
+    /// [`Self::supports_broadcast_target_list`]: the fallback is today's
+    /// unconfirmed broadcast. Honours
+    /// `NodeConfig::confirmed_delivery_floor_override`.
+    pub(crate) fn supports_confirmed_delivery(&self, addr: SocketAddr) -> bool {
+        let floor = self
+            .confirmed_delivery_floor_override
+            .unwrap_or(crate::node::CONFIRMED_DELIVERY_MIN_VERSION);
+        crate::node::version_supports_confirmed_delivery(self.remote_version(addr), floor)
     }
 
     /// Reserve the next `window`-sized slice of the hosting set for a migration

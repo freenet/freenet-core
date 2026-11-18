@@ -1164,6 +1164,45 @@ pub(crate) fn version_supports_broadcast_target_list(
     remote.is_some_and(|v| v >= floor)
 }
 
+/// Has confirmed delivery of originated broadcasts (#6143) SHIPPED, and in
+/// which release?
+///
+/// Same contract as [`HASH_FIRST_SHIPPED_IN`], checked by
+/// `confirmed_delivery_floor_tracks_the_shipping_release`: `None` means
+/// [`CONFIRMED_DELIVERY_MIN_VERSION`] is a prediction that must stay strictly
+/// ABOVE the crate version; `Some(v)` means it shipped in `v`, which must equal
+/// the floor. Write the literal release when it ships, not
+/// `Some(CONFIRMED_DELIVERY_MIN_VERSION)`, which would compare the floor with
+/// itself.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const CONFIRMED_DELIVERY_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+
+/// Version floor for confirmed delivery of originated broadcasts (#6143): the
+/// ack-requested broadcast variants (`UpdateMsg::BroadcastToAckRequested`,
+/// `UpdateMsg::BroadcastToStreamingAckRequested`) and the ack itself
+/// (`InterestMessage::BroadcastAck`).
+///
+/// A peer below it has no variant index for either and would close the
+/// connection on one, so the sender flags a leg only for a peer whose
+/// negotiated version is KNOWN and at least this. The ack goes only back to a
+/// peer that flagged a leg, which proves it decodes the ack. Bias HIGH: too
+/// low closes connections to the release below it, too high only delays the
+/// confirmation.
+pub(crate) const CONFIRMED_DELIVERY_MIN_VERSION: (u8, u8, u16) = (0, 2, 161);
+
+/// Pure version-gate for confirmed delivery, mirroring
+/// [`version_supports_broadcast_target_list`]: `true` iff `remote` is known
+/// (`Some`) AND at least `floor`.
+///
+/// Fail-closed on `None`. The fallback is today's unconfirmed broadcast, so a
+/// closed gate costs only the confirmation, never convergence.
+pub(crate) fn version_supports_confirmed_delivery(
+    remote: Option<(u8, u8, u16)>,
+    floor: (u8, u8, u16),
+) -> bool {
+    remote.is_some_and(|v| v >= floor)
+}
+
 use crate::operations::connect::native::NativeWire;
 
 /// Version floor for the QUIC-native fields of `ConnectMsg` (#5940): the
@@ -4334,6 +4373,65 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
 }
 
 // TODO: add testing for the network loop, now it should be possible to do since we don't depend upon having real connections
+
+#[cfg(test)]
+mod confirmed_delivery_floor_tests {
+    use super::{
+        CONFIRMED_DELIVERY_MIN_VERSION, CONFIRMED_DELIVERY_SHIPPED_IN, own_crate_version,
+        version_supports_confirmed_delivery,
+    };
+
+    /// Same guard as `quic_native_floor_tracks_the_shipping_release`: the
+    /// release that lifts the crate to the floor must record that it carries
+    /// the decoder, or raise the floor.
+    #[test]
+    fn confirmed_delivery_floor_tracks_the_shipping_release() {
+        let crate_version = own_crate_version();
+        match CONFIRMED_DELIVERY_SHIPPED_IN {
+            Some(shipped) => {
+                assert_eq!(
+                    shipped, CONFIRMED_DELIVERY_MIN_VERSION,
+                    "the release that ships the confirmed-delivery decoder must EQUAL the floor"
+                );
+                let next = (crate_version.0, crate_version.1, crate_version.2 + 1);
+                assert!(
+                    shipped <= next,
+                    "CONFIRMED_DELIVERY_SHIPPED_IN {shipped:?} is beyond the next release {next:?}"
+                );
+            }
+            None => assert!(
+                crate_version < CONFIRMED_DELIVERY_MIN_VERSION,
+                "floor {CONFIRMED_DELIVERY_MIN_VERSION:?} is a PREDICTION about the next \
+                 release, but the crate is already at {crate_version:?}: either set \
+                 CONFIRMED_DELIVERY_SHIPPED_IN = Some(floor) (this release carries the \
+                 decoder) or raise the floor"
+            ),
+        }
+    }
+
+    /// The floor must never drop to a release without the decoder.
+    #[test]
+    fn confirmed_delivery_floor_stays_above_every_release_without_the_decoder() {
+        const LAST_RELEASE_WITHOUT_DECODER: (u8, u8, u16) = (0, 2, 160);
+        assert!(CONFIRMED_DELIVERY_MIN_VERSION > LAST_RELEASE_WITHOUT_DECODER);
+    }
+
+    /// Fail closed on an unknown version; open at and above the floor.
+    #[test]
+    fn confirmed_delivery_gate_discriminates_by_version() {
+        let floor = (0, 2, 161);
+        assert!(!version_supports_confirmed_delivery(None, floor));
+        assert!(!version_supports_confirmed_delivery(
+            Some((0, 2, 160)),
+            floor
+        ));
+        assert!(version_supports_confirmed_delivery(
+            Some((0, 2, 161)),
+            floor
+        ));
+        assert!(version_supports_confirmed_delivery(Some((0, 3, 0)), floor));
+    }
+}
 
 #[cfg(test)]
 mod quic_native_floor_tests {
