@@ -729,7 +729,19 @@ fn epoch_deadline_ticks(max_execution_seconds: f64) -> u64 {
 /// backedges and function entries. A blocking HOST-function call in progress is
 /// never cut off mid-flight; the trap can only fire once control returns to
 /// guest code. So a slow host call completes normally.
-fn arm_epoch_deadline(store: &mut Store<HostState>, ticks: u64) {
+///
+/// It also records which instance the guest entry is for
+/// ([`HostState::calling_instance`]). That is done here, rather than in a
+/// separate call, so that every guest entry is forced to state it: the
+/// argument is not optional, and every guest entry is already pinned to be
+/// preceded by this call (`every_guest_entry_is_preceded_by_arm_epoch_deadline`).
+/// Pass `None` only where no guest code is about to run (store creation).
+fn arm_epoch_deadline(
+    store: &mut Store<HostState>,
+    ticks: u64,
+    calling_instance: Option<native_api::InstanceId>,
+) {
+    store.data_mut().calling_instance = calling_instance;
     store.set_epoch_deadline(ticks);
     store.epoch_deadline_trap();
     // Piggyback a cheap dead-ticker health check on this already-per-call site.
@@ -805,12 +817,28 @@ pub(crate) struct WasmtimeEngine {
 /// Host state for wasmtime Store, implementing ResourceLimiter for memory limits.
 pub(crate) struct HostState {
     memory_limit_bytes: usize,
+    /// The instance whose guest code this store is running, set by
+    /// [`arm_epoch_deadline`] at every guest entry. Host functions resolve
+    /// their instance from here and NEVER from a guest-supplied argument:
+    /// `MEM_ADDR` and `CONTRACT_IO` are process-global, so an id taken from
+    /// the guest would let one instance act on another's records.
+    ///
+    /// This relies on a store running ONE guest call at a time, with no host
+    /// function entering guest code again on the same store: then the last
+    /// entry is the caller. Both hold today (the store is `&mut`, or moved into
+    /// the blocking closure, for the whole call; no host function calls a
+    /// guest). A host function that re-entered a guest would have to restore
+    /// this value afterwards. A timed-out guest that keeps running on an
+    /// abandoned thread keeps its own store, so its value stays its own.
+    /// `None` until the first entry.
+    calling_instance: Option<native_api::InstanceId>,
 }
 
 impl HostState {
     fn new(memory_limit_pages: u32) -> Self {
         Self {
             memory_limit_bytes: memory_limit_pages as usize * WASM_PAGE_SIZE,
+            calling_instance: None,
         }
     }
 }
@@ -884,7 +912,7 @@ impl WasmEngine for WasmtimeEngine {
         }
         // Arm the initial deadline + select trap behavior; every guest call
         // re-arms it (see `arm_epoch_deadline`).
-        arm_epoch_deadline(&mut store, epoch_deadline_ticks);
+        arm_epoch_deadline(&mut store, epoch_deadline_ticks, None);
 
         // Host memory sharing is not yet implemented in the wasmtime backend.
         // Fail explicitly rather than silently degrading.
@@ -1168,7 +1196,7 @@ impl WasmEngine for WasmtimeEngine {
         let func = instance
             .get_typed_func::<(), ()>(&mut *store, name)
             .map_err(|e| WasmError::Export(e.to_string()))?;
-        arm_epoch_deadline(store, epoch_ticks);
+        arm_epoch_deadline(store, epoch_ticks, Some(handle.id));
         // Use call_async because async_support(true) is enabled in the engine Config
         block_on_async(func.call_async(&mut *store, ()))
             .map_err(|e| classify_runtime_error(enabled_metering, store, e))
@@ -1220,8 +1248,8 @@ impl WasmEngine for WasmtimeEngine {
     }
 }
 
-/// Refresh the cached MEM_ADDR entry for an instance using the current memory
-/// from the wasmtime `Caller`.
+/// Refresh the cached MEM_ADDR entry for the CALLING instance using the
+/// current memory from the wasmtime `Caller`, and return that instance's id.
 ///
 /// WASM linear memory can be relocated by `memory.grow`. The initial pointer
 /// stored in `MEM_ADDR` at instance creation may become stale. This function
@@ -1230,17 +1258,24 @@ impl WasmEngine for WasmtimeEngine {
 ///
 /// Called at the start of every host function to ensure `native_api` functions
 /// see the correct memory base pointer.
-fn refresh_mem_addr_from_caller(caller: &mut Caller<'_, HostState>, instance_id: i64) {
-    if instance_id < 0 {
-        return;
-    }
+///
+/// The instance is the one the store recorded at guest entry
+/// ([`HostState::calling_instance`]). There is deliberately no id parameter:
+/// this function writes the entry it refreshes, so an id from anywhere else
+/// (a guest argument, a thread-local) could point the write at another
+/// instance's record. Returns -1 when no guest entry has been recorded.
+fn refresh_mem_addr_from_caller(caller: &mut Caller<'_, HostState>) -> native_api::InstanceId {
+    let Some(instance_id) = caller.data().calling_instance else {
+        return -1;
+    };
     let Some(memory) = caller.get_export("memory").and_then(|e| e.into_memory()) else {
-        tracing::warn!(
+        // Guest-triggerable (a module with no memory export), so not a warning.
+        tracing::debug!(
             instance_id,
             "refresh_mem_addr: no 'memory' export found — \
              stale pointer will persist until next successful refresh"
         );
-        return;
+        return instance_id;
     };
     let data = memory.data(&*caller);
     let new_ptr = data.as_ptr() as i64;
@@ -1259,12 +1294,41 @@ fn refresh_mem_addr_from_caller(caller: &mut Caller<'_, HostState>, instance_id:
             info.mem_size = new_size;
         }
     } else {
-        tracing::warn!(
+        // Expected while the instance is being created (a start function or
+        // `__frnt_set_id` runs before `RunningInstance::new` records it), and
+        // guest-triggerable, so not a warning.
+        tracing::debug!(
             instance_id,
-            "refresh_mem_addr: no MEM_ADDR entry for instance — \
-             native_api calls will fail"
+            "refresh_mem_addr: no MEM_ADDR entry for instance yet"
         );
     }
+    instance_id
+}
+
+/// Resolve the delegate instance for a delegate host function.
+///
+/// Delegate host functions find their `DELEGATE_ENV` through the
+/// `CURRENT_DELEGATE_INSTANCE` thread-local, which is per THREAD, while the
+/// guest making the call is per STORE. When they disagree (a guest entered on
+/// a thread that still carries some delegate's id), the call is refused with
+/// `ERR_NOT_IN_PROCESS`, so it can neither reach that delegate's env nor have
+/// `native_api` resolve that delegate's memory record. Returns `Err` with the
+/// code to hand back to the guest.
+///
+/// Every production delegate entry installs the thread-local on the thread that
+/// runs the guest (`GuestDelegateInstance`), and every other entry leaves it at
+/// -1 there. So a disagreement needs an entry that runs a guest on a thread
+/// carrying another delegate's id. The only such entry today is the inline
+/// `call_void`, which only tests use; this check keeps any future inline entry
+/// from opening one.
+fn delegate_caller(caller: &mut Caller<'_, HostState>) -> Result<(), i32> {
+    let calling = refresh_mem_addr_from_caller(caller);
+    let thread_delegate = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
+    // -1 is "not in process()"; `native_api` reports that itself, unchanged.
+    if thread_delegate != -1 && thread_delegate != calling {
+        return Err(native_api::error_codes::ERR_NOT_IN_PROCESS);
+    }
+    Ok(())
 }
 
 impl WasmtimeEngine {
@@ -1353,6 +1417,7 @@ impl WasmtimeEngine {
         // runaway synchronous guest. Capture the tick budget by value since the
         // closure can't borrow `self`.
         let epoch_ticks = self.epoch_deadline_ticks;
+        let calling_instance = handle.id;
 
         // Registered HERE, on the calling thread, not inside the closure: see
         // `native_api::LIVE_DELEGATE_GUESTS`. Registering inside would leave a
@@ -1372,7 +1437,7 @@ impl WasmtimeEngine {
                 // every exit path (including a panic), so a reused blocking-pool
                 // thread never carries a stale delegate id into the next job.
                 let _delegate = delegate_instance.map(GuestDelegateInstance::install);
-                arm_epoch_deadline(&mut store, epoch_ticks);
+                arm_epoch_deadline(&mut store, epoch_ticks, Some(calling_instance));
                 // Use call_async because async_support(true) is enabled in the engine Config
                 let r = block_on_async(func.call_async(&mut store, args));
                 (r, store)
@@ -1483,7 +1548,7 @@ impl WasmtimeEngine {
         if enabled_metering {
             store.set_fuel(max_fuel).map_err(|e| anyhow::anyhow!(e))?;
         }
-        arm_epoch_deadline(&mut store, epoch_deadline_ticks);
+        arm_epoch_deadline(&mut store, epoch_deadline_ticks, None);
 
         if host_mem {
             return Err(anyhow::anyhow!(
@@ -1678,7 +1743,7 @@ impl WasmtimeEngine {
         // Arm the epoch deadline before instantiation runs any guest start
         // function (#4861); the store is reused across calls so a stale deadline
         // would otherwise trap here.
-        arm_epoch_deadline(store, epoch_deadline_ticks);
+        arm_epoch_deadline(store, epoch_deadline_ticks, Some(id));
 
         // Instantiate the module using the pre-configured linker.
         // CRITICAL: Must use instantiate_async() because async_support(true) is enabled.
@@ -1707,7 +1772,7 @@ impl WasmtimeEngine {
             // `INSTANCE_SETUP_GUEST_ENTRIES` (2) x max_execution_seconds, and the
             // wall-clock bound `create_instance` passes is sized to match. Adding
             // a third guest entry here means raising that constant too.
-            arm_epoch_deadline(store, epoch_deadline_ticks);
+            arm_epoch_deadline(store, epoch_deadline_ticks, Some(id));
             block_on_async(typed_func.call_async(&mut *store, id)).map_err(|e| {
                 classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string()))
             })?;
@@ -1749,7 +1814,7 @@ impl WasmtimeEngine {
         // Re-arm the epoch deadline on the fresh store; every guest call re-arms
         // again, but arming here keeps the invariant "a live store always has a
         // future deadline" (an un-armed epoch store traps immediately).
-        arm_epoch_deadline(&mut store, self.epoch_deadline_ticks);
+        arm_epoch_deadline(&mut store, self.epoch_deadline_ticks, None);
         self.instances.clear();
         self.store = Some(store);
         self.lifetime_instances = 0;
@@ -1895,6 +1960,11 @@ impl WasmtimeEngine {
         // All host functions refresh the cached MEM_ADDR entry via the Caller
         // before calling into native_api. This prevents stale memory base
         // pointers after WASM memory.grow relocates linear memory (#3248).
+        //
+        // The instance a host function acts on is the CALLING instance
+        // (`HostState::calling_instance`), returned by the refresh. An id
+        // parameter in a signature below is part of the guest ABI and is
+        // ignored: never key a lookup by a guest-supplied id.
         // =====================================================================
 
         // Log namespace
@@ -1902,8 +1972,10 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_log",
                 "__frnt__logger__info",
-                |mut caller: Caller<'_, HostState>, id: i64, ptr: i64, len: i32| {
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                // The guest's id argument is part of the ABI and ignored; see
+                // `HostState::calling_instance`.
+                |mut caller: Caller<'_, HostState>, _guest_id: i64, ptr: i64, len: i32| {
+                    let id = refresh_mem_addr_from_caller(&mut caller);
                     native_api::log::info(id, ptr, len);
                 },
             )
@@ -1914,8 +1986,8 @@ impl WasmtimeEngine {
             .func_wrap(
                 "freenet_rand",
                 "__frnt__rand__rand_bytes",
-                |mut caller: Caller<'_, HostState>, id: i64, ptr: i64, len: u32| {
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                |mut caller: Caller<'_, HostState>, _guest_id: i64, ptr: i64, len: u32| {
+                    let id = refresh_mem_addr_from_caller(&mut caller);
                     native_api::rand::rand_bytes(id, ptr, len);
                 },
             )
@@ -1937,22 +2009,26 @@ impl WasmtimeEngine {
             .func_wrap(
                 crate::conformance::HOST_CLOCK_NAMESPACE,
                 crate::conformance::HOST_CLOCK_IMPORT,
-                |mut caller: Caller<'_, HostState>, id: i64, ptr: i64| {
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                |mut caller: Caller<'_, HostState>, _guest_id: i64, ptr: i64| {
+                    let id = refresh_mem_addr_from_caller(&mut caller);
                     native_api::time::utc_now(id, ptr);
                 },
             )
             .map_err(|e| WasmError::Other(anyhow::anyhow!(e)))?;
 
         // Delegate context namespace (synchronous)
-        // These use the thread-local CURRENT_DELEGATE_INSTANCE for the instance ID.
+        // These use the thread-local CURRENT_DELEGATE_INSTANCE for the instance ID,
+        // after `delegate_caller` has checked it is the calling instance. Every
+        // `freenet_delegate_*` registration must go through `delegate_caller`
+        // (pinned by `every_delegate_host_function_checks_the_calling_instance`).
         linker
             .func_wrap(
                 "freenet_delegate_ctx",
                 "__frnt__delegate__ctx_len",
                 |mut caller: Caller<'_, HostState>| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_context::context_len()
                 },
             )
@@ -1963,8 +2039,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_ctx",
                 "__frnt__delegate__ctx_read",
                 |mut caller: Caller<'_, HostState>, ptr: i64, len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_context::context_read(ptr, len)
                 },
             )
@@ -1975,8 +2052,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_ctx",
                 "__frnt__delegate__ctx_write",
                 |mut caller: Caller<'_, HostState>, ptr: i64, len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_context::context_write(ptr, len)
                 },
             )
@@ -1992,8 +2070,9 @@ impl WasmtimeEngine {
                  key_len: i32,
                  out_ptr: i64,
                  out_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::get_secret(key_ptr, key_len, out_ptr, out_len)
                 },
             )
@@ -2004,8 +2083,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__get_secret_len",
                 |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::get_secret_len(key_ptr, key_len)
                 },
             )
@@ -2020,8 +2100,9 @@ impl WasmtimeEngine {
                  key_len: i32,
                  val_ptr: i64,
                  val_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::set_secret(key_ptr, key_len, val_ptr, val_len)
                 },
             )
@@ -2032,8 +2113,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__has_secret",
                 |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::has_secret(key_ptr, key_len)
                 },
             )
@@ -2044,8 +2126,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__remove_secret",
                 |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::remove_secret(key_ptr, key_len)
                 },
             )
@@ -2056,8 +2139,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__list_secrets_len",
                 |mut caller: Caller<'_, HostState>, prefix_ptr: i64, prefix_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::list_secrets_len(prefix_ptr, prefix_len)
                 },
             )
@@ -2072,8 +2156,9 @@ impl WasmtimeEngine {
                  prefix_len: i32,
                  out_ptr: i64,
                  out_len: i32| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return code;
+                    }
                     native_api::delegate_secrets::list_secrets(
                         prefix_ptr, prefix_len, out_ptr, out_len,
                     )
@@ -2105,8 +2190,9 @@ impl WasmtimeEngine {
                  out_ptr: i64,
                  out_len: i64|
                  -> i64 {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return i64::from(code);
+                    }
                     native_api::delegate_contracts::local_contract_state_impl(
                         id_ptr, id_len, out_ptr, out_len,
                     )
@@ -2119,8 +2205,9 @@ impl WasmtimeEngine {
                 "freenet_delegate_contracts",
                 "__frnt__delegate__get_contract_state_len",
                 |mut caller: Caller<'_, HostState>, id_ptr: i64, id_len: i32| -> i64 {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    if let Err(code) = delegate_caller(&mut caller) {
+                        return i64::from(code);
+                    }
                     native_api::delegate_contracts::local_contract_state_len_impl(id_ptr, id_len)
                 },
             )
@@ -2155,9 +2242,11 @@ impl WasmtimeEngine {
                     out_key_ptr,
                     out_hash_ptr,
                 ): (i64, i64, i64, i64, i64, i64, i64, i64)| {
-                    let id = native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.get());
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    let refused = delegate_caller(&mut caller).err();
                     Box::new(async move {
+                        if let Some(code) = refused {
+                            return code;
+                        }
                         native_api::delegate_management::create_delegate_impl(
                             wasm_ptr,
                             wasm_len,
@@ -2179,10 +2268,10 @@ impl WasmtimeEngine {
                 "freenet_contract_io",
                 "__frnt__fill_buffer",
                 |mut caller: Caller<'_, HostState>,
-                 id: i64,
+                 _guest_id: i64,
                  buf_ptr: i64|
                  -> wasmtime::Result<u32> {
-                    refresh_mem_addr_from_caller(&mut caller, id);
+                    let id = refresh_mem_addr_from_caller(&mut caller);
                     // A builder that no longer lies in guest memory traps the
                     // guest instead of reporting EOF, which would silently
                     // truncate the input the contract is reading.
@@ -2900,7 +2989,7 @@ mod tests {
         let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
         store.limiter(|s| s);
         // Short deadline (2 ticks ≈ 200ms) so the test is fast; trap-on-deadline.
-        arm_epoch_deadline(&mut store, 2);
+        arm_epoch_deadline(&mut store, 2, None);
 
         let instance = block_on_async(Linker::new(&engine).instantiate_async(&mut store, &module))
             .expect("instantiation must succeed");
@@ -6146,5 +6235,608 @@ mod tests {
         for h in &handles {
             engine.drop_instance(h);
         }
+    }
+
+    // =====================================================================
+    // Host functions act on the CALLING instance, whatever id the guest
+    // passes. `MEM_ADDR` and `CONTRACT_IO` are process-global, so a host
+    // function that trusted a guest-supplied instance id would let one
+    // instance act on another's records.
+    //
+    // Instances are created so that the store's most recent guest entry is
+    // NOT the instance under test, wherever that matters: a guest entry that
+    // forgot to record its instance would then act on the other one, and the
+    // assertions on the other instance's record and memory catch it.
+    // =====================================================================
+
+    /// A module that forwards a guest-supplied instance id to every host
+    /// function that takes one. The data segment places a valid buffer
+    /// builder at offset 0 (data `[64, 80)`, read counter at 128, write
+    /// counter at 136), so a fill call that resolved to THIS memory would
+    /// succeed and be observable. Host writes go to `[256, 264)` (`rand_as`),
+    /// `[272, 288)` (`now_as`), `[320, 328)` (`__frnt__initiate_buffer`) and
+    /// `[384, 392)` (`void_rand`); all are zero until written.
+    const NAMES_OTHER_INSTANCE_WAT: &str = r#"
+    (module
+      (import "freenet_log" "__frnt__logger__info"
+        (func $log (param i64 i64 i32)))
+      (import "freenet_rand" "__frnt__rand__rand_bytes"
+        (func $rand (param i64 i64 i32)))
+      (import "freenet_time" "__frnt__time__utc_now"
+        (func $now (param i64 i64)))
+      (import "freenet_contract_io" "__frnt__fill_buffer"
+        (func $fill (param i64 i64) (result i32)))
+      (memory (export "memory") 1)
+      (data (i32.const 0)
+        "\40\00\00\00\00\00\00\00\10\00\00\00\00\00\00\00\80\00\00\00\00\00\00\00\88\00\00\00\00\00\00\00")
+      (global $instance_id (mut i64) (i64.const -1))
+      (func (export "__frnt_set_id") (param i64)
+        local.get 0
+        global.set $instance_id)
+      (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+        i64.const -1
+        i64.const 320
+        i32.const 8
+        call $rand
+        i64.const 0)
+      (func (export "void_rand")
+        i64.const -1
+        i64.const 384
+        i32.const 8
+        call $rand)
+      (func (export "log_as") (param i64 i64) (result i64)
+        local.get 0
+        i64.const 256
+        i32.const 0
+        call $log
+        i64.const 0)
+      (func (export "rand_as") (param i64 i64) (result i64)
+        local.get 0
+        i64.const 256
+        i32.const 8
+        call $rand
+        i64.const 0)
+      (func (export "now_as") (param i64 i64) (result i64)
+        local.get 0
+        i64.const 272
+        call $now
+        i64.const 0)
+      (func (export "fill_as") (param i64 i64) (result i64)
+        local.get 0
+        local.get 1
+        call $fill
+        i64.extend_i32_u))
+    "#;
+
+    /// Record a `MEM_ADDR` entry for `handle` the way `RunningInstance::new`
+    /// does in production, and return the recorded `(start_ptr, mem_size)`.
+    fn record_mem_addr(engine: &mut WasmtimeEngine, handle: &InstanceHandle) -> (i64, usize) {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        use freenet_stdlib::prelude::ContractInstanceId;
+        let (ptr, size) = engine.memory_info(handle).unwrap();
+        MEM_ADDR.insert(
+            handle.id,
+            InstanceInfo::new(
+                ptr as i64,
+                size,
+                Key::Contract(ContractInstanceId::new([0u8; 32])),
+            ),
+        );
+        (ptr as i64, size)
+    }
+
+    fn mem_addr_of(id: i64) -> (i64, usize) {
+        let info = MEM_ADDR.get(&id).expect("MEM_ADDR entry");
+        (info.start_ptr, info.mem_size)
+    }
+
+    /// Copy `len` bytes at `offset` out of `handle`'s linear memory.
+    fn guest_bytes(
+        engine: &mut WasmtimeEngine,
+        handle: &InstanceHandle,
+        offset: usize,
+        len: usize,
+    ) -> Vec<u8> {
+        let (ptr, size) = engine.memory_info(handle).unwrap();
+        assert!(offset + len <= size);
+        // SAFETY: `ptr` is the live base of the instance's linear memory, the
+        // range is inside it (checked above), and no guest code is running.
+        unsafe { std::slice::from_raw_parts(ptr.add(offset), len).to_vec() }
+    }
+
+    /// Two live instances; the caller passes the OTHER one's id to each host
+    /// function that takes an id. The host must act on the caller: the other
+    /// instance's memory record and memory are left alone, and `rand`/`now`
+    /// write into the caller's memory.
+    #[test]
+    fn host_functions_ignore_an_instance_id_naming_another_instance() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        // Caller first, victim last: the store's last guest entry is the
+        // victim's, so the caller's own entry has to record the caller.
+        let caller = engine.create_instance(&module, 1024).unwrap();
+        let victim = engine.create_instance(&module, 1024).unwrap();
+        let caller_mem = record_mem_addr(&mut engine, &caller);
+        let victim_mem = record_mem_addr(&mut engine, &victim);
+        assert_ne!(
+            victim_mem.0, caller_mem.0,
+            "test setup: the two instances must have distinct memories"
+        );
+
+        for export in ["log_as", "rand_as", "now_as"] {
+            let r = engine.call_2i64_blocking(&caller, export, victim.id, 0);
+            assert!(r.is_ok(), "{export} failed: {r:?}");
+            assert_eq!(
+                mem_addr_of(victim.id),
+                victim_mem,
+                "{export}: a call made by instance {} naming instance {} rewrote \
+                 the named instance's memory record",
+                caller.id,
+                victim.id
+            );
+            assert_eq!(mem_addr_of(caller.id), caller_mem);
+            // Each writing export has its own region, so one export's write
+            // cannot stand in for another's.
+            let written = match export {
+                "rand_as" => Some(256),
+                "now_as" => Some(272),
+                _ => None,
+            };
+            if let Some(offset) = written {
+                assert_ne!(
+                    guest_bytes(&mut engine, &caller, offset, 8),
+                    vec![0; 8],
+                    "{export}: nothing was written into the calling instance"
+                );
+            }
+            assert_eq!(
+                guest_bytes(&mut engine, &victim, 256, 32),
+                vec![0; 32],
+                "{export}: the host wrote into the named instance's memory"
+            );
+        }
+
+        engine.drop_instance(&caller);
+        engine.drop_instance(&victim);
+    }
+
+    /// Two live instances; the victim has pending streamed input. The caller
+    /// asks for a refill naming the victim's id and the same buffer offset.
+    /// Nothing may be delivered and the victim's input must stay where it
+    /// was. Positive control: the caller's OWN pending input is delivered.
+    #[test]
+    fn fill_buffer_ignores_an_instance_id_naming_another_instance() {
+        use crate::wasm_runtime::native_api::{CONTRACT_IO, PendingContractData};
+
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let caller = engine.create_instance(&module, 1024).unwrap();
+        let victim = engine.create_instance(&module, 1024).unwrap();
+        record_mem_addr(&mut engine, &caller);
+        let victim_mem = record_mem_addr(&mut engine, &victim);
+        CONTRACT_IO.insert(
+            (victim.id, 0),
+            PendingContractData {
+                data: vec![0xA5; 64],
+                cursor: 0,
+            },
+        );
+
+        let delivered = engine.call_2i64_blocking(&caller, "fill_as", victim.id, 0);
+        let cursor = CONTRACT_IO
+            .remove(&(victim.id, 0))
+            .map(|(_, p)| p.cursor)
+            .expect("victim's pending input entry");
+
+        assert_eq!(
+            delivered.ok(),
+            Some(0),
+            "a refill requested by instance {} naming instance {} delivered data",
+            caller.id,
+            victim.id
+        );
+        assert_eq!(cursor, 0, "the named instance's pending input was consumed");
+        assert_eq!(mem_addr_of(victim.id), victim_mem);
+
+        // Positive control: the same call delivers the caller's own input,
+        // whatever id it passes, so the builder in the data segment is valid
+        // and a zero above means "refused", not "could never deliver".
+        CONTRACT_IO.insert(
+            (caller.id, 0),
+            PendingContractData {
+                data: vec![0x5A; 64],
+                cursor: 0,
+            },
+        );
+        let own = engine.call_2i64_blocking(&caller, "fill_as", victim.id, 0);
+        CONTRACT_IO.remove(&(caller.id, 0));
+        assert_eq!(
+            own.ok(),
+            Some(16),
+            "the caller's own input was not delivered"
+        );
+        assert_eq!(guest_bytes(&mut engine, &caller, 64, 16), vec![0x5A; 16]);
+
+        engine.drop_instance(&caller);
+        engine.drop_instance(&victim);
+    }
+
+    /// A refill for an instance whose memory record is gone (a guest still
+    /// running after its `RunningInstance` was dropped) traps the guest; it
+    /// must not panic the host.
+    #[test]
+    fn fill_buffer_without_a_memory_record_traps_instead_of_panicking() {
+        use crate::wasm_runtime::native_api::{CONTRACT_IO, PendingContractData};
+
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let caller = engine.create_instance(&module, 1024).unwrap();
+        // Deliberately no MEM_ADDR record.
+        CONTRACT_IO.insert(
+            (caller.id, 0),
+            PendingContractData {
+                data: vec![0xA5; 64],
+                cursor: 0,
+            },
+        );
+        let r = engine.call_2i64_blocking(&caller, "fill_as", caller.id, 0);
+        CONTRACT_IO.remove(&(caller.id, 0));
+        // A guest trap is `WasmError::Runtime` and leaves the store intact. A
+        // host panic is caught by `execute_wasm_blocking` as
+        // `WasmError::Other` and replaces the store, which drops every
+        // instance, so the follow-up call below would find none.
+        let err = r.expect_err("the refill must fail");
+        assert!(
+            matches!(err, WasmError::Runtime(_)),
+            "expected a guest trap, got: {err:?}"
+        );
+        engine
+            .call_2i64_blocking(&caller, "rand_as", 0, 0)
+            .expect("the store must survive a trap; a host panic would have replaced it");
+        engine.drop_instance(&caller);
+    }
+
+    /// Start functions run inside `create_instance`, before
+    /// `RunningInstance::new` records the instance. Their host calls find no
+    /// record and must be refused without a host panic. Instance setup captures
+    /// a host panic as an `Err`, so a panic here fails the `.expect` below.
+    #[test]
+    fn start_function_host_calls_before_the_instance_is_recorded_do_not_panic() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let start_wat = r#"
+        (module
+          (import "freenet_log" "__frnt__logger__info"
+            (func $log (param i64 i64 i32)))
+          (import "freenet_rand" "__frnt__rand__rand_bytes"
+            (func $rand (param i64 i64 i32)))
+          (import "freenet_time" "__frnt__time__utc_now"
+            (func $now (param i64 i64)))
+          (memory (export "memory") 1)
+          (func $start
+            i64.const 9223372036854775800
+            i64.const 0
+            i32.const 0
+            call $log
+            i64.const 9223372036854775800
+            i64.const 0
+            i32.const 8
+            call $rand
+            i64.const 9223372036854775800
+            i64.const 0
+            call $now)
+          (start $start))
+        "#;
+        let module = engine.compile(start_wat.as_bytes()).unwrap();
+        let handle = engine
+            .create_instance(&module, 1024)
+            .expect("a start function's host calls must not fail instantiation");
+        engine.drop_instance(&handle);
+    }
+
+    /// Every guest entry records ITS instance: instantiation (start
+    /// function), `call_void` and `initiate_buffer`. `call_typed_blocking` is
+    /// covered by the tests above. Before each entry the store's last guest
+    /// entry was a DIFFERENT instance, so an entry that failed to record its
+    /// own would act on that one: its memory record would be rewritten.
+    #[test]
+    fn every_guest_entry_records_its_own_instance() {
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let a = engine.create_instance(&module, 1024).unwrap();
+        let a_mem = record_mem_addr(&mut engine, &a);
+
+        // Instantiation: the start function calls rand while the store's
+        // last entry was `a`'s.
+        let start_wat = r#"
+        (module
+          (import "freenet_rand" "__frnt__rand__rand_bytes"
+            (func $rand (param i64 i64 i32)))
+          (memory (export "memory") 1)
+          (func $start
+            i64.const 0
+            i64.const 0
+            i32.const 8
+            call $rand)
+          (start $start))
+        "#;
+        let start_module = engine.compile(start_wat.as_bytes()).unwrap();
+        let s = engine.create_instance(&start_module, 1024).unwrap();
+        assert_eq!(
+            mem_addr_of(a.id),
+            a_mem,
+            "instantiation acted on the previously entered instance"
+        );
+        engine.drop_instance(&s);
+
+        // `__frnt_set_id`, the second guest entry inside instantiation. The
+        // first arm in `instantiate_and_init` has already recorded the new
+        // instance, so this catches an arm before `__frnt_set_id` that records
+        // ANOTHER instance, not a missing one (a missing re-arm is harmless
+        // here; that every entry is armed at all is pinned by
+        // `every_guest_entry_is_preceded_by_arm_epoch_deadline`).
+        let set_id_wat = r#"
+        (module
+          (import "freenet_rand" "__frnt__rand__rand_bytes"
+            (func $rand (param i64 i64 i32)))
+          (memory (export "memory") 1)
+          (func (export "__frnt_set_id") (param i64)
+            i64.const 0
+            i64.const 0
+            i32.const 8
+            call $rand))
+        "#;
+        let set_id_module = engine.compile(set_id_wat.as_bytes()).unwrap();
+        let s = engine.create_instance(&set_id_module, 1024).unwrap();
+        assert_eq!(
+            mem_addr_of(a.id),
+            a_mem,
+            "__frnt_set_id acted on the previously entered instance"
+        );
+        engine.drop_instance(&s);
+
+        let b = engine.create_instance(&module, 1024).unwrap();
+        let b_mem = record_mem_addr(&mut engine, &b);
+
+        // call_void on `a`; last entry was `b`'s instantiation.
+        engine.call_void(&a, "void_rand").unwrap();
+        assert_ne!(guest_bytes(&mut engine, &a, 384, 8), vec![0; 8]);
+        assert_eq!(guest_bytes(&mut engine, &b, 384, 8), vec![0; 8]);
+        assert_eq!(
+            mem_addr_of(b.id),
+            b_mem,
+            "call_void acted on another instance"
+        );
+
+        // initiate_buffer on `b`; last entry was `a`'s call_void.
+        engine.initiate_buffer(&b, 0).unwrap();
+        assert_ne!(guest_bytes(&mut engine, &b, 320, 8), vec![0; 8]);
+        assert_eq!(guest_bytes(&mut engine, &a, 320, 8), vec![0; 8]);
+        assert_eq!(
+            mem_addr_of(a.id),
+            a_mem,
+            "initiate_buffer acted on another instance"
+        );
+
+        engine.drop_instance(&a);
+        engine.drop_instance(&b);
+    }
+
+    /// The delegate host functions find their instance through
+    /// `CURRENT_DELEGATE_INSTANCE`, a thread-local. If that thread-local names
+    /// a different instance from the one the store is running (a guest entered
+    /// inline on a thread that still carries a delegate's id), the call must be
+    /// refused rather than served from the named delegate's env.
+    ///
+    /// The env below has a 5-byte context, so `ctx_len` returns 5 when it is
+    /// served from it and `ERR_NOT_IN_PROCESS` (-1) when refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delegate_host_functions_refuse_a_thread_local_naming_another_instance() {
+        use crate::contract::storages::Storage;
+        use crate::wasm_runtime::native_api::{
+            DELEGATE_ENV, DelegateCallEnv, DelegateEnvSlot, error_codes, new_delegate_counter,
+            new_inherited_origins,
+        };
+        use crate::wasm_runtime::{ContractStore, DelegateStore, SecretsStore};
+        use freenet_stdlib::prelude::{CodeHash, DelegateKey};
+
+        struct Cleanup(i64);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+                DELEGATE_ENV.remove(&self.0);
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let db = Storage::new(temp.path()).await.unwrap();
+        let contract_store =
+            ContractStore::new(temp.path().join("contracts"), 10_000_000, db.clone()).unwrap();
+        let mut delegate_store =
+            DelegateStore::new(temp.path().join("delegates"), 10_000, db.clone()).unwrap();
+        let mut secret_store =
+            SecretsStore::new(temp.path().join("secrets"), Default::default(), db).unwrap();
+
+        let config = RuntimeConfig::default();
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        let wat = r#"
+        (module
+          (import "freenet_delegate_ctx" "__frnt__delegate__ctx_len"
+            (func $ctx_len (result i32)))
+          (memory (export "memory") 1)
+          (func (export "ctx_len_as") (param i64 i64 i64) (result i64)
+            call $ctx_len
+            i64.extend_i32_s)
+          (func (export "void_ctx_len")
+            i32.const 0
+            call $ctx_len
+            i32.store))
+        "#;
+        let module = engine.compile(wat.as_bytes()).unwrap();
+        let victim = engine.create_instance(&module, 1024).unwrap();
+        let victim_mem = record_mem_addr(&mut engine, &victim);
+
+        // SAFETY: the env holds raw pointers to the stores above. It is
+        // removed from DELEGATE_ENV by `_cleanup`, declared after the stores,
+        // so it drops (and removes the env) first.
+        let env = unsafe {
+            DelegateCallEnv::new(
+                vec![7; 5],
+                &mut secret_store,
+                &contract_store,
+                None,
+                DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32])),
+                &mut delegate_store,
+                0,
+                vec![],
+                None,
+                new_delegate_counter(),
+                new_inherited_origins(),
+            )
+        };
+        let _cleanup = Cleanup(victim.id);
+        DELEGATE_ENV.insert(victim.id, DelegateEnvSlot::new(env));
+
+        // Positive control: the delegate's own call (thread-local and calling
+        // instance both `victim`, as `call_3i64` sets them) is served.
+        let own = engine.call_3i64(&victim, "ctx_len_as", 0, 0, 0).unwrap();
+        assert_eq!(own, 5, "a delegate's own call was not served from its env");
+
+        // Mismatch: `call_void` runs the guest inline on THIS thread, so the
+        // thread-local set here is the one the host function sees, while the
+        // calling instance is `other`. (Instance setup and the typed calls run
+        // the guest on another thread, where this thread-local is not visible,
+        // so they cannot drive this case.) Unrefused, `ctx_len` would be served
+        // from `victim`'s env and return 5.
+        let other = engine.create_instance(&module, 1024).unwrap();
+        native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.set(victim.id));
+        let r = engine.call_void(&other, "void_ctx_len");
+        native_api::CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        r.unwrap();
+
+        let stored = guest_bytes(&mut engine, &other, 0, 4);
+        let ctx_len = i32::from_le_bytes([stored[0], stored[1], stored[2], stored[3]]);
+        assert_eq!(
+            ctx_len,
+            error_codes::ERR_NOT_IN_PROCESS,
+            "a guest whose thread carried another instance's delegate id was \
+             served from that instance's env"
+        );
+        assert_eq!(mem_addr_of(victim.id), victim_mem);
+
+        engine.drop_instance(&other);
+        engine.drop_instance(&victim);
+    }
+
+    /// Source pin: every delegate host function goes through `delegate_caller`,
+    /// and every other host function takes its instance from
+    /// `refresh_mem_addr_from_caller`. The behavioural test above exercises one
+    /// delegate function (`ctx_len`); this covers the rest, including the
+    /// i64-returning and async registrations.
+    ///
+    /// It checks that each delegate registration RETURNS the refusal, not
+    /// merely that it calls `delegate_caller`, and that every other
+    /// registration passes the calling instance's id on to `native_api`.
+    ///
+    /// FALSIFY: delete the `delegate_caller` check from any one
+    /// `freenet_delegate_*` registration, or replace its `return` with
+    /// `return 0;`, or pass `_guest_id` to a `native_api` call; this test
+    /// fails naming the function.
+    #[test]
+    fn every_delegate_host_function_checks_the_calling_instance() {
+        let src = include_str!("wasmtime_engine.rs");
+        let body = scrape_body(src, "fn register_host_functions(");
+        // Code only: drop `//` comments, whole-line and trailing, so prose
+        // cannot satisfy a needle. (No string literal in these registrations
+        // contains `//`.)
+        let code_lines = |block: &str| -> String {
+            block
+                .lines()
+                .map(|l| l.split_once("//").map_or(l, |(code, _)| code).trim_end())
+                .filter(|l| !l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // The line after `needle` must hand the refusal code back to the guest.
+        let refusal_returned = |code: &str, needle: &str, then: &str| -> bool {
+            code.split_once(needle).is_some_and(|(_, rest)| {
+                rest.lines()
+                    .nth(1)
+                    .is_some_and(|l| l.trim_start().starts_with(then))
+            })
+        };
+
+        let mut delegate_fns = 0;
+        let mut other_fns = 0;
+        // Each registration starts at `.func_wrap(` or `.func_wrap_async(`.
+        for block in body.split(".func_wrap").skip(1) {
+            let code = code_lines(block);
+            let name = code
+                .split('"')
+                .find(|s| s.starts_with("__frnt"))
+                .unwrap_or("<unnamed>")
+                .to_string();
+            if code.contains("\"freenet_delegate_") {
+                delegate_fns += 1;
+                // Sync form: `if let Err(code) = delegate_caller(..) {` then
+                // `return ..code..`. Async form: the result is taken before
+                // the future and returned at the top of it.
+                let sync = refusal_returned(
+                    &code,
+                    "if let Err(code) = delegate_caller(&mut caller) {",
+                    "return code;",
+                ) || refusal_returned(
+                    &code,
+                    "if let Err(code) = delegate_caller(&mut caller) {",
+                    "return i64::from(code);",
+                );
+                let async_form = code.contains("let refused = delegate_caller(&mut caller).err();")
+                    && refusal_returned(&code, "if let Some(code) = refused {", "return code;");
+                assert!(
+                    sync || async_form,
+                    "delegate host function {name} does not refuse, via \
+                     `delegate_caller`, a thread-local delegate id that is not the \
+                     calling instance"
+                );
+            } else {
+                other_fns += 1;
+                assert!(
+                    code.contains("let id = refresh_mem_addr_from_caller(&mut caller);"),
+                    "host function {name} does not take its instance from \
+                     `refresh_mem_addr_from_caller`"
+                );
+                // ...and hands THAT id to every native_api call, not the guest's.
+                let calls: Vec<&str> = code.split("native_api::").skip(1).collect();
+                let passes_id = !calls.is_empty()
+                    && calls.iter().all(|call| {
+                        call.split_once('(')
+                            .is_some_and(|(_, args)| args.trim_start().starts_with("id,"))
+                    });
+                assert!(
+                    passes_id,
+                    "host function {name} does not pass the calling instance's id \
+                     to native_api"
+                );
+                assert!(
+                    !code.contains("CURRENT_DELEGATE_INSTANCE"),
+                    "host function {name} reads the delegate thread-local directly"
+                );
+            }
+        }
+        // Structural anchors, counted independently of the needles above.
+        let delegate_namespaces = code_lines(body).matches("\"freenet_delegate_").count();
+        assert_eq!(delegate_fns, delegate_namespaces);
+        assert!(
+            delegate_fns >= 13,
+            "found only {delegate_fns} delegate host functions"
+        );
+        assert!(
+            other_fns >= 4,
+            "found only {other_fns} other host functions"
+        );
     }
 }
