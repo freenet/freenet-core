@@ -108,7 +108,9 @@ use crate::transport::{
 };
 
 /// An admitted native join at a gateway (`quic::admission`): the handshake
-/// and the Hello exchange, within [`NATIVE_JOIN_WINDOW`] on `clock`. Until
+/// and the Hello exchange, within [`NATIVE_JOIN_WINDOW`] on `clock`, where
+/// the exchange includes the client's acknowledgement of the gateway's Hello
+/// (a close stops retransmission, so closing earlier could lose it). Until
 /// phase B hands the connection to the node, a join that gets this far is
 /// closed here and counted as `joined`. Returns what to count.
 pub(in crate::transport::quic) async fn join_gateway<T: TimeSource>(
@@ -132,8 +134,14 @@ pub(in crate::transport::quic) async fn join_gateway<T: TimeSource>(
     let own =
         crate::transport::quic::native::setup::own_hello(connection.inner().remote_address(), 0);
     let left = NATIVE_JOIN_WINDOW.saturating_sub(clock.now().saturating_sub(start));
-    match crate::transport::quic::native::exchange::exchange(&connection, &own, false, clock, left)
-        .await
+    match crate::transport::quic::native::exchange::exchange_confirmed(
+        &connection,
+        &own,
+        false,
+        clock,
+        left,
+    )
+    .await
     {
         Ok(_) => {
             connection.close(crate::transport::metrics::QuicCloseCode::NodeDroppedPeer);

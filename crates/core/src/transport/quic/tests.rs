@@ -49,9 +49,16 @@ struct Recording<S> {
     addr: SocketAddr,
     time: VirtualTime,
     log: Arc<Mutex<Vec<Sent>>>,
+    /// While set, a datagram sent through this socket is lost on the way:
+    /// the send reports success and nothing is delivered or logged.
+    muted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<S: Socket> Recording<S> {
+    fn is_muted(&self) -> bool {
+        self.muted.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn note(&self, buf: &[u8], to: SocketAddr) {
         self.log.lock().unwrap().push(Sent {
             at_ns: self.time.now_nanos(),
@@ -72,18 +79,27 @@ impl<S: Socket> Socket for Recording<S> {
     }
 
     async fn send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        if self.is_muted() {
+            return Ok(buf.len());
+        }
         let sent = self.inner.send_to(buf, target).await?;
         self.note(buf, target);
         Ok(sent)
     }
 
     fn send_to_blocking(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        if self.is_muted() {
+            return Ok(buf.len());
+        }
         let sent = self.inner.send_to_blocking(buf, target)?;
         self.note(buf, target);
         Ok(sent)
     }
 
     fn try_send_to(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        if self.is_muted() {
+            return Ok(buf.len());
+        }
         let sent = self.inner.try_send_to(buf, target)?;
         self.note(buf, target);
         Ok(sent)
@@ -336,6 +352,8 @@ pub(in crate::transport::quic) struct Pair {
     a_socket: Arc<SimDemux>,
     b_socket: Arc<SimDemux>,
     log: Arc<Mutex<Vec<Sent>>>,
+    /// Loses every datagram `b` sends while set.
+    pub(super) b_muted: Arc<std::sync::atomic::AtomicBool>,
     pumps: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -374,24 +392,32 @@ pub(in crate::transport::quic) async fn pair_with(
     register_address_network(a_addr, network);
     register_address_network(b_addr, network);
     let log = Arc::new(Mutex::new(Vec::new()));
-    let bind = |addr: SocketAddr, cap: Option<EgressCap>| {
-        let time = time.clone();
-        let log = log.clone();
-        async move {
-            let inner = SimulationSocket::bind(addr).await.expect("sim bind");
-            Arc::new(DemuxSocket::wrap(
-                Recording {
-                    inner,
-                    addr,
-                    time,
-                    log,
-                },
-                cap,
-            ))
-        }
-    };
-    let a_socket = bind(a_addr, a_cap.map(|rate| EgressCap::new(rate, time.clone()))).await;
-    let b_socket = bind(b_addr, None).await;
+    let b_muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bind =
+        |addr: SocketAddr, cap: Option<EgressCap>, muted: Arc<std::sync::atomic::AtomicBool>| {
+            let time = time.clone();
+            let log = log.clone();
+            async move {
+                let inner = SimulationSocket::bind(addr).await.expect("sim bind");
+                Arc::new(DemuxSocket::wrap(
+                    Recording {
+                        inner,
+                        addr,
+                        time,
+                        log,
+                        muted,
+                    },
+                    cap,
+                ))
+            }
+        };
+    let a_socket = bind(
+        a_addr,
+        a_cap.map(|rate| EgressCap::new(rate, time.clone())),
+        Arc::default(),
+    )
+    .await;
+    let b_socket = bind(b_addr, None, b_muted.clone()).await;
     let a_keys = TransportKeypair::new();
     let b_keys = TransportKeypair::new();
     let a = QuicEndpoint::bind(a_socket.clone(), a_addr, time.clone(), &settings, &a_keys)
@@ -411,6 +437,7 @@ pub(in crate::transport::quic) async fn pair_with(
         a_socket,
         b_socket,
         log,
+        b_muted,
         pumps,
     }
 }
@@ -484,6 +511,7 @@ impl Pair {
                 addr,
                 time: self.time.clone(),
                 log: self.log.clone(),
+                muted: Arc::default(),
             },
             None,
         ));
@@ -5574,6 +5602,79 @@ fn an_admitted_join_exchanges_hellos_and_is_closed_at_the_hook() {
             }
         })
     }
+}
+
+/// The gateway keeps the connection open until its Hello is acknowledged: a
+/// close stops retransmission, so with the gateway's first transmissions lost
+/// (everything it sends is dropped for a while after the handshake) a join
+/// that closed as soon as the exchange returned would leave the client with
+/// no Hello while counting `joined`. Here the client gets its Hello, by
+/// retransmission, and the join still counts as `joined`.
+#[test]
+fn a_gateway_hello_lost_at_first_is_retransmitted_before_the_join_closes() {
+    use super::upgrade::driver::join_gateway;
+    use crate::transport::metrics::GatewayAdmission;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-admission-hello-lost", net.addr(1), net.addr(2), None).await;
+        assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+        let server_peer = PeerKey::of(pair.b_keys.public()).unwrap();
+        let tls = pair
+            .a
+            .identity
+            .client_tls_for(&server_peer, config::Alpn::Native)
+            .unwrap();
+        let client_config = pair.a.client_config(Arc::new(tls));
+        let (a, b, b_addr, time) = (
+            pair.a.clone(),
+            pair.b.clone(),
+            pair.b_addr,
+            pair.time.clone(),
+        );
+        let muted = pair.b_muted.clone();
+        let (hello, joined) = drive(&pair.time, Duration::from_secs(60), async move {
+            let client = async {
+                let connection = a
+                    .connect_with(b_addr, client_config, server_peer)
+                    .await
+                    .expect("the client connects");
+                // The gateway's Hello is sent after the handshake finishes,
+                // which needs this side's last flight: mute from here.
+                muted.store(true, std::sync::atomic::Ordering::SeqCst);
+                let heal = async {
+                    time.sleep(Duration::from_millis(500)).await;
+                    muted.store(false, std::sync::atomic::Ordering::SeqCst);
+                };
+                let own = super::native::setup::own_hello(b_addr, 0);
+                let (hello, ()) = tokio::join!(
+                    super::native::exchange::exchange(
+                        &connection,
+                        &own,
+                        true,
+                        &time,
+                        Duration::from_secs(8),
+                    ),
+                    heal
+                );
+                hello
+            };
+            let server = async {
+                match b.accept_attempt().await {
+                    Some(super::EndpointAttempt::Joiner(joiner)) => {
+                        join_gateway(joiner, &time).await
+                    }
+                    Some(super::EndpointAttempt::Allowed(_)) | None => {
+                        panic!("an admitted joiner")
+                    }
+                }
+            };
+            tokio::join!(client, server)
+        })
+        .await;
+        assert!(hello.is_ok(), "the client's exchange: {hello:?}");
+        assert_eq!(joined, GatewayAdmission::Joined);
+    })
 }
 
 /// An admission whose attempt cannot be accepted is given back: with the
