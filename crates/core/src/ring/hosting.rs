@@ -1192,6 +1192,16 @@ impl HostingManager {
         }
     }
 
+    /// The size of `key`'s state at its last committed write, from the disk
+    /// tracker. `None` before the tracker is installed or when no write or
+    /// seed has recorded it.
+    pub(crate) fn committed_state_size(&self, key: &ContractKey) -> Option<u64> {
+        self.disk_tracker
+            .read()
+            .as_ref()
+            .and_then(|tracker| tracker.committed_state_size(key))
+    }
+
     /// Apply a state-write delta to the disk tracker at a state-write chokepoint.
     /// Wired from `Ring::commit_state_write` (the single infallible post-write
     /// funnel for all four executor chokepoints), so

@@ -5021,6 +5021,13 @@ impl Ring {
         self.hosting_manager.disk_usage_stats()
     }
 
+    /// The size of `contract`'s stored state at its last committed write, if
+    /// the disk tracker has recorded it. See
+    /// `HostingManager::committed_state_size`.
+    pub(crate) fn committed_state_size(&self, contract: &ContractKey) -> Option<u64> {
+        self.hosting_manager.committed_state_size(contract)
+    }
+
     pub(crate) fn commit_state_write(&self, contract: &ContractKey, state_size: usize) {
         let new_gen = self.hosting_manager.bump_state_generation(contract);
         self.hosting_manager

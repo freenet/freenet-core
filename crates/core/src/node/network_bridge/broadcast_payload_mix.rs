@@ -41,6 +41,10 @@
 //!    have three different fixes, published as
 //!    `tracked_missing_<reason>_{sends,bytes}` plus a
 //!    `tracked_missing_unattributed_*` residual that must stay at zero.
+//! 7. [`PayloadArm::FullLargeDeltaStreamed`] — a delta WAS computed, but the
+//!    state is large and the delta too large to send inline, so the state went
+//!    out as a stream to keep the fan-out's resident memory under the lane
+//!    bound. Can be several times the bytes of the delta it replaced.
 //!
 //! Arms 4-6 were a single `full_no_summary` bucket when #4922 first shipped.
 //! The 2026-07-25 measurement then found that bucket was the LARGEST single
@@ -377,13 +381,20 @@ pub(crate) enum PayloadArm {
     /// cleared by a delta-apply failure / `ResyncRequest`. The next delivered
     /// broadcast caches a summary and the pair collapses to deltas.
     FullNoTheirSummaryTracked,
+    /// Full state: the contract's state is large and the computed delta was
+    /// too large to send inline, so the state went out as a stream instead,
+    /// where the lane permit bounds how many are resident. Kept apart from
+    /// [`Self::FullNotEfficient`]: that arm is the delta not being smaller than
+    /// the state, this one is a memory bound chosen over a smaller payload.
+    /// See `broadcast_queue::delta_sent_as_full_state`.
+    FullLargeDeltaStreamed,
 }
 
 impl PayloadArm {
     /// Every arm, in reporting order. Exhaustive by construction: the
     /// `match` in [`PayloadArm::index`] fails to compile if a variant is
     /// added without being listed here.
-    pub(crate) const ALL: [PayloadArm; 7] = [
+    pub(crate) const ALL: [PayloadArm; 8] = [
         PayloadArm::Delta,
         PayloadArm::FullDeltaSuppressed,
         PayloadArm::FullNotEfficient,
@@ -391,6 +402,7 @@ impl PayloadArm {
         PayloadArm::FullNoOurSummary,
         PayloadArm::FullNoTheirSummaryUntracked,
         PayloadArm::FullNoTheirSummaryTracked,
+        PayloadArm::FullLargeDeltaStreamed,
     ];
 
     /// The three arms that together make up the legacy `full_no_summary`
@@ -413,6 +425,7 @@ impl PayloadArm {
             PayloadArm::FullNoOurSummary => 4,
             PayloadArm::FullNoTheirSummaryUntracked => 5,
             PayloadArm::FullNoTheirSummaryTracked => 6,
+            PayloadArm::FullLargeDeltaStreamed => 7,
         }
     }
 
@@ -427,6 +440,7 @@ impl PayloadArm {
             PayloadArm::FullNoOurSummary => "full_no_our_summary",
             PayloadArm::FullNoTheirSummaryUntracked => "full_no_their_summary_untracked",
             PayloadArm::FullNoTheirSummaryTracked => "full_no_their_summary_tracked",
+            PayloadArm::FullLargeDeltaStreamed => "full_large_delta_streamed",
         }
     }
 
@@ -1134,6 +1148,13 @@ impl PayloadMix {
         if let Some(slot) = w.propagation_events.get_mut(ev.index()) {
             *slot = slot.saturating_add(1);
         }
+    }
+
+    /// Test-only view of one arm's delivered `(sends, bytes)`, without draining.
+    #[cfg(test)]
+    pub(crate) fn arm_for_test(&self, arm: PayloadArm) -> (u64, u64) {
+        let w = self.window.lock();
+        (w.sends[arm.index()], w.bytes[arm.index()])
     }
 
     /// Test-only view of the [`PropagationEvent`] counts, without draining.
