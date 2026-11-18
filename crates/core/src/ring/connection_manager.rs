@@ -51,6 +51,9 @@ pub(crate) struct TransientEntry {
     /// connection that is never promoted is closed by the zombie sweep or the
     /// transport's idle timeout.
     pub held: bool,
+    /// Distinguishes this entry from earlier and later ones at the same
+    /// address (`ConnectionManager::transient_generation`).
+    pub generation: u64,
 }
 
 /// Why a transient registration was refused.
@@ -601,6 +604,11 @@ pub(crate) struct ConnectionManager {
     /// `max(MIN_TRANSIENT_SOURCE_SHARE, transient_budget / TRANSIENT_SOURCE_SHARE_DIVISOR)`.
     transient_source_share: usize,
     transient_source_refusals: Arc<AtomicU64>,
+    transient_evictions: Arc<AtomicU64>,
+    /// Transient entries in registration order, as `(addr, generation)`;
+    /// entries no longer in the map are skipped and dropped lazily.
+    transient_order: Arc<Mutex<std::collections::VecDeque<(SocketAddr, u64)>>>,
+    transient_generation: Arc<AtomicU64>,
     transient_ttl: Duration,
     pub min_connections: usize,
     pub max_connections: usize,
@@ -811,6 +819,9 @@ impl ConnectionManager {
             transient_per_source: Arc::new(DashMap::new()),
             transient_source_share: transient_source_share(transient_budget),
             transient_source_refusals: Arc::new(AtomicU64::new(0)),
+            transient_evictions: Arc::new(AtomicU64::new(0)),
+            transient_order: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            transient_generation: Arc::new(AtomicU64::new(0)),
             transient_ttl,
             min_connections,
             max_connections,
@@ -2035,58 +2046,144 @@ impl ConnectionManager {
         addr: SocketAddr,
         location: Option<Location>,
     ) -> Result<(), TransientRefusal> {
-        if self.transient_connections.contains_key(&addr) {
-            if let Some(mut entry) = self.transient_connections.get_mut(&addr) {
-                entry.location = location;
+        use dashmap::mapref::entry::Entry as MapEntry;
+        // The whole check-and-insert runs under the entry's shard lock, so two
+        // registrations of one address cannot both count, and the budget slot
+        // is taken by compare-and-swap, so concurrent registrations of
+        // different addresses cannot pass it together.
+        let generation = match self.transient_connections.entry(addr) {
+            MapEntry::Occupied(mut entry) => {
+                entry.get_mut().location = location;
+                return Ok(());
             }
-            return Ok(());
-        }
-
-        let current = self.transient_in_use.load(Ordering::Acquire);
-        if current >= self.transient_budget {
-            return Err(TransientRefusal::Budget);
-        }
-
-        let source = TransientSource::of(addr);
-        {
-            let mut held = self.transient_per_source.entry(source).or_insert(0);
-            if *held >= self.transient_source_share {
-                drop(held);
-                let refused = self
-                    .transient_source_refusals
-                    .fetch_add(1, Ordering::Relaxed)
-                    + 1;
-                if refused.is_power_of_two() {
-                    tracing::info!(
-                        remote = %addr,
-                        share = self.transient_source_share,
-                        refused_total = refused,
-                        "Transient connection refused: its source holds its share of the budget"
-                    );
+            MapEntry::Vacant(vacant) => {
+                let reserve_slot = || {
+                    self.transient_in_use
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                            (current < self.transient_budget).then_some(current + 1)
+                        })
+                        .is_ok()
+                };
+                // No entry is created for a source that is refused, so
+                // refused sources leave nothing behind.
+                match self.transient_per_source.entry(TransientSource::of(addr)) {
+                    MapEntry::Occupied(mut held) => {
+                        if *held.get() >= self.transient_source_share {
+                            drop(held);
+                            self.record_source_refusal(addr);
+                            return Err(TransientRefusal::SourceShare);
+                        }
+                        if !reserve_slot() {
+                            return Err(TransientRefusal::Budget);
+                        }
+                        *held.get_mut() += 1;
+                    }
+                    // A source's share is at least MIN_TRANSIENT_SOURCE_SHARE.
+                    MapEntry::Vacant(source) => {
+                        if !reserve_slot() {
+                            return Err(TransientRefusal::Budget);
+                        }
+                        source.insert(1);
+                    }
                 }
-                return Err(TransientRefusal::SourceShare);
+                let generation = self.transient_generation.fetch_add(1, Ordering::Relaxed);
+                vacant.insert(TransientEntry {
+                    location,
+                    created_at: Instant::now(),
+                    held: false,
+                    generation,
+                });
+                generation
             }
-            *held += 1;
+        };
+        // Taken after the entry's shard lock is released: `oldest_held_transient`
+        // takes the queue first and then reads the map.
+        let mut order = self.transient_order.lock();
+        order.push_back((addr, generation));
+        if order.len() > 2 * self.transient_connections.len() + 64 {
+            order.retain(|(addr, generation)| {
+                self.transient_connections
+                    .get(addr)
+                    .is_some_and(|entry| entry.generation == *generation)
+            });
         }
-
-        self.transient_connections.insert(
-            addr,
-            TransientEntry {
-                location,
-                created_at: Instant::now(),
-                held: false,
-            },
-        );
-        let prev = self.transient_in_use.fetch_add(1, Ordering::SeqCst);
-        if prev >= self.transient_budget {
-            // Undo if we raced past the budget.
-            self.transient_connections.remove(&addr);
-            self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
-            self.release_transient_source(addr);
-            return Err(TransientRefusal::Budget);
-        }
-
         Ok(())
+    }
+
+    fn record_source_refusal(&self, addr: SocketAddr) {
+        let refused = self
+            .transient_source_refusals
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        if refused.is_power_of_two() {
+            tracing::info!(
+                remote = %addr,
+                share = self.transient_source_share,
+                refused_total = refused,
+                "Transient connection refused: its source holds its share of the budget"
+            );
+        }
+    }
+
+    /// The address of the oldest transient entry an open connection holds
+    /// (`hold_transient`), for eviction when the budget is spent: closing it
+    /// gives its slot back, so a newcomer is admitted and a host that fills
+    /// the budget has to keep opening connections to keep it full.
+    pub(crate) fn oldest_held_transient(&self) -> Option<SocketAddr> {
+        let mut order = self.transient_order.lock();
+        // Entries that were removed or replaced are dropped from the front.
+        while let Some((addr, generation)) = order.front().copied() {
+            let live = self
+                .transient_connections
+                .get(&addr)
+                .is_some_and(|entry| entry.generation == generation);
+            if live {
+                break;
+            }
+            order.pop_front();
+        }
+        order.iter().find_map(|(addr, generation)| {
+            self.transient_connections
+                .get(addr)
+                .filter(|entry| entry.generation == *generation && entry.held)
+                .map(|_| *addr)
+        })
+    }
+
+    /// Counts a transient entry closed to admit a newcomer.
+    pub(crate) fn record_transient_eviction(&self, victim: SocketAddr) {
+        let evicted = self.transient_evictions.fetch_add(1, Ordering::Relaxed) + 1;
+        if evicted.is_power_of_two() {
+            tracing::info!(
+                %victim,
+                budget = self.transient_budget,
+                evicted_total = evicted,
+                "Transient budget spent: closed the oldest unpromoted connection"
+            );
+        }
+    }
+
+    /// The generation of the transient entry at `addr`: a new one for every
+    /// registration of an address that was not tracked, so a timer started
+    /// for one entry can tell a later entry at the same address apart.
+    pub(crate) fn transient_generation(&self, addr: SocketAddr) -> Option<u64> {
+        self.transient_connections
+            .get(&addr)
+            .map(|entry| entry.generation)
+    }
+
+    /// Whether the transient entry whose generation was `generation` (read
+    /// when its connection registered) is still the one at `addr`: false once
+    /// it was promoted or closed, and for a later entry at the address.
+    pub(crate) fn still_the_transient(&self, addr: SocketAddr, generation: Option<u64>) -> bool {
+        generation.is_some() && self.transient_generation(addr) == generation
+    }
+
+    /// The transient entry at `addr`, left in place.
+    pub(crate) fn transient_entry(&self, addr: SocketAddr) -> Option<TransientEntry> {
+        self.transient_connections
+            .get(&addr)
+            .map(|entry| entry.clone())
     }
 
     /// Gives back the share slot of `addr`'s source; called once for every
@@ -2106,6 +2203,12 @@ impl ConnectionManager {
     #[cfg(test)]
     pub fn transient_source_refusals(&self) -> u64 {
         self.transient_source_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Transient connections closed to admit a newcomer at the budget.
+    #[cfg(test)]
+    pub fn transient_evictions(&self) -> u64 {
+        self.transient_evictions.load(Ordering::Relaxed)
     }
 
     /// Most transient slots one source may hold.
@@ -3337,6 +3440,86 @@ mod tests {
             Duration::from_secs(60),
             0,
         )
+    }
+
+    /// Concurrent registrations, many of them of the same addresses, take
+    /// exactly the budget, count each source's entries exactly, and give
+    /// every slot back when dropped.
+    #[test]
+    fn concurrent_transient_registrations_count_exactly() {
+        let cm = make_connection_manager_with_transient_budget(64);
+        let addrs: Vec<SocketAddr> = (0..256u16)
+            .map(|n| SocketAddr::from(([10, 77, (n % 8) as u8, (n / 8) as u8], 9000)))
+            .collect();
+        std::thread::scope(|scope| {
+            for t in 0..8 {
+                let (cm, addrs) = (&cm, &addrs);
+                scope.spawn(move || {
+                    // Every thread walks every address, from its own start.
+                    for i in 0..addrs.len() {
+                        let _outcome =
+                            cm.register_transient(addrs[(i + t * 31) % addrs.len()], None);
+                    }
+                });
+            }
+        });
+        let tracked = cm.transient_connections.len();
+        assert_eq!(tracked, 64, "exactly the budget is taken");
+        assert_eq!(cm.transient_count(), tracked);
+        let per_source: usize = cm.transient_per_source.iter().map(|e| *e.value()).sum();
+        assert_eq!(
+            per_source, tracked,
+            "each entry counted once for its source"
+        );
+        for addr in &addrs {
+            let _dropped = cm.drop_transient(*addr);
+        }
+        assert_eq!(cm.transient_count(), 0);
+        assert!(cm.transient_per_source.is_empty());
+    }
+
+    /// The oldest entry an open connection holds is the eviction candidate;
+    /// entries nothing holds, and removed or replaced ones, are passed over.
+    #[test]
+    fn the_oldest_held_transient_is_the_eviction_candidate() {
+        let cm = make_connection_manager_with_transient_budget(64);
+        let a = |n: u8| SocketAddr::from(([10, 78, 0, n], 1));
+        assert_eq!(cm.oldest_held_transient(), None);
+        for n in 1..=4 {
+            assert_eq!(cm.register_transient(a(n), None), Ok(()));
+        }
+        assert_eq!(cm.oldest_held_transient(), None, "nothing is held");
+        cm.hold_transient(a(2));
+        cm.hold_transient(a(3));
+        assert_eq!(cm.oldest_held_transient(), Some(a(2)));
+        assert!(cm.drop_transient(a(2)).is_some());
+        assert_eq!(cm.oldest_held_transient(), Some(a(3)));
+        // A later entry at a dropped address is new, not the old one.
+        assert!(cm.drop_transient(a(3)).is_some());
+        assert_eq!(cm.register_transient(a(3), None), Ok(()));
+        cm.hold_transient(a(3));
+        cm.hold_transient(a(4));
+        assert_eq!(cm.oldest_held_transient(), Some(a(4)));
+    }
+
+    /// A TTL timer started for one entry does not count a later entry at the
+    /// same address as its own.
+    #[test]
+    fn a_ttl_timer_recognises_only_its_own_entry() {
+        let cm = make_connection_manager_with_transient_budget(64);
+        let addr = SocketAddr::from(([10, 79, 0, 1], 1));
+        assert_eq!(cm.register_transient(addr, None), Ok(()));
+        let first = cm.transient_generation(addr);
+        assert!(cm.still_the_transient(addr, first));
+        // Re-registering the tracked address keeps the entry.
+        assert_eq!(cm.register_transient(addr, None), Ok(()));
+        assert!(cm.still_the_transient(addr, first));
+        assert!(cm.drop_transient(addr).is_some());
+        assert!(!cm.still_the_transient(addr, first), "gone");
+        assert_eq!(cm.register_transient(addr, None), Ok(()));
+        assert!(!cm.still_the_transient(addr, first), "a later entry");
+        assert!(cm.still_the_transient(addr, cm.transient_generation(addr)));
+        assert!(!cm.still_the_transient(addr, None));
     }
 
     #[test]
@@ -5266,7 +5449,7 @@ mod tests {
                 "promote_existing_connection transient-promotion gate",
                 region(
                     promote,
-                    "connection_manager.drop_transient(peer_addr)",
+                    "connection_manager.transient_entry(peer_addr)",
                     "connect_peer: rejecting transient promotion to enforce cap",
                 ),
             ),

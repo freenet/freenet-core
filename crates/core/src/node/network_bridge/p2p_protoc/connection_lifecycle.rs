@@ -644,7 +644,10 @@ impl P2pConnManager {
         }
         let key = key.clone();
         let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-        let was_transient = connection_manager.drop_transient(peer_addr);
+        // Read, not removed: the connection keeps its transient slot unless
+        // the ring takes it (`add_connection` removes the entry), so a
+        // promotion refused at the cap leaves it counted.
+        let was_transient = connection_manager.transient_entry(peer_addr);
 
         // Promote if: (a) was tracked as transient, OR (b) not already in ring.
         // Case (b) handles an open connection with no tracking entry (#3113:
@@ -685,6 +688,7 @@ impl P2pConnManager {
                     transient_expired,
                     "connect_peer: rejecting transient promotion to enforce cap"
                 );
+                self.count_refused_promotion(peer_addr);
                 return Promotion::Refused;
             }
             // The key promoted is the one the caller passed: for a
@@ -727,6 +731,7 @@ impl P2pConnManager {
                     .connection_manager
                     .is_in_ring(peer_addr)
             {
+                self.count_refused_promotion(peer_addr);
                 return Promotion::Refused;
             }
             // A promotion only when the ring took an address it did not hold.
@@ -782,6 +787,33 @@ impl P2pConnManager {
         }
 
         Promotion::AlreadyInRing
+    }
+
+    /// A connection the ring refused stays open outside it, so it must hold a
+    /// transient slot like any other such connection. One with no entry (it
+    /// never had one) is registered and held here; when the budget or its
+    /// source's share refuses that, it stays uncounted and
+    /// [`Self::uncounted_outside_ring`] reports it, for the caller to close.
+    fn count_refused_promotion(&self, peer_addr: SocketAddr) {
+        let cm = &self.bridge.op_manager.ring.connection_manager;
+        if cm.is_transient(peer_addr) || cm.is_in_ring(peer_addr) {
+            return;
+        }
+        if cm
+            .register_transient(peer_addr, Some(Location::from_address(&peer_addr)))
+            .is_ok()
+        {
+            cm.hold_transient(peer_addr);
+        }
+    }
+
+    /// An open connection at `peer_addr` that is neither in the ring nor
+    /// holding a transient slot.
+    fn uncounted_outside_ring(&self, peer_addr: SocketAddr) -> bool {
+        let cm = &self.bridge.op_manager.ring.connection_manager;
+        self.connections.contains_key(&peer_addr)
+            && !cm.is_transient(peer_addr)
+            && !cm.is_in_ring(peer_addr)
     }
 
     // `origin` is telemetry carried alongside the dial; bundling it with the
@@ -968,6 +1000,15 @@ impl P2pConnManager {
                         );
                     })
                     .ok();
+                // Kept open, it would be outside the ring and uncounted.
+                if self.uncounted_outside_ring(peer_addr) {
+                    self.drop_connection_by_addr(
+                        peer_addr,
+                        handshake_commands,
+                        crate::tracing::DisconnectReason::ConnectionLimitReached,
+                    )
+                    .await;
+                }
                 return Ok(());
             }
 
@@ -2917,7 +2958,26 @@ impl P2pConnManager {
                     // budget refused it (nothing inserted at all). Only a fresh
                     // insertion is a "transient registered".
                     let already_transient = connection_manager.is_transient(peer_addr);
-                    let registered = connection_manager.register_transient(peer_addr, Some(loc));
+                    let cm = connection_manager.clone();
+                    let mut registered = cm.register_transient(peer_addr, Some(loc));
+                    if registered == Err(crate::ring::TransientRefusal::Budget) {
+                        // The budget is spent by sources each within their
+                        // share. Close the oldest unpromoted connection and
+                        // admit this one, so whoever fills the budget has to
+                        // keep opening connections to keep it full, rather
+                        // than holding it and refusing every joiner.
+                        if let Some(victim) = cm.oldest_held_transient() {
+                            cm.record_transient_eviction(victim);
+                            self.drop_connection_by_addr(
+                                victim,
+                                handshake_commands,
+                                crate::tracing::DisconnectReason::ConnectionLimitReached,
+                            )
+                            .await;
+                            registered = cm.register_transient(peer_addr, Some(loc));
+                        }
+                    }
+                    let connection_manager = &cm;
                     if let Err(refusal) = registered {
                         // The budget bounds the connections held outside the
                         // ring. An inbound connection nobody expected arrives
@@ -2959,9 +3019,12 @@ impl P2pConnManager {
                         );
                         let ttl = connection_manager.transient_ttl();
                         let cm = connection_manager.clone();
+                        // Keyed to this entry, so a later connection or a
+                        // new registration at the address is not counted.
+                        let generation = cm.transient_generation(peer_addr);
                         GlobalExecutor::spawn(async move {
                             sleep(ttl).await;
-                            if cm.is_transient(peer_addr) {
+                            if cm.still_the_transient(peer_addr, generation) {
                                 // Still not promoted. Do NOT dispatch
                                 // DropConnection: that tears down the
                                 // transport, killing any in-progress CONNECT.

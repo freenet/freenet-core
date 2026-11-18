@@ -5266,52 +5266,70 @@ fn transient_count(h: &Harness) -> usize {
         .transient_count()
 }
 
-fn is_transient(h: &Harness, addr: SocketAddr) -> bool {
-    h.mgr
-        .bridge
-        .op_manager
-        .ring
-        .connection_manager
-        .is_transient(addr)
+/// At the transient budget, an unexpected inbound connection closes the
+/// oldest connection still waiting outside the ring and takes its slot, so a
+/// host that fills the budget has to keep opening connections to keep it
+/// full, rather than holding it and refusing every joiner.
+#[tokio::test]
+async fn unexpected_inbound_at_the_budget_evicts_the_oldest_unpromoted() {
+    let mut h = Harness::with_config("transient-budget-evict-oldest", |config| {
+        config.transient_budget = 2;
+    })
+    .await;
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    let addr = |n: u8| SocketAddr::from(([198, 51, 100, 216], 7300 + u16::from(n)));
+    unexpected_inbound(&mut h, addr(1)).await;
+    unexpected_inbound(&mut h, addr(2)).await;
+    assert_eq!(cm.transient_count(), 2, "premise: the budget is spent");
+
+    unexpected_inbound(&mut h, addr(3)).await;
+    assert!(
+        !h.mgr.connections.contains_key(&addr(1)),
+        "the oldest is closed"
+    );
+    assert!(!cm.is_transient(addr(1)));
+    for kept in [addr(2), addr(3)] {
+        assert!(h.mgr.connections.contains_key(&kept));
+        assert!(cm.is_transient(kept));
+    }
+    assert_eq!(cm.transient_count(), 2);
+    assert_eq!(cm.transient_evictions(), 1);
+
+    unexpected_inbound(&mut h, addr(4)).await;
+    assert!(
+        !h.mgr.connections.contains_key(&addr(2)),
+        "then the next oldest"
+    );
+    assert!(h.mgr.connections.contains_key(&addr(3)));
+    assert!(h.mgr.connections.contains_key(&addr(4)));
+    assert_eq!(cm.transient_evictions(), 2);
+    h.assert_open_transports_match();
 }
 
-/// An unexpected inbound connection is first counted against the transient
-/// budget after it was inserted. One the budget refuses is closed, not kept
-/// open and uncounted: with a budget of two, every such connection after the
-/// second is dropped, and the two holding the slots are untouched.
+/// An unexpected inbound connection the budget refuses is closed, not kept
+/// open and uncounted. Here every slot is held by a registration no open
+/// connection owns, so there is nothing to evict.
 #[tokio::test]
-async fn unexpected_inbound_over_the_transient_budget_is_dropped() {
+async fn unexpected_inbound_refused_by_the_budget_is_dropped() {
     let mut h = Harness::with_config("transient-budget-unexpected-inbound", |config| {
         config.transient_budget = 2;
     })
     .await;
-    let within: Vec<SocketAddr> = [7301, 7302]
-        .iter()
-        .map(|port| SocketAddr::from(([198, 51, 100, 210], *port)))
-        .collect();
-    for addr in &within {
-        unexpected_inbound(&mut h, *addr).await;
-        assert!(h.mgr.connections.contains_key(addr), "within the budget");
-        assert!(is_transient(&h, *addr));
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    for port in [7301, 7302] {
+        assert!(cm.try_register_transient(SocketAddr::from(([198, 51, 100, 210], port)), None));
     }
-    assert_eq!(transient_count(&h), 2, "premise: the budget is spent");
-
-    for port in [7303, 7304] {
-        let addr = SocketAddr::from(([198, 51, 100, 210], port));
-        unexpected_inbound(&mut h, addr).await;
-        assert!(
-            !h.mgr.connections.contains_key(&addr),
-            "refused by the budget: dropped"
-        );
-        assert!(!is_transient(&h, addr));
-        assert_eq!(h.ring_key_at(addr), None, "not in the ring");
-    }
+    let addr = SocketAddr::from(([198, 51, 100, 210], 7303));
+    unexpected_inbound(&mut h, addr).await;
+    assert!(
+        !h.mgr.connections.contains_key(&addr),
+        "refused by the budget: dropped"
+    );
+    assert!(!cm.is_transient(addr));
+    assert_eq!(h.ring_key_at(addr), None, "not in the ring");
+    assert_eq!(cm.transient_count(), 2);
+    assert_eq!(cm.transient_evictions(), 0);
     h.assert_open_transports_match();
-    assert_eq!(transient_count(&h), 2);
-    for addr in &within {
-        assert!(h.mgr.connections.contains_key(addr), "the holders are kept");
-        assert!(is_transient(&h, *addr));
-    }
 }
 
 /// The budget counts the connections open outside the ring, not those
@@ -5341,20 +5359,21 @@ async fn an_unpromoted_connection_keeps_its_budget_slot_past_the_ttl() {
         "premise: still open"
     );
     assert!(cm.is_transient(first), "an open connection keeps its slot");
+    // The slot is still spent, so the next connection has to evict it.
     unexpected_inbound(&mut h, second).await;
-    assert!(
-        !h.mgr.connections.contains_key(&second),
-        "the budget is still spent"
-    );
+    assert!(h.mgr.connections.contains_key(&second));
+    assert!(!h.mgr.connections.contains_key(&first));
+    assert_eq!(cm.transient_evictions(), 1);
 
     // Promoting it gives the slot back.
     let peer = key();
-    h.connect_peer(PeerKeyLocation::new(peer.clone(), first))
+    h.connect_peer(PeerKeyLocation::new(peer.clone(), second))
         .await;
-    assert_eq!(h.ring_key_at(first).as_ref(), Some(&peer));
+    assert_eq!(h.ring_key_at(second).as_ref(), Some(&peer));
     assert_eq!(cm.transient_count(), 0);
     unexpected_inbound(&mut h, third).await;
     assert!(h.mgr.connections.contains_key(&third));
+    assert_eq!(cm.transient_evictions(), 1, "a free slot needs no eviction");
 }
 
 /// Every path that closes an unpromoted connection gives its budget slot
@@ -5448,4 +5467,147 @@ async fn one_address_saturating_its_transient_share_leaves_others_admitted() {
     let again = a(7400 + share as u16 + 1);
     unexpected_inbound(&mut h, again).await;
     assert!(h.mgr.connections.contains_key(&again));
+}
+
+/// A ConnectPeer the ring refuses at its cap leaves the connection holding
+/// its transient slot: the slot is given back only when the ring takes it.
+#[tokio::test]
+async fn a_promotion_refused_at_the_cap_keeps_the_transient_slot() {
+    let mut h = Harness::with_config("transient-budget-refused-promotion", |config| {
+        config.min_number_conn = Some(1);
+        config.max_number_conn = Some(2);
+    })
+    .await;
+    for port in [7341, 7342] {
+        h.dial(SocketAddr::from(([198, 51, 100, 217], port)), &key())
+            .await;
+    }
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    let remote = SocketAddr::from(([198, 51, 100, 217], 7343));
+    unexpected_inbound(&mut h, remote).await;
+    assert_eq!(cm.transient_count(), 1, "premise");
+
+    assert!(
+        !h.try_connect_peer(PeerKeyLocation::new(key(), remote))
+            .await
+    );
+    assert!(h.mgr.connections.contains_key(&remote), "kept open");
+    assert!(cm.is_transient(remote), "and counted");
+    assert_eq!(cm.transient_count(), 1);
+}
+
+/// A refused promotion of a connection that holds no transient slot, when
+/// none can be had, closes the connection rather than keep it uncounted.
+#[tokio::test]
+async fn a_refused_promotion_without_a_slot_closes_the_connection() {
+    let mut h = Harness::with_config("transient-budget-refused-uncounted", |config| {
+        config.min_number_conn = Some(1);
+        config.max_number_conn = Some(2);
+        config.transient_budget = 1;
+    })
+    .await;
+    for port in [7351, 7352] {
+        h.dial(SocketAddr::from(([198, 51, 100, 218], port)), &key())
+            .await;
+    }
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    let remote = SocketAddr::from(([198, 51, 100, 218], 7353));
+    unexpected_inbound(&mut h, remote).await;
+    // An open connection outside the ring with no slot, and none free.
+    assert!(cm.drop_transient(remote).is_some());
+    assert!(cm.try_register_transient(SocketAddr::from(([198, 51, 100, 219], 1)), None));
+
+    assert!(
+        !h.try_connect_peer(PeerKeyLocation::new(key(), remote))
+            .await
+    );
+    assert!(!h.mgr.connections.contains_key(&remote), "closed");
+    h.assert_open_transports_match();
+}
+
+/// A transient connection kept outside the ring on a node that is not a
+/// gateway (a dial marked transient) holds its slot past the TTL too.
+#[tokio::test(start_paused = true)]
+async fn an_unpromoted_transient_dial_holds_its_slot_past_the_ttl() {
+    let mut h = Harness::with_non_gateway_ring("transient-budget-dial-held").await;
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    let addr = SocketAddr::from(([198, 51, 100, 220], 7360));
+    h.establish(addr, Some(PeerKeyLocation::new(key(), addr)), true)
+        .await;
+    assert_eq!(h.ring_key_at(addr), None, "premise: not promoted");
+    tokio::time::sleep(cm.transient_ttl() + Duration::from_secs(1)).await;
+    assert_eq!(cm.cleanup_expired_transients(), 0);
+    assert!(cm.is_transient(addr));
+}
+
+/// End to end, on the simulated network: every node outside a NAT listens on
+/// `::1`, so a gateway sees all its joiners come from one source. Runs
+/// `nodes` joiners against one gateway with transient budget `budget` and
+/// returns the gateway's evictions and the nodes that ended with no ring
+/// connection.
+fn join_behind_one_address(
+    name: &'static str,
+    seed: u64,
+    nodes: usize,
+    budget: usize,
+) -> (u64, Vec<crate::node::testing_impl::NodeLabel>) {
+    use crate::node::testing_impl::{NodeLabel, SimNetwork};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut sim = rt.block_on(SimNetwork::new(name, 1, nodes, 7, 3, 10, 2, seed));
+    sim.with_start_backoff(Duration::ZERO);
+    sim.with_transient_budget(budget);
+    let result = sim.run_controlled_simulation(
+        seed,
+        Vec::new(),
+        Duration::from_secs(600),
+        Duration::from_secs(300),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "[{name}] simulation must complete: {:?}",
+        result.turmoil_result.err()
+    );
+    let gateway = NodeLabel::gateway(name, 0);
+    let cm = &result
+        .node_rings
+        .get(&gateway)
+        .expect("the gateway started")
+        .connection_manager;
+    let mut unconnected: Vec<NodeLabel> = result
+        .node_rings
+        .iter()
+        .filter(|(label, ring)| {
+            !label.is_gateway() && ring.connection_manager.connection_count() == 0
+        })
+        .map(|(label, _)| label.clone())
+        .collect();
+    unconnected.sort_by_key(|label| label.to_string());
+    assert_eq!(
+        result.node_rings.len(),
+        nodes + 1,
+        "[{name}] every node started"
+    );
+    (cm.transient_evictions(), unconnected)
+}
+
+/// Many joiners from one address against a gateway with a small transient
+/// budget (8, below the per-source share): a joiner at the budget evicts the
+/// oldest unpromoted connection, and every joiner still joins the ring.
+///
+/// The share itself is not reached here: the gateway's start-up admission
+/// ramp (5 handshakes a second) keeps far fewer than 16 joiners unpromoted at
+/// once. `one_address_saturating_its_transient_share_leaves_others_admitted`
+/// covers it through the bridge's real handlers.
+#[test]
+fn joiners_behind_one_address_get_past_transient_eviction() {
+    let (evicted, unconnected) =
+        join_behind_one_address("transient-evict-one-address", 0x7A45_0002, 24, 8);
+    assert!(
+        evicted > 0,
+        "the budget was never reached; the test would be vacuous"
+    );
+    assert!(unconnected.is_empty(), "never joined: {unconnected:?}");
 }
