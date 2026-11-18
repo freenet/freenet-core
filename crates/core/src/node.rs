@@ -2538,9 +2538,30 @@ where
                 );
                 return Ok(());
             };
-            let result = op_manager
+            // `source_pub_key` was resolved above, but this task runs
+            // concurrently with the event loop's disconnect handling and
+            // applying a large message takes a while. Ring membership is
+            // therefore re-checked AFTER the message is applied (see
+            // `handle_message_unless_disconnected`); otherwise a peer that
+            // drops its connection in between leaves a neighbor-hosting entry
+            // behind that nothing ever removes.
+            let Some(result) = op_manager
                 .neighbor_hosting
-                .handle_message(&source_pub_key, message.clone());
+                .handle_message_unless_disconnected(&source_pub_key, message.clone(), || {
+                    op_manager
+                        .ring
+                        .connection_manager
+                        .get_peer_by_pub_key(&source_pub_key)
+                        .is_some()
+                })
+            else {
+                tracing::debug!(
+                    %source,
+                    peer = %source_pub_key,
+                    "NeighborHosting: sender left the ring while its message was applied, discarded"
+                );
+                return Ok(());
+            };
             if let Some(response) = result.response {
                 // Send response back to sender
                 let response_msg =
@@ -2553,7 +2574,38 @@ where
             // so the neighbor gets current state if they're stale after restart.
             // Only sync contracts we're actively interested in (receiving updates
             // or have downstream subscribers) — skip cached-only contracts.
-            for instance_id in result.overlapping_contracts {
+            //
+            // The ids are already distinct (`handle_message` de-duplicates), and
+            // the number of state FETCHES per message is capped at
+            // `MAX_STALE_SYNCS_PER_SUMMARIES`, the same budget the `Summaries`
+            // path uses (ANT-2026-27GZI7ZB: a repeated id used to cost one
+            // full-state fetch and one sync per copy). The budget is charged at
+            // the `get_contract_state_by_id` call, not at the emit: the fetch
+            // and the `flush_pending_broadcast_on_interest` after it are the
+            // work being bounded, and they also run for ids that then fail the
+            // post-fetch check or return no state. Ids skipped before the fetch
+            // (banned, or neither served nor owing a broadcast) are free.
+            // Overflow is not dropped: InterestSync revisits every shared
+            // contract within 2*ceil(shared/64)-1 rounds of its 5-minute
+            // heartbeat (about 75 minutes for 500 shared contracts). When over
+            // the budget the start is rotated at random so the same prefix does
+            // not consume it every time.
+            let mut overlapping_contracts = result.overlapping_contracts;
+            let overlap_budget = stale_sync_emit_budget(overlapping_contracts.len());
+            if overlapping_contracts.len() > overlap_budget {
+                let start = crate::config::GlobalRng::random_range(0..overlapping_contracts.len());
+                overlapping_contracts.rotate_left(start);
+            }
+            let mut overlap_fetched = 0usize;
+            for instance_id in overlapping_contracts {
+                if overlap_fetched >= overlap_budget {
+                    // Telemetry only: may overstate when the remaining
+                    // unvisited ids would all have been skipped for free.
+                    op_manager
+                        .neighbor_hosting
+                        .note_sync_budget_hit(&source_pub_key, overlap_budget);
+                    break;
+                }
                 // Phase 7 egress gate. If we've banned the contract,
                 // don't proactively push its state to a sibling peer
                 // via the overlap-sync path — that would undermine
@@ -2610,6 +2662,7 @@ where
                 {
                     continue;
                 }
+                overlap_fetched += 1;
                 if let Some((key, state)) =
                     get_contract_state_by_id(&op_manager, &instance_id).await
                 {
@@ -7350,8 +7403,8 @@ mod tests {
         // ordering check can't false-pass on a neighbouring handler. The loop
         // is the only site that iterates `result.overlapping_contracts`.
         let loop_start = src
-            .find("for instance_id in result.overlapping_contracts {")
-            .expect("NeighborHosting overlap-sync loop not found");
+            .find("NetMessageV1::NeighborHosting { ref message } => {")
+            .expect("NeighborHosting dispatch arm not found");
         let loop_src = &src[loop_start..];
 
         let gate_pos = loop_src
@@ -7375,6 +7428,218 @@ mod tests {
             "the activity gate (is_receiving_updates || has_downstream_subscribers \
              || pending_broadcasts.contains) MUST precede get_contract_state_by_id, \
              or the #4473 fetch_contract churn regresses for phantom contracts"
+        );
+    }
+
+    /// Production source of the NeighborHosting dispatch arm (up to the next
+    /// arm), whitespace-stripped (rustfmt-proof). Bounded to production code so
+    /// an anchor that moves fails here instead of matching this module's own
+    /// string literals.
+    fn neighbor_hosting_arm() -> String {
+        let src = include_str!("node.rs");
+        let (production, _) = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("test module must be locatable");
+        let arm_start = production
+            .find("NetMessageV1::NeighborHosting { ref message } => {")
+            .expect("NeighborHosting dispatch arm not found in production code");
+        let arm_len = production[arm_start..]
+            .find("NetMessageV1::InterestSync { ref message } => {")
+            .expect("InterestSync arm not found after the NeighborHosting arm");
+        production[arm_start..arm_start + arm_len]
+            .split_whitespace()
+            .collect()
+    }
+
+    /// ANT-2026-VLEFNWN1 pin: the dispatch arm runs on a per-message task,
+    /// concurrently with the disconnect clean-up, so it MUST apply the message
+    /// through `handle_message_unless_disconnected` with a live ring-membership
+    /// lookup by the sender's key. The primitive itself is covered by
+    /// `message_applied_after_disconnect_leaves_no_entry` in
+    /// `node/neighbor_hosting.rs`.
+    #[test]
+    fn neighbor_hosting_dispatch_rechecks_sender_after_apply_pin() {
+        let arm = neighbor_hosting_arm();
+        let apply = arm
+            .find(".handle_message_unless_disconnected(")
+            .expect("dispatch must apply the message via handle_message_unless_disconnected");
+        // The span of the apply call's argument list, by paren matching.
+        let open = apply + ".handle_message_unless_disconnected".len();
+        let mut depth = 0usize;
+        let mut close = None;
+        for (i, c) in arm[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let args = &arm[open..close.expect("apply call's parentheses must balance")];
+        assert!(
+            args.contains("||{") && args.contains(".get_peer_by_pub_key("),
+            "the ring-membership lookup by the sender's key must be INSIDE the \
+             liveness closure passed to handle_message_unless_disconnected"
+        );
+        assert!(
+            !arm.contains(".handle_message("),
+            "NeighborHosting dispatch must not call the unguarded handle_message"
+        );
+    }
+
+    /// ANT-2026-27GZI7ZB pin: the overlap-sync loop takes its per-message budget
+    /// from `stale_sync_emit_budget` and reports exhaustion, and still emits
+    /// through the targeted builder. The counting itself is covered
+    /// behaviourally by `neighbor_hosting_overlap_fetches_are_capped_per_message`.
+    #[test]
+    fn neighbor_hosting_overlap_sync_is_capped_per_message_pin() {
+        let arm = neighbor_hosting_arm();
+        let budget = arm
+            .find("stale_sync_emit_budget(")
+            .expect("the overlap-sync loop must take its budget from stale_sync_emit_budget");
+        let hit = arm
+            .find(".note_sync_budget_hit(")
+            .expect("budget exhaustion must be reported (release-visible counter)");
+        let emit = arm
+            .find("try_notify_node_event(stale_peer_sync_event(")
+            .expect("the loop must still emit the targeted sync");
+        assert!(budget < hit && hit < emit);
+    }
+
+    /// ANT-2026-27GZI7ZB, behavioural: an announce naming many served contracts
+    /// makes at most `MAX_STALE_SYNCS_PER_SUMMARIES` state fetches, including
+    /// fetches that return no state (which emit nothing, so an emit-counting
+    /// budget would not bound them), and duplicate ids cost one fetch.
+    #[tokio::test]
+    async fn neighbor_hosting_overlap_fetches_are_capped_per_message() {
+        use crate::contract::ContractHandlerEvent;
+        use crate::message::NeighborHostingMessage;
+        use crate::operations::test_utils::MockNetworkBridge;
+        use freenet_stdlib::prelude::{CodeHash, ContractInstanceId, ContractKey};
+
+        let config_args = crate::config::ConfigArgs {
+            id: Some("neighbor-hosting-fetch-cap".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, mut handler_side, _wait) = crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14300".parse().unwrap());
+
+        // A ring neighbour the dispatch arm can resolve by address and key.
+        let peer_addr: SocketAddr = "127.0.0.1:15300".parse().unwrap();
+        let peer_key = TransportKeypair::new().public().clone();
+        op_manager.ring.connection_manager.add_connection(
+            crate::ring::Location::new(0.3),
+            peer_addr,
+            peer_key,
+            false,
+        );
+
+        // Many served contracts: hosted (so they overlap) and receiving
+        // updates (so they pass the pre-fetch gate and reach the fetch).
+        let total = MAX_STALE_SYNCS_PER_SUMMARIES * 3;
+        let mut ids = Vec::new();
+        for n in 0..total {
+            let mut id_bytes = [0u8; 32];
+            id_bytes[..8].copy_from_slice(&(n as u64 + 1).to_le_bytes());
+            let id = ContractInstanceId::new(id_bytes);
+            let key = ContractKey::from_id_and_code(id, CodeHash::new([9u8; 32]));
+            op_manager.neighbor_hosting.on_contract_hosted(&key);
+            op_manager
+                .ring
+                .add_client_subscription(key.id(), crate::client_events::ClientId::FIRST);
+            ids.push(id);
+        }
+
+        // Stand-in contract handler: counts GetQuery and answers "no state".
+        let fetches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = fetches.clone();
+        let responder = tokio::spawn(async move {
+            while let Ok((id, ev, _prio)) = handler_side.recv_from_sender().await {
+                if matches!(ev, ContractHandlerEvent::GetQuery { .. }) {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let sent = handler_side
+                        .send_to_sender(
+                            id,
+                            ContractHandlerEvent::GetResponse {
+                                key: None,
+                                response: Ok(crate::contract::StoreResponse {
+                                    state: None,
+                                    contract: None,
+                                }),
+                            },
+                        )
+                        .await;
+                    if sent.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Every id is named three times; only distinct ids may cost work.
+        let mut added = ids.clone();
+        added.extend(ids.iter().copied());
+        added.extend(ids.iter().copied());
+        let bridge = MockNetworkBridge::new();
+        let mut listener: Box<dyn NetEventRegister> =
+            Box::new(crate::tracing::DynamicRegister::new(vec![]));
+        handle_pure_network_message_v1(
+            NetMessageV1::NeighborHosting {
+                message: NeighborHostingMessage::HostingAnnounce {
+                    added,
+                    removed: vec![],
+                    is_response: false,
+                },
+            },
+            Some(peer_addr),
+            op_manager.clone(),
+            bridge,
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error");
+
+        let n = fetches.load(std::sync::atomic::Ordering::SeqCst);
+        responder.abort();
+        assert_eq!(
+            n, MAX_STALE_SYNCS_PER_SUMMARIES,
+            "fetches per message must equal the budget: {total} distinct served ids, \
+             each named three times, none of the fetches emitting a sync"
+        );
+        assert_eq!(
+            op_manager.neighbor_hosting.sync_budget_hits_total(),
+            1,
+            "budget exhaustion must be counted"
         );
     }
 
