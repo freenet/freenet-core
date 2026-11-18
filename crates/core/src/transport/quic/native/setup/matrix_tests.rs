@@ -15,8 +15,7 @@
 //! class and order, over the skews the connect op can produce. A single
 //! attempt that passes it stays (the design's 6.2 decision).
 //!
-//! Not measured here: in-flight attempts per waiter and half-open server
-//! states (the waiter takes one attempt by construction, `NativeWaiters`).
+//! Not measured here: half-open server states.
 //!
 //! A lost punch is lost between the two NATs: it has already opened its
 //! sender's binding (`nat_model`), as a real one has, so punch loss only
@@ -501,9 +500,9 @@ struct GateCell {
     expired: u64,
 }
 
-/// Runs `cells`, 20 seeds each (gate 15 is judged on 100), several cells at a time (each cell's runs
-/// stay on one thread, in seed order, so results are as if run alone),
-/// printing each.
+/// Runs `cells`, 20 seeds each (gate 15 is judged on 100), several cells at a
+/// time (each cell's runs stay on one thread, in seed order, so results are
+/// as if run alone), printing each.
 fn run_gate_cells(gate: &str, cells: Vec<Cell>) -> Vec<GateCell> {
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8));
     let seeds = if gate == "15" { 0..100 } else { 0..20 };
@@ -616,10 +615,10 @@ fn native_setup_gate_14_late_server_with_travel() {
 }
 
 /// Gate 15: 10% loss on QUIC Initial and Handshake packets as well as on
-/// punches, at 800 ms. Does NOT meet the 95% criterion with one attempt:
-/// 80-85% measured (16-17 of 20; one cell 20 of 20), all failures two-sided.
-/// Held to a 70% baseline; overlapping attempts (PR-3) must reach 95%,
-/// judged on 100 seeds per cell. A premise checks the loss is applied.
+/// punches, at 800 ms, judged on 100 seeds per cell. One attempt did not
+/// meet the 95% criterion (80-85% on 20 seeds); overlapping attempts
+/// (`OVERLAP_BEFORE_END`) are held to it. A premise checks the loss is
+/// applied.
 #[test]
 fn native_setup_gate_15_handshake_loss_baseline() {
     let lossy = Extra {
@@ -640,7 +639,7 @@ fn native_setup_gate_15_handshake_loss_baseline() {
         }
     }
     let results = run_gate_cells("15", cells);
-    assert_gate("15", &results, 0.70, 1);
+    assert_gate("15", &results, 0.95, 1);
     let failures: usize = results.iter().map(|r| r.failures.len()).sum();
     assert!(failures > 0, "premise: the handshake loss is applied");
 }
