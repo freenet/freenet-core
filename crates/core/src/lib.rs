@@ -36,12 +36,15 @@ pub use transport::connection_handler::QUIC_RESTORE_MIN_UPTIME;
 #[doc(hidden)]
 pub use transport::quic::breaker::{
     ENDPOINT_DOWN_EXITS_TO_TRIP, GATEWAY_QUIC_BREAKER_COOLDOWN, PEER_SHORT_RUNS_TO_TRIP_WITH_UDP,
+    UDP_FALLBACK as QUIC_BREAKER_UDP_FALLBACK,
+    short_runs_to_trip as quic_breaker_short_runs_to_trip,
 };
 pub use transport::quic::breaker::{
     STOP_NOTE_ENV_VAR as QUIC_BREAKER_STOP_NOTE_ENV_VAR,
     STOP_NOTE_FILE as QUIC_BREAKER_STOP_NOTE_FILE, enable_quic_crash_breaker,
-    quic_breaker_clean_exit, quic_breaker_signals_ready,
+    quic_breaker_clean_exit, quic_breaker_signals_ready, quic_crash_loop_update_now,
     record_deliberate_stop as record_quic_breaker_deliberate_stop,
+    wait_for_transport_open as wait_for_quic_transport_open,
 };
 pub use transport::quic::liveness::{
     enable_gateway_quic_restarts, note_gateway_supervisor_unverified,

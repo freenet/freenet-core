@@ -1499,6 +1499,17 @@ impl P2pConnManager {
         notification_channel: EventLoopNotificationsReceiver,
         node_controller: Receiver<NodeEvent>,
     ) -> anyhow::Result<Infallible> {
+        // A peer in a QUIC crash loop with no UDP to fall back to waits here,
+        // before its transport opens (#6151, `breaker::Verdict::Backoff`).
+        // The update check is already running by now; a stop ends the wait.
+        // Nothing waits unless the binary's breaker decided a backoff.
+        if crate::transport::quic::breaker::wait_out_crash_loop_backoff(&op_manager.shutting_down)
+            .await
+        {
+            // Stopped during the wait: do not bind the socket for a node
+            // that is going away.
+            return Err(EventLoopExitReason::GracefulShutdown.into());
+        }
         let transport = open_udp_transport::<S>(
             self.key_pair.clone(),
             self.listening_ip,

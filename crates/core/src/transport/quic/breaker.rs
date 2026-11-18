@@ -11,8 +11,10 @@
 //! on Windows, and a gateway on a unix platform with no boot identity
 //! (`platform::boot_id`: anything but Linux and macOS), count short runs
 //! that panicked in QUIC code ([`short_runs`]). A gateway on Linux or macOS
-//! asks how its last run ended, which the rest of this doc describes. Peers on unix used that second rule until
-//! #6151; it still runs on them as a shadow ([`legacy_shadow`]) that only
+//! asks how its last run ended, which the rest of this doc describes. With no
+//! UDP to fall back to ([`UDP_FALLBACK`] false) every node counts short runs,
+//! a gateway included, because only that rule can back off. Peers on unix used
+//! that second rule until #6151; it still runs on them as a shadow ([`legacy_shadow`]) that only
 //! telemetry reads, until UDP is removed.
 //!
 //! # Gateways
@@ -79,6 +81,42 @@
 //! those limits weighed. On a unix peer the shadow of the exit rule measures
 //! what they cost: the `quic_breaker_start` event reports what it would have
 //! decided ([`StartReport`]).
+//!
+//! # Without UDP (#6151; off until UDP is removed)
+//!
+//! Turning QUIC off is a fallback only while UDP exists. [`UDP_FALLBACK`]
+//! says whether it does; the UDP-removal release sets it to `false`, and
+//! until then everything below runs only in tests. With no UDP:
+//!
+//! - a peer trips at three short runs again
+//!   ([`short_runs::short_runs_to_trip`]);
+//! - a trip keeps QUIC on, on a gateway as on a peer ([`Verdict::Backoff`];
+//!   QUIC off would leave a gateway with no transport for 15 minutes to 4
+//!   hours, and every unix gateway counts short runs for this, see
+//!   [`decides_by_short_runs`]): its transport opens
+//!   only after a delay, 1 minute doubling per further counted run up to 30
+//!   ([`backoff_delay`], waited out in [`wait_out_crash_loop_backoff`] just
+//!   before the transport opens, and cut short by a stop), the marker records
+//!   the step at once with no QUIC panic (so a stop or crash during the wait
+//!   ends the backoff), and a run that outlives the short-run limit clears it.
+//!   The update probation (`rollback::COMMIT_HEALTHY_UPTIME_SECS`) does not
+//!   run while the wait does ([`wait_for_transport_open`]), so a release that
+//!   crashes the moment QUIC opens is still rolled back;
+//! - the binary's startup update check runs after a jitter of under 5
+//!   seconds instead of its 0-60 s one ([`quic_crash_loop_update_now`]), through the same claim, so the
+//!   known-bad pin, the lockout, a release cooling down and the download
+//!   budget still apply, and the backoff spaces the checks to about one per
+//!   30 minutes;
+//! - an earlier release's QUIC-off trip is dropped with a WARN;
+//! - a supervised peer exits when its QUIC endpoint dies, as a gateway does
+//!   (`liveness::gateway_quic_restarts`), under the same endpoint-death rule.
+//!   On unix this is a change in today's behaviour for a gateway with no boot
+//!   identity: [`note_endpoint_down_exit`] now writes its marker again after the
+//!   short-run timer cleared it, where it used to find none and keep running.
+//!
+//! An unsupervised peer whose endpoint dies is not restarted: it keeps
+//! running, with no transport once UDP is gone. Whether it should exit
+//! instead is left to the UDP-removal release.
 //!
 //! # The marker
 //!
@@ -201,6 +239,190 @@ use crate::node::background_task_monitor::LateRegistrar;
 mod short_runs;
 pub use short_runs::PEER_SHORT_RUNS_TO_TRIP_WITH_UDP;
 pub(crate) use short_runs::QuicCode;
+
+/// Whether UDP is still there to fall back to when the breaker trips (#6151).
+/// While it is, a trip keeps QUIC off for a cooldown and the node runs over
+/// UDP. The UDP-removal release (#5940 phase D) sets this to `false`: a
+/// peer's trip then keeps QUIC on and delays the start instead
+/// ([`Verdict::Backoff`]), runs the update check within seconds, and a supervised
+/// peer exits when its QUIC endpoint dies, as a gateway does; and a peer
+/// trips at [`short_runs::SHORT_RUNS_TO_TRIP`] again. Everything that reads
+/// it takes it as a parameter, so tests cover both values; production reads
+/// it through [`udp_fallback`].
+pub const UDP_FALLBACK: bool = true;
+
+/// [`UDP_FALLBACK`], or `false` in a test build of the binary whose
+/// environment sets `FREENET_TEST_BREAKER_NO_UDP_FALLBACK` (the
+/// `quic-panic-injection` feature, which cannot be built without debug
+/// assertions), so a real-process test can run the post-UDP path.
+pub(crate) fn udp_fallback() -> bool {
+    #[cfg(feature = "quic-panic-injection")]
+    if std::env::var_os("FREENET_TEST_BREAKER_NO_UDP_FALLBACK").is_some() {
+        return false;
+    }
+    UDP_FALLBACK
+}
+
+/// How many short runs in a row trip the crash-loop breaker for a node, with
+/// or without UDP to fall back to. Read by the binary's test of the order
+/// between the breaker and the post-update rollback.
+#[doc(hidden)]
+pub fn short_runs_to_trip(is_gateway: bool, udp_fallback: bool) -> u32 {
+    short_runs::short_runs_to_trip(BreakerRole::from_is_gateway(is_gateway), udp_fallback)
+}
+
+/// The first start delay of a peer's crash loop with no UDP to fall back to
+/// ([`Verdict::Backoff`]); each further counted run doubles it.
+pub(crate) const BACKOFF_FIRST: Duration = Duration::from_secs(60);
+
+/// The longest start delay ([`backoff_delay`]).
+pub(crate) const BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// How long a start at backoff `step` (1 for the first) waits before it
+/// opens the transport: [`BACKOFF_FIRST`] doubled for each step after the
+/// first, at most [`BACKOFF_MAX`]. A run that outlives
+/// [`short_runs::SHORT_RUN`] clears the marker, and with it the step.
+pub(crate) fn backoff_delay(step: u32) -> Duration {
+    backoff_delay_from(step, backoff_first())
+}
+
+fn backoff_delay_from(step: u32, first: Duration) -> Duration {
+    let doublings = step.max(1) - 1;
+    first
+        .checked_mul(2u32.saturating_pow(doublings))
+        .unwrap_or(BACKOFF_MAX)
+        .min(BACKOFF_MAX)
+}
+
+/// [`BACKOFF_FIRST`], or the seconds `FREENET_TEST_BREAKER_BACKOFF_SECS`
+/// gives in a `quic-panic-injection` test build.
+fn backoff_first() -> Duration {
+    #[cfg(feature = "quic-panic-injection")]
+    if let Some(secs) = std::env::var("FREENET_TEST_BREAKER_BACKOFF_SECS")
+        .ok()
+        .and_then(|secs| secs.parse().ok())
+    {
+        return Duration::from_secs(secs);
+    }
+    BACKOFF_FIRST
+}
+
+/// The start delay [`gate`] decided for this run, until the transport waits
+/// it out ([`wait_out_crash_loop_backoff`]).
+static BACKOFF: parking_lot::Mutex<Option<Duration>> = parking_lot::Mutex::new(None);
+
+/// Set when this start is in a crash-loop backoff, so the binary's startup
+/// update check runs after a few seconds of jitter instead of its 0-60 s one
+/// ([`quic_crash_loop_update_now`]).
+static UPDATE_NOW: AtomicBool = AtomicBool::new(false);
+
+fn note_backoff(delay: Duration) {
+    *BACKOFF.lock() = Some(delay);
+    BACKOFF_PENDING.store(true, Ordering::SeqCst);
+    UPDATE_NOW.store(true, Ordering::Relaxed);
+}
+
+/// Whether this start found the node in a QUIC crash loop with no UDP to fall
+/// back to (#6151), so the startup update check should run after a few
+/// seconds of jitter rather than its 0-60 s one: the node is broken, and a fixed release is
+/// what ends the loop. Read by the binary after the node is built (which runs
+/// the breaker) and before the update check starts. The check still goes
+/// through the same claim: a release pinned bad, the lockout, a release
+/// cooling down and the download budget all still refuse it.
+pub fn quic_crash_loop_update_now() -> bool {
+    UPDATE_NOW.load(Ordering::Relaxed)
+}
+
+/// Wait out this start's crash-loop backoff, if [`gate`] decided one, before
+/// the transport opens. Returns early once `shutting_down` is set, so a stop
+/// during the wait is prompt. The marker the wait leaves on disk records the
+/// step and no QUIC panic, so a start after a stop during the wait does not
+/// wait again. Real time: only the binary sets a backoff. Returns true when a
+/// stop ended the wait: the caller must not open the transport.
+pub(crate) async fn wait_out_crash_loop_backoff(shutting_down: &AtomicBool) -> bool {
+    let Some(delay) = BACKOFF.lock().take() else {
+        return false;
+    };
+    use crate::simulation::TimeSource;
+    let time = crate::simulation::RealTime::new();
+    let waited = wait_unless(
+        delay,
+        HOLDER_POLL,
+        || shutting_down.load(Ordering::SeqCst),
+        |d| time.sleep(d),
+    )
+    .await;
+    let stopped = shutting_down.load(Ordering::SeqCst);
+    BACKOFF_PENDING.store(false, Ordering::SeqCst);
+    TRANSPORT_WAIT_OVER.notify_waiters();
+    if stopped {
+        tracing::info!(
+            waited_secs = waited.as_secs(),
+            "Stopped during the QUIC crash-loop backoff; the transport is not opened"
+        );
+    } else {
+        tracing::info!(
+            waited_secs = waited.as_secs(),
+            "QUIC crash-loop backoff over; opening the transport"
+        );
+    }
+    stopped
+}
+
+/// Set from [`note_backoff`] until [`wait_out_crash_loop_backoff`] ends.
+static BACKOFF_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Wakes [`wait_for_transport_open`] when the backoff wait ends.
+static TRANSPORT_WAIT_OVER: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+/// Return once no crash-loop backoff wait is pending: at once when this start
+/// has none, otherwise when the wait ends. The binary's update probation
+/// commit (`rollback::commit_probation`) starts its healthy-uptime window from
+/// here, so a backoff start, whose transport is closed for the wait, does not
+/// count the wait as healthy uptime: a release that crashes as soon as QUIC
+/// opens is still rolled back, and a rollback that is retrying
+/// (`RollbackUnavailable` leaves its marker for a later crash) is not cleared
+/// by the node's own idle time.
+///
+/// Returns whether it had to wait. The caller starts its window again when it
+/// did, and calls this only after a first window, by when the breaker (which
+/// runs early in the node's build) has decided.
+pub async fn wait_for_transport_open() -> bool {
+    wait_while_pending(&BACKOFF_PENDING, &TRANSPORT_WAIT_OVER).await
+}
+
+async fn wait_while_pending(pending: &AtomicBool, over: &tokio::sync::Notify) -> bool {
+    let mut waited = false;
+    loop {
+        let notified = over.notified();
+        tokio::pin!(notified);
+        // Registered before the flag is read, so an end between the read and
+        // the await is not missed.
+        notified.as_mut().enable();
+        if !pending.load(Ordering::SeqCst) {
+            return waited;
+        }
+        waited = true;
+        notified.await;
+    }
+}
+
+/// Sleep `delay` in steps of `poll` with `sleep`, stopping early once
+/// `stop` returns true. Returns how long it slept.
+async fn wait_unless<Sleep: std::future::Future<Output = ()>>(
+    delay: Duration,
+    poll: Duration,
+    stop: impl Fn() -> bool,
+    sleep: impl Fn(Duration) -> Sleep,
+) -> Duration {
+    let mut slept = Duration::ZERO;
+    while slept < delay && !stop() {
+        let step = poll.min(delay - slept);
+        sleep(step).await;
+        slept += step;
+    }
+    slept
+}
 
 /// How long QUIC stays off on a peer after a run with QUIC enabled ended
 /// abnormally.
@@ -345,6 +567,11 @@ pub(crate) fn tripped_trips(previous: &Previous) -> u32 {
     }
 }
 
+/// Serde: a field left out when 0.
+fn is_zero(value: &u32) -> bool {
+    *value == 0
+}
+
 /// Serde: a first trip is written as before, without the count.
 fn is_first_trip(trips: &u32) -> bool {
     *trips <= 1
@@ -427,7 +654,12 @@ static OVERRIDDEN: AtomicBool = AtomicBool::new(false);
 ///   which ends the process without a clean exit.
 pub(super) static MARKER_UPDATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
-/// The marker this process armed, as armed, for a Windows run that must
+/// Set by [`gate`] when this start decides by short runs
+/// ([`decides_by_short_runs`]), whose marker the short-run timer clears, so
+/// an endpoint death after that writes it again ([`note_endpoint_down_exit`]).
+static DECIDED_BY_SHORT_RUNS: AtomicBool = AtomicBool::new(false);
+
+/// The marker this process armed, as armed, for a short-run start that must
 /// write it again after clearing it ([`note_endpoint_down_exit`]).
 static ARMED_MARKER: parking_lot::Mutex<Option<Marker>> = parking_lot::Mutex::new(None);
 
@@ -583,6 +815,12 @@ pub(crate) enum Marker {
         /// ignores it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         quic_panic_at: Option<String>,
+        /// A peer with no UDP to fall back to (#6151): the start-delay step
+        /// this run started at after its crash loop was detected
+        /// ([`Verdict::Backoff`]); 0 when it was not. Absent when 0, and in a
+        /// marker from an earlier release, which ignores it.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        backoff_step: u32,
         /// As in [`Marker::Armed`].
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         endpoint_down_secs: Vec<u64>,
@@ -630,6 +868,11 @@ pub(crate) enum Verdict {
     RunUnarmed,
     /// Crash evidence: record the trip, QUIC off.
     Trip,
+    /// Crash evidence on a peer with no UDP to fall back to (#6151): QUIC
+    /// stays on, but the transport opens only after [`backoff_delay`] for
+    /// this step, the update check runs within seconds, and the marker records the
+    /// step so the next counted run goes one step further.
+    Backoff { step: u32 },
     /// QUIC off until the earlier trip's cooldown ends.
     Cool { tripped_at_secs: u64 },
     /// The marker cannot be read: QUIC off for this run.
@@ -639,7 +882,7 @@ pub(crate) enum Verdict {
 impl Verdict {
     /// Whether QUIC runs.
     pub(crate) fn quic_enabled(self) -> bool {
-        matches!(self, Self::Arm | Self::RunUnarmed)
+        matches!(self, Self::Arm | Self::RunUnarmed | Self::Backoff { .. })
     }
 
     /// The name telemetry reports ([`StartReport`]).
@@ -648,6 +891,7 @@ impl Verdict {
             Self::Arm => "arm",
             Self::RunUnarmed => "run_unarmed",
             Self::Trip => "trip",
+            Self::Backoff { .. } => "backoff",
             Self::Cool { .. } => "cool",
             Self::Unreadable => "unreadable",
         }
@@ -815,10 +1059,10 @@ pub(crate) enum EndpointDownNote {
 /// for an unrecorded death: the next start could not count it, so a death at
 /// every start would restart the node without bound.
 pub(crate) fn note_endpoint_down_exit(now: SystemTime) -> bool {
-    let recreate = if cfg!(unix) {
-        None
-    } else {
+    let recreate = if DECIDED_BY_SHORT_RUNS.load(Ordering::Relaxed) {
         ARMED_MARKER.lock().clone()
+    } else {
+        None
     };
     let noted = note_endpoint_down_exit_with(
         ARMED.get(),
@@ -827,8 +1071,9 @@ pub(crate) fn note_endpoint_down_exit(now: SystemTime) -> bool {
         unix_secs(now),
         recreate.as_ref(),
     );
-    let keeps_running = "this gateway does not restart itself for it and keeps running over \
-                         UDP, with QUIC off until it is restarted";
+    let keeps_running = "this node does not restart itself for it and keeps running, over UDP \
+                         while UDP exists and with no transport once it is gone, with QUIC off \
+                         until it is restarted";
     match noted {
         Ok(EndpointDownNote::Recorded) => return true,
         Ok(EndpointDownNote::Overridden) => tracing::warn!(
@@ -1069,7 +1314,14 @@ pub(crate) async fn gate<T>(
         return not_consulted(settings);
     }
     OVERRIDDEN.store(ignore_breaker, Ordering::Relaxed);
-    if decides_by_short_runs(cfg!(unix), role, platform::boot_id().is_some()) {
+    let by_short_runs = decides_by_short_runs(
+        cfg!(unix),
+        role,
+        platform::boot_id().is_some(),
+        udp_fallback(),
+    );
+    DECIDED_BY_SHORT_RUNS.store(by_short_runs, Ordering::Relaxed);
+    if by_short_runs {
         // The legacy shadow reads its marker first: on the first start after
         // an upgrade it takes the earlier release's marker as its evidence.
         let legacy = if cfg!(unix) {
@@ -1077,7 +1329,14 @@ pub(crate) async fn gate<T>(
         } else {
             None
         };
-        let (gated, counted) = short_runs::gate(settings, data_dir, ignore_breaker, now, role);
+        let (gated, counted) = short_runs::gate(
+            settings,
+            data_dir,
+            ignore_breaker,
+            now,
+            role,
+            udp_fallback(),
+        );
         if let BreakerOutcome::Decided(verdict) = gated.breaker {
             set_start_report(StartReport {
                 role,
@@ -1251,6 +1510,10 @@ pub(crate) async fn gate<T>(
             );
             set_quic_restore_at(role, tripped_at_secs, trips);
         }
+        // The exit-status rule never backs off: only `short_runs::decide`
+        // decides a backoff, and `decides_by_short_runs` sends every node
+        // there when there is no UDP.
+        Verdict::Backoff { .. } => {}
         Verdict::Unreadable => {
             metrics.set_quic_breaker_suppressed(true);
             tracing::warn!(
@@ -1277,13 +1540,20 @@ pub(crate) async fn gate<T>(
 }
 
 /// Whether a start decides by short runs that panicked in QUIC code
-/// ([`short_runs`]): every peer (#6151), a gateway on Windows, and a gateway
+/// ([`short_runs`]): every peer (#6151), a gateway on Windows, a gateway
 /// on a `unix` platform with no boot identity (`boot_id_known` false), where
-/// [`verdict`] cannot tell a reboot from a crash and would never trip. A
-/// gateway on `unix` with a boot identity decides by how its last run ended
-/// ([`verdict`]).
-pub(crate) fn decides_by_short_runs(unix: bool, role: BreakerRole, boot_id_known: bool) -> bool {
-    !unix || role == BreakerRole::Peer || !boot_id_known
+/// [`verdict`] cannot tell a reboot from a crash and would never trip, and
+/// every node when there is no UDP to fall back to (`udp_fallback` false),
+/// because [`verdict`] can only trip to QUIC off and never backs off. A
+/// gateway on `unix` with a boot identity and UDP decides by how its last
+/// run ended ([`verdict`]).
+pub(crate) fn decides_by_short_runs(
+    unix: bool,
+    role: BreakerRole,
+    boot_id_known: bool,
+    udp_fallback: bool,
+) -> bool {
+    !unix || role == BreakerRole::Peer || !boot_id_known || !udp_fallback
 }
 
 /// The stop note: the wrapper's when it passed one; otherwise the note at
@@ -1511,7 +1781,10 @@ fn legacy_shadow_decide(
             tripped_at_secs: start.now_secs,
             trips: 1,
         }),
-        Verdict::RunUnarmed | Verdict::Cool { .. } | Verdict::Unreadable => None,
+        Verdict::RunUnarmed
+        | Verdict::Backoff { .. }
+        | Verdict::Cool { .. }
+        | Verdict::Unreadable => None,
     };
     (decided, marker)
 }
@@ -1586,6 +1859,13 @@ impl StartReport {
             .expect("the payload is an object literal");
         if let Some(short_runs) = self.short_runs {
             fields.insert("short_runs".into(), short_runs.into());
+        }
+        if let Verdict::Backoff { step } = self.verdict {
+            fields.insert("backoff_step".into(), step.into());
+            fields.insert(
+                "backoff_secs".into(),
+                backoff_delay_from(step, BACKOFF_FIRST).as_secs().into(),
+            );
         }
         if let Some(at) = &self.quic_panic_at {
             fields.insert("quic_panic_at".into(), at.as_str().into());
@@ -2172,7 +2452,10 @@ mod tests {
                     });
                     now += gw.cooldown(trips).as_secs().max(90);
                 }
-                Verdict::Cool { .. } | Verdict::RunUnarmed | Verdict::Unreadable => {
+                Verdict::Cool { .. }
+                | Verdict::Backoff { .. }
+                | Verdict::RunUnarmed
+                | Verdict::Unreadable => {
                     panic!("every start in this loop comes after its cooldown")
                 }
             }
@@ -2349,6 +2632,7 @@ mod tests {
                     nonce: 7,
                     quic_panicked: true,
                     quic_panic_at: Some("quinn-0.11.12/src/endpoint.rs:403".into()),
+                    backoff_step: 0,
                     prior_trip,
                 },
                 MarkerV0_2_159::ShortRuns {
@@ -2356,6 +2640,25 @@ mod tests {
                     started_at_secs: 4,
                     nonce: 7,
                     quic_panicked: true,
+                },
+            ),
+            // A marker at a backoff step: the older release ignores the step.
+            (
+                Marker::ShortRuns {
+                    endpoint_down_secs: vec![3, 4],
+                    short_runs: 4,
+                    started_at_secs: 4,
+                    nonce: 7,
+                    quic_panicked: false,
+                    quic_panic_at: None,
+                    backoff_step: 3,
+                    prior_trip,
+                },
+                MarkerV0_2_159::ShortRuns {
+                    short_runs: 4,
+                    started_at_secs: 4,
+                    nonce: 7,
+                    quic_panicked: false,
                 },
             ),
         ];
@@ -2439,7 +2742,9 @@ mod tests {
         assert!(kept < written);
         let note = flat("pub(crate) fn note_endpoint_down_exit(");
         assert!(
-            note.contains("letrecreate=ifcfg!(unix){None}else{ARMED_MARKER.lock().clone()};"),
+            note.contains(
+                "letrecreate=ifDECIDED_BY_SHORT_RUNS.load(Ordering::Relaxed){ARMED_MARKER.lock().clone()}else{None};"
+            ),
             "off unix the record gets the marker as armed: {note}"
         );
         assert!(
@@ -2580,6 +2885,7 @@ mod tests {
             nonce: 7,
             quic_panicked: true,
             quic_panic_at: None,
+            backoff_step: 0,
             prior_trip: Some(prior),
         });
         assert_eq!(trip_number(&short_runs, T0 + 7200, gw), 3);
@@ -2662,6 +2968,7 @@ mod tests {
             nonce: 7,
             quic_panicked: false,
             quic_panic_at: None,
+            backoff_step: 0,
             endpoint_down_secs,
             prior_trip,
         };
@@ -3012,6 +3319,7 @@ mod tests {
             nonce: 7,
             quic_panicked: false,
             quic_panic_at: None,
+            backoff_step: 0,
         };
         let pending = |path: &Path| Pending {
             marker: Some((path.to_path_buf(), marker.clone())),
@@ -3055,6 +3363,7 @@ mod tests {
             nonce: 7,
             quic_panicked: false,
             quic_panic_at: None,
+            backoff_step: 0,
         };
         let pending = |marker: Option<Marker>, signals_ready| Pending {
             marker: marker.map(|marker| (path.clone(), marker)),
@@ -3101,6 +3410,7 @@ mod tests {
             nonce: 7,
             quic_panicked: false,
             quic_panic_at: None,
+            backoff_step: 0,
         };
         let written = OnceLock::new();
         let arm_now = |marker: Marker, registrar: Option<LateRegistrar>| {
@@ -3135,6 +3445,7 @@ mod tests {
     /// test and embedder.
     #[tokio::test]
     async fn gate_is_inert_unless_enabled() {
+        let _globals = BACKOFF_GLOBALS.lock().await;
         let dir = tempfile::tempdir().unwrap();
         // Nothing in this test binary enables the breaker: it is process-wide
         // and would act on every node a test builds. A test that needs it
@@ -3209,13 +3520,20 @@ mod tests {
                 .unwrap_or_else(|| panic!("not found: {needle}"))
         };
         let enabled = at("if!ENABLED.load(Ordering::Relaxed){returnnot_consulted(settings);}");
-        let dispatch =
-            at("ifdecides_by_short_runs(cfg!(unix),role,platform::boot_id().is_some()){");
+        let decided = at(
+            "letby_short_runs=decides_by_short_runs(cfg!(unix),role,platform::boot_id().is_some(),udp_fallback(),);",
+        );
+        // The endpoint-death record reads which rule decided
+        // (`note_endpoint_down_exit`), so it is stored before either runs.
+        let stored = at("DECIDED_BY_SHORT_RUNS.store(by_short_runs,Ordering::Relaxed);");
+        let dispatch = at("ifby_short_runs{");
+        assert!(decided < stored && stored < dispatch);
         let shadow = at(
             "letlegacy=ifcfg!(unix){legacy_shadow(settings.is_some(),data_dir,ignore_breaker,now)}else{None};",
         );
-        let short_runs =
-            at("let(gated,counted)=short_runs::gate(settings,data_dir,ignore_breaker,now,role);");
+        let short_runs = at(
+            "let(gated,counted)=short_runs::gate(settings,data_dir,ignore_breaker,now,role,udp_fallback(),);",
+        );
         let returned = at("returngated;}");
         assert!(enabled < dispatch && dispatch < shadow && shadow < short_runs);
         assert!(short_runs < returned);
@@ -3350,15 +3668,38 @@ mod tests {
     /// identity decides by how its last run ended.
     #[test]
     fn who_decides_by_short_runs() {
-        // (unix, role, boot identity known)
-        assert!(decides_by_short_runs(true, BreakerRole::Peer, true));
-        assert!(decides_by_short_runs(true, BreakerRole::Peer, false));
-        assert!(!decides_by_short_runs(true, BreakerRole::Gateway, true));
-        assert!(decides_by_short_runs(false, BreakerRole::Peer, false));
-        assert!(decides_by_short_runs(false, BreakerRole::Gateway, false));
+        // (unix, role, boot identity known, udp fallback)
+        assert!(decides_by_short_runs(true, BreakerRole::Peer, true, true));
+        assert!(decides_by_short_runs(true, BreakerRole::Peer, false, true));
+        assert!(!decides_by_short_runs(
+            true,
+            BreakerRole::Gateway,
+            true,
+            true
+        ));
+        assert!(decides_by_short_runs(false, BreakerRole::Peer, false, true));
+        assert!(decides_by_short_runs(
+            false,
+            BreakerRole::Gateway,
+            false,
+            true
+        ));
         // A unix gateway with no boot identity cannot tell a reboot from a
         // crash, so it counts short runs rather than never tripping.
-        assert!(decides_by_short_runs(true, BreakerRole::Gateway, false));
+        assert!(decides_by_short_runs(
+            true,
+            BreakerRole::Gateway,
+            false,
+            true
+        ));
+        // With no UDP every node counts short runs, a unix gateway with a
+        // boot identity included: only that rule can back off (#6151).
+        assert!(decides_by_short_runs(
+            true,
+            BreakerRole::Gateway,
+            true,
+            false
+        ));
     }
 
     fn legacy_start(stopped: &[u32], ignore_breaker: bool) -> LegacyStart {
@@ -3483,6 +3824,7 @@ mod tests {
             nonce: 3,
             quic_panicked: true,
             quic_panic_at: None,
+            backoff_step: 0,
             endpoint_down_secs: Vec::new(),
             prior_trip: None,
         });
@@ -3708,6 +4050,7 @@ mod tests {
             nonce: 7,
             quic_panicked: false,
             quic_panic_at: None,
+            backoff_step: 0,
             endpoint_down_secs: Vec::new(),
             prior_trip: None,
         };
@@ -3831,6 +4174,7 @@ mod tests {
                     nonce: 7,
                     quic_panicked: true,
                     quic_panic_at: None,
+                    backoff_step: 0,
                     endpoint_down_secs: Vec::new(),
                     prior_trip: None,
                 },
@@ -3843,6 +4187,159 @@ mod tests {
                 "{json}"
             );
         }
+    }
+
+    /// The backoff doubles from a minute to its 30-minute cap.
+    #[test]
+    fn the_backoff_doubles_up_to_its_cap() {
+        let minutes = |step| backoff_delay_from(step, BACKOFF_FIRST).as_secs() / 60;
+        assert_eq!(
+            [0, 1, 2, 3, 4, 5, 6, 7, 40, u32::MAX].map(minutes),
+            [1, 1, 2, 4, 8, 16, 30, 30, 30, 30]
+        );
+        assert_eq!(backoff_delay(3), backoff_delay_from(3, BACKOFF_FIRST));
+    }
+
+    /// The wait sleeps in steps until the delay is over, and stops at the
+    /// first check after a stop is requested.
+    #[tokio::test]
+    async fn the_backoff_wait_ends_early_on_a_stop() {
+        use std::sync::atomic::AtomicU32;
+        let slept = AtomicU32::new(0);
+        let sleep = |d: Duration| {
+            slept.fetch_add(u32::try_from(d.as_millis()).unwrap(), Ordering::SeqCst);
+            std::future::ready(())
+        };
+        let full = wait_unless(
+            Duration::from_secs(2),
+            Duration::from_millis(300),
+            || false,
+            sleep,
+        )
+        .await;
+        assert_eq!(full, Duration::from_secs(2));
+        assert_eq!(slept.load(Ordering::SeqCst), 2000);
+
+        let polls = AtomicU32::new(0);
+        let stopped = wait_unless(
+            Duration::from_secs(60),
+            Duration::from_millis(250),
+            || polls.fetch_add(1, Ordering::SeqCst) >= 3,
+            |_| std::future::ready(()),
+        )
+        .await;
+        assert_eq!(
+            stopped,
+            Duration::from_millis(750),
+            "three steps, then the stop"
+        );
+    }
+
+    /// GitHub checks in a day of a peer's QUIC crash loop with no UDP to
+    /// fall back to: one startup check per start (as today; the crash loop
+    /// only shortens the jitter), each run panicking in QUIC 5 s after it opens
+    /// and the supervisor restarting it 10 s later, with `delay` as the start
+    /// delay of a backoff step.
+    fn checks_per_day(delay: impl Fn(u32) -> Duration) -> u32 {
+        const DAY: u64 = 24 * 60 * 60;
+        let mut previous = Previous::Nothing;
+        let mut now = T0;
+        let mut checks = 0;
+        while now < T0 + DAY {
+            checks += 1;
+            let decision = short_runs::decide(&previous, now, false, BreakerRole::Peer, false);
+            let wait = match decision.verdict {
+                Verdict::Backoff { step } => delay(step),
+                Verdict::Arm => Duration::ZERO,
+                other @ (Verdict::RunUnarmed
+                | Verdict::Trip
+                | Verdict::Cool { .. }
+                | Verdict::Unreadable) => panic!("a peer with no UDP never {other:?}"),
+            };
+            let Some(Marker::ShortRuns {
+                short_runs,
+                started_at_secs,
+                nonce,
+                backoff_step,
+                ..
+            }) = short_runs::marker_after(decision, &previous, now, 7, BreakerRole::Peer)
+            else {
+                panic!("a start with QUIC on leaves a short-run marker");
+            };
+            previous = Previous::Marker(Marker::ShortRuns {
+                short_runs,
+                started_at_secs,
+                nonce,
+                quic_panicked: true,
+                quic_panic_at: None,
+                backoff_step,
+                endpoint_down_secs: Vec::new(),
+                prior_trip: None,
+            });
+            now += wait.as_secs() + 5 + 10;
+        }
+        checks
+    }
+
+    /// #6151: a tripped peer cannot hammer GitHub. Its startup check runs at
+    /// once, but the backoff spaces its starts, so a day of crash loop asks
+    /// GitHub about once per 30 minutes (49 at most from the cap, plus the
+    /// first steps); without the backoff it would ask every 15 s. Each
+    /// check also still passes the update claim (known-bad pin, lockout,
+    /// release cooldown, download budget), which this does not model.
+    #[test]
+    fn a_tripped_peer_checks_for_updates_a_bounded_number_of_times_a_day() {
+        let bounded = checks_per_day(backoff_delay_from_first);
+        assert!(bounded <= 60, "{bounded} checks a day");
+        let unbounded = checks_per_day(|_| Duration::ZERO);
+        assert!(unbounded > 5_000, "without the backoff: {unbounded}");
+    }
+
+    fn backoff_delay_from_first(step: u32) -> Duration {
+        backoff_delay_from(step, BACKOFF_FIRST)
+    }
+
+    /// The start report says how long a backoff waits.
+    #[test]
+    fn the_start_report_gives_the_backoff() {
+        let report = StartReport {
+            role: BreakerRole::Peer,
+            rule: Rule::ShortRuns,
+            verdict: Verdict::Backoff { step: 3 },
+            ignore_breaker: false,
+            short_runs: Some(5),
+            quic_panic_at: None,
+            legacy_verdict: None,
+        };
+        assert_eq!(
+            report.to_json(),
+            serde_json::json!({
+                "role": "peer", "rule": "short_runs", "verdict": "backoff",
+                "quic_off": false, "overridden": false, "short_runs": 5,
+                "backoff_step": 3, "backoff_secs": 240
+            })
+        );
+    }
+
+    /// A marker with a backoff step is one 0.2.159 reads as a short-run
+    /// marker, the step ignored; without a step the field is left out.
+    #[test]
+    fn the_backoff_step_field_is_compatible() {
+        let marker = |backoff_step| Marker::ShortRuns {
+            short_runs: 3,
+            started_at_secs: 4,
+            nonce: 7,
+            quic_panicked: false,
+            quic_panic_at: None,
+            backoff_step,
+            endpoint_down_secs: Vec::new(),
+            prior_trip: None,
+        };
+        let json = serde_json::to_value(marker(0)).unwrap();
+        assert!(json.get("backoff_step").is_none(), "{json}");
+        let json = serde_json::to_value(marker(2)).unwrap();
+        assert_eq!(json["backoff_step"], 2);
+        assert_eq!(serde_json::from_value::<Marker>(json).unwrap(), marker(2));
     }
 
     /// The format is plain JSON with a `state` tag; pinned so a later release
@@ -3863,6 +4360,164 @@ mod tests {
             })
             .unwrap(),
             serde_json::json!({"state": "tripped", "tripped_at_secs": 3})
+        );
+    }
+
+    /// Held by the tests that read or write the process-global marker slot and
+    /// backoff state (`PENDING`, `BACKOFF`, `UPDATE_NOW`), which run on threads
+    /// of one process under plain `cargo test`.
+    static BACKOFF_GLOBALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A start the short-run decision backs off, end to end through `gate`
+    /// (#6151): QUIC stays on, the start delay and the update-now flag are set,
+    /// the update probation is held until the wait ends, and a stop during the
+    /// wait returns without opening the transport and releases the probation.
+    /// Peer and gateway alike. FALSIFY: delete the `UPDATE_NOW.store` in
+    /// `note_backoff` (the update check keeps its full jitter), the
+    /// `BACKOFF_PENDING` store (the probation commits during the wait), or
+    /// the `BACKOFF_PENDING` clear after the wait.
+    ///
+    /// Process globals, so one test owns them all and resets them.
+    #[tokio::test]
+    async fn a_backed_off_start_sets_the_delay_the_update_flag_and_holds_the_probation() {
+        let _globals = BACKOFF_GLOBALS.lock().await;
+        for role in [BreakerRole::Peer, BreakerRole::Gateway] {
+            let dir = tempfile::tempdir().unwrap();
+            write_marker(
+                &marker_path(dir.path()),
+                &Marker::ShortRuns {
+                    short_runs: 2,
+                    started_at_secs: T0 - 10,
+                    nonce: 7,
+                    quic_panicked: true,
+                    quic_panic_at: None,
+                    backoff_step: 0,
+                    endpoint_down_secs: Vec::new(),
+                    prior_trip: None,
+                },
+            )
+            .unwrap();
+            let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0);
+            assert!(!quic_crash_loop_update_now());
+            let (gated, _) = short_runs::gate(Some(7u8), dir.path(), false, now, role, false);
+            assert_eq!(gated.settings, Some(7), "{role:?}: QUIC stays on");
+            assert!(
+                quic_crash_loop_update_now(),
+                "{role:?}: the update check does not wait for its full jitter"
+            );
+            assert_eq!(*BACKOFF.lock(), Some(backoff_delay(1)), "{role:?}");
+            assert!(BACKOFF_PENDING.load(Ordering::SeqCst), "{role:?}");
+            // The probation is held while the wait is pending.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), wait_for_transport_open())
+                    .await
+                    .is_err(),
+                "{role:?}: the probation window must not start during the wait"
+            );
+            // A stop during the wait ends it at once, without opening the
+            // transport, and releases the probation.
+            let stopping = AtomicBool::new(true);
+            assert!(wait_out_crash_loop_backoff(&stopping).await, "{role:?}");
+            assert!(!BACKOFF_PENDING.load(Ordering::SeqCst), "{role:?}");
+            assert!(BACKOFF.lock().is_none(), "{role:?}");
+            assert!(
+                !wait_for_transport_open().await,
+                "{role:?}: nothing to wait for"
+            );
+            UPDATE_NOW.store(false, Ordering::Relaxed);
+            // `gate` left the marker pending; other tests read `PENDING`.
+            PENDING.lock().marker = None;
+        }
+        // With nothing decided, the wait is a no-op that opens the transport.
+        assert!(!wait_out_crash_loop_backoff(&AtomicBool::new(false)).await);
+    }
+
+    /// `wait_while_pending` returns at once when nothing is pending, and
+    /// otherwise only after the wait ends, reporting that it waited.
+    #[tokio::test(start_paused = true)]
+    async fn the_transport_open_wait_returns_only_after_the_backoff_ends() {
+        let pending = std::sync::Arc::new(AtomicBool::new(false));
+        let over = std::sync::Arc::new(tokio::sync::Notify::new());
+        assert!(!wait_while_pending(&pending, &over).await);
+        pending.store(true, Ordering::SeqCst);
+        let waiter = {
+            let (pending, over) = (pending.clone(), over.clone());
+            tokio::spawn(async move { wait_while_pending(&pending, &over).await })
+        };
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(!waiter.is_finished(), "returned during the backoff");
+        pending.store(false, Ordering::SeqCst);
+        over.notify_waiters();
+        assert!(waiter.await.unwrap(), "reports that it waited");
+    }
+
+    /// Reverting `gateway_quic_restart`'s first argument at the transport's
+    /// open from `restarts_for_quic(is_gateway)` to `is_gateway` leaves a
+    /// supervised peer with no UDP running without a transport when its QUIC
+    /// endpoint dies (#6151). The helpers are tested apart; this pins the
+    /// call site.
+    #[test]
+    fn the_transport_asks_restarts_for_quic_not_is_gateway() {
+        let src = include_str!("../connection_handler.rs");
+        let open = src
+            .split("let restart = gateway_quic_restart(")
+            .nth(1)
+            .expect("the call site")
+            .split(");")
+            .next()
+            .unwrap();
+        let squeezed: String = open.split_whitespace().collect();
+        assert!(
+            squeezed.starts_with("super::quic::liveness::restarts_for_quic(is_gateway),"),
+            "the first argument must be restarts_for_quic(is_gateway): {squeezed}"
+        );
+    }
+
+    /// An unix node that decided by short runs (every peer, and a gateway with
+    /// no boot identity or no UDP) writes its marker again when the run's
+    /// short-run timer already cleared it, so an endpoint death is still
+    /// counted; with no marker to write again it is not recorded. This is the
+    /// same record the Windows test pins, on the unix path
+    /// (`note_endpoint_down_exit_with`).
+    #[cfg(unix)]
+    #[test]
+    fn a_unix_short_run_marker_cleared_by_the_timer_is_written_again_for_an_endpoint_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = marker_path(dir.path());
+        let as_armed = Marker::ShortRuns {
+            short_runs: 0,
+            started_at_secs: T0,
+            nonce: 7,
+            quic_panicked: false,
+            quic_panic_at: None,
+            backoff_step: 0,
+            endpoint_down_secs: Vec::new(),
+            prior_trip: None,
+        };
+        let armed = (path.clone(), 7u64);
+        let pending = parking_lot::Mutex::new(Pending {
+            marker: None,
+            shadow: None,
+            quic_up: false,
+            signals_ready: false,
+            registrar: None,
+        });
+        // The timer cleared the marker: written again from the armed copy.
+        assert_eq!(
+            note_endpoint_down_exit_with(Some(&armed), &pending, false, T0 + 900, Some(&as_armed))
+                .unwrap(),
+            EndpointDownNote::Recorded
+        );
+        assert!(matches!(
+            read_previous(&path),
+            Previous::Marker(Marker::ShortRuns { endpoint_down_secs, .. })
+                if endpoint_down_secs == vec![T0 + 900]
+        ));
+        std::fs::remove_file(&path).unwrap();
+        // No armed copy (the exit-status rule decided): nothing to write.
+        assert_eq!(
+            note_endpoint_down_exit_with(Some(&armed), &pending, false, T0 + 900, None).unwrap(),
+            EndpointDownNote::NoMarker
         );
     }
 }

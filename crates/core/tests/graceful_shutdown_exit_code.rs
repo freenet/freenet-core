@@ -1114,6 +1114,111 @@ fn a_unix_peer_trips_after_two_quic_panics_in_a_row() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The breaker's WARN when a peer with no UDP backs off (#6151).
+#[cfg(feature = "quic-panic-injection")]
+const QUIC_BACKOFF_MARKER: &str = "QUIC stays on, the node checks for an update";
+
+/// #6151, the post-UDP path (`breaker::UDP_FALLBACK` false, switched on in
+/// this test build by `FREENET_TEST_BREAKER_NO_UDP_FALLBACK`): a unix peer
+/// whose three runs abort on a QUIC panic does not turn QUIC off at the
+/// fourth start; it backs off (a 30 s first step here, by
+/// `FREENET_TEST_BREAKER_BACKOFF_SECS`) with the transport not yet open and
+/// the marker already recording the step and no QUIC panic. A SIGTERM during
+/// the wait ends the node promptly with exit 0, and the next start reads the
+/// marker as a run with no QUIC panic: QUIC on at once, no wait.
+///
+/// FALSIFY: drop the `wait_out_crash_loop_backoff` call before the transport
+/// opens (the fourth start binds at once); write the backoff marker only at
+/// arming (it is not on disk during the wait); or make a backoff marker
+/// record a QUIC panic (the fifth start backs off again).
+#[cfg(feature = "quic-panic-injection")]
+#[test]
+fn with_no_udp_a_unix_peer_backs_off_and_a_stop_during_the_wait_ends_it() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let gateway = unreachable_gateway();
+    let no_udp = ("FREENET_TEST_BREAKER_NO_UDP_FALLBACK", "1");
+    let backoff = ("FREENET_TEST_BREAKER_BACKOFF_SECS", "30");
+    let inject = [no_udp, backoff, ("FREENET_TEST_QUIC_PANIC", "abort:5")];
+    for run in 0..3u64 {
+        let logs_dir = dir.path().join(format!("logs-{run}"));
+        let mut node =
+            spawn_quic_node_full(dir.path(), &logs_dir, &peer_args(&gateway), None, &inject)?;
+        let report = start_report(&node.logs())?;
+        assert_eq!(report["verdict"], "arm", "run {run}: {report}");
+        assert_eq!(report["short_runs"], run, "{report}");
+        let status = node.wait_for_exit(Duration::from_secs(60))?;
+        assert!(
+            !status.success(),
+            "an abort: {status:?}. Logs:\n{}",
+            node.logs()
+        );
+    }
+
+    let logs_dir = dir.path().join("logs-backoff");
+    std::fs::create_dir_all(&logs_dir)?;
+    let mut args = vec!["--transport-quic", "prefer"];
+    args.extend_from_slice(&peer_args(&gateway));
+    let mut waiting =
+        NodeProcess::spawn_full(dir.path(), &logs_dir, &args, None, &[no_udp, backoff])?;
+    waiting.wait_for_logs(
+        &[READY_MARKER, QUIC_BACKOFF_MARKER],
+        Duration::from_secs(120),
+    )?;
+    let logs = waiting.logs();
+    let report = start_report(&logs)?;
+    assert_eq!(report["verdict"], "backoff", "{report}");
+    assert_eq!(report["quic_off"], false, "{report}");
+    assert_eq!(report["short_runs"], 3, "{report}");
+    assert_eq!(report["backoff_step"], 1, "{report}");
+    assert!(
+        !logs.contains(TRANSPORT_BOUND_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
+        "the transport waits. Logs:\n{logs}"
+    );
+    let marker = read_quic_marker(dir.path())?;
+    assert_eq!(
+        marker.as_ref().map(|m| (
+            m["state"].clone(),
+            m["backoff_step"].clone(),
+            m["quic_panicked"].clone()
+        )),
+        Some(("short_runs".into(), 1.into(), false.into())),
+        "the step is on disk during the wait, with no QUIC panic: {marker:?}"
+    );
+
+    let stop_sent = Instant::now();
+    waiting.send_sigterm()?;
+    let status = waiting.wait_for_exit(Duration::from_secs(25))?;
+    assert_eq!(status.code(), Some(0), "Logs:\n{}", waiting.logs());
+    assert!(
+        stop_sent.elapsed() < Duration::from_secs(20),
+        "the stop did not wait out the backoff"
+    );
+    let after_stop = read_quic_marker(dir.path())?;
+    assert!(
+        after_stop
+            .as_ref()
+            .is_none_or(|m| m["state"] == "short_runs" && m["quic_panicked"] == false),
+        "a stop during the wait leaves no QUIC panic recorded: {after_stop:?}"
+    );
+
+    let mut next = spawn_quic_node_full(
+        dir.path(),
+        &dir.path().join("logs-next"),
+        &peer_args(&gateway),
+        None,
+        &[no_udp, backoff],
+    )?;
+    let logs = next.logs();
+    assert!(
+        logs.contains(QUIC_BUILT_MARKER) && !logs.contains(QUIC_BACKOFF_MARKER),
+        "the start after a stop during the wait runs QUIC at once. Logs:\n{logs}"
+    );
+    assert_eq!(start_report(&logs)?["verdict"], "arm");
+    next.send_sigterm()?;
+    assert_eq!(next.wait_for_exit(Duration::from_secs(45))?.code(), Some(0));
+    Ok(())
+}
+
 /// Write a Tripped breaker marker for `tripped_at_secs`.
 fn write_tripped_marker(dir: &Path, tripped_at_secs: u64) -> anyhow::Result<()> {
     let marker = serde_json::json!({
