@@ -524,9 +524,26 @@ dropped unanswered past the per-CONNECT cap on refused acceptors,
 `connect_native_setup_<label>` for how each native setup ended (one per
 `NativeSetupOutcome`), `connect_native_demotions` for each time the node
 turned its own native connects off,
-`connect_native_rescued_by_udp_{joiner,acceptor}` for each UDP dial after a
-failed native setup that connected (R5: a connection a node without UDP
-would not have made), `connect_native_both_dials_connected_{udp,native}_first`
+`connect_native_rescued_by_udp_{joiner,acceptor}` for each UDP dial that
+connected after a native setup that failed ON THE PATH (timed out,
+handshake failed, Hello lost: `counts_toward_demotion`; R5: a connection a
+node without UDP would not have made). A local refusal (punch budget,
+setups full, too late) is not a rescue, on either side: the native outcome
+reaches the connect op as `ConnectResult`'s error (`Err(Some(outcome))`,
+`Err(None)` for UDP and local failures) and both sides test it with
+`op_ctx_task::native_path_failed`.
+`connect_native_fallback_connected_{joiner,acceptor}` counts every UDP dial
+that connected after ANY failed native setup (path failure, local refusal,
+Hello mismatch): the joins a node without UDP would lose. Phase D's gate
+reads the SUM of the joiner and acceptor sides of THIS counter: each side
+counts the UDP dial of its own that connected, and whichever dial makes the
+connection first counts it and the other counts nothing (in
+test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join the joiner
+side is 0 and the acceptor side 3, so neither alone is the figure; that test
+counts from the run's own wire trace, since the process-wide counters are
+shared by every sim in a plain `cargo test` process). It does not
+read the rescue counter, which is only the path-failure
+subset, `connect_native_both_dials_connected_{udp,native}_first`
 for a native dial and the UDP dial beside it that both connected (the native
 one kept), `connect_native_survivor_{swapped,udp_dropped}` for each
 survivor-rule decision, and the last offer as states
@@ -2433,13 +2450,25 @@ Simulation: every node shares [::1], so the per-destination punch budget
   segment, the last one Location::from_address reads) and puts the regular
   nodes behind NATs (transport::nat_model: endpoint-independent mapping,
   full, address-restricted or port-restricted filtering, bindings refreshed
-  by outbound datagrams, 30 s lifetime). The sender's NAT opens its binding
-  at send; the receiver's decides at DELIVERY (in_memory_socket
-  deliver_packet_to_network), so a punch crossing one the receiver sends is
-  admitted. Symmetric mapping is A5c-2. The 6.2 matrix
+  by outbound datagrams, 30 s lifetime; or Symmetric, a fresh external
+  port per destination admitting only that destination, the node's own
+  address closed). The sender's NAT opens its binding (and, if symmetric,
+  rewrites the source) at send; the receiver's decides at DELIVERY
+  (in_memory_socket deliver_packet_to_network), so a punch crossing one the
+  receiver sends is admitted. A native setup with a symmetric peer never
+  connects, whatever the other side's class: the setup admits only the
+  peer's known address, and a symmetric peer's port toward anyone else is
+  not it (test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join). The 6.2 matrix
   (quic/native/setup/matrix_tests.rs) runs connect_native/accept_native
   behind NATs over classes, late side and skew, punch loss and round trip;
-  every cell establishes, so the single attempt stays.
+  every cell of that original matrix establishes. The gate rows added
+  beside it (gates 14, 15, 17) are a baseline: gate 15 (handshake loss) and
+  gate 17's jitter edges do not meet the 95% criterion with one attempt
+  (overlapping attempts and option (b) are the follow-ups). Gate 17's
+  binding-expiry half is NOT demonstrated: at a 5 s lifetime no binding
+  expires inside a setup (measured), and a lifetime short enough to expire
+  one (200 ms) is under the round trip, so it fails every setup whatever the
+  setup does and says nothing about it; those rows were dropped.
 Determinism: a plain tokio::select! draws its arm order from tokio's RNG,
   which the seed does not set. bounded_send's loop (every QUIC path, upgrade
   ones included: a send and its deadline ready together now resolve as the

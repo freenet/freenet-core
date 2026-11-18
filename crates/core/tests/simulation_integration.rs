@@ -23107,6 +23107,9 @@ fn test_quic_native_zero_percent_forms_the_same_mesh() {
     assert_eq!(on.trace.undecodable_closes(), 0);
 }
 
+/// Gateways in the QUIC-native connect sims.
+const NATIVE_SIM_GATEWAYS: usize = 2;
+
 /// One QUIC-native connect run: the wire run plus the upgrade trace, which
 /// records what native paths sent (session 0).
 struct NativeConnectRun {
@@ -23142,8 +23145,11 @@ fn run_native_connect_sim_with(
     let rt = create_runtime();
     let (sim, logs_handle, trace, upgrades, nodes, gateways, nat_counts) = rt.block_on(async {
         let mut sim = match nat {
-            Some(nat) => SimNetwork::new_with_nat(name, 2, 8, 10, 3, 10, 3, seed, nat).await,
-            None => SimNetwork::new(name, 2, 8, 10, 3, 10, 3, seed).await,
+            Some(nat) => {
+                SimNetwork::new_with_nat(name, NATIVE_SIM_GATEWAYS, 8, 10, 3, 10, 3, seed, nat)
+                    .await
+            }
+            None => SimNetwork::new(name, NATIVE_SIM_GATEWAYS, 8, 10, 3, 10, 3, seed).await,
         };
         let nat_counts = sim.nat_filtered_handle();
         sim.enable_gateway_ack_version();
@@ -23637,6 +23643,108 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
     );
     assert!(setups.0 > 0, "premise: native setups ended at both ends");
     assert!(held_both > 0, "premise: pairs held at both ends");
+}
+
+/// A5c-2: nodes behind symmetric NATs. Half the regular nodes are behind a
+/// symmetric NAT (a fresh external port per destination, admitting only that
+/// destination) and half behind port-restricted ones, with native on at
+/// 100%. A native setup with a symmetric peer cannot connect: the setup
+/// admits only the peer's known address, and a symmetric peer's port toward
+/// anyone else is not that address. So every native setup between two
+/// regular nodes that involves a symmetric one fails, none forms, and still
+/// every node joins, through the gateways (reachable from anywhere) and the
+/// pairs that can connect. Nodes are told apart by IP, since a symmetric
+/// node shows each peer a different port. Fails closed: such setups must
+/// have been tried.
+#[test_log::test]
+fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
+    use freenet::dev_tool::{NatFiltering, SimNat};
+    const SEED: u64 = 0x0059_40A5_00E1;
+    let name = "native-nat-symmetric";
+    let nat = SimNat {
+        classes: vec![NatFiltering::Symmetric, NatFiltering::PortRestricted],
+        lifetime: SimNat::all(NatFiltering::Symmetric).lifetime,
+    };
+    let mut symmetric_ips = std::collections::BTreeSet::new();
+    let run = run_native_connect_sim_with(name, SEED, 200, Some(nat), |sim| {
+        sim.with_native_connect(100);
+        // Regular node `i` gets `classes[i % 2]`; regular nodes are numbered
+        // after the gateways.
+        for (label, addr) in sim.all_node_addresses() {
+            if !label.is_gateway() && label.number().saturating_sub(NATIVE_SIM_GATEWAYS) % 2 == 0 {
+                symmetric_ips.insert(addr.ip());
+            }
+        }
+    });
+    log_native_connect(name, &run);
+    // Counted from this run's own wire trace, for both sides: the
+    // process-wide transport counters are shared with every other sim in a
+    // plain `cargo test` process, so they cannot be compared with one run.
+    // (Their wiring is pinned by the connect driver's unit tests; phase D
+    // reads the sum of the joiner and acceptor sides, since whichever side's
+    // dial connects first counts it.)
+    let fallback = run
+        .wire
+        .trace
+        .udp_fallbacks_ended()
+        .iter()
+        .filter(|(_, _, connected)| *connected)
+        .count() as u64;
+    let rescued = run.wire.trace.udp_fallbacks_rescued();
+    assert!(
+        fallback > 0,
+        "premise: UDP dials connected after native failures"
+    );
+    assert!(
+        fallback >= rescued,
+        "fallback {fallback} counts every rescue {rescued}"
+    );
+    let t = &run.wire.trace;
+    let gateway_ips: std::collections::BTreeSet<_> = run.gateways.iter().map(|a| a.ip()).collect();
+    let between_peers = |a: &SocketAddr, b: &SocketAddr| {
+        !gateway_ips.contains(&a.ip()) && !gateway_ips.contains(&b.ip())
+    };
+    let involves_symmetric = |a: &SocketAddr, b: &SocketAddr| {
+        symmetric_ips.contains(&a.ip()) || symmetric_ips.contains(&b.ip())
+    };
+    assert_eq!(symmetric_ips.len(), 4, "premise: half the regular nodes");
+    assert!(
+        run.nat_filtered
+            .get(&NatFiltering::Symmetric)
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "premise: the symmetric NATs dropped datagrams"
+    );
+    let tried: Vec<_> = t
+        .native_failed_pairs()
+        .into_iter()
+        .filter(|(a, b)| between_peers(a, b) && involves_symmetric(a, b))
+        .collect();
+    assert!(
+        !tried.is_empty(),
+        "premise: native setups with symmetric peers were tried"
+    );
+    let formed: Vec<_> = t
+        .native_established_at_both_ends()
+        .into_iter()
+        .filter(|(a, b, _)| between_peers(a, b) && involves_symmetric(a, b))
+        .collect();
+    assert_eq!(
+        formed,
+        Vec::new(),
+        "no native connection with a symmetric peer"
+    );
+    let ips: std::collections::BTreeSet<_> = run
+        .wire
+        .mesh
+        .iter()
+        .flat_map(|(a, b)| [a.ip(), b.ip()])
+        .collect();
+    assert_eq!(ips.len(), run.wire.nodes, "every node joined");
+    for ip in &symmetric_ips {
+        assert!(ips.contains(ip), "symmetric node {ip} joined");
+    }
 }
 
 /// The same seed gives the same native connects: the same counts, the same

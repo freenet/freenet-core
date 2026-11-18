@@ -868,7 +868,7 @@ impl P2pConnManager {
                     "Outgoing connection to peer blocked by local policy"
                 );
                 callback
-                    .send_result(Err(()))
+                    .send_result(Err(None))
                     .await
                     .inspect_err(|error| {
                         tracing::debug!(
@@ -954,7 +954,7 @@ impl P2pConnManager {
             };
             if refused {
                 callback
-                    .send_result(Err(()))
+                    .send_result(Err(None))
                     .await
                     .inspect_err(|err| {
                         tracing::debug!(
@@ -1008,7 +1008,7 @@ impl P2pConnManager {
                 "Skipping connection attempt - peer in backoff"
             );
             callback
-                .send_result(Err(()))
+                .send_result(Err(None))
                 .await
                 .inspect_err(|error| {
                     tracing::debug!(
@@ -1045,7 +1045,7 @@ impl P2pConnManager {
                     "connect_peer: skipping connection — at max_connections"
                 );
                 callback
-                    .send_result(Err(()))
+                    .send_result(Err(None))
                     .await
                     .inspect_err(|err| {
                         tracing::debug!(
@@ -1163,7 +1163,7 @@ impl P2pConnManager {
         // back-pressures on the handshake command channel (cap 128) would stall
         // the loop. On Full/Closed we run the SAME cleanup the blocking error
         // path used: prune the in-transit connection slot and fail every
-        // awaiting callback with Err(()), so callers (including the SubscribeHint
+        // awaiting callback with Err(None), so callers (including the SubscribeHint
         // resend-waiter registered above) are notified immediately instead of
         // parking. The connect op can retry on a later attempt; this failure is
         // LOCAL channel contention, not a remote connection failure, so we do
@@ -1729,7 +1729,7 @@ impl P2pConnManager {
                             return Ok(());
                         }
                         if native_pending {
-                            answer_beside(peer_addr, beside, Err(())).await;
+                            answer_beside(peer_addr, beside, Err(None)).await;
                             return Ok(());
                         }
                         for (tx, callback) in beside {
@@ -1872,9 +1872,14 @@ impl P2pConnManager {
                         "Notifying callbacks after outbound failure"
                     );
 
+                    // A native dial's requesters learn how its setup ended,
+                    // so the connect op can tell a path failure from a
+                    // local refusal (the rescue definition, 10.2 item 16);
+                    // a UDP dial's carry nothing.
+                    let failure = if native { native_outcome } else { None };
                     let mut callbacks = callbacks.into_iter();
                     if let Some(mut cb) = callbacks.next() {
-                        cb.send_result(Err(()))
+                        cb.send_result(Err(failure))
                             .await
                             .inspect_err(|err| {
                                 tracing::debug!(
@@ -1886,7 +1891,7 @@ impl P2pConnManager {
                             .ok();
                     }
                     for mut cb in callbacks {
-                        cb.send_result(Err(()))
+                        cb.send_result(Err(failure))
                             .await
                             .inspect_err(|err| {
                                 tracing::debug!(
@@ -2135,7 +2140,7 @@ impl P2pConnManager {
         for (addr, beside) in std::mem::take(&mut state.udp_beside_native) {
             for (_, mut callback) in beside {
                 callback
-                    .send_result(Err(()))
+                    .send_result(Err(None))
                     .await
                     .inspect_err(|err| {
                         tracing::debug!(
@@ -2157,7 +2162,7 @@ impl P2pConnManager {
                 "Delivering handshake driver shutdown notification"
             );
             for mut cb in callbacks {
-                cb.send_result(Err(()))
+                cb.send_result(Err(None))
                     .await
                     .inspect_err(|err| {
                         tracing::debug!(
@@ -2209,7 +2214,7 @@ impl P2pConnManager {
                 for mut cb in callbacks {
                     // Best effort - caller will handle the connection failure
                     #[allow(clippy::let_underscore_must_use)]
-                    let _ = cb.send_result(Err(())).await;
+                    let _ = cb.send_result(Err(None)).await;
                 }
             }
             state.awaiting_connection_txs.remove(&peer_addr);
@@ -3065,7 +3070,7 @@ async fn fail_udp_beside_native(state: &mut EventListenerState, peer_addr: Socke
         .udp_beside_native
         .remove(&peer_addr)
         .unwrap_or_default();
-    answer_beside(peer_addr, requesters, Err(())).await;
+    answer_beside(peer_addr, requesters, Err(None)).await;
 }
 
 /// Answers requesters of a UDP dial beside a native one with `result`.

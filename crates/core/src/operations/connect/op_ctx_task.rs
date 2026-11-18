@@ -504,7 +504,7 @@ async fn drive_client_connect(
                                     acceptor.clone(),
                                     addr,
                                     Instant::now(),
-                                    false,
+                                    None,
                                 )));
                             }
                         }
@@ -529,7 +529,7 @@ async fn drive_client_connect(
                             acceptor,
                             acceptor_addr,
                             at,
-                            false,
+                            None,
                         )));
                         next = dial_queue.finish();
                     }
@@ -632,7 +632,7 @@ async fn drive_client_connect(
                 transport,
                 answered_at,
                 holds_slot,
-                rescues_native,
+                after_native,
             })) => {
                 // A native dial that failed is followed by a UDP dial to the
                 // same acceptor, before anything counts it as failed: until
@@ -657,14 +657,20 @@ async fn drive_client_connect(
                         acceptor,
                         acceptor_addr,
                         answered_at + crate::transport::NATIVE_FALLBACK_AFTER,
-                        true,
+                        Some(native_path_failed(&result)),
                     )));
                     start_dials!(dial_queue.finish());
                     continue;
                 }
-                if rescues_native {
+                if let Some(path_failed) = after_native {
                     let connected = matches!(result, Some(Ok(_)));
                     if connected {
+                        crate::transport::TRANSPORT_METRICS
+                            .record_connect_native_fallback_connected(
+                                crate::transport::NativeConnectSide::Joiner,
+                            );
+                    }
+                    if connected && path_failed {
                         crate::transport::TRANSPORT_METRICS.record_connect_native_rescued_by_udp(
                             crate::transport::NativeConnectSide::Joiner,
                         );
@@ -676,6 +682,7 @@ async fn drive_client_connect(
                             own: op_manager.ring.connection_manager.get_own_addr(),
                             peer: acceptor_addr,
                             connected,
+                            path_failed,
                         },
                     );
                 }
@@ -1200,17 +1207,29 @@ struct AcceptorDial {
     /// Whether this dial holds a slot in the dial queue. A UDP dial to a
     /// native acceptor waits for the fallback time outside the queue.
     holds_slot: bool,
-    /// Whether this is the UDP dial after a failed native setup, so its
-    /// success is a native setup rescued by UDP (`connect_native_rescued_by_udp`).
-    rescues_native: bool,
+    /// `Some` for the UDP dial after a failed native setup: its success is
+    /// counted as `connect_native_fallback_connected`, and, if the native
+    /// setup failed on the path (`Some(true)`, [`native_path_failed`]), as a
+    /// rescue (`connect_native_rescued_by_udp`).
+    after_native: Option<bool>,
+}
+
+/// Whether a native dial's result says native does not work on the path:
+/// its setup timed out, failed its handshake or lost its Hello
+/// (`NativeSetupOutcome::counts_toward_demotion`). A UDP dial that connects
+/// after such a failure is a rescue (`connect_native_rescued_by_udp`); one
+/// after a local refusal (punch budget, setups full, too late) or any other
+/// failure is not, on either side (design note 10.2 item 16).
+pub(super) fn native_path_failed(result: &Option<crate::message::ConnectResult>) -> bool {
+    matches!(result, Some(Err(Some(outcome))) if outcome.counts_toward_demotion())
 }
 
 /// The joiner's UDP dial to an acceptor that decided native, after a failed
 /// native dial or in place of a late one: wait until `at`, the common fallback
 /// time, then dial as [`begin_acceptor_dial`] does. A dial that cannot be
 /// started ends as a failed one. It holds no slot in the dial queue.
-/// `after_native_failure`: it follows a failed native setup, so its success
-/// is a rescue.
+/// `after_native`: `Some` when it follows a failed native setup, carrying
+/// whether that failure was on the path ([`native_path_failed`]).
 ///
 /// The acceptor starts its own UDP punch at `at` (measured from its decision),
 /// so the dial-queue wait is recorded from `at`: how late this dial is
@@ -1221,7 +1240,7 @@ async fn udp_fallback_dial(
     acceptor: PeerKeyLocation,
     acceptor_addr: SocketAddr,
     at: Instant,
-    after_native_failure: bool,
+    after_native: Option<bool>,
 ) -> AcceptorDial {
     tokio::time::sleep_until(at).await;
     let dial = match begin_acceptor_dial(
@@ -1244,14 +1263,14 @@ async fn udp_fallback_dial(
                 answered_at: at,
                 holds_slot: false,
                 // Set below; a dial that never started has no result, so it is
-                // never counted as a rescue.
-                rescues_native: false,
+                // never counted.
+                after_native: None,
             }
         }
     };
     AcceptorDial {
         holds_slot: false,
-        rescues_native: after_native_failure,
+        after_native,
         ..dial
     }
 }
@@ -1373,7 +1392,7 @@ async fn begin_acceptor_dial(
             transport,
             answered_at,
             holds_slot: true,
-            rescues_native: false,
+            after_native: None,
         }
     })
 }
@@ -2862,7 +2881,7 @@ mod driver_timing_tests {
                     let result = if addr != unreachable && in_window {
                         Ok((addr, None))
                     } else {
-                        Err(())
+                        Err(None)
                     };
                     // The driver may already have ended; nothing to do then.
                     callback.send(result).await.ok();
@@ -3412,7 +3431,7 @@ mod driver_timing_tests {
                         tokio::spawn(async move {
                             tokio::time::sleep(NAT_TRAVERSAL_DEADLINE).await;
                             in_flight.fetch_sub(1, SeqCst);
-                            let result = if ok { Ok((addr, None)) } else { Err(()) };
+                            let result = if ok { Ok((addr, None)) } else { Err(None) };
                             callback.send(result).await.ok();
                         });
                     }
@@ -3666,7 +3685,7 @@ mod driver_timing_tests {
         else {
             panic!("the native dial comes first");
         };
-        callback.send(Err(())).await.expect("callback open");
+        callback.send(Err(None)).await.expect("callback open");
         let NodeEvent::ExpectPeerConnection { addr, .. } = next_node_event(&mut events).await
         else {
             panic!("the fallback registers the expectation first");
@@ -3700,7 +3719,7 @@ mod driver_timing_tests {
             acceptor,
             addr,
             at,
-            true,
+            Some(true),
         ));
         let NodeEvent::ExpectPeerConnection { addr: expected, .. } =
             next_node_event(&mut events).await
@@ -3712,6 +3731,55 @@ mod driver_timing_tests {
         dial.abort();
     }
 
+    /// Gate 16: a UDP connect after a native dial counts as a rescue only
+    /// when the native setup failed on the path (timed out, failed its
+    /// handshake, lost its Hello). A local refusal, a UDP or local failure
+    /// (no outcome), a closed channel or a success is not one.
+    #[test]
+    fn only_a_native_path_failure_makes_the_fallback_a_rescue() {
+        use crate::transport::NativeSetupOutcome as O;
+        for outcome in O::ALL {
+            assert_eq!(
+                super::native_path_failed(&Some(Err(Some(outcome)))),
+                outcome.counts_toward_demotion(),
+                "{outcome:?}"
+            );
+        }
+        assert!(super::native_path_failed(&Some(Err(Some(O::TimedOut)))));
+        assert!(!super::native_path_failed(&Some(Err(Some(
+            O::OverBudgetDestination
+        )))));
+        assert!(!super::native_path_failed(&Some(Err(None))));
+        assert!(!super::native_path_failed(&None));
+        assert!(!super::native_path_failed(&Some(Ok((
+            "127.0.0.1:1".parse().unwrap(),
+            None
+        )))));
+    }
+
+    /// Gate 16, both sides: the acceptor counts a rescue under the same
+    /// definition as the joiner (`native_path_failed`).
+    #[test]
+    fn the_acceptor_counts_a_rescue_only_after_a_path_failure() {
+        const CONNECT: &str = include_str!("../connect.rs");
+        // Bounded to the acceptor's function, so a copy elsewhere in the
+        // file cannot satisfy it.
+        let start = CONNECT
+            .find("pub(super) async fn dispatch_expect_connection_from(")
+            .expect("the acceptor's function");
+        let end = start + CONNECT[start..].find("\n}\n").expect("its end");
+        let flat: String = CONNECT[start..end].split_whitespace().collect();
+        assert!(flat.contains("letpath_failed=op_ctx_task::native_path_failed(&failed);"));
+        assert!(flat.contains(
+            "ifconnected&&path_failed{crate::transport::TRANSPORT_METRICS.record_connect_native_rescued_by_udp("
+        ));
+        // Every connected fallback is counted for the phase-D gate, whatever
+        // the native failure.
+        assert!(flat.contains(
+            "ifconnected{crate::transport::TRANSPORT_METRICS.record_connect_native_fallback_connected("
+        ));
+    }
+
     /// The driver measures the joiner's fallback from the response's arrival,
     /// as the acceptor measures its own from the decision.
     #[test]
@@ -3720,7 +3788,7 @@ mod driver_timing_tests {
         let prod = &SOURCE[..SOURCE.find("\n#[cfg(test)]\n").expect("test module")];
         let flat: String = prod.split_whitespace().collect();
         assert!(flat.contains(
-            "dials.push(futures::future::Either::Right(udp_fallback_dial(op_manager.clone(),tx,acceptor,acceptor_addr,answered_at+crate::transport::NATIVE_FALLBACK_AFTER,true,)));"
+            "dials.push(futures::future::Either::Right(udp_fallback_dial(op_manager.clone(),tx,acceptor,acceptor_addr,answered_at+crate::transport::NATIVE_FALLBACK_AFTER,Some(native_path_failed(&result)),)));"
         ));
         const CONNECT: &str = include_str!("../connect.rs");
         let flat: String = CONNECT.split_whitespace().collect();
@@ -3866,7 +3934,7 @@ mod driver_timing_tests {
                         DialTransport::Native { deadline } => {
                             let within = deadline.saturating_duration_since(Instant::now());
                             tokio::time::sleep(native_takes.min(within)).await;
-                            Err(())
+                            Err(Some(MOCK_NATIVE_OUTCOME.with(|o| o.get())))
                         }
                         DialTransport::Udp => {
                             let started = Instant::now();
@@ -3883,7 +3951,7 @@ mod driver_timing_tests {
                             if overlapped {
                                 Ok((addr, None))
                             } else {
-                                Err(())
+                                Err(None)
                             }
                         }
                     };
@@ -3957,6 +4025,34 @@ mod driver_timing_tests {
         (t0, addrs, log)
     }
 
+    thread_local! {
+        /// How the mock's native dials fail (`queued_dials`).
+        static MOCK_NATIVE_OUTCOME: std::cell::Cell<crate::transport::NativeSetupOutcome> =
+            const { std::cell::Cell::new(crate::transport::NativeSetupOutcome::TimedOut) };
+    }
+
+    /// UDP dials that connected after any failed native setup on this thread:
+    /// (as joiner, as acceptor).
+    fn fallbacks_here() -> (u64, u64) {
+        let [joiner, acceptor] =
+            crate::transport::metrics::NATIVE_FALLBACKS_CONNECTED_ON_THIS_THREAD.with(|c| c.get());
+        (joiner, acceptor)
+    }
+
+    /// #6264 review item 1: a UDP dial that connects after a native setup
+    /// refused LOCALLY (here its punch budget) is not a rescue, but it is a
+    /// join a node without UDP would lose, so the phase-D figure counts it.
+    #[tokio::test(start_paused = true)]
+    async fn a_fallback_after_a_local_refusal_counts_for_phase_d_but_is_no_rescue() {
+        MOCK_NATIVE_OUTCOME
+            .with(|o| o.set(crate::transport::NativeSetupOutcome::OverBudgetDestination));
+        let (rescues, fallbacks) = (rescues_here(), fallbacks_here());
+        queued_dials("fallback-local-refusal", &[(24990, true, false)]).await;
+        MOCK_NATIVE_OUTCOME.with(|o| o.set(crate::transport::NativeSetupOutcome::TimedOut));
+        assert_eq!(rescues_here(), rescues, "no rescue");
+        assert_eq!(fallbacks_here(), (fallbacks.0 + 1, fallbacks.1), "counted");
+    }
+
     /// Native setups rescued by UDP on this thread: (as joiner, as acceptor).
     fn rescues_here() -> (u64, u64) {
         let [joiner, acceptor] =
@@ -3977,6 +4073,7 @@ mod driver_timing_tests {
     async fn a_queue_behind_a_failed_native_dial_moves_on_at_once() {
         use super::super::native::DialTransport;
         let before = rescues_here();
+        let fallbacks = fallbacks_here();
         let (t0, addrs, log) = queued_dials(
             "queued-native-clients",
             &[
@@ -4002,8 +4099,10 @@ mod driver_timing_tests {
         ];
         expected.sort_by_key(|(addr, _, at)| (*at, *addr));
         assert_eq!(log, expected);
-        // Only the first had a native setup for UDP to rescue (R5).
+        // Only the first had a native setup for UDP to rescue (R5), and it
+        // counts for phase D too.
         assert_eq!(rescues_here(), (before.0 + 1, before.1));
+        assert_eq!(fallbacks_here(), (fallbacks.0 + 1, fallbacks.1));
     }
 
     /// 10.2 item 10, the acceptors as servers: a server's window runs 12 s,

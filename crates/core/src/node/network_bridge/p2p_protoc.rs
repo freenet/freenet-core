@@ -2575,7 +2575,7 @@ impl P2pConnManager {
                                         // Best effort notification during shutdown - receiver may already be dropped
                                         for mut callback in callbacks {
                                             #[allow(clippy::let_underscore_must_use)]
-                                            let _ = callback.send_result(Err(())).await;
+                                            let _ = callback.send_result(Err(None)).await;
                                         }
                                     }
 
@@ -3235,14 +3235,14 @@ impl P2pConnManager {
 trait ConnectResultSender: Send {
     fn send_result(
         &mut self,
-        result: Result<(SocketAddr, Option<usize>), ()>,
+        result: crate::message::ConnectResult,
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>>;
 }
 
-impl ConnectResultSender for mpsc::Sender<Result<(SocketAddr, Option<usize>), ()>> {
+impl ConnectResultSender for mpsc::Sender<crate::message::ConnectResult> {
     fn send_result(
         &mut self,
-        result: Result<(SocketAddr, Option<usize>), ()>,
+        result: crate::message::ConnectResult,
     ) -> Pin<Box<dyn Future<Output = Result<(), ()>> + Send + '_>> {
         async move { self.send(result).await.map_err(|_| ()) }.boxed()
     }
@@ -3319,7 +3319,7 @@ fn unsent_message_notice(
 /// Extracted as a free function so its callback/state invariants are
 /// unit-testable without standing up a full `P2pConnManager`:
 ///
-/// 1. Every awaiting callback for `peer_addr` is resolved with `Err(())` — never
+/// 1. Every awaiting callback for `peer_addr` is resolved with `Err(None)` — never
 ///    left parked — so callers (including the SubscribeHint resend-waiter) fail
 ///    fast and the op can retry.
 /// 2. `awaiting_connection` AND `awaiting_connection_txs` are both drained for
@@ -3352,7 +3352,7 @@ async fn fail_awaiting_connection(
             "Cleaning up callbacks after connect command failure"
         );
         for mut cb in callbacks {
-            cb.send_result(Err(()))
+            cb.send_result(Err(None))
                 .await
                 .inspect_err(|send_err| {
                     tracing::debug!(
@@ -7831,7 +7831,7 @@ pub(crate) mod tests {
     ///   (a) prune the in-transit connection slot — covered by the source pin
     ///       `connect_peer_full_handshake_channel_prunes_in_transit` below,
     ///       since the prune touches the live ring;
-    ///   (b) resolve EVERY awaiting callback with Err(()) — never park it;
+    ///   (b) resolve EVERY awaiting callback with Err(None) — never park it;
     ///   (c) drain BOTH awaiting_connection and awaiting_connection_txs;
     ///   (d) NOT record peer backoff (local channel contention, not a remote
     ///       failure).
@@ -7849,8 +7849,8 @@ pub(crate) mod tests {
         let tx = Transaction::new::<crate::operations::connect::ConnectMsg>();
 
         // Two callers queued on this peer (mirrors the Occupied-entry append).
-        let (cb1, mut rx1) = mpsc::channel::<Result<(SocketAddr, Option<usize>), ()>>(1);
-        let (cb2, mut rx2) = mpsc::channel::<Result<(SocketAddr, Option<usize>), ()>>(1);
+        let (cb1, mut rx1) = mpsc::channel::<crate::message::ConnectResult>(1);
+        let (cb2, mut rx2) = mpsc::channel::<crate::message::ConnectResult>(1);
         state.awaiting_connection.insert(
             peer_addr,
             vec![
@@ -7868,15 +7868,15 @@ pub(crate) mod tests {
 
         super::fail_awaiting_connection(&mut state, peer_addr, tx, false).await;
 
-        // (b) every callback resolved with Err(()), immediately (not parked).
+        // (b) every callback resolved with Err(None), immediately (not parked).
         let r1 = timeout(Duration::from_secs(1), rx1.recv())
             .await
             .expect("callback 1 must resolve immediately, not park");
         let r2 = timeout(Duration::from_secs(1), rx2.recv())
             .await
             .expect("callback 2 must resolve immediately, not park");
-        assert_eq!(r1, Some(Err(())), "callback 1 must receive Err(())");
-        assert_eq!(r2, Some(Err(())), "callback 2 must receive Err(())");
+        assert_eq!(r1, Some(Err(None)), "callback 1 must receive Err(None)");
+        assert_eq!(r2, Some(Err(None)), "callback 2 must receive Err(None)");
 
         // (c) both maps drained for this peer.
         assert!(

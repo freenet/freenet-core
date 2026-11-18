@@ -886,7 +886,14 @@ pub trait InnerMessage: Into<NetMessage> {
 }
 
 type RemainingChecks = Option<usize>;
-pub(crate) type ConnectResult = Result<(SocketAddr, RemainingChecks), ()>;
+/// A ConnectPeer's outcome. A failure carries how the native setup ended
+/// when the dial was a QUIC-native one that the setup itself ended
+/// (`NativeSetupOutcome`), and `None` for every other failure: a UDP dial,
+/// or one refused or failed locally before any setup ran. The connect op
+/// reads it to tell a native path failure from a local refusal (design note
+/// 10.2 item 16, the rescue definition).
+pub(crate) type ConnectResult =
+    Result<(SocketAddr, RemainingChecks), Option<crate::transport::NativeSetupOutcome>>;
 
 /// Internal node events emitted to the event loop.
 #[derive(Debug, Clone)]
