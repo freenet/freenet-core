@@ -456,20 +456,30 @@ pub(crate) fn contract_handler_channel() -> (
     )
 }
 
-const EV_ID_BLOCK: u64 = 1_000_000;
-
 thread_local! {
-    static EV_ID: Cell<u64> = {
-        let idx = crate::config::GlobalRng::thread_index();
-        Cell::new(idx * EV_ID_BLOCK)
-    };
+    static EV_ID: Cell<crate::util::id_block::IdBlock> =
+        Cell::new(crate::util::id_block::IdBlock::for_thread(
+            crate::config::GlobalRng::thread_index(),
+            0,
+        ));
+}
+
+/// Next contract-handler event id for this thread; never overlaps another
+/// thread's ids (ANT-2026-8LFV3MG8).
+fn next_event_id() -> u64 {
+    EV_ID.with(|c| {
+        let mut block = c.get();
+        let id = block.take();
+        c.set(block);
+        id
+    })
 }
 
 /// Reset the event ID counter to initial state for this thread.
 /// Thread-local, so safe for parallel test execution.
 pub fn reset_event_id_counter() {
     let idx = crate::config::GlobalRng::thread_index();
-    EV_ID.with(|c| c.set(idx * EV_ID_BLOCK));
+    EV_ID.with(|c| c.set(crate::util::id_block::IdBlock::for_thread(idx, 0)));
 }
 
 impl Stream for ContractHandlerChannel<WaitingResolution> {
@@ -521,11 +531,7 @@ impl ContractHandlerChannel<SenderHalve> {
         timeout: Duration,
         priority: super::fair_queue::Priority,
     ) -> Result<ContractHandlerEvent, ContractError> {
-        let id = EV_ID.with(|c| {
-            let v = c.get();
-            c.set(v + 1);
-            v
-        });
+        let id = next_event_id();
         let (result, result_receiver) = tokio::sync::oneshot::channel();
         let internal = InternalCHEvent {
             ev,
@@ -650,6 +656,35 @@ impl ContractHandlerChannel<SenderHalve> {
         }
     }
 
+    /// Tell the session actor that `client_id` is gone, so it drops every
+    /// transaction still registered for that client. Without this the actor
+    /// only forgets a registration when a result is delivered for it, and a
+    /// request that was refused after registering never gets one
+    /// (ANT-2026-DN7GTB1F).
+    pub async fn notify_session_actor_client_disconnect(&self, client_id: ClientId) {
+        let Some(session_tx) = &self.session_adapter_tx else {
+            return;
+        };
+        let msg = SessionMessage::ClientDisconnect { client_id };
+        match tokio::time::timeout(Self::WAIT_FOR_RES_SEND_TIMEOUT, session_tx.send(msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(
+                    client = %client_id,
+                    error = %e,
+                    "Failed to notify session actor of client disconnect — receiver dropped"
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    client = %client_id,
+                    timeout_secs = Self::WAIT_FOR_RES_SEND_TIMEOUT.as_secs(),
+                    "Timed out notifying session actor of client disconnect — channel full"
+                );
+            }
+        }
+    }
+
     /// Send an event to the contract handler without waiting for a response.
     ///
     /// Used for fire-and-forget events like `ClientDisconnect` that don't
@@ -667,11 +702,7 @@ impl ContractHandlerChannel<SenderHalve> {
         ev: ContractHandlerEvent,
         priority: super::fair_queue::Priority,
     ) -> Result<(), ContractError> {
-        let id = EV_ID.with(|c| {
-            let v = c.get();
-            c.set(v + 1);
-            v
-        });
+        let id = next_event_id();
         // Create a oneshot but immediately drop the receiver — the handler
         // won't send a response, and if it does, the send will harmlessly fail.
         let (result, _) = tokio::sync::oneshot::channel();

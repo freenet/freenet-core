@@ -422,18 +422,21 @@ impl<T: TimeSource> SessionActor<T> {
 
     /// Clean up client from all transaction mappings on disconnect
     fn cleanup_client_transactions(&mut self, client_id: ClientId) {
-        // Remove client from all transaction mappings
+        // Remove the client from every transaction, remembering the
+        // transactions nobody else waits for.
+        let mut emptied: HashSet<Transaction> = HashSet::new();
         self.client_transactions.retain(|tx, clients| {
             clients.remove(&client_id);
-            // If no clients left for this transaction, also clean up RequestId mappings
             if clients.is_empty() {
-                self.client_request_ids.retain(|(t, _), _| t != tx);
+                emptied.insert(*tx);
             }
             !clients.is_empty()
         });
 
-        // Clean up RequestId mappings for this client across all transactions
-        self.client_request_ids.retain(|(_, c), _| *c != client_id);
+        // One pass over the RequestId mappings: this client's, and those of
+        // transactions that no client waits for any more.
+        self.client_request_ids
+            .retain(|(t, c), _| *c != client_id && !emptied.contains(t));
     }
 
     /// Prune stale pending results based on TTL and enforce capacity limits.

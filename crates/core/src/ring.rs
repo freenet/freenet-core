@@ -5182,6 +5182,12 @@ impl Ring {
             .remove_client_from_all_subscriptions(client_id)
     }
 
+    /// Whether `client_id`'s disconnect has already been swept, so a
+    /// subscription registered for it now would never be removed.
+    pub(crate) fn is_client_disconnected(&self, client_id: crate::client_events::ClientId) -> bool {
+        self.hosting_manager.is_client_disconnected(client_id)
+    }
+
     /// Get all hosted contract keys from the hosting cache.
     pub fn hosting_contract_keys(&self) -> Vec<ContractKey> {
         self.hosting_manager.hosting_contract_keys()

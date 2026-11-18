@@ -19,20 +19,19 @@ pub type HostResult = Result<HostResponse, ClientError>;
 #[repr(transparent)]
 pub struct RequestId(u64);
 
-const COUNTER_BLOCK: u64 = 1_000_000;
+use crate::util::id_block::IdBlock;
 
 thread_local! {
-    static REQUEST_ID_COUNTER: Cell<u64> = {
-        let idx = crate::config::GlobalRng::thread_index();
-        Cell::new(1 + idx * COUNTER_BLOCK)
-    };
+    static REQUEST_ID_COUNTER: Cell<IdBlock> =
+        Cell::new(IdBlock::for_thread(crate::config::GlobalRng::thread_index(), 1));
 }
 
 impl RequestId {
     pub fn new() -> Self {
         Self(REQUEST_ID_COUNTER.with(|c| {
-            let v = c.get();
-            c.set(v + 1);
+            let mut block = c.get();
+            let v = block.take();
+            c.set(block);
             v
         }))
     }
@@ -41,7 +40,7 @@ impl RequestId {
     /// Thread-local, so safe for parallel test execution.
     pub fn reset_counter() {
         let idx = crate::config::GlobalRng::thread_index();
-        REQUEST_ID_COUNTER.with(|c| c.set(1 + idx * COUNTER_BLOCK));
+        REQUEST_ID_COUNTER.with(|c| c.set(IdBlock::for_thread(idx, 1)));
     }
 }
 
@@ -74,10 +73,8 @@ impl From<ClientId> for usize {
 }
 
 thread_local! {
-    static CLIENT_ID_COUNTER: Cell<usize> = {
-        let idx = crate::config::GlobalRng::thread_index();
-        Cell::new(1 + (idx as usize) * (COUNTER_BLOCK as usize))
-    };
+    static CLIENT_ID_COUNTER: Cell<IdBlock> =
+        Cell::new(IdBlock::for_thread(crate::config::GlobalRng::thread_index(), 1));
 }
 
 impl ClientId {
@@ -85,9 +82,10 @@ impl ClientId {
 
     pub fn next() -> Self {
         ClientId(CLIENT_ID_COUNTER.with(|c| {
-            let v = c.get();
-            c.set(v + 1);
-            v
+            let mut block = c.get();
+            let v = block.take();
+            c.set(block);
+            v as usize
         }))
     }
 
@@ -95,7 +93,7 @@ impl ClientId {
     /// Thread-local, so safe for parallel test execution.
     pub fn reset_counter() {
         let idx = crate::config::GlobalRng::thread_index();
-        CLIENT_ID_COUNTER.with(|c| c.set(1 + (idx as usize) * (COUNTER_BLOCK as usize)));
+        CLIENT_ID_COUNTER.with(|c| c.set(IdBlock::for_thread(idx, 1)));
     }
 }
 
@@ -394,5 +392,89 @@ mod connection_scope_tests {
             .connection_scope
             .is_local()
         );
+    }
+}
+
+/// ANT-2026-8LFV3MG8: a thread's id block used to run into the next thread's
+/// block after 1M allocations, so two clients (or requests) could be handed
+/// the same id and replies were cross-delivered.
+#[cfg(test)]
+mod id_block_overflow_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    const BLOCK: usize = crate::util::id_block::ID_BLOCK as usize;
+
+    /// Allocate `n` client ids on a fresh thread pinned to index `idx`.
+    fn client_ids_on_thread(idx: u64, n: usize) -> Vec<usize> {
+        std::thread::spawn(move || {
+            crate::config::GlobalRng::pin_thread_index_for_test(idx);
+            (0..n).map(|_| ClientId::next().0).collect()
+        })
+        .join()
+        .unwrap()
+    }
+
+    fn request_ids_on_thread(idx: u64, n: usize) -> Vec<u64> {
+        std::thread::spawn(move || {
+            crate::config::GlobalRng::pin_thread_index_for_test(idx);
+            (0..n).map(|_| RequestId::new().0).collect()
+        })
+        .join()
+        .unwrap()
+    }
+
+    #[test]
+    fn client_ids_stay_unique_after_a_thread_exhausts_its_block() {
+        // Thread 3000007000 allocates past the end of its block; thread 3000007001's first
+        // ids must not be among them.
+        let overflowing = client_ids_on_thread(3000007000, BLOCK + 10);
+        let neighbour = client_ids_on_thread(3000007001, 10);
+        let seen: HashSet<_> = overflowing.iter().copied().collect();
+        assert_eq!(seen.len(), overflowing.len(), "ids repeated on one thread");
+        for id in neighbour {
+            assert!(!seen.contains(&id), "client id {id} handed out twice");
+        }
+    }
+
+    #[test]
+    fn request_ids_stay_unique_after_a_thread_exhausts_its_block() {
+        let overflowing = request_ids_on_thread(3000007100, BLOCK + 10);
+        let neighbour = request_ids_on_thread(3000007101, 10);
+        let seen: HashSet<_> = overflowing.iter().copied().collect();
+        assert_eq!(seen.len(), overflowing.len(), "ids repeated on one thread");
+        for id in neighbour {
+            assert!(!seen.contains(&id), "request id {id} handed out twice");
+        }
+    }
+
+    /// Two threads that both exhaust their blocks must not be given the same
+    /// replacement block.
+    #[test]
+    fn two_overflowing_threads_get_distinct_replacement_blocks() {
+        let a = client_ids_on_thread(3000007200, BLOCK + 10);
+        let b = client_ids_on_thread(3000007300, BLOCK + 10);
+        let seen: HashSet<_> = a.iter().copied().collect();
+        for id in b {
+            assert!(!seen.contains(&id), "client id {id} handed out twice");
+        }
+    }
+
+    /// Ids below the first block boundary are unchanged, so simulations that
+    /// pin their thread index keep their existing, deterministic ids.
+    #[test]
+    fn first_block_ids_are_unchanged() {
+        let ids = client_ids_on_thread(3000007400, 3);
+        assert_eq!(
+            ids,
+            vec![
+                3000007400 * BLOCK + 1,
+                3000007400 * BLOCK + 2,
+                3000007400 * BLOCK + 3
+            ]
+        );
+        let reqs = request_ids_on_thread(3000007500, 3);
+        let base = 3000007500 * crate::util::id_block::ID_BLOCK;
+        assert_eq!(reqs, vec![base + 1, base + 2, base + 3]);
     }
 }
