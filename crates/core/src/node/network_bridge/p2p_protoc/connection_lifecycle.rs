@@ -2096,6 +2096,11 @@ impl P2pConnManager {
             connection_id,
             "Native connection kept beside the UDP one until it carries a frame from the peer"
         );
+        #[cfg(any(test, feature = "testing"))]
+        crate::operations::connect::native_wire_trace::record_at(
+            peer_addr,
+            crate::operations::connect::native_wire_trace::NativeWireEvent::NativeHeld,
+        );
         self.spawn_peer_connection_listener(rx, connection, peer_addr, connection_id, link_use, true)
             .await
     }
@@ -2149,7 +2154,13 @@ impl P2pConnManager {
         );
         self.held_native.insert(peer_addr, held);
         #[cfg(any(test, feature = "testing"))]
-        self.trace_transport(peer_addr, Some(false));
+        {
+            crate::operations::connect::native_wire_trace::record_at(
+                peer_addr,
+                crate::operations::connect::native_wire_trace::NativeWireEvent::NativeHeld,
+            );
+            self.trace_transport(peer_addr, Some(false));
+        }
         self.spawn_peer_connection_listener(rx, connection, peer_addr, conn_id, link_use, false)
             .await
     }
@@ -2235,6 +2246,11 @@ impl P2pConnManager {
                 entry_alive = alive,
                 "Dropping the held native connection: {}",
                 if alive { "no frame from the peer in time, keeping UDP" } else { "its UDP entry is gone or changed" }
+            );
+            #[cfg(any(test, feature = "testing"))]
+            crate::operations::connect::native_wire_trace::record_at(
+                *addr,
+                crate::operations::connect::native_wire_trace::NativeWireEvent::NativeHoldExpired,
             );
             false
         });
@@ -3191,6 +3207,10 @@ impl P2pConnManager {
 /// just made (or a fresh entry's) cannot find it full; if it somehow did, the
 /// peer's hold window expires and UDP stays, which is the safe outcome.
 fn send_native_probe(sender: &PeerConnChannelSender, peer_addr: SocketAddr) {
+    #[cfg(any(test, feature = "testing"))]
+    if crate::operations::connect::native_wire_trace::native_probe_suppressed(peer_addr) {
+        return;
+    }
     let probe = NetMessage::V1(NetMessageV1::Aborted(
         crate::message::Transaction::new::<crate::operations::connect::ConnectMsg>(),
     ));

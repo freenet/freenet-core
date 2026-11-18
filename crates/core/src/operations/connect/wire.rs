@@ -332,6 +332,11 @@ pub mod sim_trace {
         survivor_swapped: AtomicU64,
         survivor_udp_dropped: AtomicU64,
         survivor_inbound_dropped: AtomicU64,
+        /// Native connections kept beside a UDP entry until they carry a
+        /// frame ([`NativeWireEvent::NativeHeld`]), and the ones dropped
+        /// without one ([`NativeWireEvent::NativeHoldExpired`]).
+        native_held: AtomicU64,
+        native_hold_expired: AtomicU64,
     }
 
     /// How each end's native setup in a CONNECT ended: by (transaction, lower
@@ -415,6 +420,13 @@ pub mod sim_trace {
             own: SocketAddr,
             established: bool,
         },
+        /// A native connection is kept beside the UDP entry for the peer at
+        /// the recorded address, waiting for a frame from the peer.
+        NativeHeld,
+        /// A held native connection was dropped without having carried a
+        /// frame (window passed, or its UDP entry went), and the UDP entry
+        /// stayed.
+        NativeHoldExpired,
     }
 
     static TRACES: LazyLock<dashmap::DashMap<String, NativeWireTrace>> =
@@ -494,6 +506,8 @@ pub mod sim_trace {
                     .push((own, established, seq));
                 return;
             }
+            NativeWireEvent::NativeHeld => &c.native_held,
+            NativeWireEvent::NativeHoldExpired => &c.native_hold_expired,
             NativeWireEvent::Survivor { swapped: true, .. } => &c.survivor_swapped,
             NativeWireEvent::Survivor {
                 swapped: false,
@@ -574,6 +588,25 @@ pub mod sim_trace {
     static UDP_BESIDE_FORCED: LazyLock<dashmap::DashMap<String, bool>> =
         LazyLock::new(dashmap::DashMap::new);
 
+    /// Networks whose native connections send no first-frame probe
+    /// ([`suppress_native_probe`]).
+    static NATIVE_PROBE_SUPPRESSED: LazyLock<dashmap::DashSet<String>> =
+        LazyLock::new(dashmap::DashSet::new);
+
+    /// Makes the nodes of `network` send no first-frame probe on their native
+    /// connections, so a native connection kept beside a UDP entry carries
+    /// nothing and has to expire (option (b)'s timeout path). Test-only.
+    pub(crate) fn suppress_native_probe(network: &str) {
+        NATIVE_PROBE_SUPPRESSED.insert(network.to_string());
+    }
+
+    /// Whether the network the peer at `addr` belongs to suppresses the
+    /// first-frame probe.
+    pub(crate) fn native_probe_suppressed(addr: SocketAddr) -> bool {
+        crate::transport::in_memory_socket::network_of(&addr)
+            .is_some_and(|network| NATIVE_PROBE_SUPPRESSED.contains(&network))
+    }
+
     /// Makes every node of `network` start a UDP dial to the peer at once
     /// beside each native dial, as joiner, and also as acceptor unless
     /// `joiner_only`, so a pair is handed both connections and the survivor
@@ -596,6 +629,7 @@ pub mod sim_trace {
     /// Removes the trace of `network` (on `SimNetwork` drop).
     pub(crate) fn remove(network: &str) {
         UDP_BESIDE_FORCED.remove(network);
+        NATIVE_PROBE_SUPPRESSED.remove(network);
         TRACES.remove(network);
     }
 
@@ -690,6 +724,14 @@ pub mod sim_trace {
         /// connection held the peer.
         pub fn survivor_udp_dropped(&self) -> u64 {
             Self::get(&self.0.survivor_udp_dropped)
+        }
+        /// Native connections kept beside a UDP entry to wait for a frame.
+        pub fn native_held(&self) -> u64 {
+            Self::get(&self.0.native_held)
+        }
+        /// Held native connections dropped without a frame from the peer.
+        pub fn native_hold_expired(&self) -> u64 {
+            Self::get(&self.0.native_hold_expired)
         }
         /// Of [`Self::survivor_udp_dropped`], the UDP connections that
         /// arrived inbound.
