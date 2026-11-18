@@ -1283,6 +1283,7 @@ mod tests {
         let deliver = |from: SocketAddr| deliver_packet_to_network(network, natted, vec![1], from);
 
         assert!(!deliver(peer), "closed before the node sends");
+        assert_eq!(nat_expired(network), 0, "never opened is not expired");
         socket.send_to(b"punch", peer).await.unwrap();
         assert!(deliver(peer), "open to the address it sent to");
         assert!(!deliver(other_port), "not to another port of that host");
@@ -1290,6 +1291,7 @@ mod tests {
         assert!(deliver_packet_to_network(network, peer, vec![2], natted));
         time.advance(Duration::from_secs(31));
         assert!(!deliver(peer), "the binding expired");
+        assert_eq!(nat_expired(network), 1, "the lapsed binding is counted");
         assert_eq!(
             nat_filtered(network).get(&NatFiltering::PortRestricted),
             Some(&3)

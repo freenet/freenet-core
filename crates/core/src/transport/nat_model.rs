@@ -416,4 +416,38 @@ mod tests {
         assert_eq!(nat.by_ip.len(), 1);
         assert!(nat.admits(fresh, 10 * S));
     }
+
+    /// `expired_for` is true only for a source whose binding existed and has
+    /// since lapsed, in every filtering class; never for a source that was
+    /// never opened, and not while the binding is refreshed.
+    #[test]
+    fn expired_for_reports_only_lapsed_bindings() {
+        let a = addr("[fd00::a]:1000");
+        let b = addr("[fd00::b]:1000");
+        let life = DEFAULT_BINDING_LIFETIME.as_nanos() as u64;
+        for filtering in [
+            NatFiltering::Full,
+            NatFiltering::AddressRestricted,
+            NatFiltering::PortRestricted,
+            NatFiltering::Symmetric,
+        ] {
+            let mut nat = NatModel::new(filtering, DEFAULT_BINDING_LIFETIME);
+            assert!(!nat.expired_for(a, 0), "{filtering:?}: never opened");
+            nat.on_outbound(a, 0);
+            assert!(!nat.expired_for(a, life), "{filtering:?}: live at the edge");
+            assert!(nat.expired_for(a, life + 1), "{filtering:?}: lapsed");
+            assert!(!nat.admits(a, life + 1), "{filtering:?}: lapsed is dropped");
+            if filtering == NatFiltering::PortRestricted {
+                assert!(!nat.expired_for(b, life + 1), "{filtering:?}: never opened");
+            }
+            // Refreshing the binding keeps it from lapsing.
+            nat.on_outbound(a, life);
+            assert!(!nat.expired_for(a, life + 1), "{filtering:?}: refreshed");
+            assert!(nat.admits(a, life + 1), "{filtering:?}: refreshed admits");
+            assert!(
+                nat.expired_for(a, 2 * life + 1),
+                "{filtering:?}: lapses again"
+            );
+        }
+    }
 }
