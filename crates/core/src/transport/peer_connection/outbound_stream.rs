@@ -2489,6 +2489,113 @@ mod tests {
         Ok(())
     }
 
+    /// Sends `len` bytes with the default controller (FixedRate at its
+    /// default rate, paced by a token bucket at that rate) to a receiver that
+    /// confirms every packet `receipt_delay` after it arrives, the way a peer
+    /// does across a round trip plus its receipt delay. Returns the result and
+    /// the largest flight size seen.
+    async fn stream_with_delayed_receipts(
+        len: usize,
+        receipt_delay: Duration,
+    ) -> (
+        Result<crate::transport::TransferStats, TransportError>,
+        usize,
+    ) {
+        use crate::transport::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC;
+        use std::collections::VecDeque;
+        let (outbound_sender, mut outbound_receiver) =
+            mpsc::channel::<(SocketAddr, Arc<[u8]>)>(1024);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let cipher = random_cipher();
+        let congestion_controller = CongestionControlConfig::default().build_arc();
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        let token_bucket = Arc::new(TokenBucket::new(
+            DEFAULT_RATE_BYTES_PER_SEC / 10,
+            DEFAULT_RATE_BYTES_PER_SEC,
+        ));
+
+        let receiver = {
+            let (cipher, tracker, cc) = (
+                cipher.clone(),
+                sent_tracker.clone(),
+                congestion_controller.clone(),
+            );
+            GlobalExecutor::spawn(async move {
+                let mut arrived: VecDeque<(tokio::time::Instant, u32)> = VecDeque::new();
+                let mut peak = 0usize;
+                loop {
+                    peak = peak.max(cc.flightsize());
+                    let due = arrived.front().map(|(at, _)| *at + receipt_delay);
+                    tokio::select! {
+                        packet = outbound_receiver.recv() => {
+                            let Some((_, packet)) = packet else { break };
+                            let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(packet.as_ref())
+                                .try_decrypt_sym(&cipher)
+                                .expect("decrypt");
+                            let message = SymmetricMessage::deser(decrypted.data()).expect("deser");
+                            arrived.push_back((tokio::time::Instant::now(), message.packet_id));
+                        }
+                        _ = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {
+                            let now = tokio::time::Instant::now();
+                            let mut ids = Vec::new();
+                            while arrived.front().is_some_and(|(at, _)| *at + receipt_delay <= now) {
+                                ids.push(arrived.pop_front().expect("checked").1);
+                            }
+                            let (acks, _) = tracker.lock().report_received_receipts(&ids);
+                            for (rtt, size, token) in acks {
+                                cc.on_ack_with_token(rtt.unwrap_or(receipt_delay), size, token);
+                            }
+                        }
+                    }
+                }
+                peak
+            })
+        };
+        let result = send_stream(
+            StreamId::next_transport_internal(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(vec![7u8; len]),
+            cipher,
+            sent_tracker,
+            token_bucket,
+            congestion_controller,
+            RealTime::new(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        let peak = tokio::time::timeout(Duration::from_secs(60), receiver)
+            .await
+            .expect("the socket is dropped when send_stream returns")
+            .expect("join error");
+        (result, peak)
+    }
+
+    /// The flight-size ceiling never stops a stream to a peer that sends
+    /// receipts (#6284 measured 64 KiB to 4 MiB sends failing on the cwnd
+    /// wait). At the default rate a peer confirming each packet 1 s after it
+    /// arrives keeps about 1.25 MB in flight against a ceiling of 10 MB, and a
+    /// whole 4 MiB stream fits under the ceiling even with no receipts at all.
+    /// A 32 MiB stream, longer than the ceiling, completes too.
+    #[tokio::test(start_paused = true)]
+    async fn streams_with_receipts_complete_under_the_flight_ceiling() {
+        let ceiling = crate::transport::fixed_rate::MAX_FLIGHT_SECS
+            * crate::transport::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC;
+        assert!(4 * 1024 * 1024 < ceiling, "a 4 MiB stream fits outright");
+        for len in [4 * 1024 * 1024, 32 * 1024 * 1024] {
+            let (result, peak) = stream_with_delayed_receipts(len, Duration::from_secs(1)).await;
+            let stats = result.unwrap_or_else(|e| panic!("{len} B stream failed: {e:?}"));
+            assert_eq!(stats.bytes_transferred, len as u64);
+            assert!(
+                peak < ceiling / 4,
+                "{len} B: flight reached {peak} of the {ceiling} ceiling"
+            );
+        }
+    }
+
     /// A peer that confirms nothing cannot make `send_stream` send more than
     /// the default controller's flight-size ceiling: the stream stops at the
     /// ceiling, waits for receipts, and fails after `CWND_WAIT_TIMEOUT`.
