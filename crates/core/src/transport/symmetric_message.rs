@@ -84,7 +84,9 @@ impl SymmetricMessage {
                 packet_id: u32::MAX,
                 confirm_receipt: vec![],
                 payload: SymmetricMessagePayload::StreamFragment {
-                    stream_id: StreamId::next_transport_internal(),
+                    // A fixed id: drawing one would shift the ids of
+                    // whichever simulation first touches this.
+                    stream_id: StreamId(0),
                     total_length_bytes: u64::MAX,
                     fragment_number: u32::MAX,
                     payload: Bytes::new(),

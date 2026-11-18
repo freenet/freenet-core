@@ -88,9 +88,10 @@ use super::{TransportError, TransportPublicKey};
 /// ([`StreamId::next_transport_internal`]). The UDP transport relies on that
 /// split to route a stream (see [`StreamId::is_caller_named`]).
 ///
-/// Both allocators share one per-thread counter that lives in the low 31 bits
-/// ([`COUNTER_MASK`]); the top bit is set or cleared by the allocator, never
-/// by the counter. It used to be a plain `u32` starting at `thread_index *
+/// Both allocators share one counter (the thread's or the process's, see
+/// below) that lives in the low 31 bits ([`COUNTER_MASK`]); the top bit is
+/// set or cleared by the allocator, never by the counter. It used to be a
+/// plain per-thread `u32` starting at `thread_index *
 /// 100_000`, and `thread_index` grows by one for every thread that ever
 /// allocates, so a node creating a few threads a minute (tokio's blocking pool
 /// and `block_in_place` replacements) passed index 21,475 after a few days of
@@ -105,8 +106,13 @@ use super::{TransportError, TransportPublicKey};
 /// thread's block, and two streams on one connection could then share an id:
 /// the receiver drops the second as already completed. A simulation thread
 /// (one with a [`GlobalRng`] seed) and a test that calls
-/// [`StreamId::reset_counter`] keep the per-thread block instead, so their ids
-/// stay deterministic.
+/// [`StreamId::reset_counter`] keep a per-thread block instead. That mode is
+/// chosen at the thread's first allocation and kept for the thread's life
+/// (clearing the seed does not end it), so a simulation's ids are
+/// deterministic when its thread resets the counter after seeding, as
+/// `setup_deterministic_state` does. The process counter starts at 2^30,
+/// above every block a simulation uses, so a seeded and an unseeded thread in
+/// one test process do not hand out the same ids either.
 ///
 /// [`GlobalRng`]: crate::config::GlobalRng
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -114,9 +120,10 @@ use super::{TransportError, TransportPublicKey};
 #[serde(transparent)]
 pub struct StreamId(pub(in crate::transport) u32);
 
-/// A deterministic thread's counter starts at its own block, so ids from
-/// parallel simulation threads start apart (they overlap after
-/// `STREAM_ID_BLOCK` allocations on one thread).
+/// A deterministic thread's counter starts at its thread index's block.
+/// Seeding pins the thread index to 0, so every seeded thread starts at 0;
+/// threads that reset the counter without a seed start apart and overlap
+/// after `STREAM_ID_BLOCK` allocations on one thread.
 const STREAM_ID_BLOCK: u32 = 100_000;
 
 /// Top bit of ids from [`StreamId::next`].
@@ -127,9 +134,9 @@ const CALLER_NAMED_BIT: u32 = 0x8000_0000;
 /// ever set by [`StreamId::next`].
 const COUNTER_MASK: u32 = !CALLER_NAMED_BIT;
 
-/// Where thread `idx`'s counter starts: its block, wrapped into the 31-bit
-/// counter space. Identical to the old `idx * 100_000` for every index below
-/// 21,475, so ids from young nodes and simulations are unchanged.
+/// Where a deterministic thread `idx`'s counter starts: its block, wrapped
+/// into the 31-bit counter space. Identical to the old `idx * 100_000` for
+/// every index below 21,475, so simulation ids are unchanged.
 fn block_start(idx: u64) -> u32 {
     (idx.wrapping_mul(u64::from(STREAM_ID_BLOCK)) & u64::from(COUNTER_MASK)) as u32
 }
@@ -142,9 +149,20 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// The counter every unseeded thread of this process draws from. Masked to
-/// 31 bits on every read, so it wraps after 2^31 allocations.
-static PROCESS_STREAM_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// The counter every unseeded thread of this process draws from, read
+/// through [`process_counter_id`]. It starts at 2^30, above every block a
+/// simulation uses (a seeded thread starts at 0 and would need 2^30
+/// allocations to get there).
+static PROCESS_STREAM_COUNTER: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(1 << 30);
+
+/// The id for a raw value of [`PROCESS_STREAM_COUNTER`]: its low 31 bits, so
+/// the counter wraps after 2^31 allocations without reaching the
+/// caller-named bit (the u32 wraps at 2^32, a multiple of 2^31, so the
+/// sequence stays continuous).
+fn process_counter_id(raw: u32) -> u32 {
+    raw & COUNTER_MASK
+}
 
 fn next_stream_counter() -> u32 {
     STREAM_ID_COUNTER.with(|c| {
@@ -154,8 +172,9 @@ fn next_stream_counter() -> u32 {
                 block_start(crate::config::GlobalRng::thread_index())
             }
             None => {
-                return PROCESS_STREAM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    & COUNTER_MASK;
+                return process_counter_id(
+                    PROCESS_STREAM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                );
             }
         };
         c.set(Some(v.wrapping_add(1) & COUNTER_MASK));
@@ -189,7 +208,10 @@ impl StreamId {
     /// Thread-local, so safe for parallel test execution.
     ///
     /// The thread then allocates from its own deterministic block, starting
-    /// at its thread index's block, instead of the process-wide counter.
+    /// at its thread index's block, instead of the process-wide counter, for
+    /// the rest of its life. For simulations and tests only: on a node's own
+    /// thread it would bring back the per-thread blocks whose overlap #6270
+    /// fixed.
     pub fn reset_counter() {
         let idx = crate::config::GlobalRng::thread_index();
         STREAM_ID_COUNTER.with(|c| c.set(Some(block_start(idx))));
@@ -872,11 +894,11 @@ pub(crate) trait PeerConnectionApi: Send {
 mod stream_id_tests {
     use super::StreamId;
 
-    /// The values are part of the wire protocol with existing peers: the two
-    /// allocators share one per-thread counter starting at the thread's
-    /// block, ids from `next` carry the top bit, and transport-internal ids
-    /// do not. These are exactly the values `next_operations` and `next`
-    /// produced before `StreamId` moved into the boundary.
+    /// The values are part of the wire protocol with existing peers: after
+    /// `reset_counter` the two allocators share the thread's counter starting
+    /// at its block, ids from `next` carry the top bit, and transport-internal
+    /// ids do not. These are exactly the values a simulation thread got
+    /// before `StreamId` moved into the boundary.
     #[test]
     fn stream_id_values_are_unchanged() {
         StreamId::reset_counter();
@@ -976,7 +998,7 @@ mod stream_id_tests {
     fn unseeded_threads_never_hand_out_the_same_id() {
         let first = std::thread::spawn(|| {
             crate::config::GlobalRng::pin_thread_index_for_test(0);
-            (0..=16_352)
+            (0..=16_353)
                 .map(|_| StreamId::next_transport_internal().0)
                 .collect::<std::collections::HashSet<_>>()
         })
@@ -990,6 +1012,7 @@ mod stream_id_tests {
         })
         .join()
         .unwrap();
+        assert_eq!(first.len(), 16_354, "thread 0 repeated an id");
         assert!(!later.0.is_caller_named() && later.1.is_caller_named());
         assert!(!first.contains(&later.0.0), "{:?} reused", later.0);
         assert!(
@@ -997,6 +1020,17 @@ mod stream_id_tests {
             "{:?} reused",
             later.1
         );
+    }
+
+    /// The process counter yields its low 31 bits, so it wraps from
+    /// 2^31 - 1 back to 0 without ever reaching the caller-named bit.
+    #[test]
+    fn the_process_counter_wraps_below_the_caller_named_bit() {
+        assert_eq!(super::process_counter_id(0), 0);
+        assert_eq!(super::process_counter_id(1 << 30), 1 << 30);
+        assert_eq!(super::process_counter_id(0x7FFF_FFFF), 0x7FFF_FFFF);
+        assert_eq!(super::process_counter_id(0x8000_0000), 0);
+        assert_eq!(super::process_counter_id(u32::MAX), 0x7FFF_FFFF);
     }
 
     /// A `StreamId` is serialized as its bare `u32`, as before.
