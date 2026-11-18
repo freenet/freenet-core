@@ -5030,16 +5030,16 @@ async fn a_native_connection_arriving_second_waits_for_a_frame() {
 /// unkeyed one is bound to no key and takes the ordinary path.
 #[tokio::test]
 async fn a_udp_connection_arriving_second_is_kept_until_native_carries_a_frame() {
-    for (case, udp) in [
-        (0u16, Arrival::OutboundUdp),
-        (1, Arrival::InboundUdpKeyed),
-    ] {
+    for (case, udp) in [(0u16, Arrival::OutboundUdp), (1, Arrival::InboundUdpKeyed)] {
         let mut h = Harness::new(&format!("hold-native-then-udp-{case}")).await;
         let addr: SocketAddr = format!("203.0.113.231:{}", 6510 + case).parse().unwrap();
         let peer = PeerKeyLocation::new(key(), addr);
         h.handshake_event(Arrival::Native.event(&peer, false)).await;
         let native_id = h.mgr.connections[&addr].connection_id;
-        assert!(!h.mgr.connections[&addr].frame_seen, "premise: no frame yet");
+        assert!(
+            !h.mgr.connections[&addr].frame_seen,
+            "premise: no frame yet"
+        );
         let pair = PairState::of(&h, addr);
         let survivors = survivor_here();
         h.handshake_event(udp.event(&peer, false)).await;
@@ -5121,7 +5121,10 @@ async fn a_stray_first_frame_and_an_orphaned_hold_change_nothing() {
     assert_eq!(survivor_here(), survivors);
     let udp_id = h.mgr.connections[&addr].connection_id;
     h.transport_closed(addr).await;
-    assert!(h.mgr.held_native.contains_key(&addr), "premise: not yet seen");
+    assert!(
+        h.mgr.held_native.contains_key(&addr),
+        "premise: not yet seen"
+    );
     let _ = udp_id;
     h.mgr.expire_held_native(Instant::now());
     assert!(h.mgr.held_native.is_empty(), "orphaned hold dropped");

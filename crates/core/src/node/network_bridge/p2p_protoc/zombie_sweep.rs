@@ -1872,7 +1872,9 @@ mod tests {
             "the connection entry must hold the stamp"
         );
         assert!(
-            squashed.contains("conn_id,outbound_mix,propagation,link_use,native_wire,report_first_frame)"),
+            squashed.contains(
+                "conn_id,outbound_mix,propagation,link_use,native_wire,report_first_frame)"
+            ),
             "the listener must be given the same stamp"
         );
         assert!(
@@ -2543,7 +2545,15 @@ mod tests {
                         kinds.push("first");
                     }
                     ConnEvent::InboundMessage(_) => kinds.push("message"),
-                    other => panic!("unexpected event {other:?}"),
+                    other @ (ConnEvent::OutboundMessage(_)
+                    | ConnEvent::OutboundMessageWithTarget { .. }
+                    | ConnEvent::NodeAction(_)
+                    | ConnEvent::ClosedChannel(_)
+                    | ConnEvent::TransportClosed { .. }
+                    | ConnEvent::StreamSend { .. }
+                    | ConnEvent::PipeStream { .. }
+                    | ConnEvent::SetPeerIdentity(_)
+                    | ConnEvent::Barrier(_)) => panic!("unexpected event {other:?}"),
                 }
             }
             let expected: &[&str] = if report {

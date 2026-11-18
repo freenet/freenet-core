@@ -2101,8 +2101,15 @@ impl P2pConnManager {
             peer_addr,
             crate::operations::connect::native_wire_trace::NativeWireEvent::NativeHeld,
         );
-        self.spawn_peer_connection_listener(rx, connection, peer_addr, connection_id, link_use, true)
-            .await
+        self.spawn_peer_connection_listener(
+            rx,
+            connection,
+            peer_addr,
+            connection_id,
+            link_use,
+            true,
+        )
+        .await
     }
 
     /// Option (b), the other order: a UDP connection arrived for a peer
@@ -3211,9 +3218,9 @@ fn send_native_probe(sender: &PeerConnChannelSender, peer_addr: SocketAddr) {
     if crate::operations::connect::native_wire_trace::native_probe_suppressed(peer_addr) {
         return;
     }
-    let probe = NetMessage::V1(NetMessageV1::Aborted(
-        crate::message::Transaction::new::<crate::operations::connect::ConnectMsg>(),
-    ));
+    let probe = NetMessage::V1(NetMessageV1::Aborted(crate::message::Transaction::new::<
+        crate::operations::connect::ConnectMsg,
+    >()));
     if sender.try_send(Left(probe)).is_err() {
         tracing::debug!(%peer_addr, "Could not queue the native first-frame probe");
     }
