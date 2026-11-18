@@ -106,13 +106,15 @@ use super::{TransportError, TransportPublicKey};
 /// thread's block, and two streams on one connection could then share an id:
 /// the receiver drops the second as already completed. A simulation thread
 /// (one with a [`GlobalRng`] seed) and a test that calls
-/// [`StreamId::reset_counter`] keep a per-thread block instead. That mode is
-/// chosen at the thread's first allocation and kept for the thread's life
-/// (clearing the seed does not end it), so a simulation's ids are
+/// [`StreamId::reset_counter`] keep a per-thread block instead. A thread
+/// enters block mode at its first allocation while seeded, or at a reset, and
+/// stays in it for its life (clearing the seed does not end it); an unseeded
+/// thread that has not reset uses the process counter. A simulation's ids are
 /// deterministic when its thread resets the counter after seeding, as
 /// `setup_deterministic_state` does. The process counter starts at 2^30,
-/// above every block a simulation uses, so a seeded and an unseeded thread in
-/// one test process do not hand out the same ids either.
+/// above the block every seeded thread uses (seeding pins the thread index to
+/// 0), so a seeded and an unseeded thread in one test process do not hand out
+/// the same ids either.
 ///
 /// [`GlobalRng`]: crate::config::GlobalRng
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -962,7 +964,7 @@ mod stream_id_tests {
     }
 
     /// Every thread index below 21,475 keeps the block start it always had,
-    /// `idx * 100_000`, so ids from young nodes and simulations are unchanged.
+    /// `idx * 100_000`, so simulation ids are unchanged.
     #[test]
     fn block_starts_below_the_old_overflow_are_unchanged() {
         for idx in 0u64..21_475 {
@@ -1020,6 +1022,26 @@ mod stream_id_tests {
             "{:?} reused",
             later.1
         );
+    }
+
+    /// An unseeded thread draws from the process counter, which starts at
+    /// 2^30, and a seeded one from block 0, so the two cannot meet in a test
+    /// process (one never allocates 2^30 ids).
+    #[test]
+    fn unseeded_and_seeded_threads_allocate_from_separate_ranges() {
+        let unseeded = std::thread::spawn(StreamId::next_transport_internal)
+            .join()
+            .unwrap();
+        assert!(unseeded.0 >= 1 << 30, "{unseeded:?}");
+        let seeded = std::thread::spawn(|| {
+            crate::config::GlobalRng::set_seed(5);
+            let id = StreamId::next_transport_internal();
+            crate::config::GlobalRng::clear_seed();
+            id
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seeded.0, 0);
     }
 
     /// The process counter yields its low 31 bits, so it wraps from

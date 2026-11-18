@@ -5098,9 +5098,9 @@ pub fn emit_transfer_started(
 }
 
 // Test-only: the transfer events emitted on this thread, as (stream id, event,
-// transport), so a test finds its own: stream ids are unique in the process
-// and transfers run on the test's thread (a current-thread runtime), so
-// another test's events never land here. Kept apart from the QUIC event log, which every
+// transport), so a test finds its own: events are recorded per thread and
+// transfers run on the test's thread (a current-thread runtime), so another
+// test's events never land here. Kept apart from the QUIC event log, which every
 // transfer would otherwise crowd.
 #[cfg(test)]
 thread_local! {

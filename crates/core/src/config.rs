@@ -5531,10 +5531,10 @@ impl GlobalRng {
 
     /// Give the current thread index `idx`, as if it were the `idx`-th
     /// thread to ask. Only for a fresh thread that has not asked yet: a
-    /// thread-local derived from the index (a seeded or reset stream-id
-    /// counter) is initialized on first use and does not see a later change.
-    /// Unseeded threads use a process-wide stream-id counter that does not
-    /// read it.
+    /// thread-local derived from the index (the nonce counter, or a seeded or
+    /// reset stream-id counter) is initialized on first use and does not see a
+    /// later change. Unseeded threads draw stream ids from a process-wide
+    /// counter that does not read it.
     #[cfg(test)]
     pub(crate) fn pin_thread_index_for_test(idx: u64) {
         THREAD_INDEX.with(|c| c.set(Some(idx)));

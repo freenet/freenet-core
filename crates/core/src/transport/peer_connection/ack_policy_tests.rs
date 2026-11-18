@@ -2712,8 +2712,9 @@ async fn a_legacy_stream_completed_by_its_task_is_remembered() {
     assert!(holds_no_state(&e, id), "not started again");
 }
 
-/// Allocates stream ids on this thread as thread `idx` would, and puts the
-/// counter back when dropped, also when the test panics.
+/// Allocates stream ids on this thread as thread `idx` would, and resets the
+/// counter to this thread's own block when dropped, also when the test
+/// panics (the thread stays in block mode; libtest threads end with the test).
 struct ResetStreamCounter;
 
 impl ResetStreamCounter {
