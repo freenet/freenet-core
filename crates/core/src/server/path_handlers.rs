@@ -370,6 +370,39 @@ fn try_acquire_cache_lock(
 /// sit on a different mount than the one the budget's free-space term measures).
 const WEBAPP_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+// One archive must fit the budget on its own: the sweep never evicts the entry
+// that triggered it (`in_use`), so an entry larger than the budget would stay
+// over it. The unpack limits guarantee that cannot happen.
+const _: () = assert!(super::app_packaging::MAX_UNPACKED_TOTAL_BYTES < WEBAPP_CACHE_MAX_BYTES);
+
+/// Largest cached file the handlers will read whole into memory, for the two
+/// cases that rewrite text (`.js` and HTML pages). Everything else is streamed
+/// by `ServeFile`. Real bundles are well under 1 MB; this is far above that, and
+/// the rewrite holds about three copies (bytes, `String`, rewritten `String`)
+/// so memory per request stays under about 50 MB.
+const MAX_REWRITTEN_ASSET_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Bumped whenever the unpack rules change, so a cache written under older,
+/// weaker rules no longer matches the stored state hash and is unpacked again
+/// (and rejected, if it violates the new limits) on the next reconcile.
+const WEBAPP_CACHE_FORMAT: u64 = 2;
+
+/// Read `path` whole, refusing files larger than `limit` bytes. The bound is
+/// enforced on the bytes actually read, not on the file's reported length, so a
+/// file that grows or is sparse cannot exceed it.
+async fn read_file_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    let file = File::open(path).await?;
+    let mut buf = Vec::new();
+    file.take(limit + 1).read_to_end(&mut buf).await?;
+    if buf.len() as u64 > limit {
+        return Err(std::io::Error::other(format!(
+            "{} is larger than the {limit} byte limit for rewritten assets",
+            path.display()
+        )));
+    }
+    Ok(buf)
+}
+
 /// How long an entry is protected from eviction after this process last served
 /// from it.
 ///
@@ -1765,6 +1798,11 @@ async fn unpack_if_stale(
         if let Err(cleanup_failed) = tokio::fs::remove_dir_all(&path).await {
             debug!("webapp cache: could not remove failed unpack dir: {cleanup_failed}");
         }
+        // The stored hash described the directory just removed. Leave it and the
+        // entry reads as warm (hash present) while serving nothing.
+        if let Err(e) = tokio::fs::remove_file(&hash_path).await {
+            debug!("webapp cache: could not remove stale hash: {e}");
+        }
         return Err(unpack_failed);
     }
 
@@ -2024,7 +2062,12 @@ pub(super) async fn variable_content(
         // A missing `.js` is a 404 like any other missing asset. This branch
         // bypasses `ServeFile`, so it never inherited the dependency's
         // missing-file mapping and answered 500 until #5718.
-        let content = match tokio::fs::read_to_string(&file_path).await {
+        let content = match read_file_bounded(&file_path, MAX_REWRITTEN_ASSET_BYTES)
+            .await
+            .and_then(|bytes| {
+                String::from_utf8(bytes)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            }) {
             Ok(content) => content,
             Err(err) if asset_is_missing(&err) => {
                 return Ok(asset_missing_response(&file_path, &err));
@@ -2447,12 +2490,20 @@ async fn sandbox_content_body(
         }
     };
     let mut buf = vec![];
-    key_file
+    (&mut key_file)
+        .take(MAX_REWRITTEN_ASSET_BYTES + 1)
         .read_to_end(&mut buf)
         .await
         .map_err(|err| WebSocketApiError::NodeError {
             error_cause: format!("{err}"),
         })?;
+    if buf.len() as u64 > MAX_REWRITTEN_ASSET_BYTES {
+        return Err(WebSocketApiError::NodeError {
+            error_cause: format!(
+                "{page} is larger than the {MAX_REWRITTEN_ASSET_BYTES} byte limit for rewritten pages"
+            ),
+        });
+    }
     let mut body = String::from_utf8(buf).map_err(|err| WebSocketApiError::NodeError {
         error_cause: format!("{err}"),
     })?;
@@ -2718,6 +2769,7 @@ fn resolve_web_asset_path(base: &Path, relative: &str) -> Result<PathBuf, WebSoc
 fn hash_state(state: &[u8]) -> u64 {
     use std::hash::Hasher;
     let mut hasher = ahash::AHasher::default();
+    hasher.write_u64(WEBAPP_CACHE_FORMAT);
     hasher.write(state);
     hasher.finish()
 }
@@ -5266,6 +5318,147 @@ mod tests {
         );
 
         clear_cache(&instance_id).await;
+    }
+
+    /// A cached `.js` file bigger than the rewrite bound (which a cache written
+    /// before the unpack limits can hold, e.g. a sparse file) must not be read
+    /// into memory. A sparse file keeps the test from writing real bytes.
+    #[tokio::test]
+    async fn variable_content_refuses_to_read_an_oversized_js_file() {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x3a;
+        bytes[1] = 0x5c;
+        let instance_id = ContractInstanceId::new(bytes);
+        let key = instance_id.to_string();
+        clear_cache(&instance_id).await;
+
+        let cache_dir = contract_web_path(&instance_id);
+        tokio::fs::create_dir_all(&cache_dir).await.unwrap();
+        let big = std::fs::File::create(cache_dir.join("big.js")).unwrap();
+        big.set_len(MAX_REWRITTEN_ASSET_BYTES + 1).unwrap();
+        tokio::fs::write(state_hash_path(&instance_id), 0u64.to_be_bytes())
+            .await
+            .unwrap();
+        CONTRACT_CACHE_REFRESH.insert(instance_id, Instant::now());
+
+        let (sender, _rx) = request_channel();
+        let result = variable_content(
+            key.clone(),
+            format!("/v1/contract/web/{key}/big.js"),
+            ApiVersion::V1,
+            sender,
+            &test_webapp_cache(),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ref e) if format!("{e:?}").contains("byte limit")),
+            "an oversized .js must be refused, got {:?}",
+            result.as_ref().map(|_| "a response")
+        );
+        clear_cache(&instance_id).await;
+    }
+
+    #[tokio::test]
+    async fn sandbox_content_body_refuses_to_read_an_oversized_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = std::fs::File::create(dir.path().join("index.html")).unwrap();
+        big.set_len(MAX_REWRITTEN_ASSET_BYTES + 1).unwrap();
+
+        let result = sandbox_content_body(dir.path(), "key", ApiVersion::V1, "index.html").await;
+        assert!(
+            matches!(result, Err(WebSocketApiError::NodeError { .. })),
+            "an oversized page must be refused"
+        );
+
+        // Exactly at the bound is still served (it is not valid UTF-8 text here,
+        // so the refusal must be the size check, not the later decode).
+        let at_limit = std::fs::File::create(dir.path().join("ok.html")).unwrap();
+        at_limit.set_len(MAX_REWRITTEN_ASSET_BYTES).unwrap();
+        let result = sandbox_content_body(dir.path(), "key", ApiVersion::V1, "ok.html").await;
+        assert!(result.is_ok(), "a page at the bound must still be served");
+    }
+
+    #[tokio::test]
+    async fn read_file_bounded_enforces_the_limit_on_bytes_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let exact = dir.path().join("exact");
+        std::fs::write(&exact, [1u8; 10]).unwrap();
+        assert_eq!(read_file_bounded(&exact, 10).await.unwrap().len(), 10);
+        assert!(read_file_bounded(&exact, 9).await.is_err());
+
+        let sparse = dir.path().join("sparse");
+        std::fs::File::create(&sparse)
+            .unwrap()
+            .set_len(1 << 40)
+            .unwrap();
+        assert!(read_file_bounded(&sparse, 1024 * 1024).await.is_err());
+    }
+
+    /// An archive that violates the unpack limits must not leave a directory or
+    /// a state hash behind, including the hash of the entry it replaces: a hash
+    /// with no directory reads as a warm cache that serves nothing.
+    #[tokio::test]
+    async fn rejected_archive_removes_the_old_entry_and_its_hash() {
+        let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(super::super::app_packaging::MAX_UNPACKED_FILE_BYTES + 1);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "big.bin",
+                std::io::Read::take(
+                    std::io::repeat(0),
+                    super::super::app_packaging::MAX_UNPACKED_FILE_BYTES + 1,
+                ),
+            )
+            .unwrap();
+        let packed = WebApp::from_data(Vec::new(), archive)
+            .unwrap()
+            .pack()
+            .unwrap();
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![0xd7])),
+            Parameters::from(vec![0]),
+        )));
+        let state = WrappedState::new(packed);
+        let instance_id = *contract.key().id();
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let webapp_cache = cache(root.path(), u64::MAX);
+        clear_cache(&instance_id).await;
+        // A previously cached (older, valid) entry with its hash.
+        std::fs::create_dir_all(webapp_cache.entry_dir(&instance_id)).unwrap();
+        std::fs::write(
+            webapp_cache.entry_dir(&instance_id).join("index.html"),
+            b"old",
+        )
+        .unwrap();
+        std::fs::write(webapp_cache.hash_path(&instance_id), 1u64.to_be_bytes()).unwrap();
+
+        let result = unpack_if_stale(&contract, state.as_ref(), &webapp_cache).await;
+
+        assert!(result.is_err(), "an oversized archive must be rejected");
+        assert!(!webapp_cache.entry_dir(&instance_id).exists());
+        assert!(!webapp_cache.hash_path(&instance_id).exists());
+    }
+
+    /// A cache written by a build without the unpack limits stores a hash that
+    /// no longer matches, so it is unpacked again under the new rules instead
+    /// of being trusted.
+    #[test]
+    fn state_hash_covers_the_cache_format() {
+        use std::hash::Hasher;
+        let state = b"some state";
+        let mut legacy = ahash::AHasher::default();
+        legacy.write(state);
+        assert_ne!(
+            hash_state(state),
+            legacy.finish(),
+            "caches written before the unpack limits must not match"
+        );
     }
 
     /// Pins the `IsADirectory` (EISDIR) arm added to `asset_is_missing` in
