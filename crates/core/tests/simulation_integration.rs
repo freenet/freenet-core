@@ -23666,8 +23666,6 @@ fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
         lifetime: SimNat::all(NatFiltering::Symmetric).lifetime,
     };
     let mut symmetric_ips = std::collections::BTreeSet::new();
-    // The counters are process-wide: drain what earlier runs left.
-    let _ = freenet::transport::metrics::TRANSPORT_METRICS.take_snapshot();
     let run = run_native_connect_sim_with(name, SEED, 200, Some(nat), |sim| {
         sim.with_native_connect(100);
         // Regular node `i` gets `classes[i % 2]`; regular nodes are numbered
@@ -23679,18 +23677,20 @@ fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
         }
     });
     log_native_connect(name, &run);
-    let counters = freenet::transport::metrics::TRANSPORT_METRICS
-        .take_snapshot()
-        .expect("premise: the run recorded transport activity");
-    // Phase D's figure is the SUM of the two sides: each side counts the UDP
-    // dial of its own that connected after a failed native setup, and in this
-    // run the acceptor's dial won every time (joiner side 0), so neither side
-    // alone is the figure. It must equal the connected UDP fallbacks the wire
-    // trace saw (both sides record those), and cover every rescue.
-    let fallback = counters.connect_native_fallback_connected_joiner
-        + counters.connect_native_fallback_connected_acceptor;
-    let rescued = counters.connect_native_rescued_by_udp_joiner
-        + counters.connect_native_rescued_by_udp_acceptor;
+    // Counted from this run's own wire trace, for both sides: the
+    // process-wide transport counters are shared with every other sim in a
+    // plain `cargo test` process, so they cannot be compared with one run.
+    // (Their wiring is pinned by the connect driver's unit tests; phase D
+    // reads the sum of the joiner and acceptor sides, since whichever side's
+    // dial connects first counts it.)
+    let fallback = run
+        .wire
+        .trace
+        .udp_fallbacks_ended()
+        .iter()
+        .filter(|(_, _, connected)| *connected)
+        .count() as u64;
+    let rescued = run.wire.trace.udp_fallbacks_rescued();
     assert!(
         fallback > 0,
         "premise: UDP dials connected after native failures"
@@ -23699,14 +23699,6 @@ fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
         fallback >= rescued,
         "fallback {fallback} counts every rescue {rescued}"
     );
-    let traced = run
-        .wire
-        .trace
-        .udp_fallbacks_ended()
-        .iter()
-        .filter(|(_, _, connected)| *connected)
-        .count() as u64;
-    assert_eq!(fallback, traced, "one count per connected UDP fallback");
     let t = &run.wire.trace;
     let gateway_ips: std::collections::BTreeSet<_> = run.gateways.iter().map(|a| a.ip()).collect();
     let between_peers = |a: &SocketAddr, b: &SocketAddr| {

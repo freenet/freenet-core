@@ -1649,6 +1649,7 @@ pub(super) async fn dispatch_expect_connection_from(
                                 own: op_manager.ring.connection_manager.get_own_addr(),
                                 peer: addr,
                                 connected,
+                                path_failed,
                             },
                         );
                         log_acceptor_dial(&peer, tx, result);

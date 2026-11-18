@@ -534,8 +534,9 @@ reads the SUM of the joiner and acceptor sides of THIS counter: each side
 counts the UDP dial of its own that connected, and whichever dial makes the
 connection first counts it and the other counts nothing (in
 test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join the joiner
-side is 0 and the acceptor side 3, so neither alone is the figure; the sum is
-pinned there to the connected UDP fallbacks in the wire trace). It does not
+side is 0 and the acceptor side 3, so neither alone is the figure; that test
+counts from the run's own wire trace, since the process-wide counters are
+shared by every sim in a plain `cargo test` process). It does not
 read the rescue counter, which is only the path-failure
 subset, `connect_native_both_dials_connected_{udp,native}_first`
 for a native dial and the UDP dial beside it that both connected (the native

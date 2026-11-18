@@ -682,6 +682,7 @@ async fn drive_client_connect(
                             own: op_manager.ring.connection_manager.get_own_addr(),
                             peer: acceptor_addr,
                             connected,
+                            path_failed,
                         },
                     );
                 }

@@ -304,6 +304,9 @@ pub mod sim_trace {
         /// UDP dials that followed a failed native setup and ended, as
         /// (node, peer, connected).
         fallbacks_ended: parking_lot::Mutex<Vec<(Option<SocketAddr>, SocketAddr, bool)>>,
+        /// Of those, the ones that connected after a native failure on the
+        /// path (what the rescue counter counts), for either side.
+        fallbacks_rescued: AtomicU64,
         /// Nodes standing in for a release below the floor
         /// ([`mark_pre_floor`]).
         pre_floor: parking_lot::Mutex<std::collections::HashSet<SocketAddr>>,
@@ -388,6 +391,8 @@ pub mod sim_trace {
             own: Option<SocketAddr>,
             peer: SocketAddr,
             connected: bool,
+            /// The native failure was on the path (`native_path_failed`).
+            path_failed: bool,
         },
         /// The node `own` now holds a native (`Some(true)`), UDP
         /// (`Some(false)`) or no (`None`) connection to the peer at the
@@ -444,7 +449,11 @@ pub mod sim_trace {
                 own,
                 peer,
                 connected,
+                path_failed,
             } => {
+                if connected && path_failed {
+                    c.fallbacks_rescued.fetch_add(1, Ordering::Relaxed);
+                }
                 c.fallbacks_ended.lock().push((own, peer, connected));
                 return;
             }
@@ -662,6 +671,12 @@ pub mod sim_trace {
         /// connected), in the order they ended.
         pub fn udp_fallbacks_ended(&self) -> Vec<(Option<SocketAddr>, SocketAddr, bool)> {
             self.0.fallbacks_ended.lock().clone()
+        }
+        /// UDP dials that connected after a native failure on the path, on
+        /// either side: this run's own count of what the rescue counter
+        /// counts (the process-wide counter is shared with other sims).
+        pub fn udp_fallbacks_rescued(&self) -> u64 {
+            Self::get(&self.0.fallbacks_rescued)
         }
         /// Native failures after the pair had connected another way.
         pub fn native_superseded(&self) -> u64 {
