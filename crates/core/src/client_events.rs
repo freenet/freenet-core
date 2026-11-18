@@ -63,14 +63,18 @@ use crate::{config::GlobalExecutor, contract::StoreResponse};
 
 use crate::contract::{contains_debug_sections, debug_sections};
 
-/// Helper function to register a subscription listener for GET/PUT operations with auto-subscribe
+/// Helper function to register a subscription listener for GET/PUT operations with auto-subscribe.
+///
+/// Returns `Ok(false)` when the client's `Disconnect` was handled before or
+/// during the registration: nothing stays registered, and the caller must not
+/// start a subscription for it.
 async fn register_subscription_listener(
     op_manager: &Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_id: ClientId,
     subscription_listener: mpsc::Sender<HostResult>,
     operation_type: &str,
-) -> Result<(), Error> {
+) -> Result<bool, Error> {
     // The client's `Disconnect` may already have been handled: requests run as
     // independent tasks, so one can still be in flight after it. Nothing would
     // ever clean up a subscription registered now (ANT-2026-VCHSBVO6).
@@ -81,7 +85,7 @@ async fn register_subscription_listener(
             operation = operation_type,
             "Client already disconnected, not registering subscription listener"
         );
-        return Ok(());
+        return Ok(false);
     }
     tracing::debug!(
         client_id = %client_id,
@@ -127,8 +131,7 @@ async fn register_subscription_listener(
                     op_manager.ring.register_events(Either::Left(event)).await;
                 }
             }
-            sweep_if_client_disconnected(op_manager, client_id).await;
-            Ok(())
+            Ok(!sweep_if_client_disconnected(op_manager, client_id).await)
         }
         // #4681: registration was rejected (e.g. subscriber-limit reached).
         // Forward the underlying RequestError so the client sees the real
@@ -282,15 +285,18 @@ async fn sweep_disconnected_client(op_manager: &Arc<OpManager>, client_id: Clien
 ///
 /// The `Disconnect` records the client before it sweeps, so for any
 /// registration either the sweep finds it, or this check, which runs after the
-/// registration, sees the record and removes it (ANT-2026-VCHSBVO6).
-async fn sweep_if_client_disconnected(op_manager: &Arc<OpManager>, client_id: ClientId) {
+/// registration, sees the record and removes it (ANT-2026-VCHSBVO6). Returns
+/// whether the client was gone.
+async fn sweep_if_client_disconnected(op_manager: &Arc<OpManager>, client_id: ClientId) -> bool {
     if op_manager.ring.is_client_disconnected(client_id) {
         tracing::debug!(
             %client_id,
             "Client disconnected while a subscription was being registered, sweeping again"
         );
         sweep_disconnected_client(op_manager, client_id).await;
+        return true;
     }
+    false
 }
 
 /// Report an operation init failure to the client via the result router.
@@ -846,9 +852,12 @@ async fn process_open_request(
                         // returns early, and a transaction registered by then
                         // is never published a result, so the session actor
                         // would keep it forever (ANT-2026-DN7GTB1F).
+                        let mut subscribe = subscribe;
                         if subscribe && !rejected_debug_wasm {
                             if let Some(sl) = subscription_listener {
-                                register_subscription_listener(
+                                // A client that is already gone gets the PUT
+                                // but no subscription.
+                                subscribe = register_subscription_listener(
                                     &op_manager,
                                     *contract_key.id(),
                                     client_id,
@@ -1370,14 +1379,19 @@ async fn process_open_request(
                             // Handle subscription for locally found contracts
                             if subscribe {
                                 if let Some(subscription_listener) = subscription_listener {
-                                    register_subscription_listener(
+                                    if !register_subscription_listener(
                                         &op_manager,
                                         *full_key.id(),
                                         client_id,
                                         subscription_listener,
                                         "local GET",
                                     )
-                                    .await?;
+                                    .await?
+                                    {
+                                        // The client is gone: nobody to answer,
+                                        // and no subscription to establish.
+                                        return Ok(None);
+                                    }
                                 } else {
                                     // Expected for HTTP web endpoint which sets subscribe=true
                                     // but has no notification channel. The subscription is
@@ -1479,9 +1493,10 @@ async fn process_open_request(
 
                         // Listener first, transaction second: see the PUT arm
                         // (ANT-2026-DN7GTB1F).
+                        let mut subscribe = subscribe;
                         if subscribe {
                             if let Some(sl) = subscription_listener {
-                                register_subscription_listener(
+                                subscribe = register_subscription_listener(
                                     &op_manager,
                                     key,
                                     client_id,
@@ -1677,7 +1692,12 @@ async fn process_open_request(
                                         op_manager.ring.register_events(Either::Left(event)).await;
                                     }
                                 }
-                                sweep_if_client_disconnected(&op_manager, client_id).await;
+                                if sweep_if_client_disconnected(&op_manager, client_id).await {
+                                    // The client is gone: starting the network
+                                    // subscribe would re-create the upstream
+                                    // subscription the sweep just collapsed.
+                                    return Ok(None);
+                                }
                             }
                             // #4681: registration rejected (e.g. subscriber-limit
                             // reached). Forward the underlying RequestError so the
@@ -3042,11 +3062,18 @@ mod disconnect_and_refusal_tests {
         ContractKey::from_id_and_code(ContractInstanceId::new([3u8; 32]), CodeHash::new([4u8; 32]))
     }
 
+    fn test_contract() -> ContractContainer {
+        ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1u8, 2, 3])),
+            Parameters::from(vec![]),
+        )))
+    }
+
     /// An `OpManager` over a scripted contract handler: every
     /// `RegisterSubscriberListener` is answered `Ok`, or refused as a
     /// subscription-limit rejection when `refuse` is set, after waiting for a
     /// permit when `gated`.
-    async fn harness(id: &str, refuse: bool, gated: bool) -> Harness {
+    async fn harness(id: &str, refuse: bool, gated: bool, has_contract: bool) -> Harness {
         let config_args = ConfigArgs {
             id: Some(id.to_string()),
             mode: Some(OperationMode::Local),
@@ -3089,7 +3116,29 @@ mod disconnect_and_refusal_tests {
         let handler_go = go.clone();
         tokio::spawn(async move {
             while let Ok((event_id, ev, _priority)) = ch_channel.recv_from_sender().await {
-                if let ContractHandlerEvent::RegisterSubscriberListener { .. } = ev {
+                if let ContractHandlerEvent::GetQuery { .. } = ev {
+                    let response = if has_contract {
+                        Ok(crate::contract::StoreResponse {
+                            state: Some(WrappedState::new(vec![1u8])),
+                            contract: Some(test_contract()),
+                        })
+                    } else {
+                        Ok(crate::contract::StoreResponse {
+                            state: None,
+                            contract: None,
+                        })
+                    };
+                    ch_channel
+                        .send_to_sender(
+                            event_id,
+                            ContractHandlerEvent::GetResponse {
+                                key: None,
+                                response,
+                            },
+                        )
+                        .await
+                        .ok();
+                } else if let ContractHandlerEvent::RegisterSubscriberListener { .. } = ev {
                     got_tx.send(()).ok();
                     if gated {
                         handler_go.acquire().await.expect("semaphore open").forget();
@@ -3138,7 +3187,7 @@ mod disconnect_and_refusal_tests {
     /// ever remove it, and 256 of them fill the contract's subscriber slots.
     #[tokio::test(flavor = "current_thread")]
     async fn subscription_registered_during_a_disconnect_is_removed() {
-        let mut h = harness("disconnect-race-in-flight", false, true).await;
+        let mut h = harness("disconnect-race-in-flight", false, true, false).await;
         let instance_id = *contract_key().id();
         let client = ClientId::next();
         let (listener, _listener_rx) = mpsc::channel(1);
@@ -3168,7 +3217,7 @@ mod disconnect_and_refusal_tests {
     /// A request that arrives after its client's `Disconnect` registers nothing.
     #[tokio::test(flavor = "current_thread")]
     async fn disconnected_client_registers_no_listener() {
-        let mut h = harness("disconnect-race-after", false, false).await;
+        let mut h = harness("disconnect-race-after", false, false, false).await;
         let instance_id = *contract_key().id();
         let client = ClientId::next();
         process_open_request(disconnect(client), h.op_manager.clone(), None)
@@ -3191,7 +3240,7 @@ mod disconnect_and_refusal_tests {
     /// A client that stays connected still gets its subscription.
     #[tokio::test(flavor = "current_thread")]
     async fn connected_client_keeps_its_subscription() {
-        let h = harness("disconnect-race-control", false, false).await;
+        let h = harness("disconnect-race-control", false, false, false).await;
         let instance_id = *contract_key().id();
         let client = ClientId::next();
         let (listener, _listener_rx) = mpsc::channel(1);
@@ -3205,7 +3254,7 @@ mod disconnect_and_refusal_tests {
     /// now `ClientDisconnect` was never sent outside tests.
     #[tokio::test(flavor = "current_thread")]
     async fn disconnect_tells_the_session_actor() {
-        let mut h = harness("disconnect-session-actor", false, false).await;
+        let mut h = harness("disconnect-session-actor", false, false, false).await;
         let client = ClientId::next();
         process_open_request(disconnect(client), h.op_manager.clone(), None)
             .await
@@ -3226,13 +3275,10 @@ mod disconnect_and_refusal_tests {
     /// session actor (and the event loop) would keep it for good.
     #[tokio::test(flavor = "current_thread")]
     async fn refused_subscribing_put_registers_no_transaction() {
-        let mut h = harness("refused-put", true, false).await;
+        let mut h = harness("refused-put", true, false, false).await;
         let client = ClientId::next();
         let (listener, _listener_rx) = mpsc::channel(1);
-        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
-            Arc::new(ContractCode::from(vec![1u8, 2, 3])),
-            Parameters::from(vec![]),
-        )));
+        let contract = test_contract();
         let mut request = OpenRequest::new(
             client,
             Box::new(ClientRequest::ContractOp(ContractRequest::Put {
@@ -3265,6 +3311,75 @@ mod disconnect_and_refusal_tests {
         );
     }
 
+    async fn request_during_disconnect(
+        h: &mut Harness,
+        client: ClientId,
+        request: ClientRequest<'static>,
+    ) {
+        let (listener, _listener_rx) = mpsc::channel(1);
+        let mut request = OpenRequest::new(client, Box::new(request));
+        request.notification_channel = Some(listener);
+        let fut = process_open_request(request, h.op_manager.clone(), None).await;
+        let in_flight = tokio::spawn(fut);
+        // The handler holds the listener registration; the client disconnects.
+        h.got_rx
+            .recv()
+            .await
+            .expect("handler received the listener");
+        process_open_request(disconnect(client), h.op_manager.clone(), None)
+            .await
+            .await
+            .expect("disconnect is handled");
+        h.go.add_permits(1);
+        let _outcome = in_flight.await.expect("request task");
+    }
+
+    /// A Subscribe still in flight when its client disconnects leaves no
+    /// subscription and does not go on to start the network subscribe, which
+    /// would re-create the upstream subscription the sweep just collapsed.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribe_in_flight_during_disconnect_leaks_nothing() {
+        let mut h = harness("race-subscribe", false, true, true).await;
+        let client = ClientId::next();
+        request_during_disconnect(
+            &mut h,
+            client,
+            ClientRequest::ContractOp(ContractRequest::Subscribe {
+                key: *contract_key().id(),
+                summary: None,
+            }),
+        )
+        .await;
+
+        assert!(!h.op_manager.ring.has_client_subscriptions(&contract_key()));
+        let sent = drain(&mut h.session_rx);
+        assert!(
+            sent.iter()
+                .all(|m| !matches!(m, SessionMessage::RegisterTransaction { .. })),
+            "the network subscribe was started for a disconnected client: {sent:?}"
+        );
+    }
+
+    /// Same for a GET with `subscribe: true`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribing_get_in_flight_during_disconnect_leaks_nothing() {
+        let mut h = harness("race-get", false, true, false).await;
+        let client = ClientId::next();
+        request_during_disconnect(
+            &mut h,
+            client,
+            ClientRequest::ContractOp(ContractRequest::Get {
+                key: *contract_key().id(),
+                return_contract_code: false,
+                subscribe: true,
+                blocking_subscribe: false,
+            }),
+        )
+        .await;
+
+        assert!(!h.op_manager.ring.has_client_subscriptions(&contract_key()));
+    }
+
     /// The GET arm registers the listener before the transaction, like the PUT
     /// arm. A source pin: building a GET that reaches that point needs a
     /// routable network.
@@ -3272,7 +3387,9 @@ mod disconnect_and_refusal_tests {
     fn get_arm_registers_the_listener_before_the_transaction() {
         let src = include_str!("client_events.rs");
         let arm = &src[src.find("get::GetMsg>();").expect("GET arm")..];
-        let listener = arm.find("\"GET\",").expect("GET listener registration");
+        let listener = arm
+            .find("register_subscription_listener(")
+            .expect("GET listener registration");
         let transaction = arm
             .find(".waiting_for_transaction_result(client_tx")
             .expect("GET transaction registration");

@@ -426,10 +426,10 @@ mod id_block_overflow_tests {
 
     #[test]
     fn client_ids_stay_unique_after_a_thread_exhausts_its_block() {
-        // Thread 7000 allocates past the end of its block; thread 7001's first
+        // Thread 3000007000 allocates past the end of its block; thread 3000007001's first
         // ids must not be among them.
-        let overflowing = client_ids_on_thread(7000, BLOCK + 10);
-        let neighbour = client_ids_on_thread(7001, 10);
+        let overflowing = client_ids_on_thread(3000007000, BLOCK + 10);
+        let neighbour = client_ids_on_thread(3000007001, 10);
         let seen: HashSet<_> = overflowing.iter().copied().collect();
         assert_eq!(seen.len(), overflowing.len(), "ids repeated on one thread");
         for id in neighbour {
@@ -439,8 +439,8 @@ mod id_block_overflow_tests {
 
     #[test]
     fn request_ids_stay_unique_after_a_thread_exhausts_its_block() {
-        let overflowing = request_ids_on_thread(7100, BLOCK + 10);
-        let neighbour = request_ids_on_thread(7101, 10);
+        let overflowing = request_ids_on_thread(3000007100, BLOCK + 10);
+        let neighbour = request_ids_on_thread(3000007101, 10);
         let seen: HashSet<_> = overflowing.iter().copied().collect();
         assert_eq!(seen.len(), overflowing.len(), "ids repeated on one thread");
         for id in neighbour {
@@ -452,8 +452,8 @@ mod id_block_overflow_tests {
     /// replacement block.
     #[test]
     fn two_overflowing_threads_get_distinct_replacement_blocks() {
-        let a = client_ids_on_thread(7200, BLOCK + 10);
-        let b = client_ids_on_thread(7300, BLOCK + 10);
+        let a = client_ids_on_thread(3000007200, BLOCK + 10);
+        let b = client_ids_on_thread(3000007300, BLOCK + 10);
         let seen: HashSet<_> = a.iter().copied().collect();
         for id in b {
             assert!(!seen.contains(&id), "client id {id} handed out twice");
@@ -464,13 +464,17 @@ mod id_block_overflow_tests {
     /// pin their thread index keep their existing, deterministic ids.
     #[test]
     fn first_block_ids_are_unchanged() {
-        let ids = client_ids_on_thread(7400, 3);
+        let ids = client_ids_on_thread(3000007400, 3);
         assert_eq!(
             ids,
-            vec![7400 * BLOCK + 1, 7400 * BLOCK + 2, 7400 * BLOCK + 3]
+            vec![
+                3000007400 * BLOCK + 1,
+                3000007400 * BLOCK + 2,
+                3000007400 * BLOCK + 3
+            ]
         );
-        let reqs = request_ids_on_thread(7500, 3);
-        let base = 7500 * crate::util::id_block::ID_BLOCK;
+        let reqs = request_ids_on_thread(3000007500, 3);
+        let base = 3000007500 * crate::util::id_block::ID_BLOCK;
         assert_eq!(reqs, vec![base + 1, base + 2, base + 3]);
     }
 }
