@@ -23796,7 +23796,15 @@ fn assert_non_settling_contract_is_bounded(streaming_threshold: Option<usize>, e
     }
     let _disarm = Disarm;
     arm(BAD_MODULUS);
-    let mut config = TestConfig::medium("merge-budget-non-settling", 0x4D31_0001)
+    // One name per variant: the network name is the node data directory under
+    // the temp dir, and nextest runs the two variants at the same time, so a
+    // shared name lets one run delete the other's config files.
+    let name = if streaming_threshold.is_some() {
+        "merge-budget-non-settling-streaming"
+    } else {
+        "merge-budget-non-settling"
+    };
+    let mut config = TestConfig::medium(name, 0x4D31_0001)
         .with_nodes(12)
         .with_gateways(2)
         .with_iterations(300)
