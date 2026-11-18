@@ -63,6 +63,13 @@ use crate::{config::GlobalExecutor, contract::StoreResponse};
 
 use crate::contract::{contains_debug_sections, debug_sections};
 
+/// Test-only record of the `subscribe` flag a client's GET or PUT was started
+/// with, so tests can tell a request started without its subscription from one
+/// that was not changed. Keyed by client id, which is unique per test.
+#[cfg(test)]
+static STARTED_WITH_SUBSCRIBE: std::sync::Mutex<Vec<(ClientId, bool)>> =
+    std::sync::Mutex::new(Vec::new());
+
 /// Helper function to register a subscription listener for GET/PUT operations with auto-subscribe.
 ///
 /// Returns `Ok(false)` when the client's `Disconnect` was handled before or
@@ -918,6 +925,11 @@ async fn process_open_request(
                             return Ok(None);
                         }
 
+                        #[cfg(test)]
+                        STARTED_WITH_SUBSCRIBE
+                            .lock()
+                            .unwrap()
+                            .push((client_id, subscribe));
                         if let Err(err) = put::op_ctx_task::start_client_put(
                             op_manager.clone(),
                             client_tx,
@@ -1536,6 +1548,11 @@ async fn process_open_request(
                                 freenet_stdlib::prelude::CodeHash::new([0u8; 32]),
                             )
                         });
+                        #[cfg(test)]
+                        STARTED_WITH_SUBSCRIBE
+                            .lock()
+                            .unwrap()
+                            .push((client_id, subscribe));
                         if let Err(err) = get::op_ctx_task::start_client_get(
                             op_manager.clone(),
                             client_tx,
@@ -3378,6 +3395,70 @@ mod disconnect_and_refusal_tests {
         .await;
 
         assert!(!h.op_manager.ring.has_client_subscriptions(&contract_key()));
+        assert_eq!(
+            started_with_subscribe(client),
+            vec![false],
+            "the GET must be started without its subscription"
+        );
+    }
+
+    /// Same for a PUT with `subscribe: true`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscribing_put_in_flight_during_disconnect_leaks_nothing() {
+        let mut h = harness("race-put", false, true, false).await;
+        let client = ClientId::next();
+        request_during_disconnect(
+            &mut h,
+            client,
+            ClientRequest::ContractOp(ContractRequest::Put {
+                contract: test_contract(),
+                state: WrappedState::new(vec![1u8]),
+                related_contracts: RelatedContracts::default(),
+                subscribe: true,
+                blocking_subscribe: false,
+            }),
+        )
+        .await;
+
+        assert!(!h.op_manager.ring.has_client_subscriptions(&contract_key()));
+        assert_eq!(
+            started_with_subscribe(client),
+            vec![false],
+            "the PUT must be started without its subscription"
+        );
+    }
+
+    /// A client that stays connected keeps `subscribe` on its PUT.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connected_clients_put_keeps_its_subscription_flag() {
+        let h = harness("put-flag-control", false, false, false).await;
+        let client = ClientId::next();
+        let (listener, _listener_rx) = mpsc::channel(1);
+        let mut request = OpenRequest::new(
+            client,
+            Box::new(ClientRequest::ContractOp(ContractRequest::Put {
+                contract: test_contract(),
+                state: WrappedState::new(vec![1u8]),
+                related_contracts: RelatedContracts::default(),
+                subscribe: true,
+                blocking_subscribe: false,
+            })),
+        );
+        request.notification_channel = Some(listener);
+        let _outcome = process_open_request(request, h.op_manager.clone(), None)
+            .await
+            .await;
+        assert_eq!(started_with_subscribe(client), vec![true]);
+    }
+
+    fn started_with_subscribe(client: ClientId) -> Vec<bool> {
+        super::STARTED_WITH_SUBSCRIBE
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(c, _)| *c == client)
+            .map(|(_, s)| *s)
+            .collect()
     }
 
     /// The GET arm registers the listener before the transaction, like the PUT
