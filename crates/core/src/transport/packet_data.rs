@@ -1,6 +1,8 @@
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::marker::PhantomData;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use aes_gcm::{Aes128Gcm, aead::AeadInPlace};
 
@@ -51,18 +53,48 @@ pub(super) const MAX_DATA_SIZE: usize = MAX_PACKET_SIZE - PACKET_TYPE_SIZE - NON
 const NONCE_BLOCK: u64 = 1_000_000;
 
 thread_local! {
-    /// Counter-based nonce generation for AES-GCM.
-    /// Uses 8 bytes from a thread-local counter + 4 random bytes.
-    static NONCE_COUNTER: Cell<u64> = {
-        let idx = GlobalRng::thread_index();
-        Cell::new(idx * NONCE_BLOCK)
-    };
+    /// The deterministic nonce counter of a seeded simulation thread, or of a
+    /// test that called [`reset_nonce_counter`]: `Some` once such a thread
+    /// has used it, `None` on every other thread, which uses the process-wide
+    /// counter instead.
+    static NONCE_COUNTER: Cell<Option<u64>> = const { Cell::new(None) };
 
-    /// Random prefix generated lazily per-thread to ensure nonce uniqueness.
+    /// The random prefix that goes with [`NONCE_COUNTER`], drawn from the
+    /// seeded `GlobalRng` so a simulation's packets repeat.
     static NONCE_RANDOM_PREFIX: RefCell<Option<[u8; 4]>> = const { RefCell::new(None) };
 }
 
-/// Get or generate the nonce random prefix for this thread.
+/// The counter every unseeded thread of this process draws its nonces from.
+///
+/// One counter for the whole process makes every nonce this node sends
+/// distinct, whichever thread encrypts and whichever key it uses, until 2^64
+/// packets have been sent (`.claude/rules/transport.md`: "NEVER reuse (key,
+/// nonce) pair"). Per-thread counters starting at `thread_index * 1_000_000`
+/// did not guarantee that: a long-lived thread sends more than a million
+/// packets, its counter runs into the range of threads created after it, and
+/// sends for one connection run on several threads, so two packets under one
+/// key were kept apart only by their threads' random prefixes.
+///
+/// It starts at 2^62, far above every seeded thread's counter
+/// (`thread_index * 1_000_000`), so a seeded thread and an unseeded one in one
+/// test process cannot produce the same counter either.
+static PROCESS_NONCE_COUNTER: AtomicU64 = AtomicU64::new(1 << 62);
+
+/// The prefix of every nonce from [`PROCESS_NONCE_COUNTER`]: drawn once per
+/// process from the OS entropy pool (code-style.md, the OsRng exception for
+/// nonces), so two runs of the node do not start from the same nonces.
+static PROCESS_NONCE_PREFIX: OnceLock<[u8; 4]> = OnceLock::new();
+
+fn process_nonce_prefix() -> [u8; 4] {
+    *PROCESS_NONCE_PREFIX.get_or_init(|| {
+        use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
+        let mut bytes = [0u8; 4];
+        OsRng.fill_bytes(&mut bytes);
+        bytes
+    })
+}
+
+/// Get or generate the nonce random prefix for this deterministic thread.
 fn get_nonce_prefix() -> [u8; 4] {
     NONCE_RANDOM_PREFIX.with(|cell| {
         let mut borrow = cell.borrow_mut();
@@ -78,29 +110,41 @@ fn get_nonce_prefix() -> [u8; 4] {
 }
 
 /// Reset the nonce counter and prefix to initial state for this thread.
-/// Thread-local, so safe for parallel test execution.
+/// Thread-local, so safe for parallel test execution. The thread then uses
+/// its own deterministic counter instead of the process-wide one.
 /// Call this AFTER GlobalRng::set_seed() so the prefix is regenerated
 /// deterministically on next use.
 pub fn reset_nonce_counter() {
     let idx = GlobalRng::thread_index();
-    NONCE_COUNTER.with(|c| c.set(idx * NONCE_BLOCK));
+    NONCE_COUNTER.with(|c| c.set(Some(idx.wrapping_mul(NONCE_BLOCK))));
     NONCE_RANDOM_PREFIX.with(|cell| {
         *cell.borrow_mut() = None;
     });
 }
 
-/// Generate a unique 12-byte nonce using counter + random prefix.
-/// This is faster than random generation while ensuring uniqueness.
+/// Generate a unique 12-byte nonce: a 4-byte random prefix and an 8-byte
+/// counter. This is faster than random generation while ensuring uniqueness.
 #[inline]
 fn generate_nonce() -> [u8; NONCE_SIZE] {
-    let counter = NONCE_COUNTER.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
+    let deterministic = NONCE_COUNTER.with(|c| {
+        let v = match c.get() {
+            Some(v) => v,
+            None if GlobalRng::is_seeded() => GlobalRng::thread_index().wrapping_mul(NONCE_BLOCK),
+            None => return None,
+        };
+        c.set(Some(v.wrapping_add(1)));
+        Some(v)
     });
+    let (prefix, counter) = match deterministic {
+        Some(counter) => (get_nonce_prefix(), counter),
+        None => (
+            process_nonce_prefix(),
+            PROCESS_NONCE_COUNTER.fetch_add(1, Ordering::Relaxed),
+        ),
+    };
     let mut nonce = [0u8; NONCE_SIZE];
     // First 4 bytes: random prefix (ensures uniqueness across restarts)
-    nonce[..4].copy_from_slice(&get_nonce_prefix());
+    nonce[..4].copy_from_slice(&prefix);
     // Last 8 bytes: counter (ensures uniqueness within this process)
     nonce[4..].copy_from_slice(&counter.to_le_bytes());
     nonce
@@ -352,6 +396,71 @@ mod tests {
     use super::*;
 
     use aes_gcm::KeyInit;
+
+    /// A node's threads never send two nonces with the same counter, so
+    /// nonce uniqueness does not rest on two threads' random prefixes
+    /// differing. Per-thread counters started at `thread_index * 1_000_000`:
+    /// once thread 0 had sent a million packets its counter reached thread 1's
+    /// start, and packets for one connection are encrypted on several threads.
+    #[test]
+    fn unseeded_threads_never_repeat_a_nonce_counter() {
+        let counter = |nonce: [u8; NONCE_SIZE]| u64::from_le_bytes(nonce[4..].try_into().unwrap());
+        let first = std::thread::spawn(move || {
+            crate::config::GlobalRng::pin_thread_index_for_test(0);
+            (0..=NONCE_BLOCK)
+                .map(|_| generate_nonce())
+                .collect::<Vec<_>>()
+        })
+        .join()
+        .unwrap();
+        let later = std::thread::spawn(|| {
+            crate::config::GlobalRng::pin_thread_index_for_test(1);
+            generate_nonce()
+        })
+        .join()
+        .unwrap();
+        let counters: std::collections::HashSet<u64> = first.iter().map(|n| counter(*n)).collect();
+        assert_eq!(counters.len(), first.len(), "a thread repeated a counter");
+        assert!(
+            !counters.contains(&counter(later)),
+            "counter {} reused across threads",
+            counter(later)
+        );
+        // One prefix for the whole process: uniqueness comes from the counter.
+        assert_eq!(first[0][..4], later[..4]);
+    }
+
+    /// An unseeded thread draws from the process counter, which starts at
+    /// 2^62, far above every seeded thread's counter.
+    #[test]
+    fn unseeded_nonce_counters_start_above_every_seeded_one() {
+        let nonce = std::thread::spawn(generate_nonce).join().unwrap();
+        assert!(u64::from_le_bytes(nonce[4..].try_into().unwrap()) >= 1 << 62);
+    }
+
+    /// A seeded (simulation) thread keeps its deterministic counter, starting
+    /// at its thread index's block, so a simulation's packets repeat.
+    #[test]
+    fn a_seeded_thread_uses_its_own_nonce_counter() {
+        std::thread::spawn(|| {
+            crate::config::GlobalRng::set_seed(11);
+            crate::config::GlobalRng::pin_thread_index_for_test(3);
+            let a = generate_nonce();
+            let b = generate_nonce();
+            crate::config::GlobalRng::clear_seed();
+            assert_eq!(
+                u64::from_le_bytes(a[4..].try_into().unwrap()),
+                3 * NONCE_BLOCK
+            );
+            assert_eq!(
+                u64::from_le_bytes(b[4..].try_into().unwrap()),
+                3 * NONCE_BLOCK + 1
+            );
+            assert_eq!(a[..4], b[..4]);
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn test_encryption_decryption() {
