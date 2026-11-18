@@ -88,11 +88,20 @@ use super::{TransportError, TransportPublicKey};
 /// ([`StreamId::next_transport_internal`]). The UDP transport relies on that
 /// split to route a stream (see [`StreamId::is_caller_named`]).
 ///
-/// The split is a convention, not a guarantee: both allocators share one
-/// per-thread counter, so once it passes 2^31 an internal id also has the top
-/// bit, and each thread's 100,000-id block overlaps the next thread's after
-/// 100,000 allocations. Receivers key streams by (peer, id), so a collision
-/// needs both within one connection's live streams.
+/// Both allocators share one per-thread counter that lives in the low 31 bits
+/// ([`COUNTER_MASK`]); the top bit is set or cleared by the allocator, never
+/// by the counter. It used to be a plain `u32` starting at `thread_index *
+/// 100_000`, and `thread_index` grows by one for every thread that ever
+/// allocates, so a node creating a few threads a minute (tokio's blocking pool
+/// and `block_in_place` replacements) passed index 21,475 after a few days of
+/// uptime. From then on every transport-internal id carried the top bit, the
+/// receiver routed it as a caller-named operations stream that nothing claims,
+/// and every oversized message the node sent was silently dropped (#6143).
+///
+/// Each thread's 100,000-id block still overlaps the next thread's after
+/// 100,000 allocations, and blocks wrap modulo 2^31. Receivers key streams by
+/// (peer, id), so a collision needs both within one connection's live or
+/// recently completed streams.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(transparent)]
 #[serde(transparent)]
@@ -106,17 +115,29 @@ const STREAM_ID_BLOCK: u32 = 100_000;
 /// Top bit of ids from [`StreamId::next`].
 const CALLER_NAMED_BIT: u32 = 0x8000_0000;
 
+/// The bits the shared counter may occupy. Keeping the counter below the top
+/// bit is what makes [`StreamId::is_caller_named`] reliable: the bit is only
+/// ever set by [`StreamId::next`].
+const COUNTER_MASK: u32 = !CALLER_NAMED_BIT;
+
+/// Where thread `idx`'s counter starts: its block, wrapped into the 31-bit
+/// counter space. Identical to the old `idx * 100_000` for every index below
+/// 21,475, so ids from young nodes and simulations are unchanged.
+fn block_start(idx: u64) -> u32 {
+    (idx.wrapping_mul(u64::from(STREAM_ID_BLOCK)) & u64::from(COUNTER_MASK)) as u32
+}
+
 thread_local! {
     static STREAM_ID_COUNTER: std::cell::Cell<u32> = {
         let idx = crate::config::GlobalRng::thread_index();
-        std::cell::Cell::new((idx as u32) * STREAM_ID_BLOCK)
+        std::cell::Cell::new(block_start(idx))
     };
 }
 
 fn next_stream_counter() -> u32 {
     STREAM_ID_COUNTER.with(|c| {
         let v = c.get();
-        c.set(v + 1);
+        c.set(v.wrapping_add(1) & COUNTER_MASK);
         v
     })
 }
@@ -129,11 +150,12 @@ impl StreamId {
     }
 
     /// A fresh id for a stream a transport opens for its own purposes (the
-    /// UDP transport's oversized messages). Distinct from ids from
-    /// [`Self::next`] until the shared counter passes 2^31 (see the type
-    /// docs).
+    /// UDP transport's oversized messages). It never has the top bit, so it
+    /// is always distinct from ids from [`Self::next`]. The counter is
+    /// already kept below the bit; the mask here keeps that true at the one
+    /// place receivers depend on it, whatever the counter does.
     pub(crate) fn next_transport_internal() -> Self {
-        Self(next_stream_counter())
+        Self(next_stream_counter() & COUNTER_MASK)
     }
 
     /// Whether this id came from [`Self::next`]: a stream named by the
@@ -146,7 +168,14 @@ impl StreamId {
     /// Thread-local, so safe for parallel test execution.
     pub fn reset_counter() {
         let idx = crate::config::GlobalRng::thread_index();
-        STREAM_ID_COUNTER.with(|c| c.set((idx as u32) * STREAM_ID_BLOCK));
+        STREAM_ID_COUNTER.with(|c| c.set(block_start(idx)));
+    }
+
+    /// Put this thread's counter where thread `idx` would start, so a test can
+    /// allocate as the thread of a node that has been up for days.
+    #[cfg(test)]
+    pub(crate) fn reset_counter_as_thread(idx: u64) {
+        STREAM_ID_COUNTER.with(|c| c.set(block_start(idx)));
     }
 }
 
@@ -827,7 +856,7 @@ mod stream_id_tests {
     #[test]
     fn stream_id_values_are_unchanged() {
         StreamId::reset_counter();
-        let base = (crate::config::GlobalRng::thread_index() as u32) * 100_000;
+        let base = super::block_start(crate::config::GlobalRng::thread_index());
         let internal = StreamId::next_transport_internal();
         let named = StreamId::next();
         let internal_again = StreamId::next_transport_internal();
@@ -837,6 +866,77 @@ mod stream_id_tests {
         assert!(named.is_caller_named());
         assert!(!internal.is_caller_named());
         assert!(!internal_again.is_caller_named());
+    }
+
+    /// #6143: a node's thread indices keep growing for its whole uptime, and
+    /// from index 21,475 on, `idx * 100_000` reaches the top bit. Every thread
+    /// must still hand out transport-internal ids WITHOUT it, and caller-named
+    /// ids WITH it, including across the counter wrapping. Index 24,160 is the
+    /// one Ian's laptop was allocating from on 2026-11-13, read back from its
+    /// logged stream ids.
+    #[test]
+    fn transport_internal_ids_never_carry_the_caller_named_bit() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                StreamId::reset_counter();
+            }
+        }
+        let _reset = Reset;
+        for idx in [
+            0u64,
+            21_474,
+            21_475,
+            24_160,
+            42_949,
+            42_950,
+            64_425,
+            1 << 40,
+        ] {
+            StreamId::reset_counter_as_thread(idx);
+            for _ in 0..3 {
+                let internal = StreamId::next_transport_internal();
+                let named = StreamId::next();
+                assert!(!internal.is_caller_named(), "idx {idx}: {internal:?}");
+                assert!(named.is_caller_named(), "idx {idx}: {named:?}");
+            }
+        }
+        // The counter wraps inside the 31-bit space instead of into the bit.
+        super::STREAM_ID_COUNTER.with(|c| c.set(super::COUNTER_MASK));
+        assert_eq!(StreamId::next_transport_internal().0, super::COUNTER_MASK);
+        assert_eq!(
+            super::STREAM_ID_COUNTER.with(|c| c.get()),
+            0,
+            "wrapped to 0"
+        );
+        assert!(!StreamId::next_transport_internal().is_caller_named());
+        // The allocator clears the bit itself, even from a counter that holds it.
+        super::STREAM_ID_COUNTER.with(|c| c.set(0x8000_0005));
+        assert_eq!(StreamId::next_transport_internal().0, 5);
+    }
+
+    /// Every thread index below 21,475 keeps the block start it always had,
+    /// `idx * 100_000`, so ids from young nodes and simulations are unchanged.
+    #[test]
+    fn block_starts_below_the_old_overflow_are_unchanged() {
+        for idx in 0u64..21_475 {
+            assert_eq!(super::block_start(idx), idx as u32 * 100_000, "idx {idx}");
+        }
+    }
+
+    /// The counter a real thread starts with comes from the thread-local
+    /// initializer, not `reset_counter`. A fresh thread whose index is past
+    /// 21,475 must still start below the caller-named bit.
+    #[test]
+    fn a_new_thread_with_a_high_index_starts_below_the_caller_named_bit() {
+        std::thread::spawn(|| {
+            crate::config::GlobalRng::pin_thread_index_for_test(24_160);
+            let first = StreamId::next_transport_internal();
+            assert!(!first.is_caller_named(), "{first:?}");
+            assert_eq!(first.0, super::block_start(24_160));
+        })
+        .join()
+        .unwrap();
     }
 
     /// A `StreamId` is serialized as its bare `u32`, as before.
