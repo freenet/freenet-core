@@ -1626,6 +1626,10 @@ pub(super) async fn dispatch_expect_connection_from(
                     Ok(mut rx) => {
                         let result = rx.recv().await;
                         let connected = matches!(result, Some(Ok(_)));
+                        // Counts this side's own dial. When the joiner's UDP
+                        // fallback connects first, the `Some(Ok(..))` arm
+                        // above counts nothing and the joiner counts it;
+                        // phase D reads the sum of the two sides.
                         if connected {
                             crate::transport::TRANSPORT_METRICS
                                 .record_connect_native_fallback_connected(

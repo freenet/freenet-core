@@ -23107,6 +23107,9 @@ fn test_quic_native_zero_percent_forms_the_same_mesh() {
     assert_eq!(on.trace.undecodable_closes(), 0);
 }
 
+/// Gateways in the QUIC-native connect sims.
+const NATIVE_SIM_GATEWAYS: usize = 2;
+
 /// One QUIC-native connect run: the wire run plus the upgrade trace, which
 /// records what native paths sent (session 0).
 struct NativeConnectRun {
@@ -23142,8 +23145,11 @@ fn run_native_connect_sim_with(
     let rt = create_runtime();
     let (sim, logs_handle, trace, upgrades, nodes, gateways, nat_counts) = rt.block_on(async {
         let mut sim = match nat {
-            Some(nat) => SimNetwork::new_with_nat(name, 2, 8, 10, 3, 10, 3, seed, nat).await,
-            None => SimNetwork::new(name, 2, 8, 10, 3, 10, 3, seed).await,
+            Some(nat) => {
+                SimNetwork::new_with_nat(name, NATIVE_SIM_GATEWAYS, 8, 10, 3, 10, 3, seed, nat)
+                    .await
+            }
+            None => SimNetwork::new(name, NATIVE_SIM_GATEWAYS, 8, 10, 3, 10, 3, seed).await,
         };
         let nat_counts = sim.nat_filtered_handle();
         sim.enable_gateway_ack_version();
@@ -23660,17 +23666,47 @@ fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
         lifetime: SimNat::all(NatFiltering::Symmetric).lifetime,
     };
     let mut symmetric_ips = std::collections::BTreeSet::new();
+    // The counters are process-wide: drain what earlier runs left.
+    let _ = freenet::transport::metrics::TRANSPORT_METRICS.take_snapshot();
     let run = run_native_connect_sim_with(name, SEED, 200, Some(nat), |sim| {
         sim.with_native_connect(100);
         // Regular node `i` gets `classes[i % 2]`; regular nodes are numbered
-        // after the 2 gateways.
+        // after the gateways.
         for (label, addr) in sim.all_node_addresses() {
-            if !label.is_gateway() && (label.number() - 2) % 2 == 0 {
+            if !label.is_gateway() && label.number().saturating_sub(NATIVE_SIM_GATEWAYS) % 2 == 0 {
                 symmetric_ips.insert(addr.ip());
             }
         }
     });
     log_native_connect(name, &run);
+    let counters = freenet::transport::metrics::TRANSPORT_METRICS
+        .take_snapshot()
+        .expect("premise: the run recorded transport activity");
+    // Phase D's figure is the SUM of the two sides: each side counts the UDP
+    // dial of its own that connected after a failed native setup, and in this
+    // run the acceptor's dial won every time (joiner side 0), so neither side
+    // alone is the figure. It must equal the connected UDP fallbacks the wire
+    // trace saw (both sides record those), and cover every rescue.
+    let fallback = counters.connect_native_fallback_connected_joiner
+        + counters.connect_native_fallback_connected_acceptor;
+    let rescued = counters.connect_native_rescued_by_udp_joiner
+        + counters.connect_native_rescued_by_udp_acceptor;
+    assert!(
+        fallback > 0,
+        "premise: UDP dials connected after native failures"
+    );
+    assert!(
+        fallback >= rescued,
+        "fallback {fallback} counts every rescue {rescued}"
+    );
+    let traced = run
+        .wire
+        .trace
+        .udp_fallbacks_ended()
+        .iter()
+        .filter(|(_, _, connected)| *connected)
+        .count() as u64;
+    assert_eq!(fallback, traced, "one count per connected UDP fallback");
     let t = &run.wire.trace;
     let gateway_ips: std::collections::BTreeSet<_> = run.gateways.iter().map(|a| a.ip()).collect();
     let between_peers = |a: &SocketAddr, b: &SocketAddr| {

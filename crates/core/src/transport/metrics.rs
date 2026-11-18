@@ -2058,9 +2058,11 @@ impl TransportMetrics {
     }
 
     /// A UDP dial that followed ANY failed native setup connected: a join a
-    /// node without UDP would lose, whatever the native failure was (the
-    /// phase-D gate's figure). A rescue (below) is the subset after a path
-    /// failure.
+    /// node without UDP would lose, whatever the native failure was. Counted
+    /// by the side whose own dial connected; phase D's gate reads the sum of
+    /// both sides (the joiner's dial and the acceptor's can each make the
+    /// connection, and the one that does not make it counts nothing). A
+    /// rescue (below) is the subset after a path failure.
     pub(crate) fn record_connect_native_fallback_connected(&self, side: NativeConnectSide) {
         match side {
             NativeConnectSide::Joiner => &self.connect_native_fallback_connected_joiner,
@@ -3734,8 +3736,11 @@ pub struct TransportSnapshot {
     /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
     pub connect_native_rescued_by_udp_acceptor: u64,
-    /// UDP dials that connected after ANY failed native setup, as joiner and
-    /// as acceptor: the joins phase D would lose (its gate reads these).
+    /// UDP dials that connected after ANY failed native setup: the joins
+    /// phase D would lose. Each side counts the UDP dial of its own that
+    /// connected, so phase D's gate reads the SUM of the joiner and acceptor
+    /// fields; neither alone is the figure (whichever side's dial makes the
+    /// connection first counts it, and the other side's does not).
     pub connect_native_fallback_connected_joiner: u64,
     pub connect_native_fallback_connected_acceptor: u64,
     /// A native dial and the UDP dial beside it both connected, UDP first or
@@ -4592,8 +4597,11 @@ struct SnapshotExtras {
     /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
     pub connect_native_rescued_by_udp_acceptor: u64,
-    /// UDP dials that connected after ANY failed native setup, as joiner and
-    /// as acceptor: the joins phase D would lose (its gate reads these).
+    /// UDP dials that connected after ANY failed native setup: the joins
+    /// phase D would lose. Each side counts the UDP dial of its own that
+    /// connected, so phase D's gate reads the SUM of the joiner and acceptor
+    /// fields; neither alone is the figure (whichever side's dial makes the
+    /// connection first counts it, and the other side's does not).
     pub connect_native_fallback_connected_joiner: u64,
     pub connect_native_fallback_connected_acceptor: u64,
     /// A native dial and the UDP dial beside it both connected, UDP first or

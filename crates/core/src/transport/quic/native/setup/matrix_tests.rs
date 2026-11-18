@@ -684,49 +684,40 @@ fn native_setup_gate_17_jitter_baseline() {
     assert!(failures > 0, "premise: the jitter is applied");
 }
 
-/// Gate 17, binding lifetime. A setup refreshes its binding with a punch
-/// every 250 ms (and every QUIC packet), so no binding can expire inside a
-/// setup unless its lifetime is under that: a 5 s lifetime (shorter than
-/// every window, and far under any real NAT's) never expires during a
-/// setup, which the expiry count shows (zero), so those rows do not, and
-/// cannot, exercise expiry inside a setup; gate 17's binding concern is met
-/// by the punch interval, not by the window. Rows at a 200 ms lifetime
-/// (under the punch interval and the round trip, far below any real NAT's)
-/// do drive bindings to expire mid-setup, which the premise checks, and are
-/// measured only: no run establishes (0 of 20 per cell), most of them
-/// one-sided, because once the handshake stops the punches nothing keeps
-/// the binding open between round trips.
+/// Gate 17, binding lifetime: NOT demonstrated. A 5 s lifetime (shorter than
+/// every window, and far under any real NAT's) never expires a binding
+/// inside a setup, which the expiry count shows (zero). That is a
+/// measurement of this model with these timings (the setup punches every
+/// 250 ms and every QUIC packet refreshes the binding), so it fails if the
+/// punch interval or the refresh rule changes, and it is not a claim that
+/// the setup survives short bindings. A lifetime short enough to expire one
+/// (200 ms) is under the round trip of every cell (300 and 800 ms), so every
+/// setup fails whatever it does; rows at it were dropped as uninformative.
+/// The shortest lifetime that could matter (between the punch interval and
+/// about one round trip) is unmeasured.
 #[test]
 fn native_setup_gate_17_binding_lifetime() {
     let at = |lifetime_ms: u64| Extra {
         binding_lifetime: Duration::from_millis(lifetime_ms),
         ..Extra::default()
     };
-    let cells = |extra: Extra| {
-        let mut cells = Vec::new();
-        for pair in class_pairs() {
-            for rtt in [300u64, 800] {
-                for (late, skew) in [
-                    (Late::Server, 0u64),
-                    (Late::Server, 4_000),
-                    (Late::Client, 0),
-                    (Late::Client, 8_000),
-                ] {
-                    cells.push(gate_cell(pair, late, skew, rtt, extra));
-                }
+    let mut cells = Vec::new();
+    for pair in class_pairs() {
+        for rtt in [300u64, 800] {
+            for (late, skew) in [
+                (Late::Server, 0u64),
+                (Late::Server, 4_000),
+                (Late::Client, 0),
+                (Late::Client, 8_000),
+            ] {
+                cells.push(gate_cell(pair, late, skew, rtt, at(5_000)));
             }
         }
-        cells
-    };
-    let five_s = run_gate_cells("17-binding-5s", cells(at(5_000)));
+    }
+    let five_s = run_gate_cells("17-binding-5s", cells);
     assert_gate("17-binding-5s", &five_s, 0.95, 1);
     let expired: u64 = five_s.iter().map(|r| r.expired).sum();
     assert_eq!(expired, 0, "a 5 s binding never expires inside a setup");
-    let short = run_gate_cells("17-binding-200ms", cells(at(200)));
-    let expired: u64 = short.iter().map(|r| r.expired).sum();
-    assert!(expired > 0, "premise: a 200 ms binding expires mid-setup");
-    let established: usize = short.iter().map(|r| r.ok).sum();
-    println!("native-matrix gate 17-binding-200ms established: {established}");
 }
 
 /// Determinism: the same cell run twice, on different subnets and so
