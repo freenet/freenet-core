@@ -141,7 +141,16 @@ static CONTRACT_REFRESH_LOCKS: LazyLock<
 enum TerminalAbsenceKind {
     ContractNotFound,
     MissingContract,
+    /// The contract's state is not an archive this node will unpack (malformed,
+    /// or over the unpack limits). The answer is a function of the state, so it
+    /// repeats until the state changes; without recording it, every request
+    /// re-fetches and re-unpacks the same refused archive.
+    ArchiveRefused,
 }
+
+/// Prefix of the error `unpack_if_stale` returns for an archive it refuses;
+/// `ensure_contract_cached`'s caller recognises it to record the refusal.
+const UNPACK_FAILED_PREFIX: &str = "failed unpacking contract: ";
 
 impl TerminalAbsenceKind {
     fn into_error(self, instance_id: ContractInstanceId) -> WebSocketApiError {
@@ -152,6 +161,9 @@ impl TerminalAbsenceKind {
             TerminalAbsenceKind::MissingContract => {
                 WebSocketApiError::MissingContract { instance_id }
             }
+            TerminalAbsenceKind::ArchiveRefused => WebSocketApiError::InvalidParam {
+                error_cause: format!("{UNPACK_FAILED_PREFIX}{instance_id}"),
+            },
         }
     }
 }
@@ -1426,6 +1438,11 @@ async fn refresh_cache_if_due(
             Err(WebSocketApiError::MissingContract { .. }) => {
                 Some(TerminalAbsenceKind::MissingContract)
             }
+            Err(WebSocketApiError::InvalidParam { error_cause })
+                if error_cause.starts_with(UNPACK_FAILED_PREFIX) =>
+            {
+                Some(TerminalAbsenceKind::ArchiveRefused)
+            }
             _ => None,
         };
         refresh.last_cold_failure =
@@ -1774,7 +1791,7 @@ async fn unpack_if_stale(
         let key = contract.key();
         tracing::error!("{err}");
         WebSocketApiError::InvalidParam {
-            error_cause: format!("failed unpacking contract: {key}"),
+            error_cause: format!("{UNPACK_FAILED_PREFIX}{key}"),
         }
     }
 
@@ -1786,9 +1803,17 @@ async fn unpack_if_stale(
             error_cause: format!("Failed to create cache dir: {e}"),
         })?;
 
-    let unpacked = WebApp::try_from(state.as_ref())
-        .and_then(|mut web| web.unpack(&path))
-        .map_err(|e| err(e, contract));
+    // Decompression and file writes are blocking work on up to 100 MB of
+    // input; keep them off the async worker.
+    let unpack_path = path.clone();
+    let state_owned = state.as_ref().to_vec();
+    let unpacked = tokio::task::spawn_blocking(move || {
+        WebApp::try_from(state_owned.as_slice()).and_then(|mut web| web.unpack(&unpack_path))
+    })
+    .await
+    .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))
+    .and_then(|result| result)
+    .map_err(|e| err(e, contract));
     if let Err(unpack_failed) = unpacked {
         // Take the directory back out. A contract that is not a web archive
         // fails here every time it is requested, and the sweep would never
@@ -5325,10 +5350,9 @@ mod tests {
     /// into memory. A sparse file keeps the test from writing real bytes.
     #[tokio::test]
     async fn variable_content_refuses_to_read_an_oversized_js_file() {
-        let mut bytes = [0u8; 32];
-        bytes[0] = 0x3a;
-        bytes[1] = 0x5c;
-        let instance_id = ContractInstanceId::new(bytes);
+        // A random id: the cache and refresh timers are process-global, so a
+        // fixed id could collide with another test under plain `cargo test`.
+        let instance_id = ContractInstanceId::new(rand::random::<[u8; 32]>());
         let key = instance_id.to_string();
         clear_cache(&instance_id).await;
 
@@ -5371,8 +5395,8 @@ mod tests {
             "an oversized page must be refused"
         );
 
-        // Exactly at the bound is still served (it is not valid UTF-8 text here,
-        // so the refusal must be the size check, not the later decode).
+        // Exactly at the bound is still served. Zero bytes are valid UTF-8, so
+        // the only thing that can refuse this file is the size check.
         let at_limit = std::fs::File::create(dir.path().join("ok.html")).unwrap();
         at_limit.set_len(MAX_REWRITTEN_ASSET_BYTES).unwrap();
         let result = sandbox_content_body(dir.path(), "key", ApiVersion::V1, "ok.html").await;
@@ -5395,24 +5419,20 @@ mod tests {
         assert!(read_file_bounded(&sparse, 1024 * 1024).await.is_err());
     }
 
-    /// An archive that violates the unpack limits must not leave a directory or
-    /// a state hash behind, including the hash of the entry it replaces: a hash
-    /// with no directory reads as a warm cache that serves nothing.
-    #[tokio::test]
-    async fn rejected_archive_removes_the_old_entry_and_its_hash() {
+    /// A contract whose state is a web archive holding one file over the unpack
+    /// limit. A few KB compressed.
+    fn oversized_archive_contract_and_state(seed: &[u8]) -> (ContractContainer, WrappedState) {
+        let limit = super::super::app_packaging::MAX_UNPACKED_FILE_BYTES + 1;
         let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
         let mut header = tar::Header::new_gnu();
-        header.set_size(super::super::app_packaging::MAX_UNPACKED_FILE_BYTES + 1);
+        header.set_size(limit);
         header.set_mode(0o644);
         header.set_cksum();
         archive
             .append_data(
                 &mut header,
                 "big.bin",
-                std::io::Read::take(
-                    std::io::repeat(0),
-                    super::super::app_packaging::MAX_UNPACKED_FILE_BYTES + 1,
-                ),
+                std::io::Read::take(std::io::repeat(0), limit),
             )
             .unwrap();
         let packed = WebApp::from_data(Vec::new(), archive)
@@ -5420,10 +5440,126 @@ mod tests {
             .pack()
             .unwrap();
         let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
-            Arc::new(ContractCode::from(vec![0xd7])),
+            Arc::new(ContractCode::from(seed.to_vec())),
             Parameters::from(vec![0]),
         )));
-        let state = WrappedState::new(packed);
+        (contract, WrappedState::new(packed))
+    }
+
+    /// A refused archive is a property of the contract's state, so it is
+    /// recorded like a proven-absent contract: the second request replays the
+    /// refusal without fetching (and so without unpacking) again.
+    #[tokio::test]
+    async fn a_refused_archive_is_not_fetched_or_unpacked_again_within_the_window() {
+        let (contract, state) = oversized_archive_contract_and_state(&rand::random::<[u8; 16]>());
+        let instance_id = *contract.key().id();
+        clear_cache(&instance_id).await;
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+
+        let (sender, mut rx) = request_channel();
+        let first = {
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                refresh_cache_if_due(instance_id, &sender, &test_webapp_cache()).await
+            })
+        };
+        let callbacks = expect_fetch_pair_holding_callbacks(&mut rx, instance_id).await;
+        callbacks
+            .send(HostCallbackResult::Result {
+                id: crate::client_events::ClientId::next(),
+                result: Ok(HostResponse::ContractResponse(
+                    ContractResponse::GetResponse {
+                        key: contract.key(),
+                        contract: Some(contract.clone()),
+                        state,
+                    },
+                )),
+            })
+            .expect("callback receiver live for the GetResponse");
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), first)
+            .await
+            .expect("the first request must resolve")
+            .expect("handler must not panic");
+        assert!(
+            matches!(first, Err(WebSocketApiError::InvalidParam { .. })),
+            "premise: the oversized archive must be refused, got {first:?}"
+        );
+        while rx.try_recv().is_ok() {}
+
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            refresh_cache_if_due(instance_id, &sender, &test_webapp_cache()),
+        )
+        .await
+        .expect("the second request must resolve, not queue behind a refetch");
+        assert!(
+            matches!(second, Err(WebSocketApiError::InvalidParam { ref error_cause })
+                if error_cause.starts_with(UNPACK_FAILED_PREFIX)),
+            "the refusal must be replayed, got {second:?}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused archive must not be fetched again inside the window"
+        );
+
+        CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+        clear_cache(&instance_id).await;
+    }
+
+    /// A cache entry whose hash was written by an earlier build (no format
+    /// version in the hash) is not trusted: it is unpacked again.
+    #[tokio::test]
+    async fn an_old_format_cache_entry_is_unpacked_again() {
+        use std::hash::Hasher;
+        let (contract, state) = webapp_contract_and_state(&rand::random::<[u8; 16]>());
+        let instance_id = *contract.key().id();
+        let root = tempfile::tempdir().expect("tempdir");
+        let webapp_cache = cache(root.path(), u64::MAX);
+        clear_cache(&instance_id).await;
+
+        let mut legacy = ahash::AHasher::default();
+        legacy.write(state.as_ref());
+        std::fs::create_dir_all(webapp_cache.entry_dir(&instance_id)).unwrap();
+        std::fs::write(
+            webapp_cache.entry_dir(&instance_id).join("stale.bin"),
+            b"written by an earlier build",
+        )
+        .unwrap();
+        std::fs::write(
+            webapp_cache.hash_path(&instance_id),
+            legacy.finish().to_be_bytes(),
+        )
+        .unwrap();
+
+        unpack_if_stale(&contract, state.as_ref(), &webapp_cache)
+            .await
+            .expect("unpack must succeed");
+
+        assert!(
+            !webapp_cache
+                .entry_dir(&instance_id)
+                .join("stale.bin")
+                .exists(),
+            "the old entry must have been replaced"
+        );
+        assert!(
+            webapp_cache
+                .entry_dir(&instance_id)
+                .join("index.html")
+                .exists()
+        );
+        assert_eq!(
+            std::fs::read(webapp_cache.hash_path(&instance_id)).unwrap(),
+            hash_state(state.as_ref()).to_be_bytes()
+        );
+    }
+
+    /// An archive that violates the unpack limits must not leave a directory or
+    /// a state hash behind, including the hash of the entry it replaces: a hash
+    /// with no directory reads as a warm cache that serves nothing.
+    #[tokio::test]
+    async fn rejected_archive_removes_the_old_entry_and_its_hash() {
+        let (contract, state) = oversized_archive_contract_and_state(&[0xd7]);
         let instance_id = *contract.key().id();
 
         let root = tempfile::tempdir().expect("tempdir");
