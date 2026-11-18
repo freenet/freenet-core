@@ -109,9 +109,17 @@ async fn exchange_inner<T: TimeSource>(
         stream.write_all(&bytes).await.map_err(|e| e.to_string())?;
         stream.finish().map_err(|e| e.to_string())?;
         if confirm_delivery {
-            // Resolves once the peer has acknowledged every byte (or stopped
-            // the stream, or the connection ended).
-            stream.stopped().await.map_err(|e| e.to_string())?;
+            // Resolves once the peer has acknowledged every byte, stopped the
+            // stream, or the connection ended.
+            // Only `None` is an acknowledgement. `Some(code)` is the peer's
+            // STOP_SENDING, reached only when it was processed before the
+            // peer's ACK of the whole Hello, so delivery is not confirmed.
+            // No test pins this: the simulation cannot order it, because a
+            // STOP_SENDING travels behind an ACK in the same packet and the
+            // ACK of this small Hello completes the stream first.
+            if let Some(code) = stream.stopped().await.map_err(|e| e.to_string())? {
+                return Err(format!("the peer stopped the Hello stream with {code}"));
+            }
         }
         Ok(())
     };
