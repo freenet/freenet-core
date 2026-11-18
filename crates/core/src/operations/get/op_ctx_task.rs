@@ -3483,12 +3483,23 @@ async fn check_local_with_interest_gate(
             // Peers with only stale LRU cache (no active interest) defer to
             // the network but keep the local value as fallback.
             if !op_manager.interest_manager.has_local_interest(&key) {
-                // Stale cache only — defer to network, keep as fallback.
+                // Stale cache only — defer to network, keep as fallback, but
+                // only while this node still hosts the contract or has it in use (the
+                // same rule as `Ring::may_merge_relayed_update`: such a copy
+                // still receives updates). An evicted
+                // copy awaiting reclamation is not in the update mesh and no
+                // longer receives updates, so its bytes are frozen: serving
+                // them would answer a read from a stale copy (hosting
+                // invariant 1).
                 tracing::debug!(
                     %instance_id,
                     "GET relay: stale cache (no local interest), will forward"
                 );
-                (None, Some((key, state, contract)))
+                if op_manager.ring.may_merge_relayed_update(&key) {
+                    (None, Some((key, state, contract)))
+                } else {
+                    (None, None)
+                }
             } else {
                 // Actively hosting with interest — serve immediately.
                 (Some((key, state, contract)), None)
@@ -12922,6 +12933,48 @@ mod candidate_log_call_site_tests {
         assert_eq!(
             lines[2]["selected"],
             serde_json::json!([dataset::peer_hash(&pinned)])
+        );
+    }
+}
+
+#[cfg(test)]
+mod evicted_copy_fallback_tests {
+    use super::*;
+    use crate::operations::route_attempt::driver_test_support::op_manager_with_peers_and_store;
+
+    /// A relay's routing-exhausted fallback must not be an evicted copy that is
+    /// awaiting reclamation: it no longer receives updates, so serving it
+    /// answers a read from a frozen copy. A hosted contract keeps being served.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_stale_fallback_is_not_an_evicted_unhosted_copy() {
+        let (op_manager, _rx, _peers, _guards, store) =
+            op_manager_with_peers_and_store("get-fallback-evicted", 1).await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([0x5a; 32]),
+            freenet_stdlib::prelude::CodeHash::new([0x5b; 32]),
+        );
+        *store.lock() = Some((key, WrappedState::new(vec![1; 8])));
+        assert!(!op_manager.ring.is_hosting_contract(&key));
+        assert!(!op_manager.interest_manager.has_local_interest(&key));
+
+        let (served, fallback) = check_local_with_interest_gate(&op_manager, key.id(), false).await;
+        assert!(served.is_none());
+        assert!(
+            fallback.is_none(),
+            "an evicted, unreclaimed copy must not be offered as the stale fallback"
+        );
+
+        op_manager.ring.host_contract(
+            key,
+            8,
+            crate::ring::AccessType::Get,
+            crate::ring::HostingCause::Other,
+        );
+        assert!(op_manager.ring.is_hosting_contract(&key));
+        let (served, fallback) = check_local_with_interest_gate(&op_manager, key.id(), false).await;
+        assert!(
+            served.is_some() || fallback.is_some(),
+            "a hosted contract's local copy is served or kept as the fallback"
         );
     }
 }

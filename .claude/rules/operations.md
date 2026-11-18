@@ -207,21 +207,26 @@ Rules for choosing the class at a send site:
                  drive_relay_* drivers, ResyncResponse apply, broadcast-path
                  summaries/deltas that propagate a real UPDATE. This is also
                  `Priority::DEFAULT`, so untagged callers fall here safely.
+                 EvictContract disk reclamation runs here too
+                 (reclaim_evicted_contract): it is what makes the hosting
+                 budget a disk bound, so the relayed writes that fill the disk
+                 must not be able to starve it.
 
   Background   → best-effort node-internal work that must yield to client/relay
                  traffic: the periodic interest-sync summarize
                  (summary_if_hosted_or_in_use), placement-migration caching,
-                 renewal, and EvictContract disk reclamation. NEVER tag a
-                 client- or peer-visible op Background.
+                 and renewal. NEVER tag a client- or peer-visible op Background,
+                 nor work that enforces a resource bound (EvictContract).
 
 When a shared helper is reached from BOTH a client and a relay path (e.g.
 put_contract, update_contract), thread a `priority` param through rather
 than hardcoding — decide the class at the driver that knows the origin.
 
-The loop's pop() applies a bounded anti-starvation floor
-(RELAY_STARVATION_FLOOR) so sustained ClientLocal load cannot indefinitely
-starve NetworkRelay/Background — but that is a backstop, not a license to
-mis-tag.
+The loop's pop() applies two bounded anti-starvation floors. RELAY_STARVATION_FLOOR
+stops sustained ClientLocal load from indefinitely starving NetworkRelay and
+Background. BACKGROUND_STARVATION_FLOOR stops sustained NetworkRelay load (the
+tier remote peers feed) from indefinitely starving Background. Both are
+backstops only: tag each send site with the class it belongs to.
 ```
 
 **Client `DelegateRequest`s and the delegate lane (#6144).** Once

@@ -764,14 +764,19 @@ pub(crate) fn reclaim_evicted_contract(
     // safe. See `crate::ring::applied_payloads`.
     op_manager.ring.applied_payloads.reset(&key);
 
-    // Disk reclamation after hosting-cache eviction is best-effort GC —
-    // background-tier so it yields the contract loop to client/relay work (#4534).
+    // Disk reclamation after hosting-cache eviction is what makes the hosting
+    // budget a real disk bound, so it is NOT background-tier: `Background`
+    // yields to `NetworkRelay`, the tier remote peers feed, and gets only its
+    // anti-starvation floor share while that tier stays busy — a peer could
+    // hold reclamation back for as long as it kept sending. At relay precedence
+    // it still yields the contract loop to client work (#4534) and takes its
+    // turn among the relayed writes that caused the eviction.
     op_manager.notify_contract_handler_fire_and_forget_prioritized(
         crate::contract::ContractHandlerEvent::EvictContract {
             key,
             expected_generation,
         },
-        crate::contract::Priority::Background,
+        crate::contract::Priority::NetworkRelay,
     );
 }
 
@@ -1607,6 +1612,24 @@ mod reclaim_retraction_pin_tests {
              in-use / subscribed), NOT the bare `announce_contract_unhosted`, which \
              retracts unconditionally and would strand a contract that a re-host or \
              a re-subscribe kept alive."
+        );
+    }
+
+    /// EvictContract is what makes the hosting budget a disk bound, so it must
+    /// not be sheddable `Background` work that relayed writes (the tier remote
+    /// peers feed) can postpone (ANT-2026-YTU5DE0O).
+    #[test]
+    fn evict_contract_is_not_sent_at_background_priority() {
+        let src = include_str!("operations.rs");
+        let needle = ["fn ", "reclaim_evicted_contract("].concat();
+        let code = extract_fn_code(src, &needle);
+        assert!(
+            code.contains(&["Priority::Network", "Relay"].concat()),
+            "`reclaim_evicted_contract` must send EvictContract at NetworkRelay priority"
+        );
+        assert!(
+            !code.contains(&["Priority::Back", "ground"].concat()),
+            "EvictContract enforces a resource bound and must never be Background"
         );
     }
 

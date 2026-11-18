@@ -1097,6 +1097,29 @@ async fn run_relay_broadcast_to(
     }
 }
 
+/// Broadcasts skipped because this node does not host the contract
+/// (`Ring::may_merge_relayed_update`), since process start.
+static UNHOSTED_BROADCAST_SKIPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count a skipped broadcast for an unhosted contract. The count is logged at
+/// `info` on each power of two, which release builds keep (a `debug` line is
+/// compiled out), so a sender that keeps broadcasting to a node that evicted
+/// the contract is visible. No resync is sent: the sender's belief about this
+/// node heals through the periodic interest sync.
+fn record_unhosted_broadcast_skip(incoming_tx: &Transaction, key: &ContractKey, kind: &str) {
+    let total = UNHOSTED_BROADCAST_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if total.is_power_of_two() {
+        tracing::info!(
+            tx = %incoming_tx,
+            contract = %key,
+            kind,
+            total_skipped = total,
+            "UPDATE relay: broadcast skipped, contract is not hosted here"
+        );
+    }
+}
+
 /// Inner driver for `RequestUpdate`. Mirrors `update.rs:347-594`.
 ///
 /// Decision tree:
@@ -1144,7 +1167,7 @@ async fn drive_relay_request_update(
         _ => None,
     };
 
-    if state_before.is_some() {
+    if state_before.is_some() && op_manager.ring.may_merge_relayed_update(&key) {
         // ── Local apply path ──────────────────────────────────────────────
         let hash_before = state_before.as_ref().map(state_hash_full);
 
@@ -1970,6 +1993,11 @@ async fn drive_relay_broadcast_to(
     covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) -> Result<(), OpError> {
     let self_location = op_manager.ring.connection_manager.own_location();
+
+    if !op_manager.ring.may_merge_relayed_update(&key) {
+        record_unhosted_broadcast_skip(&incoming_tx, &key, "BroadcastTo");
+        return Ok(());
+    }
 
     // ── Step 1: update sender's cached summary ────────────────────────────
     // Empty bytes mean the sender could not summarize itself, NOT that its
@@ -2829,6 +2857,26 @@ async fn drive_relay_request_update_streaming(
         value,
     } = payload;
 
+    if !op_manager.ring.may_merge_relayed_update(&key) {
+        tracing::debug!(
+            tx = %incoming_tx,
+            %key,
+            "UPDATE relay (driver streaming): RequestUpdateStreaming not merged, \
+             contract is not hosted here; forwarding"
+        );
+        // The non-streaming driver sees the gate refuse as well and takes its
+        // forward path.
+        return drive_relay_request_update(
+            op_manager,
+            incoming_tx,
+            key,
+            related_contracts,
+            value,
+            sender_addr,
+        )
+        .await;
+    }
+
     // Step 4: apply update. BroadcastStateChange propagates automatically.
     let UpdateExecution {
         value: updated_value,
@@ -3012,6 +3060,10 @@ async fn apply_streaming_broadcast(
     sender_addr: SocketAddr,
     covered: crate::ring::broadcast_coverage::CoveredPeers,
 ) -> Result<(), OpError> {
+    if !op_manager.ring.may_merge_relayed_update(&key) {
+        record_unhosted_broadcast_skip(&incoming_tx, &key, "BroadcastToStreaming");
+        return Ok(());
+    }
     let mut receiver_terminal = op_manager
         .payload_mix
         .receiver_terminal_guard(false, state_bytes.len());
@@ -4482,6 +4534,7 @@ mod tests {
             ContractInstanceId::new([7u8; 32]),
             CodeHash::new([8u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12100".parse().unwrap();
 
         // First broadcast delta → dropped queue-full → MUST emit a ResyncRequest.
@@ -4558,6 +4611,7 @@ mod tests {
             ContractInstanceId::new([9u8; 32]),
             CodeHash::new([10u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12200".parse().unwrap();
 
         // First streaming full-state → dropped queue-full → MUST emit a ResyncRequest.
@@ -4637,6 +4691,7 @@ mod tests {
         for key in [inline_key, stream_key] {
             host_for_test(&op_manager, key);
         }
+        let skips_before = UNHOSTED_BROADCAST_SKIPS.load(std::sync::atomic::Ordering::Relaxed);
 
         for _ in 0..2 {
             let _result: Result<(), OpError> = drive_relay_broadcast_to(
@@ -4693,8 +4748,16 @@ mod tests {
             op_manager
                 .payload_mix
                 .propagation_event_for_test(Ev::RxDedup),
-            3,
-            "telemetry still counts every received skip"
+            2,
+            "a broadcast for a contract this node does not host is skipped before the \
+             dedup cache, so only the two hosted keys' repeats are counted here"
+        );
+        // Every skip is still counted somewhere: the two unhosted broadcasts
+        // land in the release-visible unhosted-skip counter (process-global,
+        // so other tests may add to it, never subtract).
+        assert!(
+            UNHOSTED_BROADCAST_SKIPS.load(std::sync::atomic::Ordering::Relaxed) >= skips_before + 2,
+            "a skipped broadcast for an unhosted contract must be counted"
         );
     }
 
@@ -4968,6 +5031,7 @@ mod tests {
             ContractInstanceId::new([41u8; 32]),
             CodeHash::new([42u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12300".parse().unwrap();
         let set = &op_manager.ring.applied_payloads;
 
@@ -5387,6 +5451,7 @@ mod tests {
             ContractInstanceId::new([81u8; 32]),
             CodeHash::new([82u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:13300".parse().unwrap();
 
         let r = drive_relay_broadcast_to(
@@ -5418,6 +5483,7 @@ mod tests {
             ContractInstanceId::new([83u8; 32]),
             CodeHash::new([84u8; 32]),
         );
+        host_for_test(&qf_manager, qf_key);
         let qf_sender: SocketAddr = "127.0.0.1:13400".parse().unwrap();
 
         let qf = drive_relay_broadcast_to(
@@ -5466,6 +5532,7 @@ mod tests {
             ContractInstanceId::new([21u8; 32]),
             CodeHash::new([22u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender: SocketAddr = "127.0.0.1:12200".parse().unwrap();
 
         // Three consecutive delta failures (distinct bytes so none is a dedup
@@ -5535,6 +5602,7 @@ mod tests {
             ContractInstanceId::new([31u8; 32]),
             CodeHash::new([32u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender: SocketAddr = "127.0.0.1:12300".parse().unwrap();
 
         // Two delta failures (count = 2, below the trip threshold).
@@ -5630,6 +5698,7 @@ mod tests {
             ContractInstanceId::new([41u8; 32]),
             CodeHash::new([42u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_a: SocketAddr = "127.0.0.1:12400".parse().unwrap();
         let sender_b: SocketAddr = "127.0.0.1:12500".parse().unwrap();
 
@@ -5716,6 +5785,7 @@ mod tests {
             ContractInstanceId::new([51u8; 32]),
             CodeHash::new([52u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender: SocketAddr = "127.0.0.1:12600".parse().unwrap();
 
         // Five consecutive queue-full delta failures (well past the N=3 Invalid
@@ -5771,6 +5841,7 @@ mod tests {
             ContractInstanceId::new([71u8; 32]),
             CodeHash::new([72u8; 32]),
         );
+        host_for_test(&op_manager, key);
         // Six DISTINCT senders (each clears its own per-sender throttle) each send
         // a distinct-payload queue-full delta for the SAME contract.
         let sender_count = 6u16;
@@ -6014,6 +6085,7 @@ mod tests {
             ContractInstanceId::new([83u8; 32]),
             CodeHash::new([84u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_a: SocketAddr = "127.0.0.1:13300".parse().unwrap();
         let sender_b: SocketAddr = "127.0.0.1:13400".parse().unwrap();
 
@@ -6517,6 +6589,7 @@ mod tests {
             ContractInstanceId::new([9u8; 32]),
             CodeHash::new([10u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12300".parse().unwrap();
 
         // One queue-full drop → immediate ResyncRequest + a spawned trailing
@@ -6602,6 +6675,7 @@ mod tests {
             ContractInstanceId::new([17u8; 32]),
             CodeHash::new([18u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12700".parse().unwrap();
 
         let r1 = drive_relay_broadcast_to(
@@ -6679,6 +6753,7 @@ mod tests {
             ContractInstanceId::new([19u8; 32]),
             CodeHash::new([20u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12800".parse().unwrap();
 
         let r1 = drive_relay_broadcast_to(
@@ -6768,6 +6843,7 @@ mod tests {
             ContractInstanceId::new([11u8; 32]),
             CodeHash::new([12u8; 32]),
         );
+        host_for_test(&op_manager, key);
         let sender_addr: SocketAddr = "127.0.0.1:12400".parse().unwrap();
 
         let r1 = drive_relay_broadcast_to(
@@ -8195,6 +8271,118 @@ mod relay_request_loop_tests {
         for _ in 0..50 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+    }
+
+    /// ANT-2026-C5XJZSLS: state on disk for a contract that is neither hosted
+    /// nor in use (evicted, reclamation pending) must not be merged into by a
+    /// relayed UPDATE: a remote peer decides when one arrives, and the write
+    /// would keep the bytes on disk outside every budget. The request is
+    /// forwarded toward the hosts instead.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_update_to_an_evicted_unhosted_contract_is_forwarded_not_merged() {
+        let (op_manager, rx, peers, _guards, store) =
+            op_manager_with_peers_and_store("update-evicted-no-merge", 2).await;
+        let sent = record_forwards(rx);
+        let from = peers[0].socket_addr().expect("addr");
+        *store.lock() = Some((unhosted_key(), WrappedState::new(vec![9; 16])));
+        assert!(!op_manager.ring.is_hosting_contract(&unhosted_key()));
+        assert!(!op_manager.ring.contract_in_use(&unhosted_key()));
+
+        relay(&op_manager, Transaction::new::<UpdateMsg>(), from).await;
+
+        assert_eq!(
+            sent.lock().len(),
+            1,
+            "the request must be forwarded, not merged into the evicted copy"
+        );
+    }
+
+    /// The other side of the rule: a hosted contract IS merged into, so the
+    /// request is handled locally and not forwarded. (The stub handler leaves
+    /// the merge unanswered; the driver logs the failure and forwards nothing.)
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_update_to_a_hosted_contract_is_merged_locally() {
+        let (op_manager, rx, peers, _guards, store) =
+            op_manager_with_peers_and_store("update-hosted-merges", 2).await;
+        let sent = record_forwards(rx);
+        let from = peers[0].socket_addr().expect("addr");
+        *store.lock() = Some((unhosted_key(), WrappedState::new(vec![9; 16])));
+        op_manager.ring.host_contract(
+            unhosted_key(),
+            16,
+            crate::ring::AccessType::Put,
+            crate::ring::HostingCause::Other,
+        );
+        assert!(op_manager.ring.is_hosting_contract(&unhosted_key()));
+
+        relay(&op_manager, Transaction::new::<UpdateMsg>(), from).await;
+
+        assert!(
+            sent.lock().is_empty(),
+            "a hosted contract takes the local apply path, not the forward path"
+        );
+    }
+
+    /// Body of the first top-level `async fn <name>(` in `src`, up to its
+    /// closing brace at column 0.
+    fn driver_body<'a>(src: &'a str, name: &str) -> &'a str {
+        let start = src.find(name).unwrap_or_else(|| panic!("{name} not found"));
+        let body = &src[start..];
+        &body[..body.find("\n}\n").unwrap_or_else(|| panic!("{name} end"))]
+    }
+
+    /// Every driver that merges a relayed write into the local copy must ask
+    /// `may_merge_relayed_update` before EVERY call that reaches the merge
+    /// (anything named `update_contract(`), so renaming a wrapper cannot slip
+    /// past: a merge call with no gate call before it in the same driver fails.
+    #[test]
+    fn every_relay_merge_site_checks_may_merge_relayed_update() {
+        let update_src = include_str!("op_ctx_task.rs");
+        let put_src = include_str!("../put/op_ctx_task.rs");
+        for (src, name) in [
+            (update_src, "async fn drive_relay_request_update("),
+            (update_src, "async fn drive_relay_broadcast_to("),
+            (update_src, "async fn drive_relay_request_update_streaming("),
+            (update_src, "async fn apply_streaming_broadcast("),
+            (put_src, "async fn drive_relay_probe_reconcile("),
+        ] {
+            // Comments may mention the merge call; only code counts.
+            let code: String = driver_body(src, name)
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let body = code.as_str();
+            let gate = body
+                .find("may_merge_relayed_update(")
+                .unwrap_or_else(|| panic!("{name} has no gate"));
+            let mut merges = 0;
+            for (at, _) in body.match_indices("update_contract(") {
+                merges += 1;
+                assert!(
+                    gate < at,
+                    "{name}: a merge call at byte {at} is not preceded by the gate"
+                );
+            }
+            assert!(
+                merges > 0,
+                "{name} no longer calls update_contract(; re-anchor"
+            );
+        }
+    }
+
+    /// A streamed `RequestUpdate` this node declines to merge is forwarded
+    /// toward the hosts, like the non-streaming request.
+    #[test]
+    fn declined_streaming_request_update_is_forwarded() {
+        let body = driver_body(
+            include_str!("op_ctx_task.rs"),
+            "async fn drive_relay_request_update_streaming(",
+        );
+        let gate = body.find("may_merge_relayed_update(").expect("gate");
+        let forward = body.find("drive_relay_request_update(").expect("forward");
+        let merge = body.find("update_contract(").expect("merge");
+        assert!(gate < forward && forward < merge);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

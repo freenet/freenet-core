@@ -2240,6 +2240,35 @@ impl<T: TimeSource> HostingCache<T> {
         }
     }
 
+    /// Update the cached `size_bytes` for `key` to the size of the state
+    /// that was just written.
+    ///
+    /// Called paired with [`Self::refresh_entry_generation`] from every
+    /// state-write chokepoint (the executor's PUT/UPDATE paths).
+    /// `record_access` sets `size_bytes` on PUT and GET only, and the UPDATE
+    /// paths must not call it (it stamps recency). Without this refresh a
+    /// contract that grows through UPDATE stays charged its PUT-time size:
+    /// `current_bytes` under-counts what is stored, `evict_over_budget`
+    /// never fires, and the hosting budget stops bounding on-disk state.
+    ///
+    /// Byte accounting only: no recency, access type or read count is
+    /// touched, so an UPDATE still cannot refresh a contract's eviction
+    /// order. Like [`Self::set_budget_bytes`] this does NOT itself evict —
+    /// the next `evict_over_budget` (on sweep or cache insert) sheds any
+    /// overage. No-op when `key` is not in the cache.
+    pub fn refresh_entry_size(&mut self, key: &ContractKey, size_bytes: u64) {
+        if let Some(existing) = self.contracts.get_mut(key) {
+            if existing.size_bytes != size_bytes {
+                // Adjust byte accounting: add new size, subtract old size
+                self.current_bytes = self
+                    .current_bytes
+                    .saturating_add(size_bytes)
+                    .saturating_sub(existing.size_bytes);
+                existing.size_bytes = size_bytes;
+            }
+        }
+    }
+
     /// Check if a contract is in the cache.
     pub fn contains(&self, key: &ContractKey) -> bool {
         self.contracts.contains_key(key)
@@ -4196,6 +4225,78 @@ mod tests {
         cache.record_access(key, 150, AccessType::Put, 0, |_| (0, 0));
         assert_eq!(cache.current_bytes(), 150);
         assert_eq!(cache.get(&key).unwrap().size_bytes, 150);
+    }
+
+    /// An UPDATE re-charges an already-hosted entry through
+    /// `refresh_entry_size`, not `record_access`. Size and `current_bytes`
+    /// follow the stored state; recency, access type, read count and the
+    /// generation snapshot stay as the last real access left them.
+    #[test]
+    fn test_refresh_entry_size_adjusts_bytes_only() {
+        let (mut cache, time) = make_cache(1000);
+        let key = make_key(1);
+        let other = make_key(2);
+
+        cache.record_access(key, 100, AccessType::Get, 7, |_| (0, 0));
+        cache.record_access(other, 50, AccessType::Get, 0, |_| (0, 0));
+        let before = cache.get(&key).unwrap().clone();
+        time.advance_time(Duration::from_secs(60));
+
+        // Contract state grows through an UPDATE
+        cache.refresh_entry_size(&key, 400);
+        assert_eq!(cache.current_bytes(), 450);
+        let after = cache.get(&key).unwrap();
+        assert_eq!(after.size_bytes, 400);
+        assert_eq!(after.recency_seq, before.recency_seq);
+        assert_eq!(after.last_access_seq, before.last_access_seq);
+        assert_eq!(after.last_accessed, before.last_accessed);
+        assert_eq!(after.last_genuine_access, before.last_genuine_access);
+        assert_eq!(after.access_type, before.access_type);
+        assert_eq!(after.read_count, before.read_count);
+        assert_eq!(after.write_generation, 7);
+
+        // Contract state shrinks through an UPDATE
+        cache.refresh_entry_size(&key, 10);
+        assert_eq!(cache.current_bytes(), 60);
+        assert_eq!(cache.get(&key).unwrap().size_bytes, 10);
+
+        // Not hosted: no phantom entry, nothing charged
+        let absent = make_key(3);
+        cache.refresh_entry_size(&absent, 500);
+        assert!(!cache.contains(&absent));
+        assert_eq!(cache.current_bytes(), 60);
+        assert_eq!(cache.len(), 2);
+    }
+
+    /// Contracts hosted small and then grown through UPDATE count toward the
+    /// byte budget, so the next sweep sheds the overage. Before
+    /// `refresh_entry_size` they stayed charged their PUT-time size,
+    /// `current_bytes` never crossed the budget and the sweep evicted nothing
+    /// however much state the UPDATEs had stored.
+    #[test]
+    fn test_sweep_evicts_contracts_grown_by_update() {
+        let (mut cache, _time) = make_cache(1000);
+        let keys = [make_key(1), make_key(2), make_key(3), make_key(4)];
+
+        for key in keys {
+            cache.record_access(key, 1, AccessType::Put, 0, |_| (0, 0)); // recency: keys[0] oldest
+        }
+        assert_eq!(cache.current_bytes(), 4);
+
+        // One UPDATE per contract grows its state to 400 bytes. The refresh
+        // itself evicts nothing.
+        for key in &keys {
+            cache.refresh_entry_size(key, 400);
+        }
+        assert_eq!(cache.len(), 4);
+        assert_eq!(cache.current_bytes(), 1600);
+
+        // Sweep sheds least-recently-accessed entries until back under budget.
+        let evicted = cache.sweep_expired(|_| (0, 0), MemoryPressure::AtCapacity);
+        assert_eq!(evicted_pairs(&evicted), vec![(keys[0], 0), (keys[1], 0)]);
+        assert!(cache.contains(&keys[2]));
+        assert!(cache.contains(&keys[3]));
+        assert_eq!(cache.current_bytes(), 800);
     }
 
     #[test]
