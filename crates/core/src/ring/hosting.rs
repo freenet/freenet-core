@@ -450,6 +450,32 @@ impl AddSubscriberOutcome {
     }
 }
 
+/// Most recently disconnected clients remembered by [`DisconnectedClients`].
+/// Far more than the requests that can be in flight for clients that have just
+/// gone; when it is full the oldest entry is forgotten.
+const MAX_REMEMBERED_DISCONNECTED_CLIENTS: usize = 65_536;
+
+/// Bounded FIFO set of client ids whose disconnect was swept.
+#[derive(Default)]
+struct DisconnectedClients {
+    order: std::collections::VecDeque<crate::client_events::ClientId>,
+    members: HashSet<crate::client_events::ClientId>,
+}
+
+impl DisconnectedClients {
+    fn insert(&mut self, client_id: crate::client_events::ClientId) {
+        if !self.members.insert(client_id) {
+            return;
+        }
+        self.order.push_back(client_id);
+        while self.order.len() > MAX_REMEMBERED_DISCONNECTED_CLIENTS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.members.remove(&oldest);
+            }
+        }
+    }
+}
+
 /// Result of removing all subscriptions for a disconnected client.
 #[derive(Debug)]
 pub struct ClientDisconnectResult {
@@ -626,6 +652,12 @@ pub(crate) struct HostingManager {
     /// have to be mirrored into each reader, and the next reader added would
     /// silently miss it.
     client_subscriptions: DashMap<ContractInstanceId, LocalSubscribers>,
+
+    /// Clients whose `Disconnect` has already been swept. A request from such a
+    /// client can still be in flight (client requests run as independent
+    /// tasks), and without this record it would register its subscription
+    /// after the sweep and keep the slot forever (ANT-2026-VCHSBVO6).
+    disconnected_clients: parking_lot::Mutex<DisconnectedClients>,
 
     /// Unified hosting cache with byte-budget demand-ordered eviction ("fuel
     /// gauge") and TTL protection. This is the single source of truth for which
@@ -838,6 +870,7 @@ impl HostingManager {
         Self {
             active_subscriptions: Default::default(),
             client_subscriptions: DashMap::new(),
+            disconnected_clients: Default::default(),
             hosting_cache: RwLock::new(HostingCache::new(budget_bytes, time_source.clone())),
             demand_estimator: RwLock::new(ProximityPrior::new()),
             own_location: RwLock::new(None),
@@ -1868,11 +1901,25 @@ impl HostingManager {
         self.maybe_record_abandonment(contract);
     }
 
+    /// Whether `client_id`'s disconnect has been swept already, so a
+    /// subscription registered for it now would never be cleaned up.
+    pub fn is_client_disconnected(&self, client_id: crate::client_events::ClientId) -> bool {
+        self.disconnected_clients
+            .lock()
+            .members
+            .contains(&client_id)
+    }
+
     /// Remove a client from ALL its subscriptions (used when client disconnects).
     pub fn remove_client_from_all_subscriptions(
         &self,
         client_id: crate::client_events::ClientId,
     ) -> ClientDisconnectResult {
+        // Record the disconnect BEFORE sweeping. A registration that lands
+        // after the sweep checks this record (`is_client_disconnected`) and
+        // undoes itself; one that landed before it is found by the sweep.
+        self.disconnected_clients.lock().insert(client_id);
+
         let mut affected_contracts = Vec::new();
 
         // Find all contracts where this client is subscribed
@@ -4853,6 +4900,32 @@ mod tests {
 
         let is_last2 = manager.remove_client_subscription(&instance_id, client2);
         assert!(is_last2);
+    }
+
+    /// ANT-2026-VCHSBVO6: the sweep records the client, and the record is a
+    /// bounded FIFO so a flood of connections cannot grow it without limit.
+    #[test]
+    fn sweep_records_the_client_and_the_record_is_bounded() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let first = crate::client_events::ClientId::next();
+        assert!(!manager.is_client_disconnected(first));
+        manager.remove_client_from_all_subscriptions(first);
+        assert!(manager.is_client_disconnected(first));
+
+        for _ in 0..MAX_REMEMBERED_DISCONNECTED_CLIENTS {
+            manager.remove_client_from_all_subscriptions(crate::client_events::ClientId::next());
+        }
+        assert!(
+            !manager.is_client_disconnected(first),
+            "the oldest record is forgotten once the bound is reached"
+        );
+        let last = crate::client_events::ClientId::next();
+        manager.remove_client_from_all_subscriptions(last);
+        assert!(manager.is_client_disconnected(last));
+        assert_eq!(
+            manager.disconnected_clients.lock().members.len(),
+            MAX_REMEMBERED_DISCONNECTED_CLIENTS
+        );
     }
 
     #[test]

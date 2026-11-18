@@ -65,12 +65,24 @@ use crate::contract::{contains_debug_sections, debug_sections};
 
 /// Helper function to register a subscription listener for GET/PUT operations with auto-subscribe
 async fn register_subscription_listener(
-    op_manager: &OpManager,
+    op_manager: &Arc<OpManager>,
     instance_id: ContractInstanceId,
     client_id: ClientId,
     subscription_listener: mpsc::Sender<HostResult>,
     operation_type: &str,
 ) -> Result<(), Error> {
+    // The client's `Disconnect` may already have been handled: requests run as
+    // independent tasks, so one can still be in flight after it. Nothing would
+    // ever clean up a subscription registered now (ANT-2026-VCHSBVO6).
+    if op_manager.ring.is_client_disconnected(client_id) {
+        tracing::debug!(
+            client_id = %client_id,
+            contract = %instance_id,
+            operation = operation_type,
+            "Client already disconnected, not registering subscription listener"
+        );
+        return Ok(());
+    }
     tracing::debug!(
         client_id = %client_id,
         contract = %instance_id,
@@ -115,6 +127,7 @@ async fn register_subscription_listener(
                     op_manager.ring.register_events(Either::Left(event)).await;
                 }
             }
+            sweep_if_client_disconnected(op_manager, client_id).await;
             Ok(())
         }
         // #4681: registration was rejected (e.g. subscriber-limit reached).
@@ -197,6 +210,87 @@ pub(crate) fn should_serve_local_copy(
     has_local_interest: bool,
 ) -> bool {
     local_satisfies_request && (connection_count == 0 || is_subscribed || has_local_interest)
+}
+
+/// Remove everything a client's `Disconnect` is responsible for: delegate
+/// notification routing, ring and interest subscriptions, upstream
+/// subscriptions nobody needs any more, and the contract handler's
+/// per-client state. Idempotent, so it is also run again when a registration
+/// lands after the client's `Disconnect` (ANT-2026-VCHSBVO6).
+async fn sweep_disconnected_client(op_manager: &Arc<OpManager>, client_id: ClientId) {
+    // Drop any delegate-notification routing registrations for this
+    // client (#3275).
+    crate::contract::delegate_app_registry::remove_client(client_id);
+
+    let result = op_manager
+        .ring
+        .remove_client_from_all_subscriptions(client_id);
+    for contract in &result.affected_contracts {
+        op_manager.interest_manager.remove_local_client(contract);
+    }
+    if !result.affected_contracts.is_empty() {
+        tracing::debug!(
+            %client_id,
+            subscriptions_cleaned = result.affected_contracts.len(),
+            "Cleaned up client subscriptions and interest tracking"
+        );
+    }
+
+    // Send Unsubscribe upstream for contracts with no remaining interest.
+    // FLIP (keystone P6, #4642): the collapse decision is driven by the
+    // reconcile controller's strict-farther interest gate
+    // (`reconcile_wants_collapse` = `!contract_in_use`), replacing the
+    // legacy ANY-downstream `should_unsubscribe_upstream`. The teardown
+    // still targets the STORED upstream (narrow flip keeps the flag).
+    for contract in &result.affected_contracts {
+        if op_manager.reconcile_wants_collapse(
+            contract,
+            crate::node::network_status::ReconcileShadowSite::Collapse,
+        ) {
+            let op_mgr = op_manager.clone();
+            let contract = *contract;
+            GlobalExecutor::spawn(async move {
+                op_mgr.send_unsubscribe_upstream(&contract).await;
+            });
+        }
+    }
+
+    // Notify contract handler to clean up shared_summaries and
+    // shared_notifications for this client (fire-and-forget — no response needed).
+    if let Err(err) = op_manager
+        .ch_outbound
+        .send_to_handler_fire_and_forget(ContractHandlerEvent::ClientDisconnect { client_id })
+    {
+        tracing::warn!(
+            %client_id,
+            error = %err,
+            "Failed to notify contract handler of client disconnect"
+        );
+    }
+
+    // Drop the session actor's registrations for this client. It only forgets
+    // one when a result is delivered, so a transaction whose request never
+    // produced a result would otherwise stay registered for good.
+    op_manager
+        .ch_outbound
+        .notify_session_actor_client_disconnect(client_id)
+        .await;
+}
+
+/// Run the disconnect sweep again if `client_id`'s `Disconnect` was handled
+/// while a registration for it was in flight.
+///
+/// The `Disconnect` records the client before it sweeps, so for any
+/// registration either the sweep finds it, or this check, which runs after the
+/// registration, sees the record and removes it (ANT-2026-VCHSBVO6).
+async fn sweep_if_client_disconnected(op_manager: &Arc<OpManager>, client_id: ClientId) {
+    if op_manager.ring.is_client_disconnected(client_id) {
+        tracing::debug!(
+            %client_id,
+            "Client disconnected while a subscription was being registered, sweeping again"
+        );
+        sweep_disconnected_client(op_manager, client_id).await;
+    }
 }
 
 /// Report an operation init failure to the client via the result router.
@@ -743,6 +837,34 @@ async fn process_open_request(
                         // its own operation lifecycle.
                         let client_tx = crate::message::Transaction::new::<put::PutMsg>();
 
+                        // Debug-compiled contracts are rejected below (#2257),
+                        // so they never get a subscription.
+                        let rejected_debug_wasm = contains_debug_sections(contract.data());
+
+                        // Register the subscription listener BEFORE the
+                        // transaction. A refused listener (subscription cap)
+                        // returns early, and a transaction registered by then
+                        // is never published a result, so the session actor
+                        // would keep it forever (ANT-2026-DN7GTB1F).
+                        if subscribe && !rejected_debug_wasm {
+                            if let Some(sl) = subscription_listener {
+                                register_subscription_listener(
+                                    &op_manager,
+                                    *contract_key.id(),
+                                    client_id,
+                                    sl,
+                                    "PUT",
+                                )
+                                .await?;
+                            } else {
+                                tracing::warn!(
+                                    client_id = %client_id,
+                                    contract = %contract_key,
+                                    "PUT with subscribe=true but no subscription_listener"
+                                );
+                            }
+                        }
+
                         op_manager
                             .ch_outbound
                             .waiting_for_transaction_result(client_tx, client_id, request_id)
@@ -765,7 +887,7 @@ async fn process_open_request(
                         // confusing "Message too long" transport error.
                         // Failing here gives the client an actionable
                         // "recompile with --release" message instead.
-                        if contains_debug_sections(contract.data()) {
+                        if rejected_debug_wasm {
                             // Re-scan only on the (rare) rejection path to
                             // name the offending sections in the error.
                             let detected = debug_sections(contract.data());
@@ -785,25 +907,6 @@ async fn process_open_request(
                             )
                             .await;
                             return Ok(None);
-                        }
-
-                        if subscribe {
-                            if let Some(sl) = subscription_listener {
-                                register_subscription_listener(
-                                    &op_manager,
-                                    *contract_key.id(),
-                                    client_id,
-                                    sl,
-                                    "PUT",
-                                )
-                                .await?;
-                            } else {
-                                tracing::warn!(
-                                    client_id = %client_id,
-                                    contract = %contract_key,
-                                    "PUT with subscribe=true but no subscription_listener"
-                                );
-                            }
                         }
 
                         if let Err(err) = put::op_ctx_task::start_client_put(
@@ -1374,20 +1477,8 @@ async fn process_open_request(
 
                         let client_tx = crate::message::Transaction::new::<get::GetMsg>();
 
-                        op_manager
-                            .ch_outbound
-                            .waiting_for_transaction_result(client_tx, client_id, request_id)
-                            .await
-                            .inspect_err(|err| {
-                                tracing::error!(
-                                    client_id = %client_id,
-                                    request_id = %request_id,
-                                    tx = %client_tx,
-                                    error = %err,
-                                    "Error waiting for transaction result"
-                                )
-                            })?;
-
+                        // Listener first, transaction second: see the PUT arm
+                        // (ANT-2026-DN7GTB1F).
                         if subscribe {
                             if let Some(sl) = subscription_listener {
                                 register_subscription_listener(
@@ -1406,6 +1497,20 @@ async fn process_open_request(
                                 );
                             }
                         }
+
+                        op_manager
+                            .ch_outbound
+                            .waiting_for_transaction_result(client_tx, client_id, request_id)
+                            .await
+                            .inspect_err(|err| {
+                                tracing::error!(
+                                    client_id = %client_id,
+                                    request_id = %request_id,
+                                    tx = %client_tx,
+                                    error = %err,
+                                    "Error waiting for transaction result"
+                                )
+                            })?;
 
                         // `report_op_init_error` takes a &ContractKey, so we
                         // synthesize one from the instance_id for the error
@@ -1572,6 +1677,7 @@ async fn process_open_request(
                                         op_manager.ring.register_events(Either::Left(event)).await;
                                     }
                                 }
+                                sweep_if_client_disconnected(&op_manager, client_id).await;
                             }
                             // #4681: registration rejected (e.g. subscriber-limit
                             // reached). Forward the underlying RequestError so the
@@ -1988,54 +2094,7 @@ async fn process_open_request(
                     "Received disconnect request from client, triggering subscription cleanup"
                 );
 
-                // Drop any delegate-notification routing registrations for this
-                // client (#3275).
-                crate::contract::delegate_app_registry::remove_client(client_id);
-
-                let result = op_manager
-                    .ring
-                    .remove_client_from_all_subscriptions(client_id);
-                for contract in &result.affected_contracts {
-                    op_manager.interest_manager.remove_local_client(contract);
-                }
-                if !result.affected_contracts.is_empty() {
-                    tracing::debug!(
-                        %client_id,
-                        subscriptions_cleaned = result.affected_contracts.len(),
-                        "Cleaned up client subscriptions and interest tracking"
-                    );
-                }
-
-                // Send Unsubscribe upstream for contracts with no remaining interest.
-                // FLIP (keystone P6, #4642): the collapse decision is driven by the
-                // reconcile controller's strict-farther interest gate
-                // (`reconcile_wants_collapse` = `!contract_in_use`), replacing the
-                // legacy ANY-downstream `should_unsubscribe_upstream`. The teardown
-                // still targets the STORED upstream (narrow flip keeps the flag).
-                for contract in &result.affected_contracts {
-                    if op_manager.reconcile_wants_collapse(
-                        contract,
-                        crate::node::network_status::ReconcileShadowSite::Collapse,
-                    ) {
-                        let op_mgr = op_manager.clone();
-                        let contract = *contract;
-                        GlobalExecutor::spawn(async move {
-                            op_mgr.send_unsubscribe_upstream(&contract).await;
-                        });
-                    }
-                }
-
-                // Notify contract handler to clean up shared_summaries and
-                // shared_notifications for this client (fire-and-forget — no response needed).
-                if let Err(err) = op_manager.ch_outbound.send_to_handler_fire_and_forget(
-                    ContractHandlerEvent::ClientDisconnect { client_id },
-                ) {
-                    tracing::warn!(
-                        %client_id,
-                        error = %err,
-                        "Failed to notify contract handler of client disconnect"
-                    );
-                }
+                sweep_disconnected_client(&op_manager, client_id).await;
             }
             ClientRequest::NodeQueries(query) => {
                 tracing::debug!(
@@ -2938,6 +2997,287 @@ mod delegate_request_outcome_tests {
             matches!(res, Err(Error::Op(OpError::UnexpectedOpState))),
             "a response of the wrong ContractHandlerEvent variant must be \
              reported, not silently accepted; got {res:?}"
+        );
+    }
+}
+
+/// Client `Disconnect` racing in-flight registrations (ANT-2026-VCHSBVO6) and
+/// refused subscribing requests leaving transactions registered
+/// (ANT-2026-DN7GTB1F). Both drive the real `process_open_request` against a
+/// scripted contract handler.
+#[cfg(test)]
+mod disconnect_and_refusal_tests {
+    use std::sync::Arc;
+
+    use freenet_stdlib::client_api::{
+        ClientRequest, ContractError as StdContractError, ContractRequest, RequestError,
+    };
+    use freenet_stdlib::prelude::*;
+    use futures::{FutureExt, StreamExt};
+    use tokio::sync::mpsc;
+
+    use super::{
+        ClientId, ContractHandlerEvent, Error, OpenRequest, process_open_request,
+        register_subscription_listener,
+    };
+    use crate::config::ConfigArgs;
+    use crate::contract::{ContractHandlerChannel, SessionMessage, WaitingResolution};
+    use crate::dev_tool::OperationMode;
+    use crate::node::OpManager;
+
+    struct Harness {
+        op_manager: Arc<OpManager>,
+        /// Messages the node sends to the session actor.
+        session_rx: mpsc::Receiver<SessionMessage>,
+        /// The event loop's client-transaction registrations.
+        wait_for_event: ContractHandlerChannel<WaitingResolution>,
+        /// One `()` per `RegisterSubscriberListener` the handler has received.
+        got_rx: mpsc::UnboundedReceiver<()>,
+        /// A gated handler holds its reply until a permit is added.
+        go: Arc<tokio::sync::Semaphore>,
+        _guards: Box<dyn std::any::Any>,
+    }
+
+    fn contract_key() -> ContractKey {
+        ContractKey::from_id_and_code(ContractInstanceId::new([3u8; 32]), CodeHash::new([4u8; 32]))
+    }
+
+    /// An `OpManager` over a scripted contract handler: every
+    /// `RegisterSubscriberListener` is answered `Ok`, or refused as a
+    /// subscription-limit rejection when `refuse` is set, after waiting for a
+    /// permit when `gated`.
+    async fn harness(id: &str, refuse: bool, gated: bool) -> Harness {
+        let config_args = ConfigArgs {
+            id: Some(id.to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let mut node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        node_config.own_addr = Some("127.0.0.1:31337".parse().unwrap());
+
+        let (notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (mut ops_ch_channel, mut ch_channel, wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let (session_tx, session_rx) = mpsc::channel(64);
+        ops_ch_channel.with_session_adapter(session_tx);
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, result_router_rx) = mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .peer_ready
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let (got_tx, got_rx) = mpsc::unbounded_channel();
+        let go = Arc::new(tokio::sync::Semaphore::new(0));
+        let handler_go = go.clone();
+        tokio::spawn(async move {
+            while let Ok((event_id, ev, _priority)) = ch_channel.recv_from_sender().await {
+                if let ContractHandlerEvent::RegisterSubscriberListener { .. } = ev {
+                    let _ = got_tx.send(());
+                    if gated {
+                        handler_go.acquire().await.expect("semaphore open").forget();
+                    }
+                    let result = if refuse {
+                        Err(Box::new(RequestError::ContractError(
+                            StdContractError::Subscribe {
+                                key: contract_key(),
+                                cause: "per-client subscription limit (500) reached".into(),
+                            },
+                        )))
+                    } else {
+                        Ok(())
+                    };
+                    let _ = ch_channel
+                        .send_to_sender(
+                            event_id,
+                            ContractHandlerEvent::RegisterSubscriberListenerResponse { result },
+                        )
+                        .await;
+                }
+            }
+        });
+
+        Harness {
+            op_manager,
+            session_rx,
+            wait_for_event,
+            got_rx,
+            go,
+            _guards: Box::new((notification_rx, result_router_rx, task_monitor)),
+        }
+    }
+
+    fn disconnect(client: ClientId) -> OpenRequest<'static> {
+        OpenRequest::new(client, Box::new(ClientRequest::Disconnect { cause: None }))
+    }
+
+    fn drain(rx: &mut mpsc::Receiver<SessionMessage>) -> Vec<SessionMessage> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// A subscription registered by a request that was still in flight when its
+    /// client's `Disconnect` was handled must not stay behind: nothing would
+    /// ever remove it, and 256 of them fill the contract's subscriber slots.
+    #[tokio::test(flavor = "current_thread")]
+    async fn subscription_registered_during_a_disconnect_is_removed() {
+        let mut h = harness("disconnect-race-in-flight", false, true).await;
+        let instance_id = *contract_key().id();
+        let client = ClientId::next();
+        let (listener, _listener_rx) = mpsc::channel(1);
+
+        let op_manager = h.op_manager.clone();
+        let registration = tokio::spawn(async move {
+            register_subscription_listener(&op_manager, instance_id, client, listener, "GET").await
+        });
+        // The handler holds the registration; now the client disconnects.
+        h.got_rx
+            .recv()
+            .await
+            .expect("handler received the listener");
+        process_open_request(disconnect(client), h.op_manager.clone(), None)
+            .await
+            .await
+            .expect("disconnect is handled");
+        h.go.add_permits(1);
+        registration.await.unwrap().expect("registration returns");
+
+        assert!(
+            !h.op_manager.ring.has_client_subscriptions(&contract_key()),
+            "a subscription registered after the client's disconnect leaked"
+        );
+    }
+
+    /// A request that arrives after its client's `Disconnect` registers nothing.
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnected_client_registers_no_listener() {
+        let mut h = harness("disconnect-race-after", false, false).await;
+        let instance_id = *contract_key().id();
+        let client = ClientId::next();
+        process_open_request(disconnect(client), h.op_manager.clone(), None)
+            .await
+            .await
+            .expect("disconnect is handled");
+
+        let (listener, _listener_rx) = mpsc::channel(1);
+        register_subscription_listener(&h.op_manager, instance_id, client, listener, "PUT")
+            .await
+            .expect("registration returns");
+
+        assert!(
+            h.got_rx.try_recv().is_err(),
+            "the handler was asked to register"
+        );
+        assert!(!h.op_manager.ring.has_client_subscriptions(&contract_key()));
+    }
+
+    /// A client that stays connected still gets its subscription.
+    #[tokio::test(flavor = "current_thread")]
+    async fn connected_client_keeps_its_subscription() {
+        let h = harness("disconnect-race-control", false, false).await;
+        let instance_id = *contract_key().id();
+        let client = ClientId::next();
+        let (listener, _listener_rx) = mpsc::channel(1);
+        register_subscription_listener(&h.op_manager, instance_id, client, listener, "GET")
+            .await
+            .expect("registration returns");
+        assert!(h.op_manager.ring.has_client_subscriptions(&contract_key()));
+    }
+
+    /// The session actor forgets a client's transactions on disconnect; until
+    /// now `ClientDisconnect` was never sent outside tests.
+    #[tokio::test(flavor = "current_thread")]
+    async fn disconnect_tells_the_session_actor() {
+        let mut h = harness("disconnect-session-actor", false, false).await;
+        let client = ClientId::next();
+        process_open_request(disconnect(client), h.op_manager.clone(), None)
+            .await
+            .await
+            .expect("disconnect is handled");
+
+        let sent = drain(&mut h.session_rx);
+        assert!(
+            sent.iter().any(|m| matches!(
+                m, SessionMessage::ClientDisconnect { client_id } if *client_id == client
+            )),
+            "no ClientDisconnect reached the session actor: {sent:?}"
+        );
+    }
+
+    /// A subscribing PUT refused at the subscription cap must not leave its
+    /// transaction registered: no result is ever published for it, so the
+    /// session actor (and the event loop) would keep it for good.
+    #[tokio::test(flavor = "current_thread")]
+    async fn refused_subscribing_put_registers_no_transaction() {
+        let mut h = harness("refused-put", true, false).await;
+        let client = ClientId::next();
+        let (listener, _listener_rx) = mpsc::channel(1);
+        let contract = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            Arc::new(ContractCode::from(vec![1u8, 2, 3])),
+            Parameters::from(vec![]),
+        )));
+        let mut request = OpenRequest::new(
+            client,
+            Box::new(ClientRequest::ContractOp(ContractRequest::Put {
+                contract,
+                state: WrappedState::new(vec![1u8]),
+                related_contracts: RelatedContracts::default(),
+                subscribe: true,
+                blocking_subscribe: false,
+            })),
+        );
+        request.notification_channel = Some(listener);
+
+        let result = process_open_request(request, h.op_manager.clone(), None)
+            .await
+            .await;
+        assert!(
+            matches!(result, Err(Error::Registration(_))),
+            "the refusal must reach the client: {result:?}"
+        );
+
+        let sent = drain(&mut h.session_rx);
+        assert!(
+            sent.iter()
+                .all(|m| !matches!(m, SessionMessage::RegisterTransaction { .. })),
+            "the session actor was left holding a transaction: {sent:?}"
+        );
+        assert!(
+            h.wait_for_event.next().now_or_never().is_none(),
+            "the event loop was left holding a transaction"
+        );
+    }
+
+    /// The GET arm registers the listener before the transaction, like the PUT
+    /// arm. A source pin: building a GET that reaches that point needs a
+    /// routable network.
+    #[test]
+    fn get_arm_registers_the_listener_before_the_transaction() {
+        let src = include_str!("client_events.rs");
+        let arm = &src[src.find("get::GetMsg>();").expect("GET arm")..];
+        let listener = arm.find("\"GET\",").expect("GET listener registration");
+        let transaction = arm
+            .find(".waiting_for_transaction_result(client_tx")
+            .expect("GET transaction registration");
+        assert!(
+            listener < transaction,
+            "a refused listener would return with the transaction registered"
         );
     }
 }

@@ -656,6 +656,35 @@ impl ContractHandlerChannel<SenderHalve> {
         }
     }
 
+    /// Tell the session actor that `client_id` is gone, so it drops every
+    /// transaction still registered for that client. Without this the actor
+    /// only forgets a registration when a result is delivered for it, and a
+    /// request that was refused after registering never gets one
+    /// (ANT-2026-DN7GTB1F).
+    pub async fn notify_session_actor_client_disconnect(&self, client_id: ClientId) {
+        let Some(session_tx) = &self.session_adapter_tx else {
+            return;
+        };
+        let msg = SessionMessage::ClientDisconnect { client_id };
+        match tokio::time::timeout(Self::WAIT_FOR_RES_SEND_TIMEOUT, session_tx.send(msg)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::error!(
+                    client = %client_id,
+                    error = %e,
+                    "Failed to notify session actor of client disconnect — receiver dropped"
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    client = %client_id,
+                    timeout_secs = Self::WAIT_FOR_RES_SEND_TIMEOUT.as_secs(),
+                    "Timed out notifying session actor of client disconnect — channel full"
+                );
+            }
+        }
+    }
+
     /// Send an event to the contract handler without waiting for a response.
     ///
     /// Used for fire-and-forget events like `ClientDisconnect` that don't
