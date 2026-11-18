@@ -217,7 +217,19 @@ impl PendingBroadcastStore {
         let now_ms = GlobalSimulationTime::read_time_ms();
         let mut entries = self.entries.lock();
         self.drop_expired(&mut entries, now_ms);
-        entries.contains(contract)
+        // The sweep above is positional (oldest stash first). A re-stashed
+        // entry keeps its old stamp at the newest end, so check this entry's
+        // own stamp: expired means absent, and it is dropped here.
+        let expired = match entries.peek(contract) {
+            None => return false,
+            Some(at) => now_ms.saturating_sub(*at) >= PENDING_BROADCAST_TTL_MS,
+        };
+        if expired {
+            entries.pop(contract);
+            self.note_expired();
+            return false;
+        }
+        true
     }
 
     /// Remove the pending entry for `contract`, returning `true` only if one
@@ -263,6 +275,12 @@ impl PendingBroadcastStore {
             );
         }
         let mut entries = self.entries.lock();
+        // Insert only if absent. While the read was awaiting, another stash of
+        // this id may have been made; its fresher stamp must win, not be
+        // shortened by this older one.
+        if entries.contains(&contract) {
+            return;
+        }
         if let Some((displaced, _)) = entries.push(contract, stashed_at_ms) {
             if displaced != contract {
                 self.evicted_at_capacity.fetch_add(1, Ordering::Relaxed);
@@ -554,6 +572,51 @@ mod tests {
             !store.contains(&cid(1)),
             "TTL still counts from the first stash"
         );
+        GlobalSimulationTime::clear_time();
+    }
+
+    /// A concurrent stash made while the read was awaiting must not be
+    /// overwritten by the re-stash (which carries an older stamp).
+    #[test]
+    fn restash_after_failed_read_does_not_overwrite_a_concurrent_stash() {
+        GlobalSimulationTime::set_time_ms(0);
+        let store = PendingBroadcastStore::new();
+        store.stash(cid(1));
+        let stamp = store.take_stamped(&cid(1)).expect("entry present");
+        // A fresh stash of the same id lands while the read is in flight.
+        GlobalSimulationTime::set_time_ms(PENDING_BROADCAST_TTL_MS - 1);
+        store.stash(cid(1));
+        store.restash_after_failed_read(cid(1), stamp);
+        // Past the old stamp's TTL; the fresher stash must still be live.
+        GlobalSimulationTime::set_time_ms(PENDING_BROADCAST_TTL_MS + 1);
+        assert!(
+            store.contains(&cid(1)),
+            "the concurrent fresher stash must keep its own stamp"
+        );
+        GlobalSimulationTime::clear_time();
+    }
+
+    /// A re-stashed entry sits at the newest end with an old stamp, behind the
+    /// positional sweep. `contains` must still report it expired and drop it.
+    #[test]
+    fn contains_checks_the_entry_s_own_stamp_after_a_restash() {
+        GlobalSimulationTime::set_time_ms(0);
+        let store = PendingBroadcastStore::new();
+        store.stash(cid(1));
+        let stamp = store.take_stamped(&cid(1)).expect("entry present");
+        GlobalSimulationTime::set_time_ms(PENDING_BROADCAST_TTL_MS - 1);
+        store.stash(cid(2));
+        store.restash_after_failed_read(cid(1), stamp);
+        assert_eq!(store.len(), 2);
+        // cid(2) is still live, so the positional sweep stops at it and never
+        // reaches the older-stamped cid(1) behind it.
+        GlobalSimulationTime::set_time_ms(PENDING_BROADCAST_TTL_MS + 1);
+        assert!(
+            !store.contains(&cid(1)),
+            "expired entry must read as absent"
+        );
+        assert_eq!(store.len(), 1, "and be dropped");
+        assert!(store.contains(&cid(2)));
         GlobalSimulationTime::clear_time();
     }
 
