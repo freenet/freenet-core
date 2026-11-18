@@ -5,6 +5,7 @@ pub(crate) mod backoff;
 pub(crate) mod blocking;
 pub(crate) mod byte_bounded_lru;
 pub(crate) mod decision_hasher;
+pub(crate) mod id_block;
 pub(crate) use decision_hasher::{DecisionDashMap, DecisionHashMap, DecisionHashSet};
 pub mod deterministic_select;
 /// Internal to the `freenet` binary: not a stable API (it exposes reqwest types).
