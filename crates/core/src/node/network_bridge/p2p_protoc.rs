@@ -6708,7 +6708,11 @@ pub(crate) mod tests {
         // does not start writing a stash on every fan-out.
         let branch = &body[covered_pos..retry_pos];
         assert!(
-            branch.contains("pending_broadcasts.take(key.id()).is_some()"),
+            branch
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("if op_manager.pending_broadcasts.take(key.id()) {"),
             "the fully-covered branch must act on a deferred re-broadcast stash \
              only when one EXISTS. An unconditional take discards an earlier \
              give-up's stash with no replacement; an unconditional stash adds a \

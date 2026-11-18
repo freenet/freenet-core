@@ -2551,9 +2551,13 @@ where
                 // `pending_broadcasts` clause so the #4359 fresh-PUT flush at
                 // the matching arm still runs for any contract that owes one.
                 // Skipping is safe for the flush because a deferred broadcast
-                // is only ever stashed for a contract THIS node originated
-                // (broadcast give-up), so the flush is a guaranteed no-op for
-                // every contract this gate skips. The predicates take a
+                // is only ever stashed for a contract THIS node stored and
+                // tried to fan out (broadcast give-up). That includes a remote
+                // peer's PUT stored under every-hop hosting, not only
+                // contracts this node originated, so the guard here is the
+                // `pending_broadcasts` clause above: any contract that owes a
+                // flush passes the gate, and every contract the gate skips has
+                // no pending entry. The predicates take a
                 // synthetic key with a zero code hash: `ContractKey` equality
                 // and hashing are instance-only (freenet-stdlib `key.rs`), so
                 // the hosting / subscription maps resolve correctly from the
