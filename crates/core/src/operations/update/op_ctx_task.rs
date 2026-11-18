@@ -4749,6 +4749,49 @@ mod tests {
         assert_eq!(events.get(Ev::RxNotHosted), 0, "{events:?}");
     }
 
+    /// The streaming receive path declines a broadcast for a contract this
+    /// node does not host: it counts `RxNotHosted` and returns before the
+    /// dedup cache, the sender-summary seeding and the merge.
+    #[tokio::test]
+    async fn streaming_broadcast_for_an_unhosted_contract_is_counted_and_not_merged() {
+        use crate::operations::update::propagation_stats::PropagationEvent as Ev;
+
+        let (op_manager, _notification_rx, _guard) =
+            build_queue_full_test_node("rx-not-hosted-streaming").await;
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([21u8; 32]),
+            CodeHash::new([22u8; 32]),
+        );
+        let state = vec![4u8, 5, 6];
+        let result: Result<(), OpError> = apply_streaming_broadcast(
+            &op_manager,
+            Transaction::new::<UpdateMsg>(),
+            key,
+            state.clone(),
+            Vec::new(),
+            "127.0.0.1:12301".parse().unwrap(),
+            crate::ring::broadcast_coverage::CoveredPeers::empty(),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?}");
+        let mix = &op_manager.payload_mix;
+        assert_eq!(mix.propagation_event_for_test(Ev::RxNotHosted), 1);
+        for other in [Ev::RxDedup, Ev::RxAlreadyApplied, Ev::RxBackoff] {
+            assert_eq!(mix.propagation_event_for_test(other), 0, "{other:?}");
+        }
+        // The skip returned before the dedup cache: the same payload is still
+        // unseen, which it would not be had the merge path run.
+        assert!(
+            !op_manager.broadcast_dedup_cache.check_and_insert(
+                &key,
+                &state,
+                false,
+                op_manager.interest_manager.now(),
+            ),
+            "a declined broadcast must not reach the dedup cache or the merge"
+        );
+    }
+
     /// Mark `key` hosted, as a contract this node stores is.
     fn host_for_test(op_manager: &OpManager, key: ContractKey) {
         op_manager.ring.host_contract(
@@ -8427,10 +8470,42 @@ mod relay_request_loop_tests {
             let body = pinned_fn_body(src, name);
             let gate = call_at(&body, "may_merge_relayed_update(", name);
             let line_start = body[..gate].rfind('\n').map_or(0, |n| n + 1);
-            let before_gate = body[line_start..gate].trim_start();
+            let line_end = body[gate..].find('\n').map_or(body.len(), |n| gate + n);
+            let condition = body[line_start..line_end].trim();
+            // The gate must sit in an `if` whose condition is an `&&` chain:
+            // an `||` or a literal term (`if false && gate(..)`, `if x || gate(..)`)
+            // lets the merge run without the gate deciding. The gate term is
+            // exactly `[!]<path>.may_merge_relayed_update(<args>)`.
+            let chain = condition
+                .strip_prefix("if ")
+                .unwrap_or_else(|| panic!("{name}: gate line is not an `if`: `{condition}`"));
+            let chain = chain.strip_suffix('{').unwrap_or(chain).trim();
             assert!(
-                before_gate.starts_with("if "),
-                "{name}: the gate must be an `if` condition, found `{before_gate}`"
+                !chain.contains("||"),
+                "{name}: `||` in gate condition `{condition}`"
+            );
+            let gate_terms: Vec<&str> = chain
+                .split("&&")
+                .map(str::trim)
+                .inspect(|term| {
+                    assert!(
+                        !matches!(*term, "false" | "true" | "0" | "1"),
+                        "{name}: literal term in gate condition `{condition}`"
+                    );
+                })
+                .filter(|term| term.contains("may_merge_relayed_update("))
+                .collect();
+            assert_eq!(gate_terms.len(), 1, "{name}: gate term in `{condition}`");
+            let term = gate_terms[0].trim_start_matches('!').trim_start();
+            let (path, args) = term
+                .split_once("may_merge_relayed_update(")
+                .expect("term contains the gate call");
+            assert!(
+                path.chars()
+                    .all(|c| c.is_alphanumeric() || "_.".contains(c))
+                    && args.ends_with(')')
+                    && !args.contains('('),
+                "{name}: the gate term must be exactly the gate call, found `{term}`"
             );
             let mut merges = 0;
             for (at, _) in body.match_indices("update_contract(") {

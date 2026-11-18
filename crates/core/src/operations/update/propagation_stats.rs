@@ -559,12 +559,17 @@ pub(crate) fn aggregate_window(
 /// the background task started with [`Self::start_summary_task`].
 pub(crate) struct UpdatePropagationStats {
     contracts: DashMap<ContractInstanceId, ContractCounters>,
+    /// [`PropagationEvent::RxNotHosted`] this window. Node-wide on purpose:
+    /// the event is by definition for a contract this node does not host, so
+    /// it never has a per-contract entry (see [`Self::record_received`]).
+    rx_not_hosted: std::sync::atomic::AtomicU64,
 }
 
 impl UpdatePropagationStats {
     pub(crate) fn new() -> Self {
         Self {
             contracts: DashMap::new(),
+            rx_not_hosted: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -616,6 +621,11 @@ impl UpdatePropagationStats {
         ev: PropagationEvent,
         hosted: bool,
     ) {
+        if ev == PropagationEvent::RxNotHosted {
+            self.rx_not_hosted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let entry = if hosted {
             self.counters(contract)
         } else {
@@ -732,13 +742,33 @@ impl UpdatePropagationStats {
         out
     }
 
+    /// Drain the window: the per-contract summary and the node-wide
+    /// `rx_not_hosted` count (which has no per-contract entries).
+    fn take_window(&self) -> (Option<WindowSummary>, u64) {
+        let skipped = self
+            .rx_not_hosted
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        (aggregate_window(self.drain_window(), TOP_K), skipped)
+    }
+
     /// Drain the current window and emit it at INFO.
     ///
     /// Public for the periodic task and for deterministic unit tests (which
     /// call it directly after recording, instead of waiting on the real-time
     /// ticker).
     pub(crate) fn drain_and_log(&self) {
-        let Some(summary) = aggregate_window(self.drain_window(), TOP_K) else {
+        let (summary, rx_not_hosted) = self.take_window();
+        let Some(summary) = summary else {
+            if rx_not_hosted > 0 {
+                // Only broadcasts for contracts this node does not host: no
+                // per-contract entry exists, but the count must stay visible.
+                tracing::info!(
+                    rx_not_hosted,
+                    window_s = SUMMARY_WINDOW.as_secs(),
+                    phase = "summary",
+                    "update_propagation_summary"
+                );
+            }
             // Nothing happened this window — stay silent (budget rule).
             return;
         };
@@ -776,7 +806,7 @@ impl UpdatePropagationStats {
             rx_dedup = e.get(PropagationEvent::RxDedup),
             rx_already_applied = e.get(PropagationEvent::RxAlreadyApplied),
             rx_backoff = e.get(PropagationEvent::RxBackoff),
-            rx_not_hosted = e.get(PropagationEvent::RxNotHosted),
+            rx_not_hosted,
             window_s = SUMMARY_WINDOW.as_secs(),
             phase = "summary",
             "update_propagation_summary"
@@ -816,7 +846,6 @@ impl UpdatePropagationStats {
                 rx_dedup = e.get(PropagationEvent::RxDedup),
                 rx_already_applied = e.get(PropagationEvent::RxAlreadyApplied),
                 rx_backoff = e.get(PropagationEvent::RxBackoff),
-                rx_not_hosted = e.get(PropagationEvent::RxNotHosted),
                 phase = "summary_contract",
                 "update_propagation_summary contract detail"
             );
@@ -1595,6 +1624,21 @@ mod tests {
     /// carries, before any hosting check, so it counts only against a
     /// contract already tracked: a peer replaying broadcasts for random keys
     /// must not fill the tracking cap and lock this node's own contracts out.
+    /// A broadcast skipped for an unhosted contract has no per-contract
+    /// entry, yet the window must still report it (node-wide), alone or
+    /// beside other activity.
+    #[test]
+    fn an_unhosted_skip_is_reported_node_wide_in_the_window() {
+        let stats = UpdatePropagationStats::new();
+        let id = ContractInstanceId::new([9u8; 32]);
+        stats.record_received(id, PropagationEvent::RxNotHosted, false);
+        stats.record_received(id, PropagationEvent::RxNotHosted, false);
+        let (summary, skipped) = stats.take_window();
+        assert!(summary.is_none(), "no per-contract entry is created");
+        assert_eq!(skipped, 2);
+        assert_eq!(stats.take_window().1, 0, "the window resets");
+    }
+
     #[test]
     fn a_received_event_never_allocates_a_tracking_entry() {
         let id_at = |i: usize| {
