@@ -1607,8 +1607,11 @@ mod tests {
 
         let a_events = stats.events_for_test(&a);
         for ev in PropagationEvent::ALL {
+            // `RxNotHosted` is counted node-wide, never against a contract.
             let want = if ev == PropagationEvent::SkipSummaryEqual {
                 2
+            } else if ev == PropagationEvent::RxNotHosted {
+                0
             } else {
                 1
             };
@@ -1620,13 +1623,8 @@ mod tests {
         assert_eq!(a_events.sent(), 2, "sent = sent_delta + sent_full");
     }
 
-    /// A receiver-side event names whatever contract an inbound broadcast
-    /// carries, before any hosting check, so it counts only against a
-    /// contract already tracked: a peer replaying broadcasts for random keys
-    /// must not fill the tracking cap and lock this node's own contracts out.
     /// A broadcast skipped for an unhosted contract has no per-contract
-    /// entry, yet the window must still report it (node-wide), alone or
-    /// beside other activity.
+    /// entry, yet the window must still report it (node-wide).
     #[test]
     fn an_unhosted_skip_is_reported_node_wide_in_the_window() {
         let stats = UpdatePropagationStats::new();
@@ -1639,6 +1637,10 @@ mod tests {
         assert_eq!(stats.take_window().1, 0, "the window resets");
     }
 
+    /// A receiver-side event names whatever contract an inbound broadcast
+    /// carries, before any hosting check, so it counts only against a
+    /// contract already tracked: a peer replaying broadcasts for random keys
+    /// must not fill the tracking cap and lock this node's own contracts out.
     #[test]
     fn a_received_event_never_allocates_a_tracking_entry() {
         let id_at = |i: usize| {
