@@ -1720,6 +1720,38 @@ where
                         htl,
                         skip_list,
                     } => {
+                        // A reconcile delivers a delta that is merged through
+                        // `update_contract`, the same path an UPDATE takes, so it
+                        // is charged to the same per-(sender, contract) budget as
+                        // the routed `RequestUpdate*` opcodes
+                        // (ANT-2026-0ILTPRIJ). Sharing that class means switching
+                        // opcode gains a sender nothing. Only a remote sender is
+                        // charged; `source_addr` is `None` for this node's own
+                        // loopback.
+                        //
+                        // A refused reconcile is not repaired: it is best-effort
+                        // by design (the originator holds the merged state and
+                        // anti-entropy heals the receiver, see
+                        // `drive_relay_probe_reconcile`), and the limiter records
+                        // the refusal in its counters and its once-a-minute log.
+                        if let Some(sender_addr) = source_addr {
+                            let decision = op_manager.ring.update_rate_limiter.check_and_record(
+                                sender_addr,
+                                *key.id(),
+                                crate::ring::update_rate_limit::UpdateClass::Request,
+                            );
+                            if !decision.is_allowed() {
+                                tracing::debug!(
+                                    tx = %id,
+                                    contract = %key,
+                                    %sender_addr,
+                                    ?decision,
+                                    phase = "put_probe_reconcile_rate_limited",
+                                    "PUT dispatch: ProbeReconcile refused by the UPDATE rate limiter"
+                                );
+                                return Ok(());
+                            }
+                        }
                         if let Err(err) = put::op_ctx_task::start_relay_probe_reconcile(
                             op_manager.clone(),
                             *id,
@@ -8823,6 +8855,99 @@ mod tests {
             op_manager.interest_manager.outstanding_resync_retries(),
             0,
             "and it must take no node-wide follow-up slot"
+        );
+    }
+
+    /// ANT-2026-0ILTPRIJ: a `PutMsg::ProbeReconcile` delivers a delta that is
+    /// merged like an UPDATE, so it must be charged to the UPDATE rate limiter
+    /// in the same class as `RequestUpdate`. Before the fix the PUT dispatch
+    /// went straight to the driver and the limiter never saw it.
+    #[tokio::test]
+    async fn probe_reconcile_is_charged_to_the_update_rate_limiter() {
+        use crate::message::NetMessageV1;
+        use crate::operations::put::PutMsg;
+        use crate::operations::test_utils::MockNetworkBridge;
+        use crate::ring::update_rate_limit::UpdateClass;
+        use crate::util::time_source::SharedMockTimeSource;
+
+        let clock = SharedMockTimeSource::new();
+        let config_args = crate::config::ConfigArgs {
+            id: Some("probe-reconcile-rate-limit".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let mut node_config = NodeConfig::new(config_args.build().await.expect("build Config"))
+            .await
+            .expect("build NodeConfig");
+        node_config.update_rate_limit_time_source_override =
+            Some(std::sync::Arc::new(clock.clone()));
+
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = std::sync::Arc::new(
+            crate::node::OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        op_manager.ring.attach_op_manager(&op_manager);
+        op_manager
+            .ring
+            .connection_manager
+            .set_own_addr_local_for_test("127.0.0.1:14401".parse().unwrap());
+
+        let key = freenet_stdlib::prelude::ContractKey::from_id_and_code(
+            freenet_stdlib::prelude::ContractInstanceId::new([61u8; 32]),
+            freenet_stdlib::prelude::CodeHash::new([62u8; 32]),
+        );
+        let sender_addr: SocketAddr = "127.0.0.1:15301".parse().unwrap();
+        let bridge = MockNetworkBridge::new();
+        let mut listener: Box<dyn NetEventRegister> =
+            Box::new(crate::tracing::DynamicRegister::new(vec![]));
+
+        // A routed UPDATE request from this sender for this contract has just
+        // spent the pair's request budget; on the frozen clock it stays spent.
+        assert!(
+            op_manager
+                .ring
+                .update_rate_limiter
+                .check_and_record(sender_addr, *key.id(), UpdateClass::Request)
+                .is_allowed(),
+            "precondition: the first request for a fresh pair is allowed"
+        );
+
+        handle_pure_network_message_v1(
+            NetMessageV1::Put(PutMsg::ProbeReconcile {
+                id: Transaction::new::<PutMsg>(),
+                key,
+                delta: freenet_stdlib::prelude::StateDelta::from(vec![1u8, 2, 3]),
+                htl: 3,
+                skip_list: Default::default(),
+            }),
+            Some(sender_addr),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a rate-limited drop");
+
+        assert_eq!(
+            op_manager.ring.update_rate_limiter.rejected_total(),
+            1,
+            "a ProbeReconcile from a sender whose request budget for this \
+             contract is spent must be refused by the UPDATE rate limiter"
         );
     }
 

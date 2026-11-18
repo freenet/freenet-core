@@ -1945,6 +1945,11 @@ where
     CB: NetworkBridge + Clone + Send + 'static,
 {
     let key = contract.key();
+    // The sender writes `htl`, so bound it by this node's own limit before
+    // anything reads it, as the GET relay and `drive_relay_probe` do
+    // (ANT-2026-QLQ8OSNJ). Without the clamp the sender chooses how many
+    // nodes the PUT walks.
+    let htl = htl.min(op_manager.ring.max_hops_to_live);
 
     tracing::info!(
         tx = %incoming_tx,
@@ -3342,6 +3347,51 @@ where
     #[cfg(any(test, feature = "testing"))]
     RELAY_PUT_STREAMING_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+    let originator_loopback =
+        Some(upstream_addr) == op_manager.ring.connection_manager.get_own_addr();
+
+    // Bound how many drivers a source, and the node, can have waiting for or
+    // piping a stream (ANT-2026-16KQ0AS7). This node's own streaming PUT is not
+    // counted. Taken before the dedup insert so a refusal leaves nothing behind.
+    // Refused quietly: a reply per refusal would be an outbound message per
+    // inbound one, and the upstream's response timeout ends its wait anyway.
+    let admission_permit = if originator_loopback {
+        None
+    } else {
+        match op_manager
+            .relay_put_stream_admission
+            .try_admit(upstream_addr)
+        {
+            Ok(permit) => Some(permit),
+            Err(refusal) => {
+                let refused = op_manager.relay_put_stream_admission.refused_total();
+                // Release-visible, but logarithmic in the refusal count so a
+                // sustained flood does not become a log flood.
+                if refused.is_power_of_two() {
+                    tracing::info!(
+                        tx = %incoming_tx,
+                        contract = %contract_key,
+                        %upstream_addr,
+                        ?refusal,
+                        refused_total = refused,
+                        phase = "relay_put_streaming_admission_refused",
+                        "PUT streaming relay: too many streaming PUTs in flight, dropping"
+                    );
+                } else {
+                    tracing::debug!(
+                        tx = %incoming_tx,
+                        contract = %contract_key,
+                        %upstream_addr,
+                        ?refusal,
+                        phase = "relay_put_streaming_admission_refused",
+                        "PUT streaming relay: too many streaming PUTs in flight, dropping"
+                    );
+                }
+                return Ok(());
+            }
+        }
+    };
+
     if !op_manager.active_relay_put_txs.insert(incoming_tx) {
         RELAY_PUT_STREAMING_DEDUP_REJECTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(
@@ -3368,8 +3418,6 @@ where
     // here, so without this the largest PUT relays were undercounted. Exclude
     // the originator-loopback case (own streaming PUT mapped to
     // `upstream_addr=own_addr`), consistent with the non-streaming path.
-    let originator_loopback =
-        Some(upstream_addr) == op_manager.ring.connection_manager.get_own_addr();
     if !originator_loopback {
         crate::node::network_status::record_relayed_put();
     }
@@ -3390,6 +3438,7 @@ where
     let guard = RelayPutStreamingInflightGuard {
         op_manager: op_manager.clone(),
         incoming_tx,
+        _admission_permit: admission_permit,
     };
 
     GlobalExecutor::spawn(run_relay_put_streaming(
@@ -3413,6 +3462,9 @@ where
 struct RelayPutStreamingInflightGuard {
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
+    /// The driver's slot in `relay_put_stream_admission`, released with the
+    /// guard. `None` for this node's own streaming PUT.
+    _admission_permit: Option<super::stream_admission::RelayStreamPermit>,
 }
 
 impl Drop for RelayPutStreamingInflightGuard {
@@ -3628,6 +3680,10 @@ async fn drive_relay_put_streaming<CB>(
 where
     CB: NetworkBridge + Clone + Send + 'static,
 {
+    // Bound the sender-written HTL by this node's limit (ANT-2026-QLQ8OSNJ);
+    // see `drive_relay_put`.
+    let htl = htl.min(op_manager.ring.max_hops_to_live);
+
     tracing::info!(
         tx = %incoming_tx,
         contract = %contract_key,
@@ -4855,6 +4911,10 @@ async fn drive_relay_probe_reconcile(
     skip_list: HashSet<SocketAddr>,
     upstream_addr: SocketAddr,
 ) -> Result<(), OpError> {
+    // Bound the sender-written HTL by this node's limit (ANT-2026-QLQ8OSNJ);
+    // see `drive_relay_put`.
+    let htl = htl.min(op_manager.ring.max_hops_to_live);
+
     if op_manager.ring.is_receiving_updates(&key) {
         // Merge via the same path an UPDATE uses; the contract executor
         // fans the change out to the rest of the subscriber mesh
@@ -9879,5 +9939,242 @@ mod relay_probe_failure_tests {
             probe_round_trip_timeout(max_htl, max_htl),
             "a wire-supplied HTL must not stretch the wait"
         );
+    }
+}
+
+/// Bounds on what a remote sender controls in the PUT relay: the hops-to-live
+/// it writes (ANT-2026-QLQ8OSNJ) and how many streaming relay drivers its
+/// announcements start (ANT-2026-16KQ0AS7). Drives the real relay entry points
+/// against a stubbed event loop.
+#[cfg(test)]
+mod relay_sender_bound_tests {
+    use super::*;
+    use crate::message::MessageStats;
+    use crate::operations::route_attempt::driver_test_support::op_manager_with_peers_and_store;
+    use crate::operations::test_utils::MockNetworkBridge;
+    use crate::transport::peer_connection::streaming::StreamHandle;
+    use crate::transport::peer_connection::streaming_buffer::FRAGMENT_PAYLOAD_SIZE;
+    use std::time::Duration;
+
+    type Sent = Arc<parking_lot::Mutex<Vec<(NetMessage, Option<SocketAddr>)>>>;
+
+    /// A version every summary-first gate accepts.
+    const PROBE_CAPABLE_VERSION: (u8, u8, u16) = (0, 2, 200);
+
+    /// Not one of the node's ring connections, so the terminus guard, which
+    /// needs the upstream's location, never ends the walk here.
+    fn upstream() -> SocketAddr {
+        "10.0.0.42:31337".parse().unwrap()
+    }
+
+    /// Record every PUT message handed to the event loop. No waiter is ever
+    /// answered.
+    fn record_sends(mut rx: tokio::sync::mpsc::Receiver<crate::node::OpExecutionPayload>) -> Sent {
+        let sent = Sent::default();
+        let log = sent.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some((reply_tx, msg, target)) = rx.recv().await {
+                if msg.id().transaction_type() == crate::message::TransactionType::Put {
+                    log.lock().push((msg.clone(), target));
+                }
+                held.push(reply_tx);
+            }
+        });
+        sent
+    }
+
+    /// The HTL of the first message for `tx` sent anywhere but upstream.
+    fn forwarded_htl(sent: &Sent, tx: Transaction) -> Option<usize> {
+        sent.lock().iter().find_map(|(msg, target)| {
+            if *target == Some(upstream()) || *msg.id() != tx {
+                return None;
+            }
+            match msg {
+                NetMessage::V1(NetMessageV1::Put(
+                    PutMsg::Request { htl, .. }
+                    | PutMsg::RequestStreaming { htl, .. }
+                    | PutMsg::ProbeReconcile { htl, .. },
+                )) => Some(*htl),
+                _ => None,
+            }
+        })
+    }
+
+    async fn settle() {
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    fn assert_clamped(label: &str, op_manager: &OpManager, forwarded: Option<usize>) {
+        let max_htl = op_manager.ring.max_hops_to_live;
+        assert!(max_htl > 0, "precondition: a non-zero HTL limit");
+        assert_eq!(
+            forwarded,
+            Some(max_htl - 1),
+            "{label}: a wire HTL above this node's max_hops_to_live must be clamped \
+             to it before it is decremented and forwarded"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_put_clamps_an_oversized_wire_htl() {
+        let label = "relay-put-htl-clamp";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let sent = record_sends(rx);
+        let tx = Transaction::new::<PutMsg>();
+        start_relay_put(
+            op_manager.clone(),
+            MockNetworkBridge::new(),
+            tx,
+            crate::operations::test_utils::make_test_contract(label.as_bytes()),
+            RelatedContracts::default(),
+            WrappedState::new(vec![7u8; 64]),
+            usize::MAX,
+            HashSet::new(),
+            upstream(),
+        )
+        .await
+        .expect("the relay starts");
+        settle().await;
+        assert_clamped("PUT relay", &op_manager, forwarded_htl(&sent, tx));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_put_streaming_clamps_an_oversized_wire_htl() {
+        let label = "relay-put-streaming-htl-clamp";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let sent = record_sends(rx);
+        let contract = crate::operations::test_utils::make_test_contract(label.as_bytes());
+        // Above the streaming threshold: a smaller payload is not piped onward.
+        let bytes = bincode::serialize(&PutStreamingPayload {
+            contract: contract.clone(),
+            related_contracts: RelatedContracts::default(),
+            value: WrappedState::new(vec![7u8; op_manager.streaming_threshold + 4096]),
+        })
+        .expect("serialize payload");
+        let stream_id = StreamId::next();
+        let handle = StreamHandle::new(stream_id, bytes.len() as u64);
+        for (i, chunk) in bytes.chunks(FRAGMENT_PAYLOAD_SIZE).enumerate() {
+            handle
+                .push_fragment(i as u32 + 1, bytes::Bytes::copy_from_slice(chunk))
+                .expect("fragment accepted");
+        }
+        op_manager
+            .orphan_stream_registry()
+            .register_test_orphan(upstream(), stream_id, handle);
+
+        let tx = Transaction::new::<PutMsg>();
+        start_relay_put_streaming(
+            op_manager.clone(),
+            MockNetworkBridge::new(),
+            tx,
+            stream_id,
+            contract.key(),
+            bytes.len() as u64,
+            usize::MAX,
+            HashSet::new(),
+            false,
+            upstream(),
+        )
+        .await
+        .expect("the relay starts");
+        settle().await;
+        assert_clamped("streaming PUT relay", &op_manager, forwarded_htl(&sent, tx));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_probe_reconcile_clamps_an_oversized_wire_htl() {
+        let label = "relay-reconcile-htl-clamp";
+        let (op_manager, rx, peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        for peer in &peers {
+            op_manager.ring.connection_manager.record_remote_version(
+                peer.socket_addr().expect("peer address"),
+                Some(PROBE_CAPABLE_VERSION),
+            );
+        }
+        let sent = record_sends(rx);
+        let key = crate::operations::test_utils::make_test_contract(label.as_bytes()).key();
+        assert!(
+            !op_manager.ring.is_receiving_updates(&key),
+            "precondition: this node does not merge, so it forwards"
+        );
+        let tx = Transaction::new::<PutMsg>();
+        drive_relay_probe_reconcile(
+            &op_manager,
+            tx,
+            key,
+            StateDelta::from(vec![1u8, 2, 3]),
+            usize::MAX,
+            HashSet::new(),
+            upstream(),
+        )
+        .await
+        .expect("the reconcile relay runs");
+        settle().await;
+        assert_clamped(
+            "ProbeReconcile relay",
+            &op_manager,
+            forwarded_htl(&sent, tx),
+        );
+    }
+
+    /// Announcements whose streams never arrive must not start an unbounded
+    /// number of waiting drivers, however many ports the announcing host uses.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn streaming_announcements_from_one_host_are_bounded() {
+        use super::super::stream_admission::PER_SOURCE_CAP;
+
+        let label = "relay-put-streaming-admission";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let _sent = record_sends(rx);
+        let key = crate::operations::test_utils::make_test_contract(label.as_bytes()).key();
+        let announce = |from: SocketAddr| {
+            let op_manager = op_manager.clone();
+            async move {
+                start_relay_put_streaming(
+                    op_manager,
+                    MockNetworkBridge::new(),
+                    Transaction::new::<PutMsg>(),
+                    StreamId::next(),
+                    key,
+                    4096,
+                    3,
+                    HashSet::new(),
+                    false,
+                    from,
+                )
+                .await
+                .expect("an announcement is dispatched or dropped quietly");
+            }
+        };
+
+        for port in 0..(PER_SOURCE_CAP as u16 + 20) {
+            announce(SocketAddr::new([203, 0, 113, 7].into(), 40_000 + port)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            op_manager.active_relay_put_txs.len(),
+            PER_SOURCE_CAP,
+            "one host may hold at most PER_SOURCE_CAP waiting streaming drivers"
+        );
+        assert_eq!(op_manager.relay_put_stream_admission.refused_total(), 20);
+
+        announce(SocketAddr::new([203, 0, 113, 8].into(), 40_000)).await;
+        assert_eq!(
+            op_manager.active_relay_put_txs.len(),
+            PER_SOURCE_CAP + 1,
+            "another host still gets a driver"
+        );
+
+        // When the claims time out the drivers end and their slots come back.
+        tokio::time::sleep(STREAM_CLAIM_TIMEOUT + Duration::from_secs(5)).await;
+        assert_eq!(op_manager.relay_put_stream_admission.in_flight(), 0);
+        assert!(op_manager.active_relay_put_txs.is_empty());
     }
 }
