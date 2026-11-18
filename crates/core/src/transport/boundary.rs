@@ -910,6 +910,9 @@ mod stream_id_tests {
             "wrapped to 0"
         );
         assert!(!StreamId::next_transport_internal().is_caller_named());
+        // The allocator clears the bit itself, even from a counter that holds it.
+        super::STREAM_ID_COUNTER.with(|c| c.set(0x8000_0005));
+        assert_eq!(StreamId::next_transport_internal().0, 5);
     }
 
     /// Every thread index below 21,475 keeps the block start it always had,

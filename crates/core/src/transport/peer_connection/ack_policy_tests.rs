@@ -2712,6 +2712,23 @@ async fn a_legacy_stream_completed_by_its_task_is_remembered() {
     assert!(holds_no_state(&e, id), "not started again");
 }
 
+/// Allocates stream ids on this thread as thread `idx` would, and puts the
+/// counter back when dropped, also when the test panics.
+struct ResetStreamCounter;
+
+impl ResetStreamCounter {
+    fn as_thread(idx: u64) -> Self {
+        StreamId::reset_counter_as_thread(idx);
+        Self
+    }
+}
+
+impl Drop for ResetStreamCounter {
+    fn drop(&mut self) {
+        StreamId::reset_counter();
+    }
+}
+
 /// #6143, the sender's side: an oversized message sent on UDP from a thread
 /// whose index is past 21,475 goes out as fragments of a transport-internal
 /// stream, without the caller-named bit. Before the fix every such fragment
@@ -2720,9 +2737,10 @@ async fn a_legacy_stream_completed_by_its_task_is_remembered() {
 #[tokio::test(start_paused = true)]
 async fn an_oversized_send_from_a_long_running_thread_is_not_caller_named() {
     let mut e = single(CAPABLE);
-    StreamId::reset_counter_as_thread(24_160);
-    let sent = e.conn.send_serialized(vec![7u8; 4000]).await;
-    StreamId::reset_counter();
+    let sent = {
+        let _reset = ResetStreamCounter::as_thread(24_160);
+        e.conn.send_serialized(vec![7u8; 4000]).await
+    };
     sent.unwrap();
     let mut ids = Vec::new();
     for _ in 0..50 {
@@ -2739,6 +2757,13 @@ async fn an_oversized_send_from_a_long_running_thread_is_not_caller_named() {
     }
     assert!(!ids.is_empty(), "the message went out as a stream");
     assert!(ids.iter().all(|id| !id.is_caller_named()), "{ids:?}");
+    // The id came from the counter set above, not one allocated elsewhere:
+    // thread 24,160's block starts at 24,160 x 100,000 mod 2^31.
+    let start = 268_516_352u32;
+    assert!(
+        ids.iter().all(|id| (start..start + 16).contains(&id.0)),
+        "{ids:?}"
+    );
 }
 
 /// #6143: an oversized message sent from a thread whose index is past
@@ -2749,9 +2774,10 @@ async fn an_oversized_send_from_a_long_running_thread_is_not_caller_named() {
 #[tokio::test(start_paused = true)]
 async fn a_legacy_stream_from_a_long_running_sender_thread_is_delivered() {
     let mut e = single(CAPABLE);
-    StreamId::reset_counter_as_thread(24_160);
-    let id = StreamId::next_transport_internal();
-    StreamId::reset_counter();
+    let id = {
+        let _reset = ResetStreamCounter::as_thread(24_160);
+        StreamId::next_transport_internal()
+    };
     let f = super::MAX_DATA_SIZE;
     let data: Vec<u8> = (0..(2 * f)).map(|i| i as u8).collect();
     let total = data.len() as u64;

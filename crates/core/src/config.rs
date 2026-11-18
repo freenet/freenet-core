@@ -5551,6 +5551,11 @@ impl GlobalRng {
     ///
     /// Each thread gets a unique index from the global `THREAD_INDEX_COUNTER`.
     /// This is used by thread-local ID counters to compute non-overlapping offset blocks.
+    ///
+    /// Indices are never reused, so a long-running node's index keeps growing
+    /// with every thread it creates (tens of thousands within days). Any
+    /// `idx * block` arithmetic must be wide enough or wrap safely, and must
+    /// not reach bits that carry meaning (#6143).
     pub fn thread_index() -> u64 {
         THREAD_INDEX.with(|c| match c.get() {
             Some(idx) => idx,
