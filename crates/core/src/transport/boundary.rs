@@ -98,18 +98,25 @@ use super::{TransportError, TransportPublicKey};
 /// receiver routed it as a caller-named operations stream that nothing claims,
 /// and every oversized message the node sent was silently dropped (#6143).
 ///
-/// Each thread's 100,000-id block still overlaps the next thread's after
-/// 100,000 allocations, and blocks wrap modulo 2^31. Receivers key streams by
-/// (peer, id), so a collision needs both within one connection's live or
-/// recently completed streams.
+/// Where the counter lives depends on the thread (#6270). A node's own
+/// threads share ONE process-wide counter, so no two streams it sends carry
+/// the same id until 2^31 have been allocated. A per-thread counter starting
+/// at the thread's 100,000-id block let a long-lived worker run into a newer
+/// thread's block, and two streams on one connection could then share an id:
+/// the receiver drops the second as already completed. A simulation thread
+/// (one with a [`GlobalRng`] seed) and a test that calls
+/// [`StreamId::reset_counter`] keep the per-thread block instead, so their ids
+/// stay deterministic.
+///
+/// [`GlobalRng`]: crate::config::GlobalRng
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[repr(transparent)]
 #[serde(transparent)]
 pub struct StreamId(pub(in crate::transport) u32);
 
-/// Each thread's counter starts at its own block, so ids from parallel
-/// simulation threads start apart (they overlap after `STREAM_ID_BLOCK`
-/// allocations on one thread).
+/// A deterministic thread's counter starts at its own block, so ids from
+/// parallel simulation threads start apart (they overlap after
+/// `STREAM_ID_BLOCK` allocations on one thread).
 const STREAM_ID_BLOCK: u32 = 100_000;
 
 /// Top bit of ids from [`StreamId::next`].
@@ -128,16 +135,30 @@ fn block_start(idx: u64) -> u32 {
 }
 
 thread_local! {
-    static STREAM_ID_COUNTER: std::cell::Cell<u32> = {
-        let idx = crate::config::GlobalRng::thread_index();
-        std::cell::Cell::new(block_start(idx))
-    };
+    /// `Some` when this thread allocates from its own deterministic block (a
+    /// seeded simulation thread, or a test that reset the counter); `None`
+    /// when it draws from [`PROCESS_STREAM_COUNTER`].
+    static STREAM_ID_COUNTER: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
 }
+
+/// The counter every unseeded thread of this process draws from. Masked to
+/// 31 bits on every read, so it wraps after 2^31 allocations.
+static PROCESS_STREAM_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 fn next_stream_counter() -> u32 {
     STREAM_ID_COUNTER.with(|c| {
-        let v = c.get();
-        c.set(v.wrapping_add(1) & COUNTER_MASK);
+        let v = match c.get() {
+            Some(v) => v,
+            None if crate::config::GlobalRng::is_seeded() => {
+                block_start(crate::config::GlobalRng::thread_index())
+            }
+            None => {
+                return PROCESS_STREAM_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    & COUNTER_MASK;
+            }
+        };
+        c.set(Some(v.wrapping_add(1) & COUNTER_MASK));
         v
     })
 }
@@ -166,16 +187,19 @@ impl StreamId {
 
     /// Reset the stream ID counter to initial state for this thread.
     /// Thread-local, so safe for parallel test execution.
+    ///
+    /// The thread then allocates from its own deterministic block, starting
+    /// at its thread index's block, instead of the process-wide counter.
     pub fn reset_counter() {
         let idx = crate::config::GlobalRng::thread_index();
-        STREAM_ID_COUNTER.with(|c| c.set(block_start(idx)));
+        STREAM_ID_COUNTER.with(|c| c.set(Some(block_start(idx))));
     }
 
     /// Put this thread's counter where thread `idx` would start, so a test can
     /// allocate as the thread of a node that has been up for days.
     #[cfg(test)]
     pub(crate) fn reset_counter_as_thread(idx: u64) {
-        STREAM_ID_COUNTER.with(|c| c.set(block_start(idx)));
+        STREAM_ID_COUNTER.with(|c| c.set(Some(block_start(idx))));
     }
 }
 
@@ -902,16 +926,16 @@ mod stream_id_tests {
             }
         }
         // The counter wraps inside the 31-bit space instead of into the bit.
-        super::STREAM_ID_COUNTER.with(|c| c.set(super::COUNTER_MASK));
+        super::STREAM_ID_COUNTER.with(|c| c.set(Some(super::COUNTER_MASK)));
         assert_eq!(StreamId::next_transport_internal().0, super::COUNTER_MASK);
         assert_eq!(
             super::STREAM_ID_COUNTER.with(|c| c.get()),
-            0,
+            Some(0),
             "wrapped to 0"
         );
         assert!(!StreamId::next_transport_internal().is_caller_named());
         // The allocator clears the bit itself, even from a counter that holds it.
-        super::STREAM_ID_COUNTER.with(|c| c.set(0x8000_0005));
+        super::STREAM_ID_COUNTER.with(|c| c.set(Some(0x8000_0005)));
         assert_eq!(StreamId::next_transport_internal().0, 5);
     }
 
@@ -924,19 +948,55 @@ mod stream_id_tests {
         }
     }
 
-    /// The counter a real thread starts with comes from the thread-local
-    /// initializer, not `reset_counter`. A fresh thread whose index is past
-    /// 21,475 must still start below the caller-named bit.
+    /// A seeded (simulation) thread still allocates from its own block, so
+    /// its ids are deterministic, and past index 21,475 that block stays
+    /// below the caller-named bit (#6143).
     #[test]
-    fn a_new_thread_with_a_high_index_starts_below_the_caller_named_bit() {
+    fn a_seeded_thread_with_a_high_index_allocates_from_its_block() {
         std::thread::spawn(|| {
+            crate::config::GlobalRng::set_seed(7);
             crate::config::GlobalRng::pin_thread_index_for_test(24_160);
             let first = StreamId::next_transport_internal();
+            let second = StreamId::next();
+            crate::config::GlobalRng::clear_seed();
             assert!(!first.is_caller_named(), "{first:?}");
             assert_eq!(first.0, super::block_start(24_160));
+            assert_eq!(second.0, (super::block_start(24_160) + 1) | 0x8000_0000);
         })
         .join()
         .unwrap();
+    }
+
+    /// #6270: a node's own threads share one counter, so two threads never
+    /// hand out the same id. Per-thread blocks did: thread 21,475's block
+    /// starts 16,352 ids into thread 0's, so once thread 0 had allocated that
+    /// many, the next id from thread 21,475 was one thread 0 had already
+    /// used, and two streams on one connection could share it.
+    #[test]
+    fn unseeded_threads_never_hand_out_the_same_id() {
+        let first = std::thread::spawn(|| {
+            crate::config::GlobalRng::pin_thread_index_for_test(0);
+            (0..=16_352)
+                .map(|_| StreamId::next_transport_internal().0)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .join()
+        .unwrap();
+        let later = std::thread::spawn(|| {
+            crate::config::GlobalRng::pin_thread_index_for_test(21_475);
+            let internal = StreamId::next_transport_internal();
+            let named = StreamId::next();
+            (internal, named)
+        })
+        .join()
+        .unwrap();
+        assert!(!later.0.is_caller_named() && later.1.is_caller_named());
+        assert!(!first.contains(&later.0.0), "{:?} reused", later.0);
+        assert!(
+            !first.contains(&(later.1.0 & super::COUNTER_MASK)),
+            "{:?} reused",
+            later.1
+        );
     }
 
     /// A `StreamId` is serialized as its bare `u32`, as before.
