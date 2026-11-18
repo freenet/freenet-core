@@ -28,6 +28,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::config::GlobalRng;
+use crate::operations::put::stream_admission::Source as TransientSource;
 use crate::topology::{Limits, TopologyManager};
 use crate::util::backoff::{ExponentialBackoff, TrackedBackoff};
 
@@ -50,6 +51,27 @@ pub(crate) struct TransientEntry {
     /// connection that is never promoted is closed by the zombie sweep or the
     /// transport's idle timeout.
     pub held: bool,
+}
+
+/// Why a transient registration was refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransientRefusal {
+    /// The node-wide transient budget is spent.
+    Budget,
+    /// The address's source already holds its share of the budget.
+    SourceShare,
+}
+
+/// A source's share of the transient budget is at least this many slots, so
+/// many joiners behind one carrier-grade NAT still fit on a small budget.
+const MIN_TRANSIENT_SOURCE_SHARE: usize = 16;
+/// A source holds at most this fraction (1/N) of the transient budget: 128 of
+/// the default 2048.
+const TRANSIENT_SOURCE_SHARE_DIVISOR: usize = 16;
+
+/// The most transient slots one source may hold under `budget`.
+fn transient_source_share(budget: usize) -> usize {
+    (budget / TRANSIENT_SOURCE_SHARE_DIVISOR).max(MIN_TRANSIENT_SOURCE_SHARE)
 }
 
 /// Maximum time a pending reservation can remain before being considered stale.
@@ -572,6 +594,13 @@ pub(crate) struct ConnectionManager {
     open_transports: Arc<dashmap::DashSet<SocketAddr>>,
     transient_in_use: Arc<AtomicUsize>,
     transient_budget: usize,
+    /// Transient entries per source (IPv4 address or IPv6 /64), each at most
+    /// `transient_source_share`. Kept equal to the sources of
+    /// `transient_connections`: every insert counts, every removal releases.
+    transient_per_source: Arc<DashMap<TransientSource, usize>>,
+    /// `max(MIN_TRANSIENT_SOURCE_SHARE, transient_budget / TRANSIENT_SOURCE_SHARE_DIVISOR)`.
+    transient_source_share: usize,
+    transient_source_refusals: Arc<AtomicU64>,
     transient_ttl: Duration,
     pub min_connections: usize,
     pub max_connections: usize,
@@ -779,6 +808,9 @@ impl ConnectionManager {
             open_transports: Arc::new(dashmap::DashSet::new()),
             transient_in_use: Arc::new(AtomicUsize::new(0)),
             transient_budget,
+            transient_per_source: Arc::new(DashMap::new()),
+            transient_source_share: transient_source_share(transient_budget),
+            transient_source_refusals: Arc::new(AtomicU64::new(0)),
             transient_ttl,
             min_connections,
             max_connections,
@@ -1990,16 +2022,51 @@ impl ConnectionManager {
     /// Attempts to register a transient connection, enforcing the configured budget.
     /// Returns `false` when the budget is exhausted, leaving the map unchanged.
     pub fn try_register_transient(&self, addr: SocketAddr, location: Option<Location>) -> bool {
+        self.register_transient(addr, location).is_ok()
+    }
+
+    /// As [`Self::try_register_transient`], saying why a registration was
+    /// refused: the node-wide budget is spent, or the address's source (its
+    /// IPv4 address or IPv6 /64, `stream_admission::Source`) already holds its
+    /// share of the budget (`transient_source_share`). The share keeps one
+    /// host from holding every slot, which would refuse every other joiner.
+    pub(crate) fn register_transient(
+        &self,
+        addr: SocketAddr,
+        location: Option<Location>,
+    ) -> Result<(), TransientRefusal> {
         if self.transient_connections.contains_key(&addr) {
             if let Some(mut entry) = self.transient_connections.get_mut(&addr) {
                 entry.location = location;
             }
-            return true;
+            return Ok(());
         }
 
         let current = self.transient_in_use.load(Ordering::Acquire);
         if current >= self.transient_budget {
-            return false;
+            return Err(TransientRefusal::Budget);
+        }
+
+        let source = TransientSource::of(addr);
+        {
+            let mut held = self.transient_per_source.entry(source).or_insert(0);
+            if *held >= self.transient_source_share {
+                drop(held);
+                let refused = self
+                    .transient_source_refusals
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                if refused.is_power_of_two() {
+                    tracing::info!(
+                        remote = %addr,
+                        share = self.transient_source_share,
+                        refused_total = refused,
+                        "Transient connection refused: its source holds its share of the budget"
+                    );
+                }
+                return Err(TransientRefusal::SourceShare);
+            }
+            *held += 1;
         }
 
         self.transient_connections.insert(
@@ -2015,10 +2082,36 @@ impl ConnectionManager {
             // Undo if we raced past the budget.
             self.transient_connections.remove(&addr);
             self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
-            return false;
+            self.release_transient_source(addr);
+            return Err(TransientRefusal::Budget);
         }
 
-        true
+        Ok(())
+    }
+
+    /// Gives back the share slot of `addr`'s source; called once for every
+    /// entry removed from `transient_connections`.
+    fn release_transient_source(&self, addr: SocketAddr) {
+        if let dashmap::mapref::entry::Entry::Occupied(mut held) =
+            self.transient_per_source.entry(TransientSource::of(addr))
+        {
+            *held.get_mut() = held.get().saturating_sub(1);
+            if *held.get() == 0 {
+                held.remove();
+            }
+        }
+    }
+
+    /// Transient registrations refused because their source held its share.
+    #[cfg(test)]
+    pub fn transient_source_refusals(&self) -> u64 {
+        self.transient_source_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Most transient slots one source may hold.
+    #[cfg(test)]
+    pub fn transient_source_share(&self) -> usize {
+        self.transient_source_share
     }
 
     /// Keeps the transient entry at `addr`, and with it its slot in the
@@ -2040,6 +2133,7 @@ impl ConnectionManager {
             .map(|(_, entry)| entry);
         if removed.is_some() {
             self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
+            self.release_transient_source(addr);
         }
         removed
     }
@@ -2489,6 +2583,7 @@ impl ConnectionManager {
         // Remove from transient connections if present, since we're now a full ring connection.
         if self.transient_connections.remove(&addr).is_some() {
             self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
+            self.release_transient_source(addr);
         }
 
         // Track connection time for optimistic readiness timeout.
@@ -2722,6 +2817,7 @@ impl ConnectionManager {
         let now = Instant::now();
         let ttl = self.transient_ttl;
         let mut removed = 0;
+        let mut removed_addrs = Vec::new();
         self.transient_connections.retain(|addr, entry| {
             let age = now.duration_since(entry.created_at);
             if age > ttl && !entry.held {
@@ -2731,6 +2827,7 @@ impl ConnectionManager {
                     "Removing expired transient connection"
                 );
                 removed += 1;
+                removed_addrs.push(*addr);
                 false
             } else {
                 true
@@ -2738,6 +2835,9 @@ impl ConnectionManager {
         });
         if removed > 0 {
             self.transient_in_use.fetch_sub(removed, Ordering::SeqCst);
+        }
+        for addr in removed_addrs {
+            self.release_transient_source(addr);
         }
         removed
     }
@@ -3217,6 +3317,105 @@ mod tests {
 
     fn make_addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    fn make_connection_manager_with_transient_budget(budget: usize) -> ConnectionManager {
+        let keypair = TransportKeypair::new();
+        ConnectionManager::init(
+            Rate::new_per_second(1_000_000.0),
+            Rate::new_per_second(1_000_000.0),
+            1,
+            10,
+            7,
+            (
+                keypair.public().clone(),
+                None,
+                AtomicU64::new(u64::from_le_bytes((-1f64).to_le_bytes())),
+            ),
+            true,
+            budget,
+            Duration::from_secs(60),
+            0,
+        )
+    }
+
+    #[test]
+    fn transient_source_share_is_a_sixteenth_of_the_budget_and_at_least_16() {
+        assert_eq!(transient_source_share(2048), 128);
+        assert_eq!(transient_source_share(256), 16);
+        assert_eq!(transient_source_share(64), 16);
+        assert_eq!(transient_source_share(0), 16);
+    }
+
+    /// One source (an IPv4 address, or an IPv6 /64 with v4-mapped addresses
+    /// counted as IPv4) holds at most its share of the transient budget, on
+    /// as many ports or addresses as it likes; another source is still
+    /// admitted, and a slot the source gives back is its own again.
+    #[test]
+    fn one_source_holds_at_most_its_share_of_the_transient_budget() {
+        let cm = make_connection_manager_with_transient_budget(64);
+        let share = cm.transient_source_share();
+        assert_eq!(share, 16);
+        let a = |port: u16| SocketAddr::from(([203, 0, 113, 7], port));
+        for port in 0..share as u16 {
+            assert_eq!(cm.register_transient(a(port), None), Ok(()));
+        }
+        assert_eq!(
+            cm.register_transient(a(999), None),
+            Err(TransientRefusal::SourceShare)
+        );
+        // The v4-mapped form of the same address is the same source.
+        let mapped: SocketAddr = "[::ffff:203.0.113.7]:1000".parse().unwrap();
+        assert_eq!(
+            cm.register_transient(mapped, None),
+            Err(TransientRefusal::SourceShare)
+        );
+        assert_eq!(cm.transient_source_refusals(), 2);
+        assert_eq!(cm.transient_count(), share, "refusals take no slot");
+
+        // Another address is admitted.
+        let b = SocketAddr::from(([203, 0, 113, 8], 1));
+        assert_eq!(cm.register_transient(b, None), Ok(()));
+
+        // An IPv6 /64 is one source, whatever its lower bits.
+        for n in 0..share as u16 {
+            let v6 = SocketAddr::new(
+                std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, n, 0, 0, 1).into(),
+                1,
+            );
+            assert_eq!(cm.register_transient(v6, None), Ok(()));
+        }
+        let v6_more = SocketAddr::new(
+            std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 1, 0xffff, 1, 2, 3).into(),
+            1,
+        );
+        assert_eq!(
+            cm.register_transient(v6_more, None),
+            Err(TransientRefusal::SourceShare)
+        );
+
+        // Dropping one gives the source its slot back; so do promotion into
+        // the ring and expiry.
+        assert!(cm.drop_transient(a(0)).is_some());
+        assert_eq!(cm.register_transient(a(999), None), Ok(()));
+        assert!(cm.add_connection(
+            Location::from_address(&a(2)),
+            a(2),
+            TransportKeypair::new().public().clone(),
+            false
+        ));
+        assert!(
+            !cm.is_transient(a(2)),
+            "premise: promotion removed the entry"
+        );
+        assert_eq!(cm.register_transient(a(998), None), Ok(()));
+        age_transient(&cm, a(1), Duration::from_secs(61));
+        assert_eq!(cm.cleanup_expired_transients(), 1);
+        assert_eq!(cm.register_transient(a(1000), None), Ok(()));
+        assert_eq!(
+            cm.register_transient(a(1001), None),
+            Err(TransientRefusal::SourceShare)
+        );
     }
 
     /// A reservation promoted to an established connection between the two

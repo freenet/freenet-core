@@ -76,15 +76,17 @@ pub(crate) const PER_SOURCE_CAP: usize = 32;
 pub(crate) const NODE_WIDE_CAP: usize = 512;
 
 /// Where an announcement came from, at the granularity one host controls.
+/// Also groups the transient connection budget's per-source share
+/// (`ConnectionManager::try_register_transient`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum Source {
+pub(crate) enum Source {
     V4(u32),
     /// The top 64 bits of an IPv6 address: a host usually holds a whole /64.
     V6Prefix(u64),
 }
 
 impl Source {
-    fn of(addr: SocketAddr) -> Self {
+    pub(crate) fn of(addr: SocketAddr) -> Self {
         match addr.ip() {
             IpAddr::V4(v4) => Source::V4(u32::from(v4)),
             IpAddr::V6(v6) => match v6.to_ipv4_mapped() {

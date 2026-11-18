@@ -2917,22 +2917,25 @@ impl P2pConnManager {
                     // budget refused it (nothing inserted at all). Only a fresh
                     // insertion is a "transient registered".
                     let already_transient = connection_manager.is_transient(peer_addr);
-                    let registered =
-                        connection_manager.try_register_transient(peer_addr, Some(loc));
-                    if !registered {
+                    let registered = connection_manager.register_transient(peer_addr, Some(loc));
+                    if let Err(refusal) = registered {
                         // The budget bounds the connections held outside the
                         // ring. An inbound connection nobody expected arrives
                         // with `is_transient == false`, so the check at the
                         // top of this function did not count it and this is
                         // the first place it is counted. Kept after a refusal,
                         // it would be an open connection the budget does not
-                        // count, so it is closed, as at the top.
-                        tracing::warn!(
-                            remote = %peer_addr,
-                            budget = connection_manager.transient_budget(),
-                            current = connection_manager.transient_count(),
-                            "Transient connection budget exhausted; dropping inbound connection"
-                        );
+                        // count, so it is closed, as at the top. A refusal for
+                        // the source's share is counted and logged by the
+                        // connection manager.
+                        if refusal == crate::ring::TransientRefusal::Budget {
+                            tracing::warn!(
+                                remote = %peer_addr,
+                                budget = connection_manager.transient_budget(),
+                                current = connection_manager.transient_count(),
+                                "Transient connection budget exhausted; dropping inbound connection"
+                            );
+                        }
                         self.drop_connection_by_addr(
                             peer_addr,
                             handshake_commands,

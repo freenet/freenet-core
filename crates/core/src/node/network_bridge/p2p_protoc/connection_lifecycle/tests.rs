@@ -5403,3 +5403,49 @@ async fn a_transient_connection_may_take_the_last_budget_slot() {
     assert!(cm.is_transient(last));
     assert_eq!(cm.transient_count(), budget);
 }
+
+/// One address cannot hold the whole transient budget: past its share its
+/// unexpected inbound connections are closed and counted, a second address
+/// is still admitted, and a connection the address promotes gives its share
+/// slot back.
+#[tokio::test]
+async fn one_address_saturating_its_transient_share_leaves_others_admitted() {
+    let mut h = Harness::with_config("transient-budget-source-share", |config| {
+        config.transient_budget = 64;
+    })
+    .await;
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    let share = cm.transient_source_share();
+    assert!(
+        share < cm.transient_budget(),
+        "premise: the share binds first"
+    );
+    let a = |port: u16| SocketAddr::from(([198, 51, 100, 214], port));
+
+    for port in 0..share as u16 {
+        unexpected_inbound(&mut h, a(7400 + port)).await;
+        assert!(h.mgr.connections.contains_key(&a(7400 + port)));
+    }
+    let over = a(7400 + share as u16);
+    unexpected_inbound(&mut h, over).await;
+    assert!(
+        !h.mgr.connections.contains_key(&over),
+        "past its share: closed"
+    );
+    assert_eq!(cm.transient_source_refusals(), 1, "and counted");
+    assert_eq!(cm.transient_count(), share);
+    h.assert_open_transports_match();
+
+    let other = SocketAddr::from(([198, 51, 100, 215], 7400));
+    unexpected_inbound(&mut h, other).await;
+    assert!(
+        h.mgr.connections.contains_key(&other),
+        "a second address is admitted"
+    );
+
+    // Promoting one of the first address's connections frees a share slot.
+    h.connect_peer(PeerKeyLocation::new(key(), a(7400))).await;
+    let again = a(7400 + share as u16 + 1);
+    unexpected_inbound(&mut h, again).await;
+    assert!(h.mgr.connections.contains_key(&again));
+}
