@@ -483,10 +483,8 @@ async fn drive_client_get_inner(
     // returns (and the side-effect block below has run). Do not add
     // explicit `completed()` calls in the arms here — doing so would
     // race the originator-side side effects (`cache_contract_locally`,
-    // `maybe_subscribe_child`) because once the tx is in `ops.completed`, any
-    // `op_manager.push(...)` for that tx is silently dropped (see
-    // `op_state_manager.rs::push` short-circuit on
-    // `ops.completed.contains`).
+    // `maybe_subscribe_child`): `completed()` also drops the tx from the
+    // request router and the live-transaction tracker.
 
     match loop_result {
         RetryLoopOutcome::Done(terminal) => {

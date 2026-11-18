@@ -50,9 +50,10 @@ use super::{
 struct Ops {
     // No per-op DashMaps remain. CONNECT, GET, PUT, UPDATE, and
     // SUBSCRIBE all run on drivers that own state in task
-    // locals; the only state retained here is the global completed /
-    // under_progress sets used by the GC sweep.
-    completed: DashSet<Transaction>,
+    // locals; the only state retained here is the global under_progress
+    // set used by the GC sweep. There is deliberately no `completed` set:
+    // nothing read it, and since #4110 nothing removed from it, so every
+    // finished transaction stayed in memory (ANT-2026-OZWLXLHH).
     under_progress: DashSet<Transaction>,
 }
 
@@ -62,14 +63,12 @@ struct Ops {
 /// run.
 #[derive(Debug, Default)]
 struct OpsSizes {
-    completed: usize,
     under_progress: usize,
 }
 
 impl Ops {
     fn sizes(&self) -> OpsSizes {
         OpsSizes {
-            completed: self.completed.len(),
             under_progress: self.under_progress.len(),
         }
     }
@@ -693,7 +692,7 @@ impl OpManager {
         let ring = Ring::new(
             config,
             notification_channel.clone(),
-            event_register.clone(),
+            event_register,
             config.is_gateway,
             connection_manager,
             task_monitor,
@@ -729,7 +728,6 @@ impl OpManager {
                     ops.clone(),
                     ring.live_tx_tracker.clone(),
                     notification_channel.clone(),
-                    event_register,
                     result_router_tx.clone(),
                     request_router.clone(),
                     contract_waiters.clone(),
@@ -1903,7 +1901,6 @@ impl OpManager {
     pub fn completed(&self, id: Transaction) {
         self.ring.live_tx_tracker.remove_finished_transaction(id);
         self.ops.under_progress.remove(&id);
-        self.ops.completed.insert(id);
 
         // Clean up request router to prevent stale entries from blocking subsequent requests
         if let Some(router) = self.request_router.get() {
@@ -2728,12 +2725,11 @@ fn notify_transaction_timeout(
 // has a `ConnectOp` to inspect.
 
 #[allow(clippy::too_many_arguments)]
-async fn garbage_cleanup_task<ER: NetEventRegister>(
+async fn garbage_cleanup_task(
     mut new_transactions: tokio::sync::mpsc::Receiver<Transaction>,
     ops: Arc<Ops>,
     live_tx_tracker: LiveTransactionTracker,
     event_loop_notifier: EventLoopNotificationsSender,
-    mut event_register: ER,
     _result_router_tx: mpsc::Sender<(Transaction, HostResult)>,
     request_router: Arc<OnceLock<Arc<RequestRouter>>>,
     contract_waiters: Arc<
@@ -2839,7 +2835,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         ops_get = 0,
                         ops_subscribe = 0,
                         ops_update = 0,
-                        ops_completed = ops_sizes.completed,
                         ops_under_progress = ops_sizes.under_progress,
                         pending_contract_fetches = pending_fetches,
                         contract_waiters = waiters_len,
@@ -2903,15 +2898,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
 
                 let old_missing = std::mem::take(&mut delayed);
                 for tx in old_missing {
-                    if let Some(tx) = ops.completed.remove(&tx) {
-                        if cfg!(feature = "trace-ot") {
-                            let op_type = tx.transaction_type().description();
-                            event_register.notify_of_time_out(tx, op_type, None).await;
-                        } else {
-                            _ = tx;
-                        }
-                        continue;
-                    }
                     // Every op runs on a driver and owns
                     // its own timeout reporting (via
                     // `Relay*InflightGuard` failure paths or
@@ -2922,7 +2908,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         delayed.push(tx);
                     } else {
                         ops.under_progress.remove(&tx);
-                        ops.completed.remove(&tx);
                         tracing::info!(
                             tx = %tx,
                             tx_type = ?tx.transaction_type(),
@@ -2961,15 +2946,6 @@ async fn garbage_cleanup_task<ER: NetEventRegister>(
                         ops.under_progress.remove(&tx);
                         // Fall through to normal cleanup below
                     }
-                    if let Some(tx) = ops.completed.remove(&tx) {
-                        tracing::debug!("Clean up timed out: {tx}");
-                        if cfg!(feature = "trace-ot") {
-                            let op_type = tx.transaction_type().description();
-                            event_register.notify_of_time_out(tx, op_type, None).await;
-                        } else {
-                            _ = tx;
-                        }
-                    }
                     // Same as above: every op owns its own timeout
                     // reporting; the GC sweep has nothing per-op to
                     // remove.
@@ -3006,6 +2982,33 @@ mod tests {
     use crate::node::network_bridge::EventLoopNotificationsReceiver;
     use either::Either;
     use tokio::time::{Duration, Instant, timeout};
+
+    /// ANT-2026-OZWLXLHH: `OpManager::completed` used to insert every finished
+    /// transaction into a set that nothing read and nothing removed from (the
+    /// sweep that drained it has had no sender since #4110), so a long-running
+    /// node grew by one entry per client operation, forever. A source-level
+    /// pin, because the fix is the absence of a field: no behaviour is left to
+    /// observe.
+    #[test]
+    fn completed_does_not_record_finished_transactions_in_an_unbounded_set() {
+        const SRC: &str = include_str!("op_state_manager.rs");
+        let prod = &SRC[..SRC.find("#[cfg(test)]\nmod tests {").expect("test module")];
+        let start = prod.find("pub fn completed(").expect("completed() exists");
+        let body = &prod[start..start + prod[start..].find("\n    }\n").expect("end of fn")];
+        assert!(
+            !body.contains(".insert("),
+            "completed() must not accumulate transactions: {body}"
+        );
+        // Needles are split so this test does not match itself.
+        assert!(
+            !prod.contains(&["ops.", "completed"].concat()),
+            "no production code may touch an ops.completed set"
+        );
+        assert!(
+            !prod.contains(&["completed: ", "DashSet"].concat()),
+            "Ops must not hold a completed set"
+        );
+    }
 
     /// Piece-D H2 pin (keystone step-2, #4642): the strictly-farther
     /// downstream-subscriber filter the reconcile input-builder delegates to
