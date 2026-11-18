@@ -571,6 +571,14 @@ async fn drive_client_update(
                 value: updated_value,
             });
 
+            // Record our own request as relayed here, so a routing cycle that
+            // brings it back to this node ends here instead of being relayed
+            // once more (#3911). The return value is irrelevant: `client_tx`
+            // is fresh.
+            let _ = op_manager
+                .recent_relay_update_requests
+                .first_sighting(client_tx, op_manager.ring.time_source.now());
+
             // Fire-and-forget send to target peer.
             let mut ctx = op_manager.op_ctx(client_tx);
             ctx.send_fire_and_forget(target_addr, msg).await?;
@@ -709,11 +717,11 @@ pub(crate) async fn start_relay_request_update(
     #[cfg(any(test, feature = "testing"))]
     RELAY_UPDATE_DRIVER_CALL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    // Note: the Phase 2 per-(sender, contract) rate limit is applied
-    // UPSTREAM at the wire dispatch site in `node.rs` so the same
-    // gate covers all four UPDATE wire variants (RequestUpdate,
-    // BroadcastTo, RequestUpdateStreaming, BroadcastToStreaming)
-    // uniformly. Rejected messages never reach this driver.
+    // Note: the per-(sender, contract) rate limit is applied at the wire
+    // dispatch site in `node.rs`, before this driver, with a separate budget
+    // per `UpdateClass`: the two `RequestUpdate*` opcodes share the Request
+    // class and the four `BroadcastTo*` opcodes the Broadcast class.
+    // Rejected messages never reach this driver.
 
     if request_already_relayed(&op_manager, incoming_tx, &key, sender_addr) {
         return Ok(());
@@ -8224,5 +8232,50 @@ mod relay_request_loop_tests {
         // A different request is still relayed.
         relay(&op_manager, Transaction::new::<UpdateMsg>(), c).await;
         assert_eq!(sent.lock().len(), 2);
+    }
+
+    /// The streaming variant shares the same record: a `RequestUpdateStreaming`
+    /// whose tx this node already relayed starts no second driver, even after
+    /// the first driver has exited.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_streaming_request_returning_around_a_cycle_starts_no_driver() {
+        let (op_manager, rx, peers, _guards, _store) =
+            op_manager_with_peers_and_store("update-streaming-loop-3911", 3).await;
+        let _sent = record_forwards(rx);
+        let a = peers[0].socket_addr().expect("addr");
+        let c = peers[2].socket_addr().expect("addr");
+        let tx = Transaction::new::<UpdateMsg>();
+
+        let announce = |from: SocketAddr| {
+            start_relay_request_update_streaming(
+                op_manager.clone(),
+                tx,
+                unhosted_key(),
+                crate::transport::peer_connection::StreamId::next(),
+                4096,
+                from,
+            )
+        };
+
+        announce(a).await.expect("dispatch");
+        assert!(
+            op_manager.active_relay_update_txs.contains(&tx),
+            "precondition: the first announcement starts a driver"
+        );
+        // No stream ever arrives: the driver gives up and exits.
+        tokio::time::sleep(Duration::from_secs(180)).await;
+        assert!(
+            !op_manager.active_relay_update_txs.contains(&tx),
+            "precondition: the first driver has exited"
+        );
+
+        announce(c).await.expect("dispatch");
+        // A started driver would still be waiting for its stream here.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !op_manager.active_relay_update_txs.contains(&tx),
+            "a streaming request this node already relayed must start no driver"
+        );
+        assert_eq!(op_manager.recent_relay_update_requests.returned_total(), 1);
     }
 }

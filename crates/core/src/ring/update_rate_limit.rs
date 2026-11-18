@@ -413,8 +413,8 @@ pub(crate) const MIN_BROADCAST_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Which budget an inbound UPDATE is charged against.
 ///
-/// The two classes have SEPARATE stamps inside one map entry, so neither
-/// starves the other. That is deliberate: with a single shared stamp, a
+/// The classes have SEPARATE stamps inside one map entry, so none
+/// starves another. That is deliberate: with a single shared stamp, a
 /// pair busy with fan-out would advance it every ~20 ms and a routed
 /// `RequestUpdate` from the same neighbour for the same contract would
 /// essentially never see its 100 ms of quiet — a client write silently
@@ -434,6 +434,14 @@ pub(crate) enum UpdateClass {
     /// [`MIN_BROADCAST_INTERVAL`], UNIFORMLY across all four so switching
     /// broadcast opcode gains nothing.
     Broadcast,
+    /// `PutMsg::ProbeReconcile`: the delta half of a summary-first PUT,
+    /// merged through the same `update_contract` path as an UPDATE
+    /// (ANT-2026-0ILTPRIJ). Charged against [`MIN_UPDATE_INTERVAL`] with
+    /// its OWN stamp: a client's PUT followed within 100 ms by an UPDATE
+    /// of the same contract through the same first hop must not have the
+    /// UPDATE refused, because a refused `RequestUpdate` is fire-and-forget
+    /// and is lost until anti-entropy.
+    Reconcile,
 }
 
 /// The last accepted timestamp per [`UpdateClass`] for one
@@ -449,6 +457,7 @@ pub(crate) enum UpdateClass {
 pub(crate) struct PairStamps {
     request: Option<Instant>,
     broadcast: Option<Instant>,
+    reconcile: Option<Instant>,
     /// The most recent accepted stamp of EITHER class — the entry's
     /// recency for LRU eviction and for the TTL sweep.
     ///
@@ -468,6 +477,7 @@ impl UpdateClass {
         match self {
             UpdateClass::Request => 0,
             UpdateClass::Broadcast => 1,
+            UpdateClass::Reconcile => 2,
         }
     }
 
@@ -476,6 +486,7 @@ impl UpdateClass {
         match self {
             UpdateClass::Request => "request",
             UpdateClass::Broadcast => "broadcast",
+            UpdateClass::Reconcile => "reconcile",
         }
     }
 }
@@ -486,6 +497,7 @@ impl PairStamps {
         let mut stamps = Self {
             request: None,
             broadcast: None,
+            reconcile: None,
             latest: now,
         };
         stamps.set(class, now);
@@ -496,6 +508,7 @@ impl PairStamps {
         match class {
             UpdateClass::Request => self.request,
             UpdateClass::Broadcast => self.broadcast,
+            UpdateClass::Reconcile => self.reconcile,
         }
     }
 
@@ -506,6 +519,7 @@ impl PairStamps {
         match class {
             UpdateClass::Request => self.request = Some(now),
             UpdateClass::Broadcast => self.broadcast = Some(now),
+            UpdateClass::Reconcile => self.reconcile = Some(now),
         }
         self.latest = self.latest.max(now);
     }
@@ -891,7 +905,7 @@ pub(crate) struct UpdateRateLimiter {
     /// the diagnosis: a shared slot lets a busy broadcast pair suppress the
     /// line that would have told the operator a client's routed writes are
     /// being refused, which is the more alarming of the two and the rarer.
-    last_rejected_log: [Mutex<Option<Instant>>; 2],
+    last_rejected_log: [Mutex<Option<Instant>>; 3],
 }
 
 impl UpdateRateLimiter {
@@ -972,7 +986,7 @@ impl UpdateRateLimiter {
             new_pair_budget_rejected_total: AtomicU64::new(0),
             new_pair_budget_untracked_total: AtomicU64::new(0),
             last_new_pair_log: Mutex::new(None),
-            last_rejected_log: [Mutex::new(None), Mutex::new(None)],
+            last_rejected_log: [Mutex::new(None), Mutex::new(None), Mutex::new(None)],
             last_accepted: Default::default(),
             size: AtomicUsize::new(0),
             min_interval,
@@ -1189,7 +1203,7 @@ impl UpdateRateLimiter {
     /// The minimum inter-message interval charged to `class`.
     fn interval_for(&self, class: UpdateClass) -> Duration {
         match class {
-            UpdateClass::Request => self.min_interval,
+            UpdateClass::Request | UpdateClass::Reconcile => self.min_interval,
             UpdateClass::Broadcast => self.broadcast_interval,
         }
     }
@@ -1689,6 +1703,41 @@ mod tests {
             "a routed request must be judged against the REQUEST stamp alone — \
              sharing one stamp with fan-out would starve client writes on every \
              busy contract (#5510)"
+        );
+    }
+
+    /// ANT-2026-0ILTPRIJ: a PUT's reconcile and a following UPDATE of the same
+    /// contract through the same hop are both admitted with no time between
+    /// them, because the reconcile has its own stamp. A second reconcile inside
+    /// the request interval is refused, and so is a second request.
+    #[test]
+    fn a_reconcile_does_not_spend_the_request_budget() {
+        let (l, ts) = mk_limiter();
+        let (sender, contract) = (mk_sender(1), mk_contract(1));
+
+        assert!(
+            l.check_and_record(sender, contract, UpdateClass::Reconcile)
+                .is_allowed()
+        );
+        assert!(
+            l.check_and_record(sender, contract, UpdateClass::Request)
+                .is_allowed(),
+            "an UPDATE right after the PUT's reconcile must be admitted"
+        );
+        assert!(
+            !l.check_and_record(sender, contract, UpdateClass::Reconcile)
+                .is_allowed(),
+            "a second reconcile inside the interval is refused"
+        );
+        assert!(
+            !l.check_and_record(sender, contract, UpdateClass::Request)
+                .is_allowed()
+        );
+        ts.advance(MIN_UPDATE_INTERVAL);
+        assert!(
+            l.check_and_record(sender, contract, UpdateClass::Reconcile)
+                .is_allowed(),
+            "the reconcile class is charged at the request interval"
         );
     }
 

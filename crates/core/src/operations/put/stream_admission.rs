@@ -1,42 +1,60 @@
-//! Concurrency bound on streaming PUT relay drivers (ANT-2026-16KQ0AS7).
+//! Bound on streaming PUT relay drivers still waiting for their stream
+//! (ANT-2026-16KQ0AS7).
 //!
-//! A `PutMsg::RequestStreaming` spawns a relay driver whose first step waits up
+//! A `PutMsg::RequestStreaming` starts a relay driver whose first step waits up
 //! to `STREAM_CLAIM_TIMEOUT` (60 s) for the announced stream. The announcement
-//! is a small message and the stream is a separate transfer, so without a bound
-//! the number of waiting drivers, and the memory they hold, was decided by the
-//! peers sending announcements. The transport bounds inbound streams per
-//! connection, but an announcement whose stream never comes is counted against
-//! nothing there.
+//! is a small message and the stream a separate transfer, so the number of
+//! drivers waiting for a stream was decided by the peers sending
+//! announcements; the transport's per-connection stream limits do not count an
+//! announcement whose stream never comes.
 //!
-//! This admits a new driver only while the announcing source has fewer than
-//! [`PER_SOURCE_CAP`] drivers in flight and the node has fewer than
-//! [`NODE_WIDE_CAP`]. A source is one IPv4 address or one IPv6 /64, so a host
-//! does not gain capacity by opening connections from more ports or more
-//! addresses in its own prefix. A permit is held for the driver's whole life and
-//! released when it ends, so an honest sender's capacity comes back as its
-//! streams complete.
+//! A permit covers only that UNCLAIMED phase: it is taken when the driver
+//! starts and released as soon as the claim ends, whether the stream arrived or
+//! not. What happens after the claim is bounded by the transport's
+//! per-connection inbound-stream and byte limits, as for any stream.
 //!
-//! A refused announcement is dropped without a reply. Replying would turn every
-//! refused message into an outbound one; the upstream's own response timeout
-//! already ends its wait.
+//! Two bounds:
+//!
+//! - **Per source**, at most [`PER_SOURCE_CAP`] unclaimed drivers. A source is
+//!   the previous hop's IPv4 address or IPv6 /64 (an IPv4-mapped address counts
+//!   as IPv4), so more ports or more addresses in one /64 add nothing. A new
+//!   announcement over this cap is refused.
+//! - **Node-wide**, at most [`NODE_WIDE_CAP`]. At this cap the OLDEST unclaimed
+//!   driver is evicted to admit the newcomer, rather than refusing it. An
+//!   honest stream is claimed within about one round trip of its announcement,
+//!   so the oldest waiter is the one least likely to ever see its stream, and
+//!   no set of sources can lock the node out by holding every permit for the
+//!   claim timeout.
+//!
+//! A refused announcement and an evicted driver both answer their upstream with
+//! a `PutMsg::Error` (one reply per announcement, so no amplification); the
+//! upstream would otherwise wait out its whole attempt.
 
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use dashmap::DashMap;
+use tokio::sync::oneshot;
 
-/// Streaming PUT relay drivers one source may have in flight at once.
+/// Unclaimed streaming PUT relay drivers one source (the previous hop) may
+/// have at once.
 ///
-/// A PUT large enough to stream is rare, and a relay holds one driver per PUT
-/// it is passing on, so an honest peer, or several honest peers behind one
-/// NAT, stays far below this.
+/// Sized for an honest gateway relaying many joiners' PUTs, which all count
+/// against that gateway's address. A permit is held only from the
+/// announcement until the stream is claimed. The sender puts the stream on
+/// the wire right after its announcement (fragment 1 even carries a copy of
+/// it), so an honest permit lasts about one round trip: tens of
+/// milliseconds, up to a few hundred on a slow path. At 32 permits and
+/// 300 ms each, one previous hop can have 100 streaming PUTs per second
+/// announced through it before any is refused. A streaming PUT carries a
+/// payload above the streaming threshold (64 KiB), so 100 per second is
+/// at least 6.5 MB/s of PUT payload arriving over one link.
 pub(crate) const PER_SOURCE_CAP: usize = 32;
 
-/// Streaming PUT relay drivers this node runs at once across all sources.
-///
-/// A driver waiting for a stream that never arrives holds about 6.5 KB, so a
-/// full set of idle drivers is a few MiB.
+/// Unclaimed streaming PUT relay drivers this node holds across all sources.
+/// At this cap the oldest is evicted. A driver waiting for its stream holds
+/// a few KB, so a full set is a few MiB.
 pub(crate) const NODE_WIDE_CAP: usize = 512;
 
 /// Where an announcement came from, at the granularity one host controls.
@@ -63,21 +81,66 @@ impl Source {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Refusal {
     SourceAtCap,
-    NodeAtCap,
 }
 
 pub(crate) struct RelayStreamAdmission {
-    per_source: DashMap<Source, usize>,
-    total: AtomicUsize,
+    state: parking_lot::Mutex<State>,
     per_source_cap: usize,
     node_wide_cap: usize,
     refused_total: AtomicU64,
+    evicted_total: AtomicU64,
 }
 
-/// One admitted driver. Dropping it releases the slot.
+/// One lock for both maps: eviction moves an entry out of `unclaimed` and
+/// decrements its source in the same step, and the critical section is a
+/// few map operations per streaming PUT.
+#[derive(Default)]
+struct State {
+    next_seq: u64,
+    per_source: HashMap<Source, usize>,
+    /// Admitted, still-unclaimed drivers in admission order. The sender wakes
+    /// the driver when it is evicted.
+    unclaimed: BTreeMap<u64, (Source, oneshot::Sender<()>)>,
+}
+
+impl State {
+    fn release_source(&mut self, source: Source) {
+        if let Some(count) = self.per_source.get_mut(&source) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.per_source.remove(&source);
+            }
+        }
+    }
+}
+
+/// One admitted driver's unclaimed phase. Dropping it releases the slot.
 pub(crate) struct RelayStreamPermit {
     admission: Arc<RelayStreamAdmission>,
-    source: Source,
+    seq: u64,
+    evicted: oneshot::Receiver<()>,
+}
+
+impl RelayStreamPermit {
+    /// Resolves if this driver is evicted to make room for a newer one.
+    /// Never resolves otherwise.
+    pub(crate) async fn evicted(&mut self) {
+        if (&mut self.evicted).await.is_err() {
+            // The sender is gone without an eviction: the slot was released,
+            // which only this permit's own drop does.
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+impl Drop for RelayStreamPermit {
+    fn drop(&mut self) {
+        let mut state = self.admission.state.lock();
+        // Absent if this driver was evicted: eviction already released it.
+        if let Some((source, _)) = state.unclaimed.remove(&self.seq) {
+            state.release_source(source);
+        }
+    }
 }
 
 impl RelayStreamAdmission {
@@ -87,42 +150,50 @@ impl RelayStreamAdmission {
 
     pub(crate) fn with_caps(per_source_cap: usize, node_wide_cap: usize) -> Self {
         Self {
-            per_source: DashMap::new(),
-            total: AtomicUsize::new(0),
-            per_source_cap,
-            node_wide_cap,
+            state: parking_lot::Mutex::new(State::default()),
+            per_source_cap: per_source_cap.max(1),
+            node_wide_cap: node_wide_cap.max(1),
             refused_total: AtomicU64::new(0),
+            evicted_total: AtomicU64::new(0),
         }
     }
 
-    /// Admit one driver for an announcement from `from`, or say why not.
+    /// Admit one driver for an announcement from `from`. At the node-wide cap
+    /// the oldest unclaimed driver is evicted to make room; over the
+    /// per-source cap the newcomer is refused.
     pub(crate) fn try_admit(
         self: &Arc<Self>,
         from: SocketAddr,
     ) -> Result<RelayStreamPermit, Refusal> {
-        // Reserve the node-wide slot first; give it back if the source is full.
-        let reserved = self
-            .total
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < self.node_wide_cap).then_some(n + 1)
-            });
-        if reserved.is_err() {
-            self.refused_total.fetch_add(1, Ordering::Relaxed);
-            return Err(Refusal::NodeAtCap);
-        }
         let source = Source::of(from);
-        let mut count = self.per_source.entry(source).or_insert(0);
-        if *count >= self.per_source_cap {
-            drop(count);
-            self.total.fetch_sub(1, Ordering::AcqRel);
+        let mut state = self.state.lock();
+        if state.per_source.get(&source).copied().unwrap_or(0) >= self.per_source_cap {
+            drop(state);
             self.refused_total.fetch_add(1, Ordering::Relaxed);
             return Err(Refusal::SourceAtCap);
         }
-        *count += 1;
-        drop(count);
+        while state.unclaimed.len() >= self.node_wide_cap {
+            let Some((_, (victim_source, wake))) = state.unclaimed.pop_first() else {
+                break;
+            };
+            state.release_source(victim_source);
+            // An error only means the victim's driver is already gone (its
+            // permit is dropping); its slot is released here either way.
+            match wake.send(()) {
+                Ok(()) | Err(()) => {}
+            }
+            self.evicted_total.fetch_add(1, Ordering::Relaxed);
+        }
+        let seq = state.next_seq;
+        state.next_seq += 1;
+        let (wake, evicted) = oneshot::channel();
+        state.unclaimed.insert(seq, (source, wake));
+        *state.per_source.entry(source).or_insert(0) += 1;
+        drop(state);
         Ok(RelayStreamPermit {
             admission: self.clone(),
-            source,
+            seq,
+            evicted,
         })
     }
 
@@ -131,23 +202,14 @@ impl RelayStreamAdmission {
         self.refused_total.load(Ordering::Relaxed)
     }
 
-    /// Drivers currently admitted.
-    pub(crate) fn in_flight(&self) -> usize {
-        self.total.load(Ordering::Acquire)
+    /// Drivers evicted so far.
+    pub(crate) fn evicted_total(&self) -> u64 {
+        self.evicted_total.load(Ordering::Relaxed)
     }
-}
 
-impl Drop for RelayStreamPermit {
-    fn drop(&mut self) {
-        // Remove the source's entry when its last permit goes, so the map holds
-        // only sources with drivers in flight.
-        self.admission
-            .per_source
-            .remove_if_mut(&self.source, |_, count| {
-                *count = count.saturating_sub(1);
-                *count == 0
-            });
-        self.admission.total.fetch_sub(1, Ordering::AcqRel);
+    /// Drivers currently holding a permit.
+    pub(crate) fn unclaimed(&self) -> usize {
+        self.state.lock().unclaimed.len()
     }
 }
 
@@ -208,37 +270,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_node_wide_cap_binds_across_sources() {
+    /// At the node-wide cap the newcomer is admitted and the oldest unclaimed
+    /// driver is told it was evicted; its slot and its source's count are
+    /// released at once.
+    #[tokio::test]
+    async fn the_node_wide_cap_evicts_the_oldest_unclaimed_driver() {
         let admission = Arc::new(RelayStreamAdmission::with_caps(10, 2));
-        let _a = admission.try_admit(addr("192.0.2.1:1")).unwrap();
-        let _b = admission.try_admit(addr("192.0.2.2:1")).unwrap();
-        assert_eq!(
-            admission.try_admit(addr("192.0.2.3:1")).err(),
-            Some(Refusal::NodeAtCap)
+        let mut oldest = admission.try_admit(addr("192.0.2.1:1")).unwrap();
+        let mut second = admission.try_admit(addr("192.0.2.2:1")).unwrap();
+        let _newcomer = admission
+            .try_admit(addr("192.0.2.3:1"))
+            .expect("at the node-wide cap a newcomer is admitted");
+        assert_eq!(admission.unclaimed(), 2);
+        assert_eq!(admission.evicted_total(), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(1), oldest.evicted())
+            .await
+            .expect("the oldest driver is told it was evicted");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), second.evicted())
+                .await
+                .is_err(),
+            "a younger driver is not evicted"
         );
-        assert_eq!(admission.in_flight(), 2);
+        drop(oldest);
+        assert_eq!(
+            admission.unclaimed(),
+            2,
+            "an evicted permit's drop releases nothing twice"
+        );
+        // The evicted source's count was released: it may admit again.
+        let source_only_one = Arc::new(RelayStreamAdmission::with_caps(1, 1));
+        let first = source_only_one.try_admit(addr("192.0.2.9:1")).unwrap();
+        let _replacement = source_only_one.try_admit(addr("192.0.2.8:1")).unwrap();
+        drop(first);
+        assert!(source_only_one.try_admit(addr("192.0.2.9:2")).is_ok());
     }
 
     #[test]
-    fn dropping_a_permit_returns_both_slots() {
-        let admission = Arc::new(RelayStreamAdmission::with_caps(1, 1));
+    fn dropping_a_permit_returns_its_slots() {
+        let admission = Arc::new(RelayStreamAdmission::with_caps(1, 4));
         let permit = admission.try_admit(addr("192.0.2.1:1")).unwrap();
         assert!(admission.try_admit(addr("192.0.2.1:2")).is_err());
         drop(permit);
-        assert_eq!(admission.in_flight(), 0);
+        assert_eq!(admission.unclaimed(), 0);
         assert!(
-            admission.per_source.is_empty(),
+            admission.state.lock().per_source.is_empty(),
             "an idle source keeps no entry"
         );
         assert!(admission.try_admit(addr("192.0.2.1:2")).is_ok());
     }
 
-    /// A refusal at the source cap must not leak the node-wide slot it reserved.
+    /// A refusal at the source cap takes no node-wide slot and evicts nobody.
     #[test]
-    fn a_source_refusal_does_not_consume_node_capacity() {
+    fn a_source_refusal_evicts_nobody() {
         let admission = Arc::new(RelayStreamAdmission::with_caps(1, 2));
         let _a = admission.try_admit(addr("192.0.2.1:1")).unwrap();
+        let _b = admission.try_admit(addr("192.0.2.2:1")).unwrap();
         for port in 2..50 {
             assert!(
                 admission
@@ -246,7 +333,7 @@ mod tests {
                     .is_err()
             );
         }
-        assert_eq!(admission.in_flight(), 1);
-        assert!(admission.try_admit(addr("192.0.2.9:1")).is_ok());
+        assert_eq!(admission.unclaimed(), 2);
+        assert_eq!(admission.evicted_total(), 0);
     }
 }
