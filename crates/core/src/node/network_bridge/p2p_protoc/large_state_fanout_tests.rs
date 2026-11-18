@@ -44,7 +44,7 @@ use crate::ring::interest::SummaryPopulationSource;
 use crate::transport::{StreamSendOutcome, TransportPublicKey};
 use crate::util::alloc_count::{allocated_by, jemalloc_class, peak_delta};
 
-const STATE_BYTES: usize = 30 * 1024 * 1024;
+const STATE_LEN: usize = 30 * 1024 * 1024;
 const TARGETS: u8 = 20;
 /// Longer than `STREAM_PERMIT_HOLD` (120 s), so each stream's buffer outlives
 /// the permit that admitted it and another leg builds its buffer meanwhile.
@@ -68,14 +68,14 @@ struct Fanout {
     malformed_streams: usize,
 }
 
-/// Fan a `STATE_BYTES` state out to `TARGETS` co-hosts whose deltas the
+/// Fan a `STATE_LEN` state out to `TARGETS` co-hosts whose deltas the
 /// stand-in contract computes as `delta_bytes` long.
 fn fan_out(id: &str, delta_bytes: usize) -> Fanout {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("runtime");
-    let state = WrappedState::new(vec![0x5A; STATE_BYTES]);
+    let state = WrappedState::new(vec![0x5A; STATE_LEN]);
     let (mut mgr, op_manager, key, handler) = rt.block_on(node(id, state.clone(), delta_bytes));
     assert_eq!(
         op_manager.streaming_threshold, STREAMING_THRESHOLD,
@@ -363,7 +363,7 @@ async fn node(
 fn lane_bound() -> isize {
     let hold = super::super::broadcast_queue::STREAM_PERMIT_HOLD;
     let buffers_per_permit = TRANSFER.as_millis().div_ceil(hold.as_millis()) as usize;
-    let per_leg = jemalloc_class(STATE_BYTES + 1024);
+    let per_leg = jemalloc_class(STATE_LEN + 1024);
     let delta_cache = jemalloc_class(crate::ring::interest::interest_delta_cache_budget_bytes());
     (super::super::broadcast_queue::LARGE_LANE_PERMITS * buffers_per_permit * per_leg
         + delta_cache
@@ -394,7 +394,7 @@ fn assert_streams_within_lane_bound(case: &str, run: &Fanout) {
     // measuring thread. If the counter stopped seeing the fan-out (a thread
     // move, a different allocator), the peak below would pass vacuously.
     assert!(
-        run.allocated >= usize::from(TARGETS) * STATE_BYTES,
+        run.allocated >= usize::from(TARGETS) * STATE_LEN,
         "{case}: the allocation counter saw {} bytes, less than the {TARGETS} stream \
          buffers the fan-out must have built",
         run.allocated
@@ -404,7 +404,7 @@ fn assert_streams_within_lane_bound(case: &str, run: &Fanout) {
         run.peak <= bound,
         "{case}: peak live fan-out bytes {} ({:.2} x the state) exceed {bound}",
         run.peak,
-        run.peak as f64 / STATE_BYTES as f64
+        run.peak as f64 / STATE_LEN as f64
     );
 }
 
@@ -416,14 +416,14 @@ fn assert_streams_within_lane_bound(case: &str, run: &Fanout) {
 /// once (measured at 22.4 x the state).
 #[test]
 fn a_large_new_state_fans_out_within_the_large_lane_bound() {
-    let run = fan_out("fanout-state-sized-delta", STATE_BYTES);
+    let run = fan_out("fanout-state-sized-delta", STATE_LEN);
     assert_streams_within_lane_bound("state-sized deltas", &run);
 }
 
 /// A delta of about half a large state streams the state as well.
 #[test]
 fn a_half_state_delta_streams_within_the_lane_bound() {
-    let run = fan_out("fanout-half-state-delta", STATE_BYTES / 2 - 1);
+    let run = fan_out("fanout-half-state-delta", STATE_LEN / 2 - 1);
     assert_streams_within_lane_bound("half-state deltas", &run);
 }
 
