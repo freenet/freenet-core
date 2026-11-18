@@ -4027,46 +4027,49 @@ fn a_persistent_panic_in_socket_send_is_caught_once_and_does_not_loop() {
     );
 }
 
-/// NOT contained, pinned so it is not forgotten: a panic that unwinds
-/// through quinn's ENDPOINT driver (as one in quinn's own code would)
-/// aborts the process. quinn spawns the driver inside its own `async`
-/// block, and the unwind out of that block drops it during the unwind (no
-/// catch around the spawned future, ours or tokio's, runs first); then
-/// `EndpointDriver::drop` (`endpoint.rs:403`) and `EndpointRef::drop`
-/// (`endpoint.rs:724`) unwrap the lock the panic poisoned (quinn 0.11.12).
-/// The fix belongs in quinn: both destructors must tolerate a poisoned
-/// lock.
+/// CONTAINED since quinn#2987 (the `freenet-quinn` fork): a panic that
+/// unwinds through quinn's ENDPOINT driver (as one in quinn's own code
+/// would) no longer aborts the process (#6184). quinn spawns the driver
+/// inside its own `async` block, and the unwind out of that block drops the
+/// driver during the unwind; `EndpointDriver::drop` and `EndpointRef::drop`
+/// used to unwrap the lock the panic poisoned and abort. They now tolerate
+/// it, so the panic reaches `watch_endpoint_driver`, which reports the
+/// endpoint Down. The child process would abort (and so fail) without the
+/// fix, and would sit `Up` with nothing driving the endpoint without the
+/// catch in `watch_endpoint_driver`.
 #[test]
-fn a_panic_unwinding_through_the_endpoint_driver_still_aborts() {
-    const NAME: &str = "a_panic_unwinding_through_the_endpoint_driver_still_aborts";
-    if std::env::var_os(PANIC_CHILD_ENV).is_some() {
-        bounded(|| async move {
-            let _seed = GlobalRng::seed_guard(SEED);
-            let net = crate::transport::test_net::subnet();
-            let pair = pair("quic-panic-in-quinn", net.addr(1), net.addr(2), None).await;
-            pair.a.faults().panic_receive_in_quinn();
-            let mut availability = pair.a.availability();
-            drive(&pair.time, Duration::from_secs(1), async move {
-                availability.not_up().await
-            })
-            .await;
-        });
-        return;
-    }
-    let (test, output) = run_child(NAME);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    #[cfg(unix)]
-    let aborted = {
-        use std::os::unix::process::ExitStatusExt;
-        output.status.signal() == Some(6) // SIGABRT
-    };
-    #[cfg(not(unix))]
-    let aborted = !output.status.success();
-    assert!(
-        aborted && stderr.contains("unwinding through quinn"),
-        "{test} no longer aborts ({}): quinn may be fixed. Remove this pin and update the \
-         transport docs (quic/liveness.rs, .claude/rules/transport.md).\nstderr:\n{stderr}",
-        output.status
+fn a_panic_unwinding_through_the_endpoint_driver_is_contained() {
+    in_child(
+        "a_panic_unwinding_through_the_endpoint_driver_is_contained",
+        || {
+            bounded(|| async move {
+                let _seed = GlobalRng::seed_guard(SEED);
+                let net = crate::transport::test_net::subnet();
+                let pair = pair("quic-panic-in-quinn", net.addr(1), net.addr(2), None).await;
+                pair.a.faults().panic_receive_in_quinn();
+                let mut availability = pair.a.availability();
+                let state = drive(&pair.time, Duration::from_secs(1), async move {
+                    availability.not_up().await
+                })
+                .await;
+                assert_eq!(state, QuicAvailability::Down);
+                assert_eq!(TRANSPORT_METRICS.quic_endpoint_down_at(pair.a_addr), 1);
+                // The panic was quinn's, not the socket adapter's.
+                assert_eq!(TRANSPORT_METRICS.quic_adapter_panicked_at(pair.a_addr), 0);
+                // The endpoint's state lock is poisoned: what the node still
+                // calls on it must refuse, not panic on the lock.
+                let a = pair.a.clone();
+                let accepted = drive(&pair.time, Duration::from_secs(1), async move {
+                    a.accept().await.is_some()
+                })
+                .await;
+                assert!(!accepted, "accept returns None once the driver is gone");
+                pair.a
+                    .connect(pair.b_addr, &pair.b_key())
+                    .await
+                    .expect_err("the endpoint is down");
+            });
+        },
     );
 }
 

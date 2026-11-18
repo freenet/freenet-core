@@ -70,21 +70,28 @@
 //! ([`QuicPathLimits::SHADOW`]) refuses inbound data with
 //! [`stop_code::NOT_ACCEPTING_DATA`] before charging anything.
 //!
-//! Known quinn cost (quinn 0.11.12): `SendStream::stopped()` registers an
-//! `Arc<Notify>` in the connection's `stopped` map, removed only when quinn
-//! reports the stream Finished or Stopped. A stream this side resets gets
-//! neither event (`reset_acked` emits none), so each locally reset stream
-//! leaves one entry until the connection closes. Every send registers
-//! (its writes race `stopped()`), so the entries are bounded by the sends
-//! this side reset on the connection over its lifetime (a source that
-//! failed, a cancelled send). A stop the peer sent is reported as Stopped
-//! and removes its entry, so answering it with a reset adds none. The path
-//! counts its resets and closes the connection past
+//! Known quinn cost (quinn 0.11.12; much reduced in the pinned freenet-quinn
+//! 0.11.13): `SendStream::stopped()` registers an `Arc<Notify>` in the
+//! connection's `stopped` map. quinn 0.11.12 removed it only when quinn
+//! reported the stream Finished or Stopped, and a stream this side resets
+//! gets neither event (`reset_acked` emits none), so each locally reset
+//! stream left one entry until the connection closed. freenet-quinn also
+//! removes a registration when its `stopped()` future is dropped (upstream
+//! `bae3f1fa`, `send_stream.rs` `StoppedRegistration`), so a reset stream
+//! whose waiter was cancelled (a write racing `stopped()`) leaves nothing;
+//! measured 0 B per stream by
+//! `memory_tests::polling_stopped_on_a_reset_stream_costs_at_most_its_entry`.
+//! An entry still stays while a waiter is alive across the reset, such as an
+//! ack-wait task. The bound is therefore unchanged and now an upper bound:
+//! the entries are bounded by the sends this side reset on the connection
+//! over its lifetime, `config::QUIC_STOPPED_ENTRY_BYTES` each in the fixed charge
+//! (a source that failed, a cancelled send). A stop the peer sent is reported
+//! as Stopped and removes its entry, so answering it with a reset adds none.
+//! The path counts its resets and closes the connection past
 //! [`recycle::SEND_ABORT_LIMIT`] (`close_code::SEND_ABORT_LIMIT`), so the
 //! peer falls back to UDP and a new connection starts with an empty map. A
 //! write that fails because the peer stopped the stream is not a reset of
 //! this side's and is not counted.
-//! Worth an upstream quinn issue (not filed).
 //!
 //! The receive task also runs the path's acknowledgement watch
 //! ([`recycle::watch_acknowledgements`]): a peer that keeps sending but

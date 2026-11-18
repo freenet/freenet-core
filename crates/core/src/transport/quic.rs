@@ -482,7 +482,7 @@ impl EndpointCore {
 
     /// Connection pollers this endpoint's socket built outside
     /// `socket::with_poller_holds`: their cap holds go into a record nobody
-    /// reads. Expected 0 (quinn 0.11.12 builds one elsewhere only on a
+    /// reads. Expected 0 (freenet-quinn 0.11.13 builds one elsewhere only on a
     /// rebind, which needs migration, which is off).
     #[cfg(test)]
     pub(crate) fn fallback_pollers(&self) -> u64 {
@@ -756,7 +756,9 @@ impl QuicEndpoint {
     /// endpoint's end must not stop the node. Endpoint death is reported by
     /// the driver's watcher ([`Self::availability`]), not by this task. A
     /// panic here is still a node failure, as for every monitored task; a
-    /// quinn panic is not contained (see `liveness`).
+    /// panic in quinn's `accept` after a panic in its endpoint driver is
+    /// caught in [`EndpointCore::accept_attempt`] and ends the loop like a
+    /// closed endpoint (see `liveness`).
     ///
     /// The registrar is a [`LateRegistrar`] because in `run_node` the
     /// monitor starts waiting before the event listener opens the transport,
@@ -994,9 +996,16 @@ impl QuicEndpoint {
             .allow(addr)
             .ok_or(QuicConnectError::AllowSetFull)?;
         let holds = Arc::new(self.cap_holds.like());
+        // quinn locks the endpoint's state with `unwrap`, so a connect that
+        // races a panic in quinn's endpoint driver (which poisons the lock)
+        // panics in this caller's task: report it as a stopped endpoint
+        // instead, as `refuses_connects` does once the watcher has run.
         let connecting = socket::with_poller_holds(&holds, || {
-            self.endpoint
-                .connect_with(config, addr, config::SERVER_NAME)
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                self.endpoint
+                    .connect_with(config, addr, config::SERVER_NAME)
+            }))
+            .unwrap_or(Err(quinn::ConnectError::EndpointStopping))
         })?;
         let connection = connecting.await?;
         Ok(QuicConnection::new(
@@ -1041,7 +1050,27 @@ impl EndpointCore {
     /// endpoint is closed.
     pub(crate) async fn accept_attempt(&self) -> Option<EndpointAttempt> {
         loop {
-            let incoming = self.endpoint.accept().await?;
+            // After a panic in quinn's endpoint driver its state lock is
+            // poisoned and quinn's `accept` unwraps it (only the destructors
+            // are fixed in freenet-quinn). That would panic the monitored
+            // accept loop, a node failure, so it reads as a closed endpoint;
+            // the driver's watcher reports the endpoint Down (`liveness`).
+            let accepted = {
+                use futures::FutureExt;
+                std::panic::AssertUnwindSafe(self.endpoint.accept())
+                    .catch_unwind()
+                    .await
+            };
+            let incoming = match accepted {
+                Ok(incoming) => incoming?,
+                Err(_) => {
+                    tracing::error!(
+                        "QUIC accept panicked inside quinn (a poisoned endpoint lock after an \
+                         endpoint driver panic); the panic was contained"
+                    );
+                    return None;
+                }
+            };
             let remote = incoming.remote_address();
             // One step under the allow-set entry's lock, so a permit dropped
             // concurrently is not brought back.
@@ -1297,7 +1326,7 @@ impl QuicIncoming {
     /// handshake (write readiness or send) ends the driver with an error,
     /// which skips quinn's own terminate. The handshake still ends: dropping
     /// the driver drops the second-to-last reference to the connection, and
-    /// quinn's `ConnectionRef::drop` (quinn 0.11.12, `connection.rs:946`)
+    /// quinn's `ConnectionRef::drop` (freenet-quinn 0.11.13, `connection.rs:1032`)
     /// then closes it implicitly, so this returns `LocallyClosed` (read as
     /// `EndpointDown` through `QuicEndpoint::error_kind`) and the permit
     /// goes with it. A panic anywhere else in the adapter (another

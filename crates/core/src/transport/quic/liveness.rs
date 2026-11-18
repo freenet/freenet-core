@@ -69,24 +69,27 @@
 //!   the same state lock, so a panic there behaves as one in quinn's own
 //!   code (below). They have no error to return a panic as (`now` must
 //!   return an `Instant`), so they are not wrapped like the socket adapter.
-//! - In quinn's own code inside its endpoint or connection driver: NOT
-//!   contained, and it can abort the process. quinn 0.11.12 polls each
-//!   driver holding a `std::sync::Mutex` it locks with `.lock().unwrap()`,
-//!   so the panic poisons it, and quinn's destructors unwrap the poisoned
-//!   lock. For the endpoint driver that happens on every such panic: quinn
-//!   spawns it inside its own `async` block, and the unwind out of that
-//!   block drops the driver there, before any catch around the spawned
-//!   future (ours or tokio's) runs. `EndpointDriver::drop`
-//!   (`endpoint.rs:403`) and then `EndpointRef::drop` (`endpoint.rs:724`)
-//!   lock the poisoned mutex during the unwind, and the process aborts. For
-//!   a connection driver, `SendStream`, `RecvStream` and the last
-//!   `Connection` handle lock in their `Drop`, so dropping one afterwards
-//!   panics in whatever task drops it, and aborts the process if that drop
-//!   runs during an unwind. The fix belongs in quinn: those destructors
-//!   must tolerate a poisoned lock (both `endpoint.rs:403` and `:724` for
-//!   the endpoint driver);
-//!   `a_panic_unwinding_through_the_endpoint_driver_still_aborts` pins the
-//!   current behaviour.
+//! - In quinn's own code inside its ENDPOINT driver: CONTAINED since
+//!   quinn-rs/quinn#2987, which the pinned `freenet-quinn` fork carries
+//!   (#6184). quinn polls the driver holding a `std::sync::Mutex` it locks
+//!   with `.lock().unwrap()`, so the panic poisons it. quinn spawns the
+//!   driver inside its own `async` block and the unwind drops it there, so
+//!   `EndpointDriver::drop` (`endpoint.rs:399`) and `EndpointRef::drop`
+//!   (`endpoint.rs:770`) run during the unwind; they lock with
+//!   `unwrap_or_else(PoisonError::into_inner)` now (they unwrapped before,
+//!   which aborted the process). The panic then reaches
+//!   [`watch_endpoint_driver`], which catches it, logs ERROR and reports the
+//!   endpoint Down like any other end of the driver. quinn's other calls on
+//!   the poisoned endpoint (`accept`, `connect`, `local_addr`) still unwrap
+//!   the lock and panic in their caller: the accept loop and `connect_with`
+//!   catch that (`quic.rs`). Pinned by
+//!   `a_panic_unwinding_through_the_endpoint_driver_is_contained`.
+//! - In quinn's own code inside a CONNECTION driver: the destructors of
+//!   `SendStream`, `RecvStream`, `ConnectionRef`, `ConnectionDriver` and
+//!   the `StoppedRegistration` lock through `lock_for_drop`, which skips a
+//!   poisoned lock, so dropping them during an unwind no longer aborts. NOT
+//!   tested here, and the poisoned connection's other calls (a write, a
+//!   read, `close`) still panic in the task that makes them.
 //!
 //! With `transport-quic = "off"` no endpoint exists, and the transport
 //! reports [`QuicAvailability::Disabled`].
@@ -416,18 +419,32 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     }
 }
 
-/// Run quinn's endpoint driver and report to `health` when it returns.
+/// Run quinn's endpoint driver and report to `health` when it returns or
+/// panics.
 ///
-/// No panic handling here: a panic in quinn's driver code is not contained
-/// (see the module docs), and the socket adapter catches its own.
+/// A panic in quinn's own driver code no longer aborts the process (the
+/// destructors that ran during the unwind unwrapped the poisoned lock until
+/// quinn#2987, which the pinned `freenet-quinn` carries). It unwinds out of
+/// the driver's future to here, where it is logged and reported like any
+/// other end of the driver: the endpoint goes Down. Without the catch the
+/// tokio task would swallow the panic and the endpoint would stay `Up`
+/// with nothing driving it. The socket adapter catches its own panics
+/// before they reach quinn.
 pub(crate) async fn watch_endpoint_driver(
     driver: Pin<Box<dyn Future<Output = ()> + Send>>,
     health: Arc<EndpointHealth>,
 ) {
+    use futures::FutureExt;
     // quinn's spawned future logs and swallows the driver's I/O error, so an
     // error return and a normal return look alike here; `released` tells
     // them apart.
-    driver.await;
+    if let Err(payload) = std::panic::AssertUnwindSafe(driver).catch_unwind().await {
+        tracing::error!(
+            local_addr = %health.local_addr,
+            panic = panic_message(&*payload),
+            "The QUIC endpoint driver panicked inside quinn; the panic was contained"
+        );
+    }
     health.driver_ended();
 }
 

@@ -3311,24 +3311,17 @@ mod tests {
 
     /// The receive side was written against quinn-proto 0.11.17 or later
     /// within 0.11, where unordered reads release each chunk as it arrives.
-    /// A version outside that range must be re-read before it is taken.
+    /// The linked proto is `freenet-quinn-proto` 0.11.13: the fork's own
+    /// version number, built from upstream's `0.11.x` branch, which contains
+    /// the quinn-proto-0.11.19 tag (so it is past 0.11.17). Any other version
+    /// must be re-read before it is taken.
     #[test]
     fn quinn_proto_is_one_whose_assembler_this_reader_was_written_for() {
-        let versions = super::super::super::tests::locked_versions("quinn-proto");
+        let versions = super::super::super::tests::locked_versions("freenet-quinn-proto");
         assert_eq!(
-            versions.len(),
-            1,
-            "one quinn-proto in Cargo.lock: {versions:?}"
-        );
-        let parts: Vec<u64> = versions[0]
-            .split('.')
-            .map(|part| part.parse().expect("a numeric version"))
-            .collect();
-        assert_eq!(&parts[..2], &[0, 11], "quinn-proto {}", versions[0]);
-        assert!(
-            parts[2] >= 17,
-            "quinn-proto {} predates MAX_CHUNKS",
-            versions[0]
+            versions,
+            ["0.11.13"],
+            "one freenet-quinn-proto in Cargo.lock, the one this reader was checked against"
         );
     }
 
