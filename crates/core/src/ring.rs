@@ -5028,10 +5028,31 @@ impl Ring {
         self.hosting_manager.committed_state_size(contract)
     }
 
+    /// Whether a relayed UPDATE (or probe reconcile) may be merged into, and
+    /// persisted for, `key` here.
+    ///
+    /// A contract that is neither in the hosting cache nor in use (no
+    /// subscriber of any kind) is not hosted: an eviction has queued its bytes
+    /// for reclamation, or this node only still has them on disk. Merging a
+    /// relayed write into such a copy moves its state generation without
+    /// re-hosting it, and a remote peer decides when that happens, so the
+    /// bytes would stay on disk outside every budget (hosting invariants 1
+    /// and 3: a copy is served only while fresh in the update mesh, and the
+    /// demand ranking, not an UPDATE, decides what stays). Callers skip the
+    /// merge and, for a request, forward it toward the hosts instead.
+    pub(crate) fn may_merge_relayed_update(&self, key: &ContractKey) -> bool {
+        self.is_hosting_contract(key) || self.contract_in_use(key)
+    }
+
     pub(crate) fn commit_state_write(&self, contract: &ContractKey, state_size: usize) {
         let new_gen = self.hosting_manager.bump_state_generation(contract);
+        // Hosting-budget accounting: charge the hosted entry the size that was
+        // just stored. `host_contract` records a size on PUT/GET only, and the
+        // UPDATE paths must not call it (it stamps recency), so without this a
+        // contract that grows through UPDATE stays charged its PUT-time size
+        // and the byte-budget eviction never sees the growth.
         self.hosting_manager
-            .refresh_cache_generation(contract, new_gen);
+            .refresh_cache_after_write(contract, new_gen, state_size as u64);
         // Disk-usage accounting (#4683): maintain the aggregate on-disk state
         // total by signed delta (`new − previous_for_key`). Read by the
         // eviction floor and the admission gates since #4702. No-op until the
@@ -11320,6 +11341,54 @@ mod cost_pressure_seam_tests {
             crate::ring::hosting::HOSTED_ENTRY_BYTES + held,
             "the hosting cache must charge the summary bytes the interest manager holds"
         );
+    }
+
+    /// A state write must re-charge an already-hosted contract to the hosting
+    /// budget. Goes through the production funnel (`Ring::commit_state_write`,
+    /// the post-write step of every executor PUT/UPDATE chokepoint) and the
+    /// production sweep entry (`Ring::sweep_expired_hosting`). Without the
+    /// size refresh a contract hosted at 1 byte and grown by an UPDATE stays
+    /// charged 1 byte, the cache never goes over budget, and the sweep evicts
+    /// nothing however much state the UPDATEs stored.
+    #[tokio::test]
+    async fn commit_state_write_charges_update_growth_to_the_hosting_budget() {
+        let op_manager = attached_op_manager("commit-state-write-size").await;
+        let hosting = &op_manager.ring.hosting_manager;
+        let budget = hosting.hosting_cache_stats().budget_bytes;
+        let keys: Vec<_> = (0..3).map(wiring_key).collect();
+        for key in &keys {
+            hosting.record_contract_access(
+                *key,
+                1,
+                crate::ring::hosting::AccessType::Put,
+                crate::ring::hosting::HostingCause::Other,
+            );
+        }
+        assert_eq!(hosting.hosting_cache_stats().current_bytes, 3);
+
+        // One UPDATE per contract, each leaving a state of most of the budget.
+        let grown = budget / 2 + 1;
+        for key in &keys {
+            op_manager.ring.commit_state_write(key, grown as usize);
+        }
+        let stats = hosting.hosting_cache_stats();
+        assert_eq!(
+            stats.current_bytes,
+            3 * grown,
+            "every state write must charge the stored size to the hosting cache"
+        );
+        // Byte accounting only: the write itself evicts nothing.
+        assert_eq!(stats.contract_count, 3);
+
+        let swept = op_manager.ring.sweep_expired_hosting();
+        assert_eq!(
+            swept.expired.len(),
+            2,
+            "the sweep must shed the contracts that UPDATE grew over budget"
+        );
+        let stats = hosting.hosting_cache_stats();
+        assert_eq!(stats.current_bytes, grown);
+        assert!(stats.current_bytes <= stats.budget_bytes);
     }
 
     fn wiring_peer() -> crate::ring::PeerKey {

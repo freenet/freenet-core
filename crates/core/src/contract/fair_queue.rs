@@ -10,8 +10,9 @@
 //! Two layers of fairness:
 //!
 //! 1. **Across priority classes** ([`Priority`]) — events are bucketed into one
-//!    [`PriorityTier`] per class. [`FairEventQueue::pop`] drains `ClientLocal`
-//!    fully before `NetworkRelay`, which drains before `Background`. Admission
+//!    [`PriorityTier`] per class. [`FairEventQueue::pop`] serves `ClientLocal`
+//!    before `NetworkRelay`, and `NetworkRelay` before `Background`, with a
+//!    bounded anti-starvation floor for each lower tier. Admission
 //!    ([`FairEventQueue::try_push`]) reserves `CLIENT_LOCAL_RESERVE` slots that
 //!    only `ClientLocal` may use, and [`FairEventQueue::evict_background`] sheds
 //!    queued background work to make room for higher-priority events.
@@ -87,10 +88,12 @@ pub(super) const MAX_DRAIN_BATCH: usize = 256;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(crate) enum Priority {
     /// Best-effort, node-internal background work (summarize for interest-sync,
-    /// placement-migration caching, renewal, contract eviction). Shed FIRST
-    /// under pressure; never surfaces a client-facing error when dropped.
+    /// placement-migration caching, renewal). Shed FIRST under pressure; never
+    /// surfaces a client-facing error when dropped.
     Background,
-    /// Serving a remote peer's relayed operation. Normal precedence.
+    /// Serving a remote peer's relayed operation. Normal precedence. Also disk
+    /// reclamation of evicted contracts (`EvictContract`): the relayed writes
+    /// that fill the disk must not outrun the work that frees it.
     NetworkRelay,
     /// Originated by a WS/HTTP client connected to THIS node. Highest
     /// precedence; admitted into the reserved lane so it is never rejected
@@ -258,6 +261,13 @@ pub(super) struct FairEventQueue {
     /// non-empty lower tier so sustained client load cannot indefinitely starve
     /// remote relay / background execution (#4534 review).
     client_streak: usize,
+    /// Consecutive `pop()`s that served a higher tier while `Background` had
+    /// work waiting. Drives the `Background` anti-starvation floor (see `pop`):
+    /// once this reaches `BACKGROUND_STARVATION_FLOOR`, the next `pop` serves
+    /// one `Background` event, so sustained `NetworkRelay` load — the tier
+    /// remote peers feed — cannot indefinitely postpone interest-sync
+    /// summaries and the rest of the `Background` work.
+    background_passed_over: usize,
     /// Observability counters (#4917). Instance-scoped on purpose: a purely
     /// process-global counter would make every gauge assertion race other
     /// tests sharing the binary, which is the #4918 flake. [`Self::publish`]
@@ -362,6 +372,14 @@ const DEPTH_WARN_BANDS: [usize; 2] = [MAX_TOTAL_FAIR_QUEUE / 2, MAX_TOTAL_FAIR_Q
 /// `RELAY_STARVATION_FLOOR + 1` pops while still strongly favouring client work.
 pub(super) const RELAY_STARVATION_FLOOR: usize = 16;
 
+/// After this many consecutive pops that passed over waiting `Background` work
+/// (whichever higher tier they served), `pop()` serves one `Background` event
+/// regardless of pending `ClientLocal` / `NetworkRelay`. `RELAY_STARVATION_FLOOR`
+/// alone does not bound `Background` latency: it only fires under `ClientLocal`
+/// load and prefers `NetworkRelay`, so a `NetworkRelay` tier that never runs
+/// empty would otherwise starve `Background` forever.
+pub(super) const BACKGROUND_STARVATION_FLOOR: usize = 16;
+
 impl FairEventQueue {
     /// Create a new, empty fair event queue.
     pub(super) fn new() -> Self {
@@ -369,6 +387,7 @@ impl FairEventQueue {
             tiers: Default::default(),
             total_queued: 0,
             client_streak: 0,
+            background_passed_over: 0,
             counters: FairQueueCounters::default(),
         }
     }
@@ -587,17 +606,34 @@ impl FairEventQueue {
     /// relay/background latency while keeping the overwhelming majority of slots
     /// for client work.
     ///
+    /// That floor serves `NetworkRelay` ahead of `Background` and never fires
+    /// without `ClientLocal` load, so `Background` has a floor of its own: after
+    /// `BACKGROUND_STARVATION_FLOOR` consecutive pops that served a higher tier
+    /// *with `Background` work waiting*, one `Background` event is served.
+    /// Without it a `NetworkRelay` tier that never runs empty (a busy node, or a
+    /// remote peer that keeps one event queued) suspends `Background` work for
+    /// as long as it lasts.
+    ///
     /// Returns `None` if all tiers are empty.
     pub(super) fn pop(&mut self) -> Option<(EventId, ContractHandlerEvent)> {
         let client_nonempty = self.tiers[Priority::ClientLocal as usize].queued > 0;
-        let lower_nonempty = self.tiers[Priority::NetworkRelay as usize].queued > 0
-            || self.tiers[Priority::Background as usize].queued > 0;
+        let relay_nonempty = self.tiers[Priority::NetworkRelay as usize].queued > 0;
+        let background_nonempty = self.tiers[Priority::Background as usize].queued > 0;
+        let lower_nonempty = relay_nonempty || background_nonempty;
 
         // Anti-starvation: if ClientLocal has monopolized the last
         // RELAY_STARVATION_FLOOR pops and a lower tier is waiting, serve the
         // highest non-empty lower tier this round and reset the streak.
         let force_lower =
             client_nonempty && lower_nonempty && self.client_streak >= RELAY_STARVATION_FLOOR;
+
+        // The same floor for the lowest tier: higher tiers have been served
+        // BACKGROUND_STARVATION_FLOOR times in a row over waiting Background
+        // work. `force_lower` goes first when both are due; the NetworkRelay
+        // event it serves passes Background over once more, so Background
+        // follows on the next pop.
+        let force_background =
+            background_nonempty && self.background_passed_over >= BACKGROUND_STARVATION_FLOOR;
 
         let order: [Priority; 3] = if force_lower {
             // Skip ClientLocal this round; drain NetworkRelay then Background.
@@ -607,6 +643,13 @@ impl FairEventQueue {
                 // ClientLocal last as a safety net (only reached if both lower
                 // tiers raced to empty between the check and the pop).
                 Priority::ClientLocal,
+            ]
+        } else if force_background {
+            // One Background event, then back to the normal order.
+            [
+                Priority::Background,
+                Priority::ClientLocal,
+                Priority::NetworkRelay,
             ]
         } else {
             [
@@ -621,11 +664,21 @@ impl FairEventQueue {
                 debug_assert!(self.total_queued > 0);
                 self.total_queued = self.total_queued.saturating_sub(1);
                 // Track the ClientLocal streak only while lower work waits — an
-                // uncontested client burst should not trip the floor.
+                // uncontested client burst should not trip the floor. A
+                // floor-forced Background pop (the only way Background is
+                // served ahead of waiting NetworkRelay work) does not end the
+                // streak: NetworkRelay is still owed its turn.
+                let forced_background = priority == Priority::Background && relay_nonempty;
                 if priority == Priority::ClientLocal && lower_nonempty {
                     self.client_streak += 1;
-                } else {
+                } else if !forced_background {
                     self.client_streak = 0;
+                }
+                // Likewise count the pops that pass over waiting Background.
+                if priority != Priority::Background && background_nonempty {
+                    self.background_passed_over += 1;
+                } else {
+                    self.background_passed_over = 0;
                 }
                 self.publish();
                 return Some((id, event));
@@ -1642,6 +1695,169 @@ mod tests {
             assert!(queue.pop().is_some());
         }
         assert!(queue.is_empty());
+    }
+
+    /// Pop `n` events and report the tier each one was served from.
+    fn pop_tiers(queue: &mut FairEventQueue, n: usize) -> Vec<Priority> {
+        (0..n)
+            .map(|_| {
+                let before = queue.stats();
+                queue.pop().expect("queue must not run empty");
+                let after = queue.stats();
+                if after.depth_client_local < before.depth_client_local {
+                    Priority::ClientLocal
+                } else if after.depth_network_relay < before.depth_network_relay {
+                    Priority::NetworkRelay
+                } else {
+                    Priority::Background
+                }
+            })
+            .collect()
+    }
+
+    /// Longest run of consecutive pops in `served` that did not serve `tier`.
+    fn max_gap(served: &[Priority], tier: Priority) -> usize {
+        served
+            .split(|p| *p == tier)
+            .map(<[Priority]>::len)
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn background_not_starved_by_sustained_relay_load() {
+        // Regression: with a permanent NetworkRelay backlog (the tier remote
+        // peers feed) and NO ClientLocal load, Background used to be shut out
+        // completely — the relay floor never fires without client load, and it
+        // serves NetworkRelay first anyway. That suspended all Background work
+        // (at the time including EvictContract disk reclamation) for as long as
+        // a peer kept one relay event queued. Background must be served once
+        // every (BACKGROUND_STARVATION_FLOOR + 1) pops.
+        let mut queue = FairEventQueue::new();
+        fill_to(&mut queue, Priority::NetworkRelay, 1000);
+        fill_to(&mut queue, Priority::Background, 2000);
+
+        let served = pop_tiers(&mut queue, 400);
+        let background_served = served
+            .iter()
+            .filter(|p| **p == Priority::Background)
+            .count();
+        assert_eq!(
+            background_served,
+            400 / (BACKGROUND_STARVATION_FLOOR + 1),
+            "Background must get exactly its floor share under sustained relay load"
+        );
+        assert!(
+            max_gap(&served, Priority::Background) <= BACKGROUND_STARVATION_FLOOR,
+            "gap between background pops must not exceed the floor ({BACKGROUND_STARVATION_FLOOR})"
+        );
+    }
+
+    #[test]
+    fn background_floor_counts_only_pops_that_passed_background_over() {
+        // A long NetworkRelay burst with NO Background waiting must not bank
+        // credit towards the floor: a Background event that arrives afterwards
+        // still yields to the relay work queued with it.
+        let mut queue = FairEventQueue::new();
+        fill_to(&mut queue, Priority::NetworkRelay, 200);
+        assert_eq!(
+            pop_tiers(&mut queue, 200),
+            vec![Priority::NetworkRelay; 200]
+        );
+        assert!(queue.is_empty());
+
+        queue
+            .try_push(
+                make_event_id(0),
+                make_get_event(make_contract_id_u32(1)),
+                Priority::Background,
+            )
+            .unwrap();
+        for i in 0..5u64 {
+            queue
+                .try_push(
+                    make_event_id(1 + i),
+                    make_get_event(make_contract_id_u32(2)),
+                    Priority::NetworkRelay,
+                )
+                .unwrap();
+        }
+        let mut expected = vec![Priority::NetworkRelay; 5];
+        expected.push(Priority::Background);
+        assert_eq!(pop_tiers(&mut queue, 6), expected);
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn both_floors_hold_with_all_tiers_saturated() {
+        // With a permanent backlog in all three tiers each floor keeps its own
+        // bound, one extra pop apart: every round is RELAY_STARVATION_FLOOR
+        // ClientLocal pops, one NetworkRelay, one Background.
+        let mut queue = FairEventQueue::new();
+        fill_to(&mut queue, Priority::ClientLocal, 1000);
+        fill_to(&mut queue, Priority::NetworkRelay, 2000);
+        fill_to(&mut queue, Priority::Background, 3000);
+
+        let served = pop_tiers(&mut queue, 600);
+        assert!(
+            max_gap(&served, Priority::NetworkRelay) <= RELAY_STARVATION_FLOOR + 1,
+            "relay gap must stay within its floor plus one forced Background pop"
+        );
+        assert!(
+            max_gap(&served, Priority::Background) <= BACKGROUND_STARVATION_FLOOR + 1,
+            "background gap must stay within its floor plus one forced relay pop"
+        );
+        // Client work still dominates.
+        let client_served = served
+            .iter()
+            .filter(|p| **p == Priority::ClientLocal)
+            .count();
+        assert!(
+            client_served > 600 * 3 / 4,
+            "client work should still dominate scheduling, got {client_served}/600"
+        );
+    }
+
+    #[test]
+    fn forced_background_pop_does_not_restart_relay_floor() {
+        // Background has already been passed over by relay work when client
+        // load arrives, so its floor comes due in the middle of a ClientLocal
+        // streak. Serving it must not reset that streak, or NetworkRelay would
+        // wait a full RELAY_STARVATION_FLOOR again on top of the pops it has
+        // already sat out.
+        let mut queue = FairEventQueue::new();
+        fill_to(&mut queue, Priority::NetworkRelay, 1000);
+        fill_to(&mut queue, Priority::Background, 2000);
+        assert_eq!(pop_tiers(&mut queue, 10), vec![Priority::NetworkRelay; 10]);
+        fill_to(&mut queue, Priority::ClientLocal, 2990);
+
+        let served = pop_tiers(&mut queue, 200);
+        let first_background = BACKGROUND_STARVATION_FLOOR - 10;
+        assert_eq!(
+            served[first_background],
+            Priority::Background,
+            "Background floor must fire mid-streak"
+        );
+        assert!(
+            max_gap(&served, Priority::NetworkRelay) <= RELAY_STARVATION_FLOOR + 1,
+            "a forced Background pop must not push the relay floor back"
+        );
+    }
+
+    #[test]
+    fn client_and_background_only_serve_one_background_per_floor() {
+        // No NetworkRelay work: both floors come due on the same pop (the
+        // relay floor falls through to Background). Exactly one Background
+        // event is served per RELAY_STARVATION_FLOOR ClientLocal pops — the
+        // two floors must not add up.
+        let mut queue = FairEventQueue::new();
+        fill_to(&mut queue, Priority::ClientLocal, 1000);
+        fill_to(&mut queue, Priority::Background, 2000);
+
+        let served = pop_tiers(&mut queue, 4 * (RELAY_STARVATION_FLOOR + 1));
+        let mut round = vec![Priority::ClientLocal; RELAY_STARVATION_FLOOR];
+        round.push(Priority::Background);
+        assert_eq!(served, round.repeat(4));
     }
 
     #[test]

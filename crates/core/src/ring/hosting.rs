@@ -947,10 +947,40 @@ impl HostingManager {
     /// permanently skip reclamation after an UPDATE-then-evict. No-op when
     /// the entry is not currently cached. See
     /// `HostingCache::refresh_entry_generation`.
+    #[cfg(test)]
     pub(crate) fn refresh_cache_generation(&self, key: &ContractKey, new_gen: u64) {
         self.hosting_cache
             .write()
             .refresh_entry_generation(key, new_gen);
+    }
+
+    /// Refresh both the write generation and the size of `key`'s hosting-cache
+    /// entry under ONE write lock, so a concurrent reader never sees the new
+    /// generation with the old size. See `refresh_cache_generation` and
+    /// `refresh_cache_size`.
+    pub(crate) fn refresh_cache_after_write(
+        &self,
+        key: &ContractKey,
+        new_gen: u64,
+        size_bytes: u64,
+    ) {
+        let mut cache = self.hosting_cache.write();
+        cache.refresh_entry_generation(key, new_gen);
+        cache.refresh_entry_size(key, size_bytes);
+    }
+
+    /// Update the hosting-cache size of `key` to the state size just written.
+    /// Paired with `refresh_cache_generation` at every state-write chokepoint
+    /// so a contract that grows (or shrinks) through UPDATE is charged to the
+    /// hosting budget what is actually stored, not its PUT/GET-time size.
+    /// Byte accounting only: no recency stamp, and nothing is evicted here.
+    /// No-op when the entry is not currently cached. See
+    /// `HostingCache::refresh_entry_size`.
+    #[cfg(test)]
+    pub(crate) fn refresh_cache_size(&self, key: &ContractKey, size_bytes: u64) {
+        self.hosting_cache
+            .write()
+            .refresh_entry_size(key, size_bytes);
     }
 
     /// Set the storage reference for persisting hosting metadata.
@@ -7011,6 +7041,78 @@ mod tests {
             !manager.hosting_cache.read().contains(&key),
             "refresh must not insert a phantom entry for an absent contract"
         );
+    }
+
+    /// Without `refresh_cache_size`, a hosted contract whose state grows
+    /// through UPDATE stays charged the size `record_contract_access` was
+    /// given at PUT/GET time (the UPDATE paths must not call it: it stamps
+    /// recency). `current_bytes` then under-counts what is stored, the cache
+    /// never goes over budget, and the sweep that enforces the hosting budget
+    /// evicts nothing while UPDATEs fill the disk.
+    ///
+    /// The fix is to call `refresh_cache_size` paired with
+    /// `refresh_cache_generation` at every state-write chokepoint. This test
+    /// asserts the refresh re-charges the entries and that the next sweep
+    /// then sheds the overage.
+    #[test]
+    fn test_refresh_cache_size_charges_update_growth_to_budget() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        {
+            let mut cache = manager.hosting_cache.write();
+            *cache = cache::HostingCache::new(
+                1000,
+                std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+            );
+        }
+
+        // Three contracts hosted with 1-byte states: far under budget.
+        let keys = [
+            make_contract_key(1),
+            make_contract_key(2),
+            make_contract_key(3),
+        ];
+        for key in keys {
+            manager.record_contract_access(key, 1, AccessType::Put, HostingCause::Other);
+        }
+        assert_eq!(manager.hosting_cache_stats().current_bytes, 3);
+
+        // Simulate one UPDATE per contract that grows its state to 600
+        // bytes. The refresh is byte accounting only: it evicts nothing.
+        for key in &keys {
+            manager.refresh_cache_size(key, 600);
+        }
+        let stats = manager.hosting_cache_stats();
+        assert_eq!(stats.current_bytes, 1800);
+        assert_eq!(stats.contract_count, 3);
+
+        // The sweep now sees the cache over budget and sheds down to it.
+        // Without the refresh `current_bytes` would still read 3 and nothing
+        // would be evicted.
+        let swept = manager.sweep_expired_hosting();
+        assert_eq!(
+            swept.expired.len(),
+            2,
+            "sweep must evict the contracts that UPDATE grew over budget"
+        );
+        let stats = manager.hosting_cache_stats();
+        assert_eq!(stats.current_bytes, 600);
+        assert_eq!(stats.contract_count, 1);
+    }
+
+    /// `refresh_cache_size` is a no-op when the entry is not in the cache:
+    /// a state write for a contract this node does not host must not insert
+    /// a phantom entry or charge bytes to the hosting budget.
+    #[test]
+    fn test_refresh_cache_size_is_noop_when_entry_absent() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let key = make_contract_key(99);
+
+        manager.refresh_cache_size(&key, 4096);
+        assert!(
+            !manager.hosting_cache.read().contains(&key),
+            "refresh must not insert a phantom entry for an absent contract"
+        );
+        assert_eq!(manager.hosting_cache_stats().current_bytes, 0);
     }
 
     /// `bump_state_generation` is monotonic and starts at 1 on first

@@ -5000,7 +5000,12 @@ async fn drive_relay_probe_reconcile(
     // see `drive_relay_put`.
     let htl = htl.min(op_manager.ring.max_hops_to_live);
 
-    if op_manager.ring.is_receiving_updates(&key) {
+    // A probe reconcile merges into the local copy like a relayed UPDATE, so
+    // it follows the same rule: an evicted copy awaiting reclamation is not
+    // merged into (`Ring::may_merge_relayed_update`), the reconcile is routed
+    // on instead.
+    if op_manager.ring.is_receiving_updates(&key) && op_manager.ring.may_merge_relayed_update(&key)
+    {
         // Merge via the same path an UPDATE uses; the contract executor
         // fans the change out to the rest of the subscriber mesh
         // automatically on a real state change (`BroadcastStateChange`,
