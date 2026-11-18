@@ -41,6 +41,15 @@ pub(crate) struct TransientEntry {
     pub location: Option<Location>,
     /// When this transient entry was created (for expiration cleanup).
     pub created_at: Instant,
+    /// Set once an open connection kept outside the ring owns the entry
+    /// (`ConnectionManager::hold_transient`). Such an entry is not expired by
+    /// age: its slot in the transient budget is what bounds the number of
+    /// those connections, so it is given back only when the connection is
+    /// promoted (`drop_transient`, `add_connection`) or closed
+    /// (`Ring::prune_connection`, which every teardown path calls). A
+    /// connection that is never promoted is closed by the zombie sweep or the
+    /// transport's idle timeout.
+    pub held: bool,
 }
 
 /// Maximum time a pending reservation can remain before being considered stale.
@@ -1998,6 +2007,7 @@ impl ConnectionManager {
             TransientEntry {
                 location,
                 created_at: Instant::now(),
+                held: false,
             },
         );
         let prev = self.transient_in_use.fetch_add(1, Ordering::SeqCst);
@@ -2009,6 +2019,16 @@ impl ConnectionManager {
         }
 
         true
+    }
+
+    /// Keeps the transient entry at `addr`, and with it its slot in the
+    /// transient budget, until it is dropped: the entry belongs to an open
+    /// connection, so `cleanup_expired_transients` does not release it by age
+    /// (see `TransientEntry::held`). Does nothing when `addr` is not tracked.
+    pub fn hold_transient(&self, addr: SocketAddr) {
+        if let Some(mut entry) = self.transient_connections.get_mut(&addr) {
+            entry.held = true;
+        }
     }
 
     /// Drops a transient connection and returns its metadata, if it existed.
@@ -2688,7 +2708,8 @@ impl ConnectionManager {
         stale_reservations + orphaned_locations
     }
 
-    /// Remove transient connection entries that have exceeded `transient_ttl`.
+    /// Remove transient connection entries that have exceeded `transient_ttl`,
+    /// except those an open connection holds (`hold_transient`).
     /// Returns the number of expired entries removed.
     ///
     /// Concurrency safety: `DashMap::retain` holds shard-level write locks during
@@ -2703,7 +2724,7 @@ impl ConnectionManager {
         let mut removed = 0;
         self.transient_connections.retain(|addr, entry| {
             let age = now.duration_since(entry.created_at);
-            if age > ttl {
+            if age > ttl && !entry.held {
                 tracing::debug!(
                     addr = %addr,
                     age_secs = age.as_secs(),
@@ -3943,6 +3964,29 @@ mod tests {
         assert_eq!(cm.transient_count(), 1);
         assert!(cm.is_transient(make_addr(8002)));
         assert!(!cm.is_transient(make_addr(8001)));
+    }
+
+    /// An entry an open connection holds keeps its budget slot past the TTL
+    /// until it is dropped; an entry nothing holds still expires beside it.
+    #[test]
+    fn test_cleanup_expired_transients_spares_held() {
+        let cm = make_connection_manager(Some(make_addr(8000)), 1, 10, true);
+        assert!(cm.try_register_transient(make_addr(8001), None));
+        assert!(cm.try_register_transient(make_addr(8002), None));
+        cm.hold_transient(make_addr(8001));
+        // Holding an address that is not tracked registers nothing.
+        cm.hold_transient(make_addr(8003));
+        assert_eq!(cm.transient_count(), 2);
+        age_transient(&cm, make_addr(8001), Duration::from_secs(61));
+        age_transient(&cm, make_addr(8002), Duration::from_secs(61));
+        assert_eq!(cm.cleanup_expired_transients(), 1);
+        assert_eq!(cm.transient_count(), 1);
+        assert!(cm.is_transient(make_addr(8001)));
+        // Registering the address again keeps the hold.
+        assert!(cm.try_register_transient(make_addr(8001), None));
+        assert_eq!(cm.cleanup_expired_transients(), 0);
+        assert!(cm.drop_transient(make_addr(8001)).is_some());
+        assert_eq!(cm.transient_count(), 0);
     }
 
     // ============ Basic ConnectionManager tests ============

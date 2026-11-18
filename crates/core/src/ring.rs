@@ -6185,6 +6185,12 @@ impl Ring {
             crate::transport::TRANSPORT_METRICS.connection_peer_bytes(peer.socket_addr()),
         );
         crate::node::network_status::record_peer_disconnected(peer.socket_addr());
+        // A connection kept outside the ring holds a slot in the transient
+        // budget for as long as it is open (`ConnectionManager::hold_transient`).
+        // Every path that closes a connection reaches this, so the slot is
+        // given back here, before the early return below for a connection the
+        // ring never held.
+        self.connection_manager.drop_transient(peer.socket_addr());
         let orphaned_transactions = self
             .live_tx_tracker
             .prune_transactions_from_peer(peer.socket_addr());

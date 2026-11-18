@@ -2508,7 +2508,9 @@ pub struct NetworkArgs {
     #[serde(rename = "transient-budget", skip_serializing_if = "Option::is_none")]
     pub transient_budget: Option<usize>,
 
-    /// Time (in seconds) before an unpromoted transient connection is dropped.
+    /// Time (in seconds) after which an unpromoted transient connection is counted
+    /// as expired. Its transport stays open, and its slot in the transient budget
+    /// is held until it is promoted or closed.
     #[arg(long, env = "TRANSIENT_TTL_SECS")]
     #[serde(rename = "transient-ttl-secs", skip_serializing_if = "Option::is_none")]
     pub transient_ttl_secs: Option<u64>,
@@ -2919,7 +2921,9 @@ pub struct NetworkApiConfig {
     #[serde(default = "default_transient_budget", rename = "transient-budget")]
     pub transient_budget: usize,
 
-    /// Time (in seconds) before an unpromoted transient connection is dropped.
+    /// Time (in seconds) after which an unpromoted transient connection is counted
+    /// as expired. Its transport stays open, and its slot in the transient budget
+    /// is held until it is promoted or closed.
     #[serde(default = "default_transient_ttl_secs", rename = "transient-ttl-secs")]
     pub transient_ttl_secs: u64,
 

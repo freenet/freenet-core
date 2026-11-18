@@ -647,9 +647,12 @@ impl P2pConnManager {
         let was_transient = connection_manager.drop_transient(peer_addr);
 
         // Promote if: (a) was tracked as transient, OR (b) not already in ring.
-        // Case (b) handles expired transient TTL: transport preserved per 76058cf4
-        // but tracking entry gone. Without this, CONNECT succeeds but peer is never
-        // added to ring topology (#3113).
+        // Case (b) handles an open connection with no tracking entry (#3113:
+        // the entry used to expire at the TTL while the transport stayed open;
+        // an open connection now holds its entry until it is promoted or
+        // closed, so this is the fallback for one that never had one).
+        // Without this, CONNECT succeeds but peer is never added to ring
+        // topology.
         let needs_promotion = was_transient.is_some() || !connection_manager.is_in_ring(peer_addr);
         let transient_expired = was_transient.is_none() && needs_promotion;
 
@@ -2530,14 +2533,17 @@ impl P2pConnManager {
             );
         }
 
+        // The slot taken at the top of this function is gone if the
+        // replacement above released the old connection's slot at this
+        // address; take it again. Registering an address already tracked
+        // succeeds without taking a second slot.
         if is_transient {
             let cm = &self.bridge.op_manager.ring.connection_manager;
-            let current = cm.transient_count();
-            if current >= cm.transient_budget() {
+            if !cm.try_register_transient(peer_addr, None) {
                 tracing::warn!(
                     remote = %peer_addr,
                     budget = cm.transient_budget(),
-                    current,
+                    current = cm.transient_count(),
                     "Transient connection budget exhausted; dropping inbound connection before insert"
                 );
                 return Ok(());
@@ -2913,36 +2919,63 @@ impl P2pConnManager {
                     let already_transient = connection_manager.is_transient(peer_addr);
                     let registered =
                         connection_manager.try_register_transient(peer_addr, Some(loc));
-                    if registered && !already_transient {
-                        crate::node::network_status::record_bootstrap_transient_registered();
-                    }
-                    tracing::info!(
-                        peer_id = ?peer_id,
-                        %peer_addr,
-                        "Registered transient connection (not added to ring topology)"
-                    );
-                    let ttl = connection_manager.transient_ttl();
-                    let cm = connection_manager.clone();
-                    GlobalExecutor::spawn(async move {
-                        sleep(ttl).await;
-                        if cm.drop_transient(peer_addr).is_some() {
-                            // Only remove the transient tracking entry. Do NOT
-                            // dispatch DropConnection — that tears down the
-                            // underlying transport, killing any in-progress
-                            // CONNECT handshake. If the CONNECT succeeds later,
-                            // handle_connect_peer() will detect the missing
-                            // transient entry via is_in_ring() and still promote
-                            // the peer to ring topology (see #3113 fix). If it
-                            // never succeeds, the transport idle timeout handles
-                            // cleanup.
-                            crate::node::network_status::record_bootstrap_transient_expired();
-                            tracing::info!(
-                                %peer_addr,
-                                "Transient connection expired; removed tracking entry \
-                                 (transport preserved, handle_connect_peer will promote via fallback)"
-                            );
+                    if !registered {
+                        // The budget bounds the connections held outside the
+                        // ring. An inbound connection nobody expected arrives
+                        // with `is_transient == false`, so the check at the
+                        // top of this function did not count it and this is
+                        // the first place it is counted. Kept after a refusal,
+                        // it would be an open connection the budget does not
+                        // count, so it is closed, as at the top.
+                        tracing::warn!(
+                            remote = %peer_addr,
+                            budget = connection_manager.transient_budget(),
+                            current = connection_manager.transient_count(),
+                            "Transient connection budget exhausted; dropping inbound connection"
+                        );
+                        self.drop_connection_by_addr(
+                            peer_addr,
+                            handshake_commands,
+                            crate::tracing::DisconnectReason::ConnectionLimitReached,
+                        )
+                        .await;
+                    } else {
+                        // The connection stays open outside the ring, so it
+                        // keeps its slot until it is promoted or closed
+                        // (`Ring::prune_connection`), not for `transient_ttl`:
+                        // a slot given back while the transport stays open
+                        // would let the budget be filled again every TTL.
+                        connection_manager.hold_transient(peer_addr);
+                        if !already_transient {
+                            crate::node::network_status::record_bootstrap_transient_registered();
                         }
-                    });
+                        tracing::info!(
+                            peer_id = ?peer_id,
+                            %peer_addr,
+                            "Registered transient connection (not added to ring topology)"
+                        );
+                        let ttl = connection_manager.transient_ttl();
+                        let cm = connection_manager.clone();
+                        GlobalExecutor::spawn(async move {
+                            sleep(ttl).await;
+                            if cm.is_transient(peer_addr) {
+                                // Still not promoted. Do NOT dispatch
+                                // DropConnection: that tears down the
+                                // transport, killing any in-progress CONNECT.
+                                // If the CONNECT succeeds later,
+                                // handle_connect_peer() promotes the peer
+                                // (#3113). If it never does, the zombie sweep
+                                // or the transport idle timeout closes the
+                                // connection, which gives the slot back.
+                                crate::node::network_status::record_bootstrap_transient_expired();
+                                tracing::info!(
+                                    %peer_addr,
+                                    "Transient connection past its TTL unpromoted \
+                                     (transport preserved, budget slot held until promoted or closed)"
+                                );
+                            }
+                        });
+                    }
                 }
             }
         } else if is_transient {

@@ -5244,3 +5244,162 @@ async fn local_and_udp_failures_carry_no_native_outcome() {
         "a local failure of a native dial"
     );
 }
+
+/// An inbound connection nobody expected, as the handshake driver reports
+/// it: not transient, and without a peer identity.
+async fn unexpected_inbound(h: &mut Harness, addr: SocketAddr) {
+    h.handshake_event(HandshakeEvent::InboundConnection {
+        transaction: None,
+        matched: HandshakeInboundMatch::Unexpected,
+        connection: Box::new(IdleConnection::new(addr)),
+        transient: false,
+    })
+    .await;
+}
+
+fn transient_count(h: &Harness) -> usize {
+    h.mgr
+        .bridge
+        .op_manager
+        .ring
+        .connection_manager
+        .transient_count()
+}
+
+fn is_transient(h: &Harness, addr: SocketAddr) -> bool {
+    h.mgr
+        .bridge
+        .op_manager
+        .ring
+        .connection_manager
+        .is_transient(addr)
+}
+
+/// An unexpected inbound connection is first counted against the transient
+/// budget after it was inserted. One the budget refuses is closed, not kept
+/// open and uncounted: with a budget of two, every such connection after the
+/// second is dropped, and the two holding the slots are untouched.
+#[tokio::test]
+async fn unexpected_inbound_over_the_transient_budget_is_dropped() {
+    let mut h = Harness::with_config("transient-budget-unexpected-inbound", |config| {
+        config.transient_budget = 2;
+    })
+    .await;
+    let within: Vec<SocketAddr> = [7301, 7302]
+        .iter()
+        .map(|port| SocketAddr::from(([198, 51, 100, 210], *port)))
+        .collect();
+    for addr in &within {
+        unexpected_inbound(&mut h, *addr).await;
+        assert!(h.mgr.connections.contains_key(addr), "within the budget");
+        assert!(is_transient(&h, *addr));
+    }
+    assert_eq!(transient_count(&h), 2, "premise: the budget is spent");
+
+    for port in [7303, 7304] {
+        let addr = SocketAddr::from(([198, 51, 100, 210], port));
+        unexpected_inbound(&mut h, addr).await;
+        assert!(
+            !h.mgr.connections.contains_key(&addr),
+            "refused by the budget: dropped"
+        );
+        assert!(!is_transient(&h, addr));
+        assert_eq!(h.ring_key_at(addr), None, "not in the ring");
+    }
+    h.assert_open_transports_match();
+    assert_eq!(transient_count(&h), 2);
+    for addr in &within {
+        assert!(h.mgr.connections.contains_key(addr), "the holders are kept");
+        assert!(is_transient(&h, *addr));
+    }
+}
+
+/// The budget counts the connections open outside the ring, not those
+/// younger than `transient_ttl`: an unpromoted connection keeps its slot past
+/// the TTL (neither its expiry timer nor the periodic cleanup gives it back
+/// while the transport is open), and gives it back when it is promoted.
+#[tokio::test(start_paused = true)]
+async fn an_unpromoted_connection_keeps_its_budget_slot_past_the_ttl() {
+    let mut h = Harness::with_config("transient-budget-slot-held", |config| {
+        config.transient_budget = 1;
+    })
+    .await;
+    let first = SocketAddr::from(([198, 51, 100, 211], 7311));
+    let second = SocketAddr::from(([198, 51, 100, 211], 7312));
+    let third = SocketAddr::from(([198, 51, 100, 211], 7313));
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+
+    unexpected_inbound(&mut h, first).await;
+    assert!(h.mgr.connections.contains_key(&first));
+    assert_eq!(cm.transient_count(), 1, "premise: the budget is spent");
+
+    // Past the TTL: the expiry timer has run, and so has a cleanup.
+    tokio::time::sleep(cm.transient_ttl() + Duration::from_secs(1)).await;
+    assert_eq!(cm.cleanup_expired_transients(), 0);
+    assert!(
+        h.mgr.connections.contains_key(&first),
+        "premise: still open"
+    );
+    assert!(cm.is_transient(first), "an open connection keeps its slot");
+    unexpected_inbound(&mut h, second).await;
+    assert!(
+        !h.mgr.connections.contains_key(&second),
+        "the budget is still spent"
+    );
+
+    // Promoting it gives the slot back.
+    let peer = key();
+    h.connect_peer(PeerKeyLocation::new(peer.clone(), first))
+        .await;
+    assert_eq!(h.ring_key_at(first).as_ref(), Some(&peer));
+    assert_eq!(cm.transient_count(), 0);
+    unexpected_inbound(&mut h, third).await;
+    assert!(h.mgr.connections.contains_key(&third));
+}
+
+/// Every path that closes an unpromoted connection gives its budget slot
+/// back at once, so a held slot is never stranded after its connection.
+#[tokio::test]
+async fn closing_an_unpromoted_connection_gives_its_budget_slot_back() {
+    for (i, teardown) in Teardown::ALL.into_iter().enumerate() {
+        let mut h = Harness::with_config(&format!("transient-budget-close-{i}"), |config| {
+            config.transient_budget = 1;
+        })
+        .await;
+        let port = 7320 + 2 * i as u16;
+        let held = SocketAddr::from(([198, 51, 100, 212], port));
+        let next = SocketAddr::from(([198, 51, 100, 212], port + 1));
+        unexpected_inbound(&mut h, held).await;
+        assert!(h.mgr.connections.contains_key(&held));
+        assert_eq!(transient_count(&h), 1, "{teardown:?}: premise");
+
+        teardown.run(&mut h, held).await;
+        assert_eq!(transient_count(&h), 0, "{teardown:?}: slot given back");
+
+        unexpected_inbound(&mut h, next).await;
+        assert!(
+            h.mgr.connections.contains_key(&next),
+            "{teardown:?}: the slot is free for a new connection"
+        );
+    }
+}
+
+/// A transient connection that takes the budget's last slot is kept: the
+/// check before the insert asks for the slot this connection already holds,
+/// rather than comparing the count, which already includes it, to the budget.
+#[tokio::test]
+async fn a_transient_connection_may_take_the_last_budget_slot() {
+    let mut h = Harness::with_non_gateway_ring("transient-budget-last-slot").await;
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    let budget = cm.transient_budget();
+    for n in 0..budget - 1 {
+        let filler = SocketAddr::from(([10, 99, (n >> 8) as u8, n as u8], 1));
+        assert!(cm.try_register_transient(filler, None));
+    }
+    let last = SocketAddr::from(([198, 51, 100, 213], 7330));
+    let peer = PeerKeyLocation::new(key(), last);
+    // `establish` asserts the connection is kept.
+    h.establish(last, Some(peer), true).await;
+    assert!(cm.is_transient(last));
+    assert_eq!(cm.transient_count(), budget);
+}

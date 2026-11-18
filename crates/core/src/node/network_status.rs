@@ -441,7 +441,7 @@ pub struct NetworkStatus {
 }
 
 /// Bootstrap-acceptance-churn counters (issue #4787): a restarted node's
-/// connection to a gateway lingers as transient, its tracking entry expires,
+/// connection to a gateway lingers as transient, its TTL elapses,
 /// and (if the onward CONNECT never promotes it) the underlying transport is
 /// later reaped as a zombie by a separate, uninstrumented sweep — cycling the
 /// joiner through repeated reconnects before it acquires real peers. These
@@ -456,9 +456,9 @@ pub struct NetworkStatus {
 /// signature reported in the issue.
 ///
 /// They are still not a clean partition of `transient_registered`: the #3113
-/// recovery path (a slow CONNECT that completes after the tracking entry's
-/// TTL already expired, `handle_connect_peer`) increments BOTH
-/// `transient_expired` (the tracking entry lapsed) AND `promoted_to_ring` (it
+/// recovery path (a slow CONNECT that completes after the transient TTL
+/// elapsed, `handle_connect_peer`) increments BOTH
+/// `transient_expired` (the TTL elapsed unpromoted) AND `promoted_to_ring` (it
 /// promoted anyway) for the SAME connection. So `transient_expired +
 /// promoted_to_ring` can exceed `transient_registered`, and a connection that
 /// recovers this way is indistinguishable in these counters from one that is
@@ -1643,10 +1643,11 @@ pub fn record_bootstrap_transient_registered() {
     }
 }
 
-/// Record that a transient tracking entry expired (TTL elapsed) before the
-/// onward CONNECT promoted it — issue #4787 instrumentation. Called from the
-/// "Transient connection expired" site in
-/// `p2p_protoc/connection_lifecycle.rs`.
+/// Record that a transient connection's TTL elapsed before the onward
+/// CONNECT promoted it — issue #4787 instrumentation. The tracking entry, and
+/// its slot in the transient budget, stay with the connection until it is
+/// promoted or closed. Called from the "Transient connection past its TTL"
+/// site in `p2p_protoc/connection_lifecycle.rs`.
 pub fn record_bootstrap_transient_expired() {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
