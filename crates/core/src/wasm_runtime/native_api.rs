@@ -745,12 +745,14 @@ pub(super) type InstanceId = i64;
 /// [`next_instance_id`] inside `WasmEngine::create_instance` and returned in
 /// the `InstanceHandle`, so no CALLER of `create_instance` can pick an id.
 ///
-/// Scope, stated precisely: this closes the `create_instance` surface only. The
-/// WASM ABI is a separate id surface that this does NOT validate: four host
-/// functions (`__frnt__logger__info`, `__frnt__rand__rand_bytes`,
-/// `__frnt__time__utc_now`, `__frnt__fill_buffer`) take an instance id as a
-/// guest-supplied parameter and look it up in these same maps. Do not read the
-/// paragraph above as "every id reaching these maps was issued here".
+/// Scope, stated precisely: this closes the `create_instance` surface. The
+/// WASM ABI is a separate id surface. Four host functions
+/// (`__frnt__logger__info`, `__frnt__rand__rand_bytes`,
+/// `__frnt__time__utc_now`, `__frnt__fill_buffer`) still take an instance id
+/// parameter, because it is part of the guest ABI, but the host ignores it and
+/// uses the instance the store recorded at guest entry
+/// (`HostState::calling_instance` in `wasmtime_engine.rs`). Do not reintroduce
+/// a lookup keyed by a guest-supplied id.
 ///
 /// Nor is it a type-level guarantee. `InstanceHandle.id` is `pub(super)`, so
 /// anything inside `wasm_runtime` can still construct a handle with a chosen id
@@ -819,13 +821,13 @@ pub(super) fn fill_buffer_impl(
         return Ok(0); // EOF
     }
     let Some(info) = MEM_ADDR.get(&instance_id) else {
-        // This is a programming error: refresh_mem_addr_from_caller should always
-        // populate MEM_ADDR before this callback runs. Returning 0 here would
-        // silently truncate contract state, so we panic to surface the bug.
-        panic!(
-            "fill_buffer_impl: MEM_ADDR missing for instance {instance_id} — \
-             this indicates a bug in the WASM runtime (memory info not refreshed)"
-        );
+        // Reachable: after a wall-clock timeout the guest can keep running on
+        // an abandoned thread while its `RunningInstance` is dropped (removing
+        // the `MEM_ADDR` record) before the `CONTRACT_IO` guard clears its
+        // pending input. Returning 0 would report EOF and silently truncate
+        // the input, so trap the guest instead. Never panic here: this runs
+        // on behalf of guest code.
+        return Err(super::guest_mem::GuestMemoryError::InstanceNotRecorded { instance_id });
     };
     // SAFETY: `start_ptr` and `mem_size` come from the live wasmtime Caller's memory
     // export, refreshed by `refresh_mem_addr_from_caller` before this function is called.
@@ -1684,7 +1686,16 @@ pub(super) mod log {
             tracing::error!("freenet_log::info called with unset module id");
             return;
         }
-        let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
+        // No record yet is reachable from guest code (a start function runs
+        // before `RunningInstance::new` records the instance), so it is an
+        // ordinary refusal, not a panic.
+        let Some(info) = MEM_ADDR.get(&id) else {
+            tracing::debug!(
+                instance_id = id,
+                "freenet_log::info: instance memory not recorded"
+            );
+            return;
+        };
         let Some(ptr) =
             validate_and_compute_ptr::<u8>(ptr, info.start_ptr, len as usize, info.mem_size)
         else {
@@ -1719,7 +1730,16 @@ pub(super) mod rand {
             );
             return;
         }
-        let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
+        // No record yet is reachable from guest code (a start function runs
+        // before `RunningInstance::new` records the instance), so it is an
+        // ordinary refusal, not a panic.
+        let Some(info) = MEM_ADDR.get(&id) else {
+            tracing::debug!(
+                instance_id = id,
+                "freenet_rand::rand_bytes: instance memory not recorded"
+            );
+            return;
+        };
         let Some(ptr) =
             validate_and_compute_ptr::<u8>(ptr, info.start_ptr, len as usize, info.mem_size)
         else {
@@ -1861,7 +1881,16 @@ pub(super) mod time {
             );
             return;
         }
-        let info = MEM_ADDR.get(&id).expect("instance mem space not recorded");
+        // No record yet is reachable from guest code (a start function runs
+        // before `RunningInstance::new` records the instance), so it is an
+        // ordinary refusal, not a panic.
+        let Some(info) = MEM_ADDR.get(&id) else {
+            tracing::debug!(
+                instance_id = id,
+                "freenet_time::utc_now: instance memory not recorded"
+            );
+            return;
+        };
         let now = contract_now();
         let Some(ptr) = validate_and_compute_ptr::<DateTime<UtcOriginal>>(
             ptr,
