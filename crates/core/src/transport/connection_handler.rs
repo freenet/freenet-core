@@ -435,7 +435,7 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         });
     let quic_endpoint = quic_settings.as_ref().and_then(|settings| {
         let socket = socket.clone();
-        match quic_virtual_time {
+        match quic_virtual_time.clone() {
             // Building the endpoint draws quinn's RNG seed from `GlobalRng`.
             // A side stream (named by the bind address) keeps that draw out
             // of the run's main stream, so an endpoint that is bound and idle
@@ -455,6 +455,22 @@ pub(super) async fn bind_udp_listener<S: Socket>(
             ),
         }
     });
+
+    // Gateway admission of native joins from sources nobody named (#5940
+    // A7b), on the endpoint's clock. Dark: `admission::enabled_at` is false on
+    // every node until phase B (a test can turn it on for one listener), and
+    // with it off the only additions are an idle queue and its poll, one
+    // atomic load per datagram from a source not on the allow-set, and
+    // counters that stay 0.
+    if let Some(endpoint) = &quic_endpoint {
+        if super::quic::admission::enabled_at(is_gateway, bind_addr) {
+            let enabled = match quic_virtual_time {
+                Some(time) => endpoint.enable_gateway_admission(time),
+                None => endpoint.enable_gateway_admission(RealTime::new()),
+            };
+            tracing::info!(enabled, "QUIC gateway admission of native joins");
+        }
+    }
 
     // Test builds only: kill the endpoint after the delay this variable
     // names, through a caught socket adapter panic, so a real-process test can
@@ -1492,7 +1508,7 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// upgrades to route them to (`_quic_upgrades`): nothing allows a peer then,
     /// so no attempt is handed on. Each queued attempt would keep quinn's endpoint
     /// alive until drained or dropped.
-    _quic_attempts: Option<mpsc::Receiver<super::quic::QuicIncoming>>,
+    _quic_attempts: Option<mpsc::Receiver<super::quic::EndpointAttempt>>,
     /// The node's upgrades. Holds an endpoint share, and every connection holds
     /// these while it lives; the router and `upgrade_site` hold them weakly.
     _quic_upgrades: Option<Arc<super::quic::upgrade::driver::QuicUpgrades>>,

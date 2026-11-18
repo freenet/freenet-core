@@ -836,18 +836,12 @@ fn a_handshake_proves_the_clients_own_key_only() {
     assert_eq!(seen, [true, true], "both sign bits were tried");
 }
 
-/// The proven server configuration offers only the native ALPN, and quinn
-/// accepts it.
+/// quinn accepts the proven server configuration. The ALPN it offers is
+/// checked on a real handshake, in
+/// `a_proven_server_config_accepts_each_client_by_its_own_key`.
 #[test]
-fn the_proven_server_tls_offers_the_native_alpn_only() {
+fn quinn_accepts_the_proven_server_tls() {
     let _seed = GlobalRng::seed_guard(SEED);
     let identity = QuicIdentity::new(&TransportKeypair::new()).unwrap();
     identity.server_tls_proven().expect("quinn accepts it");
-    let rustls = config::rustls_server_config_for(
-        identity.certified_key(),
-        Arc::new(ProvenClientKey),
-        Alpn::Native,
-    )
-    .unwrap();
-    assert_eq!(rustls.alpn_protocols, vec![config::NATIVE_ALPN.to_vec()]);
 }

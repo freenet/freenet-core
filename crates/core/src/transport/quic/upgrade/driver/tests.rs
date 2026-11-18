@@ -2136,7 +2136,8 @@ fn native_attempts_reach_only_native_waiters() {
 
         let attempt = rig.next_attempt().await;
         assert!(attempt.is_native());
-        h.hub.dispatch(attempt);
+        h.hub
+            .dispatch(crate::transport::quic::EndpointAttempt::Allowed(attempt));
         assert_eq!(h.hub.native_waiters().len(), 0, "nothing registered");
         assert!(inbox.try_recv().is_err(), "not routed to the session");
 
@@ -2149,7 +2150,8 @@ fn native_attempts_reach_only_native_waiters() {
         for _ in 0..2 {
             let attempt = rig.next_attempt().await;
             assert!(attempt.is_native());
-            h.hub.dispatch(attempt);
+            h.hub
+                .dispatch(crate::transport::quic::EndpointAttempt::Allowed(attempt));
         }
         let (handed, _in_flight) = drive(&h.pair.time, Duration::from_secs(1), async move {
             waiter.next().await.expect("handed")
@@ -2177,7 +2179,7 @@ fn a_native_setup_through_the_hub_gives_a_connection() {
         let (ours, hub) = (rig.ours.clone(), Arc::clone(&h.hub));
         let router = tokio::spawn(async move {
             while let Some(attempt) = ours.accept().await {
-                hub.dispatch(attempt);
+                hub.dispatch(crate::transport::quic::EndpointAttempt::Allowed(attempt));
             }
         });
         let (theirs, our_addr, our_key) = (rig.theirs.clone(), rig.our_addr, rig.our_key.clone());

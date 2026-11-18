@@ -1131,7 +1131,8 @@ datagrams with their source. The listener stays the ONLY reader of the UDP
 socket and fills the queue with `try_reserve`, never a waiting send, so a slow
 endpoint costs dropped QUIC datagrams and never stalls the listener. Only
 sources on the allow-set (`allow_quic_source`, normalized addresses) are
-queued; the rest are dropped, so a prober gets no QUIC reply. One source
+queued; the rest are dropped, so a prober gets no QUIC reply (except on a
+gateway with native admission on, below). One source
 holds at most QUIC_INGRESS_PER_SOURCE_DATAGRAMS (a quarter) of the queue, so
 one allowed or spoofed-allowed source cannot starve the other connections.
 The trade-off: a lone bulk peer, with no other connection competing, still
@@ -1169,6 +1170,48 @@ receiver gone, or disabled; every node with `transport-quic` off). The QUIC
 endpoint enables the ingress through `with_quic_ingress`, which disables it
 again (allow-set emptied and closed) if the endpoint cannot be built, so a
 failed `shadow`/`prefer` bind leaves the socket as with QUIC off.
+
+Gateway admission of native joins (`quic/admission.rs`, #5940 A7b). DARK:
+`admission::GATEWAY_NATIVE_ADMISSION` is false, and `bind_udp_listener` calls
+`QuicEndpoint::enable_gateway_admission` only inside
+`admission::enabled_at(is_gateway, bind_addr)` (pinned across every source
+file of the crate by `the_node_enables_admission_only_behind_the_switch`; a
+test can turn it on for one listener with `admission::force_on_for_test`).
+Off, a node behaves as before; what it still carries is an idle second
+ingress queue (128 slots) and its poll in the endpoint's receive, one atomic
+load per QUIC datagram from a source not on the allow-set, and the
+`quic_gateway_admission_*` counters at 0. The switch's doc names what turning
+it on waits for (joiners inside the connection cap, phase B). When on, the
+demux gets an unknown-source lane (`enable_unknown_source_lane`): a
+QUIC-class datagram from a source not on the allow-set is queued on a
+separate queue of `UNKNOWN_SOURCE_QUEUE_DATAGRAMS` (128, in
+`QUIC_INGRESS_QUEUE_BYTES`) only if it can open a connection
+(`admission::unknown_source_datagram`: long header, at least 1200 bytes, a
+known version, and the Initial packet type), and counted as `forwarded`;
+anything else stays `not_allowed`. The endpoint reads the established queue
+first and the unknown-source queue only when it is empty.
+`EndpointCore::accept_attempt` decides each attempt from a source not on the
+allow-set, in order: no Retry token yet → Retry; an address admitted within
+the last second → ignored; the node-wide rate (50 a second) spent → ignored;
+otherwise admitted, recorded against both limits as an `AdmissionTicket`;
+then the address is put on the allow-set for the attempt and then the
+connection (the handshake's later, shorter datagrams take the established
+path), and the attempt is accepted with one server configuration built at
+enable (`server_tls_proven`). A ticket dropped before the join's handshake
+starts gives the admission back (`refunded`): the allow-set full, the attempt
+dropped on a full accept or join queue, the node stopping. The attempt router
+hands each admitted join to one registered task, `quic_gateway_joins`
+(`driver::run_gateway_joins`, a 64-join queue, at most 512 joins at once),
+which runs each join (`driver::join_gateway`) as a future of its own:
+handshake, the client's key read from the connection (`proven_client_key`),
+the native Hello exchange, all within `NATIVE_WINDOW`. A join that panics is
+counted and the task goes on. Until phase B hands the connection to the node,
+a join that gets that far is closed (`node_dropped_peer`). Each outcome is
+counted under `quic_gateway_admission_*`: queued, queue_full, short_header,
+runt, unknown_version, not_initial, retried, throttled_address,
+throttled_global, allow_set_full, admitted, refunded, join_queue_full,
+handshake_failed, unproven, hello_failed, joined, join_panicked. Not yet:
+joiners inside the connection cap (A7b PR 6).
 
 Socket-health signal: the listener reads through `Socket::recv_classified`,
 which `DemuxSocket` answers with `Datagram` for a legacy datagram and
@@ -2140,8 +2183,8 @@ no extra message, no exporter proof.
     never as "any key". An inbound transport's key is the key the node
     bound from the peer's claim, not one the transport authenticated; the
     QUIC handshake is what checks it.
-  → A client nobody named (a gateway admitting a native join, A7b; no
-    production caller yet): ProvenClientKey takes the key the client
+  → A client nobody named (a gateway admitting a native join, A7b; called
+    only from the gateway admission path, which is dark): ProvenClientKey takes the key the client
     presents instead of pinning one. peer_key_presented accepts only an
     exact Ed25519 SPKI (prefix + 32 bytes) with sign bit 0, no chain, a key
     PeerKey::of accepts, in its canonical encoding; the signature must be
@@ -2150,8 +2193,11 @@ no extra message, no exporter proof.
     any number of handshakes; the identity is read after the handshake from
     the connection's peer_identity() (proven_client_key, which parses it
     with peer_key_presented again), so it belongs to that connection and a
-    completed handshake. server_tls_proven offers freenet-quic/2 only. It
-    proves possession of the key's secret, nothing more.
+    completed handshake. Read it only on a fully established connection,
+    never one from Connecting::into_0rtt(): rustls records the client's
+    certificate before the client's Finished. server_tls_proven offers
+    freenet-quic/2 only. It proves possession of the key's secret, nothing
+    more.
 Tests: conversion vs curve25519-dalek 5 (random keys, bit 255 set, u = -1),
 signer key == verifier key over many keypairs with both natural sign bits,
 signatures verified by ed25519-dalek and refused with any bit flipped,

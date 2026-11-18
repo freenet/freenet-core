@@ -136,7 +136,7 @@ fn window_end<T: TimeSource>(
 /// This node's Hello to `peer`. The observed address is normalized, so an
 /// IPv4 peer reached through an IPv4-mapped IPv6 address is encoded as IPv4
 /// (family 4), as the reader's counters compare it.
-fn own_hello(peer: SocketAddr, caps: u32) -> Hello {
+pub(in crate::transport) fn own_hello(peer: SocketAddr, caps: u32) -> Hello {
     Hello {
         protoc_version: native_version::OWN,
         caps,

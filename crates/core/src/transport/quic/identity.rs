@@ -372,7 +372,6 @@ impl QuicIdentity {
     /// client proves ([`ProvenClientKey`]). The key is read from the
     /// connection after the handshake ([`proven_client_key`]). One
     /// configuration serves any number of connections.
-    #[cfg_attr(not(test), allow(dead_code))] // Used by gateway admission (A7b), dark until then.
     pub(crate) fn server_tls_proven(
         &self,
     ) -> Result<quinn::crypto::rustls::QuicServerConfig, TlsConfigError> {
@@ -675,11 +674,9 @@ impl ClientCertVerifier for PinnedClientKey {
 /// checks derive the key from the certificate rustls passes them, and the
 /// caller reads the proven key from the finished connection
 /// ([`proven_client_key`]).
-#[cfg_attr(not(test), allow(dead_code))] // Used by gateway admission (A7b), dark until then.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ProvenClientKey;
 
-#[cfg_attr(not(test), allow(dead_code))] // Used by gateway admission (A7b), dark until then.
 impl ProvenClientKey {
     /// Check the handshake signature over the parts of a
     /// `DigitallySignedStruct` under the key `presented` carries. The
@@ -702,7 +699,13 @@ impl ProvenClientKey {
 /// presented, parsed again by [`peer_key_presented`]. `None` when the
 /// connection carries no such key, which a handshake under that verifier
 /// cannot finish without.
-#[cfg_attr(not(test), allow(dead_code))] // Used by gateway admission (A7b), dark until then.
+///
+/// Only on a fully established connection (the awaited `Connecting`),
+/// never on one from `Connecting::into_0rtt()`: rustls records the client's
+/// certificate before the client's Finished arrives, so on a 0.5-RTT
+/// connection the key would be read before the handshake proved it. The
+/// gateway's accept path awaits the handshake
+/// (`proven_key_is_read_only_after_the_handshake_completes` pins it).
 pub(crate) fn proven_client_key(connection: &quinn::Connection) -> Option<PeerKey> {
     let identity = connection.peer_identity()?;
     let certificates = identity.downcast::<Vec<CertificateDer<'static>>>().ok()?;

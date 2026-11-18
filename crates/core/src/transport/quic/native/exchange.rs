@@ -76,13 +76,52 @@ pub(crate) async fn exchange<T: TimeSource>(
     clock: &T,
     limit: Duration,
 ) -> Result<PeerHello, HelloFailure> {
+    exchange_inner(connection, own, peer_is_gateway, clock, limit, false).await
+}
+
+/// [`exchange`] that also waits, within `limit`, until the peer has
+/// acknowledged all of `own`. For a caller that closes the connection as
+/// soon as the exchange returns: a close stops retransmission, so without
+/// the acknowledgement a delayed or lost `Hello` would never arrive.
+pub(crate) async fn exchange_confirmed<T: TimeSource>(
+    connection: &QuicConnection,
+    own: &Hello,
+    peer_is_gateway: bool,
+    clock: &T,
+    limit: Duration,
+) -> Result<PeerHello, HelloFailure> {
+    exchange_inner(connection, own, peer_is_gateway, clock, limit, true).await
+}
+
+async fn exchange_inner<T: TimeSource>(
+    connection: &QuicConnection,
+    own: &Hello,
+    peer_is_gateway: bool,
+    clock: &T,
+    limit: Duration,
+    confirm_delivery: bool,
+) -> Result<PeerHello, HelloFailure> {
     let sender = connection.inner().clone();
     let reader = connection.inner().clone();
     let bytes = own.encode();
     let send = async move {
         let mut stream = sender.open_uni().await.map_err(|e| e.to_string())?;
         stream.write_all(&bytes).await.map_err(|e| e.to_string())?;
-        stream.finish().map_err(|e| e.to_string())
+        stream.finish().map_err(|e| e.to_string())?;
+        if confirm_delivery {
+            // Resolves once the peer has acknowledged every byte, stopped the
+            // stream, or the connection ended.
+            // Only `None` is an acknowledgement. `Some(code)` is the peer's
+            // STOP_SENDING, reached only when it was processed before the
+            // peer's ACK of the whole Hello, so delivery is not confirmed.
+            // No test pins this: the simulation cannot order it, because a
+            // STOP_SENDING travels behind an ACK in the same packet and the
+            // ACK of this small Hello completes the stream first.
+            if let Some(code) = stream.stopped().await.map_err(|e| e.to_string())? {
+                return Err(format!("the peer stopped the Hello stream with {code}"));
+            }
+        }
+        Ok(())
     };
     let receive = async move {
         let mut stream = match reader.accept_uni().await {
