@@ -320,12 +320,11 @@ impl P2pConnManager {
             // every fully-covered fan-out — the COMMON outcome in the clique
             // regime this design targets — and re-emit on every new subscriber.
             // So: only if something was already stashed (meaning an earlier
-            // broadcast genuinely gave up on this contract) do we put the
-            // current state back in its place.
-            if op_manager.pending_broadcasts.take(key.id()).is_some() {
-                op_manager
-                    .pending_broadcasts
-                    .stash(*key.id(), new_state.clone());
+            // broadcast genuinely gave up on this contract) do we refresh its
+            // stash (the store holds only the id and time; the flush reads the
+            // CURRENT state).
+            if op_manager.pending_broadcasts.take(key.id()) {
+                op_manager.pending_broadcasts.stash(*key.id());
                 tracing::debug!(
                     contract = %key,
                     phase = "fully_covered_stash_refresh",
@@ -438,9 +437,7 @@ impl P2pConnManager {
                 // the freshly-registered target and propagates. The store is
                 // bounded by size and TTL so a churn of fresh ids that never
                 // gain a subscriber cannot pin memory.
-                op_manager
-                    .pending_broadcasts
-                    .stash(*key.id(), new_state.clone());
+                op_manager.pending_broadcasts.stash(*key.id());
 
                 // Lost-wakeup guard (#4359 re-review): stash() runs here on the
                 // event-loop task while the interest-resolve flush runs on the
@@ -472,35 +469,33 @@ impl P2pConnManager {
                     &key,
                     &crate::ring::broadcast_coverage::BroadcastOrigin::local(),
                 );
-                if !recheck.targets.is_empty() {
-                    if let Some(stashed) = op_manager.pending_broadcasts.take(key.id()) {
+                if !recheck.targets.is_empty() && op_manager.pending_broadcasts.take(key.id()) {
+                    tracing::debug!(
+                        contract = %key,
+                        target_count = recheck.targets.len(),
+                        phase = "pending_broadcast_stash_recheck",
+                        "A target appeared while giving up; re-emitting the deferred \
+                         fresh-contract broadcast immediately instead of leaving it \
+                         stashed for a future flush (#4359)"
+                    );
+                    if let Err(e) = op_manager.try_notify_node_event(
+                        crate::message::NodeEvent::BroadcastStateChange {
+                            key,
+                            new_state: new_state.clone(),
+                            is_retry: false,
+                            is_reemit: true,
+                        },
+                    ) {
+                        // Channel full/closed: re-stash so the next interest
+                        // flush still recovers it. Losing it would re-open the
+                        // locally-hosted-only failure this fix closes.
+                        op_manager.pending_broadcasts.stash(*key.id());
                         tracing::debug!(
                             contract = %key,
-                            target_count = recheck.targets.len(),
-                            phase = "pending_broadcast_stash_recheck",
-                            "A target appeared while giving up; re-emitting the deferred \
-                             fresh-contract broadcast immediately instead of leaving it \
-                             stashed for a future flush (#4359)"
+                            error = %e,
+                            "pending_broadcast_stash_recheck: immediate re-emit dropped; \
+                             re-stashed for the next interest signal"
                         );
-                        if let Err(e) = op_manager.try_notify_node_event(
-                            crate::message::NodeEvent::BroadcastStateChange {
-                                key,
-                                new_state: stashed.clone(),
-                                is_retry: false,
-                                is_reemit: true,
-                            },
-                        ) {
-                            // Channel full/closed: re-stash so the next interest
-                            // flush still recovers it. Losing it would re-open the
-                            // locally-hosted-only failure this fix closes.
-                            op_manager.pending_broadcasts.stash(*key.id(), stashed);
-                            tracing::debug!(
-                                contract = %key,
-                                error = %e,
-                                "pending_broadcast_stash_recheck: immediate re-emit dropped; \
-                                 re-stashed for the next interest signal"
-                            );
-                        }
                     }
                 }
 
