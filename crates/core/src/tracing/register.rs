@@ -28,6 +28,11 @@ pub(crate) trait NetEventRegister: std::any::Any + Send + Sync + 'static {
         &'a self,
         events: Either<NetEventLog<'a>, Vec<NetEventLog<'a>>>,
     ) -> BoxFuture<'a, ()>;
+    // No production caller remains: the only one was the garbage-collection
+    // sweep's `ops.completed` branch, removed with that set (ANT-2026-OZWLXLHH),
+    // which could never run. Kept as part of the registers' interface; tests
+    // still exercise every implementation.
+    #[allow(dead_code)]
     fn notify_of_time_out(
         &mut self,
         tx: Transaction,

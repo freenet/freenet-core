@@ -3090,7 +3090,7 @@ mod disconnect_and_refusal_tests {
         tokio::spawn(async move {
             while let Ok((event_id, ev, _priority)) = ch_channel.recv_from_sender().await {
                 if let ContractHandlerEvent::RegisterSubscriberListener { .. } = ev {
-                    let _ = got_tx.send(());
+                    got_tx.send(()).ok();
                     if gated {
                         handler_go.acquire().await.expect("semaphore open").forget();
                     }
@@ -3104,12 +3104,13 @@ mod disconnect_and_refusal_tests {
                     } else {
                         Ok(())
                     };
-                    let _ = ch_channel
+                    ch_channel
                         .send_to_sender(
                             event_id,
                             ContractHandlerEvent::RegisterSubscriberListenerResponse { result },
                         )
-                        .await;
+                        .await
+                        .ok();
                 }
             }
         });
