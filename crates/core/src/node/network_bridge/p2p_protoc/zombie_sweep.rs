@@ -2531,7 +2531,10 @@ mod tests {
             }
             let mut kinds = Vec::new();
             while kinds.len() < if report { 3 } else { 2 } {
-                match events_rx.recv().await.expect("listener alive") {
+                let event = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("no event after {kinds:?} (report = {report})"));
+                match event.expect("listener alive") {
                     ConnEvent::NativeFirstFrame {
                         remote_addr,
                         connection_id,
