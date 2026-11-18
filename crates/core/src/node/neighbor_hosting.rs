@@ -23,7 +23,13 @@
 //! `OpManager::get_broadcast_targets_update()`, where HashSet naturally deduplicates
 //! any overlap.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::HashSet,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use dashmap::DashMap;
 use freenet_stdlib::prelude::{ContractInstanceId, ContractKey};
@@ -48,6 +54,34 @@ use crate::transport::TransportPublicKey;
 // interval. That interval is also the advertisement-staleness / reconcile TOCTOU
 // bound the spec calls out: a co-host advertisement can be stale for at most one
 // heartbeat interval after a dropped update.
+
+/// Most contract ids this node remembers one neighbour advertising (65,536,
+/// about 4 MiB of set per neighbour).
+///
+/// `neighbor_contracts[peer]` is filled from the peer's own `HostingAnnounce`
+/// and `HostingStateResponse` messages and lives as long as the connection, so
+/// without a bound one neighbour decides how much heap this node spends on it
+/// (ANT-2026-N74RDRBN: 4 x 1,000,000 ids cost about 330 MiB).
+///
+/// Sizing, from what an honest peer can advertise. A node advertises every
+/// contract it hosts, and the hosting cache bounds that count by memory: each
+/// hosted contract is charged at least `HOSTED_ENTRY_BYTES` (8 KiB) against a
+/// resident-overhead budget of 1/8 of the node's RAM. A 2 GiB node therefore
+/// tops out at 32,768 hosted contracts. Measured sets are far smaller: a
+/// `hosting_contract_count` telemetry sample (16,578 readings) had median 417
+/// and max 2,814, and a busy peer was seen hosting about 6,200. 65,536
+/// is twice the 2 GiB ceiling and about 10 times the largest measured set. A
+/// node with more than 16 GiB of RAM can hold more than this, and its
+/// neighbours then stop consulting it as a co-host for the overflow ids. That
+/// is the same best-effort outcome as a dropped announce: freshness of those
+/// contracts falls back to the subscription tree and InterestSync anti-entropy
+/// (hosting-invariants 1), and nothing is evicted or forgotten elsewhere.
+///
+/// Ids over the cap are not stored and the peer is not told. Saturation is
+/// counted (`over_cap_ids_total`) and logged at `info!` on power-of-two message
+/// counts only, so release builds show it while the sender cannot flood the log.
+/// Both write sites go through this bound.
+pub(crate) const MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR: usize = 65_536;
 
 /// Result from handling a neighbor hosting message.
 ///
@@ -98,6 +132,20 @@ pub struct NeighborHostingManager {
     /// Keyed by TransportPublicKey (stable identity) rather than SocketAddr (mutable
     /// due to NAT/reconnection), so entries survive address changes.
     neighbor_contracts: DashMap<TransportPublicKey, HashSet<ContractInstanceId>>,
+
+    /// Messages whose ids were partly dropped by the per-neighbour cap.
+    over_cap_messages: AtomicU64,
+    /// Ids dropped by the per-neighbour cap, in total.
+    over_cap_ids: AtomicU64,
+    /// Inbound messages whose proximity syncs hit the per-message budget.
+    sync_budget_hits: AtomicU64,
+}
+
+/// Log at `info!` when `count` is a power of two (1, 2, 4, 8, ...): saturation
+/// shows up in release builds (`debug!` is compiled out) while the volume of
+/// log lines stays logarithmic in a peer-controlled event count.
+fn is_log_point(count: u64) -> bool {
+    count.is_power_of_two()
 }
 
 impl Default for NeighborHostingManager {
@@ -112,7 +160,56 @@ impl NeighborHostingManager {
         Self {
             my_contracts: Arc::new(DashMap::new()),
             neighbor_contracts: DashMap::new(),
+            over_cap_messages: AtomicU64::new(0),
+            over_cap_ids: AtomicU64::new(0),
+            sync_budget_hits: AtomicU64::new(0),
         }
+    }
+
+    /// Record that `dropped` ids from `from` exceeded the per-neighbour cap.
+    fn note_over_cap(&self, from: &TransportPublicKey, dropped: usize) {
+        if dropped == 0 {
+            return;
+        }
+        self.over_cap_ids
+            .fetch_add(dropped as u64, Ordering::Relaxed);
+        let messages = self.over_cap_messages.fetch_add(1, Ordering::Relaxed) + 1;
+        if is_log_point(messages) {
+            info!(
+                peer = %from,
+                dropped,
+                messages_over_cap = messages,
+                cap = MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR,
+                "NEIGHBOR_HOSTING: neighbor advertised more contracts than the per-neighbor cap; overflow ignored (logged at power-of-two counts)"
+            );
+        }
+    }
+
+    /// Record that an inbound message's proximity syncs hit the per-message
+    /// budget. Called by the dispatch loop in `node.rs`; logs at `info!` on
+    /// power-of-two counts only.
+    pub(crate) fn note_sync_budget_hit(&self, from: &TransportPublicKey, budget: usize) {
+        let hits = self.sync_budget_hits.fetch_add(1, Ordering::Relaxed) + 1;
+        if is_log_point(hits) {
+            info!(
+                peer = %from,
+                budget,
+                hits,
+                "NEIGHBOR_HOSTING: proximity sync budget hit; the rest is left to InterestSync (logged at power-of-two counts)"
+            );
+        }
+    }
+
+    /// Total ids dropped by the per-neighbour cap since start.
+    #[allow(dead_code)]
+    pub(crate) fn over_cap_ids_total(&self) -> u64 {
+        self.over_cap_ids.load(Ordering::Relaxed)
+    }
+
+    /// Total messages whose proximity syncs hit the per-message budget.
+    #[allow(dead_code)]
+    pub(crate) fn sync_budget_hits_total(&self) -> u64 {
+        self.sync_budget_hits.load(Ordering::Relaxed)
     }
 
     /// Called when we start hosting a new contract (via PUT or successful GET).
@@ -265,30 +362,50 @@ impl NeighborHostingManager {
                 removed,
                 is_response,
             } => {
-                // Get what we previously knew about this peer BEFORE updating.
-                // This is needed to detect genuinely NEW contracts vs duplicates.
-                let previously_known: HashSet<ContractInstanceId> = self
-                    .neighbor_contracts
-                    .get(from)
-                    .map(
-                        |entry: dashmap::mapref::one::Ref<
-                            '_,
-                            TransportPublicKey,
-                            HashSet<ContractInstanceId>,
-                        >| entry.value().clone(),
-                    )
-                    .unwrap_or_default();
-
-                // Update neighbor's cache state
-                if let Some(mut entry) = self.neighbor_contracts.get_mut(from) {
-                    entry.extend(added.iter().copied());
-                    for id in &removed {
-                        entry.remove(id);
+                // Update the neighbor's view and learn which ids are genuinely
+                // NEW from it. The set is never cloned: `insert` reports
+                // novelty, so a message costs O(message), not O(stored set).
+                // `newly_added` is also de-duplicated (a repeated id is
+                // already stored when its second copy is seen) and excludes
+                // ids dropped by the per-neighbour cap.
+                //
+                // Removals are applied BEFORE additions so a capacity-neutral
+                // swap at the cap (add X, remove Y) keeps X. An id named in
+                // both lists stays removed, as it did when removals ran last,
+                // and is not reported as new.
+                let mut newly_added: Vec<ContractInstanceId> = Vec::new();
+                let mut over_cap = 0usize;
+                {
+                    let removed_set: HashSet<ContractInstanceId> =
+                        removed.iter().copied().collect();
+                    let mut apply = |set: &mut HashSet<ContractInstanceId>| {
+                        for id in &removed_set {
+                            set.remove(id);
+                        }
+                        for id in &added {
+                            if removed_set.contains(id) || set.contains(id) {
+                                continue;
+                            }
+                            if set.len() >= MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR {
+                                over_cap += 1;
+                                continue;
+                            }
+                            set.insert(*id);
+                            newly_added.push(*id);
+                        }
+                    };
+                    if let Some(mut entry) = self.neighbor_contracts.get_mut(from) {
+                        apply(&mut entry);
+                    } else if !added.is_empty() {
+                        apply(
+                            self.neighbor_contracts
+                                .entry(from.clone())
+                                .or_default()
+                                .value_mut(),
+                        );
                     }
-                } else if !added.is_empty() {
-                    self.neighbor_contracts
-                        .insert(from.clone(), added.iter().copied().collect());
                 }
+                self.note_over_cap(from, over_cap);
                 crate::config::GlobalTestMetrics::record_neighbor_hosting_update();
 
                 let neighbor_contracts: usize = self
@@ -328,11 +445,9 @@ impl NeighborHostingManager {
                 // 1. NEW from this peer (not previously known from them)
                 // 2. Also in our local cache
                 // We respond so they can include us in their UPDATE targets.
-                let overlapping: Vec<ContractInstanceId> = added
-                    .iter()
-                    .filter(|id| !previously_known.contains(id)) // Only NEW contracts
-                    .filter(|id| self.my_contracts.contains_key(*id)) // That we also have
-                    .copied()
+                let overlapping: Vec<ContractInstanceId> = newly_added
+                    .into_iter()
+                    .filter(|id| self.my_contracts.contains_key(id)) // That we also have
                     .collect();
 
                 let response = if !overlapping.is_empty() {
@@ -395,28 +510,50 @@ impl NeighborHostingManager {
                 // this peer's entry) `previously_known` is empty, so every shared
                 // contract counts as new and the reconnection-recovery sync is
                 // preserved exactly.
-                let previously_known: HashSet<ContractInstanceId> = self
-                    .neighbor_contracts
-                    .get(from)
-                    .map(|entry| entry.value().clone())
-                    .unwrap_or_default();
+                //
+                // The previous set is not cloned: `DashMap::insert` hands it back
+                // when the snapshot replaces it, so the diff below reads the old
+                // set directly and a snapshot costs O(message), not O(old set).
+
+                // Build the replacement view: de-duplicated and capped at
+                // `MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR`. `shared` records, in
+                // message order, each id we also host that made it into the view,
+                // so a repeated id is reported once and an over-cap id never.
+                let mut view: HashSet<ContractInstanceId> =
+                    HashSet::with_capacity(count.min(MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR));
+                let mut shared: Vec<ContractInstanceId> = Vec::new();
+                let mut over_cap = 0usize;
+                for id in &contracts {
+                    if view.contains(id) {
+                        continue;
+                    }
+                    if view.len() >= MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR {
+                        over_cap += 1;
+                        continue;
+                    }
+                    view.insert(*id);
+                    if self.my_contracts.contains_key(id) {
+                        shared.push(*id);
+                    }
+                }
+                self.note_over_cap(from, over_cap);
 
                 // A `HostingStateResponse` is a FULL SNAPSHOT: it REPLACES our
                 // whole view of this peer, so a contract the peer stopped hosting
                 // silently disappears from our view here. That full-replace is what
                 // lets the periodic re-request heal a dropped retraction (Fix 1).
-                self.neighbor_contracts
-                    .insert(from.clone(), contracts.iter().copied().collect());
+                let previously_known: HashSet<ContractInstanceId> = self
+                    .neighbor_contracts
+                    .insert(from.clone(), view)
+                    .unwrap_or_default();
                 crate::config::GlobalTestMetrics::record_neighbor_hosting_update();
 
                 // Announce back only the NEWLY-learned overlaps so the peer can
                 // include us in its UPDATE targets for shared contracts it did not
                 // previously know we host.
-                let overlapping: Vec<ContractInstanceId> = contracts
-                    .iter()
-                    .filter(|id| !previously_known.contains(*id)) // Only NEW from this peer
-                    .filter(|id| self.my_contracts.contains_key(*id)) // That we also host
-                    .copied()
+                let overlapping: Vec<ContractInstanceId> = shared
+                    .into_iter()
+                    .filter(|id| !previously_known.contains(id)) // Only NEW from this peer
                     .collect();
 
                 info!(
@@ -453,6 +590,38 @@ impl NeighborHostingManager {
                     overlapping_contracts: overlapping,
                 }
             }
+        }
+    }
+
+    /// [`Self::handle_message`] for a message from a ring neighbour, with the
+    /// ring-membership check made AFTER the message is applied (ANT-2026-VLEFNWN1).
+    ///
+    /// Inbound messages are applied on a task of their own, concurrently with
+    /// the event loop's disconnect handling, and building a large snapshot takes
+    /// long enough for a whole disconnect to fit in between. Checking membership
+    /// first and writing second therefore lets `on_peer_disconnected` run before
+    /// the write, find nothing, and leave the late write as an entry for a peer
+    /// that is gone, which nothing removes.
+    ///
+    /// Here the write comes first. A disconnect prunes the ring connection and
+    /// only then calls [`Self::on_peer_disconnected`], so either the prune is
+    /// visible to `still_connected` after our write (we remove the entry
+    /// ourselves), or the clean-up has not run yet and it removes the entry.
+    /// `still_connected` is the caller's live "is `from` still in the ring" check.
+    /// When it reports the peer gone, the entry is removed and `None` is returned,
+    /// so the caller sends no reply and no state sync toward a departed peer.
+    pub fn handle_message_unless_disconnected(
+        &self,
+        from: &TransportPublicKey,
+        message: NeighborHostingMessage,
+        still_connected: impl FnOnce() -> bool,
+    ) -> Option<NeighborHostingResult> {
+        let result = self.handle_message(from, message);
+        if still_connected() {
+            Some(result)
+        } else {
+            self.on_peer_disconnected(from);
+            None
         }
     }
 
@@ -1647,5 +1816,255 @@ mod tests {
                 .is_none(),
             "idempotent — a pending-reclamation retry must not re-broadcast"
         );
+    }
+
+    // ---- Bounds on peer-controlled state (ANT-2026-N74RDRBN / 27GZI7ZB / VLEFNWN1) ----
+
+    fn id_n(n: u32) -> ContractInstanceId {
+        let mut b = [0u8; 32];
+        b[..4].copy_from_slice(&n.to_le_bytes());
+        ContractInstanceId::new(b)
+    }
+
+    fn announce(
+        added: Vec<ContractInstanceId>,
+        removed: Vec<ContractInstanceId>,
+    ) -> NeighborHostingMessage {
+        NeighborHostingMessage::HostingAnnounce {
+            added,
+            removed,
+            // A response: no reply is built, only the stored view is exercised.
+            is_response: true,
+        }
+    }
+
+    /// A neighbour can advertise at most `MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR`
+    /// ids through `HostingAnnounce`; the overflow is not stored, ids inside the
+    /// cap are, and removals free room for later announcements.
+    #[test]
+    fn announce_is_capped_per_neighbor() {
+        let manager = NeighborHostingManager::new();
+        let peer = make_pub_key(1);
+        let cap = MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR as u32;
+
+        manager.handle_message(&peer, announce((0..cap + 10).map(id_n).collect(), vec![]));
+        assert_eq!(
+            manager.contracts_for_peer(&peer).len(),
+            cap as usize,
+            "the per-neighbour set must stop growing at the cap"
+        );
+        assert_eq!(
+            manager.neighbors_with_contract_id(&id_n(0)),
+            vec![peer.clone()]
+        );
+        assert!(
+            manager.neighbors_with_contract_id(&id_n(cap)).is_empty(),
+            "an id past the cap must not be stored"
+        );
+
+        // Re-announcing a known id at the cap is not growth and is harmless.
+        manager.handle_message(&peer, announce(vec![id_n(0)], vec![]));
+        assert_eq!(manager.contracts_for_peer(&peer).len(), cap as usize);
+
+        // Removal frees room; a later announce of the overflow id is then stored.
+        manager.handle_message(&peer, announce(vec![], vec![id_n(0)]));
+        manager.handle_message(&peer, announce(vec![id_n(cap)], vec![]));
+        assert_eq!(manager.contracts_for_peer(&peer).len(), cap as usize);
+        assert_eq!(
+            manager.neighbors_with_contract_id(&id_n(cap)),
+            vec![peer.clone()]
+        );
+    }
+
+    /// The same bound for an (unsolicited) full `HostingStateResponse`.
+    #[test]
+    fn state_response_is_capped_per_neighbor() {
+        let manager = NeighborHostingManager::new();
+        let peer = make_pub_key(1);
+        let cap = MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR as u32;
+
+        manager.handle_message(
+            &peer,
+            NeighborHostingMessage::HostingStateResponse {
+                contracts: (0..cap + 10).map(id_n).collect(),
+            },
+        );
+        assert_eq!(manager.contracts_for_peer(&peer).len(), cap as usize);
+        assert!(
+            manager
+                .neighbors_with_contract_id(&id_n(cap + 5))
+                .is_empty()
+        );
+    }
+
+    /// Duplicate ids inside one message are reported once in
+    /// `overlapping_contracts` and once in the reply, so the dispatch loop does
+    /// one state fetch and one sync per contract, not one per copy.
+    #[test]
+    fn duplicate_ids_in_announce_overlap_once() {
+        let manager = NeighborHostingManager::new();
+        let peer = make_pub_key(1);
+        let key = test_contract_key();
+        manager.on_contract_hosted(&key);
+        let id = *key.id();
+
+        let result = manager.handle_message(
+            &peer,
+            NeighborHostingMessage::HostingAnnounce {
+                added: vec![id; 1000],
+                removed: vec![],
+                is_response: false,
+            },
+        );
+        assert_eq!(result.overlapping_contracts, vec![id]);
+        match result.response {
+            Some(NeighborHostingMessage::HostingAnnounce { added, .. }) => {
+                assert_eq!(
+                    added,
+                    vec![id],
+                    "the reciprocal announce must not repeat ids"
+                )
+            }
+            other => panic!("expected a reciprocal announce, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn duplicate_ids_in_state_response_overlap_once() {
+        let manager = NeighborHostingManager::new();
+        let peer = make_pub_key(1);
+        let key = test_contract_key();
+        manager.on_contract_hosted(&key);
+        let id = *key.id();
+
+        let result = manager.handle_message(
+            &peer,
+            NeighborHostingMessage::HostingStateResponse {
+                contracts: vec![id; 1000],
+            },
+        );
+        assert_eq!(result.overlapping_contracts, vec![id]);
+    }
+
+    /// A message applied after its sender's disconnect clean-up must not leave
+    /// an entry behind (check-then-write race), for both entry-creating arms.
+    #[test]
+    fn message_applied_after_disconnect_leaves_no_entry() {
+        for snapshot in [false, true] {
+            let manager = NeighborHostingManager::new();
+            let peer = make_pub_key(1);
+            let msg = if snapshot {
+                NeighborHostingMessage::HostingStateResponse {
+                    contracts: vec![id_n(1), id_n(2)],
+                }
+            } else {
+                announce(vec![id_n(1), id_n(2)], vec![])
+            };
+            // The real interleaving: the message is written, THEN the
+            // disconnect clean-up runs (inside the liveness check, after the
+            // write), then the check reports the sender gone. The clean-up
+            // alone cannot be relied on here: in the opposite order it finds
+            // nothing, which is the race this guards.
+            let result = manager.handle_message_unless_disconnected(&peer, msg, || {
+                assert!(
+                    !manager.contracts_for_peer(&peer).is_empty(),
+                    "the message must already be written when liveness is checked"
+                );
+                manager.on_peer_disconnected(&peer);
+                false
+            });
+            assert!(result.is_none(), "no reply or sync toward a departed peer");
+            assert!(
+                manager.contracts_for_peer(&peer).is_empty() && manager.neighbor_count() == 0,
+                "snapshot={snapshot}: a departed sender's entry must be removed"
+            );
+        }
+    }
+
+    /// The other interleaving: the clean-up already ran (and found nothing)
+    /// before the write, so only the post-write undo can remove the entry.
+    #[test]
+    fn late_write_after_cleanup_is_undone() {
+        let manager = NeighborHostingManager::new();
+        let peer = make_pub_key(1);
+        manager.on_peer_disconnected(&peer);
+        let result = manager.handle_message_unless_disconnected(
+            &peer,
+            NeighborHostingMessage::HostingStateResponse {
+                contracts: vec![id_n(1)],
+            },
+            || false,
+        );
+        assert!(result.is_none());
+        assert_eq!(manager.neighbor_count(), 0, "the late write must be undone");
+    }
+
+    /// A capacity-neutral swap at the cap (add X, remove Y) keeps X: removals
+    /// are applied before additions.
+    #[test]
+    fn announce_swap_at_cap_keeps_the_new_id() {
+        let manager = NeighborHostingManager::new();
+        let peer = make_pub_key(1);
+        let cap = MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR as u32;
+        manager.handle_message(&peer, announce((0..cap).map(id_n).collect(), vec![]));
+        assert_eq!(manager.contracts_for_peer(&peer).len(), cap as usize);
+
+        manager.handle_message(&peer, announce(vec![id_n(cap)], vec![id_n(0)]));
+        assert_eq!(
+            manager.neighbors_with_contract_id(&id_n(cap)),
+            vec![peer.clone()]
+        );
+        assert!(manager.neighbors_with_contract_id(&id_n(0)).is_empty());
+        assert_eq!(manager.contracts_for_peer(&peer).len(), cap as usize);
+    }
+
+    /// An id named in both `added` and `removed` ends up removed and is not
+    /// reported as overlapping (no reciprocal announce, no sync).
+    #[test]
+    fn id_in_both_added_and_removed_is_removed_and_not_overlapping() {
+        let manager = NeighborHostingManager::new();
+        let peer = make_pub_key(1);
+        let key = test_contract_key();
+        manager.on_contract_hosted(&key);
+        let id = *key.id();
+        let result = manager.handle_message(
+            &peer,
+            NeighborHostingMessage::HostingAnnounce {
+                added: vec![id],
+                removed: vec![id],
+                is_response: false,
+            },
+        );
+        assert!(manager.neighbors_with_contract_id(&id).is_empty());
+        assert!(result.overlapping_contracts.is_empty());
+        assert!(result.response.is_none());
+    }
+
+    /// Saturation is counted in release-visible state, per dropped id.
+    #[test]
+    fn over_cap_ids_are_counted() {
+        let manager = NeighborHostingManager::new();
+        let peer = make_pub_key(1);
+        let cap = MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR as u32;
+        manager.handle_message(&peer, announce((0..cap + 7).map(id_n).collect(), vec![]));
+        assert_eq!(manager.over_cap_ids_total(), 7);
+        manager.handle_message(
+            &peer,
+            NeighborHostingMessage::HostingStateResponse {
+                contracts: (0..cap + 3).map(id_n).collect(),
+            },
+        );
+        assert_eq!(manager.over_cap_ids_total(), 10);
+    }
+
+    #[test]
+    fn message_from_connected_peer_is_applied() {
+        let manager = NeighborHostingManager::new();
+        let peer = make_pub_key(1);
+        let result = manager
+            .handle_message_unless_disconnected(&peer, announce(vec![id_n(1)], vec![]), || true)
+            .expect("a connected sender's message is applied");
+        assert!(result.response.is_none());
+        assert_eq!(manager.neighbors_with_contract_id(&id_n(1)), vec![peer]);
     }
 }
