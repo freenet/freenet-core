@@ -140,6 +140,14 @@
 //! ```
 //!
 //! We wrap with `block_on_async()` to maintain a synchronous interface for callers.
+//!
+//! That `block_on_async` call runs inside a job passed to
+//! `execute_wasm_blocking` / `execute_wasm_blocking_within`, not on the
+//! caller's thread: every production guest entry (the typed calls through
+//! `call_typed_blocking`, the allocator export, and instance setup in
+//! `create_instance`) runs off the calling thread under the wall-clock
+//! backstop, with a host-side panic returned as an error. `call_void`, used
+//! only by tests, is the exception.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -736,8 +744,9 @@ pub(crate) struct WasmtimeEngine {
     /// Taken during blocking operations, restored after. Recreated on timeout/panic
     /// or when `lifetime_instances` exceeds `STORE_REFRESH_THRESHOLD`.
     store: Option<Store<HostState>>,
-    /// Linker pre-configured with all host functions.
-    linker: Linker<HostState>,
+    /// Linker pre-configured with all host functions. Shared (`Arc`) so the
+    /// blocking job that instantiates a module can own a handle to it.
+    linker: Arc<Linker<HostState>>,
     /// Map of instance ID to wasmtime Instance.
     instances: HashMap<i64, Instance>,
     /// Maximum execution time in seconds.
@@ -890,7 +899,7 @@ impl WasmEngine for WasmtimeEngine {
         Ok(Self {
             engine,
             store: Some(store),
-            linker,
+            linker: Arc::new(linker),
             instances: HashMap::new(),
             max_execution_seconds: config.max_execution_seconds,
             enabled_metering,
@@ -979,32 +988,60 @@ impl WasmEngine for WasmtimeEngine {
         }
 
         // The guest-entry half (instantiate + __frnt_set_id + ensure_memory) is
-        // factored out so we can RECOVER THE STORE on ANY guest-entry
-        // timeout/error before returning (#4864 round-9 item 2). Previously an
-        // epoch interrupt during __frnt_set_id returned via `?` AFTER the module
-        // was instantiated but BEFORE `instances.insert` / `lifetime_instances += 1`,
-        // so the store-refresh accounting never counted it: wasmtime's Store arena
-        // retained the dropped instance's allocation, and repeated init timeouts
-        // across fresh contract ids accumulated untracked arena memory that never
-        // triggered a count-based refresh.
+        // factored out so the store is REPLACED on ANY guest-entry failure
+        // before returning (#4864 round-9 item 2). A failure after the module
+        // was instantiated leaves its allocation in the store's arena without an
+        // `instances` entry or a `lifetime_instances` count, so nothing else
+        // would ever trigger a refresh that reclaims it.
         let epoch_ticks = self.epoch_deadline_ticks;
-        let store = self
+        let mut store = self
             .store
-            .as_mut()
+            .take()
             .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-        let instance = match Self::instantiate_and_init(
-            store,
-            &self.linker,
-            module,
-            id,
-            req_bytes,
-            epoch_ticks,
-        ) {
+        let linker = Arc::clone(&self.linker);
+        let module = module.clone();
+
+        // A module's start function and `__frnt_set_id` are guest code, so they
+        // run off the calling thread under the wall-clock backstop, with a
+        // host-side panic captured as an error, like every other guest entry
+        // (see `call_typed_blocking`). They run as ONE job, and each gets its
+        // own freshly armed epoch budget, so the wall-clock bound allows
+        // `INSTANCE_SETUP_GUEST_ENTRIES` budgets (see `WallBounds::for_entries`).
+        let result = execute_wasm_blocking_within(
+            move || {
+                let instance = Self::instantiate_and_init(
+                    &mut store,
+                    &linker,
+                    &module,
+                    id,
+                    req_bytes,
+                    epoch_ticks,
+                );
+                (Ok(instance), store)
+            },
+            WallBounds::for_entries(self.max_execution_seconds, INSTANCE_SETUP_GUEST_ENTRIES),
+            self.max_execution_seconds,
+        );
+        let outcome = match result {
+            BlockingResult::Ok(Ok(instance), store) => {
+                self.store = Some(store);
+                Ok(instance)
+            }
+            BlockingResult::Ok(Err(e), _failed_store) => Err(e),
+            // The job classifies its own errors, so it never returns this.
+            BlockingResult::WasmError(e, _failed_store) => {
+                Err(WasmError::Instantiation(e.to_string()))
+            }
+            BlockingResult::Timeout => Err(WasmError::Timeout),
+            BlockingResult::QueuedTimeout => Err(WasmError::SchedulerOverloaded),
+            BlockingResult::Panic(e) => Err(WasmError::Other(e)),
+        };
+        let instance = match outcome {
             Ok(instance) => instance,
             Err(e) => {
-                // The `store` borrow above ends with `match`, so recover_store
-                // (which reborrows &mut self) is free to replace the store and
-                // drop the failed instance's arena residue.
+                // The failed store came back with the instance's arena residue
+                // in it, or did not come back at all (the job was abandoned, or
+                // panicked). Either way the engine needs a fresh one.
                 self.recover_store();
                 return Err(e);
             }
@@ -1095,23 +1132,26 @@ impl WasmEngine for WasmtimeEngine {
     }
 
     fn initiate_buffer(&mut self, handle: &InstanceHandle, size: u32) -> Result<i64, WasmError> {
-        let store = self
-            .store
-            .as_mut()
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
-        let instance = self
-            .instances
-            .get(&handle.id)
-            .ok_or_else(|| WasmError::Other(anyhow::anyhow!("instance {} not found", handle.id)))?;
-        let func = instance
-            .get_typed_func::<u32, i64>(&mut *store, "__frnt__initiate_buffer")
-            .map_err(|e| WasmError::Export(e.to_string()))?;
-        arm_epoch_deadline(store, self.epoch_deadline_ticks);
-        // CRITICAL: Must use call_async() because async_support(true) is enabled
-        // An epoch interrupt here (a runaway allocator) is classified as a
-        // timeout, not a generic Runtime error (#4864 review).
-        block_on_async(func.call_async(&mut *store, size))
-            .map_err(|e| classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string())))
+        // The allocator export is guest code like any other entry point, and
+        // runs before every one of them, so it goes through the same blocking
+        // helper: off the calling thread, under the wall-clock backstop, with
+        // a host-side panic captured as an error.
+        //
+        // `None`, for a delegate's allocator too: an allocator has no business
+        // with the delegate host functions, so it gets no `DelegateCallEnv`
+        // access, and there is no env for an allocator abandoned by the
+        // wall-clock backstop to outlive.
+        //
+        // Errors are classified as an allocator's always were: an epoch
+        // interrupt is `Timeout`, anything else is `Runtime`, with no error-level
+        // log per guest trap (`classify_allocator_error`).
+        self.call_typed_blocking(
+            handle,
+            "__frnt__initiate_buffer",
+            size,
+            None,
+            classify_allocator_error,
+        )
     }
 
     fn call_void(&mut self, handle: &InstanceHandle, name: &str) -> Result<(), WasmError> {
@@ -1149,7 +1189,13 @@ impl WasmEngine for WasmtimeEngine {
         // it with no preemption at all) and no panic capture. `Some(handle.id)`
         // carries the delegate instance id onto the thread that runs the guest —
         // see `GuestDelegateInstance`.
-        self.call_typed_blocking(handle, name, (a, b, c), Some(handle.id))
+        self.call_typed_blocking(
+            handle,
+            name,
+            (a, b, c),
+            Some(handle.id),
+            classify_runtime_error,
+        )
     }
 
     fn call_2i64_blocking(
@@ -1159,7 +1205,7 @@ impl WasmEngine for WasmtimeEngine {
         a: i64,
         b: i64,
     ) -> Result<i64, WasmError> {
-        self.call_typed_blocking(handle, name, (a, b), None)
+        self.call_typed_blocking(handle, name, (a, b), None, classify_runtime_error)
     }
 
     fn call_3i64_blocking(
@@ -1170,7 +1216,7 @@ impl WasmEngine for WasmtimeEngine {
         b: i64,
         c: i64,
     ) -> Result<i64, WasmError> {
-        self.call_typed_blocking(handle, name, (a, b, c), None)
+        self.call_typed_blocking(handle, name, (a, b, c), None, classify_runtime_error)
     }
 }
 
@@ -1244,17 +1290,23 @@ impl WasmtimeEngine {
     /// delegates here and that the epoch arm lives inside this closure.
     ///
     /// `delegate_instance` is `Some(handle.id)` for a delegate `process()` call
-    /// and `None` for a contract. Delegate host functions locate their
+    /// and `None` for a contract, and for the allocator export of either (see
+    /// `initiate_buffer`). Delegate host functions locate their
     /// `native_api::DelegateCallEnv` through the `CURRENT_DELEGATE_INSTANCE`
     /// THREAD-LOCAL, so a guest running on a blocking-pool thread needs that id
     /// installed on the thread that actually executes it — see
     /// [`GuestDelegateInstance`].
+    ///
+    /// `classify` maps a guest error (a trap, an epoch interrupt) to a
+    /// [`WasmError`]: [`classify_runtime_error`] for contract and delegate
+    /// entry points, [`classify_allocator_error`] for the allocator export.
     fn call_typed_blocking<P>(
         &mut self,
         handle: &InstanceHandle,
         name: &str,
         args: P,
         delegate_instance: Option<i64>,
+        classify: GuestErrorClassifier,
     ) -> Result<i64, WasmError>
     where
         // `Sync` is REQUIRED and is not an over-claim, despite this change
@@ -1334,7 +1386,7 @@ impl WasmtimeEngine {
                 Ok(value)
             }
             BlockingResult::WasmError(err, mut store) => {
-                let wasm_err = classify_runtime_error(enabled_metering, &mut store, err);
+                let wasm_err = classify(enabled_metering, &mut store, err);
                 self.store = Some(store);
                 Err(wasm_err)
             }
@@ -1445,7 +1497,7 @@ impl WasmtimeEngine {
         Ok(Self {
             engine: backend,
             store: Some(store),
-            linker,
+            linker: Arc::new(linker),
             instances: HashMap::new(),
             max_execution_seconds: config.max_execution_seconds,
             enabled_metering,
@@ -1610,8 +1662,9 @@ impl WasmtimeEngine {
     /// Instantiate `module`, run its `__frnt_set_id`, and ensure request memory —
     /// the guest-entry half of [`create_instance`], factored out so the caller can
     /// RECOVER THE STORE on any guest-entry timeout/error before returning (#4864
-    /// round-9 item 2). Every guest entry here is immediately preceded by its own
-    /// `arm_epoch_deadline` (pinned by
+    /// round-9 item 2), and so it can run as ONE job under
+    /// [`execute_wasm_blocking`]. Every guest entry here is immediately preceded
+    /// by its own `arm_epoch_deadline` (pinned by
     /// `every_guest_entry_is_preceded_by_arm_epoch_deadline`, which now scrapes
     /// this method).
     fn instantiate_and_init(
@@ -1649,12 +1702,11 @@ impl WasmtimeEngine {
             // ran near the budget would leave set_id ~zero ticks and trap it
             // spuriously.
             //
-            // Adversarial ceiling (#4864 round-5 item 10): giving set_id a FRESH
-            // budget is correct per-call, but it means create_instance's worst-case
-            // GUEST CPU is ~2x max_execution_seconds (a start function running just
-            // under budget, then set_id running a fresh full budget). That is
-            // bounded at EXACTLY 2 guest entries — the pin enumerates every guest
-            // entry here, so the factor cannot silently grow.
+            // Ceiling (#4864 round-5 item 10): with a fresh budget per entry,
+            // create_instance's worst-case guest time is
+            // `INSTANCE_SETUP_GUEST_ENTRIES` (2) x max_execution_seconds, and the
+            // wall-clock bound `create_instance` passes is sized to match. Adding
+            // a third guest entry here means raising that constant too.
             arm_epoch_deadline(store, epoch_deadline_ticks);
             block_on_async(typed_func.call_async(&mut *store, id)).map_err(|e| {
                 classify_guest_entry_error(e, |e| WasmError::Runtime(e.to_string()))
@@ -2172,14 +2224,12 @@ fn is_epoch_interrupt(error: &WasmtimeError) -> bool {
         .is_some_and(|t| matches!(t, wasmtime::Trap::Interrupt))
 }
 
-/// Map an error from a GUEST-ENTRY call — instantiation (module start
-/// function), `__frnt_set_id`, or `__frnt__initiate_buffer` — to a
+/// Map an error from a setup or allocator guest entry — instantiation (module
+/// start function), `__frnt_set_id`, or `__frnt__initiate_buffer` — to a
 /// [`WasmError`], routing an epoch-deadline interrupt to [`WasmError::Timeout`]
-/// (#4864 review). Without this, a runaway guest during the init/allocator phase
-/// would surface as `Instantiation`/`Runtime` — neither `is_wasm_timeout` (wrong
-/// merge-backoff cooldown class) nor even `is_contract_exec_rejection` (not
-/// recorded at all). Non-interrupt errors keep their original category via
-/// `otherwise`, preserving the existing error text.
+/// (#4864 review), so it is recognised by `is_wasm_timeout` and recorded by
+/// `is_contract_exec_rejection` like any other guest timeout. Non-interrupt
+/// errors keep their own category via `otherwise`, with their original text.
 fn classify_guest_entry_error(
     error: WasmtimeError,
     otherwise: impl FnOnce(WasmtimeError) -> WasmError,
@@ -2189,6 +2239,23 @@ fn classify_guest_entry_error(
         return WasmError::Timeout;
     }
     otherwise(error)
+}
+
+/// How [`WasmtimeEngine::call_typed_blocking`] maps a guest error to a
+/// [`WasmError`]. Arguments: whether metering is on, the store the guest ran
+/// on, and the error.
+type GuestErrorClassifier = fn(bool, &mut Store<HostState>, WasmtimeError) -> WasmError;
+
+/// Classify an error from the allocator export `__frnt__initiate_buffer`: an
+/// epoch interrupt is [`WasmError::Timeout`], anything else is
+/// [`WasmError::Runtime`]. No error-level log, since a guest trap here is the
+/// guest's failure and not a node fault; the caller reports it.
+fn classify_allocator_error(
+    _enabled_metering: bool,
+    _store: &mut Store<HostState>,
+    error: WasmtimeError,
+) -> WasmError {
+    classify_guest_entry_error(error, |e| WasmError::Runtime(e.to_string()))
 }
 
 /// Classify a wasmtime Error, checking fuel status.
@@ -2284,10 +2351,12 @@ impl Drop for LiveGuestRegistration {
 // Blocking execution with timeout
 // =============================================================================
 
-type WasmResult = (Result<i64, WasmtimeError>, Store<HostState>);
+/// What a blocking job hands back: the guest entry's result (`i64` for every
+/// typed call; instance creation returns its own type) and the store it ran on.
+type WasmResult<T = i64> = (Result<T, WasmtimeError>, Store<HostState>);
 
-enum BlockingResult {
-    Ok(i64, Store<HostState>),
+enum BlockingResult<T = i64> {
+    Ok(T, Store<HostState>),
     WasmError(WasmtimeError, Store<HostState>),
     /// Wall-clock deadline fired while the guest was RUNNING (`started == true`)
     /// — a real, contract-intrinsic timeout backing up the epoch trap. The
@@ -2317,6 +2386,11 @@ enum WallVerdict {
     /// fault; must not be charged to the contract.
     QueuedTooLong,
 }
+
+/// Guest entries `instantiate_and_init` makes, each with its own freshly armed
+/// epoch budget: the module start function and `__frnt_set_id`. The wall-clock
+/// bound for instance setup allows this many budgets.
+const INSTANCE_SETUP_GUEST_ENTRIES: u32 = 2;
 
 /// Extra wall-clock time the backstop allows a RUNNING guest past the end of
 /// the epoch-trap window, so a live ticker's trap normally lands first.
@@ -2361,12 +2435,25 @@ impl WallBounds {
     /// that every race; this bound makes the trap win instead, as the comments
     /// around `arm_epoch_deadline` always described.
     fn for_budget(max_execution_seconds: f64) -> Self {
+        Self::for_entries(max_execution_seconds, 1)
+    }
+
+    /// The bounds for a job that runs `entries` guest entries in sequence,
+    /// each with its own freshly armed `max_execution_seconds` epoch budget
+    /// (instance setup: the module start function, then `__frnt_set_id`).
+    /// `queue` is the same as for one entry; `guest` allows each entry its
+    /// full per-entry window, so a job whose entries each stay within budget
+    /// is never cut off by the backstop.
+    fn for_entries(max_execution_seconds: f64, entries: u32) -> Self {
         let queue = Duration::from_secs_f64(max_execution_seconds);
         let ticks = u32::try_from(epoch_deadline_ticks(max_execution_seconds)).unwrap_or(u32::MAX);
         let epoch_window = EPOCH_TICK_PERIOD.saturating_mul(ticks);
         Self {
             queue,
-            guest: queue.max(epoch_window).saturating_add(WALL_BACKSTOP_MARGIN),
+            guest: queue
+                .max(epoch_window)
+                .saturating_mul(entries.max(1))
+                .saturating_add(WALL_BACKSTOP_MARGIN),
         }
     }
 }
@@ -2440,9 +2527,9 @@ fn time_to_next_wall_bound(
 }
 
 /// Outcome of [`wait_for_guest`].
-enum GuestWait {
+enum GuestWait<T = i64> {
     /// The job ran to completion and sent its result.
-    Done(WasmResult),
+    Done(WasmResult<T>),
     /// The job ended without sending a result: it panicked, or it was dropped
     /// unrun (runtime shutdown). The caller joins the job to find out which.
     Ended,
@@ -2465,12 +2552,12 @@ enum GuestWait {
 /// re-arms for the guest bound, so a late start still gets its full budget.
 /// When a bound passes at the same moment the result lands, the result wins,
 /// as it did when the old loop checked `is_finished()` before the deadline.
-fn wait_for_guest(
-    rx: &std::sync::mpsc::Receiver<WasmResult>,
+fn wait_for_guest<T>(
+    rx: &std::sync::mpsc::Receiver<WasmResult<T>>,
     start: std::time::Instant,
     bounds: WallBounds,
     read_started_at: &dyn Fn() -> Option<Duration>,
-) -> GuestWait {
+) -> GuestWait<T> {
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     loop {
         let started_at = read_started_at();
@@ -2496,14 +2583,34 @@ fn wait_for_guest(
     }
 }
 
-fn execute_wasm_blocking<F>(f: F, max_execution_seconds: f64) -> BlockingResult
+/// Run a job that makes ONE guest entry under the wall-clock backstop for
+/// `max_execution_seconds` of budget. See [`execute_wasm_blocking_within`].
+fn execute_wasm_blocking<T, F>(f: F, max_execution_seconds: f64) -> BlockingResult<T>
 where
-    F: FnOnce() -> WasmResult + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> WasmResult<T> + Send + 'static,
 {
-    // Bounds the queue wait (before the guest starts) and the guest's own run
-    // time (after it starts), SEPARATELY — see `WallBounds` and
-    // `classify_wall_timeout`.
-    let bounds = WallBounds::for_budget(max_execution_seconds);
+    execute_wasm_blocking_within(
+        f,
+        WallBounds::for_budget(max_execution_seconds),
+        max_execution_seconds,
+    )
+}
+
+/// Run `f` off the calling thread under `bounds`, which limit the queue wait
+/// (before the guest starts) and the guest's own run time (after it starts)
+/// SEPARATELY — see `WallBounds` and `classify_wall_timeout`. A panic in `f`
+/// is returned as [`BlockingResult::Panic`]. `max_execution_seconds` is only
+/// reported in the timeout logs.
+fn execute_wasm_blocking_within<T, F>(
+    f: F,
+    bounds: WallBounds,
+    max_execution_seconds: f64,
+) -> BlockingResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> WasmResult<T> + Send + 'static,
+{
     let start = std::time::Instant::now();
 
     // #4864 round-6/7: distinguish a guest that RAN and blew its budget (a real,
@@ -2530,7 +2637,7 @@ where
     // moment it finishes. Capacity 1 and exactly one send, so the send never
     // blocks. A job that panics, or is dropped unrun, drops `result_tx` without
     // sending, which the waiter sees as a disconnect.
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WasmResult<T>>(1);
     let job = move || {
         // Record started_at BEFORE flipping `started`, so a waiter that
         // observes started==true (SeqCst) is guaranteed to read a valid
@@ -3023,6 +3130,399 @@ mod tests {
         );
     }
 
+    // ---------------------------------------------------------------------
+    // The allocator export and instance setup (module start function,
+    // `__frnt_set_id`) are guest code too, and need the same three safeguards
+    // as the entry points above. The runtime calls the allocator before every
+    // contract and delegate entry point, and instance setup before that.
+    // ---------------------------------------------------------------------
+
+    /// How long `freenet_test.nap` blocks the thread that calls it.
+    const NAP: Duration = Duration::from_secs(1);
+
+    /// A linker with two test imports: `freenet_test.nap`, which blocks the
+    /// calling thread for [`NAP`] (a stand-in for any slow host function), and
+    /// `freenet_test.boom`, which panics (a stand-in for any host-side panic).
+    fn test_host_linker(engine: &Engine) -> Linker<HostState> {
+        // Named fns for the reason given in `delegate_entry_captures_host_panic`.
+        fn nap(_: Caller<'_, HostState>) {
+            std::thread::sleep(NAP)
+        }
+        fn boom(_: Caller<'_, HostState>) {
+            panic!("deliberate host-function panic (allocator / instance-setup test)");
+        }
+        let mut linker: Linker<HostState> = Linker::new(engine);
+        linker
+            .func_wrap("freenet_test", "nap", nap)
+            .expect("registering nap must succeed");
+        linker
+            .func_wrap("freenet_test", "boom", boom)
+            .expect("registering boom must succeed");
+        linker
+    }
+
+    /// An engine whose linker is [`test_host_linker`], under `max_secs` of wall
+    /// clock and `epoch_ticks` of epoch budget.
+    fn engine_with_test_host(max_secs: f64, epoch_ticks: u64) -> WasmtimeEngine {
+        let config = RuntimeConfig {
+            enable_metering: false,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).expect("engine must build");
+        engine.max_execution_seconds = max_secs;
+        engine.epoch_deadline_ticks = epoch_ticks;
+        engine.linker = test_host_linker(&engine.engine).into();
+        engine
+    }
+
+    /// Instantiate `wat` straight into the engine's store under `id`, so
+    /// `initiate_buffer` finds it without going through `create_instance`.
+    fn insert_raw_instance(engine: &mut WasmtimeEngine, id: i64, wat: &str) {
+        let store = engine.store.as_mut().expect("engine store present");
+        let eng = store.engine().clone();
+        let module = Module::new(&eng, wat.as_bytes()).expect("WAT must compile");
+        let instance =
+            block_on_async(test_host_linker(&eng).instantiate_async(&mut *store, &module))
+                .expect("instantiation must succeed");
+        engine.instances.insert(id, instance);
+    }
+
+    /// After a guest entry failed, the engine must still create and drop an
+    /// instance: the store must have been recovered, not left with the
+    /// abandoned or panicked job. Runs under a 5s budget, so a blocking pool
+    /// still busy with an abandoned guest from a short-budget test cannot turn
+    /// this check into a queue or guest timeout.
+    fn assert_engine_still_usable(engine: &mut WasmtimeEngine, after: &str) {
+        engine.max_execution_seconds = 5.0;
+        engine.epoch_deadline_ticks = epoch_deadline_ticks(5.0);
+        let module = engine.compile(SIMPLE_WASM).expect("compile");
+        let handle = engine
+            .create_instance(&module, 1024)
+            .unwrap_or_else(|e| panic!("the engine must be usable after {after}: {e}"));
+        engine.drop_instance(&handle);
+    }
+
+    /// Allocator export making three slow host calls.
+    const ALLOCATOR_SLOW_HOST_CALLS_WAT: &str = r#"
+        (module
+          (import "freenet_test" "nap" (func $nap))
+          (import "freenet_test" "boom" (func $boom))
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            (call $nap)
+            (call $nap)
+            (call $nap)
+            (i64.const 0)))
+    "#;
+
+    /// Allocator export that never returns.
+    const ALLOCATOR_SPIN_WAT: &str = r#"
+        (module
+          (import "freenet_test" "nap" (func $nap))
+          (import "freenet_test" "boom" (func $boom))
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            (loop (br 0))
+            (i64.const 0)))
+    "#;
+
+    /// Allocator export that calls a panicking host function.
+    const ALLOCATOR_HOST_PANIC_WAT: &str = r#"
+        (module
+          (import "freenet_test" "nap" (func $nap))
+          (import "freenet_test" "boom" (func $boom))
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            (call $boom)
+            (i64.const 0)))
+    "#;
+
+    /// Asserts the allocator export returns `WasmError::Timeout` within 2s
+    /// when the guest runs for 3s against a 0.2s budget, and that the engine
+    /// is usable afterwards.
+    #[test]
+    fn allocator_entry_has_wall_clock_backstop() {
+        run_abandoning_guest_test(|| {
+            let mut engine = engine_with_test_host(0.2, epoch_deadline_ticks(0.2));
+            const ID: i64 = i64::MAX - 54810;
+            insert_raw_instance(&mut engine, ID, ALLOCATOR_SLOW_HOST_CALLS_WAT);
+
+            let start = std::time::Instant::now();
+            let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+            let elapsed = start.elapsed();
+
+            assert!(
+                matches!(result, Err(WasmError::Timeout)),
+                "`initiate_buffer`: a guest past its budget must surface as \
+                 WasmError::Timeout, got {result:?} after {elapsed:?}"
+            );
+            assert!(
+                elapsed < NAP * 2,
+                "`initiate_buffer` took {elapsed:?}: the wall-clock backstop did not fire"
+            );
+            assert_engine_still_usable(&mut engine, "an allocator timeout");
+        });
+    }
+
+    /// Asserts the allocator export returns `WasmError::Timeout` within 5s for
+    /// a spinning guest under a 0.5s wall clock and ~10s of epoch budget, so
+    /// the return comes from the wall-clock backstop (the #4864 dead-ticker
+    /// case), and that the engine is usable afterwards.
+    #[test]
+    fn allocator_entry_has_wall_clock_backstop_when_epoch_cannot_fire() {
+        run_abandoning_guest_test(|| {
+            let mut engine = engine_with_test_host(0.5, 100);
+            const ID: i64 = i64::MAX - 54811;
+            insert_raw_instance(&mut engine, ID, ALLOCATOR_SPIN_WAT);
+
+            let start = std::time::Instant::now();
+            let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+            let elapsed = start.elapsed();
+
+            assert!(
+                matches!(result, Err(WasmError::Timeout)),
+                "`initiate_buffer`: a spinning allocator must surface as \
+                 WasmError::Timeout, got {result:?} after {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "`initiate_buffer` took {elapsed:?}: the 0.5s wall-clock backstop did \
+                 not fire, and the ~10s epoch budget is too far out to have returned this"
+            );
+            assert_engine_still_usable(&mut engine, "an allocator timeout");
+        });
+    }
+
+    /// Asserts a host-function panic inside the allocator export is returned
+    /// as `WasmError::Other`, and that the engine is usable afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allocator_entry_captures_host_panic() {
+        let mut engine = engine_with_test_host(5.0, epoch_deadline_ticks(5.0));
+        const ID: i64 = i64::MAX - 54812;
+        insert_raw_instance(&mut engine, ID, ALLOCATOR_HOST_PANIC_WAT);
+
+        let err = engine
+            .initiate_buffer(&InstanceHandle { id: ID }, 16)
+            .expect_err("a host panic must be returned as an Err");
+        assert!(
+            matches!(err, WasmError::Other(_)),
+            "a captured panic must surface as WasmError::Other, got {err:?}"
+        );
+        assert_engine_still_usable(&mut engine, "a captured allocator panic");
+    }
+
+    /// Module START function making the same three slow host calls.
+    const START_SLOW_HOST_CALLS_WAT: &str = r#"
+        (module
+          (import "freenet_test" "nap" (func $nap))
+          (memory (export "memory") 1)
+          (func $start
+            (call $nap)
+            (call $nap)
+            (call $nap))
+          (start $start))
+    "#;
+
+    /// Module START function that calls a panicking host function.
+    const START_HOST_PANIC_WAT: &str = r#"
+        (module
+          (import "freenet_test" "boom" (func $boom))
+          (memory (export "memory") 1)
+          (start $boom))
+    "#;
+
+    /// `__frnt_set_id` that calls a panicking host function.
+    const SET_ID_HOST_PANIC_WAT: &str = r#"
+        (module
+          (import "freenet_test" "boom" (func $boom))
+          (memory (export "memory") 1)
+          (func (export "__frnt_set_id") (param i64)
+            (call $boom)))
+    "#;
+
+    /// `__frnt_set_id` making the same three slow host calls.
+    const SET_ID_SLOW_HOST_CALLS_WAT: &str = r#"
+        (module
+          (import "freenet_test" "nap" (func $nap))
+          (memory (export "memory") 1)
+          (func (export "__frnt_set_id") (param i64)
+            (call $nap)
+            (call $nap)
+            (call $nap)))
+    "#;
+
+    /// Drive `create_instance` on `wat` and return the error, failing if it
+    /// succeeded.
+    fn create_instance_err(engine: &mut WasmtimeEngine, wat: &str) -> (WasmError, Duration) {
+        let module = engine.compile(wat.as_bytes()).expect("WAT must compile");
+        let start = std::time::Instant::now();
+        let result = engine.create_instance(&module, 0);
+        let elapsed = start.elapsed();
+        // `InstanceHandle` is not Debug, so match rather than `expect_err`.
+        match result {
+            Err(e) => (e, elapsed),
+            Ok(_) => panic!("instance setup must fail here, but succeeded after {elapsed:?}"),
+        }
+    }
+
+    /// Asserts `create_instance` returns `WasmError::Timeout` within 2s when
+    /// the module start function, or `__frnt_set_id`, runs for 3s against a
+    /// 0.2s budget, and that the engine is usable afterwards.
+    #[test]
+    fn instance_setup_has_wall_clock_backstop() {
+        run_abandoning_guest_test(|| {
+            for (entry, wat) in [
+                ("start function", START_SLOW_HOST_CALLS_WAT),
+                ("__frnt_set_id", SET_ID_SLOW_HOST_CALLS_WAT),
+            ] {
+                let mut engine = engine_with_test_host(0.2, epoch_deadline_ticks(0.2));
+                let (err, elapsed) = create_instance_err(&mut engine, wat);
+                assert!(
+                    matches!(err, WasmError::Timeout),
+                    "{entry}: a guest past its budget must surface as \
+                     WasmError::Timeout, got {err:?} after {elapsed:?}"
+                );
+                assert!(
+                    elapsed < NAP * 2,
+                    "{entry}: `create_instance` took {elapsed:?}: the wall-clock \
+                     backstop did not fire"
+                );
+                assert_engine_still_usable(&mut engine, &format!("a {entry} timeout"));
+            }
+        });
+    }
+
+    /// Asserts `create_instance` returns `WasmError::Timeout` within 5s for a
+    /// spinning start function under a 0.5s wall clock and ~10s of epoch
+    /// budget (the #4864 dead-ticker case), and that the engine is usable
+    /// afterwards.
+    #[test]
+    fn instance_setup_has_wall_clock_backstop_when_epoch_cannot_fire() {
+        run_abandoning_guest_test(|| {
+            let mut engine = engine_with_test_host(0.5, 100);
+            let (err, elapsed) = create_instance_err(&mut engine, START_LOOP_WAT);
+            assert!(
+                matches!(err, WasmError::Timeout),
+                "a spinning start function must surface as WasmError::Timeout, \
+                 got {err:?} after {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "`create_instance` took {elapsed:?}: the 0.5s wall-clock backstop did \
+                 not fire, and the ~10s epoch budget is too far out to have returned this"
+            );
+            assert_engine_still_usable(&mut engine, "a start-function timeout");
+        });
+    }
+
+    /// Allocator export that traps.
+    const ALLOCATOR_TRAP_WAT: &str = r#"
+        (module
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            unreachable))
+    "#;
+
+    /// Module start function that traps.
+    const START_TRAP_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func $start unreachable)
+          (start $start))
+    "#;
+
+    /// `__frnt_set_id` that traps.
+    const SET_ID_TRAP_WAT: &str = r#"
+        (module
+          (memory (export "memory") 1)
+          (func (export "__frnt_set_id") (param i64)
+            unreachable))
+    "#;
+
+    /// Asserts a trap in the allocator export is returned as
+    /// `WasmError::Runtime` (not `Timeout`, and not `OutOfGas`), and that the
+    /// engine is usable afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn allocator_entry_trap_is_a_runtime_error() {
+        let mut engine = engine_with_test_host(5.0, epoch_deadline_ticks(5.0));
+        const ID: i64 = i64::MAX - 54813;
+        insert_raw_instance(&mut engine, ID, ALLOCATOR_TRAP_WAT);
+
+        let err = engine
+            .initiate_buffer(&InstanceHandle { id: ID }, 16)
+            .expect_err("a trapping allocator must return an Err");
+        assert!(
+            matches!(err, WasmError::Runtime(_)),
+            "an allocator trap must be WasmError::Runtime, got {err:?}"
+        );
+        assert_engine_still_usable(&mut engine, "an allocator trap");
+    }
+
+    /// Asserts a trap during instance setup is returned with its setup
+    /// category (`Instantiation` for the start function, `Runtime` for
+    /// `__frnt_set_id`), and that the engine is usable afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instance_setup_trap_keeps_its_error_category() {
+        let mut engine = engine_with_test_host(5.0, epoch_deadline_ticks(5.0));
+        let (err, _) = create_instance_err(&mut engine, START_TRAP_WAT);
+        assert!(
+            matches!(err, WasmError::Instantiation(_)),
+            "a start-function trap must be WasmError::Instantiation, got {err:?}"
+        );
+        assert_engine_still_usable(&mut engine, "a start-function trap");
+
+        let (err, _) = create_instance_err(&mut engine, SET_ID_TRAP_WAT);
+        assert!(
+            matches!(err, WasmError::Runtime(_)),
+            "a __frnt_set_id trap must be WasmError::Runtime, got {err:?}"
+        );
+        assert_engine_still_usable(&mut engine, "a __frnt_set_id trap");
+    }
+
+    /// Start function and `__frnt_set_id` that each make one slow host call.
+    const SETUP_ONE_NAP_EACH_WAT: &str = r#"
+        (module
+          (import "freenet_test" "nap" (func $nap))
+          (memory (export "memory") 1)
+          (func $start (call $nap))
+          (func (export "__frnt_set_id") (param i64) (call $nap))
+          (start $start))
+    "#;
+
+    /// Asserts instance setup succeeds when the start function and
+    /// `__frnt_set_id` each use 0.6 of the budget (1s each against a budget of
+    /// 1/0.6 s): each setup entry has its own budget, so the wall-clock bound
+    /// for setup must allow both.
+    #[test]
+    fn instance_setup_allows_each_entry_its_own_budget() {
+        run_abandoning_guest_test(|| {
+            let budget = NAP.as_secs_f64() / 0.6;
+            let mut engine = engine_with_test_host(budget, epoch_deadline_ticks(budget));
+            let module = engine
+                .compile(SETUP_ONE_NAP_EACH_WAT.as_bytes())
+                .expect("WAT must compile");
+            match engine.create_instance(&module, 0) {
+                Ok(handle) => engine.drop_instance(&handle),
+                Err(e) => panic!("two setup entries each within budget must succeed, got {e:?}"),
+            }
+        });
+    }
+
+    /// Asserts a host-function panic during instance setup, in the module
+    /// start function or in `__frnt_set_id`, is returned as `WasmError::Other`,
+    /// and that the engine is usable afterwards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn instance_setup_captures_host_panic() {
+        for (entry, wat) in [
+            ("start function", START_HOST_PANIC_WAT),
+            ("__frnt_set_id", SET_ID_HOST_PANIC_WAT),
+        ] {
+            let mut engine = engine_with_test_host(5.0, epoch_deadline_ticks(5.0));
+            let (err, _) = create_instance_err(&mut engine, wat);
+            assert!(
+                matches!(err, WasmError::Other(_)),
+                "{entry}: a captured panic must surface as WasmError::Other, got {err:?}"
+            );
+            assert_engine_still_usable(&mut engine, &format!("a captured {entry} panic"));
+        }
+    }
+
     /// #4864 review (fix 3): `epoch_deadline_ticks` = `ceil(secs / 100ms) + 1`,
     /// the `+ 1` a phase-safety margin so a free-running ticker never traps a
     /// guest EARLY. Boundary cases.
@@ -3281,7 +3781,6 @@ mod tests {
             // instantiate_and_init so the store can be recovered on a guest-entry
             // timeout; scrape the new home of those entries.
             "fn instantiate_and_init(",
-            "fn initiate_buffer(",
             "fn call_void(",
             // #5480: the single shared body for all three contract/delegate
             // entry points.
@@ -3290,6 +3789,9 @@ mod tests {
 
         // The public entry points, which must NOT enter the guest themselves.
         const DELEGATING_ENTRY_FNS: &[&str] = &[
+            // The allocator export runs before every entry point below, so it
+            // needs the same safeguards they have.
+            "fn initiate_buffer(",
             "fn call_3i64(",
             "fn call_2i64_blocking(",
             "fn call_3i64_blocking(",
@@ -4225,8 +4727,8 @@ mod tests {
     fn execute_wasm_blocking_gates_block_in_place_on_multithread() {
         let src = include_str!("wasmtime_engine.rs");
         let after = src
-            .split_once("fn execute_wasm_blocking")
-            .expect("execute_wasm_blocking must exist")
+            .split_once("fn execute_wasm_blocking_within<")
+            .expect("execute_wasm_blocking_within must exist")
             .1;
         let body = after.split_once("\nfn ").map(|(b, _)| b).unwrap_or(after);
         assert!(
