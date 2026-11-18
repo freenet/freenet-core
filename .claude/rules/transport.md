@@ -2470,6 +2470,9 @@ Simulation: every node shares [::1], so the per-destination punch budget
   end, at least OVERLAP_MIN_DELAY after the first; neither is cancelled, and
   each attempt is the dial plus its Hello exchange, so a first attempt
   established on the client but not on the server does not end the race.
+  A first attempt that ERRORS before the overlap point ends the setup with
+  that error and starts no second (a hard error is a refusal; loss shows as a
+  timeout, which the overlap covers).
   The server takes up to MAX_IN_FLIGHT (2) attempts per waiter and runs
   their handshakes at once. Gate 15 then 96-100% per cell (100 seeds). Cost:
   a client setup can spend two charges, so about two overlapped setups per

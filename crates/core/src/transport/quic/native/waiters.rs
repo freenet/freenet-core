@@ -126,18 +126,24 @@ impl<A: NativeAttempt> NativeWaiters<A> {
             attempt.ignore();
             return NativeRoute::NoWaiter;
         };
-        if slot.busy.load(Ordering::Acquire) >= MAX_IN_FLIGHT {
+        // Reserve a slot atomically, so no caller can take the count past
+        // MAX_IN_FLIGHT whatever else routes, and the waiter cannot see an
+        // attempt that is not counted yet.
+        if slot
+            .busy
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_IN_FLIGHT).then_some(n + 1)
+            })
+            .is_err()
+        {
             attempt.ignore();
             return NativeRoute::Busy;
         }
         if !attempt.address_validated() {
+            slot.busy.fetch_sub(1, Ordering::AcqRel);
             attempt.retry();
             return NativeRoute::Retried;
         }
-        // Counted from here, before the waiter can take it, so the router
-        // hands over no more than MAX_IN_FLIGHT until a guard drops. Only the
-        // router task routes, so the check above and this count do not race.
-        slot.busy.fetch_add(1, Ordering::AcqRel);
         match slot.attempts.try_send(attempt) {
             Ok(()) => NativeRoute::Handed,
             Err(mpsc::error::TrySendError::Full(attempt))
@@ -217,6 +223,28 @@ mod tests {
             validated,
             log: log.clone(),
         }
+    }
+
+    /// Callers racing on one waiter cannot take the count past
+    /// MAX_IN_FLIGHT: exactly that many are handed.
+    #[test]
+    fn concurrent_routes_never_exceed_the_cap() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let waiters = Arc::new(NativeWaiters::<Fake>::default());
+        let _waiter = waiters.register_for_test(addr()).expect("waiter");
+        let handed = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..4 {
+                        if waiters.route(fake(true, &log)) == NativeRoute::Handed {
+                            handed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(handed.load(Ordering::SeqCst), MAX_IN_FLIGHT);
     }
 
     /// Every branch of the routing decision: no waiter, a Retry, hand-offs up

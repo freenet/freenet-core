@@ -46,7 +46,9 @@ pub(crate) const MIN_WINDOW_LEFT: Duration = Duration::from_secs(4);
 /// starts a second, overlapping one (design 6.2's variant) when this much of
 /// its window is left, and no sooner than [`OVERLAP_MIN_DELAY`] after the
 /// first. The first is never cancelled for it: both run until one finishes
-/// or the window ends. A lost Handshake packet late in the first attempt
+/// or the window ends. A first attempt that ERRORS before that point (a hard
+/// refusal, not a loss, which shows as a timeout) ends the setup with its
+/// error and starts no second, so no second charge is taken. A lost Handshake packet late in the first attempt
 /// leaves its next probe (backed off from a round trip inflated by the
 /// setup's own losses) past the window; the second attempt's fresh handshake
 /// does not wait on it. Timed from the window's END rather than its start so
@@ -248,13 +250,40 @@ pub(in crate::transport) async fn connect_native<T: TimeSource>(
         .map_err(NativeSetupError::OverBudget)?;
     // One attempt: a dial with the native ALPN, then the Hello exchange on
     // its connection. Each dial is a new connection (a new DCID).
-    let attempt = || {
-        futures::FutureExt::fuse(async {
-            let connection = endpoint.dial_native(peer.addr, peer.key).await?;
-            finish(connection, peer, caps, clock, end).await
-        })
+    let attempt = || async {
+        let connection = endpoint.dial_native(peer.addr, peer.key).await?;
+        finish(connection, peer, caps, clock, end).await
     };
-    let first = attempt();
+    // `biased`: the race first, as the punch arm never completes.
+    tokio::select! {
+        biased;
+        done = race_attempts(attempt, budget, peer.addr, clock, end) => done,
+        never = punch_until(endpoint, peer.addr, clock, end) => match never {},
+    }
+}
+
+/// The client's attempts: `attempt` runs at once, and a second `attempt`
+/// starts at [`overlap_at`] if the first has not finished, charged to
+/// `budget` for `addr`. The first to succeed is returned and the other is
+/// dropped (closing its connection). A first attempt that ERRORS before the
+/// overlap timer ends the setup with that error and starts no second: a hard
+/// error is a refusal, a second dial would be refused the same way and
+/// charged; loss shows as a timeout, which the overlap covers. After the
+/// second has started, the first's error waits for the second's outcome.
+async fn race_attempts<T, C, F, Fut>(
+    attempt: F,
+    budget: &PunchBudget,
+    addr: SocketAddr,
+    clock: &T,
+    end: Duration,
+) -> Result<C, NativeSetupError>
+where
+    T: TimeSource,
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<C, NativeSetupError>>,
+{
+    use futures::FutureExt;
+    let first = attempt().fuse();
     tokio::pin!(first);
     let mut second = std::pin::pin!(futures::future::OptionFuture::from(None));
     let mut second_due = Some(overlap_at(clock.now(), end));
@@ -263,10 +292,9 @@ pub(in crate::transport) async fn connect_native<T: TimeSource>(
         let now = clock.now();
         let left = end.saturating_sub(now);
         let until_second = second_due.map(|at| at.saturating_sub(now));
-        // `biased` (attempts, overlap timer, window, punches): a fixed order
-        // so a simulation's seed decides the run, and an attempt that
-        // completes as the window ends still counts. The punch arm never
-        // completes, so nothing starves.
+        // `biased` (attempts, overlap timer, window): a fixed order so a
+        // simulation's seed decides the run, and an attempt that completes
+        // as the window ends still counts.
         tokio::select! {
             biased;
             done = &mut first, if first_failed.is_none() => match done {
@@ -279,18 +307,17 @@ pub(in crate::transport) async fn connect_native<T: TimeSource>(
                 Ok(connection) => return Ok(connection),
                 Err(error) => match first_failed.take() {
                     Some(first) => return Err(first),
-                    None => tracing::debug!(addr = %peer.addr, %error, "the overlapping native attempt failed; the first continues"),
+                    None => tracing::debug!(%addr, %error, "the overlapping native attempt failed; the first continues"),
                 },
             },
             () = clock.sleep_cancelable(until_second.unwrap_or_default()), if until_second.is_some() => {
                 second_due = None;
-                match budget.charge(peer.addr, CLIENT_BYTES_PER_DIAL, clock.now()) {
-                    Ok(()) => second.set(Some(attempt()).into()),
-                    Err(refusal) => tracing::debug!(addr = %peer.addr, ?refusal, "no overlapping native attempt: the punch budget is spent"),
+                match budget.charge(addr, CLIENT_BYTES_PER_DIAL, clock.now()) {
+                    Ok(()) => second.set(Some(attempt().fuse()).into()),
+                    Err(refusal) => tracing::debug!(%addr, ?refusal, "no overlapping native attempt: the punch budget is spent"),
                 }
             },
             () = clock.sleep_cancelable(left) => return Err(NativeSetupError::TimedOut),
-            never = punch_until(endpoint, peer.addr, clock, end) => match never {},
         }
     }
 }
@@ -485,6 +512,180 @@ mod tests {
             assert!(server.connection.closer().is_open());
             assert!(punches(&pair, a_addr, b_addr) >= 1);
             assert!(punches(&pair, b_addr, a_addr) >= 1);
+        });
+    }
+
+    /// A budget with one client charge taken, as `connect_native` has taken
+    /// before its first attempt, and how many more fit.
+    fn charged_once(addr: SocketAddr, now: Duration) -> PunchBudget {
+        let budget = PunchBudget::default();
+        assert_eq!(budget.charge(addr, CLIENT_BYTES_PER_DIAL, now), Ok(()));
+        budget
+    }
+
+    fn charges_left(budget: &PunchBudget, addr: SocketAddr, now: Duration) -> usize {
+        let mut more = 0;
+        while budget.charge(addr, CLIENT_BYTES_PER_DIAL, now).is_ok() {
+            more += 1;
+        }
+        more
+    }
+
+    /// A first attempt that fails with an error before the overlap timer is
+    /// the setup's error: no second attempt starts and none is charged.
+    #[test]
+    fn a_first_attempt_that_errors_early_ends_the_setup_uncharged() {
+        bounded(|| async {
+            let net = crate::transport::test_net::subnet();
+            let pair = pair("native-race-error", net.addr(1), net.addr(2), None).await;
+            let clock = pair.time.clone();
+            let addr = pair.b_addr;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let c = calls.clone();
+            let budget = charged_once(addr, clock.now());
+            let end = clock.now() + NATIVE_WINDOW;
+            let (clock2, c2) = (clock.clone(), clock.clone());
+            let result = drive(&pair.time, LIMIT, async move {
+                let attempt = || {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    let clock = clock2.clone();
+                    async move {
+                        // Fails well before the overlap point (3 s).
+                        clock.sleep(Duration::from_millis(200)).await;
+                        Err::<(), _>(NativeSetupError::AlreadyWaiting)
+                    }
+                };
+                let result = race_attempts(attempt, &budget, addr, &c2, end).await;
+                (result, charges_left(&budget, addr, c2.now()))
+            })
+            .await;
+            assert!(matches!(result.0, Err(NativeSetupError::AlreadyWaiting)));
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no second attempt");
+            assert_eq!(result.1, 3, "no second charge");
+        });
+    }
+
+    /// Counts the probes alive: one per attempt started and not dropped.
+    struct Probe(Arc<std::sync::atomic::AtomicUsize>);
+    impl Probe {
+        fn new(live: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
+            live.fetch_add(1, Ordering::SeqCst);
+            Probe(live.clone())
+        }
+    }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Both attempts complete at the same instant: one connection comes
+    /// back and the other is dropped (not left alive), and both were charged.
+    #[test]
+    fn when_both_attempts_complete_one_is_returned_and_the_other_dropped() {
+        bounded(|| async {
+            let net = crate::transport::test_net::subnet();
+            let pair = pair("native-race-both", net.addr(1), net.addr(2), None).await;
+            let clock = pair.time.clone();
+            let addr = pair.b_addr;
+            let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let budget = charged_once(addr, clock.now());
+            let start = clock.now();
+            let end = start + NATIVE_WINDOW;
+            // The second starts at end - 5 s = start + 3 s; both finish at
+            // start + 4 s.
+            let finish_at = start + Duration::from_secs(4);
+            let (l, c, clk) = (live.clone(), calls.clone(), clock.clone());
+            let (returned, alive_after_return, left) = drive(&pair.time, LIMIT, async move {
+                let attempt = || {
+                    c.fetch_add(1, Ordering::SeqCst);
+                    let (clock, live) = (clk.clone(), l.clone());
+                    // Alive from the attempt's start, as its connection is.
+                    let probe = Probe::new(&live);
+                    async move {
+                        let wait = finish_at.saturating_sub(clock.now());
+                        clock.sleep(wait).await;
+                        Ok::<_, NativeSetupError>(probe)
+                    }
+                };
+                let won = race_attempts(attempt, &budget, addr, &clk, end).await;
+                let left = charges_left(&budget, addr, clk.now());
+                (won.is_ok(), l.load(Ordering::SeqCst), left)
+            })
+            .await;
+            assert!(returned);
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "both attempts ran");
+            assert_eq!(alive_after_return, 1, "exactly one result survives");
+            assert_eq!(live.load(Ordering::SeqCst), 0, "the winner dropped too");
+            assert_eq!(left, 2, "both attempts charged");
+        });
+    }
+
+    /// Two real attempts from the same client reach one server waiter and
+    /// both handshakes run; the first to complete is the connection. When
+    /// `accept_native` returns, the in-flight count is back at 0 and the
+    /// waiter is gone.
+    #[test]
+    fn two_attempts_at_the_server_leave_no_count() {
+        bounded(|| async {
+            let _seed = GlobalRng::seed_guard(SEED);
+            let net = crate::transport::test_net::subnet();
+            let pair = pair("native-two-attempts", net.addr(1), net.addr(2), None).await;
+            let waiters = Arc::new(NativeWaiters::default());
+            let (a, b, clock) = (pair.a.clone(), pair.b.clone(), pair.time.clone());
+            let (a_addr, b_addr) = (pair.a_addr, pair.b_addr);
+            let (a_key, b_key) = (pair.a_keys.public().clone(), pair.b_keys.public().clone());
+            let w = waiters.clone();
+            let (accepted, busy, queued) = drive(&pair.time, LIMIT, async move {
+                let router = route(&b, &w);
+                let deadline = clock.now() + Duration::from_secs(60);
+                let server = tokio::spawn({
+                    let (b, w, clock) = (b.clone(), w.clone(), clock.clone());
+                    let a_key = a_key.clone();
+                    async move {
+                        let to_a = NativePeer {
+                            addr: a_addr,
+                            key: &a_key,
+                            is_gateway: false,
+                        };
+                        accept_native(&b, &w, &PunchBudget::default(), to_a, 0, &clock, deadline)
+                            .await
+                            .map(|c| c.connection.closer().is_open())
+                    }
+                });
+                // Wait for the waiter, then dial twice at once.
+                while w.len() == 0 {
+                    clock.sleep(Duration::from_millis(10)).await;
+                }
+                let busy = w.by_addr.get(&a_addr).map(|slot| slot.busy.clone());
+                let dials: Vec<_> = (0..2)
+                    .map(|_| {
+                        let (a, b_key, clock) = (a.clone(), b_key.clone(), clock.clone());
+                        tokio::spawn(async move {
+                            let to_b = NativePeer {
+                                addr: b_addr,
+                                key: &b_key,
+                                is_gateway: false,
+                            };
+                            let connection = a.dial_native(b_addr, &b_key).await?;
+                            let end = clock.now() + NATIVE_WINDOW;
+                            finish(connection, to_b, 0, &clock, end).await
+                        })
+                    })
+                    .collect();
+                let accepted = server.await.expect("server task");
+                for dial in dials {
+                    dial.abort();
+                }
+                router.abort();
+                let busy = busy.expect("the waiter's count").load(Ordering::Acquire);
+                (accepted, busy, w.len())
+            })
+            .await;
+            assert!(accepted.expect("one connection"));
+            assert_eq!(busy, 0, "no attempt left counted in flight");
+            assert_eq!(queued, 0, "the waiter is gone");
         });
     }
 
