@@ -285,8 +285,9 @@ pub(in crate::transport) fn embeds_metadata(len: usize) -> bool {
 }
 
 /// A congestion window as reported in transfer telemetry: `None` when the
-/// controller has no bounded window. FixedRate outside a loss pause reports
-/// `usize::MAX / 2`, which used to surface as `u32::MAX` after truncation.
+/// controller has no bounded window. An effectively infinite window
+/// (`usize::MAX / 2`, which FixedRate reported before it had a flight-size
+/// ceiling) used to surface as `u32::MAX` after truncation.
 fn reported_cwnd(cwnd: usize) -> Option<u32> {
     if cwnd >= usize::MAX / 2 {
         return None;
@@ -1543,7 +1544,7 @@ mod telemetry_tests {
     use super::*;
     use crate::simulation::VirtualTime;
 
-    /// FixedRate's unbounded window (`usize::MAX / 2`) is not a measurement
+    /// An unbounded window (`usize::MAX / 2`) is not a measurement
     /// and must not surface as `u32::MAX`.
     #[test]
     fn reported_cwnd_hides_unbounded_window() {
@@ -2485,6 +2486,81 @@ mod tests {
             "cwnd timeout must be classified transient so the connection survives: {err:?}"
         );
 
+        Ok(())
+    }
+
+    /// A peer that confirms nothing cannot make `send_stream` send more than
+    /// the default controller's flight-size ceiling: the stream stops at the
+    /// ceiling, waits for receipts, and fails after `CWND_WAIT_TIMEOUT`.
+    ///
+    /// Under the default `FixedRate` controller cwnd used to be
+    /// `usize::MAX / 2`, so the whole 32 MiB went out and every packet stayed
+    /// in the sent-packet tracker.
+    #[tokio::test(start_paused = true)]
+    async fn send_stream_stops_at_the_default_flight_ceiling_without_receipts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (outbound_sender, mut outbound_receiver) =
+            mpsc::channel::<(SocketAddr, Arc<[u8]>)>(1024);
+        let remote_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 8080);
+        let message = vec![0u8; 32 * 1024 * 1024];
+
+        let congestion_controller = CongestionControlConfig::default().build_arc();
+        // The default controller is FixedRate at its default rate.
+        let ceiling = crate::transport::fixed_rate::MAX_FLIGHT_SECS
+            * crate::transport::fixed_rate::DEFAULT_RATE_BYTES_PER_SEC;
+        assert!(
+            ceiling < message.len() / 2,
+            "premise: the ceiling ({ceiling}) is well below the message"
+        );
+        let sent_tracker = Arc::new(parking_lot::Mutex::new(SentPacketTracker::new()));
+        // Never the limit: the window alone decides how much is sent.
+        let token_bucket = Arc::new(TokenBucket::new(1 << 30, 1 << 30));
+
+        let drained = GlobalExecutor::spawn(async move {
+            let mut bytes = 0usize;
+            while let Some((_, packet)) = outbound_receiver.recv().await {
+                bytes += packet.len();
+            }
+            bytes
+        });
+        let result = send_stream(
+            StreamId::next_transport_internal(),
+            Arc::new(AtomicU32::new(0)),
+            Arc::new(TestSocket::new(outbound_sender)),
+            remote_addr,
+            Bytes::from(message),
+            random_cipher(),
+            sent_tracker.clone(),
+            token_bucket,
+            congestion_controller.clone(),
+            RealTime::new(),
+            None,
+            None,
+            None,
+        )
+        .await;
+        // The socket, and with it the channel's sender, went with send_stream.
+        let sent_bytes = tokio::time::timeout(Duration::from_secs(60), drained)
+            .await
+            .expect("the socket is dropped when send_stream returns")
+            .expect("join error");
+
+        assert!(
+            matches!(result, Err(TransportError::OutboundStreamFailed(_))),
+            "a stream nobody confirms fails at the ceiling, got: {result:?}"
+        );
+        // Wire bytes carry each packet's header and authentication tag on
+        // top of what flight size counts, well under a tenth.
+        assert!(
+            sent_bytes <= ceiling + ceiling / 10,
+            "sent {sent_bytes} bytes without a receipt; the ceiling is {ceiling}"
+        );
+        assert!(
+            sent_bytes + 2 * MAX_PACKET_SIZE > ceiling,
+            "premise: the window filled ({sent_bytes} of {ceiling})"
+        );
+        // The abort released what it had in flight (#4345).
+        assert_eq!(congestion_controller.flightsize(), 0);
         Ok(())
     }
 
