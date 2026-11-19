@@ -55,6 +55,29 @@ pub(crate) const QUIC_INGRESS_QUEUE_DATAGRAMS: usize = 1024;
 /// `quic_ingress_source_full`.
 pub(crate) const QUIC_INGRESS_PER_SOURCE_DATAGRAMS: usize = QUIC_INGRESS_QUEUE_DATAGRAMS / 4;
 
+/// How many datagrams of the QUIC ingress queue admitted-but-unpromoted
+/// native joiners (`quic::admission`) may hold, all of them together: a
+/// sixteenth of the queue. A joiner's source is on the allow-set from its
+/// admission, so without this it would take the per-source share
+/// ([`QUIC_INGRESS_PER_SOURCE_DATAGRAMS`], 256) for the up to 8 s its
+/// handshake and `Hello` may last, and the per-address admission limit is
+/// keyed on IP and port, so one host on several ports could fill the queue
+/// down to the quiet reserve. The share is for all unpromoted joiners
+/// together, whatever their addresses, so established peers keep the other
+/// 960 slots. An honest join exchanges a few dozen datagrams over its whole
+/// window, and the global admission rate (50 a second) admits that many
+/// joiners in one second, so this holds the handshake flights of a burst
+/// without letting joiners crowd the queue; a joiner datagram over it is
+/// dropped and the QUIC handshake retransmits it. A joiner never uses the
+/// quiet reserve. A source stops counting as a joiner when its
+/// [`QuicJoinerMark`] is dropped: at promotion or the end of the join.
+pub(crate) const QUIC_INGRESS_JOINER_DATAGRAMS: usize = QUIC_INGRESS_QUEUE_DATAGRAMS / 16;
+
+const _: () = assert!(
+    QUIC_INGRESS_JOINER_DATAGRAMS <= QUIC_INGRESS_PER_SOURCE_DATAGRAMS
+        && QUIC_INGRESS_JOINER_DATAGRAMS <= QUIC_INGRESS_QUEUE_DATAGRAMS - QUIC_INGRESS_QUIET_RESERVE
+);
+
 /// The last slots of the QUIC ingress queue, kept for sources that have fewer
 /// than [`QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS`] datagrams queued. Once only
 /// these are free, a datagram from a source holding more is dropped and
@@ -103,6 +126,10 @@ pub(crate) const QUIC_INGRESS_QUEUE_BYTES: usize = (QUIC_INGRESS_QUEUE_DATAGRAMS
 pub(crate) struct QuicDatagram {
     pub bytes: Vec<u8>,
     pub from: SocketAddr,
+    /// Whether it holds a slot of the joiners' share of the queue
+    /// ([`QUIC_INGRESS_JOINER_DATAGRAMS`]), fixed when it was queued, so the
+    /// slot is given back even if its source was promoted since.
+    pub(crate) joiner_slot: bool,
 }
 
 /// The state of a QUIC ingress shared by the socket (the sending side), the
@@ -126,6 +153,12 @@ struct IngressShared {
     /// source not on the allow-set that can open a connection goes to the
     /// unknown-source queue instead of being dropped (`quic::admission`).
     unknown_lane: AtomicBool,
+    /// Allowed sources that are admitted native joiners, not yet promoted,
+    /// each with the number of live joiner permits for it.
+    joiners: DashMap<SocketAddr, usize>,
+    /// Datagrams queued and not yet received that hold a slot of the
+    /// joiners' share ([`QUIC_INGRESS_JOINER_DATAGRAMS`]).
+    joiner_queued: AtomicUsize,
 }
 
 /// The QUIC ingress of one [`DemuxSocket`]: the queue's sending half and the
@@ -156,7 +189,7 @@ impl QuicIngressReceiver {
     pub(crate) fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<QuicDatagram>> {
         match self.queue.poll_recv(cx) {
             Poll::Ready(Some(datagram)) => {
-                self.release(datagram.from);
+                self.release(&datagram);
                 Poll::Ready(Some(datagram))
             }
             Poll::Ready(None) => Poll::Ready(None),
@@ -169,8 +202,11 @@ impl QuicIngressReceiver {
         }
     }
 
-    fn release(&self, from: SocketAddr) {
-        self.shared.queued.remove_if_mut(&from, |_, queued| {
+    fn release(&self, datagram: &QuicDatagram) {
+        if datagram.joiner_slot {
+            self.shared.joiner_queued.fetch_sub(1, Ordering::AcqRel);
+        }
+        self.shared.queued.remove_if_mut(&datagram.from, |_, queued| {
             *queued = queued.saturating_sub(1);
             *queued == 0
         });
@@ -179,7 +215,7 @@ impl QuicIngressReceiver {
     #[cfg(test)]
     pub(crate) fn try_recv(&mut self) -> Result<QuicDatagram, mpsc::error::TryRecvError> {
         let datagram = self.queue.try_recv()?;
-        self.release(datagram.from);
+        self.release(&datagram);
         Ok(datagram)
     }
 
@@ -221,8 +257,34 @@ impl QuicSourcePermit {
     }
 }
 
+/// Marks an allowed source as an unpromoted native joiner while it lives
+/// ([`DemuxSocket::allow_quic_joiner`]); dropping it is promotion (or the
+/// end of the join), after which the source's datagrams take the established
+/// share. Datagrams already queued keep the slots they took.
+#[must_use = "the source counts as a joiner only while the mark is alive"]
+pub(crate) struct QuicJoinerMark {
+    shared: Arc<IngressShared>,
+    addr: SocketAddr,
+}
+
+impl Drop for QuicJoinerMark {
+    fn drop(&mut self) {
+        self.shared.unmark_joiner(self.addr);
+    }
+}
+
+impl IngressShared {
+    fn unmark_joiner(&self, addr: SocketAddr) {
+        self.joiners.remove_if_mut(&addr, |_, marks| {
+            *marks = marks.saturating_sub(1);
+            *marks == 0
+        });
+    }
+}
+
 impl Drop for QuicSourcePermit {
     fn drop(&mut self) {
+
         let removed = self.shared.allowed.remove_if_mut(&self.addr, |_, permits| {
             *permits = permits.saturating_sub(1);
             *permits == 0
@@ -447,6 +509,26 @@ impl<S> DemuxSocket<S> {
         })
     }
 
+    /// [`Self::allow_quic_source`] for an admitted native joiner
+    /// (`quic::admission`), with the mark that makes it one: until the mark
+    /// is dropped (the joiner is promoted, or its join ends), the datagrams
+    /// from `addr` share [`QUIC_INGRESS_JOINER_DATAGRAMS`] queue slots with
+    /// every other joiner instead of taking the per-source share.
+    pub(crate) fn allow_quic_joiner(
+        &self,
+        addr: SocketAddr,
+    ) -> Option<(QuicSourcePermit, QuicJoinerMark)> {
+        let permit = self.allow_quic_source(addr)?;
+        // Marked after the allow-set entry exists: a datagram that raced in
+        // between takes the established share, a handful at most.
+        *permit.shared.joiners.entry(permit.addr).or_insert(0) += 1;
+        let mark = QuicJoinerMark {
+            shared: permit.shared.clone(),
+            addr: permit.addr,
+        };
+        Some((permit, mark))
+    }
+
     /// Another permit for `addr` if it is on the allow-set now, in one step
     /// under the entry's lock, so a permit dropped concurrently cannot be
     /// brought back. `None` if it is not allowed.
@@ -502,6 +584,14 @@ impl<S> DemuxSocket<S> {
         self.quic_outcomes[outcome as usize].load(Ordering::Relaxed)
     }
 
+    /// Datagrams holding a slot of the joiners' share (tests).
+    #[cfg(test)]
+    fn joiner_queued_for_test(&self) -> usize {
+        self.quic
+            .get()
+            .map_or(0, |ingress| ingress.shared.joiner_queued.load(Ordering::Acquire))
+    }
+
     #[cfg(test)]
     pub(crate) fn inner_for_test(&self) -> &S {
         &self.inner
@@ -522,6 +612,7 @@ impl QuicIngress {
                     permit.send(QuicDatagram {
                         bytes: datagram.to_vec(),
                         from,
+                        joiner_slot: false,
                     });
                     GatewayAdmission::Queued
                 }
@@ -545,18 +636,33 @@ impl QuicIngress {
     /// The listener is the only sender, so the free slots read here cannot
     /// shrink before the `try_reserve` below; the receiver can only add some.
     fn queue_from(&self, datagram: &[u8], from: SocketAddr) -> QuicIngressOutcome {
+        let joiner = self.shared.joiners.contains_key(&from);
         {
             let mut queued = self.shared.queued.entry(from).or_insert(0);
             if *queued >= QUIC_INGRESS_PER_SOURCE_DATAGRAMS {
                 return QuicIngressOutcome::SourceFull;
             }
-            if *queued >= QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS
+            if (joiner || *queued >= QUIC_INGRESS_QUIET_SOURCE_DATAGRAMS)
                 && self.queue.capacity() <= QUIC_INGRESS_QUIET_RESERVE
             {
                 // A source that newly took an entry above holds none, so
-                // only a non-zero count can reach here: no empty entry is
-                // left behind.
+                // a non-joiner reaches here only with a non-zero count and
+                // no empty entry is left behind; a joiner never uses the
+                // reserve, so its fresh entry is removed below.
+                if *queued == 0 {
+                    drop(queued);
+                    self.shared.queued.remove_if(&from, |_, queued| *queued == 0);
+                }
                 return QuicIngressOutcome::ReserveFull;
+            }
+            if joiner && !self.take_joiner_slot() {
+                if *queued == 0 {
+                    drop(queued);
+                    self.shared.queued.remove_if(&from, |_, queued| *queued == 0);
+                }
+                super::TRANSPORT_METRICS
+                    .record_gateway_admission(super::metrics::GatewayAdmission::JoinerShareFull);
+                return QuicIngressOutcome::SourceFull;
             }
             *queued += 1;
         }
@@ -565,17 +671,31 @@ impl QuicIngress {
                 permit.send(QuicDatagram {
                     bytes: datagram.to_vec(),
                     from,
+                    joiner_slot: joiner,
                 });
                 return QuicIngressOutcome::Forwarded;
             }
             Err(mpsc::error::TrySendError::Full(())) => QuicIngressOutcome::QueueFull,
             Err(mpsc::error::TrySendError::Closed(())) => QuicIngressOutcome::NoIngress,
         };
+        if joiner {
+            self.shared.joiner_queued.fetch_sub(1, Ordering::AcqRel);
+        }
         self.shared.queued.remove_if_mut(&from, |_, queued| {
             *queued = queued.saturating_sub(1);
             *queued == 0
         });
         refused
+    }
+
+    /// Take one slot of the joiners' share, if one is free.
+    fn take_joiner_slot(&self) -> bool {
+        self.shared
+            .joiner_queued
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held < QUIC_INGRESS_JOINER_DATAGRAMS).then_some(held + 1)
+            })
+            .is_ok()
     }
 }
 
@@ -978,7 +1098,8 @@ mod tests {
                 queue.try_recv().unwrap(),
                 QuicDatagram {
                     bytes: quic(tag),
-                    from
+                    from,
+                    joiner_slot: false,
                 }
             );
         }
@@ -1036,7 +1157,8 @@ mod tests {
             queue.try_recv_unknown().unwrap(),
             QuicDatagram {
                 bytes: initial(1200, 1),
-                from: stranger
+                from: stranger,
+                joiner_slot: false,
             }
         );
         assert!(
@@ -1308,6 +1430,122 @@ mod tests {
             [QUIC_INGRESS_PER_SOURCE_DATAGRAMS as u64 + 2, 0, 0, 4, 0, 0],
             "one freed slot admits exactly one more"
         );
+    }
+
+    /// `ports` joiner sources (one host, many ports) each send `each`
+    /// datagrams, all admitted as joiners; then one established source sends
+    /// `established`. Returns the queue, the socket and the outcome counts.
+    async fn joiner_flood(
+        ports: u16,
+        each: usize,
+        established: usize,
+    ) -> (
+        DemuxSocket<ScriptedSocket>,
+        QuicIngressReceiver,
+        Vec<(QuicSourcePermit, QuicJoinerMark)>,
+        QuicSourcePermit,
+    ) {
+        let joiner = |port: u16| SocketAddr::from(([10, 254, 3, 1], 5000 + port));
+        let peer: SocketAddr = "10.254.3.2:5999".parse().unwrap();
+        let mut script = Vec::new();
+        for i in 0..each {
+            for port in 0..ports {
+                script.push(Step::Packet(joiner(port), quic(i as u8)));
+            }
+        }
+        for i in 0..established {
+            script.push(Step::Packet(peer, quic(i as u8)));
+        }
+        let total = script.len();
+        let socket = DemuxSocket::wrap(ScriptedSocket::new(script), None);
+        let queue = socket.enable_quic_ingress().expect("first enable");
+        let joiners: Vec<_> = (0..ports)
+            .map(|port| socket.allow_quic_joiner(joiner(port)).expect("allowed"))
+            .collect();
+        let permit = socket.allow_quic_source(peer).expect("allowed");
+        let mut buf = [0u8; 64];
+        for _ in 0..total {
+            socket.recv_classified(&mut buf).await.unwrap();
+        }
+        (socket, queue, joiners, permit)
+    }
+
+    /// Gate 23: however many ports one host joins from, all unpromoted
+    /// joiners together hold at most `QUIC_INGRESS_JOINER_DATAGRAMS` queue
+    /// slots (the rest are `source_full`), and an established peer keeps its
+    /// whole per-source share whatever they do.
+    #[tokio::test]
+    async fn unpromoted_joiners_share_one_bounded_part_of_the_queue() {
+        let (socket, mut queue, _joiners, _peer) =
+            joiner_flood(40, 4, QUIC_INGRESS_PER_SOURCE_DATAGRAMS).await;
+        let joiner_sent = 40 * 4;
+        let forwarded = QUIC_INGRESS_JOINER_DATAGRAMS + QUIC_INGRESS_PER_SOURCE_DATAGRAMS;
+        assert_eq!(
+            outcomes(&socket),
+            [
+                forwarded as u64,
+                0,
+                0,
+                (joiner_sent - QUIC_INGRESS_JOINER_DATAGRAMS) as u64,
+                0,
+                0
+            ],
+            "joiners hold their share and no more; the peer lost nothing"
+        );
+        let mut from_joiners = 0;
+        let mut from_peer = 0;
+        while let Ok(datagram) = queue.try_recv() {
+            if datagram.from.ip() == std::net::Ipv4Addr::new(10, 254, 3, 1) {
+                from_joiners += 1;
+            } else {
+                from_peer += 1;
+            }
+        }
+        assert_eq!(from_joiners, QUIC_INGRESS_JOINER_DATAGRAMS);
+        assert_eq!(from_peer, QUIC_INGRESS_PER_SOURCE_DATAGRAMS);
+    }
+
+    /// Reading a joiner's datagram frees one slot of the joiners' share, and
+    /// promoting a joiner (dropping its mark) moves its source to the
+    /// established share: its datagrams are no longer held to the joiners'
+    /// 64, though the slots it already took stay until read.
+    #[tokio::test]
+    async fn a_read_frees_a_joiner_slot_and_promotion_leaves_the_joiner_share() {
+        let (socket, mut queue, mut joiners, _peer) =
+            joiner_flood(40, 2, 0).await;
+        assert_eq!(queue.len(), QUIC_INGRESS_JOINER_DATAGRAMS);
+        let joiner = |port: u16| SocketAddr::from(([10, 254, 3, 1], 5000 + port));
+        let late = |port: u16, tag: u8| (joiner(port), quic(tag));
+        // Everything fell into the share: a late joiner datagram is refused.
+        let before = outcomes(&socket)[3];
+        let feed = |socket: &DemuxSocket<ScriptedSocket>, items: Vec<(SocketAddr, Vec<u8>)>| {
+            let mut script = socket.inner_for_test().script.lock().unwrap();
+            script.extend(items.into_iter().map(|(a, d)| Step::Packet(a, d)));
+        };
+        let mut buf = [0u8; 64];
+        feed(&socket, vec![late(0, 0x70)]);
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert_eq!(outcomes(&socket)[3], before + 1, "share full");
+        // One read frees one slot, which exactly one more datagram takes.
+        queue.try_recv().expect("a queued joiner datagram");
+        feed(&socket, vec![late(1, 0x71), late(2, 0x72)]);
+        socket.recv_classified(&mut buf).await.unwrap();
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert_eq!(outcomes(&socket)[3], before + 2, "one freed, one taken");
+        // Promote port 5: its datagrams are admitted past the full share.
+        let (_permit, mark) = joiners.remove(5);
+        drop(mark);
+        feed(&socket, vec![late(5, 0x73), late(6, 0x74)]);
+        socket.recv_classified(&mut buf).await.unwrap();
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert_eq!(
+            outcomes(&socket)[3],
+            before + 3,
+            "the promoted source got in; an unpromoted one did not"
+        );
+        // Draining everything returns the share to zero, promoted or not.
+        while queue.try_recv().is_ok() {}
+        assert_eq!(socket.joiner_queued_for_test(), 0, "no slot leaked");
     }
 
     /// A QUIC-class datagram from a source not on the allow-set is dropped

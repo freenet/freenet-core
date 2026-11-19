@@ -667,6 +667,14 @@ labelled_counters! {
         Joined => "joined",
         /// A join panicked; its task's owner caught it and goes on.
         JoinPanicked => "join_panicked",
+        /// An attempt was ignored: no room for another joiner inside the
+        /// node's QUIC connection cap (`admission`, `QuicPathPermits`), or
+        /// the cap is not attached yet.
+        JoinerCapFull => "joiner_cap_full",
+        /// A datagram from an admitted, unpromoted joiner was dropped: the
+        /// joiners' share of the ingress queue was full
+        /// (`demux::QUIC_INGRESS_JOINER_DATAGRAMS`).
+        JoinerShareFull => "joiner_share_full",
     }
 }
 

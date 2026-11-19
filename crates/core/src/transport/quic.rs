@@ -72,13 +72,14 @@ use tokio::sync::mpsc;
 
 use super::Socket;
 use super::crypto::{TransportKeypair, TransportPublicKey};
-use super::demux::{DemuxSocket, QuicSourcePermit};
+use super::demux::{DemuxSocket, QuicJoinerMark, QuicSourcePermit};
 use super::metrics::{QuicCloseCode, TRANSPORT_METRICS};
 use crate::config::GlobalExecutor;
 use crate::node::background_task_monitor::LateRegistrar;
 use crate::simulation::TimeSource;
 use identity::{PeerKey, QuicIdentity};
 use liveness::EndpointHealth;
+use upgrade::policy::{QuicJoinerPermit, QuicPathPermit, QuicPathPermits};
 
 pub(crate) use config::QuicSettings;
 pub(crate) use liveness::QuicAvailability;
@@ -251,6 +252,10 @@ pub(crate) struct EndpointCore {
     /// by [`QuicEndpoint::enable_gateway_admission`] (dark: see
     /// [`admission::GATEWAY_NATIVE_ADMISSION`]).
     admission: Arc<OnceLock<GatewayAdmission>>,
+    /// The node's QUIC path permits, which admitted joiners are charged
+    /// against ([`QuicEndpoint::attach_joiner_cap`]). Until it is set, no
+    /// joiner is admitted.
+    joiner_cap: Arc<OnceLock<QuicPathPermits>>,
     /// Test hooks that inject faults into quinn's drivers.
     #[cfg(any(test, feature = "testing"))]
     faults: Arc<socket::SocketFaults>,
@@ -403,6 +408,9 @@ trait QuicSources: Send + Sync {
     fn enable_unknown_source_lane(&self) -> bool;
     fn allow(&self, addr: SocketAddr) -> Option<QuicSourcePermit>;
     fn allow_existing(&self, addr: SocketAddr) -> Option<QuicSourcePermit>;
+    /// [`Self::allow`] for an admitted native joiner: its datagrams share the
+    /// joiners' slots of the ingress queue until the mark is dropped.
+    fn allow_joiner(&self, addr: SocketAddr) -> Option<(QuicSourcePermit, QuicJoinerMark)>;
     /// Send one datagram outside quinn, without waiting (a native punch).
     fn try_send(&self, datagram: &[u8], to: SocketAddr) -> io::Result<usize>;
 }
@@ -418,6 +426,10 @@ impl<S: Socket> QuicSources for DemuxSocket<S> {
 
     fn allow_existing(&self, addr: SocketAddr) -> Option<QuicSourcePermit> {
         self.allow_existing_quic_source(addr)
+    }
+
+    fn allow_joiner(&self, addr: SocketAddr) -> Option<(QuicSourcePermit, QuicJoinerMark)> {
+        self.allow_quic_joiner(addr)
     }
 
     fn try_send(&self, datagram: &[u8], to: SocketAddr) -> io::Result<usize> {
@@ -668,6 +680,7 @@ impl QuicEndpoint {
                 cap_holds: cap_holds.expect("the QUIC socket's cap holds"),
                 buffer_budget,
                 admission: Arc::default(),
+                joiner_cap: Arc::default(),
                 #[cfg(any(test, feature = "testing"))]
                 faults: faults.unwrap_or_default(),
                 #[cfg(any(test, feature = "testing"))]
@@ -698,6 +711,15 @@ impl QuicEndpoint {
             config: Arc::new(config),
         };
         self.admission.set(gate).is_ok() && self.sources.enable_unknown_source_lane()
+    }
+
+    /// Charge admitted native joiners against `permits`, the node's QUIC
+    /// path permits (the connection cap): each joiner takes a handshake-phase
+    /// charge from its admission until it is promoted or released. Set once
+    /// by the hub that owns the permits; until then every joiner is ignored
+    /// (counted `joiner_cap_full`). Whether it took effect.
+    pub(crate) fn attach_joiner_cap(&self, permits: QuicPathPermits) -> bool {
+        self.joiner_cap.set(permits).is_ok()
     }
 
     /// Whether [`Self::enable_gateway_admission`] took effect.
@@ -1117,11 +1139,28 @@ impl EndpointCore {
             }
         };
         super::TRANSPORT_METRICS.record_gateway_admission(Outcome::Admitted);
+        // Item 5: the joiner counts against the connection cap from here,
+        // at the handshake-phase charge. With no room (or no cap attached
+        // yet) the attempt is ignored and the admission given back (the
+        // ticket drops). The charge is released by dropping it: the
+        // handshake failing, the join window passing and the connection
+        // closing all end the future that holds it, and promotion hands it
+        // back as a path permit.
+        let Some(charge) = self
+            .joiner_cap
+            .get()
+            .and_then(QuicPathPermits::try_acquire_joiner)
+        else {
+            super::TRANSPORT_METRICS.record_gateway_admission(Outcome::JoinerCapFull);
+            incoming.ignore();
+            return None;
+        };
         // The handshake's later datagrams are shorter than an Initial and
         // take the established path, so the address goes on the allow-set
-        // now, held by the connection. A full set gives the admission back
-        // (the ticket drops).
-        let Some(permit) = self.sources.allow(remote) else {
+        // now, held by the connection, and marked as a joiner so that all
+        // joiners share one bounded part of the ingress queue. A full set
+        // gives the admission and the charge back (both drop).
+        let Some((permit, mark)) = self.sources.allow_joiner(remote) else {
             super::TRANSPORT_METRICS.record_gateway_admission(Outcome::AllowSetFull);
             incoming.ignore();
             return None;
@@ -1129,6 +1168,7 @@ impl EndpointCore {
         Some(JoinerIncoming {
             incoming,
             permit,
+            charge: JoinerCharge { cap: charge, mark },
             config: gate.config.clone(),
             ticket,
             health: self.health.clone(),
@@ -1176,11 +1216,42 @@ impl EndpointAttempt {
 pub(crate) struct JoinerIncoming {
     incoming: quinn::Incoming,
     permit: QuicSourcePermit,
+    /// What the joiner holds until it is promoted or released.
+    charge: JoinerCharge,
     config: Arc<quinn::ServerConfig>,
     /// Given back if the attempt is dropped before its handshake starts.
     ticket: admission::AdmissionTicket,
     health: Arc<EndpointHealth>,
     cap_holds: Arc<socket::CapHolds>,
+}
+
+/// What an admitted, unpromoted native joiner holds, from its admission until
+/// it is promoted or released: its charge against the node's connection cap
+/// at the handshake-phase rate, and its mark as a joiner in the ingress
+/// queue's accounting (`demux::QUIC_INGRESS_JOINER_DATAGRAMS`). Dropping it
+/// releases both: that is the handshake failing, the join window passing
+/// (the future holding it is dropped) and the connection closing.
+/// [`Self::promote`] re-charges at the full rate instead.
+#[must_use = "dropping the charge releases the joiner"]
+pub(crate) struct JoinerCharge {
+    cap: QuicJoinerPermit,
+    mark: QuicJoinerMark,
+}
+
+impl JoinerCharge {
+    /// The joiner becomes a normal connection: charged as a data path at the
+    /// full rate and counted as an established source from now on. If the
+    /// cap has no room for the full charge the joiner stays as it was.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn promote(self) -> Result<QuicPathPermit, Self> {
+        match self.cap.promote() {
+            Ok(path) => Ok(path),
+            Err(cap) => Err(Self {
+                cap,
+                mark: self.mark,
+            }),
+        }
+    }
 }
 
 /// Why an admitted join did not give a connection.
@@ -1209,8 +1280,10 @@ impl JoinerIncoming {
 
     /// Complete the handshake; the connection is bound to the key the client
     /// proved. The admission is used from here on, whatever the handshake
-    /// does. On failure the permit is dropped with it.
-    pub(crate) async fn establish(self) -> Result<QuicConnection, JoinerError> {
+    /// does. On failure the permit and the joiner's charge are dropped with
+    /// it. The charge comes back with the connection, to be held until the
+    /// join ends or is promoted.
+    pub(crate) async fn establish(self) -> Result<(QuicConnection, JoinerCharge), JoinerError> {
         self.ticket.keep();
         let connecting =
             socket::with_poller_holds(&self.cap_holds, || self.incoming.accept_with(self.config))?;
@@ -1219,13 +1292,16 @@ impl JoinerIncoming {
             connection.close(0u32.into(), b"");
             return Err(JoinerError::Unproven);
         };
-        Ok(QuicConnection::new(
-            connection,
-            self.permit,
-            None,
-            peer,
-            self.health,
-            self.cap_holds,
+        Ok((
+            QuicConnection::new(
+                connection,
+                self.permit,
+                None,
+                peer,
+                self.health,
+                self.cap_holds,
+            ),
+            self.charge,
         ))
     }
 }
