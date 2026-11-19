@@ -613,6 +613,18 @@ registered when its peer resolves); and the receiver's `rx_dedup`,
 `rx_already_applied`, `rx_backoff`, `rx_not_hosted` (a broadcast for a
 contract this node does not host, skipped before the merge).
 
+Confirmed delivery of originated updates (#6143,
+`operations/update/confirmed_delivery.rs`) adds, per contract on the
+originator: `ack_requested` (an entry's first flagged leg; re-flags are not
+counted), `ack_confirmed`, `ack_not_needed` (an armed leg skipped as
+converged), `ack_path_proven` (a late ack for an earlier leg of a coalesced
+entry), `ack_unmatched`, `ack_dropped_not_hosted` / `_backoff` /
+`_merge_failed` (final: no resend) and `ack_dropped_rate_limited` /
+`_merge_budget` / `_overloaded` (transient: one resend), `ack_timeout`,
+`resend_full`, `unconfirmed_giveup`, `pending_overflow`. They are exported as
+`prop_*` in the `broadcast_payload_mix` telemetry; the INFO summary line does
+not list them.
+
 `send_failed` is a leg the bridge refused (the send or stream dispatch
 returned `Err`, or the payload did not serialize); that leg has no `sent_*`.
 `wire_send_failed` is the connection task failing to send (or to serialize)
@@ -628,7 +640,10 @@ from a fan-out's resolved targets.
 
 **There is no stall WARN.** A rule that WARNed when every leg of a client
 update ended unsent was tried in #6145 and still raised false WARNs in its
-general form; it is deferred to #6165. Do not add one back without the
+general form; it is deferred to #6165. The confirmed-delivery give-up WARN is
+a different rule: it fires only after a peer that decodes the ack failed to
+confirm an originated update and its full-state resend, at most once per
+contract per 10 minutes. Do not add one back without the
 analysis there. Diagnose from the INFO line and telemetry instead:
 
 - `client_originated > 0` with `sent_delta + sent_full == 0` for a contract,

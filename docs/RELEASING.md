@@ -512,6 +512,24 @@ Current wire-gated floors:
   `quic_native_floor_stays_above_every_release_without_the_decoder` catches the
   floor being lowered.
 
+- `CONFIRMED_DELIVERY_MIN_VERSION` in
+  `crates/core/src/node/network_bridge/p2p_protoc.rs` (confirmed delivery of
+  originated broadcasts, #6143: the appended `UpdateMsg` variants
+  `BroadcastToAckRequested` / `BroadcastToStreamingAckRequested` at indices 6
+  and 7, and `InterestMessage::BroadcastAck` at index 7).
+
+  Set to **`(0, 2, 161)`** and guarded by `CONFIRMED_DELIVERY_SHIPPED_IN`,
+  currently `None`, checked by
+  `p2p_protoc::confirmed_delivery_floor_tests::confirmed_delivery_floor_tracks_the_shipping_release`.
+  When the release bump that lifts the crate to the floor fails that test,
+  set the marker to the literal `Some((0, 2, 161))` if the release carries the
+  change, otherwise raise the floor. Only legs to a peer whose negotiated
+  version is known and at least the floor are flagged (re-checked at the send
+  site), and an ack goes only back to a peer that flagged a leg, so an older
+  peer never receives either variant. Bias high, as for the floors above.
+  `confirmed_delivery_floor_stays_above_every_release_without_the_decoder`
+  catches the floor being lowered.
+
 - `QUIC_DATA_RAMP_START` (T0) and `QUIC_DATA_RAMP_RELEASE` in
   `crates/core/src/transport/quic/upgrade/policy.rs` (#5940): set for the
   0.2.158 ramp (#6224: T0 `1_794_796_200`, 2026-11-16 02:30 UTC, and

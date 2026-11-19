@@ -3883,20 +3883,6 @@ mod tests {
         assert_eq!(after.targets.len(), kps.len() - 1);
     }
 
-    /// A pre-floor peer must receive BYTE-IDENTICAL traffic to today.
-    ///
-    /// Exercises the real gate through `target_list_for`, then builds both
-    /// messages the way `broadcast_to_single_peer` does and compares the
-    /// pre-floor one to a hand-built legacy `BroadcastTo`. Asserting on the
-    /// serialized BYTES rather than on the variant is the point: a peer on
-    /// 0.2.119 has no `BroadcastToV2` variant index, so the failure mode is not
-    /// a degraded feature but a decode error that CLOSES the connection —
-    /// fleet-wide churn during a staggered rollout, presenting as a transport
-    /// fault.
-    ///
-    /// The companion `legacy_broadcast_to_encoding_is_unchanged_by_the_v2_variants`
-    /// pins the encoding itself against a literal; this one pins that the
-    /// routing decision actually reaches it.
     /// Confirmed delivery (#6143) arms only targets whose version decodes the
     /// ack-requested variants: an older or unknown peer is never flagged, so
     /// it can never be sent a variant it cannot decode, nor resent to.
@@ -3982,6 +3968,21 @@ mod tests {
         op_manager.on_ring_connection_lost(kps[0].public());
         assert_eq!(duty(&kps[0]), LegDuty::None);
     }
+
+    /// A pre-floor peer must receive BYTE-IDENTICAL traffic to today.
+    ///
+    /// Exercises the real gate through `target_list_for`, then builds both
+    /// messages the way `broadcast_to_single_peer` does and compares the
+    /// pre-floor one to a hand-built legacy `BroadcastTo`. Asserting on the
+    /// serialized BYTES rather than on the variant is the point: a peer on
+    /// 0.2.119 has no `BroadcastToV2` variant index, so the failure mode is not
+    /// a degraded feature but a decode error that CLOSES the connection —
+    /// fleet-wide churn during a staggered rollout, presenting as a transport
+    /// fault.
+    ///
+    /// The companion `legacy_broadcast_to_encoding_is_unchanged_by_the_v2_variants`
+    /// pins the encoding itself against a literal; this one pins that the
+    /// routing decision actually reaches it.
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_pre_floor_peer_receives_the_legacy_variant_index() {

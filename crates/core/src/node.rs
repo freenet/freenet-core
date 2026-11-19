@@ -8342,6 +8342,42 @@ mod tests {
         }
     }
 
+    /// Drain the notification channel and return every `BroadcastAck` emitted
+    /// (#6143), with its target.
+    #[cfg(feature = "redb")]
+    fn drain_broadcast_acks(
+        rx: &mut crate::node::EventLoopNotificationsReceiver,
+    ) -> Vec<(SocketAddr, crate::message::BroadcastAckOutcome)> {
+        let mut acks = Vec::new();
+        while let Ok(ev) = rx.notifications_receiver.try_recv() {
+            if let either::Either::Right(NodeEvent::SendInterestMessage {
+                target,
+                message: crate::message::InterestMessage::BroadcastAck { outcome, .. },
+            }) = ev
+            {
+                acks.push((target, outcome));
+            }
+        }
+        acks
+    }
+
+    /// An ack-requested broadcast (#6143) of `key`, as the originator sends it.
+    #[cfg(feature = "redb")]
+    fn ack_requested_broadcast(
+        key: freenet_stdlib::prelude::ContractKey,
+        payload: Vec<u8>,
+    ) -> crate::message::NetMessageV1 {
+        crate::message::NetMessageV1::Update(
+            crate::operations::update::UpdateMsg::BroadcastToAckRequested {
+                id: Transaction::new::<crate::operations::update::UpdateMsg>(),
+                key,
+                payload: crate::message::DeltaOrFullState::Delta(payload),
+                sender_summary_bytes: Vec::new(),
+                covered: crate::ring::broadcast_coverage::CoveredPeers::empty(),
+            },
+        )
+    }
+
     /// #5510 behavioral reproduction: an inbound `BroadcastTo` REFUSED by the
     /// UPDATE dispatch rate limiter MUST emit exactly one throttled
     /// `ResyncRequest` back to the sender, and a refused `RequestUpdate` MUST
@@ -8608,6 +8644,30 @@ mod tests {
              ResyncRequest — its originator observes the failure and it caches no \
              summary of us, so a resync here is pure amplification onto a node \
              already refusing this sender"
+        );
+
+        // 4. #6143: a refused FLAGGED broadcast is answered with a "dropped:
+        //    rate limited" ack, so the sender learns at once rather than after
+        //    its timeout. The ack is not subject to the repair throttle.
+        handle_pure_network_message_v1(
+            ack_requested_broadcast(broadcast_key, vec![9, 9, 9]),
+            Some(sender_addr),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a rate-limited drop");
+        assert_eq!(
+            drain_broadcast_acks(&mut notification_rx),
+            vec![(
+                sender_addr,
+                crate::message::BroadcastAckOutcome::Dropped(
+                    crate::message::BroadcastDropReason::RateLimited
+                )
+            )],
+            "#6143: a rate-limited flagged leg for a held contract is acked as dropped"
         );
     }
 
@@ -8935,6 +8995,34 @@ mod tests {
             "premise: the per-pair limiter admitted it, so the budget decided"
         );
         assert!(drain_resync_targets(&mut notification_rx, control_key).is_empty());
+
+        // 6. #6143: a FLAGGED over-budget broadcast is answered with a
+        //    "dropped: merge budget" ack. A fresh sender, so the per-pair
+        //    limiter admits it and the drop is the budget's. The clock moved
+        //    25 ms since step 1, half a token, so the key is still over budget.
+        let sender_f: SocketAddr = "127.0.0.1:15206".parse().unwrap();
+        let dropped_before = budget.dropped_total();
+        handle_pure_network_message_v1(
+            ack_requested_broadcast(broadcast_key, vec![3, 4, 5]),
+            Some(sender_f),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a budget drop");
+        assert_eq!(budget.dropped_total(), dropped_before + 1);
+        assert_eq!(
+            drain_broadcast_acks(&mut notification_rx),
+            vec![(
+                sender_f,
+                crate::message::BroadcastAckOutcome::Dropped(
+                    crate::message::BroadcastDropReason::MergeBudget
+                )
+            )],
+            "#6143: an over-budget flagged leg for a held contract is acked as dropped"
+        );
     }
 
     /// #5510 gate A: a refusal that is NOT `Rejected` must emit NO repair.
@@ -9107,6 +9195,28 @@ mod tests {
              would be ~1 ResyncRequest per refused message back at a flooder, \
              each inviting a full-state response into a WASM merge. Got {emitted:?}"
         );
+        // #6143: nor an ack: a flooder must not get a reply per message.
+        handle_pure_network_message_v1(
+            ack_requested_broadcast(key, vec![4, 5, 6]),
+            Some(sender_addr),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a new-pair-budget drop");
+        assert_eq!(
+            op_manager
+                .ring
+                .update_rate_limiter
+                .new_pair_budget_rejected_total(),
+            budget_refusals_before + 2
+        );
+        assert!(
+            drain_broadcast_acks(&mut notification_rx).is_empty(),
+            "#6143: no ack for a new-pair-budget refusal"
+        );
         assert_eq!(
             op_manager.interest_manager.outstanding_resync_retries(),
             0,
@@ -9248,6 +9358,23 @@ mod tests {
              MUST emit no repair — `key` is attacker-supplied, and without this \
              gate unlimited fresh keys each get a fresh throttle entry and a fresh \
              emit-limiter bucket, so no per-key bound binds. Got {emitted:?}"
+        );
+        // #6143: nor an ack. A flagged leg for a contract we do not hold is
+        // refused the same way and answered with nothing.
+        handle_pure_network_message_v1(
+            ack_requested_broadcast(key, vec![4, 5, 6]),
+            Some(sender_addr),
+            op_manager.clone(),
+            bridge.clone(),
+            listener.as_mut(),
+            None,
+        )
+        .await
+        .expect("dispatch must not error on a rate-limited drop");
+        assert_eq!(op_manager.ring.update_rate_limiter.rejected_total(), 2);
+        assert!(
+            drain_broadcast_acks(&mut notification_rx).is_empty(),
+            "#6143: no ack for a contract this node does not hold"
         );
         assert_eq!(
             op_manager.interest_manager.outstanding_resync_retries(),

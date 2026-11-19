@@ -1151,12 +1151,12 @@ pub(crate) const BROADCAST_TARGET_LIST_MIN_VERSION: (u8, u8, u16) = (0, 2, 120);
 /// what every peer receives today, so a closed gate costs the bandwidth we are
 /// already spending and never costs convergence.
 ///
-/// NOTE (#5161 / PR #5167): until that fix deploys, a joiner never learns its
-/// GATEWAY's version — `AckConnection` carries none — so `remote` is `None` on
-/// gateway links and this gate stays closed there regardless of what the
-/// gateway actually runs. Peer-to-peer links are unaffected. That is a
-/// suppression shortfall on gateway legs, not a correctness problem, and it
-/// resolves itself once #5167 ships.
+/// Gateway links: a joiner learns its gateway's version from the
+/// version-carrying `AckConnectionV2`, shipped in 0.2.120 (#5161/#5167,
+/// `transport/connection_handler/version_cmp.rs`
+/// `GATEWAY_ACK_VERSION_MIN_VERSION` / `ACK_VERSION_SHIPPED_IN`), so this gate
+/// works on gateway links too. Only simulations disable that ack by default
+/// (`SimNetwork::enable_gateway_ack_version`).
 pub(crate) fn version_supports_broadcast_target_list(
     remote: Option<(u8, u8, u16)>,
     floor: (u8, u8, u16),

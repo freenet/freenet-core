@@ -3784,16 +3784,6 @@ mod tests {
         }
     }
 
-    /// The send gate for `UpdateMsg::BroadcastToV2` / `BroadcastToStreamingV2`
-    /// (#5147).
-    ///
-    /// Same stakes as the hash-first gate above: a pre-floor peer has no
-    /// variant index for these, cannot bincode-deserialize them, and DROPS THE
-    /// CONNECTION. During a staggered rollout most peers are pre-floor.
-    ///
-    /// Asserts the gate DISCRIMINATES rather than always-rejecting — an
-    /// always-false gate would pass a test that only checked the unknown case,
-    /// and the feature would be silently inert.
     /// The send gate for the ack-requested variants (#6143): fail closed on an
     /// unknown or pre-floor version, open at the floor.
     #[test]
@@ -3808,6 +3798,17 @@ mod tests {
         cm.record_remote_version(at_floor, Some(crate::node::CONFIRMED_DELIVERY_MIN_VERSION));
         assert!(cm.supports_confirmed_delivery(at_floor));
     }
+
+    /// The send gate for `UpdateMsg::BroadcastToV2` / `BroadcastToStreamingV2`
+    /// (#5147).
+    ///
+    /// Same stakes as the hash-first gate above: a pre-floor peer has no
+    /// variant index for these, cannot bincode-deserialize them, and DROPS THE
+    /// CONNECTION. During a staggered rollout most peers are pre-floor.
+    ///
+    /// Asserts the gate DISCRIMINATES rather than always-rejecting — an
+    /// always-false gate would pass a test that only checked the unknown case,
+    /// and the feature would be silently inert.
 
     #[test]
     fn supports_broadcast_target_list_gate_discriminates_by_version() {

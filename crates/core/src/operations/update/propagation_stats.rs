@@ -56,7 +56,10 @@
 //!
 //! There is no stall WARN. A rule that WARNed when every leg of a client
 //! update ended unsent still raised false WARNs in its general form, so it is
-//! deferred to #6165. Diagnose from the counts instead: a contract with
+//! deferred to #6165. The confirmed-delivery give-up WARN
+//! (`confirmed_delivery`) is a different rule: it fires only after a peer
+//! that decodes the ack failed to confirm an originated update AND its
+//! full-state resend, at most once per contract per 10 minutes. Diagnose from the counts instead: a contract with
 //! `client_originated > 0` and `sent_delta + sent_full == 0`, sustained across
 //! windows, has client updates that are not leaving this node, and the
 //! `skip_*`, `send_failed` and `fanout_event_dropped` counts say where its
