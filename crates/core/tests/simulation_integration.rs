@@ -10317,6 +10317,211 @@ fn test_get_reaches_sparse_holder_via_relay_forwarding() {
     );
 }
 
+/// ANT-2026-K0YQ8CG4: an honest GET succeeds when the requester's first-choice
+/// relay has a full relay lane. Same topology and seeding as
+/// `test_get_reaches_sparse_holder_via_relay_forwarding`, with the decoy's
+/// contract handler refusing every relay query
+/// (`dev_tool::sim_relay_overload`). The decoy answers NotFound without
+/// forwarding, and the GET must still reach a holder.
+#[test_log::test]
+fn test_get_succeeds_past_a_relay_with_a_full_relay_lane() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    // The seed still drives node keys and gateway placement, but no assertion
+    // in this test depends on the topology it produces: peer locations, peer
+    // connections and contract placement are all set explicitly below.
+    const SEED: u64 = 0x3506_000B_0001;
+    const NETWORK_NAME: &str = "get-past-overloaded-relay";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let contract = SimOperation::create_test_contract(0xBE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+
+    // Regular-node order maps to labels as node_locations[i] -> node(i + 1).
+    const DECOY_OFFSET: f64 = 0.002;
+    const HOLDER_OFFSET: f64 = 0.02;
+    const REQUESTER_OFFSET: f64 = 0.45;
+    let node_locations = vec![
+        wrap(key_loc + DECOY_OFFSET),     // node 1: decoy, closest to the key
+        wrap(key_loc + HOLDER_OFFSET),    // node 2: holder A
+        wrap(key_loc - HOLDER_OFFSET),    // node 3: holder B
+        wrap(key_loc + REQUESTER_OFFSET), // node 4: requester, far from the key
+    ];
+    let num_nodes = node_locations.len();
+
+    let decoy = NodeLabel::node(NETWORK_NAME, 1);
+    let holders = [
+        NodeLabel::node(NETWORK_NAME, 2),
+        NodeLabel::node(NETWORK_NAME, 3),
+    ];
+    let requester = NodeLabel::node(NETWORK_NAME, 4);
+
+    let rt = create_runtime();
+    let (mut sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,         // 1 gateway
+            num_nodes, // 4 regular nodes
+            3,         // ring_max_htl — see "Why the mechanics are what they are"
+            3,         // rnd_if_htl_above — INERT, see below; value is arbitrary
+            12,        // max_connections — ample, so no preseeded edge is capped away
+            3,         // min_connections
+            SEED,
+            &node_locations,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // Wire the whole route explicitly, so it does not depend on CONNECT racing:
+    // the requester reaches the decoy and both holders, and the decoy can
+    // forward onward to a holder.
+    sim.preseed_direct_star(
+        &requester,
+        &[decoy.clone(), holders[0].clone(), holders[1].clone()],
+    );
+    sim.preseed_direct_star(&decoy, &[holders[0].clone(), holders[1].clone()]);
+
+    // Setup sanity. `new_with_node_locations` realises locations approximately
+    // (it picks the loopback port nearest each target), so assert the ordering
+    // the scenario depends on against the ACHIEVED locations rather than the
+    // requested ones. get_peer_locations() is [gateway, node1..node4].
+    let locs = sim.get_peer_locations();
+    let decoy_dist = ring_dist(locs[1], key_loc);
+    let holder_dists = [ring_dist(locs[2], key_loc), ring_dist(locs[3], key_loc)];
+    let requester_dist = ring_dist(locs[4], key_loc);
+    // The gateway's location is NOT chosen by this test — it is derived from the
+    // seed — and preseeding does not suppress organic CONNECT, so the requester
+    // does connect to it. That makes the gateway a live routing candidate whose
+    // distance to the key is a seed-derived quantity, i.e. exactly the kind of
+    // dependency this test exists to remove. Assert it rather than rely on the
+    // margin: HTL has zero slack here (requester 3 -> decoy 2 -> holder 1), so a
+    // gateway hop inserted into the route would exhaust HTL and yield NotFound.
+    let gateway_dist = ring_dist(locs[0], key_loc);
+    for (i, holder_dist) in holder_dists.iter().enumerate() {
+        assert!(
+            *holder_dist < gateway_dist,
+            "scenario setup wrong: the seed-derived gateway landed closer to the key \
+             than holder {i}, so it can win a greedy pick and insert a hop into the \
+             forced route. With no HTL slack that turns the GET into a NotFound. \
+             Re-pick SEED or move the holders. \
+             holder_dist={holder_dist}, gateway_dist={gateway_dist}"
+        );
+        assert!(
+            decoy_dist < *holder_dist,
+            "scenario setup wrong: the decoy must be strictly closer to the key than \
+             holder {i} so that a keyward-routed GET lands on the decoy (which does not \
+             host the contract) before any holder — otherwise the first hop would serve \
+             it and nothing would be exercised. \
+             decoy_dist={decoy_dist}, holder_dist={holder_dist}"
+        );
+        assert!(
+            *holder_dist < requester_dist,
+            "scenario setup wrong: holder {i} must be strictly closer to the key than \
+             the requester, so the requester's candidate list is ordered \
+             [decoy, holders, ...] and the decoy forwards onward to a holder. \
+             holder_dist={holder_dist}, requester_dist={requester_dist}"
+        );
+    }
+
+    // Place the contract at exactly two peers, BY CONSTRUCTION. Seed ops are
+    // applied at node startup, before any scheduled operation runs, so the
+    // sparse-hosting precondition holds without depending on a PUT's incidental
+    // caching. Advertisements stay off (harness default), so these holders are
+    // reachable only by being routed to — which is what keeps the decoy unable
+    // to answer.
+    let mut operations = Vec::new();
+    for holder in &holders {
+        operations.push(ScheduledOperation::new(
+            holder.clone(),
+            SimOperation::SeedDemandlessCopy {
+                contract: contract.clone(),
+                state: vec![10, 20, 30, 40],
+            },
+        ));
+    }
+    operations.push(ScheduledOperation::new(
+        requester.clone(),
+        SimOperation::Get {
+            contract_id,
+            return_contract_code: true,
+            subscribe: false,
+        },
+    ));
+
+    // The decoy, the requester's first-choice candidate, refuses every relay
+    // query as a full relay lane does.
+    let decoy_addr = sim.node_address(&decoy).expect("the decoy has an address");
+    freenet::dev_tool::sim_relay_overload::saturate(decoy_addr);
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let stored = |label: &NodeLabel| {
+        result
+            .node_storages
+            .get(label)
+            .unwrap_or_else(|| panic!("{label:?} should have a storage handle"))
+            .get_stored_state(&contract_key)
+    };
+
+    freenet::dev_tool::sim_relay_overload::clear();
+
+    // The claim: an honest GET still succeeds when the first-choice relay is
+    // overloaded. The decoy answers NotFound at once, and the requester's
+    // relay moves on to a holder, as in
+    // `test_get_reaches_sparse_holder_via_relay_forwarding` (the baseline,
+    // where the decoy forwards instead).
+    assert!(
+        stored(&requester).is_some(),
+        "the requester did not get the contract state with the decoy's relay lane \
+         full: a relay that refuses for overload must not cost an honest GET its \
+         result while another peer holds the contract"
+    );
+    // The overloaded decoy neither served nor forwarded the GET (it would then
+    // have cached the state on the return path, as in the baseline), so the
+    // state came from a holder by another route.
+    assert!(
+        stored(&decoy).is_none(),
+        "the overloaded decoy holds the state, so the GET went through it: an \
+         overloaded relay must answer NotFound and not forward"
+    );
+
+    // StateVerifier anomaly check
+    let rt = create_runtime();
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    tracing::info!(
+        "test_get_succeeds_past_a_relay_with_a_full_relay_lane PASSED: \
+         requester got contract state from a holder past the decoy, \
+         {} anomalies, {} events",
+        report.anomalies.len(),
+        report.total_events
+    );
+}
+
 /// Regression test for auto-fetch from UPDATE sender.
 ///
 /// When a node subscribed to a CRDT contract receives an UPDATE broadcast but

@@ -739,6 +739,14 @@ pub(crate) async fn start_relay_request_update(
         return Ok(());
     }
 
+    // Relay driver permit (ANT-2026-K0YQ8CG4), held by the guard until the
+    // driver exits. See `admit_relay_update` for what a refusal does.
+    let Some(driver_permit) =
+        admit_relay_update(&op_manager, incoming_tx, &key, sender_addr, false).await
+    else {
+        return Ok(());
+    };
+
     // Routing/hosting attribution (Group C): count this as a genuine relayed
     // UPDATE (past the dedup gate — a deduped duplicate is not a relay).
     crate::node::network_status::record_relayed_update();
@@ -762,6 +770,7 @@ pub(crate) async fn start_relay_request_update(
     let guard = RelayUpdateInflightGuard {
         op_manager: op_manager.clone(),
         incoming_tx,
+        _driver_permit: driver_permit,
     };
 
     GlobalExecutor::spawn(run_relay_request_update(
@@ -911,6 +920,14 @@ pub(crate) async fn start_relay_broadcast_to(
         return Ok(());
     }
 
+    // Relay driver permit (ANT-2026-K0YQ8CG4), held by the guard until the
+    // driver exits. See `admit_relay_update` for what a refusal does.
+    let Some(driver_permit) =
+        admit_relay_update(&op_manager, incoming_tx, &key, sender_addr, true).await
+    else {
+        return Ok(());
+    };
+
     // NOT counted in `relayed_updates_total`: BroadcastTo is update-mesh
     // fan-out to interested co-hosts, not a relayed UPDATE *request* toward the
     // key. Counting fan-out here would conflate relay volume with fan-out
@@ -931,6 +948,7 @@ pub(crate) async fn start_relay_broadcast_to(
     let guard = RelayUpdateInflightGuard {
         op_manager: op_manager.clone(),
         incoming_tx,
+        _driver_permit: driver_permit,
     };
 
     GlobalExecutor::spawn(run_relay_broadcast_to(
@@ -944,6 +962,46 @@ pub(crate) async fn start_relay_broadcast_to(
         covered,
     ));
     Ok(())
+}
+
+/// Take a relay driver permit for an inbound UPDATE from `sender_addr`
+/// (ANT-2026-K0YQ8CG4): the per-source and node-wide bound every relay driver
+/// takes. `None` when refused; the dedup entry is undone.
+///
+/// A refused BROADCAST needs a repair, for the reason written out at the
+/// rate-limiter drop in `node.rs`: its sender already treats the change as
+/// delivered. So it goes into the same throttled `ResyncRequest` repair,
+/// behind the same gate (only for a contract this node holds). A refused
+/// `RequestUpdate*` is not repaired, as at the rate limiter: UPDATE is
+/// fire-and-forget, and the write reaches the mesh through the originator's
+/// own apply and fan-out.
+async fn admit_relay_update(
+    op_manager: &Arc<OpManager>,
+    incoming_tx: Transaction,
+    key: &ContractKey,
+    sender_addr: SocketAddr,
+    broadcast: bool,
+) -> Option<crate::operations::relay_admission::RelayDriverPermit> {
+    match op_manager
+        .relay_driver_admission
+        .try_admit_logged(sender_addr, "update")
+    {
+        Ok(permit) => Some(permit),
+        Err(_refusal) => {
+            op_manager.active_relay_update_txs.remove(&incoming_tx);
+            if broadcast && op_manager.ring.should_summarize_or_broadcast(key) {
+                send_dropped_broadcast_resync_request(
+                    op_manager,
+                    *key,
+                    sender_addr,
+                    incoming_tx,
+                    DroppedBroadcastReason::RelayAdmission,
+                )
+                .await;
+            }
+            None
+        }
+    }
 }
 
 /// Loop bound for routed UPDATE requests (#3911, ANT-2026-B9HNLA3P).
@@ -998,6 +1056,8 @@ fn request_already_relayed(
 struct RelayUpdateInflightGuard {
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
+    /// Relay driver permit (ANT-2026-K0YQ8CG4), released with the guard.
+    _driver_permit: crate::operations::relay_admission::RelayDriverPermit,
 }
 
 impl Drop for RelayUpdateInflightGuard {
@@ -1333,6 +1393,9 @@ pub(crate) enum DroppedBroadcastReason {
     /// Refused by the per-contract merge budget in `node.rs` before any
     /// driver ran (#6190).
     MergeBudget,
+    /// Refused by the relay driver admission (`relay_admission`,
+    /// ANT-2026-K0YQ8CG4) before any driver ran.
+    RelayAdmission,
 }
 
 impl DroppedBroadcastReason {
@@ -1343,6 +1406,7 @@ impl DroppedBroadcastReason {
             DroppedBroadcastReason::QueueFull => "queue_full",
             DroppedBroadcastReason::RateLimited => "rate_limited",
             DroppedBroadcastReason::MergeBudget => "merge_budget",
+            DroppedBroadcastReason::RelayAdmission => "relay_admission",
         }
     }
 }
@@ -2536,6 +2600,14 @@ pub(crate) async fn start_relay_request_update_streaming(
         return Ok(());
     }
 
+    // Relay driver permit (ANT-2026-K0YQ8CG4), held by the guard until the
+    // driver exits. See `admit_relay_update` for what a refusal does.
+    let Some(driver_permit) =
+        admit_relay_update(&op_manager, incoming_tx, &key, sender_addr, false).await
+    else {
+        return Ok(());
+    };
+
     // Routing/hosting attribution (Group C): count this as a genuine relayed
     // UPDATE, mirroring the non-streaming `start_relay_request_update`.
     // `relayed_updates_total` counts relayed UPDATE *requests* toward the key;
@@ -2561,6 +2633,7 @@ pub(crate) async fn start_relay_request_update_streaming(
     let guard = RelayUpdateStreamingInflightGuard {
         op_manager: op_manager.clone(),
         incoming_tx,
+        _driver_permit: driver_permit,
     };
 
     GlobalExecutor::spawn(run_relay_request_update_streaming(
@@ -2604,6 +2677,14 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
         return Ok(());
     }
 
+    // Relay driver permit (ANT-2026-K0YQ8CG4), held by the guard until the
+    // driver exits. See `admit_relay_update` for what a refusal does.
+    let Some(driver_permit) =
+        admit_relay_update(&op_manager, incoming_tx, &key, sender_addr, true).await
+    else {
+        return Ok(());
+    };
+
     // NOT counted in `relayed_updates_total` (see `start_relay_broadcast_to`):
     // BroadcastToStreaming is update-mesh fan-out, not a relayed request.
 
@@ -2622,6 +2703,7 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
     let guard = RelayUpdateStreamingInflightGuard {
         op_manager: op_manager.clone(),
         incoming_tx,
+        _driver_permit: driver_permit,
     };
 
     GlobalExecutor::spawn(run_relay_broadcast_to_streaming(
@@ -2643,6 +2725,8 @@ pub(crate) async fn start_relay_broadcast_to_streaming(
 struct RelayUpdateStreamingInflightGuard {
     op_manager: Arc<OpManager>,
     incoming_tx: Transaction,
+    /// Relay driver permit (ANT-2026-K0YQ8CG4), released with the guard.
+    _driver_permit: crate::operations::relay_admission::RelayDriverPermit,
 }
 
 impl Drop for RelayUpdateStreamingInflightGuard {
@@ -7755,6 +7839,57 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// ANT-2026-K0YQ8CG4: every relay UPDATE driver takes a relay driver
+    /// permit after its dedup gate and holds it in its guard; a refused
+    /// broadcast of a held contract is repaired, a refused request is not.
+    ///
+    /// FALSIFY: drop the `admit_relay_update` call from any start function,
+    /// pass `false` for a broadcast, or drop the repair.
+    #[test]
+    fn relay_update_drivers_take_a_driver_permit() {
+        let src = production_source(include_str!("op_ctx_task.rs"));
+        for (sig, broadcast) in [
+            ("pub(crate) async fn start_relay_request_update(", "false"),
+            ("pub(crate) async fn start_relay_broadcast_to(", "true"),
+            (
+                "pub(crate) async fn start_relay_request_update_streaming(",
+                "false",
+            ),
+            (
+                "pub(crate) async fn start_relay_broadcast_to_streaming(",
+                "true",
+            ),
+        ] {
+            let body = extract_fn_body(src, sig);
+            let dedup = body
+                .find("active_relay_update_txs.insert(incoming_tx)")
+                .unwrap_or_else(|| panic!("{sig} has a dedup gate"));
+            let admit = body
+                .find("admit_relay_update(")
+                .unwrap_or_else(|| panic!("{sig} must take a relay driver permit"));
+            assert!(dedup < admit, "{sig}: a duplicate must take no slot");
+            assert!(
+                body[admit..].starts_with(&format!(
+                    "admit_relay_update(&op_manager, incoming_tx, &key, sender_addr, {broadcast})"
+                )),
+                "{sig}: broadcast = {broadcast}"
+            );
+            assert!(
+                body.contains("_driver_permit: driver_permit,"),
+                "{sig}: the guard holds the permit"
+            );
+        }
+        let admit = extract_fn_body(src, "async fn admit_relay_update(");
+        assert!(admit.contains("active_relay_update_txs.remove(&incoming_tx)"));
+        let repair = admit
+            .find("send_dropped_broadcast_resync_request(")
+            .expect("a refused broadcast is repaired");
+        let gate = admit
+            .find("if broadcast && op_manager.ring.should_summarize_or_broadcast(key)")
+            .expect("only a broadcast of a held contract");
+        assert!(gate < repair);
     }
 
     /// Issue #4828: `record_update_received` must be recorded by BOTH

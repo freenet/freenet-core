@@ -2380,6 +2380,21 @@ impl Ring {
                 snapshot.relayed_updates_total = Some(updates);
             }
 
+            // Contract-handler admission refusals (ANT-2026-K0YQ8CG4).
+            {
+                use crate::contract::Lane;
+                snapshot.contract_lane_refused_client_total =
+                    Some(crate::contract::lane_refusals(Lane::Client));
+                snapshot.contract_lane_refused_relay_total =
+                    Some(crate::contract::lane_refusals(Lane::Relay));
+                snapshot.contract_lane_refused_background_total =
+                    Some(crate::contract::lane_refusals(Lane::Background));
+                let (refused, overload_not_found) =
+                    crate::operations::relay_admission::telemetry_counts();
+                snapshot.relay_admission_refused_total = Some(refused);
+                snapshot.relay_get_overload_not_found_total = Some(overload_not_found);
+            }
+
             // Connect-event emission counters (firehose-retirement precursor).
             // Additive aggregate for a future net-negative retirement of the
             // per-event `connect_connected` / `connect_rejected` firehose.

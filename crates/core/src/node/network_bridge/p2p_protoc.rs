@@ -122,7 +122,13 @@ async fn query_app_subscriptions_bounded(
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
     match timeout(
         QUERY_SUBSCRIPTIONS_HANDLER_TIMEOUT,
-        ch_outbound.send_to_handler(ContractHandlerEvent::QuerySubscriptions { callback: tx }),
+        // Diagnostics, so the background lane: it must not take relay-lane
+        // room from peers' requests (ANT-2026-K0YQ8CG4). A refusal yields an
+        // empty list, like any other failure here.
+        ch_outbound.send_to_handler_prioritized(
+            ContractHandlerEvent::QuerySubscriptions { callback: tx },
+            crate::contract::Priority::Background,
+        ),
     )
     .await
     {

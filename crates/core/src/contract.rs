@@ -54,6 +54,7 @@ pub(crate) use handler::{
 
 pub use executor::{ContractQueueFull, Executor, ExecutorError, OperationMode};
 pub use handler::reset_event_id_counter;
+pub(crate) use handler::{Lane, RELAY_CHANNEL_CAPACITY, lane_refusals};
 pub(crate) use state_size_metrics::{
     StateSizeRejectionStage, record_state_size_rejection, state_size_rejection_snapshot,
 };
@@ -3599,36 +3600,40 @@ where
             }
         }
 
-        // Drain pending events from the channel into the fair queue (bounded batch).
-        // Capped at MAX_DRAIN_BATCH (256) to bound the synchronous work per iteration
-        // before yielding back to the Tokio scheduler. Each iteration of this loop is
-        // a non-blocking try_recv + HashMap insert, so 256 iterations complete in
-        // single-digit microseconds even at peak load.
-        for _ in 0..fair_queue::MAX_DRAIN_BATCH {
-            match contract_handler.channel().try_recv_from_sender()? {
-                Some((id, event, priority)) => {
-                    // Process ClientDisconnect inline — it's a lightweight cleanup
-                    // operation that should never be delayed or compete with
-                    // DelegateRequest events for the default queue's limited capacity.
-                    if let ContractHandlerEvent::ClientDisconnect { client_id } = &event {
-                        let client_id = *client_id;
-                        contract_handler.executor().remove_client(client_id);
-                        // Drop any delegate-notification routing registrations
-                        // for this client (#3275).
-                        delegate_app_registry::remove_client(client_id);
-                        contract_handler.channel().drop_waiting_response(id);
-                        continue;
+        // Move waiting events from the admission lanes into the fair queue
+        // (ANT-2026-K0YQ8CG4). Lane by lane in precedence order, each with
+        // its own budget, so a client event reaches the fair queue's
+        // `ClientLocal` tier on this iteration however much relay or
+        // background work is waiting; the bounded lanes refuse at the sender
+        // once full, so nothing piles up behind the budget. The control lane
+        // is taken in full (what was waiting when the drain began, so the
+        // drain stays finite under a concurrent producer). Each step is a
+        // non-blocking try_recv plus a map insert, so the whole drain is
+        // microseconds even at peak load.
+        let control_waiting = contract_handler.channel().lane_len(handler::Lane::Control);
+        for (lane, budget) in [
+            (handler::Lane::Control, control_waiting),
+            (handler::Lane::Client, fair_queue::MAX_DRAIN_BATCH),
+            (handler::Lane::Relay, fair_queue::MAX_DRAIN_BATCH),
+            (
+                handler::Lane::Background,
+                fair_queue::MAX_BACKGROUND_DRAIN_BATCH,
+            ),
+        ] {
+            for _ in 0..budget {
+                match contract_handler.channel().try_recv_lane(lane)? {
+                    Some((id, event, priority)) => {
+                        admit_to_fair_queue(
+                            &mut contract_handler,
+                            &mut fair_queue,
+                            id,
+                            event,
+                            priority,
+                        )
+                        .await;
                     }
-                    push_with_background_eviction(
-                        &mut contract_handler,
-                        &mut fair_queue,
-                        id,
-                        event,
-                        priority,
-                    )
-                    .await;
+                    None => break,
                 }
-                None => break,
             }
         }
 
@@ -3800,7 +3805,7 @@ where
             } => {}
             result = contract_handler.channel().recv_from_sender() => {
                 let (id, event, priority) = result?;
-                push_with_background_eviction(
+                admit_to_fair_queue(
                     &mut contract_handler,
                     &mut fair_queue,
                     id,
@@ -4544,6 +4549,32 @@ where
     })
 }
 
+/// Take one event received from the admission lanes: a `ClientDisconnect` is
+/// handled inline, anything else goes into the fair queue.
+async fn admit_to_fair_queue<CH>(
+    contract_handler: &mut CH,
+    fair_queue: &mut fair_queue::FairEventQueue,
+    id: handler::EventId,
+    event: ContractHandlerEvent,
+    priority: fair_queue::Priority,
+) where
+    CH: ContractHandler + Send + 'static,
+{
+    // Process ClientDisconnect inline — it's a lightweight cleanup
+    // operation that should never be delayed or compete with
+    // DelegateRequest events for the default queue's limited capacity.
+    if let ContractHandlerEvent::ClientDisconnect { client_id } = &event {
+        let client_id = *client_id;
+        contract_handler.executor().remove_client(client_id);
+        // Drop any delegate-notification routing registrations
+        // for this client (#3275).
+        delegate_app_registry::remove_client(client_id);
+        contract_handler.channel().drop_waiting_response(id);
+        return;
+    }
+    push_with_background_eviction(contract_handler, fair_queue, id, event, priority).await;
+}
+
 /// Push an event into the fair queue, shedding queued `Background` work to make
 /// room when a higher-priority (foreground) event is rejected *for lack of
 /// global capacity* (#4534).
@@ -4651,10 +4682,32 @@ async fn send_queue_full_response(
     // A delegate request the lane forwarded carries its loop-owned mark in
     // the event (`delegate_lane::LaneTicket`); it is released when `rejected`
     // drops at the end of this function.
+    let Some(response) = queue_full_response_for(&rejected.event) else {
+        channel.drop_waiting_response(rejected.id);
+        return;
+    };
+    if let Err(error) = channel.send_to_sender(rejected.id, response).await {
+        tracing::warn!(
+            error = %error,
+            "Failed to send queue-full response (client may have disconnected)"
+        );
+    }
+}
+
+/// The response a refused `event` is answered with, or `None` for an event
+/// with no error response variant (the caller then drops the responder, which
+/// the waiting side sees as `ContractError::NoEvHandlerResponse`).
+///
+/// Shared by the fair queue's refusals (`send_queue_full_response`) and the
+/// admission lanes' (`ContractHandlerChannel::send_to_handler_with_timeout`),
+/// so a caller cannot tell which of the two refused it.
+pub(crate) fn queue_full_response_for(
+    event: &ContractHandlerEvent,
+) -> Option<ContractHandlerEvent> {
     // Typed `ContractQueueFull` marker powers `is_contract_queue_full` at
     // every caller; the UPDATE relay drivers gate amplification on it. #4251.
     let make_err = || ExecutorError::other(ContractQueueFull);
-    let response = match &rejected.event {
+    let response = match event {
         ContractHandlerEvent::PutQuery { .. } => ContractHandlerEvent::PutResponse {
             new_value: Err(make_err()),
             state_changed: false,
@@ -4693,12 +4746,16 @@ async fn send_queue_full_response(
         ContractHandlerEvent::ImportSecrets { .. } => {
             ContractHandlerEvent::ImportSecretsResponse(Err(make_err()))
         }
+        // A delegate request's answer can carry an error, so the client is
+        // told why rather than seeing its response channel close.
+        ContractHandlerEvent::DelegateRequest { .. } => {
+            ContractHandlerEvent::DelegateResponse(Err(make_err()))
+        }
         // Events without error response variants: drop the oneshot sender to
         // unblock the caller. The caller's receiver will get a RecvError, which
         // maps to ContractError::NoEvHandlerResponse. This prevents leaking
         // entries in the waiting_response map.
-        ContractHandlerEvent::DelegateRequest { .. }
-        | ContractHandlerEvent::DelegateResponse(_)
+        ContractHandlerEvent::DelegateResponse(_)
         | ContractHandlerEvent::ExportUserSecretsResponse(_)
         | ContractHandlerEvent::ImportSecretsResponse(_)
         | ContractHandlerEvent::PutResponse { .. }
@@ -4713,17 +4770,9 @@ async fn send_queue_full_response(
         | ContractHandlerEvent::GetDeltaResponse { .. }
         | ContractHandlerEvent::GetStateAndSummaryResponse { .. }
         | ContractHandlerEvent::ClientDisconnect { .. }
-        | ContractHandlerEvent::EvictContract { .. } => {
-            channel.drop_waiting_response(rejected.id);
-            return;
-        }
+        | ContractHandlerEvent::EvictContract { .. } => return None,
     };
-    if let Err(error) = channel.send_to_sender(rejected.id, response).await {
-        tracing::warn!(
-            error = %error,
-            "Failed to send queue-full response (client may have disconnected)"
-        );
-    }
+    Some(response)
 }
 
 async fn handle_delegate_notification<CH, P>(
@@ -17417,5 +17466,336 @@ mod hol_4391_tests {
             "the sweep must reap another delegate's closed registration on a hosted node"
         );
         delegate_app_registry::remove_client(client);
+    }
+
+    // ── ANT-2026-K0YQ8CG4: admission before the fair queue ─────────────────
+
+    type PendingSend = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ContractHandlerEvent, ContractError>> + Send>,
+    >;
+
+    /// A PUT of a fresh contract whose validate records its state bytes in
+    /// `seen`, so the order the loop EXECUTES PUTs in can be read back.
+    fn recorded_put(
+        handler: &mut MockWasmContractHandler,
+        seen: &Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        tag: &str,
+    ) -> ContractHandlerEvent {
+        let contract = make_contract(format!("k0yq8cg4_{tag}").as_bytes());
+        handler
+            .runtime_mut()
+            .validate_overrides
+            .insert(*contract.key().id(), ValidateOverride::Record(seen.clone()));
+        ContractHandlerEvent::PutQuery {
+            key: contract.key(),
+            state: WrappedState::new(tag.as_bytes().to_vec()),
+            related_contracts: RelatedContracts::default(),
+            contract: Some(contract),
+        }
+    }
+
+    fn is_queue_full_put(res: &Result<ContractHandlerEvent, ContractError>) -> bool {
+        matches!(
+            res,
+            Ok(ContractHandlerEvent::PutResponse { new_value: Err(err), .. })
+                if err.is_contract_queue_full()
+        )
+    }
+
+    /// Poll each send once, in order, so every event is offered to the handler
+    /// in exactly this order before the test goes on. Returns the sends that
+    /// are still waiting and the results of those already answered.
+    async fn offer_in_order(
+        sends: Vec<PendingSend>,
+    ) -> (
+        Vec<PendingSend>,
+        Vec<Result<ContractHandlerEvent, ContractError>>,
+    ) {
+        let mut waiting = Vec::new();
+        let mut answered = Vec::new();
+        for mut send in sends {
+            match futures::poll!(send.as_mut()) {
+                std::task::Poll::Ready(res) => answered.push(res),
+                std::task::Poll::Pending => waiting.push(send),
+            }
+        }
+        (waiting, answered)
+    }
+
+    const RELAY_BURST: usize = 2_000;
+
+    /// THE REGRESSION TEST for ANT-2026-K0YQ8CG4: a local client's request
+    /// sent after many relay requests runs as soon as the loop is free, not
+    /// behind them.
+    ///
+    /// The loop is held inside one contract execution. While it is held, 2,000 relay PUTs are offered, then one
+    /// `ClientLocal` PUT. Every PUT records its state when the loop executes
+    /// it, so the order is read back exactly, with no timing involved. Before
+    /// the fix every event shared one FIFO channel and the loop moved only
+    /// 256 of them into the fair queue per execution, so a relay PUT ran
+    /// first and the client's waited 2000 / 256 executions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_client_request_sent_after_a_relay_burst_runs_next() {
+        let _guard = TEST_GUARD.lock().await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut relay_events = Vec::new();
+        let mut client_event = None;
+        let (send, gate, put, handle) = loop_held_in_contract_wasm(
+            |h| {
+                for i in 0..RELAY_BURST {
+                    relay_events.push(recorded_put(h, &seen, &format!("relay_{i}")));
+                }
+                client_event = Some(recorded_put(h, &seen, "client"));
+            },
+            false,
+        )
+        .await;
+        let _release = ReleaseOnDrop(gate.clone());
+
+        let relay_sends: Vec<PendingSend> = relay_events
+            .into_iter()
+            .map(|ev| {
+                let send = send.clone();
+                Box::pin(async move { send.send_to_handler(ev).await }) as PendingSend
+            })
+            .collect();
+        let (relay_waiting, _refused) = offer_in_order(relay_sends).await;
+        let client_send: PendingSend = {
+            let send = send.clone();
+            let ev = client_event.take().unwrap();
+            Box::pin(async move {
+                send.send_to_handler_prioritized(ev, fair_queue::Priority::ClientLocal)
+                    .await
+            })
+        };
+        let (mut client_waiting, client_answered) = offer_in_order(vec![client_send]).await;
+        assert!(
+            client_answered.is_empty(),
+            "the client's PUT must be admitted, not refused, while the loop is held"
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "nothing may have executed while the loop is held"
+        );
+
+        gate.release();
+        let relays = GlobalExecutor::spawn(futures::future::join_all(relay_waiting));
+        let client = tokio::time::timeout(Duration::from_secs(30), client_waiting.remove(0))
+            .await
+            .expect("the client's PUT is answered")
+            .expect("answered");
+        assert!(
+            matches!(
+                client,
+                ContractHandlerEvent::PutResponse {
+                    new_value: Ok(_),
+                    ..
+                }
+            ),
+            "the client's PUT must succeed, got {client}"
+        );
+        let first = seen.lock().unwrap().first().cloned();
+        assert_eq!(
+            first.as_deref(),
+            Some(b"client".as_slice()),
+            "the client's PUT must be the first event executed once the loop is free"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(60), relays).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), put).await;
+        handle.abort();
+    }
+
+    /// The relay overflow is refused AT ONCE, by the sender, while the loop is
+    /// still held: exactly what does not fit in the relay channel is answered
+    /// with the typed `ContractQueueFull` error every relay caller already
+    /// handles. Before the fix nothing was refused until the loop reached it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn relay_overflow_is_refused_at_once_with_contract_queue_full() {
+        let _guard = TEST_GUARD.lock().await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut relay_events = Vec::new();
+        let (send, gate, put, handle) = loop_held_in_contract_wasm(
+            |h| {
+                for i in 0..RELAY_BURST {
+                    relay_events.push(recorded_put(h, &seen, &format!("relay_{i}")));
+                }
+            },
+            false,
+        )
+        .await;
+        let _release = ReleaseOnDrop(gate.clone());
+
+        let relay_sends: Vec<PendingSend> = relay_events
+            .into_iter()
+            .map(|ev| {
+                let send = send.clone();
+                Box::pin(async move { send.send_to_handler(ev).await }) as PendingSend
+            })
+            .collect();
+        let (waiting, refused) = offer_in_order(relay_sends).await;
+        assert_eq!(
+            refused.len(),
+            RELAY_BURST - handler::RELAY_CHANNEL_CAPACITY,
+            "exactly the events beyond the relay channel's capacity are refused"
+        );
+        assert!(
+            refused.iter().all(is_queue_full_put),
+            "every refusal must carry the typed ContractQueueFull error"
+        );
+        assert_eq!(waiting.len(), handler::RELAY_CHANNEL_CAPACITY);
+
+        gate.release();
+        let _ =
+            tokio::time::timeout(Duration::from_secs(60), futures::future::join_all(waiting)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), put).await;
+        handle.abort();
+    }
+
+    /// `EvictContract` travels on the control lane, which is never refused, so
+    /// an eviction sent while the relay lane is full still runs. Sent after a
+    /// relay PUT of the same contract, it reaches the fair queue first (the
+    /// control lane is drained first), so it runs before that PUT, and the
+    /// PUT's state survives it.
+    ///
+    /// The mock executor keeps state on eviction, so this checks the ORDER
+    /// (read back from the contract's record) and that the eviction was not
+    /// refused, not the real executor's `expected_generation` guard.
+    ///
+    /// FALSIFY: route `EvictContract` by its priority in `Lane::of` (it is
+    /// refused by the full relay lane and never runs), or drain the relay
+    /// lane before the control lane (the PUT runs first).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_eviction_overtakes_a_queued_relay_put_and_the_state_survives() {
+        let _guard = TEST_GUARD.lock().await;
+        let filler_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let target_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut fillers = Vec::new();
+        let mut target = None;
+        let (send, gate, put, handle) = loop_held_in_contract_wasm(
+            |h| {
+                target = Some(recorded_put(h, &target_seen, "evict_target"));
+                for i in 0..handler::RELAY_CHANNEL_CAPACITY {
+                    fillers.push(recorded_put(h, &filler_seen, &format!("evict_filler_{i}")));
+                }
+            },
+            false,
+        )
+        .await;
+        let _release = ReleaseOnDrop(gate.clone());
+        let target = target.take().unwrap();
+        let ContractHandlerEvent::PutQuery { key, .. } = &target else {
+            unreachable!()
+        };
+        let key = *key;
+
+        // The target's relay PUT first, then enough relay PUTs to fill the
+        // lane, so a relay-lane eviction would be refused.
+        let mut sends: Vec<PendingSend> = vec![{
+            let send = send.clone();
+            Box::pin(async move { send.send_to_handler(target).await })
+        }];
+        sends.extend(fillers.into_iter().map(|ev| {
+            let send = send.clone();
+            Box::pin(async move { send.send_to_handler(ev).await }) as PendingSend
+        }));
+        let (mut waiting, refused) = offer_in_order(sends).await;
+        assert_eq!(refused.len(), 1, "the relay lane is full");
+        send.send_to_handler_fire_and_forget_prioritized(
+            ContractHandlerEvent::EvictContract {
+                key,
+                expected_generation: 0,
+            },
+            fair_queue::Priority::NetworkRelay,
+        )
+        .expect("an eviction is never refused");
+
+        gate.release();
+        let target_put = tokio::time::timeout(Duration::from_secs(30), waiting.remove(0))
+            .await
+            .expect("the target's PUT is answered")
+            .expect("answered");
+        assert!(
+            matches!(
+                target_put,
+                ContractHandlerEvent::PutResponse {
+                    new_value: Ok(_),
+                    ..
+                }
+            ),
+            "the target's PUT succeeds, got {target_put}"
+        );
+        assert_eq!(
+            *target_seen.lock().unwrap(),
+            vec![b"evicted".to_vec(), b"evict_target".to_vec()],
+            "the eviction runs, and before the PUT queued ahead of it"
+        );
+        let read = send
+            .send_to_handler_prioritized(
+                ContractHandlerEvent::GetQuery {
+                    instance_id: *key.id(),
+                    return_contract_code: false,
+                },
+                fair_queue::Priority::ClientLocal,
+            )
+            .await
+            .expect("answered");
+        let ContractHandlerEvent::GetResponse {
+            response: Ok(store),
+            ..
+        } = read
+        else {
+            panic!("expected a stored state, got {read}");
+        };
+        assert_eq!(
+            store.state.expect("the state survives").as_ref(),
+            b"evict_target"
+        );
+        let _ =
+            tokio::time::timeout(Duration::from_secs(60), futures::future::join_all(waiting)).await;
+        let _ = tokio::time::timeout(Duration::from_secs(5), put).await;
+        handle.abort();
+    }
+
+    /// A `ClientDisconnect` the loop takes in its idle select is handled
+    /// inline, like one taken by the drain: the client's delegate-notification
+    /// registrations are removed. Before, that arm put it in the fair queue,
+    /// whose handler did not remove them (and which could refuse it).
+    ///
+    /// FALSIFY: call `push_with_background_eviction` instead of
+    /// `admit_to_fair_queue` in the idle select's arm.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_client_disconnect_taken_by_the_idle_select_is_handled_inline() {
+        let _guard = TEST_GUARD.lock().await;
+        let (handler, send) = build_handler(vec![]).await;
+        let handle = GlobalExecutor::spawn(contract_handling(
+            handler,
+            crate::contract::user_input::AutoApprovePrompter,
+        ));
+        // One round trip, then a pause, so the loop is waiting in its idle
+        // select when the disconnect arrives.
+        let _ = send
+            .send_to_handler(ContractHandlerEvent::GetQuery {
+                instance_id: ContractInstanceId::new([0x71; 32]),
+                return_contract_code: false,
+            })
+            .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let delegate = DelegateKey::new(
+            [0x72; 32],
+            freenet_stdlib::prelude::CodeHash::new([0x72; 32]),
+        );
+        let (client, _rx) = register(&delegate, delegate_app_registry::AppIdentity::Local, None);
+        assert_eq!(delegate_app_registry::registration_count(&delegate), 1);
+        send.send_to_handler_fire_and_forget(ContractHandlerEvent::ClientDisconnect {
+            client_id: client,
+        })
+        .expect("sent");
+        wait_until("the disconnect removes the client's registration", || {
+            delegate_app_registry::registration_count(&delegate) == 0
+        })
+        .await;
+        delegate_app_registry::remove_client(client);
+        handle.abort();
     }
 }

@@ -1368,6 +1368,23 @@ pub(crate) struct RouterSnapshotInfo {
     /// 25-of-`max_connections` truncation is costing anything.
     #[serde(default)]
     pub selection_ranks: SelectionRankSnapshot,
+    /// Contract-handler admission refusals (ANT-2026-K0YQ8CG4), monotonic
+    /// process totals populated by `Ring` on the snapshot cadence: events a
+    /// full admission lane refused, per lane (`contract::handler::Lane`);
+    /// relay requests the relay driver admission refused; and relay GETs
+    /// answered `NotFound` because this node could not take them, as opposed
+    /// to a real miss. Appended last with `serde(default)`, like the fields
+    /// above. `None` until populated.
+    #[serde(default)]
+    pub contract_lane_refused_client_total: Option<u64>,
+    #[serde(default)]
+    pub contract_lane_refused_relay_total: Option<u64>,
+    #[serde(default)]
+    pub contract_lane_refused_background_total: Option<u64>,
+    #[serde(default)]
+    pub relay_admission_refused_total: Option<u64>,
+    #[serde(default)]
+    pub relay_get_overload_not_found_total: Option<u64>,
 }
 
 /// Plain-data lognormality check for one hierarchical log stage (#4485).
@@ -3808,6 +3825,11 @@ impl Router {
             isotonic_fallback_enabled: isotonic_fallback_enabled(),
             route_events_discarded_unlocated: self.route_events_discarded_unlocated,
             selection_ranks: self.selection_ranks.snapshot(),
+            contract_lane_refused_client_total: None,
+            contract_lane_refused_relay_total: None,
+            contract_lane_refused_background_total: None,
+            relay_admission_refused_total: None,
+            relay_get_overload_not_found_total: None,
         }
     }
 
