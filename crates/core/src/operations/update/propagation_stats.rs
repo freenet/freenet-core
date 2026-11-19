@@ -100,7 +100,7 @@ const TOP_K: usize = 8;
 /// capacity, rather than letting a key churn grow the map without bound.
 /// 4096 is comfortably above the active-contract count of a busy gateway.
 /// Each entry is at most [`MAX_COUNTERS_SIZE`] plus its key (pinned by
-/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.6 MB of
+/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.7 MB of
 /// entries at the cap. A hash table holds 4096 entries in 8192 buckets
 /// (hashbrown's 7/8 load factor rounds up to the next power of two), so the
 /// map is about 3.3 MB at the cap.
@@ -109,7 +109,7 @@ const MAX_TRACKED_CONTRACTS: usize = 4096;
 /// Upper bound on `size_of::<ContractCounters>()` and
 /// `size_of::<ContractSummary>()`, for the memory estimate above.
 #[cfg(test)]
-const MAX_COUNTERS_SIZE: usize = 368;
+const MAX_COUNTERS_SIZE: usize = 376;
 
 /// One countable thing that happened to an UPDATE's propagation for a
 /// contract, other than the fan-out target resolution `record_broadcast`
@@ -200,6 +200,9 @@ pub(crate) enum PropagationEvent {
     /// Receiver: an inbound broadcast skipped by the merge-failure backoff
     /// (per-sender cooldown or a known-failed payload).
     RxBackoff,
+    /// Receiver: an inbound broadcast skipped because this node does not host
+    /// the contract (`Ring::may_merge_relayed_update`), so it was not merged.
+    RxNotHosted,
     /// Confirmed delivery (#6143): an originated update's first leg went flagged,
     /// asking the receiver to acknowledge it.
     AckRequested,
@@ -240,7 +243,7 @@ pub(crate) enum PropagationEvent {
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 37] = [
+    pub(crate) const ALL: [PropagationEvent; 38] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -266,6 +269,7 @@ impl PropagationEvent {
         PropagationEvent::RxDedup,
         PropagationEvent::RxAlreadyApplied,
         PropagationEvent::RxBackoff,
+        PropagationEvent::RxNotHosted,
         PropagationEvent::AckRequested,
         PropagationEvent::AckConfirmed,
         PropagationEvent::AckNotNeeded,
@@ -309,18 +313,19 @@ impl PropagationEvent {
             PropagationEvent::RxDedup => 22,
             PropagationEvent::RxAlreadyApplied => 23,
             PropagationEvent::RxBackoff => 24,
-            PropagationEvent::AckRequested => 25,
-            PropagationEvent::AckConfirmed => 26,
-            PropagationEvent::AckNotNeeded => 27,
-            PropagationEvent::AckDroppedNotHosted => 28,
-            PropagationEvent::AckDroppedBackoff => 29,
-            PropagationEvent::AckDroppedRateLimited => 30,
-            PropagationEvent::AckDroppedMergeBudget => 31,
-            PropagationEvent::AckDroppedMergeFailed => 32,
-            PropagationEvent::AckTimeout => 33,
-            PropagationEvent::ResendFull => 34,
-            PropagationEvent::UnconfirmedGiveup => 35,
-            PropagationEvent::PendingOverflow => 36,
+            PropagationEvent::RxNotHosted => 25,
+            PropagationEvent::AckRequested => 26,
+            PropagationEvent::AckConfirmed => 27,
+            PropagationEvent::AckNotNeeded => 28,
+            PropagationEvent::AckDroppedNotHosted => 29,
+            PropagationEvent::AckDroppedBackoff => 30,
+            PropagationEvent::AckDroppedRateLimited => 31,
+            PropagationEvent::AckDroppedMergeBudget => 32,
+            PropagationEvent::AckDroppedMergeFailed => 33,
+            PropagationEvent::AckTimeout => 34,
+            PropagationEvent::ResendFull => 35,
+            PropagationEvent::UnconfirmedGiveup => 36,
+            PropagationEvent::PendingOverflow => 37,
         }
     }
 
@@ -334,6 +339,7 @@ impl PropagationEvent {
             PropagationEvent::RxDedup
                 | PropagationEvent::RxAlreadyApplied
                 | PropagationEvent::RxBackoff
+                | PropagationEvent::RxNotHosted
         )
     }
 
@@ -379,6 +385,7 @@ impl PropagationEvent {
             PropagationEvent::RxDedup => "rx_dedup",
             PropagationEvent::RxAlreadyApplied => "rx_already_applied",
             PropagationEvent::RxBackoff => "rx_backoff",
+            PropagationEvent::RxNotHosted => "rx_not_hosted",
             PropagationEvent::AckRequested => "ack_requested",
             PropagationEvent::AckConfirmed => "ack_confirmed",
             PropagationEvent::AckNotNeeded => "ack_not_needed",
@@ -630,12 +637,17 @@ pub(crate) fn aggregate_window(
 /// the background task started with [`Self::start_summary_task`].
 pub(crate) struct UpdatePropagationStats {
     contracts: DashMap<ContractInstanceId, ContractCounters>,
+    /// [`PropagationEvent::RxNotHosted`] this window. Node-wide on purpose:
+    /// the event is by definition for a contract this node does not host, so
+    /// it never has a per-contract entry (see [`Self::record_received`]).
+    rx_not_hosted: std::sync::atomic::AtomicU64,
 }
 
 impl UpdatePropagationStats {
     pub(crate) fn new() -> Self {
         Self {
             contracts: DashMap::new(),
+            rx_not_hosted: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -687,6 +699,11 @@ impl UpdatePropagationStats {
         ev: PropagationEvent,
         hosted: bool,
     ) {
+        if ev == PropagationEvent::RxNotHosted {
+            self.rx_not_hosted
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let entry = if hosted {
             self.counters(contract)
         } else {
@@ -803,13 +820,33 @@ impl UpdatePropagationStats {
         out
     }
 
+    /// Drain the window: the per-contract summary and the node-wide
+    /// `rx_not_hosted` count (which has no per-contract entries).
+    fn take_window(&self) -> (Option<WindowSummary>, u64) {
+        let skipped = self
+            .rx_not_hosted
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        (aggregate_window(self.drain_window(), TOP_K), skipped)
+    }
+
     /// Drain the current window and emit it at INFO.
     ///
     /// Public for the periodic task and for deterministic unit tests (which
     /// call it directly after recording, instead of waiting on the real-time
     /// ticker).
     pub(crate) fn drain_and_log(&self) {
-        let Some(summary) = aggregate_window(self.drain_window(), TOP_K) else {
+        let (summary, rx_not_hosted) = self.take_window();
+        let Some(summary) = summary else {
+            if rx_not_hosted > 0 {
+                // Only broadcasts for contracts this node does not host: no
+                // per-contract entry exists, but the count must stay visible.
+                tracing::info!(
+                    rx_not_hosted,
+                    window_s = SUMMARY_WINDOW.as_secs(),
+                    phase = "summary",
+                    "update_propagation_summary"
+                );
+            }
             // Nothing happened this window — stay silent (budget rule).
             return;
         };
@@ -847,6 +884,7 @@ impl UpdatePropagationStats {
             rx_dedup = e.get(PropagationEvent::RxDedup),
             rx_already_applied = e.get(PropagationEvent::RxAlreadyApplied),
             rx_backoff = e.get(PropagationEvent::RxBackoff),
+            rx_not_hosted,
             window_s = SUMMARY_WINDOW.as_secs(),
             phase = "summary",
             "update_propagation_summary"
@@ -1647,8 +1685,11 @@ mod tests {
 
         let a_events = stats.events_for_test(&a);
         for ev in PropagationEvent::ALL {
+            // `RxNotHosted` is counted node-wide, never against a contract.
             let want = if ev == PropagationEvent::SkipSummaryEqual {
                 2
+            } else if ev == PropagationEvent::RxNotHosted {
+                0
             } else {
                 1
             };
@@ -1658,6 +1699,20 @@ mod tests {
         assert_eq!(b_events.get(PropagationEvent::RxBackoff), 1);
         assert_eq!(b_events.sent(), 0);
         assert_eq!(a_events.sent(), 2, "sent = sent_delta + sent_full");
+    }
+
+    /// A broadcast skipped for an unhosted contract has no per-contract
+    /// entry, yet the window must still report it (node-wide).
+    #[test]
+    fn an_unhosted_skip_is_reported_node_wide_in_the_window() {
+        let stats = UpdatePropagationStats::new();
+        let id = ContractInstanceId::new([9u8; 32]);
+        stats.record_received(id, PropagationEvent::RxNotHosted, false);
+        stats.record_received(id, PropagationEvent::RxNotHosted, false);
+        let (summary, skipped) = stats.take_window();
+        assert!(summary.is_none(), "no per-contract entry is created");
+        assert_eq!(skipped, 2);
+        assert_eq!(stats.take_window().1, 0, "the window resets");
     }
 
     /// A receiver-side event names whatever contract an inbound broadcast
@@ -1676,6 +1731,7 @@ mod tests {
             PropagationEvent::RxDedup,
             PropagationEvent::RxAlreadyApplied,
             PropagationEvent::RxBackoff,
+            PropagationEvent::RxNotHosted,
         ] {
             assert!(rx.is_received());
             for i in 0..MAX_TRACKED_CONTRACTS + 1 {
@@ -1725,6 +1781,7 @@ mod tests {
                 PropagationEvent::RxDedup
                     | PropagationEvent::RxAlreadyApplied
                     | PropagationEvent::RxBackoff
+                    | PropagationEvent::RxNotHosted
             );
             assert_eq!(ev.is_received(), rx, "{ev:?}");
         }

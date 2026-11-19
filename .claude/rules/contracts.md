@@ -220,19 +220,25 @@ Host functions (callable from WASM):
 
 CRITICAL — Memory pointer refresh (#3248):
   Every func_wrap / func_wrap_async registration in wasmtime_engine.rs
-  MUST call refresh_mem_addr_from_caller(&mut caller, id) BEFORE
+  MUST call refresh_mem_addr_from_caller(&mut caller) BEFORE
   delegating to native_api. WASM memory.grow can relocate linear memory,
   invalidating the cached base pointer in MEM_ADDR. Without the refresh,
   host functions use a stale pointer and read/write garbage data.
 
-  For functions that take an explicit `id` parameter, pass it directly.
-  For delegate functions that use thread-local state, read the instance
-  ID from CURRENT_DELEGATE_INSTANCE.
+CRITICAL — The instance is the CALLER, never a guest argument:
+  MEM_ADDR, CONTRACT_IO and DELEGATE_ENV are process-global maps keyed by
+  instance id. A host function resolves its instance from
+  HostState::calling_instance, which arm_epoch_deadline records at every
+  guest entry; refresh_mem_addr_from_caller returns it. The id parameter
+  that some host functions still take is part of the guest ABI and is
+  IGNORED (`_guest_id`). Never key a lookup by a guest-supplied id.
+  Delegate functions go through delegate_caller(&mut caller), which also
+  refuses a CURRENT_DELEGATE_INSTANCE that is not the calling instance.
 
 Pattern (registration in wasmtime_engine.rs):
   linker.func_wrap("namespace", "name",
-      |mut caller: Caller<'_, HostState>, id: i64, ptr: i64, len: i32| {
-          refresh_mem_addr_from_caller(&mut caller, id);
+      |mut caller: Caller<'_, HostState>, _guest_id: i64, ptr: i64, len: i32| {
+          let id = refresh_mem_addr_from_caller(&mut caller);
           native_api::module::host_function(id, ptr, len)
       },
   )
