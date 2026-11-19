@@ -1227,8 +1227,8 @@ use crate::operations::connect::native::NativeWire;
 /// which ships while the data ramp is still under watch. Raised to 0.2.161
 /// for 0.2.160: native connect is still off (`QUIC_NATIVE_PERCENT` is 0) and
 /// its wire fields may change before it is enabled, so no release is frozen
-/// as the floor yet.
-pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 161);
+/// as the floor yet. Raised to 0.2.162 for 0.2.161 for the same reasons.
+pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 162);
 
 /// Has the decoder for the QUIC-native `ConnectMsg` variants shipped, and in
 /// which release?
