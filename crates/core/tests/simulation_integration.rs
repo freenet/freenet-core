@@ -23453,6 +23453,9 @@ fn test_quic_native_blocked_pairs_connect_over_udp_behind_nats() {
     assert!(connected);
 }
 
+/// Seeds tried, from the listed one, for a run whose survivor-rule order is a premise.
+const SURVIVOR_SEED_SEARCH: u64 = 32;
+
 /// Which survivor-rule decision a run must produce.
 #[derive(Clone, Copy, Debug)]
 enum SurvivorOrder {
@@ -23514,7 +23517,7 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
         ),
         (
             6,
-            0x0059_40A5_00DB,
+            0x0059_40A5_00E0,
             None,
             Some(600),
             Some(SurvivorOrder::NativeFirstInbound),
@@ -23522,32 +23525,65 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
         ),
     ] {
         let name = format!("native-survivor-{run_id}");
-        let nat = SimNat::all(NatFiltering::PortRestricted);
-        let run = run_native_connect_sim_with(&name, seed, 200, Some(nat), |sim| {
-            sim.with_native_connect(100);
-            if let Some(ms) = quic_delay {
-                sim.delay_quic_datagrams(Duration::from_millis(ms));
+        // The decision a run must produce depends on event order, which any
+        // change to connection setup shifts. Search a bounded range of fixed
+        // seeds, starting at the listed one, for the first that yields it;
+        // the search is deterministic and fails closed below.
+        let decided_by = |t: &freenet::dev_tool::NativeWireTrace, order: SurvivorOrder| -> u64 {
+            match order {
+                SurvivorOrder::UdpFirst => t.survivor_swapped(),
+                SurvivorOrder::NativeFirst => t.survivor_udp_dropped(),
+                SurvivorOrder::NativeFirstInbound => t.survivor_inbound_dropped(),
             }
-            if let Some(ms) = intro_delay {
-                sim.delay_udp_intros(Duration::from_millis(ms));
-            }
-            if let Some(order) = order {
-                sim.with_udp_dial_beside_every_native_dial(matches!(
-                    order,
-                    SurvivorOrder::NativeFirstInbound
-                ));
-            }
-            if drop_some {
-                let mut labels: Vec<NodeLabel> = sim.all_node_addresses().keys().cloned().collect();
-                labels.sort();
-                for (i, a) in labels.iter().enumerate() {
-                    for (j, b) in labels.iter().enumerate().skip(i + 1) {
-                        if (i + j) % 3 == 0 {
-                            sim.drop_quic_datagrams_between(a, b, Duration::ZERO);
+        };
+        let seed_range = if order.is_some() {
+            SURVIVOR_SEED_SEARCH
+        } else {
+            1
+        };
+        let mut found = None;
+        for offset in 0..seed_range {
+            let seed = seed + offset;
+            let nat = SimNat::all(NatFiltering::PortRestricted);
+            let run = run_native_connect_sim_with(&name, seed, 200, Some(nat), |sim| {
+                sim.with_native_connect(100);
+                if let Some(ms) = quic_delay {
+                    sim.delay_quic_datagrams(Duration::from_millis(ms));
+                }
+                if let Some(ms) = intro_delay {
+                    sim.delay_udp_intros(Duration::from_millis(ms));
+                }
+                if let Some(order) = order {
+                    sim.with_udp_dial_beside_every_native_dial(matches!(
+                        order,
+                        SurvivorOrder::NativeFirstInbound
+                    ));
+                }
+                if drop_some {
+                    let mut labels: Vec<NodeLabel> =
+                        sim.all_node_addresses().keys().cloned().collect();
+                    labels.sort();
+                    for (i, a) in labels.iter().enumerate() {
+                        for (j, b) in labels.iter().enumerate().skip(i + 1) {
+                            if (i + j) % 3 == 0 {
+                                sim.drop_quic_datagrams_between(a, b, Duration::ZERO);
+                            }
                         }
                     }
                 }
+            });
+            let chose = order.is_none_or(|o| decided_by(&run.wire.trace, o) > 0);
+            if chose {
+                println!("{name}: seed {seed:#x} (offset {offset})");
+                found = Some(run);
+                break;
             }
+        }
+        let run = found.unwrap_or_else(|| {
+            panic!(
+                "{name}: premise: the rule chose {order:?} for none of the {seed_range} seeds \
+                 from {seed:#x}"
+            )
         });
         log_native_connect(&name, &run);
         let t = &run.wire.trace;
@@ -23602,11 +23638,7 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
         );
         held_both += both;
         if let Some(order) = order {
-            let decided = match order {
-                SurvivorOrder::UdpFirst => t.survivor_swapped(),
-                SurvivorOrder::NativeFirst => t.survivor_udp_dropped(),
-                SurvivorOrder::NativeFirstInbound => t.survivor_inbound_dropped(),
-            };
+            let decided = decided_by(t, order);
             assert!(decided > 0, "{name}: premise: the rule chose {order:?}");
             // Keep-first instead of native-wins shows as a pair that holds
             // UDP at both ends although a native setup completed at both
