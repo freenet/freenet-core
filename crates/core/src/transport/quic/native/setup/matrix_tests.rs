@@ -12,8 +12,9 @@
 //! The whole matrix runs in about 30 s (debug build), so it runs with the
 //! library tests rather than only nightly. It asserts the design's decision
 //! criterion: at least 95% success at 800 ms and 10% punch loss in every
-//! class and order, over the skews the connect op can produce. A single
-//! attempt that passes it stays (the design's 6.2 decision).
+//! class and order, over the skews the connect op can produce. One attempt
+//! meets it except under handshake loss (gate 15), which the client's
+//! overlapping second attempt (`OVERLAP_BEFORE_END`) brings to the criterion.
 //!
 //! Not measured here: half-open server states.
 //!
@@ -490,6 +491,11 @@ fn class_pairs() -> Vec<(NatFiltering, NatFiltering)> {
     pairs
 }
 
+/// Seeds per gate cell.
+const SEEDS: u64 = 20;
+/// Seeds per cell for gate 15, whose criterion is judged on more.
+const GATE_15_SEEDS: u64 = 100;
+
 /// One gate cell's results, for the gate tests.
 struct GateCell {
     cell: Cell,
@@ -500,12 +506,16 @@ struct GateCell {
     expired: u64,
 }
 
-/// Runs `cells`, 20 seeds each (gate 15 is judged on 100), several cells at a
+/// Runs `cells`, [`SEEDS`] seeds each (gate 15: [`GATE_15_SEEDS`]), several cells at a
 /// time (each cell's runs stay on one thread, in seed order, so results are
 /// as if run alone), printing each.
 fn run_gate_cells(gate: &str, cells: Vec<Cell>) -> Vec<GateCell> {
     let threads = std::thread::available_parallelism().map_or(2, |n| n.get().clamp(2, 8));
-    let seeds = if gate == "15" { 0..100 } else { 0..20 };
+    let seeds = if gate == "15" {
+        0..GATE_15_SEEDS
+    } else {
+        0..SEEDS
+    };
     let mut results = Vec::new();
     for chunk in cells.chunks(threads) {
         let runs: Vec<_> = std::thread::scope(|scope| {
@@ -620,7 +630,7 @@ fn native_setup_gate_14_late_server_with_travel() {
 /// (`OVERLAP_BEFORE_END`) are held to it. A premise checks the loss is
 /// applied.
 #[test]
-fn native_setup_gate_15_handshake_loss_baseline() {
+fn native_setup_gate_15_handshake_loss_meets_the_criterion() {
     let lossy = Extra {
         handshake_loss_pct: 10,
         ..Extra::default()

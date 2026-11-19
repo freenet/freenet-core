@@ -48,7 +48,9 @@ pub(crate) const MIN_WINDOW_LEFT: Duration = Duration::from_secs(4);
 /// first. The first is never cancelled for it: both run until one finishes
 /// or the window ends. A first attempt that ERRORS before that point (a hard
 /// refusal, not a loss, which shows as a timeout) ends the setup with its
-/// error and starts no second, so no second charge is taken. A lost Handshake packet late in the first attempt
+/// error and starts no second, so no second charge is taken. The offset is
+/// fixed, not jittered: it is a single hedge, not a retry loop. A lost
+/// Handshake packet late in the first attempt
 /// leaves its next probe (backed off from a round trip inflated by the
 /// setup's own losses) past the window; the second attempt's fresh handshake
 /// does not wait on it. Timed from the window's END rather than its start so
@@ -323,8 +325,10 @@ where
 }
 
 /// Set up a native connection from `peer` as the server: allow the peer as
-/// native, punch, and take its attempts one at a time until one completes
-/// its handshake, then exchange Hellos, all before the window ends
+/// native, punch, and run up to [`MAX_IN_FLIGHT`] (2) attempts' handshakes at
+/// once (a client's first and its overlapping second); the first to complete
+/// its handshake is the connection and the other is dropped. Then exchange
+/// Hellos, all before the window ends
 /// (`deadline`, cut to [`NATIVE_WINDOW`] + [`SERVER_WINDOW_ALLOWANCE`] from
 /// now). The
 /// budget is charged after the waiter and the allow, which can fail without
@@ -355,6 +359,13 @@ pub(in crate::transport) async fn accept_native<T: TimeSource>(
         let mut handshakes = futures::stream::FuturesUnordered::new();
         let mut open = true;
         loop {
+            // `biased`: finished handshakes first, then new attempts, so a
+            // completed connection is taken before more work is queued. The
+            // new-attempt arm cannot starve: `handshakes` never holds more
+            // than MAX_IN_FLIGHT (2) entries (the router hands over no more
+            // until a guard drops), so the first arm runs at most twice
+            // before it has nothing ready, and an attempt that completes
+            // while another waits still wins.
             tokio::select! {
                 biased;
                 Some((done, _in_flight)) = futures::StreamExt::next(&mut handshakes), if !handshakes.is_empty() => {
@@ -562,6 +573,149 @@ mod tests {
             assert!(matches!(result.0, Err(NativeSetupError::AlreadyWaiting)));
             assert_eq!(calls.load(Ordering::SeqCst), 1, "no second attempt");
             assert_eq!(result.1, 3, "no second charge");
+        });
+    }
+
+    /// Runs `race_attempts` against a script: attempt `i` (0 first, 1
+    /// second) finishes after `plan[i].0` ms from its own start, with its
+    /// index if `plan[i].1` and an error otherwise (AlreadyWaiting for the
+    /// first, TooLate for the second). `spent` further charges are taken
+    /// first. Returns the result, attempts started, time taken and charges
+    /// still available.
+    async fn run_race(
+        name: &'static str,
+        plan: [(u64, bool); 2],
+        spent: usize,
+    ) -> (Result<usize, NativeSetupError>, usize, Duration, usize) {
+        let net = crate::transport::test_net::subnet();
+        let pair = pair(name, net.addr(1), net.addr(2), None).await;
+        let clock = pair.time.clone();
+        let addr = pair.b_addr;
+        let start = clock.now();
+        let budget = charged_once(addr, start);
+        for _ in 0..spent {
+            assert_eq!(budget.charge(addr, CLIENT_BYTES_PER_DIAL, start), Ok(()));
+        }
+        let end = start + NATIVE_WINDOW;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (c, clk) = (calls.clone(), clock.clone());
+        let (result, took, left) = drive(&pair.time, LIMIT, async move {
+            let attempt = || {
+                let index = c.fetch_add(1, Ordering::SeqCst);
+                let (ms, ok) = plan[index];
+                let clock = clk.clone();
+                async move {
+                    clock.sleep(Duration::from_millis(ms)).await;
+                    match (ok, index) {
+                        (true, i) => Ok(i),
+                        (false, 0) => Err(NativeSetupError::AlreadyWaiting),
+                        (false, _) => Err(NativeSetupError::TooLate),
+                    }
+                }
+            };
+            let result = race_attempts(attempt, &budget, addr, &clk, end).await;
+            let took = clk.now() - start;
+            (result, took, charges_left(&budget, addr, clk.now()))
+        })
+        .await;
+        (result, calls.load(Ordering::SeqCst), took, left)
+    }
+
+    /// The overlap point is 3 s into the 8 s window (5 s before its end).
+    /// A second attempt the punch budget refuses is not started and not
+    /// charged; the first continues alone and can still succeed.
+    #[test]
+    fn a_refused_second_attempt_leaves_the_first_running() {
+        bounded(|| async {
+            // Four charges (64 KiB) spent: the refill by 3 s does not cover
+            // a fifth.
+            let (result, calls, _, _) =
+                run_race("native-race-refused", [(5_000, true), (0, true)], 3).await;
+            assert_eq!(result.expect("the first succeeds"), 0);
+            assert_eq!(calls, 1, "no second attempt");
+        });
+    }
+
+    /// The first fails after the second started: its error waits for the
+    /// second's outcome. If the second succeeds it wins.
+    #[test]
+    fn a_first_failure_after_the_second_started_waits_for_the_second() {
+        bounded(|| async {
+            let (result, calls, took, _) = run_race(
+                "native-race-first-fails-second-wins",
+                [(4_000, false), (3_000, true)],
+                0,
+            )
+            .await;
+            assert_eq!(result.expect("the second succeeds"), 1);
+            assert_eq!(calls, 2);
+            assert_eq!(took, Duration::from_secs(6), "waited for the second");
+        });
+    }
+
+    /// The first fails after the second started and the second fails too:
+    /// the first's error is the setup's, at the second's end.
+    #[test]
+    fn both_attempts_failing_returns_the_first_error() {
+        bounded(|| async {
+            let (result, calls, took, _) =
+                run_race("native-race-both-fail", [(4_000, false), (2_000, false)], 0).await;
+            assert!(
+                matches!(result, Err(NativeSetupError::AlreadyWaiting)),
+                "{result:?}"
+            );
+            assert_eq!(calls, 2);
+            assert_eq!(took, Duration::from_secs(5));
+        });
+    }
+
+    /// The second fails while the first runs: the first continues and wins.
+    #[test]
+    fn a_failed_second_attempt_leaves_the_first_running() {
+        bounded(|| async {
+            let (result, calls, took, _) = run_race(
+                "native-race-second-fails",
+                [(6_000, true), (1_000, false)],
+                0,
+            )
+            .await;
+            assert_eq!(result.expect("the first succeeds"), 0);
+            assert_eq!(calls, 2);
+            assert_eq!(took, Duration::from_secs(6));
+        });
+    }
+
+    /// Both attempts still pending when the window ends: TimedOut, at the
+    /// window's end, both charged.
+    #[test]
+    fn both_attempts_pending_at_the_window_end_time_out() {
+        bounded(|| async {
+            let (result, calls, took, left) =
+                run_race("native-race-timeout", [(60_000, true), (60_000, true)], 0).await;
+            assert!(
+                matches!(result, Err(NativeSetupError::TimedOut)),
+                "{result:?}"
+            );
+            assert_eq!(calls, 2);
+            assert_eq!(took, NATIVE_WINDOW);
+            // The destination's budget refills about 8.7 KB over the window, so
+            // three more fit after two charges (as in the silent-peer test);
+            // `calls` is what shows the second was started and charged.
+            assert_eq!(left, 3);
+        });
+    }
+
+    /// A first attempt that succeeds exactly at the overlap point wins
+    /// before the second starts: no second attempt, no second charge.
+    #[test]
+    fn a_first_success_at_the_overlap_point_starts_no_second() {
+        bounded(|| async {
+            let (result, calls, took, left) =
+                run_race("native-race-at-overlap", [(3_000, true), (0, true)], 0).await;
+            assert_eq!(result.expect("the first succeeds"), 0);
+            assert_eq!(calls, 1);
+            assert_eq!(took, Duration::from_secs(3));
+            assert_eq!(left, 3, "charged once");
         });
     }
 

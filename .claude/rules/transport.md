@@ -2242,7 +2242,9 @@ ALPN per attempt: an address allowed with allow_native_peer is accepted with
 Router: an attempt from a native-allowed address goes only to
   native::waiters (QuicUpgrades::dispatch), never to an upgrade session. The
   only production registration is in accept_native. Handing an attempt over
-  marks the waiter busy until its InFlight guard drops; others are ignored.
+  counts it against the waiter (up to MAX_IN_FLIGHT, 2: a client's first
+  attempt and its overlapping second) until its InFlight guard drops;
+  further ones are ignored.
   An attempt without a Retry token gets a Retry first (one more round trip
   in the window).
 Hello (native/hello.rs, frozen layout) is exchanged on one uni stream each
@@ -2255,13 +2257,15 @@ Punches (native/punch.rs): byte 0x03 + 8 GlobalRng bytes, sent on the
   250 ms, at most 32 per setup (288 B). A client also sends at most 12
   padded Initials (quinn sends two probes per timeout: 9 in 8 s and a
   close; a Retry does not reset the probe count, so one more after a Retry,
-  11 of 12), so a client setup is charged 14688 B and a server
-  setup 288 B, before anything is sent. PunchBudget: 64 KiB per destination
+  11 of 12), so a client setup is charged 14688 B per attempt (twice, 29376 B,
+  when it starts its overlapping second attempt) and a server setup 288 B,
+  each charge before anything is sent. PunchBudget: 64 KiB per destination
   per minute (an IPv4 address, or an IPv6 /64), and 1 MiB per minute for the
   node (provisional); 4096 destinations remembered, and a new one replaces
   the least recently charged only once that one has refilled (else
   refused, PunchRefusal::Table), so forgetting never gives bytes back early.
-  The silent-peer test checks a client sends no more than it was charged.
+  The silent-peer test checks a client sends no more than it was charged
+  (twice CLIENT_BYTES_PER_DIAL, as its second attempt starts).
 Setup (native/setup.rs): one window, 8 s cut to the caller's deadline, not
   started with less than 4 s left; punching, the handshake and the Hello
   exchange all inside it. The server waits 4 s more
