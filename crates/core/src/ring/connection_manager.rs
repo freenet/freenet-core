@@ -2125,10 +2125,19 @@ impl ConnectionManager {
         }
     }
 
-    /// The address of the oldest transient entry an open connection holds
-    /// (`hold_transient`), for eviction when the budget is spent: closing it
-    /// gives its slot back, so a newcomer is admitted and a host that fills
-    /// the budget has to keep opening connections to keep it full.
+    /// The transient entry to close when the budget is spent: among entries
+    /// an open connection holds (`hold_transient`), the oldest one of the
+    /// source that holds the most slots. Closing it gives its slot back for
+    /// the newcomer. A host filling the budget from one source is the source
+    /// with the most slots, so it mostly evicts its own connections and has
+    /// to keep opening new ones to keep the budget full. A host spread over
+    /// many sources that hold one slot each (many IPv6 /64s, say) ties with
+    /// every honest joiner, and then the oldest held entry overall is
+    /// evicted, which can be an honest joiner's.
+    ///
+    /// Cost: a scan of the registration queue (at most about twice the
+    /// budget plus 64 entries) under its lock, once per arrival at the
+    /// budget.
     pub(crate) fn oldest_held_transient(&self) -> Option<SocketAddr> {
         let mut order = self.transient_order.lock();
         // Entries that were removed or replaced are dropped from the front.
@@ -2142,12 +2151,26 @@ impl ConnectionManager {
             }
             order.pop_front();
         }
-        order.iter().find_map(|(addr, generation)| {
-            self.transient_connections
+        // One pass, oldest first: the first held entry of the largest
+        // source wins (a later one replaces it only from a larger source).
+        let mut best: Option<(usize, SocketAddr)> = None;
+        for (addr, generation) in order.iter() {
+            let held = self
+                .transient_connections
                 .get(addr)
-                .filter(|entry| entry.generation == *generation && entry.held)
-                .map(|_| *addr)
-        })
+                .is_some_and(|entry| entry.generation == *generation && entry.held);
+            if !held {
+                continue;
+            }
+            let slots = self
+                .transient_per_source
+                .get(&TransientSource::of(*addr))
+                .map_or(0, |count| *count);
+            if best.is_none_or(|(most, _)| slots > most) {
+                best = Some((slots, *addr));
+            }
+        }
+        best.map(|(_, addr)| addr)
     }
 
     /// Counts a transient entry closed to admit a newcomer.

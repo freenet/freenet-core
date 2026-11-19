@@ -2587,6 +2587,16 @@ impl P2pConnManager {
                     current = cm.transient_count(),
                     "Transient connection budget exhausted; dropping inbound connection before insert"
                 );
+                // As the refusal at the top: whoever waits for this
+                // connection is told it failed.
+                if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
+                    for mut cb in callbacks {
+                        // Best effort - caller will handle the connection failure
+                        #[allow(clippy::let_underscore_must_use)]
+                        let _ = cb.send_result(Err(None)).await;
+                    }
+                }
+                state.awaiting_connection_txs.remove(&peer_addr);
                 return Ok(());
             }
         }
@@ -2960,12 +2970,15 @@ impl P2pConnManager {
                     let already_transient = connection_manager.is_transient(peer_addr);
                     let cm = connection_manager.clone();
                     let mut registered = cm.register_transient(peer_addr, Some(loc));
+                    let mut promoted_meanwhile = false;
                     if registered == Err(crate::ring::TransientRefusal::Budget) {
                         // The budget is spent by sources each within their
-                        // share. Close the oldest unpromoted connection and
-                        // admit this one, so whoever fills the budget has to
-                        // keep opening connections to keep it full, rather
-                        // than holding it and refusing every joiner.
+                        // share. Close an unpromoted connection (the oldest
+                        // of the source holding the most slots, see
+                        // `oldest_held_transient`) and admit this one, so
+                        // whoever fills the budget has to keep opening
+                        // connections to keep it full, rather than holding
+                        // it and refusing every joiner.
                         if let Some(victim) = cm.oldest_held_transient() {
                             cm.record_transient_eviction(victim);
                             self.drop_connection_by_addr(
@@ -2974,11 +2987,24 @@ impl P2pConnManager {
                                 crate::tracing::DisconnectReason::ConnectionLimitReached,
                             )
                             .await;
-                            registered = cm.register_transient(peer_addr, Some(loc));
+                            // Closing the victim can release a key a pending
+                            // claim on this connection names, which binds the
+                            // claim and promotes this connection into the
+                            // ring (`release_identity`). Then it is not
+                            // transient and must not take a slot.
+                            promoted_meanwhile = cm.has_connection_or_pending(peer_addr);
+                            if !promoted_meanwhile {
+                                registered = cm.register_transient(peer_addr, Some(loc));
+                            }
                         }
                     }
                     let connection_manager = &cm;
-                    if let Err(refusal) = registered {
+                    if promoted_meanwhile {
+                        tracing::debug!(
+                            %peer_addr,
+                            "Promoted while the transient budget evicted; not registered as transient"
+                        );
+                    } else if let Err(refusal) = registered {
                         // The budget bounds the connections held outside the
                         // ring. An inbound connection nobody expected arrives
                         // with `is_transient == false`, so the check at the
