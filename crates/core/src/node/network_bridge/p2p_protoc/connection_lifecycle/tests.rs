@@ -5103,10 +5103,10 @@ async fn a_held_native_connection_that_closes_leaves_the_udp_entry() {
 
 /// A frame reported by a connection that is neither the entry nor the held
 /// one (a replaced connection's listener) changes nothing, and a held
-/// native connection is dropped once its UDP entry is gone, whatever the
-/// window says.
+/// native connection is dropped once its UDP entry is removed, whatever the
+/// window says (so it cannot be promoted onto a later entry).
 #[tokio::test]
-async fn a_stray_first_frame_and_an_orphaned_hold_change_nothing() {
+async fn a_stray_first_frame_changes_nothing_and_removal_drops_the_hold() {
     let mut h = Harness::new("hold-stray").await;
     let addr: SocketAddr = "203.0.113.232:6531".parse().unwrap();
     let peer = PeerKeyLocation::new(key(), addr);
@@ -5119,21 +5119,80 @@ async fn a_stray_first_frame_and_an_orphaned_hold_change_nothing() {
     assert!(h.mgr.held_native.contains_key(&addr), "still held");
     assert!(!h.mgr.connections[&addr].native);
     assert_eq!(survivor_here(), survivors);
-    let udp_id = h.mgr.connections[&addr].connection_id;
-    h.transport_closed(addr).await;
-    assert!(
-        h.mgr.held_native.contains_key(&addr),
-        "premise: not yet seen"
+    h.mgr.remove_connection(addr);
+    assert!(h.mgr.held_native.is_empty(), "removed with its entry");
+    // A new UDP entry for the same peer and address is not promoted onto by
+    // a frame from the old session's native connection.
+    h.handshake_event(Arrival::OutboundUdp.event(&peer, false))
+        .await;
+    h.mgr.on_native_first_frame(addr, held_id);
+    assert!(!h.mgr.connections[&addr].native);
+    assert_eq!(survivor_here(), survivors);
+}
+
+/// The held connection's deadline is what the event loop wakes for, so
+/// expiry runs with no other event; a frame that arrives after the deadline
+/// does not promote.
+#[tokio::test(start_paused = true)]
+async fn the_hold_has_a_wake_deadline_and_a_late_frame_does_not_promote() {
+    let mut h = Harness::new("hold-deadline").await;
+    let addr: SocketAddr = "203.0.113.234:6550".parse().unwrap();
+    let peer = PeerKeyLocation::new(key(), addr);
+    assert_eq!(h.mgr.held_native_deadline(), None);
+    h.handshake_event(Arrival::OutboundUdp.event(&peer, false))
+        .await;
+    h.handshake_event(Arrival::Native.event(&peer, false)).await;
+    let since = h.mgr.held_native[&addr].since;
+    assert_eq!(
+        h.mgr.held_native_deadline(),
+        Some(since + HELD_NATIVE_WINDOW)
     );
-    let _ = udp_id;
-    h.mgr.expire_held_native(Instant::now());
-    assert!(h.mgr.held_native.is_empty(), "orphaned hold dropped");
+    tokio::time::advance(HELD_NATIVE_WINDOW + Duration::from_millis(1)).await;
+    let held_id = h.mgr.held_native[&addr].connection_id;
+    let survivors = survivor_here();
+    h.mgr.on_native_first_frame(addr, held_id);
+    assert!(h.mgr.held_native.is_empty(), "expired, not promoted");
+    assert!(!h.mgr.connections[&addr].native, "UDP stays");
+    assert_eq!(survivor_here(), survivors);
+    assert_eq!(h.mgr.held_native_deadline(), None);
+    // The loop's wake deadline includes it.
+    const LOOP: &str = include_str!("../../p2p_protoc.rs");
+    assert!(
+        LOOP.contains("ctx.held_native_deadline()"),
+        "the event loop wakes for the held-native deadline"
+    );
+}
+
+/// The peer promoted its native connection on our probe and closed UDP; our
+/// UDP entry's close arrives (in either order against the native frame) while
+/// a native connection is held: it becomes the entry, the ring is untouched.
+#[tokio::test]
+async fn a_closed_udp_entry_hands_over_to_the_held_native_connection() {
+    let mut h = Harness::new("hold-udp-closes").await;
+    let addr: SocketAddr = "203.0.113.235:6560".parse().unwrap();
+    let peer = PeerKeyLocation::new(key(), addr);
+    h.handshake_event(Arrival::OutboundUdp.event(&peer, false))
+        .await;
+    let udp_id = h.mgr.connections[&addr].connection_id;
+    h.handshake_event(Arrival::Native.event(&peer, false)).await;
+    let held_id = h.mgr.held_native[&addr].connection_id;
+    let pair = PairState::of(&h, addr);
+    close_connection(&mut h, addr, udp_id).await;
+    let entry = &h.mgr.connections[&addr];
+    assert!(entry.native, "the held native connection is the entry");
+    assert_eq!(entry.connection_id, held_id);
+    assert!(h.mgr.held_native.is_empty());
+    assert_eq!(PairState::of(&h, addr), pair, "the peer stays connected");
+    // If it is dead too, its own close removes the entry as usual.
+    close_connection(&mut h, addr, held_id).await;
+    assert!(!h.mgr.connections.contains_key(&addr));
 }
 
 /// At most one native connection is held per address: a second native
-/// connection for it is dropped, and the first stays held.
+/// connection for it replaces the first (a re-dial means the old one is
+/// likely stale).
 #[tokio::test]
-async fn one_native_connection_is_held_per_address() {
+async fn a_newer_native_connection_replaces_the_held_one() {
     let mut h = Harness::new("hold-one").await;
     let addr: SocketAddr = "203.0.113.233:6540".parse().unwrap();
     let peer = PeerKeyLocation::new(key(), addr);
@@ -5143,7 +5202,7 @@ async fn one_native_connection_is_held_per_address() {
     let first = h.mgr.held_native[&addr].connection_id;
     h.handshake_event(Arrival::Native.event(&peer, false)).await;
     assert_eq!(h.mgr.held_native.len(), 1);
-    assert_eq!(h.mgr.held_native[&addr].connection_id, first);
+    assert_ne!(h.mgr.held_native[&addr].connection_id, first, "the newer");
 }
 
 /// Gate 16: only a native setup's own end is carried to its requesters. A

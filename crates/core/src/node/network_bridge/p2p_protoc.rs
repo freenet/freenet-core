@@ -1311,6 +1311,9 @@ impl P2pConnManager {
     /// Removes a transport from the connection map and the open-transport set.
     fn remove_connection(&mut self, addr: SocketAddr) -> Option<ConnectionEntry> {
         let removed = self.connections.remove(addr);
+        // A native connection held beside the entry belongs to its session:
+        // it must never be promoted onto a later entry at this address.
+        self.held_native.remove(&addr);
         #[cfg(any(test, feature = "testing"))]
         if removed.is_some() {
             self.trace_transport(addr, None);
@@ -1776,8 +1779,11 @@ impl P2pConnManager {
                     &mut select_stream,
                     zombie_sweep::earliest(
                         zombie_sweep_state.backlog_deadline(),
-                        pending_claim_retry
-                            .deadline(ctx.addr_by_pub_key.may_have_pending_claims()),
+                        zombie_sweep::earliest(
+                            pending_claim_retry
+                                .deadline(ctx.addr_by_pub_key.may_have_pending_claims()),
+                            ctx.held_native_deadline(),
+                        ),
                     ),
                 ) => {
                     match wake {

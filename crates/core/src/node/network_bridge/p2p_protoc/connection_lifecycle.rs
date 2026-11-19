@@ -2063,7 +2063,7 @@ impl P2pConnManager {
     /// Keeps `connection` as the held native connection for the entry at
     /// `peer_addr`, bound to `key`, with its listener running. Callers check
     /// the entry exists and is UDP under `key`. A second native connection
-    /// for an address already holding one is dropped: the first stays.
+    /// for an address already holding one replaces it (the newer is kept).
     async fn hold_native(
         &mut self,
         peer_addr: SocketAddr,
@@ -2073,9 +2073,10 @@ impl P2pConnManager {
         let Some(entry) = self.connections.get(&peer_addr) else {
             return Ok(());
         };
-        if self.held_native.contains_key(&peer_addr) {
-            return Ok(());
-        }
+        // A second native connection for an address that already holds one
+        // replaces it: a re-dial means the older one is likely stale. Dropping
+        // the old `HeldNative` drops its sender, which closes its connection;
+        // its later `TransportClosed` carries the old id and is ignored.
         let link_use = entry.link_use.clone();
         let connection_id = next_connection_id();
         let (tx, rx) = mpsc::channel(10);
@@ -2234,6 +2235,15 @@ impl P2pConnManager {
     /// gone, replaced, or no longer UDP under the same key. Dropping the
     /// sender closes the connection. Cheap when nothing is held; the event
     /// loop runs it on every iteration.
+    /// When the earliest held native connection's window ends, for the event
+    /// loop's wake-up, so expiry runs on a quiet node.
+    pub(super) fn held_native_deadline(&self) -> Option<Instant> {
+        self.held_native
+            .values()
+            .map(|held| held.since + HELD_NATIVE_WINDOW)
+            .min()
+    }
+
     pub(super) fn expire_held_native(&mut self, now: Instant) {
         if self.held_native.is_empty() {
             return;
@@ -2266,6 +2276,9 @@ impl P2pConnManager {
     /// A first-frame report or a close for a connection that is held beside
     /// an entry (or is the entry): see [`HeldNative`].
     fn on_native_first_frame(&mut self, remote_addr: SocketAddr, connection_id: u64) {
+        // A frame that arrives after the hold's deadline does not promote:
+        // the hold is dropped first, as the sweep would have.
+        self.expire_held_native(Instant::now());
         if let Some(entry) = self.connections.get_mut(&remote_addr) {
             if entry.connection_id == connection_id {
                 entry.frame_seen = true;
@@ -3127,6 +3140,24 @@ impl P2pConnManager {
                         );
                         return Ok(EventResult::Continue);
                     }
+                }
+                // The UDP entry closed while a native connection is held beside
+                // it for the same key: the peer may have promoted that native
+                // connection and dropped UDP (the two can arrive in either
+                // order), so it becomes the entry, as the connection the peer
+                // chose, rather than the peer being torn down. If it is dead
+                // too, its own close removes the entry as usual.
+                if self.held_native.get(&remote_addr).is_some_and(|held| {
+                    self.connections
+                        .get(&remote_addr)
+                        .is_some_and(|e| !e.native && e.pub_key() == Some(&held.key))
+                }) {
+                    self.promote_held_native(remote_addr);
+                    if let Some(entry) = self.connections.get_mut(&remote_addr) {
+                        // No frame has been seen on it.
+                        entry.frame_seen = false;
+                    }
+                    return Ok(EventResult::Continue);
                 }
                 // Look up the connection directly by address
                 if let Some(entry) = self.remove_connection(remote_addr) {
