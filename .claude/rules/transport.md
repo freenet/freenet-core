@@ -2242,7 +2242,9 @@ ALPN per attempt: an address allowed with allow_native_peer is accepted with
 Router: an attempt from a native-allowed address goes only to
   native::waiters (QuicUpgrades::dispatch), never to an upgrade session. The
   only production registration is in accept_native. Handing an attempt over
-  marks the waiter busy until its InFlight guard drops; others are ignored.
+  counts it against the waiter (up to MAX_IN_FLIGHT, 2: a client's first
+  attempt and its overlapping second) until its InFlight guard drops;
+  further ones are ignored.
   An attempt without a Retry token gets a Retry first (one more round trip
   in the window).
 Hello (native/hello.rs, frozen layout) is exchanged on one uni stream each
@@ -2255,13 +2257,15 @@ Punches (native/punch.rs): byte 0x03 + 8 GlobalRng bytes, sent on the
   250 ms, at most 32 per setup (288 B). A client also sends at most 12
   padded Initials (quinn sends two probes per timeout: 9 in 8 s and a
   close; a Retry does not reset the probe count, so one more after a Retry,
-  11 of 12), so a client setup is charged 14688 B and a server
-  setup 288 B, before anything is sent. PunchBudget: 64 KiB per destination
+  11 of 12), so a client setup is charged 14688 B per attempt (twice, 29376 B,
+  when it starts its overlapping second attempt) and a server setup 288 B,
+  each charge before anything is sent. PunchBudget: 64 KiB per destination
   per minute (an IPv4 address, or an IPv6 /64), and 1 MiB per minute for the
   node (provisional); 4096 destinations remembered, and a new one replaces
   the least recently charged only once that one has refilled (else
   refused, PunchRefusal::Table), so forgetting never gives bytes back early.
-  The silent-peer test checks a client sends no more than it was charged.
+  The silent-peer test checks a client sends no more than it was charged
+  (twice CLIENT_BYTES_PER_DIAL, as its second attempt starts).
 Setup (native/setup.rs): one window, 8 s cut to the caller's deadline, not
   started with less than 4 s left; punching, the handshake and the Hello
   exchange all inside it. The server waits 4 s more
@@ -2269,11 +2273,14 @@ Setup (native/setup.rs): one window, 8 s cut to the caller's deadline, not
   without sending (window, key, waiter, allow). Roles by key order are the
   caller's decision.
 Not decided here (A5): fairness between the requesters that steer setups,
-  for both budgets. A requester steering about 4 client setups a minute at
-  one destination empties that destination's budget, blocking native setups
-  to every peer behind it; steering about 71 a minute empties the node
-  budget, blocking native setups to every destination. Both must be fair
-  before UDP is removed.
+  for both budgets. A client setup that overlaps (a silent or lossy
+  destination) is charged CLIENT_BYTES_PER_DIAL twice, 29376 B, so a
+  requester steering about 2 such setups a minute at one destination empties
+  that destination's budget (PUNCH_BUDGET_BYTES, 64 KiB; about 4 a minute
+  when each setup takes one attempt), blocking native setups to every peer
+  behind it; steering about 35 a minute (about 71 with one attempt each)
+  empties the node budget (NODE_PUNCH_BUDGET_BYTES, 1 MiB), blocking native
+  setups to every destination. Both must be fair before UDP is removed.
 ```
 
 Native connection (`peer_connection/native_connection.rs`, A5a): the
@@ -2476,18 +2483,32 @@ Simulation: every node shares [::1], so the per-destination punch budget
   (quic/native/setup/matrix_tests.rs) runs connect_native/accept_native
   behind NATs over classes, late side and skew, punch loss and round trip;
   every cell of that original matrix establishes. The gate rows added
-  beside it (gates 14, 15, 17) are a baseline: gate 15 (handshake loss) and
-  gate 17's jitter edges do not meet the 95% criterion with one attempt
-  (overlapping attempts and option (b) are the follow-ups). Gate 17's
-  binding-expiry half is NOT demonstrated: at a 5 s lifetime no binding
-  expires inside a setup (measured), and a lifetime short enough to expire
-  one (200 ms) is under the round trip, so it fails every setup whatever the
-  setup does and says nothing about it; those rows were dropped.
+  beside it (gates 14, 15, 17) follow. With 10% loss on Initial and Handshake packets too
+  (gate 15) one attempt established 72-91% at 800 ms (a lost late Handshake
+  packet leaves the next probe past the window), so the client makes
+  OVERLAPPING ATTEMPTS: a second dial (new connection, charged
+  CLIENT_BYTES_PER_DIAL again) OVERLAP_BEFORE_END (5 s) before its window's
+  end, at least OVERLAP_MIN_DELAY after the first; neither is cancelled, and
+  each attempt is the dial plus its Hello exchange, so a first attempt
+  established on the client but not on the server does not end the race.
+  A first attempt that ERRORS before the overlap point ends the setup with
+  that error and starts no second (a hard error is a refusal; loss shows as a
+  timeout, which the overlap covers).
+  The server takes up to MAX_IN_FLIGHT (2) attempts per waiter and runs
+  their handshakes at once. Gate 15 then 96-100% per cell (100 seeds). Cost:
+  a client setup can spend two charges, so about two overlapped setups per
+  destination per minute fit PUNCH_BUDGET_BYTES instead of four. Jitter at
+  the window edges (gate 17) still fails mostly one-sided (PR-4, option b).
+  Gate 17's binding-expiry half is NOT demonstrated: at a 5 s lifetime no
+  binding expires inside a setup (measured), and a lifetime short enough to
+  expire one (200 ms) is under the round trip, so it fails every setup
+  whatever the setup does and says nothing about it; those rows were dropped.
 Determinism: a plain tokio::select! draws its arm order from tokio's RNG,
   which the seed does not set. bounded_send's loop (every QUIC path, upgrade
   ones included: a send and its deadline ready together now resolve as the
-  send) and the native setup's two selects are `biased` with a documented
-  order, so one seed runs the
+  send) and the native setup's four selects (connect_native, race_attempts,
+  and accept_native's accept loop and accept/deadline select) are `biased`
+  with a documented order, so one seed runs the
   same twice (test_quic_native_connect_is_deterministic). Not
   deterministic_select!: it draws from GlobalRng, which shifts the seed's
   stream for every QUIC test after it.
