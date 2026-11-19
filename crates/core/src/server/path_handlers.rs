@@ -1803,16 +1803,15 @@ async fn unpack_if_stale(
     // concurrently. The task finishes (and releases the lock) regardless of
     // whether anyone is still waiting on it.
     let contract_owned = contract.clone();
-    let state_owned = state_bytes.to_vec();
+    // One owned copy of the state, shared with the blocking task by refcount.
+    let state_shared: Arc<[u8]> = Arc::from(state_bytes);
     let path_owned = path.clone();
     let hash_path_owned = hash_path.clone();
-    tokio::spawn(async move {
+    crate::config::GlobalExecutor::spawn(async move {
         let _guard = _guard;
         let contract = &contract_owned;
-        let state_bytes: &[u8] = &state_owned;
         let path = path_owned;
         let hash_path = hash_path_owned;
-        let state = State::from(state_bytes);
 
         fn err(err: WebContractError, contract: &ContractContainer) -> WebSocketApiError {
             let key = contract.key();
@@ -1833,9 +1832,10 @@ async fn unpack_if_stale(
         // Decompression and file writes are blocking work on up to 100 MB of
         // input; keep them off the async worker.
         let unpack_path = path.clone();
-        let state_owned = state.as_ref().to_vec();
+        #[cfg(test)]
+        unpack_test_gate(&instance_id).await;
         let unpacked = tokio::task::spawn_blocking(move || {
-            WebApp::try_from(state_owned.as_slice()).and_then(|mut web| web.unpack(&unpack_path))
+            WebApp::try_from(&*state_shared).and_then(|mut web| web.unpack(&unpack_path))
         })
         .await
         .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))
@@ -2821,6 +2821,30 @@ fn resolve_web_asset_path(base: &Path, relative: &str) -> Result<PathBuf, WebSoc
             Ok(canonical_file)
         }
         _ => Ok(joined),
+    }
+}
+
+/// Test hook: when set for a contract, the detached unpack signals `started`
+/// and then waits for a permit on `release` before doing the blocking unpack,
+/// so a test can drop the caller's future while the unpack is provably in
+/// progress.
+#[cfg(test)]
+static UNPACK_TEST_GATES: LazyLock<DashMap<ContractInstanceId, UnpackTestGate>> =
+    LazyLock::new(DashMap::new);
+
+#[cfg(test)]
+type UnpackTestGate = (Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>);
+
+#[cfg(test)]
+async fn unpack_test_gate(instance_id: &ContractInstanceId) {
+    let gate = UNPACK_TEST_GATES.get(instance_id).map(|g| g.clone());
+    if let Some((started, release)) = gate {
+        started.notify_one();
+        release
+            .acquire()
+            .await
+            .expect("test gate semaphore is never closed")
+            .forget();
     }
 }
 
@@ -5572,21 +5596,22 @@ mod tests {
         let webapp_cache = cache(root.path(), u64::MAX);
         clear_cache(&instance_id).await;
 
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        UNPACK_TEST_GATES.insert(instance_id, (started.clone(), release.clone()));
+
         let mut first = Box::pin(unpack_if_stale(
             &contract,
             big_state.as_ref(),
             &webapp_cache,
         ));
         let entry_dir = webapp_cache.entry_dir(&instance_id);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !entry_dir.exists() {
-            assert!(std::time::Instant::now() < deadline, "unpack never started");
-            tokio::select! {
-                result = &mut first => panic!("the unpack finished before it was dropped: {result:?}"),
-                () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
-            }
+        // Poll the future until the detached unpack reports it has started and
+        // is parked at the gate, then drop the future.
+        tokio::select! {
+            result = &mut first => panic!("the unpack finished before it was dropped: {result:?}"),
+            () = started.notified() => {}
         }
-        // The directory exists, so the detached task is past `create_dir_all`.
         drop(first);
 
         assert!(
@@ -5594,7 +5619,10 @@ mod tests {
             "the lock was released while the unpack was still running"
         );
 
-        // A second request waits for the first to finish, then replaces it.
+        // Let the parked unpack run; a second request waits for it to finish and
+        // then replaces it.
+        release.add_permits(1);
+        UNPACK_TEST_GATES.remove(&instance_id);
         unpack_if_stale(&contract, small_state.as_ref(), &webapp_cache)
             .await
             .expect("the second unpack must succeed");
