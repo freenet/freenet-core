@@ -158,29 +158,6 @@ impl BroadcastDedupCache {
     }
 }
 
-#[cfg(test)]
-mod dedup_merged_tests {
-    use super::*;
-
-    /// A dedup hit means "seen" until the first copy's merge finishes; only
-    /// then is it "already had it" (#6292 round 1, Should Fix 3).
-    #[test]
-    fn a_seen_payload_counts_as_merged_only_after_its_merge() {
-        let cache = BroadcastDedupCache::new();
-        let key = crate::operations::test_utils::make_contract_key(4);
-        let now = Instant::now();
-        assert!(!cache.check_and_insert(&key, b"delta", true, now));
-        assert!(cache.check_and_insert(&key, b"delta", true, now));
-        assert!(!cache.seen_merged(&key, b"delta", true), "seen, not merged");
-        cache.mark_merged(&key, b"delta", true);
-        assert!(cache.seen_merged(&key, b"delta", true));
-        assert!(
-            !cache.seen_merged(&key, b"delta", false),
-            "a full state with the same bytes is a different payload"
-        );
-    }
-}
-
 /// Result of `get_broadcast_targets_update()` with skip-reason counters
 /// for broadcast delivery diagnostics (issue #3046).
 pub(crate) struct BroadcastTargetResult {
@@ -1958,6 +1935,24 @@ mod messages {
 #[allow(clippy::wildcard_enum_match_arm)]
 mod tests {
     use super::*;
+
+    /// A dedup hit means "seen" until the first copy's merge finishes; only
+    /// then is it "already had it" (#6292 round 1, Should Fix 3).
+    #[test]
+    fn a_seen_payload_counts_as_merged_only_after_its_merge() {
+        let cache = BroadcastDedupCache::new();
+        let key = crate::operations::test_utils::make_contract_key(4);
+        let now = Instant::now();
+        assert!(!cache.check_and_insert(&key, b"delta", true, now));
+        assert!(cache.check_and_insert(&key, b"delta", true, now));
+        assert!(!cache.seen_merged(&key, b"delta", true), "seen, not merged");
+        cache.mark_merged(&key, b"delta", true);
+        assert!(cache.seen_merged(&key, b"delta", true));
+        assert!(
+            !cache.seen_merged(&key, b"delta", false),
+            "a full state with the same bytes is a different payload"
+        );
+    }
     use crate::operations::test_utils::make_contract_key;
 
     /// The borrowed payload a broadcast sender serializes must decode as the
