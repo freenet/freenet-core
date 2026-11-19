@@ -2273,11 +2273,14 @@ Setup (native/setup.rs): one window, 8 s cut to the caller's deadline, not
   without sending (window, key, waiter, allow). Roles by key order are the
   caller's decision.
 Not decided here (A5): fairness between the requesters that steer setups,
-  for both budgets. A requester steering about 4 client setups a minute at
-  one destination empties that destination's budget, blocking native setups
-  to every peer behind it; steering about 71 a minute empties the node
-  budget, blocking native setups to every destination. Both must be fair
-  before UDP is removed.
+  for both budgets. A client setup that overlaps (a silent or lossy
+  destination) is charged CLIENT_BYTES_PER_DIAL twice, 29376 B, so a
+  requester steering about 2 such setups a minute at one destination empties
+  that destination's budget (PUNCH_BUDGET_BYTES, 64 KiB; about 4 a minute
+  when each setup takes one attempt), blocking native setups to every peer
+  behind it; steering about 35 a minute (about 71 with one attempt each)
+  empties the node budget (NODE_PUNCH_BUDGET_BYTES, 1 MiB), blocking native
+  setups to every destination. Both must be fair before UDP is removed.
 ```
 
 Native connection (`peer_connection/native_connection.rs`, A5a): the
