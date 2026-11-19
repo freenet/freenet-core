@@ -567,8 +567,8 @@ pub fn build_transfer_card(snap: &Option<network_status::NetworkStatusSnapshot>)
         String::new()
     };
 
-    // `avg_cwnd_bytes` is `None` when no bounded window was sampled (e.g.
-    // FixedRate, which has no meaningful cwnd), so the row is hidden.
+    // `avg_cwnd_bytes` is `None` when no bounded window was sampled, so the
+    // row is hidden.
     let cwnd_str = if let Some(avg_cwnd) = ts.avg_cwnd_bytes.filter(|v| *v > 0) {
         format!(
             r#"<div class="transfer-stat">

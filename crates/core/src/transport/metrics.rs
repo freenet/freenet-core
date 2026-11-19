@@ -2516,8 +2516,8 @@ impl TransportMetrics {
             })
             .ok();
 
-        // Update cwnd stats. A controller without a bounded window (FixedRate)
-        // reports `None`; recording its effectively-infinite window would make
+        // Update cwnd stats. A controller without a bounded window reports
+        // `None`; recording an effectively-infinite window would make
         // the snapshot's avg/peak/min cwnd a sentinel rather than a value.
         if let Some(final_cwnd) = stats.final_cwnd_bytes {
             self.record_cwnd_sample(final_cwnd);
@@ -3665,8 +3665,8 @@ pub struct TransportSnapshot {
     /// Peak throughput observed (bytes per second).
     pub peak_throughput_bps: u64,
     /// Average congestion window size in bytes. `None` (JSON null) if no
-    /// bounded cwnd was sampled, e.g. when every transfer ran under the
-    /// FixedRate controller, which has no meaningful window.
+    /// bounded cwnd was sampled. FixedRate reports its flight-size ceiling
+    /// (or a loss pause's lower window).
     ///
     /// Type change: this was a `u32` that read `0` (or, under FixedRate,
     /// a `u32::MAX`-derived sentinel) with no samples. A typed consumer must
@@ -5787,8 +5787,8 @@ mod tests {
         assert_eq!(metrics.cumulative_packets().0, 3, "cumulative is not reset");
     }
 
-    /// A FixedRate transfer has no bounded cwnd. It must not feed the cwnd
-    /// accumulators, and `avg_cwnd_bytes` must then be null, not a sentinel.
+    /// A transfer with no bounded cwnd must not feed the cwnd accumulators,
+    /// and `avg_cwnd_bytes` must then be null, not a sentinel.
     #[test]
     fn unbounded_cwnd_transfer_leaves_avg_cwnd_null() {
         let metrics = TransportMetrics::new();

@@ -644,12 +644,18 @@ impl P2pConnManager {
         }
         let key = key.clone();
         let connection_manager = &self.bridge.op_manager.ring.connection_manager;
-        let was_transient = connection_manager.drop_transient(peer_addr);
+        // Read, not removed: the connection keeps its transient slot unless
+        // the ring takes it (`add_connection` removes the entry), so a
+        // promotion refused at the cap leaves it counted.
+        let was_transient = connection_manager.transient_entry(peer_addr);
 
         // Promote if: (a) was tracked as transient, OR (b) not already in ring.
-        // Case (b) handles expired transient TTL: transport preserved per 76058cf4
-        // but tracking entry gone. Without this, CONNECT succeeds but peer is never
-        // added to ring topology (#3113).
+        // Case (b) handles an open connection with no tracking entry (#3113:
+        // the entry used to expire at the TTL while the transport stayed open;
+        // an open connection now holds its entry until it is promoted or
+        // closed, so this is the fallback for one that never had one).
+        // Without this, CONNECT succeeds but peer is never added to ring
+        // topology.
         let needs_promotion = was_transient.is_some() || !connection_manager.is_in_ring(peer_addr);
         let transient_expired = was_transient.is_none() && needs_promotion;
 
@@ -682,6 +688,7 @@ impl P2pConnManager {
                     transient_expired,
                     "connect_peer: rejecting transient promotion to enforce cap"
                 );
+                self.count_refused_promotion(peer_addr);
                 return Promotion::Refused;
             }
             // The key promoted is the one the caller passed: for a
@@ -724,6 +731,7 @@ impl P2pConnManager {
                     .connection_manager
                     .is_in_ring(peer_addr)
             {
+                self.count_refused_promotion(peer_addr);
                 return Promotion::Refused;
             }
             // A promotion only when the ring took an address it did not hold.
@@ -779,6 +787,33 @@ impl P2pConnManager {
         }
 
         Promotion::AlreadyInRing
+    }
+
+    /// A connection the ring refused stays open outside it, so it must hold a
+    /// transient slot like any other such connection. One with no entry (it
+    /// never had one) is registered and held here; when the budget or its
+    /// source's share refuses that, it stays uncounted and
+    /// [`Self::uncounted_outside_ring`] reports it, for the caller to close.
+    fn count_refused_promotion(&self, peer_addr: SocketAddr) {
+        let cm = &self.bridge.op_manager.ring.connection_manager;
+        if cm.is_transient(peer_addr) || cm.is_in_ring(peer_addr) {
+            return;
+        }
+        if cm
+            .register_transient(peer_addr, Some(Location::from_address(&peer_addr)))
+            .is_ok()
+        {
+            cm.hold_transient(peer_addr);
+        }
+    }
+
+    /// An open connection at `peer_addr` that is neither in the ring nor
+    /// holding a transient slot.
+    fn uncounted_outside_ring(&self, peer_addr: SocketAddr) -> bool {
+        let cm = &self.bridge.op_manager.ring.connection_manager;
+        self.connections.contains_key(&peer_addr)
+            && !cm.is_transient(peer_addr)
+            && !cm.is_in_ring(peer_addr)
     }
 
     // `origin` is telemetry carried alongside the dial; bundling it with the
@@ -965,6 +1000,16 @@ impl P2pConnManager {
                         );
                     })
                     .ok();
+                // Kept open, it would be outside the ring and uncounted.
+                if self.uncounted_outside_ring(peer_addr) {
+                    self.drop_connection_by_addr(
+                        peer_addr,
+                        handshake_commands,
+                        crate::tracing::DisconnectReason::ConnectionLimitReached,
+                    )
+                    .await;
+                    fail_awaiting_connection_callbacks(state, peer_addr).await;
+                }
                 return Ok(());
             }
 
@@ -2530,16 +2575,29 @@ impl P2pConnManager {
             );
         }
 
+        // The slot taken at the top of this function is gone if the
+        // replacement above released the old connection's slot at this
+        // address; take it again. Registering an address already tracked
+        // succeeds without taking a second slot.
         if is_transient {
             let cm = &self.bridge.op_manager.ring.connection_manager;
-            let current = cm.transient_count();
-            if current >= cm.transient_budget() {
+            if !cm.try_register_transient(peer_addr, None) {
                 tracing::warn!(
                     remote = %peer_addr,
                     budget = cm.transient_budget(),
-                    current,
+                    current = cm.transient_count(),
                     "Transient connection budget exhausted; dropping inbound connection before insert"
                 );
+                // As the refusal at the top: whoever waits for this
+                // connection is told it failed.
+                if let Some(callbacks) = state.awaiting_connection.remove(&peer_addr) {
+                    for mut cb in callbacks {
+                        // Best effort - caller will handle the connection failure
+                        #[allow(clippy::let_underscore_must_use)]
+                        let _ = cb.send_result(Err(None)).await;
+                    }
+                }
+                state.awaiting_connection_txs.remove(&peer_addr);
                 return Ok(());
             }
         }
@@ -2911,38 +2969,139 @@ impl P2pConnManager {
                     // budget refused it (nothing inserted at all). Only a fresh
                     // insertion is a "transient registered".
                     let already_transient = connection_manager.is_transient(peer_addr);
-                    let registered =
-                        connection_manager.try_register_transient(peer_addr, Some(loc));
-                    if registered && !already_transient {
-                        crate::node::network_status::record_bootstrap_transient_registered();
-                    }
-                    tracing::info!(
-                        peer_id = ?peer_id,
-                        %peer_addr,
-                        "Registered transient connection (not added to ring topology)"
-                    );
-                    let ttl = connection_manager.transient_ttl();
                     let cm = connection_manager.clone();
-                    GlobalExecutor::spawn(async move {
-                        sleep(ttl).await;
-                        if cm.drop_transient(peer_addr).is_some() {
-                            // Only remove the transient tracking entry. Do NOT
-                            // dispatch DropConnection — that tears down the
-                            // underlying transport, killing any in-progress
-                            // CONNECT handshake. If the CONNECT succeeds later,
-                            // handle_connect_peer() will detect the missing
-                            // transient entry via is_in_ring() and still promote
-                            // the peer to ring topology (see #3113 fix). If it
-                            // never succeeds, the transport idle timeout handles
-                            // cleanup.
-                            crate::node::network_status::record_bootstrap_transient_expired();
-                            tracing::info!(
-                                %peer_addr,
-                                "Transient connection expired; removed tracking entry \
-                                 (transport preserved, handle_connect_peer will promote via fallback)"
+                    let mut registered = cm.register_transient(peer_addr, Some(loc));
+                    let mut promoted_meanwhile = false;
+                    if registered == Err(crate::ring::TransientRefusal::Budget) {
+                        // The budget is spent by sources each within their
+                        // share. Close an unpromoted connection (the oldest
+                        // of the source holding the most slots, see
+                        // `oldest_held_transient`) and admit this one, so
+                        // whoever fills the budget has to keep opening
+                        // connections to keep it full, rather than holding
+                        // it and refusing every joiner.
+                        // A native leg is never evicted: neither an entry
+                        // that is a QUIC-native connection nor a UDP entry
+                        // with one held beside it (`held_native`), since
+                        // closing either ends a native path. A UDP session
+                        // cannot have a QUIC path while it is unpromoted
+                        // (the upgrade starts only at promotion, which takes
+                        // the connection out of this pool).
+                        let victim = cm.oldest_held_transient(|addr| {
+                            self.held_native.contains_key(&addr)
+                                || self.connections.get(&addr).is_some_and(|e| e.native)
+                        });
+                        if let Some(victim) = victim {
+                            cm.record_transient_eviction(victim);
+                            self.drop_connection_by_addr(
+                                victim,
+                                handshake_commands,
+                                crate::tracing::DisconnectReason::ConnectionLimitReached,
+                            )
+                            .await;
+                            fail_awaiting_connection_callbacks(state, victim).await;
+                            // Closing the victim can release a key a pending
+                            // claim on this connection names, which binds the
+                            // claim and promotes this connection into the
+                            // ring (`release_identity`). Then it is not
+                            // transient and must not take a slot.
+                            promoted_meanwhile = cm.has_connection_or_pending(peer_addr);
+                            if !promoted_meanwhile {
+                                registered = cm.register_transient(peer_addr, Some(loc));
+                            }
+                        }
+                    }
+                    let connection_manager = &cm;
+                    if promoted_meanwhile {
+                        tracing::debug!(
+                            %peer_addr,
+                            "Promoted while the transient budget evicted; not registered as transient"
+                        );
+                    } else if let Err(refusal) = registered {
+                        // The budget bounds the connections held outside the
+                        // ring. An inbound connection nobody expected arrives
+                        // with `is_transient == false`, so the check at the
+                        // top of this function did not count it and this is
+                        // the first place it is counted. Kept after a refusal,
+                        // it would be an open connection the budget does not
+                        // count, so it is closed, as at the top. A refusal for
+                        // the source's share is counted and logged by the
+                        // connection manager.
+                        if refusal == crate::ring::TransientRefusal::Budget {
+                            tracing::warn!(
+                                remote = %peer_addr,
+                                budget = connection_manager.transient_budget(),
+                                current = connection_manager.transient_count(),
+                                "Transient connection budget exhausted; dropping inbound connection"
                             );
                         }
-                    });
+                        self.drop_connection_by_addr(
+                            peer_addr,
+                            handshake_commands,
+                            crate::tracing::DisconnectReason::ConnectionLimitReached,
+                        )
+                        .await;
+                        fail_awaiting_connection_callbacks(state, peer_addr).await;
+                    } else {
+                        // The connection stays open outside the ring, so it
+                        // keeps its slot until it is promoted or closed
+                        // (`Ring::prune_connection`), not for `transient_ttl`:
+                        // a slot given back while the transport stays open
+                        // would let the budget be filled again every TTL.
+                        // The held entry is exempt from age expiry and
+                        // bounded only by the connection closing (zombie
+                        // sweep or transport idle timeout), which is not
+                        // guaranteed for a connection kept open indefinitely
+                        // (#5922); eviction at the budget limits how many
+                        // slots such entries can take.
+                        connection_manager.hold_transient(peer_addr);
+                        if !already_transient {
+                            crate::node::network_status::record_bootstrap_transient_registered();
+                        }
+                        tracing::info!(
+                            peer_id = ?peer_id,
+                            %peer_addr,
+                            "Registered transient connection (not added to ring topology)"
+                        );
+                        let ttl = connection_manager.transient_ttl();
+                        let cm = connection_manager.clone();
+                        // Keyed to this entry, so a later connection or a
+                        // new registration at the address is not counted.
+                        let generation = cm.transient_generation(peer_addr);
+                        GlobalExecutor::spawn(async move {
+                            sleep(ttl).await;
+                            // #4787's series keeps its meaning: a
+                            // registration whose TTL elapsed before it was
+                            // promoted, whether the connection is still open
+                            // or has closed.
+                            match cm.transient_ttl_outcome(peer_addr, generation) {
+                                crate::ring::TransientTtlOutcome::Promoted => {}
+                                crate::ring::TransientTtlOutcome::Closed => {
+                                    crate::node::network_status::record_bootstrap_transient_expired(
+                                    );
+                                }
+                                crate::ring::TransientTtlOutcome::StillHeld => {
+                                    crate::node::network_status::record_bootstrap_transient_expired(
+                                    );
+                                    // Do NOT dispatch DropConnection: that
+                                    // tears down the transport, killing any
+                                    // in-progress CONNECT. If the CONNECT
+                                    // succeeds later, handle_connect_peer()
+                                    // promotes the peer (#3113). Otherwise
+                                    // the slot is given back only when the
+                                    // connection closes (zombie sweep or
+                                    // transport idle timeout), which is not
+                                    // guaranteed for one kept open
+                                    // indefinitely (#5922).
+                                    tracing::info!(
+                                        %peer_addr,
+                                        "Transient connection past its TTL unpromoted \
+                                         (transport preserved, budget slot held until promoted or closed)"
+                                    );
+                                }
+                            }
+                        });
+                    }
                 }
             }
         } else if is_transient {
@@ -3236,6 +3395,20 @@ impl P2pConnManager {
             }
         }
     }
+}
+
+/// Tells whoever still waits for a connection to `addr` that it failed, for a
+/// connection the transient budget closes: as the refusal at the top of
+/// `handle_successful_connection`, so no waiter is left until its timeout.
+async fn fail_awaiting_connection_callbacks(state: &mut EventListenerState, addr: SocketAddr) {
+    if let Some(callbacks) = state.awaiting_connection.remove(&addr) {
+        for mut cb in callbacks {
+            // Best effort - caller will handle the connection failure
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = cb.send_result(Err(None)).await;
+        }
+    }
+    state.awaiting_connection_txs.remove(&addr);
 }
 
 /// Sends the first-frame probe on a native connection's channel: a message

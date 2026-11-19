@@ -2380,6 +2380,81 @@ pub(in crate::transport) mod tests {
     /// `get_resend` returns `Abandon` and the packet is dropped from tracking,
     /// so it is no longer re-queued (which would otherwise pin flight size
     /// forever). An ACK before the limit resets the count.
+    /// Every way a packet leaves the tracker gives its bytes back to the
+    /// FixedRate controller, so after a cycle of receipts, a retransmitted
+    /// packet confirmed late, timeouts and abandonment, flight size is 0 and
+    /// the controller's whole window is open again. FixedRate's window is
+    /// bounded (`MAX_FLIGHT_SECS`), so a leak here would shrink it for the
+    /// rest of the connection.
+    #[test]
+    fn flight_size_returns_to_zero_after_a_loss_and_abandon_cycle() {
+        use crate::transport::fixed_rate::{FixedRateConfig, FixedRateController};
+        let controller = FixedRateController::new(FixedRateConfig::default());
+        let window = controller.current_cwnd();
+        let mut tracker = mock_sent_packet_tracker();
+        let packet_size = 1_000usize;
+        for packet_id in 0..20u32 {
+            tracker.report_sent_packet(packet_id, vec![0u8; packet_size].into());
+            controller.on_send(packet_size);
+        }
+        let apply = |ack_info: Vec<(Option<Duration>, usize, Option<_>)>| {
+            for (rtt, size, _token) in ack_info {
+                match rtt {
+                    Some(rtt) => controller.on_ack(rtt, size),
+                    None => controller.on_ack_without_rtt(size),
+                }
+            }
+        };
+        // Receipts for the first ten.
+        apply(
+            tracker
+                .report_received_receipts(&(0..10).collect::<Vec<_>>())
+                .0,
+        );
+
+        // The rest time out; packet 10 is confirmed after its first resend,
+        // the others never are.
+        let mut confirmed_late = false;
+        let mut abandoned = 0;
+        for _ in 0..10_000 {
+            tracker.time_source.advance(Duration::from_secs(120));
+            match tracker.get_resend() {
+                ResendAction::Resend(id, packet) => {
+                    controller.on_timeout();
+                    tracker.report_sent_packet(id, packet);
+                    if id == 10 && !confirmed_late {
+                        tracker.mark_retransmitted(id);
+                        apply(tracker.report_received_receipts(&[id]).0);
+                        confirmed_late = true;
+                    }
+                }
+                ResendAction::Abandon { payload_len, .. } => {
+                    controller.release_flightsize(payload_len);
+                    abandoned += 1;
+                }
+                ResendAction::TlpProbe(..) | ResendAction::WaitUntil(_) => {}
+            }
+            if tracker.pending_receipts.is_empty() {
+                break;
+            }
+        }
+        assert!(confirmed_late, "premise: a resent packet was confirmed");
+        assert_eq!(abandoned, 9, "premise: the others were abandoned");
+        assert!(tracker.pending_receipts.is_empty());
+        assert_eq!(controller.flightsize(), 0, "no byte stays in flight");
+        // The loss pause holds until the next receipt, and leaves room to
+        // send; the receipt for that send opens the whole window.
+        assert!(controller.current_cwnd() >= packet_size);
+        controller.on_send(packet_size);
+        controller.on_ack(Duration::from_millis(50), packet_size);
+        assert_eq!(controller.flightsize(), 0);
+        assert_eq!(
+            controller.current_cwnd(),
+            window,
+            "the whole window is open"
+        );
+    }
+
     #[test]
     fn test_issue_4345_packet_abandoned_after_max_retransmits() {
         let mut tracker = mock_sent_packet_tracker();

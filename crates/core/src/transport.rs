@@ -273,8 +273,9 @@ pub struct TransferStats {
     /// Note: This is when we finished SENDING, not when all ACKs arrived.
     pub elapsed: Duration,
     /// Peak congestion window during transfer (bytes). `None` when the
-    /// controller has no bounded window (FixedRate outside a loss pause
-    /// reports an effectively infinite cwnd, which is not a measurement).
+    /// controller has no bounded window (an effectively infinite cwnd is not
+    /// a measurement). FixedRate reports its flight-size ceiling, or the
+    /// lower window of a loss pause.
     pub peak_cwnd_bytes: Option<u32>,
     /// Final congestion window at completion (bytes). `None` under the same
     /// condition as `peak_cwnd_bytes`.

@@ -1712,6 +1712,9 @@ pub struct SimNetwork {
     /// the capability-derived default, so a test can force cache pressure with a
     /// tiny budget and observe demand-driven eviction (#4642 piece A).
     hosting_budget_override: Option<u64>,
+    /// Transient connection budget (`--transient-budget`) for every node this
+    /// network builds, when set ([`SimNetwork::with_transient_budget`]).
+    transient_budget_override: Option<usize>,
     /// Per-node capture slots for the live `Arc<Ring>`, populated by
     /// `run_controlled_simulation` so governance sim tests can read each
     /// node's `contract_ban_list` after the simulation completes. Keyed by
@@ -1933,6 +1936,7 @@ impl SimNetwork {
             broadcast_target_list_floor_override: Some(Self::SIM_MIGRATION_DISABLED_FLOOR),
             hosting_clock: None,
             hosting_budget_override: None,
+            transient_budget_override: None,
             shared_rings: HashMap::new(),
             node_port_override,
             quic_datagram_drops: Vec::new(),
@@ -2743,6 +2747,20 @@ impl SimNetwork {
     /// [`enable_hosting_time_control`]: Self::enable_hosting_time_control
     pub fn hosting_clock(&self) -> Option<crate::util::time_source::SharedMockTimeSource> {
         self.hosting_clock.clone()
+    }
+
+    /// Give every node this network builds `budget` as its transient
+    /// connection budget. Call before `start*`.
+    pub fn with_transient_budget(&mut self, budget: usize) -> &mut Self {
+        self.transient_budget_override = Some(budget);
+        // Patch already-built configs (see `with_hosting_budget`).
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.transient_budget = budget;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.transient_budget = budget;
+        }
+        self
     }
 
     /// Set the per-node hosting-cache byte budget (`max_hosting_storage`) for
@@ -3766,6 +3784,9 @@ impl SimNetwork {
             if let Some(budget) = self.hosting_budget_override {
                 std::sync::Arc::make_mut(&mut config.config).max_hosting_storage = budget;
             }
+            if let Some(budget) = self.transient_budget_override {
+                config.transient_budget = budget;
+            }
             config.key_pair = keypair;
             config.network_listener_ip = ip.into();
             config.network_listener_port = port;
@@ -3872,6 +3893,9 @@ impl SimNetwork {
                 .map(|c| std::sync::Arc::new(c) as crate::util::time_source::DynTimeSource);
             if let Some(budget) = self.hosting_budget_override {
                 std::sync::Arc::make_mut(&mut config.config).max_hosting_storage = budget;
+            }
+            if let Some(budget) = self.transient_budget_override {
+                config.transient_budget = budget;
             }
             for GatewayConfig {
                 peer_key_location,

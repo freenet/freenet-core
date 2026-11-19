@@ -5,6 +5,11 @@
 //! temporarily capped at the current flightsize. This prevents new data
 //! from competing with retransmissions, breaking the congestion cascade
 //! that causes stream stalls. The cap is released after a successful ACK.
+//!
+//! Independently of the loss pause, cwnd never exceeds a flight-size ceiling
+//! (`MAX_FLIGHT_SECS` of data at the configured rate), so the unconfirmed data
+//! a connection keeps for retransmission stays bounded whatever the remote
+//! chooses to confirm.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -49,6 +54,23 @@ const _: () = assert!(
     LOSS_PAUSE_MARGIN >= 10 * MAX_PACKET_SIZE,
     "LOSS_PAUSE_MARGIN must allow enough packets for reliable recovery under loss"
 );
+
+/// Upper bound on flight size (bytes sent and neither confirmed nor
+/// abandoned), in seconds of sending at the configured rate.
+///
+/// The token bucket bounds how fast data is sent, not how much of it stays
+/// unconfirmed, and the `SentPacketTracker` keeps every unconfirmed packet for
+/// retransmission. Which packets are confirmed is the remote's choice, so this
+/// bound must not depend on receipts or timeouts: a remote that confirms one
+/// packet now and then clears the loss pause each time, and would otherwise
+/// be sent new data at the full rate while the tracker kept all of it.
+///
+/// A remote that sends receipts keeps flight size near
+/// `rate * (RTT + receipt delay)`, well under a second of data. The rest is
+/// room for a path that goes quiet for a few seconds and recovers (the 3.4 s
+/// RTT spike of `link_model::r1_tests`). A stream that finds the ceiling full
+/// waits for receipts and fails after `CWND_WAIT_TIMEOUT`.
+pub(crate) const MAX_FLIGHT_SECS: usize = 8;
 
 /// Configuration for the fixed-rate controller.
 #[derive(Debug, Clone)]
@@ -189,21 +211,32 @@ impl<T: TimeSource> FixedRateController<T> {
 
     /// Returns the effective congestion window.
     ///
-    /// Normally returns a very large value so cwnd never blocks (all rate
-    /// limiting is done by the token bucket). When loss_pause is active,
-    /// returns the flightsize captured at loss time + LOSS_PAUSE_MARGIN.
+    /// Normally returns the flight-size ceiling (see `MAX_FLIGHT_SECS`), which
+    /// a peer that sends receipts never approaches, so the token bucket does
+    /// the rate limiting. When loss_pause is active, returns the flightsize
+    /// captured at loss time + LOSS_PAUSE_MARGIN, at most the ceiling.
     /// The captured value is frozen per loss event, but note that successive
     /// retransmission timeouts will re-capture at the current (higher)
-    /// flightsize, effectively sliding the cap upward. This is acceptable
-    /// because the token bucket is the real rate limiter for FixedRate;
-    /// loss_pause primarily prevents complete stalls, not rate reduction.
+    /// flightsize, effectively sliding the cap upward, and any receipt clears
+    /// it. So loss_pause prevents complete stalls; it does not bound flight
+    /// size. The ceiling does.
     pub fn current_cwnd(&self) -> usize {
+        let ceiling = self.flight_ceiling();
         let paused_at = self.loss_pause_cwnd.load(Ordering::Acquire);
         if paused_at > 0 {
-            paused_at + LOSS_PAUSE_MARGIN
+            paused_at.saturating_add(LOSS_PAUSE_MARGIN).min(ceiling)
         } else {
-            usize::MAX / 2
+            ceiling
         }
+    }
+
+    /// `MAX_FLIGHT_SECS` of data at the configured rate, and at least
+    /// LOSS_PAUSE_MARGIN so a very low rate still leaves the loss pause its
+    /// margin.
+    fn flight_ceiling(&self) -> usize {
+        self.rate
+            .saturating_mul(MAX_FLIGHT_SECS)
+            .max(LOSS_PAUSE_MARGIN)
     }
 
     /// Returns the configured fixed rate.
@@ -283,13 +316,101 @@ mod tests {
         assert_eq!(controller.flightsize(), 0);
     }
 
+    /// Outside a loss pause cwnd is the flight-size ceiling: `MAX_FLIGHT_SECS`
+    /// of data at the configured rate, far above what a peer that sends
+    /// receipts leaves in flight, but bounded.
     #[test]
-    fn test_cwnd_always_large() {
+    fn test_cwnd_is_the_flight_ceiling() {
         let controller = FixedRateController::new(FixedRateConfig::default());
+        assert_eq!(
+            controller.current_cwnd(),
+            MAX_FLIGHT_SECS * DEFAULT_RATE_BYTES_PER_SEC
+        );
 
-        // cwnd should be large enough that any reasonable flightsize fits
-        let cwnd = controller.current_cwnd();
-        assert!(cwnd > 1_000_000_000); // At least 1GB
+        // The ceiling follows the configured rate.
+        let fast = FixedRateController::new(FixedRateConfig::from_mbps(50));
+        assert_eq!(fast.current_cwnd(), MAX_FLIGHT_SECS * 6_250_000);
+
+        // A very low or zero rate still leaves the loss pause its margin.
+        let slow = FixedRateController::new(FixedRateConfig::new(1_000));
+        assert_eq!(slow.current_cwnd(), LOSS_PAUSE_MARGIN);
+        let zero = FixedRateController::new(FixedRateConfig::new(0));
+        assert_eq!(zero.current_cwnd(), LOSS_PAUSE_MARGIN);
+
+        // An absurd rate does not overflow.
+        let huge = FixedRateController::new(FixedRateConfig::new(usize::MAX));
+        assert_eq!(huge.current_cwnd(), usize::MAX);
+    }
+
+    /// A remote that sends a receipt for only an occasional packet must not
+    /// grow flight size without bound.
+    ///
+    /// Each receipt clears the loss pause and each retransmission timeout
+    /// captures it again at the current flight size, so the loss pause never
+    /// holds such a sender back. Before the ceiling cwnd was then
+    /// `usize::MAX / 2`, so the sender kept sending at the full rate and the
+    /// `SentPacketTracker` kept every packet the remote did not confirm.
+    #[test]
+    fn test_flight_ceiling_holds_against_sparse_receipts() {
+        let controller = FixedRateController::new(FixedRateConfig::default());
+        let packet_size = MAX_PACKET_SIZE;
+        let ceiling = MAX_FLIGHT_SECS * DEFAULT_RATE_BYTES_PER_SEC;
+
+        // Offer ten times the ceiling, sending as `send_stream` does (only
+        // while the packet fits in cwnd). One packet in 100 is confirmed;
+        // the others time out.
+        let offered = 10 * ceiling / packet_size;
+        let mut sent = 0usize;
+        for i in 0..offered {
+            if controller.flightsize() + packet_size <= controller.current_cwnd() {
+                controller.on_send(packet_size);
+                sent += 1;
+            }
+            if i % 100 == 0 {
+                controller.on_ack(Duration::from_millis(50), packet_size);
+            } else if i % 100 == 50 {
+                controller.on_timeout();
+            }
+            assert!(
+                controller.flightsize() <= ceiling,
+                "flight size {} passed the ceiling {ceiling} after {sent} packets",
+                controller.flightsize()
+            );
+        }
+        // The window filled, so the ceiling is what stopped the sender, and
+        // from then on only what the receipts released was sent.
+        assert!(controller.flightsize() + 2 * packet_size > ceiling);
+        assert!(
+            sent <= ceiling / packet_size + offered / 100 + 1,
+            "sent {sent} of {offered} offered packets"
+        );
+    }
+
+    /// The loss pause never lifts cwnd above the ceiling, including when
+    /// short messages (which do not wait on cwnd) pushed flight size past it.
+    #[test]
+    fn test_loss_pause_does_not_exceed_the_flight_ceiling() {
+        let controller = FixedRateController::new(FixedRateConfig::default());
+        let packet_size = MAX_PACKET_SIZE;
+        let ceiling = MAX_FLIGHT_SECS * DEFAULT_RATE_BYTES_PER_SEC;
+
+        for _ in 0..ceiling / packet_size {
+            controller.on_send(packet_size);
+        }
+        assert!(controller.flightsize() + packet_size > controller.current_cwnd());
+
+        controller.on_timeout();
+        assert_eq!(controller.current_cwnd(), ceiling);
+
+        controller.on_send(2 * packet_size);
+        controller.on_timeout();
+        assert_eq!(controller.current_cwnd(), ceiling);
+        assert!(controller.flightsize() + packet_size > controller.current_cwnd());
+
+        // Once receipts bring flight size back under the ceiling, sending
+        // resumes.
+        controller.on_ack(Duration::from_millis(50), 3 * packet_size);
+        assert!(controller.flightsize() + packet_size <= controller.current_cwnd());
     }
 
     #[test]
@@ -319,8 +440,11 @@ mod tests {
         controller.on_send(1000);
         let flightsize_at_loss = controller.flightsize();
 
-        // Before loss: cwnd is large
-        assert!(controller.current_cwnd() > 1_000_000_000);
+        // Before loss: cwnd is the flight-size ceiling
+        assert_eq!(
+            controller.current_cwnd(),
+            MAX_FLIGHT_SECS * DEFAULT_RATE_BYTES_PER_SEC
+        );
 
         // Loss captures flightsize and caps cwnd
         controller.on_loss();
@@ -339,9 +463,12 @@ mod tests {
             "cwnd must be frozen at loss-time flightsize, not current flightsize"
         );
 
-        // ACK clears the pause and restores large cwnd
+        // ACK clears the pause and restores the ceiling
         controller.on_ack(Duration::from_millis(50), 500);
-        assert!(controller.current_cwnd() > 1_000_000_000);
+        assert_eq!(
+            controller.current_cwnd(),
+            MAX_FLIGHT_SECS * DEFAULT_RATE_BYTES_PER_SEC
+        );
         assert_eq!(controller.flightsize(), 2500); // 3000 - 500
     }
 

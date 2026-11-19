@@ -76,7 +76,9 @@ pub(crate) const PER_SOURCE_CAP: usize = 32;
 pub(crate) const NODE_WIDE_CAP: usize = 512;
 
 /// Where an announcement came from, at the granularity one host controls.
-/// Also the source unit of `operations::relay_admission`.
+/// Also the source unit of `operations::relay_admission`, and groups the
+/// transient connection budget's per-source share
+/// (`ConnectionManager::try_register_transient`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Source {
     V4(u32),

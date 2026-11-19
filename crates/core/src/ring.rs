@@ -91,7 +91,7 @@ pub(crate) mod contract_exec_metrics;
 pub(crate) mod delta_incompat;
 /// Shadow-mode detector for repairs that never converge (see the module docs).
 pub(crate) mod futile_repair;
-pub(crate) use connection_manager::ConnectionManager;
+pub(crate) use connection_manager::{ConnectionManager, TransientRefusal, TransientTtlOutcome};
 // Nearest-neighbor ring lattice (successor+predecessor base edges).
 // `nn_lattice_active_for` is the full activation gate — the flag AND the
 // minimum-degree floor (`NN_LATTICE_MIN_MAX_CONNECTIONS`) — used by the
@@ -287,6 +287,8 @@ fn apply_bootstrap_churn_stats(
 ) {
     snapshot.bootstrap_transient_registered = Some(b.transient_registered);
     snapshot.bootstrap_transient_expired = Some(b.transient_expired);
+    snapshot.bootstrap_transient_source_refusals = Some(b.transient_source_refusals);
+    snapshot.bootstrap_transient_evictions = Some(b.transient_evictions);
     snapshot.bootstrap_promoted_to_ring = Some(b.promoted_to_ring);
     snapshot.bootstrap_time_to_min_connections_secs =
         b.time_to_min_connections.map(|d| d.as_secs_f64());
@@ -2369,6 +2371,7 @@ impl Ring {
             // `router_snapshot_json_includes_routing_attribution_counters`.
             snapshot.ring_connections = Some(cm.connection_count() as u64);
             snapshot.transient_connections = Some(cm.transient_count() as u64);
+            snapshot.transient_largest_source = Some(cm.transient_largest_source() as u64);
             snapshot.connections_to_gateways =
                 crate::node::network_status::connections_to_gateways();
             if let Some((gets, puts, subscribes, updates)) =
@@ -6200,6 +6203,12 @@ impl Ring {
             crate::transport::TRANSPORT_METRICS.connection_peer_bytes(peer.socket_addr()),
         );
         crate::node::network_status::record_peer_disconnected(peer.socket_addr());
+        // A connection kept outside the ring holds a slot in the transient
+        // budget for as long as it is open (`ConnectionManager::hold_transient`).
+        // Every path that closes a connection reaches this, so the slot is
+        // given back here, before the early return below for a connection the
+        // ring never held.
+        self.connection_manager.drop_transient(peer.socket_addr());
         let orphaned_transactions = self
             .live_tx_tracker
             .prune_transactions_from_peer(peer.socket_addr());
@@ -11750,6 +11759,8 @@ mod cost_pressure_seam_tests {
             &BootstrapChurnStats {
                 transient_registered: 11,
                 transient_expired: 12,
+                transient_source_refusals: 22,
+                transient_evictions: 23,
                 promoted_to_ring: 13,
                 time_to_min_connections: Some(Duration::from_millis(14_500)),
                 time_to_first_ring_connection: Some(Duration::from_millis(2_345)),
@@ -11762,6 +11773,8 @@ mod cost_pressure_seam_tests {
         );
         assert_eq!(snapshot.bootstrap_transient_registered, Some(11));
         assert_eq!(snapshot.bootstrap_transient_expired, Some(12));
+        assert_eq!(snapshot.bootstrap_transient_source_refusals, Some(22));
+        assert_eq!(snapshot.bootstrap_transient_evictions, Some(23));
         assert_eq!(snapshot.bootstrap_promoted_to_ring, Some(13));
         assert_eq!(snapshot.bootstrap_time_to_min_connections_secs, Some(14.5));
         assert_eq!(snapshot.bootstrap_completed, Some(true));
