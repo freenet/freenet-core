@@ -53,9 +53,9 @@ const _: () = assert!(
 );
 
 /// Maximum total events across all queues.
-/// Global backpressure to bound total memory usage.
-/// Set below MAX_PENDING_REQUESTS (10,000) so backpressure propagates
-/// before the mediator hits its limit.
+/// Global backpressure to bound total memory usage. What waits upstream of
+/// this queue is bounded separately, by the capacities of the bounded
+/// admission lanes (`handler::Lane`).
 pub(super) const MAX_TOTAL_FAIR_QUEUE: usize = 5_000;
 
 /// Admission capacity reserved for [`Priority::ClientLocal`] events.
@@ -70,9 +70,14 @@ pub(super) const MAX_TOTAL_FAIR_QUEUE: usize = 5_000;
 /// client's in-flight working set without materially shrinking the shared cap.
 pub(super) const CLIENT_LOCAL_RESERVE: usize = 256;
 
-/// Maximum events to drain from channel per iteration.
-/// Prevents the drain loop from blocking delegate notifications too long.
+/// Maximum events `contract_handling` moves from the client lane, and from the
+/// relay lane, into this queue per loop iteration (`handler::Lane`). Prevents
+/// the drain from blocking delegate notifications too long.
 pub(super) const MAX_DRAIN_BATCH: usize = 256;
+
+/// The same for the background lane, which is smaller because background
+/// work is shed first anyway and re-runs on its next cycle.
+pub(super) const MAX_BACKGROUND_DRAIN_BATCH: usize = 64;
 
 /// Scheduling/admission priority class for a contract-handler event (#4534).
 ///

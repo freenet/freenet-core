@@ -911,6 +911,24 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         self.bridged_lookup_key(instance_id)
     }
 
+    /// Keeps the state (the mock has no disk to reclaim), but a contract whose
+    /// validate RECORDS (`ValidateOverride::Record`) also records its eviction
+    /// there as `b"evicted"`, so a test can read the order the loop ran a PUT
+    /// and an `EvictContract` in.
+    async fn remove_contract(
+        &mut self,
+        key: &ContractKey,
+        _expected_generation: u64,
+    ) -> Result<(), ExecutorError> {
+        if let Some(ValidateOverride::Record(seen)) = self.runtime.validate_overrides.get(key.id())
+        {
+            seen.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(b"evicted".to_vec());
+        }
+        Ok(())
+    }
+
     fn delegate_capabilities(
         &self,
     ) -> Option<std::sync::Arc<crate::contract::delegate_capabilities::DelegateCapabilities>> {

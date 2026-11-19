@@ -202,18 +202,21 @@ pub(super) async fn put_contract(
         ));
     }
 
-    match op_manager
-        .notify_contract_handler_prioritized(
-            ContractHandlerEvent::PutQuery {
-                key,
-                state,
-                related_contracts,
-                contract: Some(contract.clone()),
-            },
-            priority,
-        )
-        .await
-    {
+    let event = ContractHandlerEvent::PutQuery {
+        key,
+        state,
+        related_contracts,
+        contract: Some(contract.clone()),
+    };
+    // A relay hop waits no longer than its upstream does (ANT-2026-K0YQ8CG4).
+    let response = if priority == crate::contract::Priority::NetworkRelay {
+        op_manager.notify_contract_handler_relay(event).await
+    } else {
+        op_manager
+            .notify_contract_handler_prioritized(event, priority)
+            .await
+    };
+    match response {
         Ok(ContractHandlerEvent::PutResponse {
             new_value: Ok(new_val),
             state_changed,
