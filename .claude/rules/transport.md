@@ -2489,8 +2489,9 @@ Simulation: every node shares [::1], so the per-destination punch budget
 Determinism: a plain tokio::select! draws its arm order from tokio's RNG,
   which the seed does not set. bounded_send's loop (every QUIC path, upgrade
   ones included: a send and its deadline ready together now resolve as the
-  send) and the native setup's two selects are `biased` with a documented
-  order, so one seed runs the
+  send) and the native setup's four selects (connect_native, race_attempts,
+  and accept_native's accept loop and accept/deadline select) are `biased`
+  with a documented order, so one seed runs the
   same twice (test_quic_native_connect_is_deterministic). Not
   deterministic_select!: it draws from GlobalRng, which shifts the seed's
   stream for every QUIC test after it.
