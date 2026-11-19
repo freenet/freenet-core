@@ -5445,10 +5445,12 @@ struct LostInlineLegsOutcome {
     swallowed: usize,
     /// Every confirmed-delivery counter, by label, over the run.
     events: Vec<(&'static str, u64)>,
+    /// The CRDT version of node 1's last update.
+    final_version: u64,
 }
 
 /// The confirmed-delivery counters a scenario reports (#6143).
-const CONFIRMED_DELIVERY_LABELS: [&str; 12] = [
+const CONFIRMED_DELIVERY_LABELS: [&str; 15] = [
     "ack_requested",
     "ack_confirmed",
     "ack_not_needed",
@@ -5461,6 +5463,9 @@ const CONFIRMED_DELIVERY_LABELS: [&str; 12] = [
     "resend_full",
     "unconfirmed_giveup",
     "pending_overflow",
+    "ack_dropped_overloaded",
+    "ack_path_proven",
+    "ack_unmatched",
 ];
 
 impl LostInlineLegsOutcome {
@@ -5489,6 +5494,43 @@ fn run_lost_inline_legs_scenario(
     confirmed_delivery: bool,
     lose_inline_legs: bool,
 ) -> LostInlineLegsOutcome {
+    run_confirmed_delivery_scenario(ConfirmedDeliveryScenario {
+        network_name,
+        seed,
+        contract_seed,
+        confirmed_delivery,
+        lose_inline_legs,
+        updates: 1,
+        state_len: 128,
+        latency: None,
+    })
+}
+
+/// One confirmed-delivery simulation (#6143). Node 1 sends `updates` client
+/// UPDATEs, one per controlled-op interval (3 s), each with a CRDT state of
+/// `state_len` bytes after its 8-byte version.
+struct ConfirmedDeliveryScenario {
+    network_name: &'static str,
+    seed: u64,
+    contract_seed: u8,
+    confirmed_delivery: bool,
+    lose_inline_legs: bool,
+    updates: u64,
+    state_len: usize,
+    latency: Option<std::ops::Range<Duration>>,
+}
+
+fn run_confirmed_delivery_scenario(scenario: ConfirmedDeliveryScenario) -> LostInlineLegsOutcome {
+    let ConfirmedDeliveryScenario {
+        network_name,
+        seed,
+        contract_seed,
+        confirmed_delivery,
+        lose_inline_legs,
+        updates,
+        state_len,
+        latency,
+    } = scenario;
     use freenet::dev_tool::{
         NodeLabel, ScheduledOperation, SimOperation, inline_leg_fault_injection,
         register_crdt_contract,
@@ -5497,7 +5539,13 @@ fn run_lost_inline_legs_scenario(
     /// The objective in the design: an originated update reaches its direct
     /// targets within 30 s or the node knows it did not.
     const POST_UPDATE_WAIT: Duration = Duration::from_secs(30);
-    const UPDATE_VERSION: u64 = 100;
+    const FIRST_VERSION: u64 = 100;
+    let final_version = FIRST_VERSION + updates - 1;
+    let crdt_state = |version: u64| {
+        let mut state = version.to_le_bytes().to_vec();
+        state.extend((0..state_len).map(|i| (i as u8).wrapping_mul(3) ^ contract_seed));
+        state
+    };
 
     GlobalTestMetrics::reset();
     setup_deterministic_state(seed);
@@ -5526,6 +5574,13 @@ fn run_lost_inline_legs_scenario(
     if confirmed_delivery {
         sim.enable_confirmed_delivery();
     }
+    if let Some(range) = latency {
+        sim.with_fault_injection(
+            freenet::simulation::FaultConfig::builder()
+                .latency_range(range)
+                .build(),
+        );
+    }
 
     let originator = NodeLabel::node(network_name, 1);
     let originator_addr = sim
@@ -5549,13 +5604,15 @@ fn run_lost_inline_legs_scenario(
             SimOperation::Subscribe { contract_id },
         ));
     }
-    operations.push(ScheduledOperation::new(
-        originator.clone(),
-        SimOperation::Update {
-            key: contract_key,
-            data: SimOperation::create_crdt_state(UPDATE_VERSION, 0x6D),
-        },
-    ));
+    for version in FIRST_VERSION..=final_version {
+        operations.push(ScheduledOperation::new(
+            originator.clone(),
+            SimOperation::Update {
+                key: contract_key,
+                data: crdt_state(version),
+            },
+        ));
+    }
 
     let result =
         sim.run_controlled_simulation(seed, operations, Duration::from_secs(120), POST_UPDATE_WAIT);
@@ -5589,10 +5646,11 @@ fn run_lost_inline_legs_scenario(
     }
     assert_eq!(
         version_of(&originator),
-        Some(UPDATE_VERSION),
+        Some(final_version),
         "the originator must hold its own update"
     );
     LostInlineLegsOutcome {
+        final_version,
         versions,
         swallowed,
         events: CONFIRMED_DELIVERY_LABELS
@@ -5675,6 +5733,123 @@ fn test_confirmed_delivery_recovers_an_originated_update_from_lost_inline_legs()
         "every resend should have been confirmed; got {:?}",
         outcome.events
     );
+    // Per armed peer, not only in aggregate: every armed target timed out
+    // once and was resent to once.
+    assert_eq!(
+        (outcome.event("ack_timeout"), outcome.event("resend_full")),
+        (
+            outcome.event("ack_requested"),
+            outcome.event("ack_requested")
+        ),
+        "one timeout and one resend per armed peer; got {:?}",
+        outcome.events
+    );
+}
+
+/// Round 1 (Must Fix 2): sustained client writes, one every 3 s with every
+/// inline leg lost. Before the fix each newer update restarted the entry, so
+/// the resend never came while the writes continued. Every host must end on
+/// the LAST update within 30 s of it, and the resend must have fired.
+#[test_log::test]
+fn test_confirmed_delivery_resends_under_sustained_writes() {
+    let outcome = run_confirmed_delivery_scenario(ConfirmedDeliveryScenario {
+        network_name: "confirmed-delivery-sustained",
+        seed: 0x6143_C0DE_0003,
+        contract_seed: 0x64,
+        confirmed_delivery: true,
+        lose_inline_legs: true,
+        updates: 10,
+        state_len: 128,
+        latency: None,
+    });
+    assert!(outcome.swallowed > 0, "the fault seam never fired");
+    for (label, version) in &outcome.versions {
+        assert_eq!(
+            *version,
+            Some(outcome.final_version),
+            "{label}; all: {:?}; confirmed delivery: {:?}",
+            outcome.versions,
+            outcome.events
+        );
+    }
+    assert!(
+        outcome.event("resend_full") > 0,
+        "sustained writes must still reach the resend; got {:?}",
+        outcome.events
+    );
+}
+
+/// Round 1 (testing lens): a healthy network with 20-120 ms link latency
+/// sends no resends and every flagged leg is acknowledged.
+#[test_log::test]
+fn test_confirmed_delivery_with_latency_sends_no_resends() {
+    let outcome = run_confirmed_delivery_scenario(ConfirmedDeliveryScenario {
+        network_name: "confirmed-delivery-latency",
+        seed: 0x6143_C0DE_0004,
+        contract_seed: 0x65,
+        confirmed_delivery: true,
+        lose_inline_legs: false,
+        updates: 1,
+        state_len: 128,
+        latency: Some(Duration::from_millis(20)..Duration::from_millis(120)),
+    });
+    assert_healthy(&outcome);
+}
+
+/// Round 1 (testing lens): a healthy network carrying a state larger than
+/// one packet (the inline message goes out in several fragments, the shape
+/// #6143 lost) sends no resends.
+#[test_log::test]
+fn test_confirmed_delivery_with_a_multi_fragment_state_sends_no_resends() {
+    let outcome = run_confirmed_delivery_scenario(ConfirmedDeliveryScenario {
+        network_name: "confirmed-delivery-multi-fragment",
+        seed: 0x6143_C0DE_0005,
+        contract_seed: 0x66,
+        confirmed_delivery: true,
+        lose_inline_legs: false,
+        updates: 1,
+        state_len: 8 * 1024,
+        latency: None,
+    });
+    assert_healthy(&outcome);
+}
+
+/// Every host holds the update, every flagged leg was acknowledged, and the
+/// mechanism sent nothing extra.
+fn assert_healthy(outcome: &LostInlineLegsOutcome) {
+    assert_eq!(outcome.swallowed, 0, "nothing is lost in this arm");
+    for (label, version) in &outcome.versions {
+        assert_eq!(
+            *version,
+            Some(outcome.final_version),
+            "{label}; all: {:?}",
+            outcome.versions
+        );
+    }
+    assert!(
+        outcome.event("ack_requested") > 0,
+        "the originator must have asked for confirmation; got {:?}",
+        outcome.events
+    );
+    assert_eq!(
+        outcome.event("ack_confirmed"),
+        outcome.event("ack_requested"),
+        "every flagged leg must be acknowledged; got {:?}",
+        outcome.events
+    );
+    for label in [
+        "ack_timeout",
+        "resend_full",
+        "unconfirmed_giveup",
+        "pending_overflow",
+    ] {
+        assert_eq!(
+            outcome.event(label),
+            0,
+            "{label} must be zero on a healthy network; got {:?}",
+            outcome.events
+        );
+    }
 }
 
 /// The healthy-network arm: with confirmed delivery ON and nothing lost, every

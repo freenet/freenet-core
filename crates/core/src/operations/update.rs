@@ -52,6 +52,11 @@ pub(crate) struct BroadcastDedupCache {
 struct DedupEntry {
     delta_hash: u64,
     inserted_at: Instant,
+    /// The copy this entry was inserted for finished its merge without error
+    /// (changed or not). A later copy's dedup hit can then be acknowledged as
+    /// "already had it" for confirmed delivery (#6292 round 1, Should Fix 3);
+    /// before the merge finishes a hit only means "seen".
+    merged: bool,
 }
 
 /// Maximum entries per contract in the dedup cache.
@@ -85,14 +90,7 @@ impl BroadcastDedupCache {
         is_delta: bool,
         now: Instant,
     ) -> bool {
-        use ahash::AHasher;
-        use std::hash::Hasher;
-
-        let mut hasher = AHasher::default();
-        // Include payload type discriminant to avoid delta/full-state collisions
-        hasher.write_u8(if is_delta { 1 } else { 0 });
-        hasher.write(payload_bytes);
-        let delta_hash = hasher.finish();
+        let delta_hash = Self::payload_hash(payload_bytes, is_delta);
 
         let mut entry = self.entries.entry(*key).or_default();
         let queue = entry.value_mut();
@@ -119,9 +117,67 @@ impl BroadcastDedupCache {
         queue.push_back(DedupEntry {
             delta_hash,
             inserted_at: now,
+            merged: false,
         });
 
         false // Not a duplicate
+    }
+
+    fn payload_hash(payload_bytes: &[u8], is_delta: bool) -> u64 {
+        use ahash::AHasher;
+        use std::hash::Hasher;
+
+        let mut hasher = AHasher::default();
+        // Include payload type discriminant to avoid delta/full-state collisions
+        hasher.write_u8(if is_delta { 1 } else { 0 });
+        hasher.write(payload_bytes);
+        hasher.finish()
+    }
+
+    /// The merge of the copy inserted for this payload finished without error.
+    pub(crate) fn mark_merged(&self, key: &ContractKey, payload_bytes: &[u8], is_delta: bool) {
+        let delta_hash = Self::payload_hash(payload_bytes, is_delta);
+        if let Some(mut queue) = self.entries.get_mut(key) {
+            for entry in queue.iter_mut().filter(|e| e.delta_hash == delta_hash) {
+                entry.merged = true;
+            }
+        }
+    }
+
+    /// Whether a copy of this payload is recorded and finished its merge.
+    pub(crate) fn seen_merged(
+        &self,
+        key: &ContractKey,
+        payload_bytes: &[u8],
+        is_delta: bool,
+    ) -> bool {
+        let delta_hash = Self::payload_hash(payload_bytes, is_delta);
+        self.entries
+            .get(key)
+            .is_some_and(|queue| queue.iter().any(|e| e.delta_hash == delta_hash && e.merged))
+    }
+}
+
+#[cfg(test)]
+mod dedup_merged_tests {
+    use super::*;
+
+    /// A dedup hit means "seen" until the first copy's merge finishes; only
+    /// then is it "already had it" (#6292 round 1, Should Fix 3).
+    #[test]
+    fn a_seen_payload_counts_as_merged_only_after_its_merge() {
+        let cache = BroadcastDedupCache::new();
+        let key = crate::operations::test_utils::make_contract_key(4);
+        let now = Instant::now();
+        assert!(!cache.check_and_insert(&key, b"delta", true, now));
+        assert!(cache.check_and_insert(&key, b"delta", true, now));
+        assert!(!cache.seen_merged(&key, b"delta", true), "seen, not merged");
+        cache.mark_merged(&key, b"delta", true);
+        assert!(cache.seen_merged(&key, b"delta", true));
+        assert!(
+            !cache.seen_merged(&key, b"delta", false),
+            "a full state with the same bytes is a different payload"
+        );
     }
 }
 

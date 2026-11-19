@@ -2066,9 +2066,24 @@ async fn drive_relay_broadcast_to(
         op_manager.interest_manager.now(),
     ) {
         receiver_terminal.mark_dedup();
-        // No confirmed-delivery ack here: the dedup cache records a payload
-        // BEFORE its merge, so a hit means seen, not applied (#6292 round 1,
-        // Should Fix 3). The sender's deadline covers it.
+        // The dedup cache records a payload BEFORE its merge, so a hit means
+        // seen, not applied (#6292 round 1, Should Fix 3). Ack "already had
+        // it" only when the payload is recorded as merged; otherwise send no
+        // ack and leave it to the sender's deadline.
+        if op_manager.ring.applied_payloads.contains(
+            &key,
+            op_manager
+                .ring
+                .applied_payloads
+                .payload_hash(is_delta, &payload_bytes),
+        ) || op_manager
+            .broadcast_dedup_cache
+            .seen_merged(&key, &payload_bytes, is_delta)
+        {
+            super::confirmed_delivery::note_receiver_outcome(
+                crate::message::BroadcastAckOutcome::AlreadyHad,
+            );
+        }
         count_receiver_skip(
             op_manager,
             &key,
@@ -2178,6 +2193,10 @@ async fn drive_relay_broadcast_to(
         changed,
     } = match update_result {
         Ok(result) => {
+            // A later copy's dedup hit may now be acked as "already had it".
+            op_manager
+                .broadcast_dedup_cache
+                .mark_merged(&key, &payload_bytes, is_delta);
             // Per-contract merge budget (#6190): only a merge that changed the
             // stored state spends a token, so duplicates and no-op deltas
             // cannot empty the bucket. Checked in `node.rs` before this driver.
@@ -3142,9 +3161,24 @@ async fn apply_streaming_broadcast(
         op_manager.interest_manager.now(),
     ) {
         receiver_terminal.mark_dedup();
-        // No confirmed-delivery ack here: the dedup cache records a payload
-        // BEFORE its merge, so a hit means seen, not applied (#6292 round 1,
-        // Should Fix 3). The sender's deadline covers it.
+        // The dedup cache records a payload BEFORE its merge, so a hit means
+        // seen, not applied (#6292 round 1, Should Fix 3). Ack "already had
+        // it" only when the payload is recorded as merged; otherwise send no
+        // ack and leave it to the sender's deadline.
+        if op_manager.ring.applied_payloads.contains(
+            &key,
+            op_manager
+                .ring
+                .applied_payloads
+                .payload_hash(false, &state_bytes),
+        ) || op_manager
+            .broadcast_dedup_cache
+            .seen_merged(&key, &state_bytes, false)
+        {
+            super::confirmed_delivery::note_receiver_outcome(
+                crate::message::BroadcastAckOutcome::AlreadyHad,
+            );
+        }
         count_receiver_skip(
             op_manager,
             &key,
@@ -3254,6 +3288,10 @@ async fn apply_streaming_broadcast(
         changed,
     } = match update_result {
         Ok(exec) => {
+            // A later copy's dedup hit may now be acked as "already had it".
+            op_manager
+                .broadcast_dedup_cache
+                .mark_merged(&key, &state_bytes, false);
             // Strictly delta-only reset (#4861): a streaming full-state broadcast
             // merge is mechanically the SAME operation as a ResyncResponse apply
             // (a WASM merge of an incoming FULL STATE), so the fork-oscillation
@@ -7848,10 +7886,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("{sig} has a dedup branch"));
             let branch = &body[start..];
             let end = branch.find("return Ok(());").expect("dedup branch returns");
-            assert!(
-                !branch[..end].contains("note_receiver_outcome"),
-                "{sig}: a dedup hit must not ack; the merge may still fail"
-            );
+            let branch = &branch[..end];
+            // An ack here is allowed only behind the merged-payload record.
+            if let Some(note) = branch.find("note_receiver_outcome") {
+                assert!(
+                    branch[..note].contains("applied_payloads.contains("),
+                    "{sig}: a dedup hit may ack only a payload recorded as merged"
+                );
+            }
         }
     }
 
