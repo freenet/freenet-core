@@ -43,13 +43,15 @@ pub(crate) struct TransientEntry {
     /// When this transient entry was created (for expiration cleanup).
     pub created_at: Instant,
     /// Set once an open connection kept outside the ring owns the entry
-    /// (`ConnectionManager::hold_transient`). Such an entry is not expired by
-    /// age: its slot in the transient budget is what bounds the number of
-    /// those connections, so it is given back only when the connection is
-    /// promoted (`drop_transient`, `add_connection`) or closed
-    /// (`Ring::prune_connection`, which every teardown path calls). A
-    /// connection that is never promoted is closed by the zombie sweep or the
-    /// transport's idle timeout.
+    /// (`ConnectionManager::hold_transient`). Such an entry is exempt from
+    /// age expiry: it is given back only when the connection is promoted
+    /// (`drop_transient`, `add_connection`) or closed
+    /// (`Ring::prune_connection`, which every teardown path calls). Its life
+    /// is bounded ONLY by its connection closing, through the zombie sweep or
+    /// the transport idle timeout; nothing guarantees that a connection held
+    /// open indefinitely is ever closed, which is the known gap in #5922 (no
+    /// time bound on such a connection yet). Eviction at the budget
+    /// (`oldest_held_transient`) limits how many slots such entries can take.
     pub held: bool,
     /// Distinguishes this entry from earlier and later ones at the same
     /// address (`ConnectionManager::transient_generation`).

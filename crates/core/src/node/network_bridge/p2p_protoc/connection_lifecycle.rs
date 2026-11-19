@@ -3048,6 +3048,12 @@ impl P2pConnManager {
                         // (`Ring::prune_connection`), not for `transient_ttl`:
                         // a slot given back while the transport stays open
                         // would let the budget be filled again every TTL.
+                        // The held entry is exempt from age expiry and
+                        // bounded only by the connection closing (zombie
+                        // sweep or transport idle timeout), which is not
+                        // guaranteed for a connection kept open indefinitely
+                        // (#5922); eviction at the budget limits how many
+                        // slots such entries can take.
                         connection_manager.hold_transient(peer_addr);
                         if !already_transient {
                             crate::node::network_status::record_bootstrap_transient_registered();
@@ -3081,10 +3087,12 @@ impl P2pConnManager {
                                     // tears down the transport, killing any
                                     // in-progress CONNECT. If the CONNECT
                                     // succeeds later, handle_connect_peer()
-                                    // promotes the peer (#3113). If it never
-                                    // does, the zombie sweep or the transport
-                                    // idle timeout closes the connection,
-                                    // which gives the slot back.
+                                    // promotes the peer (#3113). Otherwise
+                                    // the slot is given back only when the
+                                    // connection closes (zombie sweep or
+                                    // transport idle timeout), which is not
+                                    // guaranteed for one kept open
+                                    // indefinitely (#5922).
                                     tracing::info!(
                                         %peer_addr,
                                         "Transient connection past its TTL unpromoted \
