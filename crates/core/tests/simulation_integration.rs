@@ -5747,12 +5747,12 @@ fn test_confirmed_delivery_recovers_an_originated_update_from_lost_inline_legs()
     );
 }
 
-/// Round 1 (Must Fix 2): sustained client writes, one every 3 s for 27 s,
+/// Sustained client writes, one every 3 s for 27 s,
 /// with every inline leg lost. Before the fix each newer update restarted the
 /// entry, so no resend could fire until the writes STOPPED. The run ends 5 s
 /// after the last write, inside one ack timeout, so only a resend that fired
 /// DURING the writes can have reached the other hosts: each must hold one of
-/// node 1's updates. (Checked against the round-1 coalescing: with a 30 s
+/// node 1's updates. (Checked against a coalescing that restarts the entry: with a 30 s
 /// tail the post-write resend masked it and this test passed.)
 #[test_log::test]
 fn test_confirmed_delivery_resends_under_sustained_writes() {
@@ -5784,7 +5784,47 @@ fn test_confirmed_delivery_resends_under_sustained_writes() {
     );
 }
 
-/// Round 1 (testing lens): a healthy network with 20-120 ms link latency
+/// A healthy network with sustained client writes (one every 3 s for 27 s):
+/// every update reaches every host, and no timer fires. Coalescing must not
+/// let one write's pending legs make a later write look overdue.
+#[test_log::test]
+fn test_confirmed_delivery_under_healthy_sustained_writes_sends_no_resends() {
+    let outcome = run_confirmed_delivery_scenario(ConfirmedDeliveryScenario {
+        network_name: "confirmed-delivery-healthy-sustained",
+        seed: 0x6143_C0DE_0006,
+        contract_seed: 0x67,
+        confirmed_delivery: true,
+        lose_inline_legs: false,
+        updates: 10,
+        state_len: 128,
+        latency: Some(Duration::from_millis(20)..Duration::from_millis(120)),
+        post_update_wait: Duration::from_secs(30),
+    });
+    assert_eq!(outcome.swallowed, 0, "nothing is lost in this arm");
+    for (label, version) in &outcome.versions {
+        assert_eq!(
+            *version,
+            Some(outcome.final_version),
+            "{label}; all: {:?}",
+            outcome.versions
+        );
+    }
+    assert!(
+        outcome.event("ack_requested") > 0 && outcome.event("ack_confirmed") > 0,
+        "{:?}",
+        outcome.events
+    );
+    for label in [
+        "ack_timeout",
+        "resend_full",
+        "unconfirmed_giveup",
+        "pending_overflow",
+    ] {
+        assert_eq!(outcome.event(label), 0, "{label}; got {:?}", outcome.events);
+    }
+}
+
+/// A healthy network with 20-120 ms link latency
 /// sends no resends and every flagged leg is acknowledged.
 #[test_log::test]
 fn test_confirmed_delivery_with_latency_sends_no_resends() {
@@ -5802,7 +5842,7 @@ fn test_confirmed_delivery_with_latency_sends_no_resends() {
     assert_healthy(&outcome);
 }
 
-/// Round 1 (testing lens): a healthy network carrying a state larger than
+/// A healthy network carrying a state larger than
 /// one packet (the inline message goes out in several fragments, the shape
 /// #6143 lost) sends no resends.
 #[test_log::test]

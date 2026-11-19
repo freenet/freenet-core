@@ -3832,6 +3832,23 @@ mod tests {
         /// is DISJOINT from `is_wasm_timeout`: the guest never executed, so it
         /// must NOT earn the Timeout-class quarantine a runaway merge does.
         #[test]
+        fn a_scheduler_timeout_is_an_overloaded_confirmed_delivery_drop() {
+            use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
+            let key = test_fixtures::make_contract_key();
+            let contract_err: ContractError =
+                RuntimeInnerError::ContractExecError(ContractExecError::SchedulerOverloaded).into();
+            let err = crate::operations::OpError::from(ExecutorError::execution(
+                contract_err,
+                Some(super::super::InnerOpError::Upsert(key)),
+            ));
+            assert_eq!(
+                crate::operations::update::confirmed_delivery::drop_reason_for_merge_error(&err),
+                crate::message::BroadcastDropReason::Overloaded,
+                "a merge that never ran is transient load (#6143)"
+            );
+        }
+
+        #[test]
         fn test_scheduler_timeout_is_distinct_transient_classification() {
             use crate::wasm_runtime::{ContractError, ContractExecError, RuntimeInnerError};
             let key = test_fixtures::make_contract_key();

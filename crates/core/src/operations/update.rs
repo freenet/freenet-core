@@ -54,7 +54,7 @@ struct DedupEntry {
     inserted_at: Instant,
     /// The copy this entry was inserted for finished its merge without error
     /// (changed or not). A later copy's dedup hit can then be acknowledged as
-    /// "already had it" for confirmed delivery (#6292 round 1, Should Fix 3);
+    /// "already had it" for confirmed delivery (#6143);
     /// before the merge finishes a hit only means "seen".
     merged: bool,
 }
@@ -1937,7 +1937,7 @@ mod tests {
     use super::*;
 
     /// A dedup hit means "seen" until the first copy's merge finishes; only
-    /// then is it "already had it" (#6292 round 1, Should Fix 3).
+    /// then is it "already had it" (#6143).
     #[test]
     fn a_seen_payload_counts_as_merged_only_after_its_merge() {
         let cache = BroadcastDedupCache::new();

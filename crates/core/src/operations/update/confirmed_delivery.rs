@@ -746,6 +746,18 @@ pub(crate) fn dropped_event(
     }
 }
 
+/// The drop reason a receiver reports for a merge that returned `err`.
+/// Saturation (a full contract queue, or a scheduler timeout before the merge
+/// ran) is `Overloaded`, a transient reason; a merge that ran and failed is
+/// `MergeFailed`, a final one.
+pub(crate) fn drop_reason_for_merge_error(err: &crate::operations::OpError) -> BroadcastDropReason {
+    if err.is_contract_queue_full() || err.is_scheduler_timeout() {
+        BroadcastDropReason::Overloaded
+    } else {
+        BroadcastDropReason::MergeFailed
+    }
+}
+
 /// The duty of a leg about to go to `peer_addr`, re-checking the version gate
 /// at the send site: arming already checked it, but a queued leg can outlive a
 /// reconnect at the same key, and the gate is what keeps undecodable variants
@@ -1144,6 +1156,25 @@ mod tests {
         assert!(!is_transient(BroadcastDropReason::NotHosted));
         assert!(!is_transient(BroadcastDropReason::Backoff));
         assert!(!is_transient(BroadcastDropReason::MergeFailed));
+    }
+
+    /// A full contract queue is `Overloaded` (transient); any other merge
+    /// error is `MergeFailed` (final). The scheduler-timeout case is covered
+    /// next to its constructor in `contract::executor`.
+    #[test]
+    fn a_saturated_merge_is_overloaded_and_a_failed_one_is_final() {
+        use crate::contract::{ContractQueueFull, ExecutorError};
+        use crate::operations::OpError;
+        let queue_full = OpError::from(ExecutorError::other(ContractQueueFull));
+        assert_eq!(
+            drop_reason_for_merge_error(&queue_full),
+            BroadcastDropReason::Overloaded
+        );
+        let failed = OpError::from(ExecutorError::other(anyhow::anyhow!("merge rejected")));
+        assert_eq!(
+            drop_reason_for_merge_error(&failed),
+            BroadcastDropReason::MergeFailed
+        );
     }
 
     /// The body of `fn <sig>...{...}` in `src`, by brace matching.

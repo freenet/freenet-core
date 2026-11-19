@@ -206,8 +206,8 @@ pub(crate) enum PropagationEvent {
     /// Receiver: an inbound broadcast skipped because this node does not host
     /// the contract (`Ring::may_merge_relayed_update`), so it was not merged.
     RxNotHosted,
-    /// Confirmed delivery (#6143): an originated update's first leg went flagged,
-    /// asking the receiver to acknowledge it.
+    /// Confirmed delivery (#6143): the first flagged leg of a pair's pending
+    /// entry went, asking the receiver to acknowledge it.
     AckRequested,
     /// Confirmed delivery: a receiver acknowledged a flagged leg (applied, or
     /// already had it).
@@ -216,36 +216,38 @@ pub(crate) enum PropagationEvent {
     /// reported holding our state, so no confirmation was asked.
     AckNotNeeded,
     /// Confirmed delivery: the receiver dropped a flagged leg, not hosting the
-    /// contract. No resend.
+    /// contract. Final: tracking of the latest update ends.
     AckDroppedNotHosted,
     /// Confirmed delivery: the receiver dropped a flagged leg in merge-failure
-    /// backoff. No resend.
+    /// backoff. Final.
     AckDroppedBackoff,
     /// Confirmed delivery: the receiver's rate limiter dropped a flagged leg.
-    /// No resend.
+    /// Transient: treated as no ack.
     AckDroppedRateLimited,
     /// Confirmed delivery: the receiver's per-contract merge budget dropped a
-    /// flagged leg. No resend.
+    /// flagged leg. Transient: treated as no ack.
     AckDroppedMergeBudget,
-    /// Confirmed delivery: the receiver's merge of a flagged leg failed or its
-    /// contract handler was saturated. No resend.
+    /// Confirmed delivery: the receiver's merge of a flagged leg ran and
+    /// failed. Final.
     AckDroppedMergeFailed,
-    /// Confirmed delivery: no ack for a flagged first leg within the timeout.
+    /// Confirmed delivery: an unconfirmed update aged past the escalation
+    /// bound with nothing in flight, so its one resend was queued.
     AckTimeout,
-    /// Confirmed delivery: the one full-state resend, on the stream path, after
-    /// an unconfirmed (or never sent) first leg.
+    /// Confirmed delivery: the queued full-state resend was built and sent,
+    /// flagged, on the stream path.
     ResendFull,
-    /// Confirmed delivery: the resend went unconfirmed too; the belief about the
-    /// peer was cleared and the node stopped.
+    /// Confirmed delivery: the resend went unconfirmed too (or the update
+    /// aged past the hard bound); the belief about the peer was cleared and
+    /// the node stopped.
     UnconfirmedGiveup,
     /// Confirmed delivery: a target was not tracked because the pending table
     /// was full.
     PendingOverflow,
     /// Confirmed delivery: the receiver's contract handler was saturated when
-    /// a flagged leg arrived. The one resend follows.
+    /// a flagged leg arrived. Transient: treated as no ack.
     AckDroppedOverloaded,
-    /// Confirmed delivery: an ack for the previous flagged leg of a coalesced
-    /// entry proved the path delivers; the escalation clock restarted.
+    /// Confirmed delivery: an ack confirmed an older update of a pair whose
+    /// newer update is still pending.
     AckPathProven,
     /// Confirmed delivery: an ack matched no pending leg (superseded, late,
     /// or never asked for).

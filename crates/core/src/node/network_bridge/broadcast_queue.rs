@@ -1467,7 +1467,7 @@ mod queue {
         /// one per evicted leg.
         evicted: Vec<ContractKey>,
         /// The same evicted legs as (contract, target) pairs, for the
-        /// confirmed-delivery table (#6292 round 1, Must Fix 1).
+        /// confirmed-delivery table (#6143).
         evicted_pairs: Vec<(ContractKey, PeerKeyLocation)>,
     }
 

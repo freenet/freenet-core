@@ -3934,7 +3934,7 @@ mod tests {
             "an unknown version fails closed"
         );
 
-        // Round 1 Should Fix 9: the SEND site re-checks the version, so a leg
+        // The SEND site re-checks the version too, so a leg
         // still queued when the peer reconnects on an older release is sent
         // unflagged even though the table still holds its entry.
         let addr0 = addr_of(&op_manager, &kps[0]);

@@ -4413,7 +4413,7 @@ mod confirmed_delivery_floor_tests {
         }
     }
 
-    /// Round 1 Should Fix 7: a flagged INLINE leg is observed by the #6143
+    /// A flagged INLINE leg is observed by the #6143
     /// `wire_*` counters like any inline broadcast; streams are not inline.
     #[test]
     fn a_flagged_inline_leg_is_an_observed_inline_broadcast() {

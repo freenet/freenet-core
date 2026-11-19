@@ -605,6 +605,11 @@ pub enum InterestMessage {
 ///
 /// Wire type: bincode encodes the variant index, so append only. A new
 /// variant needs a new version floor.
+///
+/// The ack is sent only to the peer that flagged the leg, so a receiver may
+/// send a new variant only to a flagger whose own version is at or above that
+/// new variant's floor; an older flagger cannot decode it. The same rule
+/// applies to [`BroadcastDropReason`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BroadcastAckOutcome {
     /// Merged; the receiver's state now includes the update.
@@ -612,12 +617,19 @@ pub enum BroadcastAckOutcome {
     /// Skipped as a duplicate or an already-merged payload, or merged with no
     /// change: the receiver already held it.
     AlreadyHad,
-    /// Not merged. The sender does not resend (the receiver would drop the
-    /// resend for the same reason) and clears its belief about the receiver.
+    /// Not merged. A final reason ends tracking of the latest update and
+    /// clears the sender's belief about the receiver; a transient reason is
+    /// treated as no ack, and the sender's timers decide (see
+    /// `confirmed_delivery::is_transient`).
     Dropped(BroadcastDropReason),
 }
 
 /// Why a receiver dropped an ack-requested leg (#6143). Append only.
+///
+/// Adding a reason after `CONFIRMED_DELIVERY_MIN_VERSION` has shipped needs
+/// its own floor: a receiver may report it only to a flagger at or above that
+/// floor (the ack goes back to the flagger), and must report an older reason
+/// (or no ack) to an older flagger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BroadcastDropReason {
     /// The receiver does not host the contract.
@@ -631,8 +643,8 @@ pub enum BroadcastDropReason {
     /// The merge ran and failed (the contract rejected it, or it timed out).
     MergeFailed,
     /// The receiver's contract handler was saturated (queue full, or a
-    /// scheduler timeout before the merge ran). Transient: the sender gives it
-    /// the one resend (#6292 round 1, Should Fix 5). Appended.
+    /// scheduler timeout before the merge ran). Transient: the sender treats it
+    /// as no ack and its timers decide. Appended.
     Overloaded,
 }
 

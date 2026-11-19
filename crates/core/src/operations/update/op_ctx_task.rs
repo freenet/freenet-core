@@ -2067,9 +2067,9 @@ async fn drive_relay_broadcast_to(
     ) {
         receiver_terminal.mark_dedup();
         // The dedup cache records a payload BEFORE its merge, so a hit means
-        // seen, not applied (#6292 round 1, Should Fix 3). Ack "already had
-        // it" only when the payload is recorded as merged; otherwise send no
-        // ack and leave it to the sender's deadline.
+        // seen, not applied. Ack "already had it" (#6143) only when the
+        // payload is recorded as merged; otherwise send no ack and leave it to
+        // the sender's timers.
         if op_manager.ring.applied_payloads.contains(
             &key,
             op_manager
@@ -2256,16 +2256,10 @@ async fn drive_relay_broadcast_to(
             result
         }
         Err(err) => {
-            // Saturation (queue full, a scheduler timeout before the merge ran)
-            // is transient and gets the sender's one resend; a merge that ran
-            // and failed does not (#6292 round 1, Should Fix 5).
+            // Saturation is a transient reason, a failed merge a final one.
             super::confirmed_delivery::note_receiver_outcome(
                 crate::message::BroadcastAckOutcome::Dropped(
-                    if err.is_contract_queue_full() || err.is_scheduler_timeout() {
-                        crate::message::BroadcastDropReason::Overloaded
-                    } else {
-                        crate::message::BroadcastDropReason::MergeFailed
-                    },
+                    super::confirmed_delivery::drop_reason_for_merge_error(&err),
                 ),
             );
             // Record the merge failure for the per-contract backoff (#4861),
@@ -3162,9 +3156,9 @@ async fn apply_streaming_broadcast(
     ) {
         receiver_terminal.mark_dedup();
         // The dedup cache records a payload BEFORE its merge, so a hit means
-        // seen, not applied (#6292 round 1, Should Fix 3). Ack "already had
-        // it" only when the payload is recorded as merged; otherwise send no
-        // ack and leave it to the sender's deadline.
+        // seen, not applied. Ack "already had it" (#6143) only when the
+        // payload is recorded as merged; otherwise send no ack and leave it to
+        // the sender's timers.
         if op_manager.ring.applied_payloads.contains(
             &key,
             op_manager
@@ -3323,16 +3317,10 @@ async fn apply_streaming_broadcast(
             exec
         }
         Err(err) => {
-            // Saturation (queue full, a scheduler timeout before the merge ran)
-            // is transient and gets the sender's one resend; a merge that ran
-            // and failed does not (#6292 round 1, Should Fix 5).
+            // Saturation is a transient reason, a failed merge a final one.
             super::confirmed_delivery::note_receiver_outcome(
                 crate::message::BroadcastAckOutcome::Dropped(
-                    if err.is_contract_queue_full() || err.is_scheduler_timeout() {
-                        crate::message::BroadcastDropReason::Overloaded
-                    } else {
-                        crate::message::BroadcastDropReason::MergeFailed
-                    },
+                    super::confirmed_delivery::drop_reason_for_merge_error(&err),
                 ),
             );
             // Record poison-contract merge failures for the backoff (#4861),
@@ -7870,7 +7858,7 @@ mod tests {
     /// Walk brace depth from the opening `{` of the named fn to the
     /// matching `}`. Returns the body slice. Robust to nearby section
     /// comments being renamed.
-    /// Round-1 Should Fix 3: a dedup-cache hit means the payload was SEEN, not
+    /// A dedup-cache hit means the payload was SEEN, not
     /// applied (the cache inserts before the merge), so it must not be acked.
     /// Pinned on both drivers: the dedup branch notes no receiver outcome.
     #[test]
@@ -7894,6 +7882,50 @@ mod tests {
                     "{sig}: a dedup hit may ack only a payload recorded as merged"
                 );
             }
+        }
+    }
+
+    /// The dedup cache's merged flag (#6143) is set by the code that knows a
+    /// merge finished: inside each broadcast driver's Ok arm, after
+    /// `update_contract`, for the payload just merged. And the dedup branch
+    /// consults it. Bounded to each driver.
+    #[test]
+    fn the_dedup_cache_learns_merges_from_the_drivers_ok_arm() {
+        let src = include_str!("op_ctx_task.rs");
+        for (sig, mark, seen) in [
+            (
+                "async fn drive_relay_broadcast_to(",
+                ".mark_merged(&key, &payload_bytes, is_delta);",
+                ".seen_merged(&key, &payload_bytes, is_delta)",
+            ),
+            (
+                "async fn apply_streaming_broadcast(",
+                ".mark_merged(&key, &state_bytes, false);",
+                ".seen_merged(&key, &state_bytes, false)",
+            ),
+        ] {
+            let body = extract_fn_body(src, sig);
+            let compact: String = body.split_whitespace().collect();
+            let mark: String = mark.split_whitespace().collect();
+            let seen: String = seen.split_whitespace().collect();
+            assert_eq!(compact.matches(&mark).count(), 1, "{sig}: one mark_merged");
+            let merge = compact.find("super::update_contract(").expect("merges");
+            let ok_arm = compact[merge..].find("Ok(").expect("an Ok arm") + merge;
+            let err_arm = compact[merge..].find("Err(err)=>").expect("an Err arm") + merge;
+            let at = compact.find(&mark).expect("counted above");
+            assert!(
+                ok_arm < at && at < err_arm,
+                "{sig}: mark_merged must sit in the Ok arm of the merge"
+            );
+            let dedup = compact
+                .find("receiver_terminal.mark_dedup();")
+                .expect("dedup branch");
+            assert!(
+                compact[dedup..]
+                    .find(&seen)
+                    .is_some_and(|i| dedup + i < merge),
+                "{sig}: the dedup branch consults seen_merged before the merge"
+            );
         }
     }
 

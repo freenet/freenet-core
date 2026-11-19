@@ -616,12 +616,15 @@ contract this node does not host, skipped before the merge).
 Confirmed delivery of originated updates (#6143,
 `operations/update/confirmed_delivery.rs`) adds, per contract on the
 originator: `ack_requested` (an entry's first flagged leg; re-flags are not
-counted), `ack_confirmed`, `ack_not_needed` (an armed leg skipped as
-converged), `ack_path_proven` (a late ack for an earlier leg of a coalesced
-entry), `ack_unmatched`, `ack_dropped_not_hosted` / `_backoff` /
-`_merge_failed` (final: no resend) and `ack_dropped_rate_limited` /
-`_merge_budget` / `_overloaded` (transient: one resend), `ack_timeout`,
-`resend_full`, `unconfirmed_giveup`, `pending_overflow`. They are exported as
+counted), `ack_confirmed` (the entry confirmed up to its latest update),
+`ack_not_needed` (an armed leg skipped as converged), `ack_path_proven` (an
+ack confirmed an older update while a newer one is pending), `ack_unmatched`,
+`ack_dropped_not_hosted` / `_backoff` / `_merge_failed` (final: tracking of the
+latest update ends, belief cleared) and `ack_dropped_rate_limited` /
+`_merge_budget` / `_overloaded` (transient: treated as no ack),
+`ack_timeout` (the one resend was queued), `resend_full` (it was sent),
+`unconfirmed_giveup`, `pending_overflow`. The table's transitions are in the
+module doc of `confirmed_delivery.rs`. They are exported as
 `prop_*` in the `broadcast_payload_mix` telemetry; the INFO summary line does
 not list them.
 
