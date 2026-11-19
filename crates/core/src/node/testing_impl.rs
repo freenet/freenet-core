@@ -2505,6 +2505,15 @@ impl SimNetwork {
         self
     }
 
+    /// Stops every native connection of this network sending its first-frame
+    /// probe, so one kept beside a UDP entry (option (b), 10.4 answer 2)
+    /// carries no frame from the peer and has to expire, leaving UDP.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn without_native_probes(&mut self) -> &mut Self {
+        crate::operations::connect::native_wire_trace::suppress_native_probe(&self.name);
+        self
+    }
+
     /// Delays every QUIC-class datagram between any two nodes by `delay`,
     /// one way; every other datagram is delivered as before. A test slows
     /// native setups this way (each takes a few round trips) without slowing
