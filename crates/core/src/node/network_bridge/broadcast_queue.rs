@@ -5267,6 +5267,13 @@ pub(super) async fn broadcast_to_single_peer(
             }
         };
 
+        // The stream's declared length, which the receiver sizes its age
+        // limit from (the state plus the sender summary plus framing), and
+        // the completion wait it scales. Computed once: the flagged leg's
+        // provisional deadline (#6292 round 1, Must Fix 1) and the wait below
+        // must agree.
+        let stream_bytes = payload_bytes.len() as u64;
+        let completion_timeout = stream_completion_timeout(stream_bytes);
         if flagged {
             record_flagged_leg(
                 op_manager,
@@ -5274,8 +5281,7 @@ pub(super) async fn broadcast_to_single_peer(
                 &peer_key,
                 update_tx,
                 resend_full,
-                stream_completion_timeout(payload_bytes.len() as u64)
-                    + crate::operations::update::confirmed_delivery::ACK_TIMEOUT,
+                completion_timeout + crate::operations::update::confirmed_delivery::ACK_TIMEOUT,
             );
         }
         let send_res = bridge.send(peer_addr, net_msg).await;
@@ -5294,10 +5300,8 @@ pub(super) async fn broadcast_to_single_peer(
             // broadcast-queue task, not the event loop; the StreamSend this
             // enqueues is drained by the loop, so it cannot self-stall it. The
             // #4001 `None` progress arg that brought this statement into the diff
-            // does not change the send path.
-            // The stream's declared length, which the receiver sizes its age
-            // limit from: the state plus the sender summary plus framing.
-            let stream_bytes = payload_bytes.len() as u64;
+            // does not change the send path. `stream_bytes` and
+            // `completion_timeout` are computed above the metadata send.
             if let Err(err) = bridge
                 .send_stream_with_completion(
                     peer_addr,
@@ -5334,7 +5338,6 @@ pub(super) async fn broadcast_to_single_peer(
                 // completion signal carries a `StreamSendOutcome` so we
                 // distinguish a real delivery from a drop (#4235); a drop must
                 // NOT be recorded as a send.
-                let completion_timeout = stream_completion_timeout(stream_bytes);
                 let completion = await_stream_completion_releasing_permit(
                     completion_rx,
                     lane_permit.take(),

@@ -5503,6 +5503,7 @@ fn run_lost_inline_legs_scenario(
         updates: 1,
         state_len: 128,
         latency: None,
+        post_update_wait: Duration::from_secs(30),
     })
 }
 
@@ -5518,6 +5519,8 @@ struct ConfirmedDeliveryScenario {
     updates: u64,
     state_len: usize,
     latency: Option<std::ops::Range<Duration>>,
+    /// Virtual time the run continues after the last update.
+    post_update_wait: Duration,
 }
 
 fn run_confirmed_delivery_scenario(scenario: ConfirmedDeliveryScenario) -> LostInlineLegsOutcome {
@@ -5530,15 +5533,13 @@ fn run_confirmed_delivery_scenario(scenario: ConfirmedDeliveryScenario) -> LostI
         updates,
         state_len,
         latency,
+        post_update_wait,
     } = scenario;
     use freenet::dev_tool::{
         NodeLabel, ScheduledOperation, SimOperation, inline_leg_fault_injection,
         register_crdt_contract,
     };
 
-    /// The objective in the design: an originated update reaches its direct
-    /// targets within 30 s or the node knows it did not.
-    const POST_UPDATE_WAIT: Duration = Duration::from_secs(30);
     const FIRST_VERSION: u64 = 100;
     let final_version = FIRST_VERSION + updates - 1;
     let crdt_state = |version: u64| {
@@ -5615,7 +5616,7 @@ fn run_confirmed_delivery_scenario(scenario: ConfirmedDeliveryScenario) -> LostI
     }
 
     let result =
-        sim.run_controlled_simulation(seed, operations, Duration::from_secs(120), POST_UPDATE_WAIT);
+        sim.run_controlled_simulation(seed, operations, Duration::from_secs(120), post_update_wait);
     let swallowed = inline_leg_fault_injection::swallowed(&contract_key);
     inline_leg_fault_injection::clear(&contract_key);
     assert!(
@@ -5746,10 +5747,13 @@ fn test_confirmed_delivery_recovers_an_originated_update_from_lost_inline_legs()
     );
 }
 
-/// Round 1 (Must Fix 2): sustained client writes, one every 3 s with every
-/// inline leg lost. Before the fix each newer update restarted the entry, so
-/// the resend never came while the writes continued. Every host must end on
-/// the LAST update within 30 s of it, and the resend must have fired.
+/// Round 1 (Must Fix 2): sustained client writes, one every 3 s for 27 s,
+/// with every inline leg lost. Before the fix each newer update restarted the
+/// entry, so no resend could fire until the writes STOPPED. The run ends 5 s
+/// after the last write, inside one ack timeout, so only a resend that fired
+/// DURING the writes can have reached the other hosts: each must hold one of
+/// node 1's updates. (Checked against the round-1 coalescing: with a 30 s
+/// tail the post-write resend masked it and this test passed.)
 #[test_log::test]
 fn test_confirmed_delivery_resends_under_sustained_writes() {
     let outcome = run_confirmed_delivery_scenario(ConfirmedDeliveryScenario {
@@ -5761,13 +5765,14 @@ fn test_confirmed_delivery_resends_under_sustained_writes() {
         updates: 10,
         state_len: 128,
         latency: None,
+        post_update_wait: Duration::from_secs(5),
     });
     assert!(outcome.swallowed > 0, "the fault seam never fired");
     for (label, version) in &outcome.versions {
-        assert_eq!(
-            *version,
-            Some(outcome.final_version),
-            "{label}; all: {:?}; confirmed delivery: {:?}",
+        assert!(
+            version.is_some_and(|v| v >= 100),
+            "{label} must hold one of node 1's updates before the writes end \
+             plus one ack timeout; all: {:?}; confirmed delivery: {:?}",
             outcome.versions,
             outcome.events
         );
@@ -5792,6 +5797,7 @@ fn test_confirmed_delivery_with_latency_sends_no_resends() {
         updates: 1,
         state_len: 128,
         latency: Some(Duration::from_millis(20)..Duration::from_millis(120)),
+        post_update_wait: Duration::from_secs(30),
     });
     assert_healthy(&outcome);
 }
@@ -5810,6 +5816,7 @@ fn test_confirmed_delivery_with_a_multi_fragment_state_sends_no_resends() {
         updates: 1,
         state_len: 8 * 1024,
         latency: None,
+        post_update_wait: Duration::from_secs(30),
     });
     assert_healthy(&outcome);
 }
