@@ -1440,9 +1440,17 @@ mod behaviour_tests {
     // ── M1: a healthy fast writer pays nothing ─────────────────────────────
 
     /// M1: a healthy writer (an update every 3 s) whose acks take 7 s pays no
-    /// resend and no give-up over two minutes.
+    /// resend and no give-up over two minutes. Also with 12 s acks: slower
+    /// than [`ACK_TIMEOUT`], so only the escalation age keeps a writer whose
+    /// every ack does arrive from being resent to.
     #[test]
     fn a_healthy_fast_writer_with_slow_acks_gets_no_resend() {
+        for ack_latency in [7u64, 12] {
+            healthy_writer(ack_latency);
+        }
+    }
+
+    fn healthy_writer(ack_latency: u64) {
         let p = Pair::new();
         let mut pending: Vec<(u64, Transaction)> = Vec::new();
         let mut actions = Vec::new();
@@ -1458,11 +1466,14 @@ mod behaviour_tests {
             if t % 3 == 0 {
                 p.arm(t);
                 let tx = p.leg(t);
-                pending.push((t + 7, tx));
+                pending.push((t + ack_latency, tx));
             }
             actions.extend(p.sweep(t));
         }
-        assert!(actions.is_empty(), "no resend or give-up: {actions:?}");
+        assert!(
+            actions.is_empty(),
+            "{ack_latency} s acks: no resend or give-up: {actions:?}"
+        );
     }
 
     /// The other side of M1: the same writer whose legs are all lost reaches
@@ -1717,11 +1728,16 @@ mod behaviour_tests {
 
         p.arm(1);
         p.leg(1);
-        p.arm(2);
+        // A later leg to the pair (a relayed fan-out, say) skips as
+        // converged: the belief it reads was written by the flagged leg that
+        // may have been lost, so it must not settle the update.
         assert!(
             !p.table.settle_converged(p.key.id(), &p.peer),
             "the skip reads a belief the unconfirmed leg wrote"
         );
+        p.arm(2);
+        assert!(!p.table.settle_converged(p.key.id(), &p.peer));
+        assert!(!p.settled());
     }
 
     // ── bounds and bookkeeping ────────────────────────────────────────────
