@@ -1169,6 +1169,7 @@ impl EndpointCore {
             incoming,
             permit,
             charge: JoinerCharge { cap: charge, mark },
+            queued_at: None,
             config: gate.config.clone(),
             ticket,
             health: self.health.clone(),
@@ -1218,6 +1219,9 @@ pub(crate) struct JoinerIncoming {
     permit: QuicSourcePermit,
     /// What the joiner holds until it is promoted or released.
     charge: JoinerCharge,
+    /// When the hub queued it for its join, nanoseconds on the hub's clock
+    /// ([`Self::stamp`]); the join window counts from here.
+    queued_at: Option<u64>,
     config: Arc<quinn::ServerConfig>,
     /// Given back if the attempt is dropped before its handshake starts.
     ticket: admission::AdmissionTicket,
@@ -1276,6 +1280,18 @@ impl JoinerIncoming {
     /// The address the attempt came from (normalized).
     pub(crate) fn source(&self) -> SocketAddr {
         self.permit.addr()
+    }
+
+    /// Record when the join was queued, on the clock `join_gateway` runs on,
+    /// so time spent waiting for a free join slot comes out of the join
+    /// window instead of extending the joiner's charge.
+    pub(crate) fn stamp(&mut self, now_nanos: u64) {
+        self.queued_at = Some(now_nanos);
+    }
+
+    /// When the join was queued ([`Self::stamp`]).
+    pub(crate) fn queued_at(&self) -> Option<u64> {
+        self.queued_at
     }
 
     /// Complete the handshake; the connection is bound to the key the client

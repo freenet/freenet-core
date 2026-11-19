@@ -520,14 +520,17 @@ impl<S> DemuxSocket<S> {
         &self,
         addr: SocketAddr,
     ) -> Option<(QuicSourcePermit, QuicJoinerMark)> {
+        let shared = self.live_quic_ingress()?.shared.clone();
+        let addr = normalize_mapped_addr(addr);
+        // Marked BEFORE the address is allowed: a datagram is classified only
+        // once its source is on the allow-set, so none can be taken as
+        // established in between and use the per-source share. The mark's
+        // drop is the rollback if the allow-set refuses (and a source not on
+        // the allow-set takes the unknown-source lane, which never reads
+        // the mark).
+        *shared.joiners.entry(addr).or_insert(0) += 1;
+        let mark = QuicJoinerMark { shared, addr };
         let permit = self.allow_quic_source(addr)?;
-        // Marked after the allow-set entry exists: a datagram that raced in
-        // between takes the established share, a handful at most.
-        *permit.shared.joiners.entry(permit.addr).or_insert(0) += 1;
-        let mark = QuicJoinerMark {
-            shared: permit.shared.clone(),
-            addr: permit.addr,
-        };
         Some((permit, mark))
     }
 
@@ -1551,6 +1554,74 @@ mod tests {
         // Draining everything returns the share to zero, promoted or not.
         while queue.try_recv().is_ok() {}
         assert_eq!(socket.joiner_queued_for_test(), 0, "no slot leaked");
+    }
+
+    /// A source marked as a joiner is a joiner from the moment it is on the
+    /// allow-set: the mark is placed first, so no datagram can see the source
+    /// allowed and unmarked. A datagram right after `allow_quic_joiner`
+    /// counts against the joiners' share, and when the allow-set refuses, no
+    /// mark is left behind.
+    #[tokio::test]
+    async fn a_joiner_is_marked_before_it_is_allowed() {
+        let (socket, _queue, _joiners, _peer) = joiner_flood(1, 1, 0).await;
+        assert_eq!(socket.joiner_queued_for_test(), 1, "counted as a joiner");
+        // Source scrape: the mark is made before the allow-set entry.
+        let source = include_str!("demux.rs");
+        let body = &source[source.find("pub(crate) fn allow_quic_joiner(").unwrap()..];
+        let mark = body.find("shared.joiners.entry(addr)").expect("the mark");
+        let allow = body
+            .find("self.allow_quic_source(addr)?")
+            .expect("the allow");
+        assert!(mark < allow, "marked first");
+
+        // A full allow-set refuses the joiner and leaves no mark.
+        let full = DemuxSocket::wrap(ScriptedSocket::new(vec![]), None);
+        let _queue = full.enable_quic_ingress().expect("first enable");
+        let _held: Vec<_> = (0..QUIC_ALLOWED_SOURCES_MAX)
+            .map(|i| {
+                let addr = SocketAddr::from(([10, 9, (i / 250) as u8, (i % 250) as u8], 7000));
+                full.allow_quic_source(addr).expect("room")
+            })
+            .collect();
+        let late: SocketAddr = "10.8.8.8:7000".parse().unwrap();
+        assert!(full.allow_quic_joiner(late).is_none(), "the set is full");
+        assert!(
+            !full.quic.get().unwrap().shared.joiners.contains_key(&late),
+            "the refused joiner left no mark"
+        );
+    }
+
+    /// While one joiner keeps the joiners' share full, an honest joiner's
+    /// datagram is dropped (and the QUIC handshake retransmits it), and is
+    /// admitted as soon as the endpoint reads a slot free. The honest join is
+    /// slowed to the endpoint's read rate, not stopped.
+    #[tokio::test]
+    async fn an_honest_joiner_gets_in_as_the_endpoint_reads_while_the_share_is_full() {
+        let attacker = |i: usize| SocketAddr::from(([10, 254, 4, 1], 6000 + i as u16));
+        let honest: SocketAddr = "10.254.4.9:6500".parse().unwrap();
+        let mut script: Vec<Step> = (0..QUIC_INGRESS_JOINER_DATAGRAMS)
+            .map(|i| Step::Packet(attacker(i), quic(1)))
+            .collect();
+        script.push(Step::Packet(honest, quic(0xA0)));
+        script.push(Step::Packet(honest, quic(0xA1)));
+        let socket = DemuxSocket::wrap(ScriptedSocket::new(script), None);
+        let mut queue = socket.enable_quic_ingress().expect("first enable");
+        let _attackers: Vec<_> = (0..QUIC_INGRESS_JOINER_DATAGRAMS)
+            .map(|i| socket.allow_quic_joiner(attacker(i)).expect("allowed"))
+            .collect();
+        let _honest = socket.allow_quic_joiner(honest).expect("allowed");
+        let mut buf = [0u8; 64];
+        for _ in 0..QUIC_INGRESS_JOINER_DATAGRAMS + 1 {
+            socket.recv_classified(&mut buf).await.unwrap();
+        }
+        assert_eq!(outcomes(&socket)[3], 1, "the honest datagram was dropped");
+        queue.try_recv().expect("the endpoint reads one");
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert_eq!(outcomes(&socket)[3], 1, "its retransmission got in");
+        assert!(
+            std::iter::from_fn(|| queue.try_recv().ok()).any(|d| d.from == honest),
+            "the honest joiner's datagram is queued"
+        );
     }
 
     /// A QUIC-class datagram from a source not on the allow-set is dropped

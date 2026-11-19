@@ -5838,7 +5838,7 @@ fn a_joiner_is_charged_from_admission_and_released_at_each_exit() {
             let _seed = GlobalRng::seed_guard(SEED);
             let net = crate::transport::test_net::subnet();
             let pair = pair("quic-joiner-cap-exits", net.addr(1), net.addr(2), None).await;
-            let cap = QuicPathPermits::new(2);
+            let cap = QuicPathPermits::new(3);
             assert!(pair.b.attach_joiner_cap(cap.clone()));
             assert!(pair.b.enable_gateway_admission(pair.time.clone()));
             let wrong_key = TransportKeypair::new();
@@ -5928,9 +5928,71 @@ fn a_joiner_is_charged_from_admission_and_released_at_each_exit() {
     }
 }
 
+/// The join window counts from the moment the hub queued the join, so time
+/// spent waiting for a join slot comes out of it: a join that waited past the
+/// window ends at once and gives its charge back, and one that waited part of
+/// it ends within the window as measured from the queueing, not from the
+/// start of its handshake.
+#[test]
+fn the_join_window_counts_from_queueing() {
+    use super::upgrade::driver::join_gateway;
+    use super::upgrade::policy::QuicPathPermits;
+    use crate::transport::metrics::GatewayAdmission;
+    // (seconds waited in the queue, wanted outcome, longest total from queueing)
+    for (waited, want, longest) in [
+        (9u64, GatewayAdmission::HandshakeFailed, 9u64),
+        (5, GatewayAdmission::HelloFailed, 9),
+    ] {
+        bounded(move || async move {
+            let _seed = GlobalRng::seed_guard(SEED);
+            let net = crate::transport::test_net::subnet();
+            let pair = pair("quic-joiner-window", net.addr(1), net.addr(2), None).await;
+            let cap = QuicPathPermits::new(3);
+            assert!(pair.b.attach_joiner_cap(cap.clone()));
+            assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+            let (client_config, server_peer) = native_client_config(&pair.a, pair.b_keys.public());
+            let (a, b, b_addr, time) = (
+                pair.a.clone(),
+                pair.b.clone(),
+                pair.b_addr,
+                pair.time.clone(),
+            );
+            let (held, outcome, total, after) =
+                drive(&pair.time, Duration::from_secs(60), async move {
+                    let client = time.timeout(Duration::from_secs(30), async move {
+                        a.connect_with(b_addr, client_config, server_peer).await
+                    });
+                    let server = async {
+                        let Some(super::EndpointAttempt::Joiner(mut joiner)) =
+                            b.accept_attempt().await
+                        else {
+                            panic!("an admitted joiner");
+                        };
+                        let queued = time.now_nanos();
+                        joiner.stamp(queued);
+                        let held = cap.joiners_in_use();
+                        time.advance(Duration::from_secs(waited));
+                        let outcome = join_gateway(joiner, &time).await;
+                        let total = Duration::from_nanos(time.now_nanos() - queued);
+                        (held, outcome, total, cap.joiners_in_use())
+                    };
+                    tokio::join!(client, server).1
+                })
+                .await;
+            assert_eq!(held, 1, "charged while queued");
+            assert_eq!(outcome, want, "waited {waited} s");
+            assert!(
+                total <= Duration::from_secs(longest),
+                "waited {waited} s: held for {total:?} in all"
+            );
+            assert_eq!(after, 0, "released");
+        })
+    }
+}
+
 /// With no room in the cap a newcomer is ignored (no handshake, nothing
 /// recorded against the address or the rate), and once a joiner releases its
-/// charge the next one is admitted. One path of cap holds one joiner.
+/// charge the next one is admitted. Three paths of cap hold one joiner (a quarter of the cap).
 #[test]
 fn a_joiner_with_no_room_in_the_cap_is_ignored_until_one_is_released() {
     use super::upgrade::policy::QuicPathPermits;
@@ -5940,7 +6002,7 @@ fn a_joiner_with_no_room_in_the_cap_is_ignored_until_one_is_released() {
         let mut pair = pair("quic-joiner-cap-full", net.addr(1), net.addr(2), None).await;
         let (c, c_keys) = pair.third(net.addr(3)).await;
         let _ = c_keys;
-        let cap = QuicPathPermits::new(1);
+        let cap = QuicPathPermits::new(3);
         assert!(pair.b.attach_joiner_cap(cap.clone()));
         assert!(pair.b.enable_gateway_admission(pair.time.clone()));
         let (a_config, server_peer) = native_client_config(&pair.a, pair.b_keys.public());
