@@ -31,6 +31,20 @@ slow-timeout = { period = "300s", terminate-after = 2 }
 filter = "test(test_evicted_contracts_keep_no_interest_records)"
 slow-timeout = { period = "300s", terminate-after = 2 }
 
+# #6237 merge-budget sims (non_settling_contract_is_bounded_by_merge_budget and
+# its _streaming variant): a 12-node / 2-gateway Turmoil simulation of 300
+# iterations with a quarter of contracts made non-settling, each run alone in a
+# child process. Measured 370s wall-clock for the pair running side by side
+# under nextest on a 2-thread local run (2026-11-18), well past the default
+# 240s cap; they timed out on all three tries in CI run 44433313054 once #6283
+# stopped them crashing early on a shared data directory. No retries: the run
+# is deterministic (fixed seed), so a retry could only hide a regression, and
+# three 600s attempts would use most of the Simulation job's 40 min.
+[[profile.ci.overrides]]
+filter = "test(/non_settling_contract_is_bounded_by_merge_budget/)"
+slow-timeout = { period = "300s", terminate-after = 2 }
+retries = 0
+
 # #5814 degree-creep model: two arms of a 1000-peer topology model over 3h of
 # virtual time, on parallel threads. Measured ~55s wall-clock locally; give it
 # headroom on a contended runner.
