@@ -1178,6 +1178,9 @@ allowed addresses can fill the reserve; the queue then holds 1024, as
 without it. Limitation: the reserve helps only while most sources are busy;
 with about 256 or more connections each holding a few datagrams, most
 traffic counts as quiet and the queue behaves close to a plain FIFO.
+Unpromoted native joiners (gateway admission on) hold one separate slice,
+`QUIC_INGRESS_JOINER_DATAGRAMS` (64) in all, instead of the per-source share,
+and never use the quiet reserve.
 `allow_quic_source` returns a QuicSourcePermit: the address stays allowed
 while a permit for it is alive, and the set holds at most
 QUIC_ALLOWED_SOURCES_MAX addresses (past it, `allow_quic_source` refuses; a
@@ -1207,7 +1210,7 @@ Off, a node behaves as before; what it still carries is an idle second
 ingress queue (128 slots) and its poll in the endpoint's receive, one atomic
 load per QUIC datagram from a source not on the allow-set, and the
 `quic_gateway_admission_*` counters at 0. The switch's doc names what turning
-it on waits for (joiners inside the connection cap, phase B). When on, the
+it on waits for (phase B; joiners inside the connection cap are done, A7b PR 6). When on, the
 demux gets an unknown-source lane (`enable_unknown_source_lane`): a
 QUIC-class datagram from a source not on the allow-set is queued on a
 separate queue of `UNKNOWN_SOURCE_QUEUE_DATAGRAMS` (128, in
@@ -1220,7 +1223,11 @@ first and the unknown-source queue only when it is empty.
 allow-set, in order: no Retry token yet → Retry; an address admitted within
 the last second → ignored; the node-wide rate (50 a second) spent → ignored;
 otherwise admitted, recorded against both limits as an `AdmissionTicket`;
-then the address is put on the allow-set for the attempt and then the
+then the joiner is charged against the node's QUIC path cap at the
+handshake-phase rate (`QuicPathPermits::try_acquire_joiner`; no room, joiners
+already at a quarter of the cap, or no cap attached yet → ignored,
+`joiner_cap_full`); then the address is put on the allow-set, marked as a
+joiner (`allow_joiner`), for the attempt and then the
 connection (the handshake's later, shorter datagrams take the established
 path), and the attempt is accepted with one server configuration built at
 enable (`server_tls_proven`). A ticket dropped before the join's handshake
@@ -1236,8 +1243,10 @@ a join that gets that far is closed (`node_dropped_peer`). Each outcome is
 counted under `quic_gateway_admission_*`: queued, queue_full, short_header,
 runt, unknown_version, not_initial, retried, throttled_address,
 throttled_global, allow_set_full, admitted, refunded, join_queue_full,
-handshake_failed, unproven, hello_failed, joined, join_panicked. Not yet:
-joiners inside the connection cap (A7b PR 6).
+handshake_failed, unproven, hello_failed, joined, join_panicked,
+joiner_cap_full, joiner_share_full. Joiners are inside the connection cap and
+share one bounded slice of the ingress queue (section "WHEN admitting native
+joiners at a gateway").
 
 Socket-health signal: the listener reads through `Socket::recv_classified`,
 which `DemuxSocket` answers with `Datagram` for a legacy datagram and
@@ -1763,8 +1772,10 @@ rule that stops upgrades: `Mode` (off), `Breaker`, `NoPaths`
 (`quic-max-paths` = 0) or `Endpoint(availability)` (not `Up`); `allowed()` is
 true when none does. `admit()` returns a `QuicPathPermit` or
 `PathRefusal::{Disabled(cause), Busy}`; `Ok` does not prove the endpoint is
-still up. `QuicPathPermits` holds at most `quic-max-paths` paths, released on
-drop.
+still up. `QuicPathPermits` holds at most `quic-max-paths` paths and, on a gateway
+with admission on, native joiners, together in memory units (a path
+`PATH_PERMIT_UNITS`, a joiner `JOINER_PERMIT_UNITS`, joiners at most a quarter
+of the total); each permit is released on drop.
 
 `quic-max-paths` is stored as text (`lenient_count`), like `transport-quic`,
 so any value loads: an integer or string is kept as written, a bool or float

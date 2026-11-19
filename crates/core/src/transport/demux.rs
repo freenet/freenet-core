@@ -840,6 +840,32 @@ impl<S: Socket> Socket for DemuxSocket<S> {
     }
 }
 
+/// The body of the production function whose signature line starts with
+/// `signature`, from `source` (a file read with `include_str!`), with comment
+/// lines stripped. Only the part of the file before its test module is
+/// searched, so a pin's own literals (which sit in the test module) cannot
+/// satisfy it, and a renamed or missing function panics: source-scrape pins
+/// fail closed (`bug-prevention-patterns.md`). The function's closing brace
+/// is its first line `    }` at four-space indent (a method in an `impl`).
+#[cfg(test)]
+pub(crate) fn production_fn_body(source: &str, signature: &str) -> String {
+    let production = source
+        .split("\n#[cfg(test)]\nmod tests {")
+        .next()
+        .expect("the production part");
+    let start = production
+        .find(signature)
+        .unwrap_or_else(|| panic!("`{signature}` is not in the production code"));
+    let end = production[start..]
+        .find("\n    }\n")
+        .unwrap_or_else(|| panic!("the end of `{signature}`"));
+    production[start..start + end]
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1566,26 +1592,11 @@ mod tests {
         let (socket, _queue, _joiners, _peer) = joiner_flood(1, 1, 0).await;
         assert_eq!(socket.joiner_queued_for_test(), 1, "counted as a joiner");
         // Source scrape, bounded to the production function: the mark is
-        // made before the allow-set entry. Only the part of the file before
-        // the test module is searched (this test's own literals sit after
-        // it), and a missing function fails the test.
-        let file = include_str!("demux.rs");
-        let production = file
-            .split("\n#[cfg(test)]\nmod tests {")
-            .next()
-            .expect("the production part");
-        let signature = "    pub(crate) fn allow_quic_joiner(";
-        let start = production
-            .find(signature)
-            .expect("allow_quic_joiner in the production code");
-        let end = production[start..]
-            .find("\n    }\n")
-            .expect("the end of allow_quic_joiner");
-        let body: String = production[start..start + end]
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // made before the allow-set entry.
+        let body = production_fn_body(
+            include_str!("demux.rs"),
+            "    pub(crate) fn allow_quic_joiner(",
+        );
         let mark = body.find("shared.joiners.entry(addr)").expect("the mark");
         let allow = body
             .find("self.allow_quic_source(addr)?")

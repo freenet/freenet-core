@@ -6119,11 +6119,21 @@ fn with_admission_off_no_joiner_is_charged() {
     // The cap the joiners are charged against is the node's path permits:
     // the hub attaches them when it is built, and the accept path charges
     // before it puts the address on the allow-set.
-    let driver = include_str!("upgrade/driver.rs");
-    assert!(driver.contains("endpoint.attach_joiner_cap(policy.permits().clone());"));
-    let quic = include_str!("../quic.rs");
-    let charge = quic.find("try_acquire_joiner").expect("the charge");
-    let allow = quic
+    // Source scrapes, bounded to the production bodies (a renamed or missing
+    // function fails them): the hub attaches the permits in
+    // `QuicUpgrades::new`, and `EndpointCore::admit` charges before it allows.
+    use crate::transport::demux::production_fn_body;
+    let new_body = production_fn_body(
+        include_str!("upgrade/driver.rs"),
+        "    pub(in crate::transport) fn new(\n        endpoint: QuicEndpoint,",
+    );
+    assert!(new_body.contains("endpoint.attach_joiner_cap(policy.permits().clone());"));
+    let admit = production_fn_body(
+        include_str!("../quic.rs"),
+        "    fn admit(&self, gate: &GatewayAdmission, incoming: quinn::Incoming)",
+    );
+    let charge = admit.find("try_acquire_joiner").expect("the charge");
+    let allow = admit
         .find("self.sources.allow_joiner(remote)")
         .expect("the allow");
     assert!(charge < allow, "charged before the address is allowed");
