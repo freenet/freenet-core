@@ -4271,6 +4271,26 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         snapshot.relayed_subscribes_total,
                     ),
                     ("relayed_updates_total", snapshot.relayed_updates_total),
+                    (
+                        "contract_lane_refused_client_total",
+                        snapshot.contract_lane_refused_client_total,
+                    ),
+                    (
+                        "contract_lane_refused_relay_total",
+                        snapshot.contract_lane_refused_relay_total,
+                    ),
+                    (
+                        "contract_lane_refused_background_total",
+                        snapshot.contract_lane_refused_background_total,
+                    ),
+                    (
+                        "relay_admission_refused_total",
+                        snapshot.relay_admission_refused_total,
+                    ),
+                    (
+                        "relay_get_overload_not_found_total",
+                        snapshot.relay_get_overload_not_found_total,
+                    ),
                     ("connect_accepts_emitted", snapshot.connect_accepts_emitted),
                     ("connect_rejects_emitted", snapshot.connect_rejects_emitted),
                     (
@@ -5420,6 +5440,11 @@ mod tests {
         info.relayed_puts_total = Some(25);
         info.relayed_subscribes_total = Some(26);
         info.relayed_updates_total = Some(27);
+        info.contract_lane_refused_client_total = Some(28);
+        info.contract_lane_refused_relay_total = Some(29);
+        info.contract_lane_refused_background_total = Some(30);
+        info.relay_admission_refused_total = Some(31);
+        info.relay_get_overload_not_found_total = Some(32);
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         for (key, want) in [
             ("ring_connections", 21),
@@ -5429,6 +5454,11 @@ mod tests {
             ("relayed_puts_total", 25),
             ("relayed_subscribes_total", 26),
             ("relayed_updates_total", 27),
+            ("contract_lane_refused_client_total", 28),
+            ("contract_lane_refused_relay_total", 29),
+            ("contract_lane_refused_background_total", 30),
+            ("relay_admission_refused_total", 31),
+            ("relay_get_overload_not_found_total", 32),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

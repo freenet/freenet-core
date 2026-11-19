@@ -977,8 +977,10 @@ pub(crate) async fn drive_retry_loop<D: RetryDriver>(
                     "{op_label}: peer indicated retry; advancing"
                 );
                 // `Retry` means the peer answered but could not serve the
-                // contract: GET's `NotFound` is its only producer, and PUT
-                // never returns it.
+                // request: GET's `NotFound`, and PUT's `ReplyClass::Overloaded`
+                // (a hop that could not take the PUT for overload,
+                // ANT-2026-K0YQ8CG4). Both are recorded as a NotFound-class
+                // attempt failure against that hop.
                 driver.on_not_found_hop(attempt_hop.as_ref());
                 record_attempt_failure(
                     driver,

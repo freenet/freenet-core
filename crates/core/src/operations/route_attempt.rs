@@ -761,6 +761,27 @@ pub(crate) mod driver_test_support {
         store_rejections().contains(id)
     }
 
+    fn lane_overloads() -> &'static dashmap::DashSet<(String, crate::contract::Priority)> {
+        static OVERLOADED: std::sync::OnceLock<
+            dashmap::DashSet<(String, crate::contract::Priority)>,
+        > = std::sync::OnceLock::new();
+        OVERLOADED.get_or_init(dashmap::DashSet::new)
+    }
+
+    /// Make the stub contract handler of the test node built with `id` answer
+    /// every `GetQuery` and `PutQuery` sent at `Priority::NetworkRelay` with
+    /// the typed `ContractQueueFull` refusal, as a full relay lane does
+    /// (ANT-2026-K0YQ8CG4). Other priorities are answered as usual.
+    pub(crate) fn overload_relay_lane(id: &str) {
+        lane_overloads().insert((id.to_string(), crate::contract::Priority::NetworkRelay));
+    }
+
+    /// As [`overload_relay_lane`], for `Priority::ClientLocal`: the node's own
+    /// client lane is full.
+    pub(crate) fn overload_client_lane(id: &str) {
+        lane_overloads().insert((id.to_string(), crate::contract::Priority::ClientLocal));
+    }
+
     fn summary_answerers() -> &'static dashmap::DashSet<String> {
         static ANSWERERS: std::sync::OnceLock<dashmap::DashSet<String>> =
             std::sync::OnceLock::new();
@@ -962,7 +983,19 @@ pub(crate) mod driver_test_support {
         let handler_store = store.clone();
         let node_id = id.to_string();
         tokio::spawn(async move {
-            while let Ok((id, event, _priority)) = ch_channel.recv_from_sender().await {
+            while let Ok((id, event, priority)) = ch_channel.recv_from_sender().await {
+                if lane_overloads().contains(&(node_id.clone(), priority))
+                    && matches!(
+                        event,
+                        ContractHandlerEvent::GetQuery { .. }
+                            | ContractHandlerEvent::PutQuery { .. }
+                    )
+                {
+                    let refusal = crate::contract::queue_full_response_for(&event)
+                        .expect("GET and PUT queries have a typed refusal");
+                    let _answered = ch_channel.send_to_sender(id, refusal).await;
+                    continue;
+                }
                 match event {
                     ContractHandlerEvent::GetQuery { instance_id, .. } => {
                         let stored = handler_store

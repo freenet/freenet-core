@@ -3250,6 +3250,44 @@ where
         crate::node::network_status::record_relayed_get();
     }
 
+    // Bound the relay drivers one source may have in flight, and the node's
+    // total (ANT-2026-K0YQ8CG4). Held for the driver's lifetime. The node's
+    // own client GET (originator loopback) is not counted. Taken after the
+    // dedup gate, so a duplicate takes no slot.
+    let driver_permit = if originator_loopback {
+        None
+    } else {
+        match op_manager
+            .relay_driver_admission
+            .try_admit_logged(upstream_addr, "get")
+        {
+            Ok(permit) => Some(permit),
+            Err(_refusal) => {
+                op_manager.active_relay_get_txs.remove(&incoming_tx);
+                crate::operations::relay_admission::record_overload_not_found();
+                // One NotFound per refused request, so the requester moves on
+                // to its next peer now instead of waiting out its attempt.
+                let hop_count = op_manager
+                    .ring
+                    .max_hops_to_live
+                    .saturating_sub(htl.min(op_manager.ring.max_hops_to_live));
+                relay_send_not_found(
+                    &op_manager,
+                    incoming_tx,
+                    instance_id,
+                    upstream_addr,
+                    hop_count,
+                )
+                .await;
+                // Release the reply's `pending_op_results` slot now, as
+                // `run_relay_get` does at driver exit (see the yield there).
+                tokio::task::yield_now().await;
+                op_manager.release_pending_op_slot(incoming_tx).await;
+                return Ok(());
+            }
+        }
+    };
+
     tracing::debug!(
         tx = %incoming_tx,
         %instance_id,
@@ -3260,6 +3298,7 @@ where
     );
 
     GlobalExecutor::spawn(run_relay_get(
+        driver_permit,
         op_manager,
         conn_manager,
         incoming_tx,
@@ -3295,6 +3334,8 @@ impl Drop for RelayInflightGuard {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_relay_get<CB>(
+    // Held until the driver exits (ANT-2026-K0YQ8CG4).
+    _driver_permit: Option<crate::operations::relay_admission::RelayDriverPermit>,
     op_manager: Arc<OpManager>,
     conn_manager: CB,
     incoming_tx: Transaction,
@@ -3438,22 +3479,41 @@ type LocalFallback = (ContractKey, WrappedState, Option<ContractContainer>);
 ///
 /// Mirrors `GetMsg::Request` match arm at `get.rs:1369-1433`.
 ///
-/// Returns `(local_value, local_fallback)`:
+/// Returns `Ok((local_value, local_fallback))`:
 /// - `local_value`: Some if we should serve immediately (active interest or
 ///   originator).  None if we should forward.
 /// - `local_fallback`: Some if we have stale local state with no active
 ///   interest — used as a fallback if all downstream peers return NotFound.
+///
+/// `Err(HandlerOverloaded)` when the contract handler refused the query for
+/// overload (ANT-2026-K0YQ8CG4). That says nothing about whether this node
+/// holds the contract, and the caller must not forward in that case: a
+/// forward would pass the overload on to the next hop, and from there along
+/// the whole path.
+///
+/// `originator_loopback`: the GET is this node's own client's. Its query goes
+/// on the client lane (`Priority::ClientLocal`), so a full relay lane cannot
+/// turn the node's own read of a contract it holds into a network lookup.
 async fn check_local_with_interest_gate(
     op_manager: &OpManager,
     instance_id: &ContractInstanceId,
     fetch_contract: bool,
-) -> (Option<LocalFallback>, Option<LocalFallback>) {
-    let get_result = op_manager
-        .notify_contract_handler(ContractHandlerEvent::GetQuery {
-            instance_id: *instance_id,
-            return_contract_code: fetch_contract,
-        })
-        .await;
+    originator_loopback: bool,
+) -> Result<(Option<LocalFallback>, Option<LocalFallback>), HandlerOverloaded> {
+    let query = ContractHandlerEvent::GetQuery {
+        instance_id: *instance_id,
+        return_contract_code: fetch_contract,
+    };
+    let get_result = if originator_loopback {
+        op_manager
+            .notify_contract_handler_prioritized(query, crate::contract::Priority::ClientLocal)
+            .await
+    } else {
+        op_manager.notify_contract_handler_relay(query).await
+    };
+    if local_get_was_refused(&get_result) {
+        return Err(HandlerOverloaded);
+    }
 
     let raw_local = match get_result {
         Ok(ContractHandlerEvent::GetResponse {
@@ -3475,7 +3535,7 @@ async fn check_local_with_interest_gate(
         _ => None,
     };
 
-    match raw_local {
+    Ok(match raw_local {
         None => (None, None),
         Some((key, state, contract)) => {
             // Interest gate (mirrors get.rs:1408-1433):
@@ -3505,7 +3565,25 @@ async fn check_local_with_interest_gate(
                 (Some((key, state, contract)), None)
             }
         }
-    }
+    })
+}
+
+/// The contract handler refused a relay GET's local query for overload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HandlerOverloaded;
+
+/// Whether the handler answered a local GET query with the typed
+/// `ContractQueueFull` refusal (a full admission lane or a full fair queue).
+fn local_get_was_refused(
+    result: &Result<ContractHandlerEvent, crate::contract::ContractError>,
+) -> bool {
+    matches!(
+        result,
+        Ok(ContractHandlerEvent::GetResponse {
+            response: Err(err),
+            ..
+        }) if err.is_contract_queue_full()
+    )
 }
 
 /// A skip list that admits exactly one peer, so
@@ -4045,8 +4123,42 @@ where
     new_visited.mark_visited(upstream_addr);
 
     // ── Short-circuit 2: Local cache hit with interest ───────────────────
-    let (local_value, local_fallback) =
-        check_local_with_interest_gate(op_manager, &instance_id, fetch_contract).await;
+    let (local_value, local_fallback) = match check_local_with_interest_gate(
+        op_manager,
+        &instance_id,
+        fetch_contract,
+        Some(upstream_addr) == own_addr,
+    )
+    .await
+    {
+        Ok(local) => local,
+        // The handler refused the query for overload (ANT-2026-K0YQ8CG4).
+        // Answer NotFound and do NOT forward: forwarding would pass the
+        // overload on to the next hop. The requester moves on to
+        // its next peer. The node's own client GET (originator loopback)
+        // still goes to the network, since it has no other peer to try.
+        Err(HandlerOverloaded) if Some(upstream_addr) != own_addr => {
+            tracing::debug!(
+                tx = %incoming_tx,
+                %instance_id,
+                %upstream_addr,
+                phase = "local_query_refused",
+                "GET relay: contract handler overloaded — sending NotFound upstream, not forwarding"
+            );
+            crate::operations::relay_admission::record_overload_not_found();
+            let hop_count = op_manager.ring.max_hops_to_live.saturating_sub(htl);
+            relay_send_not_found(
+                op_manager,
+                incoming_tx,
+                instance_id,
+                upstream_addr,
+                hop_count,
+            )
+            .await;
+            return Ok(());
+        }
+        Err(HandlerOverloaded) => (None, None),
+    };
 
     if let Some((key, state, contract)) = local_value {
         tracing::info!(
@@ -7246,6 +7358,108 @@ mod tests {
             body.contains("None, Some("),
             "check_local_with_interest_gate must return (None, Some(fallback)) \
              when there is local state but no active interest"
+        );
+    }
+
+    // ── ANT-2026-K0YQ8CG4: overload is not "not held here" ─────────────────
+
+    /// Only the typed `ContractQueueFull` refusal counts as overload. A miss,
+    /// a hit, a timeout or another error must keep today's handling.
+    /// FALSIFY: make `local_get_was_refused` return true for any `Err`
+    /// response, or false always.
+    #[test]
+    fn only_a_queue_full_answer_counts_as_overload() {
+        use crate::contract::{ContractError, ContractQueueFull, ExecutorError};
+        let refused = Ok(ContractHandlerEvent::GetResponse {
+            key: None,
+            response: Err(ExecutorError::other(ContractQueueFull)),
+        });
+        assert!(local_get_was_refused(&refused));
+        let other_error = Ok(ContractHandlerEvent::GetResponse {
+            key: None,
+            response: Err(ExecutorError::other(anyhow::anyhow!("boom"))),
+        });
+        assert!(!local_get_was_refused(&other_error));
+        let miss = Ok(ContractHandlerEvent::GetResponse {
+            key: None,
+            response: Ok(StoreResponse {
+                state: None,
+                contract: None,
+            }),
+        });
+        assert!(!local_get_was_refused(&miss));
+        let no_answer: Result<ContractHandlerEvent, ContractError> =
+            Err(ContractError::NoEvHandlerResponse);
+        assert!(!local_get_was_refused(&no_answer));
+    }
+
+    /// A relay GET whose local query the handler refused for overload answers
+    /// NotFound and returns BEFORE the forward loop, so the overload is not
+    /// passed down the path; the node's own client GET is exempt. The query
+    /// itself goes through the relay wait ([`RELAY_HANDLER_TIMEOUT`]).
+    ///
+    /// FALSIFY: map `Err(HandlerOverloaded)` to `(None, None)` for every
+    /// upstream (the arm no longer replies and returns), or send the query with
+    /// `notify_contract_handler` (the 300 s wait).
+    #[test]
+    fn a_refused_local_query_answers_not_found_without_forwarding() {
+        let src = production_source();
+        let gate = extract_fn_body(src, "async fn check_local_with_interest_gate(");
+        assert!(
+            gate.contains("notify_contract_handler_relay(")
+                && gate.contains("local_get_was_refused("),
+            "the local query must use the relay wait and detect the refusal"
+        );
+        let body = extract_fn_body(src, "async fn drive_relay_get_inner<CB>(");
+        let arm_start = body
+            .find("Err(HandlerOverloaded) if Some(upstream_addr) != own_addr =>")
+            .expect("drive_relay_get_inner must handle an overloaded local query for a peer");
+        let arm = &body[arm_start..];
+        let arm = &arm[..arm.find("Err(HandlerOverloaded) =>").expect("loopback arm")];
+        let reply = arm
+            .find("relay_send_not_found(")
+            .expect("the arm answers NotFound");
+        let ret = arm.find("return Ok(());").expect("the arm returns");
+        assert!(reply < ret, "NotFound is sent before returning");
+        let forward = body
+            .find("relay_advance_to_next_peer")
+            .expect("drive_relay_get_inner must have a forward loop");
+        assert!(
+            arm_start < forward,
+            "the overload arm must come before the forward loop"
+        );
+    }
+
+    /// `start_relay_get` takes a relay driver permit after the dedup gate,
+    /// for every request from a peer, and the driver holds it until it exits.
+    /// A refusal undoes the dedup entry and answers NotFound.
+    ///
+    /// FALSIFY: skip `try_admit`, or drop the permit before spawning.
+    #[test]
+    fn start_relay_get_holds_a_driver_permit_for_the_driver_lifetime() {
+        let src = production_source();
+        let body = extract_fn_body(src, "pub(crate) async fn start_relay_get<CB>(");
+        let dedup = body
+            .find("active_relay_get_txs.insert(incoming_tx)")
+            .expect("dedup gate");
+        let admit = body
+            .find(".try_admit_logged(upstream_addr,")
+            .expect("start_relay_get must take a relay driver permit");
+        assert!(dedup < admit, "a duplicate must take no slot");
+        let refusal = &body[admit..];
+        assert!(
+            refusal.contains("active_relay_get_txs.remove(&incoming_tx)")
+                && refusal.contains("relay_send_not_found("),
+            "a refusal must undo the dedup entry and answer NotFound"
+        );
+        assert!(
+            body.contains("GlobalExecutor::spawn(run_relay_get(\n        driver_permit,"),
+            "the permit must move into the spawned driver"
+        );
+        let run = extract_fn_body(src, "async fn run_relay_get<CB>(");
+        assert!(
+            !run.contains("drop(_driver_permit)"),
+            "the driver holds its permit until it exits"
         );
     }
 
@@ -12957,7 +13171,10 @@ mod evicted_copy_fallback_tests {
         assert!(!op_manager.ring.is_hosting_contract(&key));
         assert!(!op_manager.interest_manager.has_local_interest(&key));
 
-        let (served, fallback) = check_local_with_interest_gate(&op_manager, key.id(), false).await;
+        let (served, fallback) =
+            check_local_with_interest_gate(&op_manager, key.id(), false, false)
+                .await
+                .expect("the handler is not overloaded here");
         assert!(served.is_none());
         assert!(
             fallback.is_none(),
@@ -12971,10 +13188,141 @@ mod evicted_copy_fallback_tests {
             crate::ring::HostingCause::Other,
         );
         assert!(op_manager.ring.is_hosting_contract(&key));
-        let (served, fallback) = check_local_with_interest_gate(&op_manager, key.id(), false).await;
+        let (served, fallback) =
+            check_local_with_interest_gate(&op_manager, key.id(), false, false)
+                .await
+                .expect("the handler is not overloaded here");
         assert!(
             served.is_some() || fallback.is_some(),
             "a hosted contract's local copy is served or kept as the fallback"
+        );
+    }
+}
+
+/// ANT-2026-K0YQ8CG4: a full relay lane on this node.
+#[cfg(test)]
+mod relay_overload_tests {
+    use super::*;
+    use crate::operations::route_attempt::driver_test_support::{
+        LocalStore, op_manager_with_peers_and_store, overload_relay_lane,
+    };
+    use crate::operations::test_utils::MockNetworkBridge;
+    use std::time::Duration;
+
+    type Sent = Arc<parking_lot::Mutex<Vec<(NetMessage, Option<SocketAddr>)>>>;
+
+    /// Record every GET message handed to the event loop; no waiter is answered.
+    fn record_sends(mut rx: tokio::sync::mpsc::Receiver<crate::node::OpExecutionPayload>) -> Sent {
+        let sent = Sent::default();
+        let log = sent.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some((reply_tx, msg, target)) = rx.recv().await {
+                if crate::message::MessageStats::id(&msg).transaction_type()
+                    == crate::message::TransactionType::Get
+                {
+                    log.lock().push((msg.clone(), target));
+                }
+                held.push(reply_tx);
+            }
+        });
+        sent
+    }
+
+    fn hosted_contract(op_manager: &OpManager, store: &LocalStore, seed: u8) -> ContractKey {
+        let key = ContractKey::from_id_and_code(
+            ContractInstanceId::new([seed; 32]),
+            freenet_stdlib::prelude::CodeHash::new([seed; 32]),
+        );
+        *store.lock() = Some((key, WrappedState::new(vec![1; 8])));
+        op_manager.ring.host_contract(
+            key,
+            8,
+            crate::ring::AccessType::Get,
+            crate::ring::HostingCause::Other,
+        );
+        key
+    }
+
+    /// M2: the node's own GET of a contract it holds is answered locally even
+    /// while the relay lane refuses: it queries on the client lane. A peer's
+    /// relay GET of the same contract sees the overload.
+    ///
+    /// FALSIFY: send the loopback query through `notify_contract_handler_relay`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_nodes_own_get_is_answered_through_a_full_relay_lane() {
+        let label = "get-overload-loopback";
+        let (op_manager, _rx, _peers, _guards, store) =
+            op_manager_with_peers_and_store(label, 1).await;
+        let key = hosted_contract(&op_manager, &store, 0x61);
+        overload_relay_lane(label);
+
+        let own = check_local_with_interest_gate(&op_manager, key.id(), false, true)
+            .await
+            .expect("the node's own query is not refused");
+        assert!(
+            own.0.is_some() || own.1.is_some(),
+            "the node's own GET finds the contract it holds"
+        );
+        assert!(
+            matches!(
+                check_local_with_interest_gate(&op_manager, key.id(), false, false).await,
+                Err(HandlerOverloaded)
+            ),
+            "a peer's relay GET sees the overload"
+        );
+    }
+
+    /// A relay GET the handler refuses for overload is answered `NotFound`
+    /// upstream and is NOT forwarded, and is counted as an overload NotFound.
+    ///
+    /// FALSIFY: map the overload to `(None, None)` for a peer's GET (the GET is
+    /// then forwarded to a ring peer).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_overloaded_relay_get_answers_not_found_without_forwarding() {
+        let label = "get-overload-no-forward";
+        let (op_manager, rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        overload_relay_lane(label);
+        let sent = record_sends(rx);
+        let upstream: SocketAddr = "10.0.0.42:31337".parse().unwrap();
+        let tx = Transaction::new::<GetMsg>();
+        let before = crate::operations::relay_admission::telemetry_counts().1;
+        start_relay_get(
+            op_manager.clone(),
+            MockNetworkBridge::new(),
+            tx,
+            ContractInstanceId::new([0x62; 32]),
+            op_manager.ring.max_hops_to_live,
+            upstream,
+            VisitedPeers::new(&tx),
+            false,
+            false,
+        )
+        .await
+        .expect("the relay starts");
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let sent = sent.lock().clone();
+        assert!(
+            sent.iter().any(|(msg, target)| *target == Some(upstream)
+                && matches!(
+                    msg,
+                    NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+                        result: GetMsgResult::NotFound,
+                        ..
+                    }))
+                )),
+            "NotFound goes upstream, got {sent:?}"
+        );
+        assert!(
+            sent.iter().all(|(_, target)| *target == Some(upstream)),
+            "nothing is forwarded downstream, got {sent:?}"
+        );
+        assert!(
+            crate::operations::relay_admission::telemetry_counts().1 > before,
+            "the overload NotFound is counted"
         );
     }
 }

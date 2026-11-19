@@ -229,6 +229,53 @@ tier remote peers feed) from indefinitely starving Background. Both are
 backstops only: tag each send site with the class it belongs to.
 ```
 
+**Admission lanes in front of the fair queue (ANT-2026-K0YQ8CG4).** Events
+reach `contract_handling` over four channels, chosen by `handler::Lane::of`:
+control (`ClientDisconnect`, `EvictContract`, by event type and whatever
+their priority; unbounded, never refused), client (`ClientLocal`, 2048),
+relay (`NetworkRelay`, 1024) and background (`Background`, 256). Every send
+into them is non-blocking (`try_send`); NEVER add a `.send().await` there
+(pinned by `no_send_into_the_lanes_waits`). A full bounded lane answers the
+caller at once with the same typed `ContractQueueFull` response the fair
+queue gives a refused event (`queue_full_response_for`), so a full client
+lane is now an immediate `ContractQueueFull` to the client rather than a
+wait. Each loop iteration drains control in full, then up to 256 client, 256
+relay and 64 background events, so a client event reaches the
+`ClientLocal` tier within one execution. The tag you choose therefore also
+picks the lane: a node-originated burst tagged `NetworkRelay` competes with
+peers' requests for relay-lane room.
+
+Relay drivers bound the relay lane per peer. `start_relay_get`,
+`start_relay_put`, `start_relay_put_streaming` and the four relay UPDATE
+starters take a `relay_admission::RelayDriverPermit` (256 per source, an
+IPv4 address or IPv6 /64; 4096 per node) after their dedup gate and hold it
+until the driver exits; the node's own operations (originator loopback) are
+not counted. A refusal is answered upstream at once: GET `NotFound`, PUT
+`PutMsg::Error` with `PUT_RELAY_OVERLOADED_CAUSE` (the originator's
+`classify_reply` treats it as "try the next peer", not terminal), and a
+refused UPDATE broadcast of a held contract gets the same throttled
+`ResyncRequest` repair as a rate-limited one. Relay drivers wait for the
+handler through `OpManager::notify_contract_handler_relay`
+(`RELAY_HANDLER_TIMEOUT` = `OPERATION_TTL`), not the 300 s default. A relay
+GET whose local query is refused for overload answers `NotFound` and does
+NOT forward (`check_local_with_interest_gate` returns `HandlerOverloaded`);
+the node's own GET queries on the client lane instead. A relay PUT whose
+permit or local store is refused for overload is NOT forwarded: the relay
+answers `PUT_RELAY_OVERLOADED_CAUSE`. A first hop's answer reaches the
+originator's client driver directly (the loopback relay forwards without
+waiting), which classifies it `Overloaded` and retries; `PutRetryDriver`
+hands every first hop that answered it to the loopback relay as first-pick
+exclusions (`first_hop_exclusions`, via `AttemptHopRegistry`, as GET does):
+local to that one pick, never in the forwarded `skip_list`, and ignored when
+they would exclude every candidate, so the loopback picks a different first
+hop when one exists and never ends up with an empty pick. When the attempts run out, a
+non-streaming PUT gets an error; a streaming PUT (no further attempts)
+ends as `exhausted_attempt_is_local_success` decides. A relay further along
+that stored and then hears the cause from its next hop reports success
+upstream (it holds a copy), and an overload reply labels no route failure.
+The node's own PUT whose client-lane store is refused fails at once with
+`ContractQueueFull`. No path reports success without a stored copy.
+
 **Client `DelegateRequest`s and the delegate lane (#6144).** Once
 `contract_handling` has started a delegate lane (`contract/delegate_lane.rs`;
 production always does), `ContractHandlerChannel::send_to_handler` hands a
@@ -240,7 +287,9 @@ the operator's own local requests, and hosted users share the other 7/8 among
 themselves). The lane runs a request itself only when its
 delegate is free and fewer than `MAX_PENDING_UNITS` (16) continuations wait
 for the loop; every other request it FORWARDS, unchanged (same id, priority,
-scope, user, responder), into this loop's event channel. The fair-queue
+scope, user, responder), into this loop's admission lane for that priority
+(the client lane for a `ClientLocal` request), with `try_send`: a full lane
+answers the client with the typed `ContractQueueFull` refusal. The fair-queue
 bounds above (capacity, per-slot cap, `CLIENT_LOCAL_RESERVE`) and, for a
 parked delegate, the park's `queue_pending` cap and byte budget apply ONLY
 to forwarded requests; a request the lane runs never enters the fair queue.
