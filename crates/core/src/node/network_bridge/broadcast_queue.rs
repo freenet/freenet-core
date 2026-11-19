@@ -1566,20 +1566,25 @@ mod queue {
             use crate::operations::update::propagation_stats::{
                 PropagationEvent, record_propagation_event,
             };
+            // Confirmed delivery (#6143) counts the leg in flight BEFORE it
+            // is inserted, so it cannot be dequeued and finished uncounted.
+            // A superseded or evicted leg ends here; a dequeued one ends when
+            // `broadcast_to_single_peer` returns.
             let peer_key = crate::ring::PeerKey::from(target.pub_key().clone());
+            op_manager
+                .confirmed_delivery
+                .leg_started(key.id(), &peer_key);
             let outcome = self
                 .enqueue_in_lane(lane, key, target, new_state, fanout)
                 .await;
-            // #6292 round 1, Must Fix 1: an armed entry does not age while its
-            // leg waits here; an evicted leg's entry ages again.
-            op_manager
-                .confirmed_delivery
-                .note_queued(key.id(), &peer_key);
+            if outcome.superseded {
+                super::end_queued_leg(op_manager, &key, &peer_key);
+            }
             for (evicted, target) in &outcome.evicted_pairs {
-                op_manager.confirmed_delivery.note_dequeued(
-                    evicted.id(),
+                super::end_queued_leg(
+                    op_manager,
+                    evicted,
                     &crate::ring::PeerKey::from(target.pub_key().clone()),
-                    op_manager.confirmed_delivery.now(),
                 );
             }
             if outcome.superseded {
@@ -4420,6 +4425,16 @@ fn record_delivery_to_interest<T: crate::util::time_source::TimeSource + Sync>(
 
 use crate::operations::update::confirmed_delivery::LegDuty;
 
+/// A queued leg that ends without running (superseded or evicted) leaves
+/// flight; clear the belief again if a final drop is waiting on it. Only the
+/// production queue calls it; the simulation fan-out has no queue.
+#[cfg_attr(feature = "simulation_tests", allow(dead_code))]
+fn end_queued_leg(op_manager: &OpManager, key: &ContractKey, peer_key: &crate::ring::PeerKey) {
+    if op_manager.confirmed_delivery.leg_ended(key.id(), peer_key) {
+        crate::operations::update::confirmed_delivery::clear_belief(op_manager, key, peer_key);
+    }
+}
+
 /// A leg skipped as converged settles a just-armed confirmed-delivery entry
 /// (#6143): the peer itself told us it holds our state. Counted where decided.
 pub(crate) fn settle_converged_leg(
@@ -4428,7 +4443,7 @@ pub(crate) fn settle_converged_leg(
     peer_key: &crate::ring::PeerKey,
     duty: LegDuty,
 ) {
-    if duty == LegDuty::RequestAck
+    if matches!(duty, LegDuty::RequestAck(_))
         && op_manager
             .confirmed_delivery
             .settle_converged(key.id(), peer_key)
@@ -4441,57 +4456,42 @@ pub(crate) fn settle_converged_leg(
     }
 }
 
-/// Record that a flagged leg with transaction `tx` is about to go (#6143),
-/// counting it as the first ask or the resend (a re-flag is not counted).
-///
-/// `provisional` bounds the send itself: [`ACK_TIMEOUT`] for an inline leg,
-/// the stream's completion wait plus [`ACK_TIMEOUT`] for a stream, so a long
-/// stream is not resent mid-transfer (#6292 round 1, Must Fix 1).
-///
-/// [`ACK_TIMEOUT`]: crate::operations::update::confirmed_delivery::ACK_TIMEOUT
+/// Record that a flagged leg with transaction `tx`, carrying `duty`'s
+/// generation, is about to go (#6143), counting it as the first ask or the
+/// resend (a re-flag is not counted).
 pub(crate) fn record_flagged_leg(
     op_manager: &OpManager,
     key: &ContractKey,
     peer_key: &crate::ring::PeerKey,
     tx: crate::message::Transaction,
-    full_resend: bool,
-    provisional: Duration,
+    duty: LegDuty,
 ) {
     use crate::operations::update::confirmed_delivery::{FlaggedSend, count};
-    match op_manager.confirmed_delivery.record_flagged_send(
-        key.id(),
-        peer_key,
-        tx,
-        full_resend,
-        provisional,
-        op_manager.confirmed_delivery.now(),
-    ) {
+    match op_manager
+        .confirmed_delivery
+        .record_flagged_send(key.id(), peer_key, tx, duty)
+    {
         FlaggedSend::First => count(op_manager, key.id(), PropagationEvent::AckRequested),
         FlaggedSend::Resend => count(op_manager, key.id(), PropagationEvent::ResendFull),
         FlaggedSend::Reflag | FlaggedSend::Untracked => {}
     }
 }
 
-/// The flagged leg `tx` finished, AFTER its delivery bookkeeping cached our
-/// summary as the peer's: start its ack deadline, and if a final "dropped"
-/// ack already arrived for it, clear the belief that bookkeeping just
-/// rewrote (#6292 round 1, Should Fix 4).
+/// The flagged leg `tx` finished sending (a stream: its completion), after
+/// its delivery bookkeeping. Starts the resend's ack deadline when it was the
+/// resend.
 pub(crate) fn finish_flagged_leg(
     op_manager: &OpManager,
     key: &ContractKey,
     peer_key: &crate::ring::PeerKey,
     tx: crate::message::Transaction,
 ) {
-    use crate::operations::update::confirmed_delivery::{SendFinished, clear_belief};
-    if op_manager.confirmed_delivery.send_finished(
+    op_manager.confirmed_delivery.send_finished(
         key.id(),
         peer_key,
         tx,
         op_manager.confirmed_delivery.now(),
-    ) == SendFinished::ReclearBelief
-    {
-        clear_belief(op_manager, key, peer_key);
-    }
+    );
 }
 
 /// Build the originator target list to attach to one leg of a fan-out (#5147),
@@ -4660,6 +4660,17 @@ pub(super) async fn broadcast_to_single_peer(
     use crate::ring::PeerKey;
     use crate::transport::StreamId;
 
+    // Confirmed delivery (#6143): this leg is in flight until this function
+    // returns, on every exit, after its delivery bookkeeping. A queued leg
+    // was counted at enqueue; a direct call (simulation, heal) is counted
+    // here.
+    let _in_flight = crate::operations::update::confirmed_delivery::LegInFlight::begin(
+        op_manager,
+        key,
+        PeerKey::from(target.pub_key().clone()),
+        scheduling.is_some(),
+    );
+
     // #6143: every exit below that sends nothing logs at debug/trace only,
     // which release builds compile out. Each one is counted instead, per
     // contract, in the `update_propagation_summary` INFO line and the
@@ -4668,14 +4679,6 @@ pub(super) async fn broadcast_to_single_peer(
         record_propagation_event(op_manager, key.id(), PropagationEvent::SkipNoAddress);
         return;
     };
-
-    // #6292 round 1, Must Fix 1: this pair's leg has left the queue, so an
-    // armed entry's unsent bound runs again from now. Before every exit.
-    op_manager.confirmed_delivery.note_dequeued(
-        key.id(),
-        &PeerKey::from(target.pub_key().clone()),
-        op_manager.confirmed_delivery.now(),
-    );
 
     // Split the bundle: the class is a fixed property of how this send was
     // SCHEDULED (the mismatch counters compare it against the real payload), the
@@ -4704,17 +4707,18 @@ pub(super) async fn broadcast_to_single_peer(
 
     let peer_key = PeerKey::from(target.pub_key().clone());
 
-    // #6143: what this leg owes confirmed delivery. The table holds only
-    // pairs whose peer decodes the flag, so no version check is needed here.
-    // A resend is full state on the stream path and skips the converged
-    // check, because the belief that check reads is what the resend distrusts.
+    // #6143: what this leg owes confirmed delivery, read BEFORE the payload is
+    // built so the generation it carries is one the payload includes. The
+    // version gate is re-checked here. A resend is full state on the stream
+    // path and skips the converged check, because the belief that check reads
+    // is what the resend distrusts.
     let duty = crate::operations::update::confirmed_delivery::leg_duty_for(
         op_manager,
         key.id(),
         &peer_key,
         peer_addr,
     );
-    let resend_full = duty == LegDuty::ResendFull;
+    let resend_full = duty.is_resend();
 
     // A leg queued in the small lane may find the stored state has since grown
     // past `LARGE_STATE_LANE_THRESHOLD` (a later write replaced it). The
@@ -5167,7 +5171,7 @@ pub(super) async fn broadcast_to_single_peer(
     // #6143: a flagged leg records its transaction id BEFORE it is sent (in
     // each branch below, once its size is known), so an ack that beats the
     // bookkeeping still matches.
-    let flagged = duty != LegDuty::None;
+    let flagged = duty.is_flagged();
 
     // Each branch below tracks whether the message was *actually delivered* to
     // the peer, as distinct from merely being enqueued for dispatch, and applies
@@ -5269,20 +5273,11 @@ pub(super) async fn broadcast_to_single_peer(
 
         // The stream's declared length, which the receiver sizes its age
         // limit from (the state plus the sender summary plus framing), and
-        // the completion wait it scales. Computed once: the flagged leg's
-        // provisional deadline (#6292 round 1, Must Fix 1) and the wait below
-        // must agree.
+        // the completion wait it scales.
         let stream_bytes = payload_bytes.len() as u64;
         let completion_timeout = stream_completion_timeout(stream_bytes);
         if flagged {
-            record_flagged_leg(
-                op_manager,
-                &key,
-                &peer_key,
-                update_tx,
-                resend_full,
-                completion_timeout + crate::operations::update::confirmed_delivery::ACK_TIMEOUT,
-            );
+            record_flagged_leg(op_manager, &key, &peer_key, update_tx, duty);
         }
         let send_res = bridge.send(peer_addr, net_msg).await;
         if send_res.is_err() {
@@ -5451,14 +5446,7 @@ pub(super) async fn broadcast_to_single_peer(
             }
         };
         if flagged {
-            record_flagged_leg(
-                op_manager,
-                &key,
-                &peer_key,
-                update_tx,
-                resend_full,
-                crate::operations::update::confirmed_delivery::ACK_TIMEOUT,
-            );
+            record_flagged_leg(op_manager, &key, &peer_key, update_tx, duty);
         }
         // Test seam for the #6143 failure class: the bridge "accepts" the
         // leg and it never arrives. No-op outside test builds.

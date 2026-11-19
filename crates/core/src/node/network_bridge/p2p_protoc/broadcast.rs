@@ -757,8 +757,10 @@ impl P2pConnManager {
                 // queue's task; here only the resend gets its own task, so
                 // every other heal keeps its deterministic inline ordering.
                 Ok(claim)
-                    if op_manager.confirmed_delivery.leg_duty(key.id(), &peer_key)
-                        == crate::operations::update::confirmed_delivery::LegDuty::ResendFull =>
+                    if op_manager
+                        .confirmed_delivery
+                        .leg_duty(key.id(), &peer_key)
+                        .is_resend() =>
                 {
                     let bridge = self.bridge.clone();
                     let op_manager = op_manager.clone();
@@ -957,9 +959,15 @@ impl P2pConnManager {
                 &peer_key,
                 peer_addr,
             );
-            let resend_full =
-                duty == crate::operations::update::confirmed_delivery::LegDuty::ResendFull;
-            let flagged = duty != crate::operations::update::confirmed_delivery::LegDuty::None;
+            let resend_full = duty.is_resend();
+            let flagged = duty.is_flagged();
+            // In flight until this iteration ends, after its bookkeeping.
+            let _in_flight = crate::operations::update::confirmed_delivery::LegInFlight::begin(
+                op_manager,
+                key,
+                peer_key.clone(),
+                false,
+            );
 
             // Get peer's cached summary
             let their_summary = op_manager
@@ -1199,14 +1207,7 @@ impl P2pConnManager {
                 // broadcast ordering. Production uses the BroadcastQueue path.
                 if flagged {
                     super::super::broadcast_queue::record_flagged_leg(
-                        op_manager,
-                        &key,
-                        &peer_key,
-                        update_tx,
-                        resend_full,
-                        super::super::broadcast_queue::stream_completion_timeout(
-                            payload_bytes.len() as u64,
-                        ) + crate::operations::update::confirmed_delivery::ACK_TIMEOUT,
+                        op_manager, &key, &peer_key, update_tx, duty,
                     );
                 }
                 let send_res = bridge.send(peer_addr, net_msg).await;
@@ -1287,12 +1288,7 @@ impl P2pConnManager {
                 };
                 if flagged {
                     super::super::broadcast_queue::record_flagged_leg(
-                        op_manager,
-                        &key,
-                        &peer_key,
-                        update_tx,
-                        resend_full,
-                        crate::operations::update::confirmed_delivery::ACK_TIMEOUT,
+                        op_manager, &key, &peer_key, update_tx, duty,
                     );
                 }
                 // Test seam for the #6143 failure class: the bridge "accepts"

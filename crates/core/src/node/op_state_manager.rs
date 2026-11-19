@@ -3920,7 +3920,7 @@ mod tests {
         };
         assert_eq!(
             duty(&kps[0]),
-            LegDuty::RequestAck,
+            LegDuty::RequestAck(1),
             "an at-floor peer is armed"
         );
         assert_eq!(
@@ -3946,13 +3946,13 @@ mod tests {
                 &peer0,
                 addr0
             ),
-            LegDuty::RequestAck
+            LegDuty::RequestAck(1)
         );
         op_manager
             .ring
             .connection_manager
             .record_remote_version(addr0, Some((0, 2, 160)));
-        assert_eq!(duty(&kps[0]), LegDuty::RequestAck, "the entry remains");
+        assert_eq!(duty(&kps[0]), LegDuty::RequestAck(1), "the entry remains");
         assert_eq!(
             crate::operations::update::confirmed_delivery::leg_duty_for(
                 &op_manager,

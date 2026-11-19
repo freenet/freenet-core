@@ -14,36 +14,51 @@
 //! mesh's redundancy carries it. So only the originator's legs are confirmed,
 //! and only for a client UPDATE that changed this node's state.
 //!
-//! ## Mechanism
+//! ## Model: generations
 //!
-//! 1. **Arm.** The originated fan-out arms one [`ConfirmedDelivery`] entry per
-//!    target whose version decodes the ack-requested variants. One entry per
-//!    (contract, peer): a newer originated update re-arms it (coalescing).
-//! 2. **Ask.** The entry IS the flag. A leg to an armed peer is sent as
-//!    `UpdateMsg::BroadcastToAckRequested` (or the streaming twin), and the
-//!    entry records the leg's transaction id and a deadline.
-//! 3. **Confirm.** The receiver answers a flagged leg, and only a flagged leg,
-//!    with `InterestMessage::BroadcastAck`: applied, already had it, or
-//!    dropped with a reason. A matching ack removes the entry.
-//! 4. **Resend once.** No ack by the deadline: one full-state resend on the
-//!    caller-named stream path (the path that kept working in #6143), flagged
-//!    again. No ack to that either: clear the cached belief about the peer, so
-//!    later broadcasts and anti-entropy stop skipping it, count, and WARN at
-//!    most once per contract per [`GIVE_UP_WARN_INTERVAL`]. A "dropped" ack
-//!    means no resend (the receiver would drop it too) and clears the belief.
+//! One [`Entry`] per (contract, peer) whose version decodes the ack-requested
+//! variants. Each originated fan-out to the peer ARMS it, which increments
+//! its `generation`. Every flagged leg carries the generation current when its
+//! payload was built (read before the payload, so the payload includes at
+//! least that generation's update), recorded in a bounded tx -> generation
+//! map. The receiver answers a flagged leg, and only a flagged leg, with
+//! `InterestMessage::BroadcastAck`. An Applied or AlreadyHad ack for a leg of
+//! generation `G` sets `confirmed = max(confirmed, G)`; the entry settles when
+//! `confirmed` reaches `generation`. An ack can therefore never confirm an
+//! update armed after its leg's payload was built.
+//!
+//! Every leg of the pair, flagged or not, is counted IN FLIGHT from the moment
+//! it is queued until its send finishes (a stream's completion included). No
+//! timer runs against a pair with a leg in flight: a queued leg, one waiting
+//! for a lane permit, or one still streaming is given its chance first.
+//!
+//! | Event | Effect |
+//! |---|---|
+//! | arm | `generation += 1`, record its arm time |
+//! | flagged leg built | record `tx -> generation` |
+//! | Applied / AlreadyHad ack for `G` | `confirmed = max(confirmed, G)`; settle (remove) once `confirmed >= generation`; a resend for a generation now confirmed is cancelled |
+//! | ack for an unknown tx | nothing (counted `ack_unmatched`) |
+//! | transient drop ack (rate limit, merge budget, overload) | nothing (counted); the timers handle it |
+//! | final drop ack for `G == generation` | clear the belief; remove once no leg is in flight, re-clearing as each in-flight leg's bookkeeping ends |
+//! | final drop ack for `G < generation` | nothing: a newer leg is pending |
+//! | sweep, no resend outstanding, `confirmed < generation`, nothing in flight, the oldest unconfirmed arm >= [`ESCALATE_AFTER`] old, and the first flagged leg for it finished >= [`ACK_TIMEOUT`] ago (or never sent and [`UNSENT_TTL`] old) | queue ONE full-state resend (heal) |
+//! | resend leg built | if its generation is already confirmed, it goes unflagged; else record it and mark the resend sent |
+//! | sweep, resend sent, its send finished >= [`ACK_TIMEOUT`] ago, its generation unconfirmed | give up: clear the belief, count, WARN at most once per contract per [`GIVE_UP_WARN_INTERVAL`] |
+//! | sweep, oldest unconfirmed arm >= [`MAX_ENTRY_AGE`] old | give up (bounds a pair whose legs are always in flight, or a resend that never went) |
+//! | converged skip of a leg | settle only if no flagged leg was recorded and only the latest generation is unconfirmed |
+//! | peer disconnects | drop its entries and counts |
+//!
+//! A confirmed resend lets a later unconfirmed generation escalate again, so a
+//! pair whose inline path is broken but whose streams work keeps receiving
+//! sustained writes, one resend per confirmed round trip.
 //!
 //! ## Bounds
 //!
-//! At most [`MAX_PENDING`] entries; an arm past that is counted and not
-//! tracked. At most two sends per (originated update, peer). Entries end on an
-//! ack, a give-up, the peer disconnecting, or [`UNSENT_TTL`]. One sweep task
-//! per node runs only while entries exist, so an idle node pays nothing.
-//!
-//! The node layer has no per-peer RTT, so the deadline is a fixed
-//! [`ACK_TIMEOUT`] from when the leg's send FINISHED (for a stream, from its
-//! completion), which already absorbs transfer time.
+//! At most [`MAX_PENDING`] entries (an arm past that is counted, not tracked),
+//! [`MAX_ARM_TIMES`] arm times and [`MAX_LEGS`] legs per entry. One sweep task
+//! per node runs only while entries exist.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -56,24 +71,37 @@ use crate::message::{BroadcastAckOutcome, BroadcastDropReason, Transaction};
 use crate::ring::PeerKey;
 
 /// How long after a flagged leg's send finished the sender waits for its ack.
-///
-/// Inside the design's 5-20 s band. Above the floor because the ack is sent
-/// after the receiver's merge, which waits in its contract handler queue on a
-/// loaded node; a spurious timeout costs one full-state resend.
+/// Above the 5 s floor of the design's band because the ack is sent after the
+/// receiver's merge, which waits in its contract handler queue on a loaded
+/// node; a spurious timeout costs one full-state resend.
 pub(crate) const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Hard cap on pending entries per node. Field volume is tens of originated
-/// updates per 15 minutes network-wide, times fan-out (~16), so the cap is
-/// reached only by a node flooding its own client writes across many
-/// contracts; the overflow is counted.
-pub(crate) const MAX_PENDING: usize = 1024;
+/// The oldest unconfirmed generation must be at least this old before its
+/// resend is queued. Measured from its arm, which coalescing never moves, so
+/// sustained writes cannot postpone it; long enough that a healthy writer
+/// whose acks take several seconds is never resent to.
+pub(crate) const ESCALATE_AFTER: Duration = Duration::from_secs(20);
 
-/// An entry armed or resend-due whose leg never went (queue eviction, a skip,
-/// a send refused before the flag was recorded) is resolved after this long.
-/// An unsent armed entry gets the full-state resend; an unsent resend gives up.
+/// A generation that was armed but never carried by a flagged leg (the leg was
+/// skipped, evicted, or refused before it was flagged) is resent after this.
 pub(crate) const UNSENT_TTL: Duration = Duration::from_secs(120);
 
-/// How often the sweep looks for expired deadlines while entries exist.
+/// Hard bound on an unconfirmed generation's age. Gives up on a pair whose
+/// legs are always in flight, or whose resend never went.
+pub(crate) const MAX_ENTRY_AGE: Duration = Duration::from_secs(600);
+
+/// Hard cap on pending entries per node; overflow is counted, not tracked.
+pub(crate) const MAX_PENDING: usize = 1024;
+
+/// Arm times kept per entry (oldest dropped). Escalation reads the oldest
+/// unconfirmed one; a dropped older time only makes escalation later.
+pub(crate) const MAX_ARM_TIMES: usize = 16;
+
+/// Flagged legs kept per entry (oldest dropped). An ack for a dropped leg is
+/// unmatched and changes nothing.
+pub(crate) const MAX_LEGS: usize = 8;
+
+/// How often the sweep runs while entries exist.
 pub(crate) const SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// At most one give-up WARN per contract per this long.
@@ -82,39 +110,40 @@ pub(crate) const GIVE_UP_WARN_INTERVAL: Duration = Duration::from_secs(600);
 /// Bound on the give-up WARN throttle map.
 const MAX_WARN_ENTRIES: usize = 1024;
 
-/// An entry whose flagged legs have all gone unconfirmed for this long since
-/// it was first armed is escalated to the resend, even while newer updates
-/// keep coalescing into it and pushing each leg's own deadline (#6292 round
-/// 1, Must Fix 2). Measured from `first_unconfirmed_at`, which coalescing
-/// never moves, and never earlier than [`ACK_TIMEOUT`] after the FIRST
-/// flagged leg's send finished, so a long first stream is not cut short.
-pub(crate) const ESCALATE_AFTER: Duration = Duration::from_secs(20);
-
-/// Hard ceiling on how long an armed entry may wait while its leg sits in the
-/// broadcast queue (#6292 round 1, Must Fix 1). A queued or active leg does
-/// not age the [`UNSENT_TTL`] bound; this is the GC bound on that exemption,
-/// for a leg the queue dropped without a hook (it is evicted with a hook).
-pub(crate) const QUEUED_TTL: Duration = Duration::from_secs(600);
-
-/// What a leg to a peer owes the confirmed-delivery protocol.
+/// What a leg to a peer owes the confirmed-delivery protocol. The generation
+/// is read when the duty is, before the leg's payload is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LegDuty {
     /// Nothing pending for this (contract, peer): an ordinary leg.
     None,
-    /// Send it flagged, so the receiver acks it.
-    RequestAck,
-    /// The first leg went unconfirmed: send the FULL state, on the stream
-    /// path, flagged, bypassing the converged-belief skip (that belief is what
-    /// this resend distrusts).
-    ResendFull,
+    /// Send it flagged, carrying this generation.
+    RequestAck(u64),
+    /// The queued resend: the FULL state, on the stream path, flagged,
+    /// bypassing the converged-belief skip (the belief is what it distrusts).
+    ResendFull(u64),
+}
+
+impl LegDuty {
+    pub(crate) fn is_flagged(self) -> bool {
+        !matches!(self, LegDuty::None)
+    }
+
+    pub(crate) fn is_resend(self) -> bool {
+        matches!(self, LegDuty::ResendFull(_))
+    }
+
+    fn generation(self) -> Option<u64> {
+        match self {
+            LegDuty::None => None,
+            LegDuty::RequestAck(generation) | LegDuty::ResendFull(generation) => Some(generation),
+        }
+    }
 }
 
 /// Outcome of arming one target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ArmOutcome {
-    /// A new entry.
     Armed,
-    /// An entry existed and now also covers this newer update.
     Coalesced,
     /// The table is full; this target is not tracked.
     Overflow,
@@ -125,68 +154,42 @@ pub(crate) enum ArmOutcome {
 pub(crate) enum FlaggedSend {
     /// The first flagged leg of this entry.
     First,
-    /// A later flagged leg of the same entry (a coalesced newer update, or a
-    /// relayed leg to the same pair). Not counted as a new request.
+    /// A later flagged leg of the same entry. Not counted as a new request.
     Reflag,
-    /// The one full-state resend.
+    /// The resend.
     Resend,
-    /// No entry: the pair settled while the leg was in flight.
+    /// No entry: the pair settled while the leg was being built.
     Untracked,
-}
-
-/// What finishing a flagged leg's send asks of the caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SendFinished {
-    Nothing,
-    /// A final "dropped" ack for this leg beat the send's own bookkeeping,
-    /// which has just re-cached our summary as the peer's: clear it again
-    /// (#6292 round 1, Should Fix 4).
-    ReclearBelief,
-}
-
-/// After a "dropped" ack: what happens next.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DropNext {
-    /// A transient drop of the first leg: the full-state resend follows
-    /// after [`ACK_TIMEOUT`]. The belief is left alone; the resend bypasses it.
-    Retry,
-    /// Stop: the entry is gone and the caller clears its belief.
-    Stop,
 }
 
 /// What an inbound ack did to the table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AckEffect {
-    /// The peer applied or already held the update; the entry is removed.
+    /// The entry is confirmed up to its latest generation and removed.
     Confirmed { latency: Duration },
-    /// An Applied/AlreadyHad ack for the PREVIOUS flagged leg of a coalesced
-    /// entry. It does not confirm the newer update, but it proves the path
-    /// delivers, so the escalation clock restarts.
-    PathProven,
-    /// The peer dropped the leg.
-    Dropped {
+    /// An older generation was confirmed; a newer one is still pending.
+    Partial,
+    /// A final drop of the latest generation: the caller clears its belief.
+    DroppedFinal {
         key: ContractKey,
         reason: BroadcastDropReason,
-        next: DropNext,
     },
-    /// No entry waits on this transaction id (a superseded leg, a stale ack,
-    /// or an ack we never asked for).
+    /// A drop the table ignores: transient, or of an older generation.
+    DroppedIgnored { reason: BroadcastDropReason },
+    /// No entry or leg for this transaction.
     Unmatched,
 }
 
 /// One thing the sweep decided.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SweepAction {
-    /// Send one full-state resend to `addr`. `timed_out` is true when an ack
-    /// deadline passed, false for a leg that never went or a transient drop.
+    /// Queue one full-state resend to `addr`.
     Resend {
         key: ContractKey,
         peer: PeerKey,
         addr: SocketAddr,
-        timed_out: bool,
     },
-    /// The resend went unconfirmed (or never went): stop, clear the belief,
-    /// count, maybe WARN.
+    /// Stop: clear the belief, count, maybe WARN.
     GiveUp {
         key: ContractKey,
         peer: PeerKey,
@@ -195,7 +198,8 @@ pub(crate) enum SweepAction {
 }
 
 /// Whether a drop reason is transient load rather than a property of the
-/// payload or the receiver, and so worth the one resend.
+/// payload or the receiver. A transient drop is treated as no ack at all, so
+/// the timers decide; a final one ends tracking of the latest generation.
 pub(crate) fn is_transient(reason: BroadcastDropReason) -> bool {
     match reason {
         BroadcastDropReason::RateLimited
@@ -208,82 +212,101 @@ pub(crate) fn is_transient(reason: BroadcastDropReason) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct InFlight {
+struct Leg {
     tx: Transaction,
-    sent_at: Instant,
-    deadline: Instant,
-    /// The send finished: `deadline` is the real ack deadline, not the
-    /// provisional bound on the send itself.
-    send_done: bool,
+    generation: u64,
+    /// When its send finished; `None` while it is being sent.
+    finished: Option<Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Stage {
-    /// Armed by the fan-out; no flagged leg has gone yet. `queued` while the
-    /// pair's leg waits in (or runs from) the broadcast queue: then only
-    /// [`QUEUED_TTL`] ages it.
-    Armed { since: Instant, queued: bool },
-    /// A flagged leg went; waiting for its ack.
-    AwaitingAck(InFlight),
-    /// The first leg was dropped for a transient reason: the resend goes at
-    /// `at`.
-    RetryAt { at: Instant },
-    /// The full-state resend is due.
-    ResendDue { since: Instant },
-    /// The resend went; waiting for its ack.
-    AwaitingResendAck(InFlight),
-    /// A final drop for `tx` arrived before that leg's send finished. Held so
-    /// `send_finished` can undo the belief its bookkeeping rewrites.
-    DroppedBeforeSendDone { tx: Transaction, since: Instant },
+enum Resend {
+    None,
+    /// Queued by the sweep; not yet built.
+    Queued,
+    /// Built, carrying `generation`; `deadline` once its send finished.
+    Sent {
+        generation: u64,
+        deadline: Option<Instant>,
+    },
 }
 
 #[derive(Debug, Clone)]
 struct Entry {
     key: ContractKey,
     addr: SocketAddr,
-    stage: Stage,
-    /// When the oldest unconfirmed update in this entry was armed. Coalescing
-    /// never moves it; only a confirmation or a proven path does.
-    first_unconfirmed_at: Instant,
-    /// When the first flagged leg since `first_unconfirmed_at` finished.
-    first_done_at: Option<Instant>,
-    /// The previous flagged leg of this entry, so its late ack still counts
-    /// as proof the path delivers.
-    prev_tx: Option<Transaction>,
-    /// Whether any flagged leg has gone for this entry.
+    generation: u64,
+    confirmed: u64,
+    /// (generation, arm time) for unconfirmed generations, oldest first.
+    arm_times: VecDeque<(u64, Instant)>,
+    /// The last [`MAX_LEGS`] flagged legs.
+    legs: VecDeque<Leg>,
+    resend: Resend,
+    /// A final drop of the latest generation arrived; the entry is removed
+    /// once the pair has no leg in flight, re-clearing the belief as each
+    /// in-flight leg's bookkeeping ends. The one piece of state beyond the
+    /// generation model.
+    final_drop: bool,
     flagged_any: bool,
 }
 
 impl Entry {
-    fn fresh(key: ContractKey, addr: SocketAddr, now: Instant) -> Self {
+    fn new(key: ContractKey, addr: SocketAddr) -> Self {
         Self {
             key,
             addr,
-            stage: Stage::Armed {
-                since: now,
-                queued: false,
-            },
-            first_unconfirmed_at: now,
-            first_done_at: None,
-            prev_tx: None,
+            generation: 0,
+            confirmed: 0,
+            arm_times: VecDeque::new(),
+            legs: VecDeque::new(),
+            resend: Resend::None,
+            final_drop: false,
             flagged_any: false,
         }
     }
 
-    /// Whether an `AwaitingAck` leg is due for the resend at `now`.
-    fn ack_overdue(&self, leg: &InFlight, now: Instant) -> bool {
-        if now >= leg.deadline {
-            return true;
+    fn arm(&mut self, now: Instant) {
+        if self.final_drop {
+            // Everything up to the dropped generation is resolved; this is a
+            // new update.
+            self.final_drop = false;
+            self.confirmed = self.generation;
+            self.arm_times.clear();
+            self.legs.clear();
+            self.resend = Resend::None;
+            self.flagged_any = false;
         }
-        if !leg.send_done {
-            return false;
+        self.generation += 1;
+        if self.arm_times.len() >= MAX_ARM_TIMES {
+            self.arm_times.pop_front();
         }
-        let escalate = self.first_unconfirmed_at + ESCALATE_AFTER;
-        let escalate = match self.first_done_at {
-            Some(done) => escalate.max(done + ACK_TIMEOUT),
-            None => escalate,
-        };
-        now >= escalate
+        self.arm_times.push_back((self.generation, now));
+    }
+
+    fn settled(&self) -> bool {
+        self.confirmed >= self.generation
+    }
+
+    fn confirm(&mut self, generation: u64) {
+        self.confirmed = self.confirmed.max(generation);
+        self.arm_times.retain(|(g, _)| *g > self.confirmed);
+        self.legs.retain(|leg| leg.generation > self.confirmed);
+        match self.resend {
+            Resend::Sent { generation, .. } if generation <= self.confirmed => {
+                self.resend = Resend::None;
+            }
+            Resend::None | Resend::Queued | Resend::Sent { .. } => {}
+        }
+    }
+
+    /// Arm time of the oldest unconfirmed generation.
+    fn oldest_unconfirmed(&self) -> Option<Instant> {
+        self.arm_times.front().map(|(_, at)| *at)
+    }
+
+    /// When the first flagged leg carrying an unconfirmed generation finished.
+    fn first_unconfirmed_leg_done(&self) -> Option<Instant> {
+        self.legs.iter().filter_map(|leg| leg.finished).min()
     }
 }
 
@@ -292,9 +315,13 @@ type PairKey = (ContractInstanceId, PeerKey);
 #[derive(Default)]
 struct Inner {
     entries: HashMap<PairKey, Entry>,
+    /// Legs of each pair from enqueue until their send finished, for every
+    /// pair (tracked or not), so the count never depends on whether an entry
+    /// existed when the leg was queued.
+    in_flight: HashMap<PairKey, u32>,
     /// Whether a sweep task is running. Read and written under the same lock
     /// as `entries`, so an arm cannot insert into a table the sweep has just
-    /// seen empty and is leaving (the lost-wakeup race).
+    /// seen empty and is leaving.
     sweeping: bool,
     last_warn: HashMap<ContractInstanceId, Instant>,
 }
@@ -313,20 +340,14 @@ impl ConfirmedDelivery {
         }
     }
 
-    /// The table's clock. The deadlines are waited on by a tokio sleep, so
-    /// production passes the same tokio-backed source as `BroadcastSpacing`.
+    /// The table's clock (tokio-backed in production, like `BroadcastSpacing`,
+    /// because the sweep waits on a tokio sleep).
     pub(crate) fn now(&self) -> Instant {
         self.time_source.now()
     }
 
-    /// Arm `peer` for the originated update of `key` just fanned out.
-    ///
-    /// A newer update coalesces into an existing entry WITHOUT moving its
-    /// stage or its escalation clock: a due or in-flight resend stays due or
-    /// in flight, and the next leg (which carries the newest state) is what
-    /// the newer update rides on.
-    ///
-    /// Returns the outcome and whether the caller must start the sweep task.
+    /// Arm `peer` for the originated update of `key` just fanned out. Returns
+    /// the outcome and whether the caller must start the sweep task.
     pub(crate) fn arm(
         &self,
         key: ContractKey,
@@ -338,15 +359,14 @@ impl ConfirmedDelivery {
         let pair = (*key.id(), peer);
         let outcome = if let Some(entry) = inner.entries.get_mut(&pair) {
             entry.addr = addr;
-            if matches!(entry.stage, Stage::DroppedBeforeSendDone { .. }) {
-                // The previous update was finally dropped; this is a new one.
-                *entry = Entry::fresh(key, addr, now);
-            }
+            entry.arm(now);
             ArmOutcome::Coalesced
         } else if inner.entries.len() >= MAX_PENDING {
             return (ArmOutcome::Overflow, false);
         } else {
-            inner.entries.insert(pair, Entry::fresh(key, addr, now));
+            let mut entry = Entry::new(key, addr);
+            entry.arm(now);
+            inner.entries.insert(pair, entry);
             ArmOutcome::Armed
         };
         let start_sweep = !inner.sweeping;
@@ -354,174 +374,151 @@ impl ConfirmedDelivery {
         (outcome, start_sweep)
     }
 
-    /// The pair's leg was handed to the broadcast queue: while it waits there
-    /// an armed entry does not age toward [`UNSENT_TTL`].
-    // Called by the production broadcast queue only; the simulation fan-out
-    // has no queue.
-    #[cfg_attr(feature = "simulation_tests", allow(dead_code))]
-    pub(crate) fn note_queued(&self, key: &ContractInstanceId, peer: &PeerKey) {
-        let mut inner = self.inner.lock();
-        if let Some(Entry {
-            stage: Stage::Armed { queued, .. },
-            ..
-        }) = inner.entries.get_mut(&(*key, peer.clone()))
-        {
-            *queued = true;
-        }
+    /// A leg of the pair entered flight (queued, or started directly).
+    pub(crate) fn leg_started(&self, key: &ContractInstanceId, peer: &PeerKey) {
+        *self
+            .inner
+            .lock()
+            .in_flight
+            .entry((*key, peer.clone()))
+            .or_insert(0) += 1;
     }
 
-    /// The pair's queued leg left the queue (it started running, or was
-    /// evicted): the [`UNSENT_TTL`] bound restarts from `now`.
-    pub(crate) fn note_dequeued(&self, key: &ContractInstanceId, peer: &PeerKey, now: Instant) {
+    /// A leg of the pair left flight: its send finished, or it was evicted,
+    /// superseded or skipped. Called AFTER the leg's delivery bookkeeping.
+    /// Returns true when the caller must clear its belief about the peer
+    /// again, because a final drop arrived while this leg was in flight.
+    pub(crate) fn leg_ended(&self, key: &ContractInstanceId, peer: &PeerKey) -> bool {
         let mut inner = self.inner.lock();
-        if let Some(Entry {
-            stage: Stage::Armed { since, queued },
-            ..
-        }) = inner.entries.get_mut(&(*key, peer.clone()))
-        {
-            if *queued {
-                *queued = false;
-                *since = now;
+        let pair = (*key, peer.clone());
+        let remaining = match inner.in_flight.get_mut(&pair) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                *count
             }
+            None => 0,
+        };
+        if remaining == 0 {
+            inner.in_flight.remove(&pair);
         }
+        let Some(entry) = inner.entries.get(&pair) else {
+            return false;
+        };
+        if !entry.final_drop {
+            return false;
+        }
+        if remaining == 0 {
+            inner.entries.remove(&pair);
+        }
+        true
     }
 
-    /// What the next leg to `peer` for `key` owes. Reads only.
+    fn in_flight(inner: &Inner, pair: &PairKey) -> u32 {
+        inner.in_flight.get(pair).copied().unwrap_or(0)
+    }
+
+    /// What the next leg to `peer` for `key` owes. Reads only. Read BEFORE the
+    /// leg's payload is built, so the generation it returns is one the payload
+    /// includes.
     pub(crate) fn leg_duty(&self, key: &ContractInstanceId, peer: &PeerKey) -> LegDuty {
         let inner = self.inner.lock();
-        match inner.entries.get(&(*key, peer.clone())).map(|e| e.stage) {
-            None | Some(Stage::DroppedBeforeSendDone { .. }) => LegDuty::None,
-            Some(Stage::ResendDue { .. }) => LegDuty::ResendFull,
-            Some(
-                Stage::Armed { .. }
-                | Stage::AwaitingAck(_)
-                | Stage::RetryAt { .. }
-                | Stage::AwaitingResendAck(_),
-            ) => LegDuty::RequestAck,
+        match inner.entries.get(&(*key, peer.clone())) {
+            None => LegDuty::None,
+            Some(entry) if entry.final_drop || entry.settled() => LegDuty::None,
+            Some(entry) if entry.resend == Resend::Queued => LegDuty::ResendFull(entry.generation),
+            Some(entry) => LegDuty::RequestAck(entry.generation),
         }
     }
 
-    /// A flagged leg with transaction `tx` is about to be sent at `now`.
-    ///
-    /// Recorded BEFORE the send so an ack that arrives before the sender's
-    /// own bookkeeping still matches. `provisional` bounds the send itself
-    /// until [`Self::send_finished`] starts the real deadline: [`ACK_TIMEOUT`]
-    /// for an inline leg, the stream completion wait plus [`ACK_TIMEOUT`] for
-    /// a stream (#6292 round 1, Must Fix 1).
-    ///
-    /// Only a `full_resend` leg consumes a due resend. A leg that read its
-    /// duty before the sweep made the resend due is tracked (its ack still
-    /// proves the path) but leaves the resend due (Should Fix 6).
+    /// A flagged leg with transaction `tx`, carrying `duty`'s generation, is
+    /// about to be sent. Recorded BEFORE the send so an early ack matches.
     pub(crate) fn record_flagged_send(
         &self,
         key: &ContractInstanceId,
         peer: &PeerKey,
         tx: Transaction,
-        full_resend: bool,
-        provisional: Duration,
-        now: Instant,
+        duty: LegDuty,
     ) -> FlaggedSend {
+        let Some(generation) = duty.generation() else {
+            return FlaggedSend::Untracked;
+        };
         let mut inner = self.inner.lock();
         let Some(entry) = inner.entries.get_mut(&(*key, peer.clone())) else {
             return FlaggedSend::Untracked;
         };
-        let leg = InFlight {
+        if entry.final_drop || generation <= entry.confirmed {
+            return FlaggedSend::Untracked;
+        }
+        if entry.legs.len() >= MAX_LEGS {
+            entry.legs.pop_front();
+        }
+        entry.legs.push_back(Leg {
             tx,
-            sent_at: now,
-            deadline: now + provisional,
-            send_done: false,
-        };
+            generation,
+            finished: None,
+        });
         let first = !entry.flagged_any;
         entry.flagged_any = true;
-        match entry.stage {
-            Stage::Armed { .. } => {
-                entry.stage = Stage::AwaitingAck(leg);
-                if first {
-                    FlaggedSend::First
-                } else {
-                    FlaggedSend::Reflag
-                }
-            }
-            Stage::AwaitingAck(previous) => {
-                entry.prev_tx = Some(previous.tx);
-                entry.stage = Stage::AwaitingAck(leg);
-                FlaggedSend::Reflag
-            }
-            Stage::ResendDue { .. } if full_resend => {
-                entry.stage = Stage::AwaitingResendAck(leg);
-                FlaggedSend::Resend
-            }
-            Stage::RetryAt { .. } | Stage::ResendDue { .. } | Stage::AwaitingResendAck(_) => {
-                // Not the resend: track it for path proof only.
-                entry.prev_tx = Some(tx);
-                FlaggedSend::Reflag
-            }
-            Stage::DroppedBeforeSendDone { .. } => FlaggedSend::Untracked,
+        if duty.is_resend() && entry.resend == Resend::Queued {
+            entry.resend = Resend::Sent {
+                generation,
+                deadline: None,
+            };
+            return FlaggedSend::Resend;
+        }
+        if first {
+            FlaggedSend::First
+        } else {
+            FlaggedSend::Reflag
         }
     }
 
-    /// The flagged leg `tx` finished sending at `now` (for a stream, its
-    /// completion; success or not, since a failed send is what the deadline is
-    /// for). Starts the [`ACK_TIMEOUT`] deadline, unless the entry has moved
-    /// on. Called AFTER the send's delivery bookkeeping, so a final drop that
-    /// beat it can be re-applied.
+    /// The flagged leg `tx` finished sending at `now` (a stream: its
+    /// completion). Starts the resend's ack deadline if this was the resend.
     pub(crate) fn send_finished(
         &self,
         key: &ContractInstanceId,
         peer: &PeerKey,
         tx: Transaction,
         now: Instant,
-    ) -> SendFinished {
+    ) {
         let mut inner = self.inner.lock();
-        let pair = (*key, peer.clone());
-        let Some(entry) = inner.entries.get_mut(&pair) else {
-            return SendFinished::Nothing;
+        let Some(entry) = inner.entries.get_mut(&(*key, peer.clone())) else {
+            return;
         };
-        match &mut entry.stage {
-            Stage::AwaitingAck(leg) | Stage::AwaitingResendAck(leg)
-                if leg.tx == tx && !leg.send_done =>
-            {
-                leg.sent_at = now;
-                leg.deadline = now + ACK_TIMEOUT;
-                leg.send_done = true;
-                if entry.first_done_at.is_none() {
-                    entry.first_done_at = Some(now);
-                }
-                SendFinished::Nothing
+        let Some(leg) = entry.legs.iter_mut().find(|leg| leg.tx == tx) else {
+            return;
+        };
+        leg.finished = Some(now);
+        let generation = leg.generation;
+        if let Resend::Sent {
+            generation: sent,
+            deadline: deadline @ None,
+        } = &mut entry.resend
+        {
+            if *sent == generation {
+                *deadline = Some(now + ACK_TIMEOUT);
             }
-            Stage::DroppedBeforeSendDone { tx: dropped, .. } if *dropped == tx => {
-                inner.entries.remove(&pair);
-                SendFinished::ReclearBelief
-            }
-            Stage::Armed { .. }
-            | Stage::AwaitingAck(_)
-            | Stage::RetryAt { .. }
-            | Stage::ResendDue { .. }
-            | Stage::AwaitingResendAck(_)
-            | Stage::DroppedBeforeSendDone { .. } => SendFinished::Nothing,
         }
     }
 
-    /// The first leg to `peer` was skipped because our belief says the peer
-    /// already holds our state. A just-originated update can only match the
-    /// peer's summary if the peer told us so, so an entry NO flagged leg has
-    /// touched is settled. Once one went unconfirmed, the belief may be the
-    /// very thing that lost leg wrote. Returns whether an entry was removed.
+    /// A leg was skipped because our belief says the peer already holds our
+    /// state. Only a just-armed update with no flagged leg recorded can match
+    /// that honestly (the peer told us); once a flagged leg went, the belief
+    /// may be what a lost leg wrote. Returns whether the entry settled.
     pub(crate) fn settle_converged(&self, key: &ContractInstanceId, peer: &PeerKey) -> bool {
         let mut inner = self.inner.lock();
         let pair = (*key, peer.clone());
-        if matches!(
-            inner.entries.get(&pair),
-            Some(Entry {
-                stage: Stage::Armed { .. },
-                flagged_any: false,
-                ..
-            })
-        ) {
+        let settle = inner.entries.get(&pair).is_some_and(|entry| {
+            !entry.final_drop
+                && entry.legs.is_empty()
+                && !entry.flagged_any
+                && entry.confirmed + 1 == entry.generation
+        });
+        if settle {
             inner.entries.remove(&pair);
-            return true;
         }
-        false
+        settle
     }
 
     /// An ack for `tx` arrived from `peer`.
@@ -535,126 +532,102 @@ impl ConfirmedDelivery {
     ) -> AckEffect {
         let mut inner = self.inner.lock();
         let pair = (*key, peer.clone());
+        let in_flight = Self::in_flight(&inner, &pair);
         let Some(entry) = inner.entries.get_mut(&pair) else {
             return AckEffect::Unmatched;
         };
-        let (current, is_resend) = match entry.stage {
-            Stage::AwaitingAck(leg) => (Some(leg), false),
-            Stage::AwaitingResendAck(leg) => (Some(leg), true),
-            Stage::Armed { .. }
-            | Stage::RetryAt { .. }
-            | Stage::ResendDue { .. }
-            | Stage::DroppedBeforeSendDone { .. } => (None, false),
+        let Some(leg) = entry.legs.iter().find(|leg| leg.tx == tx).copied() else {
+            return AckEffect::Unmatched;
         };
-        match current {
-            Some(leg) if leg.tx == tx => match outcome {
-                BroadcastAckOutcome::Applied | BroadcastAckOutcome::AlreadyHad => {
+        match outcome {
+            BroadcastAckOutcome::Applied | BroadcastAckOutcome::AlreadyHad => {
+                entry.confirm(leg.generation);
+                if entry.settled() {
                     inner.entries.remove(&pair);
-                    AckEffect::Confirmed {
-                        latency: now.saturating_duration_since(leg.sent_at),
-                    }
+                    return AckEffect::Confirmed {
+                        latency: leg
+                            .finished
+                            .map_or(Duration::ZERO, |done| now.saturating_duration_since(done)),
+                    };
                 }
-                BroadcastAckOutcome::Dropped(reason) => {
-                    let full_key = entry.key;
-                    if is_transient(reason) && !is_resend {
-                        entry.stage = Stage::RetryAt {
-                            at: now + ACK_TIMEOUT,
-                        };
-                        return AckEffect::Dropped {
-                            key: full_key,
-                            reason,
-                            next: DropNext::Retry,
-                        };
-                    }
-                    if leg.send_done {
-                        inner.entries.remove(&pair);
-                    } else {
-                        entry.stage = Stage::DroppedBeforeSendDone { tx, since: now };
-                    }
-                    AckEffect::Dropped {
-                        key: full_key,
-                        reason,
-                        next: DropNext::Stop,
-                    }
-                }
-            },
-            _ if entry.prev_tx == Some(tx)
-                && matches!(
-                    outcome,
-                    BroadcastAckOutcome::Applied | BroadcastAckOutcome::AlreadyHad
-                ) =>
-            {
-                entry.prev_tx = None;
-                entry.first_unconfirmed_at = now;
-                entry.first_done_at = None;
-                AckEffect::PathProven
+                AckEffect::Partial
             }
-            _ => AckEffect::Unmatched,
+            BroadcastAckOutcome::Dropped(reason) => {
+                if is_transient(reason) || leg.generation < entry.generation {
+                    return AckEffect::DroppedIgnored { reason };
+                }
+                let full_key = entry.key;
+                if in_flight == 0 {
+                    inner.entries.remove(&pair);
+                } else {
+                    entry.final_drop = true;
+                }
+                AckEffect::DroppedFinal {
+                    key: full_key,
+                    reason,
+                }
+            }
         }
     }
 
-    /// The peer disconnected: its entries are discarded. Returns how many.
+    /// The peer disconnected: its entries and in-flight counts are discarded.
     pub(crate) fn remove_peer(&self, peer: &PeerKey) -> usize {
         let mut inner = self.inner.lock();
         let before = inner.entries.len();
         inner.entries.retain(|(_, p), _| p != peer);
+        inner.in_flight.retain(|(_, p), _| p != peer);
         before - inner.entries.len()
     }
 
-    /// Advance every expired entry. Returns the actions, and whether the
-    /// sweep should keep running (false when the table is empty, in which
-    /// case the sweep flag is cleared under the same lock).
+    /// Advance every entry. Returns the actions, and whether the sweep should
+    /// keep running (false when the table is empty, in which case the sweep
+    /// flag is cleared under the same lock).
     pub(crate) fn sweep(&self, now: Instant) -> (Vec<SweepAction>, bool) {
         let mut inner = self.inner.lock();
+        let Inner {
+            entries, in_flight, ..
+        } = &mut *inner;
         let mut actions = Vec::new();
         let mut give_up = Vec::new();
-        let mut forget = Vec::new();
-        for (pair, entry) in inner.entries.iter_mut() {
-            let resend = |entry: &mut Entry, timed_out: bool| {
-                entry.stage = Stage::ResendDue { since: now };
-                SweepAction::Resend {
-                    key: entry.key,
-                    peer: pair.1.clone(),
-                    addr: entry.addr,
-                    timed_out,
-                }
+        for (pair, entry) in entries.iter_mut() {
+            if entry.final_drop || entry.settled() {
+                continue;
+            }
+            let Some(oldest) = entry.oldest_unconfirmed() else {
+                continue;
             };
-            match entry.stage {
-                Stage::Armed { since, queued } => {
-                    let bound = if queued { QUEUED_TTL } else { UNSENT_TTL };
-                    if now.saturating_duration_since(since) >= bound {
-                        actions.push(resend(entry, false));
-                    }
+            let age = now.saturating_duration_since(oldest);
+            if age >= MAX_ENTRY_AGE {
+                give_up.push(pair.clone());
+                continue;
+            }
+            match entry.resend {
+                Resend::Sent {
+                    generation,
+                    deadline: Some(deadline),
+                } if now >= deadline && entry.confirmed < generation => {
+                    give_up.push(pair.clone());
                 }
-                Stage::AwaitingAck(leg) => {
-                    if entry.ack_overdue(&leg, now) {
-                        actions.push(resend(entry, true));
-                    }
-                }
-                Stage::RetryAt { at } => {
-                    if now >= at {
-                        actions.push(resend(entry, false));
-                    }
-                }
-                Stage::AwaitingResendAck(leg) => {
-                    if now >= leg.deadline {
-                        give_up.push(pair.clone());
-                    }
-                }
-                Stage::ResendDue { since } => {
-                    if now.saturating_duration_since(since) >= UNSENT_TTL {
-                        give_up.push(pair.clone());
-                    }
-                }
-                Stage::DroppedBeforeSendDone { since, .. } => {
-                    if now.saturating_duration_since(since) >= UNSENT_TTL {
-                        forget.push(pair.clone());
+                Resend::Sent { .. } | Resend::Queued => {}
+                Resend::None => {
+                    let quiet = in_flight.get(pair).copied().unwrap_or(0) == 0;
+                    let leg_waited = match entry.first_unconfirmed_leg_done() {
+                        Some(done) => now.saturating_duration_since(done) >= ACK_TIMEOUT,
+                        None => age >= UNSENT_TTL,
+                    };
+                    if quiet && age >= ESCALATE_AFTER && leg_waited {
+                        entry.resend = Resend::Queued;
+                        actions.push(SweepAction::Resend {
+                            key: entry.key,
+                            peer: pair.1.clone(),
+                            addr: entry.addr,
+                        });
                     }
                 }
             }
         }
         for pair in give_up {
-            if let Some(entry) = inner.entries.remove(&pair) {
+            if let Some(entry) = entries.remove(&pair) {
                 actions.push(SweepAction::GiveUp {
                     key: entry.key,
                     peer: pair.1,
@@ -662,10 +635,7 @@ impl ConfirmedDelivery {
                 });
             }
         }
-        for pair in forget {
-            inner.entries.remove(&pair);
-        }
-        let keep_running = !inner.entries.is_empty();
+        let keep_running = !entries.is_empty();
         if !keep_running {
             inner.sweeping = false;
         }
@@ -692,8 +662,6 @@ impl ConfirmedDelivery {
                 .last_warn
                 .retain(|_, last| now.saturating_duration_since(*last) < GIVE_UP_WARN_INTERVAL);
             if inner.last_warn.len() >= MAX_WARN_ENTRIES {
-                // Every slot is inside its interval: stay quiet rather than
-                // grow. The give-up is still counted.
                 return false;
             }
         }
@@ -709,6 +677,46 @@ impl ConfirmedDelivery {
     #[cfg(test)]
     fn is_sweeping(&self) -> bool {
         self.inner.lock().sweeping
+    }
+}
+
+/// Counts one leg of a pair as in flight for as long as it lives, and ends it
+/// on every exit, after the leg's delivery bookkeeping (it is dropped at the
+/// end of the send function). A leg the broadcast queue already counted at
+/// enqueue passes `counted_by_queue`; any other leg is counted here.
+pub(crate) struct LegInFlight<'a> {
+    op_manager: &'a crate::node::OpManager,
+    key: ContractKey,
+    peer: PeerKey,
+}
+
+impl<'a> LegInFlight<'a> {
+    pub(crate) fn begin(
+        op_manager: &'a crate::node::OpManager,
+        key: ContractKey,
+        peer: PeerKey,
+        counted_by_queue: bool,
+    ) -> Self {
+        if !counted_by_queue {
+            op_manager.confirmed_delivery.leg_started(key.id(), &peer);
+        }
+        Self {
+            op_manager,
+            key,
+            peer,
+        }
+    }
+}
+
+impl Drop for LegInFlight<'_> {
+    fn drop(&mut self) {
+        if self
+            .op_manager
+            .confirmed_delivery
+            .leg_ended(self.key.id(), &self.peer)
+        {
+            clear_belief(self.op_manager, &self.key, &self.peer);
+        }
     }
 }
 
@@ -739,10 +747,9 @@ pub(crate) fn dropped_event(
 }
 
 /// The duty of a leg about to go to `peer_addr`, re-checking the version gate
-/// at the send site (#6292 round 1, Should Fix 9). Arming already checked it,
-/// but a queued leg can outlive a reconnect at the same key, and the version
-/// gate is what keeps undecodable variants off the wire, so it is enforced
-/// where the variant is chosen rather than only where the entry was created.
+/// at the send site: arming already checked it, but a queued leg can outlive a
+/// reconnect at the same key, and the gate is what keeps undecodable variants
+/// off the wire.
 pub(crate) fn leg_duty_for(
     op_manager: &crate::node::OpManager,
     key: &ContractInstanceId,
@@ -824,32 +831,25 @@ pub(crate) fn handle_ack(
                 "confirmed delivery: originated update acknowledged"
             );
         }
-        AckEffect::PathProven => {
+        AckEffect::Partial => {
             count(op_manager, &key, PropagationEvent::AckPathProven);
         }
-        AckEffect::Dropped {
+        AckEffect::DroppedFinal {
             key: full_key,
             reason,
-            next,
         } => {
             count(op_manager, &key, dropped_event(reason));
-            match next {
-                DropNext::Retry => {}
-                DropNext::Stop => {
-                    clear_belief(op_manager, &full_key, &peer);
-                    if is_transient(reason) {
-                        // The resend itself was dropped: the repair ends.
-                        count(op_manager, &key, PropagationEvent::UnconfirmedGiveup);
-                    }
-                }
-            }
+            clear_belief(op_manager, &full_key, &peer);
             tracing::debug!(
                 contract = %key,
                 peer = %sender_addr,
                 ?reason,
-                ?next,
-                "confirmed delivery: peer dropped the originated update"
+                "confirmed delivery: peer dropped the latest originated update; \
+                 belief cleared, no resend"
             );
+        }
+        AckEffect::DroppedIgnored { reason } => {
+            count(op_manager, &key, dropped_event(reason));
         }
         AckEffect::Unmatched => {
             count(op_manager, &key, PropagationEvent::AckUnmatched);
@@ -868,8 +868,7 @@ pub(crate) fn clear_belief(op_manager: &crate::node::OpManager, key: &ContractKe
 }
 
 /// Resets the sweep flag if the sweep task ends early (a panic, or its node
-/// is gone), so a later arm can start a new one rather than leaving entries
-/// with no sweep at all.
+/// is gone), so a later arm can start a new one.
 struct SweepGuard(std::sync::Weak<crate::node::OpManager>, bool);
 
 impl Drop for SweepGuard {
@@ -902,19 +901,11 @@ async fn run_sweep(weak: std::sync::Weak<crate::node::OpManager>) {
         > = HashMap::new();
         for action in actions {
             match action {
-                SweepAction::Resend {
-                    key,
-                    peer,
-                    addr,
-                    timed_out,
-                } => {
-                    if timed_out {
-                        count(&op_manager, key.id(), PropagationEvent::AckTimeout);
-                    }
-                    // The resend leg consults the table and finds it
-                    // `ResendDue`, so it goes as full state on the stream
-                    // path. Routed through the targeted heal, which applies
-                    // the per-pair broadcast spacing like any other leg.
+                SweepAction::Resend { key, peer, addr } => {
+                    count(&op_manager, key.id(), PropagationEvent::AckTimeout);
+                    // The heal leg reads the table again when it is built: if
+                    // the resend's generation was confirmed meanwhile, it goes
+                    // unflagged (and is usually skipped as converged).
                     let state = match snapshots.get(key.id()) {
                         Some(state) => state.clone(),
                         None => {
@@ -926,7 +917,7 @@ async fn run_sweep(weak: std::sync::Weak<crate::node::OpManager>) {
                         }
                     };
                     let Some(state) = state else {
-                        // No local state to resend; the unsent TTL gives up.
+                        // No local state to resend; MAX_ENTRY_AGE gives up.
                         continue;
                     };
                     if op_manager
@@ -937,8 +928,8 @@ async fn run_sweep(weak: std::sync::Weak<crate::node::OpManager>) {
                         })
                         .is_err()
                     {
-                        // The event loop is saturated. The entry stays
-                        // resend-due and the unsent TTL gives up on it.
+                        // The event loop is saturated. The resend stays
+                        // queued and MAX_ENTRY_AGE gives up on it.
                         tracing::debug!(
                             contract = %key,
                             peer = %addr,
@@ -1123,508 +1114,6 @@ pub(crate) fn inline_leg_swallowed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::TransportKeypair;
-
-    fn table() -> ConfirmedDelivery {
-        ConfirmedDelivery::new(Arc::new(crate::util::time_source::InstantTimeSrc::new()))
-    }
-
-    fn key(seed: u8) -> ContractKey {
-        crate::operations::test_utils::make_contract_key(seed)
-    }
-
-    fn peer() -> PeerKey {
-        PeerKey::from(TransportKeypair::new().public().clone())
-    }
-
-    fn addr(port: u16) -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], port))
-    }
-
-    fn tx() -> Transaction {
-        Transaction::new::<crate::operations::update::UpdateMsg>()
-    }
-
-    /// Drive one entry to `AwaitingAck` with a finished send at `t0`.
-    fn flagged(t: &ConfirmedDelivery, k: ContractKey, p: &PeerKey, t0: Instant) -> Transaction {
-        t.arm(k, p.clone(), addr(1), t0);
-        let id = tx();
-        assert_eq!(
-            t.record_flagged_send(k.id(), p, id, false, ACK_TIMEOUT, t0),
-            FlaggedSend::First
-        );
-        t.send_finished(k.id(), p, id, t0);
-        id
-    }
-
-    #[test]
-    fn a_newer_update_coalesces_into_one_entry_per_pair() {
-        let t = table();
-        let (k, p, now) = (key(1), peer(), Instant::now());
-        assert_eq!(t.arm(k, p.clone(), addr(1), now), (ArmOutcome::Armed, true));
-        for _ in 0..50 {
-            assert_eq!(
-                t.arm(k, p.clone(), addr(1), now),
-                (ArmOutcome::Coalesced, false),
-                "a burst of client writes costs one entry, and the sweep is \
-                 started once"
-            );
-        }
-        assert_eq!(t.len(), 1);
-        // A different contract or peer is a different entry.
-        t.arm(key(2), p.clone(), addr(1), now);
-        t.arm(k, peer(), addr(2), now);
-        assert_eq!(t.len(), 3);
-    }
-
-    /// Round 1 Must Fix 2 changed this contract. Coalescing used to restart
-    /// the entry, which let a frequently written contract postpone its resend
-    /// forever. Now a newer update keeps the pending leg and its deadline:
-    /// the next leg (carrying the newest state) is what the newer update
-    /// rides on, and an unconfirmed leg still comes due on time.
-    #[test]
-    fn coalescing_keeps_the_pending_leg_and_its_deadline() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        flagged(&t, k, &p, t0);
-        t.arm(k, p.clone(), addr(1), t0);
-        assert_eq!(t.leg_duty(k.id(), &p), LegDuty::RequestAck);
-        let (actions, _) = t.sweep(t0 + ACK_TIMEOUT);
-        assert!(
-            matches!(
-                actions.as_slice(),
-                [SweepAction::Resend {
-                    timed_out: true,
-                    ..
-                }]
-            ),
-            "{actions:?}"
-        );
-    }
-
-    #[test]
-    fn the_table_is_capped_and_an_overflow_is_not_tracked() {
-        let t = table();
-        let now = Instant::now();
-        let k = key(1);
-        for port in 0..MAX_PENDING as u16 {
-            assert_eq!(t.arm(k, peer(), addr(port), now).0, ArmOutcome::Armed);
-        }
-        let extra = peer();
-        assert_eq!(
-            t.arm(k, extra.clone(), addr(9), now),
-            (ArmOutcome::Overflow, false)
-        );
-        assert_eq!(t.len(), MAX_PENDING);
-        assert_eq!(t.leg_duty(k.id(), &extra), LegDuty::None);
-    }
-
-    #[test]
-    fn a_matching_ack_confirms_and_removes_the_entry() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        let id = flagged(&t, k, &p, t0);
-        let later = t0 + Duration::from_millis(300);
-        assert_eq!(
-            t.on_ack(k.id(), &p, id, BroadcastAckOutcome::Applied, later),
-            AckEffect::Confirmed {
-                latency: Duration::from_millis(300)
-            }
-        );
-        assert_eq!(t.len(), 0);
-        assert_eq!(t.leg_duty(k.id(), &p), LegDuty::None);
-        // "Already had it" confirms too.
-        let id = flagged(&t, k, &p, t0);
-        assert!(matches!(
-            t.on_ack(k.id(), &p, id, BroadcastAckOutcome::AlreadyHad, t0),
-            AckEffect::Confirmed { .. }
-        ));
-    }
-
-    #[test]
-    fn an_ack_for_another_leg_or_peer_settles_nothing() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        let id = flagged(&t, k, &p, t0);
-        // A stale ack for a superseded leg.
-        assert_eq!(
-            t.on_ack(k.id(), &p, tx(), BroadcastAckOutcome::Applied, t0),
-            AckEffect::Unmatched
-        );
-        // The right tx from the wrong peer, or for the wrong contract.
-        assert_eq!(
-            t.on_ack(k.id(), &peer(), id, BroadcastAckOutcome::Applied, t0),
-            AckEffect::Unmatched
-        );
-        assert_eq!(
-            t.on_ack(key(2).id(), &p, id, BroadcastAckOutcome::Applied, t0),
-            AckEffect::Unmatched
-        );
-        // An ack for an armed entry whose leg has not gone yet.
-        let p2 = peer();
-        t.arm(k, p2.clone(), addr(2), t0);
-        assert_eq!(
-            t.on_ack(k.id(), &p2, id, BroadcastAckOutcome::Applied, t0),
-            AckEffect::Unmatched
-        );
-        assert_eq!(t.len(), 2);
-    }
-
-    #[test]
-    fn an_ack_that_beats_the_send_bookkeeping_still_matches() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        t.arm(k, p.clone(), addr(1), t0);
-        let id = tx();
-        t.record_flagged_send(k.id(), &p, id, false, ACK_TIMEOUT, t0);
-        assert!(matches!(
-            t.on_ack(k.id(), &p, id, BroadcastAckOutcome::Applied, t0),
-            AckEffect::Confirmed { .. }
-        ));
-        // `send_finished` for a settled entry is a no-op, not a resurrection.
-        t.send_finished(k.id(), &p, id, t0);
-        assert_eq!(t.len(), 0);
-    }
-
-    #[test]
-    fn a_dropped_ack_removes_the_entry_without_a_resend() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        let id = flagged(&t, k, &p, t0);
-        assert_eq!(
-            t.on_ack(
-                k.id(),
-                &p,
-                id,
-                BroadcastAckOutcome::Dropped(BroadcastDropReason::Backoff),
-                t0
-            ),
-            AckEffect::Dropped {
-                key: k,
-                reason: BroadcastDropReason::Backoff,
-                next: DropNext::Stop,
-            }
-        );
-        let (actions, keep_running) = t.sweep(t0 + UNSENT_TTL * 2);
-        assert!(actions.is_empty(), "no resend after a dropped ack");
-        assert!(!keep_running);
-    }
-
-    #[test]
-    fn no_ack_resends_once_then_gives_up() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        flagged(&t, k, &p, t0);
-
-        // Not yet due.
-        let (actions, keep) = t.sweep(t0 + ACK_TIMEOUT - Duration::from_millis(1));
-        assert!(actions.is_empty() && keep);
-
-        // Due: one resend, and the next leg is the full-state resend.
-        let t1 = t0 + ACK_TIMEOUT;
-        let (actions, keep) = t.sweep(t1);
-        assert_eq!(
-            actions,
-            vec![SweepAction::Resend {
-                key: k,
-                peer: p.clone(),
-                addr: addr(1),
-                timed_out: true
-            }]
-        );
-        assert!(keep);
-        assert_eq!(t.leg_duty(k.id(), &p), LegDuty::ResendFull);
-        // Sweeping again before the resend goes does not resend twice.
-        assert!(t.sweep(t1 + Duration::from_secs(1)).0.is_empty());
-
-        let resend = tx();
-        assert_eq!(
-            t.record_flagged_send(k.id(), &p, resend, true, ACK_TIMEOUT, t1),
-            FlaggedSend::Resend
-        );
-        t.send_finished(k.id(), &p, resend, t1);
-        // While the resend awaits its ack, another leg to the peer asks for an
-        // ack but does not restart the resend.
-        assert_eq!(t.leg_duty(k.id(), &p), LegDuty::RequestAck);
-
-        let (actions, keep) = t.sweep(t1 + ACK_TIMEOUT);
-        assert_eq!(
-            actions,
-            vec![SweepAction::GiveUp {
-                key: k,
-                peer: p.clone(),
-                addr: addr(1)
-            }]
-        );
-        assert!(!keep, "the table is empty, so the sweep stops");
-        assert_eq!(t.len(), 0);
-        assert!(!t.is_sweeping());
-        // And the next arm starts the sweep again.
-        assert!(t.arm(k, p, addr(1), t1).1);
-    }
-
-    #[test]
-    fn the_resend_is_confirmed_by_its_own_ack() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        let first = flagged(&t, k, &p, t0);
-        t.sweep(t0 + ACK_TIMEOUT);
-        let resend = tx();
-        t.record_flagged_send(k.id(), &p, resend, true, ACK_TIMEOUT, t0 + ACK_TIMEOUT);
-        // A late ack for the first leg no longer matches.
-        assert_eq!(
-            t.on_ack(k.id(), &p, first, BroadcastAckOutcome::Applied, t0),
-            AckEffect::Unmatched
-        );
-        assert!(matches!(
-            t.on_ack(k.id(), &p, resend, BroadcastAckOutcome::Applied, t0),
-            AckEffect::Confirmed { .. }
-        ));
-    }
-
-    #[test]
-    fn a_leg_that_never_went_is_resent_then_given_up_on() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        t.arm(k, p.clone(), addr(1), t0);
-        assert!(
-            t.sweep(t0 + UNSENT_TTL - Duration::from_secs(1))
-                .0
-                .is_empty()
-        );
-        let t1 = t0 + UNSENT_TTL;
-        assert_eq!(
-            t.sweep(t1).0,
-            vec![SweepAction::Resend {
-                key: k,
-                peer: p.clone(),
-                addr: addr(1),
-                timed_out: false
-            }]
-        );
-        // The resend never goes either: give up after the same bound.
-        assert_eq!(
-            t.sweep(t1 + UNSENT_TTL).0,
-            vec![SweepAction::GiveUp {
-                key: k,
-                peer: p,
-                addr: addr(1)
-            }]
-        );
-        assert_eq!(t.len(), 0);
-    }
-
-    /// A send that never finishes is still bounded, by its provisional
-    /// deadline.
-    #[test]
-    fn a_send_that_never_finishes_is_bounded() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        t.arm(k, p.clone(), addr(1), t0);
-        t.record_flagged_send(k.id(), &p, tx(), false, ACK_TIMEOUT, t0);
-        assert!(
-            t.sweep(t0 + ACK_TIMEOUT - Duration::from_millis(1))
-                .0
-                .is_empty()
-        );
-        assert_eq!(t.sweep(t0 + ACK_TIMEOUT).0.len(), 1);
-    }
-
-    /// Round 1 Must Fix 1: a long stream is not resent mid-transfer. Its
-    /// provisional deadline is the stream's completion wait plus the ack
-    /// timeout, not the fixed unsent bound.
-    #[test]
-    fn a_long_stream_is_not_resent_mid_transfer() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        t.arm(k, p.clone(), addr(1), t0);
-        let id = tx();
-        let stream_wait = Duration::from_secs(600);
-        t.record_flagged_send(k.id(), &p, id, false, stream_wait + ACK_TIMEOUT, t0);
-        assert!(
-            t.sweep(t0 + UNSENT_TTL * 3).0.is_empty(),
-            "the stream is still within its completion wait"
-        );
-        // The stream completes; only now does the ack deadline run, and the
-        // escalation clock does not cut it short.
-        let done = t0 + Duration::from_secs(500);
-        t.send_finished(k.id(), &p, id, done);
-        assert!(
-            t.sweep(done + ACK_TIMEOUT - Duration::from_millis(1))
-                .0
-                .is_empty()
-        );
-        assert_eq!(t.sweep(done + ACK_TIMEOUT).0.len(), 1);
-    }
-
-    /// Round 1 Must Fix 1: an armed entry whose leg waits in the broadcast
-    /// queue does not age, bounded by the queued ceiling; once it leaves the
-    /// queue the unsent bound runs from then.
-    #[test]
-    fn a_queued_leg_does_not_age_its_entry() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        t.arm(k, p.clone(), addr(1), t0);
-        t.note_queued(k.id(), &p);
-        assert!(t.sweep(t0 + UNSENT_TTL * 2).0.is_empty());
-        let t1 = t0 + UNSENT_TTL * 3;
-        t.note_dequeued(k.id(), &p, t1);
-        assert!(
-            t.sweep(t1 + UNSENT_TTL - Duration::from_secs(1))
-                .0
-                .is_empty()
-        );
-        assert_eq!(t.sweep(t1 + UNSENT_TTL).0.len(), 1);
-
-        // The ceiling still bounds a leg the queue lost without a hook.
-        let q = peer();
-        t.arm(k, q.clone(), addr(2), t0);
-        t.note_queued(k.id(), &q);
-        assert!(
-            t.sweep(t0 + QUEUED_TTL)
-                .0
-                .iter()
-                .any(|a| matches!(a, SweepAction::Resend { peer, .. } if *peer == q))
-        );
-    }
-
-    /// Round 1 Should Fix 6: a leg that read its duty before the resend came
-    /// due does not consume it; only the full-state resend does.
-    #[test]
-    fn only_the_full_resend_consumes_a_due_resend() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        flagged(&t, k, &p, t0);
-        t.sweep(t0 + ACK_TIMEOUT);
-        assert_eq!(
-            t.record_flagged_send(k.id(), &p, tx(), false, ACK_TIMEOUT, t0 + ACK_TIMEOUT),
-            FlaggedSend::Reflag
-        );
-        assert_eq!(t.leg_duty(k.id(), &p), LegDuty::ResendFull);
-        assert_eq!(
-            t.record_flagged_send(k.id(), &p, tx(), true, ACK_TIMEOUT, t0 + ACK_TIMEOUT),
-            FlaggedSend::Resend
-        );
-    }
-
-    /// Round 1 Should Fix 4: a final drop that beats the leg's own send
-    /// bookkeeping is re-applied when the send finishes.
-    #[test]
-    fn a_drop_before_the_send_finishes_reclears_the_belief() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        t.arm(k, p.clone(), addr(1), t0);
-        let id = tx();
-        t.record_flagged_send(k.id(), &p, id, false, ACK_TIMEOUT, t0);
-        assert!(matches!(
-            t.on_ack(
-                k.id(),
-                &p,
-                id,
-                BroadcastAckOutcome::Dropped(BroadcastDropReason::NotHosted),
-                t0
-            ),
-            AckEffect::Dropped {
-                next: DropNext::Stop,
-                ..
-            }
-        ));
-        assert_eq!(t.leg_duty(k.id(), &p), LegDuty::None);
-        assert_eq!(
-            t.send_finished(k.id(), &p, id, t0),
-            SendFinished::ReclearBelief
-        );
-        assert_eq!(t.len(), 0);
-    }
-
-    /// Round 1 Must Fix 2: a late Applied ack for the PREVIOUS leg of a
-    /// coalesced entry proves the path, restarting the escalation clock,
-    /// without confirming the newer update.
-    #[test]
-    fn a_late_ack_for_the_previous_leg_proves_the_path() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        let first = flagged(&t, k, &p, t0);
-        let second = tx();
-        let t3 = t0 + Duration::from_secs(3);
-        t.arm(k, p.clone(), addr(1), t3);
-        t.record_flagged_send(k.id(), &p, second, false, ACK_TIMEOUT, t3);
-        t.send_finished(k.id(), &p, second, t0 + Duration::from_secs(15));
-        assert_eq!(
-            t.on_ack(
-                k.id(),
-                &p,
-                first,
-                BroadcastAckOutcome::Applied,
-                t0 + Duration::from_secs(4)
-            ),
-            AckEffect::PathProven
-        );
-        assert_eq!(t.len(), 1, "the newer update is not confirmed by it");
-        // Without the proof the escalation would fire at t0 + 20 s.
-        assert!(t.sweep(t0 + Duration::from_secs(21)).0.is_empty());
-    }
-
-    /// Round 1 Should Fix 5: the transient reasons get the resend, the final
-    /// ones do not, and a transient drop of the resend itself ends the repair.
-    #[test]
-    fn transient_reasons_are_exactly_the_load_ones() {
-        assert!(is_transient(BroadcastDropReason::RateLimited));
-        assert!(is_transient(BroadcastDropReason::MergeBudget));
-        assert!(is_transient(BroadcastDropReason::Overloaded));
-        assert!(!is_transient(BroadcastDropReason::NotHosted));
-        assert!(!is_transient(BroadcastDropReason::Backoff));
-        assert!(!is_transient(BroadcastDropReason::MergeFailed));
-
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        flagged(&t, k, &p, t0);
-        t.sweep(t0 + ACK_TIMEOUT);
-        let resend = tx();
-        t.record_flagged_send(k.id(), &p, resend, true, ACK_TIMEOUT, t0 + ACK_TIMEOUT);
-        t.send_finished(k.id(), &p, resend, t0 + ACK_TIMEOUT);
-        assert!(matches!(
-            t.on_ack(
-                k.id(),
-                &p,
-                resend,
-                BroadcastAckOutcome::Dropped(BroadcastDropReason::Overloaded),
-                t0 + ACK_TIMEOUT
-            ),
-            AckEffect::Dropped {
-                next: DropNext::Stop,
-                ..
-            }
-        ));
-        assert_eq!(t.len(), 0, "the one resend was spent");
-    }
-
-    #[test]
-    fn only_a_just_armed_entry_settles_on_a_converged_skip() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        t.arm(k, p.clone(), addr(1), t0);
-        assert!(t.settle_converged(k.id(), &p));
-        assert_eq!(t.len(), 0);
-
-        // Once a leg went, a converged belief is exactly what a lost leg
-        // leaves behind, so it settles nothing.
-        flagged(&t, k, &p, t0);
-        assert!(!t.settle_converged(k.id(), &p));
-        assert_eq!(t.len(), 1);
-    }
-
-    #[test]
-    fn a_disconnect_discards_that_peers_entries_only() {
-        let t = table();
-        let (p, q, t0) = (peer(), peer(), Instant::now());
-        t.arm(key(1), p.clone(), addr(1), t0);
-        t.arm(key(2), p.clone(), addr(1), t0);
-        t.arm(key(1), q.clone(), addr(2), t0);
-        assert_eq!(t.remove_peer(&p), 2);
-        assert_eq!(t.len(), 1);
-        assert_eq!(t.leg_duty(key(1).id(), &q), LegDuty::RequestAck);
-    }
 
     /// The receiver's outcome is captured only inside a driver scope, and the
     /// last note wins (each driver notes once, at its terminal exit). Outside
@@ -1645,121 +1134,49 @@ mod tests {
         );
     }
 
-    /// Round-1 Must Fix 2: a newer update must not demote a due resend back to
-    /// a first leg. Before the fix `arm` reset every stage to `Armed`, so a
-    /// contract written again during the resend window never got its resend.
+    /// The load reasons are transient (no ack, timers decide); the others end
+    /// tracking of the latest generation.
     #[test]
-    fn a_rearm_does_not_demote_a_due_resend() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        flagged(&t, k, &p, t0);
-        t.sweep(t0 + ACK_TIMEOUT);
-        assert_eq!(t.leg_duty(k.id(), &p), LegDuty::ResendFull);
-        t.arm(k, p.clone(), addr(1), t0 + ACK_TIMEOUT);
-        assert_eq!(
-            t.leg_duty(k.id(), &p),
-            LegDuty::ResendFull,
-            "re-arming must keep the resend that is already due"
-        );
+    fn transient_reasons_are_exactly_the_load_ones() {
+        assert!(is_transient(BroadcastDropReason::RateLimited));
+        assert!(is_transient(BroadcastDropReason::MergeBudget));
+        assert!(is_transient(BroadcastDropReason::Overloaded));
+        assert!(!is_transient(BroadcastDropReason::NotHosted));
+        assert!(!is_transient(BroadcastDropReason::Backoff));
+        assert!(!is_transient(BroadcastDropReason::MergeFailed));
     }
 
-    /// Round-1 Must Fix 2: sustained client writes (one every 3 s, each leg
-    /// lost) must still reach the resend. Before the fix every re-arm and
-    /// every flagged leg pushed the deadline forward, so the resend never
-    /// came while the writes continued.
-    #[test]
-    fn sustained_writes_still_reach_the_resend() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        let mut resent = false;
-        for step in 0..20u32 {
-            let now = t0 + Duration::from_secs(3) * step;
-            if t.leg_duty(k.id(), &p) == LegDuty::ResendFull {
-                resent = true;
-                break;
+    /// The body of `fn <sig>...{...}` in `src`, by brace matching.
+    fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src.find(sig).unwrap_or_else(|| panic!("missing {sig}"));
+        let open = start + src[start..].find('{').expect("fn body opens");
+        let mut depth = 0usize;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[open..open + i];
+                    }
+                }
+                _ => {}
             }
-            t.arm(k, p.clone(), addr(1), now);
-            let id = tx();
-            t.record_flagged_send(k.id(), &p, id, false, ACK_TIMEOUT, now);
-            t.send_finished(k.id(), &p, id, now);
-            t.sweep(now);
         }
-        assert!(
-            resent,
-            "a lossy pair written every 3 s must still be resent to within 60 s"
-        );
+        panic!("{sig} does not close")
     }
 
-    /// Round-1 Must Fix 2 (and the converged-skip race): once a flagged leg
-    /// has gone unconfirmed, a re-arm followed by a converged skip must not
-    /// settle the entry. The lost leg is what made the belief converged.
-    #[test]
-    fn a_converged_skip_after_an_unconfirmed_leg_settles_nothing() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        flagged(&t, k, &p, t0);
-        t.arm(k, p.clone(), addr(1), t0 + Duration::from_secs(1));
-        assert!(
-            !t.settle_converged(k.id(), &p),
-            "the skip reads a belief the unconfirmed leg wrote"
-        );
-        assert_eq!(t.len(), 1);
-    }
+    const QUEUE_SRC: &str = include_str!("../../node/network_bridge/broadcast_queue.rs");
+    const SIM_SRC: &str = include_str!("../../node/network_bridge/p2p_protoc/broadcast.rs");
 
-    /// Round-1 Should Fix 5: a TRANSIENT drop (rate limit, merge budget,
-    /// overload) gets the one full-state resend after the ack timeout rather
-    /// than ending the repair.
-    #[test]
-    fn a_transient_drop_gets_the_resend() {
-        let t = table();
-        let (k, p, t0) = (key(1), peer(), Instant::now());
-        let id = flagged(&t, k, &p, t0);
-        t.on_ack(
-            k.id(),
-            &p,
-            id,
-            BroadcastAckOutcome::Dropped(BroadcastDropReason::RateLimited),
-            t0,
-        );
-        let (actions, _) = t.sweep(t0 + ACK_TIMEOUT);
-        assert!(
-            matches!(actions.as_slice(), [SweepAction::Resend { .. }]),
-            "a rate-limited drop must be retried once; got {actions:?}"
-        );
-    }
-
-    /// Round 1 Should Fix 9/10: both send paths that build the ack-requested
-    /// variants decide the flag through `leg_duty_for` (which re-checks the
-    /// version gate), never through the raw table. Bounded to each function.
+    /// Both send paths that build the ack-requested variants decide the flag
+    /// through `leg_duty_for` (which re-checks the version gate), never
+    /// through the raw table, and count every leg in flight.
     #[test]
     fn every_flagged_send_site_reads_its_duty_through_the_version_gate() {
-        fn fn_body<'a>(src: &'a str, sig: &str) -> &'a str {
-            let start = src.find(sig).unwrap_or_else(|| panic!("missing {sig}"));
-            let open = start + src[start..].find('{').expect("fn body opens");
-            let mut depth = 0usize;
-            for (i, c) in src[open..].char_indices() {
-                match c {
-                    '{' => depth += 1,
-                    '}' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return &src[open..open + i];
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            panic!("{sig} does not close")
-        }
         for (src, sig) in [
-            (
-                include_str!("../../node/network_bridge/broadcast_queue.rs"),
-                "pub(super) async fn broadcast_to_single_peer(",
-            ),
-            (
-                include_str!("../../node/network_bridge/p2p_protoc/broadcast.rs"),
-                "async fn broadcast_state_to_peers(",
-            ),
+            (QUEUE_SRC, "pub(super) async fn broadcast_to_single_peer("),
+            (SIM_SRC, "async fn broadcast_state_to_peers("),
         ] {
             let body = fn_body(src, sig);
             assert!(
@@ -1770,31 +1187,65 @@ mod tests {
                 !body.contains("confirmed_delivery.leg_duty("),
                 "{sig} must not read the raw table duty (no version re-check)"
             );
+            assert!(
+                body.contains("LegInFlight::begin("),
+                "{sig} must count each leg in flight until it ends"
+            );
         }
     }
 
+    /// The production send path: the leg is in flight from the start, and
+    /// its flagged-leg finish (which starts the resend's ack deadline) comes
+    /// AFTER the stream's completion wait and after the delivery bookkeeping,
+    /// so a long stream is never timed while it is still sending.
     #[test]
-    fn the_give_up_warn_is_throttled_per_contract() {
-        let t = table();
-        let t0 = Instant::now();
-        let (a, b) = (key(1), key(2));
-        assert!(t.may_warn(a.id(), t0));
-        assert!(!t.may_warn(a.id(), t0 + GIVE_UP_WARN_INTERVAL - Duration::from_secs(1)));
+    fn the_production_leg_finishes_after_its_stream_completes() {
+        let body = fn_body(QUEUE_SRC, "pub(super) async fn broadcast_to_single_peer(");
+        let begin = body.find("LegInFlight::begin(").expect("begins in flight");
+        let duty = body.find("leg_duty_for(").expect("reads the duty");
+        let wait = body
+            .find("await_stream_completion_releasing_permit(")
+            .expect("waits for the stream");
+        let bookkeeping = body
+            .rfind("record_delivery_to_interest(")
+            .expect("records the delivery");
+        let finish = body
+            .rfind("finish_flagged_leg(")
+            .expect("finishes the flagged leg");
+        assert!(begin < duty, "the leg is in flight before its duty is read");
         assert!(
-            t.may_warn(b.id(), t0),
-            "another contract has its own budget"
+            wait < finish,
+            "the stream completes before the leg finishes"
         );
-        assert!(t.may_warn(a.id(), t0 + GIVE_UP_WARN_INTERVAL));
+        assert!(
+            bookkeeping < finish,
+            "the delivery bookkeeping precedes the finish"
+        );
+    }
+
+    /// The broadcast queue counts a leg in flight BEFORE it can be dequeued,
+    /// and ends the count for a superseded or evicted leg.
+    #[test]
+    fn the_queue_counts_legs_from_enqueue() {
+        let body = fn_body(QUEUE_SRC, "pub(crate) async fn enqueue(");
+        let started = body.find("leg_started(").expect("counts the leg");
+        let inserted = body.find(".enqueue_in_lane(").expect("inserts the leg");
+        assert!(started < inserted, "counted before it can be dequeued");
+        assert!(
+            body.matches("end_queued_leg(").count() >= 2,
+            "a superseded and an evicted leg each end their count"
+        );
     }
 }
 
 /// Behaviour tests for the sender table, written against a small event
 /// harness (arm, enqueue, send, finish, ack, sweep) rather than its internal
-/// stages, so they state what a peer and a writer observe.
+/// state, so they state what a peer and a writer observe.
 #[cfg(test)]
 mod behaviour_tests {
     use super::*;
     use crate::transport::TransportKeypair;
+    use std::cell::Cell;
 
     /// One (contract, peer) pair driven by events at explicit times (seconds
     /// from a common origin).
@@ -1803,17 +1254,24 @@ mod behaviour_tests {
         key: ContractKey,
         peer: PeerKey,
         t0: Instant,
+        /// Legs enqueued but not yet sent.
+        queued: Cell<u32>,
     }
 
     impl Pair {
         fn new() -> Self {
+            Self::with_peer(PeerKey::from(TransportKeypair::new().public().clone()))
+        }
+
+        fn with_peer(peer: PeerKey) -> Self {
             Self {
                 table: ConfirmedDelivery::new(Arc::new(
                     crate::util::time_source::InstantTimeSrc::new(),
                 )),
                 key: crate::operations::test_utils::make_contract_key(7),
-                peer: PeerKey::from(TransportKeypair::new().public().clone()),
+                peer,
                 t0: Instant::now(),
+                queued: Cell::new(0),
             }
         }
 
@@ -1822,48 +1280,48 @@ mod behaviour_tests {
         }
 
         /// A client update was applied and fanned out to this peer.
-        fn arm(&self, secs: u64) {
+        fn arm(&self, secs: u64) -> (ArmOutcome, bool) {
             self.table.arm(
                 self.key,
                 self.peer.clone(),
                 SocketAddr::from(([127, 0, 0, 1], 9)),
                 self.at(secs),
-            );
+            )
         }
 
         /// A leg for this pair entered the broadcast queue.
         fn enqueue(&self) {
-            self.table.note_queued(self.key.id(), &self.peer);
+            self.table.leg_started(self.key.id(), &self.peer);
+            self.queued.set(self.queued.get() + 1);
         }
 
-        /// A leg for this pair left the queue and was sent, flagged as its
-        /// duty says. Returns its transaction id.
-        fn send(&self, secs: u64) -> Transaction {
+        /// A leg for this pair (a queued one if any) started sending, flagged
+        /// as its duty says. Returns its transaction id.
+        fn send(&self, _secs: u64) -> Transaction {
+            if self.queued.get() > 0 {
+                self.queued.set(self.queued.get() - 1);
+            } else {
+                self.table.leg_started(self.key.id(), &self.peer);
+            }
             let tx = Transaction::new::<crate::operations::update::UpdateMsg>();
+            let duty = self.duty();
             self.table
-                .note_dequeued(self.key.id(), &self.peer, self.at(secs));
-            let full = self.duty() == LegDuty::ResendFull;
-            self.table.record_flagged_send(
-                self.key.id(),
-                &self.peer,
-                tx,
-                full,
-                ACK_TIMEOUT,
-                self.at(secs),
-            );
+                .record_flagged_send(self.key.id(), &self.peer, tx, duty);
             tx
         }
 
-        /// The leg's send finished (an inline leg finishes as it is sent; a
-        /// stream when its last fragment leaves).
-        fn finish(&self, tx: Transaction, secs: u64) {
+        /// The leg's send finished (an inline leg as it is sent; a stream
+        /// when its last fragment leaves) and its bookkeeping ended. Returns
+        /// whether the belief must be cleared again.
+        fn finish(&self, tx: Transaction, secs: u64) -> bool {
             self.table
                 .send_finished(self.key.id(), &self.peer, tx, self.at(secs));
+            self.table.leg_ended(self.key.id(), &self.peer)
         }
 
-        fn ack(&self, tx: Transaction, outcome: BroadcastAckOutcome, secs: u64) {
+        fn ack(&self, tx: Transaction, outcome: BroadcastAckOutcome, secs: u64) -> AckEffect {
             self.table
-                .on_ack(self.key.id(), &self.peer, tx, outcome, self.at(secs));
+                .on_ack(self.key.id(), &self.peer, tx, outcome, self.at(secs))
         }
 
         fn sweep(&self, secs: u64) -> Vec<SweepAction> {
@@ -1875,7 +1333,14 @@ mod behaviour_tests {
         }
 
         fn settled(&self) -> bool {
-            self.duty() == LegDuty::None
+            self.table.len() == 0
+        }
+
+        /// One inline flagged leg, sent and finished at `secs`.
+        fn leg(&self, secs: u64) -> Transaction {
+            let tx = self.send(secs);
+            self.finish(tx, secs);
+            tx
         }
     }
 
@@ -1886,7 +1351,20 @@ mod behaviour_tests {
             .count()
     }
 
+    fn give_ups(actions: &[SweepAction]) -> usize {
+        actions
+            .iter()
+            .filter(|a| matches!(a, SweepAction::GiveUp { .. }))
+            .count()
+    }
+
     const APPLIED: BroadcastAckOutcome = BroadcastAckOutcome::Applied;
+
+    fn dropped(reason: BroadcastDropReason) -> BroadcastAckOutcome {
+        BroadcastAckOutcome::Dropped(reason)
+    }
+
+    // ── H1: an ack never confirms an update armed after its leg ───────────
 
     /// H1 (a): an ack for the leg of an OLDER update must not settle a newer
     /// update that coalesced into the entry after that leg went.
@@ -1894,11 +1372,11 @@ mod behaviour_tests {
     fn an_older_legs_ack_does_not_confirm_a_newer_update() {
         let p = Pair::new();
         p.arm(0);
-        let first = p.send(0);
-        p.finish(first, 0);
+        let first = p.leg(0);
         p.arm(1);
         p.ack(first, APPLIED, 2);
         assert!(!p.settled(), "the update armed at 1 s is not confirmed");
+        assert!(matches!(p.duty(), LegDuty::RequestAck(_)));
     }
 
     /// H1 (b): a resend whose snapshot was read before the latest arm does
@@ -1907,12 +1385,10 @@ mod behaviour_tests {
     fn a_resend_snapshot_older_than_the_latest_arm_does_not_confirm_it() {
         let p = Pair::new();
         p.arm(0);
-        let first = p.send(0);
-        p.finish(first, 0);
+        p.leg(0);
         assert_eq!(resends(&p.sweep(30)), 1);
-        assert_eq!(p.duty(), LegDuty::ResendFull);
-        let resend = p.send(31);
-        p.finish(resend, 31);
+        assert!(p.duty().is_resend());
+        let resend = p.leg(31);
         p.arm(32);
         p.ack(resend, APPLIED, 33);
         assert!(!p.settled(), "the update armed at 32 s is not confirmed");
@@ -1923,24 +1399,22 @@ mod behaviour_tests {
     fn a_final_drop_of_an_older_leg_keeps_the_newer_update_tracked() {
         let p = Pair::new();
         p.arm(0);
-        let first = p.send(0);
-        p.finish(first, 0);
+        let first = p.leg(0);
         p.arm(1);
-        p.ack(
-            first,
-            BroadcastAckOutcome::Dropped(BroadcastDropReason::NotHosted),
-            2,
-        );
+        p.ack(first, dropped(BroadcastDropReason::NotHosted), 2);
         assert!(!p.settled(), "the update armed at 1 s is still unconfirmed");
+        assert!(p.duty().is_flagged());
     }
 
+    // ── M1: a healthy fast writer pays nothing ─────────────────────────────
+
     /// M1: a healthy writer (an update every 3 s) whose acks take 7 s pays no
-    /// resend over two minutes.
+    /// resend and no give-up over two minutes.
     #[test]
     fn a_healthy_fast_writer_with_slow_acks_gets_no_resend() {
         let p = Pair::new();
         let mut pending: Vec<(u64, Transaction)> = Vec::new();
-        let mut total = 0;
+        let mut actions = Vec::new();
         for t in 0..=120u64 {
             pending.retain(|(due, tx)| {
                 if *due == t {
@@ -1952,47 +1426,331 @@ mod behaviour_tests {
             });
             if t % 3 == 0 {
                 p.arm(t);
-                let tx = p.send(t);
-                p.finish(tx, t);
+                let tx = p.leg(t);
                 pending.push((t + 7, tx));
             }
-            total += resends(&p.sweep(t));
+            actions.extend(p.sweep(t));
         }
-        assert_eq!(total, 0, "no resend for a peer that acks every leg");
+        assert!(actions.is_empty(), "no resend or give-up: {actions:?}");
     }
 
-    /// M2: a late ack for the leg that timed out cancels the due resend if it
-    /// lands before the resend is sent.
+    /// The other side of M1: the same writer whose legs are all lost reaches
+    /// the resend WHILE the writes continue (coalescing cannot postpone it).
+    #[test]
+    fn a_lossy_fast_writer_is_resent_to_during_the_writes() {
+        let p = Pair::new();
+        let mut first_resend = None;
+        for t in 0..=60u64 {
+            if t % 3 == 0 {
+                p.arm(t);
+                p.leg(t);
+            }
+            if resends(&p.sweep(t)) > 0 && first_resend.is_none() {
+                first_resend = Some(t);
+            }
+        }
+        let at = first_resend.expect("the resend fired");
+        assert!(
+            at <= ESCALATE_AFTER.as_secs() + 3,
+            "escalated at {at} s, from the first arm"
+        );
+    }
+
+    // ── M2: a late ack cancels a due resend ────────────────────────────────
+
+    /// M2: a late ack for the leg that timed out cancels the queued resend if
+    /// it lands before the resend is built: the heal then goes unflagged.
     #[test]
     fn a_late_ack_cancels_a_due_resend() {
         let p = Pair::new();
         p.arm(0);
-        let first = p.send(0);
-        p.finish(first, 0);
+        let first = p.leg(0);
         assert_eq!(resends(&p.sweep(30)), 1);
-        p.ack(first, APPLIED, 31);
-        assert!(p.settled(), "the ack confirmed the only update");
-        assert_ne!(p.duty(), LegDuty::ResendFull);
+        assert!(matches!(
+            p.ack(first, APPLIED, 31),
+            AckEffect::Confirmed { .. }
+        ));
+        assert!(p.settled());
+        assert_eq!(p.duty(), LegDuty::None, "the heal is no longer a resend");
     }
 
-    /// M3: no resend while one of the pair's legs is still queued.
+    // ── M3/M4: no timer while a leg is in flight ──────────────────────────
+
+    /// M3: no resend while one of the pair's legs is still queued (which
+    /// includes waiting for a lane permit: the leg is in flight until its
+    /// send finishes).
     #[test]
     fn no_resend_while_a_leg_is_queued() {
         let p = Pair::new();
         p.arm(0);
-        let first = p.send(0);
-        p.finish(first, 0);
+        p.leg(0);
         p.arm(5);
         p.enqueue();
         assert_eq!(resends(&p.sweep(300)), 0, "a leg of the pair is queued");
+        let tx = p.send(301);
+        assert_eq!(resends(&p.sweep(301)), 0, "and then sending");
+        p.finish(tx, 301);
+        // The oldest unconfirmed update's own leg had its ack window long
+        // ago, so the resend follows as soon as nothing is in flight.
+        assert_eq!(resends(&p.sweep(301)), 1);
     }
 
-    /// M4: no resend while one of the pair's legs is still streaming.
+    /// M4: no resend while a leg is still streaming, however long; the ack
+    /// window runs from its completion.
     #[test]
     fn no_resend_while_a_leg_is_streaming() {
         let p = Pair::new();
         p.arm(0);
-        let _streaming = p.send(0);
-        assert_eq!(resends(&p.sweep(300)), 0, "the leg is still streaming");
+        let streaming = p.send(0);
+        assert_eq!(resends(&p.sweep(500)), 0, "the leg is still streaming");
+        p.finish(streaming, 500);
+        assert_eq!(resends(&p.sweep(509)), 0);
+        assert_eq!(resends(&p.sweep(510)), 1);
+    }
+
+    /// A pair whose legs never stop being in flight is still bounded.
+    #[test]
+    fn a_pair_always_in_flight_is_given_up_on() {
+        let p = Pair::new();
+        p.arm(0);
+        let _ = p.send(0);
+        assert_eq!(give_ups(&p.sweep(MAX_ENTRY_AGE.as_secs() - 1)), 0);
+        assert_eq!(give_ups(&p.sweep(MAX_ENTRY_AGE.as_secs())), 1);
+        assert!(p.settled());
+    }
+
+    // ── confirmation ──────────────────────────────────────────────────────
+
+    #[test]
+    fn an_ack_confirms_and_removes_the_entry() {
+        for outcome in [APPLIED, BroadcastAckOutcome::AlreadyHad] {
+            let p = Pair::new();
+            p.arm(0);
+            let tx = p.leg(0);
+            assert!(matches!(p.ack(tx, outcome, 1), AckEffect::Confirmed { .. }));
+            assert!(p.settled());
+        }
+    }
+
+    /// The ack for the newest leg confirms every older update with it.
+    #[test]
+    fn the_newest_legs_ack_confirms_all_older_updates() {
+        let p = Pair::new();
+        p.arm(0);
+        p.leg(0);
+        p.arm(3);
+        let newest = p.leg(3);
+        assert!(matches!(
+            p.ack(newest, APPLIED, 4),
+            AckEffect::Confirmed { .. }
+        ));
+        assert!(p.settled());
+    }
+
+    #[test]
+    fn an_ack_that_beats_the_send_finish_still_matches() {
+        let p = Pair::new();
+        p.arm(0);
+        let tx = p.send(0);
+        assert!(matches!(p.ack(tx, APPLIED, 0), AckEffect::Confirmed { .. }));
+        p.finish(tx, 0);
+        assert!(p.settled());
+    }
+
+    #[test]
+    fn an_unknown_ack_changes_nothing() {
+        let p = Pair::new();
+        p.arm(0);
+        p.leg(0);
+        let stray = Transaction::new::<crate::operations::update::UpdateMsg>();
+        assert_eq!(p.ack(stray, APPLIED, 1), AckEffect::Unmatched);
+        assert!(!p.settled());
+        // An ack from another peer for this tx does not reach this pair.
+        let other = Pair::with_peer(PeerKey::from(TransportKeypair::new().public().clone()));
+        assert_eq!(other.ack(stray, APPLIED, 1), AckEffect::Unmatched);
+    }
+
+    // ── drops ─────────────────────────────────────────────────────────────
+
+    /// A final drop of the latest update stops tracking it: no resend.
+    #[test]
+    fn a_final_drop_of_the_latest_update_ends_tracking() {
+        let p = Pair::new();
+        p.arm(0);
+        let tx = p.leg(0);
+        assert!(matches!(
+            p.ack(tx, dropped(BroadcastDropReason::Backoff), 1),
+            AckEffect::DroppedFinal { .. }
+        ));
+        assert!(p.settled());
+        assert!(p.sweep(MAX_ENTRY_AGE.as_secs()).is_empty());
+    }
+
+    /// A final drop that arrives while a leg of the pair is still in flight:
+    /// the belief is cleared again when that leg's bookkeeping ends, and the
+    /// entry goes once nothing is in flight.
+    #[test]
+    fn a_final_drop_during_a_send_reclears_after_its_bookkeeping() {
+        let p = Pair::new();
+        p.arm(0);
+        let tx = p.send(0);
+        assert!(matches!(
+            p.ack(tx, dropped(BroadcastDropReason::NotHosted), 0),
+            AckEffect::DroppedFinal { .. }
+        ));
+        assert_eq!(p.duty(), LegDuty::None, "no further leg is flagged");
+        assert!(p.finish(tx, 0), "re-clear after the bookkeeping");
+        assert!(p.settled());
+    }
+
+    /// A transient drop is treated as no ack: the timers resend later.
+    #[test]
+    fn a_transient_drop_is_left_to_the_timers() {
+        let p = Pair::new();
+        p.arm(0);
+        let tx = p.leg(0);
+        assert!(matches!(
+            p.ack(tx, dropped(BroadcastDropReason::RateLimited), 1),
+            AckEffect::DroppedIgnored { .. }
+        ));
+        assert_eq!(resends(&p.sweep(30)), 1);
+    }
+
+    // ── resend and give-up ────────────────────────────────────────────────
+
+    #[test]
+    fn no_ack_resends_once_then_gives_up() {
+        let p = Pair::new();
+        p.arm(0);
+        p.leg(0);
+        assert_eq!(resends(&p.sweep(ESCALATE_AFTER.as_secs() - 1)), 0);
+        assert_eq!(resends(&p.sweep(ESCALATE_AFTER.as_secs())), 1);
+        assert!(p.duty().is_resend());
+        assert_eq!(resends(&p.sweep(25)), 0, "one resend queued, not two");
+        let resend = p.leg(26);
+        assert!(!p.duty().is_resend(), "the resend went");
+        assert!(p.sweep(35).is_empty(), "its ack window is still open");
+        assert_eq!(give_ups(&p.sweep(36)), 1);
+        assert!(p.settled());
+        assert!(!p.table.is_sweeping(), "an empty table stops the sweep");
+        assert!(p.arm(40).1, "and the next arm starts it again");
+        let _ = resend;
+    }
+
+    #[test]
+    fn the_resend_is_confirmed_by_its_own_ack() {
+        let p = Pair::new();
+        p.arm(0);
+        p.leg(0);
+        p.sweep(30);
+        let resend = p.leg(31);
+        assert!(matches!(
+            p.ack(resend, APPLIED, 32),
+            AckEffect::Confirmed { .. }
+        ));
+        assert!(p.settled());
+    }
+
+    /// A generation no flagged leg ever carried (the leg was skipped or
+    /// refused before it was flagged) is resent after the unsent bound.
+    #[test]
+    fn an_update_that_never_went_is_resent() {
+        let p = Pair::new();
+        p.arm(0);
+        assert_eq!(resends(&p.sweep(UNSENT_TTL.as_secs() - 1)), 0);
+        assert_eq!(resends(&p.sweep(UNSENT_TTL.as_secs())), 1);
+    }
+
+    /// A confirmed resend lets a later unconfirmed update escalate again.
+    #[test]
+    fn a_confirmed_resend_lets_a_later_update_escalate() {
+        let p = Pair::new();
+        p.arm(0);
+        p.leg(0);
+        p.sweep(30);
+        let resend = p.leg(31);
+        p.arm(32);
+        p.leg(32);
+        assert_eq!(p.ack(resend, APPLIED, 33), AckEffect::Partial);
+        assert_eq!(resends(&p.sweep(52)), 1, "the update armed at 32 s");
+    }
+
+    // ── converged skip ────────────────────────────────────────────────────
+
+    #[test]
+    fn a_converged_skip_settles_only_before_any_flagged_leg() {
+        let p = Pair::new();
+        p.arm(0);
+        assert!(p.table.settle_converged(p.key.id(), &p.peer));
+        assert!(p.settled());
+
+        p.arm(1);
+        p.leg(1);
+        p.arm(2);
+        assert!(
+            !p.table.settle_converged(p.key.id(), &p.peer),
+            "the skip reads a belief the unconfirmed leg wrote"
+        );
+    }
+
+    // ── bounds and bookkeeping ────────────────────────────────────────────
+
+    #[test]
+    fn coalescing_keeps_one_entry_per_pair() {
+        let p = Pair::new();
+        assert_eq!(p.arm(0), (ArmOutcome::Armed, true));
+        for t in 1..50 {
+            assert_eq!(p.arm(t), (ArmOutcome::Coalesced, false));
+        }
+        assert_eq!(p.table.len(), 1);
+    }
+
+    #[test]
+    fn the_table_is_capped_and_an_overflow_is_not_tracked() {
+        let p = Pair::new();
+        let now = p.at(0);
+        for port in 0..MAX_PENDING as u16 {
+            let peer = PeerKey::from(TransportKeypair::new().public().clone());
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            assert_eq!(p.table.arm(p.key, peer, addr, now).0, ArmOutcome::Armed);
+        }
+        assert_eq!(p.arm(0), (ArmOutcome::Overflow, false));
+        assert_eq!(p.duty(), LegDuty::None);
+    }
+
+    #[test]
+    fn a_disconnect_discards_that_peers_entries_only() {
+        let p = Pair::new();
+        let q = Pair::with_peer(PeerKey::from(TransportKeypair::new().public().clone()));
+        p.arm(0);
+        // `q`'s pair in the SAME table.
+        p.table.arm(
+            q.key,
+            q.peer.clone(),
+            SocketAddr::from(([127, 0, 0, 1], 10)),
+            p.at(0),
+        );
+        assert_eq!(p.table.remove_peer(&p.peer), 1);
+        assert_eq!(p.table.len(), 1);
+        assert!(p.table.leg_duty(q.key.id(), &q.peer).is_flagged());
+    }
+
+    #[test]
+    fn the_give_up_warn_is_throttled_per_contract() {
+        let p = Pair::new();
+        let (a, b) = (
+            crate::operations::test_utils::make_contract_key(1),
+            crate::operations::test_utils::make_contract_key(2),
+        );
+        assert!(p.table.may_warn(a.id(), p.at(0)));
+        assert!(
+            !p.table
+                .may_warn(a.id(), p.at(GIVE_UP_WARN_INTERVAL.as_secs() - 1))
+        );
+        assert!(p.table.may_warn(b.id(), p.at(0)));
+        assert!(
+            p.table
+                .may_warn(a.id(), p.at(GIVE_UP_WARN_INTERVAL.as_secs()))
+        );
     }
 }
