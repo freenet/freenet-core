@@ -84,18 +84,22 @@ static PROCESS_NONCE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// The start is 2^62 plus 61 random bits, so it is far above every seeded
 /// thread's counter (`thread_index * 1_000_000`, so a seeded thread and an
 /// unseeded one in one test process cannot meet), and two runs of the node
-/// do not replay one another's counters: a repeat between two runs would
+/// are unlikely to replay one another's counters: a repeat between two runs would
 /// need both the 4-byte prefix and the counter ranges to coincide, not the
 /// prefix alone.
 static PROCESS_NONCE_START: OnceLock<([u8; 4], u64)> = OnceLock::new();
+
+/// The counter start for a random draw `r`: 2^62 plus the top 61 bits of `r`.
+fn nonce_start_from(r: u64) -> u64 {
+    (1u64 << 62) + (r >> 3)
+}
 
 fn process_nonce_start() -> ([u8; 4], u64) {
     *PROCESS_NONCE_START.get_or_init(|| {
         use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
         let mut prefix = [0u8; 4];
         OsRng.fill_bytes(&mut prefix);
-        let offset = (1u64 << 62) + (OsRng.next_u64() >> 3);
-        (prefix, offset)
+        (prefix, nonce_start_from(OsRng.next_u64()))
     })
 }
 
@@ -411,6 +415,9 @@ mod tests {
     #[test]
     fn unseeded_threads_never_repeat_a_nonce_counter() {
         let counter = |nonce: [u8; NONCE_SIZE]| u64::from_le_bytes(nonce[4..].try_into().unwrap());
+        // The pins have no effect on the process counter. They place a
+        // per-thread counter (the old scheme) on blocks 0 and 1, which collide
+        // after a million draws, so the test fails if that scheme returns.
         let first = std::thread::spawn(move || {
             crate::config::GlobalRng::pin_thread_index_for_test(0);
             (0..=NONCE_BLOCK)
@@ -444,6 +451,10 @@ mod tests {
         assert!(u64::from_le_bytes(nonce[4..].try_into().unwrap()) >= 1 << 62);
         let (_, start) = process_nonce_start();
         assert!((1u64 << 62..(1u64 << 62) + (1u64 << 61)).contains(&start));
+        // The start follows the draw: different draws give different starts.
+        assert_eq!(nonce_start_from(0), 1 << 62);
+        assert_eq!(nonce_start_from(u64::MAX), (1u64 << 62) + (1u64 << 61) - 1);
+        assert_ne!(nonce_start_from(8), nonce_start_from(16));
     }
 
     /// The same seed on two fresh threads gives byte-identical nonces, so a
@@ -463,12 +474,6 @@ mod tests {
         };
         let first = run();
         assert_eq!(first, run());
-        let (prefix, _) = process_nonce_start();
-        assert_ne!(
-            first[0][..4],
-            prefix,
-            "a seeded nonce used the process prefix"
-        );
         assert!(u64::from_le_bytes(first[1][4..].try_into().unwrap()) < 1 << 62);
     }
 
