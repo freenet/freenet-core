@@ -75,7 +75,8 @@ pub(crate) const QUIC_INGRESS_JOINER_DATAGRAMS: usize = QUIC_INGRESS_QUEUE_DATAG
 
 const _: () = assert!(
     QUIC_INGRESS_JOINER_DATAGRAMS <= QUIC_INGRESS_PER_SOURCE_DATAGRAMS
-        && QUIC_INGRESS_JOINER_DATAGRAMS <= QUIC_INGRESS_QUEUE_DATAGRAMS - QUIC_INGRESS_QUIET_RESERVE
+        && QUIC_INGRESS_JOINER_DATAGRAMS
+            <= QUIC_INGRESS_QUEUE_DATAGRAMS - QUIC_INGRESS_QUIET_RESERVE
 );
 
 /// The last slots of the QUIC ingress queue, kept for sources that have fewer
@@ -206,10 +207,12 @@ impl QuicIngressReceiver {
         if datagram.joiner_slot {
             self.shared.joiner_queued.fetch_sub(1, Ordering::AcqRel);
         }
-        self.shared.queued.remove_if_mut(&datagram.from, |_, queued| {
-            *queued = queued.saturating_sub(1);
-            *queued == 0
-        });
+        self.shared
+            .queued
+            .remove_if_mut(&datagram.from, |_, queued| {
+                *queued = queued.saturating_sub(1);
+                *queued == 0
+            });
     }
 
     #[cfg(test)]
@@ -284,7 +287,6 @@ impl IngressShared {
 
 impl Drop for QuicSourcePermit {
     fn drop(&mut self) {
-
         let removed = self.shared.allowed.remove_if_mut(&self.addr, |_, permits| {
             *permits = permits.saturating_sub(1);
             *permits == 0
@@ -587,9 +589,9 @@ impl<S> DemuxSocket<S> {
     /// Datagrams holding a slot of the joiners' share (tests).
     #[cfg(test)]
     fn joiner_queued_for_test(&self) -> usize {
-        self.quic
-            .get()
-            .map_or(0, |ingress| ingress.shared.joiner_queued.load(Ordering::Acquire))
+        self.quic.get().map_or(0, |ingress| {
+            ingress.shared.joiner_queued.load(Ordering::Acquire)
+        })
     }
 
     #[cfg(test)]
@@ -651,14 +653,18 @@ impl QuicIngress {
                 // reserve, so its fresh entry is removed below.
                 if *queued == 0 {
                     drop(queued);
-                    self.shared.queued.remove_if(&from, |_, queued| *queued == 0);
+                    self.shared
+                        .queued
+                        .remove_if(&from, |_, queued| *queued == 0);
                 }
                 return QuicIngressOutcome::ReserveFull;
             }
             if joiner && !self.take_joiner_slot() {
                 if *queued == 0 {
                     drop(queued);
-                    self.shared.queued.remove_if(&from, |_, queued| *queued == 0);
+                    self.shared
+                        .queued
+                        .remove_if(&from, |_, queued| *queued == 0);
                 }
                 super::TRANSPORT_METRICS
                     .record_gateway_admission(super::metrics::GatewayAdmission::JoinerShareFull);
@@ -1511,8 +1517,7 @@ mod tests {
     /// 64, though the slots it already took stay until read.
     #[tokio::test]
     async fn a_read_frees_a_joiner_slot_and_promotion_leaves_the_joiner_share() {
-        let (socket, mut queue, mut joiners, _peer) =
-            joiner_flood(40, 2, 0).await;
+        let (socket, mut queue, mut joiners, _peer) = joiner_flood(40, 2, 0).await;
         assert_eq!(queue.len(), QUIC_INGRESS_JOINER_DATAGRAMS);
         let joiner = |port: u16| SocketAddr::from(([10, 254, 3, 1], 5000 + port));
         let late = |port: u16, tag: u8| (joiner(port), quic(tag));

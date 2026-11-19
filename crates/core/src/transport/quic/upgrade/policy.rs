@@ -290,7 +290,9 @@ pub(crate) struct QuicJoinerPermit(Arc<PermitCount>);
 impl Drop for QuicJoinerPermit {
     fn drop(&mut self) {
         self.0.joiners.fetch_sub(1, Ordering::AcqRel);
-        self.0.units.fetch_sub(JOINER_PERMIT_UNITS, Ordering::AcqRel);
+        self.0
+            .units
+            .fetch_sub(JOINER_PERMIT_UNITS, Ordering::AcqRel);
     }
 }
 
@@ -1293,7 +1295,10 @@ mod tests {
         let paths: Vec<_> = (0..LIMIT)
             .map(|_| permits.try_acquire().expect("a path"))
             .collect();
-        assert!(permits.try_acquire().is_none(), "no joiners: the plain count");
+        assert!(
+            permits.try_acquire().is_none(),
+            "no joiners: the plain count"
+        );
         assert!(permits.try_acquire_joiner().is_none(), "full of paths");
         drop(paths);
         assert_eq!(permits.in_use(), 0);
@@ -1302,7 +1307,10 @@ mod tests {
         let joiners: Vec<_> = (0..fit)
             .map(|_| permits.try_acquire_joiner().expect("a joiner"))
             .collect();
-        assert!(permits.try_acquire_joiner().is_none(), "joiners fill the cap");
+        assert!(
+            permits.try_acquire_joiner().is_none(),
+            "joiners fill the cap"
+        );
         assert_eq!(permits.joiners_in_use(), fit);
         assert!(
             permits.try_acquire().is_none(),
@@ -1313,7 +1321,11 @@ mod tests {
         let path = permits.try_acquire().expect("freed");
         let mixed = (LIMIT * PATH_PERMIT_UNITS - PATH_PERMIT_UNITS) / JOINER_PERMIT_UNITS;
         let joiners: Vec<_> = (0..mixed)
-            .map(|_| permits.try_acquire_joiner().expect("a joiner beside a path"))
+            .map(|_| {
+                permits
+                    .try_acquire_joiner()
+                    .expect("a joiner beside a path")
+            })
             .collect();
         assert!(
             (mixed + 1) * JOINER_PERMIT_UNITS + PATH_PERMIT_UNITS > LIMIT * PATH_PERMIT_UNITS,
@@ -1348,7 +1360,7 @@ mod tests {
         let held: Vec<_> = (0..3)
             .map(|_| permits.try_acquire_joiner().expect("a joiner"))
             .collect();
-        assert!(3 * JOINER_PERMIT_UNITS + PATH_PERMIT_UNITS - JOINER_PERMIT_UNITS > 2 * PATH_PERMIT_UNITS);
+        const { assert!(2 * JOINER_PERMIT_UNITS + PATH_PERMIT_UNITS > 2 * PATH_PERMIT_UNITS) };
         let mut held = held.into_iter();
         let first = held.next().unwrap();
         let first = first.promote().expect_err("no room for the difference");

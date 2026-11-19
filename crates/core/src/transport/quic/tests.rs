@@ -5397,9 +5397,12 @@ async fn native_dial_to_gateway(
     drive(time, limit, async move {
         let accept = async {
             match server.accept_attempt().await {
-                Some(super::EndpointAttempt::Joiner(joiner)) => {
-                    Some(joiner.establish().await.map(|(connection, _charge)| connection))
-                }
+                Some(super::EndpointAttempt::Joiner(joiner)) => Some(
+                    joiner
+                        .establish()
+                        .await
+                        .map(|(connection, _charge)| connection),
+                ),
                 Some(super::EndpointAttempt::Allowed(_)) => {
                     panic!("the client was never allowed")
                 }
@@ -5863,14 +5866,16 @@ fn a_joiner_is_charged_from_admission_and_released_at_each_exit() {
                     {
                         if exit != "hello_failed" {
                             let own = super::native::setup::own_hello(b_addr, 0);
-                            let _ = super::native::exchange::exchange(
-                                connection,
-                                &own,
-                                true,
-                                &client_time,
-                                Duration::from_secs(8),
-                            )
-                            .await;
+                            drop(
+                                super::native::exchange::exchange(
+                                    connection,
+                                    &own,
+                                    true,
+                                    &client_time,
+                                    Duration::from_secs(8),
+                                )
+                                .await,
+                            );
                         }
                     }
                     connection
@@ -5951,24 +5956,19 @@ fn a_joiner_with_no_room_in_the_cap_is_ignored_until_one_is_released() {
                 let first_peer = server_peer.clone();
                 let second_peer = server_peer.clone();
                 let first_dial = tokio::spawn(async move {
-                    let _ = a.connect_with(b_addr, a_config, first_peer).await;
+                    drop(a.connect_with(b_addr, a_config, first_peer).await);
                 });
                 let Some(super::EndpointAttempt::Joiner(first)) = b.accept_attempt().await else {
                     panic!("the first joiner");
                 };
                 let first_held = cap.joiners_in_use();
-                let admitted_before = b
-                    .admission
-                    .get()
-                    .expect("enabled")
-                    .decisions
-                    .tracked();
+                let admitted_before = b.admission.get().expect("enabled").decisions.tracked();
                 // The second joiner finds the cap full.
                 let c2 = c.clone();
                 let second_dial = tokio::spawn({
                     let c_config = c_config.clone();
                     async move {
-                        let _ = c2.connect_with(b_addr, c_config, second_peer).await;
+                        drop(c2.connect_with(b_addr, c_config, second_peer).await);
                     }
                 });
                 let second = time
@@ -5987,7 +5987,7 @@ fn a_joiner_with_no_room_in_the_cap_is_ignored_until_one_is_released() {
                 first.ignore();
                 let c3 = c.clone();
                 let third_dial = tokio::spawn(async move {
-                    let _ = c3.connect_with(b_addr, c_config, server_peer).await;
+                    drop(c3.connect_with(b_addr, c_config, server_peer).await);
                 });
                 let third = time
                     .timeout(Duration::from_secs(20), {
@@ -6042,9 +6042,10 @@ fn with_admission_off_no_joiner_is_charged() {
             let dial = time.timeout(Duration::from_secs(10), async move {
                 a.connect_with(b_addr, client_config, server_peer).await
             });
-            let accept = time.timeout(Duration::from_secs(10), async move {
-                b.accept_attempt().await
-            });
+            let accept = time.timeout(
+                Duration::from_secs(10),
+                async move { b.accept_attempt().await },
+            );
             tokio::join!(dial, accept)
         })
         .await;
@@ -6060,7 +6061,9 @@ fn with_admission_off_no_joiner_is_charged() {
     assert!(driver.contains("endpoint.attach_joiner_cap(policy.permits().clone());"));
     let quic = include_str!("../quic.rs");
     let charge = quic.find("try_acquire_joiner").expect("the charge");
-    let allow = quic.find("self.sources.allow_joiner(remote)").expect("the allow");
+    let allow = quic
+        .find("self.sources.allow_joiner(remote)")
+        .expect("the allow");
     assert!(charge < allow, "charged before the address is allowed");
 }
 

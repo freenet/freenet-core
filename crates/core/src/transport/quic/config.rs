@@ -454,7 +454,8 @@ pub(crate) const QUIC_HANDSHAKE_PHASE_CHARGE_BYTES: usize = QUIC_CONNECTION_FIXE
 pub(crate) const PERMIT_UNIT_BYTES: usize = 16 * 1024;
 
 /// Permit units of one data path, [`QUIC_CONNECTION_CHARGE_BYTES`] rounded up.
-pub(crate) const PATH_PERMIT_UNITS: usize = QUIC_CONNECTION_CHARGE_BYTES.div_ceil(PERMIT_UNIT_BYTES);
+pub(crate) const PATH_PERMIT_UNITS: usize =
+    QUIC_CONNECTION_CHARGE_BYTES.div_ceil(PERMIT_UNIT_BYTES);
 
 /// Permit units of one joiner, [`QUIC_HANDSHAKE_PHASE_CHARGE_BYTES`] rounded up.
 pub(crate) const JOINER_PERMIT_UNITS: usize =
