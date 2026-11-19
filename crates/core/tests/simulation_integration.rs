@@ -23514,7 +23514,7 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
         ),
         (
             6,
-            0x0059_40A5_00D8,
+            0x0059_40A5_00DB,
             None,
             Some(600),
             Some(SurvivorOrder::NativeFirstInbound),
@@ -23643,6 +23643,86 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
     );
     assert!(setups.0 > 0, "premise: native setups ended at both ends");
     assert!(held_both > 0, "premise: pairs held at both ends");
+}
+
+/// Option (b), the timeout path (10.4 answer 2): a native connection that
+/// never carries a frame from the peer does not displace the UDP connection.
+/// Native connections here send no first-frame probe, which is what a
+/// one-sided setup looks like to the end that finished it: the peer never
+/// holds the connection, so nothing arrives over it. Every native dial gets a
+/// UDP dial beside it at both ends, with QUIC delayed so the UDP connection
+/// lands first. No native connection may be swapped in, no UDP connection
+/// dropped, the held native connections must expire, and the two ends of
+/// every pair held at both must keep the same transport, so the pairs keep
+/// working over UDP. The other order (native first) cannot be run this way:
+/// a native entry carries the peer's ordinary traffic, which proves it
+/// without any probe; the unit tests cover that order, and the one-sided case
+/// where the peer sends nothing over it.
+#[test_log::test]
+fn test_quic_native_without_frames_keeps_udp() {
+    use freenet::dev_tool::{NatFiltering, SimNat};
+    for (run_id, seed, quic_delay, intro_delay) in [(0u8, 0x0059_40A5_00F1u64, Some(600), None)] {
+        let name = format!("native-no-frames-{run_id}");
+        let nat = SimNat::all(NatFiltering::PortRestricted);
+        let run = run_native_connect_sim_with(&name, seed, 200, Some(nat), |sim| {
+            sim.with_native_connect(100);
+            sim.without_native_probes();
+            if let Some(ms) = quic_delay {
+                sim.delay_quic_datagrams(Duration::from_millis(ms));
+            }
+            if let Some(ms) = intro_delay {
+                sim.delay_udp_intros(Duration::from_millis(ms));
+            }
+            sim.with_udp_dial_beside_every_native_dial(false);
+        });
+        log_native_connect(&name, &run);
+        let t = &run.wire.trace;
+        let transports = t.transports();
+        let mut mismatched = Vec::new();
+        let mut both = 0;
+        let mut native_at_both = 0;
+        for (&(own, peer), &native) in &transports {
+            if let Some(&other) = transports.get(&(peer, own)) {
+                if own < peer {
+                    both += 1;
+                    if other != native {
+                        mismatched.push((own, peer, native, other));
+                    }
+                    if native && other {
+                        native_at_both += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "{name}: held={} expired={} swapped={} udp_dropped={} held_at_both_ends={both} \
+             native_at_both_ends={native_at_both}",
+            t.native_held(),
+            t.native_hold_expired(),
+            t.survivor_swapped(),
+            t.survivor_udp_dropped(),
+        );
+        assert!(
+            t.native_held() > 0,
+            "{name}: premise: native connections were held beside UDP"
+        );
+        assert!(
+            t.native_hold_expired() > 0,
+            "{name}: the held native connections expired"
+        );
+        assert_eq!(t.survivor_swapped(), 0, "{name}: nothing carried a frame");
+        assert_eq!(
+            t.survivor_udp_dropped(),
+            0,
+            "{name}: no UDP connection was dropped for a native one with no frame"
+        );
+        assert!(
+            mismatched.is_empty(),
+            "{name}: pairs whose ends keep different transports (own, peer, own native, \
+             peer native): {mismatched:?}"
+        );
+        assert!(both > 0, "{name}: premise: pairs held at both ends");
+    }
 }
 
 /// A5c-2: nodes behind symmetric NATs. Half the regular nodes are behind a

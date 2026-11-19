@@ -1649,6 +1649,7 @@ mod tests {
                     link_use: LinkUseStamp::new(created),
                     remote_version: None,
                     native: false,
+                    frame_seen: true,
                 },
             );
         }
@@ -1718,6 +1719,7 @@ mod tests {
             link_use,
             remote_version: None,
             native: false,
+            frame_seen: true,
         }
     }
 
@@ -1870,7 +1872,9 @@ mod tests {
             "the connection entry must hold the stamp"
         );
         assert!(
-            squashed.contains("conn_id,outbound_mix,propagation,link_use,native_wire)"),
+            squashed.contains(
+                "conn_id,outbound_mix,propagation,link_use,native_wire,report_first_frame)"
+            ),
             "the listener must be given the same stamp"
         );
         assert!(
@@ -2490,6 +2494,82 @@ mod tests {
         }
     }
 
+    /// Option (b): a native connection's listener reports its first decoded
+    /// message once, BEFORE queueing it, and a UDP one (`report_first_frame`
+    /// false) never does. The event loop's hold of a native connection beside a
+    /// UDP entry (`HeldNative`) depends on exactly this.
+    #[tokio::test(start_paused = true)]
+    async fn listener_reports_the_first_frame_once_and_only_when_asked() {
+        let remote = addr("198.51.100.10:4000");
+        for report in [true, false] {
+            let (_commands_tx, commands_rx) = mpsc::channel(10);
+            let (bytes_tx, bytes_rx) = mpsc::channel(4);
+            let (events_tx, mut events_rx) = mpsc::channel(8);
+            let listener = tokio::spawn(super::super::peer_connection_listener(
+                commands_rx,
+                Box::new(QueuedConnection {
+                    addr: remote,
+                    inbound: bytes_rx,
+                }),
+                remote,
+                events_tx,
+                7,
+                Arc::new(crate::node::network_bridge::outbound_message_mix::OutboundMix::new()),
+                crate::operations::update::propagation_stats::PropagationSink::for_test().0,
+                LinkUseStamp::new(Instant::now()),
+                crate::operations::connect::native::NativeWire::new(None, false),
+                report,
+            ));
+            let request = every_variant()
+                .into_iter()
+                .find(|(name, _, _)| *name == "Get::Request")
+                .map(|(_, msg, _)| msg)
+                .unwrap();
+            for _ in 0..2 {
+                bytes_tx
+                    .send(bincode::serialize(&request).unwrap())
+                    .await
+                    .unwrap();
+            }
+            let mut kinds = Vec::new();
+            while kinds.len() < if report { 3 } else { 2 } {
+                let event = tokio::time::timeout(Duration::from_secs(5), events_rx.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("no event after {kinds:?} (report = {report})"));
+                match event.expect("listener alive") {
+                    ConnEvent::NativeFirstFrame {
+                        remote_addr,
+                        connection_id,
+                    } => {
+                        assert_eq!((remote_addr, connection_id), (remote, 7));
+                        kinds.push("first");
+                    }
+                    ConnEvent::InboundMessage(_) => kinds.push("message"),
+                    other @ (ConnEvent::OutboundMessage(_)
+                    | ConnEvent::OutboundMessageWithTarget { .. }
+                    | ConnEvent::NodeAction(_)
+                    | ConnEvent::ClosedChannel(_)
+                    | ConnEvent::TransportClosed { .. }
+                    | ConnEvent::StreamSend { .. }
+                    | ConnEvent::PipeStream { .. }
+                    | ConnEvent::SetPeerIdentity(_)
+                    | ConnEvent::Barrier(_)) => panic!("unexpected event {other:?}"),
+                }
+            }
+            let expected: &[&str] = if report {
+                &["first", "message", "message"]
+            } else {
+                &["message", "message"]
+            };
+            assert_eq!(kinds, expected, "report_first_frame = {report}");
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            assert!(events_rx.try_recv().is_err(), "no later first-frame event");
+            listener.abort();
+        }
+    }
+
     /// A request that the transport's listener has received and queued for the
     /// event loop, but that the loop has not yet dequeued (it is busy with
     /// higher-priority work), must already protect its transport from a sweep
@@ -2514,6 +2594,7 @@ mod tests {
                 link_use: link_use.clone(),
                 remote_version: None,
                 native: false,
+                frame_seen: true,
             },
         );
 
@@ -2538,6 +2619,7 @@ mod tests {
             crate::operations::update::propagation_stats::PropagationSink::for_test().0,
             link_use,
             crate::operations::connect::native::NativeWire::new(None, false),
+            false,
         ));
 
         let request = every_variant()
