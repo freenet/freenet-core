@@ -119,12 +119,25 @@ pub(in crate::transport::quic) async fn join_gateway<T: TimeSource>(
 ) -> crate::transport::metrics::GatewayAdmission {
     use crate::transport::metrics::GatewayAdmission;
     use crate::transport::quic::JoinerError;
-    let start = clock.now();
-    let Some(established) = clock.timeout(NATIVE_JOIN_WINDOW, joiner.establish()).await else {
+    // The window counts from the moment the join was queued, so a join that
+    // waited for a slot has that much less (and holds its cap charge for the
+    // window in all, not the window plus the wait).
+    let queued_for = joiner.queued_at().map_or(Duration::ZERO, |at| {
+        Duration::from_nanos(clock.now_nanos().saturating_sub(at))
+    });
+    let start = clock.now().saturating_sub(queued_for);
+    let window = NATIVE_JOIN_WINDOW.saturating_sub(queued_for);
+    if window.is_zero() {
+        return GatewayAdmission::HandshakeFailed;
+    }
+    let Some(established) = clock.timeout(window, joiner.establish()).await else {
         return GatewayAdmission::HandshakeFailed;
     };
-    let connection = match established {
-        Ok(connection) => connection,
+    // The joiner's charge against the connection cap is held to the end of
+    // this function: a failed handshake or an elapsed window drops it with
+    // the future above, and closing the connection ends it here.
+    let (connection, _charge) = match established {
+        Ok(established) => established,
         Err(JoinerError::Unproven) => return GatewayAdmission::Unproven,
         Err(JoinerError::Handshake(error)) => {
             tracing::debug!(%error, "An admitted native join's handshake failed");
@@ -145,6 +158,7 @@ pub(in crate::transport::quic) async fn join_gateway<T: TimeSource>(
     {
         Ok(_) => {
             connection.close(crate::transport::metrics::QuicCloseCode::NodeDroppedPeer);
+            drop(_charge);
             GatewayAdmission::Joined
         }
         Err(error) => {
@@ -604,6 +618,9 @@ impl QuicUpgrades {
             trace.register_permits(policy.permits().clone());
         }
         let native_setups = Arc::new(tokio::sync::Semaphore::new(policy.native_setups_max()));
+        // Native joiners at a gateway count against the same cap as paths
+        // (`admission`, item 5); until this runs none is admitted.
+        endpoint.attach_joiner_cap(policy.permits().clone());
         Arc::new(Self {
             endpoint,
             policy,
@@ -690,12 +707,13 @@ impl QuicUpgrades {
     /// Hand an admitted joiner to the task that runs gateway joins. A full
     /// queue, or none (an endpoint that does not admit joins), drops it,
     /// which gives its admission back.
-    fn queue_gateway_join(&self, joiner: JoinerIncoming) {
+    fn queue_gateway_join(&self, mut joiner: JoinerIncoming) {
         use crate::transport::metrics::GatewayAdmission;
         let Some(joins) = self.gateway_joins.get() else {
             joiner.ignore();
             return;
         };
+        joiner.stamp(self.path_clock.now_nanos());
         if let Err(refused) = joins.try_send(joiner) {
             let joiner = match refused {
                 mpsc::error::TrySendError::Full(joiner) => {

@@ -427,6 +427,42 @@ pub(crate) const QUIC_SHADOW_CONNECTION_CHARGE_BYTES: usize = QUIC_CONNECTION_FI
     + super::upgrade::machine::CONTROL_SENDS_PER_PATH
         * (QUIC_STOPPED_ENTRY_BYTES + QUIC_ACK_WAIT_BYTES);
 
+/// What one native joiner may hold from its first packet until it is
+/// promoted or released (`admission`, QUIC-NATIVE-CONNECT 5.1 item 5): the
+/// fixed state; quinn's state for the [`INITIAL_UNI_STREAMS`] uni streams the
+/// endpoint lets a peer open; the CRYPTO reassembly of all three packet
+/// number spaces (a half-open connection holds the Initial and Handshake
+/// spaces besides the 1-RTT one, [`QUIC_CRYPTO_HOLD_BYTES`] each); the
+/// receive charge at the [`INITIAL_RECEIVE_WINDOW_BYTES`] windows; and the
+/// ACK-only tail. It carries no data (data off) and sends no control frames
+/// of its own, so none of the data path's stopped-entry, ack-wait or
+/// control-channel terms apply. Against [`QUIC_CONNECTION_CHARGE_BYTES`] plus
+/// a floor grant: a promoted joiner is charged that in full
+/// (`upgrade::policy::QuicJoinerPermit::promote`).
+pub(crate) const QUIC_HANDSHAKE_PHASE_CHARGE_BYTES: usize = QUIC_CONNECTION_FIXED_BYTES
+    + INITIAL_UNI_STREAMS as usize * QUIC_OPEN_STREAM_BYTES
+    + 3 * QUIC_CRYPTO_HOLD_BYTES
+    + QUIC_ACK_TAIL_BYTES
+    + super::budget::receive_charge(INITIAL_RECEIVE_WINDOW_BYTES) as usize;
+
+/// The granularity the path permits count memory in (`upgrade::policy::
+/// QuicPathPermits`): a path is [`PATH_PERMIT_UNITS`] of these and a joiner
+/// [`JOINER_PERMIT_UNITS`], each rounded UP, so a permit is charged at least
+/// its bytes. The floor grant a data path also holds is left out of the
+/// path's side, so a joiner is charged slightly more than its share of the
+/// cap, the safe direction.
+pub(crate) const PERMIT_UNIT_BYTES: usize = 16 * 1024;
+
+/// Permit units of one data path, [`QUIC_CONNECTION_CHARGE_BYTES`] rounded up.
+pub(crate) const PATH_PERMIT_UNITS: usize =
+    QUIC_CONNECTION_CHARGE_BYTES.div_ceil(PERMIT_UNIT_BYTES);
+
+/// Permit units of one joiner, [`QUIC_HANDSHAKE_PHASE_CHARGE_BYTES`] rounded up.
+pub(crate) const JOINER_PERMIT_UNITS: usize =
+    QUIC_HANDSHAKE_PHASE_CHARGE_BYTES.div_ceil(PERMIT_UNIT_BYTES);
+
+const _: () = assert!(JOINER_PERMIT_UNITS >= 1 && JOINER_PERMIT_UNITS < PATH_PERMIT_UNITS);
+
 /// The share of the node's memory for QUIC buffers that scale with the windows,
 /// as a divisor: one sixteenth.
 const QUIC_BUFFER_BUDGET_DIVISOR: usize = 16;

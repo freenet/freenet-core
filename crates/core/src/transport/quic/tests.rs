@@ -5367,6 +5367,13 @@ fn a_proven_server_config_accepts_each_client_by_its_own_key() {
     })
 }
 
+/// Turn gateway admission on for `endpoint` with room for 64 paths' worth of
+/// joiners, as the hub does with the node's path permits.
+fn enable_admission(endpoint: &QuicEndpoint, time: VirtualTime) -> bool {
+    endpoint.attach_joiner_cap(super::upgrade::policy::QuicPathPermits::new(64));
+    endpoint.enable_gateway_admission(time)
+}
+
 /// What a client's native dial to `server` gave, and what `server`'s
 /// accept loop made of the attempts it read, for the admission tests.
 async fn native_dial_to_gateway(
@@ -5390,7 +5397,12 @@ async fn native_dial_to_gateway(
     drive(time, limit, async move {
         let accept = async {
             match server.accept_attempt().await {
-                Some(super::EndpointAttempt::Joiner(joiner)) => Some(joiner.establish().await),
+                Some(super::EndpointAttempt::Joiner(joiner)) => Some(
+                    joiner
+                        .establish()
+                        .await
+                        .map(|(connection, _charge)| connection),
+                ),
                 Some(super::EndpointAttempt::Allowed(_)) => {
                     panic!("the client was never allowed")
                 }
@@ -5414,9 +5426,9 @@ fn a_gateway_with_admission_accepts_a_native_join_from_an_unknown_source() {
         let _seed = GlobalRng::seed_guard(SEED);
         let net = crate::transport::test_net::subnet();
         let pair = pair("quic-admission-join", net.addr(1), net.addr(2), None).await;
-        assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+        assert!(enable_admission(&pair.b, pair.time.clone()));
         assert!(
-            !pair.b.enable_gateway_admission(pair.time.clone()),
+            !enable_admission(&pair.b, pair.time.clone()),
             "once per endpoint"
         );
         let (dialled, joined) = native_dial_to_gateway(
@@ -5521,7 +5533,7 @@ fn a_gateways_admission_decides_on_the_endpoints_clock() {
         let _seed = GlobalRng::seed_guard(SEED);
         let net = crate::transport::test_net::subnet();
         let pair = pair("quic-admission-clock", net.addr(1), net.addr(2), None).await;
-        assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+        assert!(enable_admission(&pair.b, pair.time.clone()));
         use super::admission::tests::{DecideKept, Verdict};
         let admission = &pair.b.admission.get().expect("enabled").decisions;
         let from = pair.a_addr;
@@ -5549,7 +5561,7 @@ fn an_admitted_join_exchanges_hellos_and_is_closed_at_the_hook() {
             let _seed = GlobalRng::seed_guard(SEED);
             let net = crate::transport::test_net::subnet();
             let pair = pair("quic-admission-hello", net.addr(1), net.addr(2), None).await;
-            assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+            assert!(enable_admission(&pair.b, pair.time.clone()));
             let server_peer = PeerKey::of(pair.b_keys.public()).unwrap();
             let tls = pair
                 .a
@@ -5628,7 +5640,7 @@ fn a_gateway_hello_lost_at_first_is_retransmitted_before_the_join_closes() {
         let _seed = GlobalRng::seed_guard(SEED);
         let net = crate::transport::test_net::subnet();
         let pair = pair("quic-admission-hello-lost", net.addr(1), net.addr(2), None).await;
-        assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+        assert!(enable_admission(&pair.b, pair.time.clone()));
         let server_peer = PeerKey::of(pair.b_keys.public()).unwrap();
         let tls = pair
             .a
@@ -5697,7 +5709,7 @@ fn an_admission_refused_by_a_full_allow_set_is_given_back() {
         let _seed = GlobalRng::seed_guard(SEED);
         let net = crate::transport::test_net::subnet();
         let pair = pair("quic-admission-allow-full", net.addr(1), net.addr(2), None).await;
-        assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+        assert!(enable_admission(&pair.b, pair.time.clone()));
         let max = crate::transport::demux::QUIC_ALLOWED_SOURCES_MAX;
         // Allow-set entries only: never bound, sent to, or read from a log.
         let filler = |i: usize| SocketAddr::from(([10, 252, (i >> 8) as u8, i as u8], 1)); // test_net: exempt (allow-set filler)
@@ -5749,7 +5761,7 @@ fn a_dropped_joiner_gives_its_admission_back() {
         let _seed = GlobalRng::seed_guard(SEED);
         let net = crate::transport::test_net::subnet();
         let pair = pair("quic-admission-dropped", net.addr(1), net.addr(2), None).await;
-        assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+        assert!(enable_admission(&pair.b, pair.time.clone()));
         let server_peer = PeerKey::of(pair.b_keys.public()).unwrap();
         let tls = pair
             .a
@@ -5785,6 +5797,346 @@ fn a_dropped_joiner_gives_its_admission_back() {
             "recorded while held, given back when dropped"
         );
     })
+}
+
+/// A client config for a native dial from `client` to the gateway whose
+/// transport key is `server_key`.
+fn native_client_config(
+    client: &QuicEndpoint,
+    server_key: &TransportPublicKey,
+) -> (quinn::ClientConfig, PeerKey) {
+    let server_peer = PeerKey::of(server_key).unwrap();
+    let tls = client
+        .identity
+        .client_tls_for(&server_peer, config::Alpn::Native)
+        .unwrap();
+    (client.client_config(Arc::new(tls)), server_peer)
+}
+
+/// Item 5 (joiners inside the connection cap): a native joiner takes a
+/// handshake-phase charge from its admission and gives it back at the first
+/// of the exits. Each exit is a row: the joiner is dropped before its
+/// handshake (`ignored`), the handshake fails (`handshake_failed`), the
+/// handshake cannot finish within the window (`window_elapsed`), the Hello
+/// does not arrive in time (`hello_failed`), and the join completes and the
+/// connection is closed (`closed`). A promoted joiner (`promoted`) is
+/// re-charged at the full rate instead.
+#[test]
+fn a_joiner_is_charged_from_admission_and_released_at_each_exit() {
+    use super::upgrade::driver::join_gateway;
+    use super::upgrade::policy::QuicPathPermits;
+    use crate::transport::metrics::GatewayAdmission;
+    for exit in [
+        "ignored",
+        "handshake_failed",
+        "window_elapsed",
+        "hello_failed",
+        "closed",
+        "promoted",
+    ] {
+        bounded(move || async move {
+            let _seed = GlobalRng::seed_guard(SEED);
+            let net = crate::transport::test_net::subnet();
+            let pair = pair("quic-joiner-cap-exits", net.addr(1), net.addr(2), None).await;
+            let cap = QuicPathPermits::new(3);
+            assert!(pair.b.attach_joiner_cap(cap.clone()));
+            assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+            let wrong_key = TransportKeypair::new();
+            let dialed_key = if exit == "handshake_failed" {
+                wrong_key.public().clone()
+            } else {
+                pair.b_keys.public().clone()
+            };
+            let (client_config, server_peer) = native_client_config(&pair.a, &dialed_key);
+            let (a, b, b_addr, time, muted, cap) = (
+                pair.a.clone(),
+                pair.b.clone(),
+                pair.b_addr,
+                pair.time.clone(),
+                pair.b_muted.clone(),
+                cap.clone(),
+            );
+            let time_for_client = pair.time.clone();
+            let (held, outcome, after) = drive(&pair.time, Duration::from_secs(60), async move {
+                let client_time = time.clone();
+                let client = async move {
+                    let connection = a.connect_with(b_addr, client_config, server_peer).await;
+                    if let (Ok(connection), "hello_failed" | "closed" | "promoted") =
+                        (&connection, exit)
+                    {
+                        if exit != "hello_failed" {
+                            let own = super::native::setup::own_hello(b_addr, 0);
+                            drop(
+                                super::native::exchange::exchange(
+                                    connection,
+                                    &own,
+                                    true,
+                                    &client_time,
+                                    Duration::from_secs(8),
+                                )
+                                .await,
+                            );
+                        }
+                    }
+                    connection
+                };
+                let server = async {
+                    let Some(super::EndpointAttempt::Joiner(joiner)) = b.accept_attempt().await
+                    else {
+                        panic!("an admitted joiner");
+                    };
+                    let held = cap.joiners_in_use();
+                    let outcome = match exit {
+                        "ignored" => {
+                            joiner.ignore();
+                            None
+                        }
+                        "promoted" => {
+                            let (connection, charge) =
+                                joiner.establish().await.expect("established");
+                            let path = charge.promote().ok().expect("room at the full rate");
+                            let promoted = (cap.joiners_in_use(), cap.in_use());
+                            drop(connection);
+                            drop(path);
+                            assert_eq!(promoted, (0, 1), "re-charged as a path");
+                            None
+                        }
+                        "window_elapsed" => {
+                            muted.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Some(join_gateway(joiner, &time).await)
+                        }
+                        _ => Some(join_gateway(joiner, &time).await),
+                    };
+                    (held, outcome, (cap.joiners_in_use(), cap.in_use()))
+                };
+                // The client of a join that ends early has nothing to wait for.
+                let client = time_for_client.timeout(Duration::from_secs(20), client);
+                let (_client, server) = tokio::join!(client, server);
+                server
+            })
+            .await;
+            assert_eq!(held, 1, "{exit}: charged from admission");
+            assert_eq!(after, (0, 0), "{exit}: released");
+            let want = match exit {
+                "ignored" | "promoted" => None,
+                "handshake_failed" | "window_elapsed" => Some(GatewayAdmission::HandshakeFailed),
+                "hello_failed" => Some(GatewayAdmission::HelloFailed),
+                _ => Some(GatewayAdmission::Joined),
+            };
+            assert_eq!(outcome, want, "{exit}");
+        })
+    }
+}
+
+/// The join window counts from the moment the hub queued the join, so time
+/// spent waiting for a join slot comes out of it: a join that waited past the
+/// window ends at once and gives its charge back, and one that waited part of
+/// it ends within the window as measured from the queueing, not from the
+/// start of its handshake.
+#[test]
+fn the_join_window_counts_from_queueing() {
+    use super::upgrade::driver::join_gateway;
+    use super::upgrade::policy::QuicPathPermits;
+    use crate::transport::metrics::GatewayAdmission;
+    // (seconds waited in the queue, wanted outcome, longest total from queueing)
+    for (waited, want, longest) in [
+        (9u64, GatewayAdmission::HandshakeFailed, 9u64),
+        (5, GatewayAdmission::HelloFailed, 9),
+    ] {
+        bounded(move || async move {
+            let _seed = GlobalRng::seed_guard(SEED);
+            let net = crate::transport::test_net::subnet();
+            let pair = pair("quic-joiner-window", net.addr(1), net.addr(2), None).await;
+            let cap = QuicPathPermits::new(3);
+            assert!(pair.b.attach_joiner_cap(cap.clone()));
+            assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+            let (client_config, server_peer) = native_client_config(&pair.a, pair.b_keys.public());
+            let (a, b, b_addr, time) = (
+                pair.a.clone(),
+                pair.b.clone(),
+                pair.b_addr,
+                pair.time.clone(),
+            );
+            let (held, outcome, total, after) =
+                drive(&pair.time, Duration::from_secs(60), async move {
+                    let client = time.timeout(Duration::from_secs(30), async move {
+                        a.connect_with(b_addr, client_config, server_peer).await
+                    });
+                    let server = async {
+                        let Some(super::EndpointAttempt::Joiner(mut joiner)) =
+                            b.accept_attempt().await
+                        else {
+                            panic!("an admitted joiner");
+                        };
+                        let queued = time.now_nanos();
+                        joiner.stamp(queued);
+                        let held = cap.joiners_in_use();
+                        time.advance(Duration::from_secs(waited));
+                        let outcome = join_gateway(joiner, &time).await;
+                        let total = Duration::from_nanos(time.now_nanos() - queued);
+                        (held, outcome, total, cap.joiners_in_use())
+                    };
+                    tokio::join!(client, server).1
+                })
+                .await;
+            assert_eq!(held, 1, "charged while queued");
+            assert_eq!(outcome, want, "waited {waited} s");
+            assert!(
+                total <= Duration::from_secs(longest),
+                "waited {waited} s: held for {total:?} in all"
+            );
+            assert_eq!(after, 0, "released");
+        })
+    }
+}
+
+/// With no room in the cap a newcomer is ignored (no handshake, nothing
+/// recorded against the address or the rate), and once a joiner releases its
+/// charge the next one is admitted. Three paths of cap hold one joiner (a quarter of the cap).
+#[test]
+fn a_joiner_with_no_room_in_the_cap_is_ignored_until_one_is_released() {
+    use super::upgrade::policy::QuicPathPermits;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let mut pair = pair("quic-joiner-cap-full", net.addr(1), net.addr(2), None).await;
+        let (c, c_keys) = pair.third(net.addr(3)).await;
+        let _ = c_keys;
+        let cap = QuicPathPermits::new(3);
+        assert!(pair.b.attach_joiner_cap(cap.clone()));
+        assert!(pair.b.enable_gateway_admission(pair.time.clone()));
+        let (a_config, server_peer) = native_client_config(&pair.a, pair.b_keys.public());
+        let (c_config, _) = native_client_config(&c, pair.b_keys.public());
+        let (a, b, b_addr, time) = (
+            pair.a.clone(),
+            pair.b.clone(),
+            pair.b_addr,
+            pair.time.clone(),
+        );
+        let (first_held, second_admitted, ignored_count, third_admitted) =
+            drive(&pair.time, Duration::from_secs(120), async move {
+                let first_peer = server_peer.clone();
+                let second_peer = server_peer.clone();
+                let first_dial = tokio::spawn(async move {
+                    drop(a.connect_with(b_addr, a_config, first_peer).await);
+                });
+                let Some(super::EndpointAttempt::Joiner(first)) = b.accept_attempt().await else {
+                    panic!("the first joiner");
+                };
+                let first_held = cap.joiners_in_use();
+                let admitted_before = b.admission.get().expect("enabled").decisions.tracked();
+                // The second joiner finds the cap full.
+                let c2 = c.clone();
+                let second_dial = tokio::spawn({
+                    let c_config = c_config.clone();
+                    async move {
+                        drop(c2.connect_with(b_addr, c_config, second_peer).await);
+                    }
+                });
+                let second = time
+                    .timeout(Duration::from_secs(10), {
+                        let b = b.clone();
+                        async move { b.accept_attempt().await }
+                    })
+                    .await;
+                let second_admitted = second.is_some();
+                let ignored_count = (
+                    cap.joiners_in_use(),
+                    b.admission.get().expect("enabled").decisions.tracked() - admitted_before,
+                );
+                second_dial.abort();
+                // Releasing the first admits a newcomer.
+                first.ignore();
+                let c3 = c.clone();
+                let third_dial = tokio::spawn(async move {
+                    drop(c3.connect_with(b_addr, c_config, server_peer).await);
+                });
+                let third = time
+                    .timeout(Duration::from_secs(20), {
+                        let b = b.clone();
+                        async move { b.accept_attempt().await }
+                    })
+                    .await;
+                third_dial.abort();
+                first_dial.abort();
+                (
+                    first_held,
+                    second_admitted,
+                    ignored_count,
+                    matches!(third, Some(Some(super::EndpointAttempt::Joiner(_)))),
+                )
+            })
+            .await;
+        assert_eq!(first_held, 1);
+        assert!(!second_admitted, "no room: ignored");
+        assert_eq!(
+            ignored_count,
+            (1, 0),
+            "still one charge held, and the ignored attempt recorded nothing"
+        );
+        assert!(third_admitted, "admitted once the charge was released");
+    })
+}
+
+/// Off by default: with gateway admission off (as it is on every node while
+/// `GATEWAY_NATIVE_ADMISSION` is false) an unknown source is ignored whether
+/// or not the cap is attached, no joiner is ever charged, and the hub is
+/// what attaches the cap.
+#[test]
+fn with_admission_off_no_joiner_is_charged() {
+    use super::upgrade::policy::QuicPathPermits;
+    const { assert!(!super::admission::GATEWAY_NATIVE_ADMISSION) };
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-joiner-cap-off", net.addr(1), net.addr(2), None).await;
+        let cap = QuicPathPermits::new(4);
+        assert!(pair.b.attach_joiner_cap(cap.clone()));
+        assert!(!pair.b.gateway_admission_enabled());
+        let (client_config, server_peer) = native_client_config(&pair.a, pair.b_keys.public());
+        let (a, b, b_addr, time) = (
+            pair.a.clone(),
+            pair.b.clone(),
+            pair.b_addr,
+            pair.time.clone(),
+        );
+        let (dialed, attempt) = drive(&pair.time, Duration::from_secs(60), async move {
+            let dial = time.timeout(Duration::from_secs(10), async move {
+                a.connect_with(b_addr, client_config, server_peer).await
+            });
+            let accept = time.timeout(
+                Duration::from_secs(10),
+                async move { b.accept_attempt().await },
+            );
+            tokio::join!(dial, accept)
+        })
+        .await;
+        assert!(dialed.is_none() || dialed.is_some_and(|dial| dial.is_err()));
+        assert!(attempt.is_none(), "nothing reached the accept loop");
+        assert_eq!(cap.joiners_in_use(), 0);
+        assert_eq!(cap.in_use(), 0);
+    });
+    // The cap the joiners are charged against is the node's path permits:
+    // the hub attaches them when it is built, and the accept path charges
+    // before it puts the address on the allow-set.
+    // Source scrapes, bounded to the production bodies (a renamed or missing
+    // function fails them): the hub attaches the permits in
+    // `QuicUpgrades::new`, and `EndpointCore::admit` charges before it allows.
+    use crate::transport::demux::production_fn_body;
+    let new_body = production_fn_body(
+        include_str!("upgrade/driver.rs"),
+        "    pub(in crate::transport) fn new(\n        endpoint: QuicEndpoint,",
+    );
+    assert!(new_body.contains("endpoint.attach_joiner_cap(policy.permits().clone());"));
+    let admit = production_fn_body(
+        include_str!("../quic.rs"),
+        "    fn admit(&self, gate: &GatewayAdmission, incoming: quinn::Incoming)",
+    );
+    let charge = admit.find("try_acquire_joiner").expect("the charge");
+    let allow = admit
+        .find("self.sources.allow_joiner(remote)")
+        .expect("the allow");
+    assert!(charge < allow, "charged before the address is allowed");
 }
 
 /// The whole path on a gateway listener, as the node builds it: a test
