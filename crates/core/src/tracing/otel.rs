@@ -1484,6 +1484,14 @@ fn register_ring_metrics(meter: &opentelemetry::metrics::Meter, sources: RingSou
                     &[KeyValue::new("event", "transient_expired")],
                 );
                 observer.observe(
+                    status.bootstrap_transient_source_refusals,
+                    &[KeyValue::new("event", "transient_source_refused")],
+                );
+                observer.observe(
+                    status.bootstrap_transient_evictions,
+                    &[KeyValue::new("event", "transient_evicted")],
+                );
+                observer.observe(
                     status.bootstrap_promoted_to_ring,
                     &[KeyValue::new("event", "promoted_to_ring")],
                 );
@@ -2042,6 +2050,8 @@ mod tests {
                 bootstrap_connect_attempts_before_first_connection: 3,
                 bootstrap_transient_registered: 10,
                 bootstrap_transient_expired: 9,
+                bootstrap_transient_source_refusals: 6,
+                bootstrap_transient_evictions: 8,
                 bootstrap_promoted_to_ring: 1,
                 bootstrap_startup_rounds_connect_issued_gateway: 4,
                 bootstrap_startup_rounds_connect_issued_routed: 5,
@@ -3197,6 +3207,8 @@ mod tests {
             ("freenet.ring.lattice.probes", "result=improvement"),
             ("freenet.bootstrap.churn", "event=transient_registered"),
             ("freenet.bootstrap.churn", "event=transient_expired"),
+            ("freenet.bootstrap.churn", "event=transient_source_refused"),
+            ("freenet.bootstrap.churn", "event=transient_evicted"),
             ("freenet.bootstrap.churn", "event=promoted_to_ring"),
             (
                 "freenet.bootstrap.startup_rounds",

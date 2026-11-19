@@ -4263,6 +4263,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     ),
                     ("ring_connections", snapshot.ring_connections),
                     ("transient_connections", snapshot.transient_connections),
+                    (
+                        "transient_largest_source",
+                        snapshot.transient_largest_source,
+                    ),
                     ("connections_to_gateways", snapshot.connections_to_gateways),
                     ("relayed_gets_total", snapshot.relayed_gets_total),
                     ("relayed_puts_total", snapshot.relayed_puts_total),
@@ -4288,6 +4292,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     (
                         "bootstrap_transient_expired",
                         snapshot.bootstrap_transient_expired,
+                    ),
+                    (
+                        "bootstrap_transient_source_refusals",
+                        snapshot.bootstrap_transient_source_refusals,
+                    ),
+                    (
+                        "bootstrap_transient_evictions",
+                        snapshot.bootstrap_transient_evictions,
                     ),
                     (
                         "bootstrap_promoted_to_ring",
@@ -5415,6 +5427,7 @@ mod tests {
             .expect("construct RouterSnapshotInfo for test");
         info.ring_connections = Some(21);
         info.transient_connections = Some(22);
+        info.transient_largest_source = Some(28);
         info.connections_to_gateways = Some(23);
         info.relayed_gets_total = Some(24);
         info.relayed_puts_total = Some(25);
@@ -5424,6 +5437,7 @@ mod tests {
         for (key, want) in [
             ("ring_connections", 21),
             ("transient_connections", 22),
+            ("transient_largest_source", 28),
             ("connections_to_gateways", 23),
             ("relayed_gets_total", 24),
             ("relayed_puts_total", 25),
@@ -5460,6 +5474,8 @@ mod tests {
             .expect("construct RouterSnapshotInfo for test");
         info.bootstrap_transient_registered = Some(10);
         info.bootstrap_transient_expired = Some(9);
+        info.bootstrap_transient_source_refusals = Some(13);
+        info.bootstrap_transient_evictions = Some(14);
         info.bootstrap_promoted_to_ring = Some(1);
         info.bootstrap_time_to_min_connections_secs = Some(12.5);
         info.bootstrap_completed = Some(true);
@@ -5472,6 +5488,8 @@ mod tests {
         let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
         assert_eq!(json["bootstrap_transient_registered"], 10);
         assert_eq!(json["bootstrap_transient_expired"], 9);
+        assert_eq!(json["bootstrap_transient_source_refusals"], 13);
+        assert_eq!(json["bootstrap_transient_evictions"], 14);
         assert_eq!(json["bootstrap_promoted_to_ring"], 1);
         assert_eq!(json["bootstrap_time_to_min_connections_secs"], 12.5);
         assert_eq!(json["bootstrap_completed"], true);

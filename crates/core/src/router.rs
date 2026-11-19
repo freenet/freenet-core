@@ -1094,6 +1094,9 @@ pub(crate) struct RouterSnapshotInfo {
     /// populates them.
     pub ring_connections: Option<u64>,
     pub transient_connections: Option<u64>,
+    /// Gauge: the most transient slots any one source (IPv4 address or IPv6
+    /// /64) holds now, against its share of the budget.
+    pub transient_largest_source: Option<u64>,
     pub connections_to_gateways: Option<u64>,
     pub relayed_gets_total: Option<u64>,
     pub relayed_puts_total: Option<u64>,
@@ -1135,6 +1138,11 @@ pub(crate) struct RouterSnapshotInfo {
     /// cadence; `None` until the ring's snapshot task populates them.
     pub bootstrap_transient_registered: Option<u64>,
     pub bootstrap_transient_expired: Option<u64>,
+    /// Monotonic: transient registrations refused for their source's share
+    /// of the budget, and unpromoted connections closed to admit a newcomer
+    /// at the budget.
+    pub bootstrap_transient_source_refusals: Option<u64>,
+    pub bootstrap_transient_evictions: Option<u64>,
     pub bootstrap_promoted_to_ring: Option<u64>,
     pub bootstrap_time_to_min_connections_secs: Option<f64>,
     pub bootstrap_completed: Option<bool>,
@@ -3729,6 +3737,7 @@ impl Router {
             // cadence (Group C).
             ring_connections: None,
             transient_connections: None,
+            transient_largest_source: None,
             connections_to_gateways: None,
             relayed_gets_total: None,
             relayed_puts_total: None,
@@ -3742,6 +3751,8 @@ impl Router {
             // snapshot cadence (#4787).
             bootstrap_transient_registered: None,
             bootstrap_transient_expired: None,
+            bootstrap_transient_source_refusals: None,
+            bootstrap_transient_evictions: None,
             bootstrap_promoted_to_ring: None,
             bootstrap_time_to_min_connections_secs: None,
             bootstrap_completed: None,

@@ -1008,6 +1008,7 @@ impl P2pConnManager {
                         crate::tracing::DisconnectReason::ConnectionLimitReached,
                     )
                     .await;
+                    fail_awaiting_connection_callbacks(state, peer_addr).await;
                 }
                 return Ok(());
             }
@@ -2979,7 +2980,18 @@ impl P2pConnManager {
                         // whoever fills the budget has to keep opening
                         // connections to keep it full, rather than holding
                         // it and refusing every joiner.
-                        if let Some(victim) = cm.oldest_held_transient() {
+                        // A native leg is never evicted: neither an entry
+                        // that is a QUIC-native connection nor a UDP entry
+                        // with one held beside it (`held_native`), since
+                        // closing either ends a native path. A UDP session
+                        // cannot have a QUIC path while it is unpromoted
+                        // (the upgrade starts only at promotion, which takes
+                        // the connection out of this pool).
+                        let victim = cm.oldest_held_transient(|addr| {
+                            self.held_native.contains_key(&addr)
+                                || self.connections.get(&addr).is_some_and(|e| e.native)
+                        });
+                        if let Some(victim) = victim {
                             cm.record_transient_eviction(victim);
                             self.drop_connection_by_addr(
                                 victim,
@@ -2987,6 +2999,7 @@ impl P2pConnManager {
                                 crate::tracing::DisconnectReason::ConnectionLimitReached,
                             )
                             .await;
+                            fail_awaiting_connection_callbacks(state, victim).await;
                             // Closing the victim can release a key a pending
                             // claim on this connection names, which binds the
                             // claim and promotes this connection into the
@@ -3028,6 +3041,7 @@ impl P2pConnManager {
                             crate::tracing::DisconnectReason::ConnectionLimitReached,
                         )
                         .await;
+                        fail_awaiting_connection_callbacks(state, peer_addr).await;
                     } else {
                         // The connection stays open outside the ring, so it
                         // keeps its slot until it is promoted or closed
@@ -3050,21 +3064,33 @@ impl P2pConnManager {
                         let generation = cm.transient_generation(peer_addr);
                         GlobalExecutor::spawn(async move {
                             sleep(ttl).await;
-                            if cm.still_the_transient(peer_addr, generation) {
-                                // Still not promoted. Do NOT dispatch
-                                // DropConnection: that tears down the
-                                // transport, killing any in-progress CONNECT.
-                                // If the CONNECT succeeds later,
-                                // handle_connect_peer() promotes the peer
-                                // (#3113). If it never does, the zombie sweep
-                                // or the transport idle timeout closes the
-                                // connection, which gives the slot back.
-                                crate::node::network_status::record_bootstrap_transient_expired();
-                                tracing::info!(
-                                    %peer_addr,
-                                    "Transient connection past its TTL unpromoted \
-                                     (transport preserved, budget slot held until promoted or closed)"
-                                );
+                            // #4787's series keeps its meaning: a
+                            // registration whose TTL elapsed before it was
+                            // promoted, whether the connection is still open
+                            // or has closed.
+                            match cm.transient_ttl_outcome(peer_addr, generation) {
+                                crate::ring::TransientTtlOutcome::Promoted => {}
+                                crate::ring::TransientTtlOutcome::Closed => {
+                                    crate::node::network_status::record_bootstrap_transient_expired(
+                                    );
+                                }
+                                crate::ring::TransientTtlOutcome::StillHeld => {
+                                    crate::node::network_status::record_bootstrap_transient_expired(
+                                    );
+                                    // Do NOT dispatch DropConnection: that
+                                    // tears down the transport, killing any
+                                    // in-progress CONNECT. If the CONNECT
+                                    // succeeds later, handle_connect_peer()
+                                    // promotes the peer (#3113). If it never
+                                    // does, the zombie sweep or the transport
+                                    // idle timeout closes the connection,
+                                    // which gives the slot back.
+                                    tracing::info!(
+                                        %peer_addr,
+                                        "Transient connection past its TTL unpromoted \
+                                         (transport preserved, budget slot held until promoted or closed)"
+                                    );
+                                }
                             }
                         });
                     }
@@ -3361,6 +3387,20 @@ impl P2pConnManager {
             }
         }
     }
+}
+
+/// Tells whoever still waits for a connection to `addr` that it failed, for a
+/// connection the transient budget closes: as the refusal at the top of
+/// `handle_successful_connection`, so no waiter is left until its timeout.
+async fn fail_awaiting_connection_callbacks(state: &mut EventListenerState, addr: SocketAddr) {
+    if let Some(callbacks) = state.awaiting_connection.remove(&addr) {
+        for mut cb in callbacks {
+            // Best effort - caller will handle the connection failure
+            #[allow(clippy::let_underscore_must_use)]
+            let _ = cb.send_result(Err(None)).await;
+        }
+    }
+    state.awaiting_connection_txs.remove(&addr);
 }
 
 /// Sends the first-frame probe on a native connection's channel: a message

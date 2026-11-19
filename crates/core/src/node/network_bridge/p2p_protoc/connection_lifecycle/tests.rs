@@ -5700,37 +5700,106 @@ async fn eviction_takes_from_the_source_holding_the_most_slots() {
     }
 }
 
-/// (a) An unpromoted UDP entry with a native connection held beside it,
-/// evicted at the budget: the entry, the held connection and the slot all
-/// go.
+/// (a) Eviction never takes a native leg. With a UDP entry that has a native
+/// connection held beside it, an unpromoted QUIC-native entry, and one plain
+/// unpromoted UDP entry holding the budget, an arrival evicts the plain entry
+/// even though both native legs are older; once only native legs remain, an
+/// arrival is refused rather than closing one of them.
 #[tokio::test]
-async fn evicting_an_entry_drops_the_native_connection_held_beside_it() {
-    let mut h = non_gateway_with_budget("transient-evict-held-native", 1).await;
+async fn eviction_leaves_native_legs_alone() {
+    let mut h = non_gateway_with_budget("transient-evict-native-legs", 3).await;
     let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
-    let addr = SocketAddr::from(([198, 51, 100, 223], 7375));
-    let peer = PeerKeyLocation::new(key(), addr);
-    h.handshake_event(Arrival::OutboundUdp.event(&peer, true))
+    let pair = SocketAddr::from(([198, 51, 100, 223], 7375));
+    let native = SocketAddr::from(([198, 51, 100, 238], 7386));
+    let plain = SocketAddr::from(([198, 51, 100, 239], 7387));
+    let pair_peer = PeerKeyLocation::new(key(), pair);
+    h.handshake_event(Arrival::OutboundUdp.event(&pair_peer, true))
         .await;
-    h.handshake_event(Arrival::Native.event(&peer, true)).await;
+    h.handshake_event(Arrival::Native.event(&pair_peer, true))
+        .await;
+    h.handshake_event(Arrival::Native.event(&PeerKeyLocation::new(key(), native), true))
+        .await;
+    unexpected_inbound(&mut h, plain).await;
     assert!(
-        h.mgr.held_native.contains_key(&addr),
+        h.mgr.held_native.contains_key(&pair),
         "premise: held beside"
     );
-    assert!(cm.is_transient(addr));
+    assert!(h.mgr.connections[&native].native, "premise: a native entry");
+    assert_eq!(cm.transient_count(), 3, "premise: the budget is spent");
 
-    let arrival = SocketAddr::from(([198, 51, 100, 224], 7376));
-    unexpected_inbound(&mut h, arrival).await;
+    let first = SocketAddr::from(([198, 51, 100, 224], 7376));
+    unexpected_inbound(&mut h, first).await;
     assert!(
-        !h.mgr.connections.contains_key(&addr),
-        "the entry is evicted"
+        !h.mgr.connections.contains_key(&plain),
+        "the plain entry is evicted"
     );
     assert!(
-        h.mgr.held_native.is_empty(),
-        "and the held native connection"
+        h.mgr.connections.contains_key(&first),
+        "and the arrival admitted"
     );
-    assert!(!cm.is_transient(addr));
-    assert!(cm.is_transient(arrival), "the arrival has the slot");
-    assert_eq!(cm.transient_count(), 1);
+    assert!(h.mgr.connections.contains_key(&pair), "the pair stays");
+    assert!(
+        h.mgr.held_native.contains_key(&pair),
+        "with its held native connection"
+    );
+    assert!(
+        h.mgr.connections.contains_key(&native),
+        "the native entry stays"
+    );
+
+    // Now the oldest evictable entry is the arrival itself; the next one
+    // evicts it, and with only native legs left the one after is refused.
+    let second = SocketAddr::from(([198, 51, 100, 240], 7388));
+    unexpected_inbound(&mut h, second).await;
+    assert!(!h.mgr.connections.contains_key(&first));
+    assert!(h.mgr.connections.contains_key(&second));
+    assert!(cm.drop_transient(second).is_some());
+    assert!(cm.try_register_transient(SocketAddr::from(([198, 51, 100, 241], 1)), None));
+    let refused = SocketAddr::from(([198, 51, 100, 242], 7389));
+    unexpected_inbound(&mut h, refused).await;
+    assert!(!h.mgr.connections.contains_key(&refused), "refused");
+    assert!(h.mgr.held_native.contains_key(&pair));
+    assert!(h.mgr.connections.contains_key(&native));
+    assert_eq!(cm.transient_evictions(), 2);
+}
+
+/// A connection the transient budget closes tells whoever still waits for a
+/// connection to its address that it failed, instead of leaving them to their
+/// timeout: here the close of a refused promotion that cannot be counted.
+#[tokio::test]
+async fn a_budget_close_fails_the_waiters_for_its_address() {
+    let mut h = Harness::with_config("transient-budget-close-fails-waiters", |config| {
+        config.min_number_conn = Some(1);
+        config.max_number_conn = Some(2);
+        config.transient_budget = 1;
+    })
+    .await;
+    for port in [7395, 7396] {
+        h.dial(SocketAddr::from(([198, 51, 100, 243], port)), &key())
+            .await;
+    }
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    let remote = SocketAddr::from(([198, 51, 100, 243], 7397));
+    unexpected_inbound(&mut h, remote).await;
+    assert!(cm.drop_transient(remote).is_some());
+    assert!(cm.try_register_transient(SocketAddr::from(([198, 51, 100, 244], 1)), None));
+    let (callback, mut waiter) = mpsc::channel::<crate::message::ConnectResult>(1);
+    h.state
+        .awaiting_connection
+        .entry(remote)
+        .or_default()
+        .push(Box::new(callback));
+
+    assert!(
+        !h.try_connect_peer(PeerKeyLocation::new(key(), remote))
+            .await
+    );
+    assert!(!h.mgr.connections.contains_key(&remote), "premise: closed");
+    assert!(
+        matches!(waiter.try_recv(), Ok(Err(_))),
+        "the waiter is told"
+    );
+    assert!(!h.state.awaiting_connection.contains_key(&remote));
 }
 
 /// (b) The same when the entry is closed because a promotion was refused at
@@ -5786,13 +5855,16 @@ async fn a_held_native_connection_takes_no_transient_slot() {
     let peer = PeerKeyLocation::new(key(), addr);
     h.handshake_event(Arrival::OutboundUdp.event(&peer, true))
         .await;
-    let before = (cm.transient_count(), cm.oldest_held_transient());
+    let before = (cm.transient_count(), cm.oldest_held_transient(|_| false));
     h.handshake_event(Arrival::Native.event(&peer, true)).await;
     assert!(
         h.mgr.held_native.contains_key(&addr),
         "premise: held beside"
     );
-    assert_eq!((cm.transient_count(), cm.oldest_held_transient()), before);
+    assert_eq!(
+        (cm.transient_count(), cm.oldest_held_transient(|_| false)),
+        before
+    );
     assert_eq!(before, (1, Some(addr)), "only the entry's own slot");
 }
 

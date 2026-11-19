@@ -163,6 +163,8 @@ pub(crate) struct OtelStatusScalars {
     /// scalar source rather than a new provider.
     pub bootstrap_transient_registered: u64,
     pub bootstrap_transient_expired: u64,
+    pub bootstrap_transient_source_refusals: u64,
+    pub bootstrap_transient_evictions: u64,
     pub bootstrap_promoted_to_ring: u64,
     pub bootstrap_time_to_min_connections: Option<Duration>,
     /// Time from process start to this node's FIRST ring connection (#5858).
@@ -204,6 +206,8 @@ pub(crate) fn otel_status_scalars() -> Option<OtelStatusScalars> {
         op_stats: status.op_stats.clone(),
         bootstrap_transient_registered: b.transient_registered,
         bootstrap_transient_expired: b.transient_expired,
+        bootstrap_transient_source_refusals: b.transient_source_refusals,
+        bootstrap_transient_evictions: b.transient_evictions,
         bootstrap_promoted_to_ring: b.promoted_to_ring,
         bootstrap_time_to_min_connections: b.time_to_min_connections,
         bootstrap_time_to_first_ring_connection: b.time_to_first_ring_connection,
@@ -542,7 +546,15 @@ pub struct BootstrapChurnStats {
     /// and a re-registration of an already-tracked address (nothing new
     /// inserted) do not inflate it.
     pub transient_registered: u64,
+    /// Transient registrations whose TTL elapsed before the connection was
+    /// promoted, whether it was still open then or had already closed.
     pub transient_expired: u64,
+    /// Transient registrations refused because the address's source (IPv4
+    /// address or IPv6 /64) already held its share of the budget.
+    pub transient_source_refusals: u64,
+    /// Unpromoted connections closed to admit a newcomer at the transient
+    /// budget.
+    pub transient_evictions: u64,
     /// Counts promotions the ring actually accepted — both promotion call
     /// sites gate on `Ring::add_connection`'s reported `added`, so a
     /// cap-rejected promotion attempt is not counted as a promotion.
@@ -1644,15 +1656,42 @@ pub fn record_bootstrap_transient_registered() {
 }
 
 /// Record that a transient connection's TTL elapsed before the onward
-/// CONNECT promoted it — issue #4787 instrumentation. The tracking entry, and
-/// its slot in the transient budget, stay with the connection until it is
-/// promoted or closed. Called from the "Transient connection past its TTL"
-/// site in `p2p_protoc/connection_lifecycle.rs`.
+/// CONNECT promoted it — issue #4787 instrumentation. Counted whether the
+/// connection is still open (it keeps its budget slot until it is promoted or
+/// closed) or had already closed, as before slots were held. Called from the
+/// "Transient connection past its TTL" site in
+/// `p2p_protoc/connection_lifecycle.rs`.
 pub fn record_bootstrap_transient_expired() {
     if let Some(status) = NETWORK_STATUS.get() {
         if let Ok(mut s) = status.write() {
             s.bootstrap_churn_stats.transient_expired =
                 s.bootstrap_churn_stats.transient_expired.saturating_add(1);
+        }
+    }
+}
+
+/// Record that a transient registration was refused for its source's share
+/// of the budget. Called from `ConnectionManager::register_transient`.
+pub fn record_transient_source_refused() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.bootstrap_churn_stats.transient_source_refusals = s
+                .bootstrap_churn_stats
+                .transient_source_refusals
+                .saturating_add(1);
+        }
+    }
+}
+
+/// Record that an unpromoted connection was closed to admit a newcomer at the
+/// transient budget. Called from `ConnectionManager::record_transient_eviction`.
+pub fn record_transient_evicted() {
+    if let Some(status) = NETWORK_STATUS.get() {
+        if let Ok(mut s) = status.write() {
+            s.bootstrap_churn_stats.transient_evictions = s
+                .bootstrap_churn_stats
+                .transient_evictions
+                .saturating_add(1);
         }
     }
 }
@@ -3031,6 +3070,9 @@ mod tests {
         record_bootstrap_transient_registered();
         record_bootstrap_transient_expired();
         record_bootstrap_transient_expired();
+        record_transient_source_refused();
+        record_transient_evicted();
+        record_transient_evicted();
         record_bootstrap_promoted_to_ring();
         record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedGateway);
         record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedGateway);
@@ -3067,6 +3109,8 @@ mod tests {
             Some(BootstrapChurnStats {
                 transient_registered: 3,
                 transient_expired: 2,
+                transient_source_refusals: 1,
+                transient_evictions: 2,
                 promoted_to_ring: 1,
                 time_to_min_connections: Some(first),
                 time_to_first_ring_connection: None,

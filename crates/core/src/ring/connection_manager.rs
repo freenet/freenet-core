@@ -56,6 +56,18 @@ pub(crate) struct TransientEntry {
     pub generation: u64,
 }
 
+/// What became of a transient entry when its TTL elapsed
+/// (`ConnectionManager::transient_ttl_outcome`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TransientTtlOutcome {
+    /// Promoted into the ring before the TTL (or never registered).
+    Promoted,
+    /// Still held by its open, unpromoted connection.
+    StillHeld,
+    /// Its connection closed without being promoted.
+    Closed,
+}
+
 /// Why a transient registration was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TransientRefusal {
@@ -609,6 +621,9 @@ pub(crate) struct ConnectionManager {
     /// entries no longer in the map are skipped and dropped lazily.
     transient_order: Arc<Mutex<std::collections::VecDeque<(SocketAddr, u64)>>>,
     transient_generation: Arc<AtomicU64>,
+    /// Generations of held entries promoted before their TTL, until their
+    /// TTL timer asks (`take_promoted_within_ttl`), with when.
+    transient_promoted_within_ttl: Arc<DashMap<u64, Instant>>,
     transient_ttl: Duration,
     pub min_connections: usize,
     pub max_connections: usize,
@@ -822,6 +837,7 @@ impl ConnectionManager {
             transient_evictions: Arc::new(AtomicU64::new(0)),
             transient_order: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             transient_generation: Arc::new(AtomicU64::new(0)),
+            transient_promoted_within_ttl: Arc::new(DashMap::new()),
             transient_ttl,
             min_connections,
             max_connections,
@@ -2111,6 +2127,7 @@ impl ConnectionManager {
     }
 
     fn record_source_refusal(&self, addr: SocketAddr) {
+        crate::node::network_status::record_transient_source_refused();
         let refused = self
             .transient_source_refusals
             .fetch_add(1, Ordering::Relaxed)
@@ -2138,7 +2155,13 @@ impl ConnectionManager {
     /// Cost: a scan of the registration queue (at most about twice the
     /// budget plus 64 entries) under its lock, once per arrival at the
     /// budget.
-    pub(crate) fn oldest_held_transient(&self) -> Option<SocketAddr> {
+    ///
+    /// `exclude` names addresses that are never victims (the bridge's native
+    /// legs).
+    pub(crate) fn oldest_held_transient(
+        &self,
+        exclude: impl Fn(SocketAddr) -> bool,
+    ) -> Option<SocketAddr> {
         let mut order = self.transient_order.lock();
         // Entries that were removed or replaced are dropped from the front.
         while let Some((addr, generation)) = order.front().copied() {
@@ -2159,7 +2182,7 @@ impl ConnectionManager {
                 .transient_connections
                 .get(addr)
                 .is_some_and(|entry| entry.generation == *generation && entry.held);
-            if !held {
+            if !held || exclude(*addr) {
                 continue;
             }
             let slots = self
@@ -2175,6 +2198,7 @@ impl ConnectionManager {
 
     /// Counts a transient entry closed to admit a newcomer.
     pub(crate) fn record_transient_eviction(&self, victim: SocketAddr) {
+        crate::node::network_status::record_transient_evicted();
         let evicted = self.transient_evictions.fetch_add(1, Ordering::Relaxed) + 1;
         if evicted.is_power_of_two() {
             tracing::info!(
@@ -2195,11 +2219,53 @@ impl ConnectionManager {
             .map(|entry| entry.generation)
     }
 
+    /// What became of the entry of `generation` (read when its connection
+    /// registered) when its TTL elapses: promoted into the ring before then,
+    /// still held by its open connection, or closed without promotion. Asked
+    /// once per entry, by its TTL timer.
+    pub(crate) fn transient_ttl_outcome(
+        &self,
+        addr: SocketAddr,
+        generation: Option<u64>,
+    ) -> TransientTtlOutcome {
+        let Some(generation) = generation else {
+            return TransientTtlOutcome::Promoted;
+        };
+        if self.take_promoted_within_ttl(generation) {
+            TransientTtlOutcome::Promoted
+        } else if self.still_the_transient(addr, Some(generation)) {
+            TransientTtlOutcome::StillHeld
+        } else {
+            TransientTtlOutcome::Closed
+        }
+    }
+
     /// Whether the transient entry whose generation was `generation` (read
     /// when its connection registered) is still the one at `addr`: false once
     /// it was promoted or closed, and for a later entry at the address.
     pub(crate) fn still_the_transient(&self, addr: SocketAddr, generation: Option<u64>) -> bool {
         generation.is_some() && self.transient_generation(addr) == generation
+    }
+
+    /// Notes that a held entry, whose connection's TTL timer is running, was
+    /// promoted into the ring before its TTL, so the timer does not count
+    /// it as expired (`take_promoted_within_ttl`).
+    fn note_transient_promoted(&self, entry: &TransientEntry) {
+        let now = Instant::now();
+        if entry.held && now.duration_since(entry.created_at) <= self.transient_ttl {
+            self.transient_promoted_within_ttl
+                .insert(entry.generation, now);
+        }
+    }
+
+    /// Whether the entry of `generation` was promoted into the ring before
+    /// its TTL elapsed. Asked once, by that entry's TTL timer: a connection
+    /// that was not is counted as expired, whether it is still open (and
+    /// holding its slot) or has closed.
+    pub(crate) fn take_promoted_within_ttl(&self, generation: u64) -> bool {
+        self.transient_promoted_within_ttl
+            .remove(&generation)
+            .is_some()
     }
 
     /// The transient entry at `addr`, left in place.
@@ -2220,6 +2286,16 @@ impl ConnectionManager {
                 held.remove();
             }
         }
+    }
+
+    /// The most transient slots any one source holds now (a gauge for
+    /// telemetry, against `transient_source_share`).
+    pub fn transient_largest_source(&self) -> usize {
+        self.transient_per_source
+            .iter()
+            .map(|held| *held.value())
+            .max()
+            .unwrap_or(0)
     }
 
     /// Transient registrations refused because their source held its share.
@@ -2707,9 +2783,10 @@ impl ConnectionManager {
         }
 
         // Remove from transient connections if present, since we're now a full ring connection.
-        if self.transient_connections.remove(&addr).is_some() {
+        if let Some((_, entry)) = self.transient_connections.remove(&addr) {
             self.transient_in_use.fetch_sub(1, Ordering::SeqCst);
             self.release_transient_source(addr);
+            self.note_transient_promoted(&entry);
         }
 
         // Track connection time for optimistic readiness timeout.
@@ -2942,6 +3019,10 @@ impl ConnectionManager {
     pub(crate) fn cleanup_expired_transients(&self) -> usize {
         let now = Instant::now();
         let ttl = self.transient_ttl;
+        // A promotion noted for a TTL timer that will never ask (one that was
+        // not started) is forgotten after two TTLs.
+        self.transient_promoted_within_ttl
+            .retain(|_, promoted_at| now.duration_since(*promoted_at) <= ttl * 2);
         let mut removed = 0;
         let mut removed_addrs = Vec::new();
         self.transient_connections.retain(|addr, entry| {
@@ -3507,22 +3588,22 @@ mod tests {
     fn the_oldest_held_transient_is_the_eviction_candidate() {
         let cm = make_connection_manager_with_transient_budget(64);
         let a = |n: u8| SocketAddr::from(([10, 78, 0, n], 1));
-        assert_eq!(cm.oldest_held_transient(), None);
+        assert_eq!(cm.oldest_held_transient(|_| false), None);
         for n in 1..=4 {
             assert_eq!(cm.register_transient(a(n), None), Ok(()));
         }
-        assert_eq!(cm.oldest_held_transient(), None, "nothing is held");
+        assert_eq!(cm.oldest_held_transient(|_| false), None, "nothing is held");
         cm.hold_transient(a(2));
         cm.hold_transient(a(3));
-        assert_eq!(cm.oldest_held_transient(), Some(a(2)));
+        assert_eq!(cm.oldest_held_transient(|_| false), Some(a(2)));
         assert!(cm.drop_transient(a(2)).is_some());
-        assert_eq!(cm.oldest_held_transient(), Some(a(3)));
+        assert_eq!(cm.oldest_held_transient(|_| false), Some(a(3)));
         // A later entry at a dropped address is new, not the old one.
         assert!(cm.drop_transient(a(3)).is_some());
         assert_eq!(cm.register_transient(a(3), None), Ok(()));
         cm.hold_transient(a(3));
         cm.hold_transient(a(4));
-        assert_eq!(cm.oldest_held_transient(), Some(a(4)));
+        assert_eq!(cm.oldest_held_transient(|_| false), Some(a(4)));
     }
 
     /// A TTL timer started for one entry does not count a later entry at the
@@ -3543,6 +3624,48 @@ mod tests {
         assert!(!cm.still_the_transient(addr, first), "a later entry");
         assert!(cm.still_the_transient(addr, cm.transient_generation(addr)));
         assert!(!cm.still_the_transient(addr, None));
+    }
+
+    /// The #4787 expired series counts a registration whose TTL elapsed
+    /// before promotion, whether its connection is still open or closed, as
+    /// it did before slots were held; a promotion before the TTL is not
+    /// counted, and is asked for only once.
+    #[test]
+    fn a_ttl_outcome_tells_promoted_from_held_from_closed() {
+        let cm = make_connection_manager_with_transient_budget(64);
+        let a = |n: u8| SocketAddr::from(([10, 80, 0, n], 1));
+        for n in 1..=3 {
+            assert_eq!(cm.register_transient(a(n), None), Ok(()));
+            cm.hold_transient(a(n));
+        }
+        let generation = |n: u8| cm.transient_generation(a(n));
+        let (promoted, held, closed) = (generation(1), generation(2), generation(3));
+        assert!(cm.add_connection(
+            Location::from_address(&a(1)),
+            a(1),
+            TransportKeypair::new().public().clone(),
+            false
+        ));
+        assert!(cm.drop_transient(a(3)).is_some());
+
+        assert_eq!(
+            cm.transient_ttl_outcome(a(1), promoted),
+            TransientTtlOutcome::Promoted
+        );
+        assert_eq!(
+            cm.transient_ttl_outcome(a(1), promoted),
+            TransientTtlOutcome::Closed,
+            "asked once: the note is taken"
+        );
+        assert_eq!(
+            cm.transient_ttl_outcome(a(2), held),
+            TransientTtlOutcome::StillHeld
+        );
+        assert_eq!(
+            cm.transient_ttl_outcome(a(3), closed),
+            TransientTtlOutcome::Closed
+        );
+        assert!(cm.transient_promoted_within_ttl.is_empty());
     }
 
     #[test]
@@ -3578,6 +3701,7 @@ mod tests {
         );
         assert_eq!(cm.transient_source_refusals(), 2);
         assert_eq!(cm.transient_count(), share, "refusals take no slot");
+        assert_eq!(cm.transient_largest_source(), share, "the gauge");
 
         // Another address is admitted.
         let b = SocketAddr::from(([203, 0, 113, 8], 1));
