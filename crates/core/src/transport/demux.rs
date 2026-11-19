@@ -1620,6 +1620,78 @@ mod tests {
         );
     }
 
+    /// With the queue filled down to the quiet reserve, a joiner datagram is
+    /// refused as `reserve_full` (a joiner never uses the reserve, however
+    /// few datagrams it holds) and leaves no `queued` entry behind, while a
+    /// quiet established source still gets in.
+    #[tokio::test]
+    async fn a_joiner_never_uses_the_quiet_reserve_and_leaves_no_entry() {
+        let fill = QUIC_INGRESS_QUEUE_DATAGRAMS - QUIC_INGRESS_QUIET_RESERVE;
+        let source =
+            |i: usize| SocketAddr::from(([10, 253, (i / 250) as u8, (i % 250) as u8], 8000));
+        let joiner: SocketAddr = "10.252.0.1:8100".parse().unwrap();
+        let quiet: SocketAddr = "10.252.0.2:8101".parse().unwrap();
+        let mut script: Vec<Step> = (0..fill)
+            .map(|i| Step::Packet(source(i), quic(1)))
+            .collect();
+        script.push(Step::Packet(joiner, quic(2)));
+        script.push(Step::Packet(quiet, quic(3)));
+        let socket = DemuxSocket::wrap(ScriptedSocket::new(script), None);
+        let _queue = socket.enable_quic_ingress().expect("first enable");
+        let _permits: Vec<_> = (0..fill)
+            .map(|i| socket.allow_quic_source(source(i)).expect("allowed"))
+            .collect();
+        let _joiner = socket.allow_quic_joiner(joiner).expect("allowed");
+        let _quiet = socket.allow_quic_source(quiet).expect("allowed");
+        let mut buf = [0u8; 64];
+        for _ in 0..fill {
+            socket.recv_classified(&mut buf).await.unwrap();
+        }
+        let before = outcomes(&socket);
+        socket.recv_classified(&mut buf).await.unwrap();
+        socket.recv_classified(&mut buf).await.unwrap();
+        let after = outcomes(&socket);
+        assert_eq!(after[5], before[5] + 1, "the joiner got reserve_full");
+        assert_eq!(after[0], before[0] + 1, "the quiet source used the reserve");
+        let shared = &socket.quic.get().unwrap().shared;
+        assert!(
+            !shared.queued.contains_key(&joiner),
+            "the refused joiner left no queued entry"
+        );
+        assert_eq!(
+            socket.joiner_queued_for_test(),
+            0,
+            "and took no joiner slot"
+        );
+    }
+
+    /// When the queue refuses a joiner's datagram after its slot was taken
+    /// (here: the receiver is gone, `Closed`), the joiner slot and the
+    /// source's share are rolled back, so nothing leaks. The refusal as
+    /// `Full` is the same lines but unreachable here: the one sender checks
+    /// the free capacity first and is the only sender.
+    #[tokio::test]
+    async fn a_refused_joiner_datagram_rolls_back_its_slot() {
+        let joiner: SocketAddr = "10.252.1.1:8200".parse().unwrap();
+        let socket = DemuxSocket::wrap(
+            ScriptedSocket::new(vec![
+                Step::Packet(joiner, quic(1)),
+                Step::Packet(joiner, quic(2)),
+            ]),
+            None,
+        );
+        let queue = socket.enable_quic_ingress().expect("first enable");
+        let _joiner = socket.allow_quic_joiner(joiner).expect("allowed");
+        drop(queue);
+        let mut buf = [0u8; 64];
+        socket.recv_classified(&mut buf).await.unwrap();
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert_eq!(outcomes(&socket)[4], 2, "both refused as no_ingress");
+        assert_eq!(socket.joiner_queued_for_test(), 0, "no joiner slot leaked");
+        let shared = &socket.quic.get().unwrap().shared;
+        assert!(!shared.queued.contains_key(&joiner), "no share leaked");
+    }
+
     /// While one joiner keeps the joiners' share full, an honest joiner's
     /// datagram is dropped (and the QUIC handshake retransmits it), and is
     /// admitted as soon as the endpoint reads a slot free. The honest join is
