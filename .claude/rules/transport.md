@@ -2390,17 +2390,31 @@ Fallback: a failed native setup is followed by today's UDP dial to the same
   connection silent for about two keepalive intervals (HOLD_WINDOW >= 2 x
   KEEPALIVE_INTERVAL is a const assert in identity.rs), so about two lost
   keepalives. Rare; a gate before native is enabled (design note 10.2 item
-  18). Native second: replace_transport_in_place swaps only the
-  transport (listener, sender, connection id, receipt, remote version) and
-  keeps identity, ring membership, transient status, ReadyState,
-  connected-since and health (no promotion, prune or budget call); the old
-  listener's close carries the old id and is ignored. UDP second: dropped,
-  nothing else touched. A native dial onto an entry bound to ANOTHER key
-  takes the ordinary replace (the entry is stale). Two UDP connections keep
-  the old later-replaces-earlier behaviour. record_success runs before any
+  18). Native only wins once it has carried a frame from the peer (option
+  (b), #6294): each native connection sends one probe when it starts
+  (send_native_probe) and its listener reports its first decoded message once
+  (ConnEvent::NativeFirstFrame), because only one end may have finished the
+  native setup. Native second: kept beside the UDP entry (hold_native,
+  P2pConnManager::held_native, one per address, a newer one replaces it) and
+  swapped in on its first frame by promote_held_native, which replaces only
+  the transport (sender, connection id, receipt, remote version) and keeps
+  identity, ring membership, transient status, ReadyState, connected-since
+  and health (no promotion, prune or budget call). UDP second: dropped if the
+  native entry has already carried a frame; otherwise it becomes the entry
+  in place (swap_udp_in_beside_native) and the native connection is held,
+  the same way. A held native connection is dropped after HELD_NATIVE_WINDOW
+  (15 s, the event loop wakes for it) with no frame, when it closes, or with
+  its entry (remove_connection); a frame after the deadline does not
+  promote. If the UDP entry closes while a native one is held for the same
+  key, the native one becomes the entry (the peer may have promoted it and
+  dropped UDP). A holder at another address keeps the drop. A native dial
+  onto an entry bound to ANOTHER key takes the ordinary replace (the entry is
+  stale). Two UDP connections keep the old later-replaces-earlier behaviour.
+  record_success runs before any
   keep/swap/drop. A dropped UDP dial's requesters are answered with the
   native holder's address, and an unused reservation at the dial's own
-  address is released. Counted: connect_native_survivor_{swapped,udp_dropped},
+  address is released. Counted: connect_native_survivor_{swapped,udp_dropped}
+  (swapped is counted at promotion, not at arrival),
   connect_native_both_dials_connected_{udp,native}_first (beside pair only).
   One-sided native setups (one end connected, the other's setup failed;
   10.2 item 20) are NOT counted locally: no counter at one end can see them

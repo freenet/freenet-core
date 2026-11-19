@@ -569,7 +569,9 @@ struct ConnectionEntry {
     /// Whether this transport is a QUIC-native connection rather than a
     /// legacy UDP one. The survivor rule reads it: when a node holds, or is
     /// handed, a native and a UDP connection to one peer, it keeps the
-    /// native one (`P2pConnManager::replace_transport_in_place`).
+    /// native one once it has carried a frame from the peer
+    /// (`P2pConnManager::promote_held_native`, and
+    /// `P2pConnManager::swap_udp_in_beside_native` while it has not).
     native: bool,
     /// Whether this transport has carried a frame from the peer. A UDP
     /// entry is born with one (its handshake was a round trip). A native
