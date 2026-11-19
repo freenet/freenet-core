@@ -1565,9 +1565,27 @@ mod tests {
     async fn a_joiner_is_marked_before_it_is_allowed() {
         let (socket, _queue, _joiners, _peer) = joiner_flood(1, 1, 0).await;
         assert_eq!(socket.joiner_queued_for_test(), 1, "counted as a joiner");
-        // Source scrape: the mark is made before the allow-set entry.
-        let source = include_str!("demux.rs");
-        let body = &source[source.find("pub(crate) fn allow_quic_joiner(").unwrap()..];
+        // Source scrape, bounded to the production function: the mark is
+        // made before the allow-set entry. Only the part of the file before
+        // the test module is searched (this test's own literals sit after
+        // it), and a missing function fails the test.
+        let file = include_str!("demux.rs");
+        let production = file
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .expect("the production part");
+        let signature = "    pub(crate) fn allow_quic_joiner(";
+        let start = production
+            .find(signature)
+            .expect("allow_quic_joiner in the production code");
+        let end = production[start..]
+            .find("\n    }\n")
+            .expect("the end of allow_quic_joiner");
+        let body: String = production[start..start + end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mark = body.find("shared.joiners.entry(addr)").expect("the mark");
         let allow = body
             .find("self.allow_quic_source(addr)?")
