@@ -1787,3 +1787,212 @@ mod tests {
         assert!(t.may_warn(a.id(), t0 + GIVE_UP_WARN_INTERVAL));
     }
 }
+
+/// Behaviour tests for the sender table, written against a small event
+/// harness (arm, enqueue, send, finish, ack, sweep) rather than its internal
+/// stages, so they state what a peer and a writer observe.
+#[cfg(test)]
+mod behaviour_tests {
+    use super::*;
+    use crate::transport::TransportKeypair;
+
+    /// One (contract, peer) pair driven by events at explicit times (seconds
+    /// from a common origin).
+    struct Pair {
+        table: ConfirmedDelivery,
+        key: ContractKey,
+        peer: PeerKey,
+        t0: Instant,
+    }
+
+    impl Pair {
+        fn new() -> Self {
+            Self {
+                table: ConfirmedDelivery::new(Arc::new(
+                    crate::util::time_source::InstantTimeSrc::new(),
+                )),
+                key: crate::operations::test_utils::make_contract_key(7),
+                peer: PeerKey::from(TransportKeypair::new().public().clone()),
+                t0: Instant::now(),
+            }
+        }
+
+        fn at(&self, secs: u64) -> Instant {
+            self.t0 + Duration::from_secs(secs)
+        }
+
+        /// A client update was applied and fanned out to this peer.
+        fn arm(&self, secs: u64) {
+            self.table.arm(
+                self.key,
+                self.peer.clone(),
+                SocketAddr::from(([127, 0, 0, 1], 9)),
+                self.at(secs),
+            );
+        }
+
+        /// A leg for this pair entered the broadcast queue.
+        fn enqueue(&self) {
+            self.table.note_queued(self.key.id(), &self.peer);
+        }
+
+        /// A leg for this pair left the queue and was sent, flagged as its
+        /// duty says. Returns its transaction id.
+        fn send(&self, secs: u64) -> Transaction {
+            let tx = Transaction::new::<crate::operations::update::UpdateMsg>();
+            self.table
+                .note_dequeued(self.key.id(), &self.peer, self.at(secs));
+            let full = self.duty() == LegDuty::ResendFull;
+            self.table.record_flagged_send(
+                self.key.id(),
+                &self.peer,
+                tx,
+                full,
+                ACK_TIMEOUT,
+                self.at(secs),
+            );
+            tx
+        }
+
+        /// The leg's send finished (an inline leg finishes as it is sent; a
+        /// stream when its last fragment leaves).
+        fn finish(&self, tx: Transaction, secs: u64) {
+            self.table
+                .send_finished(self.key.id(), &self.peer, tx, self.at(secs));
+        }
+
+        fn ack(&self, tx: Transaction, outcome: BroadcastAckOutcome, secs: u64) {
+            self.table
+                .on_ack(self.key.id(), &self.peer, tx, outcome, self.at(secs));
+        }
+
+        fn sweep(&self, secs: u64) -> Vec<SweepAction> {
+            self.table.sweep(self.at(secs)).0
+        }
+
+        fn duty(&self) -> LegDuty {
+            self.table.leg_duty(self.key.id(), &self.peer)
+        }
+
+        fn settled(&self) -> bool {
+            self.duty() == LegDuty::None
+        }
+    }
+
+    fn resends(actions: &[SweepAction]) -> usize {
+        actions
+            .iter()
+            .filter(|a| matches!(a, SweepAction::Resend { .. }))
+            .count()
+    }
+
+    const APPLIED: BroadcastAckOutcome = BroadcastAckOutcome::Applied;
+
+    /// H1 (a): an ack for the leg of an OLDER update must not settle a newer
+    /// update that coalesced into the entry after that leg went.
+    #[test]
+    fn an_older_legs_ack_does_not_confirm_a_newer_update() {
+        let p = Pair::new();
+        p.arm(0);
+        let first = p.send(0);
+        p.finish(first, 0);
+        p.arm(1);
+        p.ack(first, APPLIED, 2);
+        assert!(!p.settled(), "the update armed at 1 s is not confirmed");
+    }
+
+    /// H1 (b): a resend whose snapshot was read before the latest arm does
+    /// not confirm that latest update.
+    #[test]
+    fn a_resend_snapshot_older_than_the_latest_arm_does_not_confirm_it() {
+        let p = Pair::new();
+        p.arm(0);
+        let first = p.send(0);
+        p.finish(first, 0);
+        assert_eq!(resends(&p.sweep(30)), 1);
+        assert_eq!(p.duty(), LegDuty::ResendFull);
+        let resend = p.send(31);
+        p.finish(resend, 31);
+        p.arm(32);
+        p.ack(resend, APPLIED, 33);
+        assert!(!p.settled(), "the update armed at 32 s is not confirmed");
+    }
+
+    /// H1 (c): a final drop of an OLDER leg says nothing about a newer update.
+    #[test]
+    fn a_final_drop_of_an_older_leg_keeps_the_newer_update_tracked() {
+        let p = Pair::new();
+        p.arm(0);
+        let first = p.send(0);
+        p.finish(first, 0);
+        p.arm(1);
+        p.ack(
+            first,
+            BroadcastAckOutcome::Dropped(BroadcastDropReason::NotHosted),
+            2,
+        );
+        assert!(!p.settled(), "the update armed at 1 s is still unconfirmed");
+    }
+
+    /// M1: a healthy writer (an update every 3 s) whose acks take 7 s pays no
+    /// resend over two minutes.
+    #[test]
+    fn a_healthy_fast_writer_with_slow_acks_gets_no_resend() {
+        let p = Pair::new();
+        let mut pending: Vec<(u64, Transaction)> = Vec::new();
+        let mut total = 0;
+        for t in 0..=120u64 {
+            pending.retain(|(due, tx)| {
+                if *due == t {
+                    p.ack(*tx, APPLIED, t);
+                    false
+                } else {
+                    true
+                }
+            });
+            if t % 3 == 0 {
+                p.arm(t);
+                let tx = p.send(t);
+                p.finish(tx, t);
+                pending.push((t + 7, tx));
+            }
+            total += resends(&p.sweep(t));
+        }
+        assert_eq!(total, 0, "no resend for a peer that acks every leg");
+    }
+
+    /// M2: a late ack for the leg that timed out cancels the due resend if it
+    /// lands before the resend is sent.
+    #[test]
+    fn a_late_ack_cancels_a_due_resend() {
+        let p = Pair::new();
+        p.arm(0);
+        let first = p.send(0);
+        p.finish(first, 0);
+        assert_eq!(resends(&p.sweep(30)), 1);
+        p.ack(first, APPLIED, 31);
+        assert!(p.settled(), "the ack confirmed the only update");
+        assert_ne!(p.duty(), LegDuty::ResendFull);
+    }
+
+    /// M3: no resend while one of the pair's legs is still queued.
+    #[test]
+    fn no_resend_while_a_leg_is_queued() {
+        let p = Pair::new();
+        p.arm(0);
+        let first = p.send(0);
+        p.finish(first, 0);
+        p.arm(5);
+        p.enqueue();
+        assert_eq!(resends(&p.sweep(300)), 0, "a leg of the pair is queued");
+    }
+
+    /// M4: no resend while one of the pair's legs is still streaming.
+    #[test]
+    fn no_resend_while_a_leg_is_streaming() {
+        let p = Pair::new();
+        p.arm(0);
+        let _streaming = p.send(0);
+        assert_eq!(resends(&p.sweep(300)), 0, "the leg is still streaming");
+    }
+}
