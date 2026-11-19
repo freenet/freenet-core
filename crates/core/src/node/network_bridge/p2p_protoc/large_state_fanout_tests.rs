@@ -195,7 +195,9 @@ fn is_inline_broadcast(msg: &NetMessage) -> bool {
     matches!(
         msg,
         NetMessage::V1(NetMessageV1::Update(
-            UpdateMsg::BroadcastTo { .. } | UpdateMsg::BroadcastToV2 { .. }
+            UpdateMsg::BroadcastTo { .. }
+                | UpdateMsg::BroadcastToV2 { .. }
+                | UpdateMsg::BroadcastToAckRequested { .. }
         ))
     )
 }

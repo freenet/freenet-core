@@ -1120,6 +1120,9 @@ mod tests {
             // but the guard had stopped guarding.
             "UpdateMsg::BroadcastToV2 {",
             "UpdateMsg::BroadcastToStreamingV2 {",
+            // #6143 appended the two ack-requested variants.
+            "UpdateMsg::BroadcastToAckRequested {",
+            "UpdateMsg::BroadcastToStreamingAckRequested {",
         ] {
             assert!(
                 block.contains(variant),

@@ -2066,9 +2066,9 @@ async fn drive_relay_broadcast_to(
         op_manager.interest_manager.now(),
     ) {
         receiver_terminal.mark_dedup();
-        super::confirmed_delivery::note_receiver_outcome(
-            crate::message::BroadcastAckOutcome::AlreadyHad,
-        );
+        // No confirmed-delivery ack here: the dedup cache records a payload
+        // BEFORE its merge, so a hit means seen, not applied (#6292 round 1,
+        // Should Fix 3). The sender's deadline covers it.
         count_receiver_skip(
             op_manager,
             &key,
@@ -2237,9 +2237,16 @@ async fn drive_relay_broadcast_to(
             result
         }
         Err(err) => {
+            // Saturation (queue full, a scheduler timeout before the merge ran)
+            // is transient and gets the sender's one resend; a merge that ran
+            // and failed does not (#6292 round 1, Should Fix 5).
             super::confirmed_delivery::note_receiver_outcome(
                 crate::message::BroadcastAckOutcome::Dropped(
-                    crate::message::BroadcastDropReason::MergeFailed,
+                    if err.is_contract_queue_full() || err.is_scheduler_timeout() {
+                        crate::message::BroadcastDropReason::Overloaded
+                    } else {
+                        crate::message::BroadcastDropReason::MergeFailed
+                    },
                 ),
             );
             // Record the merge failure for the per-contract backoff (#4861),
@@ -3135,9 +3142,9 @@ async fn apply_streaming_broadcast(
         op_manager.interest_manager.now(),
     ) {
         receiver_terminal.mark_dedup();
-        super::confirmed_delivery::note_receiver_outcome(
-            crate::message::BroadcastAckOutcome::AlreadyHad,
-        );
+        // No confirmed-delivery ack here: the dedup cache records a payload
+        // BEFORE its merge, so a hit means seen, not applied (#6292 round 1,
+        // Should Fix 3). The sender's deadline covers it.
         count_receiver_skip(
             op_manager,
             &key,
@@ -3278,9 +3285,16 @@ async fn apply_streaming_broadcast(
             exec
         }
         Err(err) => {
+            // Saturation (queue full, a scheduler timeout before the merge ran)
+            // is transient and gets the sender's one resend; a merge that ran
+            // and failed does not (#6292 round 1, Should Fix 5).
             super::confirmed_delivery::note_receiver_outcome(
                 crate::message::BroadcastAckOutcome::Dropped(
-                    crate::message::BroadcastDropReason::MergeFailed,
+                    if err.is_contract_queue_full() || err.is_scheduler_timeout() {
+                        crate::message::BroadcastDropReason::Overloaded
+                    } else {
+                        crate::message::BroadcastDropReason::MergeFailed
+                    },
                 ),
             );
             // Record poison-contract merge failures for the backoff (#4861),

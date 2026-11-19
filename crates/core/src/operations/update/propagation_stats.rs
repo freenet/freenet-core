@@ -100,16 +100,16 @@ const TOP_K: usize = 8;
 /// capacity, rather than letting a key churn grow the map without bound.
 /// 4096 is comfortably above the active-contract count of a busy gateway.
 /// Each entry is at most [`MAX_COUNTERS_SIZE`] plus its key (pinned by
-/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.7 MB of
+/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.8 MB of
 /// entries at the cap. A hash table holds 4096 entries in 8192 buckets
 /// (hashbrown's 7/8 load factor rounds up to the next power of two), so the
-/// map is about 3.3 MB at the cap.
+/// map is about 3.5 MB at the cap.
 const MAX_TRACKED_CONTRACTS: usize = 4096;
 
 /// Upper bound on `size_of::<ContractCounters>()` and
 /// `size_of::<ContractSummary>()`, for the memory estimate above.
 #[cfg(test)]
-const MAX_COUNTERS_SIZE: usize = 376;
+const MAX_COUNTERS_SIZE: usize = 400;
 
 /// One countable thing that happened to an UPDATE's propagation for a
 /// contract, other than the fan-out target resolution `record_broadcast`
@@ -238,12 +238,21 @@ pub(crate) enum PropagationEvent {
     /// Confirmed delivery: a target was not tracked because the pending table
     /// was full.
     PendingOverflow,
+    /// Confirmed delivery: the receiver's contract handler was saturated when
+    /// a flagged leg arrived. The one resend follows.
+    AckDroppedOverloaded,
+    /// Confirmed delivery: an ack for the previous flagged leg of a coalesced
+    /// entry proved the path delivers; the escalation clock restarted.
+    AckPathProven,
+    /// Confirmed delivery: an ack matched no pending leg (superseded, late,
+    /// or never asked for).
+    AckUnmatched,
 }
 
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 38] = [
+    pub(crate) const ALL: [PropagationEvent; 41] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -282,6 +291,9 @@ impl PropagationEvent {
         PropagationEvent::ResendFull,
         PropagationEvent::UnconfirmedGiveup,
         PropagationEvent::PendingOverflow,
+        PropagationEvent::AckDroppedOverloaded,
+        PropagationEvent::AckPathProven,
+        PropagationEvent::AckUnmatched,
     ];
 
     pub(crate) const COUNT: usize = Self::ALL.len();
@@ -326,6 +338,9 @@ impl PropagationEvent {
             PropagationEvent::ResendFull => 35,
             PropagationEvent::UnconfirmedGiveup => 36,
             PropagationEvent::PendingOverflow => 37,
+            PropagationEvent::AckDroppedOverloaded => 38,
+            PropagationEvent::AckPathProven => 39,
+            PropagationEvent::AckUnmatched => 40,
         }
     }
 
@@ -398,6 +413,9 @@ impl PropagationEvent {
             PropagationEvent::ResendFull => "resend_full",
             PropagationEvent::UnconfirmedGiveup => "unconfirmed_giveup",
             PropagationEvent::PendingOverflow => "pending_overflow",
+            PropagationEvent::AckDroppedOverloaded => "ack_dropped_overloaded",
+            PropagationEvent::AckPathProven => "ack_path_proven",
+            PropagationEvent::AckUnmatched => "ack_unmatched",
         }
     }
 }

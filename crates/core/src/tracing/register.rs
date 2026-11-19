@@ -2260,6 +2260,9 @@ mod broadcast_to_telemetry_tests {
             "UpdateMsg::BroadcastToStreaming {",
             "UpdateMsg::BroadcastToV2 {",
             "UpdateMsg::BroadcastToStreamingV2 {",
+            // #6143's ack-requested forms carry the same payload.
+            "UpdateMsg::BroadcastToAckRequested {",
+            "UpdateMsg::BroadcastToStreamingAckRequested {",
         ] {
             assert!(
                 !body.contains(variant),

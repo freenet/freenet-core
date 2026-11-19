@@ -3948,6 +3948,36 @@ mod tests {
             "an unknown version fails closed"
         );
 
+        // Round 1 Should Fix 9: the SEND site re-checks the version, so a leg
+        // still queued when the peer reconnects on an older release is sent
+        // unflagged even though the table still holds its entry.
+        let addr0 = addr_of(&op_manager, &kps[0]);
+        let peer0 = crate::ring::PeerKey::from(kps[0].public().clone());
+        assert_eq!(
+            crate::operations::update::confirmed_delivery::leg_duty_for(
+                &op_manager,
+                key.id(),
+                &peer0,
+                addr0
+            ),
+            LegDuty::RequestAck
+        );
+        op_manager
+            .ring
+            .connection_manager
+            .record_remote_version(addr0, Some((0, 2, 160)));
+        assert_eq!(duty(&kps[0]), LegDuty::RequestAck, "the entry remains");
+        assert_eq!(
+            crate::operations::update::confirmed_delivery::leg_duty_for(
+                &op_manager,
+                key.id(),
+                &peer0,
+                addr0
+            ),
+            LegDuty::None,
+            "but a below-floor peer is never sent a flagged variant"
+        );
+
         // A disconnect discards the pending entry with the connection.
         op_manager.on_ring_connection_lost(kps[0].public());
         assert_eq!(duty(&kps[0]), LegDuty::None);

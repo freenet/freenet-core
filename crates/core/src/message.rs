@@ -628,8 +628,12 @@ pub enum BroadcastDropReason {
     RateLimited,
     /// The contract is over the receiver's per-contract merge budget.
     MergeBudget,
-    /// The merge ran and failed, or the contract handler was saturated.
+    /// The merge ran and failed (the contract rejected it, or it timed out).
     MergeFailed,
+    /// The receiver's contract handler was saturated (queue full, or a
+    /// scheduler timeout before the merge ran). Transient: the sender gives it
+    /// the one resend (#6292 round 1, Should Fix 5). Appended.
+    Overloaded,
 }
 
 /// Which code path built an [`InterestMessage::Summaries`] — a NON-WIRE
@@ -1464,6 +1468,7 @@ mod tests {
             BroadcastAckOutcome::Dropped(BroadcastDropReason::RateLimited),
             BroadcastAckOutcome::Dropped(BroadcastDropReason::MergeBudget),
             BroadcastAckOutcome::Dropped(BroadcastDropReason::MergeFailed),
+            BroadcastAckOutcome::Dropped(BroadcastDropReason::Overloaded),
         ] {
             let msg = InterestMessage::BroadcastAck { key, tx, outcome };
             let bytes = bincode::serialize(&msg).expect("serialize BroadcastAck");
@@ -1498,9 +1503,10 @@ mod tests {
                 BroadcastDropReason::RateLimited,
                 BroadcastDropReason::MergeBudget,
                 BroadcastDropReason::MergeFailed,
+                BroadcastDropReason::Overloaded,
             ]
             .map(reason),
-            [0, 1, 2, 3, 4]
+            [0, 1, 2, 3, 4, 5]
         );
     }
 

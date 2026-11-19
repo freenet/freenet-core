@@ -951,7 +951,12 @@ impl P2pConnManager {
 
             // #6143: what this leg owes confirmed delivery. Mirrors the
             // production `broadcast_to_single_peer`.
-            let duty = op_manager.confirmed_delivery.leg_duty(key.id(), &peer_key);
+            let duty = crate::operations::update::confirmed_delivery::leg_duty_for(
+                op_manager,
+                key.id(),
+                &peer_key,
+                peer_addr,
+            );
             let resend_full =
                 duty == crate::operations::update::confirmed_delivery::LegDuty::ResendFull;
             let flagged = duty != crate::operations::update::confirmed_delivery::LegDuty::None;
@@ -1108,11 +1113,6 @@ impl P2pConnManager {
                         op_manager.streaming_threshold,
                         payload_size,
                     ));
-            if flagged {
-                super::super::broadcast_queue::record_flagged_leg(
-                    op_manager, &key, &peer_key, update_tx,
-                );
-            }
 
             let send_result = if use_streaming {
                 let sender_summary_bytes = sent_summary
@@ -1197,6 +1197,18 @@ impl P2pConnManager {
                 // `#[cfg(feature = "simulation_tests")]` only and never compiled into
                 // the production binary; the sim runner drives inline deterministic
                 // broadcast ordering. Production uses the BroadcastQueue path.
+                if flagged {
+                    super::super::broadcast_queue::record_flagged_leg(
+                        op_manager,
+                        &key,
+                        &peer_key,
+                        update_tx,
+                        resend_full,
+                        super::super::broadcast_queue::stream_completion_timeout(
+                            payload_bytes.len() as u64,
+                        ) + crate::operations::update::confirmed_delivery::ACK_TIMEOUT,
+                    );
+                }
                 let send_res = bridge.send(peer_addr, net_msg).await;
                 match send_res {
                     Ok(()) => {
@@ -1273,6 +1285,16 @@ impl P2pConnManager {
                         },
                     }
                 };
+                if flagged {
+                    super::super::broadcast_queue::record_flagged_leg(
+                        op_manager,
+                        &key,
+                        &peer_key,
+                        update_tx,
+                        resend_full,
+                        crate::operations::update::confirmed_delivery::ACK_TIMEOUT,
+                    );
+                }
                 // Test seam for the #6143 failure class: the bridge "accepts"
                 // the leg and it never arrives.
                 if crate::operations::update::confirmed_delivery::inline_leg_swallowed(
@@ -1286,15 +1308,6 @@ impl P2pConnManager {
                     bridge.send(peer_addr, msg.into()).await
                 }
             };
-
-            if flagged {
-                op_manager.confirmed_delivery.send_finished(
-                    key.id(),
-                    &peer_key,
-                    update_tx,
-                    op_manager.confirmed_delivery.now(),
-                );
-            }
 
             if let Err(err) = send_result {
                 send_failed += 1;
@@ -1376,6 +1389,14 @@ impl P2pConnManager {
                         crate::ring::interest::SummaryPopulationSource::Delivery,
                     );
                 }
+            }
+
+            // After the delivery bookkeeping above, as in production
+            // (`broadcast_queue::finish_flagged_leg`).
+            if flagged {
+                super::super::broadcast_queue::finish_flagged_leg(
+                    op_manager, &key, &peer_key, update_tx,
+                );
             }
         }
 

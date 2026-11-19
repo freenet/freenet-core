@@ -1466,6 +1466,9 @@ mod queue {
         /// The contracts of the entries evicted at capacity to make room,
         /// one per evicted leg.
         evicted: Vec<ContractKey>,
+        /// The same evicted legs as (contract, target) pairs, for the
+        /// confirmed-delivery table (#6292 round 1, Must Fix 1).
+        evicted_pairs: Vec<(ContractKey, PeerKeyLocation)>,
     }
 
     /// Global broadcast queue that serializes outbound broadcast streams
@@ -1563,9 +1566,22 @@ mod queue {
             use crate::operations::update::propagation_stats::{
                 PropagationEvent, record_propagation_event,
             };
+            let peer_key = crate::ring::PeerKey::from(target.pub_key().clone());
             let outcome = self
                 .enqueue_in_lane(lane, key, target, new_state, fanout)
                 .await;
+            // #6292 round 1, Must Fix 1: an armed entry does not age while its
+            // leg waits here; an evicted leg's entry ages again.
+            op_manager
+                .confirmed_delivery
+                .note_queued(key.id(), &peer_key);
+            for (evicted, target) in &outcome.evicted_pairs {
+                op_manager.confirmed_delivery.note_dequeued(
+                    evicted.id(),
+                    &crate::ring::PeerKey::from(target.pub_key().clone()),
+                    op_manager.confirmed_delivery.now(),
+                );
+            }
             if outcome.superseded {
                 // #6143: the replaced leg ends here without a send of its own.
                 // Its update rides on this newer leg, whose outcome decides
@@ -1643,6 +1659,9 @@ mod queue {
                     if let Some(entry) = queue.evict_oldest(Instant::now(), &self.spacing) {
                         crate::node::BROADCAST_QUEUE_EFFICIENCY_METRICS.record_capacity_eviction();
                         outcome.evicted.push(entry.key);
+                        outcome
+                            .evicted_pairs
+                            .push((entry.key, entry.target.clone()));
                         tracing::warn!(
                             contract = %entry.key,
                             peer = ?entry.target.socket_addr(),
@@ -4423,23 +4442,55 @@ pub(crate) fn settle_converged_leg(
 }
 
 /// Record that a flagged leg with transaction `tx` is about to go (#6143),
-/// counting it as the first ask or the resend.
+/// counting it as the first ask or the resend (a re-flag is not counted).
+///
+/// `provisional` bounds the send itself: [`ACK_TIMEOUT`] for an inline leg,
+/// the stream's completion wait plus [`ACK_TIMEOUT`] for a stream, so a long
+/// stream is not resent mid-transfer (#6292 round 1, Must Fix 1).
+///
+/// [`ACK_TIMEOUT`]: crate::operations::update::confirmed_delivery::ACK_TIMEOUT
 pub(crate) fn record_flagged_leg(
     op_manager: &OpManager,
     key: &ContractKey,
     peer_key: &crate::ring::PeerKey,
     tx: crate::message::Transaction,
+    full_resend: bool,
+    provisional: Duration,
 ) {
     use crate::operations::update::confirmed_delivery::{FlaggedSend, count};
     match op_manager.confirmed_delivery.record_flagged_send(
         key.id(),
         peer_key,
         tx,
+        full_resend,
+        provisional,
         op_manager.confirmed_delivery.now(),
     ) {
         FlaggedSend::First => count(op_manager, key.id(), PropagationEvent::AckRequested),
         FlaggedSend::Resend => count(op_manager, key.id(), PropagationEvent::ResendFull),
-        FlaggedSend::Untracked => {}
+        FlaggedSend::Reflag | FlaggedSend::Untracked => {}
+    }
+}
+
+/// The flagged leg `tx` finished, AFTER its delivery bookkeeping cached our
+/// summary as the peer's: start its ack deadline, and if a final "dropped"
+/// ack already arrived for it, clear the belief that bookkeeping just
+/// rewrote (#6292 round 1, Should Fix 4).
+pub(crate) fn finish_flagged_leg(
+    op_manager: &OpManager,
+    key: &ContractKey,
+    peer_key: &crate::ring::PeerKey,
+    tx: crate::message::Transaction,
+) {
+    use crate::operations::update::confirmed_delivery::{SendFinished, clear_belief};
+    if op_manager.confirmed_delivery.send_finished(
+        key.id(),
+        peer_key,
+        tx,
+        op_manager.confirmed_delivery.now(),
+    ) == SendFinished::ReclearBelief
+    {
+        clear_belief(op_manager, key, peer_key);
     }
 }
 
@@ -4618,6 +4669,14 @@ pub(super) async fn broadcast_to_single_peer(
         return;
     };
 
+    // #6292 round 1, Must Fix 1: this pair's leg has left the queue, so an
+    // armed entry's unsent bound runs again from now. Before every exit.
+    op_manager.confirmed_delivery.note_dequeued(
+        key.id(),
+        &PeerKey::from(target.pub_key().clone()),
+        op_manager.confirmed_delivery.now(),
+    );
+
     // Split the bundle: the class is a fixed property of how this send was
     // SCHEDULED (the mismatch counters compare it against the real payload), the
     // permit is live state that may be upgraded once the payload is known.
@@ -4649,7 +4708,12 @@ pub(super) async fn broadcast_to_single_peer(
     // pairs whose peer decodes the flag, so no version check is needed here.
     // A resend is full state on the stream path and skips the converged
     // check, because the belief that check reads is what the resend distrusts.
-    let duty = op_manager.confirmed_delivery.leg_duty(key.id(), &peer_key);
+    let duty = crate::operations::update::confirmed_delivery::leg_duty_for(
+        op_manager,
+        key.id(),
+        &peer_key,
+        peer_addr,
+    );
     let resend_full = duty == LegDuty::ResendFull;
 
     // A leg queued in the small lane may find the stored state has since grown
@@ -5100,12 +5164,10 @@ pub(super) async fn broadcast_to_single_peer(
                 op_manager.streaming_threshold,
                 payload_size,
             ));
-    // #6143: a flagged leg records its transaction id BEFORE it is sent, so an
-    // ack that beats the bookkeeping below still matches.
+    // #6143: a flagged leg records its transaction id BEFORE it is sent (in
+    // each branch below, once its size is known), so an ack that beats the
+    // bookkeeping still matches.
     let flagged = duty != LegDuty::None;
-    if flagged {
-        record_flagged_leg(op_manager, &key, &peer_key, update_tx);
-    }
 
     // Each branch below tracks whether the message was *actually delivered* to
     // the peer, as distinct from merely being enqueued for dispatch, and applies
@@ -5205,6 +5267,17 @@ pub(super) async fn broadcast_to_single_peer(
             }
         };
 
+        if flagged {
+            record_flagged_leg(
+                op_manager,
+                &key,
+                &peer_key,
+                update_tx,
+                resend_full,
+                stream_completion_timeout(payload_bytes.len() as u64)
+                    + crate::operations::update::confirmed_delivery::ACK_TIMEOUT,
+            );
+        }
         let send_res = bridge.send(peer_addr, net_msg).await;
         if send_res.is_err() {
             // Telemetry gauge (#4440): the initial metadata send failed, so the
@@ -5374,6 +5447,16 @@ pub(super) async fn broadcast_to_single_peer(
                 },
             }
         };
+        if flagged {
+            record_flagged_leg(
+                op_manager,
+                &key,
+                &peer_key,
+                update_tx,
+                resend_full,
+                crate::operations::update::confirmed_delivery::ACK_TIMEOUT,
+            );
+        }
         // Test seam for the #6143 failure class: the bridge "accepts" the
         // leg and it never arrives. No-op outside test builds.
         let res = if crate::operations::update::confirmed_delivery::inline_leg_swallowed(
@@ -5456,15 +5539,11 @@ pub(super) async fn broadcast_to_single_peer(
     }
 
     // #6143: the flagged leg's send is over (a stream's completion has been
-    // awaited above), so its ack deadline starts now. A failed send is left
-    // to the deadline: that is what it is for.
+    // awaited above) and its delivery bookkeeping is done, so its ack
+    // deadline starts now. A failed send is left to the deadline: that is
+    // what it is for.
     if flagged {
-        op_manager.confirmed_delivery.send_finished(
-            key.id(),
-            &peer_key,
-            update_tx,
-            op_manager.confirmed_delivery.now(),
-        );
+        finish_flagged_leg(op_manager, &key, &peer_key, update_tx);
     }
 
     // NOTE: telemetry / interest-refresh / summary-cache are intentionally NOT

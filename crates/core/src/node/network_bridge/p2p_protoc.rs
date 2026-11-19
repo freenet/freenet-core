@@ -3609,8 +3609,12 @@ fn inline_broadcast_contract(
 ) -> Option<freenet_stdlib::prelude::ContractInstanceId> {
     use crate::operations::update::UpdateMsg;
     match msg {
+        // The flagged inline variant (#6143) too, or a confirmed leg's wire
+        // outcome would be the one leg the #6143 `wire_*` counts miss.
         NetMessage::V1(NetMessageV1::Update(
-            UpdateMsg::BroadcastTo { key, .. } | UpdateMsg::BroadcastToV2 { key, .. },
+            UpdateMsg::BroadcastTo { key, .. }
+            | UpdateMsg::BroadcastToV2 { key, .. }
+            | UpdateMsg::BroadcastToAckRequested { key, .. },
         )) => Some(*key.id()),
         NetMessage::V1(_) => None,
     }
@@ -4407,6 +4411,35 @@ mod confirmed_delivery_floor_tests {
                  decoder) or raise the floor"
             ),
         }
+    }
+
+    /// Round 1 Should Fix 7: a flagged INLINE leg is observed by the #6143
+    /// `wire_*` counters like any inline broadcast; streams are not inline.
+    #[test]
+    fn a_flagged_inline_leg_is_an_observed_inline_broadcast() {
+        use crate::message::{DeltaOrFullState, NetMessage, Transaction};
+        use crate::operations::update::UpdateMsg;
+        use crate::ring::broadcast_coverage::CoveredPeers;
+        let key = crate::operations::test_utils::make_contract_key(3);
+        let id = Transaction::new::<UpdateMsg>();
+        let inline: NetMessage = UpdateMsg::BroadcastToAckRequested {
+            id,
+            key,
+            payload: DeltaOrFullState::Delta(vec![1]),
+            sender_summary_bytes: vec![],
+            covered: CoveredPeers::empty(),
+        }
+        .into();
+        assert_eq!(super::inline_broadcast_contract(&inline), Some(*key.id()));
+        let streamed: NetMessage = UpdateMsg::BroadcastToStreamingAckRequested {
+            id,
+            stream_id: crate::transport::StreamId::next(),
+            key,
+            total_size: 1,
+            covered: CoveredPeers::empty(),
+        }
+        .into();
+        assert_eq!(super::inline_broadcast_contract(&streamed), None);
     }
 
     /// The floor must never drop to a release without the decoder.
