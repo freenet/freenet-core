@@ -3116,6 +3116,19 @@ mod tests {
                  sides), not a ceiling; a term inside QUIC_CONNECTION_CHARGE_BYTES",
             ),
             (
+                "QUIC_HANDSHAKE_PHASE_CHARGE_BYTES",
+                "the charge one native joiner takes from the QUIC connection cap \
+                 (#6297), not a ceiling; joiners draw permit units from the same \
+                 cap total as paths, so their memory is inside the QUIC transport \
+                 share (cap x QUIC_CONNECTION_CHARGE_BYTES), which is summed",
+            ),
+            (
+                "PERMIT_UNIT_BYTES",
+                "the unit the QUIC connection cap counts in (#6297), not a budget; \
+                 the cap's total is limit x the path charge in these units, which \
+                 the QUIC transport share already sums",
+            ),
+            (
                 "QUIC_STOPPED_ENTRY_BYTES",
                 "a measurement of one QUIC connection term (one entry of quinn's \
                  stopped map), not a ceiling; a term inside \
