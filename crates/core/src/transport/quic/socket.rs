@@ -348,6 +348,10 @@ const RECEIVE_PANIC_IN_QUINN: u8 = 3;
 /// Every write-readiness poll panics in the adapter's own code.
 #[cfg(any(test, feature = "testing"))]
 const WRITABLE_PANIC: u8 = 1;
+/// The next write-readiness poll panics so that the panic unwinds through
+/// quinn's connection driver, as one in quinn's own code would.
+#[cfg(any(test, feature = "testing"))]
+const WRITABLE_PANIC_IN_QUINN: u8 = 4;
 /// The next write-readiness poll panics in the adapter's own code, once.
 #[cfg(any(test, feature = "testing"))]
 const WRITABLE_PANIC_ONCE: u8 = 2;
@@ -394,6 +398,14 @@ impl SocketFaults {
     /// code.
     pub(crate) fn panic_next_writable(&self) {
         self.writable.store(WRITABLE_PANIC_ONCE, Ordering::Release);
+    }
+
+    /// Panic in the NEXT write-readiness poll only, outside the adapter's
+    /// catch, so it unwinds through quinn's connection driver while the
+    /// driver holds the connection's state lock.
+    pub(crate) fn panic_next_writable_in_quinn(&self) {
+        self.writable
+            .store(WRITABLE_PANIC_IN_QUINN, Ordering::Release);
     }
 
     /// Write-readiness polls that panicked.
@@ -773,7 +785,7 @@ thread_local! {
     /// transmit back to back on one thread with nothing in between
     /// (`quinn/src/connection.rs:1138-1145`), so the next `try_send` on this
     /// thread is that connection's, and its take uses exactly that admission.
-    /// quinn's endpoint `respond` (`endpoint.rs:584`) sends with no poll, finds
+    /// quinn's endpoint `respond` (`endpoint.rs:606`) sends with no poll, finds
     /// nothing here, and leaves every admission alone. quinn is pinned; a
     /// quinn bump must re-check this call order
     /// (`a_poller_hands_its_admission_to_the_transmit_that_follows`).
@@ -854,6 +866,20 @@ impl<S: Socket> UdpPoller for QuicPoller<S> {
         let socket = this.socket.clone();
         if socket.health.has_adapter_panicked() {
             return Poll::Ready(Err(adapter_panicked_error()));
+        }
+        #[cfg(any(test, feature = "testing"))]
+        if socket
+            .faults
+            .writable
+            .compare_exchange(
+                WRITABLE_PANIC_IN_QUINN,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            panic!("injected panic in the QUIC connection driver, unwinding through quinn");
         }
         let _quic = super::breaker::QuicCode::enter();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| this.poll_ready(cx))) {

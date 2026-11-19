@@ -162,7 +162,7 @@ through a thread-local (quic/socket.rs HANDED_ADMISSION), relying on
 freenet-quinn 0.11.13 calling poll_writable then try_send back to back on one
 thread (connection.rs:1138-1145; a quinn bump must re-check it,
 a_poller_hands_its_admission_to_the_transmit_that_follows). quinn's
-endpoint respond (endpoint.rs:627) sends with no poll, finds no handoff and
+endpoint respond (endpoint.rs:606) sends with no poll, finds no handoff and
 leaves every admission alone. No take ever uses an admission it does not
 name. The queue holds a waker
 and a place, never bytes. So connections share the cap by their number of
@@ -3710,7 +3710,7 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     quinn-rs/quinn#2987, which upstream has merged and not released: switch
     back to upstream `quinn` once it does. Re-checked against it for the
     switch to the fork: the poller handoff (connection.rs:1138-1145),
-    `respond` (endpoint.rs:627), `ConnectionRef::new` building the poller
+    `respond` (endpoint.rs:606), `ConnectionRef::new` building the poller
     synchronously (connection.rs:1010; rebind 1187), `ConnectionRef::drop`
     (connection.rs:1032), the INTERNAL_ERROR on a dropped event channel
     (connection.rs:1196-1201), the spawn order and the driver poll are
@@ -3740,18 +3740,32 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     aborted the process (#6184); they now use
     unwrap_or_else(PoisonError::into_inner). The panic reaches
     liveness::watch_endpoint_driver, which catches it, logs ERROR and turns
-    the endpoint Down like any other end of the driver. quinn's other calls
-    on the poisoned endpoint (accept, connect, local_addr, stats) still
-    unwrap the lock and panic in their caller, so the accept loop
-    (quic.rs spawn_accept_loop; it is a monitored task, where a panic is a
-    node failure) and connect_with catch it. Pinned by
-    a_panic_unwinding_through_the_endpoint_driver_is_contained.
-  → CONNECTION-driver panics: SendStream, RecvStream, ConnectionRef,
-    ConnectionDriver and StoppedRegistration now lock in Drop through
-    lock_for_drop, which skips a poisoned lock, so dropping them during an
-    unwind no longer aborts. NOT tested here, and the poisoned connection's
-    other calls (a write, a read, close) still panic in the task that makes
-    them. Do not add catch-and-leak machinery around quinn here.
+    the endpoint Down (EndpointHealth::quinn_panicked: ERROR log,
+    quic_endpoint_down, the adapter-panic flag and signal so every
+    connection's watcher closes locally; quic_adapter_panicked stays 0).
+    quinn's other calls on the poisoned endpoint (accept, connect,
+    local_addr, every Incoming method and the drop of an unanswered Incoming)
+    still unwrap the lock and panic in their caller, so the node reaches
+    them through one mechanism: once the endpoint is Down
+    EndpointHealth::guard_quinn skips the call, and a panic in one is caught
+    and reported the same way (quic::GuardedIncoming wraps every
+    quinn::Incoming; connect and local_addr use guard_quinn; accept has a
+    catch in accept_attempt). The accept loop is a monitored task, where a
+    panic is a node failure. Pinned by
+    a_panic_unwinding_through_the_endpoint_driver_is_contained and the
+    a_pending_incoming_*_after_an_endpoint_driver_panic_is_contained tests
+    (a pending attempt, then ignore/retry/establish/drop).
+  → CONNECTION-driver panics: watch_connection_driver (runtime.rs spawn)
+    catches them and reports them the same way, so the endpoint goes Down and
+    every connection closes locally (traffic falls back); the poisoned
+    connection would otherwise stay wedged with its permit held.
+    SendStream, RecvStream, ConnectionRef, ConnectionDriver and
+    StoppedRegistration lock in Drop through lock_for_drop, which skips a
+    poisoned lock, and QuicCloser::close catches the panic quinn's close
+    raises on one, so QuicConnection::drop cannot abort during an unwind.
+    Pinned by a_connection_driver_panic_in_quinn_is_contained. The poisoned
+    connection's other calls (a write, a read) still panic in the task that
+    makes them. Do not add catch-and-leak machinery around quinn here.
   → Telling them apart: a caught adapter panic leaves the process running
     (ERROR log, quic_adapter_panicked, quic_endpoint_down) and leaves no
     crash-loop breaker state, so QUIC comes back on the next start, and a

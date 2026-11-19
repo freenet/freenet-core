@@ -78,18 +78,29 @@
 //!   (`endpoint.rs:770`) run during the unwind; they lock with
 //!   `unwrap_or_else(PoisonError::into_inner)` now (they unwrapped before,
 //!   which aborted the process). The panic then reaches
-//!   [`watch_endpoint_driver`], which catches it, logs ERROR and reports the
-//!   endpoint Down like any other end of the driver. quinn's other calls on
-//!   the poisoned endpoint (`accept`, `connect`, `local_addr`) still unwrap
-//!   the lock and panic in their caller: the accept loop and `connect_with`
-//!   catch that (`quic.rs`). Pinned by
-//!   `a_panic_unwinding_through_the_endpoint_driver_is_contained`.
-//! - In quinn's own code inside a CONNECTION driver: the destructors of
-//!   `SendStream`, `RecvStream`, `ConnectionRef`, `ConnectionDriver` and
-//!   the `StoppedRegistration` lock through `lock_for_drop`, which skips a
-//!   poisoned lock, so dropping them during an unwind no longer aborts. NOT
-//!   tested here, and the poisoned connection's other calls (a write, a
-//!   read, `close`) still panic in the task that makes them.
+//!   [`watch_endpoint_driver`], which catches it, reports it through
+//!   [`EndpointHealth::quinn_panicked`] (ERROR log, endpoint Down, the
+//!   adapter-panic flag and signal, so every connection's watcher closes its
+//!   connection locally) like any other end of the driver. quinn's other
+//!   calls on the poisoned endpoint (`accept`, `connect`, `local_addr`, and
+//!   every `Incoming` method and drop) still unwrap the lock and panic in
+//!   their caller. The node reaches them through ONE mechanism: Down makes
+//!   [`EndpointHealth::guard_quinn`] skip the call, and a panic in one is
+//!   caught and reported the same way (`quic::GuardedIncoming` for the
+//!   attempts, `guard_quinn` for `connect` and `local_addr`, a catch around
+//!   `accept`). Pinned by
+//!   `a_panic_unwinding_through_the_endpoint_driver_is_contained` and the
+//!   `a_pending_incoming_*_after_an_endpoint_driver_panic_is_contained` tests.
+//! - In quinn's own code inside a CONNECTION driver: caught by
+//!   [`watch_connection_driver`] and reported the same way (the endpoint goes
+//!   Down and its connections are closed locally, so traffic falls back; the
+//!   poisoned connection would otherwise stay wedged with its permit held).
+//!   The connection's destructors lock through `lock_for_drop`, which skips
+//!   a poisoned lock, and `QuicCloser::close` (so `QuicConnection::drop`)
+//!   catches the panic quinn's `close` raises on one. Pinned by
+//!   `a_connection_driver_panic_in_quinn_is_contained`. The poisoned
+//!   connection's other calls (a write, a read) still panic in the task that
+//!   makes them.
 //!
 //! With `transport-quic = "off"` no endpoint exists, and the transport
 //! reports [`QuicAvailability::Disabled`].
@@ -378,6 +389,87 @@ impl EndpointHealth {
         }
     }
 
+    /// A panic escaped from quinn's own code (a driver, or a call into a
+    /// quinn object whose state lock a driver panic poisoned) and was caught
+    /// by the node. Unlike [`Self::adapter_panicked`] it is not the socket
+    /// adapter's, so `quic_adapter_panicked` is not counted, but the effect
+    /// is the same: the lock quinn holds that state under is poisoned, so
+    /// the endpoint (or at least that connection) cannot be trusted. It sets
+    /// the same final flag (every adapter call then fails, connects are
+    /// refused), signals the connection watchers to close their connections
+    /// locally, and turns the endpoint `Down` (the first one logs at ERROR
+    /// and counts `quic_endpoint_down`; a later one logs at DEBUG).
+    pub(crate) fn quinn_panicked(&self, call: &'static str, payload: &(dyn std::any::Any + Send)) {
+        let message = panic_message(payload);
+        if self.adapter_panicked.swap(true, Ordering::AcqRel) {
+            tracing::debug!(local_addr = %self.local_addr, call, panic = message, "A panic in quinn was caught again");
+            return;
+        }
+        let mut was = QuicAvailability::Up;
+        let went_down = self.availability.send_if_modified(|availability| {
+            was = *availability;
+            if *availability == QuicAvailability::Up {
+                *availability = QuicAvailability::Down;
+                true
+            } else {
+                false
+            }
+        });
+        self.adapter_panic_signal.send_replace(true);
+        if went_down {
+            TRANSPORT_METRICS.record_quic_endpoint_down(self.local_addr);
+        }
+        tracing::error!(
+            local_addr = %self.local_addr,
+            call,
+            panic = message,
+            availability = ?was,
+            "A panic inside quinn was caught (a poisoned quinn lock); the QUIC endpoint is \
+             down and its connections are closed locally"
+        );
+    }
+
+    /// Run `f`, a call into quinn that locks state a driver panic may have
+    /// poisoned (quinn unwraps those locks outside its destructors). Not run
+    /// at all once the endpoint is Down or a panic was caught, because the
+    /// lock may be poisoned and the answer would be an error anyway: `None`.
+    /// A panic in it is caught, reported through [`Self::quinn_panicked`],
+    /// and also gives `None`. The one place the node calls quinn through
+    /// where a poisoned lock is possible, so the call sites do not each
+    /// carry a catch.
+    pub(crate) fn guard_quinn<R>(&self, call: &'static str, f: impl FnOnce() -> R) -> Option<R> {
+        if self.refuses_connects() {
+            return None;
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            Ok(value) => Some(value),
+            Err(payload) => {
+                self.quinn_panicked(call, &*payload);
+                None
+            }
+        }
+    }
+
+    /// Drop a quinn value whose destructor locks endpoint state (an
+    /// unanswered `Incoming`), catching a panic from a poisoned lock.
+    /// quinn's destructors take what they hold out first, so the unwind
+    /// does not lock again.
+    pub(crate) fn drop_quinn<T>(&self, call: &'static str, value: T) {
+        if let Err(payload) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(value)))
+        {
+            self.quinn_panicked(call, &*payload);
+        }
+    }
+
+    /// Test only: mark the endpoint `Up` again after a caught panic, so a
+    /// call reaches quinn's poisoned lock instead of being refused first.
+    #[cfg(test)]
+    pub(crate) fn force_up_for_test(&self) {
+        self.adapter_panicked.store(false, Ordering::Release);
+        self.availability.send_replace(QuicAvailability::Up);
+    }
+
     /// The endpoint driver's future returned.
     fn driver_ended(&self) {
         if self.is_released() {
@@ -439,13 +531,25 @@ pub(crate) async fn watch_endpoint_driver(
     // error return and a normal return look alike here; `released` tells
     // them apart.
     if let Err(payload) = std::panic::AssertUnwindSafe(driver).catch_unwind().await {
-        tracing::error!(
-            local_addr = %health.local_addr,
-            panic = panic_message(&*payload),
-            "The QUIC endpoint driver panicked inside quinn; the panic was contained"
-        );
+        health.quinn_panicked("endpoint driver", &*payload);
     }
     health.driver_ended();
+}
+
+/// Run one of quinn's connection drivers and report a panic in it to
+/// `health`. The panic poisons that connection's state lock, so its watcher's
+/// `closed()` would never resolve and its permit and key hold would stay;
+/// reporting it turns the endpoint Down, and every connection's watcher then
+/// closes its connection locally (traffic falls back to UDP, as after an
+/// adapter panic). A driver that returns normally needs nothing here.
+pub(crate) async fn watch_connection_driver(
+    driver: Pin<Box<dyn Future<Output = ()> + Send>>,
+    health: Arc<EndpointHealth>,
+) {
+    use futures::FutureExt;
+    if let Err(payload) = std::panic::AssertUnwindSafe(driver).catch_unwind().await {
+        health.quinn_panicked("connection driver", &*payload);
+    }
 }
 
 #[cfg(test)]

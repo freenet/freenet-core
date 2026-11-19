@@ -246,9 +246,13 @@ pub(crate) const INCOMING_BUFFER_TOTAL_BYTES: u64 = 1024 * 1024;
 
 // Measured terms of the memory one QUIC connection holds, per side, from
 // `quic::memory_tests` with quinn 0.11.12 / quinn-proto 0.11.19 / rustls
-// 0.23.45 (every pin test was re-run against freenet-quinn 0.11.13, the
-// pinned fork build: all bounds hold, so the figures stand as upper bounds), in bytes rounded up to jemalloc's size classes as the node's
-// linux-gnu build allocates them (`util::alloc_count`). Each constant is a
+// 0.23.45, in bytes rounded up to jemalloc's size classes as the node's
+// linux-gnu build allocates them (`util::alloc_count`). The committed tree
+// links freenet-quinn / freenet-quinn-proto 0.11.13 (see
+// `QUIC_MEMORY_MEASURED_WITH`); every pin test passes against it, so the
+// figures hold as upper bounds there, and they were not re-measured: one
+// term (the `stopped` map entry) now measures 0 rather than its figure.
+// Each constant is a
 // measurement of one named term under the conditions its doc states, plus
 // a stated margin, and its test fails if a re-measurement exceeds it. They
 // are NOT a ceiling on what a connection can hold: the conditions listed

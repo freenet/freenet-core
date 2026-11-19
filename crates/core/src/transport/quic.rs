@@ -428,7 +428,13 @@ impl<S: Socket> QuicSources for DemuxSocket<S> {
 impl std::fmt::Debug for QuicEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QuicEndpoint")
-            .field("local_addr", &self.endpoint.local_addr().ok())
+            .field(
+                "local_addr",
+                &self
+                    .health
+                    .guard_quinn("endpoint local_addr", || self.endpoint.local_addr().ok())
+                    .flatten(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -998,14 +1004,16 @@ impl QuicEndpoint {
         let holds = Arc::new(self.cap_holds.like());
         // quinn locks the endpoint's state with `unwrap`, so a connect that
         // races a panic in quinn's endpoint driver (which poisons the lock)
-        // panics in this caller's task: report it as a stopped endpoint
-        // instead, as `refuses_connects` does once the watcher has run.
+        // would panic in this caller's task: `guard_quinn` reports it and
+        // this is a stopped endpoint, as `refuses_connects` says once the
+        // watcher has run.
         let connecting = socket::with_poller_holds(&holds, || {
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                self.endpoint
-                    .connect_with(config, addr, config::SERVER_NAME)
-            }))
-            .unwrap_or(Err(quinn::ConnectError::EndpointStopping))
+            self.health
+                .guard_quinn("endpoint connect", || {
+                    self.endpoint
+                        .connect_with(config, addr, config::SERVER_NAME)
+                })
+                .unwrap_or(Err(quinn::ConnectError::EndpointStopping))
         })?;
         let connection = connecting.await?;
         Ok(QuicConnection::new(
@@ -1063,14 +1071,12 @@ impl EndpointCore {
             };
             let incoming = match accepted {
                 Ok(incoming) => incoming?,
-                Err(_) => {
-                    tracing::error!(
-                        "QUIC accept panicked inside quinn (a poisoned endpoint lock after an \
-                         endpoint driver panic); the panic was contained"
-                    );
+                Err(payload) => {
+                    self.health.quinn_panicked("endpoint accept", &*payload);
                     return None;
                 }
             };
+            let incoming = GuardedIncoming::new(incoming, self.health.clone());
             let remote = incoming.remote_address();
             // One step under the allow-set entry's lock, so a permit dropped
             // concurrently is not brought back.
@@ -1119,7 +1125,7 @@ impl EndpointCore {
     /// Decide an attempt from a source nobody named, in order: Retry, the
     /// per-address and global limits, the allow-set, the TLS configuration.
     /// Every outcome is counted; `Some` only for an admitted joiner.
-    fn admit(&self, gate: &GatewayAdmission, incoming: quinn::Incoming) -> Option<JoinerIncoming> {
+    fn admit(&self, gate: &GatewayAdmission, incoming: GuardedIncoming) -> Option<JoinerIncoming> {
         use crate::transport::metrics::GatewayAdmission as Outcome;
         let remote = incoming.remote_address();
         let ticket = match gate
@@ -1129,11 +1135,7 @@ impl EndpointCore {
             Ok(ticket) => ticket,
             Err(refusal @ admission::Refusal::Retry) => {
                 super::TRANSPORT_METRICS.record_gateway_admission(refusal.outcome());
-                if let Err(refused) = incoming.retry() {
-                    // quinn refuses only an attempt that carries a token,
-                    // which reads as validated.
-                    refused.into_incoming().ignore();
-                }
+                incoming.retry();
                 return None;
             }
             Err(
@@ -1199,11 +1201,98 @@ impl EndpointAttempt {
     }
 }
 
+/// A quinn [`quinn::Incoming`] reached only through the endpoint's health.
+///
+/// After a panic in quinn's endpoint driver the endpoint's state lock is
+/// poisoned, and every `Incoming` method that locks it (`ignore`, `retry`,
+/// `accept_with`, and the drop of an unanswered one) unwraps that lock and
+/// panics. Those calls come from the monitored accept loop and from
+/// `establish`, so each goes through here: once the endpoint is Down the call
+/// is not made, and a panic in one is caught and reported
+/// ([`EndpointHealth::quinn_panicked`]). quinn takes the attempt's state out
+/// before it locks, so the unwind drops nothing that locks again.
+struct GuardedIncoming {
+    incoming: Option<quinn::Incoming>,
+    health: Arc<EndpointHealth>,
+}
+
+impl GuardedIncoming {
+    fn new(incoming: quinn::Incoming, health: Arc<EndpointHealth>) -> Self {
+        Self {
+            incoming: Some(incoming),
+            health,
+        }
+    }
+
+    fn live(&self) -> &quinn::Incoming {
+        self.incoming.as_ref().expect("not yet consumed")
+    }
+
+    /// Not a quinn lock: a read of the attempt's own state.
+    fn remote_address(&self) -> SocketAddr {
+        self.live().remote_address()
+    }
+
+    fn remote_address_validated(&self) -> bool {
+        self.live().remote_address_validated()
+    }
+
+    /// Run `f` on the attempt unless the endpoint is Down; `None` then, or
+    /// if `f` panicked.
+    fn consume<R>(mut self, call: &'static str, f: impl FnOnce(quinn::Incoming) -> R) -> Option<R> {
+        let incoming = self.incoming.take()?;
+        if self.health.refuses_connects() {
+            self.health.drop_quinn(call, incoming);
+            return None;
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(incoming))) {
+            Ok(value) => Some(value),
+            Err(payload) => {
+                self.health.quinn_panicked(call, &*payload);
+                None
+            }
+        }
+    }
+
+    fn ignore(self) {
+        self.consume("incoming ignore", quinn::Incoming::ignore);
+    }
+
+    fn retry(self) {
+        self.consume("incoming retry", |incoming| {
+            if let Err(refused) = incoming.retry() {
+                // quinn refuses only an attempt that already carries a Retry
+                // token, and that one reads as validated.
+                refused.into_incoming().ignore();
+            }
+        });
+    }
+
+    /// `Err(LocallyClosed)` when the endpoint is Down or quinn panicked: the
+    /// handshake did not start, which reads as `EndpointDown`.
+    fn accept_with(
+        self,
+        config: Arc<quinn::ServerConfig>,
+    ) -> Result<quinn::Connecting, quinn::ConnectionError> {
+        self.consume("incoming accept", |incoming| incoming.accept_with(config))
+            .unwrap_or(Err(quinn::ConnectionError::LocallyClosed))
+    }
+}
+
+impl Drop for GuardedIncoming {
+    /// An unanswered attempt dropped: quinn refuses it, which locks.
+    fn drop(&mut self) {
+        if let Some(incoming) = self.incoming.take() {
+            self.health.drop_quinn("incoming drop", incoming);
+        }
+    }
+}
+
 /// An admitted native join from a source nobody named: accepted with the
 /// proven-key verifier, offering the native ALPN only, its address on the
 /// allow-set while the attempt and then its connection live.
 pub(crate) struct JoinerIncoming {
-    incoming: quinn::Incoming,
+    incoming: GuardedIncoming,
     permit: QuicSourcePermit,
     config: Arc<quinn::ServerConfig>,
     /// Given back if the attempt is dropped before its handshake starts.
@@ -1262,7 +1351,7 @@ impl JoinerIncoming {
 /// An incoming connection attempt from an allowed source, holding a permit
 /// for its address until the handshake ends.
 pub(crate) struct QuicIncoming {
-    incoming: quinn::Incoming,
+    incoming: GuardedIncoming,
     /// The endpoint's health, for the connection's watcher and closer.
     health: Arc<EndpointHealth>,
     permit: QuicSourcePermit,
@@ -1313,11 +1402,7 @@ impl QuicIncoming {
     /// egress cap has no room for it, as any datagram can be lost: the client
     /// retransmits its Initial and is answered again.
     pub(crate) fn retry(self) {
-        if let Err(refused) = self.incoming.retry() {
-            // quinn refuses only an attempt that already carries a Retry
-            // token, and that one reads as validated.
-            refused.into_incoming().ignore();
-        }
+        self.incoming.retry();
     }
 
     /// Complete the handshake. On failure the permit is dropped with it.
@@ -1407,33 +1492,43 @@ impl QuicConnection {
         // the watcher then closes it the same way.
         let watched = connection.clone();
         let down_closer = closer.clone();
+        let watcher_health = down_closer.health.clone();
         GlobalExecutor::spawn(async move {
-            let close_now = async {
-                if availability.not_up().await != QuicAvailability::Down
-                    && adapter_panic.wait_for(|panicked| *panicked).await.is_err()
-                {
-                    // Unreachable while this task runs: `down_closer` holds
-                    // the health, whose sender therefore outlives this
-                    // receiver. Kept as a safe fallback (never close).
-                    std::future::pending::<()>().await;
+            use futures::FutureExt;
+            // A panic in the connection's driver poisoned its state lock, which
+            // `closed()` below unwraps: caught, so the permit and the key hold
+            // are dropped with the future instead of the task dying noisily.
+            let watch = async move {
+                let close_now = async {
+                    if availability.not_up().await != QuicAvailability::Down
+                        && adapter_panic.wait_for(|panicked| *panicked).await.is_err()
+                    {
+                        // Unreachable while this task runs: `down_closer` holds
+                        // the health, whose sender therefore outlives this
+                        // receiver. Kept as a safe fallback (never close).
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::select! {
+                    _ = watched.closed() => {}
+                    _ = close_now => {
+                        down_closer.close(QuicCloseCode::Downgrade);
+                    }
                 }
+                let reason = watched.closed().await;
+                if let quinn::ConnectionError::ApplicationClosed(close) = &reason {
+                    TRANSPORT_METRICS.record_quic_close_received(
+                        close.error_code.into_inner(),
+                        watched.remote_address(),
+                    );
+                }
+                tracing::debug!(%reason, remote = %watched.remote_address(), "QUIC connection ended");
+                drop(hold);
+                drop(permit);
             };
-            tokio::select! {
-                _ = watched.closed() => {}
-                _ = close_now => {
-                    down_closer.close(QuicCloseCode::Downgrade);
-                }
+            if let Err(payload) = std::panic::AssertUnwindSafe(watch).catch_unwind().await {
+                watcher_health.quinn_panicked("connection watcher", &*payload);
             }
-            let reason = watched.closed().await;
-            if let quinn::ConnectionError::ApplicationClosed(close) = &reason {
-                TRANSPORT_METRICS.record_quic_close_received(
-                    close.error_code.into_inner(),
-                    watched.remote_address(),
-                );
-            }
-            tracing::debug!(%reason, remote = %watched.remote_address(), "QUIC connection ended");
-            drop(hold);
-            drop(permit);
         });
         Self {
             connection,
@@ -1586,18 +1681,32 @@ impl QuicCloser {
         if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return false;
         }
-        if self.connection.close_reason().is_some() {
-            return false;
+        // Every call below locks the connection's state, which a panic in
+        // its driver poisoned (quinn unwraps that lock). This runs from
+        // `QuicConnection::drop`, which can be reached during an unwind, so
+        // a second panic there would abort: it is caught and reported, and
+        // the connection counts as not closed by us.
+        let closed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if self.connection.close_reason().is_some() {
+                return false;
+            }
+            if let Some(cause) = cause {
+                let _first = self.closed_for.set(cause);
+            }
+            if self.health.closes_can_be_sent() {
+                TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
+            }
+            self.connection.close(code.code().into(), reason);
+            let _first = self.closed_with.set(code);
+            true
+        }));
+        match closed {
+            Ok(closed) => closed,
+            Err(payload) => {
+                self.health.quinn_panicked("connection close", &*payload);
+                false
+            }
         }
-        if let Some(cause) = cause {
-            let _first = self.closed_for.set(cause);
-        }
-        if self.health.closes_can_be_sent() {
-            TRANSPORT_METRICS.record_quic_close_sent(code, self.connection.remote_address());
-        }
-        self.connection.close(code.code().into(), reason);
-        let _first = self.closed_with.set(code);
-        true
     }
 
     /// The code of the close this node sent on the connection, if it sent one.
