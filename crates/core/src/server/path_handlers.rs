@@ -1749,6 +1749,15 @@ async fn handle_get_response(
 ///
 /// Both exits then run [`maybe_enforce_webapp_cache_budget`], which is what
 /// keeps the cache from growing without bound (see [`WEBAPP_CACHE_MAX_BYTES`]).
+///
+/// # Cancellation safety
+///
+/// Dropping this future is safe. Once the directory mutation starts it runs in
+/// a detached task that owns the lock guard, so it completes, and releases the
+/// lock, whether or not the caller is still waiting. A later call therefore
+/// waits for it instead of unpacking into the same directory concurrently.
+/// Only the trailing budget sweep is skipped, and the next unpack or debounced
+/// reconcile sweep covers it.
 async fn unpack_if_stale(
     contract: &ContractContainer,
     state_bytes: &[u8],
@@ -1785,59 +1794,84 @@ async fn unpack_if_stale(
     }
 
     debug!("State changed or not cached, unpacking webapp");
-    let state = State::from(state_bytes);
 
-    fn err(err: WebContractError, contract: &ContractContainer) -> WebSocketApiError {
-        let key = contract.key();
-        tracing::error!("{err}");
-        WebSocketApiError::InvalidParam {
-            error_cause: format!("{UNPACK_FAILED_PREFIX}{key}"),
+    // The mutation below runs in a DETACHED task that owns the per-contract
+    // lock guard. `spawn_blocking` work cannot be cancelled, so if this future
+    // were dropped mid-await (a client disconnect) with the guard held here,
+    // the guard would be released while the unpack kept writing, and the next
+    // request could `remove_dir_all` + unpack into the same directory
+    // concurrently. The task finishes (and releases the lock) regardless of
+    // whether anyone is still waiting on it.
+    let contract_owned = contract.clone();
+    let state_owned = state_bytes.to_vec();
+    let path_owned = path.clone();
+    let hash_path_owned = hash_path.clone();
+    tokio::spawn(async move {
+        let _guard = _guard;
+        let contract = &contract_owned;
+        let state_bytes: &[u8] = &state_owned;
+        let path = path_owned;
+        let hash_path = hash_path_owned;
+        let state = State::from(state_bytes);
+
+        fn err(err: WebContractError, contract: &ContractContainer) -> WebSocketApiError {
+            let key = contract.key();
+            tracing::error!("{err}");
+            WebSocketApiError::InvalidParam {
+                error_cause: format!("{UNPACK_FAILED_PREFIX}{key}"),
+            }
         }
-    }
 
-    // Clear existing cache if any; may not exist yet
-    let _cleanup = tokio::fs::remove_dir_all(&path).await;
-    tokio::fs::create_dir_all(&path)
+        // Clear existing cache if any; may not exist yet
+        let _cleanup = tokio::fs::remove_dir_all(&path).await;
+        tokio::fs::create_dir_all(&path)
+            .await
+            .map_err(|e| WebSocketApiError::NodeError {
+                error_cause: format!("Failed to create cache dir: {e}"),
+            })?;
+
+        // Decompression and file writes are blocking work on up to 100 MB of
+        // input; keep them off the async worker.
+        let unpack_path = path.clone();
+        let state_owned = state.as_ref().to_vec();
+        let unpacked = tokio::task::spawn_blocking(move || {
+            WebApp::try_from(state_owned.as_slice()).and_then(|mut web| web.unpack(&unpack_path))
+        })
         .await
-        .map_err(|e| WebSocketApiError::NodeError {
-            error_cause: format!("Failed to create cache dir: {e}"),
-        })?;
+        .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))
+        .and_then(|result| result)
+        .map_err(|e| err(e, contract));
+        if let Err(unpack_failed) = unpacked {
+            // Take the directory back out. A contract that is not a web archive
+            // fails here every time it is requested, and the sweep would never
+            // reclaim what it leaves: an empty directory contributes 0 bytes to a
+            // budget measured in bytes. With the cold fetch no longer gated on
+            // local presence, that would be one attacker-named directory per key.
+            if let Err(cleanup_failed) = tokio::fs::remove_dir_all(&path).await {
+                debug!("webapp cache: could not remove failed unpack dir: {cleanup_failed}");
+            }
+            // The stored hash described the directory just removed. Leave it and the
+            // entry reads as warm (hash present) while serving nothing.
+            if let Err(e) = tokio::fs::remove_file(&hash_path).await {
+                debug!("webapp cache: could not remove stale hash: {e}");
+            }
+            return Err(unpack_failed);
+        }
 
-    // Decompression and file writes are blocking work on up to 100 MB of
-    // input; keep them off the async worker.
-    let unpack_path = path.clone();
-    let state_owned = state.as_ref().to_vec();
-    let unpacked = tokio::task::spawn_blocking(move || {
-        WebApp::try_from(state_owned.as_slice()).and_then(|mut web| web.unpack(&unpack_path))
+        // Store new hash LAST, so a partial unpack does not leave a stale
+        // hash file that would make future requests skip the fetch.
+        tokio::fs::write(&hash_path, current_hash.to_be_bytes())
+            .await
+            .map_err(|e| WebSocketApiError::NodeError {
+                error_cause: format!("Failed to write state hash: {e}"),
+            })?;
+
+        Ok::<(), WebSocketApiError>(())
     })
     .await
-    .map_err(|e| WebContractError::UnpackingError(anyhow::anyhow!(e)))
-    .and_then(|result| result)
-    .map_err(|e| err(e, contract));
-    if let Err(unpack_failed) = unpacked {
-        // Take the directory back out. A contract that is not a web archive
-        // fails here every time it is requested, and the sweep would never
-        // reclaim what it leaves: an empty directory contributes 0 bytes to a
-        // budget measured in bytes. With the cold fetch no longer gated on
-        // local presence, that would be one attacker-named directory per key.
-        if let Err(cleanup_failed) = tokio::fs::remove_dir_all(&path).await {
-            debug!("webapp cache: could not remove failed unpack dir: {cleanup_failed}");
-        }
-        // The stored hash described the directory just removed. Leave it and the
-        // entry reads as warm (hash present) while serving nothing.
-        if let Err(e) = tokio::fs::remove_file(&hash_path).await {
-            debug!("webapp cache: could not remove stale hash: {e}");
-        }
-        return Err(unpack_failed);
-    }
-
-    // Store new hash LAST, so a partial unpack does not leave a stale
-    // hash file that would make future requests skip the fetch.
-    tokio::fs::write(&hash_path, current_hash.to_be_bytes())
-        .await
-        .map_err(|e| WebSocketApiError::NodeError {
-            error_cause: format!("Failed to write state hash: {e}"),
-        })?;
+    .map_err(|e| WebSocketApiError::NodeError {
+        error_cause: format!("webapp unpack task failed: {e}"),
+    })??;
 
     // The unpack above is the only thing that grows the webapp cache, so it is
     // the natural (and cheapest) sweep trigger: the directory walk it costs is
@@ -1845,7 +1879,6 @@ async fn unpack_if_stale(
     // no request that merely reads from a warm cache pays for it. Released the
     // per-contract lock first so the sweep's `try_lock` guard is only reporting
     // on OTHER contracts' in-flight unpacks.
-    drop(_guard);
     maybe_enforce_webapp_cache_budget(cache, instance_id, SweepTrigger::Unpack).await;
 
     Ok(())
@@ -5504,6 +5537,76 @@ mod tests {
 
         CONTRACT_REFRESH_LOCKS.remove(&instance_id);
         clear_cache(&instance_id).await;
+    }
+
+    /// Dropping `unpack_if_stale` mid-unpack (a client disconnect) must not
+    /// release the per-contract lock while the unpack is still writing: the
+    /// next request would otherwise `remove_dir_all` and unpack into the same
+    /// directory concurrently.
+    #[tokio::test]
+    async fn dropping_unpack_if_stale_mid_unpack_keeps_the_lock_until_it_finishes() {
+        // A valid archive big enough that the unpack is still running when the
+        // future is dropped.
+        let len = 30 * 1024 * 1024;
+        let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(len);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                "big.bin",
+                std::io::Read::take(std::io::repeat(0), len),
+            )
+            .unwrap();
+        let big_state = WrappedState::new(
+            WebApp::from_data(Vec::new(), archive)
+                .unwrap()
+                .pack()
+                .unwrap(),
+        );
+        let (contract, small_state) = webapp_contract_and_state(&rand::random::<[u8; 16]>());
+        let instance_id = *contract.key().id();
+        let root = tempfile::tempdir().expect("tempdir");
+        let webapp_cache = cache(root.path(), u64::MAX);
+        clear_cache(&instance_id).await;
+
+        let mut first = Box::pin(unpack_if_stale(
+            &contract,
+            big_state.as_ref(),
+            &webapp_cache,
+        ));
+        let entry_dir = webapp_cache.entry_dir(&instance_id);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !entry_dir.exists() {
+            assert!(std::time::Instant::now() < deadline, "unpack never started");
+            tokio::select! {
+                result = &mut first => panic!("the unpack finished before it was dropped: {result:?}"),
+                () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {}
+            }
+        }
+        // The directory exists, so the detached task is past `create_dir_all`.
+        drop(first);
+
+        assert!(
+            try_acquire_cache_lock(&instance_id).is_none(),
+            "the lock was released while the unpack was still running"
+        );
+
+        // A second request waits for the first to finish, then replaces it.
+        unpack_if_stale(&contract, small_state.as_ref(), &webapp_cache)
+            .await
+            .expect("the second unpack must succeed");
+        assert!(entry_dir.join("index.html").exists());
+        assert!(
+            !entry_dir.join("big.bin").exists(),
+            "the two unpacks interleaved"
+        );
+        assert_eq!(
+            std::fs::read(webapp_cache.hash_path(&instance_id)).unwrap(),
+            hash_state(small_state.as_ref()).to_be_bytes()
+        );
     }
 
     /// A cache entry whose hash was written by an earlier build (no format

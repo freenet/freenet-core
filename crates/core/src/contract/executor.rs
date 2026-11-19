@@ -2921,6 +2921,26 @@ mod tests {
                 "unpacked-webapp cache under the XDG CACHE dir; on disk, and by its own \
                  doc outside the node's disk accounting too, so it is not resident memory",
             ),
+            (
+                "MAX_UNPACKED_TOTAL_BYTES",
+                "per-archive limit on one web-app unpack, written to disk; not a standing cache",
+            ),
+            (
+                "MAX_UNPACKED_FILE_BYTES",
+                "per-file limit within one web-app unpack, written to disk; not a standing cache",
+            ),
+            (
+                "TAR_ENTRY_OVERHEAD_BYTES",
+                "per-entry allowance used to derive the web-app decompressed-stream cap",
+            ),
+            (
+                "MAX_DECOMPRESSED_STREAM_BYTES",
+                "per-unpack cap on a streaming decoder, transient and freed when the unpack ends",
+            ),
+            (
+                "MAX_REWRITTEN_ASSET_BYTES",
+                "per-request read bound for one .js or HTML file, transient",
+            ),
             ("LOG_DIR_MAX_BYTES", "on-disk log rotation cap"),
             ("MIN_LOG_DIR_MAX_BYTES", "clamp for that log rotation cap"),
             (
