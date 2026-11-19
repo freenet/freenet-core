@@ -1167,6 +1167,89 @@ mod tests {
         );
     }
 
+    /// Round-1 Must Fix 2: a newer update must not demote a due resend back to
+    /// a first leg. Before the fix `arm` reset every stage to `Armed`, so a
+    /// contract written again during the resend window never got its resend.
+    #[test]
+    fn a_rearm_does_not_demote_a_due_resend() {
+        let t = table();
+        let (k, p, t0) = (key(1), peer(), Instant::now());
+        flagged(&t, k, &p, t0);
+        t.sweep(t0 + ACK_TIMEOUT);
+        assert_eq!(t.leg_duty(k.id(), &p), LegDuty::ResendFull);
+        t.arm(k, p.clone(), addr(1), t0 + ACK_TIMEOUT);
+        assert_eq!(
+            t.leg_duty(k.id(), &p),
+            LegDuty::ResendFull,
+            "re-arming must keep the resend that is already due"
+        );
+    }
+
+    /// Round-1 Must Fix 2: sustained client writes (one every 3 s, each leg
+    /// lost) must still reach the resend. Before the fix every re-arm and
+    /// every flagged leg pushed the deadline forward, so the resend never
+    /// came while the writes continued.
+    #[test]
+    fn sustained_writes_still_reach_the_resend() {
+        let t = table();
+        let (k, p, t0) = (key(1), peer(), Instant::now());
+        let mut resent = false;
+        for step in 0..20u32 {
+            let now = t0 + Duration::from_secs(3) * step;
+            if t.leg_duty(k.id(), &p) == LegDuty::ResendFull {
+                resent = true;
+                break;
+            }
+            t.arm(k, p.clone(), addr(1), now);
+            let id = tx();
+            t.record_flagged_send(k.id(), &p, id, now);
+            t.send_finished(k.id(), &p, id, now);
+            t.sweep(now);
+        }
+        assert!(
+            resent,
+            "a lossy pair written every 3 s must still be resent to within 60 s"
+        );
+    }
+
+    /// Round-1 Must Fix 2 (and the converged-skip race): once a flagged leg
+    /// has gone unconfirmed, a re-arm followed by a converged skip must not
+    /// settle the entry. The lost leg is what made the belief converged.
+    #[test]
+    fn a_converged_skip_after_an_unconfirmed_leg_settles_nothing() {
+        let t = table();
+        let (k, p, t0) = (key(1), peer(), Instant::now());
+        flagged(&t, k, &p, t0);
+        t.arm(k, p.clone(), addr(1), t0 + Duration::from_secs(1));
+        assert!(
+            !t.settle_converged(k.id(), &p),
+            "the skip reads a belief the unconfirmed leg wrote"
+        );
+        assert_eq!(t.len(), 1);
+    }
+
+    /// Round-1 Should Fix 5: a TRANSIENT drop (rate limit, merge budget,
+    /// overload) gets the one full-state resend after the ack timeout rather
+    /// than ending the repair.
+    #[test]
+    fn a_transient_drop_gets_the_resend() {
+        let t = table();
+        let (k, p, t0) = (key(1), peer(), Instant::now());
+        let id = flagged(&t, k, &p, t0);
+        t.on_ack(
+            k.id(),
+            &p,
+            id,
+            BroadcastAckOutcome::Dropped(BroadcastDropReason::RateLimited),
+            t0,
+        );
+        let (actions, _) = t.sweep(t0 + ACK_TIMEOUT);
+        assert!(
+            matches!(actions.as_slice(), [SweepAction::Resend { .. }]),
+            "a rate-limited drop must be retried once; got {actions:?}"
+        );
+    }
+
     #[test]
     fn the_give_up_warn_is_throttled_per_contract() {
         let t = table();

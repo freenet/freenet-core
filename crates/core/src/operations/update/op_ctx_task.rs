@@ -7818,6 +7818,29 @@ mod tests {
     /// Walk brace depth from the opening `{` of the named fn to the
     /// matching `}`. Returns the body slice. Robust to nearby section
     /// comments being renamed.
+    /// Round-1 Should Fix 3: a dedup-cache hit means the payload was SEEN, not
+    /// applied (the cache inserts before the merge), so it must not be acked.
+    /// Pinned on both drivers: the dedup branch notes no receiver outcome.
+    #[test]
+    fn a_dedup_hit_sends_no_confirmed_delivery_ack() {
+        let src = include_str!("op_ctx_task.rs");
+        for sig in [
+            "async fn drive_relay_broadcast_to(",
+            "async fn apply_streaming_broadcast(",
+        ] {
+            let body = extract_fn_body(src, sig);
+            let start = body
+                .find("receiver_terminal.mark_dedup();")
+                .unwrap_or_else(|| panic!("{sig} has a dedup branch"));
+            let branch = &body[start..];
+            let end = branch.find("return Ok(());").expect("dedup branch returns");
+            assert!(
+                !branch[..end].contains("note_receiver_outcome"),
+                "{sig}: a dedup hit must not ack; the merge may still fail"
+            );
+        }
+    }
+
     fn extract_fn_body<'a>(source: &'a str, signature_prefix: &str) -> &'a str {
         let start = source
             .find(signature_prefix)
