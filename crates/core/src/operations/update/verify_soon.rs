@@ -727,10 +727,14 @@ pub(crate) async fn run_verify_soon(ring: std::sync::Arc<crate::ring::Ring>) {
             }
             budget = budget.saturating_sub(fire_round(&op_manager, round, now));
         }
+        // Never sleep until a time already past: a due time this wake did not
+        // consume (deferred rounds, or a bug) would otherwise spin the loop.
         let next = if deferred {
             Some(now + DEFER_DELAY)
         } else {
-            verify.next_wake()
+            verify
+                .next_wake()
+                .map(|at| if at > now { at } else { now + DEFER_DELAY })
         };
         drop(op_manager);
         // Cancellation safety: every arm is a timer, a notification or the
@@ -1197,6 +1201,17 @@ mod tests {
         let take = body
             .find(".take_forced(&key, &peer_key")
             .expect("the leg consults the force mark");
+        let bind = body
+            .find("let forced_full =")
+            .expect("the forced_full binding");
+        let bound_to: String = body[bind + "let forced_full =".len()..take]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            bound_to, "op_manager.verify_soon",
+            "forced_full is exactly the force mark, nothing else"
+        );
         let skip = body
             .find("fanout_send_needed(")
             .expect("the converged skip");
