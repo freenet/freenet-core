@@ -2874,6 +2874,29 @@ impl TransportMetrics {
         self.record_per_peer(remote_addr, bytes, |s| &s.bytes_received);
     }
 
+    /// Record authenticated inbound QUIC stream payload bytes of one connection.
+    ///
+    /// QUIC packets are decrypted inside quinn and never reach
+    /// [`Self::record_packet_received`], so without this the download counters
+    /// miss every QUIC byte while [`Self::record_packet_sent`] counts QUIC
+    /// sends at the socket. `bytes` must come from data quinn returned after
+    /// authenticating it (stream reads), never from quinn's `udp_rx`, which
+    /// counts before decryption (#3999). `remote_addr` is `None` for a
+    /// connection that has ended: only the cumulative counter moves, so the
+    /// per-peer table does not regrow an entry for a peer that is gone. Skips
+    /// zero so an idle path does not churn the per-peer LRU. The packet count
+    /// is not moved: quinn exposes no authenticated packet count.
+    pub(crate) fn record_quic_received(&self, remote_addr: Option<SocketAddr>, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.cumulative_bytes_received
+            .fetch_add(bytes, Ordering::Relaxed);
+        if let Some(addr) = remote_addr {
+            self.record_per_peer(addr, bytes, |s| &s.bytes_received);
+        }
+    }
+
     /// Read cumulative bytes downloaded without resetting counters.
     pub fn cumulative_bytes_received(&self) -> u64 {
         self.cumulative_bytes_received.load(Ordering::Relaxed)

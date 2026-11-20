@@ -1094,6 +1094,7 @@ impl QuicPath {
         // carrying data while it is in the gauge.
         let counted_as_data_path = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ended_as_data_path = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let read_ranges = receiver.ranges();
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut report = recycle::PathReport::new(
             connection.inner().clone(),
@@ -1104,7 +1105,8 @@ impl QuicPath {
                 now: counted_as_data_path.clone(),
                 at_end: ended_as_data_path.clone(),
             },
-        );
+        )
+        .with_read(read_ranges);
         #[cfg(test)]
         {
             report.panic_once_bucketed = limits.panic_in_watch;

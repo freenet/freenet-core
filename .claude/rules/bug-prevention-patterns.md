@@ -1209,3 +1209,24 @@ straddle a commit.
 Audit question when touching the fan-out: *can this path send twice to one
 peer for one contract inside the receiver's budget, and does every summary it
 records come from the same read as the bytes it sent?*
+
+## A new transport whose bytes bypass the socket-layer counters
+
+Wire bytes are metered at two different layers. Sent bytes are counted at the
+socket (`record_packet_sent`, every transport). Received bytes are counted only
+after legacy symmetric decryption (`record_packet_received`). A transport that
+decrypts elsewhere (QUIC, inside quinn) is counted on send and missing on
+receive, so upload and download diverge with no error. #6301: once the QUIC
+data ramp reached 100%, the fleet upload/download ratio read 2.41.
+
+Fix shape: `recycle::PathReport::report` feeds the connection's authenticated
+stream-read byte count (`ConnRanges::read_bytes`) into
+`TransportMetrics::record_quic_received`. Do NOT use quinn's `udp_rx`: it is
+incremented before decryption, so a datagram with a live connection ID and bad
+ciphertext inflates it (#3999). The cost is a unit difference: payload only, not
+the whole datagram the sent side counts (about 4% on a bulk transfer, more for
+ack-only traffic). Never call `record_packet_received` for QUIC (double count).
+Audit question when adding a transport: *for each direction, where is it
+metered, and is it the same layer?* Pinned by
+`received_wire_bytes_count_only_authenticated_reads` (real path lifecycle, forged
+datagrams) and `a_path_report_counts_stream_reads_per_peer_on_ticks_and_cumulative_on_drop`.

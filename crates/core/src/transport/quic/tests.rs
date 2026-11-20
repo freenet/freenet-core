@@ -443,6 +443,14 @@ pub(in crate::transport::quic) async fn pair_with(
 }
 
 impl Pair {
+    /// Send `bytes` from `a`'s socket to `b`'s, as a forger on the path would.
+    pub(in crate::transport::quic) async fn inject_from_a(&self, bytes: &[u8]) {
+        self.a_socket
+            .send_to(bytes, self.b_addr)
+            .await
+            .expect("inject");
+    }
+
     fn a_key(&self) -> TransportPublicKey {
         self.a_keys.public().clone()
     }
@@ -4924,6 +4932,56 @@ async fn connected(pair: &Pair) -> (QuicConnection, QuicConnection) {
     .await;
     drop(permit);
     result
+}
+
+/// A path's final report must not regrow the per-peer entry of a peer whose
+/// connection is gone, and the tick report must count what the connection's
+/// streams read, once (#6301). Private metrics, so no other test is in them.
+#[test]
+fn a_path_report_counts_stream_reads_per_peer_on_ticks_and_cumulative_on_drop() {
+    use crate::transport::metrics::TransportMetrics;
+    use crate::transport::quic::path::inbound::ConnRanges;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let rig = pair("quic-wire-report", net.addr(1), net.addr(2), None).await;
+        let (_client, server) = connected(&rig).await;
+        let wire: &'static TransportMetrics = Box::leak(Box::new(TransportMetrics::new()));
+        let node: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let ranges = Arc::new(ConnRanges::new(1000, 64));
+        let mut report = super::recycle::PathReport::new(
+            server.inner().clone(),
+            node,
+            0,
+            None,
+            super::recycle::Carrying {
+                now: Arc::default(),
+                at_end: Arc::default(),
+            },
+        )
+        .with_wire(wire)
+        .with_read(ranges.clone());
+        ranges.note_read(1000);
+        report.report(Some(1));
+        assert_eq!(wire.cumulative_bytes_received(), 1000);
+        assert_eq!(wire.peer_bytes(rig.a_addr), Some((0, 1000)));
+        report.report(Some(2));
+        assert_eq!(wire.cumulative_bytes_received(), 1000, "counted once");
+        ranges.note_read(500);
+        drop(report);
+        assert_eq!(
+            wire.cumulative_bytes_received(),
+            1500,
+            "the final report counts"
+        );
+        assert_eq!(
+            wire.peer_bytes(rig.a_addr),
+            Some((0, 1000)),
+            "the final report leaves the per-peer table alone"
+        );
+        assert_eq!(wire.cumulative_bytes_sent(), 0, "sent is the socket's");
+    })
 }
 
 /// DATA_BLOCKED and STREAM_DATA_BLOCKED frames this side sent.
