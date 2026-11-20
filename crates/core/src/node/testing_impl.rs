@@ -1671,6 +1671,13 @@ pub struct SimNetwork {
     /// release PR, where a red sim could not be attributed between the
     /// feature and the version bump.
     hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
+    /// Per-node digest-first NeighborHosting floor override (#5157). Defaults
+    /// ON, for the reason given on `NodeConfig::neighbor_hosting_digest_floor_override`.
+    /// [`SimNetwork::disable_neighbor_hosting_digest`] pins it OFF and makes
+    /// every node answer legacy requests in full, emulating pre-#5157 peers.
+    neighbor_hosting_digest_floor_override: Option<(u8, u8, u16)>,
+    /// See `NodeConfig::neighbor_hosting_legacy_reply_unthrottled`.
+    neighbor_hosting_legacy_reply_unthrottled: bool,
     /// Per-node version-carrying-ack version-floor override (#5161, see
     /// [`SimNetwork::enable_gateway_ack_version`]).
     ///
@@ -1925,6 +1932,8 @@ impl SimNetwork {
             // version-gated wire change simulation coverage BEFORE the release
             // that lifts the crate version past its floor.
             hash_first_summaries_floor_override: Some(Self::SIM_MIGRATION_ENABLED_FLOOR),
+            neighbor_hosting_digest_floor_override: Some(Self::SIM_MIGRATION_ENABLED_FLOOR),
+            neighbor_hosting_legacy_reply_unthrottled: false,
             // Fail-CLOSED by default, like the two cascade gates and unlike
             // hash-first. This gate is encoding-only where it fires, but what
             // it teaches — the remote's version — is the INPUT to every other
@@ -3085,6 +3094,27 @@ impl SimNetwork {
         self
     }
 
+    /// Emulate a network of pre-#5157 peers: close the digest-first
+    /// NeighborHosting gate on every node (so the heartbeat sends the legacy
+    /// `HostingStateRequest`) and make every node answer a legacy request in
+    /// full every time, as an old responder does. Must be called before the
+    /// nodes start.
+    #[allow(dead_code)]
+    pub fn disable_neighbor_hosting_digest(&mut self) -> &mut Self {
+        let floor = Some(Self::SIM_MIGRATION_DISABLED_FLOOR);
+        self.neighbor_hosting_digest_floor_override = floor;
+        self.neighbor_hosting_legacy_reply_unthrottled = true;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.neighbor_hosting_digest_floor_override = floor;
+            builder.config.neighbor_hosting_legacy_reply_unthrottled = true;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.neighbor_hosting_digest_floor_override = floor;
+            builder.config.neighbor_hosting_legacy_reply_unthrottled = true;
+        }
+        self
+    }
+
     /// Force summary-first PUT OFF for this simulation by pinning the
     /// per-node probe version floor to the unreachable
     /// [`Self::SIM_MIGRATION_DISABLED_FLOOR`].
@@ -3775,6 +3805,10 @@ impl SimNetwork {
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
             config.summary_first_put_floor_override = self.summary_first_put_floor_override;
             config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
+            config.neighbor_hosting_digest_floor_override =
+                self.neighbor_hosting_digest_floor_override;
+            config.neighbor_hosting_legacy_reply_unthrottled =
+                self.neighbor_hosting_legacy_reply_unthrottled;
             config.ack_version_floor_override = self.ack_version_floor_override;
             config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
             config.hosting_time_source_override = self
@@ -3885,6 +3919,10 @@ impl SimNetwork {
             config.subscribe_hint_floor_override = self.subscribe_hint_floor_override;
             config.summary_first_put_floor_override = self.summary_first_put_floor_override;
             config.hash_first_summaries_floor_override = self.hash_first_summaries_floor_override;
+            config.neighbor_hosting_digest_floor_override =
+                self.neighbor_hosting_digest_floor_override;
+            config.neighbor_hosting_legacy_reply_unthrottled =
+                self.neighbor_hosting_legacy_reply_unthrottled;
             config.ack_version_floor_override = self.ack_version_floor_override;
             config.broadcast_target_list_floor_override = self.broadcast_target_list_floor_override;
             config.hosting_time_source_override = self

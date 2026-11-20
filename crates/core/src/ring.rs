@@ -1918,13 +1918,30 @@ impl Ring {
                 // by the `sleep_or_shutdown` on the spread delay below (and by the
                 // interest `send().await` above), so a dropped/closed send here just
                 // moves on.
+                //
+                // Digest-first (#5157): a peer whose version is known and at or
+                // above `NEIGHBOR_HOSTING_DIGEST_MIN_VERSION` is asked with the
+                // digest of our view of it, and answers `HostingStateUnchanged`
+                // when nothing changed. Every other peer gets the legacy request,
+                // because a digest request sent to a peer without the variant
+                // index closes the connection. The gate verdict is computed for
+                // EVERY peer, here, so no path can send the new variant ungated.
+                let digest_supported = ring
+                    .connection_manager
+                    .supports_neighbor_hosting_digest(peer_addr);
+                let peer_key = ring
+                    .connection_manager
+                    .get_peer_by_addr(peer_addr)
+                    .map(|pkl| pkl.pub_key().clone());
+                let hosting_request = op_manager
+                    .neighbor_hosting
+                    .anti_entropy_request(peer_key.as_ref(), digest_supported);
                 if let Err(e) = sender.try_send(either::Either::Right(
                     crate::message::NodeEvent::SendNetMessage {
                         target: peer_addr,
                         msg: Box::new(crate::message::NetMessage::V1(
                             crate::message::NetMessageV1::NeighborHosting {
-                                message:
-                                    crate::message::NeighborHostingMessage::HostingStateRequest,
+                                message: hosting_request,
                             },
                         )),
                     },
@@ -2186,6 +2203,18 @@ impl Ring {
                 Some(version_gate_refusals.summary_first_put_declined_unknown_version);
             snapshot.summary_first_put_declined_pre_floor =
                 Some(version_gate_refusals.summary_first_put_declined_pre_floor);
+            // Digest-first NeighborHosting anti-entropy (#5157): the gate's
+            // refusals by cause, plus the responder's own counters.
+            snapshot.neighbor_hosting_digest_declined_unknown_version =
+                Some(version_gate_refusals.neighbor_hosting_digest_declined_unknown_version);
+            snapshot.neighbor_hosting_digest_declined_pre_floor =
+                Some(version_gate_refusals.neighbor_hosting_digest_declined_pre_floor);
+            if let Some(op_manager) = ring.upgrade_op_manager() {
+                let ae = op_manager.neighbor_hosting.anti_entropy_stats();
+                snapshot.neighbor_hosting_digest_matched = Some(ae.digest_matched);
+                snapshot.neighbor_hosting_digest_mismatched = Some(ae.digest_mismatched);
+                snapshot.neighbor_hosting_legacy_replies_skipped = Some(ae.legacy_replies_skipped);
+            }
 
             // Compiled-WASM module-cache occupancy + eviction gauges (#4440),
             // read from the per-node `Arc` the caches publish into (they live
@@ -10915,12 +10944,63 @@ mod hosting_heartbeat_pin_test {
     fn hosting_re_request_is_piggybacked_on_interest_heartbeat() {
         let body = extract_interest_heartbeat_body();
         assert!(
-            body.contains("HostingStateRequest"),
+            body.contains("anti_entropy_request("),
             "the advertisement-layer re-request (Fix 1) must be PIGGYBACKED on \
-             `interest_heartbeat` — it must send a `HostingStateRequest` in that \
-             loop. Do NOT move it to a separate task: a task with its own \
+             `interest_heartbeat` — it must send the hosting anti-entropy request \
+             (`anti_entropy_request`) in that loop. Do NOT move it to a separate task: a task with its own \
              `GlobalRng` initial-delay draw perturbs the shared seeded RNG stream \
              the deterministic sim harness depends on."
+        );
+    }
+
+    /// The first line of `body` containing `needle` outside a `//` comment,
+    /// as a byte offset, requiring the needle at statement position or as part
+    /// of a real expression (the line, trimmed, does not start with `//`).
+    fn code_offset(body: &str, needle: &str) -> Option<usize> {
+        let mut offset = 0;
+        for line in body.split_inclusive('\n') {
+            if !line.trim_start().starts_with("//") {
+                if let Some(at) = line.find(needle) {
+                    return Some(offset + at);
+                }
+            }
+            offset += line.len();
+        }
+        None
+    }
+
+    /// #5157: the digest request must only ever be built for a peer the version
+    /// gate approved. A digest request sent to a peer older than
+    /// `NEIGHBOR_HOSTING_DIGEST_MIN_VERSION` has no variant index and closes the
+    /// connection. So the heartbeat must (1) consult
+    /// `supports_neighbor_hosting_digest` in code (not in a comment), (2) pass
+    /// its verdict to `anti_entropy_request`, and (3) never name the digest
+    /// variant itself, which would be a way around the gate.
+    #[test]
+    fn hosting_heartbeat_goes_through_the_digest_gate() {
+        let body = extract_interest_heartbeat_body();
+        let gate = code_offset(body, "supports_neighbor_hosting_digest(")
+            .expect("the heartbeat must call `supports_neighbor_hosting_digest` in code");
+        let request = code_offset(body, ".anti_entropy_request(")
+            .expect("the heartbeat must build its request with `anti_entropy_request`");
+        assert!(
+            gate < request,
+            "the gate verdict must be computed before the request is built"
+        );
+        let squashed: String = body[request..]
+            .chars()
+            .take_while(|c| *c != ';')
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            squashed.contains("peer_key.as_ref(),digest_supported)"),
+            "`anti_entropy_request` must be given the gate verdict (`digest_supported`), \
+             not a constant: {squashed}"
+        );
+        assert!(
+            !body.contains("HostingStateDigestRequest"),
+            "the heartbeat must not construct `HostingStateDigestRequest` itself; \
+             only `anti_entropy_request` may, so the version gate cannot be bypassed"
         );
     }
 

@@ -3918,6 +3918,28 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     "summary_first_put_declined_pre_floor".to_string(),
                     serde_json::json!(snapshot.summary_first_put_declined_pre_floor),
                 );
+                // Digest-first NeighborHosting anti-entropy counters (#5157),
+                // pinned by `router_snapshot_json_includes_neighbor_hosting_digest_counters`.
+                obj.insert(
+                    "neighbor_hosting_digest_declined_unknown_version".to_string(),
+                    serde_json::json!(snapshot.neighbor_hosting_digest_declined_unknown_version),
+                );
+                obj.insert(
+                    "neighbor_hosting_digest_declined_pre_floor".to_string(),
+                    serde_json::json!(snapshot.neighbor_hosting_digest_declined_pre_floor),
+                );
+                obj.insert(
+                    "neighbor_hosting_digest_matched".to_string(),
+                    serde_json::json!(snapshot.neighbor_hosting_digest_matched),
+                );
+                obj.insert(
+                    "neighbor_hosting_digest_mismatched".to_string(),
+                    serde_json::json!(snapshot.neighbor_hosting_digest_mismatched),
+                );
+                obj.insert(
+                    "neighbor_hosting_legacy_replies_skipped".to_string(),
+                    serde_json::json!(snapshot.neighbor_hosting_legacy_replies_skipped),
+                );
                 // Interest-weighted (two-tier) module-cache SHADOW gauges
                 // (#4441/#4534). Inserted here (not as inline `json!` keys) to
                 // keep the macro under its recursion limit, same as the
@@ -5302,6 +5324,33 @@ mod tests {
             ("hash_first_summaries_declined_pre_floor", 43),
             ("summary_first_put_declined_unknown_version", 47),
             ("summary_first_put_declined_pre_floor", 53),
+        ] {
+            assert_eq!(json[key], want, "{key} must reach the OTLP body");
+        }
+    }
+
+    /// Pin: the digest-first NeighborHosting counters (#5157) must reach the
+    /// hand-mirrored OTLP body. Without the gate-refusal split a fleet where
+    /// most peers cannot negotiate digests looks identical to one where the
+    /// feature works (#4965 shipped that way).
+    #[test]
+    fn router_snapshot_json_includes_neighbor_hosting_digest_counters() {
+        use arbitrary::{Arbitrary, Unstructured};
+        let mut u = Unstructured::new(&[0u8; 4096]);
+        let mut info = crate::router::RouterSnapshotInfo::arbitrary(&mut u)
+            .expect("construct RouterSnapshotInfo for test");
+        info.neighbor_hosting_digest_declined_unknown_version = Some(61);
+        info.neighbor_hosting_digest_declined_pre_floor = Some(67);
+        info.neighbor_hosting_digest_matched = Some(71);
+        info.neighbor_hosting_digest_mismatched = Some(73);
+        info.neighbor_hosting_legacy_replies_skipped = Some(79);
+        let json = event_kind_to_json(&EventKind::RouterSnapshot(Box::new(info)));
+        for (key, want) in [
+            ("neighbor_hosting_digest_declined_unknown_version", 61),
+            ("neighbor_hosting_digest_declined_pre_floor", 67),
+            ("neighbor_hosting_digest_matched", 71),
+            ("neighbor_hosting_digest_mismatched", 73),
+            ("neighbor_hosting_legacy_replies_skipped", 79),
         ] {
             assert_eq!(json[key], want, "{key} must reach the OTLP body");
         }

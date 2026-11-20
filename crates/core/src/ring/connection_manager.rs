@@ -564,6 +564,12 @@ pub(crate) struct ConnectionManager {
     /// exercises the hash-first path before the crate version reaches the
     /// production floor. See `NodeConfig`.
     hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
+    /// Override for the digest-first NeighborHosting floor (#5157), threaded
+    /// like `hash_first_summaries_floor_override`. `None` in production (the
+    /// real `NEIGHBOR_HOSTING_DIGEST_MIN_VERSION` applies); a floor above every
+    /// live version is the kill switch that forces the legacy request. See
+    /// `NodeConfig`.
+    neighbor_hosting_digest_floor_override: Option<(u8, u8, u16)>,
     /// How this node encodes and decodes the QUIC-native connect variants:
     /// the floor (`NodeConfig::quic_native_floor_override` or the production
     /// one) and the simulation's pre-floor decoder mode.
@@ -587,6 +593,11 @@ pub(crate) struct ConnectionManager {
     hash_first_declined_pre_floor: Arc<AtomicU64>,
     summary_first_put_declined_unknown_version: Arc<AtomicU64>,
     summary_first_put_declined_pre_floor: Arc<AtomicU64>,
+    /// Refusals of `supports_neighbor_hosting_digest` (#5157), split the same
+    /// way. #4965's digest shipped without this split, and one uncapped
+    /// fallback then outweighed hundreds of digest exchanges unseen.
+    neighbor_hosting_digest_declined_unknown_version: Arc<AtomicU64>,
+    neighbor_hosting_digest_declined_pre_floor: Arc<AtomicU64>,
     /// Test-only override for the originator-target-list version floor
     /// (#5147), threaded exactly like `summary_first_put_floor_override`.
     /// `None` in production (the real `BROADCAST_TARGET_LIST_MIN_VERSION`
@@ -701,6 +712,8 @@ pub(crate) struct VersionGateRefusalStats {
     pub hash_first_declined_pre_floor: u64,
     pub summary_first_put_declined_unknown_version: u64,
     pub summary_first_put_declined_pre_floor: u64,
+    pub neighbor_hosting_digest_declined_unknown_version: u64,
+    pub neighbor_hosting_digest_declined_pre_floor: u64,
 }
 
 impl ConnectionManager {
@@ -774,6 +787,7 @@ impl ConnectionManager {
         cm.subscribe_hint_floor_override = config.subscribe_hint_floor_override;
         cm.summary_first_put_floor_override = config.summary_first_put_floor_override;
         cm.hash_first_summaries_floor_override = config.hash_first_summaries_floor_override;
+        cm.neighbor_hosting_digest_floor_override = config.neighbor_hosting_digest_floor_override;
         cm.native_wire = crate::operations::connect::native::NativeWire::new(
             config.quic_native_floor_override,
             config.native_wire_pre_floor,
@@ -819,6 +833,7 @@ impl ConnectionManager {
             // Default off; `new(config)` overrides from config after init.
             summary_first_put_floor_override: None,
             hash_first_summaries_floor_override: None,
+            neighbor_hosting_digest_floor_override: None,
             native_wire: crate::operations::connect::native::NativeWire::new(None, false),
             native_connect: Arc::new(crate::operations::connect::native::NativeConnectState::new(
                 None,
@@ -827,6 +842,8 @@ impl ConnectionManager {
             hash_first_declined_pre_floor: Arc::new(AtomicU64::new(0)),
             summary_first_put_declined_unknown_version: Arc::new(AtomicU64::new(0)),
             summary_first_put_declined_pre_floor: Arc::new(AtomicU64::new(0)),
+            neighbor_hosting_digest_declined_unknown_version: Arc::new(AtomicU64::new(0)),
+            neighbor_hosting_digest_declined_pre_floor: Arc::new(AtomicU64::new(0)),
             broadcast_target_list_floor_override: None,
             migration_scan_cursor: Arc::new(AtomicUsize::new(0)),
             transient_connections: Arc::new(DashMap::new()),
@@ -1862,6 +1879,41 @@ impl ConnectionManager {
         supported
     }
 
+    /// Whether the peer at `addr` reports a version new enough to understand
+    /// the digest-first NeighborHosting variants
+    /// (`NeighborHostingMessage::HostingStateDigestRequest` /
+    /// `HostingStateUnchanged`, #5157).
+    ///
+    /// Same shape and fail-closed rule as [`Self::supports_hash_first_summaries`]:
+    /// an unknown version is treated as unsupported because a peer without the
+    /// variant index drops the connection on the decode failure. The caller's
+    /// fallback is the legacy `HostingStateRequest`, so failing closed costs
+    /// bytes, never convergence.
+    ///
+    /// Refusals are counted at the point of decision, split by cause: a `None`
+    /// remote version increments `neighbor_hosting_digest_declined_unknown_version`
+    /// (never self-heals), a known version below the floor increments
+    /// `neighbor_hosting_digest_declined_pre_floor` (self-heals as the fleet
+    /// upgrades). See [`Self::version_gate_refusal_stats`].
+    pub(crate) fn supports_neighbor_hosting_digest(&self, addr: SocketAddr) -> bool {
+        let floor = self
+            .neighbor_hosting_digest_floor_override
+            .unwrap_or(crate::node::NEIGHBOR_HOSTING_DIGEST_MIN_VERSION);
+        let remote = self.remote_version(addr);
+        let supported = crate::node::version_supports_neighbor_hosting_digest(remote, floor);
+        if !supported {
+            match remote {
+                None => self
+                    .neighbor_hosting_digest_declined_unknown_version
+                    .fetch_add(1, Ordering::Relaxed),
+                Some(_) => self
+                    .neighbor_hosting_digest_declined_pre_floor
+                    .fetch_add(1, Ordering::Relaxed),
+            };
+        }
+        supported
+    }
+
     /// Read the version-gate refusal counters (#5156): why
     /// [`Self::supports_hash_first_summaries`] and
     /// [`Self::supports_summary_first_put`] fell back to the full-bytes /
@@ -1883,6 +1935,12 @@ impl ConnectionManager {
                 .load(Ordering::Relaxed),
             summary_first_put_declined_pre_floor: self
                 .summary_first_put_declined_pre_floor
+                .load(Ordering::Relaxed),
+            neighbor_hosting_digest_declined_unknown_version: self
+                .neighbor_hosting_digest_declined_unknown_version
+                .load(Ordering::Relaxed),
+            neighbor_hosting_digest_declined_pre_floor: self
+                .neighbor_hosting_digest_declined_pre_floor
                 .load(Ordering::Relaxed),
         }
     }

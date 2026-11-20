@@ -29,6 +29,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use dashmap::DashMap;
@@ -37,6 +38,7 @@ use tracing::{debug, info, trace};
 
 use crate::message::NeighborHostingMessage;
 use crate::transport::TransportPublicKey;
+use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
 
 // Advertisement-layer anti-entropy cadence (#4642 spec step 1, "Fix 1").
 //
@@ -83,6 +85,86 @@ use crate::transport::TransportPublicKey;
 /// Both write sites go through this bound.
 pub(crate) const MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR: usize = 65_536;
 
+/// How often one peer may get a full reply to a LEGACY `HostingStateRequest`
+/// (#5157), after the first one on a connection.
+///
+/// A peer that sends the legacy request every 5 minutes is either older than
+/// `NEIGHBOR_HOSTING_DIGEST_MIN_VERSION` or could not negotiate the digest form.
+/// Answering each of those in full is the cost this design removes, and #4965
+/// showed that an unbounded fallback outweighs the digest exchanges it sits
+/// beside. Skipping a reply is safe: the old requester does nothing when no
+/// response arrives (it keeps no pending-request state, timer or retry, and only
+/// a received `HostingStateResponse` changes its view), and announces keep that
+/// view current in the meantime. What the throttle costs is how fast a dropped
+/// announce is repaired at such a peer: up to this interval instead of 5 minutes.
+pub(crate) const LEGACY_FULL_REPLY_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// The digest contribution of one id: its first 8 bytes. Ids are BLAKE3 outputs,
+/// so any 8 bytes are uniformly distributed.
+fn id_digest(id: &ContractInstanceId) -> u64 {
+    let mut first = [0u8; 8];
+    first.copy_from_slice(&id.as_bytes()[..8]);
+    u64::from_le_bytes(first)
+}
+
+/// A set of contract ids with an incrementally maintained digest: the XOR of
+/// [`id_digest`] over its members (#5157).
+///
+/// The digest is order-independent, and the XOR runs only when `insert` or
+/// `remove` actually changed the set, so adding a present id or removing an
+/// absent one cannot corrupt it. Every mutation goes through this type, so the
+/// digest cannot drift from the members.
+#[derive(Debug, Default)]
+struct IdSet {
+    ids: HashSet<ContractInstanceId>,
+    digest: u64,
+}
+
+impl IdSet {
+    fn insert(&mut self, id: ContractInstanceId) -> bool {
+        let added = self.ids.insert(id);
+        if added {
+            self.digest ^= id_digest(&id);
+        }
+        added
+    }
+
+    fn remove(&mut self, id: &ContractInstanceId) -> bool {
+        let removed = self.ids.remove(id);
+        if removed {
+            self.digest ^= id_digest(id);
+        }
+        removed
+    }
+
+    fn contains(&self, id: &ContractInstanceId) -> bool {
+        self.ids.contains(id)
+    }
+
+    fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// `(digest, count)` as carried by `HostingStateDigestRequest`.
+    fn summary(&self) -> (u64, u32) {
+        (
+            self.digest,
+            u32::try_from(self.ids.len()).unwrap_or(u32::MAX),
+        )
+    }
+}
+
+/// Lifetime counters of the anti-entropy responder (#5157), for telemetry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct AntiEntropyStats {
+    /// Digest requests answered `HostingStateUnchanged`.
+    pub digest_matched: u64,
+    /// Digest requests answered with the full set.
+    pub digest_mismatched: u64,
+    /// Legacy requests whose full reply the per-peer throttle skipped.
+    pub legacy_replies_skipped: u64,
+}
+
 /// Result from handling a neighbor hosting message.
 ///
 /// Contains an optional response message to send back, plus any contracts
@@ -127,11 +209,34 @@ pub struct NeighborHostingManager {
     /// (#5782).
     my_contracts: Arc<DashMap<ContractInstanceId, ContractKey>>,
 
+    /// XOR digest of the ids in `my_contracts` (#5157), maintained by
+    /// `host_insert` / `host_remove`, which XOR only on a real change. XOR is
+    /// commutative, so concurrent changes applied in either order leave the
+    /// digest of the final set; between a map change and its XOR a reader can see
+    /// a torn pair, which only produces one spurious mismatch (a full reply).
+    my_digest: AtomicU64,
+
     /// What we know about our neighbors' hosted contracts.
     /// Maps neighbor public key to the set of contracts they're hosting.
     /// Keyed by TransportPublicKey (stable identity) rather than SocketAddr (mutable
     /// due to NAT/reconnection), so entries survive address changes.
-    neighbor_contracts: DashMap<TransportPublicKey, HashSet<ContractInstanceId>>,
+    neighbor_contracts: DashMap<TransportPublicKey, IdSet>,
+
+    /// When each peer was last sent a full reply to a legacy
+    /// `HostingStateRequest` (#5157). Absent means none on this connection, so
+    /// the next one is always answered. Removed in `on_peer_disconnected`, so an
+    /// entry lives no longer than the connection and the peer cannot extend it.
+    legacy_replies: DashMap<TransportPublicKey, tokio::time::Instant>,
+
+    time_source: DynTimeSource,
+
+    /// Answer every legacy request in full (emulates a pre-#5157 responder).
+    /// Simulation only; see `NodeConfig::neighbor_hosting_legacy_reply_unthrottled`.
+    legacy_reply_unthrottled: bool,
+
+    digest_matched: AtomicU64,
+    digest_mismatched: AtomicU64,
+    legacy_replies_skipped: AtomicU64,
 
     /// Messages whose ids were partly dropped by the per-neighbour cap.
     over_cap_messages: AtomicU64,
@@ -157,9 +262,22 @@ impl Default for NeighborHostingManager {
 impl NeighborHostingManager {
     /// Create a new neighbor hosting manager.
     pub fn new() -> Self {
+        Self::with_options(Arc::new(InstantTimeSrc::new()), false)
+    }
+
+    /// [`Self::new`] with an injected clock for the legacy-reply throttle, and
+    /// optionally with the throttle off.
+    pub(crate) fn with_options(time_source: DynTimeSource, legacy_reply_unthrottled: bool) -> Self {
         Self {
             my_contracts: Arc::new(DashMap::new()),
+            my_digest: AtomicU64::new(0),
             neighbor_contracts: DashMap::new(),
+            legacy_replies: DashMap::new(),
+            time_source,
+            legacy_reply_unthrottled,
+            digest_matched: AtomicU64::new(0),
+            digest_mismatched: AtomicU64::new(0),
+            legacy_replies_skipped: AtomicU64::new(0),
             over_cap_messages: AtomicU64::new(0),
             over_cap_ids: AtomicU64::new(0),
             sync_budget_hits: AtomicU64::new(0),
@@ -212,6 +330,109 @@ impl NeighborHostingManager {
         self.sync_budget_hits.load(Ordering::Relaxed)
     }
 
+    /// Add `id` to the advertised set, keeping the digest in step. `true` iff the
+    /// set changed.
+    fn host_insert(&self, id: ContractInstanceId, key: ContractKey) -> bool {
+        let added = self.my_contracts.insert(id, key).is_none();
+        if added {
+            self.my_digest.fetch_xor(id_digest(&id), Ordering::Relaxed);
+        }
+        added
+    }
+
+    /// Remove `id` from the advertised set, keeping the digest in step. `true`
+    /// iff the set changed.
+    fn host_remove(&self, id: &ContractInstanceId) -> bool {
+        let removed = self.my_contracts.remove(id).is_some();
+        if removed {
+            self.my_digest.fetch_xor(id_digest(id), Ordering::Relaxed);
+        }
+        removed
+    }
+
+    /// `(digest, count)` of the advertised set.
+    fn own_summary(&self) -> (u64, u32) {
+        (
+            self.my_digest.load(Ordering::Relaxed),
+            u32::try_from(self.my_contracts.len()).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// The full hosted set as a sorted `HostingStateResponse`.
+    fn full_state_response(&self) -> NeighborHostingMessage {
+        let mut contracts: Vec<ContractInstanceId> =
+            self.my_contracts.iter().map(|r| *r.key()).collect();
+        // Sort for deterministic message order (DashSet iteration is non-deterministic).
+        // ContractInstanceId doesn't impl Ord, so compare raw bytes. Do NOT sort by
+        // `to_string()`: that base58-encodes per comparison (~O(n log n) encodes per
+        // request) and was ~40% of CPU on a peer hosting ~6,200 contracts. Ids are
+        // unique, so an unstable sort is still deterministic.
+        contracts.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        NeighborHostingMessage::HostingStateResponse { contracts }
+    }
+
+    /// `(digest, count)` of what we believe `peer` hosts; `(0, 0)` for a peer we
+    /// hold no view of.
+    pub(crate) fn view_summary(&self, peer: &TransportPublicKey) -> (u64, u32) {
+        self.neighbor_contracts
+            .get(peer)
+            .map(|view| view.summary())
+            .unwrap_or((0, 0))
+    }
+
+    /// The anti-entropy request for the periodic heartbeat (#5157).
+    ///
+    /// `digest_supported` is the version gate's verdict for this peer
+    /// (`ConnectionManager::supports_neighbor_hosting_digest`), which the caller
+    /// must consult for every peer: a digest request sent to a peer without the
+    /// variant index closes the connection. Supported: ask with the digest of our
+    /// view, so an unchanged set costs a ~12-byte reply. Otherwise the legacy
+    /// request, which an old responder answers in full and a new one throttles.
+    pub(crate) fn anti_entropy_request(
+        &self,
+        peer: Option<&TransportPublicKey>,
+        digest_supported: bool,
+    ) -> NeighborHostingMessage {
+        if !digest_supported {
+            return NeighborHostingMessage::HostingStateRequest;
+        }
+        let (digest, count) = peer.map(|p| self.view_summary(p)).unwrap_or((0, 0));
+        NeighborHostingMessage::HostingStateDigestRequest { digest, count }
+    }
+
+    /// Lifetime counters of the responder, for telemetry.
+    pub(crate) fn anti_entropy_stats(&self) -> AntiEntropyStats {
+        AntiEntropyStats {
+            digest_matched: self.digest_matched.load(Ordering::Relaxed),
+            digest_mismatched: self.digest_mismatched.load(Ordering::Relaxed),
+            legacy_replies_skipped: self.legacy_replies_skipped.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Whether a legacy `HostingStateRequest` from `from` gets a full reply now.
+    /// The first on a connection always does; after that at most one per
+    /// [`LEGACY_FULL_REPLY_INTERVAL`].
+    fn legacy_reply_allowed(&self, from: &TransportPublicKey) -> bool {
+        if self.legacy_reply_unthrottled {
+            return true;
+        }
+        let now = self.time_source.now();
+        match self.legacy_replies.entry(from.clone()) {
+            dashmap::mapref::entry::Entry::Vacant(slot) => {
+                slot.insert(now);
+                true
+            }
+            dashmap::mapref::entry::Entry::Occupied(mut slot) => {
+                if now.saturating_duration_since(*slot.get()) >= LEGACY_FULL_REPLY_INTERVAL {
+                    slot.insert(now);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     /// Called when we start hosting a new contract (via PUT or successful GET).
     ///
     /// Returns a `HostingAnnounce` message to broadcast to neighbors if this
@@ -219,11 +440,7 @@ impl NeighborHostingManager {
     pub fn on_contract_hosted(&self, contract_key: &ContractKey) -> Option<NeighborHostingMessage> {
         let contract_id = *contract_key.id();
 
-        if self
-            .my_contracts
-            .insert(contract_id, *contract_key)
-            .is_none()
-        {
+        if self.host_insert(contract_id, *contract_key) {
             info!(
                 contract = %contract_key,
                 "NEIGHBOR_HOSTING: Added contract to locally hosted"
@@ -267,7 +484,7 @@ impl NeighborHostingManager {
     ) -> Option<NeighborHostingMessage> {
         let contract_id = *contract_key.id();
 
-        if self.my_contracts.remove(&contract_id).is_some() {
+        if self.host_remove(&contract_id) {
             debug!(
                 contract = %contract_key,
                 "NEIGHBOR_HOSTING: Removed contract from locally hosted (retracting advertisement)"
@@ -322,11 +539,13 @@ impl NeighborHostingManager {
         still_hosted: impl FnOnce() -> bool,
     ) -> Option<NeighborHostingMessage> {
         let contract_id = *contract_key.id();
-        self.my_contracts.remove(&contract_id)?;
+        if !self.host_remove(&contract_id) {
+            return None;
+        }
         if still_hosted() {
             // Re-host / re-subscribe raced us: put the advertisement back and
             // emit nothing. Neighbors never observed the removal.
-            self.my_contracts.insert(contract_id, *contract_key);
+            self.host_insert(contract_id, *contract_key);
             trace!(
                 contract = %contract_key,
                 "NEIGHBOR_HOSTING: eviction retraction skipped — contract re-hosted \
@@ -378,7 +597,7 @@ impl NeighborHostingManager {
                 {
                     let removed_set: HashSet<ContractInstanceId> =
                         removed.iter().copied().collect();
-                    let mut apply = |set: &mut HashSet<ContractInstanceId>| {
+                    let mut apply = |set: &mut IdSet| {
                         for id in &removed_set {
                             set.remove(id);
                         }
@@ -412,11 +631,9 @@ impl NeighborHostingManager {
                     .neighbor_contracts
                     .get(from)
                     .map(
-                        |entry: dashmap::mapref::one::Ref<
-                            '_,
-                            TransportPublicKey,
-                            HashSet<ContractInstanceId>,
-                        >| entry.value().len(),
+                        |entry: dashmap::mapref::one::Ref<'_, TransportPublicKey, IdSet>| {
+                            entry.value().len()
+                        },
                     )
                     .unwrap_or(0);
 
@@ -472,24 +689,63 @@ impl NeighborHostingManager {
             }
 
             NeighborHostingMessage::HostingStateRequest => {
-                let mut contracts: Vec<ContractInstanceId> =
-                    self.my_contracts.iter().map(|r| *r.key()).collect();
-                // Sort for deterministic message order (DashSet iteration is non-deterministic).
-                // ContractInstanceId doesn't impl Ord, so compare raw bytes. Do NOT sort by
-                // `to_string()`: that base58-encodes per comparison (~O(n log n) encodes per
-                // request) and was ~40% of CPU on a peer hosting ~6,200 contracts. Ids are
-                // unique, so an unstable sort is still deterministic.
-                contracts.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-
+                // The legacy request carries no state, so the only reply is the
+                // full set. The first on a connection is the on-connect exchange
+                // and is always answered; after that a peer asking again every
+                // heartbeat is either old or could not negotiate the digest form,
+                // and gets one full reply per `LEGACY_FULL_REPLY_INTERVAL`.
+                if !self.legacy_reply_allowed(from) {
+                    let skipped = self.legacy_replies_skipped.fetch_add(1, Ordering::Relaxed) + 1;
+                    if is_log_point(skipped) {
+                        info!(
+                            peer = %from,
+                            skipped,
+                            "NEIGHBOR_HOSTING: legacy hosting state request throttled \
+                             (logged at power-of-two counts)"
+                        );
+                    }
+                    return NeighborHostingResult::empty();
+                }
+                let response = self.full_state_response();
                 debug!(
                     peer = %from,
-                    hosted_count = contracts.len(),
+                    hosted_count = self.my_contracts.len(),
                     "NEIGHBOR_HOSTING: Responding to hosting state request"
                 );
+                NeighborHostingResult::response_only(response)
+            }
 
-                NeighborHostingResult::response_only(NeighborHostingMessage::HostingStateResponse {
-                    contracts,
-                })
+            NeighborHostingMessage::HostingStateDigestRequest { digest, count } => {
+                // Compare the requester's view of our set with the set itself.
+                // A match is the common case and costs a ~12-byte reply; anything
+                // else, including a view that is merely behind an announce still
+                // in flight, gets the full set and the requester's view is
+                // replaced exactly as for a legacy request. A requester whose
+                // view of us is capped (we advertise more than
+                // `MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR`) can never match on
+                // `count`, so it gets the full set every cycle, as today.
+                let (my_digest, my_count) = self.own_summary();
+                if digest == my_digest && count == my_count {
+                    self.digest_matched.fetch_add(1, Ordering::Relaxed);
+                    trace!(peer = %from, "NEIGHBOR_HOSTING: digest matches, replying unchanged");
+                    NeighborHostingResult::response_only(
+                        NeighborHostingMessage::HostingStateUnchanged,
+                    )
+                } else {
+                    self.digest_mismatched.fetch_add(1, Ordering::Relaxed);
+                    debug!(
+                        peer = %from,
+                        hosted_count = my_count,
+                        "NEIGHBOR_HOSTING: digest differs, replying with the full set"
+                    );
+                    NeighborHostingResult::response_only(self.full_state_response())
+                }
+            }
+
+            NeighborHostingMessage::HostingStateUnchanged => {
+                // Our view of `from` already matches its set; nothing to apply.
+                trace!(peer = %from, "NEIGHBOR_HOSTING: hosting state unchanged");
+                NeighborHostingResult::empty()
             }
 
             NeighborHostingMessage::HostingStateResponse { contracts } => {
@@ -519,8 +775,9 @@ impl NeighborHostingManager {
                 // `MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR`. `shared` records, in
                 // message order, each id we also host that made it into the view,
                 // so a repeated id is reported once and an over-cap id never.
-                let mut view: HashSet<ContractInstanceId> =
-                    HashSet::with_capacity(count.min(MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR));
+                let mut view = IdSet::default();
+                view.ids
+                    .reserve(count.min(MAX_ADVERTISED_CONTRACTS_PER_NEIGHBOR));
                 let mut shared: Vec<ContractInstanceId> = Vec::new();
                 let mut over_cap = 0usize;
                 for id in &contracts {
@@ -542,7 +799,7 @@ impl NeighborHostingManager {
                 // whole view of this peer, so a contract the peer stopped hosting
                 // silently disappears from our view here. That full-replace is what
                 // lets the periodic re-request heal a dropped retraction (Fix 1).
-                let previously_known: HashSet<ContractInstanceId> = self
+                let previously_known: IdSet = self
                     .neighbor_contracts
                     .insert(from.clone(), view)
                     .unwrap_or_default();
@@ -649,18 +906,14 @@ impl NeighborHostingManager {
             .neighbor_contracts
             .iter()
             .filter(
-                |entry: &dashmap::mapref::multiple::RefMulti<
-                    '_,
-                    TransportPublicKey,
-                    HashSet<ContractInstanceId>,
-                >| entry.value().contains(contract_id),
+                |entry: &dashmap::mapref::multiple::RefMulti<'_, TransportPublicKey, IdSet>| {
+                    entry.value().contains(contract_id)
+                },
             )
             .map(
-                |entry: dashmap::mapref::multiple::RefMulti<
-                    '_,
-                    TransportPublicKey,
-                    HashSet<ContractInstanceId>,
-                >| entry.key().clone(),
+                |entry: dashmap::mapref::multiple::RefMulti<'_, TransportPublicKey, IdSet>| {
+                    entry.key().clone()
+                },
             )
             .collect();
 
@@ -692,12 +945,14 @@ impl NeighborHostingManager {
     ) -> HashSet<ContractInstanceId> {
         self.neighbor_contracts
             .get(pub_key)
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().ids.clone())
             .unwrap_or_default()
     }
 
     /// Handle peer disconnection by removing their hosting state.
     pub fn on_peer_disconnected(&self, pub_key: &TransportPublicKey) {
+        // The next connection's first legacy request is answered in full again.
+        self.legacy_replies.remove(pub_key);
         if let Some((_, removed_cache)) = self.neighbor_contracts.remove(pub_key) {
             let count = removed_cache.len();
             debug!(
@@ -728,7 +983,7 @@ impl NeighborHostingManager {
     pub fn initialize_from_hosting_cache(&self, contract_keys: impl Iterator<Item = ContractKey>) {
         let mut count = 0;
         for key in contract_keys {
-            self.my_contracts.insert(*key.id(), key);
+            self.host_insert(*key.id(), key);
             count += 1;
         }
         if count > 0 {

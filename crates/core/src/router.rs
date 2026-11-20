@@ -1060,6 +1060,19 @@ pub(crate) struct RouterSnapshotInfo {
     pub hash_first_summaries_declined_pre_floor: Option<u64>,
     pub summary_first_put_declined_unknown_version: Option<u64>,
     pub summary_first_put_declined_pre_floor: Option<u64>,
+    /// Digest-first NeighborHosting anti-entropy counters (#5157), populated by
+    /// `Ring` on the snapshot cadence. The first two are the version-gate
+    /// refusals split by cause (unknown remote version never self-heals, a
+    /// known pre-floor version self-heals as the fleet upgrades). The rest come
+    /// from the responder: digest requests answered `Unchanged` / answered with
+    /// the full set, and legacy requests whose full reply was skipped by the
+    /// per-peer throttle. Monotonic lifetime totals, differenced by the
+    /// collector. `None` until the snapshot task populates them.
+    pub neighbor_hosting_digest_declined_unknown_version: Option<u64>,
+    pub neighbor_hosting_digest_declined_pre_floor: Option<u64>,
+    pub neighbor_hosting_digest_matched: Option<u64>,
+    pub neighbor_hosting_digest_mismatched: Option<u64>,
+    pub neighbor_hosting_legacy_replies_skipped: Option<u64>,
     /// Streamed-transfer (> 64 KB) abort counters, populated by `Ring` from the
     /// per-node `network_status` singleton on the snapshot cadence. They isolate
     /// the large-contract failure class (~50% of large fetches were failing)
@@ -3738,6 +3751,11 @@ impl Router {
             hash_first_summaries_declined_pre_floor: None,
             summary_first_put_declined_unknown_version: None,
             summary_first_put_declined_pre_floor: None,
+            neighbor_hosting_digest_declined_unknown_version: None,
+            neighbor_hosting_digest_declined_pre_floor: None,
+            neighbor_hosting_digest_matched: None,
+            neighbor_hosting_digest_mismatched: None,
+            neighbor_hosting_legacy_replies_skipped: None,
             // Streamed-transfer abort counters, populated by Ring from the
             // network_status singleton on the snapshot cadence (Group B).
             stream_recv_aborts_inactivity_total: None,

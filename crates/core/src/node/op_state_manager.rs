@@ -767,7 +767,10 @@ impl OpManager {
             tracing::debug!("Regular peer node: peer_ready will be set after first handshake");
         }
 
-        let neighbor_hosting = Arc::new(NeighborHostingManager::new());
+        let neighbor_hosting = Arc::new(NeighborHostingManager::with_options(
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+            config.neighbor_hosting_legacy_reply_unthrottled,
+        ));
         // The InterestManager draws its clock from the same injectable source as the
         // HostingManager, so subscription/interest-lease expiry and hosting-cache TTL
         // read the same clock. Production (`hosting_time_source_override == None`)

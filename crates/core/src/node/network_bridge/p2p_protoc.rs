@@ -1230,6 +1230,40 @@ use crate::operations::connect::native::NativeWire;
 /// as the floor yet. Raised to 0.2.162 for 0.2.161 for the same reasons.
 pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 162);
 
+/// Version floor for the digest-first NeighborHosting anti-entropy (#5157):
+/// `NeighborHostingMessage::HostingStateDigestRequest` and
+/// `HostingStateUnchanged`, appended as variant indices 3 and 4.
+///
+/// A peer below it has no such index and closes the connection on one, so the
+/// heartbeat sends a digest request only to a peer whose version is known and at
+/// least this, and falls back to the legacy `HostingStateRequest` otherwise.
+/// Set to the release after the one current when this was written (0.2.161).
+/// Bias HIGH: too low closes connections to the release below it, too high only
+/// delays the saving. Guarded by
+/// `neighbor_hosting_digest_floor_tracks_the_shipping_release`.
+pub(crate) const NEIGHBOR_HOSTING_DIGEST_MIN_VERSION: (u8, u8, u16) = (0, 2, 162);
+
+/// Has the digest-first NeighborHosting exchange shipped, and in which release?
+///
+/// Same contract as [`HASH_FIRST_SHIPPED_IN`]: `None` means
+/// [`NEIGHBOR_HOSTING_DIGEST_MIN_VERSION`] is a prediction that must stay
+/// strictly above the crate version; `Some(v)` means it shipped in `v`, which
+/// must equal the floor. Write the literal release when it ships, not
+/// `Some(NEIGHBOR_HOSTING_DIGEST_MIN_VERSION)`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const NEIGHBOR_HOSTING_DIGEST_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+
+/// Pure version gate for the digest-first NeighborHosting exchange: `true` iff
+/// `remote` is known (`Some`) AND at least `floor`. Fails closed on `None`; the
+/// fallback is the legacy full-set exchange, which costs bytes and never
+/// correctness.
+pub(crate) fn version_supports_neighbor_hosting_digest(
+    remote: Option<(u8, u8, u16)>,
+    floor: (u8, u8, u16),
+) -> bool {
+    remote.is_some_and(|v| v >= floor)
+}
+
 /// Has the decoder for the QUIC-native `ConnectMsg` variants shipped, and in
 /// which release?
 ///

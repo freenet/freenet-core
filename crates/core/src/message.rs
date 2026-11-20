@@ -458,6 +458,30 @@ pub enum NeighborHostingMessage {
     HostingStateRequest,
     /// Response with the neighbor's full hosting state.
     HostingStateResponse { contracts: Vec<ContractInstanceId> },
+    /// Digest-first anti-entropy request (#5157). Carries the digest and size
+    /// of the requester's cached view of the responder's hosted set. The
+    /// responder answers [`Self::HostingStateUnchanged`] when its own set has
+    /// the same digest and size, and the full [`Self::HostingStateResponse`]
+    /// otherwise.
+    ///
+    /// The digest is the XOR of `u64::from_le_bytes(id[0..8])` over the set.
+    ///
+    /// APPENDED after `HostingStateResponse`: bincode encodes a variant by its
+    /// index, so the existing three keep indices 0..=2. A peer older than
+    /// `NEIGHBOR_HOSTING_DIGEST_MIN_VERSION` has no index 3 or 4 and fails to
+    /// decode them, which closes the connection, so these are sent only to a
+    /// peer whose version is known and at or above that floor. Do not reorder
+    /// or insert before them.
+    HostingStateDigestRequest {
+        /// XOR digest of the requester's view of the responder's hosted set.
+        digest: u64,
+        /// Number of ids in that view.
+        count: u32,
+    },
+    /// Reply to [`Self::HostingStateDigestRequest`] when the responder's
+    /// hosted set matches the requester's view (#5157). Same floor and
+    /// append-only rule as the request.
+    HostingStateUnchanged,
 }
 
 /// Messages for the delta-based interest synchronization protocol.

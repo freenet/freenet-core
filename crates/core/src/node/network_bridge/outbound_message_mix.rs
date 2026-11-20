@@ -331,13 +331,19 @@ pub(crate) enum NeighborHostingKind {
     Announce,
     /// `HostingStateResponse`: the full hosted set.
     Response,
+    /// `HostingStateDigestRequest`: the digest-first anti-entropy request.
+    DigestRequest,
+    /// `HostingStateUnchanged`: the short reply to a matching digest.
+    Unchanged,
 }
 
 impl NeighborHostingKind {
-    pub(crate) const ALL: [NeighborHostingKind; 3] = [
+    pub(crate) const ALL: [NeighborHostingKind; 5] = [
         NeighborHostingKind::Request,
         NeighborHostingKind::Announce,
         NeighborHostingKind::Response,
+        NeighborHostingKind::DigestRequest,
+        NeighborHostingKind::Unchanged,
     ];
 
     const fn index(self) -> usize {
@@ -345,6 +351,8 @@ impl NeighborHostingKind {
             NeighborHostingKind::Request => 0,
             NeighborHostingKind::Announce => 1,
             NeighborHostingKind::Response => 2,
+            NeighborHostingKind::DigestRequest => 3,
+            NeighborHostingKind::Unchanged => 4,
         }
     }
 
@@ -355,6 +363,8 @@ impl NeighborHostingKind {
             NeighborHostingKind::Request => "request",
             NeighborHostingKind::Announce => "announce",
             NeighborHostingKind::Response => "response",
+            NeighborHostingKind::DigestRequest => "digest_request",
+            NeighborHostingKind::Unchanged => "unchanged",
         }
     }
 
@@ -363,6 +373,10 @@ impl NeighborHostingKind {
             NeighborHostingMessage::HostingStateRequest => NeighborHostingKind::Request,
             NeighborHostingMessage::HostingAnnounce { .. } => NeighborHostingKind::Announce,
             NeighborHostingMessage::HostingStateResponse { .. } => NeighborHostingKind::Response,
+            NeighborHostingMessage::HostingStateDigestRequest { .. } => {
+                NeighborHostingKind::DigestRequest
+            }
+            NeighborHostingMessage::HostingStateUnchanged => NeighborHostingKind::Unchanged,
         }
     }
 }

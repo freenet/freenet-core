@@ -62,9 +62,10 @@ pub(crate) use network_bridge::broadcast_queue_metrics::BROADCAST_QUEUE_EFFICIEN
 // re-export rather than a path through `network_bridge` directly. Mirrors
 // `BROADCAST_STREAM_METRICS` above.
 pub(crate) use network_bridge::p2p_protoc::{
-    BROADCAST_TARGET_LIST_MIN_VERSION, HASH_FIRST_SUMMARIES_MIN_VERSION, QUIC_NATIVE_MIN_VERSION,
-    SUMMARY_FIRST_PUT_MIN_VERSION, version_supports_broadcast_target_list,
-    version_supports_hash_first_summaries, version_supports_summary_first_put,
+    BROADCAST_TARGET_LIST_MIN_VERSION, HASH_FIRST_SUMMARIES_MIN_VERSION,
+    NEIGHBOR_HOSTING_DIGEST_MIN_VERSION, QUIC_NATIVE_MIN_VERSION, SUMMARY_FIRST_PUT_MIN_VERSION,
+    version_supports_broadcast_target_list, version_supports_hash_first_summaries,
+    version_supports_neighbor_hosting_digest, version_supports_summary_first_put,
 };
 // The visited-peers bloom gates its index check on the handshake floor (#5994).
 pub(crate) use network_bridge::p2p_protoc::parse_crate_version;
@@ -78,6 +79,8 @@ pub(crate) use network_bridge::event_loop_notification_channel_with_capacity;
 pub(crate) use network_bridge::p2p_protoc::BROADCAST_TARGET_LIST_SHIPPED_IN;
 #[cfg(test)]
 pub(crate) use network_bridge::p2p_protoc::HASH_FIRST_SHIPPED_IN;
+#[cfg(test)]
+pub(crate) use network_bridge::p2p_protoc::NEIGHBOR_HOSTING_DIGEST_SHIPPED_IN;
 #[cfg(test)]
 pub(crate) use network_bridge::{EventLoopNotificationsReceiver, event_loop_notification_channel};
 // Source-walk helpers for crate-wide source pins outside `network_bridge`.
@@ -469,6 +472,30 @@ pub struct NodeConfig {
     /// `#[serde(skip)]`; never serialized.
     #[serde(skip)]
     pub(crate) hash_first_summaries_floor_override: Option<(u8, u8, u16)>,
+    /// Override for the digest-first NeighborHosting version floor
+    /// (`NEIGHBOR_HOSTING_DIGEST_MIN_VERSION`, #5157), consulted as
+    /// `neighbor_hosting_digest_floor_override.unwrap_or(NEIGHBOR_HOSTING_DIGEST_MIN_VERSION)`
+    /// by `ConnectionManager::supports_neighbor_hosting_digest`. `None` in
+    /// production. A floor above every live version is the kill switch: the
+    /// heartbeat then sends the legacy `HostingStateRequest` to everyone.
+    ///
+    /// Simulations default it ON (like `hash_first_summaries_floor_override`):
+    /// the exchange changes only the encoding of an anti-entropy round that
+    /// already runs in every sim, with the same convergence semantics, and
+    /// defaulting it on is what gives the suite coverage of the new variants
+    /// before the release that lifts the crate version over the floor.
+    /// `#[serde(skip)]`; never serialized.
+    #[serde(skip)]
+    pub(crate) neighbor_hosting_digest_floor_override: Option<(u8, u8, u16)>,
+    /// Answer every legacy `HostingStateRequest` in full, instead of throttling
+    /// to one full reply per peer per `LEGACY_FULL_REPLY_INTERVAL`. `false` in
+    /// production. A simulation sets it together with a closed
+    /// `neighbor_hosting_digest_floor_override` to emulate a network of
+    /// pre-#5157 peers, whose responders always answered in full; without it
+    /// the "forced legacy" run would measure the throttle, not the old
+    /// behaviour. `#[serde(skip)]`; never serialized.
+    #[serde(skip)]
+    pub(crate) neighbor_hosting_legacy_reply_unthrottled: bool,
     /// Test-only override for the version-carrying-ack floor
     /// (`GATEWAY_ACK_VERSION_MIN_VERSION`, #5161). Threaded down into the
     /// TRANSPORT layer (`create_connection_handler`), unlike the three
@@ -905,6 +932,8 @@ impl NodeConfig {
             subscribe_hint_floor_override: None,
             summary_first_put_floor_override: None,
             hash_first_summaries_floor_override: None,
+            neighbor_hosting_digest_floor_override: None,
+            neighbor_hosting_legacy_reply_unthrottled: false,
             ack_version_floor_override: None,
             broadcast_target_list_floor_override: None,
             advertised_version_override: None,
