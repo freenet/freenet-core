@@ -582,7 +582,9 @@ async fn drive_client_update(
             // Fire-and-forget send to target peer. The test seam for the #6143
             // failure class swallows it too: it is an inline message from the
             // originator, the class that node lost.
-            if !super::inline_leg_fault_injection::inline_leg_swallowed(op_manager, &key) {
+            if super::inline_leg_fault_injection::inline_leg_fate(op_manager, &key)
+                == super::inline_leg_fault_injection::LegFate::Send
+            {
                 let mut ctx = op_manager.op_ctx(client_tx);
                 ctx.send_fire_and_forget(target_addr, msg).await?;
             }

@@ -46,8 +46,9 @@
 //!    out as a stream to keep the fan-out's resident memory under the lane
 //!    bound. Can be several times the bytes of the delta it replaced.
 //! 8. [`PayloadArm::FullVerifyForced`] — a verify-soon escalation (#6143): a
-//!    peer found stale twice with an unchanged summary gets full state on the
-//!    stream, whatever its size.
+//!    peer still stale in the confirm round, past every force condition, gets
+//!    full state on the stream whatever its size. Its bytes are the forced
+//!    bytes this node sent.
 //!
 //! Arms 4-6 were a single `full_no_summary` bucket when #4922 first shipped.
 //! The 2026-07-25 measurement then found that bucket was the LARGEST single
@@ -392,7 +393,7 @@ pub(crate) enum PayloadArm {
     /// See `broadcast_queue::delta_sent_as_full_state`.
     FullLargeDeltaStreamed,
     /// Full state on the stream: a verify-soon escalation (#6143) for a peer
-    /// found stale twice with an unchanged summary.
+    /// still stale in the confirm round, past every force condition.
     FullVerifyForced,
 }
 

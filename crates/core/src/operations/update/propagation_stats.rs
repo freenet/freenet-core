@@ -102,16 +102,16 @@ const TOP_K: usize = 8;
 /// capacity, rather than letting a key churn grow the map without bound.
 /// 4096 is comfortably above the active-contract count of a busy gateway.
 /// Each entry is at most [`MAX_COUNTERS_SIZE`] plus its key (pinned by
-/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.7 MB of
+/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.8 MB of
 /// entries at the cap. A hash table holds 4096 entries in 8192 buckets
 /// (hashbrown's 7/8 load factor rounds up to the next power of two), so the
-/// map is about 3.4 MB at the cap.
+/// map is about 3.6 MB at the cap.
 const MAX_TRACKED_CONTRACTS: usize = 4096;
 
 /// Upper bound on `size_of::<ContractCounters>()` and
 /// `size_of::<ContractSummary>()`, for the memory estimate above.
 #[cfg(test)]
-const MAX_COUNTERS_SIZE: usize = 400;
+const MAX_COUNTERS_SIZE: usize = 416;
 
 /// One countable thing that happened to an UPDATE's propagation for a
 /// contract, other than the fan-out target resolution `record_broadcast`
@@ -221,8 +221,8 @@ pub(crate) enum PropagationEvent {
     VerifyPeerStale,
     /// Verify-soon: a target's reply found it converged.
     VerifyPeerConverged,
-    /// Verify-soon: a target stale twice with an unchanged summary; its heal
-    /// is forced to full state on the stream.
+    /// Verify-soon: a target still stale in the confirm round passed every
+    /// force condition; its heal is forced to full state on the stream.
     VerifyForcedFull,
     /// Verify-soon: a leg carrying a forced full state was built for the
     /// stream.
@@ -248,12 +248,19 @@ pub(crate) enum PropagationEvent {
     /// Verify-soon: stale in the confirm round but not forced, because the
     /// pair was forced within the cooldown and its summary has not moved.
     VerifyNotForcedNoProgress,
+    /// Verify-soon: a target still stale in the confirm round (also counted in
+    /// `VerifyPeerStale`). Read against `VerifyPeerStale` to see how many first-round
+    /// stale peers the delta heal did not repair.
+    VerifyPeerStaleConfirm,
+    /// Verify-soon: stale in the confirm round but not forced, because the
+    /// node-wide forced-bytes budget for the window is spent.
+    VerifyNotForcedBytes,
 }
 
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 41] = [
+    pub(crate) const ALL: [PropagationEvent; 43] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -295,6 +302,8 @@ impl PropagationEvent {
         PropagationEvent::VerifyPeersTruncated,
         PropagationEvent::VerifyRoundTimedOut,
         PropagationEvent::VerifyNotForcedNoProgress,
+        PropagationEvent::VerifyPeerStaleConfirm,
+        PropagationEvent::VerifyNotForcedBytes,
     ];
 
     pub(crate) const COUNT: usize = Self::ALL.len();
@@ -342,6 +351,8 @@ impl PropagationEvent {
             PropagationEvent::VerifyPeersTruncated => 38,
             PropagationEvent::VerifyRoundTimedOut => 39,
             PropagationEvent::VerifyNotForcedNoProgress => 40,
+            PropagationEvent::VerifyPeerStaleConfirm => 41,
+            PropagationEvent::VerifyNotForcedBytes => 42,
         }
     }
 
@@ -417,6 +428,8 @@ impl PropagationEvent {
             PropagationEvent::VerifyPeersTruncated => "verify_peers_truncated",
             PropagationEvent::VerifyRoundTimedOut => "verify_round_timed_out",
             PropagationEvent::VerifyNotForcedNoProgress => "verify_not_forced_no_progress",
+            PropagationEvent::VerifyPeerStaleConfirm => "verify_peer_stale_confirm",
+            PropagationEvent::VerifyNotForcedBytes => "verify_not_forced_bytes",
         }
     }
 }
@@ -926,6 +939,8 @@ impl UpdatePropagationStats {
             PropagationEvent::VerifyPeersTruncated,
             PropagationEvent::VerifyRoundTimedOut,
             PropagationEvent::VerifyNotForcedNoProgress,
+            PropagationEvent::VerifyPeerStaleConfirm,
+            PropagationEvent::VerifyNotForcedBytes,
         ];
         if verify_events.iter().any(|ev| e.get(*ev) > 0) {
             tracing::info!(
@@ -944,6 +959,8 @@ impl UpdatePropagationStats {
                 verify_peers_truncated = e.get(PropagationEvent::VerifyPeersTruncated),
                 verify_round_timed_out = e.get(PropagationEvent::VerifyRoundTimedOut),
                 verify_not_forced_no_progress = e.get(PropagationEvent::VerifyNotForcedNoProgress),
+                verify_peer_stale_confirm = e.get(PropagationEvent::VerifyPeerStaleConfirm),
+                verify_not_forced_bytes = e.get(PropagationEvent::VerifyNotForcedBytes),
                 window_s = SUMMARY_WINDOW.as_secs(),
                 phase = "summary_verify",
                 "update_propagation_summary verify"

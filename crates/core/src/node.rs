@@ -4338,6 +4338,9 @@ pub mod stale_peer_heal_observations {
         pub verify_not_forced_no_progress: u64,
         pub verify_not_forced_cap: u64,
         pub verify_not_forced_busy: u64,
+        pub verify_not_forced_bytes: u64,
+        /// Stale verdicts in a confirm round (also in `verify_stale`).
+        pub verify_stale_confirm: u64,
         /// Rounds that ended at their deadline with a target unanswered.
         pub verify_rounds_timed_out: u64,
     }
@@ -4371,16 +4374,19 @@ pub mod stale_peer_heal_observations {
             Verdict::Stale => obs.verify_stale += 1,
             Verdict::Escalate => {
                 obs.verify_stale += 1;
+                obs.verify_stale_confirm += 1;
                 obs.verify_forced += 1;
             }
             Verdict::Held(hold) => {
                 obs.verify_stale += 1;
+                obs.verify_stale_confirm += 1;
                 match hold {
                     Hold::Evidence => obs.verify_not_forced_evidence += 1,
                     Hold::Floor => obs.verify_not_forced_floor += 1,
                     Hold::NoProgress => obs.verify_not_forced_no_progress += 1,
                     Hold::Cap => obs.verify_not_forced_cap += 1,
                     Hold::Busy => obs.verify_not_forced_busy += 1,
+                    Hold::Bytes => obs.verify_not_forced_bytes += 1,
                 }
             }
         }
