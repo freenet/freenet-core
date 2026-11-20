@@ -698,6 +698,28 @@ analysis there. Diagnose from the INFO line and telemetry instead:
   shows in the `wire_*` counts and the receivers' `rx_*` counts across the
   fleet.
 
+### Verify-soon check of originated updates (`update/verify_soon.rs`)
+
+A node that originates an UPDATE asks its fan-out targets for their summary
+`CHECK_DELAY` (5 s) later, with the existing `SummaryRequest` (only to peers
+at or above the hash-first floor). Replies go through the `Summaries` arm's
+staleness check and targeted heal, unchanged. A peer found stale in that
+round and stale again with the SAME summary in a confirm round 5 s later
+has its heal forced to full state on the caller-named stream (payload arm
+`full_verify_forced`), once per (contract, peer) per check. One check per
+contract, never postponed by later writes; a write during a check starts
+one more after it. Counters: `verify_scheduled`, `verify_dropped_cap`,
+`verify_request_sent`, `verify_peer_stale` (each is followed by a heal),
+`verify_peer_converged`, `verify_forced_full`, `verify_forced_full_sent`,
+logged on their own `update_propagation_summary verify` INFO line.
+
+Do not hook it anywhere but `update_contract`'s `ClientLocal` +
+`state_changed` branch, and keep the escalation decision in the `Summaries`
+arm BEFORE `emit_stale_peer_syncs`: the force mark must exist when that heal's
+leg is built. In simulations the forced leg is spawned rather than awaited
+(`spawn_forced_leg`): the simulation sends heals inline on the event loop,
+and a stream leg awaits a completion signal that loop has to drive.
+
 The INFO summary's per-contract lines are the top 8 by update activity, so a
 contract can fall into the "...and N others" rollup behind busier ones; the
 node-wide line and the `prop_*` telemetry fields still count it.
