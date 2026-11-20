@@ -4305,9 +4305,9 @@ pub mod stale_peer_heal_observations {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
 
-    /// What the `Summaries` arm and `emit_stale_peer_syncs` decided for one
-    /// contract, summed over every node in the process.
-    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    /// What the `Summaries` arm, `emit_stale_peer_syncs` and the verify-soon
+    /// check decided for one contract, summed over every node in the process.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
     pub struct Observations {
         /// Two-sided comparisons in the `Summaries` arm that found the peer
         /// stale.
@@ -4317,6 +4317,55 @@ pub mod stale_peer_heal_observations {
         pub peers_converged: u64,
         /// `SyncStateToPeer` heals queued by `emit_stale_peer_syncs`.
         pub heals_emitted: u64,
+        /// Verify-soon `SummaryRequest`s queued, per target address.
+        pub verify_requests_to: std::collections::BTreeMap<std::net::SocketAddr, u64>,
+        /// Verify-soon replies that found the peer stale (including
+        /// escalations).
+        pub verify_stale: u64,
+        /// Verify-soon replies that found the peer converged.
+        pub verify_converged: u64,
+        /// Verify-soon escalations to a forced full-state stream.
+        pub verify_forced: u64,
+        /// Legs built carrying a forced full state on the stream.
+        pub verify_forced_legs: u64,
+    }
+
+    impl Observations {
+        /// Every verify-soon `SummaryRequest` queued, to any target.
+        pub fn verify_requests(&self) -> u64 {
+            self.verify_requests_to.values().sum()
+        }
+    }
+
+    pub(crate) fn record_verify_request(key: &ContractKey, target: std::net::SocketAddr) {
+        *state()
+            .entry(*key)
+            .or_default()
+            .verify_requests_to
+            .entry(target)
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_verify_verdict(
+        key: &ContractKey,
+        verdict: crate::operations::update::verify_soon::Verdict,
+    ) {
+        use crate::operations::update::verify_soon::Verdict;
+        let mut state = state();
+        let obs = state.entry(*key).or_default();
+        match verdict {
+            Verdict::Ignored => {}
+            Verdict::Converged => obs.verify_converged += 1,
+            Verdict::Stale => obs.verify_stale += 1,
+            Verdict::Escalate => {
+                obs.verify_stale += 1;
+                obs.verify_forced += 1;
+            }
+        }
+    }
+
+    pub(crate) fn record_forced_leg(key: &ContractKey) {
+        state().entry(*key).or_default().verify_forced_legs += 1;
     }
 
     fn state() -> std::sync::MutexGuard<'static, HashMap<ContractKey, Observations>> {
@@ -4343,7 +4392,7 @@ pub mod stale_peer_heal_observations {
 
     /// Everything recorded for `key` since it was last cleared.
     pub fn get(key: &ContractKey) -> Observations {
-        state().get(key).copied().unwrap_or_default()
+        state().get(key).cloned().unwrap_or_default()
     }
 
     /// Forget everything recorded for `key`.
@@ -4968,6 +5017,19 @@ async fn handle_interest_sync_message(
                                 .record_repair_outcome(&contract, &pk, !is_stale, evidence);
                             #[cfg(any(test, feature = "testing"))]
                             stale_peer_heal_observations::record_comparison(&contract, is_stale);
+                            // #6143 verify-soon: an answer to a check of our own
+                            // originated write. Decided BEFORE the heal below is
+                            // emitted, so an escalation's force mark is in place
+                            // when that heal's leg is built.
+                            if let Some(theirs) = their_summary.as_ref() {
+                                crate::operations::update::verify_soon::on_summary_comparison(
+                                    op_manager,
+                                    &contract,
+                                    &pk,
+                                    is_stale,
+                                    theirs.as_ref(),
+                                );
+                            }
                         }
 
                         // #4952: upsert (not update) when the peer reported a

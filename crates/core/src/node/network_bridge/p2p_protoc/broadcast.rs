@@ -739,6 +739,21 @@ impl P2pConnManager {
             // interval is handed to the held-legs timer instead.
             let peer_key = crate::ring::PeerKey::from(target.pub_key().clone());
             match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
+                Ok(_claim)
+                    if op_manager.verify_soon.has_forced(
+                        &key,
+                        &peer_key,
+                        op_manager.ring.time_source.now(),
+                    ) =>
+                {
+                    Self::spawn_forced_leg(
+                        self.bridge.clone(),
+                        op_manager.clone(),
+                        key,
+                        new_state,
+                        target,
+                    );
+                }
                 Ok(_claim) => {
                     super::super::broadcast_queue::broadcast_to_single_peer(
                         &self.bridge,
@@ -774,6 +789,35 @@ impl P2pConnManager {
                 }
             }
         }
+    }
+
+    /// Send a verify-soon forced full-state leg (#6143) on its own task.
+    ///
+    /// Simulation only. Production sends every leg from the broadcast queue's
+    /// tasks; the simulation sends heals inline on the event loop, and a stream
+    /// leg awaits its completion signal, which this same event loop has to
+    /// drive. Awaiting it here would stall the node.
+    #[cfg(feature = "simulation_tests")]
+    fn spawn_forced_leg(
+        bridge: P2pBridge,
+        op_manager: Arc<OpManager>,
+        key: freenet_stdlib::prelude::ContractKey,
+        new_state: freenet_stdlib::prelude::WrappedState,
+        target: crate::ring::PeerKeyLocation,
+    ) {
+        // A sim-only, single-send task that ends when the stream does.
+        drop(crate::config::GlobalExecutor::spawn(async move {
+            super::super::broadcast_queue::broadcast_to_single_peer(
+                &bridge,
+                &op_manager,
+                key,
+                new_state,
+                target,
+                None,
+                super::super::broadcast_queue::no_fanout(),
+            )
+            .await;
+        }));
     }
 
     #[cfg(feature = "simulation_tests")]
@@ -911,6 +955,23 @@ impl P2pConnManager {
                     continue;
                 }
             };
+
+            // #6143 verify-soon: a pair marked for a forced full-state stream
+            // goes through the production single-peer path, which owns that
+            // choice, so this simulation copy does not have to duplicate it.
+            if op_manager
+                .verify_soon
+                .has_forced(&key, &peer_key, op_manager.ring.time_source.now())
+            {
+                Self::spawn_forced_leg(
+                    bridge.clone(),
+                    op_manager.clone(),
+                    key,
+                    new_state.clone(),
+                    target.clone(),
+                );
+                continue;
+            }
 
             // Get peer's cached summary
             let their_summary = op_manager

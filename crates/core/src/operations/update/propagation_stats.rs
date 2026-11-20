@@ -100,16 +100,16 @@ const TOP_K: usize = 8;
 /// capacity, rather than letting a key churn grow the map without bound.
 /// 4096 is comfortably above the active-contract count of a busy gateway.
 /// Each entry is at most [`MAX_COUNTERS_SIZE`] plus its key (pinned by
-/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.3 MB of
+/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.5 MB of
 /// entries at the cap. A hash table holds 4096 entries in 8192 buckets
 /// (hashbrown's 7/8 load factor rounds up to the next power of two), so the
-/// map is about 2.6 MB at the cap.
+/// map is about 3 MB at the cap.
 const MAX_TRACKED_CONTRACTS: usize = 4096;
 
 /// Upper bound on `size_of::<ContractCounters>()` and
 /// `size_of::<ContractSummary>()`, for the memory estimate above.
 #[cfg(test)]
-const MAX_COUNTERS_SIZE: usize = 288;
+const MAX_COUNTERS_SIZE: usize = 344;
 
 /// One countable thing that happened to an UPDATE's propagation for a
 /// contract, other than the fan-out target resolution `record_broadcast`
@@ -203,12 +203,34 @@ pub(crate) enum PropagationEvent {
     /// Receiver: an inbound broadcast skipped because this node does not host
     /// the contract (`Ring::may_merge_relayed_update`), so it was not merged.
     RxNotHosted,
+    /// Verify-soon (#6143): an originated write scheduled a check of its fan-out
+    /// targets (`verify_soon`). A write coalesced into an existing check is
+    /// not counted.
+    VerifyScheduled,
+    /// Verify-soon: an originated write was not checked because the table of
+    /// checks was full.
+    VerifyDroppedCap,
+    /// Verify-soon: a `SummaryRequest` for the contract was queued to one
+    /// target.
+    VerifyRequestSent,
+    /// Verify-soon: a target's reply found it stale. The `Summaries` arm
+    /// heals it right after, so this is also the count of heals the check
+    /// triggered.
+    VerifyPeerStale,
+    /// Verify-soon: a target's reply found it converged.
+    VerifyPeerConverged,
+    /// Verify-soon: a target stale twice with an unchanged summary; its heal
+    /// is forced to full state on the stream.
+    VerifyForcedFull,
+    /// Verify-soon: a leg carrying a forced full state was built for the
+    /// stream.
+    VerifyForcedFullSent,
 }
 
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 26] = [
+    pub(crate) const ALL: [PropagationEvent; 33] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -235,6 +257,13 @@ impl PropagationEvent {
         PropagationEvent::RxAlreadyApplied,
         PropagationEvent::RxBackoff,
         PropagationEvent::RxNotHosted,
+        PropagationEvent::VerifyScheduled,
+        PropagationEvent::VerifyDroppedCap,
+        PropagationEvent::VerifyRequestSent,
+        PropagationEvent::VerifyPeerStale,
+        PropagationEvent::VerifyPeerConverged,
+        PropagationEvent::VerifyForcedFull,
+        PropagationEvent::VerifyForcedFullSent,
     ];
 
     pub(crate) const COUNT: usize = Self::ALL.len();
@@ -267,6 +296,13 @@ impl PropagationEvent {
             PropagationEvent::RxAlreadyApplied => 23,
             PropagationEvent::RxBackoff => 24,
             PropagationEvent::RxNotHosted => 25,
+            PropagationEvent::VerifyScheduled => 26,
+            PropagationEvent::VerifyDroppedCap => 27,
+            PropagationEvent::VerifyRequestSent => 28,
+            PropagationEvent::VerifyPeerStale => 29,
+            PropagationEvent::VerifyPeerConverged => 30,
+            PropagationEvent::VerifyForcedFull => 31,
+            PropagationEvent::VerifyForcedFullSent => 32,
         }
     }
 
@@ -327,13 +363,27 @@ impl PropagationEvent {
             PropagationEvent::RxAlreadyApplied => "rx_already_applied",
             PropagationEvent::RxBackoff => "rx_backoff",
             PropagationEvent::RxNotHosted => "rx_not_hosted",
+            PropagationEvent::VerifyScheduled => "verify_scheduled",
+            PropagationEvent::VerifyDroppedCap => "verify_dropped_cap",
+            PropagationEvent::VerifyRequestSent => "verify_request_sent",
+            PropagationEvent::VerifyPeerStale => "verify_peer_stale",
+            PropagationEvent::VerifyPeerConverged => "verify_peer_converged",
+            PropagationEvent::VerifyForcedFull => "verify_forced_full",
+            PropagationEvent::VerifyForcedFullSent => "verify_forced_full_sent",
         }
     }
 }
 
 /// Per-event counts, indexed by [`PropagationEvent::index`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EventCounts([u64; PropagationEvent::COUNT]);
+
+// Written out: `Default` is derived for arrays of at most 32 elements.
+impl Default for EventCounts {
+    fn default() -> Self {
+        Self([0; PropagationEvent::COUNT])
+    }
+}
 
 impl EventCounts {
     pub(crate) fn get(&self, ev: PropagationEvent) -> u64 {
@@ -811,6 +861,31 @@ impl UpdatePropagationStats {
             phase = "summary",
             "update_propagation_summary"
         );
+        // Verify-soon (#6143) on its own line: the line above is at tracing's
+        // field limit. All of these are also exported as `prop_*`.
+        let verify_events = [
+            PropagationEvent::VerifyScheduled,
+            PropagationEvent::VerifyDroppedCap,
+            PropagationEvent::VerifyRequestSent,
+            PropagationEvent::VerifyPeerStale,
+            PropagationEvent::VerifyPeerConverged,
+            PropagationEvent::VerifyForcedFull,
+            PropagationEvent::VerifyForcedFullSent,
+        ];
+        if verify_events.iter().any(|ev| e.get(*ev) > 0) {
+            tracing::info!(
+                verify_scheduled = e.get(PropagationEvent::VerifyScheduled),
+                verify_dropped_cap = e.get(PropagationEvent::VerifyDroppedCap),
+                verify_request_sent = e.get(PropagationEvent::VerifyRequestSent),
+                verify_peer_stale = e.get(PropagationEvent::VerifyPeerStale),
+                verify_peer_converged = e.get(PropagationEvent::VerifyPeerConverged),
+                verify_forced_full = e.get(PropagationEvent::VerifyForcedFull),
+                verify_forced_full_sent = e.get(PropagationEvent::VerifyForcedFullSent),
+                window_s = SUMMARY_WINDOW.as_secs(),
+                phase = "summary_verify",
+                "update_propagation_summary verify"
+            );
+        }
 
         for c in &summary.top {
             let e = &c.events;
@@ -1969,6 +2044,7 @@ mod tests {
             include_str!("../../node/op_state_manager.rs"),
             include_str!("../update.rs"),
             include_str!("op_ctx_task.rs"),
+            include_str!("verify_soon.rs"),
         ];
         // Production code only: everything above the first top-level test
         // module, whatever its visibility.

@@ -4601,6 +4601,16 @@ pub(super) async fn broadcast_to_single_peer(
 
     let peer_key = PeerKey::from(target.pub_key().clone());
 
+    // #6143 verify-soon: this peer was found stale twice with an unchanged
+    // summary, so neither the original legs nor a delta heal reached it. Send
+    // full state on the caller-named stream whatever its size (the path that
+    // kept working in #6143), and skip the converged check: the belief it reads
+    // is what the escalation distrusts.
+    let forced_full =
+        op_manager
+            .verify_soon
+            .take_forced(&key, &peer_key, op_manager.ring.time_source.now());
+
     // A leg queued in the small lane may find the stored state has since grown
     // past `LARGE_STATE_LANE_THRESHOLD` (a later write replaced it). The
     // summary and delta below run against the stored state, so take a
@@ -4693,7 +4703,7 @@ pub(super) async fn broadcast_to_single_peer(
     // fan-out is the nondeterministic-summary heal storm. `fanout_send_needed`
     // asks the shared delta cache / the contract itself (bounded probe)
     // whether the peer actually lacks state we hold.
-    if let (Some(ours), Some(theirs)) = (&our_summary, &their_summary) {
+    if let (false, Some(ours), Some(theirs)) = (forced_full, &our_summary, &their_summary) {
         // Per-invocation probe budget: one (contract, peer) pair per call, so
         // at most one WASM probe per queue entry (see `fanout_send_needed`).
         let mut staleness_probes_used = 0usize;
@@ -4786,6 +4796,13 @@ pub(super) async fn broadcast_to_single_peer(
     // #4961: WHY a tracked peer has no cached summary. Set only on the
     // `FullNoTheirSummaryTracked` arm below, where the entry exists to be read.
     let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
+        // #6143 verify-soon escalation: full state whatever the summaries say.
+        // Checked first so it is attributed to its own arm.
+        _ if forced_full => (
+            LegPayload::FullState(new_state.clone()),
+            false,
+            PayloadArm::FullVerifyForced,
+        ),
         // Scoped to the both-summaries-present case ON PURPOSE. When a summary
         // is missing a delta was impossible regardless of the memo, so letting
         // the suppression guard win there would credit the memo for a full
@@ -5031,8 +5048,18 @@ pub(super) async fn broadcast_to_single_peer(
     let update_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
 
     // Check if we should use streaming for full state broadcasts
+    // A verify-soon escalation always streams, whatever its size.
     let use_streaming = matches!(&payload, LegPayload::FullState(_))
-        && crate::operations::should_use_streaming(op_manager.streaming_threshold, payload_size);
+        && (forced_full
+            || crate::operations::should_use_streaming(
+                op_manager.streaming_threshold,
+                payload_size,
+            ));
+    if forced_full {
+        record_propagation_event(op_manager, key.id(), PropagationEvent::VerifyForcedFullSent);
+        #[cfg(any(test, feature = "testing"))]
+        crate::node::stale_peer_heal_observations::record_forced_leg(&key);
+    }
 
     // Each branch below tracks whether the message was *actually delivered* to
     // the peer, as distinct from merely being enqueued for dispatch, and applies
@@ -6884,6 +6911,7 @@ mod tests {
             "PayloadArm::FullNoOurSummary",
             "PayloadArm::FullNoTheirSummaryUntracked",
             "PayloadArm::FullNoTheirSummaryTracked",
+            "PayloadArm::FullVerifyForced",
         ] {
             assert!(
                 body.contains(arm),

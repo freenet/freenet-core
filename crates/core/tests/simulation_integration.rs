@@ -24505,3 +24505,377 @@ fn test_summary_request_heals_a_peer_that_is_behind() {
         outcome.versions
     );
 }
+
+// =============================================================================
+// #6143 verify-soon: the check of a node's own originated UPDATEs, end to end.
+// One gateway and three nodes, all subscribed; node 1 originates.
+// =============================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum InlineFault {
+    /// No fault.
+    None,
+    /// Node 1's inline legs are lost while it writes, then the fault lifts.
+    Lifted,
+    /// Node 1's inline legs for the contract are lost for the whole run; its
+    /// streams still work. The real #6143 shape.
+    Persistent,
+}
+
+struct VerifyScenario {
+    network_name: &'static str,
+    seed: u64,
+    contract_seed: u8,
+    fault: InlineFault,
+    /// Updates node 1 sends, one per controlled-op interval (3 s).
+    updates: u64,
+    /// Bytes after the CRDT version prefix.
+    state_len: usize,
+    /// Node 3 advertises a version below the hash-first floor.
+    node3_pre_floor: bool,
+    /// Node 3 is crashed (its traffic blocked) before node 1 writes.
+    node3_crashed: bool,
+}
+
+impl VerifyScenario {
+    fn new(network_name: &'static str, contract_seed: u8, fault: InlineFault) -> Self {
+        Self {
+            network_name,
+            seed: 0x6143_7E51_0001,
+            contract_seed,
+            fault,
+            updates: 1,
+            state_len: 128,
+            node3_pre_floor: false,
+            node3_crashed: false,
+        }
+    }
+}
+
+struct VerifyOutcome {
+    final_version: u64,
+    /// (label, address, stored CRDT version) for each host other than node 1.
+    others: Vec<(String, std::net::SocketAddr, Option<u64>)>,
+    swallowed: usize,
+    obs: freenet::dev_tool::stale_peer_heal_observations::Observations,
+}
+
+impl VerifyOutcome {
+    fn all_converged(&self) -> bool {
+        self.others
+            .iter()
+            .all(|(_, _, v)| *v == Some(self.final_version))
+    }
+    fn versions(&self) -> Vec<(&str, Option<u64>)> {
+        self.others
+            .iter()
+            .map(|(l, _, v)| (l.as_str(), *v))
+            .collect()
+    }
+}
+
+/// Virtual time the run continues after node 1's last write: the 25 s bound
+/// of the success criterion (5 s delay, a round, 5 s confirm delay, a round,
+/// the forced stream).
+const VERIFY_BOUND: Duration = Duration::from_secs(25);
+
+fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
+    use freenet::dev_tool::{
+        NodeLabel, ScheduledOperation, SimOperation, inline_leg_fault_injection,
+        register_crdt_contract, stale_peer_heal_observations,
+    };
+    let VerifyScenario {
+        network_name,
+        seed,
+        contract_seed,
+        fault,
+        updates,
+        state_len,
+        node3_pre_floor,
+        node3_crashed,
+    } = scenario;
+
+    const FIRST_VERSION: u64 = 100;
+    let final_version = FIRST_VERSION + updates - 1;
+    let crdt_state = |version: u64| {
+        let mut state = version.to_le_bytes().to_vec();
+        state.extend((0..state_len).map(|i| (i as u8).wrapping_mul(3) ^ contract_seed));
+        state
+    };
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    let contract = SimOperation::create_test_contract(contract_seed);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+    stale_peer_heal_observations::clear(&contract_key);
+
+    let mut sim =
+        rt.block_on(async { SimNetwork::new(network_name, 1, 3, 7, 3, 10, 2, seed).await });
+    // As in production since 0.2.120: a joiner learns its gateway's version,
+    // so the gateway is a version-gated target like any other peer.
+    sim.enable_gateway_ack_version();
+    let originator = NodeLabel::node(network_name, 1);
+    let node3 = NodeLabel::node(network_name, 3);
+    if node3_pre_floor {
+        // Every node but node 3 is at or above (0, 2, 151); node 3 says 150.
+        sim.with_hash_first_summaries_floor((0, 2, 151));
+        sim.with_node_advertised_version(&node3, (0, 2, 150));
+    }
+    let originator_addr = sim
+        .node_address(&originator)
+        .expect("node 1 has an address");
+    let others = [
+        NodeLabel::gateway(network_name, 0),
+        NodeLabel::node(network_name, 2),
+        node3.clone(),
+    ];
+    let other_addrs: Vec<_> = others
+        .iter()
+        .map(|l| sim.node_address(l).expect("node has an address"))
+        .collect();
+    if fault != InlineFault::None {
+        inline_leg_fault_injection::drop_inline_legs_from(originator_addr, contract_key);
+    }
+
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(network_name, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x01),
+            subscribe: true,
+        },
+    )];
+    for n in 1..=3 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(network_name, n),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+    if node3_crashed {
+        operations.push(ScheduledOperation::new(
+            node3.clone(),
+            SimOperation::CrashNode,
+        ));
+    }
+    for version in FIRST_VERSION..=final_version {
+        operations.push(ScheduledOperation::new(
+            originator.clone(),
+            SimOperation::Update {
+                key: contract_key,
+                data: crdt_state(version),
+            },
+        ));
+    }
+    // The lift is sequenced one op interval (3 s) after the last write, so
+    // before the first check (5 s); it counts toward the bound.
+    let mut post_wait = VERIFY_BOUND;
+    if fault == InlineFault::Lifted {
+        operations.push(ScheduledOperation::new(
+            originator.clone(),
+            SimOperation::LiftInlineLegFault { key: contract_key },
+        ));
+        post_wait -= Duration::from_secs(3);
+    }
+
+    let result =
+        sim.run_controlled_simulation(seed, operations, Duration::from_secs(180), post_wait);
+    let swallowed = inline_leg_fault_injection::swallowed(&contract_key);
+    inline_leg_fault_injection::clear(&contract_key);
+    let obs = stale_peer_heal_observations::get(&contract_key);
+    stale_peer_heal_observations::clear(&contract_key);
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation must complete: {:?}",
+        result.turmoil_result.err()
+    );
+    let version_of = |label: &NodeLabel| {
+        result
+            .node_storages
+            .get(label)
+            .and_then(|s| s.get_stored_state(&contract_key))
+            .map(|state| {
+                let bytes: &[u8] = state.as_ref();
+                u64::from_le_bytes(bytes[..8].try_into().expect("CRDT state has a version"))
+            })
+    };
+    assert_eq!(
+        version_of(&originator),
+        Some(final_version),
+        "the originator must hold its own last update"
+    );
+    let outcome = VerifyOutcome {
+        final_version,
+        others: others
+            .iter()
+            .zip(other_addrs)
+            .map(|(l, a)| (l.to_string(), a, version_of(l)))
+            .collect(),
+        swallowed,
+        obs,
+    };
+    tracing::info!(
+        network_name,
+        versions = ?outcome.versions(),
+        swallowed = outcome.swallowed,
+        obs = ?outcome.obs,
+        "verify-soon scenario outcome"
+    );
+    outcome
+}
+
+/// (a) Healthy network: the check costs one request per co-host and finds
+/// nothing to heal.
+#[test_log::test]
+fn test_verify_soon_healthy_update_costs_one_request_per_cohost() {
+    let o = run_verify_scenario(VerifyScenario::new("vs-healthy", 0x81, InlineFault::None));
+    assert!(o.all_converged(), "versions: {:?}", o.versions());
+    assert!(
+        o.obs.verify_requests() >= 1,
+        "the check must run at all: {:?}",
+        o.obs
+    );
+    assert!(
+        o.obs.verify_requests() <= 3,
+        "one request per co-host per check: {:?}",
+        o.obs
+    );
+    assert_eq!(o.obs.verify_stale, 0, "{:?}", o.obs);
+    assert_eq!(o.obs.verify_forced, 0, "{:?}", o.obs);
+    assert_eq!(o.obs.verify_forced_legs, 0, "{:?}", o.obs);
+    assert_eq!(o.obs.heals_emitted, 0, "{:?}", o.obs);
+}
+
+/// (b) Legs lost, fault lifted before the check: the delta heal repairs every
+/// host within the bound, with no forced stream.
+#[test_log::test]
+fn test_verify_soon_heals_lost_legs_with_a_delta() {
+    let o = run_verify_scenario(VerifyScenario::new("vs-lifted", 0x82, InlineFault::Lifted));
+    assert!(o.swallowed > 0, "the fault seam never fired");
+    assert!(o.obs.verify_stale >= 1, "{:?}", o.obs);
+    assert_eq!(o.obs.verify_forced, 0, "{:?}", o.obs);
+    assert!(
+        o.all_converged(),
+        "every host must converge within {VERIFY_BOUND:?}: {:?} {:?}",
+        o.versions(),
+        o.obs
+    );
+}
+
+/// (c) The real #6143 shape: every inline leg from node 1 for the contract is
+/// lost for the whole run, its streams work. The delta heal is lost too, so
+/// the confirm round escalates to a forced full-state stream.
+#[test_log::test]
+fn test_verify_soon_escalates_to_a_stream_under_a_persistent_inline_fault() {
+    let o = run_verify_scenario(VerifyScenario::new(
+        "vs-persistent",
+        0x83,
+        InlineFault::Persistent,
+    ));
+    assert!(o.swallowed > 0, "the fault seam never fired");
+    assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
+    assert!(
+        o.obs.verify_forced <= 3,
+        "one per co-host per update: {:?}",
+        o.obs
+    );
+    assert!(o.obs.verify_forced_legs >= 1, "{:?}", o.obs);
+    assert!(
+        o.all_converged(),
+        "every host must converge within {VERIFY_BOUND:?}: {:?} {:?}",
+        o.versions(),
+        o.obs
+    );
+}
+
+/// (d) Sustained writes, healthy: checks are coalesced, never postponed, and
+/// bounded; nothing is forced.
+#[test_log::test]
+fn test_verify_soon_sustained_writes_are_bounded() {
+    let mut s = VerifyScenario::new("vs-sustained", 0x84, InlineFault::None);
+    s.updates = 6;
+    let o = run_verify_scenario(s);
+    assert!(o.all_converged(), "versions: {:?}", o.versions());
+    // Six writes 3 s apart span 15 s: at most ceil(15 / 5) + 1 = 4 checks,
+    // each one request per co-host (no stale peer, so no confirm round).
+    assert!(o.obs.verify_requests() >= 1, "{:?}", o.obs);
+    assert!(o.obs.verify_requests() <= 12, "{:?}", o.obs);
+    assert_eq!(o.obs.verify_forced, 0, "{:?}", o.obs);
+}
+
+/// (d') Sustained writes under the persistent fault: every host still reaches
+/// the last version within the bound.
+#[test_log::test]
+fn test_verify_soon_sustained_writes_under_a_persistent_fault_converge() {
+    let mut s = VerifyScenario::new("vs-sustained-fault", 0x85, InlineFault::Persistent);
+    s.updates = 6;
+    let o = run_verify_scenario(s);
+    assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
+    // Two rounds per check, at most 4 checks, 3 co-hosts.
+    assert!(o.obs.verify_requests() <= 24, "{:?}", o.obs);
+    assert!(o.obs.verify_forced <= 12, "{:?}", o.obs);
+    assert!(
+        o.all_converged(),
+        "versions: {:?} {:?}",
+        o.versions(),
+        o.obs
+    );
+}
+
+/// (e) Mixed versions: a peer below the hash-first floor cannot decode
+/// `SummaryRequest`, so it is never sent one; the others are still checked.
+#[test_log::test]
+fn test_verify_soon_never_asks_a_peer_below_the_floor() {
+    let mut s = VerifyScenario::new("vs-mixed", 0x86, InlineFault::Lifted);
+    s.node3_pre_floor = true;
+    let o = run_verify_scenario(s);
+    let node3 = o.others[2].1;
+    assert_eq!(
+        o.obs.verify_requests_to.get(&node3).copied().unwrap_or(0),
+        0,
+        "node 3 is below the floor: {:?}",
+        o.obs
+    );
+    assert!(o.obs.verify_requests() >= 1, "{:?}", o.obs);
+}
+
+/// (f) A peer that never replies: its round times out and the check ends;
+/// no request is retried beyond the two rounds.
+#[test_log::test]
+fn test_verify_soon_a_silent_peer_is_not_retried() {
+    let mut s = VerifyScenario::new("vs-silent", 0x87, InlineFault::Lifted);
+    s.node3_crashed = true;
+    let o = run_verify_scenario(s);
+    let node3 = o.others[2].1;
+    let to_node3 = o.obs.verify_requests_to.get(&node3).copied().unwrap_or(0);
+    assert!(to_node3 <= 2, "First + at most Confirm: {:?}", o.obs);
+    assert!(o.obs.verify_requests() >= 1, "{:?}", o.obs);
+    for (label, _, v) in &o.others[..2] {
+        assert_eq!(
+            *v,
+            Some(o.final_version),
+            "{label} must converge despite the silent peer: {:?}",
+            o.obs
+        );
+    }
+}
+
+/// (g) A large, multi-fragment state under the persistent fault converges
+/// through the forced stream.
+#[test_log::test]
+fn test_verify_soon_large_state_escalates_to_a_stream() {
+    let mut s = VerifyScenario::new("vs-large", 0x88, InlineFault::Persistent);
+    s.state_len = 8 * 1024;
+    let o = run_verify_scenario(s);
+    assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
+    assert!(o.obs.verify_forced_legs >= 1, "{:?}", o.obs);
+    assert!(
+        o.all_converged(),
+        "versions: {:?} {:?}",
+        o.versions(),
+        o.obs
+    );
+}
