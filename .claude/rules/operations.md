@@ -706,14 +706,20 @@ A node that originates an UPDATE asks its fan-out targets for their summary
 `CHECK_DELAY` (5 s) later, with the existing `SummaryRequest` (only to peers
 at or above the hash-first floor). Replies go through the `Summaries` arm's
 staleness check and targeted heal, unchanged. A peer found stale in that
-round and stale again with the SAME summary in a confirm round 5 s later
-has its heal forced to full state on the caller-named stream (payload arm
-`full_verify_forced`), once per (contract, peer) per check. One check per
-contract, never postponed by later writes; a write during a check starts
-one more after it. Counters: `verify_scheduled`, `verify_dropped_cap`,
-`verify_request_sent`, `verify_peer_stale` (each is followed by a heal),
-`verify_peer_converged`, `verify_forced_full`, `verify_forced_full_sent`,
-logged on their own `update_propagation_summary verify` INFO line.
+round and stale again in a confirm round 5 s later has its heal forced to full
+state on the caller-named stream (payload arm `full_verify_forced`), when the
+confirm verdict is real evidence (`OutcomeEvidence::Verdict`), no leg for the
+pair is queued or sending, the pair was not forced in the last 60 s, and, if
+it was forced in the last 10 min, the peer's summary has moved since. A floor
+hold schedules one retry when the floor ends, so a persistently broken
+originator still delivers each write within about 65 s. One check per
+contract, never postponed by later writes; a write during a check starts one
+more after it. Counters (`verify_*`, on their own
+`update_propagation_summary verify` INFO line): scheduled, dropped_cap,
+request_sent, request_dropped, peers_truncated, round_timed_out, peer_stale (a
+stale verdict, not a heal), peer_converged, forced_full, forced_full_sent, and
+not_forced_{evidence,floor,no_progress,cap,busy}. Bounds and residuals are in
+the `verify_soon` module doc.
 
 Do not hook it anywhere but `update_contract`'s `ClientLocal` +
 `state_changed` branch, and keep the escalation decision in the `Summaries`
