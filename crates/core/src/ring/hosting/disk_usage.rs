@@ -788,9 +788,9 @@ impl DiskUsageTracker {
     }
 
     /// Re-measure the unpacked-webapp cache (#5007), recursively. REPORTED
-    /// ONLY: the result never enters [`Self::total_bytes`]. #5012 already caps
-    /// this cache at 64 MiB with its own LRU, and hosting eviction has no lever
-    /// on it.
+    /// ONLY: the result never enters [`Self::total_bytes`]. The cache has its own
+    /// LRU bound (`WEBAPP_CACHE_MAX_BYTES` in `server/path_handlers.rs`), and
+    /// hosting eviction has no lever on it.
     pub(crate) fn refresh_webapp_cache(&self) {
         self.store_measurement(
             &self.webapp_cache_bytes,

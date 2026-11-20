@@ -388,6 +388,16 @@ const WEBAPP_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 // over it. The unpack limits guarantee that cannot happen.
 const _: () = assert!(super::app_packaging::MAX_UNPACKED_TOTAL_BYTES < WEBAPP_CACHE_MAX_BYTES);
 
+/// Most archives this node unpacks to disk at once.
+///
+/// `unpack_if_stale` holds only a per-contract lock, so without this bound N
+/// different contracts could each write up to `MAX_UNPACKED_TOTAL_BYTES` before
+/// the cache sweep runs. Worst-case transient disk is
+/// `MAX_CONCURRENT_UNPACKS * MAX_UNPACKED_TOTAL_BYTES` = 4 x 256 MiB = 1 GiB,
+/// which exceeds [`WEBAPP_CACHE_MAX_BYTES`] until the sweep catches up. Further
+/// unpacks queue for a permit rather than being refused.
+const MAX_CONCURRENT_UNPACKS: usize = 4;
+
 /// Largest cached file the handlers will read whole into memory, for the two
 /// cases that rewrite text (`.js` and HTML pages). Everything else is streamed
 /// by `ServeFile`. Real bundles are well under 1 MB; this is far above that, and
@@ -561,6 +571,9 @@ pub(crate) struct WebappCache {
     /// simulation harness does). A global would let one simulated node's
     /// traffic refuse another's.
     speculative_fetches: Arc<Semaphore>,
+    /// Permits for in-flight unpacks, see [`MAX_CONCURRENT_UNPACKS`]. Per node
+    /// for the same reason as `speculative_fetches`.
+    unpacks: Arc<Semaphore>,
 }
 
 impl WebappCache {
@@ -605,6 +618,7 @@ impl WebappCache {
             max_bytes: WEBAPP_CACHE_MAX_BYTES,
             sweep: Arc::new(parking_lot::Mutex::new(SweepState::default())),
             speculative_fetches: Arc::new(Semaphore::new(SPECULATIVE_FETCH_LIMIT)),
+            unpacks: Arc::new(Semaphore::new(MAX_CONCURRENT_UNPACKS)),
         }
     }
 
@@ -1808,8 +1822,20 @@ async fn unpack_if_stale(
     let state_shared: Arc<[u8]> = Arc::from(state_bytes);
     let path_owned = path.clone();
     let hash_path_owned = hash_path.clone();
+    let unpack_slots = cache.unpacks.clone();
     crate::config::GlobalExecutor::spawn(async move {
         let _guard = _guard;
+        // Queue for a node-wide unpack slot, held until the unpack finishes.
+        // Acquired inside the detached task so that dropping the caller cannot
+        // release it while the blocking unpack is still writing. The semaphore
+        // is never closed, so acquisition cannot fail.
+        let _unpack_slot =
+            unpack_slots
+                .acquire_owned()
+                .await
+                .map_err(|e| WebSocketApiError::NodeError {
+                    error_cause: format!("unpack limiter closed: {e}"),
+                })?;
         let contract = &contract_owned;
         let path = path_owned;
         let hash_path = hash_path_owned;
@@ -2970,6 +2996,7 @@ mod tests {
             max_bytes,
             sweep: Arc::new(parking_lot::Mutex::new(SweepState::default())),
             speculative_fetches: Arc::new(Semaphore::new(SPECULATIVE_FETCH_LIMIT)),
+            unpacks: Arc::new(Semaphore::new(MAX_CONCURRENT_UNPACKS)),
         }
     }
 
@@ -5561,6 +5588,70 @@ mod tests {
         );
 
         CONTRACT_REFRESH_LOCKS.remove(&instance_id);
+        clear_cache(&instance_id).await;
+    }
+
+    /// With every unpack slot taken, a further unpack queues instead of
+    /// writing to disk, and starts once a slot frees.
+    #[tokio::test]
+    async fn unpacks_queue_when_the_node_wide_limit_is_reached() {
+        let (contract, state) = webapp_contract_and_state(&rand::random::<[u8; 16]>());
+        let instance_id = *contract.key().id();
+        let root = tempfile::tempdir().expect("tempdir");
+        let webapp_cache = WebappCache {
+            unpacks: Arc::new(Semaphore::new(1)),
+            ..cache(root.path(), u64::MAX)
+        };
+        clear_cache(&instance_id).await;
+
+        // The test gate sits AFTER the slot acquisition, so `started` firing
+        // means the unpack got its slot.
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(1));
+        UNPACK_TEST_GATES.insert(instance_id, (started.clone(), release));
+
+        let slot = webapp_cache
+            .unpacks
+            .clone()
+            .try_acquire_owned()
+            .expect("the only slot is free");
+        let task = tokio::spawn({
+            let webapp_cache = webapp_cache.clone();
+            async move { unpack_if_stale(&contract, state.as_ref(), &webapp_cache).await }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), started.notified())
+                .await
+                .is_err(),
+            "an unpack started while every slot was taken"
+        );
+        assert!(
+            !webapp_cache
+                .entry_dir(&instance_id)
+                .join("index.html")
+                .exists(),
+            "an unpack wrote to disk while every slot was taken"
+        );
+
+        drop(slot);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the queued unpack must run once a slot frees")
+            .expect("join")
+            .expect("unpack succeeds");
+        assert!(
+            webapp_cache
+                .entry_dir(&instance_id)
+                .join("index.html")
+                .exists()
+        );
+        assert_eq!(
+            webapp_cache.unpacks.available_permits(),
+            1,
+            "the slot must be returned when the unpack finishes"
+        );
+        UNPACK_TEST_GATES.remove(&instance_id);
         clear_cache(&instance_id).await;
     }
 
