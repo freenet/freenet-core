@@ -707,19 +707,23 @@ A node that originates an UPDATE asks its fan-out targets for their summary
 at or above the hash-first floor). Replies go through the `Summaries` arm's
 staleness check and targeted heal, unchanged. A peer found stale in that
 round and stale again in a confirm round 5 s later has its heal forced to full
-state on the caller-named stream (payload arm `full_verify_forced`), when the
-confirm verdict is real evidence (`OutcomeEvidence::Verdict`), no leg for the
-pair is queued or sending, the pair was not forced in the last 60 s, and, if
-it was forced in the last 10 min, the peer's summary has moved since. A floor
-hold schedules one retry when the floor ends, so a persistently broken
-originator still delivers each write within about 65 s. One check per
-contract, never postponed by later writes; a write during a check starts one
-more after it. Counters (`verify_*`, on their own
-`update_propagation_summary verify` INFO line): scheduled, dropped_cap,
-request_sent, request_dropped, peers_truncated, round_timed_out, peer_stale (a
-stale verdict, not a heal), peer_converged, forced_full, forced_full_sent, and
-not_forced_{evidence,floor,no_progress,cap,busy}. Bounds and residuals are in
-the `verify_soon` module doc.
+state on the caller-named stream (payload arm `full_verify_forced`, whose bytes
+are the forced bytes sent), when the confirm verdict is real evidence
+(`OutcomeEvidence::Verdict`), no leg for the pair is queued or sending, no
+forced leg went to the pair in the last 60 s, the peer's summary has moved
+since a forced leg in the last 10 min, and the node has sent under 64 MiB of
+forced state this minute. The floor and cooldown arm when the forced leg is
+built, not when it is decided. A floor, busy, cap or byte hold schedules a
+retry at the earliest time it can clear, at most 3 per check, so a
+persistently broken originator still delivers each write within
+`PERSISTENT_FAULT_BOUND` (70 s). One check per contract, never postponed by
+later writes; a write during a check starts one more after it. Counters
+(`verify_*`, on their own `update_propagation_summary verify` INFO line):
+scheduled, dropped_cap, request_sent, request_dropped, peers_truncated,
+round_timed_out, peer_stale (any round; a stale verdict, not a heal),
+peer_stale_confirm (confirm round only), peer_converged, forced_full,
+forced_full_sent, and not_forced_{evidence,floor,no_progress,cap,busy,bytes}.
+Bounds and residuals are in the `verify_soon` module doc.
 
 Do not hook it anywhere but `update_contract`'s `ClientLocal` +
 `state_changed` branch, and keep the escalation decision in the `Summaries`

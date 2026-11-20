@@ -285,6 +285,8 @@ pub mod dev_tool {
 
     // Per-contract off switch for the verify-soon check, for control arms (#6143).
     #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::update::verify_soon::PERSISTENT_FAULT_BOUND as VERIFY_SOON_PERSISTENT_FAULT_BOUND;
+    #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::update::verify_soon::test_switch as verify_soon_switch;
 
     // Test hooks for the relay-hop routing-event plumbing. Each counter

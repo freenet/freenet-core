@@ -16,6 +16,11 @@
 //!
 //! [`lift`] removes the rules for a contract and keeps its count, so a test
 //! can lose one update's legs and then let later traffic (a heal) through.
+//!
+//! A delay rule instead delivers matching inline legs late, on their own task:
+//! a slow but healthy path. The originator's routed `RequestUpdate` is dropped
+//! under a delay rule, so the other hosts learn the update only from the late
+//! legs.
 //! Ported from the confirmed-delivery branch (PR #6292).
 
 #[cfg(any(test, feature = "testing"))]
@@ -28,6 +33,7 @@ pub mod seam {
     #[derive(Default)]
     struct State {
         rules: HashSet<(SocketAddr, ContractKey)>,
+        delays: HashMap<(SocketAddr, ContractKey), std::time::Duration>,
         /// Inline legs swallowed, per contract. Per contract rather than one
         /// process-wide count because simulation tests run in parallel in one
         /// process; each test uses its own contract.
@@ -47,6 +53,16 @@ pub mod seam {
         state().rules.insert((sender, key));
     }
 
+    /// Deliver every inline broadcast leg `sender` sends for `key` `delay`
+    /// late.
+    pub fn delay_inline_legs_from(
+        sender: SocketAddr,
+        key: ContractKey,
+        delay: std::time::Duration,
+    ) {
+        state().delays.insert((sender, key), delay);
+    }
+
     /// Stop dropping legs for `key`, keeping the swallowed count.
     pub fn lift(key: &ContractKey) {
         state().rules.retain(|(_, k)| k != key);
@@ -61,38 +77,54 @@ pub mod seam {
     pub fn clear(key: &ContractKey) {
         let mut state = state();
         state.rules.retain(|(_, k)| k != key);
+        state.delays.retain(|(_, k), _| k != key);
         state.swallowed.remove(key);
     }
 
-    /// Whether an inline leg from `sender` for `key` is to be swallowed.
-    /// Counts each one it swallows.
-    pub(crate) fn swallows(sender: Option<SocketAddr>, key: &ContractKey) -> bool {
+    /// What happens to an inline leg from `sender` for `key`. Counts each one
+    /// it swallows.
+    pub(crate) fn fate(sender: Option<SocketAddr>, key: &ContractKey) -> super::LegFate {
         let Some(sender) = sender else {
-            return false;
+            return super::LegFate::Send;
         };
         let mut state = state();
-        let hit = state.rules.contains(&(sender, *key));
-        if hit {
+        if state.rules.contains(&(sender, *key)) {
             *state.swallowed.entry(*key).or_insert(0) += 1;
+            return super::LegFate::Swallow;
         }
-        hit
+        match state.delays.get(&(sender, *key)) {
+            Some(delay) => super::LegFate::Delay(*delay),
+            None => super::LegFate::Send,
+        }
     }
 }
 
-/// Whether the inline leg about to be sent for `key` is swallowed by the
-/// test seam. Always `false` outside test builds.
+/// What the test seam does with an inline leg.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LegFate {
+    /// Send it now (always, outside test builds).
+    Send,
+    /// Report it sent and drop it.
+    Swallow,
+    /// Report it sent and deliver it this much later.
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
+    Delay(std::time::Duration),
+}
+
+/// What the test seam does with the inline leg about to be sent for `key`.
+/// Always [`LegFate::Send`] outside test builds.
 #[inline]
-pub(crate) fn inline_leg_swallowed(
+pub(crate) fn inline_leg_fate(
     op_manager: &crate::node::OpManager,
     key: &freenet_stdlib::prelude::ContractKey,
-) -> bool {
+) -> LegFate {
     #[cfg(any(test, feature = "testing"))]
     {
-        seam::swallows(op_manager.ring.connection_manager.get_own_addr(), key)
+        seam::fate(op_manager.ring.connection_manager.get_own_addr(), key)
     }
     #[cfg(not(any(test, feature = "testing")))]
     {
         let _ = (op_manager, key);
-        false
+        LegFate::Send
     }
 }

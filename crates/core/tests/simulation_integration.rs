@@ -24546,8 +24546,9 @@ struct VerifyScenario {
     /// the other hosts' state, and so their summaries, without superseding
     /// node 1's write.
     other_writes: Vec<(usize, u64)>,
-    /// Per-message latency for every link.
-    latency: Option<std::ops::Range<Duration>>,
+    /// Node 1's inline legs for the contract are delivered this late, and its
+    /// routed request is dropped: a slow but healthy path.
+    inline_delay: Option<Duration>,
     /// Virtual time the run continues after node 1's last write.
     bound: Duration,
 }
@@ -24565,7 +24566,7 @@ impl VerifyScenario {
             node3_crashed: false,
             check_disabled: false,
             other_writes: Vec::new(),
-            latency: None,
+            inline_delay: None,
             bound: VERIFY_BOUND,
         }
     }
@@ -24614,7 +24615,7 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
         node3_crashed,
         check_disabled,
         other_writes,
-        latency,
+        inline_delay,
         bound,
     } = scenario;
 
@@ -24644,13 +24645,6 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
     // As in production since 0.2.120: a joiner learns its gateway's version,
     // so the gateway is a version-gated target like any other peer.
     sim.enable_gateway_ack_version();
-    if let Some(range) = latency {
-        sim.with_fault_injection(
-            freenet::simulation::FaultConfig::builder()
-                .latency_range(range)
-                .build(),
-        );
-    }
     let originator = NodeLabel::node(network_name, 1);
     let node3 = NodeLabel::node(network_name, 3);
     if node3_pre_floor {
@@ -24672,6 +24666,9 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
         .collect();
     if fault != InlineFault::None {
         inline_leg_fault_injection::drop_inline_legs_from(originator_addr, contract_key);
+    }
+    if let Some(delay) = inline_delay {
+        inline_leg_fault_injection::delay_inline_legs_from(originator_addr, contract_key, delay);
     }
 
     let mut operations = vec![ScheduledOperation::new(
@@ -24885,15 +24882,21 @@ fn test_verify_soon_escalates_on_a_contract_other_hosts_write_to() {
     );
 }
 
-/// A slow but healthy network: every message takes 1-2 s. Legs land late but
-/// land, so nothing is forced.
+/// A slow but healthy path: node 1's legs arrive 7 s late. The first round
+/// (at 5 s) finds the hosts stale; by the confirm round (about 10 s) the late
+/// legs have landed, so nothing is forced.
 #[test_log::test]
 fn test_verify_soon_does_not_force_a_slow_healthy_peer() {
     let mut s = VerifyScenario::new("vs-slow", 0xEB, InlineFault::None);
-    s.latency = Some(Duration::from_secs(1)..Duration::from_secs(2));
+    s.inline_delay = Some(Duration::from_secs(7));
     let o = run_verify_scenario(s);
     assert!(o.all_converged(), "versions: {:?}", o.versions());
-    assert!(o.obs.verify_requests() >= 1, "{:?}", o.obs);
+    assert!(
+        o.obs.verify_stale >= 1,
+        "the first round must see the late legs missing, or this tests nothing: {:?}",
+        o.obs
+    );
+    assert_eq!(o.obs.verify_stale_confirm, 0, "{:?}", o.obs);
     assert_eq!(o.obs.verify_forced, 0, "{:?}", o.obs);
     assert_eq!(o.obs.verify_forced_legs, 0, "{:?}", o.obs);
 }
@@ -24916,12 +24919,12 @@ fn test_verify_soon_sustained_writes_are_bounded() {
 /// (d') Sustained writes under the persistent fault: the first check forces
 /// every host, the 60 s floor holds the later writes' escalations, and the one
 /// retry at the end of the floor delivers the last version. Every host holds it
-/// within about 65 s of node 1's last write.
+/// within `PERSISTENT_FAULT_BOUND` of node 1's last write.
 #[test_log::test]
 fn test_verify_soon_sustained_writes_under_a_persistent_fault_converge() {
     let mut s = VerifyScenario::new("vs-sustained-fault", 0xE5, InlineFault::Persistent);
     s.updates = 6;
-    s.bound = Duration::from_secs(66);
+    s.bound = freenet::dev_tool::VERIFY_SOON_PERSISTENT_FAULT_BOUND;
     let o = run_verify_scenario(s);
     assert!(o.obs.verify_forced >= 3, "{:?}", o.obs);
     assert!(o.obs.verify_not_forced_floor >= 1, "{:?}", o.obs);

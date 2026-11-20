@@ -2053,6 +2053,35 @@ mod queue {
             assert_eq!(hol.finish_at(start + Duration::from_millis(40)), None);
         }
 
+        /// The verify-soon pending-leg probe (#6143): a pair with a leg sending
+        /// is busy, another pair is not, and a contended lock reads as busy.
+        #[tokio::test]
+        async fn has_pending_for_sees_sending_pairs_and_reads_contention_as_busy() {
+            let queue = BroadcastQueue::new();
+            let code = freenet_stdlib::prelude::ContractCode::from(vec![7]);
+            let params = freenet_stdlib::prelude::Parameters::from(vec![9]);
+            let key = ContractKey::from_params_and_code(&params, &code);
+            let sending = PeerKeyLocation::random();
+            let peer = crate::ring::PeerKey::from(sending.pub_key().clone());
+            // Not `PeerKeyLocation::random()`: it reuses one key per thread.
+            let other = crate::ring::PeerKey::from(
+                crate::transport::TransportKeypair::new().public().clone(),
+            );
+            assert!(!queue.has_pending_for(&key, &peer));
+            {
+                let mut state = queue.queue.lock().await;
+                assert!(state.track_active((key, sending)));
+            }
+            assert!(queue.has_pending_for(&key, &peer));
+            assert!(!queue.has_pending_for(&key, &other));
+            let held = queue.queue.lock().await;
+            assert!(
+                queue.has_pending_for(&key, &other),
+                "a contended lock reads as busy"
+            );
+            drop(held);
+        }
+
         #[test]
         fn active_refcount_survives_one_of_two_overlapping_completions() {
             let mut queue = QueueState::new();
@@ -4620,8 +4649,9 @@ pub(super) async fn broadcast_to_single_peer(
 
     let peer_key = PeerKey::from(target.pub_key().clone());
 
-    // #6143 verify-soon: this peer was found stale twice with an unchanged
-    // summary, so neither the original legs nor a delta heal reached it. Send
+    // #6143 verify-soon: this peer was still stale in the confirm round and
+    // passed every force condition, so neither the original legs nor a delta
+    // heal reached it. Send
     // full state on the caller-named stream whatever its size (the path that
     // kept working in #6143), and skip the converged check: the belief it reads
     // is what the escalation distrusts.
@@ -5075,6 +5105,9 @@ pub(super) async fn broadcast_to_single_peer(
                 payload_size,
             ));
     if forced_full {
+        op_manager
+            .verify_soon
+            .record_forced_bytes(payload_size as u64, op_manager.ring.time_source.now());
         record_propagation_event(op_manager, key.id(), PropagationEvent::VerifyForcedFullSent);
         #[cfg(any(test, feature = "testing"))]
         crate::node::stale_peer_heal_observations::record_forced_leg(&key);
@@ -5323,13 +5356,23 @@ pub(super) async fn broadcast_to_single_peer(
             },
         };
         // Test seam for the #6143 failure class: the bridge "accepts" the
-        // leg and it never arrives. No-op outside test builds.
-        let res = if crate::operations::update::inline_leg_fault_injection::inline_leg_swallowed(
-            op_manager, &key,
-        ) {
-            Ok(())
-        } else {
-            bridge.send(peer_addr, msg.into()).await
+        // leg and it never arrives, or arrives late. Always `Send` outside
+        // test builds.
+        use crate::operations::update::inline_leg_fault_injection::{LegFate, inline_leg_fate};
+        let res = match inline_leg_fate(op_manager, &key) {
+            LegFate::Send => bridge.send(peer_addr, msg.into()).await,
+            LegFate::Swallow => Ok(()),
+            LegFate::Delay(delay) => {
+                let bridge = bridge.clone();
+                let msg: NetMessage = msg.into();
+                drop(crate::config::GlobalExecutor::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    if let Err(e) = bridge.send(peer_addr, msg).await {
+                        tracing::debug!(error = %e, "delayed test leg not sent");
+                    }
+                }));
+                Ok(())
+            }
         };
         // Non-streaming inline broadcasts have no separate transfer phase: a
         // successful enqueue is the terminal state we can observe, so delivery

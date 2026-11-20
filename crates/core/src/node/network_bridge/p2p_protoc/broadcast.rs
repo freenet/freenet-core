@@ -1247,16 +1247,27 @@ impl P2pConnManager {
                     },
                 };
                 // Test seam for the #6143 failure class: the bridge "accepts"
-                // the leg and it never arrives.
-                if crate::operations::update::inline_leg_fault_injection::inline_leg_swallowed(
-                    op_manager, &key,
-                ) {
-                    Ok(())
-                } else {
+                // the leg and it never arrives, or arrives late.
+                use crate::operations::update::inline_leg_fault_injection::{
+                    LegFate, inline_leg_fate,
+                };
+                match inline_leg_fate(op_manager, &key) {
                     // channel-safety: ok — sim-only path (see the
                     // `#[cfg(feature = "simulation_tests")]` gate on this fn); never
                     // compiled into the production binary.
-                    bridge.send(peer_addr, msg.into()).await
+                    LegFate::Send => bridge.send(peer_addr, msg.into()).await,
+                    LegFate::Swallow => Ok(()),
+                    LegFate::Delay(delay) => {
+                        let bridge = bridge.clone();
+                        let msg: crate::message::NetMessage = msg.into();
+                        drop(crate::config::GlobalExecutor::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            if let Err(e) = bridge.send(peer_addr, msg).await {
+                                tracing::debug!(error = %e, "delayed test leg not sent");
+                            }
+                        }));
+                        Ok(())
+                    }
                 }
             };
 
