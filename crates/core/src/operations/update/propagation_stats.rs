@@ -231,8 +231,8 @@ pub(crate) enum PropagationEvent {
     /// verdict was a byte-compare fallback rather than real evidence.
     VerifyNotForcedEvidence,
     /// Verify-soon: stale in the confirm round but not forced, because the
-    /// pair was forced within the cooldown.
-    VerifyNotForcedCooldown,
+    /// pair was forced within the 60 s floor.
+    VerifyNotForcedFloor,
     /// Verify-soon: stale in the confirm round but not forced, because the
     /// table of forced pairs is full.
     VerifyNotForcedCap,
@@ -245,12 +245,15 @@ pub(crate) enum PropagationEvent {
     VerifyPeersTruncated,
     /// Verify-soon: a round ended at its deadline with a target unanswered.
     VerifyRoundTimedOut,
+    /// Verify-soon: stale in the confirm round but not forced, because the
+    /// pair was forced within the cooldown and its summary has not moved.
+    VerifyNotForcedNoProgress,
 }
 
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 40] = [
+    pub(crate) const ALL: [PropagationEvent; 41] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -285,12 +288,13 @@ impl PropagationEvent {
         PropagationEvent::VerifyForcedFull,
         PropagationEvent::VerifyForcedFullSent,
         PropagationEvent::VerifyNotForcedEvidence,
-        PropagationEvent::VerifyNotForcedCooldown,
+        PropagationEvent::VerifyNotForcedFloor,
         PropagationEvent::VerifyNotForcedCap,
         PropagationEvent::VerifyNotForcedBusy,
         PropagationEvent::VerifyRequestDropped,
         PropagationEvent::VerifyPeersTruncated,
         PropagationEvent::VerifyRoundTimedOut,
+        PropagationEvent::VerifyNotForcedNoProgress,
     ];
 
     pub(crate) const COUNT: usize = Self::ALL.len();
@@ -331,12 +335,13 @@ impl PropagationEvent {
             PropagationEvent::VerifyForcedFull => 31,
             PropagationEvent::VerifyForcedFullSent => 32,
             PropagationEvent::VerifyNotForcedEvidence => 33,
-            PropagationEvent::VerifyNotForcedCooldown => 34,
+            PropagationEvent::VerifyNotForcedFloor => 34,
             PropagationEvent::VerifyNotForcedCap => 35,
             PropagationEvent::VerifyNotForcedBusy => 36,
             PropagationEvent::VerifyRequestDropped => 37,
             PropagationEvent::VerifyPeersTruncated => 38,
             PropagationEvent::VerifyRoundTimedOut => 39,
+            PropagationEvent::VerifyNotForcedNoProgress => 40,
         }
     }
 
@@ -405,12 +410,13 @@ impl PropagationEvent {
             PropagationEvent::VerifyForcedFull => "verify_forced_full",
             PropagationEvent::VerifyForcedFullSent => "verify_forced_full_sent",
             PropagationEvent::VerifyNotForcedEvidence => "verify_not_forced_evidence",
-            PropagationEvent::VerifyNotForcedCooldown => "verify_not_forced_cooldown",
+            PropagationEvent::VerifyNotForcedFloor => "verify_not_forced_floor",
             PropagationEvent::VerifyNotForcedCap => "verify_not_forced_cap",
             PropagationEvent::VerifyNotForcedBusy => "verify_not_forced_busy",
             PropagationEvent::VerifyRequestDropped => "verify_request_dropped",
             PropagationEvent::VerifyPeersTruncated => "verify_peers_truncated",
             PropagationEvent::VerifyRoundTimedOut => "verify_round_timed_out",
+            PropagationEvent::VerifyNotForcedNoProgress => "verify_not_forced_no_progress",
         }
     }
 }
@@ -913,12 +919,13 @@ impl UpdatePropagationStats {
             PropagationEvent::VerifyForcedFull,
             PropagationEvent::VerifyForcedFullSent,
             PropagationEvent::VerifyNotForcedEvidence,
-            PropagationEvent::VerifyNotForcedCooldown,
+            PropagationEvent::VerifyNotForcedFloor,
             PropagationEvent::VerifyNotForcedCap,
             PropagationEvent::VerifyNotForcedBusy,
             PropagationEvent::VerifyRequestDropped,
             PropagationEvent::VerifyPeersTruncated,
             PropagationEvent::VerifyRoundTimedOut,
+            PropagationEvent::VerifyNotForcedNoProgress,
         ];
         if verify_events.iter().any(|ev| e.get(*ev) > 0) {
             tracing::info!(
@@ -930,12 +937,13 @@ impl UpdatePropagationStats {
                 verify_forced_full = e.get(PropagationEvent::VerifyForcedFull),
                 verify_forced_full_sent = e.get(PropagationEvent::VerifyForcedFullSent),
                 verify_not_forced_evidence = e.get(PropagationEvent::VerifyNotForcedEvidence),
-                verify_not_forced_cooldown = e.get(PropagationEvent::VerifyNotForcedCooldown),
+                verify_not_forced_floor = e.get(PropagationEvent::VerifyNotForcedFloor),
                 verify_not_forced_cap = e.get(PropagationEvent::VerifyNotForcedCap),
                 verify_not_forced_busy = e.get(PropagationEvent::VerifyNotForcedBusy),
                 verify_request_dropped = e.get(PropagationEvent::VerifyRequestDropped),
                 verify_peers_truncated = e.get(PropagationEvent::VerifyPeersTruncated),
                 verify_round_timed_out = e.get(PropagationEvent::VerifyRoundTimedOut),
+                verify_not_forced_no_progress = e.get(PropagationEvent::VerifyNotForcedNoProgress),
                 window_s = SUMMARY_WINDOW.as_secs(),
                 phase = "summary_verify",
                 "update_propagation_summary verify"

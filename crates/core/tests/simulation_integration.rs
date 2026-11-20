@@ -24548,6 +24548,8 @@ struct VerifyScenario {
     other_writes: Vec<(usize, u64)>,
     /// Per-message latency for every link.
     latency: Option<std::ops::Range<Duration>>,
+    /// Virtual time the run continues after node 1's last write.
+    bound: Duration,
 }
 
 impl VerifyScenario {
@@ -24564,6 +24566,7 @@ impl VerifyScenario {
             check_disabled: false,
             other_writes: Vec::new(),
             latency: None,
+            bound: VERIFY_BOUND,
         }
     }
 }
@@ -24612,6 +24615,7 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
         check_disabled,
         other_writes,
         latency,
+        bound,
     } = scenario;
 
     const FIRST_VERSION: u64 = 100;
@@ -24701,7 +24705,7 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
     }
     // Every op after node 1's last write is sequenced one op interval (3 s)
     // later and counts toward the bound.
-    let mut post_wait = VERIFY_BOUND;
+    let mut post_wait = bound;
     for (host, version) in &other_writes {
         let label = if *host == 0 {
             NodeLabel::gateway(network_name, 0)
@@ -24909,17 +24913,21 @@ fn test_verify_soon_sustained_writes_are_bounded() {
     assert_eq!(o.obs.verify_forced, 0, "{:?}", o.obs);
 }
 
-/// (d') Sustained writes under the persistent fault: every host still reaches
-/// the last version within the bound.
+/// (d') Sustained writes under the persistent fault: the first check forces
+/// every host, the 60 s floor holds the later writes' escalations, and the one
+/// retry at the end of the floor delivers the last version. Every host holds it
+/// within about 65 s of node 1's last write.
 #[test_log::test]
 fn test_verify_soon_sustained_writes_under_a_persistent_fault_converge() {
     let mut s = VerifyScenario::new("vs-sustained-fault", 0xE5, InlineFault::Persistent);
     s.updates = 6;
+    s.bound = Duration::from_secs(66);
     let o = run_verify_scenario(s);
-    assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
-    // Two rounds per check, at most 4 checks, 3 co-hosts.
-    assert!(o.obs.verify_requests() <= 24, "{:?}", o.obs);
-    assert!(o.obs.verify_forced <= 12, "{:?}", o.obs);
+    assert!(o.obs.verify_forced >= 3, "{:?}", o.obs);
+    assert!(o.obs.verify_not_forced_floor >= 1, "{:?}", o.obs);
+    // Each host is forced at most twice: once by the first check, once by the
+    // retry after the floor (the run spans less than two floors).
+    assert!(o.obs.verify_forced <= 6, "{:?}", o.obs);
     assert!(
         o.all_converged(),
         "versions: {:?} {:?}",
