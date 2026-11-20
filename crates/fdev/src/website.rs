@@ -236,6 +236,49 @@ fn ensure_state_within_limit(state_len: usize, dir: &Path) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Packed state size above which `publish` warns that the site is large.
+///
+/// A nudge, not a limit: the publish goes ahead. Every visitor's node fetches
+/// the whole state before it can show any page, and every republish ships it
+/// again, so a site this size loads slowly for everyone. Typical sites are a
+/// few MiB; the hard ceiling is [`MAX_CONTRACT_STATE_SIZE`].
+const LARGE_SITE_WARNING_BYTES: usize = 10 * 1024 * 1024;
+
+/// How many of the largest files the large-site warning names.
+const LARGE_SITE_FILES_SHOWN: usize = 3;
+
+/// The warning `publish` prints for a large site, or `None` at or below
+/// [`LARGE_SITE_WARNING_BYTES`]. Names the largest files, since one or two
+/// media files are usually most of it.
+fn large_site_warning(state_len: usize, dir: &Path) -> anyhow::Result<Option<String>> {
+    if state_len <= LARGE_SITE_WARNING_BYTES {
+        return Ok(None);
+    }
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    let mut files = Vec::new();
+    for path in walkdir(dir)? {
+        let len = fs::metadata(&path)?.len();
+        files.push((len, path));
+    }
+    files.sort_by_key(|(len, _)| std::cmp::Reverse(*len));
+    let largest: Vec<String> = files
+        .iter()
+        .take(LARGE_SITE_FILES_SHOWN)
+        .map(|(len, path)| {
+            let shown = path.strip_prefix(dir).unwrap_or(path);
+            format!("  {:>7.1} MiB  {}", mib(*len), shown.display())
+        })
+        .collect();
+    Ok(Some(format!(
+        "Warning: this website is {:.1} MiB after compression. Every visitor's node \
+         downloads the whole site before it can show a page, and each republish sends it \
+         again, so large sites load slowly. Consider hosting large media separately and \
+         linking to it. Largest files:\n{}",
+        mib(state_len as u64),
+        largest.join("\n"),
+    )))
+}
+
 fn load_contract_wasm(custom_path: Option<&Path>) -> anyhow::Result<Vec<u8>> {
     match custom_path {
         Some(path) => {
@@ -381,6 +424,9 @@ pub async fn publish(
     // message (its state-size limit for ~50-64 MiB, or a cryptic chunk-count
     // stream-reassembly error for >64 MiB serialized) (#4653).
     ensure_state_within_limit(state.as_ref().len(), &directory)?;
+    if let Some(warning) = large_site_warning(state.as_ref().len(), &directory)? {
+        eprintln!("{warning}");
+    }
 
     println!("Publishing website as contract {key} (version {version})");
 
@@ -501,6 +547,43 @@ mod tests {
                 .to_string()
                 .contains("Missing keys.signing_key"),
         );
+    }
+
+    #[test]
+    fn large_site_warning_names_the_largest_files_above_the_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("assets")).unwrap();
+        fs::write(dir.path().join("index.html"), vec![0u8; 100]).unwrap();
+        fs::write(
+            dir.path().join("assets/video.webm"),
+            vec![0u8; 3 * 1024 * 1024],
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("assets/song.mp3"),
+            vec![0u8; 2 * 1024 * 1024],
+        )
+        .unwrap();
+        fs::write(dir.path().join("assets/pic.jpg"), vec![0u8; 1024 * 1024]).unwrap();
+
+        // At the threshold: no warning, so ordinary sites publish quietly.
+        assert!(
+            large_site_warning(LARGE_SITE_WARNING_BYTES, dir.path())
+                .unwrap()
+                .is_none()
+        );
+
+        // Over it: a warning naming the largest files, largest first, and
+        // not the small ones beyond LARGE_SITE_FILES_SHOWN.
+        let warning = large_site_warning(LARGE_SITE_WARNING_BYTES + 1, dir.path())
+            .unwrap()
+            .expect("a site over the threshold must be warned about");
+        let video = warning.find("video.webm").expect(&warning);
+        let song = warning.find("song.mp3").expect(&warning);
+        let pic = warning.find("pic.jpg").expect(&warning);
+        assert!(video < song && song < pic, "{warning}");
+        assert!(!warning.contains("index.html"), "{warning}");
+        assert!(warning.contains("10.0 MiB"), "{warning}");
     }
 
     #[test]

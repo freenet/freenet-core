@@ -17,6 +17,19 @@ pub enum WebContractError {
     StoringError(std::io::Error),
     #[error("file not found: {0}")]
     FileNotFound(String),
+    /// The archive is well-formed but this node will not unpack it: it breaks
+    /// one of the unpack limits (size, entry count, entry type, path). The
+    /// message is composed here from the archive's own headers and the limits,
+    /// never from a filesystem error, so it is safe to show to whoever asked
+    /// for the site, and it is shown to them: it is the only way a site's
+    /// author learns why the page does not load.
+    #[error("{0}")]
+    Refused(String),
+}
+
+/// `bytes` in MiB with one decimal, for messages a person reads.
+fn mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// Largest compressed web archive accepted from a contract's state.
@@ -184,7 +197,7 @@ impl WebApp {
         use std::path::Component;
         use tar::EntryType;
 
-        let reject = |msg: String| WebContractError::UnpackingError(anyhow::anyhow!(msg));
+        let reject = WebContractError::Refused;
 
         let mut decoded_web = self.decode_web();
         decoded_web.set_overwrite(false);
@@ -243,13 +256,20 @@ impl WebApp {
             let size = entry.size();
             if size > MAX_UNPACKED_FILE_BYTES {
                 return Err(reject(format!(
-                    "web archive entry {path:?} is {size} bytes, over the {MAX_UNPACKED_FILE_BYTES} byte limit"
+                    "the website's file {path:?} is {}, over this node's {} limit for one \
+                     file. A website is downloaded whole by every visitor, so large media \
+                     is better hosted separately and linked to.",
+                    mib(size),
+                    mib(MAX_UNPACKED_FILE_BYTES),
                 )));
             }
             total = total.saturating_add(size);
             if total > MAX_UNPACKED_TOTAL_BYTES {
                 return Err(reject(format!(
-                    "web archive unpacks to more than {MAX_UNPACKED_TOTAL_BYTES} bytes"
+                    "the website unpacks to more than {}, over this node's limit for one \
+                     website. A website is downloaded whole by every visitor, so large media \
+                     (video, audio, big images) is better hosted separately and linked to.",
+                    mib(MAX_UNPACKED_TOTAL_BYTES),
                 )));
             }
 
@@ -721,5 +741,35 @@ mod tests {
         };
         assert_eq!(total, 100);
         assert!(err.to_string().contains("limit"));
+    }
+
+    /// A size refusal is a [`WebContractError::Refused`] (the variant whose
+    /// text reaches the person who requested the site) and says, in MiB, which
+    /// limit was hit and what to do about it.
+    #[test]
+    fn size_refusals_are_refused_errors_that_state_the_limit() {
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        append_zero_file(&mut builder, "big.bin", MAX_UNPACKED_FILE_BYTES + 1);
+        let per_file = finish(builder).unpack(tempfile::tempdir().unwrap().path());
+        let Err(WebContractError::Refused(msg)) = per_file else {
+            panic!("per-file overflow must be Refused, got {per_file:?}");
+        };
+        assert!(msg.contains("\"big.bin\""), "{msg}");
+        assert!(msg.contains(&mib(MAX_UNPACKED_FILE_BYTES)), "{msg}");
+
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        let mut written = 0;
+        let mut i = 0;
+        while written <= MAX_UNPACKED_TOTAL_BYTES {
+            append_zero_file(&mut builder, &format!("f{i}.bin"), MAX_UNPACKED_FILE_BYTES);
+            written += MAX_UNPACKED_FILE_BYTES;
+            i += 1;
+        }
+        let total = finish(builder).unpack(tempfile::tempdir().unwrap().path());
+        let Err(WebContractError::Refused(msg)) = total else {
+            panic!("total overflow must be Refused, got {total:?}");
+        };
+        assert!(msg.contains(&mib(MAX_UNPACKED_TOTAL_BYTES)), "{msg}");
+        assert!(msg.contains("hosted separately"), "{msg}");
     }
 }

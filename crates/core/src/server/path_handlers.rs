@@ -137,7 +137,7 @@ static CONTRACT_REFRESH_LOCKS: LazyLock<
 /// `Retry-After`). A suppressed request must get the SAME answer the request
 /// that recorded the failure got, not an arbitrary pick between them — so this
 /// records which one it was, not just that failure occurred.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum TerminalAbsenceKind {
     ContractNotFound,
     MissingContract,
@@ -145,12 +145,32 @@ enum TerminalAbsenceKind {
     /// or over the unpack limits). The answer is a function of the state, so it
     /// repeats until the state changes; without recording it, every request
     /// re-fetches and re-unpacks the same refused archive.
-    ArchiveRefused,
+    ///
+    /// Carries the full error text the first request got, so a replayed
+    /// refusal still says WHY (which limit, how big) rather than only that it
+    /// failed.
+    ArchiveRefused(std::sync::Arc<str>),
 }
 
 /// Prefix of the error `unpack_if_stale` returns for an archive it refuses;
 /// `ensure_contract_cached`'s caller recognises it to record the refusal.
 const UNPACK_FAILED_PREFIX: &str = "failed unpacking contract: ";
+
+/// The 400 body for an archive this node will not serve.
+///
+/// A [`WebContractError::Refused`] reason is appended: it names the limit and
+/// the size, and without it a site's author sees only that the page failed
+/// (the 0.2.161 media-site refusal was reported with exactly that). Any other
+/// error stays generic, since an I/O error can carry a local filesystem path
+/// and this body is shown at the node's origin, including on hosted nodes.
+fn unpack_failed_message(key: &str, err: &WebContractError) -> String {
+    match err {
+        WebContractError::Refused(reason) => format!("{UNPACK_FAILED_PREFIX}{key}: {reason}"),
+        WebContractError::UnpackingError(_)
+        | WebContractError::StoringError(_)
+        | WebContractError::FileNotFound(_) => format!("{UNPACK_FAILED_PREFIX}{key}"),
+    }
+}
 
 impl TerminalAbsenceKind {
     fn into_error(self, instance_id: ContractInstanceId) -> WebSocketApiError {
@@ -161,8 +181,8 @@ impl TerminalAbsenceKind {
             TerminalAbsenceKind::MissingContract => {
                 WebSocketApiError::MissingContract { instance_id }
             }
-            TerminalAbsenceKind::ArchiveRefused => WebSocketApiError::InvalidParam {
-                error_cause: format!("{UNPACK_FAILED_PREFIX}{instance_id}"),
+            TerminalAbsenceKind::ArchiveRefused(error_cause) => WebSocketApiError::InvalidParam {
+                error_cause: error_cause.to_string(),
             },
         }
     }
@@ -198,8 +218,8 @@ impl RefreshState {
         &self,
         instance_id: &ContractInstanceId,
     ) -> Option<TerminalAbsenceKind> {
-        self.last_cold_failure.and_then(|(id, at, kind)| {
-            (id == *instance_id && at.elapsed() < CONTRACT_CACHE_REFRESH_TTL).then_some(kind)
+        self.last_cold_failure.as_ref().and_then(|(id, at, kind)| {
+            (id == instance_id && at.elapsed() < CONTRACT_CACHE_REFRESH_TTL).then(|| kind.clone())
         })
     }
 }
@@ -1441,7 +1461,9 @@ async fn refresh_cache_if_due(
             Err(WebSocketApiError::InvalidParam { error_cause })
                 if error_cause.starts_with(UNPACK_FAILED_PREFIX) =>
             {
-                Some(TerminalAbsenceKind::ArchiveRefused)
+                Some(TerminalAbsenceKind::ArchiveRefused(
+                    error_cause.as_str().into(),
+                ))
             }
             _ => None,
         };
@@ -1817,7 +1839,7 @@ async fn unpack_if_stale(
             let key = contract.key();
             tracing::error!("{err}");
             WebSocketApiError::InvalidParam {
-                error_cause: format!("{UNPACK_FAILED_PREFIX}{key}"),
+                error_cause: unpack_failed_message(&key.to_string(), &err),
             }
         }
 
@@ -5478,6 +5500,29 @@ mod tests {
 
     /// A contract whose state is a web archive holding one file over the unpack
     /// limit. A few KB compressed.
+    /// Only a `Refused` reason reaches the 400 body. An I/O error can name a
+    /// local path (the webapp cache dir), and the body is served at the node's
+    /// origin, hosted nodes included, so it must stay generic.
+    #[test]
+    fn unpack_failed_message_shows_refusals_but_not_io_errors() {
+        let refused = unpack_failed_message(
+            "KEY",
+            &WebContractError::Refused("the website unpacks to more than 1.0 MiB".into()),
+        );
+        assert_eq!(
+            refused,
+            format!("{UNPACK_FAILED_PREFIX}KEY: the website unpacks to more than 1.0 MiB")
+        );
+
+        let io = unpack_failed_message(
+            "KEY",
+            &WebContractError::StoringError(std::io::Error::other(
+                "/home/someone/.cache/freenet/webapp_cache/KEY: disk full",
+            )),
+        );
+        assert_eq!(io, format!("{UNPACK_FAILED_PREFIX}KEY"));
+    }
+
     fn oversized_archive_contract_and_state(seed: &[u8]) -> (ContractContainer, WrappedState) {
         let limit = super::super::app_packaging::MAX_UNPACKED_FILE_BYTES + 1;
         let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
@@ -5537,9 +5582,16 @@ mod tests {
             .await
             .expect("the first request must resolve")
             .expect("handler must not panic");
+        // The body must say why, not only that it failed: the 0.2.161
+        // media-site refusal reached its author as a bare "failed unpacking
+        // contract: <key>".
+        let first_cause = match &first {
+            Err(WebSocketApiError::InvalidParam { error_cause }) => error_cause.clone(),
+            other => panic!("premise: the oversized archive must be refused, got {other:?}"),
+        };
         assert!(
-            matches!(first, Err(WebSocketApiError::InvalidParam { .. })),
-            "premise: the oversized archive must be refused, got {first:?}"
+            first_cause.contains("\"big.bin\"") && first_cause.contains("over this node's"),
+            "the refusal must name the file and the limit, got {first_cause:?}"
         );
         while rx.try_recv().is_ok() {}
 
@@ -5551,8 +5603,8 @@ mod tests {
         .expect("the second request must resolve, not queue behind a refetch");
         assert!(
             matches!(second, Err(WebSocketApiError::InvalidParam { ref error_cause })
-                if error_cause.starts_with(UNPACK_FAILED_PREFIX)),
-            "the refusal must be replayed, got {second:?}"
+                if *error_cause == first_cause),
+            "the refusal must be replayed with the same reason, got {second:?}"
         );
         assert!(
             rx.try_recv().is_err(),
