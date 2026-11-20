@@ -24340,6 +24340,9 @@ fn run_peer_behind_scenario(
     let contract_key = contract.key();
     register_crdt_contract(contract_id);
     stale_peer_heal_observations::clear(&contract_key);
+    // This experiment measures the existing heal alone: the automatic
+    // verify-soon check that this step motivated is off for its contract.
+    freenet::dev_tool::verify_soon_switch::disable_for(contract_key);
 
     let sim = rt.block_on(async {
         SimNetwork::new(
@@ -24414,6 +24417,7 @@ fn run_peer_behind_scenario(
     inline_leg_fault_injection::clear(&contract_key);
     let heal = stale_peer_heal_observations::get(&contract_key);
     stale_peer_heal_observations::clear(&contract_key);
+    freenet::dev_tool::verify_soon_switch::enable_for(&contract_key);
     assert!(
         result.turmoil_result.is_ok(),
         "simulation must complete: {:?}",
@@ -24535,6 +24539,8 @@ struct VerifyScenario {
     node3_pre_floor: bool,
     /// Node 3 is crashed (its traffic blocked) before node 1 writes.
     node3_crashed: bool,
+    /// Run with the verify-soon check off for the contract (a control arm).
+    check_disabled: bool,
 }
 
 impl VerifyScenario {
@@ -24548,6 +24554,7 @@ impl VerifyScenario {
             state_len: 128,
             node3_pre_floor: false,
             node3_crashed: false,
+            check_disabled: false,
         }
     }
 }
@@ -24593,6 +24600,7 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
         state_len,
         node3_pre_floor,
         node3_crashed,
+        check_disabled,
     } = scenario;
 
     const FIRST_VERSION: u64 = 100;
@@ -24612,6 +24620,9 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
     let contract_key = contract.key();
     register_crdt_contract(contract_id);
     stale_peer_heal_observations::clear(&contract_key);
+    if check_disabled {
+        freenet::dev_tool::verify_soon_switch::disable_for(contract_key);
+    }
 
     let mut sim =
         rt.block_on(async { SimNetwork::new(network_name, 1, 3, 7, 3, 10, 2, seed).await });
@@ -24687,6 +24698,7 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
     inline_leg_fault_injection::clear(&contract_key);
     let obs = stale_peer_heal_observations::get(&contract_key);
     stale_peer_heal_observations::clear(&contract_key);
+    freenet::dev_tool::verify_soon_switch::enable_for(&contract_key);
     assert!(
         result.turmoil_result.is_ok(),
         "simulation must complete: {:?}",
@@ -24788,6 +24800,22 @@ fn test_verify_soon_escalates_to_a_stream_under_a_persistent_inline_fault() {
         "every host must converge within {VERIFY_BOUND:?}: {:?} {:?}",
         o.versions(),
         o.obs
+    );
+}
+
+/// Control for (c): the same persistent fault with the check off. Every host
+/// stays behind for the whole bound, so a pass in (c) is the check's doing.
+#[test_log::test]
+fn test_verify_soon_control_persistent_fault_strands_the_update() {
+    let mut s = VerifyScenario::new("vs-persistent-control", 0x89, InlineFault::Persistent);
+    s.check_disabled = true;
+    let o = run_verify_scenario(s);
+    assert!(o.swallowed > 0, "the fault seam never fired");
+    assert_eq!(o.obs.verify_requests(), 0, "{:?}", o.obs);
+    assert!(
+        o.others.iter().all(|(_, _, v)| *v != Some(o.final_version)),
+        "with the check off no host should get the update: {:?}",
+        o.versions()
     );
 }
 

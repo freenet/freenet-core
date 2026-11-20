@@ -232,14 +232,15 @@ impl VerifySoon {
         self.wake.notify_one();
     }
 
-    /// A two-sided `Summaries` comparison for `key` from `peer`. `their_hash`
-    /// identifies the summary the peer reported.
+    /// A two-sided `Summaries` comparison for `key` from `peer`, which
+    /// reported `their_summary`. Hashed only for a peer the check awaits, so
+    /// the comparisons of untracked contracts cost a map lookup.
     pub(crate) fn on_comparison(
         &self,
         key: &ContractKey,
         peer: &PeerKey,
         stale: bool,
-        their_hash: u64,
+        their_summary: &[u8],
         now: Instant,
     ) -> Verdict {
         let mut inner = self.inner.lock();
@@ -250,6 +251,7 @@ impl VerifySoon {
         if !matches!(check.phase, Phase::Sent { .. }) || !check.awaiting.remove(peer) {
             return Verdict::Ignored;
         }
+        let their_hash = summary_hash(their_summary);
         let verdict = match (check.round, stale) {
             (_, false) => Verdict::Converged,
             (Round::First, true) => {
@@ -331,6 +333,10 @@ pub(crate) fn summary_hash(bytes: &[u8]) -> u64 {
 /// count what happened.
 pub(crate) fn note_originated(op_manager: &crate::node::OpManager, key: ContractKey) {
     use super::propagation_stats::{PropagationEvent, record_propagation_event};
+    #[cfg(any(test, feature = "testing"))]
+    if test_switch::is_disabled(&key) {
+        return;
+    }
     let event = match op_manager
         .verify_soon
         .note_originated(key, op_manager.ring.time_source.now())
@@ -341,6 +347,37 @@ pub(crate) fn note_originated(op_manager: &crate::node::OpManager, key: Contract
     };
     if let Some(event) = event {
         record_propagation_event(op_manager, key.id(), event);
+    }
+}
+
+/// Test-only per-contract off switch, so a simulation can measure the same
+/// scenario without the check (a control arm). Keyed by contract because
+/// simulation tests share one process; each test uses its own contract.
+#[cfg(any(test, feature = "testing"))]
+pub mod test_switch {
+    use freenet_stdlib::prelude::ContractKey;
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    fn disabled() -> std::sync::MutexGuard<'static, HashSet<ContractKey>> {
+        static SET: OnceLock<Mutex<HashSet<ContractKey>>> = OnceLock::new();
+        SET.get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Originated writes to `key` schedule no check.
+    pub fn disable_for(key: ContractKey) {
+        disabled().insert(key);
+    }
+
+    /// Undo [`disable_for`].
+    pub fn enable_for(key: &ContractKey) {
+        disabled().remove(key);
+    }
+
+    pub(crate) fn is_disabled(key: &ContractKey) -> bool {
+        disabled().contains(key)
     }
 }
 
@@ -358,7 +395,7 @@ pub(crate) fn on_summary_comparison(
         key,
         peer,
         stale,
-        summary_hash(their_summary),
+        their_summary,
         op_manager.ring.time_source.now(),
     );
     let events: &[PropagationEvent] = match verdict {
@@ -510,17 +547,17 @@ mod tests {
         vs.take_due(t1);
         vs.record_sent(&key(1), vec![a.clone(), b.clone()], t1);
         assert_eq!(
-            vs.on_comparison(&key(1), &a, false, 7, t1),
+            vs.on_comparison(&key(1), &a, false, &[7], t1),
             Verdict::Converged
         );
         assert_eq!(vs.tracked(), 1, "still waiting for b");
         assert_eq!(
-            vs.on_comparison(&key(1), &b, false, 7, t1),
+            vs.on_comparison(&key(1), &b, false, &[7], t1),
             Verdict::Converged
         );
         assert_eq!(vs.tracked(), 0);
         assert_eq!(
-            vs.on_comparison(&key(1), &a, true, 7, t1),
+            vs.on_comparison(&key(1), &a, true, &[7], t1),
             Verdict::Ignored,
             "a comparison outside a round is not an answer"
         );
@@ -535,10 +572,16 @@ mod tests {
         let t1 = t0 + CHECK_DELAY;
         vs.take_due(t1);
         vs.record_sent(&key(1), vec![a.clone(), b.clone(), c.clone()], t1);
-        assert_eq!(vs.on_comparison(&key(1), &a, true, 10, t1), Verdict::Stale);
-        assert_eq!(vs.on_comparison(&key(1), &b, true, 20, t1), Verdict::Stale);
         assert_eq!(
-            vs.on_comparison(&key(1), &c, false, 30, t1),
+            vs.on_comparison(&key(1), &a, true, &[10], t1),
+            Verdict::Stale
+        );
+        assert_eq!(
+            vs.on_comparison(&key(1), &b, true, &[20], t1),
+            Verdict::Stale
+        );
+        assert_eq!(
+            vs.on_comparison(&key(1), &c, false, &[30], t1),
             Verdict::Converged
         );
         let t2 = t1 + CONFIRM_DELAY;
@@ -552,12 +595,12 @@ mod tests {
         assert_eq!(asked, expected, "Confirm asks exactly the stale peers");
         vs.record_sent(&key(1), vec![a.clone(), b.clone()], t2);
         assert_eq!(
-            vs.on_comparison(&key(1), &a, true, 10, t2),
+            vs.on_comparison(&key(1), &a, true, &[10], t2),
             Verdict::Escalate,
             "stale with the same summary: nothing reached it"
         );
         assert_eq!(
-            vs.on_comparison(&key(1), &b, true, 21, t2),
+            vs.on_comparison(&key(1), &b, true, &[21], t2),
             Verdict::Stale,
             "stale with a different summary: something reached it"
         );
@@ -592,13 +635,13 @@ mod tests {
         vs.record_sent(&key(1), vec![a.clone()], t1);
         vs.note_originated(key(1), t1);
         vs.note_originated(key(1), t1);
-        vs.on_comparison(&key(1), &a, false, 1, t1);
+        vs.on_comparison(&key(1), &a, false, &[1], t1);
         assert_eq!(vs.tracked(), 1);
         assert_eq!(vs.next_wake(), Some(t1 + CHECK_DELAY));
         let t2 = t1 + CHECK_DELAY;
         assert_eq!(vs.take_due(t2).len(), 1);
         vs.record_sent(&key(1), vec![a.clone()], t2);
-        vs.on_comparison(&key(1), &a, false, 1, t2);
+        vs.on_comparison(&key(1), &a, false, &[1], t2);
         assert_eq!(vs.tracked(), 0, "no write since: no further check");
     }
 
@@ -624,12 +667,12 @@ mod tests {
         let t1 = t0 + CHECK_DELAY;
         vs.take_due(t1);
         vs.record_sent(&key(1), vec![a.clone()], t1);
-        vs.on_comparison(&key(1), &a, true, 5, t1);
+        vs.on_comparison(&key(1), &a, true, &[5], t1);
         let t2 = t1 + CONFIRM_DELAY;
         vs.take_due(t2);
         vs.record_sent(&key(1), vec![a.clone()], t2);
         assert_eq!(
-            vs.on_comparison(&key(1), &a, true, 5, t2),
+            vs.on_comparison(&key(1), &a, true, &[5], t2),
             Verdict::Escalate
         );
         assert_eq!(vs.next_wake(), Some(t2 + FORCE_TTL));
