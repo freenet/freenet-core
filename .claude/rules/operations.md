@@ -691,8 +691,10 @@ analysis there. Diagnose from the INFO line and telemetry instead:
 - All legs of a client update skipped as converged (`skip_summary_equal` and
   the like) is suspect: the update changed this node's state, so no peer can
   already hold it, and the skip means this node's belief about the peer is
-  stale. That is the leading #6143 hypothesis. Exception: a contract with a
-  lossy summary (two states can share one) can legitimately match.
+  stale. Exception: a contract with a lossy summary (two states can share
+  one) can legitimately match. (The #6143 root cause was transport stream ids,
+  #6269; a belief poisoned by lost legs is what the `verify_*` counters of the
+  verify-soon check measure and repair.)
 - Loss at or after the transport (a stream that fails after the bridge took
   it, a single packet abandoned after its retransmits, a lost QUIC message)
   shows in the `wire_*` counts and the receivers' `rx_*` counts across the

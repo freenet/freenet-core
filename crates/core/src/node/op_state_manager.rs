@@ -855,10 +855,10 @@ impl OpManager {
             broadcast_coverage: Arc::new(
                 crate::ring::broadcast_coverage::BroadcastCoverageStore::new(),
             ),
+            verify_soon: Arc::new(crate::operations::update::verify_soon::VerifySoon::new()),
             // The spacing waits on tokio time (`tokio::time::sleep`), so
             // it reads the same clock rather than the hosting override, which
             // sims advance by hand.
-            verify_soon: Arc::new(crate::operations::update::verify_soon::VerifySoon::new()),
             broadcast_spacing: Arc::new(
                 crate::node::network_bridge::broadcast_spacing::BroadcastSpacing::new(Arc::new(
                     InstantTimeSrc::new(),

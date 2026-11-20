@@ -4328,6 +4328,13 @@ pub mod stale_peer_heal_observations {
         pub verify_forced: u64,
         /// Legs built carrying a forced full state on the stream.
         pub verify_forced_legs: u64,
+        /// Stale in a confirm round but not forced, by reason.
+        pub verify_not_forced_evidence: u64,
+        pub verify_not_forced_cooldown: u64,
+        pub verify_not_forced_cap: u64,
+        pub verify_not_forced_busy: u64,
+        /// Rounds that ended at their deadline with a target unanswered.
+        pub verify_rounds_timed_out: u64,
     }
 
     impl Observations {
@@ -4350,7 +4357,7 @@ pub mod stale_peer_heal_observations {
         key: &ContractKey,
         verdict: crate::operations::update::verify_soon::Verdict,
     ) {
-        use crate::operations::update::verify_soon::Verdict;
+        use crate::operations::update::verify_soon::{Hold, Verdict};
         let mut state = state();
         let obs = state.entry(*key).or_default();
         match verdict {
@@ -4361,7 +4368,20 @@ pub mod stale_peer_heal_observations {
                 obs.verify_stale += 1;
                 obs.verify_forced += 1;
             }
+            Verdict::Held(hold) => {
+                obs.verify_stale += 1;
+                match hold {
+                    Hold::Evidence => obs.verify_not_forced_evidence += 1,
+                    Hold::Cooldown => obs.verify_not_forced_cooldown += 1,
+                    Hold::Cap => obs.verify_not_forced_cap += 1,
+                    Hold::Busy => obs.verify_not_forced_busy += 1,
+                }
+            }
         }
+    }
+
+    pub(crate) fn record_verify_timeout(key: &ContractKey) {
+        state().entry(*key).or_default().verify_rounds_timed_out += 1;
     }
 
     pub(crate) fn record_forced_leg(key: &ContractKey) {
@@ -5021,15 +5041,9 @@ async fn handle_interest_sync_message(
                             // originated write. Decided BEFORE the heal below is
                             // emitted, so an escalation's force mark is in place
                             // when that heal's leg is built.
-                            if let Some(theirs) = their_summary.as_ref() {
-                                crate::operations::update::verify_soon::on_summary_comparison(
-                                    op_manager,
-                                    &contract,
-                                    &pk,
-                                    is_stale,
-                                    theirs.as_ref(),
-                                );
-                            }
+                            crate::operations::update::verify_soon::on_summary_comparison(
+                                op_manager, &contract, &pk, is_stale, evidence,
+                            );
                         }
 
                         // #4952: upsert (not update) when the peer reported a

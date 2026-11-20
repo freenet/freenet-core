@@ -1743,6 +1743,15 @@ impl P2pConnManager {
         // Start the broadcast queue worker (production only).
         // In simulation tests, broadcasts are sent inline for deterministic ordering.
         #[cfg(not(feature = "simulation_tests"))]
+        {
+            // The verify-soon check (#6143) does not force a resend to a pair
+            // whose leg is still queued or sending here.
+            let queue = broadcast_queue.clone();
+            op_manager
+                .verify_soon
+                .set_pending_leg_probe(Box::new(move |key, peer| queue.has_pending_for(key, peer)));
+        }
+        #[cfg(not(feature = "simulation_tests"))]
         let _broadcast_worker_handles =
             broadcast_queue.start_worker(ctx.bridge.clone(), op_manager.clone());
 
