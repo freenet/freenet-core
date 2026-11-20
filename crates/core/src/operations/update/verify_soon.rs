@@ -1163,13 +1163,15 @@ mod tests {
         let t3 = t2 + CONFIRM_DELAY;
         vs.take_due(t3);
         vs.record_sent(&key(1), vec![a.clone(), b.clone()], t3);
-        assert_eq!(
-            vs.on_comparison(&key(1), &a, true, true, &[1], idle, t3),
-            Verdict::Held(Hold::Floor)
-        );
+        // b (clears first) answers first, a (clears later) last: a retry
+        // that kept the last holder's time would wait for the floor.
         assert_eq!(
             vs.on_comparison(&key(1), &b, true, true, &[1], || true, t3),
             Verdict::Held(Hold::Busy)
+        );
+        assert_eq!(
+            vs.on_comparison(&key(1), &a, true, true, &[1], idle, t3),
+            Verdict::Held(Hold::Floor)
         );
         assert_eq!(
             vs.next_wake(),
