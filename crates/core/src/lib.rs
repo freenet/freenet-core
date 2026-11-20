@@ -274,6 +274,12 @@ pub mod dev_tool {
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_STREAMING_FAILURES_REPORTED;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::relay_stream_fault_injection as put_relay_stream_fault_injection;
+    // Silent loss of a node's inline UPDATE legs for one contract (#6143).
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::update::inline_leg_fault_injection::seam as inline_leg_fault_injection;
+    // Per-contract record of the summary-mismatch heal path (#6143).
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::node::stale_peer_heal_observations;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DRIVER_CALL_COUNT;
 

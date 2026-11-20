@@ -9,6 +9,7 @@
 //! the post-merge propagation helpers survive here because the
 //! drivers consume them.
 
+pub(crate) mod inline_leg_fault_injection;
 pub(crate) mod op_ctx_task;
 pub(crate) mod pending_broadcast;
 pub(crate) mod propagation_stats;

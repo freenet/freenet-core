@@ -24302,3 +24302,213 @@ fn assert_non_settling_contract_is_bounded(streaming_threshold: Option<usize>, e
         );
     }
 }
+
+// =============================================================================
+// #6143 verify-soon, step 1: does the existing summary-mismatch heal fire when
+// the PEER is the one behind?
+// =============================================================================
+
+/// What one verify-soon experiment run observed.
+struct PeerBehindOutcome {
+    /// (label, stored CRDT version) for every host other than the originator.
+    versions: Vec<(String, Option<u64>)>,
+    /// Inline legs the fault seam swallowed.
+    swallowed: usize,
+    /// The heal path's decisions for the contract, summed over every node.
+    heal: freenet::dev_tool::stale_peer_heal_observations::Observations,
+}
+
+/// Node 1 sends one client UPDATE (version 100) while the inline-leg fault
+/// seam drops every inline leg node 1 sends for the contract, so the other
+/// three hosts never get it. The fault is then lifted, and with
+/// `send_summary_requests` node 1 sends `SummaryRequest` for the contract to
+/// each other host by hand. The run continues 30 s of virtual time.
+fn run_peer_behind_scenario(
+    network_name: &'static str,
+    seed: u64,
+    contract_seed: u8,
+    send_summary_requests: bool,
+) -> PeerBehindOutcome {
+    use freenet::dev_tool::{
+        NodeLabel, ScheduledOperation, SimOperation, inline_leg_fault_injection,
+        register_crdt_contract, stale_peer_heal_observations,
+    };
+
+    const VERSION: u64 = 100;
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+
+    // A contract per arm: the seam and the observations are process-wide and
+    // keyed by contract, and the arms run in parallel.
+    let contract = SimOperation::create_test_contract(contract_seed);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    register_crdt_contract(contract_id);
+    stale_peer_heal_observations::clear(&contract_key);
+
+    let sim = rt.block_on(async {
+        SimNetwork::new(
+            network_name,
+            1,  // gateway
+            3,  // nodes
+            7,  // max_htl
+            3,  // rnd_if_htl_above
+            10, // max_connections
+            2,  // min_connections
+            seed,
+        )
+        .await
+    });
+
+    let originator = NodeLabel::node(network_name, 1);
+    let originator_addr = sim
+        .node_address(&originator)
+        .expect("node 1 has an address");
+    inline_leg_fault_injection::drop_inline_legs_from(originator_addr, contract_key);
+
+    let others = [
+        NodeLabel::gateway(network_name, 0),
+        NodeLabel::node(network_name, 2),
+        NodeLabel::node(network_name, 3),
+    ];
+
+    let mut operations = vec![ScheduledOperation::new(
+        NodeLabel::gateway(network_name, 0),
+        SimOperation::Put {
+            contract: contract.clone(),
+            state: SimOperation::create_crdt_state(1, 0x01),
+            subscribe: true,
+        },
+    )];
+    for n in 1..=3 {
+        operations.push(ScheduledOperation::new(
+            NodeLabel::node(network_name, n),
+            SimOperation::Subscribe { contract_id },
+        ));
+    }
+    operations.push(ScheduledOperation::new(
+        originator.clone(),
+        SimOperation::Update {
+            key: contract_key,
+            data: SimOperation::create_crdt_state(VERSION, contract_seed),
+        },
+    ));
+    operations.push(ScheduledOperation::new(
+        originator.clone(),
+        SimOperation::LiftInlineLegFault { key: contract_key },
+    ));
+    if send_summary_requests {
+        for to in &others {
+            operations.push(ScheduledOperation::new(
+                originator.clone(),
+                SimOperation::SendSummaryRequest {
+                    key: contract_key,
+                    to: to.clone(),
+                },
+            ));
+        }
+    }
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(120),
+        Duration::from_secs(30),
+    );
+    let swallowed = inline_leg_fault_injection::swallowed(&contract_key);
+    inline_leg_fault_injection::clear(&contract_key);
+    let heal = stale_peer_heal_observations::get(&contract_key);
+    stale_peer_heal_observations::clear(&contract_key);
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation must complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let version_of = |label: &NodeLabel| {
+        result
+            .node_storages
+            .get(label)
+            .and_then(|s| s.get_stored_state(&contract_key))
+            .map(|state| {
+                let bytes: &[u8] = state.as_ref();
+                u64::from_le_bytes(bytes[..8].try_into().expect("CRDT state has a version"))
+            })
+    };
+    assert_eq!(
+        version_of(&originator),
+        Some(VERSION),
+        "the originator must hold its own update"
+    );
+    let outcome = PeerBehindOutcome {
+        versions: others
+            .iter()
+            .map(|label| (label.to_string(), version_of(label)))
+            .collect(),
+        swallowed,
+        heal,
+    };
+    tracing::info!(
+        network_name,
+        versions = ?outcome.versions,
+        swallowed = outcome.swallowed,
+        heal = ?outcome.heal,
+        "peer-behind experiment outcome"
+    );
+    outcome
+}
+
+/// Control: the fault strands node 1's update and nothing repairs it within
+/// 30 s once the fault is lifted. No `Summaries` comparison runs for the
+/// contract, so no heal fires.
+#[test_log::test]
+fn test_peer_behind_stays_behind_without_a_summary_request() {
+    let outcome = run_peer_behind_scenario("peer-behind-control", 0x6143_5EED_0001, 0x71, false);
+    assert!(
+        outcome.swallowed > 0,
+        "the fault seam never fired, so this run says nothing about #6143"
+    );
+    assert!(
+        outcome.versions.iter().all(|(_, v)| *v != Some(100)),
+        "no other host should hold node 1's update without a repair; got {:?}",
+        outcome.versions
+    );
+    assert_eq!(
+        outcome.heal.heals_emitted, 0,
+        "no heal should fire without a summary exchange; got {:?}",
+        outcome.heal
+    );
+}
+
+/// Treatment: the same fault, then node 1 sends `SummaryRequest` to each other
+/// host, 3 s apart. The first host asked answers with its stale summary; node
+/// 1's `Summaries` arm finds it stale and `emit_stale_peer_syncs` sends it a
+/// targeted `SyncStateToPeer`. That host applies the heal and fans it out to
+/// its co-hosts, so the hosts asked later usually answer converged. Either
+/// way every host ends up with the update, and node 1 emits at most one heal
+/// per host asked.
+#[test_log::test]
+fn test_summary_request_heals_a_peer_that_is_behind() {
+    let outcome = run_peer_behind_scenario("peer-behind-treatment", 0x6143_5EED_0001, 0x72, true);
+    assert!(
+        outcome.swallowed > 0,
+        "the fault seam never fired, so this run says nothing about #6143"
+    );
+    assert!(
+        outcome.heal.peers_found_stale >= 1,
+        "node 1 should find at least the first host asked stale; got {:?}",
+        outcome.heal
+    );
+    assert!(
+        (1..=3).contains(&outcome.heal.heals_emitted),
+        "node 1 should emit between one heal and one per host asked; got {:?}",
+        outcome.heal
+    );
+    assert!(
+        outcome.versions.iter().all(|(_, v)| *v == Some(100)),
+        "every host should hold node 1's update after the heal; got {:?}",
+        outcome.versions
+    );
+}

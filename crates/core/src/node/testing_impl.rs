@@ -269,6 +269,26 @@ pub enum SimOperation {
     /// anti-entropy. Handled specially by `run_controlled_simulation` (it is not
     /// a client request).
     RecoverNode,
+    /// Have the scheduled node send `InterestMessage::SummaryRequest` for
+    /// `key` to `to`, through `NodeEvent::SendInterestMessage`, in-order with
+    /// the surrounding events. The peer answers with a full-bytes `Summaries`,
+    /// which the sender runs through its usual staleness check and heal.
+    /// Handled specially by `run_controlled_simulation` (it is not a client
+    /// request).
+    SendSummaryRequest {
+        /// The contract whose summary is requested.
+        key: ContractKey,
+        /// The peer asked for its summary.
+        to: NodeLabel,
+    },
+    /// Stop the inline-leg fault seam dropping legs for `key`
+    /// (`dev_tool::inline_leg_fault_injection::lift`), in-order with the
+    /// surrounding events. The `node` on the [`ScheduledOperation`] is only a
+    /// sequencing placeholder. Handled specially by `run_controlled_simulation`.
+    LiftInlineLegFault {
+        /// The contract whose rules are removed.
+        key: ContractKey,
+    },
 }
 
 impl SimOperation {
@@ -398,6 +418,12 @@ impl SimOperation {
                 panic!(
                     "AdvanceHostingClock is not a client request — it must be handled \
                      by run_controlled_simulation during event dispatch"
+                )
+            }
+            SimOperation::SendSummaryRequest { .. } | SimOperation::LiftInlineLegFault { .. } => {
+                panic!(
+                    "SendSummaryRequest/LiftInlineLegFault are not client requests — they \
+                     must be handled by run_controlled_simulation during event dispatch"
                 )
             }
             SimOperation::CrashNode => {
@@ -5859,7 +5885,9 @@ impl SimNetwork {
                 // client-request generator.
                 | SimOperation::AdvanceHostingClock { .. }
                 | SimOperation::CrashNode
-                | SimOperation::RecoverNode => event_ops.push(scheduled_op),
+                | SimOperation::RecoverNode
+                | SimOperation::SendSummaryRequest { .. }
+                | SimOperation::LiftInlineLegFault { .. } => event_ops.push(scheduled_op),
             }
         }
 
@@ -5925,6 +5953,12 @@ impl SimNetwork {
             AdvanceHostingClock(Duration),
             CrashNode(SocketAddr),
             RecoverNode(SocketAddr),
+            SendSummaryRequest {
+                from: NodeLabel,
+                target: SocketAddr,
+                key: ContractKey,
+            },
+            LiftInlineLegFault(ContractKey),
         }
 
         // Build a map of label -> list of (event_id, operation)
@@ -5966,6 +6000,22 @@ impl SimNetwork {
                             )
                         });
                     special_ops.insert(event_id, SpecialDispatch::RecoverNode(addr));
+                }
+                SimOperation::SendSummaryRequest { key, ref to } => {
+                    let target = *self.node_addresses.get(to).unwrap_or_else(|| {
+                        panic!("SendSummaryRequest: node {to:?} has no known address")
+                    });
+                    special_ops.insert(
+                        event_id,
+                        SpecialDispatch::SendSummaryRequest {
+                            from: scheduled_op.node.clone(),
+                            target,
+                            key,
+                        },
+                    );
+                }
+                SimOperation::LiftInlineLegFault { key } => {
+                    special_ops.insert(event_id, SpecialDispatch::LiftInlineLegFault(key));
                 }
                 op @ (SimOperation::Put { .. }
                 | SimOperation::Get { .. }
@@ -6239,6 +6289,8 @@ impl SimNetwork {
         // Clone the network name for the client closure (the outer
         // `network_name` is still needed after the run for topology capture).
         let network_name_for_client = network_name.clone();
+        // Ring slots, so `SendSummaryRequest` can reach the sender's OpManager.
+        let rings_for_client = self.shared_rings.clone();
 
         // Optional pre-operation join-convergence barrier (see
         // `wait_for_join_convergence_before_ops`). Captured by value into the
@@ -6376,6 +6428,35 @@ impl SimNetwork {
                                     "RecoverNode scheduled but no fault injector registered"
                                 );
                             }
+                        }
+                        SpecialDispatch::SendSummaryRequest { from, target, key } => {
+                            let op_manager = rings_for_client
+                                .get(from)
+                                .and_then(|slot| slot.lock().clone())
+                                .and_then(|ring| ring.upgrade_op_manager());
+                            let Some(op_manager) = op_manager else {
+                                panic!("SendSummaryRequest: node {from:?} has no live OpManager");
+                            };
+                            let sent = op_manager.try_notify_node_event(
+                                crate::message::NodeEvent::SendInterestMessage {
+                                    target: *target,
+                                    message: crate::message::InterestMessage::SummaryRequest {
+                                        hashes: vec![crate::ring::interest::contract_hash(key)],
+                                    },
+                                },
+                            );
+                            tracing::info!(
+                                event_id,
+                                node = %from,
+                                %target,
+                                contract = %key,
+                                queued = sent.is_ok(),
+                                "Sent SummaryRequest from a controlled event"
+                            );
+                        }
+                        SpecialDispatch::LiftInlineLegFault(key) => {
+                            crate::operations::update::inline_leg_fault_injection::seam::lift(key);
+                            tracing::info!(event_id, contract = %key, "Lifted inline-leg fault");
                         }
                     }
                     // Let the effect settle before the next event.

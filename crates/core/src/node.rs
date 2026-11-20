@@ -4281,9 +4281,13 @@ async fn emit_stale_peer_syncs(
         // Targeted heal: `stale_peer_sync_event` builds a `SyncStateToPeer`
         // aimed at exactly `source`, NEVER an all-subscriber fan-out. Pinned
         // by `stale_peer_sync_event_is_targeted_not_broadcast` (#3791/#3796).
-        if let Err(e) =
-            op_manager.try_notify_node_event(stale_peer_sync_event(contract, state, source))
-        {
+        let queued =
+            op_manager.try_notify_node_event(stale_peer_sync_event(contract, state, source));
+        #[cfg(any(test, feature = "testing"))]
+        if queued.is_ok() {
+            stale_peer_heal_observations::record_heal_emitted(&contract);
+        }
+        if let Err(e) = queued {
             // Best-effort by design (see comment above); log at debug to keep
             // the caller layer in step with the helper-internal downgrade
             // (#4238).
@@ -4293,6 +4297,62 @@ async fn emit_stale_peer_syncs(
                 "Failed to emit SyncStateToPeer for stale peer correction (best-effort)"
             );
         }
+    }
+}
+
+/// Per-contract record of the summary-mismatch heal path, for simulation
+/// tests (#6143). Keyed by contract because simulation tests share one
+/// process; each test uses its own contract.
+#[cfg(any(test, feature = "testing"))]
+pub mod stale_peer_heal_observations {
+    use freenet_stdlib::prelude::ContractKey;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// What the `Summaries` arm and `emit_stale_peer_syncs` decided for one
+    /// contract, summed over every node in the process.
+    #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+    pub struct Observations {
+        /// Two-sided comparisons in the `Summaries` arm that found the peer
+        /// stale.
+        pub peers_found_stale: u64,
+        /// Two-sided comparisons in the `Summaries` arm that found the peer
+        /// converged.
+        pub peers_converged: u64,
+        /// `SyncStateToPeer` heals queued by `emit_stale_peer_syncs`.
+        pub heals_emitted: u64,
+    }
+
+    fn state() -> std::sync::MutexGuard<'static, HashMap<ContractKey, Observations>> {
+        static STATE: OnceLock<Mutex<HashMap<ContractKey, Observations>>> = OnceLock::new();
+        STATE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn record_comparison(key: &ContractKey, stale: bool) {
+        let mut state = state();
+        let obs = state.entry(*key).or_default();
+        if stale {
+            obs.peers_found_stale += 1;
+        } else {
+            obs.peers_converged += 1;
+        }
+    }
+
+    pub(crate) fn record_heal_emitted(key: &ContractKey) {
+        state().entry(*key).or_default().heals_emitted += 1;
+    }
+
+    /// Everything recorded for `key` since it was last cleared.
+    pub fn get(key: &ContractKey) -> Observations {
+        state().get(key).copied().unwrap_or_default()
+    }
+
+    /// Forget everything recorded for `key`.
+    pub fn clear(key: &ContractKey) {
+        state().remove(key);
     }
 }
 
@@ -4910,6 +4970,8 @@ async fn handle_interest_sync_message(
                             op_manager
                                 .interest_manager
                                 .record_repair_outcome(&contract, &pk, !is_stale, evidence);
+                            #[cfg(any(test, feature = "testing"))]
+                            stale_peer_heal_observations::record_comparison(&contract, is_stale);
                         }
 
                         // #4952: upsert (not update) when the peer reported a
