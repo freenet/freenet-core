@@ -5276,7 +5276,15 @@ pub(super) async fn broadcast_to_single_peer(
                     .unwrap_or_default(),
             },
         };
-        let res = bridge.send(peer_addr, msg.into()).await;
+        // Test seam for the #6143 failure class: the bridge "accepts" the
+        // leg and it never arrives. No-op outside test builds.
+        let res = if crate::operations::update::inline_leg_fault_injection::inline_leg_swallowed(
+            op_manager, &key,
+        ) {
+            Ok(())
+        } else {
+            bridge.send(peer_addr, msg.into()).await
+        };
         // Non-streaming inline broadcasts have no separate transfer phase: a
         // successful enqueue is the terminal state we can observe, so delivery
         // tracks the send result (unchanged pre-#4235 behavior for this path).

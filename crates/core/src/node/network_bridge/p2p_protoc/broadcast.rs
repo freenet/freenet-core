@@ -1180,10 +1180,18 @@ impl P2pConnManager {
                             .unwrap_or_default(),
                     },
                 };
-                // channel-safety: ok — sim-only path (see the
-                // `#[cfg(feature = "simulation_tests")]` gate on this fn); never
-                // compiled into the production binary.
-                bridge.send(peer_addr, msg.into()).await
+                // Test seam for the #6143 failure class: the bridge "accepts"
+                // the leg and it never arrives.
+                if crate::operations::update::inline_leg_fault_injection::inline_leg_swallowed(
+                    op_manager, &key,
+                ) {
+                    Ok(())
+                } else {
+                    // channel-safety: ok — sim-only path (see the
+                    // `#[cfg(feature = "simulation_tests")]` gate on this fn); never
+                    // compiled into the production binary.
+                    bridge.send(peer_addr, msg.into()).await
+                }
             };
 
             if let Err(err) = send_result {
