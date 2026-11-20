@@ -40,6 +40,9 @@ const MAX_WEB_SIZE: u64 = 1024 * 1024 * 100;
 /// small multiple of what the network will carry.
 pub(crate) const MAX_UNPACKED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
+// Headroom over the measured site (53,046,895 bytes unpacked): at least 4x.
+const _: () = assert!(MAX_UNPACKED_TOTAL_BYTES >= 4 * 53_046_895);
+
 /// Largest single file in a web archive: about 7x the largest file measured
 /// (18.3 MB, a 2026-11 mp3), and half the total bound.
 pub(crate) const MAX_UNPACKED_FILE_BYTES: u64 = 128 * 1024 * 1024;
@@ -689,8 +692,7 @@ mod tests {
     fn unpack_accepts_the_measured_media_heavy_site() {
         const MEASURED_TOTAL: u64 = 53_046_895;
         const OLD_TOTAL_LIMIT: u64 = 48 * 1024 * 1024;
-        assert!(MEASURED_TOTAL > OLD_TOTAL_LIMIT);
-        assert!(MAX_UNPACKED_TOTAL_BYTES >= 4 * MEASURED_TOTAL);
+        const { assert!(MEASURED_TOTAL > OLD_TOTAL_LIMIT) };
 
         let dst = tempfile::tempdir().unwrap();
         let mut builder = Builder::new(Cursor::new(Vec::new()));
