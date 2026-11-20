@@ -371,16 +371,17 @@ fn try_acquire_cache_lock(
 /// (measured: 325 MB / 61 entries on one peer, 1.2 GB / 82 entries on another,
 /// with entries up to six months untouched).
 ///
-/// 64 MiB is chosen against the observed per-entry distribution: a typical
-/// unpacked webapp is a few hundred KB to a few MB, so the budget keeps roughly
-/// the last 15-30 distinct webapps the user actually browsed — far more than a
-/// browsing session touches — while cutting >90% of the observed footprint.
+/// The budget must hold one maximal archive (`MAX_UNPACKED_TOTAL_BYTES`, 256
+/// MiB, sized to admit a measured 53 MB media-heavy site with headroom), so it
+/// is 512 MiB. A typical unpacked webapp is a few hundred KB to a few MB, so
+/// the budget still keeps the last dozens of distinct webapps the user browsed
+/// while cutting about 60% of the worst observed footprint (1.2 GB).
 /// This LRU cap is the only thing that bounds these bytes. Since #5007
 /// `ring/hosting/disk_usage.rs` also measures and reports the cache, but does
 /// NOT charge it against the hosting disk budget (#5853 tracks whether it
 /// should; hosting eviction has no lever on webapp entries, and the cache may
 /// sit on a different mount than the one the budget's free-space term measures).
-const WEBAPP_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const WEBAPP_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 // One archive must fit the budget on its own: the sweep never evicts the entry
 // that triggered it (`in_use`), so an entry larger than the budget would stay
