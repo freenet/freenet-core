@@ -77,7 +77,9 @@ use std::time::Duration;
 use freenet_stdlib::prelude::ContractInstanceId;
 use parking_lot::Mutex;
 
-use crate::message::{InterestMessage, NetMessage, NetMessageV1, SummariesEmitter};
+use crate::message::{
+    InterestMessage, NeighborHostingMessage, NetMessage, NetMessageV1, SummariesEmitter,
+};
 use crate::node::background_task_monitor::BackgroundTaskMonitor;
 
 /// Per-contract attribution cap for the differing-summary map in one window.
@@ -307,6 +309,60 @@ impl OutboundKind {
             OutboundKind::InterestSyncResync => "interest_sync_resync",
             OutboundKind::NeighborHosting => "neighbor_hosting",
             OutboundKind::Other => "other",
+        }
+    }
+}
+
+/// Which NeighborHosting message these bytes are, WITHIN the
+/// `neighbor_hosting` arm (#5157).
+///
+/// The arm is one protocol family, but its variants have opposite costs: an
+/// announce is one id (61 bytes), a full response is `20 + 32n` bytes, and the
+/// digest exchange exists to replace the second with a ~12-byte reply. Without
+/// the split the arm's total cannot say whether a change moved bytes from the
+/// large variant to the small one. Attribution rides on the message variant
+/// itself, so a new variant must be named here to compile
+/// ([`OutboundClass::classify`] matches without a catch-all).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NeighborHostingKind {
+    /// `HostingStateRequest`: the legacy anti-entropy request, no payload.
+    Request,
+    /// `HostingAnnounce`: an incremental add/remove.
+    Announce,
+    /// `HostingStateResponse`: the full hosted set.
+    Response,
+}
+
+impl NeighborHostingKind {
+    pub(crate) const ALL: [NeighborHostingKind; 3] = [
+        NeighborHostingKind::Request,
+        NeighborHostingKind::Announce,
+        NeighborHostingKind::Response,
+    ];
+
+    const fn index(self) -> usize {
+        match self {
+            NeighborHostingKind::Request => 0,
+            NeighborHostingKind::Announce => 1,
+            NeighborHostingKind::Response => 2,
+        }
+    }
+
+    /// Telemetry field stem: the rollup publishes
+    /// `neighbor_hosting_<stem>_msgs` and `neighbor_hosting_<stem>_bytes`.
+    pub(crate) const fn stem(self) -> &'static str {
+        match self {
+            NeighborHostingKind::Request => "request",
+            NeighborHostingKind::Announce => "announce",
+            NeighborHostingKind::Response => "response",
+        }
+    }
+
+    fn of(message: &NeighborHostingMessage) -> Self {
+        match message {
+            NeighborHostingMessage::HostingStateRequest => NeighborHostingKind::Request,
+            NeighborHostingMessage::HostingAnnounce { .. } => NeighborHostingKind::Announce,
+            NeighborHostingMessage::HostingStateResponse { .. } => NeighborHostingKind::Response,
         }
     }
 }
@@ -590,6 +646,8 @@ pub(crate) struct OutboundClass {
     pub(crate) kind: OutboundKind,
     /// `Some` exactly when `kind == OutboundKind::InterestSyncSummaries`.
     summaries: Option<SummariesDetail>,
+    /// `Some` exactly when `kind == OutboundKind::NeighborHosting` (#5157).
+    neighbor_hosting: Option<NeighborHostingKind>,
 }
 
 impl OutboundClass {
@@ -597,6 +655,7 @@ impl OutboundClass {
         Self {
             kind,
             summaries: None,
+            neighbor_hosting: None,
         }
     }
 
@@ -627,6 +686,7 @@ impl OutboundClass {
                             wire_form: SummariesWireForm::FullBytes,
                             entries: entries.len() as u64,
                         }),
+                        neighbor_hosting: None,
                     },
                     // #4965: the digest form carries the SAME emitter tag as
                     // the `Summaries` it replaces, so a send path keeps its
@@ -639,6 +699,7 @@ impl OutboundClass {
                             wire_form: SummariesWireForm::Digests,
                             entries: entries.len() as u64,
                         }),
+                        neighbor_hosting: None,
                     },
                     // The bytes-on-mismatch request leg. Tagged rather than
                     // left `plain` because the per-emitter arms must SUM to
@@ -656,13 +717,18 @@ impl OutboundClass {
                             wire_form: SummariesWireForm::Digests,
                             entries: hashes.len() as u64,
                         }),
+                        neighbor_hosting: None,
                     },
                     InterestMessage::ResyncRequest { .. }
                     | InterestMessage::ResyncResponse { .. } => {
                         Self::plain(OutboundKind::InterestSyncResync)
                     }
                 },
-                NetMessageV1::NeighborHosting { .. } => Self::plain(OutboundKind::NeighborHosting),
+                NetMessageV1::NeighborHosting { message } => Self {
+                    kind: OutboundKind::NeighborHosting,
+                    summaries: None,
+                    neighbor_hosting: Some(NeighborHostingKind::of(message)),
+                },
                 // Exhaustive on purpose (no `_` arm): a new protocol message
                 // must not silently join `Other` and hide its bytes inside a
                 // bucket nobody investigates. Adding a variant should break
@@ -695,6 +761,13 @@ struct Window {
     /// anyway (`summaries_sub_arms_reconcile_with_the_parent_arm`), since a
     /// silently non-reconciling split is worse than no split.
     summaries_msgs: [u64; SUMMARIES_ARMS.len()],
+    /// The `neighbor_hosting` arm split by message variant, indexed by
+    /// [`NeighborHostingKind::index`] (#5157). Sums to the parent arm by
+    /// construction: [`OutboundMix::record_sent`] updates both in one branch,
+    /// and a NeighborHosting message with no tag is folded into the `Request`
+    /// slot rather than skipped.
+    neighbor_hosting_msgs: [u64; NeighborHostingKind::ALL.len()],
+    neighbor_hosting_bytes: [u64; NeighborHostingKind::ALL.len()],
     summaries_bytes: [u64; SUMMARIES_ARMS.len()],
     summaries_max_bytes: [u64; SUMMARIES_ARMS.len()],
     /// Total `SummaryEntry` count across the window's messages, per sub-arm.
@@ -955,6 +1028,15 @@ impl OutboundMix {
         // residual, or the sub-arms would quietly stop summing to the parent —
         // the one failure this split cannot afford, since a shortfall would
         // read as "that emitter got smaller".
+        if class.kind == OutboundKind::NeighborHosting {
+            let k = class
+                .neighbor_hosting
+                .unwrap_or(NeighborHostingKind::Request);
+            let i = k.index();
+            w.neighbor_hosting_msgs[i] = w.neighbor_hosting_msgs[i].saturating_add(1);
+            w.neighbor_hosting_bytes[i] = w.neighbor_hosting_bytes[i].saturating_add(b);
+            crate::config::GlobalTestMetrics::record_neighbor_hosting_send(k.stem(), b);
+        }
         if class.kind == OutboundKind::InterestSyncSummaries {
             let detail = class.summaries.unwrap_or_default();
             let s = summaries_index(detail.emitter);
@@ -1359,6 +1441,21 @@ fn outbound_mix_json(w: &Window, window_secs: u64) -> serde_json::Value {
         body.insert(format!("{stem}_msgs"), w.msgs[idx].into());
         body.insert(format!("{stem}_bytes"), w.bytes[idx].into());
         body.insert(format!("{stem}_max_bytes"), w.max_bytes[idx].into());
+    }
+
+    // #5157: the `neighbor_hosting` arm again, split by message variant.
+    // Emitted unconditionally including as zeros, same rule as every arm above.
+    for kind in NeighborHostingKind::ALL {
+        let i = kind.index();
+        let stem = kind.stem();
+        body.insert(
+            format!("neighbor_hosting_{stem}_msgs"),
+            w.neighbor_hosting_msgs[i].into(),
+        );
+        body.insert(
+            format!("neighbor_hosting_{stem}_bytes"),
+            w.neighbor_hosting_bytes[i].into(),
+        );
     }
 
     // #5052: the `interest_sync_summaries` arm again, split by emitter. Fields
@@ -2879,6 +2976,7 @@ mod tests {
             OutboundClass {
                 kind: OutboundKind::InterestSyncSummaries,
                 summaries: None,
+                neighbor_hosting: None,
             },
             777,
         );

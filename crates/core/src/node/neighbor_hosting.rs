@@ -759,12 +759,35 @@ impl NeighborHostingManager {
         self.my_contracts.len()
     }
 
+    /// Peers we hold a view for. Simulation tests only (#5157).
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(dead_code)]
+    pub(crate) fn tracked_peers(&self) -> Vec<TransportPublicKey> {
+        self.neighbor_contracts
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
+    /// The ids this node advertises. Simulation tests only (#5157).
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(dead_code)]
+    pub(crate) fn advertised_ids(&self) -> HashSet<ContractInstanceId> {
+        self.my_contracts.iter().map(|e| *e.key()).collect()
+    }
+
     /// Get the number of neighbors we're tracking.
     #[allow(dead_code)]
     pub fn neighbor_count(&self) -> usize {
         self.neighbor_contracts.len()
     }
 }
+
+/// Simulation coverage for the anti-entropy exchange (#5157). The module name
+/// is load-bearing: CI's simulation job selects in-crate simulation tests by
+/// `test(sim_e2e_tests)`, so a differently named module would never run.
+#[cfg(all(test, feature = "simulation_tests"))]
+mod sim_e2e_tests;
 
 #[cfg(test)]
 mod tests {

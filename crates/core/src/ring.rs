@@ -447,6 +447,14 @@ pub(crate) struct Ring {
     pub(crate) contract_ban_list: Arc<contract_ban_list::ContractBanList>,
     event_register: Box<dyn NetEventRegister>,
     op_manager: RwLock<Option<Weak<OpManager>>>,
+    /// Strong handle to this node's `NeighborHostingManager`, published by
+    /// [`Self::attach_op_manager`] so a simulation test can read the manager
+    /// after the run, when the `OpManager` (which `op_manager` above holds only
+    /// weakly) has been dropped (#5157). No cycle: the manager references
+    /// neither the ring nor the op manager.
+    #[cfg(any(test, feature = "testing"))]
+    neighbor_hosting_probe:
+        RwLock<Option<Arc<crate::node::neighbor_hosting::NeighborHostingManager>>>,
     /// Whether this peer is a gateway or not. This will affect behavior of the node when acquiring
     /// and dropping connections.
     pub(crate) is_gateway: bool,
@@ -920,6 +928,8 @@ impl Ring {
             live_tx_tracker: live_tx_tracker.clone(),
             event_register: Box::new(event_register),
             op_manager: RwLock::new(None),
+            #[cfg(any(test, feature = "testing"))]
+            neighbor_hosting_probe: RwLock::new(None),
             is_gateway,
             connection_backoff: Arc::new(Mutex::new(ConnectionBackoff::new())),
             contract_connect_backoff: Mutex::new(HashMap::new()),
@@ -1105,6 +1115,10 @@ impl Ring {
 
     pub fn attach_op_manager(&self, op_manager: &Arc<OpManager>) {
         self.op_manager.write().replace(Arc::downgrade(op_manager));
+        #[cfg(any(test, feature = "testing"))]
+        self.neighbor_hosting_probe
+            .write()
+            .replace(op_manager.neighbor_hosting.clone());
         // The hosting cache charges each hosted contract the neighbour-summary
         // bytes the interest manager holds for it (#5647). Holding the
         // `InterestManager` Arc directly creates no cycle: it references
@@ -1158,6 +1172,16 @@ impl Ring {
     /// `tokio::select!`.
     pub(crate) fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.clone()
+    }
+
+    /// This node's `NeighborHostingManager`, readable after the node has shut
+    /// down. Simulation tests only (#5157).
+    #[cfg(any(test, feature = "testing"))]
+    #[allow(dead_code)]
+    pub(crate) fn neighbor_hosting_for_test(
+        &self,
+    ) -> Option<Arc<crate::node::neighbor_hosting::NeighborHostingManager>> {
+        self.neighbor_hosting_probe.read().clone()
     }
 
     pub(crate) fn upgrade_op_manager(&self) -> Option<Arc<OpManager>> {

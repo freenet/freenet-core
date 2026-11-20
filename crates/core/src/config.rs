@@ -6031,6 +6031,12 @@ std::thread_local! {
     static GLOBAL_PENDING_OP_HWM: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PENDING_OP_SKIPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_NEIGHBOR_HOSTING_UPDATES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Send log for NeighborHosting messages (#5157). Written only while the
+    /// trace is enabled (never in production: the flag is thread-local and
+    /// only a test sets it), so the log cannot grow without bound.
+    static GLOBAL_NEIGHBOR_HOSTING_TRACE_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static GLOBAL_NEIGHBOR_HOSTING_SENDS: std::cell::RefCell<Vec<NeighborHostingSendSample>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Recipients dropped from a proactive summary notification because they
     /// are advertised co-hosts the broadcast already covered (#4965).
     static GLOBAL_NOTIFICATION_COHOSTS_SKIPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -6126,6 +6132,19 @@ std::thread_local! {
 /// ```
 pub struct GlobalTestMetrics;
 
+/// One logged NeighborHosting send (#5157). See
+/// [`GlobalTestMetrics::record_neighbor_hosting_send`].
+#[derive(Debug, Clone, Copy)]
+pub struct NeighborHostingSendSample {
+    /// When it was sent (tokio clock, so virtual time in a simulation).
+    pub at: tokio::time::Instant,
+    /// Variant stem: `request`, `digest_request`, `unchanged`, `response` or
+    /// `announce`.
+    pub kind: &'static str,
+    /// Serialized `NetMessage` length in bytes.
+    pub bytes: u64,
+}
+
 impl GlobalTestMetrics {
     /// Resets all test metrics to zero (thread-local). Call at the start of each test.
     pub fn reset() {
@@ -6147,6 +6166,8 @@ impl GlobalTestMetrics {
         GLOBAL_PENDING_OP_REMOVES.with(|c| c.set(0));
         GLOBAL_PENDING_OP_HWM.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.set(0));
+        GLOBAL_NEIGHBOR_HOSTING_TRACE_ON.with(|c| c.set(false));
+        GLOBAL_NEIGHBOR_HOSTING_SENDS.with(|v| v.borrow_mut().clear());
         GLOBAL_NOTIFICATION_COHOSTS_SKIPPED.with(|c| c.set(0));
         GLOBAL_NOTIFICATION_TARGETS.with(|c| c.set(0));
         GLOBAL_NEIGHBOR_HOSTING_RETRACTIONS.with(|c| c.set(0));
@@ -6463,6 +6484,34 @@ impl GlobalTestMetrics {
 
     pub fn neighbor_hosting_updates() -> u64 {
         GLOBAL_NEIGHBOR_HOSTING_UPDATES.with(|c| c.get())
+    }
+
+    /// Start logging every NeighborHosting message this thread's nodes send
+    /// (#5157). Off by default and cleared by [`Self::reset`]; a simulation
+    /// test turns it on so it can measure NeighborHosting bytes over a window
+    /// of virtual time.
+    pub fn enable_neighbor_hosting_trace() {
+        GLOBAL_NEIGHBOR_HOSTING_TRACE_ON.with(|c| c.set(true));
+    }
+
+    /// Record one NeighborHosting message handed to the transport. `kind` is
+    /// the variant stem (see `NeighborHostingKind::stem`) and `bytes` the
+    /// serialized `NetMessage` length. A no-op unless the trace is enabled.
+    pub fn record_neighbor_hosting_send(kind: &'static str, bytes: u64) {
+        if !GLOBAL_NEIGHBOR_HOSTING_TRACE_ON.with(|c| c.get()) {
+            return;
+        }
+        let at = tokio::time::Instant::now();
+        GLOBAL_NEIGHBOR_HOSTING_SENDS.with(|v| {
+            v.borrow_mut()
+                .push(NeighborHostingSendSample { at, kind, bytes })
+        });
+    }
+
+    /// Every NeighborHosting send logged since the trace was enabled, in send
+    /// order.
+    pub fn neighbor_hosting_sends() -> Vec<NeighborHostingSendSample> {
+        GLOBAL_NEIGHBOR_HOSTING_SENDS.with(|v| v.borrow().clone())
     }
 
     /// A proactive summary notification skipped `n` advertised co-hosts,
