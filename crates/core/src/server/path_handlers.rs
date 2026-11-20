@@ -5570,6 +5570,21 @@ mod tests {
             body.len()
         );
         assert!(body.ends_with("..."), "{body}");
+
+        // Counted in characters, cut on a character boundary: a byte slice
+        // would panic mid-character here.
+        let cjk = "\u{5b57}".repeat(10_000);
+        let body = unpack_failed_message("KEY", &WebContractError::Refused(cjk));
+        let reason = body
+            .strip_prefix(&format!("{UNPACK_FAILED_PREFIX}KEY: "))
+            .expect("prefix");
+        assert_eq!(reason.chars().count(), REFUSAL_REASON_MAX_CHARS + 3);
+        assert!(reason.ends_with("..."), "{reason}");
+
+        // Exactly at the cap: passed whole, no cut marker.
+        let exact = "y".repeat(REFUSAL_REASON_MAX_CHARS);
+        let body = unpack_failed_message("KEY", &WebContractError::Refused(exact.clone()));
+        assert_eq!(body, format!("{UNPACK_FAILED_PREFIX}KEY: {exact}"));
     }
 
     /// The reason carries archive-controlled text (an entry path) to a page

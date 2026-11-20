@@ -22,9 +22,16 @@ pub enum WebContractError {
     /// entry type, path). The message is shown to whoever asked for the site,
     /// since it is the only way a site's author learns why the page does not
     /// load. The decompressed-stream cap and the state-framing checks in
-    /// `TryFrom` still report `UnpackingError` (shown generically): they fire
-    /// only for padded or malformed archives, never for an ordinary site under
-    /// the network's state-size limit.
+    /// `TryFrom` still report `UnpackingError`, or `StoringError` when the cap
+    /// trips while `unpack_in` reads a file's data; both are shown
+    /// generically. They fire only for padded or malformed archives, never for
+    /// an ordinary site under the network's state-size limit.
+    ///
+    /// Up to [`SHOWN_PATH_MAX_CHARS`] characters of the archive author's own
+    /// text (an entry path) therefore appear on a page at the node's origin:
+    /// quoted, escaped, HTML-escaped by the response layer, and framed as the
+    /// site's file name. Accepted, because the author needs the name to fix
+    /// the site and can show any text they like in the site itself.
     ///
     /// It is composed here from the limits and the archive's own headers, never
     /// from a filesystem error, so it carries no detail of the node's disk. The
@@ -40,8 +47,10 @@ pub enum WebContractError {
 /// message, counted after escaping.
 const SHOWN_PATH_MAX_CHARS: usize = 120;
 
-/// An archive entry path quoted for a refusal message: escaped like `Debug`
-/// (control and bidi characters become `\u{..}`), cut at a whole escape once
+/// An archive entry path quoted for a refusal message: each character escaped
+/// with `char::escape_debug` (control, bidi and combining characters become
+/// `\u{..}`, quotes are backslashed; slightly stricter than `str`'s `Debug`,
+/// which leaves `'` and non-initial combining marks alone), cut at a whole escape once
 /// [`SHOWN_PATH_MAX_CHARS`] escaped characters are reached, then quoted, with
 /// `...` after the closing quote when cut.
 ///
@@ -851,8 +860,21 @@ mod tests {
             EntryType::Regular,
         );
         let msg = refusal(builder);
-        assert!(msg.contains("\"big.bin\""), "{msg}");
+        // A short path is quoted whole: no cut marker after the quote.
+        assert!(msg.contains("file \"big.bin\" is "), "{msg}");
+        assert!(!msg.contains("..."), "{msg}");
         assert!(msg.contains("limit for one file"), "{msg}");
+
+        // A quote in the name is escaped, so it cannot end the quoting early.
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        append_header_only(
+            &mut builder,
+            "a\"b.bin",
+            MAX_UNPACKED_FILE_BYTES + 1,
+            EntryType::Regular,
+        );
+        let msg = refusal(builder);
+        assert!(msg.contains(r#"file "a\"b.bin" is "#), "{msg}");
 
         let mut builder = Builder::new(Cursor::new(Vec::new()));
         for i in 0..=MAX_ARCHIVE_ENTRIES {
@@ -930,26 +952,38 @@ mod tests {
         assert!(msg.ends_with("only regular files and folders."), "{msg}");
     }
 
-    /// The total-size refusal. Unlike the per-entry checks it needs real data
-    /// (later headers sit behind earlier files), so the archive is streamed
-    /// straight into the xz encoder: zeros compress to almost nothing and the
-    /// uncompressed tar is never held in memory. Files are sized as
-    /// `total / 3`, so each stays under the per-file limit at any ratio of the
-    /// two limits above 1:3.
+    /// The total-size refusal. Entries before the one that crosses the total
+    /// are unpacked, so they need real data; the crossing entry is refused on
+    /// its header and needs none. So: real files (each within the per-file
+    /// limit) adding up to `total - file + 1` bytes, then a header-only entry
+    /// of exactly `file` bytes, the least real data that can cross the total.
+    /// The archive streams straight into the xz encoder, so the uncompressed
+    /// tar is never held in memory.
     #[test]
     fn the_total_size_refusal_says_how_much_was_counted() {
+        const _: () = assert!(MAX_UNPACKED_FILE_BYTES < MAX_UNPACKED_TOTAL_BYTES);
         let mut builder = Builder::new(xz2::write::XzEncoder::new(Vec::new(), 1));
-        let each = MAX_UNPACKED_TOTAL_BYTES / 3 + 1024;
-        assert!(each <= MAX_UNPACKED_FILE_BYTES);
-        for i in 0..3 {
+        let mut remaining = MAX_UNPACKED_TOTAL_BYTES - MAX_UNPACKED_FILE_BYTES + 1;
+        let mut i = 0;
+        while remaining > 0 {
+            let len = remaining.min(MAX_UNPACKED_FILE_BYTES);
             let mut h = Header::new_gnu();
             h.set_entry_type(EntryType::Regular);
-            h.set_size(each);
+            h.set_size(len);
             h.set_mode(0o644);
             builder
-                .append_data(&mut h, format!("f{i}.bin"), std::io::repeat(0).take(each))
+                .append_data(&mut h, format!("f{i}.bin"), std::io::repeat(0).take(len))
                 .unwrap();
+            remaining -= len;
+            i += 1;
         }
+        let mut h = Header::new_gnu();
+        h.set_entry_type(EntryType::Regular);
+        h.set_size(MAX_UNPACKED_FILE_BYTES);
+        h.set_mode(0o644);
+        builder
+            .append_data(&mut h, "last.bin", std::io::empty())
+            .unwrap();
         let compressed = builder.into_inner().unwrap().finish().unwrap();
         let mut web = WebApp::from_compressed(b"meta".to_vec(), compressed).unwrap();
         let dst = tempfile::tempdir().unwrap();
@@ -957,7 +991,12 @@ mod tests {
             Err(WebContractError::Refused(msg)) => msg,
             other => panic!("expected a Refused error, got {other:?}"),
         };
-        let (counted, limit) = size_and_limit(3 * each, MAX_UNPACKED_TOTAL_BYTES);
+        assert!(
+            dir_is_empty(dst.path()),
+            "partial output was not cleaned up"
+        );
+        let (counted, limit) =
+            size_and_limit(MAX_UNPACKED_TOTAL_BYTES + 1, MAX_UNPACKED_TOTAL_BYTES);
         assert!(
             msg.contains(&format!(
                 "at least {counted}, over this node's {limit} limit"
