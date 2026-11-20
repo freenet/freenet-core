@@ -229,11 +229,76 @@ fn ensure_state_within_limit(state_len: usize, dir: &Path) -> anyhow::Result<()>
             "Website is {state_mib:.1} MiB after compression, exceeding Freenet's \
              {limit_mib} MiB contract-state limit. Reduce the size of {dir}: check for \
              large media files, or an accidentally included node_modules/, .git/, or \
-             build/target/ directory.",
+             build/target/ directory.{largest}",
             dir = dir.display(),
+            largest = largest_files(dir),
         );
     }
     Ok(())
+}
+
+/// The largest files under `dir` (uncompressed sizes), one per line after a
+/// heading, or an empty string if none can be read. Best effort: it only
+/// decorates a message, so it never returns an error. A file whose size cannot
+/// be read is skipped; if any directory cannot be listed, the whole list is
+/// omitted.
+fn largest_files(dir: &Path) -> String {
+    let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
+    let mut files: Vec<(u64, PathBuf)> = walkdir(dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| Some((fs::metadata(&path).ok()?.len(), path)))
+        .collect();
+    if files.is_empty() {
+        return String::new();
+    }
+    files.sort_by_key(|(len, _)| std::cmp::Reverse(*len));
+    let lines: Vec<String> = files
+        .iter()
+        .take(LARGE_SITE_FILES_SHOWN)
+        .map(|(len, path)| {
+            let shown = path.strip_prefix(dir).unwrap_or(path);
+            format!("  {:>7.1} MiB  {}", mib(*len), shown.display())
+        })
+        .collect();
+    format!(
+        "\nLargest files (before compression):\n{}",
+        lines.join("\n")
+    )
+}
+
+/// Packed state size above which `publish` warns that the site is large.
+///
+/// A nudge, not a limit: the publish goes ahead. Every visitor's node fetches
+/// the whole state before it can show any page, and every republish ships it
+/// again, so a site this size loads slowly for everyone. Typical sites are a
+/// few MiB; the hard ceiling is [`MAX_CONTRACT_STATE_SIZE`].
+const LARGE_SITE_WARNING_BYTES: usize = 10 * 1024 * 1024;
+
+/// How many of the largest files the size messages name.
+const LARGE_SITE_FILES_SHOWN: usize = 3;
+
+/// The warning `publish` prints for a large site, or `None` at or below
+/// [`LARGE_SITE_WARNING_BYTES`]. Names the largest files, since one or two
+/// media files are usually most of it.
+///
+/// It measures the packed (compressed) state, which is what the network
+/// carries and every visitor downloads. It does not check a node's unpack
+/// limits, which count uncompressed bytes on the node's disk and live in
+/// `freenet::server::app_packaging`: a site that compresses unusually well
+/// could pass this and still be refused there, with a message naming the limit.
+fn large_site_warning(state_len: usize, dir: &Path) -> Option<String> {
+    if state_len <= LARGE_SITE_WARNING_BYTES {
+        return None;
+    }
+    Some(format!(
+        "Warning: this website is {:.1} MiB after compression. Every visitor's node \
+         downloads the whole site before it can show a page, and each republish sends it \
+         again, so large sites load slowly. Consider hosting large media separately and \
+         linking to it.{}",
+        state_len as f64 / (1024.0 * 1024.0),
+        largest_files(dir),
+    ))
 }
 
 fn load_contract_wasm(custom_path: Option<&Path>) -> anyhow::Result<Vec<u8>> {
@@ -381,6 +446,9 @@ pub async fn publish(
     // message (its state-size limit for ~50-64 MiB, or a cryptic chunk-count
     // stream-reassembly error for >64 MiB serialized) (#4653).
     ensure_state_within_limit(state.as_ref().len(), &directory)?;
+    if let Some(warning) = large_site_warning(state.as_ref().len(), &directory) {
+        eprintln!("{warning}");
+    }
 
     println!("Publishing website as contract {key} (version {version})");
 
@@ -504,8 +572,59 @@ mod tests {
     }
 
     #[test]
+    fn large_site_warning_names_the_largest_files_above_the_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("assets")).unwrap();
+        fs::write(dir.path().join("index.html"), vec![0u8; 100]).unwrap();
+        fs::write(
+            dir.path().join("assets/video.webm"),
+            vec![0u8; 3 * 1024 * 1024],
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("assets/song.mp3"),
+            vec![0u8; 2 * 1024 * 1024],
+        )
+        .unwrap();
+        fs::write(dir.path().join("assets/pic.jpg"), vec![0u8; 1024 * 1024]).unwrap();
+
+        // At the threshold: no warning, so ordinary sites publish quietly.
+        assert!(large_site_warning(LARGE_SITE_WARNING_BYTES, dir.path()).is_none());
+
+        // Over it: a warning naming the largest files, largest first, and
+        // not the small ones beyond LARGE_SITE_FILES_SHOWN.
+        let warning = large_site_warning(LARGE_SITE_WARNING_BYTES + 1, dir.path())
+            .expect("a site over the threshold must be warned about");
+        let video = warning.find("video.webm").expect(&warning);
+        let song = warning.find("song.mp3").expect(&warning);
+        let pic = warning.find("pic.jpg").expect(&warning);
+        assert!(video < song && song < pic, "{warning}");
+        assert!(!warning.contains("index.html"), "{warning}");
+        assert!(warning.contains("10.0 MiB"), "{warning}");
+
+        // The hard ceiling's error names them too: that is where the author
+        // most needs to know what to trim.
+        let err = ensure_state_within_limit(MAX_CONTRACT_STATE_SIZE + 1, dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("video.webm"), "{err}");
+
+        // A directory that cannot be read still warns, just without a list:
+        // the nudge must never fail a publish.
+        let missing = dir.path().join("does-not-exist");
+        let warning = large_site_warning(LARGE_SITE_WARNING_BYTES + 1, &missing)
+            .expect("the warning does not depend on reading the files");
+        assert!(!warning.contains("Largest files"), "{warning}");
+    }
+
+    #[test]
     fn test_ensure_state_within_limit() {
-        let dir = Path::new("/tmp/my-site");
+        // A path that does not exist: the error now lists the largest files
+        // under it, and a fixed shared path such as /tmp/my-site could be
+        // another process's real directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_buf = tmp.path().join("my-site");
+        let dir = dir_buf.as_path();
 
         // Just over the limit: rejected, and the error names both the actual
         // size and the limit so the user can act on it.
@@ -521,7 +640,7 @@ mod tests {
             "error should mention the actual size in MiB: {msg}"
         );
         assert!(
-            msg.contains("/tmp/my-site"),
+            msg.contains(&dir.display().to_string()),
             "error should name the directory to trim: {msg}"
         );
 
