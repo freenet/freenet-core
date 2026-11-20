@@ -104,16 +104,26 @@ const MAX_WEB_SIZE: u64 = 1024 * 1024 * 100;
 ///
 /// `MAX_WEB_SIZE` bounds only the compressed bytes, and xz compresses runs of
 /// zeros by several orders of magnitude, so it says nothing about what lands on
-/// disk or in memory. This bound is below the node's webapp cache budget
-/// (`WEBAPP_CACHE_MAX_BYTES`, 64 MiB; a test in `path_handlers` pins the
-/// relation) so a single archive can never exceed the budget by itself, and well
-/// above the largest real web app we have measured (about 23 MB unpacked, 14.5 MB
-/// of it one wasm file).
-pub(crate) const MAX_UNPACKED_TOTAL_BYTES: u64 = 48 * 1024 * 1024;
+/// disk. This bound stays below the node's webapp cache budget
+/// (`WEBAPP_CACHE_MAX_BYTES`, 512 MiB; a const assert in `path_handlers` pins the
+/// relation) so a single archive can never exceed the budget by itself.
+///
+/// Sizing: media-heavy sites exist and are legitimate. The site at contract
+/// `Ch5S5guTNAontnYX2qTFLmHxAh2kLodU1xpoJjv4dx5J`, measured on 2026-11-19, is
+/// 51.9 MB compressed (xz barely shrinks gif/webm/mp3), 53.0 MB (50.6 MiB)
+/// unpacked in 8 files, largest 18.3 MB. The previous 48 MiB total refused it
+/// (#6281 regression). 256 MiB is about 4.8x that site and about 5x the largest
+/// compressed state a node stores (`MAX_STATE_SIZE`, 50 MiB), so a legitimate
+/// site has headroom while a decompression bomb is still cut off at a fixed,
+/// small multiple of what the network will carry.
+pub(crate) const MAX_UNPACKED_TOTAL_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Largest single file in a web archive. Twice the largest wasm bundle measured
-/// (14.5 MB), and below the total bound.
-pub(crate) const MAX_UNPACKED_FILE_BYTES: u64 = 32 * 1024 * 1024;
+// Headroom over the measured site (53,046,895 bytes unpacked): at least 4x.
+const _: () = assert!(MAX_UNPACKED_TOTAL_BYTES >= 4 * 53_046_895);
+
+/// Largest single file in a web archive: about 7x the largest file measured
+/// (18.3 MB, a 2026-11 mp3), and half the total bound.
+pub(crate) const MAX_UNPACKED_FILE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Most entries (files plus directories) in a web archive. Real apps have tens
 /// to a few hundred.
@@ -701,10 +711,11 @@ mod tests {
     fn unpack_rejects_total_over_limit_with_each_file_under_per_file_limit() {
         let dst = tempfile::tempdir().unwrap();
         let mut builder = Builder::new(Cursor::new(Vec::new()));
-        let each = MAX_UNPACKED_TOTAL_BYTES / 2 + 1024;
+        let each = MAX_UNPACKED_TOTAL_BYTES / 3 + 1024;
         assert!(each <= MAX_UNPACKED_FILE_BYTES);
         append_zero_file(&mut builder, "a.bin", each);
         append_zero_file(&mut builder, "b.bin", each);
+        append_zero_file(&mut builder, "c.bin", each);
         let mut web = finish(builder);
 
         assert!(web.unpack(dst.path()).is_err());
@@ -762,6 +773,43 @@ mod tests {
                 .unwrap()
                 .len(),
             15 * 1024 * 1024
+        );
+    }
+
+    /// Regression for the 0.2.161 refusal of a published media-heavy site
+    /// (contract Ch5S5guTNAontnYX2qTFLmHxAh2kLodU1xpoJjv4dx5J): 8 files totalling
+    /// 53,046,895 bytes, largest 18,302,078. The 48 MiB total limit rejected it.
+    #[test]
+    fn unpack_accepts_the_measured_media_heavy_site() {
+        const MEASURED_TOTAL: u64 = 53_046_895;
+        const OLD_TOTAL_LIMIT: u64 = 48 * 1024 * 1024;
+        const { assert!(MEASURED_TOTAL > OLD_TOTAL_LIMIT) };
+
+        let dst = tempfile::tempdir().unwrap();
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        let sizes = [
+            18_302_078u64,
+            16_033_794,
+            10_664_880,
+            5_000_000,
+            2_000_000,
+            1_000_000,
+            45_000,
+            1_143,
+        ];
+        assert_eq!(sizes.iter().sum::<u64>(), MEASURED_TOTAL);
+        for (i, size) in sizes.iter().enumerate() {
+            append_zero_file(&mut builder, &format!("assets/f{i}.bin"), *size);
+        }
+        let mut web = finish(builder);
+
+        web.unpack(dst.path())
+            .expect("the measured site must unpack");
+        assert_eq!(
+            std::fs::metadata(dst.path().join("assets/f0.bin"))
+                .unwrap()
+                .len(),
+            18_302_078
         );
     }
 
