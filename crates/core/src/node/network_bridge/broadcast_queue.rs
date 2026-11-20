@@ -1517,6 +1517,25 @@ mod queue {
             }
         }
 
+        /// Whether a leg for (`key`, `peer`) is queued, waiting for a permit or
+        /// sending (#6143 verify-soon: such a pair is not lost, its leg is
+        /// waiting). A contended queue lock answers `true`, the conservative
+        /// side: the caller then does not force a resend.
+        pub(crate) fn has_pending_for(
+            &self,
+            key: &ContractKey,
+            peer: &crate::ring::PeerKey,
+        ) -> bool {
+            let Ok(state) = self.queue.try_lock() else {
+                return true;
+            };
+            state
+                .entries
+                .keys()
+                .chain(state.active.keys())
+                .any(|(k, p)| k == key && p.pub_key() == &peer.0)
+        }
+
         pub(crate) fn with_spacing(spacing: Arc<BroadcastSpacing>) -> Self {
             Self {
                 queue: Arc::new(Mutex::new(QueueState::new())),

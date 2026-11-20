@@ -739,7 +739,7 @@ impl P2pConnManager {
             // interval is handed to the held-legs timer instead.
             let peer_key = crate::ring::PeerKey::from(target.pub_key().clone());
             match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
-                Ok(_claim)
+                Ok(claim)
                     if op_manager.verify_soon.has_forced(
                         &key,
                         &peer_key,
@@ -752,6 +752,7 @@ impl P2pConnManager {
                         key,
                         new_state,
                         target,
+                        claim,
                     );
                 }
                 Ok(_claim) => {
@@ -796,7 +797,8 @@ impl P2pConnManager {
     /// Simulation only. Production sends every leg from the broadcast queue's
     /// tasks; the simulation sends heals inline on the event loop, and a stream
     /// leg awaits its completion signal, which this same event loop has to
-    /// drive. Awaiting it here would stall the node.
+    /// drive. Awaiting it here would stall the node. The task holds the pair's
+    /// spacing `claim` until the send ends, as an inline send would.
     #[cfg(feature = "simulation_tests")]
     fn spawn_forced_leg(
         bridge: P2pBridge,
@@ -804,9 +806,11 @@ impl P2pConnManager {
         key: freenet_stdlib::prelude::ContractKey,
         new_state: freenet_stdlib::prelude::WrappedState,
         target: crate::ring::PeerKeyLocation,
+        claim: super::super::broadcast_spacing::SendClaim,
     ) {
         // A sim-only, single-send task that ends when the stream does.
         drop(crate::config::GlobalExecutor::spawn(async move {
+            let _claim = claim;
             super::super::broadcast_queue::broadcast_to_single_peer(
                 &bridge,
                 &op_manager,
@@ -946,7 +950,7 @@ impl P2pConnManager {
             // a held-legs task or another fan-out cannot start a second send to
             // it meanwhile, and the interval runs from the end of this one. Like
             // production, a converged skip still counts as a send.
-            let _claim = match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
+            let claim = match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
                 Ok(claim) => claim,
                 Err(wait) => {
                     crate::config::GlobalTestMetrics::record_broadcast_leg_spaced();
@@ -969,9 +973,12 @@ impl P2pConnManager {
                     key,
                     new_state.clone(),
                     target.clone(),
+                    claim,
                 );
                 continue;
             }
+            // Held to the end of this iteration (see above).
+            let _claim = claim;
 
             // Get peer's cached summary
             let their_summary = op_manager
