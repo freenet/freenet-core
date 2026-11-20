@@ -4486,6 +4486,161 @@ mod tests {
         }
     }
 
+    /// The send gate for `NeighborHostingMessage::HostingStateDigestRequest`
+    /// (#5157; scenario rows 4, 5 and 11). A pre-floor peer has no variant index
+    /// for it and DROPS THE CONNECTION on one, so the gate must refuse an unknown
+    /// version and a pre-floor one, count each under its own cause, and still
+    /// open for a peer at or above the floor (an always-false gate would pass a
+    /// test that only checked the refusals).
+    #[test]
+    fn supports_neighbor_hosting_digest_gate_discriminates_and_counts_by_cause() {
+        let cm = make_connection_manager(Some(make_addr(9300)), 1, 10, false);
+        assert_eq!(
+            cm.version_gate_refusal_stats(),
+            VersionGateRefusalStats::default(),
+            "premise: nothing refused yet"
+        );
+
+        let unknown = make_addr(9301);
+        assert!(
+            !cm.supports_neighbor_hosting_digest(unknown),
+            "an unrecorded version must fail CLOSED"
+        );
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(s.neighbor_hosting_digest_declined_unknown_version, 1);
+        assert_eq!(s.neighbor_hosting_digest_declined_pre_floor, 0);
+
+        // 0.2.161 is the release this was written against and has no variants.
+        let pre_floor = make_addr(9302);
+        cm.record_remote_version(pre_floor, Some((0, 2, 161)));
+        assert!(!cm.supports_neighbor_hosting_digest(pre_floor));
+        assert!(!cm.supports_neighbor_hosting_digest(pre_floor));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(s.neighbor_hosting_digest_declined_unknown_version, 1);
+        assert_eq!(s.neighbor_hosting_digest_declined_pre_floor, 2);
+
+        let at_floor = make_addr(9303);
+        cm.record_remote_version(
+            at_floor,
+            Some(crate::node::NEIGHBOR_HOSTING_DIGEST_MIN_VERSION),
+        );
+        assert!(
+            cm.supports_neighbor_hosting_digest(at_floor),
+            "the floor release carries the variants"
+        );
+        let newer = make_addr(9304);
+        cm.record_remote_version(newer, Some((0, 3, 0)));
+        assert!(cm.supports_neighbor_hosting_digest(newer));
+        let s = cm.version_gate_refusal_stats();
+        assert_eq!(
+            (
+                s.neighbor_hosting_digest_declined_unknown_version,
+                s.neighbor_hosting_digest_declined_pre_floor
+            ),
+            (1, 2),
+            "an approved peer is not counted as a refusal"
+        );
+        // The other gates' counters are separate.
+        assert_eq!(s.hash_first_declined_unknown_version, 0);
+    }
+
+    /// Scenario row 11: the floor override is the kill switch. A floor above
+    /// every live version refuses even a current peer, so the heartbeat sends
+    /// the legacy request to everyone; an always-passing floor still fails
+    /// closed on an unknown version.
+    #[test]
+    fn neighbor_hosting_digest_floor_override_is_a_kill_switch() {
+        let mut cm = make_connection_manager(Some(make_addr(9310)), 1, 10, false);
+        let current = make_addr(9311);
+        cm.record_remote_version(current, Some((0, 9, 0)));
+        assert!(cm.supports_neighbor_hosting_digest(current));
+
+        cm.neighbor_hosting_digest_floor_override = Some((255, 255, 65535));
+        assert!(
+            !cm.supports_neighbor_hosting_digest(current),
+            "a closed floor must force the legacy request for every peer"
+        );
+        assert_eq!(
+            cm.version_gate_refusal_stats()
+                .neighbor_hosting_digest_declined_pre_floor,
+            1
+        );
+
+        cm.neighbor_hosting_digest_floor_override = Some((0, 0, 0));
+        assert!(cm.supports_neighbor_hosting_digest(current));
+        assert!(
+            !cm.supports_neighbor_hosting_digest(make_addr(9312)),
+            "even the always-passing floor refuses an unknown version"
+        );
+    }
+
+    /// #5157's copy of the release-timing guard. See
+    /// `hash_first_floor_tracks_the_shipping_release` for the full rationale: a
+    /// floor left behind by a release bump means peers on the real release read
+    /// as at-floor, receive a `HostingStateDigestRequest` they have no variant
+    /// index for, fail to decode, and the connection is closed.
+    #[test]
+    fn neighbor_hosting_digest_floor_tracks_the_shipping_release() {
+        fn crate_version() -> (u8, u8, u16) {
+            let v = env!("CARGO_PKG_VERSION");
+            let mut it = v.split('.');
+            let major = it.next().unwrap().parse().expect("major");
+            let minor = it.next().unwrap().parse().expect("minor");
+            let patch = it
+                .next()
+                .unwrap()
+                .split(['-', '+'])
+                .next()
+                .unwrap()
+                .parse()
+                .expect("patch");
+            (major, minor, patch)
+        }
+
+        let floor = crate::node::NEIGHBOR_HOSTING_DIGEST_MIN_VERSION;
+        let current = crate_version();
+
+        match crate::node::NEIGHBOR_HOSTING_DIGEST_SHIPPED_IN {
+            None => assert!(
+                floor > current,
+                "NEIGHBOR_HOSTING_DIGEST_MIN_VERSION is {floor:?} but the crate is already at \
+                 {current:?}, and NEIGHBOR_HOSTING_DIGEST_SHIPPED_IN is None.\n\n\
+                 The release has caught up with the floor. Decide which is true and encode it:\n\
+                 - This release DOES carry the digest variants -> set \
+                 NEIGHBOR_HOSTING_DIGEST_SHIPPED_IN = Some({floor:?}) (a literal) and freeze both.\n\
+                 - It does NOT -> raise NEIGHBOR_HOSTING_DIGEST_MIN_VERSION to the release that will.\n\n\
+                 Leaving it ships a floor that peers on the real {current:?} satisfy without \
+                 carrying the variants: they cannot decode them, and the connection is closed."
+            ),
+            Some(shipped) => {
+                assert_eq!(
+                    shipped, floor,
+                    "NEIGHBOR_HOSTING_DIGEST_SHIPPED_IN ({shipped:?}) must EQUAL \
+                     NEIGHBOR_HOSTING_DIGEST_MIN_VERSION ({floor:?})"
+                );
+                assert!(
+                    floor <= current,
+                    "shipped in {shipped:?} but the crate is only at {current:?}"
+                );
+            }
+        }
+    }
+
+    /// Catches the digest floor being LOWERED, which the marker test above
+    /// cannot see.
+    #[test]
+    fn neighbor_hosting_digest_floor_stays_above_every_release_without_the_variants() {
+        /// Last release that does NOT carry the digest variants.
+        const LAST_RELEASE_WITHOUT_VARIANTS: (u8, u8, u16) = (0, 2, 161);
+        assert!(
+            crate::node::NEIGHBOR_HOSTING_DIGEST_MIN_VERSION > LAST_RELEASE_WITHOUT_VARIANTS,
+            "NEIGHBOR_HOSTING_DIGEST_MIN_VERSION ({:?}) dropped to or below \
+             {LAST_RELEASE_WITHOUT_VARIANTS:?}, a release with no HostingStateDigestRequest \
+             variant index. Sending it to those peers fails to decode and drops the connection.",
+            crate::node::NEIGHBOR_HOSTING_DIGEST_MIN_VERSION,
+        );
+    }
+
     /// Catches the floor being LOWERED, which the marker test above cannot see.
     #[test]
     fn broadcast_target_list_floor_stays_above_every_release_without_the_variants() {

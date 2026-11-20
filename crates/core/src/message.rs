@@ -1413,6 +1413,108 @@ mod tests {
         );
     }
 
+    /// The pre-#5157 `NeighborHostingMessage`, verbatim: three variants. This
+    /// is what a peer below `NEIGHBOR_HOSTING_DIGEST_MIN_VERSION` decodes with.
+    #[derive(Debug, PartialEq, Deserialize)]
+    enum PreFloorNeighborHostingMessage {
+        HostingAnnounce {
+            added: Vec<ContractInstanceId>,
+            removed: Vec<ContractInstanceId>,
+            #[serde(default)]
+            is_response: bool,
+        },
+        HostingStateRequest,
+        HostingStateResponse {
+            contracts: Vec<ContractInstanceId>,
+        },
+    }
+
+    /// Scenario row 12 (#5157). The three existing `NeighborHostingMessage`
+    /// variants keep indices 0, 1 and 2 and the new ones take 3 and 4, and a
+    /// decoder built from the pre-floor enum accepts exactly the old variants:
+    /// it reads the old messages unchanged and fails on the new ones, which is
+    /// why the heartbeat must never send them ungated.
+    #[test]
+    fn neighbor_hosting_wire_variant_indices_are_frozen_and_the_new_ones_are_gated() {
+        fn index(msg: &NeighborHostingMessage) -> u32 {
+            let bytes = bincode::serialize(msg).expect("serialize");
+            u32::from_le_bytes(bytes[..4].try_into().expect("variant index prefix"))
+        }
+        let id = ContractInstanceId::new([4u8; 32]);
+        let announce = NeighborHostingMessage::HostingAnnounce {
+            added: vec![id],
+            removed: vec![],
+            is_response: false,
+        };
+        let request = NeighborHostingMessage::HostingStateRequest;
+        let response = NeighborHostingMessage::HostingStateResponse {
+            contracts: vec![id],
+        };
+        let digest = NeighborHostingMessage::HostingStateDigestRequest {
+            digest: 0xdead_beef,
+            count: 7,
+        };
+        let unchanged = NeighborHostingMessage::HostingStateUnchanged;
+
+        assert_eq!(index(&announce), 0, "HostingAnnounce must stay variant 0");
+        assert_eq!(
+            index(&request),
+            1,
+            "HostingStateRequest must stay variant 1"
+        );
+        assert_eq!(
+            index(&response),
+            2,
+            "HostingStateResponse must stay variant 2"
+        );
+        assert_eq!(
+            index(&digest),
+            3,
+            "HostingStateDigestRequest is variant 3 (appended)"
+        );
+        assert_eq!(
+            index(&unchanged),
+            4,
+            "HostingStateUnchanged is variant 4 (appended)"
+        );
+
+        // New decoder, new messages: round trip.
+        for msg in [&digest, &unchanged] {
+            let bytes = bincode::serialize(msg).expect("serialize");
+            let back: NeighborHostingMessage = bincode::deserialize(&bytes).expect("decode");
+            assert_eq!(bincode::serialize(&back).unwrap(), bytes);
+        }
+        // Pre-floor decoder: the old variants decode, the new ones do not.
+        assert_eq!(
+            bincode::deserialize::<PreFloorNeighborHostingMessage>(
+                &bincode::serialize(&request).unwrap()
+            )
+            .expect("old variant decodes"),
+            PreFloorNeighborHostingMessage::HostingStateRequest
+        );
+        assert!(
+            bincode::deserialize::<PreFloorNeighborHostingMessage>(
+                &bincode::serialize(&announce).unwrap()
+            )
+            .is_ok()
+        );
+        assert!(
+            bincode::deserialize::<PreFloorNeighborHostingMessage>(
+                &bincode::serialize(&response).unwrap()
+            )
+            .is_ok()
+        );
+        for msg in [&digest, &unchanged] {
+            assert!(
+                bincode::deserialize::<PreFloorNeighborHostingMessage>(
+                    &bincode::serialize(msg).unwrap()
+                )
+                .is_err(),
+                "a pre-floor decoder must reject {msg:?}: that is what the version gate protects"
+            );
+        }
+    }
+
     /// The hash-first variants must survive a bincode round trip intact —
     /// including the fixed-size digest array, which is the one field whose
     /// encoding differs in kind from anything `SummaryEntry` carries.

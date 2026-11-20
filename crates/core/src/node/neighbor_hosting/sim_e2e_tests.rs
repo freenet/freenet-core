@@ -71,6 +71,18 @@ fn reset_simulation_state(seed: u64) {
     crate::test_utils::reset_global_node_index();
 }
 
+/// Which anti-entropy a scenario runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Every node on the new code with the digest gate open (the simulation
+    /// default).
+    Digest,
+    /// The kill switch: the gate is closed on every node and every responder
+    /// answers a legacy request in full, which is what a network of pre-#5157
+    /// peers does.
+    Legacy,
+}
+
 /// What one scenario run measured.
 #[derive(Debug)]
 struct ScenarioOutcome {
@@ -102,7 +114,14 @@ impl ScenarioOutcome {
 ///
 /// `tag` keeps network names distinct: lib tests run on parallel threads and the
 /// simulation registries are keyed by network name.
-fn run_scenario(tag: &str, seed: u64, with_crash: bool) -> ScenarioOutcome {
+fn run_scenario(
+    tag: &str,
+    seed: u64,
+    with_crash: bool,
+    mode: Mode,
+    extra_contracts: usize,
+    ack_version: bool,
+) -> ScenarioOutcome {
     reset_simulation_state(seed);
     let network = format!("nh-digest-{tag}-{seed:x}");
 
@@ -128,9 +147,9 @@ fn run_scenario(tag: &str, seed: u64, with_crash: bool) -> ScenarioOutcome {
     sim.use_mock_wasm = true;
     sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
     sim.with_controlled_op_interval(Duration::from_secs(2));
-    configure_network(&mut sim);
+    configure_network(&mut sim, mode, ack_version);
 
-    let contracts: Vec<_> = (0..8u8)
+    let contracts: Vec<_> = (0..(8 + extra_contracts) as u8)
         .map(|i| SimOperation::create_test_contract(0x50 + i))
         .collect();
     let gateway = NodeLabel::gateway(&network, 0);
@@ -163,6 +182,11 @@ fn run_scenario(tag: &str, seed: u64, with_crash: bool) -> ScenarioOutcome {
         subscribe(node(4), 0),
         subscribe(node(4), 3),
     ];
+    // Larger hosted sets, so a full response is the size it is in the field
+    // (tens of ids per neighbour or more) rather than a single packet's worth.
+    for i in 0..extra_contracts {
+        operations.push(put(node(1 + i % NODES), 8 + i));
+    }
     if with_crash {
         // Node 3 is silently crashed while others host new contracts, so the
         // announcements for contracts 4 and 5 never reach it and its own
@@ -202,9 +226,19 @@ fn run_scenario(tag: &str, seed: u64, with_crash: bool) -> ScenarioOutcome {
 /// Hook for the scenario's network configuration. The baseline (legacy-only)
 /// build needs none beyond turning the send trace on; the digest build also
 /// sets the version floor per mode.
-fn configure_network(sim: &mut SimNetwork) {
+///
+/// `ack_version` makes a regular node learn its gateway's version, as every
+/// node does in production since 0.2.120. Without it the node -> gateway link
+/// has an unknown version, so the gate fails closed and that pair runs the
+/// legacy exchange, which a new responder throttles to one full reply per hour.
+fn configure_network(sim: &mut SimNetwork, mode: Mode, ack_version: bool) {
     GlobalTestMetrics::enable_neighbor_hosting_trace();
-    let _ = sim;
+    if ack_version {
+        sim.enable_gateway_ack_version();
+    }
+    if mode == Mode::Legacy {
+        sim.disable_neighbor_hosting_digest();
+    }
 }
 
 /// `require_quiet`: the run must contain a window with no announces. A run with
@@ -276,6 +310,7 @@ fn measure(
             manager,
         ));
     }
+    for (label, key, _) in &by_key {}
     let mut pairs_checked = 0usize;
     let mut mismatches = Vec::new();
     let mut hosted_total = 0usize;
@@ -291,10 +326,13 @@ fn measure(
             let actual = sm.advertised_ids();
             pairs_checked += 1;
             if view != actual {
-                let missing: Vec<_> = actual.difference(&view).map(|id| id.to_string()).collect();
-                let phantom: Vec<_> = view.difference(&actual).map(|id| id.to_string()).collect();
+                let missing = actual.difference(&view).count();
+                let phantom = view.difference(&actual).count();
                 mismatches.push(format!(
-                    "{viewer} view of {subject}: missing {missing:?}, phantom {phantom:?}"
+                    "{viewer} view of {subject}: view has {} ids, subject hosts {}, \
+                     {missing} missing, {phantom} phantom",
+                    view.len(),
+                    actual.len()
                 ));
             }
         }
@@ -316,7 +354,7 @@ fn measure(
 /// stream of `response` bytes even though nothing changes.
 #[test]
 fn baseline_legacy_steady_state_bytes_and_view_accuracy() {
-    let out = run_scenario("baseline", 0x5157_0001, false);
+    let out = run_scenario("baseline", 0x5157_0001, false, Mode::Legacy, 0, false);
     eprintln!("5157 BASELINE outcome: {out:#?}");
 
     assert!(
@@ -345,7 +383,7 @@ fn baseline_legacy_steady_state_bytes_and_view_accuracy() {
 /// periodic full-set exchange can repair the views.
 #[test]
 fn baseline_legacy_views_heal_after_a_crashed_node_misses_announcements() {
-    let out = run_scenario("baseline-crash", 0x5157_0002, true);
+    let out = run_scenario("baseline-crash", 0x5157_0002, true, Mode::Legacy, 0, false);
     eprintln!("5157 BASELINE (crash) outcome: {out:#?}");
     assert!(
         out.pairs_checked >= NODES * 2,
@@ -357,4 +395,101 @@ fn baseline_legacy_views_heal_after_a_crashed_node_misses_announcements() {
         "views must heal after the crashed node recovers: {:#?}",
         out.mismatches
     );
+}
+
+/// How many extra contracts the comparison scenario hosts on top of the
+/// baseline's eight, so a node's set is about 24 ids and a full response is
+/// ~800 bytes.
+const COMPARISON_EXTRA_CONTRACTS: usize = 16;
+
+fn quiet(out: &ScenarioOutcome, kind: &str) -> (u64, u64) {
+    (
+        out.quiet_msgs.get(kind).copied().unwrap_or(0),
+        out.quiet_bytes.get(kind).copied().unwrap_or(0),
+    )
+}
+
+/// The headline #5157 assertion: on the same seed and network, NeighborHosting
+/// bytes in a window with no hosting changes fall by at least 90% against the
+/// forced-legacy run, and views are exactly as accurate in both.
+///
+/// What carries the weight: the bytes ratio fails if the responder stops
+/// sending `HostingStateUnchanged` (it would then answer every digest request
+/// with the full set) and if the heartbeat stops sending digest requests; the
+/// accuracy assertions fail if a digest mismatch stops replacing a stale view.
+#[test]
+fn digest_steady_state_bytes_are_at_least_90_percent_below_forced_legacy() {
+    let seed = 0x5157_0003;
+    let legacy = run_scenario(
+        "cmp-legacy",
+        seed,
+        false,
+        Mode::Legacy,
+        COMPARISON_EXTRA_CONTRACTS,
+        true,
+    );
+    let digest = run_scenario(
+        "cmp-digest",
+        seed,
+        false,
+        Mode::Digest,
+        COMPARISON_EXTRA_CONTRACTS,
+        true,
+    );
+    eprintln!("5157 CMP legacy: {legacy:#?}");
+    eprintln!("5157 CMP digest: {digest:#?}");
+
+    // Premises: both runs saw the same quiet-window length class, hosted the
+    // same number of contracts and used the path they claim to.
+    assert_eq!(legacy.hosted_total, digest.hosted_total, "same hosted sets");
+    assert!(legacy.hosted_total >= 5 * 16, "{}", legacy.hosted_total);
+    assert!(quiet(&legacy, "response").1 > 0, "legacy ships full sets");
+    assert_eq!(quiet(&legacy, "digest_request").0, 0);
+    assert_eq!(quiet(&legacy, "unchanged").0, 0);
+    assert!(
+        quiet(&digest, "digest_request").0 > 0,
+        "digest requests are sent"
+    );
+    assert!(quiet(&digest, "unchanged").0 > 0, "and answered Unchanged");
+    assert_eq!(
+        quiet(&digest, "request").0,
+        0,
+        "no legacy request is sent when every peer is on the new code"
+    );
+
+    // Compare per virtual second, since the two runs' quiet windows differ in
+    // length by a few seconds.
+    let legacy_rate = legacy.quiet_total_bytes() as f64 / legacy.quiet_secs as f64;
+    let digest_rate = digest.quiet_total_bytes() as f64 / digest.quiet_secs as f64;
+    assert!(
+        digest_rate <= legacy_rate * 0.10,
+        "steady-state NeighborHosting bytes/s must fall by at least 90%: \
+         legacy {legacy_rate:.2} B/s, digest {digest_rate:.2} B/s"
+    );
+
+    // Accuracy is not traded for bytes.
+    assert!(legacy.pairs_checked >= NODES * 2 && digest.pairs_checked >= NODES * 2);
+    assert!(legacy.mismatches.is_empty(), "{:#?}", legacy.mismatches);
+    assert!(digest.mismatches.is_empty(), "{:#?}", digest.mismatches);
+}
+
+/// View accuracy under message loss, in both modes (#5157). A node silently
+/// crashed while others host new contracts misses announcements, and the views
+/// must be repaired by anti-entropy: in digest mode by the digest mismatch that
+/// triggers a full replacement.
+#[test]
+fn views_heal_after_a_crashed_node_in_both_modes() {
+    for (mode, tag) in [(Mode::Digest, "heal-digest"), (Mode::Legacy, "heal-legacy")] {
+        let out = run_scenario(tag, 0x5157_0004, true, mode, 4, true);
+        assert!(
+            out.pairs_checked >= NODES * 2,
+            "[{mode:?}] premise: {} pairs checked",
+            out.pairs_checked
+        );
+        assert!(
+            out.mismatches.is_empty(),
+            "[{mode:?}] views must heal after the crashed node recovers: {:#?}",
+            out.mismatches
+        );
+    }
 }

@@ -1044,6 +1044,11 @@ impl NeighborHostingManager {
 #[cfg(all(test, feature = "simulation_tests"))]
 mod sim_e2e_tests;
 
+/// Unit tests for the digest-first exchange, one per row of the #5157 scenario
+/// matrix.
+#[cfg(test)]
+mod digest_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
