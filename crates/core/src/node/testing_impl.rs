@@ -3141,6 +3141,22 @@ impl SimNetwork {
         self
     }
 
+    /// Set the hash-first summary floor on every node, so a peer advertising a
+    /// version below `floor` (see `with_node_advertised_version`) is treated as
+    /// pre-hash-first: it is sent full-bytes summaries and no `SummaryRequest`.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_hash_first_summaries_floor(&mut self, floor: (u8, u8, u16)) -> &mut Self {
+        let floor = Some(floor);
+        self.hash_first_summaries_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        self
+    }
+
     /// Force the hash-first summary exchange OFF for this simulation by
     /// pinning the per-node floor to the unreachable
     /// [`Self::SIM_MIGRATION_DISABLED_FLOOR`], so every peer falls back to the

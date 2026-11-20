@@ -213,6 +213,9 @@ pub(crate) struct OpManager {
     /// than the receiver's rate limit allows (#5842). See
     /// [`crate::node::network_bridge::broadcast_spacing`].
     pub broadcast_spacing: Arc<crate::node::network_bridge::broadcast_spacing::BroadcastSpacing>,
+    /// Verify-soon checks of this node's own originated UPDATEs (#6143),
+    /// driven by `verify_soon::run_verify_soon`.
+    pub(crate) verify_soon: Arc<crate::operations::update::verify_soon::VerifySoon>,
     /// Bounded per-contract UPDATE-propagation counters. Fed from the
     /// broadcast fan-out path and drained by a periodic background task that
     /// emits an INFO `update_propagation_summary` line per window. Restores
@@ -417,6 +420,7 @@ impl Clone for OpManager {
             broadcast_dedup_cache: self.broadcast_dedup_cache.clone(),
             broadcast_coverage: self.broadcast_coverage.clone(),
             broadcast_spacing: self.broadcast_spacing.clone(),
+            verify_soon: self.verify_soon.clone(),
             update_propagation_stats: self.update_propagation_stats.clone(),
             pending_broadcasts: self.pending_broadcasts.clone(),
             request_router: self.request_router.clone(),
@@ -738,6 +742,16 @@ impl OpManager {
         let active_relay_subscribe_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
         let active_relay_connect_txs: Arc<DashSet<Transaction>> = Arc::new(DashSet::new());
 
+        // Verify-soon checks of this node's own originated UPDATEs (#6143).
+        // Started here so every node builder gets it; the task reaches the
+        // OpManager through the ring once `attach_op_manager` has run.
+        task_monitor.register(
+            "verify_soon",
+            GlobalExecutor::spawn(crate::operations::update::verify_soon::run_verify_soon(
+                ring.clone(),
+            )),
+        );
+
         task_monitor.register(
             "garbage_cleanup",
             GlobalExecutor::spawn(
@@ -848,6 +862,7 @@ impl OpManager {
             // The spacing waits on tokio time (`tokio::time::sleep`), so
             // it reads the same clock rather than the hosting override, which
             // sims advance by hand.
+            verify_soon: Arc::new(crate::operations::update::verify_soon::VerifySoon::new()),
             broadcast_spacing: Arc::new(
                 crate::node::network_bridge::broadcast_spacing::BroadcastSpacing::new(Arc::new(
                     InstantTimeSrc::new(),
