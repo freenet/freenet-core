@@ -280,8 +280,11 @@ pub mod dev_tool {
     // Per-contract record of the summary-mismatch heal path (#6143).
     #[cfg(any(test, feature = "testing"))]
     pub use crate::node::stale_peer_heal_observations;
+    // Per-contract off switch for the verify-soon check, for control arms (#6143).
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DRIVER_CALL_COUNT;
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::update::verify_soon::test_switch as verify_soon_switch;
 
     // Test hooks for the relay-hop routing-event plumbing. Each counter
     // increments every time `operations::record_relay_route_event` fires
