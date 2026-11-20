@@ -163,14 +163,28 @@ const UNPACK_FAILED_PREFIX: &str = "failed unpacking contract: ";
 /// (the 0.2.161 media-site refusal was reported with exactly that). Any other
 /// error stays generic, since an I/O error can carry a local filesystem path
 /// and this body is shown at the node's origin, including on hosted nodes.
+///
+/// The reason is cut to [`REFUSAL_REASON_MAX_CHARS`]. `Refused` already bounds
+/// the archive-controlled path it quotes; this is the backstop, because the
+/// result is served on every request and kept in the negative cache
+/// (`TerminalAbsenceKind::ArchiveRefused`).
 fn unpack_failed_message(key: &str, err: &WebContractError) -> String {
     match err {
-        WebContractError::Refused(reason) => format!("{UNPACK_FAILED_PREFIX}{key}: {reason}"),
+        WebContractError::Refused(reason) => {
+            let mut shown: String = reason.chars().take(REFUSAL_REASON_MAX_CHARS).collect();
+            if shown.len() < reason.len() {
+                shown.push_str("...");
+            }
+            format!("{UNPACK_FAILED_PREFIX}{key}: {shown}")
+        }
         WebContractError::UnpackingError(_)
         | WebContractError::StoringError(_)
         | WebContractError::FileNotFound(_) => format!("{UNPACK_FAILED_PREFIX}{key}"),
     }
 }
+
+/// Most characters of a refusal reason [`unpack_failed_message`] passes on.
+const REFUSAL_REASON_MAX_CHARS: usize = 512;
 
 impl TerminalAbsenceKind {
     fn into_error(self, instance_id: ContractInstanceId) -> WebSocketApiError {
@@ -1837,7 +1851,7 @@ async fn unpack_if_stale(
 
         fn err(err: WebContractError, contract: &ContractContainer) -> WebSocketApiError {
             let key = contract.key();
-            tracing::error!("{err}");
+            tracing::error!(contract = %key, "web archive not unpacked: {err}");
             WebSocketApiError::InvalidParam {
                 error_cause: unpack_failed_message(&key.to_string(), &err),
             }
@@ -5498,8 +5512,6 @@ mod tests {
         assert!(read_file_bounded(&sparse, 1024 * 1024).await.is_err());
     }
 
-    /// A contract whose state is a web archive holding one file over the unpack
-    /// limit. A few KB compressed.
     /// Only a `Refused` reason reaches the 400 body. An I/O error can name a
     /// local path (the webapp cache dir), and the body is served at the node's
     /// origin, hosted nodes included, so it must stay generic.
@@ -5514,15 +5526,72 @@ mod tests {
             format!("{UNPACK_FAILED_PREFIX}KEY: the website unpacks to more than 1.0 MiB")
         );
 
-        let io = unpack_failed_message(
-            "KEY",
-            &WebContractError::StoringError(std::io::Error::other(
-                "/home/someone/.cache/freenet/webapp_cache/KEY: disk full",
-            )),
-        );
-        assert_eq!(io, format!("{UNPACK_FAILED_PREFIX}KEY"));
+        let leaky_path = "/home/someone/.cache/freenet/webapp_cache/KEY: disk full";
+        for err in [
+            WebContractError::StoringError(std::io::Error::other(leaky_path)),
+            WebContractError::UnpackingError(anyhow::anyhow!(leaky_path)),
+        ] {
+            assert_eq!(
+                unpack_failed_message("KEY", &err),
+                format!("{UNPACK_FAILED_PREFIX}KEY"),
+                "{err:?} must not reach the body"
+            );
+        }
     }
 
+    /// The backstop on the reason's length holds even for a `Refused` built
+    /// somewhere that forgot to bound its archive-controlled parts.
+    #[test]
+    fn unpack_failed_message_bounds_the_reason() {
+        let body = unpack_failed_message("KEY", &WebContractError::Refused("x".repeat(1_000_000)));
+        assert!(
+            body.len() < UNPACK_FAILED_PREFIX.len() + REFUSAL_REASON_MAX_CHARS + 16,
+            "body is {} bytes",
+            body.len()
+        );
+        assert!(body.ends_with("..."), "{body}");
+    }
+
+    /// The reason carries archive-controlled text (an entry path) to a page
+    /// served at the node's origin. It must arrive HTML-escaped through the
+    /// real unpack and response path, not only in hand-built errors.
+    #[tokio::test]
+    async fn a_refusal_naming_a_hostile_file_is_escaped_in_the_response() {
+        let name = "<img src=x onerror=alert(1)>.bin";
+        let size = super::super::app_packaging::MAX_UNPACKED_FILE_BYTES + 1;
+        let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                name,
+                std::io::Read::take(std::io::repeat(0), size),
+            )
+            .unwrap();
+        let mut web = WebApp::from_data(Vec::new(), archive).unwrap();
+        let err = web
+            .unpack(tempfile::tempdir().unwrap().path())
+            .expect_err("premise: the archive is refused");
+        let response = WebSocketApiError::InvalidParam {
+            error_cause: unpack_failed_message("KEY", &err),
+        }
+        .into_response();
+        let raw = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&raw);
+        assert!(!body.contains("<img "), "markup survived: {body}");
+        assert!(
+            body.contains("&lt;img src=x"),
+            "the name must survive, escaped: {body}"
+        );
+    }
+
+    /// A contract whose state is a web archive holding one file over the unpack
+    /// limit. A few KB compressed.
     fn oversized_archive_contract_and_state(seed: &[u8]) -> (ContractContainer, WrappedState) {
         let limit = super::super::app_packaging::MAX_UNPACKED_FILE_BYTES + 1;
         let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));

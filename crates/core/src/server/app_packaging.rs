@@ -18,18 +18,55 @@ pub enum WebContractError {
     #[error("file not found: {0}")]
     FileNotFound(String),
     /// The archive is well-formed but this node will not unpack it: it breaks
-    /// one of the unpack limits (size, entry count, entry type, path). The
-    /// message is composed here from the archive's own headers and the limits,
-    /// never from a filesystem error, so it is safe to show to whoever asked
-    /// for the site, and it is shown to them: it is the only way a site's
-    /// author learns why the page does not load.
+    /// one of the per-entry unpack checks (file size, total size, entry count,
+    /// entry type, path). The message is shown to whoever asked for the site,
+    /// since it is the only way a site's author learns why the page does not
+    /// load. The decompressed-stream cap and the state-framing checks in
+    /// `TryFrom` still report `UnpackingError` (shown generically): they fire
+    /// only for padded or malformed archives, never for an ordinary site under
+    /// the network's state-size limit.
+    ///
+    /// It is composed here from the limits and the archive's own headers, never
+    /// from a filesystem error, so it carries no detail of the node's disk. The
+    /// one archive-controlled part, an entry path, goes through
+    /// [`shown_path`], which bounds its length: the message is returned on
+    /// every request and kept in the node's negative cache, and a tar long-name
+    /// record can make a path megabytes long.
     #[error("{0}")]
     Refused(String),
+}
+
+/// Most characters of an archive entry path quoted in a [`WebContractError::Refused`]
+/// message.
+const SHOWN_PATH_MAX_CHARS: usize = 120;
+
+/// An archive entry path quoted for a refusal message, cut to
+/// [`SHOWN_PATH_MAX_CHARS`] characters.
+fn shown_path(path: &Path) -> String {
+    let quoted = format!("{path:?}");
+    if quoted.chars().count() <= SHOWN_PATH_MAX_CHARS {
+        return quoted;
+    }
+    let mut cut: String = quoted.chars().take(SHOWN_PATH_MAX_CHARS).collect();
+    cut.push_str("...");
+    cut
 }
 
 /// `bytes` in MiB with one decimal, for messages a person reads.
 fn mib(bytes: u64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+/// `size` and `limit` for a "size is over limit" message. In MiB unless the
+/// two would round to the same figure (a file a few bytes over the limit),
+/// where the message would read as a contradiction; then in bytes.
+fn size_and_limit(size: u64, limit: u64) -> (String, String) {
+    let (s, l) = (mib(size), mib(limit));
+    if s == l {
+        (format!("{size} bytes"), format!("{limit} byte"))
+    } else {
+        (s, l)
+    }
 }
 
 /// Largest compressed web archive accepted from a contract's state.
@@ -216,7 +253,8 @@ impl WebApp {
             count += 1;
             if count > MAX_ARCHIVE_ENTRIES {
                 return Err(reject(format!(
-                    "web archive has more than {MAX_ARCHIVE_ENTRIES} entries"
+                    "the website has more than {MAX_ARCHIVE_ENTRIES} files and folders, over \
+                     this node's limit for one website."
                 )));
             }
 
@@ -227,7 +265,9 @@ impl WebApp {
             if !matches!(entry_type, EntryType::Regular | EntryType::Directory) {
                 let path = entry.path().map(|p| p.to_path_buf()).unwrap_or_default();
                 return Err(reject(format!(
-                    "refusing to unpack {entry_type:?} entry from web archive: {path:?}"
+                    "the website contains {} as a {entry_type:?} entry; a website may hold \
+                     only regular files and folders.",
+                    shown_path(&path),
                 )));
             }
 
@@ -246,7 +286,8 @@ impl WebApp {
                     .any(|c| matches!(c, Component::ParentDir | Component::Prefix(_)))
             {
                 return Err(reject(format!(
-                    "path traversal attempt in web archive entry: {path:?}"
+                    "the website contains the path {}, which points outside the website.",
+                    shown_path(&path),
                 )));
             }
 
@@ -255,12 +296,12 @@ impl WebApp {
             // yields no more than that, so this is what gets written.
             let size = entry.size();
             if size > MAX_UNPACKED_FILE_BYTES {
+                let (size, limit) = size_and_limit(size, MAX_UNPACKED_FILE_BYTES);
                 return Err(reject(format!(
-                    "the website's file {path:?} is {}, over this node's {} limit for one \
+                    "the website's file {} is {size}, over this node's {limit} limit for one \
                      file. A website is downloaded whole by every visitor, so large media \
                      is better hosted separately and linked to.",
-                    mib(size),
-                    mib(MAX_UNPACKED_FILE_BYTES),
+                    shown_path(&path),
                 )));
             }
             total = total.saturating_add(size);
@@ -743,33 +784,90 @@ mod tests {
         assert!(err.to_string().contains("limit"));
     }
 
-    /// A size refusal is a [`WebContractError::Refused`] (the variant whose
-    /// text reaches the person who requested the site) and says, in MiB, which
-    /// limit was hit and what to do about it.
+    /// Unpack `builder`'s archive and return the [`WebContractError::Refused`]
+    /// message, failing the test on success or on any other error variant.
+    fn refusal(builder: Builder<Cursor<Vec<u8>>>) -> String {
+        match finish(builder).unpack(tempfile::tempdir().unwrap().path()) {
+            Err(WebContractError::Refused(msg)) => msg,
+            other => panic!("expected a Refused error, got {other:?}"),
+        }
+    }
+
+    /// Every unpack-limit refusal is a [`WebContractError::Refused`], the
+    /// variant whose text reaches the person who requested the site, and says
+    /// what was wrong.
     #[test]
-    fn size_refusals_are_refused_errors_that_state_the_limit() {
+    fn every_unpack_refusal_is_a_refused_error_that_says_why() {
         let mut builder = Builder::new(Cursor::new(Vec::new()));
         append_zero_file(&mut builder, "big.bin", MAX_UNPACKED_FILE_BYTES + 1);
-        let per_file = finish(builder).unpack(tempfile::tempdir().unwrap().path());
-        let Err(WebContractError::Refused(msg)) = per_file else {
-            panic!("per-file overflow must be Refused, got {per_file:?}");
-        };
+        let msg = refusal(builder);
         assert!(msg.contains("\"big.bin\""), "{msg}");
-        assert!(msg.contains(&mib(MAX_UNPACKED_FILE_BYTES)), "{msg}");
+        assert!(msg.contains("limit for one file"), "{msg}");
 
+        // Each file under the per-file limit, three of them over the total.
         let mut builder = Builder::new(Cursor::new(Vec::new()));
-        let mut written = 0;
-        let mut i = 0;
-        while written <= MAX_UNPACKED_TOTAL_BYTES {
-            append_zero_file(&mut builder, &format!("f{i}.bin"), MAX_UNPACKED_FILE_BYTES);
-            written += MAX_UNPACKED_FILE_BYTES;
-            i += 1;
+        let each = MAX_UNPACKED_TOTAL_BYTES / 3 + 1024;
+        assert!(each <= MAX_UNPACKED_FILE_BYTES);
+        for i in 0..3 {
+            append_zero_file(&mut builder, &format!("f{i}.bin"), each);
         }
-        let total = finish(builder).unpack(tempfile::tempdir().unwrap().path());
-        let Err(WebContractError::Refused(msg)) = total else {
-            panic!("total overflow must be Refused, got {total:?}");
-        };
+        let msg = refusal(builder);
         assert!(msg.contains(&mib(MAX_UNPACKED_TOTAL_BYTES)), "{msg}");
         assert!(msg.contains("hosted separately"), "{msg}");
+
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        for i in 0..=MAX_ARCHIVE_ENTRIES {
+            append_zero_file(&mut builder, &format!("f{i}"), 0);
+        }
+        let msg = refusal(builder);
+        assert!(msg.contains(&MAX_ARCHIVE_ENTRIES.to_string()), "{msg}");
+
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        append_symlink(&mut builder, "link", "/etc/passwd");
+        let msg = refusal(builder);
+        assert!(msg.contains("\"link\"") && msg.contains("Symlink"), "{msg}");
+
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        append_raw_path_file(&mut builder, "../escape.txt", b"x");
+        let msg = refusal(builder);
+        assert!(msg.contains("\"../escape.txt\""), "{msg}");
+    }
+
+    /// A file a byte over the limit must not read "32.0 MiB, over this
+    /// node's 32.0 MiB limit": when the two round alike, both are in bytes.
+    #[test]
+    fn a_size_just_over_the_limit_does_not_read_as_equal_to_it() {
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        append_zero_file(&mut builder, "big.bin", MAX_UNPACKED_FILE_BYTES + 1);
+        let msg = refusal(builder);
+        assert!(
+            msg.contains(&format!("{} bytes", MAX_UNPACKED_FILE_BYTES + 1))
+                && msg.contains(&format!("{MAX_UNPACKED_FILE_BYTES} byte limit")),
+            "{msg}"
+        );
+
+        let (size, limit) = size_and_limit(2 * MAX_UNPACKED_FILE_BYTES, MAX_UNPACKED_FILE_BYTES);
+        assert_eq!(
+            (size, limit),
+            (
+                mib(2 * MAX_UNPACKED_FILE_BYTES),
+                mib(MAX_UNPACKED_FILE_BYTES)
+            )
+        );
+    }
+
+    /// An entry path is archive-controlled, and a GNU long-name record can
+    /// make it arbitrarily long. The refusal message is served on every
+    /// request and kept in the node's negative cache, so the quoted path must
+    /// be cut short.
+    #[test]
+    fn a_refusal_quotes_at_most_a_bounded_prefix_of_a_long_path() {
+        let long = "a".repeat(100_000);
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        append_zero_file(&mut builder, &long, MAX_UNPACKED_FILE_BYTES + 1);
+        let msg = refusal(builder);
+        assert!(msg.len() < 1024, "message is {} bytes", msg.len());
+        assert!(msg.contains(&"a".repeat(SHOWN_PATH_MAX_CHARS - 1)), "{msg}");
+        assert!(msg.contains("..."), "{msg}");
     }
 }
