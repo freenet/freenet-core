@@ -950,7 +950,7 @@ impl P2pConnManager {
             // a held-legs task or another fan-out cannot start a second send to
             // it meanwhile, and the interval runs from the end of this one. Like
             // production, a converged skip still counts as a send.
-            let claim = match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
+            let _claim = match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
                 Ok(claim) => claim,
                 Err(wait) => {
                     crate::config::GlobalTestMetrics::record_broadcast_leg_spaced();
@@ -973,12 +973,10 @@ impl P2pConnManager {
                     key,
                     new_state.clone(),
                     target.clone(),
-                    claim,
+                    _claim,
                 );
                 continue;
             }
-            // Held to the end of this iteration (see above).
-            let _claim = claim;
 
             // Get peer's cached summary
             let their_summary = op_manager
