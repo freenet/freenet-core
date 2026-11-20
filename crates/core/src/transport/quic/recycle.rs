@@ -2231,6 +2231,14 @@ pub(crate) struct PathReport {
     connection: quinn::Connection,
     node: &'static crate::transport::metrics::QuicDataCounters,
     bytes: UdpBytes,
+    /// Datagrams quinn had counted as received at the last report.
+    datagrams_received: u64,
+    /// Where the path's received bytes are also counted as wire bytes
+    /// (`cumulative_bytes_received`, per-peer `bytes_received`); the
+    /// process-wide metrics unless a test passes its own ([`Self::with_wire`]).
+    wire: &'static crate::transport::metrics::TransportMetrics,
+    /// The peer's canonical address, the key the sent side uses per peer.
+    remote: std::net::SocketAddr,
     loss: PathLoss,
     window: crate::transport::metrics::PathLossWindow,
     /// The loss gate's verdict counts and those already reported; `None` when
@@ -2278,6 +2286,9 @@ impl PathReport {
             timed_at: built_at,
             meter,
             bytes: UdpBytes::of(&stats),
+            datagrams_received: stats.udp_rx.datagrams,
+            wire: &crate::transport::TRANSPORT_METRICS,
+            remote: crate::transport::normalize_mapped_addr(connection.remote_address()),
             loss: PathLoss::of(&stats),
             window: crate::transport::metrics::PathLossWindow::new(node),
             gate,
@@ -2292,11 +2303,22 @@ impl PathReport {
         }
     }
 
+    /// Count the path's received bytes in `wire` instead of the process-wide
+    /// metrics (tests, which share the global one with every other test).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn with_wire(
+        mut self,
+        wire: &'static crate::transport::metrics::TransportMetrics,
+    ) -> Self {
+        self.wire = wire;
+        self
+    }
+
     /// Report the change since the last report, from one read of the stats,
     /// and the time since the last one when `now` is given. The final report,
     /// on drop, has no clock, so a path's last tick to its end (under
     /// [`ACK_WATCH_TICK`]) is not counted.
-    fn report(&mut self, now: Option<u64>) {
+    pub(in crate::transport::quic) fn report(&mut self, now: Option<u64>) {
         let mut tick_ms = None;
         if let Some(now) = now {
             // Whole milliseconds, carrying the rest to the next report.
@@ -2311,6 +2333,19 @@ impl PathReport {
         let stats = self.connection.stats();
         let (next, sent, got) = self.bytes.step(UdpBytes::of(&stats));
         self.node.record_bytes(sent, got);
+        // Wire bytes for the dashboard and telemetry. QUIC datagrams are
+        // decrypted inside quinn, so the legacy post-decryption call never sees
+        // them; quinn's per-connection count is the same kind of figure the
+        // sent side meters at the socket: whole UDP datagram payloads,
+        // headers and encryption overhead included. Datagrams routed to this
+        // established connection are not raw `recv_from` output (#3999).
+        let datagrams = stats.udp_rx.datagrams;
+        self.wire.record_quic_received(
+            self.remote,
+            got,
+            datagrams.saturating_sub(self.datagrams_received),
+        );
+        self.datagrams_received = datagrams;
         self.bytes = next;
         let (next, delta) = self.loss.step(PathLoss::of(&stats));
         let carrying = self.carrying.now.load(std::sync::atomic::Ordering::Acquire)
