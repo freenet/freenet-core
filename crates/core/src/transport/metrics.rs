@@ -2874,25 +2874,27 @@ impl TransportMetrics {
         self.record_per_peer(remote_addr, bytes, |s| &s.bytes_received);
     }
 
-    /// Record inbound QUIC datagrams of one connection, as the change in
-    /// quinn's per-connection receive stats since the path's last report.
+    /// Record authenticated inbound QUIC stream payload bytes of one connection.
     ///
     /// QUIC packets are decrypted inside quinn and never reach
     /// [`Self::record_packet_received`], so without this the download counters
     /// miss every QUIC byte while [`Self::record_packet_sent`] counts QUIC
-    /// sends at the socket. Same unit as the sent side: UDP payload bytes.
-    /// Only called with the stats of an established connection, never with raw
-    /// `recv_from` output (#3999). Skips a report that saw no datagrams, so an
-    /// idle path does not churn the per-peer LRU.
-    pub(crate) fn record_quic_received(&self, remote_addr: SocketAddr, bytes: u64, datagrams: u64) {
-        if bytes == 0 && datagrams == 0 {
+    /// sends at the socket. `bytes` must come from data quinn returned after
+    /// authenticating it (stream reads), never from quinn's `udp_rx`, which
+    /// counts before decryption (#3999). `remote_addr` is `None` for a
+    /// connection that has ended: only the cumulative counter moves, so the
+    /// per-peer table does not regrow an entry for a peer that is gone. Skips
+    /// zero so an idle path does not churn the per-peer LRU. The packet count
+    /// is not moved: quinn exposes no authenticated packet count.
+    pub(crate) fn record_quic_received(&self, remote_addr: Option<SocketAddr>, bytes: u64) {
+        if bytes == 0 {
             return;
         }
         self.cumulative_bytes_received
             .fetch_add(bytes, Ordering::Relaxed);
-        self.cumulative_packets_received
-            .fetch_add(datagrams, Ordering::Relaxed);
-        self.record_per_peer(remote_addr, bytes, |s| &s.bytes_received);
+        if let Some(addr) = remote_addr {
+            self.record_per_peer(addr, bytes, |s| &s.bytes_received);
+        }
     }
 
     /// Read cumulative bytes downloaded without resetting counters.

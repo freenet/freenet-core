@@ -443,6 +443,14 @@ pub(in crate::transport::quic) async fn pair_with(
 }
 
 impl Pair {
+    /// Send `bytes` from `a`'s socket to `b`'s, as a forger on the path would.
+    pub(in crate::transport::quic) async fn inject_from_a(&self, bytes: &[u8]) {
+        self.a_socket
+            .send_to(bytes, self.b_addr)
+            .await
+            .expect("inject");
+    }
+
     fn a_key(&self) -> TransportPublicKey {
         self.a_keys.public().clone()
     }
@@ -4926,93 +4934,53 @@ async fn connected(pair: &Pair) -> (QuicConnection, QuicConnection) {
     result
 }
 
-/// A path's report for `connection`, counting wire bytes in `wire` (#6301).
-fn wire_report(
-    connection: &QuicConnection,
-    wire: &'static crate::transport::metrics::TransportMetrics,
-) -> super::recycle::PathReport {
-    let node: &'static crate::transport::metrics::QuicDataCounters =
-        Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
-    super::recycle::PathReport::new(
-        connection.inner().clone(),
-        node,
-        0,
-        None,
-        super::recycle::Carrying {
-            now: Arc::default(),
-            at_end: Arc::default(),
-        },
-    )
-    .with_wire(wire)
-}
-
-/// QUIC datagrams are decrypted inside quinn, so the legacy post-decryption
-/// call never counts them. The path report must move `cumulative_bytes_received`,
-/// the packet count and the per-peer received bytes by exactly what quinn
-/// received on the connection, once, however often it reports (#6301).
+/// A path's final report must not regrow the per-peer entry of a peer whose
+/// connection is gone, and the tick report must count what the connection's
+/// streams read, once (#6301). Private metrics, so no other test is in them.
 #[test]
-fn a_quic_path_report_counts_received_wire_bytes_once() {
+fn a_path_report_counts_stream_reads_per_peer_on_ticks_and_cumulative_on_drop() {
     use crate::transport::metrics::TransportMetrics;
+    use crate::transport::quic::path::inbound::ConnRanges;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let net = crate::transport::test_net::subnet();
-        let rig = pair("quic-wire-rx", net.addr(1), net.addr(2), None).await;
-        let (client, server) = connected(&rig).await;
-        let server_wire: &'static TransportMetrics = Box::leak(Box::new(TransportMetrics::new()));
-        let client_wire: &'static TransportMetrics = Box::leak(Box::new(TransportMetrics::new()));
-        let start = server.inner().stats().udp_rx;
-        let mut server_report = wire_report(&server, server_wire);
-        let mut client_report = wire_report(&client, client_wire);
-        // The handshake bytes were received before the report was built; they
-        // are not counted, only what arrives after.
-        let (raw, srv) = (client.inner().clone(), server.inner().clone());
-        let sent = 256 * 1024;
-        drive(&rig.time, Duration::from_secs(60), async move {
-            let mut send = raw.open_uni().await.expect("open");
-            tokio::join!(
-                async {
-                    send.write_all(&payload(sent)).await.expect("write");
-                    send.finish().expect("finish");
-                },
-                async {
-                    let mut recv = srv.accept_uni().await.expect("accept");
-                    recv.read_to_end(2 * sent).await.expect("read");
-                }
-            );
-        })
-        .await;
-        server_report.report(None);
-        client_report.report(None);
-        let after = server.inner().stats().udp_rx;
-        let counted = server_wire.cumulative_bytes_received();
-        assert!(
-            counted >= sent as u64,
-            "the payload alone is {sent} bytes, counted {counted}"
-        );
-        assert_eq!(counted, after.bytes - start.bytes, "exactly quinn's count");
+        let rig = pair("quic-wire-report", net.addr(1), net.addr(2), None).await;
+        let (_client, server) = connected(&rig).await;
+        let wire: &'static TransportMetrics = Box::leak(Box::new(TransportMetrics::new()));
+        let node: &'static crate::transport::metrics::QuicDataCounters =
+            Box::leak(Box::new(crate::transport::metrics::QuicDataCounters::new()));
+        let ranges = Arc::new(ConnRanges::new(1000, 64));
+        let mut report = super::recycle::PathReport::new(
+            server.inner().clone(),
+            node,
+            0,
+            None,
+            super::recycle::Carrying {
+                now: Arc::default(),
+                at_end: Arc::default(),
+            },
+        )
+        .with_wire(wire)
+        .with_read(ranges.clone());
+        ranges.note_read(1000);
+        report.report(Some(1));
+        assert_eq!(wire.cumulative_bytes_received(), 1000);
+        assert_eq!(wire.peer_bytes(rig.a_addr), Some((0, 1000)));
+        report.report(Some(2));
+        assert_eq!(wire.cumulative_bytes_received(), 1000, "counted once");
+        ranges.note_read(500);
+        drop(report);
         assert_eq!(
-            server_wire.cumulative_packets().1,
-            after.datagrams - start.datagrams
+            wire.cumulative_bytes_received(),
+            1500,
+            "the final report counts"
         );
-        let (_, per_peer_rx) = server_wire
-            .peer_bytes(rig.a_addr)
-            .expect("the client's address has a per-peer entry");
-        assert_eq!(per_peer_rx, counted, "per-peer and cumulative agree");
-        // Same unit as the sent side: what the client wrote to its socket is
-        // what the server received, none lost on this link.
-        let client_tx = client.inner().stats().udp_tx.bytes;
-        assert!(
-            counted <= client_tx,
-            "received {counted} > sent {client_tx}"
+        assert_eq!(
+            wire.peer_bytes(rig.a_addr),
+            Some((0, 1000)),
+            "the final report leaves the per-peer table alone"
         );
-        // The client received only acknowledgements.
-        let client_rx = client_wire.cumulative_bytes_received();
-        assert!(client_rx > 0 && client_rx < counted / 10, "{client_rx}");
-        // Reporting again with no new datagrams adds nothing.
-        server_report.report(None);
-        assert_eq!(server_wire.cumulative_bytes_received(), counted);
-        // Legacy UDP counting is untouched: this path never calls it.
-        assert_eq!(server_wire.cumulative_bytes_sent(), 0);
+        assert_eq!(wire.cumulative_bytes_sent(), 0, "sent is the socket's");
     })
 }
 

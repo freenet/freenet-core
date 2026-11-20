@@ -11982,3 +11982,78 @@ fn a_slow_lossy_path_stays_within_its_consumer_gap() {
         eprintln!("gap lossy: worst over all seeds {worst:?}");
     })
 }
+
+/// Received wire bytes come from the authenticated stream reads, through the
+/// real path lifecycle and the process-wide metrics (#6301): the payload sent
+/// is counted for the peer, and never more than quinn's own datagram count.
+/// Datagrams with a live connection ID and invalid ciphertext reach quinn's
+/// `udp_rx` (it counts before decrypting) and must not move the counters.
+#[test]
+fn received_wire_bytes_count_only_authenticated_reads() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-wire-rx", QuicPathLimits::DEFAULT).await;
+        let a_addr = p.pair.a_addr;
+        let (a, time) = (p.a.clone(), p.pair.time.clone());
+        let len = 256 * 1024;
+        p.drive({
+            let time = time.clone();
+            async move {
+                a.send_stream(StreamId::next(), None, Bytes::from(payload(len)))
+                    .await
+                    .expect("send");
+                // Several ack-watch ticks, so the report has run.
+                time.sleep(Duration::from_secs(6)).await;
+            }
+        })
+        .await;
+        let global = &crate::transport::TRANSPORT_METRICS;
+        let (_, counted) = global.peer_bytes(a_addr).expect("a per-peer entry");
+        let udp = p.b.connection().inner().stats().udp_rx;
+        assert!(counted >= len as u64, "payload {len}, counted {counted}");
+        assert!(
+            counted <= udp.bytes,
+            "counted {counted} > quinn {}",
+            udp.bytes
+        );
+        eprintln!(
+            "wire-rx payload={counted} quinn_udp_rx={} ratio={:.4}",
+            udp.bytes,
+            udp.bytes as f64 / counted as f64
+        );
+
+        // Forged datagrams: a live CID taken from a real short-header packet.
+        let real = p
+            .pair
+            .sent()
+            .into_iter()
+            .rev()
+            .find(|s| s.from == a_addr && s.bytes.first().is_some_and(|b| b & 0x80 == 0))
+            .expect("a short-header datagram from a");
+        let mut forged = real.bytes[..1 + super::super::cid::CID_LEN].to_vec();
+        forged.extend(std::iter::repeat_n(0xAB, 1100));
+        let pair_ref = &p.pair;
+        for _ in 0..10 {
+            pair_ref.inject_from_a(&forged).await;
+        }
+        let t = p.pair.time.clone();
+        let b_conn = p.b.connection().inner().clone();
+        let seen = p
+            .drive(async move {
+                t.sleep(Duration::from_secs(6)).await;
+                b_conn.stats().udp_rx
+            })
+            .await;
+        assert!(
+            seen.datagrams >= udp.datagrams + 10,
+            "premise: quinn counted the forged datagrams ({} -> {})",
+            udp.datagrams,
+            seen.datagrams
+        );
+        let (_, after) = global.peer_bytes(a_addr).expect("entry");
+        assert_eq!(
+            after, counted,
+            "forged datagrams moved the received counter"
+        );
+    })
+}

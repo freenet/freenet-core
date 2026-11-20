@@ -2076,28 +2076,3 @@ fn credit_raised_every_other_interval_still_closes() {
         "{closed:?}"
     );
 }
-
-/// Pin (#6301): every QUIC path's report feeds quinn's received bytes into the
-/// wire counters, because quinn decrypts inside itself and the legacy
-/// post-decryption `record_packet_received` never sees QUIC. Dropping the call
-/// leaves the dashboard download line and telemetry `cumulative_bytes_received`
-/// short by every QUIC byte while sends stay counted at the socket.
-#[test]
-fn path_report_feeds_received_bytes_into_wire_counters() {
-    let source = include_str!("../recycle.rs");
-    let at = source
-        .find("pub(in crate::transport::quic) fn report(&mut self")
-        .expect("PathReport::report");
-    let body = &source[at..];
-    let end = body.find("\n    }\n").expect("end of report");
-    let body = &body[..end];
-    let record = body
-        .find("self.wire.record_quic_received(")
-        .expect("report must call record_quic_received");
-    let bytes = body.find("self.bytes.step(").expect("byte step");
-    assert!(bytes < record, "the delta is taken before it is recorded");
-    assert!(
-        !body.contains("record_packet_received"),
-        "the legacy call is for decrypted UDP-session packets only"
-    );
-}

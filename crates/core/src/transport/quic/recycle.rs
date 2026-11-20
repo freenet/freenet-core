@@ -2231,8 +2231,12 @@ pub(crate) struct PathReport {
     connection: quinn::Connection,
     node: &'static crate::transport::metrics::QuicDataCounters,
     bytes: UdpBytes,
-    /// Datagrams quinn had counted as received at the last report.
-    datagrams_received: u64,
+    /// The connection's count of stream bytes read, which quinn hands over
+    /// only after it has decrypted and authenticated the packets that carried
+    /// them. `None` until [`Self::with_read`] (nothing is counted then).
+    read: Option<Arc<super::path::inbound::ConnRanges>>,
+    /// Bytes of `read` already reported.
+    read_reported: u64,
     /// Where the path's received bytes are also counted as wire bytes
     /// (`cumulative_bytes_received`, per-peer `bytes_received`); the
     /// process-wide metrics unless a test passes its own ([`Self::with_wire`]).
@@ -2286,7 +2290,8 @@ impl PathReport {
             timed_at: built_at,
             meter,
             bytes: UdpBytes::of(&stats),
-            datagrams_received: stats.udp_rx.datagrams,
+            read: None,
+            read_reported: 0,
             wire: &crate::transport::TRANSPORT_METRICS,
             remote: crate::transport::normalize_mapped_addr(connection.remote_address()),
             loss: PathLoss::of(&stats),
@@ -2301,6 +2306,16 @@ impl PathReport {
             #[cfg(test)]
             watch_closes: true,
         }
+    }
+
+    /// Report the bytes the connection's streams read as received wire bytes.
+    pub(in crate::transport::quic) fn with_read(
+        mut self,
+        read: Arc<super::path::inbound::ConnRanges>,
+    ) -> Self {
+        self.read_reported = read.read_bytes();
+        self.read = Some(read);
+        self
     }
 
     /// Count the path's received bytes in `wire` instead of the process-wide
@@ -2333,19 +2348,24 @@ impl PathReport {
         let stats = self.connection.stats();
         let (next, sent, got) = self.bytes.step(UdpBytes::of(&stats));
         self.node.record_bytes(sent, got);
-        // Wire bytes for the dashboard and telemetry. QUIC datagrams are
+        // Received wire bytes for the dashboard and telemetry. QUIC packets are
         // decrypted inside quinn, so the legacy post-decryption call never sees
-        // them; quinn's per-connection count is the same kind of figure the
-        // sent side meters at the socket: whole UDP datagram payloads,
-        // headers and encryption overhead included. Datagrams routed to this
-        // established connection are not raw `recv_from` output (#3999).
-        let datagrams = stats.udp_rx.datagrams;
-        self.wire.record_quic_received(
-            self.remote,
-            got,
-            datagrams.saturating_sub(self.datagrams_received),
-        );
-        self.datagrams_received = datagrams;
+        // them. quinn's `udp_rx` is counted BEFORE decryption (a datagram with a
+        // live connection ID and bad ciphertext is in it), so it cannot feed
+        // metrics that count only authenticated traffic (#3999). The stream
+        // bytes the receive side has read are authenticated, and are what is
+        // reported: payload only, so QUIC framing, acknowledgement-only
+        // packets and handshake bytes are not in it, unlike the sent side,
+        // which meters whole datagrams at the socket.
+        if let Some(read) = &self.read {
+            let total = read.read_bytes();
+            let delta = total.saturating_sub(self.read_reported);
+            self.read_reported = total;
+            // The final report (no clock) runs after the connection is gone:
+            // it must not recreate the peer's entry in the per-peer table.
+            self.wire
+                .record_quic_received(now.map(|_| self.remote), delta);
+        }
         self.bytes = next;
         let (next, delta) = self.loss.step(PathLoss::of(&stats));
         let carrying = self.carrying.now.load(std::sync::atomic::Ordering::Acquire)

@@ -1721,12 +1721,12 @@ impl ConnRanges {
     }
 
     /// `bytes` more were read on one of the connection's streams.
-    fn note_read(&self, bytes: u64) {
+    pub(in crate::transport::quic) fn note_read(&self, bytes: u64) {
         self.read.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Bytes read on the connection's streams so far.
-    fn read_bytes(&self) -> u64 {
+    pub(in crate::transport::quic) fn read_bytes(&self) -> u64 {
         self.read.load(Ordering::Relaxed)
     }
 
