@@ -40,16 +40,21 @@ pub enum WebContractError {
 /// message.
 const SHOWN_PATH_MAX_CHARS: usize = 120;
 
-/// An archive entry path quoted for a refusal message, cut to
-/// [`SHOWN_PATH_MAX_CHARS`] characters.
+/// An archive entry path quoted for a refusal message: its first
+/// [`SHOWN_PATH_MAX_CHARS`] characters, Debug-quoted (which escapes control
+/// and bidi characters), with `...` after the closing quote when cut.
+///
+/// Cut before quoting, so a huge path is never formatted whole and an escape
+/// sequence is never split.
 fn shown_path(path: &Path) -> String {
-    let quoted = format!("{path:?}");
-    if quoted.chars().count() <= SHOWN_PATH_MAX_CHARS {
-        return quoted;
+    let lossy = path.to_string_lossy();
+    let mut chars = lossy.chars();
+    let head: String = chars.by_ref().take(SHOWN_PATH_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{head:?}...")
+    } else {
+        format!("{head:?}")
     }
-    let mut cut: String = quoted.chars().take(SHOWN_PATH_MAX_CHARS).collect();
-    cut.push_str("...");
-    cut
 }
 
 /// `bytes` in MiB with one decimal, for messages a person reads.
@@ -58,7 +63,7 @@ fn mib(bytes: u64) -> String {
 }
 
 /// `size` and `limit` for a "size is over limit" message. In MiB unless the
-/// two would round to the same figure (a file a few bytes over the limit),
+/// two would round to the same figure (within about 50 KiB of each other),
 /// where the message would read as a contradiction; then in bytes.
 fn size_and_limit(size: u64, limit: u64) -> (String, String) {
     let (s, l) = (mib(size), mib(limit));
@@ -306,11 +311,13 @@ impl WebApp {
             }
             total = total.saturating_add(size);
             if total > MAX_UNPACKED_TOTAL_BYTES {
+                // `total` is what was counted before stopping, so the site is
+                // at least this big; the rest is never read.
+                let (total, limit) = size_and_limit(total, MAX_UNPACKED_TOTAL_BYTES);
                 return Err(reject(format!(
-                    "the website unpacks to more than {}, over this node's limit for one \
-                     website. A website is downloaded whole by every visitor, so large media \
-                     (video, audio, big images) is better hosted separately and linked to.",
-                    mib(MAX_UNPACKED_TOTAL_BYTES),
+                    "the website unpacks to at least {total}, over this node's {limit} limit \
+                     for one website. A website is downloaded whole by every visitor, so large \
+                     media (video, audio, big images) is better hosted separately and linked to."
                 )));
             }
 
@@ -761,7 +768,14 @@ mod tests {
         }
         let mut web = finish(builder);
 
-        assert!(web.unpack(dst.path()).is_err());
+        // The stream cap trips inside the decoder, as an I/O error: it stays
+        // a generic `UnpackingError`, and its decoder text must not reach the
+        // 400 body the way a `Refused` reason does.
+        let result = web.unpack(dst.path());
+        assert!(
+            matches!(result, Err(WebContractError::UnpackingError(_))),
+            "{result:?}"
+        );
         assert!(dir_is_empty(dst.path()));
     }
 
@@ -793,27 +807,38 @@ mod tests {
         }
     }
 
+    /// An entry header claiming `size` bytes, with no data behind it. Every
+    /// per-entry check runs on the header before any data is read, so this is
+    /// refused exactly as a real file would be, from a few hundred bytes of
+    /// fixture whatever the limits are. Long names get a GNU long-name record.
+    fn append_header_only(
+        builder: &mut Builder<Cursor<Vec<u8>>>,
+        name: &str,
+        size: u64,
+        ty: EntryType,
+    ) {
+        let mut h = Header::new_gnu();
+        h.set_entry_type(ty);
+        h.set_size(size);
+        h.set_mode(0o644);
+        builder.append_data(&mut h, name, std::io::empty()).unwrap();
+    }
+
     /// Every unpack-limit refusal is a [`WebContractError::Refused`], the
     /// variant whose text reaches the person who requested the site, and says
     /// what was wrong.
     #[test]
     fn every_unpack_refusal_is_a_refused_error_that_says_why() {
         let mut builder = Builder::new(Cursor::new(Vec::new()));
-        append_zero_file(&mut builder, "big.bin", MAX_UNPACKED_FILE_BYTES + 1);
+        append_header_only(
+            &mut builder,
+            "big.bin",
+            MAX_UNPACKED_FILE_BYTES + 1,
+            EntryType::Regular,
+        );
         let msg = refusal(builder);
         assert!(msg.contains("\"big.bin\""), "{msg}");
         assert!(msg.contains("limit for one file"), "{msg}");
-
-        // Each file under the per-file limit, three of them over the total.
-        let mut builder = Builder::new(Cursor::new(Vec::new()));
-        let each = MAX_UNPACKED_TOTAL_BYTES / 3 + 1024;
-        assert!(each <= MAX_UNPACKED_FILE_BYTES);
-        for i in 0..3 {
-            append_zero_file(&mut builder, &format!("f{i}.bin"), each);
-        }
-        let msg = refusal(builder);
-        assert!(msg.contains(&mib(MAX_UNPACKED_TOTAL_BYTES)), "{msg}");
-        assert!(msg.contains("hosted separately"), "{msg}");
 
         let mut builder = Builder::new(Cursor::new(Vec::new()));
         for i in 0..=MAX_ARCHIVE_ENTRIES {
@@ -833,41 +858,111 @@ mod tests {
         assert!(msg.contains("\"../escape.txt\""), "{msg}");
     }
 
-    /// A file a byte over the limit must not read "32.0 MiB, over this
-    /// node's 32.0 MiB limit": when the two round alike, both are in bytes.
+    /// The total-size refusal. Unlike the per-entry checks it needs real data
+    /// (later headers sit behind earlier files), so the archive is streamed
+    /// straight into the xz encoder: zeros compress to almost nothing and the
+    /// uncompressed tar is never held in memory. Files are sized as
+    /// `total / 3`, so each stays under the per-file limit at any ratio of the
+    /// two limits above 1:3.
     #[test]
-    fn a_size_just_over_the_limit_does_not_read_as_equal_to_it() {
-        let mut builder = Builder::new(Cursor::new(Vec::new()));
-        append_zero_file(&mut builder, "big.bin", MAX_UNPACKED_FILE_BYTES + 1);
-        let msg = refusal(builder);
+    fn the_total_size_refusal_says_how_much_was_counted() {
+        let mut builder = Builder::new(xz2::write::XzEncoder::new(Vec::new(), 1));
+        let each = MAX_UNPACKED_TOTAL_BYTES / 3 + 1024;
+        assert!(each <= MAX_UNPACKED_FILE_BYTES);
+        for i in 0..3 {
+            let mut h = Header::new_gnu();
+            h.set_entry_type(EntryType::Regular);
+            h.set_size(each);
+            h.set_mode(0o644);
+            builder
+                .append_data(&mut h, format!("f{i}.bin"), std::io::repeat(0).take(each))
+                .unwrap();
+        }
+        let compressed = builder.into_inner().unwrap().finish().unwrap();
+        let mut web = WebApp::from_compressed(b"meta".to_vec(), compressed).unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let msg = match web.unpack(dst.path()) {
+            Err(WebContractError::Refused(msg)) => msg,
+            other => panic!("expected a Refused error, got {other:?}"),
+        };
+        let (counted, limit) = size_and_limit(3 * each, MAX_UNPACKED_TOTAL_BYTES);
         assert!(
-            msg.contains(&format!("{} bytes", MAX_UNPACKED_FILE_BYTES + 1))
-                && msg.contains(&format!("{MAX_UNPACKED_FILE_BYTES} byte limit")),
+            msg.contains(&format!(
+                "at least {counted}, over this node's {limit} limit"
+            )),
             "{msg}"
         );
+        assert!(msg.contains("hosted separately"), "{msg}");
+    }
 
-        let (size, limit) = size_and_limit(2 * MAX_UNPACKED_FILE_BYTES, MAX_UNPACKED_FILE_BYTES);
+    /// "32.0 MiB, over this node's 32.0 MiB limit" reads as a contradiction:
+    /// when the two round alike, both are in bytes.
+    #[test]
+    fn a_size_just_over_the_limit_does_not_read_as_equal_to_it() {
+        let limit = MAX_UNPACKED_FILE_BYTES;
         assert_eq!(
-            (size, limit),
-            (
-                mib(2 * MAX_UNPACKED_FILE_BYTES),
-                mib(MAX_UNPACKED_FILE_BYTES)
-            )
+            size_and_limit(limit + 1, limit),
+            (format!("{} bytes", limit + 1), format!("{limit} byte"))
+        );
+        // Far enough over to differ in MiB: stays in MiB.
+        assert_eq!(
+            size_and_limit(limit + limit / 2, limit),
+            (mib(limit + limit / 2), mib(limit))
+        );
+
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        append_header_only(&mut builder, "big.bin", limit + 1, EntryType::Regular);
+        let msg = refusal(builder);
+        assert!(
+            msg.contains(&format!(
+                "is {} bytes, over this node's {limit} byte limit",
+                limit + 1
+            )),
+            "{msg}"
         );
     }
 
     /// An entry path is archive-controlled, and a GNU long-name record can
-    /// make it arbitrarily long. The refusal message is served on every
-    /// request and kept in the node's negative cache, so the quoted path must
-    /// be cut short.
+    /// make it arbitrarily long from a few KB of xz. The refusal message is
+    /// served on every request and kept in the node's negative cache, so the
+    /// quoted path must be cut short on every arm that quotes one. The
+    /// entry-type arm is the cheap one for an attacker (a zero-length entry),
+    /// and the non-ASCII name catches a cut by bytes, which would split a
+    /// character.
     #[test]
     fn a_refusal_quotes_at_most_a_bounded_prefix_of_a_long_path() {
-        let long = "a".repeat(100_000);
+        let ascii = "a".repeat(100_000);
         let mut builder = Builder::new(Cursor::new(Vec::new()));
-        append_zero_file(&mut builder, &long, MAX_UNPACKED_FILE_BYTES + 1);
+        append_header_only(
+            &mut builder,
+            &ascii,
+            MAX_UNPACKED_FILE_BYTES + 1,
+            EntryType::Regular,
+        );
         let msg = refusal(builder);
         assert!(msg.len() < 1024, "message is {} bytes", msg.len());
-        assert!(msg.contains(&"a".repeat(SHOWN_PATH_MAX_CHARS - 1)), "{msg}");
-        assert!(msg.contains("..."), "{msg}");
+        assert!(
+            msg.contains(&format!("\"{}\"...", "a".repeat(SHOWN_PATH_MAX_CHARS))),
+            "{msg}"
+        );
+        // The backstop in path_handlers (512 chars) must not cut the hint.
+        assert!(msg.ends_with("linked to."), "{msg}");
+
+        let cjk = "\u{5b57}".repeat(100_000);
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        append_header_only(&mut builder, &cjk, 0, EntryType::Symlink);
+        let msg = refusal(builder);
+        assert!(
+            msg.chars().count() < 512,
+            "message is {} chars",
+            msg.chars().count()
+        );
+        assert!(
+            msg.contains(&format!(
+                "\"{}\"...",
+                "\u{5b57}".repeat(SHOWN_PATH_MAX_CHARS)
+            )),
+            "{msg}"
+        );
     }
 }

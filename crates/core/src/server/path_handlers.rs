@@ -144,17 +144,42 @@ enum TerminalAbsenceKind {
     /// The contract's state is not an archive this node will unpack (malformed,
     /// or over the unpack limits). The answer is a function of the state, so it
     /// repeats until the state changes; without recording it, every request
-    /// re-fetches and re-unpacks the same refused archive.
+    /// re-fetches and re-unpacks the same refused archive. A failure to WRITE
+    /// the unpacked files is the node's own fault, not the state's, and is
+    /// reported as a `NodeError` so it is never recorded here (see
+    /// [`unpack_error`]).
     ///
-    /// Carries the full error text the first request got, so a replayed
-    /// refusal still says WHY (which limit, how big) rather than only that it
-    /// failed.
+    /// Carries the full error text the first request got (bounded by
+    /// [`unpack_failed_message`]), so a replayed refusal still says WHY rather
+    /// than only that it failed.
     ArchiveRefused(std::sync::Arc<str>),
 }
 
-/// Prefix of the error `unpack_if_stale` returns for an archive it refuses;
-/// `ensure_contract_cached`'s caller recognises it to record the refusal.
+/// Prefix of the error `unpack_if_stale` returns for an archive it refuses,
+/// followed by the contract key and, for a `Refused` archive, `: <reason>`.
+/// `ensure_contract_cached`'s caller recognises the prefix to record the
+/// refusal.
 const UNPACK_FAILED_PREFIX: &str = "failed unpacking contract: ";
+
+/// The error `unpack_if_stale` returns when unpacking `key`'s archive fails.
+///
+/// A [`WebContractError::StoringError`] is the node failing to write files
+/// (disk full, permissions), which says nothing about the archive and may not
+/// repeat, so it is a generic `NodeError` (500) and is not negative-cached.
+/// Everything else is a property of the archive: an `InvalidParam` (400)
+/// carrying [`unpack_failed_message`].
+fn unpack_error(key: &str, err: &WebContractError) -> WebSocketApiError {
+    match err {
+        WebContractError::StoringError(_) => WebSocketApiError::NodeError {
+            error_cause: "failed writing the web app to this node's cache".to_string(),
+        },
+        WebContractError::Refused(_)
+        | WebContractError::UnpackingError(_)
+        | WebContractError::FileNotFound(_) => WebSocketApiError::InvalidParam {
+            error_cause: unpack_failed_message(key, err),
+        },
+    }
+}
 
 /// The 400 body for an archive this node will not serve.
 ///
@@ -1852,9 +1877,7 @@ async fn unpack_if_stale(
         fn err(err: WebContractError, contract: &ContractContainer) -> WebSocketApiError {
             let key = contract.key();
             tracing::error!(contract = %key, "web archive not unpacked: {err}");
-            WebSocketApiError::InvalidParam {
-                error_cause: unpack_failed_message(&key.to_string(), &err),
-            }
+            unpack_error(&key.to_string(), &err)
         }
 
         // Clear existing cache if any; may not exist yet
@@ -5553,32 +5576,29 @@ mod tests {
     }
 
     /// The reason carries archive-controlled text (an entry path) to a page
-    /// served at the node's origin. It must arrive HTML-escaped through the
-    /// real unpack and response path, not only in hand-built errors.
+    /// served at the node's origin. It must arrive HTML-escaped from a real
+    /// unpack through [`unpack_error`] (what `unpack_if_stale` returns) and
+    /// `into_response`, not only in hand-built errors. The handler wiring and
+    /// the negative-cache replay are covered by
+    /// `a_refused_archive_is_not_fetched_or_unpacked_again_within_the_window`.
     #[tokio::test]
     async fn a_refusal_naming_a_hostile_file_is_escaped_in_the_response() {
         let name = "<img src=x onerror=alert(1)>.bin";
         let size = super::super::app_packaging::MAX_UNPACKED_FILE_BYTES + 1;
+        // Header only: the size check runs on the header, before any data.
         let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
         let mut header = tar::Header::new_gnu();
         header.set_size(size);
         header.set_mode(0o644);
-        header.set_cksum();
         archive
-            .append_data(
-                &mut header,
-                name,
-                std::io::Read::take(std::io::repeat(0), size),
-            )
+            .append_data(&mut header, name, std::io::empty())
             .unwrap();
         let mut web = WebApp::from_data(Vec::new(), archive).unwrap();
         let err = web
             .unpack(tempfile::tempdir().unwrap().path())
             .expect_err("premise: the archive is refused");
-        let response = WebSocketApiError::InvalidParam {
-            error_cause: unpack_failed_message("KEY", &err),
-        }
-        .into_response();
+        let response = unpack_error("KEY", &err).into_response();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
         let raw = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
@@ -5588,6 +5608,33 @@ mod tests {
             body.contains("&lt;img src=x"),
             "the name must survive, escaped: {body}"
         );
+    }
+
+    /// A failure to write the unpacked files is the node's fault, not the
+    /// archive's: a generic 500 that the negative cache does not record (it
+    /// records only `InvalidParam` bodies carrying `UNPACK_FAILED_PREFIX`), so
+    /// a full disk is retried once it clears instead of being replayed as a
+    /// refusal of the site.
+    #[test]
+    fn a_storing_error_is_a_node_error_not_a_refusal() {
+        let err = unpack_error(
+            "KEY",
+            &WebContractError::StoringError(std::io::Error::other(
+                "/home/someone/.cache/freenet/webapp_cache/KEY: disk full",
+            )),
+        );
+        let WebSocketApiError::NodeError { error_cause } = &err else {
+            panic!("expected NodeError, got {err:?}");
+        };
+        assert!(!error_cause.contains("/home/"), "{error_cause}");
+        assert!(!error_cause.starts_with(UNPACK_FAILED_PREFIX));
+        // `into_response` turns this prefix into a 404.
+        assert!(!error_cause.starts_with("Contract not found"));
+        assert!(matches!(
+            unpack_error("KEY", &WebContractError::Refused("too big".into())),
+            WebSocketApiError::InvalidParam { ref error_cause }
+                if error_cause.starts_with(UNPACK_FAILED_PREFIX)
+        ));
     }
 
     /// A contract whose state is a web archive holding one file over the unpack

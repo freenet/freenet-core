@@ -239,7 +239,9 @@ fn ensure_state_within_limit(state_len: usize, dir: &Path) -> anyhow::Result<()>
 
 /// The largest files under `dir` (uncompressed sizes), one per line after a
 /// heading, or an empty string if none can be read. Best effort: it only
-/// decorates a message, so an unreadable entry is skipped, never an error.
+/// decorates a message, so it never returns an error. A file whose size cannot
+/// be read is skipped; if any directory cannot be listed, the whole list is
+/// omitted.
 fn largest_files(dir: &Path) -> String {
     let mib = |bytes: u64| bytes as f64 / (1024.0 * 1024.0);
     let mut files: Vec<(u64, PathBuf)> = walkdir(dir)
@@ -617,7 +619,12 @@ mod tests {
 
     #[test]
     fn test_ensure_state_within_limit() {
-        let dir = Path::new("/tmp/my-site");
+        // A path that does not exist: the error now lists the largest files
+        // under it, and a fixed shared path such as /tmp/my-site could be
+        // another process's real directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir_buf = tmp.path().join("my-site");
+        let dir = dir_buf.as_path();
 
         // Just over the limit: rejected, and the error names both the actual
         // size and the limit so the user can act on it.
@@ -633,7 +640,7 @@ mod tests {
             "error should mention the actual size in MiB: {msg}"
         );
         assert!(
-            msg.contains("/tmp/my-site"),
+            msg.contains(&dir.display().to_string()),
             "error should name the directory to trim: {msg}"
         );
 
