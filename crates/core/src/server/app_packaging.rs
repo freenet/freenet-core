@@ -37,24 +37,38 @@ pub enum WebContractError {
 }
 
 /// Most characters of an archive entry path quoted in a [`WebContractError::Refused`]
-/// message.
+/// message, counted after escaping.
 const SHOWN_PATH_MAX_CHARS: usize = 120;
 
-/// An archive entry path quoted for a refusal message: its first
-/// [`SHOWN_PATH_MAX_CHARS`] characters, Debug-quoted (which escapes control
-/// and bidi characters), with `...` after the closing quote when cut.
+/// An archive entry path quoted for a refusal message: escaped like `Debug`
+/// (control and bidi characters become `\u{..}`), cut at a whole escape once
+/// [`SHOWN_PATH_MAX_CHARS`] escaped characters are reached, then quoted, with
+/// `...` after the closing quote when cut.
 ///
-/// Cut before quoting, so a huge path is never formatted whole and an escape
-/// sequence is never split.
+/// The cap counts the ESCAPED output: one bidi override expands to eight
+/// characters, so capping the raw path would let a hostile name push the
+/// message past `unpack_failed_message`'s backstop, which would then cut the
+/// hint and split an escape. A huge path is never formatted whole.
 fn shown_path(path: &Path) -> String {
     let lossy = path.to_string_lossy();
-    let mut chars = lossy.chars();
-    let head: String = chars.by_ref().take(SHOWN_PATH_MAX_CHARS).collect();
-    if chars.next().is_some() {
-        format!("{head:?}...")
-    } else {
-        format!("{head:?}")
+    let mut out = String::from("\"");
+    let mut shown = 0;
+    let mut cut = false;
+    for c in lossy.chars() {
+        let escaped = c.escape_debug();
+        let len = escaped.len();
+        if shown + len > SHOWN_PATH_MAX_CHARS {
+            cut = true;
+            break;
+        }
+        out.extend(escaped);
+        shown += len;
     }
+    out.push('"');
+    if cut {
+        out.push_str("...");
+    }
+    out
 }
 
 /// `bytes` in MiB with one decimal, for messages a person reads.
@@ -851,11 +865,69 @@ mod tests {
         append_symlink(&mut builder, "link", "/etc/passwd");
         let msg = refusal(builder);
         assert!(msg.contains("\"link\"") && msg.contains("Symlink"), "{msg}");
+        assert!(msg.contains("only regular files and folders"), "{msg}");
 
         let mut builder = Builder::new(Cursor::new(Vec::new()));
         append_raw_path_file(&mut builder, "../escape.txt", b"x");
         let msg = refusal(builder);
         assert!(msg.contains("\"../escape.txt\""), "{msg}");
+        assert!(msg.contains("points outside the website"), "{msg}");
+    }
+
+    /// A GNU long-name record carrying `raw` verbatim, which applies to the
+    /// next entry. `Builder` refuses to write a `..` path itself, and a raw
+    /// header name holds only 100 bytes, so a long traversal path needs this.
+    fn append_gnu_long_name(builder: &mut Builder<Cursor<Vec<u8>>>, raw: &[u8]) {
+        let mut h = Header::new_gnu();
+        h.set_entry_type(EntryType::GNULongName);
+        h.as_gnu_mut().unwrap().name[..13].copy_from_slice(b"././@LongLink");
+        h.set_size(raw.len() as u64 + 1);
+        h.set_cksum();
+        let mut data = raw.to_vec();
+        data.push(0);
+        builder.append(&h, data.as_slice()).unwrap();
+    }
+
+    /// The traversal arm also quotes the path, and a long-name record makes
+    /// it as long as the attacker likes; it must be cut like the others.
+    #[test]
+    fn a_long_traversal_path_is_quoted_bounded() {
+        let raw = format!("../{}", "a".repeat(100_000));
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        append_gnu_long_name(&mut builder, raw.as_bytes());
+        append_header_only(&mut builder, "x", 0, EntryType::Regular);
+        let msg = refusal(builder);
+        assert!(msg.contains("points outside the website"), "{msg}");
+        assert!(msg.contains("\"../aaa"), "{msg}");
+        assert!(msg.len() < 1024, "message is {} bytes", msg.len());
+    }
+
+    /// Escaping expands a bidi override to eight characters (`\u{202e}`). The
+    /// cut counts the escaped output, so a name made of them stays inside the
+    /// budget, is cut at a whole escape, and keeps its closing quote and the
+    /// rest of the sentence.
+    #[test]
+    fn an_escape_heavy_path_is_cut_after_escaping() {
+        let rlo = "\u{202e}".repeat(100_000);
+        let mut builder = Builder::new(Cursor::new(Vec::new()));
+        append_header_only(&mut builder, &rlo, 0, EntryType::Symlink);
+        let msg = refusal(builder);
+        assert!(
+            !msg.contains('\u{202e}'),
+            "raw bidi override survived: {msg}"
+        );
+        let quoted = msg
+            .split_once('"')
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(inside, _)| inside)
+            .expect("the path is quoted");
+        assert!(quoted.chars().count() <= SHOWN_PATH_MAX_CHARS, "{quoted}");
+        assert_eq!(
+            quoted.matches("\\u{202e}").count() * 8,
+            quoted.len(),
+            "{quoted}"
+        );
+        assert!(msg.ends_with("only regular files and folders."), "{msg}");
     }
 
     /// The total-size refusal. Unlike the per-entry checks it needs real data

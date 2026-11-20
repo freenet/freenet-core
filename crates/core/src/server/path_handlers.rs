@@ -144,10 +144,10 @@ enum TerminalAbsenceKind {
     /// The contract's state is not an archive this node will unpack (malformed,
     /// or over the unpack limits). The answer is a function of the state, so it
     /// repeats until the state changes; without recording it, every request
-    /// re-fetches and re-unpacks the same refused archive. A failure to WRITE
-    /// the unpacked files is the node's own fault, not the state's, and is
-    /// reported as a `NodeError` so it is never recorded here (see
-    /// [`unpack_error`]).
+    /// re-fetches and re-unpacks the same refused archive. A genuine write
+    /// failure (disk full) is recorded too, because it cannot be told apart
+    /// from an archive fault at the point it surfaces (see [`unpack_error`]);
+    /// it is retried once the refresh window ends.
     ///
     /// Carries the full error text the first request got (bounded by
     /// [`unpack_failed_message`]), so a replayed refusal still says WHY rather
@@ -161,23 +161,20 @@ enum TerminalAbsenceKind {
 /// refusal.
 const UNPACK_FAILED_PREFIX: &str = "failed unpacking contract: ";
 
-/// The error `unpack_if_stale` returns when unpacking `key`'s archive fails.
+/// The error `unpack_if_stale` returns when unpacking `key`'s archive fails:
+/// always an `InvalidParam` (400) carrying [`unpack_failed_message`], which
+/// the negative cache records.
 ///
-/// A [`WebContractError::StoringError`] is the node failing to write files
-/// (disk full, permissions), which says nothing about the archive and may not
-/// repeat, so it is a generic `NodeError` (500) and is not negative-cached.
-/// Everything else is a property of the archive: an `InvalidParam` (400)
-/// carrying [`unpack_failed_message`].
+/// That includes a [`WebContractError::StoringError`], although it can be a
+/// node fault (disk full). It comes from `tar`'s `unpack_in`, which also
+/// READS the entry's data and refuses a duplicate entry (`set_overwrite(false)`),
+/// so a truncated or corrupt stream, the decoder cap tripping mid-file, or a
+/// crafted duplicate all surface as the same variant. Leaving those uncached
+/// would let a hostile archive be fetched and unpacked again on every request;
+/// caching a real disk fault only delays its retry to the end of the window.
 fn unpack_error(key: &str, err: &WebContractError) -> WebSocketApiError {
-    match err {
-        WebContractError::StoringError(_) => WebSocketApiError::NodeError {
-            error_cause: "failed writing the web app to this node's cache".to_string(),
-        },
-        WebContractError::Refused(_)
-        | WebContractError::UnpackingError(_)
-        | WebContractError::FileNotFound(_) => WebSocketApiError::InvalidParam {
-            error_cause: unpack_failed_message(key, err),
-        },
+    WebSocketApiError::InvalidParam {
+        error_cause: unpack_failed_message(key, err),
     }
 }
 
@@ -5610,48 +5607,49 @@ mod tests {
         );
     }
 
-    /// A failure to write the unpacked files is the node's fault, not the
-    /// archive's: a generic 500 that the negative cache does not record (it
-    /// records only `InvalidParam` bodies carrying `UNPACK_FAILED_PREFIX`), so
-    /// a full disk is retried once it clears instead of being replayed as a
-    /// refusal of the site.
+    /// A crafted duplicate entry fails inside `tar`'s `unpack_in` as a
+    /// `StoringError`, the same variant a full disk produces. It must still
+    /// come back as a recordable refusal (`InvalidParam` with
+    /// `UNPACK_FAILED_PREFIX`, which `refresh_cache_if_due` negative-caches),
+    /// or a hostile archive is fetched and unpacked again on every request.
+    /// The body stays generic: an I/O error can name a local path.
     #[test]
-    fn a_storing_error_is_a_node_error_not_a_refusal() {
-        let err = unpack_error(
-            "KEY",
-            &WebContractError::StoringError(std::io::Error::other(
-                "/home/someone/.cache/freenet/webapp_cache/KEY: disk full",
-            )),
+    fn an_archive_failing_inside_unpack_in_is_still_a_cached_refusal() {
+        let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
+        for _ in 0..2 {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            archive
+                .append_data(&mut header, "dup.txt", &b"x"[..])
+                .unwrap();
+        }
+        let mut web = WebApp::from_data(Vec::new(), archive).unwrap();
+        let err = web
+            .unpack(tempfile::tempdir().unwrap().path())
+            .expect_err("premise: the duplicate entry is refused");
+        assert!(
+            matches!(err, WebContractError::StoringError(_)),
+            "premise: a duplicate surfaces as StoringError, got {err:?}"
         );
-        let WebSocketApiError::NodeError { error_cause } = &err else {
-            panic!("expected NodeError, got {err:?}");
-        };
-        assert!(!error_cause.contains("/home/"), "{error_cause}");
-        assert!(!error_cause.starts_with(UNPACK_FAILED_PREFIX));
-        // `into_response` turns this prefix into a 404.
-        assert!(!error_cause.starts_with("Contract not found"));
         assert!(matches!(
-            unpack_error("KEY", &WebContractError::Refused("too big".into())),
+            unpack_error("KEY", &err),
             WebSocketApiError::InvalidParam { ref error_cause }
-                if error_cause.starts_with(UNPACK_FAILED_PREFIX)
+                if *error_cause == format!("{UNPACK_FAILED_PREFIX}KEY")
         ));
     }
 
     /// A contract whose state is a web archive holding one file over the unpack
-    /// limit. A few KB compressed.
+    /// limit. Header only (the size check runs on the header, before any data
+    /// is read), so it is a few hundred bytes whatever the limit.
     fn oversized_archive_contract_and_state(seed: &[u8]) -> (ContractContainer, WrappedState) {
         let limit = super::super::app_packaging::MAX_UNPACKED_FILE_BYTES + 1;
         let mut archive = tar::Builder::new(std::io::Cursor::new(Vec::new()));
         let mut header = tar::Header::new_gnu();
         header.set_size(limit);
         header.set_mode(0o644);
-        header.set_cksum();
         archive
-            .append_data(
-                &mut header,
-                "big.bin",
-                std::io::Read::take(std::io::repeat(0), limit),
-            )
+            .append_data(&mut header, "big.bin", std::io::empty())
             .unwrap();
         let packed = WebApp::from_data(Vec::new(), archive)
             .unwrap()
