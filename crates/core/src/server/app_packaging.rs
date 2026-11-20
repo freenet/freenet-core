@@ -29,8 +29,8 @@ pub enum WebContractError {
     ///
     /// Up to [`SHOWN_PATH_MAX_CHARS`] characters of the archive author's own
     /// text (an entry path) therefore appear on a page at the node's origin:
-    /// quoted, escaped, HTML-escaped by the response layer, and framed as the
-    /// site's file name. Accepted, because the author needs the name to fix
+    /// quoted, escaped, HTML-escaped by the response layer, and framed as a
+    /// path in the site. Accepted, because the author needs the name to fix
     /// the site and can show any text they like in the site itself.
     ///
     /// It is composed here from the limits and the archive's own headers, never
@@ -50,9 +50,9 @@ const SHOWN_PATH_MAX_CHARS: usize = 120;
 /// An archive entry path quoted for a refusal message: each character escaped
 /// with `char::escape_debug` (control, bidi and combining characters become
 /// `\u{..}`, quotes are backslashed; slightly stricter than `str`'s `Debug`,
-/// which leaves `'` and non-initial combining marks alone), cut at a whole escape once
-/// [`SHOWN_PATH_MAX_CHARS`] escaped characters are reached, then quoted, with
-/// `...` after the closing quote when cut.
+/// which leaves `'` and non-initial combining marks alone), cut at a whole
+/// escape once [`SHOWN_PATH_MAX_CHARS`] escaped characters are reached, then
+/// quoted, with `...` after the closing quote when cut.
 ///
 /// The cap counts the ESCAPED output: one bidi override expands to eight
 /// characters, so capping the raw path would let a hostile name push the
