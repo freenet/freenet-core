@@ -4334,7 +4334,8 @@ pub mod stale_peer_heal_observations {
         pub verify_forced_legs: u64,
         /// Stale in a confirm round but not forced, by reason.
         pub verify_not_forced_evidence: u64,
-        pub verify_not_forced_cooldown: u64,
+        pub verify_not_forced_floor: u64,
+        pub verify_not_forced_no_progress: u64,
         pub verify_not_forced_cap: u64,
         pub verify_not_forced_busy: u64,
         /// Rounds that ended at their deadline with a target unanswered.
@@ -4376,7 +4377,8 @@ pub mod stale_peer_heal_observations {
                 obs.verify_stale += 1;
                 match hold {
                     Hold::Evidence => obs.verify_not_forced_evidence += 1,
-                    Hold::Cooldown => obs.verify_not_forced_cooldown += 1,
+                    Hold::Floor => obs.verify_not_forced_floor += 1,
+                    Hold::NoProgress => obs.verify_not_forced_no_progress += 1,
                     Hold::Cap => obs.verify_not_forced_cap += 1,
                     Hold::Busy => obs.verify_not_forced_busy += 1,
                 }
@@ -5046,7 +5048,12 @@ async fn handle_interest_sync_message(
                             // emitted, so an escalation's force mark is in place
                             // when that heal's leg is built.
                             crate::operations::update::verify_soon::on_summary_comparison(
-                                op_manager, &contract, &pk, is_stale, evidence,
+                                op_manager,
+                                &contract,
+                                &pk,
+                                is_stale,
+                                evidence,
+                                their_summary.as_ref().map_or(&[][..], |s| s.as_ref()),
                             );
                         }
 

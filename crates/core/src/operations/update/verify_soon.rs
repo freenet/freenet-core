@@ -28,8 +28,21 @@
 //!   converged peer stale;
 //! - no leg for (contract, peer) is queued or sending here: a slow but healthy
 //!   peer behind a congested queue is not lost, its leg is waiting;
-//! - the pair has not been forced within `FORCE_COOLDOWN`, which bounds a peer
-//!   that never converges (or lies) to one full-state stream per cooldown.
+//! - the pair was not forced in the last `FORCE_FLOOR` (60 s), whatever else;
+//! - if it was forced in the last `FORCE_COOLDOWN` (10 min), the peer reports a
+//!   different summary from the one it reported when it was forced: the force
+//!   landed and the peer moved, so this is a new loss. A peer that keeps
+//!   reporting the same stale summary is held for the whole cooldown.
+//!
+//! A confirm verdict held by the floor schedules one more check for when the
+//! floor ends, so under a persistent fault this node's updates reach each peer
+//! within about `FORCE_FLOOR` + `CHECK_DELAY` of the write. That retry is not
+//! re-armed without a new write.
+//!
+//! Bounds on forced full-state streams per (contract, peer): one per 60 s at
+//! most, and only while this node keeps writing (a lying peer that reports a
+//! changing stale summary costs about 60 an hour per contract); one per 10 min
+//! for a peer whose summary does not move.
 //!
 //! The summary may have changed between the rounds: other writers keep a
 //! shared contract moving, and what matters is that this node's state is still
@@ -44,9 +57,9 @@
 //!   more targets, counted), two rounds per check, and at most about
 //!   `MAX_REQUESTS_PER_WAKE` requests per wake of the driver: the rest wait
 //!   `DEFER_DELAY` so a burst cannot fill the node's event channel;
-//! - one forced stream per (contract, peer) per `FORCE_COOLDOWN`, with at most
-//!   `MAX_FORCE_PAIRS` pairs remembered (a refusal at the cap is counted); an
-//!   unconsumed force mark expires after `FORCE_TTL`.
+//! - forced streams as above, with at most `MAX_FORCE_PAIRS` pairs remembered
+//!   (a refusal at the cap is counted); an unconsumed force mark expires after
+//!   `FORCE_TTL`.
 //!
 //! Residuals:
 //! - a peer that never replies costs one request per round and then nothing;
@@ -91,12 +104,17 @@ pub(crate) const MAX_REQUESTS_PER_WAKE: usize = 128;
 pub(crate) const DEFER_DELAY: Duration = Duration::from_millis(250);
 /// How long a force mark waits for the heal leg it was set for.
 pub(crate) const FORCE_TTL: Duration = Duration::from_secs(30);
-/// Minimum time between two forced full-state streams to one (contract, peer).
-/// Ten minutes is two anti-entropy heartbeats (`INTEREST_HEARTBEAT_INTERVAL`,
-/// 5 min): long enough that a peer which never converges, or lies, costs at
-/// most six full states an hour per contract, and short enough that a fault
-/// that comes back after a heal is forced again well within the hour.
+/// How long a forced pair whose summary has not moved since the force stays
+/// held. Ten minutes is two anti-entropy heartbeats
+/// (`INTEREST_HEARTBEAT_INTERVAL`, 5 min): a peer that never converges costs at
+/// most six full states an hour per contract.
 pub(crate) const FORCE_COOLDOWN: Duration = Duration::from_secs(600);
+/// Minimum time between two forced full-state streams to one (contract, peer),
+/// whatever the peer reports. Bounds a peer that lies with a changing summary
+/// to about 60 full states an hour per contract, and only while this node
+/// writes; under a persistent fault it is how late this node's updates may
+/// reach a peer.
+pub(crate) const FORCE_FLOOR: Duration = Duration::from_secs(60);
 /// (contract, peer) pairs remembered for force marks and cooldowns.
 pub(crate) const MAX_FORCE_PAIRS: usize = 1024;
 
@@ -122,6 +140,8 @@ struct Check {
     stale_first: HashSet<PeerKey>,
     /// An originated write landed after this check was scheduled.
     rewritten: bool,
+    /// The floor held a confirm verdict: check once more when it ends.
+    retry_after: Option<Instant>,
 }
 
 impl Check {
@@ -132,6 +152,7 @@ impl Check {
             awaiting: HashSet::new(),
             stale_first: HashSet::new(),
             rewritten: false,
+            retry_after: None,
         }
     }
 }
@@ -141,8 +162,17 @@ impl Check {
 struct Forced {
     /// The force mark, until the heal leg consumes it or it expires.
     mark_until: Option<Instant>,
-    /// No further force for the pair before this.
-    cooldown_until: Instant,
+    /// When the pair was forced.
+    forced_at: Instant,
+    /// The summary the peer reported when it was forced.
+    summary_hash: u64,
+}
+
+impl Forced {
+    /// Forgotten once neither the floor nor the cooldown can apply.
+    fn expires(&self) -> Instant {
+        self.forced_at + FORCE_COOLDOWN
+    }
 }
 
 /// What `note_originated` did.
@@ -179,8 +209,11 @@ pub(crate) struct Due {
 pub(crate) enum Hold {
     /// The verdict was a byte-compare fallback, not real evidence.
     Evidence,
-    /// The pair was forced within `FORCE_COOLDOWN`.
-    Cooldown,
+    /// The pair was forced within `FORCE_FLOOR`.
+    Floor,
+    /// The pair was forced within `FORCE_COOLDOWN` and the peer still reports
+    /// the summary it had then.
+    NoProgress,
     /// `MAX_FORCE_PAIRS` pairs are remembered.
     Cap,
     /// A leg for the pair is queued or sending here.
@@ -266,7 +299,7 @@ impl VerifySoon {
             Phase::Scheduled { due } => due,
             Phase::Sent { deadline } => deadline,
         });
-        let pairs = inner.forced.values().map(|f| f.cooldown_until);
+        let pairs = inner.forced.values().map(Forced::expires);
         checks.chain(pairs).min()
     }
 
@@ -275,7 +308,7 @@ impl VerifySoon {
     /// fired round with [`Self::record_sent`] BEFORE sending its requests.
     pub(crate) fn take_due(&self, now: Instant) -> Due {
         let mut inner = self.inner.lock();
-        inner.forced.retain(|_, f| f.cooldown_until > now);
+        inner.forced.retain(|_, f| f.expires() > now);
         let mut due = Due::default();
         let mut ended = Vec::new();
         for (key, check) in inner.checks.iter_mut() {
@@ -329,16 +362,18 @@ impl VerifySoon {
         self.wake.notify_one();
     }
 
-    /// A two-sided `Summaries` comparison for `key` from `peer`.
-    /// `real_evidence` says whether `stale` rests on a real verdict rather
-    /// than a byte-compare fallback. `pair_busy` is asked only when a force
-    /// is otherwise due.
+    /// A two-sided `Summaries` comparison for `key` from `peer`, which
+    /// reported `their_summary`. `real_evidence` says whether `stale` rests on
+    /// a real verdict rather than a byte-compare fallback. `pair_busy` is
+    /// asked only when a force is otherwise due.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn on_comparison(
         &self,
         key: &ContractKey,
         peer: &PeerKey,
         stale: bool,
         real_evidence: bool,
+        their_summary: &[u8],
         pair_busy: impl FnOnce() -> bool,
         now: Instant,
     ) -> Verdict {
@@ -358,11 +393,18 @@ impl VerifySoon {
             }
             (Round::Confirm, true) => {
                 let pair = (*key, peer.clone());
-                let previous = forced.get(&pair);
+                let previous = forced.get(&pair).filter(|f| f.expires() > now);
+                // Hashed only here, for a stale confirm verdict.
+                let their_hash = summary_hash(their_summary);
                 if !real_evidence {
                     Verdict::Held(Hold::Evidence)
-                } else if previous.is_some_and(|f| f.cooldown_until > now) {
-                    Verdict::Held(Hold::Cooldown)
+                } else if let Some(f) = previous.filter(|f| now < f.forced_at + FORCE_FLOOR) {
+                    // Check once more when the floor ends, so a persistent
+                    // fault still delivers this write. Not re-armed by itself.
+                    check.retry_after = Some(f.forced_at + FORCE_FLOOR);
+                    Verdict::Held(Hold::Floor)
+                } else if previous.is_some_and(|f| f.summary_hash == their_hash) {
+                    Verdict::Held(Hold::NoProgress)
                 } else if previous.is_none() && forced.len() >= MAX_FORCE_PAIRS {
                     Verdict::Held(Hold::Cap)
                 } else if pair_busy() {
@@ -372,7 +414,8 @@ impl VerifySoon {
                         pair,
                         Forced {
                             mark_until: Some(now + FORCE_TTL),
-                            cooldown_until: now + FORCE_COOLDOWN,
+                            forced_at: now,
+                            summary_hash: their_hash,
                         },
                     );
                     Verdict::Escalate
@@ -441,12 +484,28 @@ fn resolve(check: &mut Check, now: Instant) -> bool {
         };
         return true;
     }
+    let retry = check.retry_after.take();
     if check.rewritten {
         // A write landed during this check: one fresh check for it.
         *check = Check::scheduled(now + CHECK_DELAY);
+        check.retry_after = retry;
+        return true;
+    }
+    if let Some(at) = retry {
+        // The floor held a stale peer: one more check once it ends.
+        *check = Check::scheduled(at.max(now + CHECK_DELAY));
         return true;
     }
     false
+}
+
+/// A stable hash of a peer's summary bytes, for "has the peer moved since it
+/// was forced".
+fn summary_hash(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
 }
 
 /// An originated write to `key` committed locally: schedule its check, and
@@ -521,6 +580,7 @@ pub(crate) fn on_summary_comparison(
     peer: &PeerKey,
     stale: bool,
     evidence: crate::ring::futile_repair::OutcomeEvidence,
+    their_summary: &[u8],
 ) {
     use super::propagation_stats::{PropagationEvent, record_propagation_event};
     let verdict = op_manager.verify_soon.on_comparison(
@@ -531,6 +591,7 @@ pub(crate) fn on_summary_comparison(
             evidence,
             crate::ring::futile_repair::OutcomeEvidence::Verdict
         ),
+        their_summary,
         || pair_busy(op_manager, key, peer),
         op_manager.ring.time_source.now(),
     );
@@ -546,7 +607,8 @@ pub(crate) fn on_summary_comparison(
             PropagationEvent::VerifyPeerStale,
             match hold {
                 Hold::Evidence => PropagationEvent::VerifyNotForcedEvidence,
-                Hold::Cooldown => PropagationEvent::VerifyNotForcedCooldown,
+                Hold::Floor => PropagationEvent::VerifyNotForcedFloor,
+                Hold::NoProgress => PropagationEvent::VerifyNotForcedNoProgress,
                 Hold::Cap => PropagationEvent::VerifyNotForcedCap,
                 Hold::Busy => PropagationEvent::VerifyNotForcedBusy,
             },
@@ -722,12 +784,25 @@ mod tests {
         real_evidence: bool,
         busy: bool,
     ) -> Verdict {
+        confirm_verdict_reporting(vs, k, p, t0, real_evidence, busy, &[0])
+    }
+
+    /// As [`confirm_verdict`], with the peer reporting `summary` in Confirm.
+    fn confirm_verdict_reporting(
+        vs: &VerifySoon,
+        k: ContractKey,
+        p: &PeerKey,
+        t0: Instant,
+        real_evidence: bool,
+        busy: bool,
+        summary: &[u8],
+    ) -> Verdict {
         assert_eq!(vs.note_originated(k, t0), Originated::Scheduled);
         let t1 = t0 + CHECK_DELAY;
         assert_eq!(vs.take_due(t1).rounds.len(), 1);
         vs.record_sent(&k, vec![p.clone()], t1);
         assert_eq!(
-            vs.on_comparison(&k, p, true, true, idle, t1),
+            vs.on_comparison(&k, p, true, true, &[0], idle, t1),
             Verdict::Stale
         );
         let t2 = t1 + CONFIRM_DELAY;
@@ -735,7 +810,7 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].round, Round::Confirm);
         vs.record_sent(&k, vec![p.clone()], t2);
-        vs.on_comparison(&k, p, true, real_evidence, || busy, t2)
+        vs.on_comparison(&k, p, true, real_evidence, summary, || busy, t2)
     }
 
     #[tokio::test]
@@ -769,17 +844,17 @@ mod tests {
         vs.take_due(t1);
         vs.record_sent(&key(1), vec![a.clone(), b.clone()], t1);
         assert_eq!(
-            vs.on_comparison(&key(1), &a, false, true, idle, t1),
+            vs.on_comparison(&key(1), &a, false, true, &[0], idle, t1),
             Verdict::Converged
         );
         assert_eq!(vs.tracked(), 1, "still waiting for b");
         assert_eq!(
-            vs.on_comparison(&key(1), &b, false, true, idle, t1),
+            vs.on_comparison(&key(1), &b, false, true, &[0], idle, t1),
             Verdict::Converged
         );
         assert_eq!(vs.tracked(), 0);
         assert_eq!(
-            vs.on_comparison(&key(1), &a, true, true, idle, t1),
+            vs.on_comparison(&key(1), &a, true, true, &[0], idle, t1),
             Verdict::Ignored,
             "a comparison outside a round is not an answer"
         );
@@ -795,7 +870,7 @@ mod tests {
         let t1 = t0 + CHECK_DELAY;
         vs.take_due(t1);
         assert_eq!(
-            vs.on_comparison(&key(1), &a, true, true, idle, t1),
+            vs.on_comparison(&key(1), &a, true, true, &[0], idle, t1),
             Verdict::Ignored
         );
     }
@@ -810,16 +885,16 @@ mod tests {
         vs.take_due(t1);
         vs.record_sent(&key(1), vec![a.clone(), b.clone(), c.clone()], t1);
         assert_eq!(
-            vs.on_comparison(&key(1), &a, true, true, idle, t1),
+            vs.on_comparison(&key(1), &a, true, true, &[0], idle, t1),
             Verdict::Stale
         );
         assert_eq!(
-            vs.on_comparison(&key(1), &b, true, false, idle, t1),
+            vs.on_comparison(&key(1), &b, true, false, &[0], idle, t1),
             Verdict::Stale,
             "First records a stale peer whatever the evidence"
         );
         assert_eq!(
-            vs.on_comparison(&key(1), &c, false, true, idle, t1),
+            vs.on_comparison(&key(1), &c, false, true, &[0], idle, t1),
             Verdict::Converged
         );
         let t2 = t1 + CONFIRM_DELAY;
@@ -835,11 +910,11 @@ mod tests {
         // No summary is compared between rounds: on a contract other writers
         // keep changing, the peer's summary moves and the fault persists.
         assert_eq!(
-            vs.on_comparison(&key(1), &a, true, true, idle, t2),
+            vs.on_comparison(&key(1), &a, true, true, &[0], idle, t2),
             Verdict::Escalate
         );
         assert_eq!(
-            vs.on_comparison(&key(1), &b, false, true, idle, t2),
+            vs.on_comparison(&key(1), &b, false, true, &[0], idle, t2),
             Verdict::Converged
         );
         assert_eq!(vs.tracked(), 0, "Confirm ends the check");
@@ -861,7 +936,7 @@ mod tests {
         let t1 = t0 + CHECK_DELAY;
         vs.take_due(t1);
         vs.record_sent(&key(1), vec![a.clone()], t1);
-        vs.on_comparison(&key(1), &a, true, true, idle, t1);
+        vs.on_comparison(&key(1), &a, true, true, &[0], idle, t1);
         let t2 = t1 + CONFIRM_DELAY;
         vs.take_due(t2);
         vs.record_sent(&key(1), vec![a.clone()], t2);
@@ -871,6 +946,7 @@ mod tests {
                 &a,
                 true,
                 false,
+                &[0],
                 || {
                     asked.set(true);
                     false
@@ -905,30 +981,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pair_is_forced_at_most_once_per_cooldown() {
+    async fn a_peer_whose_summary_does_not_move_is_held_for_the_cooldown() {
         let vs = VerifySoon::new();
         let a = peer();
         let t0 = Instant::now();
         assert_eq!(
-            confirm_verdict(&vs, key(1), &a, t0, true, false),
+            confirm_verdict_reporting(&vs, key(1), &a, t0, true, false, &[7]),
             Verdict::Escalate
         );
-        // A peer that keeps answering stale: every later check inside the
-        // cooldown is held, so it costs no further full state.
-        let mut t = t0 + Duration::from_secs(60);
-        while t < t0 + CHECK_DELAY + CONFIRM_DELAY + FORCE_COOLDOWN - Duration::from_secs(20) {
+        let forced_at = t0 + CHECK_DELAY + CONFIRM_DELAY;
+        // Every later check past the floor and inside the cooldown, with the
+        // same stale summary: the force did not land, so no more full state.
+        let mut t = forced_at + FORCE_FLOOR;
+        while t + CHECK_DELAY + CONFIRM_DELAY < forced_at + FORCE_COOLDOWN {
             assert_eq!(
-                confirm_verdict(&vs, key(1), &a, t, true, false),
-                Verdict::Held(Hold::Cooldown)
+                confirm_verdict_reporting(&vs, key(1), &a, t, true, false, &[7]),
+                Verdict::Held(Hold::NoProgress)
             );
-            t += Duration::from_secs(60);
+            assert_eq!(vs.tracked(), 0, "a no-progress hold is not retried");
+            t += Duration::from_secs(70);
         }
-        let after = t0 + CHECK_DELAY + CONFIRM_DELAY + FORCE_COOLDOWN;
+        let after = forced_at + FORCE_COOLDOWN;
         vs.take_due(after);
         assert_eq!(
-            confirm_verdict(&vs, key(1), &a, after, true, false),
+            confirm_verdict_reporting(&vs, key(1), &a, after, true, false, &[7]),
             Verdict::Escalate,
             "after the cooldown the pair may be forced again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_moves_is_forced_again_but_at_most_once_per_floor() {
+        let vs = VerifySoon::new();
+        let a = peer();
+        let t0 = Instant::now();
+        assert_eq!(
+            confirm_verdict_reporting(&vs, key(1), &a, t0, true, false, &[1]),
+            Verdict::Escalate
+        );
+        let forced_at = t0 + CHECK_DELAY + CONFIRM_DELAY;
+        // A new write lost again 20 s later; the peer's summary has moved (it
+        // got the forced state), but the floor holds.
+        let t1 = t0 + Duration::from_secs(20);
+        assert_eq!(
+            confirm_verdict_reporting(&vs, key(1), &a, t1, true, false, &[2]),
+            Verdict::Held(Hold::Floor)
+        );
+        assert_eq!(vs.tracked(), 1, "the floor schedules one more check");
+        assert_eq!(vs.next_wake(), Some(forced_at + FORCE_FLOOR));
+        let t2 = forced_at + FORCE_FLOOR;
+        let due = vs.take_due(t2).rounds;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].round, Round::First);
+        vs.record_sent(&key(1), vec![a.clone()], t2);
+        assert_eq!(
+            vs.on_comparison(&key(1), &a, true, true, &[2], idle, t2),
+            Verdict::Stale
+        );
+        let t3 = t2 + CONFIRM_DELAY;
+        vs.take_due(t3);
+        vs.record_sent(&key(1), vec![a.clone()], t3);
+        assert_eq!(
+            vs.on_comparison(&key(1), &a, true, true, &[2], idle, t3),
+            Verdict::Escalate,
+            "past the floor, a peer that moved since its last force is forced"
+        );
+        assert_eq!(
+            vs.tracked(),
+            0,
+            "the retry is not re-armed without another write"
         );
     }
 
@@ -976,13 +1097,13 @@ mod tests {
         vs.record_sent(&key(1), vec![a.clone()], t1);
         vs.note_originated(key(1), t1);
         vs.note_originated(key(1), t1);
-        vs.on_comparison(&key(1), &a, false, true, idle, t1);
+        vs.on_comparison(&key(1), &a, false, true, &[0], idle, t1);
         assert_eq!(vs.tracked(), 1);
         assert_eq!(vs.next_wake(), Some(t1 + CHECK_DELAY));
         let t2 = t1 + CHECK_DELAY;
         assert_eq!(vs.take_due(t2).rounds.len(), 1);
         vs.record_sent(&key(1), vec![a.clone()], t2);
-        vs.on_comparison(&key(1), &a, false, true, idle, t2);
+        vs.on_comparison(&key(1), &a, false, true, &[0], idle, t2);
         assert_eq!(vs.tracked(), 0, "no write since: no further check");
     }
 
