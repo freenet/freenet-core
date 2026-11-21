@@ -9,10 +9,12 @@
 //! the post-merge propagation helpers survive here because the
 //! drivers consume them.
 
+pub(crate) mod inline_leg_fault_injection;
 pub(crate) mod op_ctx_task;
 pub(crate) mod pending_broadcast;
 pub(crate) mod propagation_stats;
 pub(crate) mod recent_requests;
+pub(crate) mod verify_soon;
 
 use freenet_stdlib::prelude::*;
 
@@ -951,6 +953,9 @@ pub(crate) async fn update_contract(
                     key.id(),
                     propagation_stats::PropagationEvent::ClientOriginated,
                 );
+                // #6143: check a few seconds from now that the fan-out
+                // targets really hold this write (`verify_soon`).
+                verify_soon::note_originated(op_manager, key);
             }
             if state_changed {
                 // A `BroadcastStateChange` was emitted for this write, so hand
