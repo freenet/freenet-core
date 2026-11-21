@@ -56,7 +56,7 @@ x25519-dalek = { version = "3", features = ["static_secrets"] }
 
 # Data structures/storage
 dashmap = "6.2"
-lru = "0.18.0"
+lru = "0.19.0"
 redb = "4"
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "sqlite"] }
 moka = { version = "0.12", features = ["sync"] }
