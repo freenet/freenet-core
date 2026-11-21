@@ -24896,6 +24896,17 @@ fn test_verify_soon_does_not_force_a_slow_healthy_peer() {
         "the first round must see the late legs missing, or this tests nothing: {:?}",
         o.obs
     );
+    // A confirm round ran (each host asked twice) and found every host
+    // converged.
+    for (label, addr, _) in &o.others {
+        assert_eq!(
+            o.obs.verify_requests_to.get(addr).copied(),
+            Some(2),
+            "{label}: First and Confirm: {:?}",
+            o.obs
+        );
+    }
+    assert!(o.obs.verify_converged >= 3, "{:?}", o.obs);
     assert_eq!(o.obs.verify_stale_confirm, 0, "{:?}", o.obs);
     assert_eq!(o.obs.verify_forced, 0, "{:?}", o.obs);
     assert_eq!(o.obs.verify_forced_legs, 0, "{:?}", o.obs);
@@ -24916,21 +24927,32 @@ fn test_verify_soon_sustained_writes_are_bounded() {
     assert_eq!(o.obs.verify_forced, 0, "{:?}", o.obs);
 }
 
-/// (d') Sustained writes under the persistent fault: the first check forces
-/// every host, the 60 s floor holds the later writes' escalations, and the one
-/// retry at the end of the floor delivers the last version. Every host holds it
-/// within `PERSISTENT_FAULT_BOUND` of node 1's last write.
+/// (d') Sustained writes under the persistent fault: node 1's checks force full
+/// state to one host at a time (the node's single forced slot); a healed host's
+/// own fan-out repairs the others, and later writes are forced again past the
+/// floor. Every host ends at the last version. Every host holds it
+/// within `PERSISTENT_FAULT_BOUND` of node 1's last write, plus one
+/// `SLOT_WAIT_BOUND` for each other stale host whose forced leg holds the
+/// node's single slot first (2 of the 3).
 #[test_log::test]
 fn test_verify_soon_sustained_writes_under_a_persistent_fault_converge() {
     let mut s = VerifyScenario::new("vs-sustained-fault", 0xE5, InlineFault::Persistent);
     s.updates = 6;
-    s.bound = freenet::dev_tool::VERIFY_SOON_PERSISTENT_FAULT_BOUND;
+    s.bound = freenet::dev_tool::VERIFY_SOON_PERSISTENT_FAULT_BOUND
+        + freenet::dev_tool::VERIFY_SOON_SLOT_WAIT_BOUND * 2;
     let o = run_verify_scenario(s);
-    assert!(o.obs.verify_forced >= 3, "{:?}", o.obs);
-    assert!(o.obs.verify_not_forced_floor >= 1, "{:?}", o.obs);
-    // Each host is forced at most twice: once by the first check, once by the
-    // retry after the floor (the run spans less than two floors).
-    assert!(o.obs.verify_forced <= 6, "{:?}", o.obs);
+    assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
+    assert!(
+        o.obs.verify_forced_delivered >= 1,
+        "a delivered forced stream is what arms the floor: {:?}",
+        o.obs
+    );
+    // At most one forced leg at a time, each delivered before the next.
+    assert!(
+        o.obs.verify_forced_legs <= o.obs.verify_forced_delivered + 1,
+        "{:?}",
+        o.obs
+    );
     assert!(
         o.all_converged(),
         "versions: {:?} {:?}",
