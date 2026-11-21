@@ -101,7 +101,7 @@ async-trait = "0.1"
 opentelemetry = "0.32"
 # Trait/types only (HttpClient for the per-request auth wrapper); its reqwest
 # integration targets reqwest 0.13 and the workspace is on 0.12, so no features.
-opentelemetry-http = "0.32"
+opentelemetry-http = "0.33"
 opentelemetry-jaeger = "0.22"
 opentelemetry-otlp = { version = "0.32.0", default-features = false }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
