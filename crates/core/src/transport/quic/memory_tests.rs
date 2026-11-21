@@ -504,7 +504,9 @@ fn an_ack_wait_task_measures_within_its_pin() {
 
 /// Polling `stopped()` on a stream this side then resets costs at most
 /// [`QUIC_STOPPED_ENTRY_BYTES`] per stream until the connection closes, in
-/// jemalloc-rounded bytes: quinn's `stopped` map entry. Measured as the
+/// jemalloc-rounded bytes: quinn's `stopped` map entry (0 here with the
+/// `freenet-quinn` fork, which releases a cancelled `stopped()` registration;
+/// 88 B with quinn 0.11.12). Measured as the
 /// difference between 1,024 resets with the poll and 1,024 without it, on
 /// connections of their own, so everything else a reset stream leaves (and the
 /// harness's timer queues, see [`measure_reset_streams`]) cancels out.
@@ -514,12 +516,15 @@ fn polling_stopped_on_a_reset_stream_costs_at_most_its_entry() {
         let streams = 1024;
         let polled = measure_reset_streams("quic-memory-stopped", streams, true).await;
         let plain = measure_reset_streams("quic-memory-unpolled", streams, false).await;
-        let entries = polled.rounded - plain.rounded;
-        assert!(
-            entries > 0,
-            "premise: the polls left memory: {polled:?} against {plain:?}"
-        );
+        // With `freenet-quinn` (quinn#2987 and the fix after it that releases a
+        // cancelled `stopped()` registration) the poll here is dropped at once,
+        // so the entry is removed and the difference is 0 or noise below it:
+        // no `entries > 0` premise any more. The pin stays as an upper bound,
+        // the cost of an entry whose waiter is still alive when the stream is
+        // reset.
+        let entries = (polled.rounded - plain.rounded).max(0);
         let per_stream = (entries as usize).div_ceil(streams);
+        eprintln!("stopped entry: {per_stream} B ({polled:?} against {plain:?})");
         assert!(
             per_stream <= QUIC_STOPPED_ENTRY_BYTES,
             "{per_stream} B per stopped() entry ({polled:?} against {plain:?}) exceeds \

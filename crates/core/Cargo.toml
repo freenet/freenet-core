@@ -124,20 +124,30 @@ rustls = { version = "0.23", default-features = false, features = ["std"] }
 # crate's own Runtime over TimeSource, so simulation drives it), no
 # platform-verifier (peers are authenticated by raw public keys, never by a CA
 # root store), and no aws-lc-rs (deny.toml bans it).
+# TEMPORARY FORK: `freenet-quinn` / `freenet-quinn-proto` (freenet/quinn, branch
+# `freenet-0.11.13`) are quinn's `0.11.x` branch head plus nothing else, published
+# only because upstream has not released quinn-rs/quinn#2987 ("Avoid poisoned-lock
+# panics during cleanup": a panic in an endpoint or connection driver no longer
+# aborts the process, #6184). `package = ` keeps the imports as `quinn` and
+# `quinn_proto`. Switch back to upstream `quinn` as soon as it releases that fix.
 # Pinned exactly: the panic containment in transport/quic relies on quinn
-# 0.11.12 internals (driver poll order, which destructors lock, respond()
-# sending without poll_writable). See .claude/rules/transport.md (PANICS)
-# and re-check those before bumping. This freezes quinn only: quinn-proto and
-# quinn-udp still float, which is intended, as the internals relied on live
-# in quinn itself. It also stops `cargo update` (and automated bumps) from
-# taking quinn patch releases, security fixes included, so taking one is a
-# deliberate step: bump this pin and re-check the transport.md items.
-quinn = { version = "=0.11.12", default-features = false, features = ["rustls-ring"] }
-# quinn's protocol crate, already in the graph under quinn. Named directly only
+# 0.11.x internals (driver poll order, which destructors lock, respond()
+# sending without poll_writable), re-checked against this fork head (0.11.x at
+# a9ae122f, 52+ commits past quinn 0.11.12). See .claude/rules/transport.md
+# (PANICS) and re-check those before bumping. The exact pin also stops
+# `cargo update` (and automated bumps) from taking a different build, so
+# taking one is a deliberate step: bump this pin and re-check the transport.md
+# items. The fork's own `quinn-udp` dependency is upstream's, from crates.io.
+quinn = { package = "freenet-quinn", version = "=0.11.13", default-features = false, features = ["rustls-ring"] }
+# quinn's protocol crate (the fork's, in the graph under quinn). Named directly only
 # for `InvalidCid`, which quinn does not re-export and a connection-ID
 # generator's `validate` must return (transport/quic/cid.rs). No features of
-# its own: quinn's `rustls-ring` decides them.
-quinn-proto = { version = "0.11.18", default-features = false }
+# its own: quinn's `rustls-ring` decides them. Must be the same package quinn
+# uses: a differently named proto package would link beside it, but its
+# `InvalidCid` would be a different type from the one quinn's
+# `ConnectionIdGenerator::validate` returns, so the generator would not
+# type-check.
+quinn-proto = { package = "freenet-quinn-proto", version = "=0.11.13", default-features = false }
 # Already in the graph via rustls's ring provider. Used directly for the QUIC
 # endpoint's stateless-reset HMAC key and handshake-token HKDF key, which
 # quinn-proto implements its key traits for. Renamed because the crate has its
