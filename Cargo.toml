@@ -182,7 +182,7 @@ wry = { version = "0.57", default-features = false, features = ["os-webview"] }
 winreg = "0.56"
 tray-icon = "0.24"
 muda = "0.19"
-zip = { version = "8", default-features = false, features = ["deflate", "time"] }
+zip = { version = "9", default-features = false, features = ["deflate", "time"] }
 
 # Freenet
 # 0.12.0 adds delegate manifests (a `freenet-manifest` WASM custom section,
