@@ -24727,7 +24727,7 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
     }
 
     let result =
-        sim.run_controlled_simulation(seed, operations, Duration::from_secs(180), post_wait);
+        sim.run_controlled_simulation(seed, operations, Duration::from_secs(400), post_wait);
     let swallowed = inline_leg_fault_injection::swallowed(&contract_key);
     inline_leg_fault_injection::clear(&contract_key);
     let obs = stale_peer_heal_observations::get(&contract_key);
@@ -24771,6 +24771,21 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
         "verify-soon scenario outcome"
     );
     outcome
+}
+
+/// Every forced leg was decided first, and every one was delivered (the
+/// forced stream is the path that works in these arms).
+fn assert_forced_legs_accounted(o: &VerifyOutcome) {
+    assert!(
+        o.obs.verify_forced_legs <= o.obs.verify_forced,
+        "a forced leg needs a decision: {:?}",
+        o.obs
+    );
+    assert_eq!(
+        o.obs.verify_forced_delivered, o.obs.verify_forced_legs,
+        "every forced stream here is delivered, and the delivery is what arms the pair: {:?}",
+        o.obs
+    );
 }
 
 /// (a) Healthy network: the check costs one request per co-host and finds
@@ -24828,6 +24843,7 @@ fn test_verify_soon_escalates_to_a_stream_under_a_persistent_inline_fault() {
         0xE3,
         InlineFault::Persistent,
     ));
+    assert_forced_legs_accounted(&o);
     assert!(o.swallowed > 0, "the fault seam never fired");
     assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
     assert!(
@@ -24872,6 +24888,7 @@ fn test_verify_soon_escalates_on_a_contract_other_hosts_write_to() {
     // confirm round at about t+10 s).
     s.other_writes = vec![(0, 50), (2, 60)];
     let o = run_verify_scenario(s);
+    assert_forced_legs_accounted(&o);
     assert!(o.swallowed > 0, "the fault seam never fired");
     assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
     assert!(
@@ -24941,24 +24958,48 @@ fn test_verify_soon_sustained_writes_under_a_persistent_fault_converge() {
     s.bound = freenet::dev_tool::VERIFY_SOON_PERSISTENT_FAULT_BOUND
         + freenet::dev_tool::VERIFY_SOON_SLOT_WAIT_BOUND * 2;
     let o = run_verify_scenario(s);
+    assert_forced_legs_accounted(&o);
     assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
     assert!(
         o.obs.verify_forced_delivered >= 1,
         "a delivered forced stream is what arms the floor: {:?}",
         o.obs
     );
-    // At most one forced leg at a time, each delivered before the next.
-    assert!(
-        o.obs.verify_forced_legs <= o.obs.verify_forced_delivered + 1,
-        "{:?}",
-        o.obs
-    );
+    assert!(o.obs.verify_forced <= 3, "{:?}", o.obs);
     assert!(
         o.all_converged(),
         "versions: {:?} {:?}",
         o.versions(),
         o.obs
     );
+}
+
+/// (d'') The persistent fault while node 1 never stops writing (every 3 s, to
+/// the end of the run): a write merges into the running check instead of
+/// restarting it, so the confirm round still runs and forces repairs. Every
+/// host is at most the bound behind node 1's last write when the run ends.
+/// (Were each write to restart the check, no confirm round would run while
+/// the writes continue, and every host would still hold the PUT state.)
+#[test_log::test]
+fn test_verify_soon_repairs_while_the_originator_keeps_writing() {
+    let mut s = VerifyScenario::new("vs-continuous", 0xEC, InlineFault::Persistent);
+    s.updates = 40;
+    s.bound = Duration::from_secs(3);
+    let o = run_verify_scenario(s);
+    assert_forced_legs_accounted(&o);
+    assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
+    let bound = freenet::dev_tool::VERIFY_SOON_PERSISTENT_FAULT_BOUND
+        + freenet::dev_tool::VERIFY_SOON_SLOT_WAIT_BOUND * 2;
+    // One write per 3 s op interval: how many writes fit in the bound.
+    let lag = bound.as_secs().div_ceil(3);
+    for (label, _, v) in &o.others {
+        assert!(
+            v.is_some_and(|v| v + lag >= o.final_version),
+            "{label} at {v:?}, more than {lag} writes behind {} while writes continue: {:?}",
+            o.final_version,
+            o.obs
+        );
+    }
 }
 
 /// (e) Mixed versions: a peer below the hash-first floor cannot decode
@@ -25016,6 +25057,7 @@ fn test_verify_soon_large_state_escalates_to_a_stream() {
     let mut s = VerifyScenario::new("vs-large", 0xE8, InlineFault::Persistent);
     s.state_len = 8 * 1024;
     let o = run_verify_scenario(s);
+    assert_forced_legs_accounted(&o);
     assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
     assert!(o.obs.verify_forced_legs >= 1, "{:?}", o.obs);
     assert!(
