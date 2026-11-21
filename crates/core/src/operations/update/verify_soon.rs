@@ -443,9 +443,8 @@ impl VerifySoon {
                 let sent_at = previous.and_then(|f| f.sent_at);
                 // Hashed only here, for a stale confirm verdict.
                 let their_hash = summary_hash(their_summary);
-                let bytes_spent = forced_bytes
-                    .filter(|(start, _)| now < *start + FORCED_BYTES_WINDOW)
-                    .map(|(start, bytes)| (start, bytes));
+                let bytes_spent =
+                    forced_bytes.filter(|(start, _)| now < *start + FORCED_BYTES_WINDOW);
                 let (verdict, retry_at) = if !real_evidence {
                     (Verdict::Held(Hold::Evidence), None)
                 } else if let Some(at) = sent_at.filter(|at| now < *at + FORCE_FLOOR) {
