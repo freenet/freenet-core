@@ -417,6 +417,7 @@ impl VerifySoon {
 
     /// The round for `key` is being fired at `now` and asks `peers`. Called
     /// before the requests go out, so a fast reply finds the round `Sent`.
+    #[cfg(test)]
     pub(crate) fn record_sent(&self, key: &ContractKey, peers: Vec<PeerKey>, now: Instant) {
         self.record_sent_leaving(key, peers, Vec::new(), now);
     }
