@@ -1936,6 +1936,7 @@ impl Ring {
                 let hosting_request = op_manager
                     .neighbor_hosting
                     .anti_entropy_request(peer_key.as_ref(), digest_supported);
+                eprintln!("RCV t={} self={:?} HEARTBEAT_SEND to={} peer_key={:?} digest={}", { static B: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new(); tokio::time::Instant::now().saturating_duration_since(*B.get_or_init(tokio::time::Instant::now)).as_millis() }, ring.connection_manager.pub_key, peer_addr, peer_key, digest_supported);
                 if let Err(e) = sender.try_send(either::Either::Right(
                     crate::message::NodeEvent::SendNetMessage {
                         target: peer_addr,

@@ -953,6 +953,7 @@ impl NeighborHostingManager {
     pub fn on_peer_disconnected(&self, pub_key: &TransportPublicKey) {
         // The next connection's first legacy request is answered in full again.
         self.legacy_replies.remove(pub_key);
+        eprintln!("RCV t={} ON_PEER_DISCONNECTED peer={:?} had_entry={}", { static B: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new(); tokio::time::Instant::now().saturating_duration_since(*B.get_or_init(tokio::time::Instant::now)).as_millis() }, pub_key, self.neighbor_contracts.contains_key(pub_key));
         if let Some((_, removed_cache)) = self.neighbor_contracts.remove(pub_key) {
             let count = removed_cache.len();
             debug!(

@@ -2685,6 +2685,7 @@ impl ConnectionManager {
             was_reserved = %was_reserved,
             "Adding connection to ring topology"
         );
+        eprintln!("RCV t={} self={:?} ADD_CONN addr={} peer={:?} reserved={}", { static B: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new(); tokio::time::Instant::now().saturating_duration_since(*B.get_or_init(tokio::time::Instant::now)).as_millis() }, self.pub_key, addr, pub_key, was_reserved);
         // Verify we're not adding a connection to ourselves (if we know our own address)
         debug_assert!(self.get_own_addr().map(|own| own != addr).unwrap_or(true));
         if was_reserved {
@@ -2859,6 +2860,8 @@ impl ConnectionManager {
     }
 
     fn prune_connection(&self, addr: SocketAddr, is_alive: bool) -> Option<Location> {
+        eprintln!("RCV t={} self={:?} PRUNE addr={} alive={}", { static B: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new(); tokio::time::Instant::now().saturating_duration_since(*B.get_or_init(tokio::time::Instant::now)).as_millis() }, self.pub_key, addr, is_alive);
+        if is_alive { eprintln!("RCVBT {:?} {}", self.pub_key, std::backtrace::Backtrace::force_capture()); }
         let connection_type = if is_alive { "active" } else { "in transit" };
         tracing::info!(
             addr = %addr,

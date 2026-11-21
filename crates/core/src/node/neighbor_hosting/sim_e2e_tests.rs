@@ -310,7 +310,7 @@ fn measure(
             manager,
         ));
     }
-    for (label, key, _) in &by_key {}
+    for (label, key, m) in &by_key { eprintln!("RCV KEY {label} {key:?} hosts={} tracked={:?}", m.advertised_ids().len(), m.tracked_peers().iter().map(|p| format!("{p:?}")).collect::<Vec<_>>()); }
     let mut pairs_checked = 0usize;
     let mut mismatches = Vec::new();
     let mut hosted_total = 0usize;

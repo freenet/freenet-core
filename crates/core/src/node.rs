@@ -2560,6 +2560,7 @@ where
                 .connection_manager
                 .get_peer_by_addr(source)
                 .map(|pkl| pkl.pub_key().clone());
+            eprintln!("RCV t={} self={:?} RECV from={} resolved={:?} in_ring={} msg={}", { static B: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new(); tokio::time::Instant::now().saturating_duration_since(*B.get_or_init(tokio::time::Instant::now)).as_millis() }, op_manager.ring.connection_manager.pub_key, source, source_pub_key, op_manager.ring.connection_manager.is_in_ring(source), match message { crate::message::NeighborHostingMessage::HostingAnnounce{added, removed, ..} => format!("announce +{} -{}", added.len(), removed.len()), crate::message::NeighborHostingMessage::HostingStateRequest => "request".into(), crate::message::NeighborHostingMessage::HostingStateResponse{..} => "response".into(), crate::message::NeighborHostingMessage::HostingStateDigestRequest{..} => "digest_req".into(), crate::message::NeighborHostingMessage::HostingStateUnchanged => "unchanged".into(), });
             let Some(source_pub_key) = source_pub_key else {
                 tracing::debug!(
                     %source,

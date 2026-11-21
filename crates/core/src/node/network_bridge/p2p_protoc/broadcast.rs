@@ -58,6 +58,7 @@ impl P2pConnManager {
             message: message.clone(),
         });
         let peers: Vec<SocketAddr> = self.connections.keys().copied().collect();
+        eprintln!("RCV t={} self={:?} HOSTING_BCAST peers={:?} ring_flags={:?} msg={:?}", { static B: std::sync::OnceLock<tokio::time::Instant> = std::sync::OnceLock::new(); tokio::time::Instant::now().saturating_duration_since(*B.get_or_init(tokio::time::Instant::now)).as_millis() }, self.bridge.op_manager.ring.connection_manager.pub_key, peers, peers.iter().map(|a| self.bridge.op_manager.ring.connection_manager.is_in_ring(*a)).collect::<Vec<_>>(), match &message { crate::message::NeighborHostingMessage::HostingAnnounce{added,removed,..} => format!("+{} -{}", added.len(), removed.len()), _ => "other".into()});
         Self::broadcast_to_peers(&self.bridge, peers, msg).await;
     }
 
