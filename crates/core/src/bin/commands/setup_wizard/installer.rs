@@ -151,7 +151,11 @@ fn download_fdev(install_dir: &Path) -> Result<()> {
 
     for i in 0..archive.len() {
         let mut file = archive.by_index(i)?;
-        let name = file.name().to_string();
+        // zip 9 returns the entry name as a Result. An entry whose name cannot
+        // be decoded is not the one being looked for, so skip it.
+        let Ok(name) = file.name().map(|name| name.into_owned()) else {
+            continue;
+        };
         if name.ends_with("fdev.exe") {
             let dest = install_dir.join("fdev.exe");
             let mut out = std::fs::File::create(&dest).context("Failed to create fdev.exe")?;
