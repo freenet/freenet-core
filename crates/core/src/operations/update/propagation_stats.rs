@@ -111,7 +111,7 @@ const MAX_TRACKED_CONTRACTS: usize = 4096;
 /// Upper bound on `size_of::<ContractCounters>()` and
 /// `size_of::<ContractSummary>()`, for the memory estimate above.
 #[cfg(test)]
-const MAX_COUNTERS_SIZE: usize = 416;
+const MAX_COUNTERS_SIZE: usize = 424;
 
 /// One countable thing that happened to an UPDATE's propagation for a
 /// contract, other than the fan-out target resolution `record_broadcast`
@@ -253,14 +253,17 @@ pub(crate) enum PropagationEvent {
     /// stale peers the delta heal did not repair.
     VerifyPeerStaleConfirm,
     /// Verify-soon: stale in the confirm round but not forced, because the
-    /// node-wide forced-bytes budget for the window is spent.
-    VerifyNotForcedBytes,
+    /// node's one forced slot is held by another forced leg.
+    VerifyNotForcedSlot,
+    /// Verify-soon: a forced stream was delivered, arming its pair's floor
+    /// and cooldown. Read against `VerifyForcedFullSent`.
+    VerifyForcedDelivered,
 }
 
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 43] = [
+    pub(crate) const ALL: [PropagationEvent; 44] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -303,7 +306,8 @@ impl PropagationEvent {
         PropagationEvent::VerifyRoundTimedOut,
         PropagationEvent::VerifyNotForcedNoProgress,
         PropagationEvent::VerifyPeerStaleConfirm,
-        PropagationEvent::VerifyNotForcedBytes,
+        PropagationEvent::VerifyNotForcedSlot,
+        PropagationEvent::VerifyForcedDelivered,
     ];
 
     pub(crate) const COUNT: usize = Self::ALL.len();
@@ -352,7 +356,8 @@ impl PropagationEvent {
             PropagationEvent::VerifyRoundTimedOut => 39,
             PropagationEvent::VerifyNotForcedNoProgress => 40,
             PropagationEvent::VerifyPeerStaleConfirm => 41,
-            PropagationEvent::VerifyNotForcedBytes => 42,
+            PropagationEvent::VerifyNotForcedSlot => 42,
+            PropagationEvent::VerifyForcedDelivered => 43,
         }
     }
 
@@ -429,7 +434,8 @@ impl PropagationEvent {
             PropagationEvent::VerifyRoundTimedOut => "verify_round_timed_out",
             PropagationEvent::VerifyNotForcedNoProgress => "verify_not_forced_no_progress",
             PropagationEvent::VerifyPeerStaleConfirm => "verify_peer_stale_confirm",
-            PropagationEvent::VerifyNotForcedBytes => "verify_not_forced_bytes",
+            PropagationEvent::VerifyNotForcedSlot => "verify_not_forced_slot",
+            PropagationEvent::VerifyForcedDelivered => "verify_forced_delivered",
         }
     }
 }
@@ -940,7 +946,8 @@ impl UpdatePropagationStats {
             PropagationEvent::VerifyRoundTimedOut,
             PropagationEvent::VerifyNotForcedNoProgress,
             PropagationEvent::VerifyPeerStaleConfirm,
-            PropagationEvent::VerifyNotForcedBytes,
+            PropagationEvent::VerifyNotForcedSlot,
+            PropagationEvent::VerifyForcedDelivered,
         ];
         if verify_events.iter().any(|ev| e.get(*ev) > 0) {
             tracing::info!(
@@ -960,7 +967,8 @@ impl UpdatePropagationStats {
                 verify_round_timed_out = e.get(PropagationEvent::VerifyRoundTimedOut),
                 verify_not_forced_no_progress = e.get(PropagationEvent::VerifyNotForcedNoProgress),
                 verify_peer_stale_confirm = e.get(PropagationEvent::VerifyPeerStaleConfirm),
-                verify_not_forced_bytes = e.get(PropagationEvent::VerifyNotForcedBytes),
+                verify_not_forced_slot = e.get(PropagationEvent::VerifyNotForcedSlot),
+                verify_forced_delivered = e.get(PropagationEvent::VerifyForcedDelivered),
                 window_s = SUMMARY_WINDOW.as_secs(),
                 phase = "summary_verify",
                 "update_propagation_summary verify"

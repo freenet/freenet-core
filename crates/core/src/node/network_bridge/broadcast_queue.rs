@@ -4659,6 +4659,16 @@ pub(super) async fn broadcast_to_single_peer(
         op_manager
             .verify_soon
             .take_forced(&key, &peer_key, op_manager.ring.time_source.now());
+    // Reports the forced stream's outcome: `delivered()` below arms the pair,
+    // and dropping it on any other exit only frees the node's forced slot.
+    let mut forced_leg = forced_full.then(|| {
+        crate::operations::update::verify_soon::ForcedLeg::new(
+            op_manager.verify_soon.clone(),
+            op_manager.ring.time_source.clone(),
+            key,
+            peer_key.clone(),
+        )
+    });
 
     // A leg queued in the small lane may find the stored state has since grown
     // past `LARGE_STATE_LANE_THRESHOLD` (a later write replaced it). The
@@ -5105,9 +5115,6 @@ pub(super) async fn broadcast_to_single_peer(
                 payload_size,
             ));
     if forced_full {
-        op_manager
-            .verify_soon
-            .record_forced_bytes(payload_size as u64, op_manager.ring.time_source.now());
         record_propagation_event(op_manager, key.id(), PropagationEvent::VerifyForcedFullSent);
         #[cfg(any(test, feature = "testing"))]
         crate::node::stale_peer_heal_observations::record_forced_leg(&key);
@@ -5293,6 +5300,16 @@ pub(super) async fn broadcast_to_single_peer(
                 // v0.2.73 incident.
                 BROADCAST_STREAM_METRICS.record_attempt(delivered);
                 if delivered {
+                    if let Some(leg) = forced_leg.take() {
+                        leg.delivered();
+                        record_propagation_event(
+                            op_manager,
+                            key.id(),
+                            PropagationEvent::VerifyForcedDelivered,
+                        );
+                        #[cfg(any(test, feature = "testing"))]
+                        crate::node::stale_peer_heal_observations::record_forced_delivered(&key);
+                    }
                     if let Some(guard) = missing_attempt_guard.as_mut() {
                         guard.mark_delivered(payload_size);
                     }

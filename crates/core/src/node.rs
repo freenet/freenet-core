@@ -4332,13 +4332,15 @@ pub mod stale_peer_heal_observations {
         pub verify_forced: u64,
         /// Legs built carrying a forced full state on the stream.
         pub verify_forced_legs: u64,
+        /// Forced streams delivered (each arms its pair).
+        pub verify_forced_delivered: u64,
         /// Stale in a confirm round but not forced, by reason.
         pub verify_not_forced_evidence: u64,
         pub verify_not_forced_floor: u64,
         pub verify_not_forced_no_progress: u64,
         pub verify_not_forced_cap: u64,
         pub verify_not_forced_busy: u64,
-        pub verify_not_forced_bytes: u64,
+        pub verify_not_forced_slot: u64,
         /// Stale verdicts in a confirm round (also in `verify_stale`).
         pub verify_stale_confirm: u64,
         /// Rounds that ended at their deadline with a target unanswered.
@@ -4386,7 +4388,7 @@ pub mod stale_peer_heal_observations {
                     Hold::NoProgress => obs.verify_not_forced_no_progress += 1,
                     Hold::Cap => obs.verify_not_forced_cap += 1,
                     Hold::Busy => obs.verify_not_forced_busy += 1,
-                    Hold::Bytes => obs.verify_not_forced_bytes += 1,
+                    Hold::Slot => obs.verify_not_forced_slot += 1,
                 }
             }
         }
@@ -4394,6 +4396,10 @@ pub mod stale_peer_heal_observations {
 
     pub(crate) fn record_verify_timeout(key: &ContractKey) {
         state().entry(*key).or_default().verify_rounds_timed_out += 1;
+    }
+
+    pub(crate) fn record_forced_delivered(key: &ContractKey) {
+        state().entry(*key).or_default().verify_forced_delivered += 1;
     }
 
     pub(crate) fn record_forced_leg(key: &ContractKey) {
