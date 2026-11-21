@@ -37,13 +37,21 @@
 //! - the node's single forced slot is free: at most ONE forced leg is pending
 //!   or in flight on this node at a time, whatever the contract or peer. The
 //!   slot is taken when the force is decided and released when the forced
-//!   stream's outcome is known, or when its mark expires unused.
+//!   stream's outcome is known, when its mark expires unused (`FORCE_TTL`),
+//!   or by the `SLOT_MAX_HOLD` backstop (30 min). Its real longest hold is
+//!   `FORCE_TTL` while pending plus the leg's stream completion wait in
+//!   flight: at least 270 s, and about 24 min for the largest state.
 //!
 //! The summary may have changed between the two rounds: other writers keep a
 //! shared contract moving, and what matters is that this node's state is still
 //! missing at the peer. The floor, the cooldown and the summary they compare
-//! against are armed only by a DELIVERED forced stream; a failed one, or a mark
-//! that is never consumed, arms nothing.
+//! against are armed by a DELIVERED forced stream. A failed one arms the floor
+//! only (no progress gate: nothing reached the peer), so the same pair cannot
+//! take the slot back at once; a mark that is never consumed arms nothing.
+//!
+//! A write during a check merges into it: the check carries on with its stale
+//! and held peers, and a fresh `First` round for the write starts only when the
+//! check would otherwise end, and not before the earliest held peer can clear.
 //!
 //! A hold by the floor, a busy pair, the slot or the pair cap retries the held
 //! peers only, at the earliest time any of them can clear, at most
@@ -52,7 +60,7 @@
 //!
 //! Bounds:
 //! - later writes never move a scheduled check; they set `rewritten`, which
-//!   starts one new check after this one ends;
+//!   starts one fresh `First` round when this check would end;
 //! - at most `MAX_TRACKED_CONTRACTS` checks; a write beyond that is not checked
 //!   (counted);
 //! - at most `MAX_PEERS_PER_CHECK` requests per round (a random start when
@@ -88,7 +96,9 @@
 //! - a request that the event channel refuses is counted and left to the
 //!   round's deadline, not retried;
 //! - a forced heal that the `Summaries` arm skips (emit budget, ban, no local
-//!   state) holds the slot until its mark expires (`FORCE_TTL`).
+//!   state) holds the slot until its mark expires (`FORCE_TTL`);
+//! - a failed forced stream with no later write is not re-checked: the pair
+//!   waits for the next write's check or for anti-entropy.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -135,6 +145,12 @@ pub(crate) const FORCE_COOLDOWN: Duration = Duration::from_secs(600);
 /// writes; under a persistent fault it is how late this node's updates may
 /// reach a peer.
 pub(crate) const FORCE_FLOOR: Duration = Duration::from_secs(60);
+/// The longest the forced slot is held, whatever happens: a pending mark is
+/// held at most `FORCE_TTL`, and an in-flight stream until its outcome, which
+/// the leg waits for at most `stream_completion_timeout` (at least 270 s, about
+/// 24 min for the largest state). This backstop frees it regardless, in case
+/// an outcome is never reported.
+pub(crate) const SLOT_MAX_HOLD: Duration = Duration::from_secs(30 * 60);
 /// Armed (contract, peer) pairs remembered for the floor and the cooldown.
 pub(crate) const MAX_FORCE_PAIRS: usize = 1024;
 /// Retry `Confirm` rounds one check may run after floor, busy, slot or cap
@@ -208,11 +224,15 @@ struct Slot {
     /// `Some(expiry)` while the mark waits for its leg; `None` once the leg
     /// took it and the stream is in flight (released by its outcome).
     mark_until: Option<Instant>,
+    /// When the force was decided: the `SLOT_MAX_HOLD` backstop runs from
+    /// here, and it tells this slot's outcome from a later slot's for the same
+    /// pair.
+    taken_at: Instant,
 }
 
 impl Slot {
     fn live(&self, now: Instant) -> bool {
-        self.mark_until.is_none_or(|until| until > now)
+        self.mark_until.is_none_or(|until| until > now) && now < self.taken_at + SLOT_MAX_HOLD
     }
 }
 
@@ -281,9 +301,10 @@ pub(crate) enum Verdict {
 #[derive(Default)]
 struct Inner {
     checks: HashMap<ContractKey, Check>,
-    /// Pairs a delivered forced stream armed: when, and the summary it was
-    /// decided on.
-    armed: HashMap<(ContractKey, PeerKey), (Instant, u64)>,
+    /// Pairs a forced stream armed: when it ended, and, if it was delivered,
+    /// the summary it was decided on. A failed stream arms the floor only
+    /// (`None`): no progress gate, since nothing reached the peer.
+    armed: HashMap<(ContractKey, PeerKey), (Instant, Option<u64>)>,
     /// The node's one forced leg, pending or in flight.
     slot: Option<Slot>,
 }
@@ -345,7 +366,10 @@ impl VerifySoon {
             Phase::Scheduled { due } => due,
             Phase::Sent { deadline } => deadline,
         });
-        let armed = inner.armed.values().map(|(at, _)| *at + FORCE_COOLDOWN);
+        let armed = inner
+            .armed
+            .values()
+            .map(|(at, hash)| armed_until(*at, *hash));
         let mark = inner.slot.as_ref().and_then(|s| s.mark_until);
         checks.chain(armed).chain(mark).min()
     }
@@ -394,15 +418,36 @@ impl VerifySoon {
     /// The round for `key` is being fired at `now` and asks `peers`. Called
     /// before the requests go out, so a fast reply finds the round `Sent`.
     pub(crate) fn record_sent(&self, key: &ContractKey, peers: Vec<PeerKey>, now: Instant) {
+        self.record_sent_leaving(key, peers, Vec::new(), now);
+    }
+
+    /// As [`Self::record_sent`], where `left_out` are eligible peers this
+    /// `Confirm` round could not ask (more than `MAX_PEERS_PER_CHECK`): they
+    /// stay stale and drive a retry rather than being dropped.
+    pub(crate) fn record_sent_leaving(
+        &self,
+        key: &ContractKey,
+        peers: Vec<PeerKey>,
+        left_out: Vec<PeerKey>,
+        now: Instant,
+    ) {
         let mut inner = self.inner.lock();
         let Some(check) = inner.checks.get_mut(key) else {
             return;
         };
         check.awaiting = peers.into_iter().collect();
         if check.round == Round::Confirm {
-            // A peer no longer asked (no longer a target) drives no retry.
+            // A peer neither asked nor left out is no longer a target, and
+            // drives no retry.
             let awaiting = &check.awaiting;
-            check.stale.retain(|peer, _| awaiting.contains(peer));
+            check
+                .stale
+                .retain(|peer, _| awaiting.contains(peer) || left_out.contains(peer));
+            for peer in &left_out {
+                if let Some(at) = check.stale.get_mut(peer) {
+                    at.get_or_insert(now);
+                }
+            }
         }
         check.phase = Phase::Sent {
             deadline: now + REPLY_TIMEOUT,
@@ -431,7 +476,6 @@ impl VerifySoon {
         now: Instant,
     ) -> Verdict {
         let mut inner = self.inner.lock();
-        prune(&mut inner, now);
         let Inner {
             checks,
             armed,
@@ -440,7 +484,10 @@ impl VerifySoon {
         let Some(check) = checks.get_mut(key) else {
             return Verdict::Ignored;
         };
-        if !matches!(check.phase, Phase::Sent { .. }) || !check.awaiting.remove(peer) {
+        let Phase::Sent { deadline } = check.phase else {
+            return Verdict::Ignored;
+        };
+        if !check.awaiting.remove(peer) {
             return Verdict::Ignored;
         }
         let verdict = match (check.round, stale) {
@@ -454,6 +501,9 @@ impl VerifySoon {
                 Verdict::Converged
             }
             (Round::Confirm, true) => {
+                // Pruned here, not on every comparison: only a stale confirm
+                // verdict reads the pairs and the slot.
+                prune_pairs(armed, slot, now);
                 let pair = (*key, peer.clone());
                 let previous = armed.get(&pair).copied();
                 // Hashed only here, for a stale confirm verdict.
@@ -462,7 +512,7 @@ impl VerifySoon {
                     (Verdict::Held(Hold::Evidence), None)
                 } else if let Some((at, _)) = previous.filter(|(at, _)| now < *at + FORCE_FLOOR) {
                     (Verdict::Held(Hold::Floor), Some(at + FORCE_FLOOR))
-                } else if previous.is_some_and(|(_, hash)| hash == their_hash) {
+                } else if previous.is_some_and(|(_, hash)| hash == Some(their_hash)) {
                     (Verdict::Held(Hold::NoProgress), None)
                 } else if previous.is_none() && armed.len() >= MAX_FORCE_PAIRS {
                     (Verdict::Held(Hold::Cap), Some(now))
@@ -476,6 +526,7 @@ impl VerifySoon {
                         peer: peer.clone(),
                         summary_hash: their_hash,
                         mark_until: Some(now + FORCE_TTL),
+                        taken_at: now,
                     });
                     (Verdict::Escalate, None)
                 };
@@ -490,19 +541,36 @@ impl VerifySoon {
                 verdict
             }
         };
-        if check.awaiting.is_empty() && !resolve(check, now) {
-            checks.remove(key);
+        // The driver sleeps until this round's deadline. A last reply that
+        // resolves the round early may schedule the next one sooner (a
+        // `CONFIRM_DELAY` shorter than `REPLY_TIMEOUT`); only then is it woken,
+        // so a reply leaves no permit otherwise.
+        let mut sooner = false;
+        if check.awaiting.is_empty() {
+            if resolve(check, now) {
+                sooner = matches!(check.phase, Phase::Scheduled { due } if due < deadline);
+            } else {
+                checks.remove(key);
+            }
         }
-        // No `wake.notify_one()`: a resolve only schedules a round at or after
-        // the deadline the driver already sleeps until.
+        drop(inner);
+        if sooner {
+            self.wake.notify_one();
+        }
         verdict
     }
 
     /// Consume the force mark for (`key`, `peer`), if the slot holds a live
     /// one for that pair: the forced leg is being built and the stream is now
     /// in flight. Its outcome must be reported with [`Self::forced_outcome`];
-    /// [`ForcedLeg`] does that on every path.
-    pub(crate) fn take_forced(&self, key: &ContractKey, peer: &PeerKey, now: Instant) -> bool {
+    /// [`ForcedLeg`] does that on every path. Returns the slot's identity for
+    /// that report, or `None` when there is no live mark for the pair.
+    pub(crate) fn take_forced(
+        &self,
+        key: &ContractKey,
+        peer: &PeerKey,
+        now: Instant,
+    ) -> Option<Instant> {
         let mut inner = self.inner.lock();
         match inner.slot.as_mut() {
             Some(slot)
@@ -511,33 +579,31 @@ impl VerifySoon {
                     && slot.mark_until.is_some_and(|until| until > now) =>
             {
                 slot.mark_until = None;
-                true
+                Some(slot.taken_at)
             }
-            _ => false,
+            _ => None,
         }
     }
 
-    /// The forced stream for (`key`, `peer`) ended: free the slot, and arm the
-    /// pair's floor and cooldown only if it was delivered.
-    pub(crate) fn forced_outcome(
-        &self,
-        key: &ContractKey,
-        peer: &PeerKey,
-        delivered: bool,
-        now: Instant,
-    ) {
+    /// The forced stream of the slot taken at `taken_at` ended: free the slot.
+    /// A delivered stream arms the pair's floor, cooldown and progress gate; a
+    /// failed one arms the floor only, so the same pair cannot take the slot
+    /// again at once. Returns whether a delivery was recorded.
+    pub(crate) fn forced_outcome(&self, taken_at: Instant, delivered: bool, now: Instant) -> bool {
         let mut inner = self.inner.lock();
         let Some(slot) = inner
             .slot
-            .take_if(|s| s.key == *key && s.peer == *peer && s.mark_until.is_none())
+            .take_if(|s| s.taken_at == taken_at && s.mark_until.is_none())
         else {
-            return;
+            return false;
         };
+        let hash = delivered.then_some(slot.summary_hash);
+        #[cfg(any(test, feature = "testing"))]
         if delivered {
-            inner
-                .armed
-                .insert((slot.key, slot.peer), (now, slot.summary_hash));
+            crate::node::stale_peer_heal_observations::record_forced_delivered(&slot.key);
         }
+        inner.armed.insert((slot.key, slot.peer), (now, hash));
+        delivered
     }
 
     /// Whether a live, unconsumed force mark exists for (`key`, `peer`).
@@ -565,9 +631,27 @@ impl VerifySoon {
 /// Forget pairs past their cooldown, and free the slot of a mark that expired
 /// before its leg took it.
 fn prune(inner: &mut Inner, now: Instant) {
-    inner.armed.retain(|_, (at, _)| *at + FORCE_COOLDOWN > now);
-    if inner.slot.as_ref().is_some_and(|s| !s.live(now)) {
-        inner.slot = None;
+    prune_pairs(&mut inner.armed, &mut inner.slot, now);
+}
+
+fn prune_pairs(
+    armed: &mut HashMap<(ContractKey, PeerKey), (Instant, Option<u64>)>,
+    slot: &mut Option<Slot>,
+    now: Instant,
+) {
+    armed.retain(|_, (at, hash)| armed_until(*at, *hash) > now);
+    if slot.as_ref().is_some_and(|s| !s.live(now)) {
+        *slot = None;
+    }
+}
+
+/// How long an armed pair matters: the cooldown after a delivered force, the
+/// floor after a failed one.
+fn armed_until(at: Instant, hash: Option<u64>) -> Instant {
+    at + if hash.is_some() {
+        FORCE_COOLDOWN
+    } else {
+        FORCE_FLOOR
     }
 }
 
@@ -607,14 +691,14 @@ impl RequestBucket {
 /// when there are more, so every target of a contract is asked with the same
 /// chance each round whatever other contracts do. Returns whether any were
 /// left out.
-fn select_targets<T>(mut candidates: Vec<T>) -> (Vec<T>, bool) {
+fn select_targets<T>(mut candidates: Vec<T>) -> (Vec<T>, Vec<T>) {
     if candidates.len() <= MAX_PEERS_PER_CHECK {
-        return (candidates, false);
+        return (candidates, Vec::new());
     }
     let len = candidates.len();
     candidates.rotate_left(crate::config::GlobalRng::random_range(0..len));
-    candidates.truncate(MAX_PEERS_PER_CHECK);
-    (candidates, true)
+    let left_out = candidates.split_off(MAX_PEERS_PER_CHECK);
+    (candidates, left_out)
 }
 
 /// Move a resolved round on. Returns `false` when the check has ended and
@@ -626,13 +710,19 @@ fn resolve(check: &mut Check, now: Instant) -> bool {
     }
     let earliest = check.stale.values().flatten().min().copied();
     let latest = check.stale.values().flatten().max().copied();
-    if check.rewritten {
-        // A write landed during this check: one fresh check for it, not
-        // before any held peer can clear.
+    // A write during the check merges into it: the check carries on with its
+    // stale and held peers, and only when it would end does a fresh `First`
+    // round start for the write, not before the earliest held peer can clear.
+    // Restarting at once would discard the stale peers, so under a stream of
+    // writes faster than `CHECK_DELAY` no `Confirm` round would ever run.
+    let end = |check: &mut Check| {
+        if !check.rewritten {
+            return false;
+        }
         let at = earliest.map_or(now + CHECK_DELAY, |t| t.max(now + CHECK_DELAY));
         *check = Check::scheduled(at);
-        return true;
-    }
+        true
+    };
     match check.round {
         Round::First if !check.stale.is_empty() => {
             check.round = Round::Confirm;
@@ -641,7 +731,7 @@ fn resolve(check: &mut Check, now: Instant) -> bool {
             };
             true
         }
-        Round::First => false,
+        Round::First => end(check),
         Round::Confirm => {
             let retry_at = if check.retries < MAX_RETRIES_PER_CHECK {
                 earliest
@@ -660,7 +750,7 @@ fn resolve(check: &mut Check, now: Instant) -> bool {
                     };
                     true
                 }
-                None => false,
+                None => end(check),
             }
         }
     }
@@ -791,12 +881,11 @@ pub(crate) fn on_summary_comparison(
 
 /// The targets one due round asks: current fan-out targets that can decode
 /// `SummaryRequest` (`supports_hash_first_summaries`), limited to the round's
-/// peers for `Confirm`, at most `MAX_PEERS_PER_CHECK`.
-fn round_targets(
-    op_manager: &crate::node::OpManager,
-    due: &DueRound,
-) -> Vec<(std::net::SocketAddr, PeerKey)> {
-    use super::propagation_stats::{PropagationEvent, record_propagation_event};
+/// peers for `Confirm`: at most `MAX_PEERS_PER_CHECK` to ask, and the eligible
+/// rest.
+type RoundTargets = (Vec<(std::net::SocketAddr, PeerKey)>, Vec<PeerKey>);
+
+fn round_targets(op_manager: &crate::node::OpManager, due: &DueRound) -> RoundTargets {
     let eligible: Vec<(std::net::SocketAddr, PeerKey)> = op_manager
         .get_broadcast_targets_update(
             &due.key,
@@ -817,32 +906,30 @@ fn round_targets(
                 .then_some((addr, peer))
         })
         .collect();
-    let (asked, truncated) = select_targets(eligible);
-    if truncated {
-        record_propagation_event(
-            op_manager,
-            due.key.id(),
-            PropagationEvent::VerifyPeersTruncated,
-        );
-    }
-    asked
+    let (asked, left_out) = select_targets(eligible);
+    (asked, left_out.into_iter().map(|(_, peer)| peer).collect())
 }
 
 /// Fire one due round: register it, then send its requests.
 fn fire_round(
     op_manager: &crate::node::OpManager,
     due: DueRound,
-    asked: Vec<(std::net::SocketAddr, PeerKey)>,
+    (asked, left_out): RoundTargets,
     now: Instant,
 ) {
     use super::propagation_stats::{PropagationEvent, record_propagation_event};
     use crate::message::{InterestMessage, NodeEvent};
 
     let DueRound { key, round, .. } = due;
+    // Counted when the round goes out, not each time a deferral re-plans it.
+    if !left_out.is_empty() {
+        record_propagation_event(op_manager, key.id(), PropagationEvent::VerifyPeersTruncated);
+    }
     // Register first: a reply can arrive before this function returns.
-    op_manager.verify_soon.record_sent(
+    op_manager.verify_soon.record_sent_leaving(
         &key,
         asked.iter().map(|(_, peer)| peer.clone()).collect(),
+        left_out,
         now,
     );
     let hash = crate::ring::interest::contract_hash(&key);
@@ -903,44 +990,48 @@ fn next_sleep(deferred: bool, next_wake: Option<Instant>, now: Instant) -> (Opti
 }
 
 /// The outcome reporter for one forced leg. Built when the leg takes its mark;
-/// [`ForcedLeg::delivered`] arms the pair, and dropping it on any other path
-/// (send refused, stream failed or timed out, the task dropped) only frees the
-/// slot. So the slot cannot outlive its leg.
-pub(crate) struct ForcedLeg {
+/// [`ForcedLeg::delivered`] reports a delivery, and dropping it unreported, on
+/// any other path (send refused, stream failed or timed out, the task dropped),
+/// reports a failure. Exactly one report, by construction: `delivered`
+/// consumes the reporter before `Drop` can run.
+pub(crate) struct ForcedLeg(Option<ForcedLegInner>);
+
+struct ForcedLegInner {
     verify: std::sync::Arc<VerifySoon>,
     time: crate::util::time_source::DynTimeSource,
-    key: ContractKey,
-    peer: PeerKey,
+    taken_at: Instant,
 }
 
 impl ForcedLeg {
     pub(crate) fn new(
         verify: std::sync::Arc<VerifySoon>,
         time: crate::util::time_source::DynTimeSource,
-        key: ContractKey,
-        peer: PeerKey,
+        taken_at: Instant,
     ) -> Self {
-        Self {
+        Self(Some(ForcedLegInner {
             verify,
             time,
-            key,
-            peer,
-        }
+            taken_at,
+        }))
     }
 
-    /// The forced stream was delivered.
-    pub(crate) fn delivered(self) {
-        let now = self.time.now();
-        self.verify.forced_outcome(&self.key, &self.peer, true, now);
-        // `Drop` then finds the slot already free.
+    /// The forced stream was delivered. Returns whether the delivery armed the
+    /// pair (`false` if the slot had already been freed, e.g. by the backstop).
+    pub(crate) fn delivered(mut self) -> bool {
+        let Some(leg) = self.0.take() else {
+            return false;
+        };
+        let now = leg.time.now();
+        leg.verify.forced_outcome(leg.taken_at, true, now)
     }
 }
 
 impl Drop for ForcedLeg {
     fn drop(&mut self) {
-        let now = self.time.now();
-        self.verify
-            .forced_outcome(&self.key, &self.peer, false, now);
+        if let Some(leg) = self.0.take() {
+            let now = leg.time.now();
+            leg.verify.forced_outcome(leg.taken_at, false, now);
+        }
     }
 }
 
@@ -979,9 +1070,9 @@ pub(crate) async fn run_verify_soon(ring: std::sync::Arc<crate::ring::Ring>) {
         let deferred = drain_due(
             due.rounds,
             |round| {
-                let asked = round_targets(&op_manager, round);
-                let needed = asked.len();
-                (asked, needed)
+                let targets = round_targets(&op_manager, round);
+                let needed = targets.0.len();
+                (targets, needed)
             },
             |needed| verify.try_take_tokens(needed, now),
             |round, asked| fire_round(&op_manager, round, asked, now),
@@ -1096,8 +1187,8 @@ mod tests {
     ) -> Instant {
         let (verdict, t2) = run_check(vs, k, p, t0, false, summary);
         assert_eq!(verdict, Verdict::Escalate);
-        assert!(vs.take_forced(&k, p, t2));
-        vs.forced_outcome(&k, p, delivered, t2);
+        let taken = vs.take_forced(&k, p, t2).expect("a live mark");
+        assert_eq!(vs.forced_outcome(taken, delivered, t2), delivered);
         t2
     }
 
@@ -1209,12 +1300,12 @@ mod tests {
             Verdict::Converged
         );
         assert_eq!(vs.tracked(), 0, "Confirm ends the check");
-        assert!(vs.take_forced(&key(1), &a, t2));
+        assert!(vs.take_forced(&key(1), &a, t2).is_some());
         assert!(
-            !vs.take_forced(&key(1), &a, t2),
+            vs.take_forced(&key(1), &a, t2).is_none(),
             "the mark is consumed once"
         );
-        assert!(!vs.take_forced(&key(1), &b, t2));
+        assert!(vs.take_forced(&key(1), &b, t2).is_none());
     }
 
     #[tokio::test]
@@ -1242,7 +1333,7 @@ mod tests {
             t2,
         );
         assert_eq!(verdict, Verdict::Held(Hold::Evidence));
-        assert!(!vs.take_forced(&key(1), &a, t2));
+        assert!(vs.take_forced(&key(1), &a, t2).is_none());
         assert!(
             !asked.get(),
             "the queue is not asked once the evidence fails"
@@ -1261,14 +1352,14 @@ mod tests {
         let (verdict, _) = run_check(&vs, key(2), &b, t0, false, &[0]);
         assert_eq!(verdict, Verdict::Held(Hold::Slot));
         // Still taken while the stream is in flight.
-        assert!(vs.take_forced(&key(1), &a, t2));
+        let taken = vs.take_forced(&key(1), &a, t2).expect("a live mark");
         let t3 = t2 + CONFIRM_DELAY;
         assert_eq!(
             answer_round(&vs, key(2), t3, &[(&b, false, &[0])]),
             vec![Verdict::Held(Hold::Slot)]
         );
         // Freed by the outcome; the held peer's retry then forces it.
-        vs.forced_outcome(&key(1), &a, true, t3);
+        vs.forced_outcome(taken, true, t3);
         let t4 = t3 + CONFIRM_DELAY;
         assert_eq!(
             answer_round(&vs, key(2), t4, &[(&b, false, &[0])]),
@@ -1281,13 +1372,16 @@ mod tests {
         // E.g. the forced heal was skipped by the emit budget or its event was
         // dropped: no leg was built.
         let vs = VerifySoon::new();
-        let (a, b) = (peer(), peer());
+        let a = peer();
         let t0 = Instant::now();
         let (verdict, t2) = run_check(&vs, key(1), &a, t0, false, &[7]);
         assert_eq!(verdict, Verdict::Escalate);
         assert_eq!(vs.next_wake(), Some(t2 + FORCE_TTL));
         let late = t2 + FORCE_TTL;
-        assert!(!vs.take_forced(&key(1), &a, late), "the mark expired");
+        assert!(
+            vs.take_forced(&key(1), &a, late).is_none(),
+            "the mark expired"
+        );
         vs.take_due(late);
         assert_eq!(vs.next_wake(), None, "slot free, nothing armed");
         // No floor and no progress gate: the same summary is forced again.
@@ -1295,21 +1389,25 @@ mod tests {
             run_check(&vs, key(1), &a, late, false, &[7]).0,
             Verdict::Escalate
         );
-        // And the slot was free for another pair in the meantime.
-        let _ = b;
     }
 
     #[tokio::test]
-    async fn a_failed_forced_stream_arms_nothing() {
+    async fn a_failed_forced_stream_arms_the_floor_only() {
         let vs = VerifySoon::new();
         let a = peer();
         let t0 = Instant::now();
-        let t2 = force_and_report(&vs, key(1), &a, t0, &[7], false);
-        assert_eq!(vs.next_wake(), None, "no cooldown armed");
+        let failed = force_and_report(&vs, key(1), &a, t0, &[7], false);
+        assert_eq!(vs.next_wake(), Some(failed + FORCE_FLOOR), "the floor only");
+        // Within the floor the pair cannot take the slot back.
+        let (verdict, _) = run_check(&vs, key(1), &a, failed, false, &[7]);
+        assert_eq!(verdict, Verdict::Held(Hold::Floor));
+        vs.inner.lock().checks.clear();
+        // Past it, the same summary is forced again: no progress gate, since
+        // nothing reached the peer.
+        let after = failed + FORCE_FLOOR;
         assert_eq!(
-            run_check(&vs, key(1), &a, t2 + Duration::from_secs(1), false, &[7]).0,
-            Verdict::Escalate,
-            "a failed force holds nothing: no floor, no progress gate"
+            run_check(&vs, key(1), &a, after, false, &[7]).0,
+            Verdict::Escalate
         );
     }
 
@@ -1460,17 +1558,33 @@ mod tests {
         // Dropped without delivery: slot freed, nothing armed.
         let (verdict, t2) = run_check(&vs, key(1), &a, t0, false, &[3]);
         assert_eq!(verdict, Verdict::Escalate);
-        assert!(vs.take_forced(&key(1), &a, t2));
-        drop(ForcedLeg::new(vs.clone(), time.clone(), key(1), a.clone()));
+        let taken = vs.take_forced(&key(1), &a, t2).expect("a live mark");
+        drop(ForcedLeg::new(vs.clone(), time.clone(), taken));
         assert!(vs.inner.lock().slot.is_none());
-        assert!(vs.inner.lock().armed.is_empty());
+        assert_eq!(
+            vs.inner
+                .lock()
+                .armed
+                .get(&(key(1), a.clone()))
+                .map(|(_, h)| *h),
+            Some(None),
+            "a failure arms the floor only"
+        );
+        vs.inner.lock().armed.clear();
         // Delivered: slot freed and the pair armed.
         let (verdict, t3) = run_check(&vs, key(1), &a, t2, false, &[3]);
         assert_eq!(verdict, Verdict::Escalate);
-        assert!(vs.take_forced(&key(1), &a, t3));
-        ForcedLeg::new(vs.clone(), time.clone(), key(1), a.clone()).delivered();
+        let taken = vs.take_forced(&key(1), &a, t3).expect("a live mark");
+        assert!(ForcedLeg::new(vs.clone(), time.clone(), taken).delivered());
         assert!(vs.inner.lock().slot.is_none());
-        assert!(vs.inner.lock().armed.contains_key(&(key(1), a.clone())));
+        assert!(
+            vs.inner
+                .lock()
+                .armed
+                .get(&(key(1), a.clone()))
+                .is_some_and(|(_, h)| h.is_some()),
+            "a delivery arms the progress gate too"
+        );
     }
 
     #[tokio::test]
@@ -1483,8 +1597,8 @@ mod tests {
         vs.note_originated(key(1), t1);
         let t2 = t1 + CHECK_DELAY;
         answer_round(&vs, key(1), t2, &[(&a, false, &[2])]);
-        // A write during the check, then a floor hold: the fresh check is not
-        // scheduled before the floor clears.
+        // A write during the check, then a floor hold: the check carries on
+        // with its held peer at the floor's end, as a Confirm.
         vs.note_originated(key(1), t2);
         let t3 = t2 + CONFIRM_DELAY;
         assert_eq!(
@@ -1492,6 +1606,85 @@ mod tests {
             vec![Verdict::Held(Hold::Floor)]
         );
         assert_eq!(vs.next_wake(), Some(sent + FORCE_FLOOR));
+        let due = vs.take_due(sent + FORCE_FLOOR).rounds;
+        assert_eq!(due[0].round, Round::Confirm);
+    }
+
+    #[tokio::test]
+    async fn a_write_merges_into_the_check_instead_of_restarting_it() {
+        let vs = VerifySoon::new();
+        let (a, b) = (peer(), peer());
+        let t0 = Instant::now();
+        vs.note_originated(key(1), t0);
+        let t1 = t0 + CHECK_DELAY;
+        vs.take_due(t1);
+        vs.record_sent(&key(1), vec![a.clone(), b.clone()], t1);
+        // Writes keep arriving while the round is out.
+        vs.note_originated(key(1), t1);
+        vs.on_comparison(&key(1), &a, true, true, &[0], idle, t1);
+        vs.on_comparison(&key(1), &b, false, true, &[0], idle, t1);
+        // The stale peer is confirmed, not forgotten by a restart.
+        let t2 = t1 + CONFIRM_DELAY;
+        let due = vs.take_due(t2).rounds;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].round, Round::Confirm);
+        assert_eq!(due[0].peers, vec![a.clone()]);
+        vs.record_sent(&key(1), vec![a.clone()], t2);
+        assert_eq!(
+            vs.on_comparison(&key(1), &a, true, true, &[0], idle, t2),
+            Verdict::Escalate
+        );
+        // Then the write gets its own First round over everyone.
+        assert_eq!(
+            vs.next_wake(),
+            Some(t2 + CHECK_DELAY).min(Some(t2 + FORCE_TTL))
+        );
+        let due = vs.take_due(t2 + CHECK_DELAY).rounds;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].round, Round::First);
+    }
+
+    #[tokio::test]
+    async fn the_slot_backstop_frees_a_stream_that_never_reports() {
+        let vs = VerifySoon::new();
+        let a = peer();
+        let t0 = Instant::now();
+        let (verdict, t2) = run_check(&vs, key(1), &a, t0, false, &[0]);
+        assert_eq!(verdict, Verdict::Escalate);
+        let stale_leg = vs.take_forced(&key(1), &a, t2).expect("a live mark");
+        // In flight, never reported: held until the backstop, no longer.
+        let late = t2 + SLOT_MAX_HOLD;
+        vs.take_due(late);
+        assert!(vs.inner.lock().slot.is_none(), "the backstop freed it");
+        // A later slot for the same pair is not freed by the old leg's late
+        // report.
+        let (verdict, t4) = run_check(&vs, key(1), &a, late, false, &[0]);
+        assert_eq!(verdict, Verdict::Escalate);
+        let fresh = vs.take_forced(&key(1), &a, t4).expect("a live mark");
+        assert!(!vs.forced_outcome(stale_leg, true, t4));
+        assert!(vs.inner.lock().slot.is_some(), "the fresh slot survives");
+        assert!(vs.forced_outcome(fresh, true, t4));
+    }
+
+    #[tokio::test]
+    async fn peers_a_confirm_round_could_not_ask_are_asked_next() {
+        let vs = VerifySoon::new();
+        let (a, b) = (peer(), peer());
+        let t0 = Instant::now();
+        vs.note_originated(key(1), t0);
+        let t1 = t0 + CHECK_DELAY;
+        answer_round(&vs, key(1), t1, &[(&a, false, &[0]), (&b, false, &[0])]);
+        let t2 = t1 + CONFIRM_DELAY;
+        vs.take_due(t2);
+        // Only a fits in this round; b is left out.
+        vs.record_sent_leaving(&key(1), vec![a.clone()], vec![b.clone()], t2);
+        assert_eq!(
+            vs.on_comparison(&key(1), &a, false, true, &[0], idle, t2),
+            Verdict::Converged
+        );
+        let due = vs.take_due(t2 + CONFIRM_DELAY).rounds;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].peers, vec![b.clone()], "b is asked, not dropped");
     }
 
     #[tokio::test]
@@ -1548,14 +1741,14 @@ mod tests {
         let all: Vec<usize> = (0..MAX_PEERS_PER_CHECK + 8).collect();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..50 {
-            let (asked, truncated) = select_targets(all.clone());
-            assert!(truncated);
+            let (asked, left_out) = select_targets(all.clone());
+            assert_eq!(asked.len() + left_out.len(), all.len());
             assert_eq!(asked.len(), MAX_PEERS_PER_CHECK);
             seen.extend(asked);
         }
         assert_eq!(seen.len(), all.len(), "no target is left out for good");
         let few: Vec<usize> = (0..3).collect();
-        assert_eq!(select_targets(few.clone()), (few, false));
+        assert_eq!(select_targets(few.clone()), (few, Vec::new()));
     }
 
     #[tokio::test]
@@ -1654,7 +1847,7 @@ mod tests {
         let src = include_str!("verify_soon.rs");
         let body = fn_body(src, "\nfn fire_round(");
         let registered = body
-            .find(".record_sent(")
+            .find(".record_sent_leaving(")
             .expect("fire_round registers the round");
         let sent = body
             .find("try_notify_node_event(")
@@ -1673,15 +1866,19 @@ mod tests {
             .find(".take_forced(&key, &peer_key")
             .expect("the leg consults the force mark");
         let bind = body
-            .find("let forced_full =")
-            .expect("the forced_full binding");
-        let bound_to: String = body[bind + "let forced_full =".len()..take]
+            .find("let forced_slot =")
+            .expect("the forced_slot binding");
+        let bound_to: String = body[bind + "let forced_slot =".len()..take]
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
         assert_eq!(
             bound_to, "op_manager.verify_soon",
-            "forced_full is exactly the force mark, nothing else"
+            "forced_slot is exactly the force mark, nothing else"
+        );
+        assert!(
+            body.contains("let forced_full = forced_slot.is_some();"),
+            "forced_full is exactly whether the mark was taken"
         );
         let skip = body
             .find("fanout_send_needed(")
