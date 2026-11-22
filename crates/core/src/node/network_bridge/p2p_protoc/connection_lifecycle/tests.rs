@@ -5101,6 +5101,222 @@ async fn a_held_native_connection_that_closes_leaves_the_udp_entry() {
     assert_eq!(PairState::of(&h, addr), pair, "the peer is still connected");
 }
 
+/// A native connection whose `recv` ends, with a chosen [`CloseReason`], when
+/// told to: what a real `NativePeerConnection` does when quinn ends its path
+/// (the idle timeout, the peer's close, a loss), which
+/// `transport::peer_connection::native_connection::tests` pins against a
+/// real QUIC connection. The node's real `peer_connection_listener` runs over
+/// it, so what these tests cover is the node's side of a dead native
+/// connection (gate 21).
+struct DyingNative {
+    inner: IdleConnection,
+    end: tokio::sync::oneshot::Receiver<crate::transport::boundary::CloseReason>,
+    reason: Option<crate::transport::boundary::CloseReason>,
+}
+
+impl DyingNative {
+    fn new(
+        addr: SocketAddr,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Sender<crate::transport::boundary::CloseReason>,
+    ) {
+        let (kill, end) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                inner: IdleConnection::new(addr),
+                end,
+                reason: None,
+            },
+            kill,
+        )
+    }
+}
+
+impl PeerConnectionApi for DyingNative {
+    fn remote_addr(&self) -> SocketAddr {
+        self.inner.remote_addr()
+    }
+
+    fn remote_version(&self) -> Option<(u8, u8, u16)> {
+        None
+    }
+
+    fn close_reason(&self) -> Option<crate::transport::boundary::CloseReason> {
+        self.reason
+    }
+
+    fn send_bytes(
+        &mut self,
+        data: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+        self.inner.send_bytes(data)
+    }
+
+    fn recv(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+        let addr = self.inner.addr;
+        Box::pin(async move {
+            // Cancel-safe: the receiver is polled in place, never consumed.
+            let reason = (&mut self.end).await;
+            self.reason = reason.ok();
+            Err(TransportError::ConnectionClosed(addr))
+        })
+    }
+
+    fn set_inbound_stream_registry(
+        &mut self,
+        registry: Arc<dyn crate::transport::InboundStreamRegistry>,
+    ) {
+        self.inner.set_inbound_stream_registry(registry);
+    }
+
+    fn set_peer_identity(&mut self, key: TransportPublicKey) {
+        self.inner.set_peer_identity(key);
+    }
+
+    fn send_stream_data(
+        &mut self,
+        stream_id: StreamId,
+        data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>>,
+        progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+        self.inner
+            .send_stream_data(stream_id, data, metadata, completion_tx, progress)
+    }
+
+    fn pipe_stream_data(
+        &mut self,
+        outbound_stream_id: StreamId,
+        inbound_handle: crate::transport::IncomingStream,
+        metadata: Option<bytes::Bytes>,
+        progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+        self.inner
+            .pipe_stream_data(outbound_stream_id, inbound_handle, metadata, progress)
+    }
+}
+
+/// Every way a native path can end, as `recv` reports it.
+fn native_end_reasons() -> Vec<crate::transport::boundary::CloseReason> {
+    use crate::transport::boundary::{CloseReason, QuicPathEnd};
+    vec![
+        CloseReason::IdleTimeout,
+        CloseReason::QuicPath(QuicPathEnd::ClosedByPeer),
+        CloseReason::QuicPath(QuicPathEnd::ClosedLocally),
+        CloseReason::QuicPath(QuicPathEnd::Lost),
+        CloseReason::QuicPath(QuicPathEnd::NotAcknowledging),
+        CloseReason::QuicPath(QuicPathEnd::Stalled),
+    ]
+}
+
+/// Delivers the next `TransportClosed` the connections' listeners report.
+async fn next_transport_closed(h: &mut Harness) -> ConnEvent {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match h._conn_events_rx.recv().await {
+                Some(event @ ConnEvent::TransportClosed { .. }) => return event,
+                Some(_) => continue,
+                None => panic!("the listeners' event channel closed"),
+            }
+        }
+    })
+    .await
+    .expect("the listener reported the dead native connection")
+}
+
+/// Gate 21: a native connection whose path ends, for any reason, leaves no
+/// entry at this end. The listener reports the end, the entry is removed, the
+/// peer is pruned from the ring and every map keyed by it is cleaned. Both
+/// ends of a native connection are built by one path (`OutboundEstablished`
+/// with a native transport, whichever end dialled), so this is each end.
+#[tokio::test]
+async fn a_native_connection_that_dies_leaves_no_entry() {
+    let mut h = Harness::new("native-dies").await;
+    for (i, reason) in native_end_reasons().into_iter().enumerate() {
+        let addr: SocketAddr = format!("203.0.113.233:{}", 6540 + i).parse().unwrap();
+        let peer = PeerKeyLocation::new(key(), addr);
+        let (conn, kill) = DyingNative::new(addr);
+        h.handshake_event(HandshakeEvent::OutboundEstablished {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: peer.clone(),
+            connection: Box::new(conn),
+            transient: false,
+            transport: crate::operations::connect::native::DialTransport::native_now(),
+            origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
+        })
+        .await;
+        h.prove_native(addr);
+        let case = format!("{reason:?}");
+        assert!(h.mgr.connections[&addr].native, "{case}: premise");
+        assert_eq!(
+            h.ring_key_at(addr).as_ref(),
+            Some(peer.pub_key()),
+            "{case}: premise, in the ring"
+        );
+
+        kill.send(reason).expect("the connection is listening");
+        let closed = next_transport_closed(&mut h).await;
+        h.mgr
+            .handle_transport_event(Some(closed), &mut h.state, &h.handshake)
+            .await
+            .expect("handle_transport_event");
+
+        assert!(!h.mgr.connections.contains_key(&addr), "{case}: entry");
+        assert!(h.mgr.held_native.is_empty(), "{case}: nothing held");
+        assert!(
+            !h.mgr.addr_by_pub_key.contains_key(peer.pub_key()),
+            "{case}: key map"
+        );
+        assert_eq!(h.ring_key_at(addr), None, "{case}: pruned from the ring");
+        assert!(
+            !h.mgr
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .has_connection_or_pending(addr),
+            "{case}: no connection or reservation"
+        );
+        h.assert_open_transports_match();
+    }
+}
+
+/// Gate 21: a native connection held beside the UDP entry whose path dies is
+/// forgotten, by its own listener's report, and the UDP entry stays.
+#[tokio::test]
+async fn a_held_native_connection_that_dies_is_forgotten() {
+    let mut h = Harness::new("native-held-dies").await;
+    let addr: SocketAddr = "203.0.113.233:6560".parse().unwrap();
+    let peer = PeerKeyLocation::new(key(), addr);
+    h.handshake_event(Arrival::OutboundUdp.event(&peer, false))
+        .await;
+    let udp_id = h.mgr.connections[&addr].connection_id;
+    let (conn, kill) = DyingNative::new(addr);
+    h.handshake_event(HandshakeEvent::OutboundEstablished {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: peer.clone(),
+        connection: Box::new(conn),
+        transient: false,
+        transport: crate::operations::connect::native::DialTransport::native_now(),
+        origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
+    })
+    .await;
+    assert!(h.mgr.held_native.contains_key(&addr), "premise: held");
+    kill.send(crate::transport::boundary::CloseReason::IdleTimeout)
+        .expect("the connection is listening");
+    let closed = next_transport_closed(&mut h).await;
+    h.mgr
+        .handle_transport_event(Some(closed), &mut h.state, &h.handshake)
+        .await
+        .expect("handle_transport_event");
+    assert!(h.mgr.held_native.is_empty(), "forgotten");
+    assert_eq!(h.mgr.connections[&addr].connection_id, udp_id);
+}
+
 /// A frame reported by a connection that is neither the entry nor the held
 /// one (a replaced connection's listener) changes nothing, and a held
 /// native connection is dropped once its UDP entry is removed, whatever the
