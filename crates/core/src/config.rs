@@ -3632,7 +3632,7 @@ pub struct WebsocketApiArgs {
 
     /// Per-user operation burst capacity for hosted mode: how many operations an
     /// idle user can issue back to back before being throttled to
-    /// `--per-user-op-rate-limit`. Default: 100. Only meaningful when operation
+    /// `--per-user-op-rate-limit`. Default: 500. Only meaningful when operation
     /// rate limiting is on.
     // Internal: #4561.
     #[arg(long = "per-user-op-burst", env = "PER_USER_OP_BURST")]
@@ -4002,7 +4002,7 @@ pub struct WebsocketApiConfig {
 
     /// Per-user operation burst capacity for hosted mode (#4561). Max ops a
     /// previously-idle user may issue back-to-back before being throttled to
-    /// the sustained rate. Default 100.
+    /// the sustained rate. Default 500.
     #[serde(default = "default_per_user_op_burst", rename = "per-user-op-burst")]
     pub per_user_op_burst: u64,
 
