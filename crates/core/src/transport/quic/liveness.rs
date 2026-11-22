@@ -493,11 +493,10 @@ pub(crate) async fn watch_endpoint_driver(
 }
 
 /// Run one of quinn's connection drivers and report a panic in it to
-/// `health`. The panic poisons that connection's state lock, so its watcher's
-/// `closed()` would never resolve and its permit and key hold would stay;
-/// reporting it turns the endpoint Down, and every connection's watcher then
-/// closes its connection locally (traffic falls back to UDP, as after an
-/// adapter panic). A driver that returns normally needs nothing here.
+/// `health` as an endpoint death (module docs). Without this the tokio task
+/// would swallow the panic and the endpoint would stay `Up` with that
+/// connection wedged on its poisoned state lock. A driver that returns
+/// normally needs nothing here.
 pub(crate) async fn watch_connection_driver(
     driver: Pin<Box<dyn Future<Output = ()> + Send>>,
     health: Arc<EndpointHealth>,

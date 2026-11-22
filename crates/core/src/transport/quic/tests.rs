@@ -4103,6 +4103,59 @@ fn a_panic_unwinding_through_the_endpoint_driver_is_contained() {
     );
 }
 
+/// After a panic in quinn's endpoint driver the monitored accept loop
+/// stops (parks) instead of polling quinn's `accept`, which unwraps the
+/// poisoned lock and would panic the loop, a node failure that would race the
+/// supervised `QuicEndpointDown` exit. `EndpointDriver::drop` wakes the
+/// loop's pending `accept` during the unwind, so when the loop next runs both
+/// its branches are ready; the loop's `select` must take the availability
+/// first. tokio's unbiased `select` picks a branch at random, so several
+/// endpoints are tried: an unbiased loop survives all eight with odds 1 in
+/// 256.
+#[test]
+fn the_accept_loop_stops_without_polling_quinn_after_a_driver_panic() {
+    in_child(
+        "the_accept_loop_stops_without_polling_quinn_after_a_driver_panic",
+        || {
+            bounded(|| async move {
+                use crate::node::background_task_monitor::BackgroundTaskMonitor;
+                let _seed = GlobalRng::seed_guard(SEED);
+                for round in 0..8 {
+                    let net = crate::transport::test_net::subnet();
+                    let pair = pair("quic-panic-accept-loop", net.addr(1), net.addr(2), None).await;
+                    let monitor = BackgroundTaskMonitor::new();
+                    let (attempts, _attempts_rx) = tokio::sync::mpsc::channel(4);
+                    assert!(
+                        pair.a
+                            .spawn_accept_loop(&monitor.late_registrar(), attempts)
+                    );
+                    let wait = monitor.wait_for_any_exit();
+                    let wait = tokio::spawn(async move { wait.await });
+                    // Let the loop reach quinn's `accept` and park on it.
+                    for _ in 0..16 {
+                        tokio::task::yield_now().await;
+                    }
+                    pair.a.faults().panic_receive_in_quinn();
+                    let mut availability = pair.a.availability();
+                    let state = drive(&pair.time, Duration::from_secs(1), async move {
+                        availability.not_up().await
+                    })
+                    .await;
+                    assert_eq!(state, QuicAvailability::Down, "round {round}");
+                    for _ in 0..16 {
+                        tokio::task::yield_now().await;
+                    }
+                    assert!(
+                        !wait.is_finished(),
+                        "round {round}: the accept loop ended (panicked on quinn's poisoned lock)"
+                    );
+                    wait.abort();
+                }
+            });
+        },
+    );
+}
+
 /// A panic that unwinds through one of quinn's CONNECTION drivers (as one
 /// in quinn's own code would) is an endpoint death: caught by
 /// `watch_connection_driver`, the endpoint turns Down, which on a supervised
