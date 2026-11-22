@@ -3417,7 +3417,9 @@ async fn fail_awaiting_connection_callbacks(state: &mut EventListenerState, addr
     }
     state.awaiting_connection_txs.remove(&addr);
     // A UDP dial queued beside a native one for this address is a waiter
-    // too: the budget has closed the address it was to connect.
+    // too: the budget has closed the address it was to connect. An inbound
+    // native eviction thus fails our pending outbound's UDP waiters, as it
+    // already does for `awaiting_connection`.
     fail_udp_beside_native(state, addr).await;
 }
 

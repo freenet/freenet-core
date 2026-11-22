@@ -5832,6 +5832,32 @@ async fn a_budget_close_fails_the_waiters_for_its_address() {
     assert!(!h.state.udp_beside_native.contains_key(&remote));
 }
 
+/// The refused arrival's own address: with the budget spent and no victim to
+/// evict, the arrival is dropped and the UDP dials queued beside a native one
+/// for its address are failed, not left to their timeout.
+#[tokio::test]
+async fn a_refused_arrival_fails_its_udp_beside_native_callbacks() {
+    let mut h = non_gateway_with_budget("transient-refused-fails-beside", 2).await;
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    for port in [7411, 7412] {
+        assert!(cm.try_register_transient(SocketAddr::from(([198, 51, 100, 247], port)), None));
+    }
+    let addr = SocketAddr::from(([198, 51, 100, 248], 7413));
+    let (callback, mut waiter) = mpsc::channel::<crate::message::ConnectResult>(1);
+    h.state
+        .udp_beside_native
+        .entry(addr)
+        .or_default()
+        .push((Transaction::new::<ConnectMsg>(), Box::new(callback)));
+    unexpected_inbound(&mut h, addr).await;
+    assert!(!h.mgr.connections.contains_key(&addr), "premise: refused");
+    assert!(
+        matches!(waiter.try_recv(), Ok(Err(_))),
+        "the beside waiter is told"
+    );
+    assert!(!h.state.udp_beside_native.contains_key(&addr));
+}
+
 /// (b) The same when the entry is closed because a promotion was refused at
 /// the cap and no slot can be had for it: the held native connection goes
 /// with it.
