@@ -1578,6 +1578,7 @@ impl P2pConnManager {
                 ledbat_min_ssthresh: self.ledbat_min_ssthresh,
                 congestion_config: Some(self.congestion_config.clone()),
                 ack_version_floor_override: self.ack_version_floor_override,
+                legacy_responder_override: None,
                 quic: self.quic.settings.clone(),
                 quic_policy: Some(self.quic_policy),
                 advertised_version_override: self.advertised_version_override,

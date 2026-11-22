@@ -170,6 +170,7 @@ async fn udp_transport_config_reaches_the_listener_by_name() {
             ledbat_min_ssthresh: Some(2_222),
             congestion_config: None,
             ack_version_floor_override: Some((9, 8, 7)),
+            legacy_responder_override: None,
             quic: None,
             quic_policy: None,
             advertised_version_override: Some((0, 2, 148)),
