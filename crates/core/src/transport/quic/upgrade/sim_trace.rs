@@ -59,6 +59,9 @@ struct TraceData {
     /// Nodes that rebuild their QUIC endpoint when it dies
     /// ([`QuicUpgradeTrace::rebuild_endpoint`]).
     rebuild: Mutex<BTreeSet<SocketAddr>>,
+    /// Nodes treated as exiting for their supervisor when their endpoint
+    /// dies ([`QuicUpgradeTrace::supervise`]).
+    supervised: Mutex<BTreeSet<SocketAddr>>,
 }
 
 /// A network's upgrade records. Clones share them.
@@ -179,6 +182,13 @@ impl QuicUpgradeTrace {
         self.data.rebuild.lock().insert(node);
     }
 
+    /// `node` counts as exiting for its supervisor when its endpoint dies, as
+    /// a node run with `FREENET_SUPERVISED` does, for the decision whether it
+    /// rebuilds the endpoint (`quic::rebuild::enabled_at`): it never does.
+    pub fn supervise(&self, node: SocketAddr) {
+        self.data.supervised.lock().insert(node);
+    }
+
     pub(crate) fn node(&self, addr: SocketAddr) -> NodeTrace {
         NodeTrace {
             trace: self.clone(),
@@ -282,6 +292,11 @@ impl NodeTrace {
     /// Whether this node rebuilds its endpoint ([`QuicUpgradeTrace::rebuild_endpoint`]).
     pub(crate) fn rebuilds_endpoint(&self) -> bool {
         self.trace.data.rebuild.lock().contains(&self.addr)
+    }
+
+    /// Whether this node counts as supervised ([`QuicUpgradeTrace::supervise`]).
+    pub(crate) fn supervised(&self) -> bool {
+        self.trace.data.supervised.lock().contains(&self.addr)
     }
 
     pub(crate) fn register_permits(&self, permits: QuicPathPermits) {

@@ -83,7 +83,6 @@ use super::machine::{
 };
 use super::policy::{QuicPathPermits, QuicPolicy};
 use crate::config::{GlobalExecutor, GlobalRng};
-use crate::node::background_task_monitor::LateRegistrar;
 use crate::simulation::{RealTime, TimeSource, VirtualTime};
 use crate::transport::boundary::QuicPathEnd;
 use crate::transport::crypto::TransportPublicKey;

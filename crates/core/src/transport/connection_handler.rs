@@ -470,16 +470,19 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     );
     // What a node that rebuilds its endpoint when it dies (`quic::rebuild`)
     // builds in place of the dead one: the same build, on this socket.
-    let rebuild_endpoint = quic_endpoint.as_ref().and(quic_settings.clone()).map(|settings| {
-        endpoint_rebuilder(
-            socket.clone(),
-            bind_addr,
-            keypair.clone(),
-            is_gateway,
-            settings,
-            quic_virtual_time.clone(),
-        )
-    });
+    let rebuild_endpoint = quic_endpoint
+        .as_ref()
+        .and(quic_settings.clone())
+        .map(|settings| {
+            endpoint_rebuilder(
+                socket.clone(),
+                bind_addr,
+                keypair.clone(),
+                is_gateway,
+                settings,
+                quic_virtual_time.clone(),
+            )
+        });
 
     // Test builds only: kill the endpoint after the delay this variable
     // names, through a caught socket adapter panic, so a real-process test can
@@ -679,13 +682,15 @@ struct StackInputs {
 }
 
 /// Start the task that rebuilds the endpoint whenever it dies
-/// (`quic::rebuild::run`), registered with the node's monitor. Each rebuild
+/// (`quic::rebuild::run`), registered with the node's monitor, handing it
+/// `first_tasks`, those serving the first endpoint. Each rebuild
 /// builds an endpoint with `factory`, starts its stack, points `site` at
 /// its upgrades and swaps it into `slot`, dropping the dead stack. The task
 /// holds `slot` weakly and stops when `stop` resolves (the listener holds
 /// its sender), then drops everything it holds and parks, as the accept
 /// loop does, since the monitor reads any end as a failure. It ends only
-/// when a task of a rebuilt stack ends, which the monitor then reports.
+/// when a task serving the endpoint ends while the endpoint stays up, which
+/// the monitor then reports.
 #[allow(clippy::too_many_arguments)]
 fn spawn_endpoint_rebuild(
     registrar: &crate::node::background_task_monitor::LateRegistrar,
@@ -693,6 +698,7 @@ fn spawn_endpoint_rebuild(
     slot: std::sync::Weak<parking_lot::Mutex<Option<QuicStack>>>,
     site: super::quic::upgrade::driver::UpgradeSite,
     first: super::quic::QuicAvailabilityWatch,
+    first_tasks: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
     node: tokio::sync::watch::Sender<super::quic::QuicAvailability>,
     stop: oneshot::Receiver<()>,
     inputs: StackInputs,
@@ -718,9 +724,11 @@ fn spawn_endpoint_rebuild(
         let mut tasks = Vec::new();
         let stack = start_quic_stack(
             endpoint,
-            Some(&mut |name: &'static str, handle: tokio::task::JoinHandle<()>| {
-                tasks.push((name, handle))
-            }),
+            Some(
+                &mut |name: &'static str, handle: tokio::task::JoinHandle<()>| {
+                    tasks.push((name, handle))
+                },
+            ),
             inputs.policy,
             permits,
             inputs.local_key.clone(),
@@ -747,7 +755,16 @@ fn spawn_endpoint_rebuild(
     let handle = GlobalExecutor::spawn(async move {
         // A `let`, so the loop's future, and the socket its factory holds,
         // are dropped before the park below.
-        let end = rebuild::run(clock, first, node, rebuild, rebuild::jitter_sample, stop).await;
+        let end = rebuild::run(
+            clock,
+            first,
+            first_tasks,
+            node,
+            rebuild,
+            rebuild::jitter_sample,
+            stop,
+        )
+        .await;
         match end {
             RebuildEnd::Stopped => {
                 tracing::debug!("QUIC endpoint rebuild stopped; parking");
@@ -930,7 +947,7 @@ pub(crate) struct GatewayQuicRestartWatch {
 /// when its supervisor is unverified and an ERROR when its QUIC stays off
 /// until it restarts. The endpoint is watched when it is up, and when it is
 /// already down at open (a death between the bind and here).
-fn gateway_quic_restart(
+pub(in crate::transport) fn gateway_quic_restart(
     is_gateway: bool,
     enabled: bool,
     unverified: bool,
@@ -1255,21 +1272,47 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         let local_key = keypair.public().clone();
         let native_rate =
             super::quic::config::QuicRateLimit::new(bandwidth_limit, global_bandwidth.clone());
-        // The endpoint's accept loop and router are registered with the
-        // node's monitor (`start_quic_stack`).
-        let mut register_with_monitor = task_registrar
-            .clone()
-            .map(|registrar| {
-                move |name: &'static str, handle: tokio::task::JoinHandle<()>| {
-                    registrar.register(name, handle)
-                }
+        // A node that does not exit for its supervisor when its endpoint dies
+        // rebuilds it in process, when that is on (`quic::rebuild`; dark).
+        // Its connector and the node then read the node's own view of the
+        // endpoint, which goes `Up` again after a rebuild; every other node
+        // reads the endpoint's own availability, as before.
+        let rebuild = rebuild_endpoint
+            .zip(task_registrar.as_ref())
+            .filter(|_| endpoint_availability.get() != super::quic::QuicAvailability::Disabled)
+            .filter(|_| {
+                super::quic::rebuild::enabled_at(
+                    super::quic::liveness::gateway_quic_restarts(is_gateway),
+                    socket_addr,
+                )
             });
+        // The endpoint's accept loop and router are registered with the
+        // node's monitor (`start_quic_stack`), or, on a node that rebuilds
+        // its endpoint, handed to the rebuild loop, which owns them as it
+        // owns a rebuilt endpoint's: one that ends as the endpoint dies (a
+        // quinn driver panic poisons quinn's lock for every task that still
+        // reaches it, #6184) is that death, which the loop repairs, not a
+        // failure that ends the node.
+        let mut first_tasks = Vec::new();
+        let mut keep_for_rebuild = |name: &'static str, handle: tokio::task::JoinHandle<()>| {
+            first_tasks.push((name, handle))
+        };
+        let mut register_with_monitor = task_registrar.clone().map(|registrar| {
+            move |name: &'static str, handle: tokio::task::JoinHandle<()>| {
+                registrar.register(name, handle)
+            }
+        });
+        let register: Option<RegisterTask<'_>> = if rebuild.is_some() {
+            Some(&mut keep_for_rebuild)
+        } else {
+            register_with_monitor
+                .as_mut()
+                .map(|register| register as RegisterTask<'_>)
+        };
         let quic_stack = quic_endpoint.map(|endpoint| {
             start_quic_stack(
                 endpoint,
-                register_with_monitor
-                    .as_mut()
-                    .map(|register| register as RegisterTask<'_>),
+                register,
                 quic_policy,
                 None,
                 local_key.clone(),
@@ -1285,20 +1328,6 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             socket_addr,
         );
         let quic_stack: QuicStackSlot = Arc::new(parking_lot::Mutex::new(quic_stack));
-        // A node that does not exit for its supervisor when its endpoint dies
-        // rebuilds it in process, when that is on (`quic::rebuild`; dark).
-        // Its connector and the node then read the node's own view of the
-        // endpoint, which goes `Up` again after a rebuild; every other node
-        // reads the endpoint's own availability, as before.
-        let rebuild = rebuild_endpoint
-            .zip(task_registrar.as_ref())
-            .filter(|_| endpoint_availability.get() != super::quic::QuicAvailability::Disabled)
-            .filter(|_| {
-                super::quic::rebuild::enabled_at(
-                    super::quic::liveness::gateway_quic_restarts(is_gateway),
-                    socket_addr,
-                )
-            });
         let (quic_availability, quic_rebuild_stop) = match rebuild {
             Some((factory, registrar)) => {
                 let (node, availability) =
@@ -1310,6 +1339,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
                     Arc::downgrade(&quic_stack),
                     upgrade_site.clone(),
                     endpoint_availability,
+                    first_tasks,
                     node,
                     stopped,
                     StackInputs {

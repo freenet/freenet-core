@@ -13,10 +13,10 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use dashmap::DashMap;

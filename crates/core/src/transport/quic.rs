@@ -513,6 +513,13 @@ impl EndpointCore {
 }
 
 impl QuicEndpoint {
+    /// Whether `other` is a handle on this same endpoint, not one built in
+    /// place of it (`rebuild`).
+    #[cfg(test)]
+    pub(crate) fn same_endpoint(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.owner, &other.owner)
+    }
+
     /// Build an endpoint over `socket`, which must be the socket the
     /// listener reads (it fills the QUIC ingress queue), bound at
     /// `local_addr`, authenticating as the holder of `keypair`.
@@ -677,28 +684,28 @@ impl QuicEndpoint {
         // If quinn refuses the socket after the ingress is enabled, the
         // ingress is disabled again, so the node is left as with QUIC off.
         let build = |ingress| {
-                let quic_socket = Arc::new(socket::QuicSocket::new(
-                    socket.clone(),
-                    ingress,
-                    local_addr,
-                    health.clone(),
-                ));
-                cap_holds = Some(quic_socket.cap_holds());
-                #[cfg(any(test, feature = "testing"))]
-                {
-                    faults = Some(quic_socket.faults());
-                }
-                let runtime = Arc::new(runtime::QuicRuntime::new(time, health.clone()));
-                // The server configuration is set so quinn hands every
-                // Initial from an allowed source to `accept` (without one it
-                // answers with a stateless reset); its TLS refuses every
-                // client, and `accept` replaces it per attempt.
-                quinn::Endpoint::new_with_abstract_socket(
-                    endpoint_config,
-                    Some((*server).clone()),
-                    quic_socket,
-                    runtime,
-                )
+            let quic_socket = Arc::new(socket::QuicSocket::new(
+                socket.clone(),
+                ingress,
+                local_addr,
+                health.clone(),
+            ));
+            cap_holds = Some(quic_socket.cap_holds());
+            #[cfg(any(test, feature = "testing"))]
+            {
+                faults = Some(quic_socket.faults());
+            }
+            let runtime = Arc::new(runtime::QuicRuntime::new(time, health.clone()));
+            // The server configuration is set so quinn hands every
+            // Initial from an allowed source to `accept` (without one it
+            // answers with a stateless reset); its TLS refuses every
+            // client, and `accept` replaces it per attempt.
+            quinn::Endpoint::new_with_abstract_socket(
+                endpoint_config,
+                Some((*server).clone()),
+                quic_socket,
+                runtime,
+            )
         };
         let endpoint = match ingress_mode {
             Ingress::Enable => socket.with_quic_ingress(build).ok_or_else(|| {
@@ -867,7 +874,10 @@ impl QuicEndpoint {
         registrar: &LateRegistrar,
         attempts: mpsc::Sender<EndpointAttempt>,
     ) -> bool {
-        self.spawn_accept_loop_with(&mut |name, handle| registrar.register(name, handle), attempts)
+        self.spawn_accept_loop_with(
+            &mut |name, handle| registrar.register(name, handle),
+            attempts,
+        )
     }
 
     /// [`Self::spawn_accept_loop`], handing the loop's task to `register`:

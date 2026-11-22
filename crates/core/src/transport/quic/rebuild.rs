@@ -22,6 +22,12 @@
 //!   upgraded, use the new endpoint; connections opened on the dead one were
 //!   already closed locally by their watchers when it went `Down`, and the
 //!   dead endpoint, its upgrades and their tasks are dropped by the swap.
+//! - It owns the tasks serving the endpoint, the first one's included,
+//!   rather than the node's task monitor: after a quinn driver panic, a task
+//!   that still reaches quinn's poisoned lock panics as the endpoint dies
+//!   (#6184), and on this node that is the death to repair, not a failure
+//!   that ends the node. A task that ends while the endpoint stays up
+//!   ([`TASK_END_DEATH_WAIT`]) still ends the node.
 //! - The backoff starts again from 1 s only after a rebuilt endpoint has
 //!   stayed up for [`REBUILD_STABLE`]. An endpoint that dies sooner keeps
 //!   the backoff where it was, so a fault that kills every new endpoint is
@@ -71,11 +77,24 @@ pub(crate) const REBUILD_JITTER: f64 = 0.2;
 /// node rebuild faster than about once per 4 minutes.
 pub(crate) const REBUILD_STABLE: Duration = Duration::from_secs(600);
 
+/// How long [`run`] waits, after a task serving the endpoint ended, for the
+/// endpoint's death to be reported before it takes the end for a failure.
+/// After a panic in a quinn driver poisons quinn's lock, a task that still
+/// reaches it (the accept loop in the moment before the watcher reports
+/// `Down`, the attempt router answering an attempt queued before the death;
+/// see `liveness`) panics, and can do so just before the report, which
+/// follows the panic within one unwind (as `liveness::driver_death_restart`
+/// waits for it).
+pub(crate) const TASK_END_DEATH_WAIT: Duration = Duration::from_secs(1);
+
 /// Whether the node bound at `bind_addr` rebuilds its endpoint when it dies.
 /// Never one that exits for its supervisor to restart it (`supervised_exit`,
 /// `liveness::gateway_quic_restarts`): the two would race for the same death.
 pub(crate) fn enabled_at(supervised_exit: bool, bind_addr: SocketAddr) -> bool {
-    enabled_with(supervised_exit, ENDPOINT_REBUILD || forced_on(bind_addr))
+    enabled_with(
+        supervised_exit || forced_supervised(bind_addr),
+        ENDPOINT_REBUILD || forced_on(bind_addr),
+    )
 }
 
 fn enabled_with(supervised_exit: bool, switch: bool) -> bool {
@@ -90,6 +109,20 @@ fn forced_on(bind_addr: SocketAddr) -> bool {
 
 #[cfg(not(any(test, feature = "testing")))]
 fn forced_on(_bind_addr: SocketAddr) -> bool {
+    false
+}
+
+/// Whether a test treats the node at `bind_addr` as one that exits for its
+/// supervisor (`QuicUpgradeTrace::supervise`), as `FREENET_SUPERVISED` does
+/// in the binary, which a test cannot set for one node of a process.
+#[cfg(any(test, feature = "testing"))]
+fn forced_supervised(bind_addr: SocketAddr) -> bool {
+    crate::transport::in_memory_socket::quic_upgrade_trace_at(bind_addr)
+        .is_some_and(|trace| trace.supervised())
+}
+
+#[cfg(not(any(test, feature = "testing")))]
+fn forced_supervised(_bind_addr: SocketAddr) -> bool {
     false
 }
 
@@ -123,20 +156,26 @@ pub(crate) struct Rebuilt {
 pub(crate) enum RebuildEnd {
     /// The listener stopped, or the node let its endpoint go (`Released`).
     Stopped,
-    /// A task serving a rebuilt endpoint ended. They never end on their own
-    /// (each parks when it stops), so this is a failure, as the end of the
-    /// first endpoint's accept loop is to the node's task monitor.
+    /// A task serving the endpoint ended while the endpoint stayed up. They
+    /// never end on their own (each parks when it stops), so this is a
+    /// failure, as the end of a registered task is to the node's monitor.
     TaskEnded(&'static str),
 }
 
 /// Rebuild the endpoint whenever it dies, until `stop` resolves (its sender
 /// is held by the listener, so dropping the listener resolves it).
 ///
-/// `current` is the availability of the endpoint the node holds now and
-/// `node` the node's own view, which this sets: `Down` when the endpoint
-/// dies, and the new endpoint's value once one is built. `rebuild` builds
-/// and swaps in a new endpoint, or returns `None` when it cannot.
-/// `jitter` gives each wait's sample for [`delay`]. Every wait is on `time`.
+/// `current` is the availability of the endpoint the node holds now, and
+/// `first_tasks` the tasks serving it, which this owns as it owns a rebuilt
+/// endpoint's; `node` is the node's own view, which this sets: `Down` when
+/// the endpoint dies, and the new endpoint's value once one is built.
+/// `rebuild` builds and swaps in a new endpoint, or returns `None` when it
+/// cannot. `jitter` gives each wait's sample for [`delay`]. Every wait is on
+/// `time`.
+///
+/// A task that ends is taken for the endpoint's death when the endpoint goes
+/// `Down` within [`TASK_END_DEATH_WAIT`], and for a failure
+/// ([`RebuildEnd::TaskEnded`]) otherwise.
 ///
 /// The `select!`s are `biased` so `stop` is always seen first; every arm is
 /// cancel-safe (a oneshot receiver, `not_up`, a sleep, and polls of
@@ -144,19 +183,36 @@ pub(crate) enum RebuildEnd {
 pub(crate) async fn run<T: TimeSource>(
     time: T,
     mut current: QuicAvailabilityWatch,
+    first_tasks: Vec<(&'static str, JoinHandle<()>)>,
     node: watch::Sender<QuicAvailability>,
     mut rebuild: impl FnMut() -> Option<Rebuilt>,
     mut jitter: impl FnMut() -> f64,
     mut stop: oneshot::Receiver<()>,
 ) -> RebuildEnd {
-    let mut tasks = OwnedTasks::default();
+    let mut tasks = OwnedTasks(first_tasks);
     let mut attempt: u32 = 0;
     let mut up_since = time.now_nanos();
     loop {
         let seen = tokio::select! {
             biased;
             _ = &mut stop => return RebuildEnd::Stopped,
-            name = tasks.any_ended() => return RebuildEnd::TaskEnded(name),
+            name = tasks.any_ended() => {
+                // The ended task is not polled again: a rebuild replaces
+                // it, and every other way out returns.
+                tokio::select! {
+                    biased;
+                    _ = &mut stop => return RebuildEnd::Stopped,
+                    seen = current.not_up() => {
+                        tracing::warn!(
+                            task = name,
+                            availability = ?seen,
+                            "A task serving the QUIC endpoint ended as the endpoint went down"
+                        );
+                        seen
+                    }
+                    () = time.sleep(TASK_END_DEATH_WAIT) => return RebuildEnd::TaskEnded(name),
+                }
+            }
             seen = current.not_up() => seen,
         };
         if seen != QuicAvailability::Down {
@@ -198,10 +254,9 @@ pub(crate) async fn run<T: TimeSource>(
     }
 }
 
-/// The tasks serving the current rebuilt endpoint, aborted when replaced or
+/// The tasks serving the current endpoint, aborted when replaced or
 /// dropped (a task left to park would hold nothing, but would add one parked
 /// task per rebuild for the life of the node).
-#[derive(Default)]
 struct OwnedTasks(Vec<(&'static str, JoinHandle<()>)>);
 
 impl OwnedTasks {

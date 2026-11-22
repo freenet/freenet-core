@@ -36,6 +36,16 @@ fn start(
     tasks: impl Fn(usize) -> Vec<(&'static str, JoinHandle<()>)> + Send + 'static,
     jitter: Vec<f64>,
 ) -> Loop {
+    start_serving(Vec::new(), outcome, tasks, jitter)
+}
+
+/// [`start`], with `first_tasks` serving the first endpoint.
+fn start_serving(
+    first_tasks: Vec<(&'static str, JoinHandle<()>)>,
+    outcome: impl Fn(usize) -> Option<QuicAvailability> + Send + 'static,
+    tasks: impl Fn(usize) -> Vec<(&'static str, JoinHandle<()>)> + Send + 'static,
+    jitter: Vec<f64>,
+) -> Loop {
     let time = VirtualTime::new();
     let (first, current) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
     let (node_sender, node) = QuicAvailabilityWatch::settable(QuicAvailability::Up);
@@ -63,6 +73,7 @@ fn start(
     let task = tokio::spawn(run(
         time.clone(),
         current,
+        first_tasks,
         node_sender,
         rebuild,
         move || samples.next().expect("a sample"),
@@ -82,7 +93,10 @@ fn start(
 impl Loop {
     /// Move the clock until `n` more attempts were made; their times.
     async fn next_attempts(&mut self, n: usize) -> Vec<u64> {
-        let (time, mut attempts) = (self.time.clone(), std::mem::replace(&mut self.attempts, mpsc::unbounded_channel().1));
+        let (time, mut attempts) = (
+            self.time.clone(),
+            std::mem::replace(&mut self.attempts, mpsc::unbounded_channel().1),
+        );
         let (seen, attempts) = drive(&time, LIMIT, async move {
             let mut seen = Vec::new();
             while seen.len() < n {
@@ -196,8 +210,7 @@ fn the_backoff_starts_again_only_after_a_rebuilt_endpoint_stayed_up() {
         assert_eq!(lp.node.get(), QuicAvailability::Up);
 
         // Just short of the stable time: 4 s.
-        lp.time
-            .advance(REBUILD_STABLE - Duration::from_millis(1));
+        lp.time.advance(REBUILD_STABLE - Duration::from_millis(1));
         let died = lp.time.now_nanos();
         lp.built.lock()[1].send(QuicAvailability::Down).unwrap();
         let third = lp.next_attempts(1).await[0];
@@ -242,8 +255,9 @@ fn an_endpoint_down_at_once_is_rebuilt_again() {
 }
 
 /// The loop owns the tasks of the endpoint it built: replacing them aborts
-/// them, and one that ends on its own ends the loop, as the end of a
-/// registered task would end the node.
+/// them, and one that ends while its endpoint stays up ends the loop, after
+/// [`TASK_END_DEATH_WAIT`], as the end of a registered task would end the
+/// node.
 #[test]
 fn the_loop_aborts_replaced_tasks_and_ends_when_one_ends() {
     bounded(|| async move {
@@ -258,7 +272,11 @@ fn the_loop_aborts_replaced_tasks_and_ends_when_one_ends() {
                 }
             }
             let guard = Guard(index, dropped_tx.clone());
-            let end = if index == 1 { end_rx.lock().take() } else { None };
+            let end = if index == 1 {
+                end_rx.lock().take()
+            } else {
+                None
+            };
             vec![(
                 "served",
                 tokio::spawn(async move {
@@ -276,16 +294,83 @@ fn the_loop_aborts_replaced_tasks_and_ends_when_one_ends() {
         lp.first.send(QuicAvailability::Down).unwrap();
         lp.next_attempts(1).await;
         Loop::settle().await;
-        assert!(dropped.try_recv().is_err(), "the first endpoint's task runs");
+        assert!(
+            dropped.try_recv().is_err(),
+            "the first endpoint's task runs"
+        );
         lp.built.lock()[0].send(QuicAvailability::Down).unwrap();
         lp.next_attempts(1).await;
         Loop::settle().await;
         assert_eq!(dropped.try_recv(), Ok(0), "replaced, so aborted");
-        // The second endpoint's task ends on its own.
+        // The second endpoint's task ends on its own, and the endpoint stays
+        // up: a failure, once the wait for a death is over.
         end_tx.send(()).unwrap();
         Loop::settle().await;
-        assert_eq!(lp.task.await.unwrap(), RebuildEnd::TaskEnded("served"));
+        assert!(!lp.task.is_finished(), "waiting for a death");
+        let ended_at = lp.time.now_nanos();
+        let task = std::mem::replace(&mut lp.task, tokio::spawn(async { RebuildEnd::Stopped }));
+        let end = drive(&lp.time, LIMIT, async move { task.await.unwrap() }).await;
+        assert_eq!(end, RebuildEnd::TaskEnded("served"));
+        assert_eq!(
+            Duration::from_nanos(lp.time.now_nanos() - ended_at),
+            TASK_END_DEATH_WAIT
+        );
         assert_eq!(dropped.try_recv(), Ok(1));
+        assert_eq!(lp.node.get(), QuicAvailability::Up, "not a death");
+    })
+}
+
+/// A task serving the first endpoint (the rebuild loop owns those too) that
+/// ends just before the endpoint is reported `Down`, as a task reaching
+/// quinn's lock poisoned by a driver panic does (#6184), is that death: the
+/// loop rebuilds the endpoint instead of ending. A task that ends with the
+/// endpoint up ends the loop.
+#[test]
+fn a_task_ending_as_the_endpoint_dies_is_the_death() {
+    bounded(|| async move {
+        let (end_tx, end_rx) = oneshot::channel::<()>();
+        let first = vec![(
+            "quic_accept_loop",
+            tokio::spawn(async move {
+                end_rx.await.ok();
+            }),
+        )];
+        let mut lp = start_serving(
+            first,
+            |_| Some(QuicAvailability::Up),
+            |_| Vec::new(),
+            vec![1.0],
+        );
+        Loop::settle().await;
+        end_tx.send(()).unwrap();
+        Loop::settle().await;
+        assert!(!lp.task.is_finished(), "waiting for the death");
+        lp.time.advance(TASK_END_DEATH_WAIT / 2);
+        Loop::settle().await;
+        lp.first.send(QuicAvailability::Down).unwrap();
+        Loop::settle().await;
+        assert_eq!(lp.node.get(), QuicAvailability::Down, "taken for the death");
+        let died = lp.time.now_nanos();
+        let at = lp.next_attempts(1).await[0];
+        assert_eq!(Duration::from_nanos(at - died), Duration::from_secs(1));
+        Loop::settle().await;
+        assert_eq!(lp.node.get(), QuicAvailability::Up, "rebuilt");
+        assert!(!lp.task.is_finished());
+        drop(lp.stop.take());
+        assert_eq!(lp.task.await.unwrap(), RebuildEnd::Stopped);
+
+        // The same end with the endpoint left up: a failure.
+        let first = vec![("quic_accept_loop", tokio::spawn(async {}))];
+        let lp = start_serving(
+            first,
+            |_| Some(QuicAvailability::Up),
+            |_| Vec::new(),
+            vec![1.0],
+        );
+        let task = lp.task;
+        let end = drive(&lp.time, LIMIT, async move { task.await.unwrap() }).await;
+        assert_eq!(end, RebuildEnd::TaskEnded("quic_accept_loop"));
+        assert!(lp.built.lock().is_empty());
     })
 }
 
