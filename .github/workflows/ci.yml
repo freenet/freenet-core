@@ -1787,7 +1787,7 @@ jobs:
         id: check-attempts
         run: |
           # Count how many times Claude has already tried to fix this
-          ATTEMPT_COUNT=$(git log -10 --pretty=%B | grep -c "🤖 Claude CI fix attempt" || echo "0")
+          ATTEMPT_COUNT=$(git log -10 --pretty=%B | grep -c "🤖 Claude CI fix attempt" || true)
           echo "Current attempt count: $ATTEMPT_COUNT"
 
           if [ "$ATTEMPT_COUNT" -ge 2 ]; then
