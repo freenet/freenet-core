@@ -53,8 +53,10 @@
 //! peer's bar. A FAILED forced stream bars the peer, for every contract, from
 //! the slot (`PeerBar`): for at least as long as the stream held the slot
 //! and at least `FORCE_FLOOR`, doubling with each consecutive failure up to
-//! `PEER_BAR_MAX` (never shorter than the hold). A barred peer's confirm
-//! verdict is not retried. A mark that is never consumed arms nothing.
+//! `PEER_BAR_MAX` (never shorter than the hold). A leg the `SLOT_MAX_HOLD`
+//! backstop gives up on counts as a failure that held the slot that long. A
+//! barred peer's confirm verdict is not retried. A mark that is never
+//! consumed arms nothing.
 //!
 //! A write during a check merges into it: the check carries on with its stale
 //! and held peers, and a fresh `First` round for the write starts only when the
@@ -83,12 +85,23 @@
 //!   (contract, peer) at most one delivered per `FORCE_FLOOR`, and one per
 //!   `FORCE_COOLDOWN` for a peer whose summary does not move;
 //! - failing peers: a peer whose `n`-th consecutive forced stream failed after
-//!   holding the slot for `h` is barred for at least `max(FORCE_FLOOR, h)`
-//!   times `2^(n-1)` (up to `PEER_BAR_MAX`, never below `h`). So after its
-//!   `n`-th failure one failing peer holds the slot at most
-//!   `max(1 / (1 + 2^(n-1)), h / (h + PEER_BAR_MAX))` of the time: at most
-//!   half at first, falling with each failure until the cap (7% for a 270 s
-//!   hold). `k` failing peers together hold it at most `k` times that;
+//!   holding the slot for `h` is barred for `max(FORCE_FLOOR, h)` times
+//!   `2^(n-1)`, capped at `PEER_BAR_MAX` (30 days) but never below `h`. A
+//!   hold is at most `SLOT_MAX_HOLD` (the backstop bars the peer too), so
+//!   with `b(n) = min(FORCE_FLOOR * 2^(n-1), PEER_BAR_MAX)`, one failing peer
+//!   holds the slot: over its failures, never more than half the time (each
+//!   bar is at least the hold before it); and in the hold after its `n`-th
+//!   failure plus the bar before it, at most `h' / (h' + b(n))` for that
+//!   hold `h'` (when every hold is 270 s, the bars are 270 s times
+//!   `2^(n-1)`, so 50%, 33%, 20%, 11%, then roughly halving, down to 0.01%
+//!   at the cap). `k` failing peers hold it at most the sum of their shares,
+//!   so for any fixed set of failing peers the share falls with their
+//!   failures, and stays below 1 at the cap for up to `MAX_BARRED_PEERS` of
+//!   them (each at most `SLOT_MAX_HOLD / (SLOT_MAX_HOLD + PEER_BAR_MAX)`,
+//!   about 0.07%). A failure up to `PEER_BAR_MAX` after the bar ends counts
+//!   as consecutive, so taking the slot again later than that is itself a
+//!   gap of `PEER_BAR_MAX`. Until each peer has failed a few times, two or
+//!   more failing peers can between them hold the slot all the time;
 //! - at most `MAX_FORCE_PAIRS` armed pairs remembered (a refusal at the cap is
 //!   counted, after expired pairs are pruned) and `MAX_BARRED_PEERS` barred
 //!   peers (at the cap the bar forgotten soonest is evicted, logged); an
@@ -127,7 +140,10 @@
 //!   state) holds the slot until its mark expires (`FORCE_TTL`);
 //! - a failed forced stream with no later write is not re-checked, nor is a
 //!   barred peer's confirm verdict: the peer waits for a later write's check
-//!   past its bar, or for anti-entropy;
+//!   past its bar, or for anti-entropy. A peer that recovers after many
+//!   failures gets no forced stream until its bar ends (up to 30 days, after
+//!   failing for about as long), though its ordinary legs and anti-entropy
+//!   still reach it;
 //! - `Summaries` carries no request id, so any two-sided `Summaries` from an
 //!   awaited peer answers its round, including a `Notification` the peer sent
 //!   for a state change before our request reached it;
@@ -190,16 +206,21 @@ pub(crate) const FORCE_FLOOR: Duration = Duration::from_secs(60);
 /// state a leg that waited more than about 5 min for permits can outlive
 /// this backstop: the slot is then freed while its stream is still running,
 /// and a second forced stream can start beside it. The old leg's late report
-/// cannot free the new slot (`forced_outcome` matches `taken_at`).
+/// cannot free the new slot (`forced_outcome` matches `taken_at`). A backstop
+/// release bars the leg's peer as a failure that held the slot this long.
 pub(crate) const SLOT_MAX_HOLD: Duration = Duration::from_secs(30 * 60);
 /// Armed (contract, peer) pairs remembered for the floor and the cooldown.
 pub(crate) const MAX_FORCE_PAIRS: usize = 1024;
 /// The longest a peer is barred from the forced slot after a failed forced
-/// stream, unless the failed stream itself held the slot longer.
-pub(crate) const PEER_BAR_MAX: Duration = Duration::from_secs(60 * 60);
-/// Barred peers remembered. At the cap the one forgotten soonest is evicted
-/// (logged); refusing instead would leave a failing peer free to take the
-/// slot again at once.
+/// stream, unless the failed stream itself held the slot longer; also how long
+/// a bar is remembered after it ends, so a later failure counts as
+/// consecutive. Long enough that `MAX_BARRED_PEERS` peers at the cap, each
+/// holding the slot `SLOT_MAX_HOLD` per bar, hold it less than all the time
+/// (`1024 * 30 min / (30 min + 30 days)` is about 71%).
+pub(crate) const PEER_BAR_MAX: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// Barred peers remembered. At the cap the one whose bar ended longest ago is
+/// evicted (logged); refusing instead would leave a failing peer free to take
+/// the slot again at once.
 pub(crate) const MAX_BARRED_PEERS: usize = 1024;
 /// Retry `Confirm` rounds one check may run after floor, busy, slot or cap
 /// holds, before the final one.
@@ -333,28 +354,30 @@ enum Resolved {
     Ended,
 }
 
-/// A peer whose last forced stream failed. It may not take the slot until
+/// A peer whose last forced stream failed (or held the slot until the
+/// `SLOT_MAX_HOLD` backstop freed it). It may not take the slot until
 /// `until`. The bar is at least as long as the failed stream held the slot,
-/// so a failing peer holds the slot at most half the time, and it doubles
-/// with each consecutive failure (up to `PEER_BAR_MAX`), so that share falls.
-/// A delivered forced stream to the peer clears it. Remembered one bar length
-/// past `until`, so a failure within that time counts as consecutive.
+/// and doubles with each consecutive failure up to `PEER_BAR_MAX`; the module
+/// doc's Bounds say what that gives. A delivered forced stream to the peer
+/// clears it. Remembered `PEER_BAR_MAX` past `until`, so a failure within
+/// that time counts as consecutive: a failing peer that takes the slot again
+/// as soon as it may can never reset its count by failing slowly.
 #[derive(Debug, Clone, Copy)]
 struct PeerBar {
     until: Instant,
-    length: Duration,
     failures: u32,
 }
 
 impl PeerBar {
     fn forgotten_at(&self) -> Instant {
-        self.until + self.length
+        self.until + PEER_BAR_MAX
     }
 }
 
 /// How long a peer is barred after its `failures`-th consecutive failed forced
 /// stream, which held the slot for `hold`.
 fn peer_bar_length(hold: Duration, failures: u32) -> Duration {
+    // 2^16 x FORCE_FLOOR (45 days) is already past PEER_BAR_MAX.
     let doubling = 1u32 << failures.saturating_sub(1).min(16);
     FORCE_FLOOR
         .max(hold)
@@ -735,8 +758,9 @@ impl VerifySoon {
     /// A delivered stream arms the pair's floor, cooldown and progress gate,
     /// and clears the peer's bar. A failed one bars the PEER, for every
     /// contract, for at least as long as the stream held the slot, doubling
-    /// with each consecutive failure (`PeerBar`). Returns whether a delivery
-    /// was recorded.
+    /// with each consecutive failure (`PeerBar`). A report for a slot already
+    /// freed (by the backstop, which barred the peer itself) does nothing.
+    /// Returns whether a delivery was recorded.
     pub(crate) fn forced_outcome(&self, taken_at: Instant, delivered: bool, now: Instant) -> bool {
         let mut inner = self.inner.lock();
         let Some(slot) = inner
@@ -754,30 +778,11 @@ impl VerifySoon {
                 .insert((slot.key, slot.peer), (now, slot.summary_hash));
             return true;
         }
-        let barred = &mut inner.barred;
-        barred.retain(|_, bar| bar.forgotten_at() > now);
-        let failures = barred.get(&slot.peer).map_or(1, |bar| bar.failures + 1);
-        let length = peer_bar_length(now.saturating_duration_since(slot.taken_at), failures);
-        if !barred.contains_key(&slot.peer) && barred.len() >= MAX_BARRED_PEERS {
-            if let Some(oldest) = barred
-                .iter()
-                .min_by_key(|(_, bar)| bar.forgotten_at())
-                .map(|(peer, _)| peer.clone())
-            {
-                barred.remove(&oldest);
-                tracing::info!(
-                    cap = MAX_BARRED_PEERS,
-                    "verify-soon: barred-peer table full, forgot the bar ending soonest"
-                );
-            }
-        }
-        barred.insert(
+        bar_peer(
+            &mut inner.barred,
             slot.peer,
-            PeerBar {
-                until: now + length,
-                length,
-                failures,
-            },
+            now.saturating_duration_since(slot.taken_at),
+            now,
         );
         false
     }
@@ -805,7 +810,8 @@ impl VerifySoon {
 }
 
 /// Forget pairs past their cooldown and peers past their bar's memory, and
-/// free the slot of a mark that expired before its leg took it.
+/// free the slot of a mark that expired before its leg took it, or of a leg
+/// the `SLOT_MAX_HOLD` backstop gives up on (barring its peer as a failure).
 fn prune(inner: &mut Inner, now: Instant) {
     prune_pairs(&mut inner.armed, &mut inner.barred, &mut inner.slot, now);
 }
@@ -818,9 +824,44 @@ fn prune_pairs(
 ) {
     armed.retain(|_, (at, _)| *at + FORCE_COOLDOWN > now);
     barred.retain(|_, bar| bar.forgotten_at() > now);
-    if slot.as_ref().is_some_and(|s| !s.live(now)) {
-        *slot = None;
+    if let Some(gone) = slot.take_if(|s| !s.live(now)) {
+        // A leg that took the mark and held the slot until the backstop
+        // delivered nothing it reported: bar its peer as a failure that held
+        // the slot `SLOT_MAX_HOLD`, so a peer whose streams hang cannot take
+        // the slot back at once. An unused mark that expired bars nothing.
+        if gone.mark_until.is_none() {
+            bar_peer(barred, gone.peer, SLOT_MAX_HOLD, now);
+        }
     }
+}
+
+/// Bar `peer` after a failed forced stream that held the slot for `hold`.
+fn bar_peer(barred: &mut HashMap<PeerKey, PeerBar>, peer: PeerKey, hold: Duration, now: Instant) {
+    barred.retain(|_, bar| bar.forgotten_at() > now);
+    let failures = barred
+        .get(&peer)
+        .map_or(1, |bar| bar.failures.saturating_add(1));
+    let length = peer_bar_length(hold, failures);
+    if !barred.contains_key(&peer) && barred.len() >= MAX_BARRED_PEERS {
+        if let Some(oldest) = barred
+            .iter()
+            .min_by_key(|(_, bar)| bar.until)
+            .map(|(peer, _)| peer.clone())
+        {
+            barred.remove(&oldest);
+            tracing::info!(
+                cap = MAX_BARRED_PEERS,
+                "verify-soon: barred-peer table full, forgot the bar that ended longest ago"
+            );
+        }
+    }
+    barred.insert(
+        peer,
+        PeerBar {
+            until: now + length,
+            failures,
+        },
+    );
 }
 
 /// The node's request budget: a token bucket holding at most `REQUEST_BURST`
@@ -1634,6 +1675,45 @@ mod tests {
         assert_eq!(verdict, Verdict::Escalate);
     }
 
+    /// A peer that takes the slot again as soon as its bar ends and fails
+    /// slowly must still count as failing consecutively. When the bar was
+    /// remembered only one bar length past its end, a 270 s failure taken
+    /// just after a 270 s bar landed past that memory and reset the count, so
+    /// the bar never grew and the peer held the slot half the time forever.
+    #[tokio::test]
+    async fn a_slow_failure_right_after_the_bar_still_counts_as_consecutive() {
+        let vs = VerifySoon::new();
+        let (a, b) = (peer(), peer());
+        let lead = CHECK_DELAY + CONFIRM_DELAY;
+        let hold = Duration::from_secs(270);
+        let fail_slowly = |k: ContractKey, at: Instant| {
+            let (verdict, t2) = run_check(&vs, k, &a, at, false, &[1]);
+            assert_eq!(verdict, Verdict::Escalate);
+            let taken = vs.take_forced(&k, &a, t2).expect("a live mark");
+            assert!(!vs.forced_outcome(taken, false, t2 + hold));
+            t2 + hold
+        };
+        let fail1 = fail_slowly(key(1), Instant::now());
+        // Barred for the hold (270 s); the peer takes the slot right after.
+        let fail2 = fail_slowly(key(2), fail1 + hold - lead);
+        // The second consecutive failure bars it for twice the hold.
+        let (verdict, _) = run_check(
+            &vs,
+            key(3),
+            &a,
+            fail2 + hold * 2 - lead - Duration::from_secs(1),
+            false,
+            &[1],
+        );
+        assert_eq!(verdict, Verdict::Held(Hold::PeerFailed), "the count kept");
+        let (verdict, t) = run_check(&vs, key(4), &b, fail2, false, &[1]);
+        assert_eq!(verdict, Verdict::Escalate, "the slot is free for others");
+        let taken = vs.take_forced(&key(4), &b, t).expect("a live mark");
+        assert!(vs.forced_outcome(taken, true, t));
+        let (verdict, _) = run_check(&vs, key(5), &a, fail2 + hold * 2 - lead, false, &[1]);
+        assert_eq!(verdict, Verdict::Escalate);
+    }
+
     #[tokio::test]
     async fn consecutive_failures_lengthen_the_bar_and_a_delivery_resets_it() {
         let vs = VerifySoon::new();
@@ -1670,6 +1750,13 @@ mod tests {
         let hold = Duration::from_secs(270);
         assert_eq!(peer_bar_length(hold, 1), hold);
         assert_eq!(peer_bar_length(hold, 2), hold * 2);
+        assert_eq!(peer_bar_length(zero, 16), FORCE_FLOOR * (1 << 15));
+        assert!(FORCE_FLOOR * (1 << 15) < PEER_BAR_MAX);
+        assert_eq!(
+            peer_bar_length(zero, 17),
+            PEER_BAR_MAX,
+            "the cap is reached"
+        );
         let huge = PEER_BAR_MAX + Duration::from_secs(1);
         assert_eq!(
             peer_bar_length(huge, 5),
@@ -1679,7 +1766,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn barred_peers_are_capped_by_evicting_the_bar_forgotten_soonest() {
+    async fn barred_peers_are_capped_by_evicting_the_bar_that_ended_longest_ago() {
         let vs = VerifySoon::new();
         let t0 = Instant::now();
         let peers: Vec<PeerKey> = (0..=MAX_BARRED_PEERS).map(|_| peer()).collect();
@@ -1999,9 +2086,27 @@ mod tests {
         let late = t2 + SLOT_MAX_HOLD;
         vs.take_due(late);
         assert!(vs.inner.lock().slot.is_none(), "the backstop freed it");
+        // ...and barred the peer as a failure that held the slot that long.
+        let lead = CHECK_DELAY + CONFIRM_DELAY;
+        let (verdict, _) = run_check(&vs, key(2), &a, late - lead, false, &[0]);
+        assert_eq!(verdict, Verdict::Held(Hold::PeerFailed));
+        let bar_end = late + SLOT_MAX_HOLD;
+        let (verdict, _) = run_check(
+            &vs,
+            key(3),
+            &a,
+            bar_end - lead - Duration::from_secs(1),
+            false,
+            &[0],
+        );
+        assert_eq!(
+            verdict,
+            Verdict::Held(Hold::PeerFailed),
+            "for SLOT_MAX_HOLD"
+        );
         // A later slot for the same pair is not freed by the old leg's late
         // report.
-        let (verdict, t4) = run_check(&vs, key(1), &a, late, false, &[0]);
+        let (verdict, t4) = run_check(&vs, key(1), &a, bar_end - lead, false, &[0]);
         assert_eq!(verdict, Verdict::Escalate);
         let fresh = vs.take_forced(&key(1), &a, t4).expect("a live mark");
         assert!(!vs.forced_outcome(stale_leg, true, t4));
