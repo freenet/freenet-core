@@ -1228,7 +1228,9 @@ use crate::operations::connect::native::NativeWire;
 /// for 0.2.160: native connect is still off (`QUIC_NATIVE_PERCENT` is 0) and
 /// its wire fields may change before it is enabled, so no release is frozen
 /// as the floor yet. Raised to 0.2.162 for 0.2.161 for the same reasons, and
-/// to 0.2.163 for 0.2.162.
+/// to 0.2.163 for 0.2.162. Frozen at 0.2.163: that release ships the variants
+/// (`QUIC_NATIVE_SHIPPED_IN`), with every offer at percent 0, so a later
+/// release can turn the native path on. Do not raise it again.
 pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 163);
 
 /// Has the decoder for the QUIC-native `ConnectMsg` variants shipped, and in
@@ -1241,7 +1243,12 @@ pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 163);
 /// floor. Write the literal release when it ships, not
 /// `Some(QUIC_NATIVE_MIN_VERSION)`, which would compare the floor with itself.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const QUIC_NATIVE_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+///
+/// `Some((0, 2, 163))`: 0.2.163 is the release that first puts the V2 variants
+/// on the wire (every offer at percent 0). The tracker test accepts the marker
+/// one release ahead of the crate version, so it holds both on the 0.2.162
+/// main that precedes the release bump and on 0.2.163 itself.
+pub(crate) const QUIC_NATIVE_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 163));
 
 /// Upper bound on the number of hosted contracts examined per new-peer
 /// migration trigger. Each examined contract may emit a best-effort
