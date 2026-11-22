@@ -2386,6 +2386,19 @@ impl SimNetwork {
         self
     }
 
+    /// Clears `quic-data-percent` on every node, so each reads the release's own
+    /// share (the ramp), instead of the simulation default of 100.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_release_quic_data_share(&mut self) -> &mut Self {
+        for label in self.pending_labels() {
+            let config = self.node_config_mut(&label);
+            Arc::make_mut(&mut config.config)
+                .network_api
+                .quic_data_percent = None;
+        }
+        self
+    }
+
     /// Sets `quic-max-paths` to `limit` on every node, as `config.toml` would.
     /// Call before the simulation starts. No effect on a node with QUIC off.
     #[cfg(any(test, feature = "testing"))]
@@ -3798,10 +3811,12 @@ impl SimNetwork {
                     // Default to usize::MAX so tests don't trigger streaming unless
                     // explicitly opted in via with_streaming_threshold().
                     streaming_threshold: Some(self.streaming_threshold.unwrap_or(usize::MAX)),
-                    // QUIC is off in a simulation unless the test turns it on
-                    // (`with_transport_quic`), whatever the node default is, so a
-                    // change of that default leaves every other run's trace as it was.
-                    transport_quic: Some(crate::transport::quic::QuicMode::OFF.to_string()),
+                    // A simulation negotiates QUIC data with every pair unless the
+                    // test opts back into the legacy UDP transport with
+                    // `with_transport_quic("off")`. The values are pinned here so a
+                    // change of the node default does not move simulations.
+                    transport_quic: Some(crate::transport::quic::QuicMode::PREFER.to_string()),
+                    quic_data_percent: Some("100".to_string()),
                     ..Default::default()
                 },
                 ..Default::default()
@@ -3909,10 +3924,12 @@ impl SimNetwork {
                     // Default to usize::MAX so tests don't trigger streaming unless
                     // explicitly opted in via with_streaming_threshold().
                     streaming_threshold: Some(self.streaming_threshold.unwrap_or(usize::MAX)),
-                    // QUIC is off in a simulation unless the test turns it on
-                    // (`with_transport_quic`), whatever the node default is, so a
-                    // change of that default leaves every other run's trace as it was.
-                    transport_quic: Some(crate::transport::quic::QuicMode::OFF.to_string()),
+                    // A simulation negotiates QUIC data with every pair unless the
+                    // test opts back into the legacy UDP transport with
+                    // `with_transport_quic("off")`. The values are pinned here so a
+                    // change of the node default does not move simulations.
+                    transport_quic: Some(crate::transport::quic::QuicMode::PREFER.to_string()),
+                    quic_data_percent: Some("100".to_string()),
                     ..Default::default()
                 },
                 ..Default::default()

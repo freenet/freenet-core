@@ -20983,9 +20983,7 @@ fn run_quic_harness_sim(name: &str, seed: u64, quic: Option<&str>) -> QuicSimTra
     let rt = create_runtime();
     let (sim, logs_handle, probe) = rt.block_on(async {
         let mut sim = SimNetwork::new(name, 2, 4, 10, 3, 10, 3, seed).await;
-        if let Some(value) = quic {
-            sim.with_transport_quic(value);
-        }
+        sim.with_transport_quic(quic.unwrap_or("off"));
         let probe = sim.probe_quic_endpoints_at(Duration::from_secs(2));
         let logs_handle = sim.event_logs_handle();
         (sim, logs_handle, probe)
@@ -21367,6 +21365,10 @@ fn run_quic_shadow_sim_waiting(
         // A joiner learns its gateway's version only from this ack, and a peer of
         // unknown version is not offered.
         sim.enable_gateway_ack_version();
+        // These runs exercise the negotiation itself, so every node starts with
+        // QUIC off and `set_up` turns it on where the test wants it. The harness
+        // default is `prefer` at 100%.
+        sim.with_transport_quic("off").with_release_quic_data_share();
         let trace = sim.quic_upgrade_trace();
         let mut labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
         labels.sort_by_key(|label| (!label.is_gateway(), label.number()));
@@ -21670,7 +21672,7 @@ fn run_quic_data_ramp(
         let mut sim = SimNetwork::new(network, 1, 3, 7, 3, 10, 2, seed).await;
         sim.enable_gateway_ack_version();
         let trace = sim.quic_upgrade_trace();
-        sim.with_transport_quic("prefer");
+        sim.with_transport_quic("prefer").with_release_quic_data_share();
         trace.ramp_data_started_before(started_before);
         run_as_first_negotiating_release(&trace);
         let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
@@ -23985,6 +23987,10 @@ fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
     let mut symmetric_ips = std::collections::BTreeSet::new();
     let run = run_native_connect_sim_with(name, SEED, 200, Some(nat), |sim| {
         sim.with_native_connect(100);
+        // At the simulation default of 100% no UDP dial connects after a native
+        // failure, which this test's premise needs, so it keeps the release's
+        // data share. Why the dials differ is tracked in the sweep note.
+        sim.with_release_quic_data_share();
         // Regular node `i` gets `classes[i % 2]`; regular nodes are numbered
         // after the gateways.
         for (label, addr) in sim.all_node_addresses() {
