@@ -32,6 +32,7 @@ use crate::transport::TransportPublicKey;
 use crate::transport::metrics::QuicEndpointState;
 use crate::transport::quic::QuicMode;
 use crate::transport::quic::breaker::{BreakerOutcome, Verdict};
+use crate::transport::quic::config::{JOINER_PERMIT_UNITS, PATH_PERMIT_UNITS};
 use crate::transport::quic::control::caps;
 use crate::transport::quic::liveness::{QuicAvailability, QuicAvailabilityWatch};
 
@@ -225,14 +226,56 @@ pub(crate) enum PathRefusal {
     Busy,
 }
 
-/// A bounded count of the QUIC paths the node holds. Clones share the count.
+/// Joiners together may hold at most one in this many of the cap's units, so
+/// established peers' path upgrades always keep the rest (at least 3/4 of
+/// the cap). At the admission rate (50 a second, 8 s each) joiners could
+/// otherwise hold about 400 of them at once, which at 32 units each is more
+/// than the whole cap of a 4 GiB host (161 paths); an honest join lasts well
+/// under a second, so a quarter of the cap (about 80 concurrent joiners at
+/// that size) is far above honest load and only bounds a flood.
+pub(crate) const JOINER_SHARE_DIVISOR: usize = 4;
+
+/// A bounded count of the QUIC paths the node holds, and of the native
+/// joiners a gateway holds half-open (`admission`), against one cap. Clones
+/// share the count.
+///
+/// The count is in memory units (`config::PERMIT_UNIT_BYTES`): the limit is
+/// `limit x PATH_PERMIT_UNITS`, a path takes [`PATH_PERMIT_UNITS`] (the
+/// full connection charge) and a joiner [`JOINER_PERMIT_UNITS`] (the
+/// handshake-phase charge, `config::QUIC_HANDSHAKE_PHASE_CHARGE_BYTES`). With
+/// no joiners it is the plain count of paths it was. Paths and joiners take
+/// from one total, so together they never pass the cap, and a joiner flood
+/// can use up to a quarter of the cap ([`JOINER_SHARE_DIVISOR`]), for at most
+/// the join window a joiner lives.
 #[derive(Debug, Clone)]
 pub(crate) struct QuicPathPermits(Arc<PermitCount>);
 
 #[derive(Debug)]
 struct PermitCount {
     limit: usize,
+    /// Units held by paths and joiners together, at most
+    /// `limit x PATH_PERMIT_UNITS`.
+    units: AtomicUsize,
+    /// Paths held (for reports; `units` decides).
     in_use: AtomicUsize,
+    /// Joiners held (for reports; `units` decides).
+    joiners: AtomicUsize,
+}
+
+impl PermitCount {
+    fn total(&self) -> usize {
+        self.limit.saturating_mul(PATH_PERMIT_UNITS)
+    }
+
+    /// Take `units` if they fit under the total.
+    fn take(&self, units: usize) -> bool {
+        let total = self.total();
+        self.units
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_add(units).filter(|sum| *sum <= total)
+            })
+            .is_ok()
+    }
 }
 
 /// One held path slot, released when dropped.
@@ -242,6 +285,53 @@ pub(crate) struct QuicPathPermit(Arc<PermitCount>);
 impl Drop for QuicPathPermit {
     fn drop(&mut self) {
         self.0.in_use.fetch_sub(1, Ordering::AcqRel);
+        self.0.units.fetch_sub(PATH_PERMIT_UNITS, Ordering::AcqRel);
+    }
+}
+
+/// One native joiner's charge against the cap, from its first admitted
+/// packet to the first of: the handshake failing, the join window passing,
+/// the connection closing (each by dropping this), or promotion
+/// ([`Self::promote`]).
+#[derive(Debug)]
+#[must_use = "dropping the permit releases the joiner's charge"]
+pub(crate) struct QuicJoinerPermit(Option<Arc<PermitCount>>);
+
+impl Drop for QuicJoinerPermit {
+    fn drop(&mut self) {
+        // `None` after a promotion, which moved the units to a path permit.
+        if let Some(count) = self.0.take() {
+            count.joiners.fetch_sub(1, Ordering::AcqRel);
+            count.units.fetch_sub(JOINER_PERMIT_UNITS, Ordering::AcqRel);
+        }
+    }
+}
+
+impl QuicJoinerPermit {
+    /// Re-charge as a data path at the full rate, in one step: the joiner's
+    /// units are given up and a path's taken, or, if the path does not fit,
+    /// nothing changes and the permit comes back. A promoted joiner holds a
+    /// path permit and no joiner charge.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn promote(mut self) -> Result<QuicPathPermit, Self> {
+        let count = self.0.take().expect("a live joiner permit holds its count");
+        let total = count.total();
+        let promoted = count
+            .units
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_sub(JOINER_PERMIT_UNITS)?
+                    .checked_add(PATH_PERMIT_UNITS)
+                    .filter(|sum| *sum <= total)
+            })
+            .is_ok();
+        if !promoted {
+            self.0 = Some(count);
+            return Err(self);
+        }
+        count.joiners.fetch_sub(1, Ordering::AcqRel);
+        count.in_use.fetch_add(1, Ordering::AcqRel);
+        // The Arc moves to the path permit; this permit's Drop sees `None`.
+        Ok(QuicPathPermit(count))
     }
 }
 
@@ -471,7 +561,6 @@ impl QuicPolicy {
     }
 
     /// The path permits.
-    #[cfg(any(test, feature = "testing"))]
     pub(crate) fn permits(&self) -> &QuicPathPermits {
         &self.permits
     }
@@ -482,20 +571,44 @@ impl QuicPathPermits {
     pub(crate) fn new(limit: usize) -> Self {
         Self(Arc::new(PermitCount {
             limit,
+            units: AtomicUsize::new(0),
             in_use: AtomicUsize::new(0),
+            joiners: AtomicUsize::new(0),
         }))
     }
 
-    /// A permit, or `None` when `limit` are held.
+    /// A permit, or `None` when the paths and joiners held leave no room
+    /// for another path.
     pub(crate) fn try_acquire(&self) -> Option<QuicPathPermit> {
         let count = &self.0;
+        count.take(PATH_PERMIT_UNITS).then(|| {
+            count.in_use.fetch_add(1, Ordering::AcqRel);
+            QuicPathPermit(Arc::clone(count))
+        })
+    }
+
+    /// A joiner's charge, or `None` when the cap has no room for another or
+    /// the joiners already hold their share of it ([`JOINER_SHARE_DIVISOR`]).
+    pub(crate) fn try_acquire_joiner(&self) -> Option<QuicJoinerPermit> {
+        let count = &self.0;
+        let allowed = count.total() / JOINER_SHARE_DIVISOR / JOINER_PERMIT_UNITS;
         count
-            .in_use
+            .joiners
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
-                (held < count.limit).then_some(held + 1)
+                (held < allowed).then_some(held + 1)
             })
-            .ok()
-            .map(|_| QuicPathPermit(Arc::clone(&self.0)))
+            .ok()?;
+        if !count.take(JOINER_PERMIT_UNITS) {
+            count.joiners.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(QuicJoinerPermit(Some(Arc::clone(count))))
+    }
+
+    /// The joiners held now.
+    #[cfg(test)]
+    pub(crate) fn joiners_in_use(&self) -> usize {
+        self.0.joiners.load(Ordering::Acquire)
     }
 
     /// The permits held now.
@@ -1187,6 +1300,119 @@ mod tests {
             assert!(line.contains(ON), "{line}");
             assert!(line.contains(&format!("data_percent={percent}")), "{line}");
         }
+    }
+
+    /// Joiners count inside the cap with paths, in memory units: with no
+    /// joiners it is the plain path count it was; a joiner takes
+    /// `JOINER_PERMIT_UNITS` of a path's `PATH_PERMIT_UNITS`; paths and
+    /// joiners together never pass `limit x PATH_PERMIT_UNITS`; and each
+    /// release (a drop) frees exactly what it took.
+    #[test]
+    fn joiners_and_paths_share_one_cap_in_memory_units() {
+        const LIMIT: usize = 8;
+        let permits = QuicPathPermits::new(LIMIT);
+        let paths: Vec<_> = (0..LIMIT)
+            .map(|_| permits.try_acquire().expect("a path"))
+            .collect();
+        assert!(
+            permits.try_acquire().is_none(),
+            "no joiners: the plain count"
+        );
+        assert!(permits.try_acquire_joiner().is_none(), "full of paths");
+        drop(paths);
+        assert_eq!(permits.in_use(), 0);
+
+        let joiners: Vec<_> = (0..3)
+            .map(|_| permits.try_acquire_joiner().expect("a joiner"))
+            .collect();
+        assert_eq!(permits.joiners_in_use(), 3);
+        // Three joiners hold 96 of 472 units; seven paths fit beside them.
+        let paths: Vec<_> = (0..LIMIT - 2)
+            .map(|_| permits.try_acquire().expect("a path beside joiners"))
+            .collect();
+        assert!(permits.try_acquire().is_none(), "joiners hold the rest");
+        drop(joiners);
+        assert_eq!(permits.joiners_in_use(), 0);
+        assert!(permits.try_acquire().is_some(), "freed units admit a path");
+        drop(paths);
+        assert!(QuicPathPermits::new(0).try_acquire_joiner().is_none());
+    }
+
+    /// A joiner flood leaves paths their floor: joiners together hold at
+    /// most `1 / JOINER_SHARE_DIVISOR` of the cap, so at least the rest, in
+    /// whole paths, stays for established peers however many joiners come
+    /// (refused ones get `None`, as when the cap is full).
+    #[test]
+    fn a_joiner_flood_leaves_paths_their_floor() {
+        for limit in [8usize, 48, 161, 323] {
+            let permits = QuicPathPermits::new(limit);
+            let mut joiners = Vec::new();
+            while let Some(joiner) = permits.try_acquire_joiner() {
+                joiners.push(joiner);
+                assert!(joiners.len() < 100_000, "bounded");
+            }
+            let held = joiners.len() * JOINER_PERMIT_UNITS;
+            assert!(held * JOINER_SHARE_DIVISOR <= limit * PATH_PERMIT_UNITS);
+            let mut paths = Vec::new();
+            while let Some(path) = permits.try_acquire() {
+                paths.push(path);
+            }
+            let floor = limit * (JOINER_SHARE_DIVISOR - 1) / JOINER_SHARE_DIVISOR;
+            assert!(
+                paths.len() >= floor,
+                "limit {limit}: {} paths after {} joiners, floor {floor}",
+                paths.len(),
+                joiners.len()
+            );
+        }
+    }
+
+    /// Promotion re-charges a joiner at the full path rate in one step: the
+    /// joiner charge is gone and a path permit held, and the permit count
+    /// (`Arc` strong count) is what it was. With no room for the difference
+    /// nothing changes and the joiner keeps its charge.
+    #[test]
+    fn promotion_recharges_at_the_full_rate() {
+        let permits = QuicPathPermits::new(8);
+        let baseline = Arc::strong_count(&permits.0);
+        let joiner = permits.try_acquire_joiner().expect("a joiner");
+        assert_eq!(Arc::strong_count(&permits.0), baseline + 1);
+        let path = joiner.promote().expect("room for the full charge");
+        assert_eq!((permits.joiners_in_use(), permits.in_use()), (0, 1));
+        assert_eq!(
+            Arc::strong_count(&permits.0),
+            baseline + 1,
+            "the count moved to the path permit, none leaked"
+        );
+        drop(path);
+        assert_eq!(Arc::strong_count(&permits.0), baseline, "back to baseline");
+        assert_eq!(permits.in_use(), 0);
+
+        // Three joiners, then paths until 22 units are left: promotion
+        // needs 27 more (59 - 32), which is not there.
+        let mut joiners = (0..3)
+            .map(|_| permits.try_acquire_joiner().expect("a joiner"))
+            .collect::<Vec<_>>();
+        let mut paths = Vec::new();
+        while let Some(path) = permits.try_acquire() {
+            paths.push(path);
+        }
+        let joiner = joiners
+            .pop()
+            .unwrap()
+            .promote()
+            .expect_err("no room for the difference");
+        assert_eq!(permits.joiners_in_use(), 3, "kept its charge");
+        assert_eq!(Arc::strong_count(&permits.0), baseline + 3 + paths.len());
+        drop(paths.pop());
+        let path = joiner.promote().expect("promotes once there is room");
+        assert_eq!(
+            (permits.joiners_in_use(), permits.in_use()),
+            (2, paths.len() + 1)
+        );
+        drop(joiners);
+        drop((path, paths));
+        assert_eq!(Arc::strong_count(&permits.0), baseline);
     }
 
     /// The bands an operator sees at INFO: 5, then every 10.

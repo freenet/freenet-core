@@ -23,6 +23,7 @@ pub(crate) mod get;
 pub(crate) mod op_ctx;
 pub(crate) mod orphan_streams;
 pub(crate) mod put;
+pub(crate) mod relay_admission;
 pub(crate) mod route_attempt;
 pub(crate) mod stream_progress;
 pub(crate) mod subscribe;

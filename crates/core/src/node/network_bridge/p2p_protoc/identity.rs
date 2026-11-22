@@ -505,6 +505,7 @@ mod tests {
                     link_use: super::super::zombie_sweep::LinkUseStamp::new(now),
                     remote_version: None,
                     native: false,
+                    frame_seen: true,
                 },
             );
         }

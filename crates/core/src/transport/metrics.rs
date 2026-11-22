@@ -667,6 +667,14 @@ labelled_counters! {
         Joined => "joined",
         /// A join panicked; its task's owner caught it and goes on.
         JoinPanicked => "join_panicked",
+        /// An attempt was ignored: no room for another joiner inside the
+        /// node's QUIC connection cap (`admission`, `QuicPathPermits`), or
+        /// the cap is not attached yet.
+        JoinerCapFull => "joiner_cap_full",
+        /// A datagram from an admitted, unpromoted joiner was dropped: the
+        /// joiners' share of the ingress queue was full
+        /// (`demux::QUIC_INGRESS_JOINER_DATAGRAMS`).
+        JoinerShareFull => "joiner_share_full",
     }
 }
 
@@ -2508,8 +2516,8 @@ impl TransportMetrics {
             })
             .ok();
 
-        // Update cwnd stats. A controller without a bounded window (FixedRate)
-        // reports `None`; recording its effectively-infinite window would make
+        // Update cwnd stats. A controller without a bounded window reports
+        // `None`; recording an effectively-infinite window would make
         // the snapshot's avg/peak/min cwnd a sentinel rather than a value.
         if let Some(final_cwnd) = stats.final_cwnd_bytes {
             self.record_cwnd_sample(final_cwnd);
@@ -2864,6 +2872,29 @@ impl TransportMetrics {
         self.cumulative_packets_received
             .fetch_add(1, Ordering::Relaxed);
         self.record_per_peer(remote_addr, bytes, |s| &s.bytes_received);
+    }
+
+    /// Record authenticated inbound QUIC stream payload bytes of one connection.
+    ///
+    /// QUIC packets are decrypted inside quinn and never reach
+    /// [`Self::record_packet_received`], so without this the download counters
+    /// miss every QUIC byte while [`Self::record_packet_sent`] counts QUIC
+    /// sends at the socket. `bytes` must come from data quinn returned after
+    /// authenticating it (stream reads), never from quinn's `udp_rx`, which
+    /// counts before decryption (#3999). `remote_addr` is `None` for a
+    /// connection that has ended: only the cumulative counter moves, so the
+    /// per-peer table does not regrow an entry for a peer that is gone. Skips
+    /// zero so an idle path does not churn the per-peer LRU. The packet count
+    /// is not moved: quinn exposes no authenticated packet count.
+    pub(crate) fn record_quic_received(&self, remote_addr: Option<SocketAddr>, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.cumulative_bytes_received
+            .fetch_add(bytes, Ordering::Relaxed);
+        if let Some(addr) = remote_addr {
+            self.record_per_peer(addr, bytes, |s| &s.bytes_received);
+        }
     }
 
     /// Read cumulative bytes downloaded without resetting counters.
@@ -3657,8 +3688,8 @@ pub struct TransportSnapshot {
     /// Peak throughput observed (bytes per second).
     pub peak_throughput_bps: u64,
     /// Average congestion window size in bytes. `None` (JSON null) if no
-    /// bounded cwnd was sampled, e.g. when every transfer ran under the
-    /// FixedRate controller, which has no meaningful window.
+    /// bounded cwnd was sampled. FixedRate reports its flight-size ceiling
+    /// (or a loss pause's lower window).
     ///
     /// Type change: this was a `u32` that read `0` (or, under FixedRate,
     /// a `u32::MAX`-derived sentinel) with no samples. A typed consumer must
@@ -5098,8 +5129,8 @@ pub fn emit_transfer_started(
 }
 
 // Test-only: the transfer events emitted on this thread, as (stream id, event,
-// transport), so a test finds its own: stream ids and transfers are per
-// thread in tests (`StreamId::next`, a current-thread runtime), and another
+// transport), so a test finds its own: events are recorded per thread and
+// transfers run on the test's thread (a current-thread runtime), so another
 // test's events never land here. Kept apart from the QUIC event log, which every
 // transfer would otherwise crowd.
 #[cfg(test)]
@@ -5779,8 +5810,8 @@ mod tests {
         assert_eq!(metrics.cumulative_packets().0, 3, "cumulative is not reset");
     }
 
-    /// A FixedRate transfer has no bounded cwnd. It must not feed the cwnd
-    /// accumulators, and `avg_cwnd_bytes` must then be null, not a sentinel.
+    /// A transfer with no bounded cwnd must not feed the cwnd accumulators,
+    /// and `avg_cwnd_bytes` must then be null, not a sentinel.
     #[test]
     fn unbounded_cwnd_transfer_leaves_avg_cwnd_null() {
         let metrics = TransportMetrics::new();

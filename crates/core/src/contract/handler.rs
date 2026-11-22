@@ -237,16 +237,227 @@ pub(crate) struct ContractHandlerChannel<End: sealed::ChannelHalve> {
 }
 
 pub(crate) struct ContractHandlerHalve {
-    event_receiver: mpsc::UnboundedReceiver<InternalCHEvent>,
+    lanes: LaneReceivers,
     waiting_response: BTreeMap<u64, tokio::sync::oneshot::Sender<(EventId, ContractHandlerEvent)>>,
     /// Shared with the [`SenderHalve`]: `contract_handling` installs the
     /// delegate lane's intake here once it has started the lane.
     delegate_lane: DelegateLaneSlot,
-    /// A WEAK handle on this channel's own event sender, for the delegate
-    /// lane to forward requests into ([`LoopForwarder`]). Weak, so that it
-    /// does not keep the channel open: the loop still sees the channel close
+    /// WEAK handles on this channel's own lane senders, for the delegate
+    /// lane to forward requests into ([`LoopForwarder`]). Weak, so that they
+    /// do not keep the channel open: the loop still sees the channel close
     /// when every client-side sender is gone.
-    event_sender: mpsc::WeakUnboundedSender<InternalCHEvent>,
+    event_sender: WeakLaneSenders,
+}
+
+// ── Admission lanes (ANT-2026-K0YQ8CG4) ────────────────────────────────────
+//
+// The fair queue's caps, its `ClientLocal` reserve and its priority tiers
+// apply to an event only once `contract_handling` has moved it out of the
+// handler channel. Event admission into that channel is therefore bounded per
+// class here, ahead of the fair queue.
+//
+// Each class has its own channel, every send is non-blocking, and a full
+// bounded channel refuses at the sender with the same typed `ContractQueueFull`
+// response the fair queue gives (`queue_full_response_for`). The loop drains
+// the lanes in precedence order each iteration, so a client event reaches the
+// fair queue's `ClientLocal` tier on the next iteration, whatever is queued in
+// the other lanes.
+
+/// Capacity of the lane carrying [`Priority::ClientLocal`] events: eight times
+/// the fair queue's `CLIENT_LOCAL_RESERVE`, which covers concurrent
+/// multi-WebSocket bursts such as freenet-git's 8-way parallel chunked PUT
+/// pool (#4056). A client sending beyond it gets an error at once.
+///
+/// [`Priority::ClientLocal`]: super::fair_queue::Priority::ClientLocal
+pub(crate) const CLIENT_CHANNEL_CAPACITY: usize = 8 * super::fair_queue::CLIENT_LOCAL_RESERVE;
+
+/// Capacity of the lane carrying `Priority::NetworkRelay` events. Each relay
+/// driver holds at most one event here at a time, and drivers are capped per
+/// source (`operations::relay_admission`), so one peer cannot fill it alone.
+pub(crate) const RELAY_CHANNEL_CAPACITY: usize = 1024;
+
+/// Capacity of the lane carrying `Priority::Background` events. Background
+/// work (interest-sync summaries, renewal, placement caching) is periodic and
+/// re-runs on its next cycle when refused.
+pub(crate) const BACKGROUND_CHANNEL_CAPACITY: usize = 256;
+
+/// Which admission channel an event travels on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Lane {
+    /// `ClientDisconnect` and `EvictContract`. Unbounded and never refused:
+    /// it grows only with the number of clients and with hosting churn, and
+    /// dropping either event would leak state (a client's registrations, an
+    /// evicted contract's disk). Its events still take their own priority
+    /// once in the fair queue.
+    Control,
+    Client,
+    Relay,
+    Background,
+}
+
+impl Lane {
+    pub(crate) fn of(ev: &ContractHandlerEvent, priority: super::fair_queue::Priority) -> Self {
+        use super::fair_queue::Priority;
+        if matches!(
+            ev,
+            ContractHandlerEvent::ClientDisconnect { .. }
+                | ContractHandlerEvent::EvictContract { .. }
+        ) {
+            return Lane::Control;
+        }
+        match priority {
+            Priority::ClientLocal => Lane::Client,
+            Priority::NetworkRelay => Lane::Relay,
+            Priority::Background => Lane::Background,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Lane::Control => 0,
+            Lane::Client => 1,
+            Lane::Relay => 2,
+            Lane::Background => 3,
+        }
+    }
+}
+
+/// Events refused at admission so far, per lane (the control lane never
+/// refuses, so its slot stays zero).
+static LANE_REFUSALS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+/// Events a full lane has refused so far.
+pub(crate) fn lane_refusals(lane: Lane) -> u64 {
+    LANE_REFUSALS[lane.index()].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Count a refusal and log it at powers of two of the running total, so a
+/// sustained refusal costs a handful of log lines rather than one per event.
+fn record_lane_refusal(lane: Lane, ev: &ContractHandlerEvent) {
+    let total = LANE_REFUSALS[lane.index()].fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if !total.is_power_of_two() {
+        return;
+    }
+    // A refused local client request is something the node's user sees, so
+    // warn. Relay and background refusals are the lanes working as intended
+    // under load (the requester or the next cycle retries), so info.
+    match lane {
+        Lane::Client | Lane::Control => tracing::warn!(
+            ?lane,
+            event = %ev,
+            total_refused = total,
+            "Refused a contract-handler event: its admission lane is full. \
+             Logged at powers of two of the running total"
+        ),
+        Lane::Relay | Lane::Background => tracing::info!(
+            ?lane,
+            event = %ev,
+            total_refused = total,
+            "Refused a contract-handler event: its admission lane is full. \
+             Logged at powers of two of the running total"
+        ),
+    }
+}
+
+/// A refused send, with the event handed back. Boxed: the event is large and
+/// the error path is the rare one.
+type LaneSendError = Box<mpsc::error::TrySendError<InternalCHEvent>>;
+
+struct LaneSenders {
+    control: mpsc::UnboundedSender<InternalCHEvent>,
+    client: mpsc::Sender<InternalCHEvent>,
+    relay: mpsc::Sender<InternalCHEvent>,
+    background: mpsc::Sender<InternalCHEvent>,
+}
+
+impl LaneSenders {
+    /// Non-blocking: a full bounded lane hands the event back as `Full`.
+    fn try_send(&self, ev: InternalCHEvent) -> Result<(), LaneSendError> {
+        match Lane::of(&ev.ev, ev.priority) {
+            Lane::Control => self
+                .control
+                .send(ev)
+                .map_err(|err| Box::new(mpsc::error::TrySendError::Closed(err.0))),
+            Lane::Client => self.client.try_send(ev).map_err(Box::new),
+            Lane::Relay => self.relay.try_send(ev).map_err(Box::new),
+            Lane::Background => self.background.try_send(ev).map_err(Box::new),
+        }
+    }
+
+    fn downgrade(&self) -> WeakLaneSenders {
+        WeakLaneSenders {
+            control: self.control.downgrade(),
+            client: self.client.downgrade(),
+            relay: self.relay.downgrade(),
+            background: self.background.downgrade(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WeakLaneSenders {
+    control: mpsc::WeakUnboundedSender<InternalCHEvent>,
+    client: mpsc::WeakSender<InternalCHEvent>,
+    relay: mpsc::WeakSender<InternalCHEvent>,
+    background: mpsc::WeakSender<InternalCHEvent>,
+}
+
+impl WeakLaneSenders {
+    /// As [`LaneSenders::try_send`]; `Closed` also when the channel is gone.
+    fn try_send(&self, ev: InternalCHEvent) -> Result<(), LaneSendError> {
+        fn bounded(
+            weak: &mpsc::WeakSender<InternalCHEvent>,
+            ev: InternalCHEvent,
+        ) -> Result<(), LaneSendError> {
+            match weak.upgrade() {
+                Some(tx) => tx.try_send(ev).map_err(Box::new),
+                None => Err(Box::new(mpsc::error::TrySendError::Closed(ev))),
+            }
+        }
+        match Lane::of(&ev.ev, ev.priority) {
+            Lane::Control => match self.control.upgrade() {
+                Some(tx) => tx
+                    .send(ev)
+                    .map_err(|err| Box::new(mpsc::error::TrySendError::Closed(err.0))),
+                None => Err(Box::new(mpsc::error::TrySendError::Closed(ev))),
+            },
+            Lane::Client => bounded(&self.client, ev),
+            Lane::Relay => bounded(&self.relay, ev),
+            Lane::Background => bounded(&self.background, ev),
+        }
+    }
+}
+
+struct LaneReceivers {
+    control: mpsc::UnboundedReceiver<InternalCHEvent>,
+    client: mpsc::Receiver<InternalCHEvent>,
+    relay: mpsc::Receiver<InternalCHEvent>,
+    background: mpsc::Receiver<InternalCHEvent>,
+}
+
+impl LaneReceivers {
+    fn try_recv(&mut self, lane: Lane) -> Result<InternalCHEvent, mpsc::error::TryRecvError> {
+        match lane {
+            Lane::Control => self.control.try_recv(),
+            Lane::Client => self.client.try_recv(),
+            Lane::Relay => self.relay.try_recv(),
+            Lane::Background => self.background.try_recv(),
+        }
+    }
+
+    fn len(&self, lane: Lane) -> usize {
+        match lane {
+            Lane::Control => self.control.len(),
+            Lane::Client => self.client.len(),
+            Lane::Relay => self.relay.len(),
+            Lane::Background => self.background.len(),
+        }
+    }
 }
 
 /// Where client delegate requests go instead of the contract loop, once the
@@ -263,7 +474,7 @@ pub(crate) struct DelegateLaneIntake {
 /// ordinary path: the same event channel, with the same id, priority and
 /// responder the handler would have sent it with before the lane existed.
 pub(crate) struct LoopForwarder {
-    event_sender: mpsc::WeakUnboundedSender<InternalCHEvent>,
+    event_sender: WeakLaneSenders,
 }
 
 impl super::delegate_lane::LoopForward for LoopForwarder {
@@ -293,17 +504,35 @@ impl super::delegate_lane::LoopForward for LoopForwarder {
             priority,
             result: responder,
         };
-        // No loop left (node shutdown): the responder drops with the event,
-        // so the client sees an error, and the loop-owned mark is moot.
-        let sent = self
-            .event_sender
-            .upgrade()
-            .is_some_and(|tx| tx.send(event).is_ok());
-        if !sent {
-            tracing::debug!(
-                id,
-                "Delegate lane: the contract loop is gone; dropping a request"
-            );
+        // Non-blocking, like every other send into the lanes: the lane task
+        // must never wait on the contract loop. A full lane refuses the
+        // request exactly as it refuses one from the handler; no loop left
+        // (node shutdown) drops it. Either way the responder drops with the
+        // event, so the client sees an error, and the loop-owned mark is
+        // released with the ticket.
+        match self.event_sender.try_send(event).map_err(|err| *err) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(refused)) => {
+                record_lane_refusal(Lane::of(&refused.ev, refused.priority), &refused.ev);
+                // Answer the client with the typed refusal, as a refusal at
+                // the handler's own send would. The event (and the mark in
+                // it) is dropped first, so the delegate is free again before
+                // the client hears back.
+                let InternalCHEvent { ev, id, result, .. } = refused;
+                let response = super::queue_full_response_for(&ev);
+                drop(ev);
+                if let Some(response) = response
+                    && result.send((EventId { id }, response)).is_err()
+                {
+                    tracing::debug!(id, "Delegate lane: the refused client is gone");
+                }
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(
+                    id,
+                    "Delegate lane: the contract loop is gone; dropping a request"
+                );
+            }
         }
     }
 }
@@ -345,7 +574,7 @@ impl StashedResponder {
 }
 
 pub(crate) struct SenderHalve {
-    event_sender: mpsc::UnboundedSender<InternalCHEvent>,
+    event_sender: LaneSenders,
     wait_for_res_tx: mpsc::Sender<(ClientId, WaitingTransaction)>,
     delegate_lane: DelegateLaneSlot,
 }
@@ -422,7 +651,22 @@ pub(crate) fn contract_handler_channel() -> (
     ContractHandlerChannel<ContractHandlerHalve>,
     ContractHandlerChannel<WaitingResolution>,
 ) {
-    let (event_sender, event_receiver) = mpsc::unbounded_channel();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let (client_tx, client_rx) = mpsc::channel(CLIENT_CHANNEL_CAPACITY);
+    let (relay_tx, relay_rx) = mpsc::channel(RELAY_CHANNEL_CAPACITY);
+    let (background_tx, background_rx) = mpsc::channel(BACKGROUND_CHANNEL_CAPACITY);
+    let event_sender = LaneSenders {
+        control: control_tx,
+        client: client_tx,
+        relay: relay_tx,
+        background: background_tx,
+    };
+    let event_receiver = LaneReceivers {
+        control: control_rx,
+        client: client_rx,
+        relay: relay_rx,
+        background: background_rx,
+    };
     // Capacity sized to comfortably absorb concurrent multi-WebSocket bursts
     // (e.g. freenet-git's 8-way parallel chunked PUT pool) while the event
     // loop's anti-starvation force-poll drains it. Smaller values caused
@@ -442,7 +686,7 @@ pub(crate) fn contract_handler_channel() -> (
         },
         ContractHandlerChannel {
             end: ContractHandlerHalve {
-                event_receiver,
+                lanes: event_receiver,
                 waiting_response: BTreeMap::new(),
                 delegate_lane,
                 event_sender: weak_event_sender,
@@ -542,10 +786,20 @@ impl ContractHandlerChannel<SenderHalve> {
         // Client delegate requests go to the delegate lane when one is
         // running, so they do not wait behind contract WASM on the loop.
         if let Some(internal) = self.offer_to_delegate_lane(internal) {
-            self.end
-                .event_sender
-                .send(internal)
-                .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
+            match self.end.event_sender.try_send(internal).map_err(|err| *err) {
+                Ok(()) => {}
+                // A full lane refuses at once, with the response the fair
+                // queue gives a refused event (ANT-2026-K0YQ8CG4), so every
+                // caller handles it on the path it already has.
+                Err(mpsc::error::TrySendError::Full(refused)) => {
+                    record_lane_refusal(Lane::of(&refused.ev, refused.priority), &refused.ev);
+                    return super::queue_full_response_for(&refused.ev)
+                        .ok_or(ContractError::NoEvHandlerResponse);
+                }
+                Err(mpsc::error::TrySendError::Closed(refused)) => {
+                    return Err(ContractError::ChannelDropped(Box::new(refused.ev)));
+                }
+            }
         }
         match tokio::time::timeout(timeout, result_receiver).await {
             Ok(Ok((_, res))) => Ok(res),
@@ -706,16 +960,24 @@ impl ContractHandlerChannel<SenderHalve> {
         // Create a oneshot but immediately drop the receiver — the handler
         // won't send a response, and if it does, the send will harmlessly fail.
         let (result, _) = tokio::sync::oneshot::channel();
-        self.end
-            .event_sender
-            .send(InternalCHEvent {
-                ev,
-                id,
-                priority,
-                result,
-            })
-            .map_err(|err| ContractError::ChannelDropped(Box::new(err.0.ev)))?;
-        Ok(())
+        let sent = self.end.event_sender.try_send(InternalCHEvent {
+            ev,
+            id,
+            priority,
+            result,
+        });
+        match sent.map_err(|err| *err) {
+            Ok(()) => Ok(()),
+            // Only a non-control event can be refused (`Lane::Control` is
+            // unbounded); the caller logs the error.
+            Err(mpsc::error::TrySendError::Full(refused)) => {
+                record_lane_refusal(Lane::of(&refused.ev, refused.priority), &refused.ev);
+                Err(ContractError::NoEvHandlerResponse)
+            }
+            Err(mpsc::error::TrySendError::Closed(refused)) => {
+                Err(ContractError::ChannelDropped(Box::new(refused.ev)))
+            }
+        }
     }
 
     /// Install session adapter for migration
@@ -923,45 +1185,84 @@ impl ContractHandlerChannel<ContractHandlerHalve> {
         self.end.waiting_response.contains_key(&id.id)
     }
 
-    pub async fn recv_from_sender(
+    fn accept(
         &mut self,
-    ) -> Result<(EventId, ContractHandlerEvent, super::fair_queue::Priority), ContractError> {
-        if let Some(InternalCHEvent {
+        internal: InternalCHEvent,
+    ) -> (EventId, ContractHandlerEvent, super::fair_queue::Priority) {
+        let InternalCHEvent {
             ev,
             id,
             priority,
             result,
-        }) = self.end.event_receiver.recv().await
-        {
-            self.end.waiting_response.insert(id, result);
-            return Ok((EventId { id }, ev, priority));
-        }
-        Err(ContractError::NoEvHandlerResponse)
+        } = internal;
+        self.end.waiting_response.insert(id, result);
+        (EventId { id }, ev, priority)
     }
 
-    /// Try to receive an event without blocking.
+    /// Wait for the next event on any lane. `Err` once every lane is closed.
     ///
-    /// Returns `Ok(None)` if the channel is empty, `Err` if the channel is closed.
-    /// Used by the fair-queue drain loop to batch-fill the fair queue before processing.
+    /// `biased` in lane precedence order. It takes ONE event per call, and
+    /// `contract_handling` calls it only from its idle select, after draining
+    /// every lane with a per-lane budget, so precedence here cannot starve a
+    /// lower lane. Cancellation-safe: each arm is an mpsc `recv`.
+    pub async fn recv_from_sender(
+        &mut self,
+    ) -> Result<(EventId, ContractHandlerEvent, super::fair_queue::Priority), ContractError> {
+        let lanes = &mut self.end.lanes;
+        let internal = tokio::select! {
+            biased;
+            Some(ev) = lanes.control.recv() => ev,
+            Some(ev) = lanes.client.recv() => ev,
+            Some(ev) = lanes.relay.recv() => ev,
+            Some(ev) = lanes.background.recv() => ev,
+            else => return Err(ContractError::NoEvHandlerResponse),
+        };
+        Ok(self.accept(internal))
+    }
+
+    /// Try to receive an event from one lane without blocking.
+    ///
+    /// Returns `Ok(None)` if the lane is empty, `Err` if it is closed. Used by
+    /// the fair-queue drain to fill the fair queue lane by lane.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn try_recv_lane(
+        &mut self,
+        lane: Lane,
+    ) -> Result<Option<(EventId, ContractHandlerEvent, super::fair_queue::Priority)>, ContractError>
+    {
+        match self.end.lanes.try_recv(lane) {
+            Ok(internal) => Ok(Some(self.accept(internal))),
+            Err(mpsc::error::TryRecvError::Empty) => Ok(None),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(ContractError::NoEvHandlerResponse),
+        }
+    }
+
+    /// Events waiting in `lane` right now.
+    pub(crate) fn lane_len(&self, lane: Lane) -> usize {
+        self.end.lanes.len(lane)
+    }
+
+    /// Try to receive an event from any lane, in precedence order, without
+    /// blocking. `Ok(None)` if every lane is empty, `Err` once every lane is
+    /// closed.
+    #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub fn try_recv_from_sender(
         &mut self,
     ) -> Result<Option<(EventId, ContractHandlerEvent, super::fair_queue::Priority)>, ContractError>
     {
-        match self.end.event_receiver.try_recv() {
-            Ok(InternalCHEvent {
-                ev,
-                id,
-                priority,
-                result,
-            }) => {
-                self.end.waiting_response.insert(id, result);
-                Ok(Some((EventId { id }, ev, priority)))
+        let mut open = false;
+        for lane in [Lane::Control, Lane::Client, Lane::Relay, Lane::Background] {
+            match self.end.lanes.try_recv(lane) {
+                Ok(internal) => return Ok(Some(self.accept(internal))),
+                Err(mpsc::error::TryRecvError::Empty) => open = true,
+                Err(mpsc::error::TryRecvError::Disconnected) => {}
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(None),
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                Err(ContractError::NoEvHandlerResponse)
-            }
+        }
+        if open {
+            Ok(None)
+        } else {
+            Err(ContractError::NoEvHandlerResponse)
         }
     }
 }
@@ -1683,6 +1984,189 @@ pub mod test {
             ContractHandlerEvent::DelegateResponse(Ok(_))
         ));
         Ok(())
+    }
+
+    // ── Admission lanes (ANT-2026-K0YQ8CG4) ─────────────────────────────
+
+    fn get_query(byte: u8) -> ContractHandlerEvent {
+        ContractHandlerEvent::GetQuery {
+            instance_id: ContractInstanceId::new([byte; 32]),
+            return_contract_code: false,
+        }
+    }
+
+    /// A full bounded lane refuses at once, without waiting for the loop:
+    /// a fire-and-forget send gets an error, an awaited one the typed
+    /// `ContractQueueFull` response. The other lanes are unaffected, and the
+    /// control lane takes `EvictContract` and `ClientDisconnect` whatever
+    /// their priority, so neither is ever refused.
+    ///
+    /// FALSIFY: route `EvictContract` by its priority in `Lane::of` (the
+    /// eviction is refused), or make the `Full` arm of
+    /// `send_to_handler_with_timeout` wait (the awaited send times out).
+    #[tokio::test]
+    async fn a_full_lane_refuses_at_once_and_the_control_lane_never_does() -> anyhow::Result<()> {
+        use crate::contract::fair_queue::Priority;
+        let (send, mut rcv, _) = contract_handler_channel();
+        for _ in 0..BACKGROUND_CHANNEL_CAPACITY {
+            send.send_to_handler_fire_and_forget_prioritized(get_query(1), Priority::Background)?;
+        }
+        assert!(
+            send.send_to_handler_fire_and_forget_prioritized(get_query(1), Priority::Background)
+                .is_err(),
+            "the background lane is full"
+        );
+        let awaited = tokio::time::timeout(
+            Duration::from_secs(5),
+            send.send_to_handler_with_timeout(
+                get_query(2),
+                Duration::from_secs(3600),
+                Priority::Background,
+            ),
+        )
+        .await
+        .expect("a refusal must not wait for the loop")?;
+        let ContractHandlerEvent::GetResponse {
+            response: Err(err), ..
+        } = &awaited
+        else {
+            panic!("expected a queue-full GetResponse, got {awaited}");
+        };
+        assert!(err.is_contract_queue_full());
+        assert_eq!(rcv.lane_len(Lane::Background), BACKGROUND_CHANNEL_CAPACITY);
+
+        // Control events at Background priority still go through.
+        let key =
+            ContractKey::from_id_and_code(ContractInstanceId::new([3; 32]), CodeHash::new([3; 32]));
+        send.send_to_handler_fire_and_forget_prioritized(
+            ContractHandlerEvent::EvictContract {
+                key,
+                expected_generation: 7,
+            },
+            Priority::Background,
+        )?;
+        send.send_to_handler_fire_and_forget(ContractHandlerEvent::ClientDisconnect {
+            client_id: ClientId::FIRST,
+        })?;
+        // Other lanes are unaffected.
+        send.send_to_handler_fire_and_forget_prioritized(get_query(4), Priority::ClientLocal)?;
+        send.send_to_handler_fire_and_forget_prioritized(get_query(5), Priority::NetworkRelay)?;
+
+        let (_, first, priority) = rcv.try_recv_lane(Lane::Control)?.expect("eviction");
+        assert!(matches!(first, ContractHandlerEvent::EvictContract { .. }));
+        assert_eq!(priority, Priority::Background, "it keeps its own priority");
+        let (_, second, _) = rcv.try_recv_lane(Lane::Control)?.expect("disconnect");
+        assert!(matches!(
+            second,
+            ContractHandlerEvent::ClientDisconnect { .. }
+        ));
+        assert!(rcv.try_recv_lane(Lane::Client)?.is_some());
+        assert!(rcv.try_recv_lane(Lane::Relay)?.is_some());
+        Ok(())
+    }
+
+    /// The delegate lane's forwarder never waits on a full contract lane: it
+    /// refuses the request, answers the client at once with the typed
+    /// `ContractQueueFull` refusal, and releases the loop-owned mark.
+    ///
+    /// FALSIFY: have `LoopForwarder::forward` fall back to an unbounded send,
+    /// keep the event, or drop the responder unanswered.
+    #[tokio::test]
+    async fn the_loop_forwarder_refuses_on_a_full_lane() -> anyhow::Result<()> {
+        use crate::contract::delegate_lane::LoopForward;
+        use crate::contract::fair_queue::Priority;
+        let (send, rcv, _) = contract_handler_channel();
+        for _ in 0..CLIENT_CHANNEL_CAPACITY {
+            send.send_to_handler_fire_and_forget_prioritized(get_query(6), Priority::ClientLocal)?;
+        }
+        let forwarder = rcv.loop_forwarder();
+        let (responder, answer) = tokio::sync::oneshot::channel();
+        let mut request = lane_filler();
+        request.responder = responder;
+        request.priority = Priority::ClientLocal;
+        let key = request.req.key().clone();
+        let gate = crate::contract::delegate_lane::DelegateGate::new();
+        let before = lane_refusals(Lane::Client);
+        forwarder.forward(request, gate.ticket_for_test(&key, None));
+        let (_, answer) = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("the client is answered at once")
+            .expect("with a response, not a closed channel");
+        let ContractHandlerEvent::DelegateResponse(Err(err)) = &answer else {
+            panic!("expected the typed refusal, got {answer}");
+        };
+        assert!(err.is_contract_queue_full(), "the refusal is typed");
+        assert!(!gate.is_tracking(&key), "the mark is released");
+        // Not an exact count: the counter is process-global.
+        assert!(lane_refusals(Lane::Client) > before);
+        Ok(())
+    }
+
+    /// No send into the lanes may wait (bug-prevention-patterns: no
+    /// `.send().await` on a bounded channel from an event or recv loop).
+    /// The client API, the relay drivers, the delegate lane task and the
+    /// node's own loops all send here; one waiting on a full lane would stall
+    /// whatever it runs in.
+    #[test]
+    fn no_send_into_the_lanes_waits() {
+        let src = include_str!("handler.rs");
+        let production = crate::contract::source_pin_util::strip_comments(
+            &src[..src
+                .find("#[cfg(test)]\npub mod test {")
+                .expect("test module")],
+        );
+        for signature in [
+            "impl LaneSenders",
+            "impl WeakLaneSenders",
+            "fn forward(",
+            "pub async fn send_to_handler_with_timeout(",
+            "pub fn send_to_handler_fire_and_forget_prioritized(",
+        ] {
+            let body = crate::contract::tests::fn_region(&production, signature);
+            for banned in ["blocking_send", "block_on", ".reserve(", "send_timeout"] {
+                assert!(
+                    !body.contains(banned),
+                    "`{signature}` must not use `{banned}`: a send into the lanes must not wait"
+                );
+            }
+            assert!(
+                !body.contains(".event_sender.send(") && !body.contains(".upgrade().is_some_and("),
+                "`{signature}` must go through the lanes' non-blocking `try_send`"
+            );
+            if signature.starts_with("impl ") {
+                // A plain `.send(` only on the unbounded control lane, where
+                // it cannot wait; every bounded lane uses `try_send`.
+                assert_eq!(
+                    body.matches(".send(").count(),
+                    1,
+                    "`{signature}`: only the control lane may use `send`"
+                );
+                for lane in ["client", "relay", "background"] {
+                    assert!(
+                        !body.contains(&format!("self.{lane}.send(")),
+                        "`{signature}`: the {lane} lane must use `try_send`"
+                    );
+                    // And positively: each bounded lane is sent to with
+                    // `try_send`, directly or through `bounded`.
+                    assert!(
+                        body.contains(&format!("self.{lane}.try_send(ev)"))
+                            || (body.contains(&format!("bounded(&self.{lane}, ev)"))
+                                && body.contains("tx.try_send(ev)")),
+                        "`{signature}`: the {lane} lane must be sent to with `try_send`"
+                    );
+                }
+            }
+        }
+        // The only awaited thing in the send path is the response.
+        let send_path = crate::contract::tests::fn_region(
+            &production,
+            "pub async fn send_to_handler_with_timeout(",
+        );
+        assert_eq!(
+            send_path.matches(".await").count(),
+            1,
+            "send_to_handler_with_timeout may await only the response"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

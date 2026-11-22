@@ -81,6 +81,14 @@ impl Ops {
 /// past the cap are unmeasured for that drop.
 const CONNECTION_DROP_SHADOW_SAMPLE_CAP: usize = 32;
 
+/// How long a relay driver waits for the contract handler
+/// ([`OpManager::notify_contract_handler_relay`]).
+pub(crate) const RELAY_HANDLER_TIMEOUT: std::time::Duration = crate::config::OPERATION_TTL;
+
+// A relay driver must wait less than the handler's 300 s default, and no
+// longer than its upstream does.
+const _: () = assert!(RELAY_HANDLER_TIMEOUT.as_secs() <= crate::config::OPERATION_TTL.as_secs());
+
 /// Max number of our active-subscription entries to EXAMINE per dropped
 /// connection while looking for the ≤`CONNECTION_DROP_SHADOW_SAMPLE_CAP` matches
 /// (keystone step-2, #4642). Bounds the SCAN itself (not just the recording): a
@@ -331,6 +339,11 @@ pub(crate) struct OpManager {
     /// flight. See [`crate::operations::put::stream_admission`].
     pub(crate) relay_put_stream_admission:
         Arc<crate::operations::put::stream_admission::RelayStreamAdmission>,
+    /// Per-source and node-wide bound on relay GET and PUT drivers in
+    /// flight (ANT-2026-K0YQ8CG4). See
+    /// [`crate::operations::relay_admission`].
+    pub(crate) relay_driver_admission:
+        Arc<crate::operations::relay_admission::RelayDriverAdmission>,
     /// Same role as `active_relay_get_txs` but for PUT relay. PUT
     /// relay has req/response semantics like GET (but forwards once
     /// — no per-hop retry), so amplification risk is comparable.
@@ -422,6 +435,7 @@ impl Clone for OpManager {
             active_relay_update_txs: self.active_relay_update_txs.clone(),
             recent_relay_update_requests: self.recent_relay_update_requests.clone(),
             relay_put_stream_admission: self.relay_put_stream_admission.clone(),
+            relay_driver_admission: self.relay_driver_admission.clone(),
             active_relay_put_txs: self.active_relay_put_txs.clone(),
             active_relay_subscribe_txs: self.active_relay_subscribe_txs.clone(),
             active_relay_connect_txs: self.active_relay_connect_txs.clone(),
@@ -870,6 +884,9 @@ impl OpManager {
             ),
             relay_put_stream_admission: Arc::new(
                 crate::operations::put::stream_admission::RelayStreamAdmission::new(),
+            ),
+            relay_driver_admission: Arc::new(
+                crate::operations::relay_admission::RelayDriverAdmission::new(),
             ),
             active_relay_put_txs,
             active_relay_subscribe_txs,
@@ -1802,6 +1819,32 @@ impl OpManager {
     ) -> Result<ContractHandlerEvent, ContractError> {
         self.ch_outbound
             .send_to_handler_with_timeout(msg, timeout, crate::contract::Priority::DEFAULT)
+            .await
+    }
+
+    /// Send a relay driver's event to the contract handler and await the
+    /// answer for at most [`RELAY_HANDLER_TIMEOUT`] (ANT-2026-K0YQ8CG4).
+    ///
+    /// A relay driver holds its relay-lane slot and its driver permit while
+    /// it waits, and its upstream gives up at `OPERATION_TTL` anyway, so it
+    /// waits no longer than that rather than the handler's 300 s default.
+    pub async fn notify_contract_handler_relay(
+        &self,
+        msg: ContractHandlerEvent,
+    ) -> Result<ContractHandlerEvent, ContractError> {
+        #[cfg(any(test, feature = "testing"))]
+        if crate::operations::relay_admission::sim_overload::is_saturated(
+            self.ring.connection_manager.get_own_addr(),
+        ) {
+            return crate::contract::queue_full_response_for(&msg)
+                .ok_or(ContractError::NoEvHandlerResponse);
+        }
+        self.ch_outbound
+            .send_to_handler_with_timeout(
+                msg,
+                RELAY_HANDLER_TIMEOUT,
+                crate::contract::Priority::NetworkRelay,
+            )
             .await
     }
 

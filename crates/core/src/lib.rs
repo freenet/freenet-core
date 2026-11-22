@@ -171,6 +171,20 @@ pub mod dev_tool {
                 .collect()
         }
     }
+    /// Simulation hook for ANT-2026-K0YQ8CG4: make chosen nodes' contract
+    /// handlers refuse every relay query, as a full relay lane does.
+    /// Process-global: a test that uses it must run in its own process.
+    #[cfg(any(test, feature = "testing"))]
+    pub mod sim_relay_overload {
+        /// Treat the node at `addr` as having a full relay lane.
+        pub fn saturate(addr: std::net::SocketAddr) {
+            crate::operations::relay_admission::sim_overload::saturate(addr);
+        }
+        /// Undo every `saturate`.
+        pub fn clear() {
+            crate::operations::relay_admission::sim_overload::clear();
+        }
+    }
     pub use crate::config::{
         Config, GlobalTestMetrics, KEK_SIZE, KekBackend, KekBackendKind, KekError, Secrets,
         ensure_kek_loaded, load_from_backend, read_backend_marker, replace_backend_marker,

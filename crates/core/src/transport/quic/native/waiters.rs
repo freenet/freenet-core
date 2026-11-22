@@ -6,16 +6,18 @@
 //! address to the waiter, which is the only way a native attempt reaches
 //! anything.
 //!
-//! At most one attempt per waiter is in flight: handing an attempt over marks
-//! the waiter busy, and the router ignores further attempts until the waiter
-//! has finished with it (its [`InFlight`] guard drops). An attempt whose
+//! At most [`MAX_IN_FLIGHT`] attempts per waiter are in flight (the
+//! overlapping-attempts variant, design 6.2: a client whose first attempt
+//! stalls starts a second): handing an attempt over counts it, and the router
+//! ignores further attempts until the waiter has finished with one (its
+//! [`InFlight`] guard drops). An attempt whose
 //! sender has not shown it reads datagrams sent to its address is answered
 //! with a Retry first, as an upgrade attempt is: one more round trip inside
 //! the 8 s window.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use dashmap::DashMap;
 use tokio::sync::mpsc;
@@ -62,7 +64,8 @@ pub(crate) enum NativeRoute {
     Retried,
     /// No waiter for the address: ignored.
     NoWaiter,
-    /// The waiter has an attempt it has not finished with: ignored.
+    /// The waiter has [`MAX_IN_FLIGHT`] attempts it has not finished with:
+    /// ignored.
     Busy,
 }
 
@@ -82,12 +85,15 @@ impl<A> Default for NativeWaiters<A> {
     }
 }
 
+/// The most attempts one waiter has in flight at once: a client's first
+/// attempt and its overlapping second (design 6.2).
+pub(crate) const MAX_IN_FLIGHT: usize = 2;
+
 pub(super) struct Slot<A> {
     pub(super) id: u64,
     pub(super) attempts: mpsc::Sender<A>,
-    /// Set when an attempt is handed over, cleared when the waiter has
-    /// finished with it.
-    pub(super) busy: Arc<AtomicBool>,
+    /// Attempts handed over that the waiter has not finished with.
+    pub(super) busy: Arc<AtomicUsize>,
 }
 
 /// One native server's place in [`NativeWaiters`]. Dropping it removes the
@@ -97,16 +103,16 @@ pub(crate) struct NativeWaiter<A: NativeAttempt = QuicIncoming> {
     pub(super) addr: SocketAddr,
     pub(super) id: u64,
     pub(super) attempts: mpsc::Receiver<A>,
-    pub(super) busy: Arc<AtomicBool>,
+    pub(super) busy: Arc<AtomicUsize>,
 }
 
-/// Keeps the waiter busy while alive; dropping it lets the router hand over
-/// the next attempt.
-pub(crate) struct InFlight(Arc<AtomicBool>);
+/// Counts one attempt in flight while alive; dropping it lets the router
+/// hand over another.
+pub(crate) struct InFlight(Arc<AtomicUsize>);
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -120,23 +126,29 @@ impl<A: NativeAttempt> NativeWaiters<A> {
             attempt.ignore();
             return NativeRoute::NoWaiter;
         };
-        if slot.busy.load(Ordering::Acquire) {
+        // Reserve a slot atomically, so no caller can take the count past
+        // MAX_IN_FLIGHT whatever else routes, and the waiter cannot see an
+        // attempt that is not counted yet.
+        if slot
+            .busy
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_IN_FLIGHT).then_some(n + 1)
+            })
+            .is_err()
+        {
             attempt.ignore();
             return NativeRoute::Busy;
         }
         if !attempt.address_validated() {
+            slot.busy.fetch_sub(1, Ordering::AcqRel);
             attempt.retry();
             return NativeRoute::Retried;
         }
-        // Busy from here, before the waiter can take it, so the router hands
-        // over nothing more until the waiter's guard drops. If the send below
-        // fails the flag stays set, which is bounded: the waiter lives at
-        // most its setup window (8 s), and dropping it removes the slot.
-        slot.busy.store(true, Ordering::Release);
         match slot.attempts.try_send(attempt) {
             Ok(()) => NativeRoute::Handed,
             Err(mpsc::error::TrySendError::Full(attempt))
             | Err(mpsc::error::TrySendError::Closed(attempt)) => {
+                slot.busy.fetch_sub(1, Ordering::AcqRel);
                 attempt.ignore();
                 NativeRoute::Busy
             }
@@ -213,32 +225,61 @@ mod tests {
         }
     }
 
-    /// Every branch of the routing decision: no waiter, a Retry, a hand-off,
-    /// busy until the waiter's guard drops, a full channel and a closed one
-    /// (both ignored), each attempt ignored or retried exactly once.
+    /// Callers racing on one waiter cannot take the count past
+    /// MAX_IN_FLIGHT: exactly that many are handed.
+    #[test]
+    fn concurrent_routes_never_exceed_the_cap() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let waiters = Arc::new(NativeWaiters::<Fake>::default());
+        let _waiter = waiters.register_for_test(addr()).expect("waiter");
+        let handed = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..4 {
+                        if waiters.route(fake(true, &log)) == NativeRoute::Handed {
+                            handed.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(handed.load(Ordering::SeqCst), MAX_IN_FLIGHT);
+    }
+
+    /// Every branch of the routing decision: no waiter, a Retry, hand-offs up
+    /// to MAX_IN_FLIGHT, busy until one of the waiter's guards drops, a full
+    /// channel and a closed one (both ignored, and not counted), each attempt
+    /// ignored or retried exactly once.
     #[test]
     fn the_router_takes_each_branch() {
         bounded(|| async {
+            assert_eq!(MAX_IN_FLIGHT, 2);
             let log = Arc::new(Mutex::new(Vec::new()));
             let waiters = Arc::new(NativeWaiters::<Fake>::default());
             assert_eq!(waiters.route(fake(true, &log)), NativeRoute::NoWaiter);
             let mut waiter = waiters.register_for_test(addr()).expect("waiter");
             assert_eq!(waiters.route(fake(false, &log)), NativeRoute::Retried);
             assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Handed);
-            // Busy from the hand-off, before the waiter takes the attempt.
+            // A client's overlapping second attempt is handed too.
+            assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Handed);
+            // Busy at two, counted from the hand-off, before the waiter takes
+            // them.
             assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Busy);
             let (_attempt, in_flight) = waiter.next().await.expect("handed");
             assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Busy);
             drop(in_flight);
             assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Handed);
-            // The guard of the one queued is not taken yet; clear busy as a
-            // finished attempt would, so the next meets a full channel.
-            waiter.busy.store(false, Ordering::Release);
+            // Two are queued and not taken; clear the count as finished
+            // attempts would, so the next meets a full channel, and its
+            // refused hand-off leaves the count as it was.
+            waiter.busy.store(0, Ordering::Release);
             assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Busy, "full");
-            waiter.busy.store(false, Ordering::Release);
+            assert_eq!(waiter.busy.load(Ordering::Acquire), 0, "not counted");
             waiter.attempts.close();
             while waiter.attempts.try_recv().is_ok() {}
             assert_eq!(waiters.route(fake(true, &log)), NativeRoute::Busy, "closed");
+            assert_eq!(waiter.busy.load(Ordering::Acquire), 0, "not counted");
             assert_eq!(
                 *log.lock().unwrap(),
                 [

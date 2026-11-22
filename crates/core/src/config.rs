@@ -2508,7 +2508,9 @@ pub struct NetworkArgs {
     #[serde(rename = "transient-budget", skip_serializing_if = "Option::is_none")]
     pub transient_budget: Option<usize>,
 
-    /// Time (in seconds) before an unpromoted transient connection is dropped.
+    /// Time (in seconds) after which an unpromoted transient connection is counted
+    /// as expired. Its transport stays open, and its slot in the transient budget
+    /// is held until it is promoted or closed.
     #[arg(long, env = "TRANSIENT_TTL_SECS")]
     #[serde(rename = "transient-ttl-secs", skip_serializing_if = "Option::is_none")]
     pub transient_ttl_secs: Option<u64>,
@@ -2919,7 +2921,9 @@ pub struct NetworkApiConfig {
     #[serde(default = "default_transient_budget", rename = "transient-budget")]
     pub transient_budget: usize,
 
-    /// Time (in seconds) before an unpromoted transient connection is dropped.
+    /// Time (in seconds) after which an unpromoted transient connection is counted
+    /// as expired. Its transport stays open, and its slot in the transient budget
+    /// is held until it is promoted or closed.
     #[serde(default = "default_transient_ttl_secs", rename = "transient-ttl-secs")]
     pub transient_ttl_secs: u64,
 
@@ -5531,8 +5535,10 @@ impl GlobalRng {
 
     /// Give the current thread index `idx`, as if it were the `idx`-th
     /// thread to ask. Only for a fresh thread that has not asked yet: a
-    /// thread-local derived from the index (the stream-id counter, the nonce
-    /// counter) is initialized on first use and does not see a later change.
+    /// thread-local derived from the index (the nonce counter, or a seeded or
+    /// reset stream-id counter) is initialized on first use and does not see a
+    /// later change. Unseeded threads draw stream ids from a process-wide
+    /// counter that does not read it.
     #[cfg(test)]
     pub(crate) fn pin_thread_index_for_test(idx: u64) {
         THREAD_INDEX.with(|c| c.set(Some(idx)));

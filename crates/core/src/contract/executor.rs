@@ -2921,6 +2921,26 @@ mod tests {
                 "unpacked-webapp cache under the XDG CACHE dir; on disk, and by its own \
                  doc outside the node's disk accounting too, so it is not resident memory",
             ),
+            (
+                "MAX_UNPACKED_TOTAL_BYTES",
+                "per-archive limit on one web-app unpack, written to disk; not a standing cache",
+            ),
+            (
+                "MAX_UNPACKED_FILE_BYTES",
+                "per-file limit within one web-app unpack, written to disk; not a standing cache",
+            ),
+            (
+                "TAR_ENTRY_OVERHEAD_BYTES",
+                "per-entry allowance used to derive the web-app decompressed-stream cap",
+            ),
+            (
+                "MAX_DECOMPRESSED_STREAM_BYTES",
+                "per-unpack cap on a streaming decoder, transient and freed when the unpack ends",
+            ),
+            (
+                "MAX_REWRITTEN_ASSET_BYTES",
+                "per-request read bound for one .js or HTML file, transient",
+            ),
             ("LOG_DIR_MAX_BYTES", "on-disk log rotation cap"),
             ("MIN_LOG_DIR_MAX_BYTES", "clamp for that log rotation cap"),
             (
@@ -3114,6 +3134,19 @@ mod tests {
                 "QUIC_OPEN_STREAM_BYTES",
                 "a measurement of one QUIC connection term (one open stream, both \
                  sides), not a ceiling; a term inside QUIC_CONNECTION_CHARGE_BYTES",
+            ),
+            (
+                "QUIC_HANDSHAKE_PHASE_CHARGE_BYTES",
+                "the charge one native joiner takes from the QUIC connection cap \
+                 (#6297), not a ceiling; joiners draw permit units from the same \
+                 cap total as paths, so their memory is inside the QUIC transport \
+                 share (cap x QUIC_CONNECTION_CHARGE_BYTES), which is summed",
+            ),
+            (
+                "PERMIT_UNIT_BYTES",
+                "the unit the QUIC connection cap counts in (#6297), not a budget; \
+                 the cap's total is limit x the path charge in these units, which \
+                 the QUIC transport share already sums",
             ),
             (
                 "QUIC_STOPPED_ENTRY_BYTES",

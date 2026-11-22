@@ -25,6 +25,14 @@
 //! 4. At most [`GLOBAL_RATE_PER_SEC`] validated attempts per second for the
 //!    node, a token bucket of one second's worth.
 //!
+//! 5. A joiner takes a handshake-phase charge against the node's connection
+//!    cap ([`super::upgrade::policy::QuicPathPermits`]) from its admission,
+//!    released when its join ends or re-charged at the full rate at
+//!    promotion; with no room, or no cap attached yet, the attempt is
+//!    ignored ([`GatewayAdmission::JoinerCapFull`]). Its address is marked
+//!    as a joiner on the allow-set, so all unpromoted joiners share one
+//!    bounded part of the ingress queue.
+//!
 //! An attempt over a limit is ignored, with no reason given. An admitted one
 //! is recorded at once, against both limits, as an [`AdmissionTicket`]; the
 //! ticket gives the admission back (counted `refunded`) if it is dropped
@@ -49,9 +57,10 @@ use crate::transport::normalize_mapped_addr;
 /// about. The change that turns it on is a one-line change here, and it
 /// waits for:
 ///
-/// - joiners counted inside the node's connection cap (the next A7b PR),
-///   with the share of the QUIC ingress queue an admitted joiner may hold
-///   settled in the same PR;
+/// - (done, A7b PR 6) joiners counted inside the node's connection cap at
+///   the handshake-phase charge, and all unpromoted joiners held to one small
+///   share of the QUIC ingress queue
+///   (`demux::QUIC_INGRESS_JOINER_DATAGRAMS`);
 /// - phase B: the node takes the admitted connection (`ConnectRequest` on
 ///   it, transient to promoted). Until then a join that completes is closed
 ///   at the hook (`driver::join_gateway`);
@@ -498,8 +507,7 @@ pub(in crate::transport::quic) mod tests {
     #[test]
     fn proven_key_is_read_only_after_the_handshake_completes() {
         let quic = include_str!("../quic.rs");
-        let signature =
-            "    pub(crate) async fn establish(self) -> Result<QuicConnection, JoinerError> {";
+        let signature = "    pub(crate) async fn establish(self) -> Result<(QuicConnection, JoinerCharge), JoinerError> {";
         let start = quic.find(signature).expect("JoinerIncoming::establish");
         let len = quic[start..].find("\n    }\n").expect("its end");
         let body = &quic[start..start + len];

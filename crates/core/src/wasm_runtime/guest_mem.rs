@@ -107,6 +107,12 @@ pub enum GuestMemoryError {
         expected: i32,
         found: i32,
     },
+
+    /// A host call for an instance whose memory record is gone, e.g. a guest
+    /// still running on an abandoned thread after a wall-clock timeout, once
+    /// its `RunningInstance` has been dropped.
+    #[error("instance {instance_id} has no memory record")]
+    InstanceNotRecorded { instance_id: i64 },
 }
 
 /// Check that `[offset, offset + len)` lies inside `mem` and that `offset` is a

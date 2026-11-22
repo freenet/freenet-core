@@ -10317,6 +10317,211 @@ fn test_get_reaches_sparse_holder_via_relay_forwarding() {
     );
 }
 
+/// ANT-2026-K0YQ8CG4: an honest GET succeeds when the requester's first-choice
+/// relay has a full relay lane. Same topology and seeding as
+/// `test_get_reaches_sparse_holder_via_relay_forwarding`, with the decoy's
+/// contract handler refusing every relay query
+/// (`dev_tool::sim_relay_overload`). The decoy answers NotFound without
+/// forwarding, and the GET must still reach a holder.
+#[test_log::test]
+fn test_get_succeeds_past_a_relay_with_a_full_relay_lane() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    // The seed still drives node keys and gateway placement, but no assertion
+    // in this test depends on the topology it produces: peer locations, peer
+    // connections and contract placement are all set explicitly below.
+    const SEED: u64 = 0x3506_000B_0001;
+    const NETWORK_NAME: &str = "get-past-overloaded-relay";
+
+    GlobalTestMetrics::reset();
+    setup_deterministic_state(SEED);
+
+    let contract = SimOperation::create_test_contract(0xBE);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let ring_dist = |a: f64, b: f64| {
+        let d = (a - b).abs();
+        d.min(1.0 - d)
+    };
+
+    // Regular-node order maps to labels as node_locations[i] -> node(i + 1).
+    const DECOY_OFFSET: f64 = 0.002;
+    const HOLDER_OFFSET: f64 = 0.02;
+    const REQUESTER_OFFSET: f64 = 0.45;
+    let node_locations = vec![
+        wrap(key_loc + DECOY_OFFSET),     // node 1: decoy, closest to the key
+        wrap(key_loc + HOLDER_OFFSET),    // node 2: holder A
+        wrap(key_loc - HOLDER_OFFSET),    // node 3: holder B
+        wrap(key_loc + REQUESTER_OFFSET), // node 4: requester, far from the key
+    ];
+    let num_nodes = node_locations.len();
+
+    let decoy = NodeLabel::node(NETWORK_NAME, 1);
+    let holders = [
+        NodeLabel::node(NETWORK_NAME, 2),
+        NodeLabel::node(NETWORK_NAME, 3),
+    ];
+    let requester = NodeLabel::node(NETWORK_NAME, 4);
+
+    let rt = create_runtime();
+    let (mut sim, logs_handle) = rt.block_on(async {
+        let sim = SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,         // 1 gateway
+            num_nodes, // 4 regular nodes
+            3,         // ring_max_htl — see "Why the mechanics are what they are"
+            3,         // rnd_if_htl_above — INERT, see below; value is arbitrary
+            12,        // max_connections — ample, so no preseeded edge is capped away
+            3,         // min_connections
+            SEED,
+            &node_locations,
+        )
+        .await;
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+
+    // Wire the whole route explicitly, so it does not depend on CONNECT racing:
+    // the requester reaches the decoy and both holders, and the decoy can
+    // forward onward to a holder.
+    sim.preseed_direct_star(
+        &requester,
+        &[decoy.clone(), holders[0].clone(), holders[1].clone()],
+    );
+    sim.preseed_direct_star(&decoy, &[holders[0].clone(), holders[1].clone()]);
+
+    // Setup sanity. `new_with_node_locations` realises locations approximately
+    // (it picks the loopback port nearest each target), so assert the ordering
+    // the scenario depends on against the ACHIEVED locations rather than the
+    // requested ones. get_peer_locations() is [gateway, node1..node4].
+    let locs = sim.get_peer_locations();
+    let decoy_dist = ring_dist(locs[1], key_loc);
+    let holder_dists = [ring_dist(locs[2], key_loc), ring_dist(locs[3], key_loc)];
+    let requester_dist = ring_dist(locs[4], key_loc);
+    // The gateway's location is NOT chosen by this test — it is derived from the
+    // seed — and preseeding does not suppress organic CONNECT, so the requester
+    // does connect to it. That makes the gateway a live routing candidate whose
+    // distance to the key is a seed-derived quantity, i.e. exactly the kind of
+    // dependency this test exists to remove. Assert it rather than rely on the
+    // margin: HTL has zero slack here (requester 3 -> decoy 2 -> holder 1), so a
+    // gateway hop inserted into the route would exhaust HTL and yield NotFound.
+    let gateway_dist = ring_dist(locs[0], key_loc);
+    for (i, holder_dist) in holder_dists.iter().enumerate() {
+        assert!(
+            *holder_dist < gateway_dist,
+            "scenario setup wrong: the seed-derived gateway landed closer to the key \
+             than holder {i}, so it can win a greedy pick and insert a hop into the \
+             forced route. With no HTL slack that turns the GET into a NotFound. \
+             Re-pick SEED or move the holders. \
+             holder_dist={holder_dist}, gateway_dist={gateway_dist}"
+        );
+        assert!(
+            decoy_dist < *holder_dist,
+            "scenario setup wrong: the decoy must be strictly closer to the key than \
+             holder {i} so that a keyward-routed GET lands on the decoy (which does not \
+             host the contract) before any holder — otherwise the first hop would serve \
+             it and nothing would be exercised. \
+             decoy_dist={decoy_dist}, holder_dist={holder_dist}"
+        );
+        assert!(
+            *holder_dist < requester_dist,
+            "scenario setup wrong: holder {i} must be strictly closer to the key than \
+             the requester, so the requester's candidate list is ordered \
+             [decoy, holders, ...] and the decoy forwards onward to a holder. \
+             holder_dist={holder_dist}, requester_dist={requester_dist}"
+        );
+    }
+
+    // Place the contract at exactly two peers, BY CONSTRUCTION. Seed ops are
+    // applied at node startup, before any scheduled operation runs, so the
+    // sparse-hosting precondition holds without depending on a PUT's incidental
+    // caching. Advertisements stay off (harness default), so these holders are
+    // reachable only by being routed to — which is what keeps the decoy unable
+    // to answer.
+    let mut operations = Vec::new();
+    for holder in &holders {
+        operations.push(ScheduledOperation::new(
+            holder.clone(),
+            SimOperation::SeedDemandlessCopy {
+                contract: contract.clone(),
+                state: vec![10, 20, 30, 40],
+            },
+        ));
+    }
+    operations.push(ScheduledOperation::new(
+        requester.clone(),
+        SimOperation::Get {
+            contract_id,
+            return_contract_code: true,
+            subscribe: false,
+        },
+    ));
+
+    // The decoy, the requester's first-choice candidate, refuses every relay
+    // query as a full relay lane does.
+    let decoy_addr = sim.node_address(&decoy).expect("the decoy has an address");
+    freenet::dev_tool::sim_relay_overload::saturate(decoy_addr);
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+    );
+
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation should complete: {:?}",
+        result.turmoil_result.err()
+    );
+
+    let stored = |label: &NodeLabel| {
+        result
+            .node_storages
+            .get(label)
+            .unwrap_or_else(|| panic!("{label:?} should have a storage handle"))
+            .get_stored_state(&contract_key)
+    };
+
+    freenet::dev_tool::sim_relay_overload::clear();
+
+    // The claim: an honest GET still succeeds when the first-choice relay is
+    // overloaded. The decoy answers NotFound at once, and the requester's
+    // relay moves on to a holder, as in
+    // `test_get_reaches_sparse_holder_via_relay_forwarding` (the baseline,
+    // where the decoy forwards instead).
+    assert!(
+        stored(&requester).is_some(),
+        "the requester did not get the contract state with the decoy's relay lane \
+         full: a relay that refuses for overload must not cost an honest GET its \
+         result while another peer holds the contract"
+    );
+    // The overloaded decoy neither served nor forwarded the GET (it would then
+    // have cached the state on the return path, as in the baseline), so the
+    // state came from a holder by another route.
+    assert!(
+        stored(&decoy).is_none(),
+        "the overloaded decoy holds the state, so the GET went through it: an \
+         overloaded relay must answer NotFound and not forward"
+    );
+
+    // StateVerifier anomaly check
+    let rt = create_runtime();
+    let report = rt.block_on(async {
+        let logs = logs_handle.lock().await;
+        let verifier = freenet::tracing::StateVerifier::from_events(logs.clone());
+        verifier.verify()
+    });
+    tracing::info!(
+        "test_get_succeeds_past_a_relay_with_a_full_relay_lane PASSED: \
+         requester got contract state from a holder past the decoy, \
+         {} anomalies, {} events",
+        report.anomalies.len(),
+        report.total_events
+    );
+}
+
 /// Regression test for auto-fetch from UPDATE sender.
 ///
 /// When a node subscribed to a CRDT contract receives an UPDATE broadcast but
@@ -23453,6 +23658,9 @@ fn test_quic_native_blocked_pairs_connect_over_udp_behind_nats() {
     assert!(connected);
 }
 
+/// Seeds tried, from the listed one, for a run whose survivor-rule order is a premise.
+const SURVIVOR_SEED_SEARCH: u64 = 32;
+
 /// Which survivor-rule decision a run must produce.
 #[derive(Clone, Copy, Debug)]
 enum SurvivorOrder {
@@ -23514,7 +23722,7 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
         ),
         (
             6,
-            0x0059_40A5_00D8,
+            0x0059_40A5_00E0,
             None,
             Some(600),
             Some(SurvivorOrder::NativeFirstInbound),
@@ -23522,32 +23730,65 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
         ),
     ] {
         let name = format!("native-survivor-{run_id}");
-        let nat = SimNat::all(NatFiltering::PortRestricted);
-        let run = run_native_connect_sim_with(&name, seed, 200, Some(nat), |sim| {
-            sim.with_native_connect(100);
-            if let Some(ms) = quic_delay {
-                sim.delay_quic_datagrams(Duration::from_millis(ms));
+        // The decision a run must produce depends on event order, which any
+        // change to connection setup shifts. Search a bounded range of fixed
+        // seeds, starting at the listed one, for the first that yields it;
+        // the search is deterministic and fails closed below.
+        let decided_by = |t: &freenet::dev_tool::NativeWireTrace, order: SurvivorOrder| -> u64 {
+            match order {
+                SurvivorOrder::UdpFirst => t.survivor_swapped(),
+                SurvivorOrder::NativeFirst => t.survivor_udp_dropped(),
+                SurvivorOrder::NativeFirstInbound => t.survivor_inbound_dropped(),
             }
-            if let Some(ms) = intro_delay {
-                sim.delay_udp_intros(Duration::from_millis(ms));
-            }
-            if let Some(order) = order {
-                sim.with_udp_dial_beside_every_native_dial(matches!(
-                    order,
-                    SurvivorOrder::NativeFirstInbound
-                ));
-            }
-            if drop_some {
-                let mut labels: Vec<NodeLabel> = sim.all_node_addresses().keys().cloned().collect();
-                labels.sort();
-                for (i, a) in labels.iter().enumerate() {
-                    for (j, b) in labels.iter().enumerate().skip(i + 1) {
-                        if (i + j) % 3 == 0 {
-                            sim.drop_quic_datagrams_between(a, b, Duration::ZERO);
+        };
+        let seed_range = if order.is_some() {
+            SURVIVOR_SEED_SEARCH
+        } else {
+            1
+        };
+        let mut found = None;
+        for offset in 0..seed_range {
+            let seed = seed + offset;
+            let nat = SimNat::all(NatFiltering::PortRestricted);
+            let run = run_native_connect_sim_with(&name, seed, 200, Some(nat), |sim| {
+                sim.with_native_connect(100);
+                if let Some(ms) = quic_delay {
+                    sim.delay_quic_datagrams(Duration::from_millis(ms));
+                }
+                if let Some(ms) = intro_delay {
+                    sim.delay_udp_intros(Duration::from_millis(ms));
+                }
+                if let Some(order) = order {
+                    sim.with_udp_dial_beside_every_native_dial(matches!(
+                        order,
+                        SurvivorOrder::NativeFirstInbound
+                    ));
+                }
+                if drop_some {
+                    let mut labels: Vec<NodeLabel> =
+                        sim.all_node_addresses().keys().cloned().collect();
+                    labels.sort();
+                    for (i, a) in labels.iter().enumerate() {
+                        for (j, b) in labels.iter().enumerate().skip(i + 1) {
+                            if (i + j) % 3 == 0 {
+                                sim.drop_quic_datagrams_between(a, b, Duration::ZERO);
+                            }
                         }
                     }
                 }
+            });
+            let chose = order.is_none_or(|o| decided_by(&run.wire.trace, o) > 0);
+            if chose {
+                println!("{name}: seed {seed:#x} (offset {offset})");
+                found = Some(run);
+                break;
             }
+        }
+        let run = found.unwrap_or_else(|| {
+            panic!(
+                "{name}: premise: the rule chose {order:?} for none of the {seed_range} seeds \
+                 from {seed:#x}"
+            )
         });
         log_native_connect(&name, &run);
         let t = &run.wire.trace;
@@ -23602,11 +23843,7 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
         );
         held_both += both;
         if let Some(order) = order {
-            let decided = match order {
-                SurvivorOrder::UdpFirst => t.survivor_swapped(),
-                SurvivorOrder::NativeFirst => t.survivor_udp_dropped(),
-                SurvivorOrder::NativeFirstInbound => t.survivor_inbound_dropped(),
-            };
+            let decided = decided_by(t, order);
             assert!(decided > 0, "{name}: premise: the rule chose {order:?}");
             // Keep-first instead of native-wins shows as a pair that holds
             // UDP at both ends although a native setup completed at both
@@ -23643,6 +23880,86 @@ fn test_quic_native_both_ends_keep_the_same_transport() {
     );
     assert!(setups.0 > 0, "premise: native setups ended at both ends");
     assert!(held_both > 0, "premise: pairs held at both ends");
+}
+
+/// Option (b), the timeout path (10.4 answer 2): a native connection that
+/// never carries a frame from the peer does not displace the UDP connection.
+/// Native connections here send no first-frame probe, which is what a
+/// one-sided setup looks like to the end that finished it: the peer never
+/// holds the connection, so nothing arrives over it. Every native dial gets a
+/// UDP dial beside it at both ends, with QUIC delayed so the UDP connection
+/// lands first. No native connection may be swapped in, no UDP connection
+/// dropped, the held native connections must expire, and the two ends of
+/// every pair held at both must keep the same transport, so the pairs keep
+/// working over UDP. The other order (native first) cannot be run this way:
+/// a native entry carries the peer's ordinary traffic, which proves it
+/// without any probe; the unit tests cover that order, and the one-sided case
+/// where the peer sends nothing over it.
+#[test_log::test]
+fn test_quic_native_without_frames_keeps_udp() {
+    use freenet::dev_tool::{NatFiltering, SimNat};
+    for (run_id, seed, quic_delay, intro_delay) in [(0u8, 0x0059_40A5_00F1u64, Some(600), None)] {
+        let name = format!("native-no-frames-{run_id}");
+        let nat = SimNat::all(NatFiltering::PortRestricted);
+        let run = run_native_connect_sim_with(&name, seed, 200, Some(nat), |sim| {
+            sim.with_native_connect(100);
+            sim.without_native_probes();
+            if let Some(ms) = quic_delay {
+                sim.delay_quic_datagrams(Duration::from_millis(ms));
+            }
+            if let Some(ms) = intro_delay {
+                sim.delay_udp_intros(Duration::from_millis(ms));
+            }
+            sim.with_udp_dial_beside_every_native_dial(false);
+        });
+        log_native_connect(&name, &run);
+        let t = &run.wire.trace;
+        let transports = t.transports();
+        let mut mismatched = Vec::new();
+        let mut both = 0;
+        let mut native_at_both = 0;
+        for (&(own, peer), &native) in &transports {
+            if let Some(&other) = transports.get(&(peer, own)) {
+                if own < peer {
+                    both += 1;
+                    if other != native {
+                        mismatched.push((own, peer, native, other));
+                    }
+                    if native && other {
+                        native_at_both += 1;
+                    }
+                }
+            }
+        }
+        println!(
+            "{name}: held={} expired={} swapped={} udp_dropped={} held_at_both_ends={both} \
+             native_at_both_ends={native_at_both}",
+            t.native_held(),
+            t.native_hold_expired(),
+            t.survivor_swapped(),
+            t.survivor_udp_dropped(),
+        );
+        assert!(
+            t.native_held() > 0,
+            "{name}: premise: native connections were held beside UDP"
+        );
+        assert!(
+            t.native_hold_expired() > 0,
+            "{name}: the held native connections expired"
+        );
+        assert_eq!(t.survivor_swapped(), 0, "{name}: nothing carried a frame");
+        assert_eq!(
+            t.survivor_udp_dropped(),
+            0,
+            "{name}: no UDP connection was dropped for a native one with no frame"
+        );
+        assert!(
+            mismatched.is_empty(),
+            "{name}: pairs whose ends keep different transports (own, peer, own native, \
+             peer native): {mismatched:?}"
+        );
+        assert!(both > 0, "{name}: premise: pairs held at both ends");
+    }
 }
 
 /// A5c-2: nodes behind symmetric NATs. Half the regular nodes are behind a

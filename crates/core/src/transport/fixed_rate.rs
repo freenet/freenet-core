@@ -34,4 +34,6 @@
 
 mod controller;
 
+#[cfg(test)]
+pub(crate) use controller::MAX_FLIGHT_SECS;
 pub use controller::{DEFAULT_RATE_BYTES_PER_SEC, FixedRateConfig, FixedRateController};
