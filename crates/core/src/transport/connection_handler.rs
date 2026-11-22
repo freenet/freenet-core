@@ -390,37 +390,44 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     // The node-wide egress cap exists only when `total-bandwidth-limit` is
     // set and not 0 (`global_bandwidth` is set; the node builds no pool for a
     // total of 0, `NetworkApiConfig::global_bandwidth_manager`), so a node
-    // without it pays nothing. The cap runs
-    // on `RealTime`, as the listener built below does, in production and in
-    // simulation alike; waiters sleep on their own connection's time
-    // source. A cap on the network's `VirtualTime` would compute deficits on
-    // one clock for stream senders that sleep and time out on another.
+    // without it pays nothing.
     //
-    // The QUIC endpoint must run on the cap's clock (see
-    // `QuicEndpoint::bind`), and in simulation it runs on `VirtualTime`, so
-    // a simulated node that has both a cap and QUIC is refused rather than
-    // run on two clocks.
-    let egress_cap = config.global_bandwidth.as_ref().and_then(|manager| {
-        super::egress_cap::EgressCap::from_total_limit(manager.total_limit(), RealTime::new())
-    });
-    if quic_virtual_time.is_some() && egress_cap.is_some() {
-        return Err(TransportError::Other(anyhow::anyhow!(
-            "simulated node at {bind_addr} sets both transport-quic and \
-             total-bandwidth-limit: the egress cap runs on RealTime and the \
-             simulated QUIC endpoint on VirtualTime, so they cannot share a clock"
-        )));
-    }
+    // The QUIC endpoint must run on the cap's clock: a hold's age is
+    // measured on the path's clock against a bound in the cap's time (see
+    // `QuicEndpoint::bind`). So a simulated node with QUIC builds the cap
+    // on the same `VirtualTime` as its endpoint; the cap's clock and its
+    // cancelable timers are then simulated time, and a seeded run repeats.
+    // If the endpoint then fails to bind (`bind_or_warn`), the cap stays on
+    // `VirtualTime` with no endpoint. Everywhere else, in production and in a simulated node
+    // without QUIC, the cap runs on `RealTime`, as the listener built below
+    // does: UDP stream senders sleep and time out on the connection's own
+    // time source, and a cap on `VirtualTime` would compute their deficits
+    // on another clock.
+    let egress_cap =
+        config
+            .global_bandwidth
+            .as_ref()
+            .and_then(|manager| match quic_virtual_time.clone() {
+                Some(time) => {
+                    super::egress_cap::EgressCap::from_total_limit(manager.total_limit(), time)
+                }
+                None => super::egress_cap::EgressCap::from_total_limit(
+                    manager.total_limit(),
+                    RealTime::new(),
+                ),
+            });
     let socket = Arc::new(
         bind_socket_with_retry::<DemuxSocket<S>>(bind_addr, SOCKET_BIND_MAX_RETRIES)
             .await?
             .with_egress_cap(egress_cap),
     );
+    #[cfg(test)]
+    super::in_memory_socket::record_egress_cap_probe(bind_addr, Arc::downgrade(&socket));
     // With `transport-quic` off nothing is built and no QUIC ingress is
     // enabled, so QUIC-class datagrams stay `quic_ingress_no_ingress`. With
-    // it on the endpoint runs on the egress cap's clock (`RealTime`, see
-    // above; the simulation's `VirtualTime` in a simulation, which has no
-    // cap), authenticates with this node's transport key, and has an empty
-    // allow-set: nothing reaches it until an upgrade path allows a peer.
+    // it on the endpoint runs on the egress cap's clock (`RealTime`, or the
+    // simulation's `VirtualTime` in a simulation, see above), authenticates
+    // with this node's transport key, and has an empty allow-set: nothing reaches it until an upgrade path allows a peer.
     // Each QUIC connection's window is capped at the rate the UDP token
     // bucket paces a connection at (`quic::recycle::CappedCubic`).
     let quic_settings = config

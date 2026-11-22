@@ -2221,6 +2221,44 @@ impl SimNetwork {
         self
     }
 
+    /// Sets `total-bandwidth-limit` (bytes per second, node-wide egress cap)
+    /// on the node `label` only. Call before the simulation starts.
+    #[cfg(test)]
+    pub fn with_node_total_bandwidth_limit(
+        &mut self,
+        label: &NodeLabel,
+        bytes_per_sec: usize,
+    ) -> &mut Self {
+        let config = self.node_config_mut(label);
+        Arc::make_mut(&mut config.config)
+            .network_api
+            .total_bandwidth_limit = Some(bytes_per_sec);
+        self
+    }
+
+    /// What the egress cap of the node `label` reads: `None` if the node has
+    /// not bound its socket, `Some(None)` if it has no cap.
+    #[cfg(test)]
+    pub(crate) fn egress_cap_reading(
+        &self,
+        label: &NodeLabel,
+    ) -> Option<Option<crate::transport::in_memory_socket::EgressCapReading>> {
+        let addr = *self.node_addresses.get(label)?;
+        crate::transport::in_memory_socket::egress_cap_reading(&self.name, addr)
+    }
+
+    /// Takes `bytes` from the egress cap of the node `label` as one
+    /// datagram's send would; see `in_memory_socket::egress_cap_take`.
+    #[cfg(test)]
+    pub(crate) fn egress_cap_take(
+        &self,
+        label: &NodeLabel,
+        bytes: usize,
+    ) -> Option<Result<(), Duration>> {
+        let addr = *self.node_addresses.get(label)?;
+        crate::transport::in_memory_socket::egress_cap_take(&self.name, addr, bytes)
+    }
+
     /// Makes the node `label` advertise `version` in its transport
     /// handshakes instead of this binary's version, so its peers treat it as
     /// that (older) release in every version gate, e.g. `(0, 2, 148)` for a
@@ -8725,6 +8763,116 @@ mod tests {
         // starts none.
         assert!(sim.quic_accept_loop_started(&labels[0]));
         assert!(!sim.quic_accept_loop_started(&labels[1]));
+    }
+
+    /// In a running simulation a node with `transport-quic` and a
+    /// `total-bandwidth-limit` runs its egress cap on the network's
+    /// `VirtualTime` (the clock of its QUIC endpoint): the cap's clock is the
+    /// simulated clock, the node's sends are charged to it, and over the run
+    /// the bytes charged stay within `burst + rate * elapsed` of simulated
+    /// time. A node without QUIC keeps its cap on `RealTime`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_simulated_quic_node_runs_its_egress_cap_on_virtual_time() {
+        use crate::simulation::TimeSource;
+        const NETWORK: &str = "quic-sim-egress-cap-d2a";
+        const RATE: usize = 128 * 1024;
+        let mut sim = SimNetwork::new(NETWORK, 1, 2, 7, 3, 6, 2, 0xD2A0_0001).await;
+        let labels = labels_in_order(&sim);
+        sim.with_transport_quic("prefer")
+            .with_node_transport_quic(&labels[2], "off");
+        for label in &labels {
+            sim.with_node_total_bandwidth_limit(label, RATE);
+        }
+        let _handles = sim
+            .start_with_rand_gen::<rand::rngs::SmallRng>(0xD2A0_0001, 1, 1)
+            .await;
+        let started = sim.virtual_time().now_nanos();
+        // Run until 30 simulated seconds have passed and both QUIC nodes
+        // have sent something (their connections formed), however long the
+        // host takes in wall time; the deadline only ends a stuck run.
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        loop {
+            sim.advance_time(Duration::from_millis(100));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let charged = labels[..2].iter().all(|label| {
+                sim.egress_cap_reading(label)
+                    .flatten()
+                    .is_some_and(|cap| cap.charged_bytes > 0)
+            });
+            if charged && sim.virtual_time().now_nanos() - started >= 30_000_000_000 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the QUIC nodes never sent anything"
+            );
+        }
+        let elapsed_ns = sim.virtual_time().now_nanos() - started;
+        assert!(elapsed_ns >= 30_000_000_000, "{elapsed_ns} ns elapsed");
+        for label in &labels[..2] {
+            let cap = sim
+                .egress_cap_reading(label)
+                .expect("the node bound its socket")
+                .unwrap_or_else(|| panic!("{label} has no egress cap"));
+            assert_eq!(cap.rate_bytes_per_sec, RATE as u64);
+            assert_eq!(
+                cap.now_nanos,
+                sim.virtual_time().now_nanos(),
+                "{label}: the cap reads the simulated clock"
+            );
+            assert!(cap.charged_bytes > 0, "{label}: its sends are charged");
+            assert!(
+                cap.charged_bytes as u128
+                    <= cap.burst_bytes as u128
+                        + RATE as u128 * u128::from(elapsed_ns) / 1_000_000_000,
+                "{label}: {} bytes charged in {elapsed_ns} ns",
+                cap.charged_bytes
+            );
+            // The bucket refuses what exceeds it, and asks for a wait in
+            // simulated time: advancing the simulated clock by that wait,
+            // and no less, lets the same datagram through.
+            const DATAGRAM: usize = 1200;
+            let mut refused = None;
+            for _ in 0..(cap.burst_bytes as usize / DATAGRAM + 8) {
+                match sim.egress_cap_take(label, DATAGRAM).expect("a cap") {
+                    Ok(()) => {}
+                    Err(wait) => {
+                        refused = Some(wait);
+                        break;
+                    }
+                }
+            }
+            let wait = refused.unwrap_or_else(|| panic!("{label}: the cap never refused"));
+            assert!(wait > Duration::ZERO, "{label}");
+            assert!(
+                sim.egress_cap_take(label, DATAGRAM)
+                    .expect("a cap")
+                    .is_err(),
+                "{label}: still refused with no simulated time passed"
+            );
+            sim.advance_time(wait + Duration::from_millis(1));
+            assert!(
+                sim.egress_cap_take(label, DATAGRAM).expect("a cap").is_ok(),
+                "{label}: admitted after the simulated wait"
+            );
+        }
+        // Without QUIC the cap keeps RealTime: simulated time does not move
+        // it. Compared across one large simulated step, so how long the host
+        // stalled in wall time does not matter.
+        let reading = |sim: &SimNetwork| {
+            sim.egress_cap_reading(&labels[2])
+                .unwrap()
+                .expect("a cap on the node without QUIC")
+                .now_nanos
+        };
+        let before = reading(&sim);
+        const STEP: Duration = Duration::from_secs(100_000);
+        sim.advance_time(STEP);
+        let moved = reading(&sim) - before;
+        assert!(
+            u128::from(moved) < STEP.as_nanos() / 2,
+            "the node without QUIC runs its cap on RealTime, it moved {moved} ns"
+        );
     }
 
     /// Watches the QUIC ingress outcomes of some addresses for a test, and
