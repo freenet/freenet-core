@@ -5110,8 +5110,8 @@ async fn a_held_native_connection_that_closes_leaves_the_udp_entry() {
 /// connection (gate 21).
 struct DyingNative {
     inner: IdleConnection,
-    end: tokio::sync::oneshot::Receiver<crate::transport::boundary::CloseReason>,
-    reason: Option<crate::transport::boundary::CloseReason>,
+    end: tokio::sync::oneshot::Receiver<crate::transport::CloseReason>,
+    reason: Option<crate::transport::CloseReason>,
 }
 
 impl DyingNative {
@@ -5119,7 +5119,7 @@ impl DyingNative {
         addr: SocketAddr,
     ) -> (
         Self,
-        tokio::sync::oneshot::Sender<crate::transport::boundary::CloseReason>,
+        tokio::sync::oneshot::Sender<crate::transport::CloseReason>,
     ) {
         let (kill, end) = tokio::sync::oneshot::channel();
         (
@@ -5142,7 +5142,7 @@ impl PeerConnectionApi for DyingNative {
         None
     }
 
-    fn close_reason(&self) -> Option<crate::transport::boundary::CloseReason> {
+    fn close_reason(&self) -> Option<crate::transport::CloseReason> {
         self.reason
     }
 
@@ -5201,8 +5201,8 @@ impl PeerConnectionApi for DyingNative {
 }
 
 /// Every way a native path can end, as `recv` reports it.
-fn native_end_reasons() -> Vec<crate::transport::boundary::CloseReason> {
-    use crate::transport::boundary::{CloseReason, QuicPathEnd};
+fn native_end_reasons() -> Vec<crate::transport::CloseReason> {
+    use crate::transport::{CloseReason, QuicPathEnd};
     vec![
         CloseReason::IdleTimeout,
         CloseReason::QuicPath(QuicPathEnd::ClosedByPeer),
@@ -5306,7 +5306,7 @@ async fn a_held_native_connection_that_dies_is_forgotten() {
     })
     .await;
     assert!(h.mgr.held_native.contains_key(&addr), "premise: held");
-    kill.send(crate::transport::boundary::CloseReason::IdleTimeout)
+    kill.send(crate::transport::CloseReason::IdleTimeout)
         .expect("the connection is listening");
     let closed = next_transport_closed(&mut h).await;
     h.mgr
