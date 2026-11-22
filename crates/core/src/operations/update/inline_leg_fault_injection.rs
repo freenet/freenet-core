@@ -21,6 +21,10 @@
 //! a slow but healthy path. The originator's routed `RequestUpdate` is dropped
 //! under a delay rule, so the other hosts learn the update only from the late
 //! legs.
+//!
+//! A stream rule refuses the next `n` broadcast STREAMS a sender starts for a
+//! contract (the stream's metadata send fails), so a test can fail a
+//! verify-soon forced stream through its real failure path.
 //! Ported from the confirmed-delivery branch (PR #6292).
 
 #[cfg(any(test, feature = "testing"))]
@@ -38,6 +42,10 @@ pub mod seam {
         /// process-wide count because simulation tests run in parallel in one
         /// process; each test uses its own contract.
         swallowed: HashMap<ContractKey, usize>,
+        /// Broadcast streams still to refuse, per (sender, contract).
+        streams_to_fail: HashMap<(SocketAddr, ContractKey), usize>,
+        /// Broadcast streams refused, per contract.
+        streams_failed: HashMap<ContractKey, usize>,
     }
 
     fn state() -> std::sync::MutexGuard<'static, State> {
@@ -63,6 +71,33 @@ pub mod seam {
         state().delays.insert((sender, key), delay);
     }
 
+    /// Refuse the next `n` broadcast streams `sender` starts for `key`.
+    pub fn fail_next_streams_from(sender: SocketAddr, key: ContractKey, n: usize) {
+        state().streams_to_fail.insert((sender, key), n);
+    }
+
+    /// Broadcast streams refused for `key` since it was last cleared.
+    pub fn streams_failed(key: &ContractKey) -> usize {
+        state().streams_failed.get(key).copied().unwrap_or(0)
+    }
+
+    /// Whether the broadcast stream `sender` is starting for `key` is to be
+    /// refused. Counts each one it refuses.
+    pub(crate) fn stream_fails(sender: Option<SocketAddr>, key: &ContractKey) -> bool {
+        let Some(sender) = sender else {
+            return false;
+        };
+        let mut state = state();
+        match state.streams_to_fail.get_mut(&(sender, *key)) {
+            Some(left) if *left > 0 => {
+                *left -= 1;
+                *state.streams_failed.entry(*key).or_insert(0) += 1;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Stop dropping legs for `key`, keeping the swallowed count.
     pub fn lift(key: &ContractKey) {
         state().rules.retain(|(_, k)| k != key);
@@ -79,6 +114,8 @@ pub mod seam {
         state.rules.retain(|(_, k)| k != key);
         state.delays.retain(|(_, k), _| k != key);
         state.swallowed.remove(key);
+        state.streams_to_fail.retain(|(_, k), _| k != key);
+        state.streams_failed.remove(key);
     }
 
     /// What happens to an inline leg from `sender` for `key`. Counts each one
@@ -127,5 +164,23 @@ pub(crate) fn inline_leg_fate(
     {
         let _ = (op_manager, key);
         LegFate::Send
+    }
+}
+
+/// Whether the test seam refuses the broadcast stream about to start for
+/// `key`. Always `false` outside test builds.
+#[inline]
+pub(crate) fn broadcast_stream_refused(
+    op_manager: &crate::node::OpManager,
+    key: &freenet_stdlib::prelude::ContractKey,
+) -> bool {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        seam::stream_fails(op_manager.ring.connection_manager.get_own_addr(), key)
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    {
+        let _ = (op_manager, key);
+        false
     }
 }

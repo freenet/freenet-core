@@ -24571,6 +24571,9 @@ struct VerifyScenario {
     inline_delay: Option<Duration>,
     /// Virtual time the run continues after node 1's last write.
     bound: Duration,
+    /// Broadcast streams node 1 starts for the contract that are refused
+    /// (the first ones; after that its streams work).
+    fail_streams: usize,
 }
 
 impl VerifyScenario {
@@ -24588,6 +24591,7 @@ impl VerifyScenario {
             other_writes: Vec::new(),
             inline_delay: None,
             bound: VERIFY_BOUND,
+            fail_streams: 0,
         }
     }
 }
@@ -24597,6 +24601,8 @@ struct VerifyOutcome {
     /// (label, address, stored CRDT version) for each host other than node 1.
     others: Vec<(String, std::net::SocketAddr, Option<u64>)>,
     swallowed: usize,
+    /// Broadcast streams the seam refused.
+    streams_failed: usize,
     obs: freenet::dev_tool::stale_peer_heal_observations::Observations,
 }
 
@@ -24637,6 +24643,7 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
         other_writes,
         inline_delay,
         bound,
+        fail_streams,
     } = scenario;
 
     const FIRST_VERSION: u64 = 100;
@@ -24689,6 +24696,13 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
     }
     if let Some(delay) = inline_delay {
         inline_leg_fault_injection::delay_inline_legs_from(originator_addr, contract_key, delay);
+    }
+    if fail_streams > 0 {
+        inline_leg_fault_injection::fail_next_streams_from(
+            originator_addr,
+            contract_key,
+            fail_streams,
+        );
     }
 
     let mut operations = vec![ScheduledOperation::new(
@@ -24749,6 +24763,7 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
     let result =
         sim.run_controlled_simulation(seed, operations, Duration::from_secs(400), post_wait);
     let swallowed = inline_leg_fault_injection::swallowed(&contract_key);
+    let streams_failed = inline_leg_fault_injection::streams_failed(&contract_key);
     inline_leg_fault_injection::clear(&contract_key);
     let obs = stale_peer_heal_observations::get(&contract_key);
     stale_peer_heal_observations::clear(&contract_key);
@@ -24781,6 +24796,7 @@ fn run_verify_scenario(scenario: VerifyScenario) -> VerifyOutcome {
             .map(|(l, a)| (l.to_string(), a, version_of(l)))
             .collect(),
         swallowed,
+        streams_failed,
         obs,
     };
     tracing::info!(
@@ -24979,6 +24995,7 @@ fn test_verify_soon_sustained_writes_under_a_persistent_fault_converge() {
         + freenet::dev_tool::VERIFY_SOON_SLOT_WAIT_BOUND * 2;
     let o = run_verify_scenario(s);
     assert_forced_legs_accounted(&o);
+    assert!(o.swallowed > 0, "the fault seam never fired");
     assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
     assert!(
         o.obs.verify_forced_delivered >= 1,
@@ -25007,6 +25024,7 @@ fn test_verify_soon_repairs_while_the_originator_keeps_writing() {
     s.bound = Duration::from_secs(3);
     let o = run_verify_scenario(s);
     assert_forced_legs_accounted(&o);
+    assert!(o.swallowed > 0, "the fault seam never fired");
     assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
     let bound = freenet::dev_tool::VERIFY_SOON_PERSISTENT_FAULT_BOUND
         + freenet::dev_tool::VERIFY_SOON_SLOT_WAIT_BOUND * 2;
@@ -25070,6 +25088,39 @@ fn test_verify_soon_a_silent_peer_is_not_retried() {
     }
 }
 
+/// (h) Under the persistent inline fault, node 1's first forced stream is
+/// refused (its metadata send fails, so the real `ForcedLeg` drop path
+/// reports a failure) and its streams work after that. The failure bars that
+/// peer from the slot (`PeerBar`, `FORCE_FLOOR` for a stream that failed at
+/// once) without stalling the others' forced legs. Node 1 keeps writing for
+/// 90 s, past the bar, and every host converges.
+#[test_log::test]
+fn test_verify_soon_a_failed_forced_stream_bars_the_peer_then_converges() {
+    let mut s = VerifyScenario::new("vs-stream-fail", 0xED, InlineFault::Persistent);
+    s.fail_streams = 1;
+    s.updates = 30;
+    s.bound = freenet::dev_tool::VERIFY_SOON_PERSISTENT_FAULT_BOUND
+        + freenet::dev_tool::VERIFY_SOON_SLOT_WAIT_BOUND * 2;
+    let o = run_verify_scenario(s);
+    assert!(o.swallowed > 0, "the fault seam never fired");
+    assert_eq!(o.streams_failed, 1, "one forced stream was refused: {:?}", o.obs);
+    assert!(o.obs.verify_forced_legs <= o.obs.verify_forced, "{:?}", o.obs);
+    assert_eq!(
+        o.obs.verify_forced_legs - o.obs.verify_forced_delivered,
+        1,
+        "every forced stream but the refused one is delivered, and the refused \
+         one arms nothing: {:?}",
+        o.obs
+    );
+    assert!(o.obs.verify_forced_delivered >= 1, "{:?}", o.obs);
+    assert!(
+        o.all_converged(),
+        "versions: {:?} {:?}",
+        o.versions(),
+        o.obs
+    );
+}
+
 /// (g) A large, multi-fragment state under the persistent fault converges
 /// through the forced stream.
 #[test_log::test]
@@ -25078,6 +25129,7 @@ fn test_verify_soon_large_state_escalates_to_a_stream() {
     s.state_len = 8 * 1024;
     let o = run_verify_scenario(s);
     assert_forced_legs_accounted(&o);
+    assert!(o.swallowed > 0, "the fault seam never fired");
     assert!(o.obs.verify_forced >= 1, "{:?}", o.obs);
     assert!(o.obs.verify_forced_legs >= 1, "{:?}", o.obs);
     assert!(

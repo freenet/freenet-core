@@ -258,12 +258,16 @@ pub(crate) enum PropagationEvent {
     /// Verify-soon: a forced stream was delivered, arming its pair's floor
     /// and cooldown. Read against `VerifyForcedFullSent`.
     VerifyForcedDelivered,
+    /// Verify-soon: stale in the confirm round but not forced, because the
+    /// peer's last forced stream failed and it is barred from the forced
+    /// slot. Not retried.
+    VerifyNotForcedPeerFailed,
 }
 
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 44] = [
+    pub(crate) const ALL: [PropagationEvent; 45] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -308,6 +312,7 @@ impl PropagationEvent {
         PropagationEvent::VerifyPeerStaleConfirm,
         PropagationEvent::VerifyNotForcedSlot,
         PropagationEvent::VerifyForcedDelivered,
+        PropagationEvent::VerifyNotForcedPeerFailed,
     ];
 
     pub(crate) const COUNT: usize = Self::ALL.len();
@@ -358,6 +363,7 @@ impl PropagationEvent {
             PropagationEvent::VerifyPeerStaleConfirm => 41,
             PropagationEvent::VerifyNotForcedSlot => 42,
             PropagationEvent::VerifyForcedDelivered => 43,
+            PropagationEvent::VerifyNotForcedPeerFailed => 44,
         }
     }
 
@@ -436,6 +442,7 @@ impl PropagationEvent {
             PropagationEvent::VerifyPeerStaleConfirm => "verify_peer_stale_confirm",
             PropagationEvent::VerifyNotForcedSlot => "verify_not_forced_slot",
             PropagationEvent::VerifyForcedDelivered => "verify_forced_delivered",
+            PropagationEvent::VerifyNotForcedPeerFailed => "verify_not_forced_peer_failed",
         }
     }
 }
@@ -948,6 +955,7 @@ impl UpdatePropagationStats {
             PropagationEvent::VerifyPeerStaleConfirm,
             PropagationEvent::VerifyNotForcedSlot,
             PropagationEvent::VerifyForcedDelivered,
+            PropagationEvent::VerifyNotForcedPeerFailed,
         ];
         if verify_events.iter().any(|ev| e.get(*ev) > 0) {
             tracing::info!(
@@ -969,6 +977,7 @@ impl UpdatePropagationStats {
                 verify_peer_stale_confirm = e.get(PropagationEvent::VerifyPeerStaleConfirm),
                 verify_not_forced_slot = e.get(PropagationEvent::VerifyNotForcedSlot),
                 verify_forced_delivered = e.get(PropagationEvent::VerifyForcedDelivered),
+                verify_not_forced_peer_failed = e.get(PropagationEvent::VerifyNotForcedPeerFailed),
                 window_s = SUMMARY_WINDOW.as_secs(),
                 phase = "summary_verify",
                 "update_propagation_summary verify"

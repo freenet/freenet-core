@@ -1260,6 +1260,8 @@ impl P2pConnManager {
                     LegFate::Delay(delay) => {
                         let bridge = bridge.clone();
                         let msg: crate::message::NetMessage = msg.into();
+                        // Fire-and-forget on purpose: a test-only late delivery that
+                        // ends after one send; nothing needs its handle.
                         drop(crate::config::GlobalExecutor::spawn(async move {
                             tokio::time::sleep(delay).await;
                             // channel-safety: ok — test-only delayed leg on its

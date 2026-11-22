@@ -4341,6 +4341,7 @@ pub mod stale_peer_heal_observations {
         pub verify_not_forced_cap: u64,
         pub verify_not_forced_busy: u64,
         pub verify_not_forced_slot: u64,
+        pub verify_not_forced_peer_failed: u64,
         /// Stale verdicts in a confirm round (also in `verify_stale`).
         pub verify_stale_confirm: u64,
         /// Rounds that ended at their deadline with a target unanswered.
@@ -4389,6 +4390,7 @@ pub mod stale_peer_heal_observations {
                     Hold::Cap => obs.verify_not_forced_cap += 1,
                     Hold::Busy => obs.verify_not_forced_busy += 1,
                     Hold::Slot => obs.verify_not_forced_slot += 1,
+                    Hold::PeerFailed => obs.verify_not_forced_peer_failed += 1,
                 }
             }
         }

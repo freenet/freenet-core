@@ -711,21 +711,27 @@ state on the caller-named stream (payload arm `full_verify_forced`, whose bytes
 are the forced bytes delivered), when the confirm verdict is real evidence
 (`OutcomeEvidence::Verdict`), no forced stream to the pair was delivered in the
 last 60 s, the peer's summary has moved since one delivered in the last 10 min,
-no leg for the pair is queued or sending, and the node's single forced slot is
+the peer is not barred by a failed forced stream, no leg for the pair is queued
+or sending (its own forced leg included), and the node's single forced slot is
 free (one forced leg pending or in flight per node, released by the stream's
 outcome or the mark's expiry). Only a DELIVERED forced stream arms the floor
-and cooldown (`ForcedLeg`). A floor, busy, slot or cap hold retries the held
+and cooldown (`ForcedLeg`); a FAILED one bars the peer, for every contract,
+for at least as long as the stream held the slot and at least 60 s, doubling
+with each consecutive failure up to 1 h, until a forced stream to it is
+delivered. A barred peer's confirm verdict is not retried. A floor, busy, slot or cap hold retries the held
 peers only, at most 3 times plus a final retry at the latest holder's clearing
 time. One check per contract, never postponed by later writes; a write during
 a check merges into it, and a fresh first round for the write starts when the
-check would otherwise end, not before the earliest held peer can clear. Requests leave through a token bucket (128
+check would otherwise end, not before the earliest held peer can clear (a
+write before the check's first round goes out is covered by that round). Requests leave through a token bucket (128
 per 250 ms). Counters (`verify_*`, on their own
-`update_propagation_summary verify` INFO line): scheduled, dropped_cap,
+`update_propagation_summary verify` INFO line): scheduled (new checks and
+checks restarted for writes they had not covered), dropped_cap,
 request_sent, request_dropped, peers_truncated, round_timed_out, peer_stale (any
 round; a stale verdict, not a heal), peer_stale_confirm (confirm round only),
 peer_converged, forced_full, forced_full_sent, forced_delivered, and
-not_forced_{evidence,floor,no_progress,cap,busy,slot}. Only the floor, busy,
-slot and cap holds are retried; an evidence or no-progress hold is not. Bounds, the
+not_forced_{evidence,floor,no_progress,cap,busy,slot,peer_failed}. Only the floor, busy,
+slot and cap holds are retried; an evidence, no-progress or peer-failed hold is not. Bounds, the
 `PERSISTENT_FAULT_BOUND` assumptions and residuals are in the `verify_soon`
 module doc.
 

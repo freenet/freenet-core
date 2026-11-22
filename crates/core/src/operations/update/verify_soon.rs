@@ -32,22 +32,29 @@
 //! - if one was delivered in the last `FORCE_COOLDOWN`, the peer reports a
 //!   different summary from the one that force was decided on: the force
 //!   landed and the peer moved, so this is a new loss;
-//! - no leg for (contract, peer) is queued or sending here: a slow but healthy
-//!   peer behind a congested queue is not lost, its leg is waiting;
+//! - the peer is not barred by a failed forced stream (below);
+//! - no leg for (contract, peer) is queued or sending here, this pair's own
+//!   forced leg included: a slow but healthy peer behind a congested queue is
+//!   not lost, its leg is waiting;
 //! - the node's single forced slot is free: at most ONE forced leg is pending
 //!   or in flight on this node at a time, whatever the contract or peer. The
 //!   slot is taken when the force is decided and released when the forced
 //!   stream's outcome is known, when its mark expires unused (`FORCE_TTL`),
-//!   or by the `SLOT_MAX_HOLD` backstop (30 min). Its real longest hold is
-//!   `FORCE_TTL` while pending plus the leg's stream completion wait in
-//!   flight: at least 270 s, and about 24 min for the largest state.
+//!   or by the `SLOT_MAX_HOLD` backstop (30 min). Its longest hold is
+//!   `FORCE_TTL` while pending, then, in flight, the production leg's waits
+//!   for a large-lane permit and the stream's metadata send, then the stream
+//!   completion wait: at least 270 s, about 24 min for the largest state,
+//!   plus the permit waits (see `SLOT_MAX_HOLD`).
 //!
 //! The summary may have changed between the two rounds: other writers keep a
 //! shared contract moving, and what matters is that this node's state is still
 //! missing at the peer. The floor, the cooldown and the summary they compare
-//! against are armed by a DELIVERED forced stream. A failed one arms the floor
-//! only (no progress gate: nothing reached the peer), so the same pair cannot
-//! take the slot back at once; a mark that is never consumed arms nothing.
+//! against are armed by a DELIVERED forced stream, which also clears the
+//! peer's bar. A FAILED forced stream bars the peer, for every contract, from
+//! the slot (`PeerBar`): for at least as long as the stream held the slot
+//! and at least `FORCE_FLOOR`, doubling with each consecutive failure up to
+//! `PEER_BAR_MAX` (never shorter than the hold). A barred peer's confirm
+//! verdict is not retried. A mark that is never consumed arms nothing.
 //!
 //! A write during a check merges into it: the check carries on with its stale
 //! and held peers, and a fresh `First` round for the write starts only when the
@@ -56,11 +63,15 @@
 //! A hold by the floor, a busy pair, the slot or the pair cap retries the held
 //! peers only, at the earliest time any of them can clear, at most
 //! `MAX_RETRIES_PER_CHECK` times; when the retries run out while a held peer's
-//! clearing time is later still, one final retry runs at that time.
+//! clearing time is later still, one final retry runs at that time. Retries
+//! carry no jitter: their count is bounded, and each node schedules them off
+//! its own writes, so nodes do not fall into step.
 //!
 //! Bounds:
-//! - later writes never move a scheduled check; they set `rewritten`, which
-//!   starts one fresh `First` round when this check would end;
+//! - later writes never move a scheduled check; a write after the check's
+//!   `First` round went out sets `rewritten`, which starts one fresh `First`
+//!   round when this check would end (a write before it is covered by it, so a
+//!   burst costs one `First` round);
 //! - at most `MAX_TRACKED_CONTRACTS` checks; a write beyond that is not checked
 //!   (counted);
 //! - at most `MAX_PEERS_PER_CHECK` requests per round (a random start when
@@ -71,13 +82,30 @@
 //! - forced full-state streams: one at a time per node (the slot); per
 //!   (contract, peer) at most one delivered per `FORCE_FLOOR`, and one per
 //!   `FORCE_COOLDOWN` for a peer whose summary does not move;
+//! - failing peers: a peer whose `n`-th consecutive forced stream failed after
+//!   holding the slot for `h` is barred for at least `max(FORCE_FLOOR, h)`
+//!   times `2^(n-1)` (up to `PEER_BAR_MAX`, never below `h`). So after its
+//!   `n`-th failure one failing peer holds the slot at most
+//!   `max(1 / (1 + 2^(n-1)), h / (h + PEER_BAR_MAX))` of the time: at most
+//!   half at first, falling with each failure until the cap (7% for a 270 s
+//!   hold). `k` failing peers together hold it at most `k` times that;
 //! - at most `MAX_FORCE_PAIRS` armed pairs remembered (a refusal at the cap is
-//!   counted, after expired pairs are pruned); an unconsumed force mark expires
-//!   after `FORCE_TTL` and frees the slot.
+//!   counted, after expired pairs are pruned) and `MAX_BARRED_PEERS` barred
+//!   peers (at the cap the bar forgotten soonest is evicted, logged); an
+//!   unconsumed force mark expires after `FORCE_TTL` and frees the slot;
+//! - a restarted check (a write the check had not covered) is counted as
+//!   scheduled where it restarts, so `verify_scheduled` counts every `First`
+//!   round's check.
 //!
 //! Under a persistent inline fault, a write with one stale peer reaches it
-//! within `PERSISTENT_FAULT_BOUND` of the write, plus the forced stream's own
-//! transfer time; see that constant for what the figure assumes.
+//! within `PERSISTENT_FAULT_BOUND` of the write, plus up to two forced
+//! streams' transfer times; see that constant for what the figure assumes.
+//! That figure is for a peer already stale in the check: a write merged into
+//! a check that is waiting on held peers gets its own `First` round only when
+//! the check ends, so a peer the write's legs missed, and which the check is
+//! not already asking, waits for that (worst case a few minutes: a `Confirm`,
+//! three retries each up to `FORCE_FLOOR + REPLY_TIMEOUT`, and the final
+//! round) before it is asked.
 //!
 //! Residuals:
 //! - a peer that never replies costs one request per round and then nothing;
@@ -97,8 +125,15 @@
 //!   round's deadline, not retried;
 //! - a forced heal that the `Summaries` arm skips (emit budget, ban, no local
 //!   state) holds the slot until its mark expires (`FORCE_TTL`);
-//! - a failed forced stream with no later write is not re-checked: the pair
-//!   waits for the next write's check or for anti-entropy.
+//! - a failed forced stream with no later write is not re-checked, nor is a
+//!   barred peer's confirm verdict: the peer waits for a later write's check
+//!   past its bar, or for anti-entropy;
+//! - `Summaries` carries no request id, so any two-sided `Summaries` from an
+//!   awaited peer answers its round, including a `Notification` the peer sent
+//!   for a state change before our request reached it;
+//! - the backstop can free the slot of a leg still in flight when its permit
+//!   waits ran long (see `SLOT_MAX_HOLD`); two forced streams can then be on
+//!   the wire at once.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -145,25 +180,42 @@ pub(crate) const FORCE_COOLDOWN: Duration = Duration::from_secs(600);
 /// writes; under a persistent fault it is how late this node's updates may
 /// reach a peer.
 pub(crate) const FORCE_FLOOR: Duration = Duration::from_secs(60);
-/// The longest the forced slot is held, whatever happens: a pending mark is
-/// held at most `FORCE_TTL`, and an in-flight stream until its outcome, which
-/// the leg waits for at most `stream_completion_timeout` (at least 270 s, about
-/// 24 min for the largest state). This backstop frees it regardless, in case
-/// an outcome is never reported.
+/// A backstop on how long the forced slot is held, in case an outcome is
+/// never reported. A pending mark is held at most `FORCE_TTL`. After the leg
+/// takes the mark, the production leg may still wait for a large-lane permit,
+/// compute the summary and send the stream's metadata before it waits up to
+/// `stream_completion_timeout` (at least 270 s, about 24 min for the largest
+/// state) for the stream. The permit waits have no fixed bound (each holder
+/// keeps a permit up to `STREAM_PERMIT_HOLD`, 120 s), so for the largest
+/// state a leg that waited more than about 5 min for permits can outlive
+/// this backstop: the slot is then freed while its stream is still running,
+/// and a second forced stream can start beside it. The old leg's late report
+/// cannot free the new slot (`forced_outcome` matches `taken_at`).
 pub(crate) const SLOT_MAX_HOLD: Duration = Duration::from_secs(30 * 60);
 /// Armed (contract, peer) pairs remembered for the floor and the cooldown.
 pub(crate) const MAX_FORCE_PAIRS: usize = 1024;
+/// The longest a peer is barred from the forced slot after a failed forced
+/// stream, unless the failed stream itself held the slot longer.
+pub(crate) const PEER_BAR_MAX: Duration = Duration::from_secs(60 * 60);
+/// Barred peers remembered. At the cap the one forgotten soonest is evicted
+/// (logged); refusing instead would leave a failing peer free to take the
+/// slot again at once.
+pub(crate) const MAX_BARRED_PEERS: usize = 1024;
 /// Retry `Confirm` rounds one check may run after floor, busy, slot or cap
 /// holds, before the final one.
 pub(crate) const MAX_RETRIES_PER_CHECK: u8 = 3;
 /// How late, at most, a write reaches its ONE stale peer under a persistent
-/// inline fault, with the forced slot free when it is needed, not counting the
-/// forced stream's own transfer time. From the write: the previous delivered
-/// force's floor ends at most `FORCE_FLOOR` later; the retry `Confirm` round
-/// runs then and waits up to `REPLY_TIMEOUT` for the reply; the force is
-/// decided on that reply. Each slot wait (another forced leg in flight) adds a
-/// retry of up to `CONFIRM_DELAY + REPLY_TIMEOUT`, so a simulation with `n`
-/// stale peers allows `n - 1` of them.
+/// inline fault, with the forced slot free when it is needed and every forced
+/// stream delivered, not counting forced streams' transfer times. Up to two
+/// of those come on top: the floor is armed when the previous forced stream
+/// is DELIVERED, so a write made while that stream is in flight waits for its
+/// transfer, then the floor, then its own transfer. From the write (or that
+/// delivery): the floor ends at most `FORCE_FLOOR` later; the retry `Confirm`
+/// round runs then and waits up to `REPLY_TIMEOUT` for the reply; the force
+/// is decided on that reply. Each slot wait (another forced leg in flight)
+/// adds a retry of up to `CONFIRM_DELAY + REPLY_TIMEOUT`, so a simulation
+/// with `n` stale peers allows `n - 1` of them. A peer whose forced stream
+/// FAILED is barred (`PeerBar`) and not covered by this figure.
 #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
 pub const PERSISTENT_FAULT_BOUND: Duration =
     Duration::from_secs(FORCE_FLOOR.as_secs() + REPLY_TIMEOUT.as_secs());
@@ -194,7 +246,8 @@ struct Check {
     /// with no time. After a `Confirm`: the peers held by something that
     /// clears, with the time it can.
     stale: HashMap<PeerKey, Option<Instant>>,
-    /// An originated write landed after this check was scheduled.
+    /// An originated write landed that no `First` round of this check covers:
+    /// after the check's `First` round went out.
     rewritten: bool,
     /// Retry `Confirm` rounds this check has run.
     retries: u8,
@@ -263,6 +316,51 @@ pub(crate) struct Due {
     pub rounds: Vec<DueRound>,
     /// Contracts whose round ended at its deadline with a peer unanswered.
     pub timed_out: Vec<ContractKey>,
+    /// Contracts whose check ended with a write it had not covered and so
+    /// scheduled a fresh `First` round for it, since the last `take_due`.
+    pub restarted: Vec<ContractKey>,
+}
+
+/// What resolving a round did to its check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolved {
+    /// The check goes on with a `Confirm` round.
+    Continues,
+    /// The check would have ended, but a write it had not covered landed: a
+    /// fresh `First` round is scheduled for it.
+    Restarted,
+    /// The check has ended and must be removed.
+    Ended,
+}
+
+/// A peer whose last forced stream failed. It may not take the slot until
+/// `until`. The bar is at least as long as the failed stream held the slot,
+/// so a failing peer holds the slot at most half the time, and it doubles
+/// with each consecutive failure (up to `PEER_BAR_MAX`), so that share falls.
+/// A delivered forced stream to the peer clears it. Remembered one bar length
+/// past `until`, so a failure within that time counts as consecutive.
+#[derive(Debug, Clone, Copy)]
+struct PeerBar {
+    until: Instant,
+    length: Duration,
+    failures: u32,
+}
+
+impl PeerBar {
+    fn forgotten_at(&self) -> Instant {
+        self.until + self.length
+    }
+}
+
+/// How long a peer is barred after its `failures`-th consecutive failed forced
+/// stream, which held the slot for `hold`.
+fn peer_bar_length(hold: Duration, failures: u32) -> Duration {
+    let doubling = 1u32 << failures.saturating_sub(1).min(16);
+    FORCE_FLOOR
+        .max(hold)
+        .saturating_mul(doubling)
+        .min(PEER_BAR_MAX)
+        .max(hold)
 }
 
 /// Why a peer stale in `Confirm` was not forced.
@@ -277,10 +375,14 @@ pub(crate) enum Hold {
     NoProgress,
     /// `MAX_FORCE_PAIRS` pairs are armed.
     Cap,
-    /// A leg for the pair is queued or sending here.
+    /// A leg for the pair is queued or sending here, including this pair's
+    /// own forced leg.
     Busy,
-    /// The node's forced slot is held by another forced leg.
+    /// The node's forced slot is held by another pair's forced leg.
     Slot,
+    /// The peer's last forced stream failed and it is barred (`PeerBar`).
+    /// Not retried: the bar outlasts a check.
+    PeerFailed,
 }
 
 /// What a `Summaries` comparison meant to the check.
@@ -301,12 +403,17 @@ pub(crate) enum Verdict {
 #[derive(Default)]
 struct Inner {
     checks: HashMap<ContractKey, Check>,
-    /// Pairs a forced stream armed: when it ended, and, if it was delivered,
-    /// the summary it was decided on. A failed stream arms the floor only
-    /// (`None`): no progress gate, since nothing reached the peer.
-    armed: HashMap<(ContractKey, PeerKey), (Instant, Option<u64>)>,
+    /// Pairs a DELIVERED forced stream armed: when it was delivered, and the
+    /// summary it was decided on.
+    armed: HashMap<(ContractKey, PeerKey), (Instant, u64)>,
+    /// Peers whose last forced stream failed, whatever the contract.
+    barred: HashMap<PeerKey, PeerBar>,
     /// The node's one forced leg, pending or in flight.
     slot: Option<Slot>,
+    /// Checks restarted outside `take_due` (by a reply or by firing a round),
+    /// for the next `take_due` to report. At most one entry per check between
+    /// two `take_due` calls: a restarted check waits for the driver.
+    restarted: Vec<ContractKey>,
 }
 
 type PendingLegProbe = Box<dyn Fn(&ContractKey, &PeerKey) -> bool + Send + Sync>;
@@ -345,7 +452,16 @@ impl VerifySoon {
     pub(crate) fn note_originated(&self, key: ContractKey, now: Instant) -> Originated {
         let mut inner = self.inner.lock();
         if let Some(check) = inner.checks.get_mut(&key) {
-            check.rewritten = true;
+            // A `First` round not yet sent goes out after this write and
+            // covers it. (A write just before it may be found stale in it,
+            // its legs still in flight: that costs a `Confirm` round and a
+            // delta heal, and forces nothing unless the peer is still stale
+            // 5 s later.)
+            let covered =
+                check.round == Round::First && matches!(check.phase, Phase::Scheduled { .. });
+            if !covered {
+                check.rewritten = true;
+            }
             return Originated::Coalesced;
         }
         if inner.checks.len() >= MAX_TRACKED_CONTRACTS {
@@ -366,10 +482,7 @@ impl VerifySoon {
             Phase::Scheduled { due } => due,
             Phase::Sent { deadline } => deadline,
         });
-        let armed = inner
-            .armed
-            .values()
-            .map(|(at, hash)| armed_until(*at, *hash));
+        let armed = inner.armed.values().map(|(at, _)| *at + FORCE_COOLDOWN);
         let mark = inner.slot.as_ref().and_then(|s| s.mark_until);
         checks.chain(armed).chain(mark).min()
     }
@@ -381,7 +494,10 @@ impl VerifySoon {
     pub(crate) fn take_due(&self, now: Instant) -> Due {
         let mut inner = self.inner.lock();
         prune(&mut inner, now);
-        let mut due = Due::default();
+        let mut due = Due {
+            restarted: std::mem::take(&mut inner.restarted),
+            ..Due::default()
+        };
         let mut ended = Vec::new();
         for (key, check) in inner.checks.iter_mut() {
             if let Phase::Sent { deadline } = check.phase {
@@ -389,9 +505,13 @@ impl VerifySoon {
                     if !check.awaiting.is_empty() {
                         due.timed_out.push(*key);
                     }
-                    if !resolve(check, now) {
-                        ended.push(*key);
-                        continue;
+                    match resolve(check, now) {
+                        Resolved::Ended => {
+                            ended.push(*key);
+                            continue;
+                        }
+                        Resolved::Restarted => due.restarted.push(*key),
+                        Resolved::Continues => {}
                     }
                 }
             }
@@ -433,7 +553,10 @@ impl VerifySoon {
         now: Instant,
     ) {
         let mut inner = self.inner.lock();
-        let Some(check) = inner.checks.get_mut(key) else {
+        let Inner {
+            checks, restarted, ..
+        } = &mut *inner;
+        let Some(check) = checks.get_mut(key) else {
             return;
         };
         check.awaiting = peers.into_iter().collect();
@@ -454,8 +577,14 @@ impl VerifySoon {
             deadline: now + REPLY_TIMEOUT,
         };
         // Nobody to ask: resolve now rather than wait out the deadline.
-        if check.awaiting.is_empty() && !resolve(check, now) {
-            inner.checks.remove(key);
+        if check.awaiting.is_empty() {
+            match resolve(check, now) {
+                Resolved::Ended => {
+                    checks.remove(key);
+                }
+                Resolved::Restarted => restarted.push(*key),
+                Resolved::Continues => {}
+            }
         }
         // No `wake.notify_one()`: only the driver calls this, and it computes
         // its next wake right after.
@@ -480,7 +609,9 @@ impl VerifySoon {
         let Inner {
             checks,
             armed,
+            barred,
             slot,
+            restarted,
         } = &mut *inner;
         let Some(check) = checks.get_mut(key) else {
             return Verdict::Ignored;
@@ -504,23 +635,30 @@ impl VerifySoon {
             (Round::Confirm, true) => {
                 // Pruned here, not on every comparison: only a stale confirm
                 // verdict reads the pairs and the slot.
-                prune_pairs(armed, slot, now);
+                prune_pairs(armed, barred, slot, now);
                 let pair = (*key, peer.clone());
                 let previous = armed.get(&pair).copied();
                 // Hashed only here, for a stale confirm verdict.
                 let their_hash = summary_hash(their_summary);
+                let own_leg = slot
+                    .as_ref()
+                    .is_some_and(|s| s.key == *key && s.peer == *peer);
                 let (verdict, retry_at) = if !real_evidence {
                     (Verdict::Held(Hold::Evidence), None)
                 } else if let Some((at, _)) = previous.filter(|(at, _)| now < *at + FORCE_FLOOR) {
                     (Verdict::Held(Hold::Floor), Some(at + FORCE_FLOOR))
-                } else if previous.is_some_and(|(_, hash)| hash == Some(their_hash)) {
+                } else if previous.is_some_and(|(_, hash)| hash == their_hash) {
                     (Verdict::Held(Hold::NoProgress), None)
+                } else if barred.get(peer).is_some_and(|bar| now < bar.until) {
+                    (Verdict::Held(Hold::PeerFailed), None)
                 } else if previous.is_none() && armed.len() >= MAX_FORCE_PAIRS {
                     (Verdict::Held(Hold::Cap), Some(now))
+                } else if own_leg || pair_busy() {
+                    // Before the slot test: when the slot holder is this very
+                    // pair, the pair is busy, not starved by another leg.
+                    (Verdict::Held(Hold::Busy), Some(now))
                 } else if slot.is_some() {
                     (Verdict::Held(Hold::Slot), Some(now))
-                } else if pair_busy() {
-                    (Verdict::Held(Hold::Busy), Some(now))
                 } else {
                     *slot = Some(Slot {
                         key: *key,
@@ -548,10 +686,17 @@ impl VerifySoon {
         // so a reply leaves no permit otherwise.
         let mut sooner = false;
         if check.awaiting.is_empty() {
-            if resolve(check, now) {
-                sooner = matches!(check.phase, Phase::Scheduled { due } if due < deadline);
-            } else {
-                checks.remove(key);
+            let resolved = resolve(check, now);
+            match resolved {
+                Resolved::Ended => {
+                    checks.remove(key);
+                }
+                Resolved::Restarted | Resolved::Continues => {
+                    if resolved == Resolved::Restarted {
+                        restarted.push(*key);
+                    }
+                    sooner = matches!(check.phase, Phase::Scheduled { due } if due < deadline);
+                }
             }
         }
         drop(inner);
@@ -587,9 +732,11 @@ impl VerifySoon {
     }
 
     /// The forced stream of the slot taken at `taken_at` ended: free the slot.
-    /// A delivered stream arms the pair's floor, cooldown and progress gate; a
-    /// failed one arms the floor only, so the same pair cannot take the slot
-    /// again at once. Returns whether a delivery was recorded.
+    /// A delivered stream arms the pair's floor, cooldown and progress gate,
+    /// and clears the peer's bar. A failed one bars the PEER, for every
+    /// contract, for at least as long as the stream held the slot, doubling
+    /// with each consecutive failure (`PeerBar`). Returns whether a delivery
+    /// was recorded.
     pub(crate) fn forced_outcome(&self, taken_at: Instant, delivered: bool, now: Instant) -> bool {
         let mut inner = self.inner.lock();
         let Some(slot) = inner
@@ -598,13 +745,41 @@ impl VerifySoon {
         else {
             return false;
         };
-        let hash = delivered.then_some(slot.summary_hash);
-        #[cfg(any(test, feature = "testing"))]
         if delivered {
+            #[cfg(any(test, feature = "testing"))]
             crate::node::stale_peer_heal_observations::record_forced_delivered(&slot.key);
+            inner.barred.remove(&slot.peer);
+            inner
+                .armed
+                .insert((slot.key, slot.peer), (now, slot.summary_hash));
+            return true;
         }
-        inner.armed.insert((slot.key, slot.peer), (now, hash));
-        delivered
+        let barred = &mut inner.barred;
+        barred.retain(|_, bar| bar.forgotten_at() > now);
+        let failures = barred.get(&slot.peer).map_or(1, |bar| bar.failures + 1);
+        let length = peer_bar_length(now.saturating_duration_since(slot.taken_at), failures);
+        if !barred.contains_key(&slot.peer) && barred.len() >= MAX_BARRED_PEERS {
+            if let Some(oldest) = barred
+                .iter()
+                .min_by_key(|(_, bar)| bar.forgotten_at())
+                .map(|(peer, _)| peer.clone())
+            {
+                barred.remove(&oldest);
+                tracing::info!(
+                    cap = MAX_BARRED_PEERS,
+                    "verify-soon: barred-peer table full, forgot the bar ending soonest"
+                );
+            }
+        }
+        barred.insert(
+            slot.peer,
+            PeerBar {
+                until: now + length,
+                length,
+                failures,
+            },
+        );
+        false
     }
 
     /// Whether a live, unconsumed force mark exists for (`key`, `peer`).
@@ -629,30 +804,22 @@ impl VerifySoon {
     }
 }
 
-/// Forget pairs past their cooldown, and free the slot of a mark that expired
-/// before its leg took it.
+/// Forget pairs past their cooldown and peers past their bar's memory, and
+/// free the slot of a mark that expired before its leg took it.
 fn prune(inner: &mut Inner, now: Instant) {
-    prune_pairs(&mut inner.armed, &mut inner.slot, now);
+    prune_pairs(&mut inner.armed, &mut inner.barred, &mut inner.slot, now);
 }
 
 fn prune_pairs(
-    armed: &mut HashMap<(ContractKey, PeerKey), (Instant, Option<u64>)>,
+    armed: &mut HashMap<(ContractKey, PeerKey), (Instant, u64)>,
+    barred: &mut HashMap<PeerKey, PeerBar>,
     slot: &mut Option<Slot>,
     now: Instant,
 ) {
-    armed.retain(|_, (at, hash)| armed_until(*at, *hash) > now);
+    armed.retain(|_, (at, _)| *at + FORCE_COOLDOWN > now);
+    barred.retain(|_, bar| bar.forgotten_at() > now);
     if slot.as_ref().is_some_and(|s| !s.live(now)) {
         *slot = None;
-    }
-}
-
-/// How long an armed pair matters: the cooldown after a delivered force, the
-/// floor after a failed one.
-fn armed_until(at: Instant, hash: Option<u64>) -> Instant {
-    at + if hash.is_some() {
-        FORCE_COOLDOWN
-    } else {
-        FORCE_FLOOR
     }
 }
 
@@ -702,9 +869,8 @@ fn select_targets<T>(mut candidates: Vec<T>) -> (Vec<T>, Vec<T>) {
     (candidates, left_out)
 }
 
-/// Move a resolved round on. Returns `false` when the check has ended and
-/// must be removed.
-fn resolve(check: &mut Check, now: Instant) -> bool {
+/// Move a resolved round on.
+fn resolve(check: &mut Check, now: Instant) -> Resolved {
     // A peer that did not answer this round is not asked again.
     for peer in check.awaiting.drain() {
         check.stale.remove(&peer);
@@ -718,11 +884,11 @@ fn resolve(check: &mut Check, now: Instant) -> bool {
     // writes faster than `CHECK_DELAY` no `Confirm` round would ever run.
     let end = |check: &mut Check| {
         if !check.rewritten {
-            return false;
+            return Resolved::Ended;
         }
         let at = earliest.map_or(now + CHECK_DELAY, |t| t.max(now + CHECK_DELAY));
         *check = Check::scheduled(at);
-        true
+        Resolved::Restarted
     };
     match check.round {
         Round::First if !check.stale.is_empty() => {
@@ -730,7 +896,7 @@ fn resolve(check: &mut Check, now: Instant) -> bool {
             check.phase = Phase::Scheduled {
                 due: now + CONFIRM_DELAY,
             };
-            true
+            Resolved::Continues
         }
         Round::First => end(check),
         Round::Confirm => {
@@ -749,7 +915,7 @@ fn resolve(check: &mut Check, now: Instant) -> bool {
                     check.phase = Phase::Scheduled {
                         due: at.max(now + CONFIRM_DELAY),
                     };
-                    true
+                    Resolved::Continues
                 }
                 None => end(check),
             }
@@ -870,6 +1036,7 @@ pub(crate) fn on_summary_comparison(
                 Hold::Cap => PropagationEvent::VerifyNotForcedCap,
                 Hold::Busy => PropagationEvent::VerifyNotForcedBusy,
                 Hold::Slot => PropagationEvent::VerifyNotForcedSlot,
+                Hold::PeerFailed => PropagationEvent::VerifyNotForcedPeerFailed,
             },
         ],
     };
@@ -1066,6 +1233,11 @@ pub(crate) async fn run_verify_soon(ring: std::sync::Arc<crate::ring::Ring>) {
         let verify = op_manager.verify_soon.clone();
         let now = ring.time_source.now();
         let due = verify.take_due(now);
+        // A restarted check is a new check for the writes it had not covered;
+        // counted where `resolve` decided it.
+        for key in &due.restarted {
+            record_propagation_event(&op_manager, key.id(), PropagationEvent::VerifyScheduled);
+        }
         for key in &due.timed_out {
             record_propagation_event(&op_manager, key.id(), PropagationEvent::VerifyRoundTimedOut);
             #[cfg(any(test, feature = "testing"))]
@@ -1396,23 +1568,183 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_forced_stream_arms_the_floor_only() {
+    async fn a_failed_forced_stream_bars_the_peer_and_arms_no_pair() {
         let vs = VerifySoon::new();
         let a = peer();
         let t0 = Instant::now();
         let failed = force_and_report(&vs, key(1), &a, t0, &[7], false);
-        assert_eq!(vs.next_wake(), Some(failed + FORCE_FLOOR), "the floor only");
-        // Within the floor the pair cannot take the slot back.
+        assert!(vs.inner.lock().armed.is_empty(), "nothing reached the peer");
+        // Within the bar (FORCE_FLOOR for a stream that failed at once) the
+        // peer cannot take the slot back, and the hold is not retried.
         let (verdict, _) = run_check(&vs, key(1), &a, failed, false, &[7]);
-        assert_eq!(verdict, Verdict::Held(Hold::Floor));
-        vs.inner.lock().checks.clear();
-        // Past it, the same summary is forced again: no progress gate, since
-        // nothing reached the peer.
+        assert_eq!(verdict, Verdict::Held(Hold::PeerFailed));
+        assert_eq!(vs.tracked(), 0, "a barred peer is not retried");
+        // Past it, the same summary is forced again: no progress gate.
         let after = failed + FORCE_FLOOR;
         assert_eq!(
             run_check(&vs, key(1), &a, after, false, &[7]).0,
             Verdict::Escalate
         );
+    }
+
+    /// Skeptical review M1, round 5: a failure floor per (contract, peer) let
+    /// one degraded peer co-hosting two contracts alternate pairs and hold the
+    /// node's slot nearly all the time.
+    #[tokio::test]
+    async fn a_failing_peer_shared_by_two_contracts_leaves_the_slot_to_a_third() {
+        let vs = VerifySoon::new();
+        let (p, q) = (peer(), peer());
+        let t0 = Instant::now();
+        // (K1, P) is forced; its stream times out after holding the slot 270 s.
+        let (verdict, t2) = run_check(&vs, key(1), &p, t0, false, &[1]);
+        assert_eq!(verdict, Verdict::Escalate);
+        let taken = vs.take_forced(&key(1), &p, t2).expect("a live mark");
+        let hold = Duration::from_secs(270);
+        let failed = t2 + hold;
+        assert!(!vs.forced_outcome(taken, false, failed));
+        // (K2, P), a different pair, may not take the slot either...
+        let (verdict, _) = run_check(&vs, key(2), &p, failed, false, &[1]);
+        assert_eq!(verdict, Verdict::Held(Hold::PeerFailed));
+        // ...so a third peer's escalation gets it.
+        let (verdict, t3) = run_check(&vs, key(3), &q, failed, false, &[1]);
+        assert_eq!(verdict, Verdict::Escalate);
+        let taken = vs.take_forced(&key(3), &q, t3).expect("a live mark");
+        assert!(vs.forced_outcome(taken, true, t3));
+        // The bar lasts as long as the failed stream held the slot (270 s,
+        // longer than FORCE_FLOOR).
+        let (verdict, _) = run_check(
+            &vs,
+            key(4),
+            &p,
+            failed + hold - CHECK_DELAY - CONFIRM_DELAY - Duration::from_secs(1),
+            false,
+            &[1],
+        );
+        assert_eq!(verdict, Verdict::Held(Hold::PeerFailed));
+        let (verdict, _) = run_check(
+            &vs,
+            key(5),
+            &p,
+            failed + hold - CHECK_DELAY - CONFIRM_DELAY,
+            false,
+            &[1],
+        );
+        assert_eq!(verdict, Verdict::Escalate);
+    }
+
+    #[tokio::test]
+    async fn consecutive_failures_lengthen_the_bar_and_a_delivery_resets_it() {
+        let vs = VerifySoon::new();
+        let a = peer();
+        // Each check takes CHECK_DELAY + CONFIRM_DELAY from its write to its
+        // confirm verdict; `confirm_at(t)` writes so the verdict lands at t.
+        let lead = CHECK_DELAY + CONFIRM_DELAY;
+        let t0 = Instant::now();
+        let fail1 = force_and_report(&vs, key(1), &a, t0, &[1], false);
+        // First failure, held for no time: barred FORCE_FLOOR.
+        let fail2 = force_and_report(&vs, key(2), &a, fail1 + FORCE_FLOOR - lead, &[1], false);
+        assert_eq!(fail2, fail1 + FORCE_FLOOR);
+        // Second consecutive failure: barred twice as long.
+        let (verdict, _) = run_check(&vs, key(3), &a, fail2 + FORCE_FLOOR - lead, false, &[1]);
+        assert_eq!(verdict, Verdict::Held(Hold::PeerFailed), "doubled");
+        let sent = force_and_report(&vs, key(4), &a, fail2 + FORCE_FLOOR * 2 - lead, &[1], true);
+        assert!(vs.inner.lock().barred.is_empty(), "a delivery clears the bar");
+        // A failure after the delivery starts again at FORCE_FLOOR.
+        let fail3 = force_and_report(&vs, key(5), &a, sent, &[1], false);
+        let (verdict, _) = run_check(&vs, key(6), &a, fail3 + FORCE_FLOOR - lead, false, &[1]);
+        assert_eq!(verdict, Verdict::Escalate, "the count restarted at one");
+    }
+
+    #[test]
+    fn the_peer_bar_doubles_up_to_its_cap_and_never_undercuts_the_hold() {
+        let zero = Duration::ZERO;
+        assert_eq!(peer_bar_length(zero, 1), FORCE_FLOOR);
+        assert_eq!(peer_bar_length(zero, 2), FORCE_FLOOR * 2);
+        assert_eq!(peer_bar_length(zero, 3), FORCE_FLOOR * 4);
+        assert_eq!(peer_bar_length(zero, 100), PEER_BAR_MAX);
+        let hold = Duration::from_secs(270);
+        assert_eq!(peer_bar_length(hold, 1), hold);
+        assert_eq!(peer_bar_length(hold, 2), hold * 2);
+        let huge = PEER_BAR_MAX + Duration::from_secs(1);
+        assert_eq!(peer_bar_length(huge, 5), huge, "never shorter than the hold");
+    }
+
+    #[tokio::test]
+    async fn barred_peers_are_capped_by_evicting_the_bar_forgotten_soonest() {
+        let vs = VerifySoon::new();
+        let t0 = Instant::now();
+        let peers: Vec<PeerKey> = (0..=MAX_BARRED_PEERS).map(|_| peer()).collect();
+        let first = peers[0].clone();
+        for (n, p) in peers.iter().enumerate() {
+            force_and_report(&vs, nth_key(n), p, t0 + Duration::from_millis(n as u64), &[0], false);
+        }
+        let inner = vs.inner.lock();
+        assert_eq!(inner.barred.len(), MAX_BARRED_PEERS);
+        assert!(!inner.barred.contains_key(&first), "the soonest forgotten went");
+        assert!(inner.barred.contains_key(&peers[MAX_BARRED_PEERS]));
+    }
+
+    /// Skeptical review S1, round 5: a pair whose own forced stream is in
+    /// flight is busy, not starved by the slot.
+    #[tokio::test]
+    async fn a_pair_whose_own_forced_leg_is_in_flight_is_busy() {
+        let vs = VerifySoon::new();
+        let (a, b) = (peer(), peer());
+        let t0 = Instant::now();
+        let (verdict, t2) = run_check(&vs, key(1), &a, t0, false, &[1]);
+        assert_eq!(verdict, Verdict::Escalate);
+        vs.take_forced(&key(1), &a, t2).expect("a live mark");
+        // The queue probe says idle: the slot itself shows the pair's leg.
+        let (verdict, _) = run_check(&vs, key(1), &a, t2, false, &[2]);
+        assert_eq!(verdict, Verdict::Held(Hold::Busy));
+        let (verdict, _) = run_check(&vs, key(2), &b, t2, false, &[2]);
+        assert_eq!(verdict, Verdict::Held(Hold::Slot), "another pair waits");
+    }
+
+    /// Skeptical review S2, round 5: a check restarted for writes it had not
+    /// covered is a new check, and is counted as one.
+    #[tokio::test]
+    async fn a_restarted_check_is_reported_where_it_restarts() {
+        let vs = VerifySoon::new();
+        let a = peer();
+        let t0 = Instant::now();
+        vs.note_originated(key(1), t0);
+        let t1 = t0 + CHECK_DELAY;
+        vs.take_due(t1);
+        vs.record_sent(&key(1), vec![a.clone()], t1);
+        vs.note_originated(key(1), t1);
+        // Restarted by the reply...
+        vs.on_comparison(&key(1), &a, false, true, &[0], idle, t1);
+        let t2 = t1 + CHECK_DELAY;
+        let due = vs.take_due(t2);
+        assert_eq!(due.restarted, vec![key(1)]);
+        assert_eq!(due.rounds.len(), 1);
+        // ...and by a deadline.
+        vs.record_sent(&key(1), vec![a.clone()], t2);
+        vs.note_originated(key(1), t2);
+        let due = vs.take_due(t2 + REPLY_TIMEOUT);
+        assert_eq!(due.restarted, vec![key(1)]);
+        assert!(
+            vs.take_due(t2 + REPLY_TIMEOUT).restarted.is_empty(),
+            "reported once"
+        );
+    }
+
+    /// Skeptical review S2, round 5: writes before the `First` round goes out
+    /// are covered by it, so a burst costs one `First` round, not two.
+    #[tokio::test]
+    async fn a_burst_before_the_first_round_costs_one_first_round() {
+        let vs = VerifySoon::new();
+        let a = peer();
+        let t0 = Instant::now();
+        vs.note_originated(key(1), t0);
+        vs.note_originated(key(1), t0 + Duration::from_secs(1));
+        vs.note_originated(key(1), t0 + Duration::from_secs(4));
+        let t1 = t0 + CHECK_DELAY;
+        assert_eq!(vs.take_due(t1).rounds.len(), 1);
+        vs.record_sent(&key(1), vec![a.clone()], t1);
+        vs.on_comparison(&key(1), &a, false, true, &[0], idle, t1);
+        assert_eq!(vs.tracked(), 0, "the First round covered every write");
     }
 
     #[tokio::test]
@@ -1519,7 +1851,7 @@ mod tests {
             sent + FORCE_FLOOR,
             &[(&a, false, &[2]), (&b, true, &[2])],
         );
-        assert_eq!(v, vec![Verdict::Escalate, Verdict::Held(Hold::Slot)]);
+        assert_eq!(v, vec![Verdict::Escalate, Verdict::Held(Hold::Busy)]);
         assert_eq!(vs.tracked(), 0, "nothing after the final round");
     }
 
@@ -1565,16 +1897,11 @@ mod tests {
         let taken = vs.take_forced(&key(1), &a, t2).expect("a live mark");
         drop(ForcedLeg::new(vs.clone(), time.clone(), taken));
         assert!(vs.inner.lock().slot.is_none());
-        assert_eq!(
-            vs.inner
-                .lock()
-                .armed
-                .get(&(key(1), a.clone()))
-                .map(|(_, h)| *h),
-            Some(None),
-            "a failure arms the floor only"
+        assert!(
+            vs.inner.lock().armed.is_empty() && vs.inner.lock().barred.contains_key(&a),
+            "a failure bars the peer and arms no pair"
         );
-        vs.inner.lock().armed.clear();
+        vs.inner.lock().barred.clear();
         // Delivered: slot freed and the pair armed.
         let (verdict, t3) = run_check(&vs, key(1), &a, t2, false, &[3]);
         assert_eq!(verdict, Verdict::Escalate);
@@ -1582,12 +1909,8 @@ mod tests {
         assert!(ForcedLeg::new(vs.clone(), time.clone(), taken).delivered());
         assert!(vs.inner.lock().slot.is_none());
         assert!(
-            vs.inner
-                .lock()
-                .armed
-                .get(&(key(1), a.clone()))
-                .is_some_and(|(_, h)| h.is_some()),
-            "a delivery arms the progress gate too"
+            vs.inner.lock().armed.contains_key(&(key(1), a.clone())),
+            "a delivery arms the pair"
         );
     }
 
@@ -1639,10 +1962,7 @@ mod tests {
             Verdict::Escalate
         );
         // Then the write gets its own First round over everyone.
-        assert_eq!(
-            vs.next_wake(),
-            Some(t2 + CHECK_DELAY).min(Some(t2 + FORCE_TTL))
-        );
+        assert_eq!(vs.next_wake(), Some(t2 + CHECK_DELAY));
         let due = vs.take_due(t2 + CHECK_DELAY).rounds;
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].round, Round::First);
