@@ -210,8 +210,8 @@ pub(crate) fn native_wire_allowed(remote: Option<(u8, u8, u16)>, floor: (u8, u8,
 /// The one encode that may emit the appended `ConnectMsg` variants, and only
 /// when [`native_wire_allowed`]. `floor` is
 /// [`crate::node::QUIC_NATIVE_MIN_VERSION`] in production; a test passes a
-/// lower one, since until the shipping release the real floor is above every
-/// version a test can run.
+/// different one to put the variants on the wire (or keep them off) regardless
+/// of the version the test binary reports.
 pub(crate) fn encode_for_peer<T: Serialize>(
     msg: &T,
     remote_version: Option<(u8, u8, u16)>,

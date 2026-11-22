@@ -23169,8 +23169,8 @@ fn run_native_wire_sim(
     NativeWireRun { trace, mesh, nodes }
 }
 
-/// A floor every node of this binary passes, injected because the real one
-/// is above this binary until the release that ships the decoder.
+/// A floor every node of this binary passes, injected so the test does not
+/// depend on the real floor relative to this binary's version.
 fn native_floor_for_tests() -> (u8, u8, u16) {
     SimNetwork::min_compatible_protocol_version()
 }

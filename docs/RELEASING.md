@@ -503,7 +503,7 @@ Current wire-gated floors:
   but were cut with the floor raised past them, so they never emitted the
   native variants. In 0.2.163 every offer carries percent 0
   (`QUIC_NATIVE_PERCENT` 0, `NATIVE_DIAL_READY` false); the step that turns
-  the native path on is a later release. Do not raise the floor again. Same failure mode as the
+  the native path on is a later release. Do not raise the floor again unless the V2 layout itself has to change. Same failure mode as the
   application-message floors above: a peer at
   or above the floor without the decoder closes the connection on the variant,
   so bias high. Only `connect::wire::encode_for_peer`, at the one peer-bound

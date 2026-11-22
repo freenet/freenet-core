@@ -2253,9 +2253,10 @@ impl SimNetwork {
 
     /// Lowers the QUIC-native wire floor to `floor` on every node, so the
     /// native connect variants go to any peer whose negotiated version is at
-    /// least `floor`. Until the release that ships them the production floor
+    /// least `floor`. Before the release that ships them the production floor
     /// is above this binary's version, so without this call no simulation can
-    /// put them on the wire. Call before the simulation starts.
+    /// put them on the wire; from that release the default already does. Call
+    /// before the simulation starts.
     #[cfg(any(test, feature = "testing"))]
     pub fn with_quic_native_floor(&mut self, floor: (u8, u8, u16)) -> &mut Self {
         for label in self.pending_labels() {
