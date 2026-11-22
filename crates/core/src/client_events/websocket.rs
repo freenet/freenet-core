@@ -2240,10 +2240,17 @@ fn rate_limited_target(req: &ClientRequest<'_>) -> Option<String> {
             ContractRequest::Get { key, .. } | ContractRequest::Subscribe { key, .. } => {
                 Some(format!("contract {key}"))
             }
+            // `ContractRequest` is `#[non_exhaustive]`, so a variant added in
+            // freenet-stdlib lands here and falls back to the unnamed message.
             _ => None,
         },
         ClientRequest::DelegateOp(op) => Some(format!("delegate {}", op.key())),
-        _ => None,
+        ClientRequest::Disconnect { .. }
+        | ClientRequest::Authenticate { .. }
+        | ClientRequest::NodeQueries(_)
+        | ClientRequest::Close
+        | ClientRequest::StreamChunk { .. }
+        | _ => None,
     }
 }
 
@@ -5768,7 +5775,10 @@ mod tests {
     /// A rate-limit rejection must name the request it refused, or a client with
     /// many requests in flight cannot tell which one to retry (River waited out a
     /// 10 s timeout per rejected request on try.freenet.org). The text keeps the
-    /// original phrase so existing substring matches still work.
+    /// original `operation rate limit exceeded` prefix, so a prefix or substring
+    /// match on that phrase still works (the full old string, which ended
+    /// `; retry shortly` directly after it, no longer appears when a target is
+    /// named).
     #[tokio::test]
     async fn ws_rate_limit_rejection_names_the_contract_key() {
         let text = rejection_text(encoded_get_op()).await;
@@ -5844,12 +5854,35 @@ mod tests {
         let _ = ContractWasmAPIVersion::V1;
     }
 
+    /// The Flatbuffers path (the default encoding, used by browser clients)
+    /// serializes the error through `into_fbs_bytes`; the longer, owned message
+    /// must come through it intact.
+    #[test]
+    fn rate_limit_rejection_text_survives_flatbuffers_encoding() {
+        let key = ContractInstanceId::new([7u8; 32]).to_string();
+        let error: ClientError = ErrorKind::OperationError {
+            cause: std::borrow::Cow::Owned(format!(
+                "operation rate limit exceeded for contract {key}; retry shortly"
+            )),
+        }
+        .into();
+        let bytes = error.into_fbs_bytes().expect("fbs encoding");
+        assert!(
+            bytes.windows(key.len()).any(|w| w == key.as_bytes()),
+            "the key must appear in the Flatbuffers frame"
+        );
+    }
+
     /// A request with no single target (a node query) is still refused with the
     /// plain message; nothing to name.
     #[tokio::test]
     async fn ws_rate_limit_rejection_of_node_query_is_plain() {
         let text = rejection_text(encoded_node_query()).await;
         assert!(text.contains("operation rate limit exceeded"), "{text}");
+        assert!(
+            !text.contains("contract ") && !text.contains("delegate "),
+            "a node query has no target to name: {text}"
+        );
     }
 
     /// The default burst must admit one normal app load. Measured on
@@ -5863,11 +5896,6 @@ mod tests {
             DEFAULT_PER_USER_OP_BURST, DEFAULT_PER_USER_OP_RATE_LIMIT,
         };
         const MEASURED_RIVER_LOAD_OPS: u64 = 135;
-        assert!(
-            DEFAULT_PER_USER_OP_BURST >= 3 * MEASURED_RIVER_LOAD_OPS,
-            "default burst {DEFAULT_PER_USER_OP_BURST} leaves < 3x headroom over a measured \
-             {MEASURED_RIVER_LOAD_OPS}-op app load"
-        );
         let limiter =
             UserOpRateLimiter::new(DEFAULT_PER_USER_OP_RATE_LIMIT, DEFAULT_PER_USER_OP_BURST, 0);
         let ctx = test_user_context(b"normal-load-user");

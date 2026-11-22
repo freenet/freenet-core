@@ -61,9 +61,16 @@ pub const DEFAULT_PER_USER_OP_RATE_LIMIT: u64 = 10;
 /// account has, so 500 leaves ~3.7x headroom over that measurement. A
 /// false-positive throttle during app load stalls the whole UI, while a larger
 /// ONE-TIME burst costs little: the sustained [`DEFAULT_PER_USER_OP_RATE_LIMIT`]
-/// (10/sec) is the real flood cap, and a drained bucket takes
-/// `burst / rate` = 50 s of idleness to refill, so the burst adds at most
-/// `burst` ops on top of the sustained rate per idle period.
+/// (10/sec) is the real flood cap for one identity, and a drained bucket takes
+/// `burst / rate` = 50 s of idleness to refill. The burst is per token, and a
+/// fresh token starts with a full bucket, so it also sets how many ops each
+/// newly minted token gets for free; that token-rotation gap exists at any
+/// burst (see [`MAX_TRACKED_USERS`]) and is not closed by this limiter.
+///
+/// Downstream queues still bound a burst aimed at one contract: the contract
+/// handler's per-contract queue (`MAX_QUEUED_PER_CONTRACT`, 100) sheds the excess
+/// of a single-contract flood, while an app load spreads its ops over many
+/// contracts and delegates.
 pub const DEFAULT_PER_USER_OP_BURST: u64 = 500;
 
 /// Minimum seconds between hosted-export downloads per user (export is far more
