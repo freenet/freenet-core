@@ -1214,6 +1214,7 @@ impl SecretsStore {
         // failure (EIO, EACCES, EMFILE) must not look like absence: a delegate
         // that acts on "missing" can overwrite real data after a transient
         // error (#5857).
+        #[allow(clippy::wildcard_enum_match_arm)] // io::ErrorKind is #[non_exhaustive]
         let blob = fs::read(secret_path).map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound => SecretStoreError::MissingSecret(key.clone()),
             _ => SecretStoreError::IO(e),

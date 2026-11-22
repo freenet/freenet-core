@@ -2471,16 +2471,14 @@ async fn a_failed_secret_read_fails_the_call_and_blocks_writes_not_reads_as_abse
         &mut runtime,
         &InboundAppMessage::HasSecret(b"never-written".to_vec()),
     )?;
-    match &absent[0] {
-        OutboundDelegateMsg::ApplicationMessage(m) => assert!(
-            matches!(
-                bincode::deserialize::<OutboundAppMessage>(&m.payload)?,
-                OutboundAppMessage::SecretExists(false)
-            ),
-            "a never-written secret must still read as absent"
+    let payloads = app_payloads(&absent);
+    assert!(
+        matches!(
+            bincode::deserialize::<OutboundAppMessage>(&payloads[0])?,
+            OutboundAppMessage::SecretExists(false)
         ),
-        other => panic!("expected ApplicationMessage, got {other:?}"),
-    }
+        "a never-written secret must still read as absent"
+    );
 
     // Seed it, then make its blob unreadable (but present).
     send(
@@ -2536,16 +2534,14 @@ async fn a_failed_secret_read_fails_the_call_and_blocks_writes_not_reads_as_abse
         },
     )?;
     let ok = send(&mut runtime, &InboundAppMessage::HasSecret(key.clone()))?;
-    match &ok[0] {
-        OutboundDelegateMsg::ApplicationMessage(m) => assert!(
-            matches!(
-                bincode::deserialize::<OutboundAppMessage>(&m.payload)?,
-                OutboundAppMessage::SecretExists(true)
-            ),
-            "the call after a transient failure must work normally"
+    let payloads = app_payloads(&ok);
+    assert!(
+        matches!(
+            bincode::deserialize::<OutboundAppMessage>(&payloads[0])?,
+            OutboundAppMessage::SecretExists(true)
         ),
-        other => panic!("expected ApplicationMessage, got {other:?}"),
-    }
+        "the call after a transient failure must work normally"
+    );
 
     Ok(())
 }
