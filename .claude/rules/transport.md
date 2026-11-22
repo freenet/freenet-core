@@ -281,9 +281,9 @@ holds exactly.
 The cap is built on RealTime in production and in a simulated node without
 QUIC, because the listener and its connections run on RealTime there: a
 VirtualTime cap would compute deficits on another clock than its UDP
-waiters sleep and time out on. The QUIC endpoint runs on the cap's clock
-(a hold's age is measured on the path's clock against a bound in the cap's
-time). In a simulation the endpoint runs on the network's VirtualTime, so
+waiters sleep and time out on. The QUIC endpoint must run on the cap's
+clock, because a hold's age is measured on the path's clock against a bound
+in the cap's time. In a simulation the endpoint runs on the network's VirtualTime, so
 bind_udp_listener builds a simulated QUIC node's cap on that VirtualTime
 too (D-2a); the same node's UDP stream senders still time on RealTime
 until the legacy path is removed.

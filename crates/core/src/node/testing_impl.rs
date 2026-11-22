@@ -8786,9 +8786,25 @@ mod tests {
             .start_with_rand_gen::<rand::rngs::SmallRng>(0xD2A0_0001, 1, 1)
             .await;
         let started = sim.virtual_time().now_nanos();
-        for _ in 0..300 {
+        // Run until 30 simulated seconds have passed and both QUIC nodes
+        // have sent something (their connections formed), however long the
+        // host takes in wall time; the deadline only ends a stuck run.
+        let deadline = std::time::Instant::now() + Duration::from_secs(600);
+        loop {
             sim.advance_time(Duration::from_millis(100));
             tokio::time::sleep(Duration::from_millis(10)).await;
+            let charged = labels[..2].iter().all(|label| {
+                sim.egress_cap_reading(label)
+                    .flatten()
+                    .is_some_and(|cap| cap.charged_bytes > 0)
+            });
+            if charged && sim.virtual_time().now_nanos() - started >= 30_000_000_000 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the QUIC nodes never sent anything"
+            );
         }
         let elapsed_ns = sim.virtual_time().now_nanos() - started;
         assert!(elapsed_ns >= 30_000_000_000, "{elapsed_ns} ns elapsed");
@@ -8839,14 +8855,22 @@ mod tests {
                 "{label}: admitted after the simulated wait"
             );
         }
-        // Without QUIC the cap keeps RealTime: simulated seconds do not move it.
-        let real = sim
-            .egress_cap_reading(&labels[2])
-            .unwrap()
-            .expect("a cap on the node without QUIC");
+        // Without QUIC the cap keeps RealTime: simulated time does not move
+        // it. Compared across one large simulated step, so how long the host
+        // stalled in wall time does not matter.
+        let reading = |sim: &SimNetwork| {
+            sim.egress_cap_reading(&labels[2])
+                .unwrap()
+                .expect("a cap on the node without QUIC")
+                .now_nanos
+        };
+        let before = reading(&sim);
+        const STEP: Duration = Duration::from_secs(100_000);
+        sim.advance_time(STEP);
+        let moved = reading(&sim) - before;
         assert!(
-            real.now_nanos < elapsed_ns / 2,
-            "the node without QUIC runs its cap on RealTime"
+            u128::from(moved) < STEP.as_nanos() / 2,
+            "the node without QUIC runs its cap on RealTime, it moved {moved} ns"
         );
     }
 
