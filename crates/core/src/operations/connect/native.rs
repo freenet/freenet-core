@@ -1548,7 +1548,17 @@ mod tests {
         let (endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
         let off = NativeConnectState::new(None);
         off.set_endpoint(watch.clone());
-        assert!(!off.readiness().ready, "production: not ready to dial");
+        assert!(
+            off.readiness().ready,
+            "production: ready once the endpoint is up"
+        );
+        assert_eq!(off.readiness().percent, QUIC_NATIVE_PERCENT);
+        let no_endpoint = NativeConnectState::new(None);
+        assert!(
+            !no_endpoint.readiness().ready,
+            "production: no transport yet"
+        );
+        assert_eq!(no_endpoint.readiness().percent, 0);
         let on = NativeConnectState::new(Some(100));
         assert!(!on.readiness().ready, "no transport yet");
         assert_eq!(on.readiness().percent, 0);
