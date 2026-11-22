@@ -146,6 +146,66 @@ pub fn note_gateway_supervisor_unverified() {
     SUPERVISOR_UNVERIFIED.store(true, Ordering::Relaxed);
 }
 
+/// Set by [`exit_for_endpoint_death`]: this process's transport listener
+/// exits when its QUIC endpoint dies (`ListenerExit::QuicEndpointDown`).
+static ENDPOINT_DEATH_EXITS: AtomicBool = AtomicBool::new(false);
+
+/// Set by [`EndpointHealth::quinn_panicked`]: a panic in a quinn driver
+/// poisoned a quinn lock in this process.
+static DRIVER_PANICKED: std::sync::LazyLock<watch::Sender<bool>> =
+    std::sync::LazyLock::new(|| watch::channel(false).0);
+
+/// Record that this process's transport listener exits for its supervisor to
+/// restart it when the QUIC endpoint dies (it watches the endpoint, see
+/// `connection_handler::gateway_quic_restart`). Read by
+/// [`driver_death_restart`].
+pub(crate) fn exit_for_endpoint_death() {
+    ENDPOINT_DEATH_EXITS.store(true, Ordering::Relaxed);
+}
+
+/// How long [`driver_death_restart`] waits for a driver panic to be reported.
+/// The report follows the panic within one unwind; a task can only beat it on
+/// another worker thread, by that much.
+const DRIVER_PANIC_REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The exit a node takes when a monitored task failed, if that failure is a
+/// consequence of a quinn driver panic (#6184): `Some` exactly when the
+/// listener would exit for the endpoint death (`QuicEndpointDown`), so the
+/// node exits the same way whichever of the two loses the race.
+///
+/// After a driver panic quinn's lock is poisoned, and any task that still
+/// reaches it panics: the accept loop in the moment before the watcher
+/// reports Down, the attempt router answering an attempt queued before the
+/// death (see the module docs). A monitored task's failure exits the node
+/// through the background monitor, a crash exit that the post-update
+/// rollback counts; the endpoint death exits it with 42, which it does not.
+/// So when this process exits for an endpoint death and a driver panicked
+/// (waiting [`DRIVER_PANIC_REPORT_WAIT`] for its report, which a task on
+/// another thread can beat), the death is recorded in the crash-breaker
+/// marker through `record` (the same once-per-process record the listener
+/// uses, `breaker::note_endpoint_down_exit_once`) and the restart is
+/// returned. `None` leaves the failure as it was: no driver panic, a node
+/// that does not exit for an endpoint death, or a death that could not be
+/// recorded (the listener keeps such a node running; here the task is
+/// already gone, so the node exits as before).
+pub(crate) async fn driver_death_restart(
+    record: impl FnOnce(std::time::SystemTime) -> bool,
+) -> Option<crate::transport::GatewayQuicRestart> {
+    if !ENDPOINT_DEATH_EXITS.load(Ordering::Relaxed) {
+        return None;
+    }
+    let mut panicked = DRIVER_PANICKED.subscribe();
+    let reported = tokio::time::timeout(DRIVER_PANIC_REPORT_WAIT, panicked.wait_for(|p| *p))
+        .await
+        .is_ok_and(|seen| seen.is_ok());
+    if !reported || !record(std::time::SystemTime::now()) {
+        return None;
+    }
+    Some(crate::transport::GatewayQuicRestart {
+        reason: "its QUIC endpoint died",
+    })
+}
+
 /// Whether [`note_gateway_supervisor_unverified`] was called.
 pub(crate) fn gateway_supervisor_unverified() -> bool {
     SUPERVISOR_UNVERIFIED.load(Ordering::Relaxed)
@@ -429,6 +489,7 @@ impl EndpointHealth {
                 false
             }
         });
+        DRIVER_PANICKED.send_replace(true);
         self.adapter_panic_signal.send_replace(true);
         if went_down {
             TRANSPORT_METRICS.record_quic_endpoint_down(self.local_addr);

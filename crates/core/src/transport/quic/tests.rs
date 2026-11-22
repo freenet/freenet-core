@@ -4154,6 +4154,100 @@ fn the_accept_loop_stops_without_polling_quinn_after_a_driver_panic() {
     );
 }
 
+/// #6184: a monitored task that a quinn driver panic kills (here the accept
+/// call quinn's poisoned endpoint lock panics, as the accept loop's would in
+/// the moment before the watcher reports Down, or the attempt router's on an
+/// attempt queued before the death) ends the node with the code the
+/// listener's `QuicEndpointDown` exit takes, recorded once in the breaker
+/// marker, not with a crash code the post-update rollback counts. The
+/// background monitor and the exit decision are the node's own
+/// (`p2p_impl`'s monitor arm calls `background_exit` with
+/// `driver_death_restart`); only `process::exit` is left out.
+#[test]
+fn a_task_a_driver_panic_kills_exits_as_the_endpoint_death() {
+    in_child(
+        "a_task_a_driver_panic_kills_exits_as_the_endpoint_death",
+        || {
+            bounded(|| async move {
+                use crate::config::GlobalExecutor;
+                use crate::node::background_task_monitor::BackgroundTaskMonitor;
+                use crate::node::{
+                    FAST_CRASH_EXIT_CODE, FATAL_LISTENER_EXIT_CODE, background_exit,
+                    listener_exit_code,
+                };
+                use crate::transport::quic::liveness::{
+                    driver_death_restart, exit_for_endpoint_death,
+                };
+                let _seed = GlobalRng::seed_guard(SEED);
+                let net = crate::transport::test_net::subnet();
+                let pair = pair("quic-panic-monitored-task", net.addr(1), net.addr(2), None).await;
+                // A supervised node: its listener exits for an endpoint death.
+                exit_for_endpoint_death();
+                pair.a.faults().panic_receive_in_quinn();
+                let mut availability = pair.a.availability();
+                let state = drive(&pair.time, Duration::from_secs(1), async move {
+                    availability.not_up().await
+                })
+                .await;
+                assert_eq!(state, QuicAvailability::Down);
+                let monitor = BackgroundTaskMonitor::new();
+                let a = pair.a.clone();
+                monitor.late_registrar().register(
+                    "poisoned_accept",
+                    GlobalExecutor::spawn(async move {
+                        let _ = a.accept().await;
+                        std::future::pending::<()>().await;
+                    }),
+                );
+                let failed = drive(
+                    &pair.time,
+                    Duration::from_secs(1),
+                    monitor.wait_for_any_exit(),
+                )
+                .await;
+                assert!(failed.to_string().contains("panic"), "{failed:#}");
+                // The control: the same failure without the decision would
+                // exit as a fast crash on a 45-aware unit.
+                assert_eq!(
+                    listener_exit_code(&failed, Duration::ZERO, true),
+                    FAST_CRASH_EXIT_CODE
+                );
+                let records = std::sync::atomic::AtomicU32::new(0);
+                let restart = driver_death_restart(|_| {
+                    records.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    true
+                })
+                .await;
+                let exit = background_exit(failed, restart);
+                assert_eq!(records.into_inner(), 1, "the death is recorded");
+                for fast_crash in [true, false] {
+                    assert_eq!(
+                        listener_exit_code(&exit, Duration::ZERO, fast_crash),
+                        FATAL_LISTENER_EXIT_CODE,
+                        "{exit:#}"
+                    );
+                }
+                assert_eq!(FATAL_LISTENER_EXIT_CODE, crate::QUIC_RESTART_EXIT_CODE);
+            });
+        },
+    );
+}
+
+/// A failed monitored task that no driver panic explains keeps its own exit:
+/// `driver_death_restart` waits for a driver panic's report and, with none,
+/// records nothing.
+#[test]
+fn a_task_failure_with_no_driver_panic_keeps_its_exit() {
+    in_child("a_task_failure_with_no_driver_panic_keeps_its_exit", || {
+        bounded(|| async move {
+            use crate::transport::quic::liveness::{driver_death_restart, exit_for_endpoint_death};
+            exit_for_endpoint_death();
+            let restart = driver_death_restart(|_| panic!("nothing to record")).await;
+            assert!(restart.is_none());
+        });
+    });
+}
+
 /// A panic that unwinds through one of quinn's CONNECTION drivers (as one
 /// in quinn's own code would) is an endpoint death: caught by
 /// `watch_connection_driver`, the endpoint turns Down, which on a supervised
