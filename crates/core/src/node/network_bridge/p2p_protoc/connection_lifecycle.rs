@@ -2980,17 +2980,24 @@ impl P2pConnManager {
                         // whoever fills the budget has to keep opening
                         // connections to keep it full, rather than holding
                         // it and refusing every joiner.
-                        // A native leg is never evicted: neither an entry
-                        // that is a QUIC-native connection nor a UDP entry
-                        // with one held beside it (`held_native`), since
-                        // closing either ends a native path. A UDP session
-                        // cannot have a QUIC path while it is unpromoted
-                        // (the upgrade starts only at promotion, which takes
-                        // the connection out of this pool).
-                        let victim = cm.oldest_held_transient(|addr| {
-                            self.held_native.contains_key(&addr)
-                                || self.connections.get(&addr).is_some_and(|e| e.native)
-                        });
+                        // Only a UDP entry with a native connection held
+                        // beside it (`held_native`) is spared: the hold lasts
+                        // `HELD_NATIVE_WINDOW`, so the exemption is bounded
+                        // in time and closing the entry would end a path the
+                        // two ends are still settling. A QUIC-native entry is
+                        // evictable like a UDP one: it costs a requester the
+                        // same, a native leg that never promotes is closed
+                        // by nothing but the zombie sweep or the idle
+                        // timeout, and exempting it (or only the ones that
+                        // have not carried a frame, which the first-frame
+                        // probe makes every live leg within a round trip)
+                        // would let a few sources fill the pool with legs
+                        // that cannot be evicted. A UDP session cannot have
+                        // a QUIC path while it is unpromoted (the upgrade
+                        // starts only at promotion, which takes the
+                        // connection out of this pool).
+                        let victim =
+                            cm.oldest_held_transient(|addr| self.held_native.contains_key(&addr));
                         if let Some(victim) = victim {
                             cm.record_transient_eviction(victim);
                             self.drop_connection_by_addr(
@@ -3409,6 +3416,11 @@ async fn fail_awaiting_connection_callbacks(state: &mut EventListenerState, addr
         }
     }
     state.awaiting_connection_txs.remove(&addr);
+    // A UDP dial queued beside a native one for this address is a waiter
+    // too: the budget has closed the address it was to connect. An inbound
+    // native eviction thus fails our pending outbound's UDP waiters, as it
+    // already does for `awaiting_connection`.
+    fail_udp_beside_native(state, addr).await;
 }
 
 /// Sends the first-frame probe on a native connection's channel: a message

@@ -5928,13 +5928,14 @@ async fn eviction_takes_from_the_source_holding_the_most_slots() {
     }
 }
 
-/// (a) Eviction never takes a native leg. With a UDP entry that has a native
-/// connection held beside it, an unpromoted QUIC-native entry, and one plain
-/// unpromoted UDP entry holding the budget, an arrival evicts the plain entry
-/// even though both native legs are older; once only native legs remain, an
-/// arrival is refused rather than closing one of them.
+/// Eviction spares only a UDP entry with a native connection held beside it
+/// (the hold lasts `HELD_NATIVE_WINDOW`), and takes a QUIC-native entry like
+/// a UDP one, oldest first. So legs a few sources hold cannot make the pool
+/// non-evictable: here the native entry is older than the plain one and goes
+/// first, then the plain one, then the arrivals; the held pair, older than all
+/// of them, is never the victim.
 #[tokio::test]
-async fn eviction_leaves_native_legs_alone() {
+async fn eviction_takes_native_entries_and_spares_only_a_held_pair() {
     let mut h = non_gateway_with_budget("transient-evict-native-legs", 3).await;
     let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
     let pair = SocketAddr::from(([198, 51, 100, 223], 7375));
@@ -5958,37 +5959,55 @@ async fn eviction_leaves_native_legs_alone() {
     let first = SocketAddr::from(([198, 51, 100, 224], 7376));
     unexpected_inbound(&mut h, first).await;
     assert!(
-        !h.mgr.connections.contains_key(&plain),
-        "the plain entry is evicted"
+        !h.mgr.connections.contains_key(&native),
+        "the older native entry is evicted"
     );
     assert!(
-        h.mgr.connections.contains_key(&first),
-        "and the arrival admitted"
+        h.mgr.connections.contains_key(&plain),
+        "the plain one stays"
     );
+    assert!(h.mgr.connections.contains_key(&first), "arrival admitted");
+
+    let second = SocketAddr::from(([198, 51, 100, 240], 7388));
+    unexpected_inbound(&mut h, second).await;
+    assert!(!h.mgr.connections.contains_key(&plain));
+    let third = SocketAddr::from(([198, 51, 100, 241], 7389));
+    unexpected_inbound(&mut h, third).await;
+    assert!(!h.mgr.connections.contains_key(&first));
+    assert!(h.mgr.connections.contains_key(&second));
+    assert!(h.mgr.connections.contains_key(&third));
     assert!(h.mgr.connections.contains_key(&pair), "the pair stays");
     assert!(
         h.mgr.held_native.contains_key(&pair),
         "with its held native connection"
     );
-    assert!(
-        h.mgr.connections.contains_key(&native),
-        "the native entry stays"
-    );
+    assert_eq!(cm.transient_evictions(), 3);
+}
 
-    // Now the oldest evictable entry is the arrival itself; the next one
-    // evicts it, and with only native legs left the one after is refused.
-    let second = SocketAddr::from(([198, 51, 100, 240], 7388));
-    unexpected_inbound(&mut h, second).await;
-    assert!(!h.mgr.connections.contains_key(&first));
-    assert!(h.mgr.connections.contains_key(&second));
-    assert!(cm.drop_transient(second).is_some());
-    assert!(cm.try_register_transient(SocketAddr::from(([198, 51, 100, 241], 1)), None));
-    let refused = SocketAddr::from(([198, 51, 100, 242], 7389));
-    unexpected_inbound(&mut h, refused).await;
-    assert!(!h.mgr.connections.contains_key(&refused), "refused");
-    assert!(h.mgr.held_native.contains_key(&pair));
-    assert!(h.mgr.connections.contains_key(&native));
-    assert_eq!(cm.transient_evictions(), 2);
+/// Callbacks queued for a UDP dial beside a native one are failed when the
+/// transient budget closes that address by eviction, instead of waiting out
+/// their own timeout; the entry is removed from `udp_beside_native` too.
+#[tokio::test]
+async fn an_evicted_address_fails_its_udp_beside_native_callbacks() {
+    let mut h = non_gateway_with_budget("transient-evict-fails-beside", 1).await;
+    let victim = SocketAddr::from(([198, 51, 100, 245], 7401));
+    unexpected_inbound(&mut h, victim).await;
+    let (callback, mut waiter) = mpsc::channel::<crate::message::ConnectResult>(1);
+    h.state
+        .udp_beside_native
+        .entry(victim)
+        .or_default()
+        .push((Transaction::new::<ConnectMsg>(), Box::new(callback)));
+
+    let arrival = SocketAddr::from(([198, 51, 100, 246], 7402));
+    unexpected_inbound(&mut h, arrival).await;
+    assert!(!h.mgr.connections.contains_key(&victim), "premise: evicted");
+    assert!(h.mgr.connections.contains_key(&arrival), "arrival admitted");
+    assert!(
+        matches!(waiter.try_recv(), Ok(Err(_))),
+        "the beside waiter is told"
+    );
+    assert!(!h.state.udp_beside_native.contains_key(&victim));
 }
 
 /// A connection the transient budget closes tells whoever still waits for a
@@ -6017,6 +6036,12 @@ async fn a_budget_close_fails_the_waiters_for_its_address() {
         .entry(remote)
         .or_default()
         .push(Box::new(callback));
+    let (beside_callback, mut beside_waiter) = mpsc::channel::<crate::message::ConnectResult>(1);
+    h.state
+        .udp_beside_native
+        .entry(remote)
+        .or_default()
+        .push((Transaction::new::<ConnectMsg>(), Box::new(beside_callback)));
 
     assert!(
         !h.try_connect_peer(PeerKeyLocation::new(key(), remote))
@@ -6028,6 +6053,37 @@ async fn a_budget_close_fails_the_waiters_for_its_address() {
         "the waiter is told"
     );
     assert!(!h.state.awaiting_connection.contains_key(&remote));
+    assert!(
+        matches!(beside_waiter.try_recv(), Ok(Err(_))),
+        "the beside waiter is told"
+    );
+    assert!(!h.state.udp_beside_native.contains_key(&remote));
+}
+
+/// The refused arrival's own address: with the budget spent and no victim to
+/// evict, the arrival is dropped and the UDP dials queued beside a native one
+/// for its address are failed, not left to their timeout.
+#[tokio::test]
+async fn a_refused_arrival_fails_its_udp_beside_native_callbacks() {
+    let mut h = non_gateway_with_budget("transient-refused-fails-beside", 2).await;
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    for port in [7411, 7412] {
+        assert!(cm.try_register_transient(SocketAddr::from(([198, 51, 100, 247], port)), None));
+    }
+    let addr = SocketAddr::from(([198, 51, 100, 248], 7413));
+    let (callback, mut waiter) = mpsc::channel::<crate::message::ConnectResult>(1);
+    h.state
+        .udp_beside_native
+        .entry(addr)
+        .or_default()
+        .push((Transaction::new::<ConnectMsg>(), Box::new(callback)));
+    unexpected_inbound(&mut h, addr).await;
+    assert!(!h.mgr.connections.contains_key(&addr), "premise: refused");
+    assert!(
+        matches!(waiter.try_recv(), Ok(Err(_))),
+        "the beside waiter is told"
+    );
+    assert!(!h.state.udp_beside_native.contains_key(&addr));
 }
 
 /// (b) The same when the entry is closed because a promotion was refused at
