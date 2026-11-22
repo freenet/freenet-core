@@ -45,7 +45,13 @@ use super::{OpManager, background_task_monitor::BackgroundTaskMonitor};
 /// Caveat (macOS): the macOS service wrapper treats a non-zero `freenet update`
 /// result (the no-op "already up to date" exit) as a failure and applies restart
 /// backoff. Production gateways are Linux, so this only slows restart on macOS.
-const FATAL_LISTENER_EXIT_CODE: i32 = 42;
+pub(crate) const FATAL_LISTENER_EXIT_CODE: i32 = 42;
+
+/// The exit code a gateway's planned restart for QUIC takes, an endpoint
+/// death included ([`listener_exit_code`]): exported so the binary's
+/// post-update rollback can pin that it never counts it as a crash.
+#[doc(hidden)]
+pub const QUIC_RESTART_EXIT_CODE: i32 = FATAL_LISTENER_EXIT_CODE;
 
 /// Exit code for a fatal listener exit that happened too soon after start
 /// (uptime < [`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`]) to be a healthy node hitting
@@ -70,7 +76,7 @@ const FATAL_LISTENER_EXIT_CODE: i32 = 42;
 ///
 /// NOT `44`: that is `EXIT_CODE_BUNDLE_UPDATE_STAGED`, an internal `freenet update`
 /// code never emitted by `freenet network`.
-const FAST_CRASH_EXIT_CODE: i32 = 45;
+pub(crate) const FAST_CRASH_EXIT_CODE: i32 = 45;
 
 /// Minimum uptime for a fatal listener exit to be treated as a "ran healthily,
 /// then died" event eligible for the non-failure auto-update self-heal path
@@ -120,7 +126,11 @@ fn fatal_listener_exit_code(uptime: Duration, fast_crash_enabled: bool) -> i32 {
 /// post-update crash-loop rollback, so three early endpoint deaths would roll
 /// a release back. The breaker bounds those restarts instead
 /// (`breaker::ENDPOINT_DOWN_EXITS_TO_TRIP`).
-fn listener_exit_code(error: &anyhow::Error, uptime: Duration, fast_crash_enabled: bool) -> i32 {
+pub(crate) fn listener_exit_code(
+    error: &anyhow::Error,
+    uptime: Duration,
+    fast_crash_enabled: bool,
+) -> i32 {
     if error
         .downcast_ref::<crate::transport::GatewayQuicRestart>()
         .is_some()
@@ -129,6 +139,54 @@ fn listener_exit_code(error: &anyhow::Error, uptime: Duration, fast_crash_enable
     } else {
         fatal_listener_exit_code(uptime, fast_crash_enabled)
     }
+}
+
+/// The error a monitored background task's failure `failed` ends the node
+/// with: the restart for an endpoint death when the failure came from a quinn
+/// driver panic (`liveness::driver_death_restart`), so the node exits with
+/// the same code as the listener's `QuicEndpointDown` ([`listener_exit_code`]),
+/// otherwise `failed` itself.
+pub(crate) fn background_exit(
+    failed: anyhow::Error,
+    restart: Option<crate::transport::GatewayQuicRestart>,
+) -> anyhow::Error {
+    match restart {
+        Some(restart) => {
+            tracing::warn!(
+                failed = %failed,
+                "A background task failed after a panic in a quinn driver poisoned the QUIC \
+                 endpoint; exiting as for the endpoint's death"
+            );
+            anyhow::Error::new(restart)
+        }
+        None => failed,
+    }
+}
+
+/// Exit the process with `exit_code` if `e` is a gateway's planned restart to
+/// restore QUIC ([`crate::transport::GatewayQuicRestart`]), logging it as the
+/// planned restart it is; return otherwise.
+fn exit_for_gateway_quic_restart(e: &anyhow::Error, exit_code: i32, uptime: Duration) {
+    let Some(restart) = e.downcast_ref::<crate::transport::GatewayQuicRestart>() else {
+        return;
+    };
+    tracing::warn!(
+        reason = restart.reason,
+        exit_code,
+        uptime_secs = uptime.as_secs(),
+        "Gateway exiting for its service supervisor to restart it with QUIC on: {}",
+        restart.reason
+    );
+    eprintln!(
+        "Gateway exiting with code {exit_code} for its service supervisor to restart it with \
+         QUIC on: {}",
+        restart.reason
+    );
+    // The file log is written by a background worker that `process::exit`
+    // does not wait for; give it a moment so the line above reaches the log.
+    // Blocking this worker thread is harmless: the process exits next.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    std::process::exit(exit_code);
 }
 
 /// When `true`, a sub-[`MIN_HEALTHY_UPTIME_FOR_UPDATE_EXIT`] fatal listener exit
@@ -713,27 +771,7 @@ impl NodeP2P {
                    // #5940: a supervised gateway restarting to restore QUIC
                    // takes this same exit, but it is planned, so it is not
                    // logged as a failure.
-                   if let Some(restart) = e.downcast_ref::<crate::transport::GatewayQuicRestart>() {
-                       tracing::warn!(
-                           reason = restart.reason,
-                           exit_code,
-                           uptime_secs = uptime.as_secs(),
-                           "Gateway exiting for its service supervisor to restart it with QUIC \
-                            on: {}",
-                           restart.reason
-                       );
-                       eprintln!(
-                           "Gateway exiting with code {exit_code} for its service supervisor to \
-                            restart it with QUIC on: {}",
-                           restart.reason
-                       );
-                       // The file log is written by a background worker that
-                       // `process::exit` does not wait for; give it a moment
-                       // so the line above reaches the log. Blocking this
-                       // worker thread is harmless: the process exits next.
-                       std::thread::sleep(std::time::Duration::from_millis(500));
-                       std::process::exit(exit_code);
-                   }
+                   exit_for_gateway_quic_restart(&e, exit_code, uptime);
                    eprintln!("CRITICAL: Network event listener exited (fatal): {e}");
                    tracing::error!(
                        error = %e,
@@ -769,6 +807,27 @@ impl NodeP2P {
             e = background_monitor => {
                 eprintln!("CRITICAL: Background task exited: {e}");
                 tracing::error!("Background task exited: {:?}", e);
+                // #6184: a task killed by a quinn driver panic exits as the
+                // endpoint death does (42, recorded in the breaker marker),
+                // not as a crash the post-update rollback would count.
+                let e = background_exit(
+                    e,
+                    crate::transport::quic::liveness::driver_death_restart(
+                        crate::transport::quic::breaker::note_endpoint_down_exit_once,
+                    )
+                    .await,
+                );
+                if e.downcast_ref::<crate::transport::GatewayQuicRestart>().is_some()
+                    && ABORT_ON_FATAL_LISTENER_EXIT.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    let uptime = start_time.elapsed();
+                    let exit_code = listener_exit_code(
+                        &e,
+                        uptime,
+                        EMIT_FAST_CRASH_EXIT_CODE.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+                    exit_for_gateway_quic_restart(&e, exit_code, uptime);
+                }
                 Err(e)
             },
         };
@@ -1303,6 +1362,25 @@ mod tests {
             FAST_CRASH_EXIT_CODE, 44,
             "must not collide with bundle-update-staged (44)"
         );
+    }
+
+    /// #6184: the background monitor's arm in `run_node` routes a task
+    /// failure through `background_exit` with `driver_death_restart` (and the
+    /// once-per-process record), and exits like the listener's planned
+    /// restart. `a_task_a_driver_panic_kills_exits_as_the_endpoint_death`
+    /// tests those functions; this pins that the arm calls them.
+    #[test]
+    fn the_background_monitor_arm_exits_as_an_endpoint_death() {
+        let src = include_str!("p2p_impl.rs");
+        let arm = &src[src.find("e = background_monitor => {").expect("the arm")..];
+        let arm = &arm[..arm.find("Err(e)\n").expect("the arm's end")];
+        let flat: String = arm.split_whitespace().collect();
+        for needle in [
+            "lete=background_exit(e,crate::transport::quic::liveness::driver_death_restart(crate::transport::quic::breaker::note_endpoint_down_exit_once,).await,);",
+            "exit_for_gateway_quic_restart(&e,exit_code,uptime);",
+        ] {
+            assert!(flat.contains(needle), "missing {needle} in {arm}");
+        }
     }
 
     /// #5940: a gateway's deliberate restart to restore QUIC takes 42 at any
