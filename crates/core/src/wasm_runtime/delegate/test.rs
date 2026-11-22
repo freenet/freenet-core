@@ -2437,14 +2437,16 @@ async fn a_write_invalidates_the_secret_memo_within_one_process_call()
 /// negative return of `get_secret` to `None` and a delegate acting on `None`
 /// can initialise over real data.
 ///
-/// The failure is injected by replacing the secret's blob with a directory, so
-/// `fs::read` fails with `EISDIR` (not `NotFound`) deterministically, including
-/// when the suite runs as root, where a `chmod 000` would not fail.
+/// The failure is injected by replacing the secret's blob with a symlink to a
+/// directory, so `fs::read` fails with `EISDIR` (not `NotFound`)
+/// deterministically, including when the suite runs as root, where a
+/// `chmod 000` would not fail. Unix only (symlink creation).
 ///
 /// Checked through a real guest, in three parts: the whole call fails (so a
 /// frozen delegate is loud), the write the guest tries after the failed read is
 /// refused (the planted directory survives), and a genuinely absent secret
 /// still reads as absent.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_secret_read_fails_the_call_and_blocks_writes_not_reads_as_absent()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -2494,8 +2496,14 @@ async fn a_failed_secret_read_fails_the_call_and_blocks_writes_not_reads_as_abse
         .join(delegate.key().encode())
         .join(freenet_stdlib::prelude::SecretsId::new(key.clone()).encode());
     assert!(blob.is_file(), "seeded blob must exist at {blob:?}");
+    // A symlink to a directory: `fs::read` follows it and fails with EISDIR,
+    // but a write would REPLACE the symlink (rename over a plain directory
+    // fails by itself, which would make the write-refusal assertion below
+    // vacuous).
+    let unreadable_target = temp_dir.path().join("unreadable-target");
+    std::fs::create_dir(&unreadable_target)?;
     std::fs::remove_file(&blob)?;
-    std::fs::create_dir(&blob)?;
+    std::os::unix::fs::symlink(&unreadable_target, &blob)?;
 
     // Read-then-write in one call: the read fails, so the call fails...
     let res = send(
@@ -2512,7 +2520,7 @@ async fn a_failed_secret_read_fails_the_call_and_blocks_writes_not_reads_as_abse
     );
     // ...and the write the guest attempted afterwards was refused.
     assert!(
-        blob.is_dir(),
+        blob.symlink_metadata()?.file_type().is_symlink(),
         "the write after a failed read must be refused, not replace the blob"
     );
 
@@ -2525,7 +2533,7 @@ async fn a_failed_secret_read_fails_the_call_and_blocks_writes_not_reads_as_abse
 
     // Poisoning is per invocation: once the blob is readable again the very
     // next call works normally, and sees the real data, not a stale failure.
-    std::fs::remove_dir(&blob)?;
+    std::fs::remove_file(&blob)?;
     send(
         &mut runtime,
         &InboundAppMessage::StoreSecret {
@@ -2543,6 +2551,59 @@ async fn a_failed_secret_read_fails_the_call_and_blocks_writes_not_reads_as_abse
         "the call after a transient failure must work normally"
     );
 
+    Ok(())
+}
+
+/// #5857 scope boundary, pinned: a blob that reads but does not authenticate
+/// is deterministic corruption or a key mismatch, not a transient I/O failure.
+/// It keeps its historical answer (absent, call succeeds) rather than failing
+/// every call that touches it. Follow-up for refusing writes over it is tracked
+/// separately.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrupt_secret_blob_keeps_its_old_answer_and_does_not_poison_the_call()
+-> Result<(), Box<dyn std::error::Error>> {
+    use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+    let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+    let key = b"corrupt".to_vec();
+    let send = |runtime: &mut Runtime, msg: &InboundAppMessage| {
+        let payload = bincode::serialize(msg).expect("serialize");
+        runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        )
+    };
+    send(
+        &mut runtime,
+        &InboundAppMessage::StoreSecret {
+            key: key.clone(),
+            value: b"real data".to_vec(),
+        },
+    )?;
+    let blob = temp_dir
+        .path()
+        .join("secrets")
+        .join(delegate.key().encode())
+        .join(freenet_stdlib::prelude::SecretsId::new(key.clone()).encode());
+    let mut bytes = std::fs::read(&blob)?;
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff;
+    std::fs::write(&blob, bytes)?;
+
+    let out = send(&mut runtime, &InboundAppMessage::HasSecret(key))?;
+    let payloads = app_payloads(&out);
+    assert!(
+        matches!(
+            bincode::deserialize::<OutboundAppMessage>(&payloads[0])?,
+            OutboundAppMessage::SecretExists(false)
+        ),
+        "a corrupt blob keeps its historical answer and does not fail the call"
+    );
     Ok(())
 }
 

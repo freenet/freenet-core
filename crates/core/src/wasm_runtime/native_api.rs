@@ -1083,10 +1083,12 @@ pub(super) struct DelegateCallEnv {
     /// (frozen predecessor generations are never rebuilt). Acting on "absent"
     /// by initialising or overwriting the secret is the data-loss shape.
     ///
-    /// So the call is POISONED: the read still returns `ERR_STORAGE_FAILED`
-    /// (a delegate built against a stdlib that knows about it may handle it),
-    /// writes and removals are refused for the rest of the call, and
-    /// `exec_inbound_with_env` fails the whole call once `process()` returns.
+    /// So the call is POISONED: the read returns `ERR_STORAGE_FAILED`, secret
+    /// writes, removals and delegate creation are refused for the rest of the
+    /// call, and `exec_inbound_with_env` fails the whole call once `process()`
+    /// returns, so no guest can handle the code and carry on. Effects made
+    /// BEFORE the failed read (an earlier `set_secret`) are not rolled back, so
+    /// a retried call must be safe to repeat.
     /// Holds the first failure's text. Behind a `RefCell` like `context`, for
     /// the same reason: nothing needs a `&mut DelegateCallEnv`.
     secret_read_failure: std::cell::RefCell<Option<String>>,
@@ -1505,6 +1507,15 @@ impl DelegateCallEnv {
         use freenet_stdlib::prelude::{
             Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion, Parameters,
         };
+
+        // A failed secret read poisons the call (#5857): the guest may be
+        // acting on a belief that something is absent, and a created delegate
+        // is durable, while the call is about to fail and be retried.
+        if self.secret_reads_poisoned() {
+            return Err(DelegateCreateError::StoreFailed(
+                "an earlier secret read failed in this call".to_string(),
+            ));
+        }
 
         // Check per-call creation limit
         let current = self.creations_this_call.get();
@@ -2185,7 +2196,11 @@ pub(super) mod delegate_context {
 /// - Returns non-negative values on success (usually byte counts)
 /// - Returns `ERR_NOT_IN_PROCESS` (-1) if called outside process()
 /// - Returns `ERR_SECRET_NOT_FOUND` (-2) if secret doesn't exist
-/// - Returns `ERR_STORAGE_FAILED` (-3) if storage operation failed
+/// - Returns `ERR_STORAGE_FAILED` (-3) if storage operation failed. A secret
+///   READ that fails with an I/O error (as opposed to the secret being absent)
+///   also returns this, and additionally poisons the call: later
+///   `set_secret` / `remove_secret` / `create_delegate` are refused and the
+///   whole `process()` call fails when it returns (#5857).
 /// - Returns `ERR_INVALID_PARAM` (-4) for invalid parameters (negative length)
 /// - Returns `ERR_BUFFER_TOO_SMALL` (-6) if output buffer is too small
 pub(super) mod delegate_secrets {
@@ -2198,6 +2213,7 @@ pub(super) mod delegate_secrets {
     /// - Non-negative: secret length in bytes
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_SECRET_NOT_FOUND`: secret doesn't exist
+    /// - `ERR_STORAGE_FAILED`: the read failed (I/O); the call is poisoned
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative key length)
     pub(crate) fn get_secret_len(key_ptr: i64, key_len: i32) -> i32 {
         let id = current_instance_id();
@@ -2269,6 +2285,7 @@ pub(super) mod delegate_secrets {
     /// - Non-negative: number of bytes written
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_SECRET_NOT_FOUND`: secret doesn't exist
+    /// - `ERR_STORAGE_FAILED`: the read failed (I/O); the call is poisoned
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
     /// - `ERR_BUFFER_TOO_SMALL`: output buffer is too small (use get_secret_len first)
     pub(crate) fn get_secret(key_ptr: i64, key_len: i32, out_ptr: i64, out_len: i32) -> i32 {
@@ -2369,7 +2386,8 @@ pub(super) mod delegate_secrets {
     /// ## Returns
     /// - `SUCCESS` (0): store succeeded
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
-    /// - `ERR_STORAGE_FAILED`: storage operation failed
+    /// - `ERR_STORAGE_FAILED`: storage operation failed, or an earlier secret
+    ///   read in this call failed (the call is poisoned, #5857)
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
     pub(crate) fn set_secret(key_ptr: i64, key_len: i32, val_ptr: i64, val_len: i32) -> i32 {
         let id = current_instance_id();
@@ -2449,6 +2467,7 @@ pub(super) mod delegate_secrets {
     /// ## Returns
     /// - 1: secret exists
     /// - 0: secret doesn't exist
+    /// - `ERR_STORAGE_FAILED`: the read failed (I/O); the call is poisoned
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
     pub(crate) fn has_secret(key_ptr: i64, key_len: i32) -> i32 {
@@ -2510,7 +2529,8 @@ pub(super) mod delegate_secrets {
     /// - `SUCCESS` (0): remove succeeded
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_SECRET_NOT_FOUND`: secret doesn't exist
-    /// - `ERR_STORAGE_FAILED`: storage operation failed
+    /// - `ERR_STORAGE_FAILED`: storage operation failed, or an earlier secret
+    ///   read in this call failed (the call is poisoned, #5857)
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
     pub(crate) fn remove_secret(key_ptr: i64, key_len: i32) -> i32 {
         let id = current_instance_id();

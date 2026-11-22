@@ -2690,18 +2690,33 @@ impl SecretsStore {
                 }
             }
             let marker_id = pred_done_marker_secret_id(predecessor);
-            if self
-                .get_secret(successor, &marker_id, SecretScope::Local)
-                .is_ok()
-            {
-                tracing::debug!(
-                    predecessor = %predecessor.encode(),
-                    successor = %successor.encode(),
-                    "delegate secret copy-forward: already migrated (crate-format marker); skipping"
-                );
-                pm.already_migrated = true;
-                report.per_predecessor.push(pm);
-                continue;
+            match self.get_secret(successor, &marker_id, SecretScope::Local) {
+                Ok(_) => {
+                    tracing::debug!(
+                        predecessor = %predecessor.encode(),
+                        successor = %successor.encode(),
+                        "delegate secret copy-forward: already migrated (crate-format marker); skipping"
+                    );
+                    pm.already_migrated = true;
+                    report.per_predecessor.push(pm);
+                    continue;
+                }
+                // Only a marker that is genuinely absent means "not migrated".
+                // A read that failed for another reason says nothing about it
+                // (#5857), so fail closed like the redb marker read above.
+                Err(SecretStoreError::MissingSecret(_)) => {}
+                Err(e) => {
+                    tracing::error!(
+                        predecessor = %predecessor.encode(),
+                        successor = %successor.encode(),
+                        error = %e,
+                        "delegate secret copy-forward: crate-format marker read failed; skipping copy (fail-closed)"
+                    );
+                    pm.already_migrated = true;
+                    pm.errors.push(format!("marker read failed: {e}"));
+                    report.per_predecessor.push(pm);
+                    continue;
+                }
             }
 
             // 1b. ABSENT predecessor (M1): if this node never held the predecessor
