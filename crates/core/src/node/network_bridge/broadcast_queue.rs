@@ -5209,16 +5209,17 @@ pub(super) async fn broadcast_to_single_peer(
         };
 
         // Test seam: refuse this stream as a failed metadata send would.
-        let send_res = if crate::operations::update::inline_leg_fault_injection::broadcast_stream_refused(
-            op_manager, &key,
-        ) {
-            Err(crate::node::network_bridge::ConnectionError::SendNotCompleted(peer_addr))
-        } else {
-            // channel-safety: ok — unchanged send, on the detached
-            // broadcast-queue task (not the event loop); only the seam
-            // branch above is new.
-            bridge.send(peer_addr, net_msg).await
-        };
+        let send_res =
+            if crate::operations::update::inline_leg_fault_injection::broadcast_stream_refused(
+                op_manager, &key,
+            ) {
+                Err(crate::node::network_bridge::ConnectionError::SendNotCompleted(peer_addr))
+            } else {
+                // channel-safety: ok — unchanged send, on the detached
+                // broadcast-queue task (not the event loop); only the seam
+                // branch above is new.
+                bridge.send(peer_addr, net_msg).await
+            };
         if send_res.is_err() {
             // Telemetry gauge (#4440): the initial metadata send failed, so the
             // streaming broadcast never landed. This is a real streaming-

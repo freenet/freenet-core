@@ -25103,8 +25103,16 @@ fn test_verify_soon_a_failed_forced_stream_bars_the_peer_then_converges() {
         + freenet::dev_tool::VERIFY_SOON_SLOT_WAIT_BOUND * 2;
     let o = run_verify_scenario(s);
     assert!(o.swallowed > 0, "the fault seam never fired");
-    assert_eq!(o.streams_failed, 1, "one forced stream was refused: {:?}", o.obs);
-    assert!(o.obs.verify_forced_legs <= o.obs.verify_forced, "{:?}", o.obs);
+    assert_eq!(
+        o.streams_failed, 1,
+        "one forced stream was refused: {:?}",
+        o.obs
+    );
+    assert!(
+        o.obs.verify_forced_legs <= o.obs.verify_forced,
+        "{:?}",
+        o.obs
+    );
     assert_eq!(
         o.obs.verify_forced_legs - o.obs.verify_forced_delivered,
         1,

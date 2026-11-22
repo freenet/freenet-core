@@ -1221,7 +1221,9 @@ pub(crate) async fn run_verify_soon(ring: std::sync::Arc<crate::ring::Ring>) {
             // return: this task is registered with `BackgroundTaskMonitor`,
             // which reads any clean return as a fatal exit (#4292, the same
             // convention as `ring.rs`'s connection maintenance).
-            OpManagerState::Detached => std::future::pending::<()>().await,
+            OpManagerState::Detached => loop {
+                std::future::pending::<()>().await;
+            },
             OpManagerState::NotAttached => {
                 tokio::select! {
                     _ = shutdown.cancelled() => {}
@@ -1648,7 +1650,10 @@ mod tests {
         let (verdict, _) = run_check(&vs, key(3), &a, fail2 + FORCE_FLOOR - lead, false, &[1]);
         assert_eq!(verdict, Verdict::Held(Hold::PeerFailed), "doubled");
         let sent = force_and_report(&vs, key(4), &a, fail2 + FORCE_FLOOR * 2 - lead, &[1], true);
-        assert!(vs.inner.lock().barred.is_empty(), "a delivery clears the bar");
+        assert!(
+            vs.inner.lock().barred.is_empty(),
+            "a delivery clears the bar"
+        );
         // A failure after the delivery starts again at FORCE_FLOOR.
         let fail3 = force_and_report(&vs, key(5), &a, sent, &[1], false);
         let (verdict, _) = run_check(&vs, key(6), &a, fail3 + FORCE_FLOOR - lead, false, &[1]);
@@ -1666,7 +1671,11 @@ mod tests {
         assert_eq!(peer_bar_length(hold, 1), hold);
         assert_eq!(peer_bar_length(hold, 2), hold * 2);
         let huge = PEER_BAR_MAX + Duration::from_secs(1);
-        assert_eq!(peer_bar_length(huge, 5), huge, "never shorter than the hold");
+        assert_eq!(
+            peer_bar_length(huge, 5),
+            huge,
+            "never shorter than the hold"
+        );
     }
 
     #[tokio::test]
@@ -1676,11 +1685,21 @@ mod tests {
         let peers: Vec<PeerKey> = (0..=MAX_BARRED_PEERS).map(|_| peer()).collect();
         let first = peers[0].clone();
         for (n, p) in peers.iter().enumerate() {
-            force_and_report(&vs, nth_key(n), p, t0 + Duration::from_millis(n as u64), &[0], false);
+            force_and_report(
+                &vs,
+                nth_key(n),
+                p,
+                t0 + Duration::from_millis(n as u64),
+                &[0],
+                false,
+            );
         }
         let inner = vs.inner.lock();
         assert_eq!(inner.barred.len(), MAX_BARRED_PEERS);
-        assert!(!inner.barred.contains_key(&first), "the soonest forgotten went");
+        assert!(
+            !inner.barred.contains_key(&first),
+            "the soonest forgotten went"
+        );
         assert!(inner.barred.contains_key(&peers[MAX_BARRED_PEERS]));
     }
 
@@ -2245,7 +2264,7 @@ mod tests {
             .collect();
         assert_eq!(
             between, "ifdelivered{",
-            "the report is the first statement inside `if delivered {`"
+            "the report is the first statement inside `if delivered {{`"
         );
     }
 }
