@@ -17825,6 +17825,13 @@ fn run_hash_first_ab(name: &str, seed: u64, hash_first: bool, divergent: bool) -
 
     let contract = SimOperation::create_test_contract(0x49);
     let contract_key = contract.key();
+    // The verify-soon check (#6143) sends its `SummaryRequest` only to peers at
+    // or above the hash-first floor, so it runs in the enabled arm and never in
+    // the pinned-fallback arm. Left on, it adds its own summary exchange to one
+    // side of the A/B, which then no longer measures the encoding. It is off
+    // for this contract, and the premise below checks that it stayed off.
+    freenet::dev_tool::verify_soon_switch::disable_for(contract_key);
+    freenet::dev_tool::stale_peer_heal_observations::clear(&contract_key);
 
     let mut sim = rt.block_on(async { SimNetwork::new(name, 1, 1, 7, 3, 10, 2, seed).await });
     if hash_first {
@@ -17915,6 +17922,12 @@ fn run_hash_first_ab(name: &str, seed: u64, hash_first: bool, divergent: bool) -
         result.turmoil_result.is_ok(),
         "hash-first sim ({name}) failed: {:?}",
         result.turmoil_result.err()
+    );
+    assert_eq!(
+        freenet::dev_tool::stale_peer_heal_observations::get(&contract_key).verify_requests(),
+        0,
+        "premise ({name}): the verify-soon check must send nothing for this \
+         contract, or its summary exchange lands in one arm of the A/B only"
     );
 
     // Strip the per-run network-name prefix. `NodeLabel` renders as

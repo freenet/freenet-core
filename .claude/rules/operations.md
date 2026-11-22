@@ -717,13 +717,15 @@ outcome or the mark's expiry). Only a DELIVERED forced stream arms the floor
 and cooldown (`ForcedLeg`). A floor, busy, slot or cap hold retries the held
 peers only, at most 3 times plus a final retry at the latest holder's clearing
 time. One check per contract, never postponed by later writes; a write during
-a check starts one more after it. Requests leave through a token bucket (128
+a check merges into it, and a fresh first round for the write starts when the
+check would otherwise end, not before the earliest held peer can clear. Requests leave through a token bucket (128
 per 250 ms). Counters (`verify_*`, on their own
 `update_propagation_summary verify` INFO line): scheduled, dropped_cap,
 request_sent, request_dropped, peers_truncated, round_timed_out, peer_stale (any
 round; a stale verdict, not a heal), peer_stale_confirm (confirm round only),
-peer_converged, forced_full, forced_full_sent, and
-not_forced_{evidence,floor,no_progress,cap,busy,slot}. Bounds, the
+peer_converged, forced_full, forced_full_sent, forced_delivered, and
+not_forced_{evidence,floor,no_progress,cap,busy,slot}. Only the floor, busy,
+slot and cap holds are retried; an evidence or no-progress hold is not. Bounds, the
 `PERSISTENT_FAULT_BOUND` assumptions and residuals are in the `verify_soon`
 module doc.
 

@@ -1050,8 +1050,11 @@ pub(crate) async fn run_verify_soon(ring: std::sync::Arc<crate::ring::Ring>) {
         }
         let op_manager = match ring.op_manager_state() {
             OpManagerState::Live(op_manager) => op_manager,
-            // Attached once and dropped: the node is gone.
-            OpManagerState::Detached => return,
+            // Attached once and dropped: the node is gone. Park rather than
+            // return: this task is registered with `BackgroundTaskMonitor`,
+            // which reads any clean return as a fatal exit (#4292, the same
+            // convention as `ring.rs`'s connection maintenance).
+            OpManagerState::Detached => std::future::pending::<()>().await,
             OpManagerState::NotAttached => {
                 tokio::select! {
                     _ = shutdown.cancelled() => {}
@@ -1901,9 +1904,28 @@ mod tests {
             .find("ForcedLeg::new(")
             .expect("a forced leg owns its outcome reporter");
         assert!(take < guard, "built once the mark is taken");
-        assert!(
-            body.contains(".delivered()"),
-            "a delivered forced stream arms the pair"
+        // Only a delivered stream arms the pair: the one `forced_leg.take()`
+        // in the body is the first statement inside `if delivered {`, right
+        // after the delivery is recorded, so a failed stream drops the
+        // reporter unreported (a failure).
+        let report = "if forced_leg.take().is_some_and(|leg| leg.delivered()) {";
+        assert_eq!(
+            body.matches("forced_leg.take()").count(),
+            1,
+            "exactly one place reports the forced leg"
+        );
+        let at = body
+            .find(report)
+            .expect("a delivered forced stream arms the pair");
+        let gate = "BROADCAST_STREAM_METRICS.record_attempt(delivered);";
+        let gate_at = body.find(gate).expect("the delivery outcome is recorded");
+        let between: String = body[gate_at + gate.len()..at]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert_eq!(
+            between, "ifdelivered{",
+            "the report is the first statement inside `if delivered {`"
         );
     }
 }
