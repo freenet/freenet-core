@@ -3785,52 +3785,54 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     lock (QuicRuntime::now, QuicTimer::reset/poll and the TimeSource's
     sleep_until; they have no error to return a panic as, so they are not
     wrapped) behaves as one in quinn's own code: see the next two items.
-  → CONTAINED since quinn#2987 (freenet-quinn): a panic in quinn's own
-    ENDPOINT driver code. quinn polls each driver holding a std Mutex it
-    locks with .lock().unwrap(), so the panic poisons it; quinn spawns the
-    endpoint driver inside its own async block and the unwind drops it there
-    (before any catch around the spawned future), so EndpointDriver::drop
-    (endpoint.rs:399) and EndpointRef::drop (endpoint.rs:770) lock the
-    poisoned mutex during the unwind. They unwrapped it, which always
-    aborted the process (#6184); they now use
-    unwrap_or_else(PoisonError::into_inner). The panic reaches
-    liveness::watch_endpoint_driver, which catches it, logs ERROR and turns
-    the endpoint Down (EndpointHealth::quinn_panicked: ERROR log,
-    quic_endpoint_down, the adapter-panic flag and signal so every
-    connection's watcher closes locally; quic_adapter_panicked stays 0).
-    quinn's other calls on the poisoned endpoint (accept, connect,
-    local_addr, every Incoming method and the drop of an unanswered Incoming)
-    still unwrap the lock and panic in their caller, so the node reaches
-    them through one mechanism: once the endpoint is Down
-    EndpointHealth::guard_quinn skips the call, and a panic in one is caught
-    and reported the same way (quic::GuardedIncoming wraps every
-    quinn::Incoming; connect and local_addr use guard_quinn; accept has a
-    catch in accept_attempt). The accept loop is a monitored task, where a
-    panic is a node failure. Pinned by
-    a_panic_unwinding_through_the_endpoint_driver_is_contained and the
-    a_pending_incoming_*_after_an_endpoint_driver_panic_is_contained tests
-    (a pending attempt, then ignore/retry/establish/drop).
-  → CONNECTION-driver panics: watch_connection_driver (runtime.rs spawn)
-    catches them and reports them the same way, so the endpoint goes Down and
-    every connection closes locally (traffic falls back); the poisoned
-    connection would otherwise stay wedged with its permit held.
-    SendStream, RecvStream, ConnectionRef, ConnectionDriver and
-    StoppedRegistration lock in Drop through lock_for_drop, which skips a
-    poisoned lock, and QuicCloser::close catches the panic quinn's close
-    raises on one, so QuicConnection::drop cannot abort during an unwind.
-    Pinned by a_connection_driver_panic_in_quinn_is_contained. The poisoned
-    connection's other calls (a write, a read) still panic in the task that
-    makes them. Do not add catch-and-leak machinery around quinn here.
+  → A panic in quinn's own ENDPOINT- or CONNECTION-driver code is an
+    ENDPOINT DEATH, a controlled exit (#6184). quinn polls each driver
+    holding a std Mutex it locks with .lock().unwrap(), so the panic
+    poisons it. quinn spawns the endpoint driver inside its own async block
+    and the unwind drops it there, so EndpointDriver::drop (endpoint.rs:399)
+    and EndpointRef::drop (endpoint.rs:770) lock the poisoned mutex during
+    the unwind: they unwrapped it, which always aborted the process; since
+    quinn#2987 (freenet-quinn) they use unwrap_or_else(PoisonError::into_inner),
+    and the connection's destructors (SendStream, RecvStream, ConnectionRef,
+    ConnectionDriver, StoppedRegistration) skip a poisoned lock. The panic
+    reaches the driver's watcher (liveness::watch_endpoint_driver, or
+    watch_connection_driver from QuicRuntime::spawn), which catches it and
+    calls EndpointHealth::quinn_panicked: ERROR log, quic_endpoint_down,
+    endpoint Down, the adapter-panic flag and signal so every connection's
+    watcher closes locally; quic_adapter_panicked stays 0. From Down the
+    existing path takes over: a supervised node exits through
+    ListenerExit::QuicEndpointDown and is restarted, counted by the crash
+    breaker (ENDPOINT_DOWN_EXITS_TO_TRIP); an unsupervised one moves its QUIC
+    paths back to UDP. Pinned by
+    a_panic_unwinding_through_the_endpoint_driver_is_contained and
+    a_panic_in_a_quinn_connection_driver_drives_the_endpoint_down.
+  → The node does NOT guard its other calls into quinn, by decision: every
+    review round of a per-call containment (a catch around accept, a guarded
+    Incoming, a guarded connect, a catch in the closer) found a new panic
+    path in the added code. Every other quinn call that takes the poisoned
+    lock (accept, connect, local_addr, each Incoming method and the drop of
+    an unanswered Incoming on the endpoint; a read, write or close on the
+    connection) unwraps it and panics in its caller. The node stops the
+    calls it makes on its own once the endpoint is Down: connect checks
+    refuses_connects first, and the accept loop's select is biased to the
+    availability, so it never polls accept again (EndpointDriver::drop wakes
+    the pending accept during the unwind, before the watcher reports Down;
+    on a multi-thread runtime another worker can poll it in that moment, and
+    it panics). A call that still reaches the lock (that moment, an attempt
+    queued before the death and answered after it, a connection dropped
+    after it) panics in QUIC code: a node failure that
+    breaker::short_runs::quic_attributed attributes to QUIC (it recognises
+    the freenet-quinn crate paths, as it does upstream quinn's), so the
+    breaker turns QUIC off after the restart. Do not add per-call guards or
+    catch-and-leak machinery around quinn here.
   → Telling them apart: a caught adapter panic leaves the process running
     (ERROR log, quic_adapter_panicked, quic_endpoint_down) and leaves no
     crash-loop breaker state, so QUIC comes back on the next start, and a
     deterministic fault recurs once per start. The exception is a
     supervised gateway, which records the death in the breaker marker and
-    exits (see above). A contained panic in quinn's endpoint driver looks the
-    same (ERROR "panicked inside quinn", quic_endpoint_down, no
-    quic_adapter_panicked); breaker/short_runs.rs quic_attributed
-    recognises the freenet-quinn crate paths as QUIC code, as it does
-    upstream quinn's. A panic that is not contained aborts the process. On a gateway on Linux or macOS the next start trips the
+    exits (see above). A caught panic in a quinn driver looks the same
+    (ERROR "A QUIC driver panicked inside quinn", quic_endpoint_down, no
+    quic_adapter_panicked). A panic that is not contained aborts the process. On a gateway on Linux or macOS the next start trips the
     breaker (quic_breaker_trips, see quic/breaker.rs): QUIC off for 15 min
     (doubling on repeat trips up to 4 h), and a supervised gateway restarts
     itself with exit 42 at the cooldown's end (breaker::quic_restore_at).

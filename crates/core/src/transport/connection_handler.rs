@@ -746,7 +746,7 @@ pub(crate) fn udp_transport_handle<S: Socket>(
 /// first. A death ends it only once `record` noted it in the crash-loop
 /// breaker's marker (`breaker::note_endpoint_down_exit`), so the next start
 /// can count it; a death that cannot be noted leaves the node running.
-async fn listener_liveness(
+pub(in crate::transport) async fn listener_liveness(
     mut listen_task: tokio::task::JoinHandle<TransportError>,
     restart: Option<GatewayQuicRestartWatch>,
     record: fn(std::time::SystemTime) -> bool,
