@@ -5375,6 +5375,9 @@ pub(super) async fn broadcast_to_single_peer(
         // test builds.
         use crate::operations::update::inline_leg_fault_injection::{LegFate, inline_leg_fate};
         let res = match inline_leg_fate(op_manager, &key) {
+            // channel-safety: ok — the same send as before the test seam
+            // wrapped it: broadcast_to_single_peer runs on the detached
+            // broadcast-queue task, not the event loop (see above).
             LegFate::Send => bridge.send(peer_addr, msg.into()).await,
             LegFate::Swallow => Ok(()),
             LegFate::Delay(delay) => {
@@ -5382,6 +5385,8 @@ pub(super) async fn broadcast_to_single_peer(
                 let msg: NetMessage = msg.into();
                 drop(crate::config::GlobalExecutor::spawn(async move {
                     tokio::time::sleep(delay).await;
+                    // channel-safety: ok — test-only delayed leg on its own
+                    // detached task; nothing waits on it.
                     if let Err(e) = bridge.send(peer_addr, msg).await {
                         tracing::debug!(error = %e, "delayed test leg not sent");
                     }

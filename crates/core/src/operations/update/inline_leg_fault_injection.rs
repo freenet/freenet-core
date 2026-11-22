@@ -105,6 +105,7 @@ pub(crate) enum LegFate {
     /// Send it now (always, outside test builds).
     Send,
     /// Report it sent and drop it.
+    #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
     Swallow,
     /// Report it sent and deliver it this much later.
     #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]

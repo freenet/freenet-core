@@ -1262,6 +1262,8 @@ impl P2pConnManager {
                         let msg: crate::message::NetMessage = msg.into();
                         drop(crate::config::GlobalExecutor::spawn(async move {
                             tokio::time::sleep(delay).await;
+                            // channel-safety: ok — test-only delayed leg on its
+                            // own detached task; nothing waits on it.
                             if let Err(e) = bridge.send(peer_addr, msg).await {
                                 tracing::debug!(error = %e, "delayed test leg not sent");
                             }
