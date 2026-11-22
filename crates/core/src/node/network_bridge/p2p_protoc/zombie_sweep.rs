@@ -281,7 +281,7 @@ impl LinkUseStamp {
         }
     }
 
-    fn record(&self, now: Instant) {
+    pub(super) fn record(&self, now: Instant) {
         let micros =
             u64::try_from(now.saturating_duration_since(self.base).as_micros()).unwrap_or(u64::MAX);
         self.micros_since_base.fetch_max(
