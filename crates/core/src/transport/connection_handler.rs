@@ -462,15 +462,24 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     // with it off the only additions are an idle queue and its poll, one
     // atomic load per datagram from a source not on the allow-set, and
     // counters that stay 0.
-    if let Some(endpoint) = &quic_endpoint {
-        if super::quic::admission::enabled_at(is_gateway, bind_addr) {
-            let enabled = match quic_virtual_time {
-                Some(time) => endpoint.enable_gateway_admission(time),
-                None => endpoint.enable_gateway_admission(RealTime::new()),
-            };
-            tracing::info!(enabled, "QUIC gateway admission of native joins");
-        }
-    }
+    admit_native_joins_if_on(
+        quic_endpoint.as_ref(),
+        is_gateway,
+        bind_addr,
+        quic_virtual_time.clone(),
+    );
+    // What a node that rebuilds its endpoint when it dies (`quic::rebuild`)
+    // builds in place of the dead one: the same build, on this socket.
+    let rebuild_endpoint = quic_endpoint.as_ref().and(quic_settings.clone()).map(|settings| {
+        endpoint_rebuilder(
+            socket.clone(),
+            bind_addr,
+            keypair.clone(),
+            is_gateway,
+            settings,
+            quic_virtual_time.clone(),
+        )
+    });
 
     // Test builds only: kill the endpoint after the delay this variable
     // names, through a caught socket adapter panic, so a real-process test can
@@ -503,6 +512,7 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         (listen_host, listen_port).into(),
         config,
         quic_endpoint,
+        rebuild_endpoint,
     )?;
     Ok((
         och,
@@ -513,21 +523,272 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     ))
 }
 
+/// Admit native joins from sources nobody named on `endpoint`, on the
+/// endpoint's clock, when this gateway does (`quic::admission`).
+fn admit_native_joins_if_on(
+    endpoint: Option<&super::quic::QuicEndpoint>,
+    is_gateway: bool,
+    bind_addr: SocketAddr,
+    quic_virtual_time: Option<VirtualTime>,
+) {
+    if let Some(endpoint) = endpoint {
+        if super::quic::admission::enabled_at(is_gateway, bind_addr) {
+            let enabled = match quic_virtual_time {
+                Some(time) => endpoint.enable_gateway_admission(time),
+                None => endpoint.enable_gateway_admission(RealTime::new()),
+            };
+            tracing::info!(enabled, "QUIC gateway admission of native joins");
+        }
+    }
+}
+
+/// How a node that rebuilds its endpoint (`quic::rebuild`) builds one in
+/// place of a dead one: as `bind_udp_listener` built the first, on the same
+/// socket, clock (and `GlobalRng` side stream, in a simulation), settings and
+/// key, with the same admission, replacing the socket's QUIC ingress
+/// (`QuicEndpoint::rebuild`). The test-only faults of the first build (the
+/// endpoint-down variable, the trace's `fail_endpoint_at`) are not set again.
+fn endpoint_rebuilder<S: Socket>(
+    socket: Arc<DemuxSocket<S>>,
+    bind_addr: SocketAddr,
+    keypair: TransportKeypair,
+    is_gateway: bool,
+    settings: super::quic::QuicSettings,
+    quic_virtual_time: Option<VirtualTime>,
+) -> super::quic::rebuild::EndpointFactory {
+    use super::quic::QuicEndpoint;
+    Box::new(move || {
+        let built = match quic_virtual_time.clone() {
+            Some(time) => GlobalRng::with_side_stream(side_stream_of(bind_addr), || {
+                QuicEndpoint::rebuild(socket.clone(), bind_addr, time, &settings, &keypair)
+            }),
+            None => QuicEndpoint::rebuild(
+                socket.clone(),
+                bind_addr,
+                RealTime::new(),
+                &settings,
+                &keypair,
+            ),
+        };
+        let endpoint = match built {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                tracing::warn!(%error, %bind_addr, "Could not rebuild the QUIC endpoint");
+                return None;
+            }
+        };
+        admit_native_joins_if_on(
+            Some(&endpoint),
+            is_gateway,
+            bind_addr,
+            quic_virtual_time.clone(),
+        );
+        Some(endpoint)
+    })
+}
+
+/// What runs on one QUIC endpoint besides quinn's own drivers, held by the
+/// listener for as long as it reads the socket that feeds the endpoint. The
+/// node replaces all of it when it rebuilds its endpoint (`quic::rebuild`).
+pub(super) struct QuicStack {
+    /// The endpoint, with its allow-set empty until an upgrade allows a peer
+    /// (#5940). Read only by tests; held for its owner share.
+    #[cfg_attr(not(test), allow(dead_code))]
+    endpoint: super::quic::QuicEndpoint,
+    /// The connection attempts the endpoint's accept loop hands on, when it
+    /// runs (`UdpTransportConfig::task_registrar` was set) and the node has no
+    /// upgrades to route them to (`upgrades`): nothing allows a peer then,
+    /// so no attempt is handed on. Each queued attempt would keep quinn's
+    /// endpoint alive until drained or dropped.
+    _attempts: Option<mpsc::Receiver<super::quic::EndpointAttempt>>,
+    /// The node's upgrades on this endpoint. Holds an endpoint share, and
+    /// every connection holds these while it lives; the router and the
+    /// listener's `upgrade_site` hold them weakly.
+    upgrades: Option<Arc<super::quic::upgrade::driver::QuicUpgrades>>,
+}
+
+/// Where a task of a QUIC stack is handed when it starts.
+type RegisterTask<'a> = &'a mut dyn FnMut(&'static str, tokio::task::JoinHandle<()>);
+
+/// Start what runs on `endpoint`: its accept loop and, with a policy, the
+/// upgrades and their attempt router, handing each task to `register` (the
+/// node's monitor, or the rebuild loop). Without `register` (tools and tests)
+/// no accept loop is started. `permits` are the node's path permits when an
+/// earlier endpoint's upgrades had them, so the cap holds across a rebuild.
+/// `arm_faults` sets the test-only faults of the first build.
+#[allow(clippy::too_many_arguments)]
+fn start_quic_stack(
+    endpoint: super::quic::QuicEndpoint,
+    mut register: Option<RegisterTask<'_>>,
+    policy: Option<super::quic::upgrade::policy::QuicPolicyConfig>,
+    permits: Option<super::quic::upgrade::policy::QuicPathPermits>,
+    local_key: TransportPublicKey,
+    socket_addr: SocketAddr,
+    native_rate: super::quic::config::QuicRateLimit,
+    arm_faults: bool,
+) -> QuicStack {
+    // The endpoint's accept loop runs from the start. Its allow-set is empty
+    // until an upgrade allows a peer. The upgrades' router consumes its queue.
+    let attempts = register.as_mut().and_then(|register| {
+        let (attempts, attempts_rx) = mpsc::channel(super::quic::config::MAX_INCOMING);
+        let started = endpoint.spawn_accept_loop_with(&mut **register, attempts);
+        #[cfg(any(test, feature = "testing"))]
+        if started {
+            super::in_memory_socket::record_quic_accept_loop(socket_addr);
+        }
+        started.then_some(attempts_rx)
+    });
+    let time_source = RealTime::new();
+    let upgrades = build_quic_upgrades(
+        Some(&endpoint),
+        policy,
+        register.is_some(),
+        permits,
+        local_key,
+        socket_addr,
+        &time_source,
+        native_rate,
+        arm_faults,
+    );
+    // With upgrades the router takes the queue; without them the listener
+    // holds it, so the accept loop still has a live consumer.
+    let attempts = match (&upgrades, register, attempts) {
+        (Some(upgrades), Some(register), Some(attempts)) => {
+            upgrades.spawn_attempt_router_with(register, attempts);
+            None
+        }
+        (_, _, attempts) => attempts,
+    };
+    QuicStack {
+        endpoint,
+        _attempts: attempts,
+        upgrades,
+    }
+}
+
+/// The listener's QUIC stack, shared with the rebuild loop (weakly).
+type QuicStackSlot = Arc<parking_lot::Mutex<Option<QuicStack>>>;
+
+/// What a node that rebuilds its endpoint (`quic::rebuild`) needs to start
+/// a new stack on the new endpoint, as `new_listener` started the first.
+struct StackInputs {
+    policy: Option<super::quic::upgrade::policy::QuicPolicyConfig>,
+    local_key: TransportPublicKey,
+    socket_addr: SocketAddr,
+    native_rate: super::quic::config::QuicRateLimit,
+}
+
+/// Start the task that rebuilds the endpoint whenever it dies
+/// (`quic::rebuild::run`), registered with the node's monitor. Each rebuild
+/// builds an endpoint with `factory`, starts its stack, points `site` at
+/// its upgrades and swaps it into `slot`, dropping the dead stack. The task
+/// holds `slot` weakly and stops when `stop` resolves (the listener holds
+/// its sender), then drops everything it holds and parks, as the accept
+/// loop does, since the monitor reads any end as a failure. It ends only
+/// when a task of a rebuilt stack ends, which the monitor then reports.
+#[allow(clippy::too_many_arguments)]
+fn spawn_endpoint_rebuild(
+    registrar: &crate::node::background_task_monitor::LateRegistrar,
+    mut factory: super::quic::rebuild::EndpointFactory,
+    slot: std::sync::Weak<parking_lot::Mutex<Option<QuicStack>>>,
+    site: super::quic::upgrade::driver::UpgradeSite,
+    first: super::quic::QuicAvailabilityWatch,
+    node: tokio::sync::watch::Sender<super::quic::QuicAvailability>,
+    stop: oneshot::Receiver<()>,
+    inputs: StackInputs,
+) {
+    use super::quic::rebuild::{self, RebuildEnd, Rebuilt};
+    use super::quic::upgrade::driver::PathClock;
+    let clock = get_socket_virtual_time(&inputs.socket_addr)
+        .map_or_else(|| PathClock::Real(RealTime::new()), PathClock::Virtual);
+    #[cfg(any(test, feature = "testing"))]
+    let trace = super::in_memory_socket::quic_upgrade_trace_at(inputs.socket_addr);
+    #[cfg(any(test, feature = "testing"))]
+    let trace_clock = clock.clone();
+    let rebuild = move || {
+        // The listener is gone: the node is stopping, and `stop` ends the loop.
+        let slot = slot.upgrade()?;
+        let endpoint = factory()?;
+        let availability = endpoint.availability();
+        let permits = slot
+            .lock()
+            .as_ref()
+            .and_then(|stack| stack.upgrades.as_ref())
+            .map(|upgrades| upgrades.permits().clone());
+        let mut tasks = Vec::new();
+        let stack = start_quic_stack(
+            endpoint,
+            Some(&mut |name: &'static str, handle: tokio::task::JoinHandle<()>| {
+                tasks.push((name, handle))
+            }),
+            inputs.policy,
+            permits,
+            inputs.local_key.clone(),
+            inputs.socket_addr,
+            inputs.native_rate.clone(),
+            false,
+        );
+        site.replace(stack.upgrades.as_ref());
+        let dead = slot.lock().replace(stack);
+        // Dropped outside the lock: the dead endpoint, its upgrades and its
+        // queued attempts.
+        drop(dead);
+        super::TRANSPORT_METRICS.record_quic_endpoint_rebuilt();
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(trace) = &trace {
+            let ms = trace_clock.now_nanos() / 1_000_000;
+            trace.record(trace.addr(), 0, format!("rebuilt the endpoint at {ms} ms"));
+        }
+        Some(Rebuilt {
+            availability,
+            tasks,
+        })
+    };
+    let handle = GlobalExecutor::spawn(async move {
+        // A `let`, so the loop's future, and the socket its factory holds,
+        // are dropped before the park below.
+        let end = rebuild::run(clock, first, node, rebuild, rebuild::jitter_sample, stop).await;
+        match end {
+            RebuildEnd::Stopped => {
+                tracing::debug!("QUIC endpoint rebuild stopped; parking");
+                std::future::pending::<()>().await;
+            }
+            RebuildEnd::TaskEnded(task) => {
+                tracing::error!(task, "A task serving the rebuilt QUIC endpoint ended");
+            }
+        }
+    });
+    registrar.register("quic_endpoint_rebuild", handle);
+}
+
 /// The node's QUIC upgrades, when it has what they need: an endpoint, a policy
-/// and a registrar for the attempt router.
+/// and a registrar for the attempt router. `permits` are the node's path
+/// permits from an earlier endpoint's upgrades, if any (`quic::rebuild`).
+/// `arm_faults` sets the trace's endpoint fault (tests): only for the first
+/// endpoint, since one rebuilt after it would be failed again at once.
+#[allow(clippy::too_many_arguments)]
 fn build_quic_upgrades(
     endpoint: Option<&super::quic::QuicEndpoint>,
     policy: Option<super::quic::upgrade::policy::QuicPolicyConfig>,
-    registrar: Option<&crate::node::background_task_monitor::LateRegistrar>,
+    has_registrar: bool,
+    permits: Option<super::quic::upgrade::policy::QuicPathPermits>,
     local_key: TransportPublicKey,
     socket_addr: SocketAddr,
     time_source: &RealTime,
     native_rate: super::quic::config::QuicRateLimit,
+    arm_faults: bool,
 ) -> Option<Arc<super::quic::upgrade::driver::QuicUpgrades>> {
     use super::quic::upgrade::driver::{PathClock, QuicUpgrades};
-    let (endpoint, policy, _registrar) = (endpoint?, policy?, registrar?);
+    let (endpoint, policy) = (endpoint?, policy?);
+    if !has_registrar {
+        return None;
+    }
     let policy =
         super::quic::upgrade::policy::QuicPolicy::from_config(policy, endpoint.availability());
+    let policy = match permits {
+        Some(permits) => policy.sharing_permits(permits),
+        None => policy,
+    };
     // The clock quinn runs on (`bind_udp_listener`).
     let path_clock = get_socket_virtual_time(&socket_addr)
         .map_or_else(|| PathClock::Real(time_source.clone()), PathClock::Virtual);
@@ -538,7 +799,11 @@ fn build_quic_upgrades(
     #[cfg(any(test, feature = "testing"))]
     let trace = super::in_memory_socket::quic_upgrade_trace_at(socket_addr);
     #[cfg(any(test, feature = "testing"))]
-    if let Some(at) = trace.as_ref().and_then(|trace| trace.down_at()) {
+    if let Some(at) = trace
+        .as_ref()
+        .filter(|_| arm_faults)
+        .and_then(|trace| trace.down_at())
+    {
         let failing = endpoint.clone();
         let clock = path_clock.clone();
         let noted = trace.clone();
@@ -856,6 +1121,9 @@ pub struct OutboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
     /// The listener's QUIC endpoint, so tests can fail its driver.
     #[cfg(test)]
     quic_endpoint: Option<super::quic::QuicEndpoint>,
+    /// The listener's QUIC stack, so tests can reach a rebuilt endpoint.
+    #[cfg(test)]
+    quic_stack: std::sync::Weak<parking_lot::Mutex<Option<QuicStack>>>,
 }
 
 impl<S, TS: TimeSource> Clone for OutboundConnectionHandler<S, TS> {
@@ -867,6 +1135,8 @@ impl<S, TS: TimeSource> Clone for OutboundConnectionHandler<S, TS> {
             upgrade_site: self.upgrade_site.clone(),
             #[cfg(test)]
             quic_endpoint: self.quic_endpoint.clone(),
+            #[cfg(test)]
+            quic_stack: self.quic_stack.clone(),
         }
     }
 }
@@ -884,6 +1154,15 @@ impl<S, TS: TimeSource> OutboundConnectionHandler<S, TS> {
     #[cfg(test)]
     pub(crate) fn quic_endpoint(&self) -> Option<&super::quic::QuicEndpoint> {
         self.quic_endpoint.as_ref()
+    }
+
+    /// The listener's current QUIC endpoint: the one it rebuilt last, or the
+    /// first (tests). `None` once the listener is gone.
+    #[cfg(test)]
+    pub(crate) fn current_quic_endpoint(&self) -> Option<super::quic::QuicEndpoint> {
+        let stack = self.quic_stack.upgrade()?;
+        let stack = stack.lock();
+        stack.as_ref().map(|stack| stack.endpoint.clone())
     }
 }
 
@@ -904,6 +1183,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         socket_addr: SocketAddr,
         config: UdpTransportConfig,
         quic_endpoint: Option<super::quic::QuicEndpoint>,
+        rebuild_endpoint: Option<super::quic::rebuild::EndpointFactory>,
     ) -> Result<ListenerSetup<S>, TransportError> {
         let (transport, connection_handler, new_connection_notifier) = Self::new_listener(
             socket,
@@ -912,6 +1192,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             socket_addr,
             config,
             quic_endpoint,
+            rebuild_endpoint,
         );
         // Packets are now sent directly to socket from each connection,
         // bypassing the centralized rate limiter that was causing serialization bottlenecks.
@@ -938,6 +1219,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         socket_addr: SocketAddr,
         config: UdpTransportConfig,
         quic_endpoint: Option<super::quic::QuicEndpoint>,
+        rebuild_endpoint: Option<super::quic::rebuild::EndpointFactory>,
     ) -> (
         UdpPacketsListener<S>,
         OutboundConnectionHandler<S>,
@@ -958,50 +1240,84 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         let (conn_handler_sender, conn_handler_receiver) = mpsc::channel(100);
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
         let expected_non_gateway = Arc::new(DashSet::new());
-        let quic_availability = quic_endpoint.as_ref().map_or_else(
+        let endpoint_availability = quic_endpoint.as_ref().map_or_else(
             super::quic::QuicAvailabilityWatch::disabled,
             super::quic::QuicEndpoint::availability,
         );
         #[cfg(test)]
         let test_quic_endpoint = quic_endpoint.clone();
         let local_key = keypair.public().clone();
-        // The endpoint's accept loop runs from the start, registered with
-        // the node's monitor. Its allow-set is empty until an upgrade allows
-        // a peer. The upgrades' router consumes its queue.
-        let quic_attempts = quic_endpoint
-            .as_ref()
-            .zip(task_registrar.as_ref())
-            .and_then(|(endpoint, registrar)| {
-                let (attempts, attempts_rx) = mpsc::channel(super::quic::config::MAX_INCOMING);
-                let started = endpoint.spawn_accept_loop(registrar, attempts);
-                #[cfg(any(test, feature = "testing"))]
-                if started {
-                    super::in_memory_socket::record_quic_accept_loop(socket_addr);
+        let native_rate =
+            super::quic::config::QuicRateLimit::new(bandwidth_limit, global_bandwidth.clone());
+        // The endpoint's accept loop and router are registered with the
+        // node's monitor (`start_quic_stack`).
+        let mut register_with_monitor = task_registrar
+            .clone()
+            .map(|registrar| {
+                move |name: &'static str, handle: tokio::task::JoinHandle<()>| {
+                    registrar.register(name, handle)
                 }
-                started.then_some(attempts_rx)
             });
-
-        let time_source = RealTime::new();
-        let quic_upgrades = build_quic_upgrades(
-            quic_endpoint.as_ref(),
-            quic_policy,
-            task_registrar.as_ref(),
-            local_key,
+        let quic_stack = quic_endpoint.map(|endpoint| {
+            start_quic_stack(
+                endpoint,
+                register_with_monitor
+                    .as_mut()
+                    .map(|register| register as RegisterTask<'_>),
+                quic_policy,
+                None,
+                local_key.clone(),
+                socket_addr,
+                native_rate.clone(),
+                true,
+            )
+        });
+        let upgrade_site = super::quic::upgrade::driver::UpgradeSite::new(
+            quic_stack
+                .as_ref()
+                .and_then(|stack| stack.upgrades.as_ref()),
             socket_addr,
-            &time_source,
-            super::quic::config::QuicRateLimit::new(bandwidth_limit, global_bandwidth.clone()),
         );
-        // With upgrades the router takes the queue; without them the listener
-        // holds it, so the accept loop still has a live consumer.
-        let quic_attempts = match (&quic_upgrades, task_registrar.as_ref(), quic_attempts) {
-            (Some(upgrades), Some(registrar), Some(attempts)) => {
-                upgrades.spawn_attempt_router(registrar, attempts);
-                None
+        let quic_stack: QuicStackSlot = Arc::new(parking_lot::Mutex::new(quic_stack));
+        // A node that does not exit for its supervisor when its endpoint dies
+        // rebuilds it in process, when that is on (`quic::rebuild`; dark).
+        // Its connector and the node then read the node's own view of the
+        // endpoint, which goes `Up` again after a rebuild; every other node
+        // reads the endpoint's own availability, as before.
+        let rebuild = rebuild_endpoint
+            .zip(task_registrar.as_ref())
+            .filter(|_| endpoint_availability.get() != super::quic::QuicAvailability::Disabled)
+            .filter(|_| {
+                super::quic::rebuild::enabled_at(
+                    super::quic::liveness::gateway_quic_restarts(is_gateway),
+                    socket_addr,
+                )
+            });
+        let (quic_availability, quic_rebuild_stop) = match rebuild {
+            Some((factory, registrar)) => {
+                let (node, availability) =
+                    super::quic::QuicAvailabilityWatch::settable(endpoint_availability.get());
+                let (stop, stopped) = oneshot::channel();
+                spawn_endpoint_rebuild(
+                    registrar,
+                    factory,
+                    Arc::downgrade(&quic_stack),
+                    upgrade_site.clone(),
+                    endpoint_availability,
+                    node,
+                    stopped,
+                    StackInputs {
+                        policy: quic_policy,
+                        local_key: local_key.clone(),
+                        socket_addr,
+                        native_rate,
+                    },
+                );
+                (availability, Some(stop))
             }
-            (_, _, attempts) => attempts,
+            None => (endpoint_availability, None),
         };
-        let upgrade_site =
-            super::quic::upgrade::driver::UpgradeSite::new(quic_upgrades.as_ref(), socket_addr);
+        let time_source = RealTime::new();
         let transport = UdpPacketsListener {
             is_gateway,
             socket_listener: socket,
@@ -1032,9 +1348,10 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             ack_version_floor_override,
             advertised_version: advertised_version_override
                 .map_or(PROTOC_VERSION, version_cmp::encode_version),
-            _quic_endpoint: quic_endpoint,
-            _quic_attempts: quic_attempts,
-            _quic_upgrades: quic_upgrades,
+            #[cfg(test)]
+            quic_stack_for_test: Arc::downgrade(&quic_stack),
+            _quic_rebuild_stop: quic_rebuild_stop,
+            _quic_stack: quic_stack,
             upgrade_site: upgrade_site.clone(),
         };
         let connection_handler = OutboundConnectionHandler {
@@ -1044,6 +1361,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             upgrade_site,
             #[cfg(test)]
             quic_endpoint: test_quic_endpoint,
+            #[cfg(test)]
+            quic_stack: transport.quic_stack_for_test.clone(),
         };
         (transport, connection_handler, new_connection_notifier)
     }
@@ -1090,6 +1409,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
                 ack_version_floor_override,
                 ..UdpTransportConfig::default()
             },
+            None,
             None,
         )?;
         Ok((handler, receiver))
@@ -1304,9 +1624,10 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             // This listener's `time_source` is already VirtualTime, so the admission
             // clock needs no override.
             gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone(), None),
-            _quic_endpoint: None,
-            _quic_attempts: None,
-            _quic_upgrades: None,
+            #[cfg(test)]
+            quic_stack_for_test: std::sync::Weak::new(),
+            _quic_rebuild_stop: None,
+            _quic_stack: Default::default(),
             upgrade_site: Default::default(),
             time_source,
             congestion_config,
@@ -1322,6 +1643,8 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             upgrade_site: Default::default(),
             #[cfg(test)]
             quic_endpoint: None,
+            #[cfg(test)]
+            quic_stack: std::sync::Weak::new(),
         };
 
         // Packets are now sent directly to socket from each connection,
@@ -1499,20 +1822,18 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// (`UdpTransportConfig::advertised_version_override`). Compatibility
     /// checks still use `PROTOC_VERSION`.
     advertised_version: [u8; 8],
-    /// The QUIC endpoint on this listener's socket, when `transport-quic`
-    /// is on. Held here so it lives as long as the listener reading the
-    /// socket that feeds it. Its allow-set is empty until an upgrade allows a
-    /// peer (#5940).
-    _quic_endpoint: Option<super::quic::QuicEndpoint>,
-    /// The connection attempts the endpoint's accept loop hands on, when it
-    /// runs (`UdpTransportConfig::task_registrar` was set) and the node has no
-    /// upgrades to route them to (`_quic_upgrades`): nothing allows a peer then,
-    /// so no attempt is handed on. Each queued attempt would keep quinn's endpoint
-    /// alive until drained or dropped.
-    _quic_attempts: Option<mpsc::Receiver<super::quic::EndpointAttempt>>,
-    /// The node's upgrades. Holds an endpoint share, and every connection holds
-    /// these while it lives; the router and `upgrade_site` hold them weakly.
-    _quic_upgrades: Option<Arc<super::quic::upgrade::driver::QuicUpgrades>>,
+    /// Stops the endpoint rebuild loop (`quic::rebuild`) when dropped, with
+    /// the listener. `None` when the node does not rebuild its endpoint.
+    _quic_rebuild_stop: Option<oneshot::Sender<()>>,
+    /// The QUIC endpoint on this listener's socket and what runs on it, when
+    /// `transport-quic` is on ([`QuicStack`]). Held here so it lives as long
+    /// as the listener reading the socket that feeds it; a node that
+    /// rebuilds its endpoint swaps a new stack in (the rebuild loop holds
+    /// this weakly).
+    _quic_stack: QuicStackSlot,
+    /// The same, for tests to reach the current endpoint.
+    #[cfg(test)]
+    quic_stack_for_test: std::sync::Weak<parking_lot::Mutex<Option<QuicStack>>>,
     /// How a new connection joins the upgrades.
     upgrade_site: super::quic::upgrade::driver::UpgradeSite,
 }
@@ -7628,6 +7949,7 @@ pub mod mock_transport {
                 addr,
                 UdpTransportConfig::default(),
                 None,
+                None,
             )
             .expect("listener setup");
         (public, handler, listen_handle, addr)
@@ -8024,6 +8346,7 @@ pub mod mock_transport {
                 is_gateway,
                 addr,
                 UdpTransportConfig::default(),
+                None,
                 None,
             )
             .expect("listener setup");

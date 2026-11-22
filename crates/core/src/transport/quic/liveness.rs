@@ -25,6 +25,10 @@
 //!   gateway does not exit for a death.
 //!   The same switch restarts such a gateway when a breaker cooldown that
 //!   kept its QUIC off ends (`breaker::quic_restore_at`).
+//!   A node that does not exit for a death rebuilds its endpoint in process
+//!   instead, on the same socket, when `super::rebuild::ENDPOINT_REBUILD` is
+//!   on (#6272; dark until the UDP removal turns it on together with
+//!   `breaker::UDP_FALLBACK = false`). See `super::rebuild`.
 //! - after the node dropped its last handle, the return is the normal
 //!   shutdown (quinn's driver ends once no handle and no connection is
 //!   left): the availability becomes `Released` and nothing is counted.
@@ -181,9 +185,11 @@ pub(crate) enum QuicAvailability {
     Disabled,
     /// The endpoint's driver has not ended.
     Up,
-    /// The endpoint's driver returned while the node held it. Final:
-    /// nothing restarts it, and the node runs with QUIC off until it
-    /// restarts.
+    /// The endpoint's driver returned while the node held it. Final for
+    /// that endpoint: nothing restarts it, and the node runs with QUIC off
+    /// until it restarts, or, for a node that rebuilds its endpoint
+    /// (`super::rebuild`, dark until the UDP removal), until it has built a
+    /// new one, whose own watch starts at `Up` again.
     Down,
     /// The node dropped its last handle to the endpoint. Final.
     Released,
@@ -205,6 +211,14 @@ impl QuicAvailabilityWatch {
     /// A watch starting at `initial`, and the sender that changes it (tests).
     #[cfg(test)]
     pub(crate) fn for_test(initial: QuicAvailability) -> (watch::Sender<QuicAvailability>, Self) {
+        Self::settable(initial)
+    }
+
+    /// A watch starting at `initial`, and the sender that changes it: the
+    /// node's view of a QUIC endpoint it rebuilds when it dies
+    /// (`super::rebuild`), which goes from `Down` back to `Up`. Unlike one
+    /// endpoint's own watch, `Down` is not final here.
+    pub(crate) fn settable(initial: QuicAvailability) -> (watch::Sender<QuicAvailability>, Self) {
         let (sender, receiver) = watch::channel(initial);
         (sender, Self(receiver))
     }
@@ -223,9 +237,12 @@ impl QuicAvailabilityWatch {
         std::future::pending::<()>().await;
     }
 
-    /// Wait until the availability is not `Up`, and return it. Every value
-    /// other than `Up` is final, so a caller that loops on this gets the
-    /// same value back at once and never waits again. Cancel-safe.
+    /// Wait until the availability is not `Up`, and return it. On one
+    /// endpoint's watch every value other than `Up` is final, so a caller
+    /// that loops on this gets the same value back at once and never waits
+    /// again. (On the node's view of an endpoint it rebuilds,
+    /// [`Self::settable`], `Down` can turn back into `Up`, so a loop on it
+    /// spins while the node is down; nothing loops on that view.) Cancel-safe.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn not_up(&mut self) -> QuicAvailability {
         let seen = self

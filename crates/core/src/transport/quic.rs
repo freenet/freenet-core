@@ -50,6 +50,7 @@ pub(crate) mod native;
 #[cfg(any(test, feature = "quic-panic-injection"))]
 pub(crate) mod panic_injection;
 pub(crate) mod path;
+pub(crate) mod rebuild;
 pub(crate) mod recycle;
 pub(crate) mod runtime;
 pub(crate) mod socket;
@@ -486,6 +487,15 @@ fn require_unwinding(unwinds: bool) -> io::Result<()> {
 /// ([`require_unwinding`]).
 pub(crate) const UNWINDS: bool = cfg!(panic = "unwind");
 
+/// What building an endpoint does to its socket's QUIC ingress.
+#[derive(Clone, Copy)]
+enum Ingress {
+    /// Enable it; the build fails if it was already enabled.
+    Enable,
+    /// Replace the one a dead endpoint read ([`QuicEndpoint::rebuild`]).
+    Replace,
+}
+
 impl EndpointCore {
     /// The node's buffer budget, which sets each data path's windows.
     pub(crate) fn buffer_budget(&self) -> &Arc<budget::QuicBudget> {
@@ -551,6 +561,31 @@ impl QuicEndpoint {
         )
     }
 
+    /// Build an endpoint as [`Self::bind`] does, to replace one on the same
+    /// socket that died (`rebuild`): the socket's QUIC ingress is replaced
+    /// rather than enabled (`DemuxSocket::with_replaced_quic_ingress`), so
+    /// the new endpoint starts with an empty allow-set and nothing the dead
+    /// one queued. Fails, leaving the socket's QUIC ingress disabled, as
+    /// [`Self::bind`] fails; also if the socket never had an ingress.
+    pub(crate) fn rebuild<S: Socket, T: TimeSource>(
+        socket: Arc<DemuxSocket<S>>,
+        local_addr: SocketAddr,
+        time: T,
+        settings: &QuicSettings,
+        keypair: &TransportKeypair,
+    ) -> io::Result<Self> {
+        require_unwinding(UNWINDS)?;
+        Self::bind_on(
+            Ingress::Replace,
+            socket,
+            local_addr,
+            time,
+            settings,
+            keypair,
+            config::endpoint_config()?,
+        )
+    }
+
     /// Build the endpoint as [`Self::bind`] describes, for this build
     /// ([`UNWINDS`], through [`Self::bind_checked`]), or `None` with a WARN
     /// when it fails, so a node with QUIC on still starts, with QUIC off.
@@ -599,6 +634,28 @@ impl QuicEndpoint {
         keypair: &TransportKeypair,
         endpoint_config: quinn::EndpointConfig,
     ) -> io::Result<Self> {
+        Self::bind_on(
+            Ingress::Enable,
+            socket,
+            local_addr,
+            time,
+            settings,
+            keypair,
+            endpoint_config,
+        )
+    }
+
+    /// [`Self::bind_with`], enabling the socket's QUIC ingress or replacing
+    /// it ([`Self::rebuild`]).
+    fn bind_on<S: Socket, T: TimeSource>(
+        ingress_mode: Ingress,
+        socket: Arc<DemuxSocket<S>>,
+        local_addr: SocketAddr,
+        time: T,
+        settings: &QuicSettings,
+        keypair: &TransportKeypair,
+        endpoint_config: quinn::EndpointConfig,
+    ) -> io::Result<Self> {
         let invalid = |error: &dyn std::fmt::Display| {
             io::Error::new(io::ErrorKind::InvalidInput, error.to_string())
         };
@@ -619,8 +676,7 @@ impl QuicEndpoint {
         let mut cap_holds = None;
         // If quinn refuses the socket after the ingress is enabled, the
         // ingress is disabled again, so the node is left as with QUIC off.
-        let endpoint = socket
-            .with_quic_ingress(|ingress| {
+        let build = |ingress| {
                 let quic_socket = Arc::new(socket::QuicSocket::new(
                     socket.clone(),
                     ingress,
@@ -643,13 +699,21 @@ impl QuicEndpoint {
                     quic_socket,
                     runtime,
                 )
-            })
-            .ok_or_else(|| {
+        };
+        let endpoint = match ingress_mode {
+            Ingress::Enable => socket.with_quic_ingress(build).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "the socket's QUIC ingress is already enabled",
                 )
-            })??;
+            }),
+            Ingress::Replace => socket.with_replaced_quic_ingress(build).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the socket has no QUIC ingress to replace",
+                )
+            }),
+        }??;
         let buffer_budget = budget::QuicBudget::new(
             config::quic_buffer_budget_for(settings.memory_limit) as u64,
             settings.window_bytes(),
@@ -797,9 +861,21 @@ impl QuicEndpoint {
     /// consumers. A second call logs a WARN, starts nothing and returns
     /// `false`.
     #[must_use = "false means no accept loop was started"]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn spawn_accept_loop(
         &self,
         registrar: &LateRegistrar,
+        attempts: mpsc::Sender<EndpointAttempt>,
+    ) -> bool {
+        self.spawn_accept_loop_with(&mut |name, handle| registrar.register(name, handle), attempts)
+    }
+
+    /// [`Self::spawn_accept_loop`], handing the loop's task to `register`:
+    /// the node's monitor for the first endpoint, the rebuild loop for one
+    /// built in place of a dead one (`rebuild`).
+    pub(crate) fn spawn_accept_loop_with(
+        &self,
+        register: &mut dyn FnMut(&'static str, tokio::task::JoinHandle<()>),
         attempts: mpsc::Sender<EndpointAttempt>,
     ) -> bool {
         if self
@@ -855,7 +931,7 @@ impl QuicEndpoint {
             drop(core);
             std::future::pending::<()>().await;
         });
-        registrar.register("quic_accept_loop", handle);
+        register("quic_accept_loop", handle);
         true
     }
 

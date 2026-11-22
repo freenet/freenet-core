@@ -2077,8 +2077,8 @@ impl TransportMetrics {
     }
 
     /// Record the QUIC endpoint's state. [`QuicEndpointState::Died`] is final
-    /// for the process: an endpoint that died is never rebuilt, so nothing
-    /// set after it replaces it.
+    /// for the process: nothing set after it replaces it, except a rebuilt
+    /// endpoint ([`Self::record_quic_endpoint_rebuilt`]).
     pub(crate) fn set_quic_endpoint_state(&self, state: QuicEndpointState) {
         let died = QuicEndpointState::Died as u8;
         // An `Err` is a death already recorded, which stays.
@@ -2087,6 +2087,13 @@ impl TransportMetrics {
                 (current != died).then_some(state as u8)
             })
             .ok();
+    }
+
+    /// The node built a new QUIC endpoint in place of one that died
+    /// (`quic::rebuild`): the state is `Up` again, replacing `Died`.
+    pub(crate) fn record_quic_endpoint_rebuilt(&self) {
+        self.quic_endpoint_state
+            .store(QuicEndpointState::Up as u8, Ordering::Relaxed);
     }
 
     /// The QUIC endpoint's state as last recorded.
@@ -3624,7 +3631,9 @@ pub(crate) enum QuicEndpointState {
     /// The crash-loop breaker keeps QUIC off for this run.
     OffBreaker = 6,
     /// The endpoint died while the node held it: its driver ended, or its
-    /// socket adapter caught a panic (`quic::liveness`). Final.
+    /// socket adapter caught a panic (`quic::liveness`). Final, unless the
+    /// node rebuilds its endpoint (`quic::rebuild`, dark until the UDP
+    /// removal), which records `Up` again.
     Died = 7,
 }
 
