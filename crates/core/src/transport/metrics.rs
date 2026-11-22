@@ -722,9 +722,16 @@ labelled_counters! {
         Unproven => "unproven",
         /// The Hello exchange failed.
         HelloFailed => "hello_failed",
-        /// A joiner connection reached the end of admission. Until phase B
-        /// hands it to the node, it is closed there.
+        /// A joiner connection reached the end of admission and was handed
+        /// to the node as an inbound connection (#5940, phase B).
         Joined => "joined",
+        /// A joiner connection reached the end of admission, but the node's
+        /// queue of handed-over joins was full (or the node gone), so it was
+        /// closed.
+        HandoffFull => "handoff_full",
+        /// A joiner connection handed to the node sent no ConnectRequest in
+        /// time, so the node closed it.
+        NoConnectRequest => "no_connect_request",
         /// A join panicked; its task's owner caught it and goes on.
         JoinPanicked => "join_panicked",
         /// An attempt was ignored: no room for another joiner inside the

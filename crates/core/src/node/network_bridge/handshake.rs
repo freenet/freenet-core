@@ -440,7 +440,14 @@ async fn run_driver(
                         }
 
                         let remote_addr = conn.remote_addr();
-                        let entry = expected_inbound.consume(remote_addr);
+                        // A gateway's native joiner (#5940, phase B) proved its
+                        // key and was never expected: it leaves any expectation
+                        // for its address to the UDP connection it names.
+                        let entry = if conn.native_joiner_key().is_some() {
+                            None
+                        } else {
+                            expected_inbound.consume(remote_addr)
+                        };
                         let (matched, transaction, transient) = if let Some(entry) = entry {
                             (InboundMatch::Expected(entry.peer_key), entry.transaction, entry.transient)
                         } else {

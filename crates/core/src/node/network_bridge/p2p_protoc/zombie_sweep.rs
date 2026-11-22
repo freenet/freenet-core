@@ -261,9 +261,10 @@ pub(super) fn is_link_use_request(msg: &NetMessage) -> bool {
 /// the request waits in the queue, and a sweep planned in that window saw a
 /// stale stamp and reaped a transport with a request already waiting (#5654).
 ///
-/// Stored as microseconds after `base` (the transport's `created_at`, so both
-/// are readings of the same `tokio::time::Instant` clock; virtual time under
-/// the simulation's paused runtime). Zero means no request yet. Writes use
+/// Stored as one more than the microseconds after `base` (the transport's
+/// `created_at`, so both are readings of the same `tokio::time::Instant`
+/// clock; virtual time under the simulation's paused runtime), so zero means
+/// no request yet, even when a request arrives at `base` itself. Writes use
 /// `fetch_max`, so the stamp never moves backwards. A request costs one
 /// classification match, one clock read and one atomic write.
 #[derive(Clone, Debug)]
@@ -283,8 +284,17 @@ impl LinkUseStamp {
     fn record(&self, now: Instant) {
         let micros =
             u64::try_from(now.saturating_duration_since(self.base).as_micros()).unwrap_or(u64::MAX);
+        self.micros_since_base.fetch_max(
+            micros.saturating_add(1),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// Whether the remote has sent a request over the transport yet.
+    pub(super) fn requested(&self) -> bool {
         self.micros_since_base
-            .fetch_max(micros, std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::Relaxed)
+            != 0
     }
 
     /// The instant of the most recent request, or `base` if there has been none.
@@ -293,7 +303,8 @@ impl LinkUseStamp {
     pub(super) fn last_use(&self) -> Instant {
         let micros = self
             .micros_since_base
-            .load(std::sync::atomic::Ordering::Relaxed);
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(1);
         self.base
             .checked_add(Duration::from_micros(micros))
             .unwrap_or(self.base)

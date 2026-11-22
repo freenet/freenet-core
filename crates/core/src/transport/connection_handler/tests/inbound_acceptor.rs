@@ -17,6 +17,7 @@ async fn acceptor_yields_the_joiners_connection_and_survives_cancellation() -> a
         create_mock_gateway(Default::default(), channels).await?;
     let mut handler = InboundConnectionHandler {
         new_connection_notifier: gw_inbound,
+        native_joins: None,
     };
     let acceptor: &mut dyn InboundAcceptor = &mut handler;
 
@@ -53,6 +54,7 @@ async fn acceptor_yields_none_once_the_transport_stops() {
     drop(sender);
     let mut handler = InboundConnectionHandler {
         new_connection_notifier: receiver,
+        native_joins: None,
     };
     let acceptor: &mut dyn InboundAcceptor = &mut handler;
     assert!(acceptor.next_connection().await.is_none());
@@ -83,6 +85,7 @@ async fn acceptor_keeps_a_connection_that_arrives_while_a_dropped_call_waited() 
     let (tx, rx) = mpsc::channel(1);
     let mut handler = InboundConnectionHandler {
         new_connection_notifier: rx,
+        native_joins: None,
     };
     let acceptor: &mut dyn InboundAcceptor = &mut handler;
     let mut waiting = acceptor.next_connection();

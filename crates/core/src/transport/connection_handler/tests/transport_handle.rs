@@ -53,6 +53,7 @@ async fn udp_handle_shares_one_expected_ip_set_and_reports_the_listener() {
     let (inbound_tx, inbound_rx) = mpsc::channel(1);
     let inbound = InboundConnectionHandler {
         new_connection_notifier: inbound_rx,
+        native_joins: None,
     };
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let listen_task = tokio::spawn(async move {
@@ -113,15 +114,6 @@ async fn listener_outlives_a_dropped_connector_while_a_clone_remains() {
         UdpTransportConfig::default(),
         None,
     )
-    .map(|(o, rx, task)| {
-        (
-            o,
-            InboundConnectionHandler {
-                new_connection_notifier: rx,
-            },
-            task,
-        )
-    })
     .expect("listener setup");
     let TransportHandle {
         connector,

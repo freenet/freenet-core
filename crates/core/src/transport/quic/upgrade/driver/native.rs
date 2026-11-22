@@ -127,14 +127,25 @@ impl QuicUpgrades {
             tracing::debug!(addr = %dial.addr, %error, "A QUIC-native setup gave no connection");
             outcome_of(&error)
         })?;
-        Ok(NativePeerConnection::new(
-            native.connection,
-            native.peer.version,
-            clock,
+        Ok(self.native_connection(native.connection, native.peer.version, dial.addr))
+    }
+
+    /// A native connection to `remote`, whose Hello gave `version`, paced and
+    /// windowed as every native connection of this node is.
+    pub(in crate::transport::quic) fn native_connection(
+        &self,
+        connection: crate::transport::quic::QuicConnection,
+        version: (u8, u8, u16),
+        remote: SocketAddr,
+    ) -> NativePeerConnection {
+        NativePeerConnection::new(
+            connection,
+            version,
+            self.path_clock.clone(),
             Some(self.endpoint.buffer_budget()),
             self.native_rate.clone(),
-            self.route_note(dial.addr),
-        ))
+            self.route_note(remote),
+        )
     }
 
     fn route_note(&self, remote: SocketAddr) -> RouteNote {
