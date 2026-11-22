@@ -1218,8 +1218,8 @@ use crate::operations::connect::native::NativeWire;
 /// one, so `connect::wire::encode_for_peer` emits them only to a peer whose
 /// negotiated version is known and at least this; every other encode emits
 /// today's variants without the fields. Per the wire-gated-floor rule in
-/// `docs/RELEASING.md`, this is the release that first ships the decoder, then
-/// frozen. Bias HIGH: too low closes connections to the release below it, too
+/// `docs/RELEASING.md`, the floor is the first release that emits them (the
+/// decoder itself shipped in 0.2.157), then frozen. Bias HIGH: too low closes connections to the release below it, too
 /// high only delays the offer.
 /// Raised from 0.2.158 to 0.2.159 by the QUIC data ramp PR (#6224): 0.2.158
 /// starts the data ramp, and turning on the native connect offer in the same
@@ -1228,20 +1228,29 @@ use crate::operations::connect::native::NativeWire;
 /// for 0.2.160: native connect is still off (`QUIC_NATIVE_PERCENT` is 0) and
 /// its wire fields may change before it is enabled, so no release is frozen
 /// as the floor yet. Raised to 0.2.162 for 0.2.161 for the same reasons, and
-/// to 0.2.163 for 0.2.162.
+/// to 0.2.163 for 0.2.162. Frozen at 0.2.163: that release ships the variants
+/// (`QUIC_NATIVE_SHIPPED_IN`), with every offer at percent 0, so a later
+/// release can turn the native path on. Do not raise it again.
 pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 163);
 
-/// Has the decoder for the QUIC-native `ConnectMsg` variants shipped, and in
-/// which release?
+/// Has the release that first emits the QUIC-native `ConnectMsg` variants
+/// shipped, and which one is it?
 ///
 /// Same contract as [`HASH_FIRST_SHIPPED_IN`], checked by
 /// `quic_native_floor_tracks_the_shipping_release`: `None` means
 /// [`QUIC_NATIVE_MIN_VERSION`] is a prediction that must stay strictly ABOVE
-/// the crate version; `Some(v)` means it shipped in `v`, which must equal the
+/// the crate version; `Some(v)` means it ships in `v`, which must equal the
 /// floor. Write the literal release when it ships, not
 /// `Some(QUIC_NATIVE_MIN_VERSION)`, which would compare the floor with itself.
+///
+/// `Some((0, 2, 163))`: 0.2.163 is the release that first puts the V2 variants
+/// on the wire (every offer at percent 0). Unlike the hash-first test, this
+/// tracker test accepts the marker one release ahead of the crate version, so
+/// it holds both on the 0.2.162 main that precedes the release bump and on
+/// 0.2.163 itself. Only the test reads this constant; the emission gate reads
+/// the floor.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const QUIC_NATIVE_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+pub(crate) const QUIC_NATIVE_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 163));
 
 /// Upper bound on the number of hosted contracts examined per new-peer
 /// migration trigger. Each examined contract may emit a best-effort

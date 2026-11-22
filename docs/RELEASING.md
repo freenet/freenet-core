@@ -494,16 +494,16 @@ Current wire-gated floors:
   and `ResponseNative` at indices 5 and 6 of
   `operations/connect/wire.rs::ConnectMsgWire`, #5940).
 
-  Set to **`(0, 2, 160)`**, the release intended to first ship the decoder,
-  and guarded by `QUIC_NATIVE_SHIPPED_IN`, currently `None`, checked by
-  `p2p_protoc::quic_native_floor_tests::quic_native_floor_tracks_the_shipping_release`.
-  0.2.157, 0.2.158 and 0.2.159 carry the decoder but were cut with the floor
-  raised past them, so they never emit the native variants. 0.2.158 is the
-  QUIC data ramp release (#6224), and 0.2.159 ships while the ramp is still
-  under watch; each raised the floor so that the native offer does not start
-  in the same release. When the 0.2.160 bump fails that test, set the marker
-  to the literal `Some((0, 2, 160))` if the release carries the decoder and
-  should start the native offer, otherwise raise the floor. Same failure mode as the
+  Set to **`(0, 2, 163)`**, the release that first ships the variants on the
+  wire, and frozen there: `QUIC_NATIVE_SHIPPED_IN` is `Some((0, 2, 163))`,
+  checked by
+  `p2p_protoc::quic_native_floor_tests::quic_native_floor_tracks_the_shipping_release`
+  (which accepts the marker one release ahead of the crate version, so it
+  holds on 0.2.162 main and on 0.2.163). 0.2.157 to 0.2.162 carry the decoder
+  but were cut with the floor raised past them, so they never emitted the
+  native variants. In 0.2.163 every offer carries percent 0
+  (`QUIC_NATIVE_PERCENT` 0, `NATIVE_DIAL_READY` false); the step that turns
+  the native path on is a later release. Do not raise the floor again unless the V2 layout itself has to change. Same failure mode as the
   application-message floors above: a peer at
   or above the floor without the decoder closes the connection on the variant,
   so bias high. Only `connect::wire::encode_for_peer`, at the one peer-bound
