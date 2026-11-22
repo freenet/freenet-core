@@ -4042,7 +4042,7 @@ fn a_persistent_panic_in_socket_send_is_caught_once_and_does_not_loop() {
 async fn supervised_listener_exit(endpoint: &QuicEndpoint) -> crate::transport::ListenerExit {
     use crate::transport::connection_handler::{GatewayQuicRestartWatch, listener_liveness};
     let listen_task = tokio::spawn(std::future::pending::<crate::transport::TransportError>());
-    let exit = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(5),
         listener_liveness(
             listen_task,
@@ -4054,8 +4054,7 @@ async fn supervised_listener_exit(endpoint: &QuicEndpoint) -> crate::transport::
         ),
     )
     .await
-    .expect("the death ends the listener");
-    exit
+    .expect("the death ends the listener")
 }
 
 /// CONTAINED since quinn#2987 (the `freenet-quinn` fork): a panic that
@@ -4129,8 +4128,7 @@ fn the_accept_loop_stops_without_polling_quinn_after_a_driver_panic() {
                         pair.a
                             .spawn_accept_loop(&monitor.late_registrar(), attempts)
                     );
-                    let wait = monitor.wait_for_any_exit();
-                    let wait = tokio::spawn(async move { wait.await });
+                    let wait = tokio::spawn(monitor.wait_for_any_exit());
                     // Let the loop reach quinn's `accept` and park on it.
                     for _ in 0..16 {
                         tokio::task::yield_now().await;
