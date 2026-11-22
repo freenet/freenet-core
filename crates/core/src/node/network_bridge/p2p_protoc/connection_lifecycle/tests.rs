@@ -5237,7 +5237,7 @@ async fn next_transport_closed(h: &mut Harness) -> ConnEvent {
 async fn a_native_connection_that_dies_leaves_no_entry() {
     let mut h = Harness::new("native-dies").await;
     for (i, reason) in native_end_reasons().into_iter().enumerate() {
-        let addr: SocketAddr = format!("203.0.113.233:{}", 6540 + i).parse().unwrap();
+        let addr: SocketAddr = format!("203.0.113.236:{}", 6600 + i).parse().unwrap();
         let peer = PeerKeyLocation::new(key(), addr);
         let (conn, kill) = DyingNative::new(addr);
         h.handshake_event(HandshakeEvent::OutboundEstablished {
@@ -5260,6 +5260,18 @@ async fn a_native_connection_that_dies_leaves_no_entry() {
 
         kill.send(reason).expect("the connection is listening");
         let closed = next_transport_closed(&mut h).await;
+        // The reason the handler passes to `prune_connection` is the event's.
+        let ConnEvent::TransportClosed {
+            reason: reported, ..
+        } = &closed
+        else {
+            panic!("{case}: not a close");
+        };
+        assert_eq!(
+            reported.to_string(),
+            disconnect_reason_for_close(Some(reason)).to_string(),
+            "{case}: the disconnect reason"
+        );
         h.mgr
             .handle_transport_event(Some(closed), &mut h.state, &h.handshake)
             .await
@@ -5290,7 +5302,7 @@ async fn a_native_connection_that_dies_leaves_no_entry() {
 #[tokio::test]
 async fn a_held_native_connection_that_dies_is_forgotten() {
     let mut h = Harness::new("native-held-dies").await;
-    let addr: SocketAddr = "203.0.113.233:6560".parse().unwrap();
+    let addr: SocketAddr = "203.0.113.236:6620".parse().unwrap();
     let peer = PeerKeyLocation::new(key(), addr);
     h.handshake_event(Arrival::OutboundUdp.event(&peer, false))
         .await;
