@@ -9,9 +9,9 @@
 //!
 //! On `Native` the joiner and the acceptor each dial a native connection
 //! ([`DialTransport::Native`]), and a failed setup falls back to today's UDP
-//! dial. In production nothing changes yet: [`NATIVE_DIAL_READY`] is false,
-//! so every offer carries percent 0 and every decision is
-//! [`NativeDecision::Udp`]; a simulation turns it on per node
+//! dial. In production [`NATIVE_DIAL_READY`] is true and
+//! [`QUIC_NATIVE_PERCENT`] is 25 (A+ step 1), so a ready pair whose bucket is
+//! below 25 decides `Native`; a simulation sets both per node
 //! ([`NativeConnectState`]). A `Native` the joiner cannot honour fails that
 //! attempt ([`joiner_response_action`]).
 //!
@@ -36,15 +36,16 @@ use crate::transport::TransportPublicKey;
 use crate::transport::metrics::ConnectArm;
 use crate::transport::metrics::TRANSPORT_METRICS;
 
-/// Whether this build can dial a native connection. False until the native
-/// connection exists and is wired into the connect op; while false, every offer
-/// this node sends carries percent 0 and it never decides `Native`.
-pub(crate) const NATIVE_DIAL_READY: bool = false;
+/// Whether this build can dial a native connection. True since A+ step 1;
+/// while false, every offer this node sends carries percent 0 and it never
+/// decides `Native`.
+pub(crate) const NATIVE_DIAL_READY: bool = true;
 
 /// This release's share of pairs, 0 to 100, that set up a native connection
 /// when both sides are ready. Each step is its own release; the acceptor's
-/// release governs, since only the acceptor decides.
-pub(crate) const QUIC_NATIVE_PERCENT: u8 = 0;
+/// release governs, since only the acceptor decides, so a reversal takes effect
+/// as acceptors update: there is no runtime kill switch. 25 is A+ step 1.
+pub(crate) const QUIC_NATIVE_PERCENT: u8 = 25;
 
 /// This release's share, 0 to 100, of (joiner, gateway) pairs whose join
 /// tries a native connection to the gateway first (#5940, phase B), when the
@@ -1458,23 +1459,35 @@ mod tests {
         );
     }
 
-    /// This build cannot dial native, so it offers 0 and never decides
-    /// `Native`, whatever the endpoint state.
+    /// A+ step 1: this build dials native and offers 25 once its endpoint is
+    /// up. A node whose endpoint is down offers 0 and decides UDP; an up node
+    /// decides `Native` exactly for buckets below 25.
     #[test]
-    fn this_release_offers_zero_and_decides_udp() {
-        const { assert!(!NATIVE_DIAL_READY) };
-        for endpoint_up in [false, true] {
-            let own = NativeReadiness::from_inputs(NATIVE_DIAL_READY, endpoint_up, false);
-            assert!(!own.ready);
-            assert_eq!(own.offer(), NativeOffer::capable(0));
-            for bucket in 0..100 {
-                assert_eq!(
-                    decide_native(Some(NativeOffer::capable(100)), own, bucket, false),
-                    NativeDecision::Udp
-                );
-            }
+    fn this_release_offers_25_when_up_and_decides_native_below_25() {
+        const { assert!(NATIVE_DIAL_READY) };
+        const { assert!(QUIC_NATIVE_PERCENT == 25) };
+        let down = NativeReadiness::from_inputs(NATIVE_DIAL_READY, false, false);
+        assert!(!down.ready);
+        assert_eq!(down.offer(), NativeOffer::capable(0));
+        let up = NativeReadiness::from_inputs(NATIVE_DIAL_READY, true, false);
+        assert!(up.ready);
+        assert_eq!(up.offer(), NativeOffer::capable(25));
+        for bucket in 0..100 {
+            assert_eq!(
+                decide_native(Some(NativeOffer::capable(100)), down, bucket, false),
+                NativeDecision::Udp
+            );
+            let want = if bucket < 25 {
+                NativeDecision::Native
+            } else {
+                NativeDecision::Udp
+            };
+            assert_eq!(
+                decide_native(Some(NativeOffer::capable(100)), up, bucket, false),
+                want,
+                "bucket {bucket}"
+            );
         }
-        assert_eq!(NativeReadiness::current().offer().percent, 0);
     }
 
     #[test]

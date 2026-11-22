@@ -641,7 +641,8 @@ labelled_counters! {
     /// How a QUIC-native connection setup ended, counted where the setup
     /// decides it (`QuicUpgrades::setup_native`), one per setup. Exported per
     /// period as `connect_native_setup_<label>`. Zero until the connect op
-    /// asks for native connections (`connect::native::NATIVE_DIAL_READY`).
+    /// asks for native connections (`connect::native::NATIVE_DIAL_READY`, true
+    /// since A+ step 1).
     pub(crate) enum NativeSetupOutcome {
         /// The setup gave a connection, after the Hello exchange.
         Established => "established",

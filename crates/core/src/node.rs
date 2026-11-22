@@ -541,8 +541,8 @@ pub struct NodeConfig {
     #[serde(skip)]
     pub(crate) quic_native_floor_override: Option<(u8, u8, u16)>,
     /// Simulation-only: QUIC-native connects on, at this release percent, in
-    /// place of `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, both off in
-    /// production until the A+ ramp (`SimNetwork::with_native_connect`). Read
+    /// place of `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, in production
+    /// they are true and 25 (A+ step 1; `SimNetwork::with_native_connect`). Read
     /// into the node's `NativeConnectState`. `None` in production.
     /// `#[serde(skip)]`.
     #[serde(skip)]

@@ -2266,9 +2266,10 @@ upgrades hub's
 `QuicUpgrades::setup_native` (A5b, below); the endpoint's native side
 (`native/endpoint.rs`: `allow_native_peer`, `dial_native`, `send_punch`)
 stays `pub(in crate::transport::quic::native)`, and registering a native
-waiter is private to `setup`. In production nothing asks for a setup: the
-connect op gates on `operations::connect::native::NATIVE_DIAL_READY` (pinned
-false) and `QUIC_NATIVE_PERCENT` (0).
+waiter is private to `setup`. Since A+ step 1 the connect op asks for a
+setup for ready pairs whose bucket is below `QUIC_NATIVE_PERCENT` (25), gated
+on `operations::connect::native::NATIVE_DIAL_READY` (true). There is no
+runtime kill switch: the acceptor's release decides.
 
 ```
 ALPN per attempt: an address allowed with allow_native_peer is accepted with
