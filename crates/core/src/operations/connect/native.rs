@@ -45,6 +45,42 @@ pub(crate) const NATIVE_DIAL_READY: bool = false;
 /// release governs, since only the acceptor decides.
 pub(crate) const QUIC_NATIVE_PERCENT: u8 = 0;
 
+/// This release's share, 0 to 100, of (joiner, gateway) pairs whose join
+/// tries a native connection to the gateway first (#5940, phase B), when the
+/// gateway is marked native in the gateway index and this node can dial
+/// native. Any failure falls back at once to today's join. The joiner alone
+/// decides (there is no connection to the gateway yet to ask it), so the
+/// joiner's release governs. At 0 no join tries native.
+pub(crate) const GATEWAY_NATIVE_JOIN_PERCENT: u8 = 0;
+
+/// After a native join with a gateway fails, joins to that gateway go
+/// straight to today's join for this long (provisional). The gateway index
+/// is read at startup, so a running joiner keeps a mark that was taken away;
+/// without this, a marked gateway that stops answering native joins would
+/// cost every join to it a whole native window before the fallback. Only
+/// lowers: it never makes a join try native.
+pub(crate) const GATEWAY_NATIVE_FAILURE_COOLDOWN: Duration = Duration::from_secs(600);
+
+/// Whether a join to a gateway tries a native connection first: this node
+/// can dial native (`ready`), the gateway is marked native in the index, and
+/// the pair's bucket ([`native_bucket`], the slice the connect op uses) is
+/// below `percent`.
+pub(crate) fn gateway_join_native(ready: bool, marked: bool, bucket: u8, percent: u8) -> bool {
+    ready && marked && bucket < percent.min(100)
+}
+
+/// How a join to a gateway connects ([`NativeConnectState::plan_gateway_join`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatewayJoinPlan {
+    /// Today's join only.
+    Legacy,
+    /// A native connection first, then today's join if it gives none.
+    NativeFirst,
+    /// Would be [`Self::NativeFirst`], but a native join with this gateway
+    /// failed within [`GATEWAY_NATIVE_FAILURE_COOLDOWN`]: today's join only.
+    LegacyCoolingDown,
+}
+
 /// Offer level: the joiner can set up a native connection, and also UDP.
 pub(crate) const LEVEL_NATIVE_CAPABLE: u8 = 1;
 
@@ -428,6 +464,16 @@ pub(crate) struct NativeConnectState {
     /// from the process-wide endpoint metric, which several simulated nodes
     /// in one process share.
     endpoint: std::sync::OnceLock<crate::transport::QuicAvailabilityWatch>,
+    /// Simulation only: native gateway joins on, at this percent, in place of
+    /// [`NATIVE_DIAL_READY`] and [`GATEWAY_NATIVE_JOIN_PERCENT`]
+    /// (`NodeConfig::native_gateway_join_override`). `None` in production.
+    gateway_join_override: Option<u8>,
+    /// The addresses of the configured gateways the gateway index marks
+    /// native, set once when the node is built. Empty until then.
+    native_gateways: std::sync::OnceLock<std::collections::HashSet<std::net::SocketAddr>>,
+    /// Marked gateways whose last native join failed, and when. At most one
+    /// entry per marked gateway, so bounded by the index.
+    gateway_failures: parking_lot::Mutex<std::collections::HashMap<std::net::SocketAddr, Instant>>,
 }
 
 impl NativeConnectState {
@@ -436,7 +482,100 @@ impl NativeConnectState {
             release_override,
             demotion: parking_lot::Mutex::new(NativeDemotion::new()),
             endpoint: std::sync::OnceLock::new(),
+            gateway_join_override: None,
+            native_gateways: std::sync::OnceLock::new(),
+            gateway_failures: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// [`Self::new`], with native gateway joins at `percent` in a simulation
+    /// (`NodeConfig::native_gateway_join_override`).
+    pub(crate) fn with_gateway_join_override(mut self, percent: Option<u8>) -> Self {
+        self.gateway_join_override = percent;
+        self
+    }
+
+    /// The configured gateways the index marks native. Only the first call
+    /// counts: a node is built once.
+    pub(crate) fn set_native_gateways(
+        &self,
+        gateways: impl IntoIterator<Item = std::net::SocketAddr>,
+    ) {
+        self.native_gateways.get_or_init(|| {
+            gateways
+                .into_iter()
+                .map(crate::transport::normalize_mapped_addr)
+                .collect()
+        });
+    }
+
+    /// How this node's join to the gateway at `addr`, with key `gateway`,
+    /// connects. Never [`GatewayJoinPlan::NativeFirst`] unless the node can
+    /// dial native now, the gateway is marked native, and the pair is in the
+    /// slice ([`gateway_join_native`]); counted
+    /// `gateway_native_join_skipped_cooldown` when a recent failure with the
+    /// gateway holds it back.
+    pub(crate) fn plan_gateway_join(
+        &self,
+        own: &TransportPublicKey,
+        addr: std::net::SocketAddr,
+        gateway: &TransportPublicKey,
+    ) -> GatewayJoinPlan {
+        let addr = crate::transport::normalize_mapped_addr(addr);
+        let (dial_ready, percent) = match self.gateway_join_override {
+            Some(percent) => (true, percent),
+            None => (NATIVE_DIAL_READY, GATEWAY_NATIVE_JOIN_PERCENT),
+        };
+        let now = Instant::now();
+        let ready = dial_ready && self.endpoint_up() && !self.demotion.lock().is_demoted(now);
+        let marked = self
+            .native_gateways
+            .get()
+            .is_some_and(|gateways| gateways.contains(&addr));
+        if !gateway_join_native(ready, marked, native_bucket(own, gateway), percent) {
+            return GatewayJoinPlan::Legacy;
+        }
+        let mut failures = self.gateway_failures.lock();
+        match failures.get(&addr) {
+            Some(failed)
+                if now.saturating_duration_since(*failed) < GATEWAY_NATIVE_FAILURE_COOLDOWN =>
+            {
+                TRANSPORT_METRICS.record_gateway_native_join(
+                    crate::transport::metrics::GatewayNativeJoin::SkippedCooldown,
+                    addr,
+                );
+                GatewayJoinPlan::LegacyCoolingDown
+            }
+            Some(_) => {
+                failures.remove(&addr);
+                GatewayJoinPlan::NativeFirst
+            }
+            None => GatewayJoinPlan::NativeFirst,
+        }
+    }
+
+    /// A native join with the gateway at `addr` ended: a failure starts its
+    /// cooldown ([`GATEWAY_NATIVE_FAILURE_COOLDOWN`]), a success ends it. Only
+    /// marked gateways are remembered. Does not touch the demotion, which
+    /// counts peer-to-peer failures only.
+    pub(crate) fn record_gateway_join(&self, addr: std::net::SocketAddr, established: bool) {
+        let addr = crate::transport::normalize_mapped_addr(addr);
+        let mut failures = self.gateway_failures.lock();
+        if established {
+            failures.remove(&addr);
+        } else if self
+            .native_gateways
+            .get()
+            .is_some_and(|gateways| gateways.contains(&addr))
+        {
+            failures.insert(addr, Instant::now());
+        }
+    }
+
+    fn endpoint_up(&self) -> bool {
+        self.endpoint
+            .get()
+            .is_some_and(|e| e.get() == crate::transport::QuicAvailability::Up)
     }
 
     /// The node's transport opened with this QUIC endpoint. Only the first
@@ -447,10 +586,7 @@ impl NativeConnectState {
 
     /// This node's readiness now, as joiner and as acceptor.
     pub(crate) fn readiness(&self) -> NativeReadiness {
-        let endpoint_up = self
-            .endpoint
-            .get()
-            .is_some_and(|e| e.get() == crate::transport::QuicAvailability::Up);
+        let endpoint_up = self.endpoint_up();
         let (dial_ready, release_percent) = match self.release_override {
             Some(percent) => (true, percent),
             None => (NATIVE_DIAL_READY, QUIC_NATIVE_PERCENT),
@@ -843,6 +979,195 @@ mod tests {
         assert_eq!(on.demotions(), 1);
         assert!(!on.readiness().ready, "demoted");
         assert_eq!(on.readiness().percent, 0);
+    }
+
+    /// Phase B ships dark: no join tries native in this release.
+    #[test]
+    fn this_release_joins_no_gateway_natively() {
+        const { assert!(GATEWAY_NATIVE_JOIN_PERCENT == 0) };
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        // Production state, with every other condition met.
+        let state = NativeConnectState::new(None);
+        state.set_endpoint(watch);
+        let gateway = "192.0.2.1:31337".parse().unwrap();
+        state.set_native_gateways([gateway]);
+        for seed in 0..200 {
+            assert_eq!(
+                state.plan_gateway_join(&key(seed), gateway, &key(10_000)),
+                GatewayJoinPlan::Legacy
+            );
+        }
+    }
+
+    /// A join tries native only when the node can dial, the gateway is
+    /// marked and the pair is in the slice; each condition alone is enough to
+    /// keep today's join.
+    #[test]
+    fn a_gateway_join_needs_readiness_a_mark_and_the_slice() {
+        for (ready, marked) in [(false, true), (true, false), (false, false)] {
+            for bucket in 0..100 {
+                assert!(!gateway_join_native(ready, marked, bucket, 100));
+            }
+        }
+        for bucket in 0..100 {
+            assert!(gateway_join_native(true, true, bucket, 100));
+            assert!(!gateway_join_native(true, true, bucket, 0));
+            assert_eq!(gateway_join_native(true, true, bucket, 30), bucket < 30);
+            // A percent above 100 reads as 100.
+            assert!(gateway_join_native(true, true, bucket, 250));
+        }
+    }
+
+    /// The state reads the override, its endpoint, the gateways marked in
+    /// the index (only those) and the demotion; the slice is the connect
+    /// slice of the (joiner, gateway) pair.
+    #[test]
+    fn plan_gateway_join_reads_endpoint_marks_slice_and_demotion() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let marked: std::net::SocketAddr = "192.0.2.1:31337".parse().unwrap();
+        let unmarked: std::net::SocketAddr = "192.0.2.2:31337".parse().unwrap();
+        let gateway = key(10_000);
+        let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
+        state.set_native_gateways([marked]);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::Legacy,
+            "no transport yet"
+        );
+        state.set_endpoint(watch);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::NativeFirst
+        );
+        // An IPv4-mapped address is the same gateway.
+        let mapped = std::net::SocketAddr::new(
+            std::net::Ipv4Addr::new(192, 0, 2, 1)
+                .to_ipv6_mapped()
+                .into(),
+            31337,
+        );
+        assert_eq!(
+            state.plan_gateway_join(&key(1), mapped, &gateway),
+            GatewayJoinPlan::NativeFirst
+        );
+        assert_eq!(
+            state.plan_gateway_join(&key(1), unmarked, &gateway),
+            GatewayJoinPlan::Legacy
+        );
+        endpoint.send(QuicAvailability::Down).unwrap();
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::Legacy,
+            "the endpoint went down"
+        );
+        endpoint.send(QuicAvailability::Up).unwrap();
+        for i in 1..=3 {
+            state.record_failure(&key(i));
+        }
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::Legacy,
+            "demoted"
+        );
+
+        // At 50%, exactly the joiners whose pair bucket is below 50.
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let half = NativeConnectState::new(None).with_gateway_join_override(Some(50));
+        half.set_endpoint(watch);
+        half.set_native_gateways([marked]);
+        let mut native = 0;
+        for seed in 0..400 {
+            let own = key(seed);
+            let plan = half.plan_gateway_join(&own, marked, &gateway);
+            let want = if native_bucket(&own, &gateway) < 50 {
+                native += 1;
+                GatewayJoinPlan::NativeFirst
+            } else {
+                GatewayJoinPlan::Legacy
+            };
+            assert_eq!(plan, want);
+        }
+        assert!((100..300).contains(&native), "premise: both arms seen");
+    }
+
+    /// A gateway the index gives as an IPv4-mapped address is the gateway
+    /// dialled at its IPv4 address: marks are stored, not only looked up,
+    /// without the mapping.
+    #[test]
+    fn a_mark_given_as_an_ipv4_mapped_address_matches_the_ipv4_dial() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let mapped = std::net::SocketAddr::new(
+            std::net::Ipv4Addr::new(192, 0, 2, 1)
+                .to_ipv6_mapped()
+                .into(),
+            31337,
+        );
+        let v4: std::net::SocketAddr = "192.0.2.1:31337".parse().unwrap();
+        let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
+        state.set_endpoint(watch);
+        state.set_native_gateways([mapped]);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), v4, &key(10_000)),
+            GatewayJoinPlan::NativeFirst
+        );
+    }
+
+    /// A failed native join sends joins to that gateway straight to today's
+    /// join for the cooldown; a success, or the cooldown passing,
+    /// ends it. Failures with an unmarked gateway are not remembered, and a
+    /// gateway failure never counts toward the demotion.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_gateway_join_cools_that_gateway_down() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let marked: std::net::SocketAddr = "192.0.2.1:31337".parse().unwrap();
+        let other: std::net::SocketAddr = "192.0.2.3:31337".parse().unwrap();
+        let gateway = key(10_000);
+        let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
+        state.set_endpoint(watch);
+        state.set_native_gateways([marked, other]);
+        state.record_gateway_join(marked, false);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::LegacyCoolingDown
+        );
+        assert_eq!(
+            state.plan_gateway_join(&key(1), other, &gateway),
+            GatewayJoinPlan::NativeFirst,
+            "only that gateway cools down"
+        );
+        tokio::time::advance(GATEWAY_NATIVE_FAILURE_COOLDOWN - Duration::from_secs(1)).await;
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::LegacyCoolingDown
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::NativeFirst,
+            "the cooldown passed"
+        );
+        state.record_gateway_join(marked, false);
+        state.record_gateway_join(marked, true);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::NativeFirst,
+            "a success ends the cooldown"
+        );
+        for _ in 0..DEMOTION_FAILURES + 1 {
+            state.record_gateway_join(other, false);
+        }
+        assert_eq!(state.demotions(), 0, "gateway joins never demote");
+        let unmarked: std::net::SocketAddr = "192.0.2.9:31337".parse().unwrap();
+        state.record_gateway_join(unmarked, false);
+        assert_eq!(
+            state.gateway_failures.lock().len(),
+            1,
+            "only marked gateways"
+        );
     }
 
     /// Every level and percent decodes and re-encodes to the same bytes, so a

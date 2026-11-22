@@ -202,7 +202,7 @@ impl HandshakeHandler {
     pub fn new(
         inbound: Box<dyn InboundAcceptor>,
         outbound: Arc<dyn OutboundConnector>,
-        _connection_manager: ConnectionManager,
+        connection_manager: ConnectionManager,
         _router: Arc<RwLock<Router>>,
         _this_location: Option<Location>,
         _is_gateway: bool,
@@ -211,9 +211,19 @@ impl HandshakeHandler {
     ) -> (Self, CommandSender) {
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (event_tx, event_rx) = mpsc::channel(128);
+        let gateway_join = GatewayJoinPolicy::of(&connection_manager);
 
         GlobalExecutor::spawn(async move {
-            run_driver(inbound, outbound, cmd_rx, event_tx, peer_ready, clock).await;
+            run_driver(
+                inbound,
+                outbound,
+                cmd_rx,
+                event_tx,
+                peer_ready,
+                clock,
+                Some(gateway_join),
+            )
+            .await;
         });
 
         (
@@ -386,6 +396,7 @@ async fn run_driver(
     events_tx: mpsc::Sender<Event>,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
     clock: DynTimeSource,
+    gateway_join: Option<GatewayJoinPolicy>,
 ) {
     use tokio::select;
 
@@ -405,7 +416,7 @@ async fn run_driver(
             _ = sweep_timer.tick() => expected_inbound.sweep(),
             command = commands_rx.recv() => match command {
                 Some(Command::Connect { peer, transaction, transient, origin, transport }) => {
-                    spawn_outbound(outbound.clone(), events_tx.clone(), OutboundDial { peer, transaction, transient, origin, transport }, peer_ready.clone());
+                    spawn_outbound(outbound.clone(), events_tx.clone(), OutboundDial { peer, transaction, transient, origin, transport }, peer_ready.clone(), gateway_join.clone());
                 }
                 Some(Command::ExpectInbound { addr, peer_key, transaction, transient }) => {
                     expected_inbound.register(addr, peer_key, transaction, transient);
@@ -532,9 +543,16 @@ fn spawn_outbound(
     events_tx: mpsc::Sender<Event>,
     dial: OutboundDial,
     peer_ready: Option<Arc<std::sync::atomic::AtomicBool>>,
+    gateway_join: Option<GatewayJoinPolicy>,
 ) {
     GlobalExecutor::spawn(async move {
-        let event = connect_outbound(&*outbound, dial, peer_ready.as_deref()).await;
+        let event = connect_outbound(
+            &*outbound,
+            dial,
+            peer_ready.as_deref(),
+            gateway_join.as_ref(),
+        )
+        .await;
 
         // channel-safety: ok — this runs in a detached per-connection task
         // (GlobalExecutor::spawn), NOT on the event loop or the run_driver
@@ -552,19 +570,97 @@ fn spawn_outbound(
 /// [`OutboundConnector`]); that unbounded stage is #5947.
 const OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// What the driver reads to decide whether a join to a gateway tries a
+/// native connection first (#5940, phase B): the node's native connect state
+/// (readiness, the gateways the index marks native, the slice, the failure
+/// cooldown) and its own key.
+#[derive(Clone)]
+pub(crate) struct GatewayJoinPolicy {
+    native: Arc<crate::operations::connect::native::NativeConnectState>,
+    own: TransportPublicKey,
+}
+
+impl GatewayJoinPolicy {
+    pub(crate) fn of(connection_manager: &ConnectionManager) -> Self {
+        Self {
+            native: connection_manager.native_connect_shared(),
+            own: (*connection_manager.pub_key).clone(),
+        }
+    }
+
+    /// How a dial with `origin` to `peer` at `addr` connects. Only a join to
+    /// a configured gateway can try native first.
+    fn plan(
+        &self,
+        origin: crate::transport::NatAttemptOrigin,
+        addr: SocketAddr,
+        peer: &TransportPublicKey,
+    ) -> crate::operations::connect::native::GatewayJoinPlan {
+        if origin == crate::transport::NatAttemptOrigin::Gateway {
+            self.native.plan_gateway_join(&self.own, addr, peer)
+        } else {
+            crate::operations::connect::native::GatewayJoinPlan::Legacy
+        }
+    }
+}
+
+/// A native join to the gateway `peer` at `addr`, within the native setup's
+/// own window (8 s). Every end is counted as `gateway_native_join_<label>`
+/// (and a failure's cause as `gateway_native_join_failure_<label>`), and
+/// starts or ends the gateway's failure cooldown.
+async fn join_gateway_native(
+    outbound: &dyn OutboundConnector,
+    policy: &GatewayJoinPolicy,
+    peer: &PeerKeyLocation,
+    addr: SocketAddr,
+) -> Result<Box<dyn PeerConnectionApi>, crate::transport::NativeSetupOutcome> {
+    use crate::transport::metrics::GatewayNativeJoin;
+    let dial = crate::transport::NativeDial {
+        addr,
+        key: peer.pub_key.clone(),
+        is_gateway: true,
+        within: crate::operations::connect::native::NATIVE_CONNECT_WITHIN,
+        join: true,
+    };
+    let result = outbound.connect_native(dial).await;
+    policy.native.record_gateway_join(addr, result.is_ok());
+    match &result {
+        Ok(_) => crate::transport::TRANSPORT_METRICS
+            .record_gateway_native_join(GatewayNativeJoin::Established, addr),
+        Err(outcome) => {
+            tracing::debug!(
+                %addr,
+                label = outcome.label(),
+                "native gateway join gave no connection; joining over UDP"
+            );
+            crate::transport::TRANSPORT_METRICS
+                .record_gateway_native_join(GatewayNativeJoin::Failed, addr);
+            crate::transport::TRANSPORT_METRICS.record_gateway_native_join_failure(*outcome, addr);
+        }
+    }
+    result
+}
+
 /// Run one outbound connect to `peer` and report it as the event the driver
 /// emits. Sets `peer_ready` only on success.
+///
+/// A UDP dial to a gateway may first try a native join
+/// ([`GatewayJoinPolicy`]); however that attempt ends, a failure runs the
+/// UDP dial at once, as if the native attempt had not happened. The event
+/// names the transport that connected, so a native join reaches the event
+/// loop as a native connection.
 async fn connect_outbound(
     outbound: &dyn OutboundConnector,
     dial: OutboundDial,
     peer_ready: Option<&std::sync::atomic::AtomicBool>,
+    gateway_join: Option<&GatewayJoinPolicy>,
 ) -> Event {
     let OutboundDial {
         peer,
         transaction,
         transient,
         origin,
-        transport,
+        mut transport,
     } = dial;
     let addr = peer
         .socket_addr()
@@ -572,10 +668,50 @@ async fn connect_outbound(
     let mut native_outcome = None;
     let result: Result<Box<dyn PeerConnectionApi>, ConnectionError> = match transport {
         crate::operations::connect::native::DialTransport::Udp => {
-            let connect_future = outbound.connect(peer.pub_key.clone(), addr, origin).await;
-            match tokio::time::timeout(OUTBOUND_CONNECT_TIMEOUT, connect_future).await {
-                Ok(res) => res.map_err(|err| err.into()),
-                Err(_) => Err(ConnectionError::Timeout),
+            let native_first = gateway_join.filter(|policy| {
+                policy.plan(origin, addr, peer.pub_key())
+                    == crate::operations::connect::native::GatewayJoinPlan::NativeFirst
+            });
+            let started = tokio::time::Instant::now();
+            let joined = match native_first {
+                Some(policy) => Some(join_gateway_native(outbound, policy, &peer, addr).await),
+                None => None,
+            };
+            match joined {
+                Some(Ok(connection)) => {
+                    crate::transport::TRANSPORT_METRICS
+                        .record_gateway_native_join_time(started.elapsed(), addr);
+                    transport = crate::operations::connect::native::DialTransport::native_now();
+                    Ok(connection)
+                }
+                joined => {
+                    let connect_future = outbound.connect(peer.pub_key.clone(), addr, origin).await;
+                    let result = match tokio::time::timeout(
+                        OUTBOUND_CONNECT_TIMEOUT,
+                        connect_future,
+                    )
+                    .await
+                    {
+                        Ok(res) => res.map_err(|err| err.into()),
+                        Err(_) => Err(ConnectionError::Timeout),
+                    };
+                    if joined.is_some() {
+                        use crate::transport::metrics::GatewayNativeJoin;
+                        if result.is_ok() {
+                            crate::transport::TRANSPORT_METRICS
+                                .record_gateway_native_join_time(started.elapsed(), addr);
+                        }
+                        crate::transport::TRANSPORT_METRICS.record_gateway_native_join(
+                            if result.is_ok() {
+                                GatewayNativeJoin::FallbackConnected
+                            } else {
+                                GatewayNativeJoin::FallbackFailed
+                            },
+                            addr,
+                        );
+                    }
+                    result
+                }
             }
         }
         crate::operations::connect::native::DialTransport::Native { deadline } => {
@@ -585,6 +721,7 @@ async fn connect_outbound(
                 is_gateway: matches!(origin, crate::transport::NatAttemptOrigin::Gateway),
                 // What is left of the dial's deadline now, as the setup starts.
                 within: deadline.saturating_duration_since(tokio::time::Instant::now()),
+                join: false,
             };
             // Not a transport failure for the address: the connect op falls
             // back to a UDP dial at its fallback time, which decides that.
@@ -732,6 +869,7 @@ mod tests {
             event_tx,
             None,
             Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+            None,
         ));
         cmd_tx
             .send(Command::Connect {
@@ -776,6 +914,7 @@ mod tests {
             event_tx,
             Some(ready.clone()),
             Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+            None,
         ));
 
         let expected_addr: SocketAddr = "127.0.0.1:4300".parse().unwrap();
@@ -945,6 +1084,7 @@ mod tests {
                 transport: crate::operations::connect::native::DialTransport::Udp,
             },
             Some(&ready),
+            None,
         )
         .await;
         ConnectRun {
@@ -981,6 +1121,7 @@ mod tests {
                 origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
                 transport: crate::operations::connect::native::DialTransport::Native { deadline },
             },
+            None,
             None,
         )
         .await;
@@ -1149,6 +1290,7 @@ mod tests {
             event_tx,
             None,
             Arc::new(clock.clone()),
+            None,
         ));
         let addr: SocketAddr = "127.0.0.1:4140".parse().unwrap();
         cmd_tx
@@ -1380,5 +1522,243 @@ mod tests {
             matches!(res, Err(mpsc::error::SendTimeoutError::Closed(_))),
             "a closed channel (event loop gone) must report Closed (break), got {res:?}"
         );
+    }
+
+    /// A connector for the gateway-join tests: the native setup gives a
+    /// connection or fails as scripted, and every call is recorded.
+    struct GatewayConnector {
+        native_ok: bool,
+        /// How long the native setup takes before it ends.
+        native_takes: Duration,
+        udp: Handshake,
+        native_dials: parking_lot::Mutex<Vec<crate::transport::NativeDial>>,
+        udp_origins: parking_lot::Mutex<Vec<crate::transport::NatAttemptOrigin>>,
+    }
+
+    impl GatewayConnector {
+        fn new(native_ok: bool, udp: Handshake) -> Self {
+            Self {
+                native_ok,
+                native_takes: Duration::ZERO,
+                udp,
+                native_dials: Default::default(),
+                udp_origins: Default::default(),
+            }
+        }
+    }
+
+    impl OutboundConnector for GatewayConnector {
+        #[allow(clippy::async_yields_async)]
+        fn connect(
+            &self,
+            _remote_public_key: crate::transport::TransportPublicKey,
+            remote_addr: SocketAddr,
+            origin: crate::transport::NatAttemptOrigin,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = crate::transport::PendingConnection> + Send + '_>,
+        > {
+            self.udp_origins.lock().push(origin);
+            let udp = self.udp;
+            Box::pin(async move {
+                let pending: crate::transport::PendingConnection = match udp {
+                    Handshake::Succeeds => Box::pin(async move {
+                        Ok(Box::new(NullConnection(remote_addr)) as Box<dyn PeerConnectionApi>)
+                    }),
+                    Handshake::Fails | Handshake::Hangs => Box::pin(async {
+                        Err(TransportError::ConnectionEstablishmentFailure {
+                            cause: "refused".into(),
+                        })
+                    }),
+                };
+                pending
+            })
+        }
+
+        fn connect_native(
+            &self,
+            dial: crate::transport::NativeDial,
+        ) -> crate::transport::NativeConnectFuture<'_> {
+            let addr = dial.addr;
+            self.native_dials.lock().push(dial);
+            let (ok, takes) = (self.native_ok, self.native_takes);
+            Box::pin(async move {
+                tokio::time::sleep(takes).await;
+                if ok {
+                    Ok(Box::new(NullConnection(addr)) as Box<dyn PeerConnectionApi>)
+                } else {
+                    Err(crate::transport::NativeSetupOutcome::TimedOut)
+                }
+            })
+        }
+    }
+
+    /// A policy for a node that can dial native, at 100%, with `marked`
+    /// gateways native in the index. Keep the returned sender alive: the
+    /// endpoint reads as down once it is dropped.
+    fn gateway_policy(
+        marked: &[SocketAddr],
+    ) -> (
+        GatewayJoinPolicy,
+        tokio::sync::watch::Sender<crate::transport::QuicAvailability>,
+    ) {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let native = crate::operations::connect::native::NativeConnectState::new(None)
+            .with_gateway_join_override(Some(100));
+        native.set_endpoint(watch);
+        native.set_native_gateways(marked.iter().copied());
+        let own = TransportKeypair::new().public().clone();
+        (
+            GatewayJoinPolicy {
+                native: Arc::new(native),
+                own,
+            },
+            endpoint,
+        )
+    }
+
+    async fn dial_gateway(
+        connector: &GatewayConnector,
+        peer: &PeerKeyLocation,
+        origin: crate::transport::NatAttemptOrigin,
+        policy: Option<&GatewayJoinPolicy>,
+    ) -> Event {
+        connect_outbound(
+            connector,
+            super::OutboundDial {
+                peer: peer.clone(),
+                transaction: Transaction::new::<ConnectMsg>(),
+                transient: true,
+                origin,
+                transport: crate::operations::connect::native::DialTransport::Udp,
+            },
+            None,
+            policy,
+        )
+        .await
+    }
+
+    fn connected_transport(event: &Event) -> crate::operations::connect::native::DialTransport {
+        match event {
+            Event::OutboundEstablished { transport, .. } => *transport,
+            Event::InboundConnection { .. } | Event::OutboundFailed { .. } => {
+                panic!("expected OutboundEstablished")
+            }
+        }
+    }
+
+    /// A join to a marked gateway tries a native join first (the client,
+    /// marked as a gateway join) and, when it connects, never dials UDP; the
+    /// event names the native transport, so the event loop keeps a native
+    /// connection.
+    #[tokio::test(start_paused = true)]
+    async fn a_marked_gateway_is_joined_natively_first() {
+        use crate::transport::NatAttemptOrigin::Gateway;
+        let gateway = make_peer(4301);
+        let (policy, _endpoint) = gateway_policy(&[gateway.socket_addr().unwrap()]);
+        let connector = GatewayConnector::new(true, Handshake::Succeeds);
+        let event = dial_gateway(&connector, &gateway, Gateway, Some(&policy)).await;
+        assert!(connected_transport(&event).is_native());
+        assert!(connector.udp_origins.lock().is_empty(), "no UDP dial");
+        let dials = connector.native_dials.lock();
+        assert_eq!(dials.len(), 1);
+        assert!(dials[0].join && dials[0].is_gateway);
+        assert_eq!(&dials[0].key, gateway.pub_key());
+        assert_eq!(
+            gateway_join_events(&gateway),
+            ["Established", "Lt1S"],
+            "counted as a native join, with its time"
+        );
+    }
+
+    /// The gateway-join telemetry recorded for `gateway`, in order.
+    fn gateway_join_events(gateway: &PeerKeyLocation) -> Vec<String> {
+        crate::transport::TRANSPORT_METRICS.quic_events_of(gateway.socket_addr().unwrap())
+    }
+
+    /// A failed native join is followed at once by today's UDP join, with
+    /// the gateway origin, and the event names UDP. The gateway then cools
+    /// down: the next join goes straight to UDP.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_native_join_falls_back_to_udp_then_cools_down() {
+        use crate::transport::NatAttemptOrigin::Gateway;
+        let gateway = make_peer(4302);
+        let (policy, _endpoint) = gateway_policy(&[gateway.socket_addr().unwrap()]);
+        let mut connector = GatewayConnector::new(false, Handshake::Succeeds);
+        // The native attempt runs its whole window before it gives up.
+        connector.native_takes = Duration::from_secs(8);
+        let event = dial_gateway(&connector, &gateway, Gateway, Some(&policy)).await;
+        assert!(!connected_transport(&event).is_native());
+        assert_eq!(*connector.udp_origins.lock(), vec![Gateway]);
+        assert_eq!(connector.native_dials.lock().len(), 1);
+        // A rescue: the legacy join connected after the native one failed.
+        // Its time counts the failed native attempt (8 s), not only the
+        // legacy join.
+        assert_eq!(
+            gateway_join_events(&gateway),
+            ["Failed", "TimedOut", "Lt10S", "FallbackConnected"]
+        );
+
+        let event = dial_gateway(&connector, &gateway, Gateway, Some(&policy)).await;
+        assert!(!connected_transport(&event).is_native());
+        assert_eq!(connector.native_dials.lock().len(), 1, "cooling down");
+        assert_eq!(connector.udp_origins.lock().len(), 2);
+        assert_eq!(
+            gateway_join_events(&gateway)[4..],
+            ["SkippedCooldown"],
+            "a skipped join is counted, and only that"
+        );
+    }
+
+    /// When the fallback fails too, the dial fails as a UDP dial (no native
+    /// outcome), as a plain UDP join would.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_fallback_fails_the_dial_as_udp() {
+        use crate::transport::NatAttemptOrigin::Gateway;
+        let gateway = make_peer(4303);
+        let (policy, _endpoint) = gateway_policy(&[gateway.socket_addr().unwrap()]);
+        let connector = GatewayConnector::new(false, Handshake::Fails);
+        let event = dial_gateway(&connector, &gateway, Gateway, Some(&policy)).await;
+        let Event::OutboundFailed {
+            transport,
+            native_outcome,
+            ..
+        } = event
+        else {
+            panic!("expected OutboundFailed");
+        };
+        assert!(!transport.is_native());
+        assert!(native_outcome.is_none());
+        assert_eq!(connector.native_dials.lock().len(), 1);
+        assert_eq!(
+            gateway_join_events(&gateway),
+            ["Failed", "TimedOut", "FallbackFailed"],
+            "no time for a join that gave no connection"
+        );
+    }
+
+    /// Only a join to a marked gateway tries native: an unmarked gateway, a
+    /// dial with another origin, and a driver with no policy all dial UDP
+    /// only.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_join_to_a_marked_gateway_tries_native() {
+        use crate::transport::NatAttemptOrigin::{ConnectJoiner, Gateway, RingPeerNoTransport};
+        let marked = make_peer(4304);
+        let unmarked = make_peer(4305);
+        let (policy, _endpoint) = gateway_policy(&[marked.socket_addr().unwrap()]);
+        let connector = GatewayConnector::new(true, Handshake::Succeeds);
+        for (peer, origin, policy) in [
+            (&unmarked, Gateway, Some(&policy)),
+            (&marked, ConnectJoiner, Some(&policy)),
+            (&marked, RingPeerNoTransport, Some(&policy)),
+            (&marked, Gateway, None),
+        ] {
+            let event = dial_gateway(&connector, peer, origin, policy).await;
+            assert!(!connected_transport(&event).is_native(), "{origin:?}");
+        }
+        assert!(connector.native_dials.lock().is_empty());
+        assert_eq!(connector.udp_origins.lock().len(), 4);
+        assert!(gateway_join_events(&marked).is_empty());
+        assert!(gateway_join_events(&unmarked).is_empty());
     }
 }

@@ -621,6 +621,66 @@ labelled_counters! {
 }
 
 labelled_counters! {
+    /// How a joiner's native join at a gateway marked native went (#5940,
+    /// phase B), counted by the handshake driver. Kept apart from
+    /// [`NativeSetupOutcome`]'s `connect_native_setup_<label>`, which the
+    /// peer-to-peer comparison reads. Exported per period as
+    /// `gateway_native_join_<label>`. Zero until
+    /// `connect::native::GATEWAY_NATIVE_JOIN_PERCENT` is above 0.
+    pub(crate) enum GatewayNativeJoin {
+        /// The native attempt gave a connection, after the Hello exchange.
+        Established => "established",
+        /// The native attempt gave no connection, so the legacy join ran.
+        Failed => "failed",
+        /// The legacy join after a failed native attempt connected: a join
+        /// that would be lost once there is no legacy join.
+        FallbackConnected => "fallback_connected",
+        /// The legacy join after a failed native attempt failed too.
+        FallbackFailed => "fallback_failed",
+        /// The gateway is marked native, but a recent native failure with it
+        /// sent this join straight to legacy
+        /// (`connect::native::GATEWAY_NATIVE_FAILURE_COOLDOWN`).
+        SkippedCooldown => "skipped_cooldown",
+    }
+}
+
+labelled_counters! {
+    /// How long a joiner's join to a gateway marked native took, from the
+    /// start of the native attempt to a connection, whichever join gave it
+    /// (#5940, phase B): a fallback's time includes the failed native
+    /// attempt. Joins that gave no connection are not counted. Exported per
+    /// period as `gateway_native_join_time_<label>`.
+    pub(crate) enum GatewayNativeJoinTime {
+        /// Under 1 second.
+        Lt1S => "lt_1s",
+        /// 1 to under 2 seconds.
+        Lt2S => "lt_2s",
+        /// 2 to under 5 seconds.
+        Lt5S => "lt_5s",
+        /// 5 to under 10 seconds.
+        Lt10S => "lt_10s",
+        /// 10 to under 20 seconds.
+        Lt20S => "lt_20s",
+        /// 20 seconds or more.
+        Ge20S => "ge_20s",
+    }
+}
+
+impl GatewayNativeJoinTime {
+    /// The bucket for a join that took `took`.
+    pub(crate) fn bucket(took: std::time::Duration) -> Self {
+        match took.as_millis() {
+            0..1_000 => Self::Lt1S,
+            1_000..2_000 => Self::Lt2S,
+            2_000..5_000 => Self::Lt5S,
+            5_000..10_000 => Self::Lt10S,
+            10_000..20_000 => Self::Lt20S,
+            _ => Self::Ge20S,
+        }
+    }
+}
+
+labelled_counters! {
     /// What a gateway's admission of native joins from sources it was not
     /// told about did (`quic::admission`, #5940 A7b): per datagram from such
     /// a source, then per connection attempt, then per admitted connection.
@@ -1093,6 +1153,14 @@ pub struct TransportMetrics {
     connect_native_setup: [AtomicU64; NativeSetupOutcome::COUNT],
     /// Gateway admission of native joins this period, by [`GatewayAdmission`].
     quic_gateway_admission: [AtomicU64; GatewayAdmission::COUNT],
+    /// Native gateway joins this period, by [`GatewayNativeJoin`].
+    gateway_native_join: [AtomicU64; GatewayNativeJoin::COUNT],
+    /// Why native gateway joins gave no connection this period, by
+    /// [`NativeSetupOutcome`].
+    gateway_native_join_failure: [AtomicU64; NativeSetupOutcome::COUNT],
+    /// How long joins to gateways marked native took this period, by
+    /// [`GatewayNativeJoinTime`].
+    gateway_native_join_time: [AtomicU64; GatewayNativeJoinTime::COUNT],
     /// Establish latencies this period in ms (bounded), and how many there
     /// were.
     quic_establish_ms: parking_lot::Mutex<Vec<u64>>,
@@ -1587,6 +1655,9 @@ impl TransportMetrics {
             quic_path_age: Default::default(),
             connect_native_setup: Default::default(),
             quic_gateway_admission: Default::default(),
+            gateway_native_join: Default::default(),
+            gateway_native_join_failure: Default::default(),
+            gateway_native_join_time: Default::default(),
             quic_establish_ms: Default::default(),
             quic_establish_samples: AtomicU64::new(0),
             quic_paths_offered_or_dialing: AtomicU64::new(0),
@@ -2265,6 +2336,49 @@ impl TransportMetrics {
     /// A gateway's admission of a native join did `outcome`.
     pub(crate) fn record_gateway_admission(&self, outcome: GatewayAdmission) {
         self.quic_gateway_admission[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A joiner's native join to the gateway at `remote` did `outcome`
+    /// (`remote` is never exported).
+    pub(crate) fn record_gateway_native_join(
+        &self,
+        outcome: GatewayNativeJoin,
+        remote: SocketAddr,
+    ) {
+        #[cfg(test)]
+        self.note_quic_event(remote, outcome);
+        #[cfg(not(test))]
+        let _ = remote;
+        self.gateway_native_join[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A joiner's native join to the gateway at `remote` gave no connection,
+    /// for `outcome` (`remote` is never exported).
+    pub(crate) fn record_gateway_native_join_failure(
+        &self,
+        outcome: NativeSetupOutcome,
+        remote: SocketAddr,
+    ) {
+        #[cfg(test)]
+        self.note_quic_event(remote, outcome);
+        #[cfg(not(test))]
+        let _ = remote;
+        self.gateway_native_join_failure[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A joiner's join to the gateway at `remote`, marked native, connected
+    /// `took` after its native attempt started (`remote` is never exported).
+    pub(crate) fn record_gateway_native_join_time(
+        &self,
+        took: std::time::Duration,
+        remote: SocketAddr,
+    ) {
+        let bucket = GatewayNativeJoinTime::bucket(took);
+        #[cfg(test)]
+        self.note_quic_event(remote, bucket);
+        #[cfg(not(test))]
+        let _ = remote;
+        self.gateway_native_join_time[bucket as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_quic_close_sent(&self, code: QuicCloseCode, remote: SocketAddr) {
@@ -3168,6 +3282,13 @@ impl TransportMetrics {
             quic_path_age_at_close: std::array::from_fn(|i| get64(&self.quic_path_age[i])),
             connect_native_setup: std::array::from_fn(|i| get64(&self.connect_native_setup[i])),
             quic_gateway_admission: std::array::from_fn(|i| get64(&self.quic_gateway_admission[i])),
+            gateway_native_join: std::array::from_fn(|i| get64(&self.gateway_native_join[i])),
+            gateway_native_join_failure: std::array::from_fn(|i| {
+                get64(&self.gateway_native_join_failure[i])
+            }),
+            gateway_native_join_time: std::array::from_fn(|i| {
+                get64(&self.gateway_native_join_time[i])
+            }),
             quic_establish_ms_p50: establish_p50,
             quic_establish_ms_p90: establish_p90,
             quic_establish_samples: get64(&self.quic_establish_samples),
@@ -3898,6 +4019,18 @@ pub struct TransportSnapshot {
     /// Gateway admission of native joins, by [`GatewayAdmission`]
     /// (`quic_gateway_admission_<label>`).
     pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
+    /// Native gateway joins, by [`GatewayNativeJoin`]
+    /// (`gateway_native_join_<label>`).
+    #[serde(default)]
+    pub gateway_native_join: [u64; GatewayNativeJoin::COUNT],
+    /// Why native gateway joins gave no connection, by [`NativeSetupOutcome`]
+    /// (`gateway_native_join_failure_<label>`).
+    #[serde(default)]
+    pub gateway_native_join_failure: [u64; NativeSetupOutcome::COUNT],
+    /// How long joins to gateways marked native took, by
+    /// [`GatewayNativeJoinTime`] (`gateway_native_join_time_<label>`).
+    #[serde(default)]
+    pub gateway_native_join_time: [u64; GatewayNativeJoinTime::COUNT],
     /// Median and p90 of this period's establish latencies, in ms (the
     /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
     /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
@@ -4302,6 +4435,9 @@ impl TransportSnapshot {
             quic_path_age_at_close,
             connect_native_setup,
             quic_gateway_admission,
+            gateway_native_join,
+            gateway_native_join_failure,
+            gateway_native_join_time,
             quic_establish_ms_p50,
             quic_establish_ms_p90,
             quic_establish_samples,
@@ -4481,6 +4617,9 @@ impl TransportSnapshot {
         self.quic_path_age_at_close = quic_path_age_at_close;
         self.connect_native_setup = connect_native_setup;
         self.quic_gateway_admission = quic_gateway_admission;
+        self.gateway_native_join = gateway_native_join;
+        self.gateway_native_join_failure = gateway_native_join_failure;
+        self.gateway_native_join_time = gateway_native_join_time;
         self.quic_establish_ms_p50 = quic_establish_ms_p50;
         self.quic_establish_ms_p90 = quic_establish_ms_p90;
         self.quic_establish_samples = quic_establish_samples;
@@ -4763,6 +4902,15 @@ struct SnapshotExtras {
     /// Gateway admission of native joins, by [`GatewayAdmission`]
     /// (`quic_gateway_admission_<label>`).
     pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
+    /// Native gateway joins, by [`GatewayNativeJoin`]
+    /// (`gateway_native_join_<label>`).
+    pub gateway_native_join: [u64; GatewayNativeJoin::COUNT],
+    /// Why native gateway joins gave no connection, by [`NativeSetupOutcome`]
+    /// (`gateway_native_join_failure_<label>`).
+    pub gateway_native_join_failure: [u64; NativeSetupOutcome::COUNT],
+    /// How long joins to gateways marked native took, by
+    /// [`GatewayNativeJoinTime`] (`gateway_native_join_time_<label>`).
+    pub gateway_native_join_time: [u64; GatewayNativeJoinTime::COUNT],
     /// Median and p90 of this period's establish latencies, in ms (the
     /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
     /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
@@ -4991,6 +5139,9 @@ impl SnapshotExtras {
             || self.quic_path_age_at_close.iter().any(|n| *n != 0)
             || self.connect_native_setup.iter().any(|n| *n != 0)
             || self.quic_gateway_admission.iter().any(|n| *n != 0)
+            || self.gateway_native_join.iter().any(|n| *n != 0)
+            || self.gateway_native_join_failure.iter().any(|n| *n != 0)
+            || self.gateway_native_join_time.iter().any(|n| *n != 0)
             || self.quic_establish_samples != 0
             || self.quic_paths_offered_or_dialing != 0
             || self.quic_paths_active != 0
@@ -6354,6 +6505,56 @@ mod tests {
     }
 
     #[test]
+    fn gateway_native_join_outcomes_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, remote| m.record_gateway_native_join(GatewayNativeJoin::ALL[slot], remote),
+            |snap| snap.gateway_native_join,
+        );
+        check_quic_family(
+            |m, slot, remote| {
+                m.record_gateway_native_join_failure(NativeSetupOutcome::ALL[slot], remote)
+            },
+            |snap| snap.gateway_native_join_failure,
+        );
+        // One duration per bucket, at its lower edge.
+        let edges = [0, 1_000, 2_000, 5_000, 10_000, 20_000];
+        check_quic_family(
+            |m, slot, remote| {
+                m.record_gateway_native_join_time(
+                    std::time::Duration::from_millis(edges[slot]),
+                    remote,
+                )
+            },
+            |snap| snap.gateway_native_join_time,
+        );
+    }
+
+    #[test]
+    fn gateway_native_join_time_buckets_split_at_their_edges() {
+        use std::time::Duration;
+        for (ms, want) in [
+            (0, GatewayNativeJoinTime::Lt1S),
+            (999, GatewayNativeJoinTime::Lt1S),
+            (1_000, GatewayNativeJoinTime::Lt2S),
+            (1_999, GatewayNativeJoinTime::Lt2S),
+            (2_000, GatewayNativeJoinTime::Lt5S),
+            (4_999, GatewayNativeJoinTime::Lt5S),
+            (5_000, GatewayNativeJoinTime::Lt10S),
+            (9_999, GatewayNativeJoinTime::Lt10S),
+            (10_000, GatewayNativeJoinTime::Lt20S),
+            (19_999, GatewayNativeJoinTime::Lt20S),
+            (20_000, GatewayNativeJoinTime::Ge20S),
+            (3_600_000, GatewayNativeJoinTime::Ge20S),
+        ] {
+            assert_eq!(
+                GatewayNativeJoinTime::bucket(Duration::from_millis(ms)),
+                want,
+                "{ms} ms"
+            );
+        }
+    }
+
+    #[test]
     fn quic_path_age_buckets_count_snapshot_and_reset() {
         let secs = [0, 59, 60, 599, 600, 3599, 3600, 86399, 86400];
         let want = [2, 2, 2, 2, 1];
@@ -7565,6 +7766,9 @@ mod tests {
             "quic_path_age_at_close",
             "connect_native_setup",
             "quic_gateway_admission",
+            "gateway_native_join",
+            "gateway_native_join_failure",
+            "gateway_native_join_time",
             "quic_establish_ms_p50",
             "quic_establish_ms_p90",
             "quic_establish_samples",

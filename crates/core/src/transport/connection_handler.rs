@@ -1215,8 +1215,11 @@ impl<S: Socket> super::OutboundConnector for OutboundConnectionHandler<S> {
         let upgrades = self.upgrade_site.upgrades();
         Box::pin(async move {
             let Some(upgrades) = upgrades else {
-                super::TRANSPORT_METRICS
-                    .record_connect_native_setup(super::NativeSetupOutcome::Unavailable);
+                // A gateway join is counted by its caller, not here.
+                if !dial.join {
+                    super::TRANSPORT_METRICS
+                        .record_connect_native_setup(super::NativeSetupOutcome::Unavailable);
+                }
                 return Err(super::NativeSetupOutcome::Unavailable);
             };
             upgrades

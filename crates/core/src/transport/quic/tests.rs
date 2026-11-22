@@ -6325,3 +6325,123 @@ fn a_gateway_listener_with_admission_carries_a_join_to_the_hook() {
         crate::transport::in_memory_socket::clear_quic_endpoint_clocks(network);
     })
 }
+
+/// A joiner's native join (`setup::join_native`, phase B) reaches a gateway
+/// that admits joins and ends with both Hellos exchanged, the joiner the
+/// client whichever key is higher (the gateway admits a joiner only as the
+/// server), and without a single punch.
+#[test]
+fn a_native_join_reaches_an_admitting_gateway_whatever_the_key_order() {
+    use super::native::punch::PunchBudget;
+    use super::native::setup::{NativePeer, join_native};
+    use super::upgrade::driver::join_gateway;
+    use crate::transport::demux::PUNCH_FIRST_BYTE;
+    use crate::transport::metrics::GatewayAdmission;
+    let joiner_higher = Arc::new(Mutex::new(Vec::new()));
+    for gateway_is_b in [true, false] {
+        let record = joiner_higher.clone();
+        bounded(move || async move {
+            let _seed = GlobalRng::seed_guard(SEED);
+            let net = crate::transport::test_net::subnet();
+            let pair = pair("quic-native-join", net.addr(1), net.addr(2), None).await;
+            let (joiner, gateway, gateway_addr, joiner_key, gateway_key) = if gateway_is_b {
+                (
+                    pair.a.clone(),
+                    pair.b.clone(),
+                    pair.b_addr,
+                    pair.a_keys.public().clone(),
+                    pair.b_keys.public().clone(),
+                )
+            } else {
+                (
+                    pair.b.clone(),
+                    pair.a.clone(),
+                    pair.a_addr,
+                    pair.b_keys.public().clone(),
+                    pair.a_keys.public().clone(),
+                )
+            };
+            assert!(enable_admission(&gateway, pair.time.clone()));
+            let time = pair.time.clone();
+            let key = gateway_key.clone();
+            let (joined, admission) = drive(&pair.time, Duration::from_secs(60), async move {
+                let client = async {
+                    let budget = PunchBudget::default();
+                    let peer = NativePeer {
+                        addr: gateway_addr,
+                        key: &key,
+                        is_gateway: false,
+                    };
+                    let deadline = time.now() + Duration::from_secs(20);
+                    join_native(&joiner, &budget, peer, 0, &time, deadline).await
+                };
+                let server = async {
+                    match gateway.accept_attempt().await {
+                        Some(super::EndpointAttempt::Joiner(joiner)) => {
+                            join_gateway(joiner, &time).await
+                        }
+                        Some(super::EndpointAttempt::Allowed(_)) | None => {
+                            panic!("an admitted joiner")
+                        }
+                    }
+                };
+                tokio::join!(client, server)
+            })
+            .await;
+            let joined = joined.expect("the joiner's native join");
+            drop(joined);
+            assert_eq!(admission, GatewayAdmission::Joined);
+            assert!(
+                pair.sent()
+                    .iter()
+                    .all(|sent| sent.bytes.first() != Some(&PUNCH_FIRST_BYTE)),
+                "a join punches nothing"
+            );
+            record.lock().unwrap().push(joiner_key > gateway_key);
+        });
+    }
+    let joiner_higher = joiner_higher.lock().unwrap();
+    assert_eq!(joiner_higher.len(), 2);
+    assert_ne!(
+        joiner_higher[0], joiner_higher[1],
+        "premise: both key orders"
+    );
+}
+
+/// A native join to a gateway that does not admit joins (admission off, or
+/// a release before it) gets no answer and ends `TimedOut` at the end of
+/// its window, so the joiner's fallback starts then.
+#[test]
+fn a_native_join_to_a_gateway_without_admission_times_out_in_its_window() {
+    use super::native::punch::PunchBudget;
+    use super::native::setup::{NATIVE_WINDOW, NativePeer, NativeSetupError, join_native};
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-native-join-off", net.addr(1), net.addr(2), None).await;
+        let (a, b_addr, key, time) = (
+            pair.a.clone(),
+            pair.b_addr,
+            pair.b_keys.public().clone(),
+            pair.time.clone(),
+        );
+        let (result, elapsed) = drive(&pair.time, Duration::from_secs(60), async move {
+            let budget = PunchBudget::default();
+            let peer = NativePeer {
+                addr: b_addr,
+                key: &key,
+                is_gateway: false,
+            };
+            let start = time.now();
+            let result =
+                join_native(&a, &budget, peer, 0, &time, start + Duration::from_secs(20)).await;
+            (result, time.now() - start)
+        })
+        .await;
+        assert!(
+            matches!(result, Err(NativeSetupError::TimedOut)),
+            "{result:?}"
+        );
+        assert_eq!(elapsed, NATIVE_WINDOW);
+    })
+}

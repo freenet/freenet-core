@@ -541,6 +541,13 @@ pub struct NodeConfig {
     /// `#[serde(skip)]`.
     #[serde(skip)]
     pub(crate) native_connect_override: Option<u8>,
+    /// Simulation-only: native gateway joins on, at this percent, in place of
+    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, both off in
+    /// production until phase B (`SimNetwork::with_native_gateway_join`).
+    /// Read into the node's `NativeConnectState`. `None` in production.
+    /// `#[serde(skip)]`.
+    #[serde(skip)]
+    pub(crate) native_gateway_join_override: Option<u8>,
     /// Simulation-only: decode the QUIC-native wire variants as a release
     /// below their floor does, failing the message and closing the
     /// connection, and never emit them
@@ -702,6 +709,7 @@ impl NodeConfig {
                 address,
                 public_key_path,
                 location,
+                native,
             } = gw;
 
             // Wait for the public key file to be in X25519 hex format.
@@ -823,7 +831,7 @@ impl NodeConfig {
             let location = location
                 .map(Location::new)
                 .unwrap_or_else(|| Location::from_address(&address));
-            gateways.push(InitPeerNode::new(peer_key_location, location));
+            gateways.push(InitPeerNode::new(peer_key_location, location).with_native(*native));
         }
         // A gateway may run with no bootstrap peers (isolated gateways are a
         // valid configuration), so only a peer that needs one fails here.
@@ -910,6 +918,7 @@ impl NodeConfig {
             advertised_version_override: None,
             quic_native_floor_override: None,
             native_connect_override: None,
+            native_gateway_join_override: None,
             native_wire_pre_floor: false,
             quic_idle_timeout_override: None,
             advertise_seeded_hosts: false,
@@ -1171,6 +1180,9 @@ impl NodeConfig {
 pub struct InitPeerNode {
     peer_key_location: PeerKeyLocation,
     location: Location,
+    /// The gateway index marks this gateway native (`GatewayConfig::native`).
+    #[serde(default)]
+    native: bool,
 }
 
 impl InitPeerNode {
@@ -1178,7 +1190,21 @@ impl InitPeerNode {
         Self {
             peer_key_location,
             location,
+            native: false,
         }
+    }
+
+    /// This gateway, marked native or not (`GatewayConfig::native`).
+    pub fn with_native(mut self, native: bool) -> Self {
+        self.native = native;
+        self
+    }
+
+    /// The gateway's address, if the index marks it native.
+    pub(crate) fn native_addr(&self) -> Option<SocketAddr> {
+        self.native
+            .then(|| self.peer_key_location.socket_addr())
+            .flatten()
     }
 }
 
@@ -7661,12 +7687,14 @@ mod tests {
             address: Address::Hostname("retired-gateway.invalid:31337".to_string()),
             public_key_path: key_path.clone(),
             location: None,
+            native: false,
         };
         let resolvable_addr: SocketAddr = "127.0.0.1:31337".parse().unwrap();
         let resolvable = GatewayConfig {
             address: Address::HostAddress(resolvable_addr),
             public_key_path: key_path,
             location: None,
+            native: false,
         };
         let build = |gateways: Vec<GatewayConfig>, id: &str, is_gateway: bool| {
             let id = id.to_string();
@@ -7745,6 +7773,7 @@ mod tests {
             address: Address::HostAddress(addr.parse().unwrap()),
             public_key_path: key.clone(),
             location: None,
+            native: false,
         };
         let good_addr: SocketAddr = "127.0.0.1:31337".parse().unwrap();
         let bad = vec![
@@ -7837,6 +7866,7 @@ mod tests {
                     address: Address::HostAddress("127.0.0.2:31337".parse().unwrap()),
                     public_key_path: pem_key,
                     location: None,
+                    native: false,
                 }];
                 config.is_gateway = is_gateway;
                 NodeConfig::new(config).await
@@ -16896,6 +16926,7 @@ mod tests {
                 address: Address::HostAddress("5.9.111.215:31337".parse().unwrap()),
                 public_key_path: key_path,
                 location: None,
+                native: false,
             }];
             config.network_api.address = listener;
 
