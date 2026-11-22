@@ -2525,6 +2525,28 @@ async fn a_failed_secret_read_fails_the_call_and_blocks_writes_not_reads_as_abse
         "has_secret on an unreadable secret must fail the call, not return false"
     );
 
+    // Poisoning is per invocation: once the blob is readable again the very
+    // next call works normally, and sees the real data, not a stale failure.
+    std::fs::remove_dir(&blob)?;
+    send(
+        &mut runtime,
+        &InboundAppMessage::StoreSecret {
+            key: key.clone(),
+            value: b"real data".to_vec(),
+        },
+    )?;
+    let ok = send(&mut runtime, &InboundAppMessage::HasSecret(key.clone()))?;
+    match &ok[0] {
+        OutboundDelegateMsg::ApplicationMessage(m) => assert!(
+            matches!(
+                bincode::deserialize::<OutboundAppMessage>(&m.payload)?,
+                OutboundAppMessage::SecretExists(true)
+            ),
+            "the call after a transient failure must work normally"
+        ),
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    }
+
     Ok(())
 }
 
