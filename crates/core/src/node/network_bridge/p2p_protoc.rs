@@ -1237,11 +1237,12 @@ pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 162);
 /// A peer below it has no such index and closes the connection on one, so the
 /// heartbeat sends a digest request only to a peer whose version is known and at
 /// least this, and falls back to the legacy `HostingStateRequest` otherwise.
-/// Set to the release after the one current when this was written (0.2.161).
+/// Set to 0.2.163: 0.2.162 was cut without these variants, so it is the last
+/// release below the floor.
 /// Bias HIGH: too low closes connections to the release below it, too high only
 /// delays the saving. Guarded by
 /// `neighbor_hosting_digest_floor_tracks_the_shipping_release`.
-pub(crate) const NEIGHBOR_HOSTING_DIGEST_MIN_VERSION: (u8, u8, u16) = (0, 2, 162);
+pub(crate) const NEIGHBOR_HOSTING_DIGEST_MIN_VERSION: (u8, u8, u16) = (0, 2, 163);
 
 /// Has the digest-first NeighborHosting exchange shipped, and in which release?
 ///

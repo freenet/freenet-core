@@ -4510,9 +4510,9 @@ mod tests {
         assert_eq!(s.neighbor_hosting_digest_declined_unknown_version, 1);
         assert_eq!(s.neighbor_hosting_digest_declined_pre_floor, 0);
 
-        // 0.2.161 is the release this was written against and has no variants.
+        // 0.2.162 was cut without the variants.
         let pre_floor = make_addr(9302);
-        cm.record_remote_version(pre_floor, Some((0, 2, 161)));
+        cm.record_remote_version(pre_floor, Some((0, 2, 162)));
         assert!(!cm.supports_neighbor_hosting_digest(pre_floor));
         assert!(!cm.supports_neighbor_hosting_digest(pre_floor));
         let s = cm.version_gate_refusal_stats();
@@ -4631,7 +4631,7 @@ mod tests {
     #[test]
     fn neighbor_hosting_digest_floor_stays_above_every_release_without_the_variants() {
         /// Last release that does NOT carry the digest variants.
-        const LAST_RELEASE_WITHOUT_VARIANTS: (u8, u8, u16) = (0, 2, 161);
+        const LAST_RELEASE_WITHOUT_VARIANTS: (u8, u8, u16) = (0, 2, 162);
         assert!(
             crate::node::NEIGHBOR_HOSTING_DIGEST_MIN_VERSION > LAST_RELEASE_WITHOUT_VARIANTS,
             "NEIGHBOR_HOSTING_DIGEST_MIN_VERSION ({:?}) dropped to or below \

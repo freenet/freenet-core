@@ -455,6 +455,25 @@ Current wire-gated floors:
   wrongly-suppressed peer waits for the ~5-minute interest heartbeat. Bias
   high, but understand that neither direction is free.
 
+- `NEIGHBOR_HOSTING_DIGEST_MIN_VERSION` in
+  `crates/core/src/node/network_bridge/p2p_protoc.rs` (digest-first
+  NeighborHosting anti-entropy, #5157: the appended
+  `NeighborHostingMessage::HostingStateDigestRequest` and
+  `HostingStateUnchanged` variants at indices 3 and 4).
+
+  Set to **`(0, 2, 163)`**, the release intended to first ship the variants
+  (0.2.162 was cut without them), guarded by
+  `NEIGHBOR_HOSTING_DIGEST_SHIPPED_IN`, currently `None`, checked by
+  `connection_manager.rs::neighbor_hosting_digest_floor_tracks_the_shipping_release`.
+  When the 0.2.163 bump fails that test, set the marker to the literal
+  `Some((0, 2, 163))` if the release carries the variants, otherwise raise the
+  floor (and move `LAST_RELEASE_WITHOUT_VARIANTS` in
+  `neighbor_hosting_digest_floor_stays_above_every_release_without_the_variants`).
+  Same failure mode as the other application-message floors: a peer at or above
+  the floor without the variants closes the connection on one, so bias high.
+  The heartbeat falls back to the legacy `HostingStateRequest` for any peer below
+  the floor or of unknown version.
+
 - `QUIC_UPGRADE_MIN_VERSION` in
   `crates/core/src/transport/symmetric_message.rs` (the QUIC upgrade control
   message `SymmetricMessagePayload::Upgrade`, #5940 step e1).
