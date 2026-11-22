@@ -578,6 +578,65 @@ pub(crate) enum NativeConnectSide {
     Acceptor,
 }
 
+/// The comparison arm of a CONNECT's transport decision (QUIC-NATIVE-CONNECT
+/// 3.2). Only pairs where both ends offered are in an arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConnectArm {
+    /// Both offered, the offer's `min` was above 0 and the pair's bucket was
+    /// below it: the pair dials native.
+    Treated,
+    /// Both offered and the bucket was at or above `min` (every pair when
+    /// `min` is 0): the pair dials UDP BECAUSE of the slice.
+    Control,
+}
+
+labelled_counters! {
+    /// Outcomes of the CONNECT dials of each [`ConnectArm`], by the side this
+    /// node had, counted once per dial that ended: `attempts` for every one,
+    /// `established` for those that gave a connection. Exported per period as
+    /// `connect_arm_<label>`. A control UDP dial counts only when it was the
+    /// decided transport; the UDP dial that follows a failed native setup (the
+    /// rescue) and one run beside a native dial are in no arm.
+    ///
+    /// Joiner control includes pairs where the acceptor already held a
+    /// transport to the joiner and reused it without dialling (the joiner
+    /// cannot see that), and is a subset of control by the bucket rule; use the
+    /// acceptor's control counters for rates. The acceptor's attempt is counted
+    /// when its dial starts, the joiner's when its dial ends.
+    pub(crate) enum ConnectArmCounter {
+        TreatedAttemptsJoiner => "treated_attempts_joiner",
+        TreatedEstablishedJoiner => "treated_established_joiner",
+        TreatedAttemptsAcceptor => "treated_attempts_acceptor",
+        TreatedEstablishedAcceptor => "treated_established_acceptor",
+        ControlAttemptsJoiner => "control_attempts_joiner",
+        ControlEstablishedJoiner => "control_established_joiner",
+        ControlAttemptsAcceptor => "control_attempts_acceptor",
+        ControlEstablishedAcceptor => "control_established_acceptor",
+    }
+}
+
+impl ConnectArmCounter {
+    /// The counter for a dial of `arm` as `side`: its attempts counter, or
+    /// its established counter.
+    fn of(arm: ConnectArm, side: NativeConnectSide, established: bool) -> Self {
+        use ConnectArmCounter as C;
+        match (arm, side, established) {
+            (ConnectArm::Treated, NativeConnectSide::Joiner, false) => C::TreatedAttemptsJoiner,
+            (ConnectArm::Treated, NativeConnectSide::Joiner, true) => C::TreatedEstablishedJoiner,
+            (ConnectArm::Treated, NativeConnectSide::Acceptor, false) => C::TreatedAttemptsAcceptor,
+            (ConnectArm::Treated, NativeConnectSide::Acceptor, true) => {
+                C::TreatedEstablishedAcceptor
+            }
+            (ConnectArm::Control, NativeConnectSide::Joiner, false) => C::ControlAttemptsJoiner,
+            (ConnectArm::Control, NativeConnectSide::Joiner, true) => C::ControlEstablishedJoiner,
+            (ConnectArm::Control, NativeConnectSide::Acceptor, false) => C::ControlAttemptsAcceptor,
+            (ConnectArm::Control, NativeConnectSide::Acceptor, true) => {
+                C::ControlEstablishedAcceptor
+            }
+        }
+    }
+}
+
 labelled_counters! {
     /// How a QUIC-native connection setup ended, counted where the setup
     /// decides it (`QuicUpgrades::setup_native`), one per setup. Exported per
@@ -1091,6 +1150,16 @@ pub struct TransportMetrics {
     quic_path_age: [AtomicU64; QuicPathAge::COUNT],
     /// QUIC-native setups this period, by [`NativeSetupOutcome`].
     connect_native_setup: [AtomicU64; NativeSetupOutcome::COUNT],
+    /// The same, for the setups of a CONNECT's joiner and of its acceptor
+    /// (the dial's origin). Every setup is in the total (`setup_native`, or
+    /// `Unavailable` in the connection handler), but these are counted when the
+    /// dial's result reaches `connect_outbound`, so they can be below it: a
+    /// setup with another origin (a gateway join) is in the total only, and so
+    /// is one whose dial future was dropped before its result.
+    connect_native_setup_joiner: [AtomicU64; NativeSetupOutcome::COUNT],
+    connect_native_setup_acceptor: [AtomicU64; NativeSetupOutcome::COUNT],
+    /// CONNECT dials by arm and side, by [`ConnectArmCounter`].
+    connect_arm: [AtomicU64; ConnectArmCounter::COUNT],
     /// Gateway admission of native joins this period, by [`GatewayAdmission`].
     quic_gateway_admission: [AtomicU64; GatewayAdmission::COUNT],
     /// Establish latencies this period in ms (bounded), and how many there
@@ -1445,6 +1514,17 @@ thread_local! {
     pub(crate) static NATIVE_OFFERS_ON_THIS_THREAD: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
 
+    /// Test-only: native setups by side (joiner, acceptor) and
+    /// [`NativeSetupOutcome`] on this thread, for the same reason.
+    pub(crate) static CONNECT_SETUP_BY_SIDE_ON_THIS_THREAD:
+        std::cell::Cell<[[u64; NativeSetupOutcome::COUNT]; 2]> =
+        const { std::cell::Cell::new([[0; NativeSetupOutcome::COUNT]; 2]) };
+
+    /// Test-only: CONNECT dials counted per [`ConnectArmCounter`] on this
+    /// thread, for the same reason.
+    pub(crate) static CONNECT_ARM_ON_THIS_THREAD: std::cell::Cell<[u64; ConnectArmCounter::COUNT]> =
+        const { std::cell::Cell::new([0; ConnectArmCounter::COUNT]) };
+
     /// Test-only: native setups rescued by UDP on this thread, as joiner and
     /// as acceptor, for the same reason.
     pub(crate) static NATIVE_RESCUES_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
@@ -1586,6 +1666,9 @@ impl TransportMetrics {
             quic_carried_fallback: Default::default(),
             quic_path_age: Default::default(),
             connect_native_setup: Default::default(),
+            connect_native_setup_joiner: Default::default(),
+            connect_native_setup_acceptor: Default::default(),
+            connect_arm: Default::default(),
             quic_gateway_admission: Default::default(),
             quic_establish_ms: Default::default(),
             quic_establish_samples: AtomicU64::new(0),
@@ -2260,6 +2343,64 @@ impl TransportMetrics {
     /// A QUIC-native setup ended with `outcome`.
     pub(crate) fn record_connect_native_setup(&self, outcome: NativeSetupOutcome) {
         self.connect_native_setup[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A native setup of a CONNECT ended with `outcome`, by the side this node
+    /// had. Counted where the dial's result is known, with the side the
+    /// dial's origin names; the total is [`Self::record_connect_native_setup`].
+    pub(crate) fn record_connect_native_setup_by_side(
+        &self,
+        side: NativeConnectSide,
+        outcome: NativeSetupOutcome,
+    ) {
+        let by_outcome = match side {
+            NativeConnectSide::Joiner => &self.connect_native_setup_joiner,
+            NativeConnectSide::Acceptor => &self.connect_native_setup_acceptor,
+        };
+        by_outcome[outcome as usize].fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        CONNECT_SETUP_BY_SIDE_ON_THIS_THREAD.with(|count| {
+            let mut counts = count.get();
+            counts[side as usize][outcome as usize] += 1;
+            count.set(counts);
+        });
+    }
+
+    /// A CONNECT dial of `arm` ended as `side`: one attempt, and one
+    /// established when it gave a connection. Called by the code that holds
+    /// the arm's decision, never by one that infers the arm.
+    pub(crate) fn record_connect_arm(
+        &self,
+        arm: ConnectArm,
+        side: NativeConnectSide,
+        established: bool,
+    ) {
+        self.record_connect_arm_started(arm, side);
+        if established {
+            self.record_connect_arm_established(arm, side);
+        }
+    }
+
+    /// A CONNECT dial of `arm` as `side` started: one attempt. For a dial whose
+    /// start is its decision and whose result may never be seen; the
+    /// established count follows via [`Self::record_connect_arm_established`].
+    pub(crate) fn record_connect_arm_started(&self, arm: ConnectArm, side: NativeConnectSide) {
+        self.count_connect_arm(ConnectArmCounter::of(arm, side, false));
+    }
+
+    /// A CONNECT dial of `arm` as `side` gave a connection.
+    pub(crate) fn record_connect_arm_established(&self, arm: ConnectArm, side: NativeConnectSide) {
+        self.count_connect_arm(ConnectArmCounter::of(arm, side, true));
+    }
+
+    fn count_connect_arm(&self, counter: ConnectArmCounter) {
+        self.connect_arm[counter as usize].fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        CONNECT_ARM_ON_THIS_THREAD.with(|count| {
+            let mut counts = count.get();
+            counts[counter as usize] += 1;
+            count.set(counts);
+        });
     }
 
     /// A gateway's admission of a native join did `outcome`.
@@ -3167,6 +3308,13 @@ impl TransportMetrics {
             quic_carried_fallback: std::array::from_fn(|i| get64(&self.quic_carried_fallback[i])),
             quic_path_age_at_close: std::array::from_fn(|i| get64(&self.quic_path_age[i])),
             connect_native_setup: std::array::from_fn(|i| get64(&self.connect_native_setup[i])),
+            connect_native_setup_joiner: std::array::from_fn(|i| {
+                get64(&self.connect_native_setup_joiner[i])
+            }),
+            connect_native_setup_acceptor: std::array::from_fn(|i| {
+                get64(&self.connect_native_setup_acceptor[i])
+            }),
+            connect_arm: std::array::from_fn(|i| get64(&self.connect_arm[i])),
             quic_gateway_admission: std::array::from_fn(|i| get64(&self.quic_gateway_admission[i])),
             quic_establish_ms_p50: establish_p50,
             quic_establish_ms_p90: establish_p90,
@@ -3895,6 +4043,13 @@ pub struct TransportSnapshot {
     /// QUIC-native setups, by [`NativeSetupOutcome`]
     /// (`connect_native_setup_<label>`).
     pub connect_native_setup: [u64; NativeSetupOutcome::COUNT],
+    /// The same for a CONNECT's joiner and acceptor
+    /// (`connect_native_setup_{joiner,acceptor}_<label>`).
+    pub connect_native_setup_joiner: [u64; NativeSetupOutcome::COUNT],
+    pub connect_native_setup_acceptor: [u64; NativeSetupOutcome::COUNT],
+    /// CONNECT dials by arm and side, by [`ConnectArmCounter`]
+    /// (`connect_arm_<label>`).
+    pub connect_arm: [u64; ConnectArmCounter::COUNT],
     /// Gateway admission of native joins, by [`GatewayAdmission`]
     /// (`quic_gateway_admission_<label>`).
     pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
@@ -4301,6 +4456,9 @@ impl TransportSnapshot {
             quic_carried_fallback,
             quic_path_age_at_close,
             connect_native_setup,
+            connect_native_setup_joiner,
+            connect_native_setup_acceptor,
+            connect_arm,
             quic_gateway_admission,
             quic_establish_ms_p50,
             quic_establish_ms_p90,
@@ -4480,6 +4638,9 @@ impl TransportSnapshot {
         self.quic_carried_fallback = quic_carried_fallback;
         self.quic_path_age_at_close = quic_path_age_at_close;
         self.connect_native_setup = connect_native_setup;
+        self.connect_native_setup_joiner = connect_native_setup_joiner;
+        self.connect_native_setup_acceptor = connect_native_setup_acceptor;
+        self.connect_arm = connect_arm;
         self.quic_gateway_admission = quic_gateway_admission;
         self.quic_establish_ms_p50 = quic_establish_ms_p50;
         self.quic_establish_ms_p90 = quic_establish_ms_p90;
@@ -4760,6 +4921,13 @@ struct SnapshotExtras {
     /// QUIC-native setups, by [`NativeSetupOutcome`]
     /// (`connect_native_setup_<label>`).
     pub connect_native_setup: [u64; NativeSetupOutcome::COUNT],
+    /// The same for a CONNECT's joiner and acceptor
+    /// (`connect_native_setup_{joiner,acceptor}_<label>`).
+    pub connect_native_setup_joiner: [u64; NativeSetupOutcome::COUNT],
+    pub connect_native_setup_acceptor: [u64; NativeSetupOutcome::COUNT],
+    /// CONNECT dials by arm and side, by [`ConnectArmCounter`]
+    /// (`connect_arm_<label>`).
+    pub connect_arm: [u64; ConnectArmCounter::COUNT],
     /// Gateway admission of native joins, by [`GatewayAdmission`]
     /// (`quic_gateway_admission_<label>`).
     pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
@@ -4990,6 +5158,9 @@ impl SnapshotExtras {
                 .any(|n| *n != 0)
             || self.quic_path_age_at_close.iter().any(|n| *n != 0)
             || self.connect_native_setup.iter().any(|n| *n != 0)
+            || self.connect_native_setup_joiner.iter().any(|n| *n != 0)
+            || self.connect_native_setup_acceptor.iter().any(|n| *n != 0)
+            || self.connect_arm.iter().any(|n| *n != 0)
             || self.quic_gateway_admission.iter().any(|n| *n != 0)
             || self.quic_establish_samples != 0
             || self.quic_paths_offered_or_dialing != 0
@@ -6346,6 +6517,74 @@ mod tests {
     }
 
     #[test]
+    fn connect_native_setup_by_side_counts_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, _| {
+                m.record_connect_native_setup_by_side(
+                    NativeConnectSide::Joiner,
+                    NativeSetupOutcome::ALL[slot],
+                )
+            },
+            |snap| snap.connect_native_setup_joiner,
+        );
+        check_quic_family(
+            |m, slot, _| {
+                m.record_connect_native_setup_by_side(
+                    NativeConnectSide::Acceptor,
+                    NativeSetupOutcome::ALL[slot],
+                )
+            },
+            |snap| snap.connect_native_setup_acceptor,
+        );
+    }
+
+    /// Each (arm, side) dial moves its own attempts counter, and its
+    /// established counter only when it gave a connection; nothing else moves.
+    #[test]
+    fn connect_arm_dials_count_attempts_and_established_apart() {
+        use ConnectArmCounter as C;
+        let cases = [
+            (
+                ConnectArm::Treated,
+                NativeConnectSide::Joiner,
+                C::TreatedAttemptsJoiner,
+                C::TreatedEstablishedJoiner,
+            ),
+            (
+                ConnectArm::Treated,
+                NativeConnectSide::Acceptor,
+                C::TreatedAttemptsAcceptor,
+                C::TreatedEstablishedAcceptor,
+            ),
+            (
+                ConnectArm::Control,
+                NativeConnectSide::Joiner,
+                C::ControlAttemptsJoiner,
+                C::ControlEstablishedJoiner,
+            ),
+            (
+                ConnectArm::Control,
+                NativeConnectSide::Acceptor,
+                C::ControlAttemptsAcceptor,
+                C::ControlEstablishedAcceptor,
+            ),
+        ];
+        for (arm, side, attempts, established) in cases {
+            let metrics = TransportMetrics::new();
+            metrics.record_connect_arm(arm, side, false);
+            let snap = metrics.take_snapshot().expect("a count is activity");
+            let mut want = [0u64; ConnectArmCounter::COUNT];
+            want[attempts as usize] = 1;
+            assert_eq!(snap.connect_arm, want, "{arm:?} {side:?} failed dial");
+            metrics.record_connect_arm(arm, side, true);
+            let snap = metrics.take_snapshot().expect("a count is activity");
+            want[established as usize] = 1;
+            assert_eq!(snap.connect_arm, want, "{arm:?} {side:?} connected dial");
+            assert!(metrics.take_snapshot().is_none(), "reset");
+        }
+    }
+
+    #[test]
     fn gateway_admission_outcomes_count_snapshot_and_reset() {
         check_quic_family(
             |m, slot, _| m.record_gateway_admission(GatewayAdmission::ALL[slot]),
@@ -7564,6 +7803,9 @@ mod tests {
             "quic_carried_fallback",
             "quic_path_age_at_close",
             "connect_native_setup",
+            "connect_native_setup_joiner",
+            "connect_native_setup_acceptor",
+            "connect_arm",
             "quic_gateway_admission",
             "quic_establish_ms_p50",
             "quic_establish_ms_p90",
