@@ -29,3 +29,5 @@ mod egress_cap;
 /// `ConnectionStateManager::cleanup_expired` drops `Established` entries whose
 /// connection has ended.
 mod established_cleanup;
+
+mod handshake_bounds;

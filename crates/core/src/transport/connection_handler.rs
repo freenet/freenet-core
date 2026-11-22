@@ -205,6 +205,45 @@ const ASYM_DECRYPTION_RATE_LIMIT: Duration = Duration::from_secs(1);
 /// This prevents unbounded growth of the last_asym_attempt HashMap.
 const RATE_LIMIT_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Bounds on state a gateway creates from unauthenticated datagrams.
+///
+/// Every limit below is keyed by [`ip_group`], not by `IP:port`, because the
+/// source port costs a sender nothing to change: IPv4 senders share one
+/// budget per address, IPv6 senders one per /64 (the smallest prefix a
+/// single subscriber or host is normally handed, so one machine cannot
+/// multiply its budget by picking different interface identifiers).
+///
+/// The numbers are sized for legitimate use. Several peers behind one NAT
+/// each start a handshake, and a gateway restart brings every peer back
+/// within seconds, but each of those comes from its own IP, so the per-group
+/// figures only need to cover a household or a small office. The totals are
+/// sized by memory: a pending handshake holds a 100-packet channel and a
+/// task, roughly 15-60 KB, for up to the 5 s ack wait.
+///
+/// Intro (asymmetric decrypt) attempts one group may make per window. A
+/// peer sends a handful of intros per connection attempt and retries with
+/// back-off, so 32 per 10 s admits a NAT with several peers retrying at
+/// once, while capping one host at about 3 X25519 operations per second.
+const GW_INTRO_BUDGET_PER_GROUP: u32 = 32;
+/// Window over which [`GW_INTRO_BUDGET_PER_GROUP`] is counted.
+const GW_INTRO_BUDGET_WINDOW: Duration = Duration::from_secs(10);
+/// Most groups whose intro budget is tracked at once (~50 B each, <1 MB).
+/// At the limit, expired entries are swept and then an arbitrary entry is
+/// dropped, never a new group refused: refusing would let a sender cycling
+/// source addresses lock out real joiners.
+const GW_MAX_TRACKED_INTRO_GROUPS: usize = 16_384;
+/// Gateway handshakes in progress at once, across all senders (at most
+/// ~60 MB at the per-handshake size above).
+const GW_MAX_PENDING_HANDSHAKES: usize = 1024;
+/// Gateway handshakes in progress at once for one [`ip_group`]. Large enough
+/// for every peer behind one NAT to join together, small enough that one
+/// host holds at most 1/64 of the total.
+const GW_MAX_PENDING_HANDSHAKES_PER_GROUP: usize = 16;
+/// Most IPs held in `expected_non_gateway`. Nothing in the node reads the
+/// set; it is advisory bookkeeping, so on reaching the limit it is emptied
+/// rather than refusing entries.
+const MAX_EXPECTED_NON_GATEWAY: usize = 8192;
+
 /// Duration to keep connections in RecentlyClosed state.
 /// Allows in-flight packets to drain without triggering asymmetric decryption.
 const RECENTLY_CLOSED_DURATION: Duration = Duration::from_secs(2);
@@ -1120,7 +1159,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         origin: NatAttemptOrigin,
     ) -> Pin<Box<dyn Future<Output = Result<PeerConnection<S>, TransportError>> + Send>> {
         let upgrade_site = self.upgrade_site.clone();
-        if self.expected_non_gateway.insert(remote_addr.ip()) {
+        if record_expected_ip(&self.expected_non_gateway, remote_addr.ip()) {
             tracing::debug!(
                 peer_addr = %remote_addr,
                 direction = "outbound",
@@ -1158,7 +1197,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
     }
 
     pub fn expect_incoming(&self, remote_addr: SocketAddr) {
-        if self.expected_non_gateway.insert(remote_addr.ip()) {
+        if record_expected_ip(&self.expected_non_gateway, remote_addr.ip()) {
             tracing::debug!(
                 peer_addr = %remote_addr,
                 direction = "inbound",
@@ -1236,7 +1275,7 @@ impl ExpectedInboundTracker {
 
     /// Register an expected inbound connection from the given address.
     pub fn expect_incoming(&self, remote_addr: SocketAddr) {
-        if self.0.insert(remote_addr.ip()) {
+        if record_expected_ip(&self.0, remote_addr.ip()) {
             tracing::debug!(
                 peer_addr = %remote_addr,
                 direction = "inbound",
@@ -1389,7 +1428,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
                 > + Send,
         >,
     > {
-        if self.expected_non_gateway.insert(remote_addr.ip()) {
+        if record_expected_ip(&self.expected_non_gateway, remote_addr.ip()) {
             tracing::debug!(
                 peer_addr = %remote_addr,
                 direction = "outbound",
@@ -1427,7 +1466,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
     }
 
     pub fn expect_incoming(&self, remote_addr: SocketAddr) {
-        if self.expected_non_gateway.insert(remote_addr.ip()) {
+        if record_expected_ip(&self.expected_non_gateway, remote_addr.ip()) {
             tracing::debug!(
                 peer_addr = %remote_addr,
                 direction = "inbound",
@@ -1577,7 +1616,90 @@ enum TrySendNatTraversalOutcome {
 struct ConnectionStateManager<S, T: TimeSource> {
     states: BTreeMap<SocketAddr, ConnectionState<S, T>>,
     last_asym_attempt: HashMap<SocketAddr, u64>,
+    /// Gateway intro budget per [`ip_group`]. Bounded by
+    /// [`GW_MAX_TRACKED_INTRO_GROUPS`].
+    intro_budgets: HashMap<IpAddr, IntroBudget>,
+    /// When `intro_budgets` was last swept for expired entries.
+    intro_last_sweep_nanos: u64,
     time_source: T,
+}
+
+/// Intros counted for one [`ip_group`] in the window starting at
+/// `window_start_nanos`.
+struct IntroBudget {
+    window_start_nanos: u64,
+    count: u32,
+}
+
+/// Why the gateway declined to start another handshake.
+#[derive(Debug, PartialEq, Eq)]
+enum GatewayAdmission {
+    Admit,
+    /// [`GW_MAX_PENDING_HANDSHAKES`] reached.
+    GlobalFull,
+    /// [`GW_MAX_PENDING_HANDSHAKES_PER_GROUP`] reached for the sender's group.
+    GroupFull,
+}
+
+/// The unit a sender is limited as: the IP, or the /64 for IPv6, with
+/// IPv4-mapped IPv6 addresses treated as the IPv4 address they carry.
+fn ip_group(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => {
+            let masked = u128::from(v6) & !(u64::MAX as u128);
+            IpAddr::V6(masked.into())
+        }
+    }
+}
+
+/// Inclusive `SocketAddr` bounds covering every address and port in `group`
+/// (as returned by [`ip_group`]). `SocketAddr` orders by IP first, so a
+/// `BTreeMap` range over these visits only that group's entries.
+fn group_bounds(group: IpAddr) -> (SocketAddr, SocketAddr) {
+    match group {
+        IpAddr::V4(v4) => (SocketAddr::from((v4, 0)), SocketAddr::from((v4, u16::MAX))),
+        // Bounds cover every flowinfo / scope id, whether or not the
+        // ordering compares them. For IPv6 `group` is a /64, so the high
+        // bound sets the low 64 bits.
+        IpAddr::V6(v6) => {
+            let high = std::net::Ipv6Addr::from(u128::from(v6) | u64::MAX as u128);
+            (
+                SocketAddr::V6(std::net::SocketAddrV6::new(v6, 0, 0, 0)),
+                SocketAddr::V6(std::net::SocketAddrV6::new(
+                    high,
+                    u16::MAX,
+                    u32::MAX,
+                    u32::MAX,
+                )),
+            )
+        }
+    }
+}
+
+/// Inclusive `SocketAddr` bounds covering every port of exactly `ip`.
+fn ip_bounds(ip: IpAddr) -> (SocketAddr, SocketAddr) {
+    match ip {
+        IpAddr::V4(v4) => (SocketAddr::from((v4, 0)), SocketAddr::from((v4, u16::MAX))),
+        IpAddr::V6(v6) => (
+            SocketAddr::V6(std::net::SocketAddrV6::new(v6, 0, 0, 0)),
+            SocketAddr::V6(std::net::SocketAddrV6::new(
+                v6,
+                u16::MAX,
+                u32::MAX,
+                u32::MAX,
+            )),
+        ),
+    }
+}
+
+/// Remember `ip` in the expected-IP set, emptying the set first when it is
+/// full so it cannot grow without bound.
+fn record_expected_ip(set: &DashSet<IpAddr>, ip: IpAddr) -> bool {
+    if set.len() >= MAX_EXPECTED_NON_GATEWAY && !set.contains(&ip) {
+        set.clear();
+    }
+    set.insert(ip)
 }
 
 impl<S, T: TimeSource> ConnectionStateManager<S, T> {
@@ -1585,6 +1707,8 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         Self {
             states: BTreeMap::new(),
             last_asym_attempt: HashMap::new(),
+            intro_budgets: HashMap::new(),
+            intro_last_sweep_nanos: 0,
             time_source,
         }
     }
@@ -1622,23 +1746,80 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
     /// A range scan over `ip`'s entries only (`SocketAddr` orders by IP
     /// first, then port), so cheap enough for the listener's drop path.
     fn has_nat_traversal_to_ip(&self, ip: IpAddr) -> bool {
-        let (low, high) = match ip {
-            IpAddr::V4(v4) => (SocketAddr::from((v4, 0)), SocketAddr::from((v4, u16::MAX))),
-            // Bounds cover every flowinfo / scope id, whether or not the
-            // ordering compares them.
-            IpAddr::V6(v6) => (
-                SocketAddr::V6(std::net::SocketAddrV6::new(v6, 0, 0, 0)),
-                SocketAddr::V6(std::net::SocketAddrV6::new(
-                    v6,
-                    u16::MAX,
-                    u32::MAX,
-                    u32::MAX,
-                )),
-            ),
-        };
+        let (low, high) = ip_bounds(ip);
         self.states
             .range(low..=high)
             .any(|(_, state)| matches!(state, ConnectionState::NatTraversal { .. }))
+    }
+
+    /// Gateway handshakes in progress for senders in `group`. A range scan
+    /// over the group's entries only, so its cost does not grow with the
+    /// number of other peers.
+    fn gateway_pending_in_group(&self, group: IpAddr) -> usize {
+        let (low, high) = group_bounds(group);
+        self.states
+            .range(low..=high)
+            .filter(|(_, state)| matches!(state, ConnectionState::GatewayHandshake { .. }))
+            .count()
+    }
+
+    /// Whether a new gateway handshake from `addr` fits the pending bounds.
+    /// `global_pending` is the number of gateway handshake tasks running.
+    fn gateway_admission(&self, addr: SocketAddr, global_pending: usize) -> GatewayAdmission {
+        if global_pending >= GW_MAX_PENDING_HANDSHAKES {
+            GatewayAdmission::GlobalFull
+        } else if self.gateway_pending_in_group(ip_group(addr.ip()))
+            >= GW_MAX_PENDING_HANDSHAKES_PER_GROUP
+        {
+            GatewayAdmission::GroupFull
+        } else {
+            GatewayAdmission::Admit
+        }
+    }
+
+    /// True if the sender's group has used its intro budget in the current
+    /// window. Read-only; see [`Self::record_intro`].
+    fn intro_budget_exhausted(&self, addr: &SocketAddr) -> bool {
+        let now = self.time_source.now_nanos();
+        self.intro_budgets
+            .get(&ip_group(addr.ip()))
+            .is_some_and(|b| {
+                now.saturating_sub(b.window_start_nanos) < GW_INTRO_BUDGET_WINDOW.as_nanos() as u64
+                    && b.count >= GW_INTRO_BUDGET_PER_GROUP
+            })
+    }
+
+    /// Charge one intro to the sender's group, keeping the table within
+    /// [`GW_MAX_TRACKED_INTRO_GROUPS`].
+    fn record_intro(&mut self, addr: SocketAddr) {
+        let now = self.time_source.now_nanos();
+        let window = GW_INTRO_BUDGET_WINDOW.as_nanos() as u64;
+        let group = ip_group(addr.ip());
+        if !self.intro_budgets.contains_key(&group)
+            && self.intro_budgets.len() >= GW_MAX_TRACKED_INTRO_GROUPS
+        {
+            // Sweep at most once a second so a flood at the limit does not
+            // pay O(n) per datagram.
+            if now.saturating_sub(self.intro_last_sweep_nanos) >= 1_000_000_000 {
+                self.intro_last_sweep_nanos = now;
+                self.intro_budgets
+                    .retain(|_, b| now.saturating_sub(b.window_start_nanos) < window);
+            }
+            if self.intro_budgets.len() >= GW_MAX_TRACKED_INTRO_GROUPS {
+                if let Some(victim) = self.intro_budgets.keys().next().copied() {
+                    self.intro_budgets.remove(&victim);
+                }
+            }
+        }
+        let budget = self.intro_budgets.entry(group).or_insert(IntroBudget {
+            window_start_nanos: now,
+            count: 0,
+        });
+        if now.saturating_sub(budget.window_start_nanos) >= window {
+            budget.window_start_nanos = now;
+            budget.count = 0;
+        }
+        budget.count = budget.count.saturating_add(1);
     }
 
     /// Try to send a packet to an established connection.
@@ -1990,12 +2171,15 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
 
     /// Remove stale closed connections from the same IP.
     fn remove_stale_from_ip(&mut self, new_addr: SocketAddr) {
-        let remote_ip = new_addr.ip();
+        // Range scan over this IP's entries only: this runs for every
+        // datagram from an unknown address, so it must not visit every
+        // connection.
+        let (low, high) = ip_bounds(new_addr.ip());
         let stale_addrs: Vec<_> = self
             .states
-            .iter()
+            .range(low..=high)
             .filter_map(|(addr, state)| {
-                if addr.ip() == remote_ip && *addr != new_addr {
+                if *addr != new_addr {
                     if let ConnectionState::Established {
                         inbound_packet_sender,
                     } = state
@@ -2052,6 +2236,9 @@ impl<S, T: TimeSource> ConnectionStateManager<S, T> {
         self.last_asym_attempt.retain(|_, last_attempt_nanos| {
             now.saturating_sub(*last_attempt_nanos) < ASYM_DECRYPTION_RATE_LIMIT.as_nanos() as u64
         });
+        let budget_window = GW_INTRO_BUDGET_WINDOW.as_nanos() as u64;
+        self.intro_budgets
+            .retain(|_, b| now.saturating_sub(b.window_start_nanos) < budget_window);
     }
 }
 
@@ -2449,12 +2636,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     continue;
                                 }
 
-                                // Rate limit intro attempts (per-IP).
-                                // NOTE: this per-IP throttle is still measured on the real
-                                // wall-clock `time_source`, unlike the gateway admission ramp
-                                // below which uses the simulation clock. It is deliberately left
-                                // on RealTime here (out of scope for the #4383 fix); see #4384.
-                                if self.connections.is_rate_limited(&remote_addr) {
+                                // Rate limit intro attempts. The budget is shared by every
+                                // source port of the sender's IP (the /64 for IPv6), see
+                                // `GW_INTRO_BUDGET_PER_GROUP`; counting `IP:port` would give a
+                                // sender a fresh budget per port.
+                                if self.connections.intro_budget_exhausted(&remote_addr) {
                                     tracing::trace!(peer_addr = %remote_addr, "Rate limiting gateway intro attempt");
                                     continue;
                                 }
@@ -2472,7 +2658,21 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     continue;
                                 }
 
-                                self.connections.record_asym_attempt(remote_addr);
+                                // Bound handshakes in progress, in total and per sender group.
+                                // Safe to drop for the same reason as the ramp limit above.
+                                match self.connections.gateway_admission(remote_addr, gw_connection_tasks.len()) {
+                                    GatewayAdmission::Admit => {}
+                                    refused => {
+                                        tracing::debug!(
+                                            peer_addr = %remote_addr,
+                                            ?refused,
+                                            "Deferring connection: too many gateway handshakes in progress"
+                                        );
+                                        continue;
+                                    }
+                                }
+
+                                self.connections.record_intro(remote_addr);
 
                                 let inbound_key_bytes = key_from_addr(&remote_addr);
                                 let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
@@ -2492,7 +2692,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                     self.count_stray_intro(remote_addr);
                                 }
                                 // Non-gateway peers: mark as expected and wait for the normal peer handshake flow.
-                                self.expected_non_gateway.insert(remote_addr.ip());
+                                // Deliberately NOT recorded in `expected_non_gateway`: an
+                                // unsolicited datagram's source is not an expectation, and
+                                // any sender could grow the set without limit.
                                 tracing::trace!(
                                     peer_addr = %remote_addr,
                                     "Ignoring unknown packet (not an intro, no active connection)"
@@ -2750,7 +2952,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     // here so the denominator matches the outcomes.
                     crate::transport::TRANSPORT_METRICS.record_nat_traversal_attempt(remote_addr, origin);
 
-                    self.expected_non_gateway.insert(remote_addr.ip());
+                    record_expected_ip(&self.expected_non_gateway, remote_addr.ip());
                     let task = GlobalExecutor::spawn(ongoing_connection
                         .map_ok(move |(conn, inbound)| (conn, inbound, origin))
                         .map_err(move |err| (err, remote_addr, nat_observation, origin))
@@ -7933,9 +8135,11 @@ pub mod mock_transport {
             .collect();
         let (survived, handler) = run_scripted_listener(script).await;
         assert!(survived, "transient errors must never end the listener");
+        // The datagram was read and dropped; an unsolicited source is not
+        // recorded as an expected peer.
         assert!(
-            handler.expected_non_gateway.contains(&from.ip()),
-            "the datagram in the middle of the run must have been handled"
+            handler.expected_non_gateway.is_empty(),
+            "an unsolicited datagram must not be recorded"
         );
     }
 
