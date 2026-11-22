@@ -597,6 +597,12 @@ labelled_counters! {
     /// `connect_arm_<label>`. A control UDP dial counts only when it was the
     /// decided transport; the UDP dial that follows a failed native setup (the
     /// rescue) and one run beside a native dial are in no arm.
+    ///
+    /// Joiner control includes pairs where the acceptor already held a
+    /// transport to the joiner and reused it without dialling (the joiner
+    /// cannot see that), and is a subset of control by the bucket rule; use the
+    /// acceptor's control counters for rates. The acceptor's attempt is counted
+    /// when its dial starts, the joiner's when its dial ends.
     pub(crate) enum ConnectArmCounter {
         TreatedAttemptsJoiner => "treated_attempts_joiner",
         TreatedEstablishedJoiner => "treated_established_joiner",
@@ -1145,8 +1151,11 @@ pub struct TransportMetrics {
     /// QUIC-native setups this period, by [`NativeSetupOutcome`].
     connect_native_setup: [AtomicU64; NativeSetupOutcome::COUNT],
     /// The same, for the setups of a CONNECT's joiner and of its acceptor
-    /// (the dial's origin). Setups with another origin (a gateway join) are in
-    /// the total only.
+    /// (the dial's origin). Every setup is in the total (`setup_native`, or
+    /// `Unavailable` in the connection handler), but these are counted when the
+    /// dial's result reaches `connect_outbound`, so they can be below it: a
+    /// setup with another origin (a gateway join) is in the total only, and so
+    /// is one whose dial future was dropped before its result.
     connect_native_setup_joiner: [AtomicU64; NativeSetupOutcome::COUNT],
     connect_native_setup_acceptor: [AtomicU64; NativeSetupOutcome::COUNT],
     /// CONNECT dials by arm and side, by [`ConnectArmCounter`].
@@ -2366,19 +2375,32 @@ impl TransportMetrics {
         side: NativeConnectSide,
         established: bool,
     ) {
-        for counted in [false, true] {
-            if counted && !established {
-                break;
-            }
-            let counter = ConnectArmCounter::of(arm, side, counted);
-            self.connect_arm[counter as usize].fetch_add(1, Ordering::Relaxed);
-            #[cfg(test)]
-            CONNECT_ARM_ON_THIS_THREAD.with(|count| {
-                let mut counts = count.get();
-                counts[counter as usize] += 1;
-                count.set(counts);
-            });
+        self.record_connect_arm_started(arm, side);
+        if established {
+            self.record_connect_arm_established(arm, side);
         }
+    }
+
+    /// A CONNECT dial of `arm` as `side` started: one attempt. For a dial whose
+    /// start is its decision and whose result may never be seen; the
+    /// established count follows via [`Self::record_connect_arm_established`].
+    pub(crate) fn record_connect_arm_started(&self, arm: ConnectArm, side: NativeConnectSide) {
+        self.count_connect_arm(ConnectArmCounter::of(arm, side, false));
+    }
+
+    /// A CONNECT dial of `arm` as `side` gave a connection.
+    pub(crate) fn record_connect_arm_established(&self, arm: ConnectArm, side: NativeConnectSide) {
+        self.count_connect_arm(ConnectArmCounter::of(arm, side, true));
+    }
+
+    fn count_connect_arm(&self, counter: ConnectArmCounter) {
+        self.connect_arm[counter as usize].fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        CONNECT_ARM_ON_THIS_THREAD.with(|count| {
+            let mut counts = count.get();
+            counts[counter as usize] += 1;
+            count.set(counts);
+        });
     }
 
     /// A gateway's admission of a native join did `outcome`.

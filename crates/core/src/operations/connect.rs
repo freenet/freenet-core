@@ -1556,16 +1556,23 @@ pub(super) async fn dispatch_expect_connection_from(
             "connect: acceptor accepted joiner, initiating hole punch"
         );
         let mut rx = acceptor_udp_dial(op_manager, tx, &peer, addr).await?;
+        // This side's own dial of a pair the slice sent to UDP: the control
+        // arm. It is the decided transport, not a fallback, so it is counted
+        // here and nowhere else. The attempt is counted now, so a dial whose
+        // callback closes or fails early is still an attempt.
+        let control = arm == Some(crate::transport::ConnectArm::Control);
+        if control {
+            crate::transport::TRANSPORT_METRICS.record_connect_arm_started(
+                crate::transport::ConnectArm::Control,
+                crate::transport::NativeConnectSide::Acceptor,
+            );
+        }
         GlobalExecutor::spawn(async move {
             let result = rx.recv().await;
-            // This side's own dial of a pair the slice sent to UDP: the control
-            // arm. It is the decided transport, not a fallback, so it is
-            // counted here and nowhere else.
-            if let (Some(crate::transport::ConnectArm::Control), Some(result)) = (arm, &result) {
-                crate::transport::TRANSPORT_METRICS.record_connect_arm(
+            if let (true, Some(Ok(_))) = (control, &result) {
+                crate::transport::TRANSPORT_METRICS.record_connect_arm_established(
                     crate::transport::ConnectArm::Control,
                     crate::transport::NativeConnectSide::Acceptor,
-                    result.is_ok(),
                 );
             }
             log_acceptor_dial(&peer, tx, result);

@@ -4221,6 +4221,17 @@ mod driver_timing_tests {
             "a control dial that failed"
         );
         assert_eq!(
+            dispatch(
+                24864,
+                Some(NativeDecision::Udp),
+                Some(ConnectArm::Control),
+                None
+            )
+            .await,
+            vec![("control_attempts_acceptor", 1)],
+            "a control dial whose callback closed unanswered is still an attempt"
+        );
+        assert_eq!(
             dispatch(24862, Some(NativeDecision::Udp), None, Some(true)).await,
             vec![],
             "a UDP decision in no arm (a transport already held)"
