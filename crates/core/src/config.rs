@@ -2250,6 +2250,25 @@ impl Config {
         }
     }
 
+    /// Warn that UDP-only transport settings will stop having any effect.
+    ///
+    /// **Call this AFTER [`set_logger`]**, like the other `log_*` replays here:
+    /// `build()` runs with no subscriber, so a warning emitted there is lost.
+    /// Called once per start. The settings keep their current effect until the
+    /// legacy UDP transport is removed.
+    pub fn log_udp_only_settings(&self) {
+        let keys = self.network_api.udp_only_settings_in_use();
+        if keys.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            keys = %keys.join(", "),
+            "These settings tune the legacy UDP transport, which a future release removes. \
+             They still apply now. After that release they are accepted and ignored, and \
+             you can delete them from your config."
+        );
+    }
+
     /// Report how the client (HTTP/WebSocket) API's exposure was decided.
     ///
     /// **Call this AFTER [`set_logger`].** These messages cannot live in
@@ -3197,6 +3216,37 @@ impl NetworkApiConfig {
                 Err(_) => QuicMaxPathsSetting::Invalid(raw),
             },
         }
+    }
+
+    /// Names of the UDP-only transport settings this node was given a
+    /// non-default value for (D-1 of the legacy-UDP removal).
+    ///
+    /// Each still takes effect today. They tune the legacy UDP data path, which
+    /// a later release removes; from then on the keys are accepted and ignored,
+    /// so a config file or flag written for this release keeps parsing after a
+    /// rollback or an upgrade. Defaults are not reported, so a node that never
+    /// set them hears nothing.
+    pub fn udp_only_settings_in_use(&self) -> Vec<&'static str> {
+        let mut set = Vec::new();
+        if self.min_bandwidth_per_connection.is_some() {
+            set.push("min-bandwidth-per-connection");
+        }
+        if self.streaming_threshold != default_streaming_threshold() {
+            set.push("streaming-threshold");
+        }
+        if self.ledbat_min_ssthresh != default_ledbat_min_ssthresh() {
+            set.push("ledbat-min-ssthresh");
+        }
+        if !self
+            .congestion_control
+            .eq_ignore_ascii_case(&default_congestion_control())
+        {
+            set.push("congestion-control");
+        }
+        if self.bbr_startup_rate != default_bbr_startup_rate() {
+            set.push("bbr-startup-rate");
+        }
+        set
     }
 
     /// Build a `CongestionControlConfig` from the current network API configuration.
@@ -8437,6 +8487,48 @@ shutdown-drain-secs = 42
                 "no key is spelled twice here, so nothing may be dropped"
             );
         }
+    }
+
+    /// The UDP-only transport keys (D-1) must keep parsing in a config file
+    /// after the legacy UDP transport is removed, where they are accepted and
+    /// ignored. Parse each one, in every spelling, and check it is reported as
+    /// in use. When a key is removed from `NetworkApiConfig` instead of
+    /// ignored, this fails to parse and the rollback case it guards breaks.
+    #[test]
+    fn udp_only_transport_keys_still_parse_and_are_reported() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "min_bandwidth_per_connection",
+                "2000000",
+                "min-bandwidth-per-connection",
+            ),
+            (
+                "min-bandwidth-per-connection",
+                "2000000",
+                "min-bandwidth-per-connection",
+            ),
+            ("streaming-threshold", "131072", "streaming-threshold"),
+            ("ledbat-min-ssthresh", "204800", "ledbat-min-ssthresh"),
+            ("congestion-control", "\"bbr\"", "congestion-control"),
+            ("bbr-startup-rate", "5000000", "bbr-startup-rate"),
+        ];
+        for (key, value, reported) in cases {
+            let cfg: NetworkApiConfig = toml::from_str(&format!("{key} = {value}\n"))
+                .unwrap_or_else(|e| panic!("`{key}` no longer parses in config.toml: {e}"));
+            assert_eq!(
+                cfg.udp_only_settings_in_use(),
+                vec![*reported],
+                "`{key}` set to {value} must be reported, and nothing else"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_only_settings_report_nothing_at_their_defaults() {
+        let cfg: NetworkApiConfig = toml::from_str("").unwrap();
+        assert!(cfg.udp_only_settings_in_use().is_empty());
+        let cfg: NetworkApiConfig = toml::from_str("congestion-control = \"FixedRate\"").unwrap();
+        assert!(cfg.udp_only_settings_in_use().is_empty());
     }
 
     /// [`CONFIG_KEY_SPELLINGS`] drives the duplicate-spelling normalization,
