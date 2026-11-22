@@ -1210,8 +1210,14 @@ impl SecretsStore {
         scope: SecretScope<'_>,
     ) -> Result<Zeroizing<Vec<u8>>, SecretStoreError> {
         let secret_path = self.scope_dir(delegate, &scope).join(key.encode());
-        let blob =
-            fs::read(secret_path).map_err(|_| SecretStoreError::MissingSecret(key.clone()))?;
+        // Only a file that does not exist is a missing secret. Any other read
+        // failure (EIO, EACCES, EMFILE) must not look like absence: a delegate
+        // that acts on "missing" can overwrite real data after a transient
+        // error (#5857).
+        let blob = fs::read(secret_path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => SecretStoreError::MissingSecret(key.clone()),
+            _ => SecretStoreError::IO(e),
+        })?;
 
         match &scope {
             SecretScope::Local => {
@@ -2197,14 +2203,16 @@ impl SecretsStore {
             .with_alphabet(bs58::Alphabet::BITCOIN)
             .into_string();
         let secret_path = self.scope_dir(delegate, scope).join(&encoded);
-        let blob = fs::read(&secret_path).map_err(|_| {
+        let blob = fs::read(&secret_path).map_err(|e| {
             // We only have the secret hash here, not a `SecretsId` (the
             // pre-image is never persisted), so we can't build a
-            // `MissingSecret(SecretsId)`. Surface an IO/NotFound error carrying
-            // the encoded path instead; export treats any read error as fatal.
+            // `MissingSecret(SecretsId)`. Surface an IO error carrying the
+            // encoded path and the real error kind instead (a NotFound stays
+            // NotFound, an EIO is no longer relabelled as one); export treats
+            // any read error as fatal.
             SecretStoreError::IO(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("secret blob not found at {}", secret_path.display()),
+                e.kind(),
+                format!("secret blob read failed at {}: {e}", secret_path.display()),
             ))
         })?;
         match scope {
@@ -5817,6 +5825,60 @@ mod test {
         assert!(
             matches!(err, SecretStoreError::Encryption(_)),
             "expected Encryption error, got {err:?}"
+        );
+        Ok(())
+    }
+
+    /// #5857: a read that fails for any reason other than the file not
+    /// existing must NOT be reported as `MissingSecret`. A delegate acts on
+    /// "missing" (initialising a fresh secret, answering "this generation holds
+    /// nothing"), so a transient EIO/EACCES/EMFILE reported as absence can
+    /// overwrite or discard real data.
+    ///
+    /// The failure is injected by putting a directory where the blob should be
+    /// (`EISDIR`), which fails the same way for root and non-root.
+    #[tokio::test]
+    async fn unreadable_secret_is_an_io_error_not_missing() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![88].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let secret_id = SecretsId::new(vec![89]);
+        store.store_secret(
+            delegate.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"real data".to_vec()),
+        )?;
+
+        let blob = secrets_dir
+            .join(delegate.key().encode())
+            .join(secret_id.encode());
+        std::fs::remove_file(&blob)?;
+        std::fs::create_dir(&blob)?;
+
+        let err = store
+            .get_secret(delegate.key(), &secret_id, SecretScope::Local)
+            .expect_err("an unreadable blob must not read successfully");
+        assert!(
+            matches!(&err, SecretStoreError::IO(e) if e.kind() != std::io::ErrorKind::NotFound),
+            "a non-NotFound read failure must surface as IO, not MissingSecret; got {err:?}"
+        );
+
+        // A secret that genuinely does not exist is still MissingSecret.
+        let absent = store.get_secret(
+            delegate.key(),
+            &SecretsId::new(vec![90]),
+            SecretScope::Local,
+        );
+        assert!(
+            matches!(absent, Err(SecretStoreError::MissingSecret(_))),
+            "an absent secret must stay MissingSecret, got {absent:?}"
         );
         Ok(())
     }

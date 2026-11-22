@@ -2432,6 +2432,102 @@ async fn a_write_invalidates_the_secret_memo_within_one_process_call()
     Ok(())
 }
 
+/// #5857: a secret read that FAILS (as opposed to finding nothing) must not
+/// reach the guest as absence, because every stdlib guest to date maps any
+/// negative return of `get_secret` to `None` and a delegate acting on `None`
+/// can initialise over real data.
+///
+/// The failure is injected by replacing the secret's blob with a directory, so
+/// `fs::read` fails with `EISDIR` (not `NotFound`) deterministically, including
+/// when the suite runs as root, where a `chmod 000` would not fail.
+///
+/// Checked through a real guest, in three parts: the whole call fails (so a
+/// frozen delegate is loud), the write the guest tries after the failed read is
+/// refused (the planted directory survives), and a genuinely absent secret
+/// still reads as absent.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_secret_read_fails_the_call_and_blocks_writes_not_reads_as_absent()
+-> Result<(), Box<dyn std::error::Error>> {
+    use delegate2_messages::{InboundAppMessage, OutboundAppMessage};
+
+    let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+    let key = b"unreadable".to_vec();
+
+    let send = |runtime: &mut Runtime, msg: &InboundAppMessage| {
+        let payload = bincode::serialize(msg).expect("serialize");
+        runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        )
+    };
+
+    // Control: a secret that was never written is genuinely absent.
+    let absent = send(
+        &mut runtime,
+        &InboundAppMessage::HasSecret(b"never-written".to_vec()),
+    )?;
+    match &absent[0] {
+        OutboundDelegateMsg::ApplicationMessage(m) => assert!(
+            matches!(
+                bincode::deserialize::<OutboundAppMessage>(&m.payload)?,
+                OutboundAppMessage::SecretExists(false)
+            ),
+            "a never-written secret must still read as absent"
+        ),
+        other => panic!("expected ApplicationMessage, got {other:?}"),
+    }
+
+    // Seed it, then make its blob unreadable (but present).
+    send(
+        &mut runtime,
+        &InboundAppMessage::StoreSecret {
+            key: key.clone(),
+            value: b"real data".to_vec(),
+        },
+    )?;
+    let blob = temp_dir
+        .path()
+        .join("secrets")
+        .join(delegate.key().encode())
+        .join(freenet_stdlib::prelude::SecretsId::new(key.clone()).encode());
+    assert!(blob.is_file(), "seeded blob must exist at {blob:?}");
+    std::fs::remove_file(&blob)?;
+    std::fs::create_dir(&blob)?;
+
+    // Read-then-write in one call: the read fails, so the call fails...
+    let res = send(
+        &mut runtime,
+        &InboundAppMessage::ReadWriteRead {
+            key: key.clone(),
+            value: b"overwrite".to_vec(),
+        },
+    );
+    let err = res.expect_err("a failed secret read must fail the whole delegate call");
+    assert!(
+        format!("{err}").contains("secret storage read failed"),
+        "error must say the storage read failed, got: {err}"
+    );
+    // ...and the write the guest attempted afterwards was refused.
+    assert!(
+        blob.is_dir(),
+        "the write after a failed read must be refused, not replace the blob"
+    );
+
+    // has_secret must not answer "no" for a read that failed.
+    let res = send(&mut runtime, &InboundAppMessage::HasSecret(key.clone()));
+    assert!(
+        res.is_err(),
+        "has_secret on an unreadable secret must fail the call, not return false"
+    );
+
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_large_secret_data() -> Result<(), Box<dyn std::error::Error>> {
     use delegate2_messages::{InboundAppMessage, OutboundAppMessage};

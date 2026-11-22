@@ -1072,6 +1072,24 @@ pub(super) struct DelegateCallEnv {
     /// after an unrelated release-profile change.
     ///
     secret_read_memo: std::cell::RefCell<SecretReadMemo>,
+    /// Set the first time a secret READ fails for any reason other than the
+    /// secret being absent (an I/O error, an authentication failure on a blob
+    /// that exists). #5857.
+    ///
+    /// A delegate cannot be trusted to tell that apart from "no such secret":
+    /// every stdlib guest to date maps ANY negative return of `get_secret` /
+    /// `get_secret_len` to `None`, so a new error code would be read as absence
+    /// by every delegate already deployed, and those are the ones that matter
+    /// (frozen predecessor generations are never rebuilt). Acting on "absent"
+    /// by initialising or overwriting the secret is the data-loss shape.
+    ///
+    /// So the call is POISONED: the read still returns `ERR_STORAGE_FAILED`
+    /// (a delegate built against a stdlib that knows about it may handle it),
+    /// writes and removals are refused for the rest of the call, and
+    /// `exec_inbound_with_env` fails the whole call once `process()` returns.
+    /// Holds the first failure's text. Behind a `RefCell` like `context`, for
+    /// the same reason: nothing needs a `&mut DelegateCallEnv`.
+    secret_read_failure: std::cell::RefCell<Option<String>>,
 }
 
 // SAFETY: `DELEGATE_ENV` is a `static`, so its `DashMap` must be `Sync`, which
@@ -1301,6 +1319,7 @@ impl DelegateCallEnv {
             created_delegates_count,
             inherited_origins,
             secret_read_memo: std::cell::RefCell::new(None),
+            secret_read_failure: std::cell::RefCell::new(None),
         }
     }
 
@@ -1385,6 +1404,40 @@ impl DelegateCallEnv {
         let out = f(&plaintext);
         *self.secret_read_memo.borrow_mut() = Some((*secret_id.hash(), plaintext));
         Ok(out)
+    }
+
+    /// Classify a failed secret read (#5857). Returns the host error code to
+    /// hand the guest: `ERR_SECRET_NOT_FOUND` only for a genuinely absent
+    /// secret, otherwise `ERR_STORAGE_FAILED`, and in that case the call is
+    /// poisoned (see [`Self::secret_read_failure`](Self)'s field docs).
+    fn classify_secret_read_error(&self, secret_id: &SecretsId, e: &SecretStoreError) -> i32 {
+        // Scope: I/O failures, which are transient and retryable. A blob that
+        // reads but does not authenticate is deterministic corruption or a key
+        // mismatch; retrying cannot help and failing the call would leave the
+        // delegate unable to run at all, so it keeps its historical answer.
+        if !matches!(e, SecretStoreError::IO(_)) {
+            return error_codes::ERR_SECRET_NOT_FOUND;
+        }
+        tracing::error!(
+            delegate = %self.delegate_key,
+            secret_id = ?secret_id,
+            error = %e,
+            "secret read I/O failure (not an absent secret); poisoning this delegate call"
+        );
+        self.secret_read_failure
+            .borrow_mut()
+            .get_or_insert_with(|| e.to_string());
+        error_codes::ERR_STORAGE_FAILED
+    }
+
+    /// The first non-absence secret read failure of this call, if any.
+    pub(super) fn secret_read_failure(&self) -> Option<String> {
+        self.secret_read_failure.borrow().clone()
+    }
+
+    /// Whether a secret read has failed during this call (it is poisoned).
+    fn secret_reads_poisoned(&self) -> bool {
+        self.secret_read_failure.borrow().is_some()
     }
 
     /// Drop the read memo.
@@ -2204,7 +2257,7 @@ pub(super) mod delegate_secrets {
                     error = %e,
                     "get_secret_len: secret not found or storage error"
                 );
-                error_codes::ERR_SECRET_NOT_FOUND
+                env.classify_secret_read_error(&secret_id, &e)
             }
         }
     }
@@ -2305,7 +2358,7 @@ pub(super) mod delegate_secrets {
                     error = %e,
                     "get_secret: secret not found or storage error"
                 );
-                error_codes::ERR_SECRET_NOT_FOUND
+                env.classify_secret_read_error(&secret_id, &e)
             }
         }
     }
@@ -2369,6 +2422,12 @@ pub(super) mod delegate_secrets {
             unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec(),
         );
 
+        if env.secret_reads_poisoned() {
+            // A read failed earlier in this call and the delegate may have
+            // taken it for absence; do not let it write on that belief (#5857).
+            tracing::error!("delegate set_secret refused: an earlier secret read failed");
+            return error_codes::ERR_STORAGE_FAILED;
+        }
         let scope = env.secret_scope();
         // A write changes what a read returns, so the read memo must go before
         // the store is touched at all.
@@ -2434,7 +2493,13 @@ pub(super) mod delegate_secrets {
                     error = %e,
                     "has_secret: secret not found or storage error"
                 );
-                0
+                // 0 is "absent". A failed read must not be reported as that
+                // (#5857): the negative code is read by every stdlib guest as
+                // "no" too, but the poisoned call fails once process() returns.
+                match env.classify_secret_read_error(&secret_id, &e) {
+                    error_codes::ERR_SECRET_NOT_FOUND => 0,
+                    code => code,
+                }
             }
         }
     }
@@ -2480,6 +2545,10 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
+        if env.secret_reads_poisoned() {
+            tracing::error!("delegate remove_secret refused: an earlier secret read failed");
+            return error_codes::ERR_STORAGE_FAILED;
+        }
         let scope = env.secret_scope();
         // A removal changes what a read returns; drop the memo first.
         env.invalidate_secret_memo();
@@ -3552,8 +3621,8 @@ mod secret_read_memo_tests {
     /// The current fields divide as follows, which is the review this forces:
     ///  - `!Sync` and load-bearing for the argument: `secret_store`,
     ///    `delegate_store` (`UnsafeCell<*mut _>`), `contract_store`
-    ///    (`*const _`), `context` and `secret_read_memo` (`RefCell`),
-    ///    `creations_this_call` (`Cell`). Six, not three — an earlier draft of
+    ///    (`*const _`), `context`, `secret_read_memo` and `secret_read_failure`
+    ///    (`RefCell`), `creations_this_call` (`Cell`). Seven, not three — an earlier draft of
     ///    the SAFETY block miscounted, which is exactly the kind of slip that
     ///    makes a reader stop trusting a soundness argument.
     ///  - Plain owned data, safe by construction: everything else.
@@ -3576,6 +3645,7 @@ mod secret_read_memo_tests {
                 created_delegates_count,
                 inherited_origins,
                 secret_read_memo,
+                secret_read_failure,
             } = env;
 
             let _ = (
@@ -3592,6 +3662,7 @@ mod secret_read_memo_tests {
                 created_delegates_count,
                 inherited_origins,
                 secret_read_memo,
+                secret_read_failure,
             );
         }
     }
