@@ -1834,6 +1834,18 @@ mod tests {
             vs.take_due(t2 + REPLY_TIMEOUT).restarted.is_empty(),
             "reported once"
         );
+        // ...and by a round with nobody left to ask: a stale peer, a write
+        // while the Confirm round waits, then that round finds no target.
+        let t3 = t2 + REPLY_TIMEOUT + CHECK_DELAY;
+        assert_eq!(
+            answer_round(&vs, key(1), t3, &[(&a, false, &[0])]),
+            vec![Verdict::Stale]
+        );
+        vs.note_originated(key(1), t3 + Duration::from_secs(1));
+        let t4 = t3 + CONFIRM_DELAY;
+        assert!(vs.take_due(t4).restarted.is_empty());
+        vs.record_sent(&key(1), Vec::new(), t4);
+        assert_eq!(vs.take_due(t4).restarted, vec![key(1)]);
     }
 
     /// Skeptical review S2, round 5: writes before the `First` round goes out
