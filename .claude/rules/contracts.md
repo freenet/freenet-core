@@ -106,12 +106,17 @@ run's WebApp or inherited origin. The target's key travels BESIDE the reply
 while handling a reply is shown under the run's own app identity. Every
 other SendDelegateMessage from the target is dropped, counted and logged
 once per iteration, and so is a reply over MAX_HOP_REPLY_BYTES (64 KiB),
-past MAX_HOP_REPLY_BYTES_PER_RUN, still waiting at the iteration cap, or
-one the caller fails on (that call's context is not persisted; secrets it
-wrote before failing stay written). Every iteration makes ONE executor call
-(a batch or one reply) and processes its output before the next, so a run
-still makes at most MAX_CONTRACT_REQUEST_ITERATIONS calls into the caller and
-holds at most one call's output at a time. The reply never runs the target again; hops the
+past MAX_HOP_REPLY_BYTES_PER_RUN, beyond what the run's remaining iterations
+can deliver (checked at enqueue, so the queue never outgrows them), still
+waiting when the run ends early, or one the caller fails on (that call's
+context is not persisted; secrets it wrote before failing stay written).
+Every iteration makes ONE executor call (a batch or one reply) and processes
+its output before the next, so a run still makes at most
+MAX_CONTRACT_REQUEST_ITERATIONS calls into the caller and holds at most one
+call's output at a time. The batch goes first, so replies wait while the
+caller's own request chain keeps its batch non-empty; a caller that never
+stops issuing requests never receives them, and they are counted as dropped
+at the cap. The reply never runs the target again; hops the
 caller makes while handling it count against its own cap. From a background run the target's other output is dropped
 (counted, one info! per hop), never merged into the caller's output, which
 would fan it out to the caller's apps under the caller's name. A background run

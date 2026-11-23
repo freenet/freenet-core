@@ -140,12 +140,19 @@ const MAX_HOP_REPLY_BYTES: usize = 64 * 1024;
 /// unprompted run is never limited by this before it reaches its hop cap. A
 /// client run, which the hop cap does not bound, is bounded by this instead.
 ///
-/// The NUMBER of replies needs no separate cap: each reply is delivered in an
-/// iteration of its own (`next_call`), and an iteration makes exactly one
-/// executor call whose output is processed before the next. So a run still
-/// makes at most `MAX_CONTRACT_REQUEST_ITERATIONS` calls into the delegate,
-/// and holds at most one call's output (the runtime's per-call budget) at a
-/// time, the same ceilings as before replies existed.
+/// The NUMBER of replies is bounded separately, because a reply may be empty
+/// and this byte bound then does not limit it. Each reply is delivered in an
+/// iteration of its own (`next_call`), so at enqueue a reply is dropped and
+/// counted once the queue already holds as many replies as the run has
+/// iterations left: the queue never holds more than
+/// `MAX_CONTRACT_REQUEST_ITERATIONS` replies, and none it cannot deliver.
+///
+/// An iteration makes exactly one executor call, whose output is processed
+/// before the next call. So a run makes at most
+/// `MAX_CONTRACT_REQUEST_ITERATIONS` calls into the delegate and holds at
+/// most one call's output (the runtime's per-call budget) at a time, plus a
+/// reply queue bounded as above: at most that many replies, and at most this
+/// many payload bytes.
 const MAX_HOP_REPLY_BYTES_PER_RUN: usize = MAX_UNPROMPTED_HOPS_PER_RUN * MAX_HOP_REPLY_BYTES;
 
 /// Maximum delegate notifications to drain per iteration.
@@ -2052,6 +2059,14 @@ where
                         contract_id = %req.contract_id,
                         "Delegate requested UnsubscribeContractRequest, which this node does not implement yet (see #5600)"
                     );
+                    // The run ends here; replies still queued are never
+                    // delivered.
+                    note_dropped_replies(
+                        parking.as_mut(),
+                        delegate_key,
+                        current_replies.len() as u64,
+                        "the run failed on an UnsubscribeContractRequest first",
+                    );
                     return DelegateRunOutcome::Failed(ExecutorError::other(anyhow::anyhow!(
                         "UnsubscribeContractRequest is not implemented by this node yet (#5600)"
                     )));
@@ -3233,11 +3248,23 @@ where
                         dropped_sends += sends;
                         if let Some(reply) = reply {
                             let len = reply.payload.len();
+                            // Each queued reply needs an iteration of its own
+                            // (`next_call`), so a queue already as long as the
+                            // iterations this run has left can never deliver
+                            // another: count it now rather than retain it
+                            // until the cap. This bounds the queue's LENGTH,
+                            // which the byte bounds do not (a reply may be
+                            // empty).
+                            let queued = current_replies.len() + pending_replies.len();
+                            let iterations_left =
+                                MAX_CONTRACT_REQUEST_ITERATIONS.saturating_sub(iterations);
                             if len > MAX_HOP_REPLY_BYTES
                                 || reply_bytes_accepted.saturating_add(len)
                                     > MAX_HOP_REPLY_BYTES_PER_RUN
+                                || queued >= iterations_left
                             {
-                                // Over a byte bound: see the constants.
+                                // Over a byte bound (see the constants) or
+                                // past what the run can still deliver.
                                 dropped_replies += 1;
                             } else {
                                 // Queued for the caller and delivered in a
@@ -3325,8 +3352,9 @@ where
                     max_reply_bytes = MAX_HOP_REPLY_BYTES,
                     max_run_bytes = MAX_HOP_REPLY_BYTES_PER_RUN,
                     "Dropped replies to this delegate's inter-delegate messages: \
-                     over MAX_HOP_REPLY_BYTES, or past MAX_HOP_REPLY_BYTES_PER_RUN \
-                     for this run"
+                     over MAX_HOP_REPLY_BYTES, past MAX_HOP_REPLY_BYTES_PER_RUN \
+                     for this run, or more than the run's remaining iterations \
+                     can deliver"
                 );
             }
             if refused_over_cap > 0 {
@@ -8952,6 +8980,85 @@ mod tests {
     ///  * `.execute_delegate_request(` in a new `pub async fn` declared
     ///    immediately after the chokepoint — a declaration form the owner scan
     ///    could not see (see `enclosing_fn`).
+    /// A hop reply (`delegate_park::PendingReply`) is BUILT in exactly one
+    /// place: the hop, which records the delegate it ran as the reply's
+    /// origin. `next_call` turns `from` into an attested
+    /// `MessageOrigin::Delegate(from)`, so a second producer could mint that
+    /// attestation for any key. `PendingReply` is `pub(super)` in
+    /// `delegate_park`, so only the `contract` module tree can build one;
+    /// this scans all of its production sources.
+    ///
+    /// FALSIFY: build a `PendingReply` anywhere else in `contract`
+    /// production code, or record anything but `target_key` as `from`.
+    #[test]
+    fn a_hop_reply_is_built_in_one_place() {
+        fn sites_in(code: &str, file: &str, out: &mut Vec<(String, usize)>) {
+            for (idx, _) in code.match_indices("PendingReply {") {
+                let rest = &code[idx..];
+                // The definition and the destructuring pattern in
+                // `next_call` are not constructions.
+                if code[..idx].ends_with("struct ")
+                    || rest.starts_with("PendingReply { from, msg }")
+                {
+                    continue;
+                }
+                out.push((file.to_string(), idx));
+            }
+        }
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("readable source directory") {
+                let path = entry.expect("directory entry").path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut sites = Vec::new();
+        let code = production_code();
+        sites_in(&code, "contract.rs", &mut sites);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/contract");
+        let mut files = Vec::new();
+        rust_files(&dir, &mut files);
+        assert!(
+            files.len() > 5,
+            "the scan found almost no files under {}, so it measures nothing",
+            dir.display()
+        );
+        for path in files {
+            let name = path.display().to_string();
+            // Test-only files may build replies for their own fixtures.
+            if name.ends_with("tests.rs") || name.ends_with("test.rs") {
+                continue;
+            }
+            let full = std::fs::read_to_string(&path).expect("readable source file");
+            let production = match full.find("mod tests {") {
+                Some(cut) => &full[..cut],
+                None => &full[..],
+            };
+            sites_in(&strip_comments(production), &name, &mut sites);
+        }
+
+        assert_eq!(
+            sites.len(),
+            1,
+            "a hop reply must be built in exactly one place, the hop: {sites:?}"
+        );
+        let (file, idx) = &sites[0];
+        assert_eq!(file, "contract.rs", "{sites:?}");
+        assert_eq!(
+            enclosing_fn(&code, *idx),
+            "handle_delegate_with_contract_requests"
+        );
+        let built = &code[*idx..(*idx + 200).min(code.len())];
+        assert!(
+            built.contains("from: target_key.clone()"),
+            "the hop must record the delegate it ran as the reply's origin: {built}"
+        );
+    }
+
     #[test]
     fn every_loop_delegate_run_goes_through_the_round_trip_chokepoint() {
         // Production text only, comments stripped. Both needles occur in this
