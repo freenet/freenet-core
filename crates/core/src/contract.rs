@@ -1600,6 +1600,64 @@ fn delegate_response_values(
     }
 }
 
+/// A hop target's output, split by [`split_hop_output`].
+struct HopOutput {
+    /// The one reply to the caller, if the target sent one, ready to deliver
+    /// as an inbound `DelegateMessage`.
+    reply: Option<DelegateMessage>,
+    /// `SendDelegateMessage`s that are not delivered: to any delegate other
+    /// than the caller, or a second reply.
+    dropped_sends: u64,
+    /// Everything else the target emitted, in order.
+    other: Vec<OutboundDelegateMsg>,
+}
+
+/// Split what a hop's target emitted: the first `SendDelegateMessage` it
+/// addressed back to `caller` is the reply; every other
+/// `SendDelegateMessage` is dropped (counted only); the rest is returned
+/// untouched for the caller's run to route.
+///
+/// The reply is normalized here rather than trusted as the target built it:
+/// - `sender` is set to `target`, the delegate the node just ran. The caller
+///   authorizes the reply on this field, so it is set on the path that
+///   delivers it, from the key the node itself ran.
+/// - `processed` is cleared: the reply is an undelivered inbound message.
+/// - `context` is cleared, as the runtime clears it on an outbound
+///   `ApplicationMessage`: the target's context is not the caller's.
+fn split_hop_output(
+    values: Vec<OutboundDelegateMsg>,
+    caller: &DelegateKey,
+    target: &DelegateKey,
+) -> HopOutput {
+    let mut out = HopOutput {
+        reply: None,
+        dropped_sends: 0,
+        other: Vec::new(),
+    };
+    for value in values {
+        match value {
+            OutboundDelegateMsg::SendDelegateMessage(mut msg)
+                if out.reply.is_none() && msg.target == *caller =>
+            {
+                msg.sender = target.clone();
+                msg.processed = false;
+                msg.context = DelegateContext::default();
+                out.reply = Some(msg);
+            }
+            OutboundDelegateMsg::SendDelegateMessage(_) => out.dropped_sends += 1,
+            other @ (OutboundDelegateMsg::ApplicationMessage(_)
+            | OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)) => out.other.push(other),
+        }
+    }
+    out
+}
+
 /// Handle a delegate request, including any contract request messages in the response.
 ///
 /// When a delegate emits contract request messages, this function:
@@ -2622,13 +2680,31 @@ where
             }
         }
 
-        // Deliver delegate-to-delegate messages (fire-and-forget, single-hop).
+        // Deliver delegate-to-delegate messages: one reply to the caller, no
+        // further chaining.
         //
         // Design notes:
-        // - Delivery is intentionally single-hop: if target delegate B emits its own
-        //   SendDelegateMessage in response, it is filtered out (not delivered). This
-        //   prevents infinite recursion between delegates. We use execute_delegate_hop
-        //   (not the full delivery loop) for the same reason.
+        // - ONE REPLY per hop. If target delegate B's output contains a
+        //   SendDelegateMessage addressed back to this delegate (the caller,
+        //   A), the FIRST such message is delivered to A as an inbound
+        //   `DelegateMessage` in A's next iteration, alongside A's other
+        //   responses (`split_hop_output`). Its `sender` is set to B there, so
+        //   A can authorize the reply on it. Every other SendDelegateMessage
+        //   from B (to a third delegate, or a second reply to A) is dropped,
+        //   counted (`count_dropped_hop_sends`) and logged once per iteration.
+        // - No further chaining. Delivering the reply does not run B again,
+        //   and B's messages are never hopped themselves; we use
+        //   execute_delegate_hop (not the full delivery loop) for that reason.
+        //   A, handling the reply, may hop again: those are A's own hops,
+        //   counted against A's hop cap on an unprompted run, inside A's
+        //   MAX_CONTRACT_REQUEST_ITERATIONS. This prevents unbounded
+        //   recursion between delegates.
+        // - The reply applies to every run kind. If A parks in the same
+        //   iteration, the reply rides the continuation with A's other
+        //   responses (`inbound_so_far`) and is delivered on resume. Its
+        //   payload is bounded only by the runtime's per-call output cap
+        //   (`MAX_OUTBOUND_BYTES_PER_RUN`), like any other delegate output,
+        //   and is charged against the park byte budget while parked.
         // - Target delegate runs with the params IT was registered with on this node
         //   (`registered_delegate_params`, #5616), never the caller's and never empty
         //   ones: a delegate key is `BLAKE3(code_hash ‖ params)`, so other params would
@@ -2653,7 +2729,7 @@ where
         //   if the delegate lane handed the loop a pending round-trip of the
         //   target, that round-trip first (see the lane paragraph below). The
         //   target's own contract requests in its reply are NOT executed.
-        // - Bounds. Delivery is single-hop (above). An UNPROMPTED run makes at
+        // - Bounds. One reply, no chaining (above). An UNPROMPTED run makes at
         //   most `MAX_UNPROMPTED_HOPS_PER_RUN` hops, for every delegate with
         //   or without a manifest; client runs are bounded by
         //   MAX_CONTRACT_REQUEST_ITERATIONS x `MAX_OUTBOUND_MSGS_PER_RUN`. The
@@ -2663,14 +2739,14 @@ where
         //   is charged to the caller's duty budget with the rest of the run; a
         //   manifest-less caller has no duty budget, so for it the hop cap is
         //   the only bound. The target is never charged for a hop it receives.
-        // - The target's reply on an UNPROMPTED run is DROPPED, counted and
-        //   logged once per hop. There is no client to return it to, and the
-        //   caller's residual output is fanned out to the CALLER's registered
-        //   apps labelled as the caller (`route_notification_outbound`), so
-        //   merging it would publish the target's output under the caller's
-        //   name. The target cannot reply to the caller either; a reply path
-        //   is a separate, undecided feature. On a client run the target's
-        //   reply (minus its own `SendDelegateMessage`s) still goes back to the
+        // - The target's other output (everything but SendDelegateMessages)
+        //   on an UNPROMPTED run is DROPPED, counted and logged once per hop.
+        //   There is no client to return it to, and the caller's residual
+        //   output is fanned out to the CALLER's registered apps labelled as
+        //   the caller (`route_notification_outbound`), so merging it would
+        //   publish the target's output under the caller's name. The one
+        //   reply above is the target's only way back to the caller. On a
+        //   client run the target's other output still goes back to the
         //   client with the caller's, as before.
         //
         // BACKGROUND RUNS MAY MESSAGE OTHER DELEGATES (Ian, 2026-11-20: "the
@@ -2713,6 +2789,9 @@ where
             // delegate emitting thousands cannot flood the log.
             let mut refused_over_cap: u64 = 0;
             let mut refused_self: u64 = 0;
+            // Targets' `SendDelegateMessage`s other than the one reply each,
+            // tallied and logged once per iteration for the same reason.
+            let mut dropped_sends: u64 = 0;
             for msg in delegate_messages {
                 let target_key = msg.target.clone();
                 // No self-hops; see the design notes above. Checked first and
@@ -2742,9 +2821,9 @@ where
                 // corruption the exclusion exists to prevent, reached through a
                 // different door.
                 //
-                // DROPPED rather than queued, deliberately. The hop is
-                // single-hop and fire-and-forget, so callers cannot rely on
-                // delivery.
+                // DROPPED rather than queued, deliberately. Delivery is not
+                // guaranteed (no reply arrives for a dropped message), so
+                // callers cannot rely on it.
                 // Queueing it would mean replaying an ATTESTED caller identity
                 // (`Some(delegate_key)`, the control that replaced the deleted
                 // registration-record refusal — GHSA-824h-7x5x-wfmf) at an
@@ -2912,33 +2991,44 @@ where
                         values,
                         ..
                     }) => {
+                        // ONE REPLY to the caller, no further chaining: see
+                        // the design notes above.
+                        let HopOutput {
+                            reply,
+                            dropped_sends: sends,
+                            other,
+                        } = split_hop_output(values, delegate_key, &target_key);
+                        dropped_sends += sends;
+                        if let Some(reply) = reply {
+                            // Delivered to the caller in its next iteration,
+                            // with the other responses. If the caller parks
+                            // in this iteration the reply rides the
+                            // continuation (`inbound_so_far`) and is delivered
+                            // on resume.
+                            inbound_responses.push(InboundDelegateMsg::DelegateMessage(reply));
+                        }
                         if is_unprompted_run(trigger) {
                             // Dropped, not merged: see the design notes above.
                             // One log line per hop, not per message.
-                            if !values.is_empty() {
+                            if !other.is_empty() {
                                 let total = parking
                                     .as_mut()
-                                    .map(|ctx| ctx.park.count_dropped_hop_output(values.len()));
+                                    .map(|ctx| ctx.park.count_dropped_hop_output(other.len()));
                                 tracing::info!(
                                     from_delegate = %delegate_key,
                                     target_delegate = %target_key,
-                                    dropped = values.len(),
+                                    dropped = other.len(),
                                     total_dropped = ?total,
-                                    "Dropped the reply of an inter-delegate message \
-                                     from a background run: there is no client to \
-                                     return it to, and it must not reach the \
+                                    "Dropped the output of an inter-delegate message's \
+                                     target from a background run: there is no client \
+                                     to return it to, and it must not reach the \
                                      caller's apps under the caller's name"
                                 );
                             }
                         } else {
-                            // Filter out SendDelegateMessage from target's output to enforce
-                            // single-hop delivery. The rest goes back to the client with the
+                            // The rest goes back to the client with the
                             // caller's output.
-                            for value in values {
-                                if !matches!(value, OutboundDelegateMsg::SendDelegateMessage(_)) {
-                                    accumulated_messages.push(value);
-                                }
-                            }
+                            accumulated_messages.extend(other);
                         }
                     }
                     Ok(_) => {}
@@ -2960,6 +3050,19 @@ where
                     refused = refused_self,
                     total_refused = ?total,
                     "Refused inter-delegate messages a delegate addressed to itself"
+                );
+            }
+            if dropped_sends > 0 {
+                let total = parking
+                    .as_mut()
+                    .map(|ctx| ctx.park.count_dropped_hop_sends(dropped_sends));
+                tracing::info!(
+                    delegate_key = %delegate_key,
+                    dropped = dropped_sends,
+                    total_dropped = ?total,
+                    "Dropped inter-delegate messages sent by the targets of this \
+                     delegate's messages: a target may send one reply to its caller \
+                     per message, and nothing else"
                 );
             }
             if refused_over_cap > 0 {

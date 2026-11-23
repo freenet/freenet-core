@@ -1769,9 +1769,14 @@ pub(super) struct DelegateParkCtx {
     /// Inter-delegate messages refused because an unprompted run reached
     /// `MAX_UNPROMPTED_HOPS_PER_RUN`.
     refused_unprompted_hops: u64,
-    /// Messages in hop targets' replies dropped because the hop came from an
-    /// unprompted run (which has no client to return them to).
+    /// Messages in hop targets' output, other than `SendDelegateMessage`s,
+    /// dropped because the hop came from an unprompted run (which has no
+    /// client to return them to).
     dropped_hop_outputs: u64,
+    /// `SendDelegateMessage`s in hop targets' output that were not delivered:
+    /// every one except the first addressed back to the caller (the reply).
+    /// Counted for every run kind. Disjoint from `dropped_hop_outputs`.
+    dropped_hop_sends: u64,
     /// Inter-delegate messages refused because a delegate addressed them to
     /// itself.
     refused_self_hops: u64,
@@ -1834,6 +1839,7 @@ impl DelegateParkCtx {
             dropped_hops: 0,
             refused_unprompted_hops: 0,
             dropped_hop_outputs: 0,
+            dropped_hop_sends: 0,
             refused_self_hops: 0,
         }
     }
@@ -1895,8 +1901,8 @@ impl DelegateParkCtx {
         self.refused_unprompted_hops
     }
 
-    /// Count `n` messages dropped from a hop target's reply on an unprompted
-    /// run; returns the new total.
+    /// Count `n` messages (other than `SendDelegateMessage`s) dropped from a
+    /// hop target's output on an unprompted run; returns the new total.
     pub(super) fn count_dropped_hop_output(&mut self, n: usize) -> u64 {
         self.dropped_hop_outputs = self.dropped_hop_outputs.saturating_add(n as u64);
         self.dropped_hop_outputs
@@ -1905,6 +1911,18 @@ impl DelegateParkCtx {
     #[cfg(test)]
     pub(super) fn dropped_hop_outputs(&self) -> u64 {
         self.dropped_hop_outputs
+    }
+
+    /// Count `n` `SendDelegateMessage`s from hop targets that were not
+    /// delivered (not the one reply to the caller); returns the new total.
+    pub(super) fn count_dropped_hop_sends(&mut self, n: u64) -> u64 {
+        self.dropped_hop_sends = self.dropped_hop_sends.saturating_add(n);
+        self.dropped_hop_sends
+    }
+
+    #[cfg(test)]
+    pub(super) fn dropped_hop_sends(&self) -> u64 {
+        self.dropped_hop_sends
     }
 
     /// Count `n` inter-delegate messages a delegate addressed to itself;

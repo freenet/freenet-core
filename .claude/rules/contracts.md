@@ -94,10 +94,16 @@ it. A client-driven hop carries the originating connection scope, so an
 off-host client gets no attested origin through it. Hosted nodes start no
 background runs. A hop runs the target's process() (after the target's
 pending lane round-trip, if the lane handed one to the loop); the target's
-own contract requests are not executed. From a background run the target's
-reply is dropped (counted, one info! per hop), never merged into the
-caller's output, which would fan it out to the caller's apps under the
-caller's name; there is no reply path to the caller yet. A background run
+own contract requests are not executed. One reply to the caller, no further
+chaining: the target's first SendDelegateMessage addressed back to the
+caller is delivered to the caller as an inbound DelegateMessage in its next
+iteration (carried across a park), with `sender` set by the core to the
+target (split_hop_output); every other SendDelegateMessage from the target
+is dropped, counted and logged once per iteration. The reply never runs the
+target again; hops the caller makes while handling it count against its
+own cap. From a background run the target's other output is dropped
+(counted, one info! per hop), never merged into the caller's output, which
+would fan it out to the caller's apps under the caller's name. A background run
 attempts at most MAX_UNPROMPTED_HOPS_PER_RUN (16) hops, manifest or not;
 refusals are counted and logged once per iteration. Hop time (including a
 target lane round-trip the hop runs first) is charged to the caller's duty

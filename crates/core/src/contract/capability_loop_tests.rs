@@ -2653,3 +2653,266 @@ async fn the_hop_cap_applies_to_a_queued_notification_run() {
     assert_eq!(runs_of(&observations, &other), cap);
     assert_eq!(park.refused_unprompted_hops(), extra as u64);
 }
+
+/// A reply from a hop target to `to`, claiming to come from `claimed_sender`.
+/// The node must deliver it as coming from the delegate that actually ran,
+/// whatever this field says.
+fn reply(to: &DelegateKey, claimed_sender: &DelegateKey) -> OutboundDelegateMsg {
+    OutboundDelegateMsg::SendDelegateMessage(DelegateMessage::new(
+        to.clone(),
+        claimed_sender.clone(),
+        b"signature".to_vec(),
+    ))
+}
+
+/// Each run as (delegate, inbound kinds, senders of its inbound
+/// `DelegateMessage`s).
+type RunTrace = Vec<(DelegateKey, Vec<&'static str>, Vec<DelegateKey>)>;
+
+fn trace(obs: &super::executor::mock_wasm_runtime::DelegateObservations) -> RunTrace {
+    obs.lock()
+        .unwrap()
+        .iter()
+        .map(|o| {
+            (
+                o.delegate_key.clone(),
+                o.inbound_kinds.clone(),
+                o.delegate_message_senders.clone(),
+            )
+        })
+        .collect()
+}
+
+/// A hop target can answer its caller once. B replies to A during a hop, and
+/// A receives the reply as an inbound `DelegateMessage` in its next
+/// iteration, with `sender == B` even though B wrote another key into the
+/// field. B runs once: delivering the reply does not run it again. Checked
+/// for a CLIENT run (where B's application message still goes back to the
+/// client) and a contract-NOTIFICATION run.
+#[tokio::test]
+async fn a_hop_target_can_reply_to_its_caller() {
+    let key = DelegateKey::new([0xA1; 32], CodeHash::new([0xA1; 32]));
+    let other = DelegateKey::new([0xA2; 32], CodeHash::new([0xA2; 32]));
+    let forged = DelegateKey::new([0xA3; 32], CodeHash::new([0xA3; 32]));
+    let script = || {
+        vec![
+            ScriptedRun::from(vec![send(&other, &key)]),
+            ScriptedRun::from(vec![reply(&key, &forged), app_out(b"from target")]),
+            ScriptedRun::from(vec![app_out(b"from caller")]),
+        ]
+    };
+
+    // Client run.
+    let (mut handler, observations, _send) = direct_handler("reply_client", script()).await;
+    let mut park = new_park();
+    let out = run_direct(
+        &mut handler,
+        &mut park,
+        &key,
+        super::RunTrigger::Client,
+        crate::client_events::ConnectionScope::Local,
+    )
+    .await;
+    assert_eq!(
+        trace(&observations),
+        vec![
+            (key.clone(), vec!["ApplicationMessage"], vec![]),
+            (other.clone(), vec!["DelegateMessage"], vec![key.clone()]),
+            (key.clone(), vec!["DelegateMessage"], vec![other.clone()]),
+        ],
+        "client run: the hop, then the caller's next iteration with the reply from B"
+    );
+    let obs = observations.lock().unwrap().clone();
+    assert_eq!(
+        obs[2].origin, obs[0].origin,
+        "the reply arrives in the caller's own run, not as a hop into it"
+    );
+    let out = labels(&out);
+    assert!(
+        out.contains(&"app:from target".to_string())
+            && out.contains(&"app:from caller".to_string()),
+        "a client run still returns the target's application message: {out:?}"
+    );
+    assert_eq!(park.dropped_hop_sends(), 0);
+
+    // Notification run.
+    let (mut handler, observations, _send) = direct_handler("reply_notify", script()).await;
+    let mut park = new_park();
+    let prompter = Arc::new(CapabilityPrompter::answering(None));
+    super::handle_delegate_notification(
+        &mut handler,
+        super::executor::DelegateNotification {
+            delegate_key: key.clone(),
+            contract_id: ContractInstanceId::new([0xA4; 32]),
+            new_state: Arc::new(WrappedState::new(vec![1])),
+        },
+        &prompter,
+        Some(&mut park),
+    )
+    .await;
+    assert_eq!(
+        trace(&observations),
+        vec![
+            (key.clone(), vec!["ContractNotification"], vec![]),
+            (other.clone(), vec!["DelegateMessage"], vec![key.clone()]),
+            (key.clone(), vec!["DelegateMessage"], vec![other.clone()]),
+        ],
+        "notification run: the hop, then the caller's next iteration with the reply from B"
+    );
+    assert_eq!(
+        park.dropped_hop_outputs(),
+        1,
+        "on a background run the target's application message is still dropped"
+    );
+    assert_eq!(park.dropped_hop_sends(), 0);
+}
+
+/// Only ONE message from the target reaches anyone: a message to a third
+/// delegate and a second reply to the caller are dropped and counted, and
+/// the third delegate never runs. Both run kinds.
+#[tokio::test]
+async fn a_hop_targets_other_messages_are_dropped_and_counted() {
+    let key = DelegateKey::new([0xA5; 32], CodeHash::new([0xA5; 32]));
+    let other = DelegateKey::new([0xA6; 32], CodeHash::new([0xA6; 32]));
+    let third = DelegateKey::new([0xA7; 32], CodeHash::new([0xA7; 32]));
+    for trigger in [super::RunTrigger::Unprompted, super::RunTrigger::Client] {
+        let (mut handler, observations, _send) = direct_handler(
+            "reply_extra",
+            vec![
+                ScriptedRun::from(vec![send(&other, &key)]),
+                ScriptedRun::from(vec![
+                    send(&third, &other),
+                    reply(&key, &other),
+                    reply(&key, &other),
+                ]),
+                ScriptedRun::default(),
+            ],
+        )
+        .await;
+        let mut park = new_park();
+        run_direct(
+            &mut handler,
+            &mut park,
+            &key,
+            trigger,
+            crate::client_events::ConnectionScope::Local,
+        )
+        .await;
+        assert_eq!(
+            trace(&observations),
+            vec![
+                (key.clone(), vec!["ApplicationMessage"], vec![]),
+                (other.clone(), vec!["DelegateMessage"], vec![key.clone()]),
+                (key.clone(), vec!["DelegateMessage"], vec![other.clone()]),
+            ],
+            "{trigger:?}: one reply reaches the caller; the third delegate never runs"
+        );
+        assert_eq!(
+            park.dropped_hop_sends(),
+            2,
+            "{trigger:?}: the message to the third delegate and the second reply"
+        );
+        assert_eq!(
+            park.dropped_hop_outputs(),
+            0,
+            "{trigger:?}: dropped sends are not counted as other output"
+        );
+    }
+}
+
+/// A reply does not chain. The caller handles each reply by hopping to the
+/// target again; those hops are the CALLER's and count against its cap on a
+/// background run, so the exchange stops at `MAX_UNPROMPTED_HOPS_PER_RUN`
+/// target runs, one per hop the caller made.
+#[tokio::test]
+async fn a_reply_triggered_hop_counts_toward_the_cap() {
+    let cap = super::MAX_UNPROMPTED_HOPS_PER_RUN;
+    let extra = 2;
+    let key = DelegateKey::new([0xA8; 32], CodeHash::new([0xA8; 32]));
+    let other = DelegateKey::new([0xA9; 32], CodeHash::new([0xA9; 32]));
+    let mut script = Vec::new();
+    for _ in 0..cap {
+        // The caller hops (the first time from its own input, then from each
+        // reply), and the target replies.
+        script.push(ScriptedRun::from(vec![send(&other, &key)]));
+        script.push(ScriptedRun::from(vec![reply(&key, &other)]));
+    }
+    for _ in 0..extra {
+        script.push(ScriptedRun::from(vec![send(&other, &key)]));
+    }
+    script.push(ScriptedRun::default());
+    let (mut handler, observations, _send) = direct_handler("reply_cap", script).await;
+    let mut park = new_park();
+    run_direct(
+        &mut handler,
+        &mut park,
+        &key,
+        super::RunTrigger::Unprompted,
+        crate::client_events::ConnectionScope::Local,
+    )
+    .await;
+    let runs = trace(&observations);
+    assert_eq!(runs_of(&observations, &other), cap, "{runs:?}");
+    assert_eq!(park.refused_unprompted_hops(), extra as u64);
+    let replies_received = runs
+        .iter()
+        .filter(|(k, kinds, _)| *k == key && *kinds == vec!["DelegateMessage"])
+        .count();
+    assert_eq!(replies_received, cap, "every delivered hop's reply arrived");
+}
+
+/// A reply survives the caller parking in the same iteration. The caller
+/// hops and prompts in one iteration; the target replies; the caller parks on
+/// the prompt, and the resumed iteration receives the reply together with
+/// the prompt's answer.
+#[tokio::test]
+async fn a_reply_survives_the_caller_parking() {
+    let key = DelegateKey::new([0xAA; 32], CodeHash::new([0xAA; 32]));
+    let other = DelegateKey::new([0xAB; 32], CodeHash::new([0xAB; 32]));
+    let mut hop_and_prompt = user_input_run();
+    hop_and_prompt.outbound.push(send(&other, &key));
+    let (mut handler, observations, _send) = direct_handler(
+        "reply_park",
+        vec![
+            hop_and_prompt,
+            ScriptedRun::from(vec![reply(&key, &other)]),
+            ScriptedRun::default(),
+        ],
+    )
+    .await;
+    let (resume_tx, mut resume_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut park = super::delegate_park::DelegateParkCtx::new(resume_tx);
+    let prompter = Arc::new(CapabilityPrompter::answering(None));
+    super::handle_delegate_notification(
+        &mut handler,
+        super::executor::DelegateNotification {
+            delegate_key: key.clone(),
+            contract_id: ContractInstanceId::new([0xAC; 32]),
+            new_state: Arc::new(WrappedState::new(vec![1])),
+        },
+        &prompter,
+        Some(&mut park),
+    )
+    .await;
+    assert!(park.is_parked(&key), "the run parked on its prompt");
+    assert_eq!(
+        runs_of(&observations, &other),
+        1,
+        "the hop ran before the park"
+    );
+
+    let resume = tokio::time::timeout(Duration::from_secs(10), resume_rx.recv())
+        .await
+        .expect("the prompt is answered")
+        .expect("resume");
+    super::handle_delegate_resume(&mut handler, &mut park, &prompter, resume).await;
+    assert!(!park.is_parked(&key), "the resumed run finished");
+    let runs = trace(&observations);
+    let resumed = runs.last().expect("the resumed iteration ran");
+    assert_eq!(resumed.0, key, "{runs:?}");
+    assert!(
+        resumed.1.contains(&"DelegateMessage") && resumed.1.contains(&"UserResponse"),
+        "the resumed iteration gets the reply and the prompt's answer: {runs:?}"
+    );
+    assert_eq!(resumed.2, vec![other.clone()], "the reply is from B");
+}
