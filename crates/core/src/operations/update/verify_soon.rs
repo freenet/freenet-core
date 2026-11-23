@@ -72,6 +72,8 @@
 //! either side of a centre 20% late), never earlier than the time the held
 //! peer clears, so nodes that held the same peer at the same moment do not
 //! retry in step.
+//! The restart of a check for a write it had not covered is not jittered: it
+//! is driven by this node's own writes, which no other node times.
 //!
 //! Bounds:
 //! - later writes never move a scheduled check; a write after the check's
@@ -1637,6 +1639,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_forced_leg_at_a_time_per_node() {
+        let _seed = crate::config::GlobalRng::seed_guard(0x6143);
         let vs = VerifySoon::new();
         let (a, b) = (peer(), peer());
         let t0 = Instant::now();
@@ -1710,6 +1713,7 @@ mod tests {
     /// write's stale peer to anti-entropy; the check retries when the bar ends.
     #[tokio::test]
     async fn a_short_bar_retries_the_peer_when_it_ends_and_a_long_one_does_not() {
+        let _seed = crate::config::GlobalRng::seed_guard(0x6143);
         let vs = VerifySoon::new();
         let a = peer();
         let t0 = Instant::now();
@@ -2069,6 +2073,7 @@ mod tests {
     /// retries need jitter).
     #[tokio::test]
     async fn retries_are_jittered_and_never_early() {
+        let _seed = crate::config::GlobalRng::seed_guard(0x6143);
         let t0 = Instant::now();
         let wait = FORCE_FLOOR;
         let mut offsets = HashSet::new();
@@ -2094,6 +2099,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_busy_pair_is_retried_asking_only_the_held_peers() {
+        let _seed = crate::config::GlobalRng::seed_guard(0x6143);
         let vs = VerifySoon::new();
         let (a, b) = (peer(), peer());
         let t0 = Instant::now();
@@ -2112,6 +2118,7 @@ mod tests {
 
     #[tokio::test]
     async fn retries_are_bounded_and_the_last_waits_for_the_latest_holder() {
+        let _seed = crate::config::GlobalRng::seed_guard(0x6143);
         let vs = VerifySoon::new();
         let (a, b) = (peer(), peer());
         let t0 = Instant::now();
@@ -2205,6 +2212,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rewrite_waits_for_a_held_peer() {
+        let _seed = crate::config::GlobalRng::seed_guard(0x6143);
         let vs = VerifySoon::new();
         let a = peer();
         let t0 = Instant::now();
@@ -2299,6 +2307,7 @@ mod tests {
 
     #[tokio::test]
     async fn peers_a_confirm_round_could_not_ask_are_asked_next() {
+        let _seed = crate::config::GlobalRng::seed_guard(0x6143);
         let vs = VerifySoon::new();
         let (a, b) = (peer(), peer());
         let t0 = Instant::now();

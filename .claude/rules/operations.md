@@ -731,7 +731,7 @@ round; a stale verdict, not a heal), peer_stale_confirm (confirm round only),
 peer_converged, forced_full, forced_full_sent, forced_delivered, and
 not_forced_{evidence,floor,no_progress,cap,busy,slot,peer_failed}. Floor, busy, slot and cap holds are retried,
 each retry delayed by 0 to 40% of its wait (jitter, never before the peer clears); a
-peer-failed hold is retried only when its bar ends within 5 minutes; an evidence or
+peer-failed hold is retried (also with jitter) only when its bar ends within 5 minutes; an evidence or
 no-progress hold is not retried. Bounds, the
 `PERSISTENT_FAULT_BOUND` assumptions and residuals are in the `verify_soon`
 module doc.

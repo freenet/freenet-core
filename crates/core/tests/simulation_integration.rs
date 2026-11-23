@@ -25020,8 +25020,9 @@ fn test_verify_soon_sustained_writes_under_a_persistent_fault_converge() {
 #[test_log::test]
 fn test_verify_soon_repairs_while_the_originator_keeps_writing() {
     let mut s = VerifyScenario::new("vs-continuous", 0xEC, InlineFault::Persistent);
-    s.updates = 40;
+    s.updates = 60;
     s.bound = Duration::from_secs(3);
+    let writes = s.updates;
     let o = run_verify_scenario(s);
     assert_forced_legs_accounted(&o);
     assert!(o.swallowed > 0, "the fault seam never fired");
@@ -25030,6 +25031,12 @@ fn test_verify_soon_repairs_while_the_originator_keeps_writing() {
         + freenet::dev_tool::VERIFY_SOON_SLOT_WAIT_BOUND * 2;
     // One write per 3 s op interval: how many writes fit in the bound.
     let lag = bound.as_secs().div_ceil(3);
+    // Fails loudly if a bound grows until the check below accepts any host
+    // that was ever repaired.
+    assert!(
+        lag * 3 < writes as u64 * 2,
+        "the allowed lag ({lag} writes) is not well below the {writes} writes: the check is vacuous"
+    );
     for (label, _, v) in &o.others {
         assert!(
             v.is_some_and(|v| v + lag >= o.final_version),
