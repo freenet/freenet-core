@@ -658,15 +658,39 @@ floor_run_case "release.sh refuses before any work when Cargo.toml has no floor"
 floor_run_case "release.sh refuses --min-compatible before any work" \
     refuse "Error: --min-compatible is no longer supported" \
     "$TOML_FLOOR" --version 0.2.201 --min-compatible 0.2.165 --dry-run
+floor_run_case "release.sh refuses an empty --min-compatible too" \
+    refuse "Error: --min-compatible is no longer supported" \
+    "$TOML_FLOOR" --version 0.2.201 --dry-run --min-compatible ""
+floor_run_case "release.sh refuses --min-compatible given without a value" \
+    refuse "Error: --min-compatible is no longer supported" \
+    "$TOML_FLOOR" --version 0.2.201 --dry-run --min-compatible
 
-# update_versions cannot run on its own (it defines its helpers inline and
-# edits the tree), so this one reads the code: no line may write the floor.
-FLOOR_WRITES="$(code_lines "$RELEASE_SH" | grep -E 'sed.*min-compatible-version' || true)"
-if [[ -z "$FLOOR_WRITES" ]]; then
-    pass "release.sh never rewrites min-compatible-version"
+# The runs above stop at the first cargo call, and update_versions cannot run
+# on its own (it defines its helpers inline and edits the tree), so these two
+# read the code, by allow-list rather than by the tool a writer would use:
+#   - min-compatible-version may appear only in the reader's grep and in
+#     messages, so a sed, perl, awk or toml-tool rewrite anywhere fails;
+#   - FREENET_MIN_COMPATIBLE_VERSION may appear only in the one `unset`, so
+#     an export or assignment added anywhere later fails.
+FLOOR_LINES="$(code_lines "$RELEASE_SH" \
+    | grep -F 'min-compatible-version' \
+    | grep -vE "^[0-9]+:[[:space:]]*echo " \
+    | grep -vF "value=\$(grep -E '^min-compatible-version[[:space:]]*=' \"\$1\"" || true)"
+if [[ -z "$FLOOR_LINES" ]]; then
+    pass "release.sh never rewrites min-compatible-version (only the reader and messages name it)"
 else
-    fail "release.sh rewrites min-compatible-version" "$FLOOR_WRITES" \
+    fail "release.sh names min-compatible-version outside the reader and messages" "$FLOOR_LINES" \
         "Raising the floor is its own reviewed PR (docs/RELEASING.md, #5833)."
+fi
+ENV_LINES="$(code_lines "$RELEASE_SH" \
+    | grep -F 'FREENET_MIN_COMPATIBLE_VERSION' \
+    | grep -vE '^[0-9]+:unset FREENET_MIN_COMPATIBLE_VERSION$' || true)"
+ENV_UNSETS="$(code_lines "$RELEASE_SH" | grep -cE '^[0-9]+:unset FREENET_MIN_COMPATIBLE_VERSION$' || true)"
+if [[ -z "$ENV_LINES" ]] && [[ "$ENV_UNSETS" -eq 1 ]]; then
+    pass "FREENET_MIN_COMPATIBLE_VERSION is only ever unset by release.sh"
+else
+    fail "release.sh sets FREENET_MIN_COMPATIBLE_VERSION, or does not unset it exactly once" \
+        "unset lines: $ENV_UNSETS" "${ENV_LINES:-}"
 fi
 
 echo

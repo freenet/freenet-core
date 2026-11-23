@@ -101,8 +101,11 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --min-compatible)
-            MIN_COMPATIBLE="$2"
-            shift 2
+            # Refused on sight, with or without a value (#5833).
+            echo "Error: --min-compatible is no longer supported. This script never changes"
+            echo "       the handshake floor; raise min-compatible-version in"
+            echo "       crates/core/Cargo.toml in its own reviewed PR (docs/RELEASING.md)."
+            exit 1
             ;;
         --skip-tests)
             SKIP_TESTS=true
@@ -153,17 +156,11 @@ current_min_compatible() {
 # that into the bump, which would make every updated peer refuse every peer
 # that had not updated yet: a network split on an ordinary release. Raising the
 # floor is its own reviewed PR (docs/RELEASING.md), so --min-compatible is
-# refused rather than written into a release bump.
+# refused during argument parsing rather than written into a release bump.
 #
 # A committed floor that cannot be read is refused too: build.rs would then
 # fall back to the package version, the same split. The env override is
 # cleared so a value left in the caller's shell cannot reach the builds.
-if [[ -n "$MIN_COMPATIBLE" ]]; then
-    echo "Error: --min-compatible is no longer supported. This script never changes"
-    echo "       the handshake floor; raise min-compatible-version in"
-    echo "       crates/core/Cargo.toml in its own reviewed PR (docs/RELEASING.md)."
-    exit 1
-fi
 if ! MIN_COMPATIBLE=$(current_min_compatible "$PROJECT_ROOT/crates/core/Cargo.toml"); then
     echo "Error: could not read an X.Y.Z min-compatible-version from crates/core/Cargo.toml."
     exit 1

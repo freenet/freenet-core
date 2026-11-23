@@ -1001,9 +1001,11 @@ variants a peer can receive.
 
 `release.yml` ships the committed value unchanged, so raising it is its own
 reviewed PR, never a side effect of a release. `scripts/release.sh` also
-ships it unchanged and refuses `--min-compatible` (#5833). `build.rs` requires an `X.Y.Z` value no higher than
-the package version. A floor in the same major.minor series is carried as a
-patch number (wire format 1). A floor in a different series (for example a
+ships it unchanged and refuses `--min-compatible` (#5833). To raise it, change
+`min-compatible-version` in `crates/core/Cargo.toml` in a PR that goes through
+the checklist below; the next release from `main` ships it. `build.rs` requires
+an `X.Y.Z` value no higher than the package version. A floor in the same
+major.minor series is carried as a patch number (wire format 1). A floor in a different series (for example a
 1.0.0 build keeping floor 0.2.N) uses wire format 2 and is accepted only if
 its major is at most one below the package's, its minor is below 64 and its
 patch is below 256; `build.rs` fails the build otherwise. Releases before the
