@@ -314,8 +314,11 @@ impl DialTransport {
 
 /// How long a native dial may wait when its caller has no deadline of its
 /// own. The setup's own window is shorter and ends it first (8 s for the
-/// client, 12 s for the server), so this only bounds a setup that never
-/// reports.
+/// client, 12 s for the server), so for the setup this only bounds one that
+/// never reports. It ALSO sets how long an acceptor holds a native setup
+/// admission ([`SetupTicket`]): from the dispatch of its native dial to this
+/// long after it. Changing it changes the acceptor's admission throughput
+/// (pending cap / this duration).
 pub(crate) const NATIVE_CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// This node's readiness for native connections in one role: as joiner
@@ -510,9 +513,10 @@ pub(crate) fn joiner_response_action(
 
 /// Where a joiner's native setup is counted for
 /// [`ACCEPTOR_PENDING_SETUPS_PER_SOURCE`]: the crate's per-host source unit
-/// (`put::stream_admission::Source`: an IPv4 address or an IPv6 /64), except
-/// a loopback or unspecified address, which is counted per port, since local
-/// test networks run every node on one such address.
+/// (`put::stream_admission::Source`: an IPv4 address or an IPv6 /64). In test
+/// builds only, a loopback or unspecified address is counted per port, since
+/// local test networks run every node on one such address; a release build
+/// counts it as one host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupSource {
     Host(crate::operations::put::stream_admission::Source),
@@ -521,12 +525,14 @@ enum SetupSource {
 
 impl SetupSource {
     fn of(addr: std::net::SocketAddr) -> Self {
-        let ip = addr.ip().to_canonical();
-        if ip.is_loopback() || ip.is_unspecified() {
-            Self::Exact(addr)
-        } else {
-            Self::Host(crate::operations::put::stream_admission::Source::of(addr))
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let ip = addr.ip().to_canonical();
+            if ip.is_loopback() || ip.is_unspecified() {
+                return Self::Exact(addr);
+            }
         }
+        Self::Host(crate::operations::put::stream_admission::Source::of(addr))
     }
 }
 
@@ -622,9 +628,17 @@ impl NativeSetupAdmission {
 }
 
 /// One admitted native setup as acceptor, held from the decision until the
-/// acceptor's native dial deadline (when the setup can no longer hold a setup
-/// slot); dropping it releases the admission, so an accept that is never
-/// dispatched (or whose dispatch fails) releases it at once.
+/// acceptor's native dial deadline, [`NATIVE_CONNECT_WITHIN`] after the dial
+/// is dispatched (when the setup can no longer hold a setup slot); dropping
+/// it releases the admission, so an accept that is never dispatched (or whose
+/// dispatch fails) releases it at once.
+///
+/// Residuals: the cap bounds distinct pending joiner ADDRESSES, not
+/// decisions (CONNECTs to one address share an entry); the node's own native
+/// dials as joiner take setup slots uncapped (the other half is left for
+/// them, not reserved); and once UDP is removed (phase D), "refused, so
+/// decide UDP" no longer has a UDP to decide, so a refusal will need another
+/// answer (a `Rejected`).
 pub(crate) struct SetupTicket {
     /// `None` for a ticket a test made with no admission behind it.
     admission: Option<std::sync::Arc<parking_lot::Mutex<NativeSetupAdmission>>>,

@@ -2570,7 +2570,27 @@ mod tests {
                 "a `dispatch_expect_connection_from` call does not pass \
                  `accept.response.native_decision`: {call}"
             );
+            // 5. ... and the decision's native setup admission (#6345). A
+            //    site passing `None` leaves the ticket in the accept, which
+            //    drops when the response block ends: the admission would be
+            //    held for milliseconds, not to the dial deadline, and the
+            //    acceptor's cap would bound nothing.
+            let flat: String = call.split_whitespace().collect();
+            assert!(
+                flat.contains(",accept.native_admission") && !flat.contains(",None,)"),
+                "a `dispatch_expect_connection_from` call does not hand over \
+                 `accept.native_admission`: {call}"
+            );
         }
+        // The happy path borrows the accept (it is read after the dispatch),
+        // so it must take the ticket out of it.
+        let happy_call = &happy_window[happy_dispatch.expect("checked above")..];
+        let happy_call = &happy_call[..happy_call.find(".await").expect("awaited")];
+        let happy_flat: String = happy_call.split_whitespace().collect();
+        assert!(
+            happy_flat.contains(",accept.native_admission.take(),"),
+            "the happy-path dispatch must pass `accept.native_admission.take()`: {happy_call}"
+        );
     }
 
     /// Pins the wiring of the lattice-probe miss report (#5814), which the
@@ -4248,7 +4268,7 @@ mod driver_timing_tests {
     }
 
     /// The acceptor's native setup admission is released at the native
-    /// dial's deadline (`NATIVE_CONNECT_WITHIN` after the decision), when the
+    /// dial's deadline (`NATIVE_CONNECT_WITHIN` after the dispatch), when the
     /// setup can no longer hold a setup slot: not at the dial's answer, which
     /// can come before the setup ends or never. Answered connected, failed,
     /// callback dropped, or not answered at all.

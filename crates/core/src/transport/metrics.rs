@@ -1108,6 +1108,9 @@ pub struct TransportMetrics {
     /// instead (`connect::native::NativeSetupAdmission`) (reset each
     /// snapshot).
     connect_native_admission_refused: AtomicU64,
+    /// Control pairs this node left out of the connect arms as acceptor
+    /// because it had no room for a native setup (reset each snapshot).
+    connect_native_admission_control_dropped: AtomicU64,
     /// A UDP dial that followed a failed native setup connected, by the side
     /// this node had in the CONNECT (reset each snapshot).
     connect_native_rescued_by_udp_joiner: AtomicU64,
@@ -1532,6 +1535,10 @@ thread_local! {
     pub(crate) static CONNECT_ARM_ON_THIS_THREAD: std::cell::Cell<[u64; ConnectArmCounter::COUNT]> =
         const { std::cell::Cell::new([0; ConnectArmCounter::COUNT]) };
 
+    /// Test-only: control pairs dropped for lack of setup room on this thread.
+    pub(crate) static NATIVE_CONTROL_DROPPED_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
     /// Test-only: native setups not admitted as acceptor on this thread.
     pub(crate) static NATIVE_ADMISSIONS_REFUSED_ON_THIS_THREAD: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
@@ -1665,6 +1672,7 @@ impl TransportMetrics {
             connect_native_demotions: AtomicU64::new(0),
             connect_native_acceptor_demotions: AtomicU64::new(0),
             connect_native_admission_refused: AtomicU64::new(0),
+            connect_native_admission_control_dropped: AtomicU64::new(0),
             connect_native_rescued_by_udp_joiner: AtomicU64::new(0),
             connect_native_rescued_by_udp_acceptor: AtomicU64::new(0),
             connect_native_fallback_connected_joiner: AtomicU64::new(0),
@@ -2295,6 +2303,16 @@ impl TransportMetrics {
     pub(crate) fn record_connect_native_demotion(&self) {
         self.connect_native_demotions
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// This node, as acceptor, left a control pair out of the connect arms:
+    /// it had no room for a native setup, as a treated pair would have been
+    /// refused.
+    pub(crate) fn record_connect_native_control_dropped(&self) {
+        self.connect_native_admission_control_dropped
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_CONTROL_DROPPED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     }
 
     /// This node did not admit a native setup as acceptor and decided UDP.
@@ -3286,6 +3304,9 @@ impl TransportMetrics {
             connect_native_demotions: get64(&self.connect_native_demotions),
             connect_native_acceptor_demotions: get64(&self.connect_native_acceptor_demotions),
             connect_native_admission_refused: get64(&self.connect_native_admission_refused),
+            connect_native_admission_control_dropped: get64(
+                &self.connect_native_admission_control_dropped,
+            ),
             connect_native_rescued_by_udp_joiner: get64(&self.connect_native_rescued_by_udp_joiner),
             connect_native_rescued_by_udp_acceptor: get64(
                 &self.connect_native_rescued_by_udp_acceptor,
@@ -4014,6 +4035,8 @@ pub struct TransportSnapshot {
     pub connect_native_acceptor_demotions: u64,
     /// Native setups not admitted as acceptor (decided UDP instead).
     pub connect_native_admission_refused: u64,
+    /// Control pairs left out of the arms for lack of setup room.
+    pub connect_native_admission_control_dropped: u64,
     /// UDP dials that connected after a native setup that failed on the
     /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
@@ -4469,6 +4492,7 @@ impl TransportSnapshot {
             connect_native_demotions,
             connect_native_acceptor_demotions,
             connect_native_admission_refused,
+            connect_native_admission_control_dropped,
             connect_native_rescued_by_udp_joiner,
             connect_native_rescued_by_udp_acceptor,
             connect_native_fallback_connected_joiner,
@@ -4650,6 +4674,7 @@ impl TransportSnapshot {
         self.connect_native_demotions = connect_native_demotions;
         self.connect_native_acceptor_demotions = connect_native_acceptor_demotions;
         self.connect_native_admission_refused = connect_native_admission_refused;
+        self.connect_native_admission_control_dropped = connect_native_admission_control_dropped;
         self.connect_native_rescued_by_udp_joiner = connect_native_rescued_by_udp_joiner;
         self.connect_native_rescued_by_udp_acceptor = connect_native_rescued_by_udp_acceptor;
         self.connect_native_fallback_connected_joiner = connect_native_fallback_connected_joiner;
@@ -4903,6 +4928,8 @@ struct SnapshotExtras {
     pub connect_native_acceptor_demotions: u64,
     /// Native setups not admitted as acceptor (decided UDP instead).
     pub connect_native_admission_refused: u64,
+    /// Control pairs left out of the arms for lack of setup room.
+    pub connect_native_admission_control_dropped: u64,
     /// UDP dials that connected after a native setup that failed on the
     /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
@@ -5176,6 +5203,7 @@ impl SnapshotExtras {
             || self.connect_native_demotions != 0
             || self.connect_native_acceptor_demotions != 0
             || self.connect_native_admission_refused != 0
+            || self.connect_native_admission_control_dropped != 0
             || self.connect_native_rescued_by_udp_joiner != 0
             || self.connect_native_rescued_by_udp_acceptor != 0
             || self.connect_native_fallback_connected_joiner != 0
@@ -6566,6 +6594,27 @@ mod tests {
         );
     }
 
+    /// The two admission counters (treated refusals, control drops) are each
+    /// activity, reach the snapshot and its JSON under their own keys, and
+    /// reset with the snapshot.
+    #[test]
+    fn native_admission_counters_count_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.record_connect_native_admission_refused();
+        metrics.record_connect_native_control_dropped();
+        metrics.record_connect_native_control_dropped();
+        let snap = metrics.take_snapshot().expect("activity");
+        assert_eq!(snap.connect_native_admission_refused, 1);
+        assert_eq!(snap.connect_native_admission_control_dropped, 2);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["connect_native_admission_control_dropped"], 2);
+        assert!(metrics.take_snapshot().is_none(), "both reset");
+    }
+
     /// Each demotion counter (joiner role, acceptor role) is activity on its
     /// own, reaches the snapshot and its JSON under its own key, leaves the
     /// other at 0, and resets with the snapshot.
@@ -7853,6 +7902,7 @@ mod tests {
             "connect_native_demotions",
             "connect_native_acceptor_demotions",
             "connect_native_admission_refused",
+            "connect_native_admission_control_dropped",
             "connect_native_rescued_by_udp_joiner",
             "connect_native_rescued_by_udp_acceptor",
             "connect_native_fallback_connected_joiner",

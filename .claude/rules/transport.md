@@ -529,6 +529,8 @@ turned its own native connects off,
 as acceptor,
 `connect_native_admission_refused` for each native setup it did not admit as
 acceptor (deciding UDP instead),
+`connect_native_admission_control_dropped` for each control pair it left out
+of the arms as acceptor for lack of setup room,
 `connect_native_rescued_by_udp_{joiner,acceptor}` for each UDP dial that
 connected after a native setup that failed ON THE PATH (timed out,
 handshake failed, Hello lost: `counts_toward_demotion`; R5: a connection a
@@ -2549,7 +2551,7 @@ Setup admission: before deciding Native, the acceptor admits the setup
   a control pair at an acceptor with no room (acceptor_setup_room) leaves
   the control arm too. The admission is a SetupTicket carried in the
   AcceptOutcome into dispatch_expect_connection_from and dropped at the
-  acceptor's native dial deadline (NATIVE_CONNECT_WITHIN after the decision,
+  acceptor's native dial deadline (NATIVE_CONNECT_WITHIN after the dispatch,
   which ends every window the setup can run in, however late it starts), not
   at the dial's answer, which can come before the setup ends (a UDP
   connection beside it or from the joiner, a transient-budget refusal) or
@@ -2559,7 +2561,14 @@ Setup admission: before deciding Native, the acceptor admits the setup
   the CONNECT carries, which the joiner or a relay on its path chooses, so
   the per-source cap bounds honest crowding (one host, one CGNAT line), not
   a sender that forges addresses; what holds either way is the node cap,
-  and that a refused pair dials UDP at once.
+  and that a refused pair dials UDP at once. A control pair dropped for lack
+  of room is counted (connect_native_admission_control_dropped), so step 1
+  sees how much of the control arm load removed, beside the treated
+  refusals (connect_native_admission_refused). Residuals: the cap bounds
+  distinct pending addresses, not decisions; the node's own native dials as
+  joiner take setup slots uncapped; loopback is counted per port only in
+  test builds; and after phase D a refusal cannot "decide UDP", so it will
+  need another answer (a Rejected).
 Existing transport: a native dial does not drop a connection the node
   already has to that peer; the joiner may have connected another way since
   the acceptor decided.

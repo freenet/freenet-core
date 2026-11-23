@@ -695,6 +695,7 @@ impl RelayState {
             && ctx.native_setup_room(&self.request.joiner).is_err()
         {
             arm = None;
+            crate::transport::metrics::TRANSPORT_METRICS.record_connect_native_control_dropped();
         }
         crate::transport::metrics::TRANSPORT_METRICS.record_connect_native_decided(decision);
         #[cfg(any(test, feature = "testing"))]
@@ -1673,10 +1674,11 @@ pub(super) async fn dispatch_expect_connection_from(
         "connect: acceptor accepted joiner, setting up a QUIC-native connection"
     );
     let decided_at = Instant::now();
-    // The dial's absolute deadline ends every window its setup can run in
-    // (the setup turns it into what is left when it starts, and does not
-    // ends its window at the earlier of that and its own window), however
-    // late the setup starts behind the event loop and the handshake driver.
+    // The dial's absolute deadline ends every window its setup can run in:
+    // the setup runs for what is left of it when it starts, cut to its own
+    // window, and does not start with less than `NATIVE_MIN_WINDOW_LEFT`
+    // left, however late it starts behind the event loop and the handshake
+    // driver.
     let dial_deadline = tokio::time::Instant::now() + native::NATIVE_CONNECT_WITHIN;
     let (callback, mut rx) = mpsc::channel(1);
     op_manager
@@ -4536,6 +4538,8 @@ mod tests {
             accept.native_arm,
             Some(crate::transport::ConnectArm::Control)
         );
+        let dropped_before =
+            crate::transport::metrics::NATIVE_CONTROL_DROPPED_ON_THIS_THREAD.with(|c| c.get());
         let full = TestRelayContext::new(self_loc)
             .native(at_zero)
             .admission(Err(native::SetupAdmissionRefusal::Full));
@@ -4545,6 +4549,11 @@ mod tests {
             Some(native::NativeDecision::Udp)
         );
         assert_eq!(accept.native_arm, None, "a control pair with no room");
+        assert_eq!(
+            crate::transport::metrics::NATIVE_CONTROL_DROPPED_ON_THIS_THREAD.with(|c| c.get()),
+            dropped_before + 1,
+            "the drop is counted"
+        );
     }
 
     /// The "already connected" input is read when this node accepts, not
