@@ -244,9 +244,15 @@ builds (`cfg(test)`) those dirs now live under a per-process root,
 has exited (`config::test_temp_root`). `flock` liveness needs a local
 `TMPDIR` (not NFS with `nolock`/`local_lock`). Do not put a test's data under a fixed
 path in the shared temp dir; use `tempfile::tempdir()` or `default_dirs`.
-**Integration tests in `crates/core/tests/` are not covered**: they link the
-library without `cfg(test)`, so they still use `/tmp/freenet-{id}` and can
-still collide across processes.
+Integration tests in `crates/core/tests/` link the library without
+`cfg(test)`, so the per-process root also applies when the library is built
+with the `simulation_tests` feature, which every simulation test binary uses.
+Before that, two concurrent runs of one simulation test shared
+`/tmp/freenet-{id}`, and a node could load the peer cache the other process
+had just persisted: its bootstrap changed and a fixed-seed run took a
+different path, which read as nondeterminism under load
+(`test_quic_native_blocked_pairs_connect_over_udp_behind_nats`). Integration
+tests built WITHOUT `simulation_tests` still use `/tmp/freenet-{id}`.
 
 The fix shape for the `tracing` instance is non-obvious enough to record:
 keep **two** permanently-registered dispatchers alive (`tracing_core`'s
