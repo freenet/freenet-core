@@ -25034,7 +25034,7 @@ fn test_verify_soon_repairs_while_the_originator_keeps_writing() {
     // Fails loudly if a bound grows until the check below accepts any host
     // that was ever repaired.
     assert!(
-        lag * 3 < writes as u64 * 2,
+        lag * 3 < writes * 2,
         "the allowed lag ({lag} writes) is not well below the {writes} writes: the check is vacuous"
     );
     for (label, _, v) in &o.others {
