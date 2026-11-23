@@ -1690,80 +1690,30 @@ impl P2pConnManager {
                         origin,
                     );
                 }
-                // Demotion counts only an end that says native does not work
-                // on the path (`counts_toward_demotion`: a refusal by this
-                // node's own limits never counts), in two streaks kept apart,
-                // each across distinct peers and reset only by a success in
-                // its own role:
-                // - As joiner: three failures turn the offer off. A joiner's
-                //   acceptors come from responses routed back along its
-                //   CONNECT. That narrows who can demote it, not to no one:
-                //   the acceptor in a response is named by whoever sent it, so
-                //   a relay on the CONNECT's path can name acceptors that never
-                //   serve.
-                // - As acceptor: `ACCEPTOR_DEMOTION_FAILURES` failures with
-                //   distinct joiners turn its `Native` decisions off, so an
-                //   acceptor whose own native path is broken stops costing
-                //   every joiner the fallback wait. The threshold is higher
-                //   because a joiner that never dialled (or sits behind a
-                //   symmetric NAT) also ends this setup as `TimedOut`, and the
-                //   acceptor cannot tell. Its joiners chose it and can fail on
-                //   purpose, so joiners holding that many keys can turn an
-                //   honest acceptor's decisions off.
-                // Either way the effect is a downgrade to UDP for the
-                // cooldown, never a failed join. The connect op then falls
-                // back to UDP.
-                if native_outcome.is_some_and(|o| o.counts_toward_demotion()) {
-                    let native_connect = self
-                        .bridge
-                        .op_manager
-                        .ring
-                        .connection_manager
-                        .native_connect();
-                    // (the role whose streak counted it, whether it demoted)
-                    let (counted_as_acceptor, demoted) = match origin {
-                        crate::transport::NatAttemptOrigin::ConnectJoiner => {
-                            (Some(false), native_connect.record_failure(peer.pub_key()))
-                        }
-                        crate::transport::NatAttemptOrigin::ConnectAcceptor => (
-                            Some(true),
-                            native_connect.record_acceptor_failure(peer.pub_key()),
-                        ),
-                        crate::transport::NatAttemptOrigin::Gateway
-                        | crate::transport::NatAttemptOrigin::RingPeerNoTransport => (None, false),
-                    };
-                    #[cfg(any(test, feature = "testing"))]
-                    {
-                        use crate::operations::connect::native_wire_trace::{
-                            NativeWireEvent, record_at,
-                        };
-                        let own = self
-                            .bridge
-                            .op_manager
-                            .ring
-                            .connection_manager
-                            .get_own_addr();
-                        match (counted_as_acceptor, own, peer.socket_addr()) {
-                            (Some(true), Some(own), _) => {
-                                record_at(
-                                    own,
-                                    NativeWireEvent::AcceptorStreak {
-                                        own,
-                                        len: native_connect.acceptor_streak(),
-                                    },
-                                );
-                                if demoted {
-                                    record_at(own, NativeWireEvent::AcceptorDemoted { own });
-                                }
-                            }
-                            (Some(false), _, Some(addr)) if demoted => {
-                                record_at(addr, NativeWireEvent::NativeDemoted);
-                            }
-                            _ => {}
-                        }
-                    }
-                    #[cfg(not(any(test, feature = "testing")))]
-                    let _ = (counted_as_acceptor, demoted);
+                // A strike needs evidence that native specifically failed
+                // where UDP worked (a rescue, `native::DEMOTION_FAILURES`).
+                // Here: the setup failed on the path while a UDP connection to
+                // the same peer already exists (its UDP fallback, or the
+                // other side's, connected first; the setup then ends
+                // superseded below). The other rescue, the fallback
+                // connecting after this failure, is counted where that dial
+                // ends (`connect::record_native_rescue_strike` callers). A
+                // failure with no UDP connection is no strike: UDP may fail
+                // for the same reason (an incompatible pair, a peer that never
+                // dialled), which says nothing against native.
+                if native_outcome.is_some_and(|o| o.counts_toward_demotion())
+                    && peer
+                        .socket_addr()
+                        .and_then(|addr| self.connections.get(&addr))
+                        .is_some_and(|entry| {
+                            !entry.native && entry.pub_key().is_none_or(|key| key == peer.pub_key())
+                        })
+                {
+                    crate::operations::connect::record_native_rescue_strike(
+                        &self.bridge.op_manager,
+                        origin,
+                        &peer,
+                    );
                 }
                 // Outbound peers must have known addresses - extract once for reuse
                 let peer_addr = match KnownPeerKeyLocation::try_from(&peer) {
@@ -1858,8 +1808,9 @@ impl P2pConnManager {
                 // must not touch that connection: the in-transit prune below
                 // removes an address's ring entry whether or not it is in
                 // transit, and nothing waits on this dial any more (the
-                // connection answered its callback). Counted toward demotion
-                // above; nothing else to do.
+                // connection answered its callback). A path failure here is a
+                // rescue when that connection is UDP, struck above; nothing
+                // else to do.
                 if native && self.connections.contains_key(&peer_addr) {
                     tracing::debug!(
                         remote = %peer_addr,

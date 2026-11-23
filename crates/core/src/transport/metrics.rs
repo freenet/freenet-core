@@ -6541,6 +6541,33 @@ mod tests {
         );
     }
 
+    /// Each demotion counter (joiner role, acceptor role) is activity on its
+    /// own, reaches the snapshot and its JSON under its own key, leaves the
+    /// other at 0, and resets with the snapshot.
+    #[test]
+    fn native_demotion_counters_count_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.record_connect_native_demotion();
+        let snap = metrics.take_snapshot().expect("a demotion is activity");
+        assert_eq!(snap.connect_native_demotions, 1);
+        assert_eq!(snap.connect_native_acceptor_demotions, 0);
+        assert!(metrics.take_snapshot().is_none(), "the count resets");
+        metrics.record_connect_native_acceptor_demotion();
+        metrics.record_connect_native_acceptor_demotion();
+        let snap = metrics
+            .take_snapshot()
+            .expect("an acceptor demotion is activity");
+        assert_eq!(snap.connect_native_acceptor_demotions, 2);
+        assert_eq!(snap.connect_native_demotions, 0);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["connect_native_acceptor_demotions"], 2);
+        assert!(metrics.take_snapshot().is_none(), "the count resets");
+    }
+
     #[test]
     fn connect_native_setup_by_side_counts_snapshot_and_reset() {
         check_quic_family(

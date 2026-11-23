@@ -54,28 +54,33 @@ pub(crate) const LEVEL_NATIVE_CAPABLE: u8 = 1;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const LEVEL_NATIVE_ONLY: u8 = 2;
 
-/// Consecutive native failures, across distinct acceptors, after which a
-/// joiner offers percent 0 for [`DEMOTION_COOLDOWN`].
+/// Strikes, across distinct acceptors, after which a joiner offers percent 0
+/// for [`DEMOTION_COOLDOWN`]. A strike is a RESCUE: a native setup with that
+/// acceptor failed on the path (`NativeSetupOutcome::counts_toward_demotion`)
+/// and UDP to the same acceptor then connected. A native failure where UDP
+/// failed too (a symmetric or otherwise incompatible pair, a peer that never
+/// dialled, a peer gone) is no evidence against native and is not counted.
 pub(crate) const DEMOTION_FAILURES: usize = 3;
 
-/// Consecutive native failures, across distinct joiners and with no native
-/// success as acceptor in between, after which a node decides `Udp` as
-/// acceptor for [`DEMOTION_COOLDOWN`]. Provisional, chosen by arithmetic, not
-/// measured: an acceptor cannot tell its own fault from a joiner that never
-/// dialled (the joiner planned UDP because the window had passed, lost its
-/// readiness, or refused by its own limits), so a healthy acceptor sees a
-/// failure share f of its native setups from joiner-side causes alone. A run
-/// of K failures then comes every 1/f + ... + 1/f^K native setups (only
-/// in-slice pairs with no transport held get one): at f = 0.2, about 155 for
-/// K = 3 (hours for a busy acceptor, so it would sit demoted most of the
-/// time) and about 490,000 for K = 8; at f = 0.3, about 22,000. The
-/// arithmetic treats failures as independent. An acceptor whose own path is
-/// broken (f = 1) demotes after 8 native setups with distinct joiners, plus
-/// the decisions it makes while those outcomes arrive. At a low release
-/// percent that can take days for an acceptor that accepts few joins, so a
-/// broken acceptor's cost shows first as acceptor-side `timed_out` setup
-/// outcomes, not as `connect_native_acceptor_demotions`.
-pub(crate) const ACCEPTOR_DEMOTION_FAILURES: usize = 8;
+/// Strikes, across distinct joiners, after which a node decides `Udp` as
+/// acceptor for [`DEMOTION_COOLDOWN`]. A strike is a rescue, as for the joiner
+/// ([`DEMOTION_FAILURES`]). Field data (0.2.162, independent-mapping nodes)
+/// put a healthy acceptor's raw failure share at about 71% of the dials it
+/// takes, almost all caused by the joiner (endpoint-dependent joiners, joiners
+/// that never dial); counting those demoted a healthy acceptor within about
+/// an hour at 25%. A rescue needs UDP to that joiner to work, which those
+/// cases do not give, while an acceptor whose own native path is broken
+/// collects a rescue on every pair UDP can connect.
+pub(crate) const ACCEPTOR_DEMOTION_FAILURES: usize = 3;
+
+/// How long a strike counts: a streak drops strikes older than this, so
+/// strikes spread thinly over days (a node that rarely uses native) do not
+/// add up to a demotion. Equal to [`DEMOTION_COOLDOWN`]: a node whose native
+/// path is broken collects its strikes at its rate of UDP-rescued native
+/// setups, which at 25% is several an hour for a node that accepts or joins
+/// at all, so three fall well inside 6 h; and a fault that does not recur
+/// within one cooldown would not have kept native off for long either.
+pub(crate) const STRIKE_WINDOW: Duration = DEMOTION_COOLDOWN;
 
 /// How long a demoted node offers (or decides) nothing native.
 pub(crate) const DEMOTION_COOLDOWN: Duration = Duration::from_secs(6 * 3600);
@@ -502,8 +507,8 @@ pub(crate) struct NativeConnectState {
     /// and, through [`Self::acceptor_readiness`], its decisions as acceptor
     /// too.
     demotion: parking_lot::Mutex<NativeDemotion>,
-    /// Driven only by native setups this node made as acceptor, across
-    /// distinct joiners. Lowers only its decisions as acceptor
+    /// Driven only by rescues of native setups this node made as acceptor,
+    /// across distinct joiners. Lowers only its decisions as acceptor
     /// ([`Self::acceptor_readiness`]): an acceptor whose own native path is
     /// broken (a gateway, a node at its target that rarely joins) would
     /// otherwise keep deciding `Native` for every joiner, and each of those
@@ -539,17 +544,6 @@ impl NativeConnectState {
     /// when `joiner_off` (`NodeConfig::native_joiner_off`).
     pub(crate) fn with_joiner_off(mut self, joiner_off: bool) -> Self {
         self.joiner_off = joiner_off;
-        self
-    }
-
-    /// Simulation only: as [`Self::new`], with the acceptor role demoting
-    /// after `failures` in place of [`ACCEPTOR_DEMOTION_FAILURES`]
-    /// (`NodeConfig::native_acceptor_demotion_failures`), so a small
-    /// simulation, whose nodes accept few distinct joiners, can reach it.
-    pub(crate) fn with_acceptor_demotion_failures(mut self, failures: Option<usize>) -> Self {
-        if let Some(failures) = failures {
-            self.acceptor_demotion = parking_lot::Mutex::new(NativeDemotion::new(failures.max(1)));
-        }
         self
     }
 
@@ -592,9 +586,10 @@ impl NativeConnectState {
         )
     }
 
-    /// A native setup with `peer` failed in a way that says native does not
-    /// work on that path; the caller falls back to UDP. Returns whether this
-    /// failure demoted the node, which is counted.
+    /// A strike in the joiner streak with `peer`: a rescue (a native setup
+    /// that failed on the path, then UDP to `peer` connected;
+    /// [`DEMOTION_FAILURES`]). Returns whether it demoted the node, which is
+    /// counted.
     pub(crate) fn record_failure(&self, peer: &TransportPublicKey) -> bool {
         let demoted = self.demotion.lock().record_failure(peer, Instant::now());
         if demoted {
@@ -612,13 +607,11 @@ impl NativeConnectState {
         self.demotion.lock().record_success();
     }
 
-    /// A native setup this node made as ACCEPTOR, with `joiner`, failed in a
-    /// way that says native does not work on that path. Counted apart from
-    /// the joiner streak, across distinct joiners, so one joiner failing on
-    /// purpose counts once; the acceptor threshold
-    /// ([`ACCEPTOR_DEMOTION_FAILURES`] outside simulations) in a row demotes.
-    /// Returns whether this failure demoted the
-    /// acceptor role, which is counted.
+    /// A strike in the acceptor streak with `joiner`: a rescue (a native
+    /// setup this node made as ACCEPTOR failed on the path, then UDP to
+    /// `joiner` connected; [`ACCEPTOR_DEMOTION_FAILURES`]). Counted apart from
+    /// the joiner streak, across distinct joiners, so one joiner counts once.
+    /// Returns whether it demoted the acceptor role, which is counted.
     pub(crate) fn record_acceptor_failure(&self, joiner: &TransportPublicKey) -> bool {
         let demoted = self
             .acceptor_demotion
@@ -657,6 +650,12 @@ impl NativeConnectState {
     pub(crate) fn acceptor_streak(&self) -> usize {
         self.acceptor_demotion.lock().streak.len()
     }
+
+    /// Distinct acceptors in the joiner role's current strike streak.
+    #[cfg(test)]
+    pub(crate) fn joiner_streak(&self) -> usize {
+        self.demotion.lock().streak.len()
+    }
 }
 
 /// One role's demotion after repeated native failures
@@ -672,8 +671,10 @@ impl NativeConnectState {
 /// decide `Udp`, never more.
 #[derive(Debug)]
 pub(crate) struct NativeDemotion {
-    /// Distinct peers in the current failure streak, at most `threshold`.
-    streak: Vec<TransportPublicKey>,
+    /// Distinct peers in the current streak, each with when its strike was
+    /// counted; strikes older than [`STRIKE_WINDOW`] are dropped. At most
+    /// `threshold`.
+    streak: Vec<(TransportPublicKey, Instant)>,
     threshold: usize,
     demoted_until: Option<Instant>,
     demotions: u64,
@@ -689,14 +690,16 @@ impl NativeDemotion {
         }
     }
 
-    /// A native attempt with `peer` failed. Returns whether it demoted the
-    /// role.
+    /// A strike with `peer` (a rescue, see [`DEMOTION_FAILURES`]). Returns
+    /// whether it demoted the role.
     pub(crate) fn record_failure(&mut self, peer: &TransportPublicKey, now: Instant) -> bool {
         if self.is_demoted(now) {
             return false;
         }
-        if !self.streak.contains(peer) {
-            self.streak.push(peer.clone());
+        self.streak
+            .retain(|(_, at)| now.saturating_duration_since(*at) < STRIKE_WINDOW);
+        if !self.streak.iter().any(|(key, _)| key == peer) {
+            self.streak.push((peer.clone(), now));
         }
         if self.streak.len() >= self.threshold {
             self.streak.clear();
@@ -1241,13 +1244,36 @@ mod tests {
         );
     }
 
-    /// The acceptor threshold is the one the arithmetic on
-    /// `ACCEPTOR_DEMOTION_FAILURES` assumes, and the joiner's is unchanged.
+    /// Both roles demote on three strikes (rescues), strikes count for one
+    /// cooldown, and a demotion lasts six hours.
     #[test]
     fn demotion_thresholds_have_these_values() {
         assert_eq!(DEMOTION_FAILURES, 3);
-        assert_eq!(ACCEPTOR_DEMOTION_FAILURES, 8);
+        assert_eq!(ACCEPTOR_DEMOTION_FAILURES, 3);
         assert_eq!(DEMOTION_COOLDOWN, Duration::from_secs(6 * 3600));
+        assert_eq!(STRIKE_WINDOW, DEMOTION_COOLDOWN);
+    }
+
+    /// A strike older than `STRIKE_WINDOW` no longer counts: strikes spread
+    /// over longer than the window never demote, while the same strikes
+    /// inside it do. Applies to both roles (one `NativeDemotion` type).
+    #[test]
+    fn strikes_older_than_the_window_age_out() {
+        let start = Instant::now();
+        let mut spread = NativeDemotion::new(DEMOTION_FAILURES);
+        for i in 0..10u32 {
+            let at = start + (STRIKE_WINDOW / 2 + Duration::from_secs(1)) * i;
+            assert!(!spread.record_failure(&key(i), at), "strike {i}");
+        }
+        assert_eq!(spread.demotions(), 0, "never three inside one window");
+        let mut close = NativeDemotion::new(DEMOTION_FAILURES);
+        let last = start + STRIKE_WINDOW - Duration::from_secs(1);
+        assert!(!close.record_failure(&key(0), start));
+        assert!(!close.record_failure(&key(1), start + Duration::from_secs(60)));
+        assert!(
+            close.record_failure(&key(2), last),
+            "three inside the window"
+        );
     }
 
     /// An acceptor whose readiness is demoted (by either role's streak)

@@ -659,8 +659,10 @@ async fn drive_client_connect(
                 // overlap. It waits outside the dial queue: the slot goes to
                 // the next acceptor at once, whose own punch window is already
                 // running, so a joiner with a connection can briefly have two
-                // dials in flight. Demotion is recorded where the setup's end
-                // is known (the connection lifecycle).
+                // dials in flight. A strike toward demotion is recorded when
+                // that UDP dial connects after a path failure (a rescue,
+                // below), or by the connection lifecycle when a UDP connection
+                // to the acceptor already exists as the setup fails.
                 if transport.is_native() && !matches!(result, Some(Ok(_))) {
                     tracing::info!(
                         tx = %tx,
@@ -689,6 +691,11 @@ async fn drive_client_connect(
                     if connected && path_failed {
                         crate::transport::TRANSPORT_METRICS.record_connect_native_rescued_by_udp(
                             crate::transport::NativeConnectSide::Joiner,
+                        );
+                        super::record_native_rescue_strike(
+                            op_manager,
+                            crate::transport::NatAttemptOrigin::ConnectJoiner,
+                            &acceptor,
                         );
                     }
                     #[cfg(any(test, feature = "testing"))]
@@ -4441,6 +4448,62 @@ mod driver_timing_tests {
         // Each side counts the rescue once (R5).
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert_eq!(rescues_here(), (before.0 + 1, before.1 + 1));
+        // And each side's rescue is a strike in its own role's streak
+        // (`record_native_rescue_strike`): native failed on the path and UDP
+        // to the same peer then connected.
+        assert_eq!(
+            joiner_om
+                .ring
+                .connection_manager
+                .native_connect()
+                .joiner_streak(),
+            1,
+            "the joiner's rescue strikes its joiner streak"
+        );
+        let acceptor_native = acceptor_om.ring.connection_manager.native_connect();
+        assert_eq!(
+            acceptor_native.acceptor_streak(),
+            1,
+            "the acceptor's rescue strikes its acceptor streak"
+        );
+        assert_eq!(
+            acceptor_native.joiner_streak(),
+            0,
+            "and not its joiner streak"
+        );
+    }
+
+    /// The node's relay context, which the CONNECT decision reads, is off
+    /// while the acceptor role is demoted (three rescue strikes with distinct
+    /// joiners), while the node's own offer as joiner stays on: the decision
+    /// reads `acceptor_readiness`, not `readiness`.
+    #[tokio::test(start_paused = true)]
+    async fn a_demoted_acceptor_decides_udp_through_the_relay_env() {
+        use super::super::RelayContext;
+        use super::super::native::{NativeDecision, NativeOffer, decide_native};
+        let (op_manager, _events, _endpoint) = native_joiner("demoted-relay-env").await;
+        let env = super::super::RelayEnv::new(&op_manager);
+        let offer = Some(NativeOffer::capable(100));
+        assert_eq!(
+            decide_native(offer, env.native_readiness(), 0, false),
+            NativeDecision::Native,
+            "premise: an undemoted acceptor decides native"
+        );
+        let native = op_manager.ring.connection_manager.native_connect();
+        for port in 0..super::super::native::ACCEPTOR_DEMOTION_FAILURES as u16 {
+            super::super::record_native_rescue_strike(
+                &op_manager,
+                crate::transport::NatAttemptOrigin::ConnectAcceptor,
+                &peer(24880 + port),
+            );
+        }
+        assert_eq!(native.acceptor_demotions(), 1);
+        assert_eq!(
+            decide_native(offer, env.native_readiness(), 0, false),
+            NativeDecision::Udp,
+            "a demoted acceptor decides UDP"
+        );
+        assert!(native.readiness().ready, "its own offer as joiner stays on");
     }
 
     /// A peer that already has a connection (#5858 leaves it unchanged):

@@ -782,8 +782,7 @@ impl ConnectionManager {
             crate::operations::connect::native::NativeConnectState::new(
                 config.native_connect_override,
             )
-            .with_joiner_off(config.native_joiner_off)
-            .with_acceptor_demotion_failures(config.native_acceptor_demotion_failures),
+            .with_joiner_off(config.native_joiner_off),
         );
         cm.broadcast_target_list_floor_override = config.broadcast_target_list_floor_override;
         cm

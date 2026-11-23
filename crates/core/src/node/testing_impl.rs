@@ -2336,21 +2336,6 @@ impl SimNetwork {
         self
     }
 
-    /// Makes the node `label`'s acceptor role demote after `failures` native
-    /// failures with distinct joiners, in place of the release's threshold,
-    /// which a node in a small simulation does not reach (it accepts few
-    /// distinct joiners). Call before the simulation starts.
-    #[cfg(any(test, feature = "testing"))]
-    pub fn with_node_native_acceptor_demotion_failures(
-        &mut self,
-        label: &NodeLabel,
-        failures: usize,
-    ) -> &mut Self {
-        self.node_config_mut(label)
-            .native_acceptor_demotion_failures = Some(failures);
-        self
-    }
-
     /// Makes the node `label` decode the QUIC-native connect variants as a
     /// release below their floor does: such a message fails to decode and the
     /// connection is closed. It also never sends them. Pair it with

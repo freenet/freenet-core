@@ -1680,6 +1680,11 @@ pub(super) async fn dispatch_expect_connection_from(
                                 .record_connect_native_rescued_by_udp(
                                     crate::transport::NativeConnectSide::Acceptor,
                                 );
+                            record_native_rescue_strike(
+                                &op_manager,
+                                crate::transport::NatAttemptOrigin::ConnectAcceptor,
+                                &peer,
+                            );
                         }
                         #[cfg(any(test, feature = "testing"))]
                         native_wire_trace::record_at(
@@ -1704,6 +1709,62 @@ pub(super) async fn dispatch_expect_connection_from(
         }
     });
     Ok(())
+}
+
+/// A native setup with `peer`, made in the role `origin` names, failed on the
+/// path and UDP to the same peer then connected: a rescue, the only evidence
+/// that counts toward demotion (`native::DEMOTION_FAILURES`). Strikes that
+/// role's streak (the joiner's or the acceptor's), each across distinct peers,
+/// so the same rescue seen at two sites counts once. Other origins strike
+/// nothing.
+///
+/// Known residual: a joiner whose plan for this acceptor was a UDP dial at the
+/// fallback time (`AcceptorDialPlan::UdpAt`: the response arrived with less
+/// than `NATIVE_MIN_WINDOW_LEFT` of the acceptor's window left) never dials
+/// native but does dial UDP, so the acceptor sees a rescue it did not earn.
+/// Bounded by the response's travel time (10.2 item 6).
+pub(crate) fn record_native_rescue_strike(
+    op_manager: &OpManager,
+    origin: crate::transport::NatAttemptOrigin,
+    peer: &PeerKeyLocation,
+) {
+    let native_connect = op_manager.ring.connection_manager.native_connect();
+    // (whether the acceptor's streak counted it, whether it demoted)
+    let (as_acceptor, demoted) = match origin {
+        crate::transport::NatAttemptOrigin::ConnectJoiner => {
+            (false, native_connect.record_failure(peer.pub_key()))
+        }
+        crate::transport::NatAttemptOrigin::ConnectAcceptor => {
+            (true, native_connect.record_acceptor_failure(peer.pub_key()))
+        }
+        crate::transport::NatAttemptOrigin::Gateway
+        | crate::transport::NatAttemptOrigin::RingPeerNoTransport => return,
+    };
+    #[cfg(any(test, feature = "testing"))]
+    {
+        use native_wire_trace::{NativeWireEvent, record_at};
+        let own = op_manager.ring.connection_manager.get_own_addr();
+        match (as_acceptor, own, peer.socket_addr()) {
+            (true, Some(own), _) => {
+                record_at(
+                    own,
+                    NativeWireEvent::AcceptorStreak {
+                        own,
+                        len: native_connect.acceptor_streak(),
+                    },
+                );
+                if demoted {
+                    record_at(own, NativeWireEvent::AcceptorDemoted { own });
+                }
+            }
+            (false, _, Some(addr)) if demoted => {
+                record_at(addr, NativeWireEvent::NativeDemoted);
+            }
+            _ => {}
+        }
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = (as_acceptor, demoted);
 }
 
 /// The acceptor's UDP hole punch towards `peer` at `addr`: an expected-inbound
