@@ -4779,6 +4779,8 @@ mod driver_timing_tests {
         all: Vec<SocketAddr>,
         /// The acceptors it reported to the gateway as failed.
         connect_failed: Vec<SocketAddr>,
+        /// Each dial and when it started (from the start of the test).
+        dial_times: Vec<(SocketAddr, Duration)>,
         /// The CONNECT's acceptor limit.
         acceptor_limit: usize,
     }
@@ -4833,6 +4835,7 @@ mod driver_timing_tests {
         let log = log.lock();
         DecisionRun {
             dialled: log.dials.iter().map(|(addr, _)| *addr).collect(),
+            dial_times: log.dials.clone(),
             all: acceptors.iter().map(|a| a.socket_addr().unwrap()).collect(),
             connect_failed: log.connect_failed.clone(),
             acceptor_limit: crate::operations::connect::bootstrap::acceptor_limit(
@@ -4877,9 +4880,9 @@ mod driver_timing_tests {
     }
 
     /// `Native` responses from more distinct acceptors than the CONNECT's
-    /// acceptor limit: the first `limit` are counted and reported, the rest
-    /// are dropped with no message and counted as over the cap. A `Udp`
-    /// response after them is still dialled.
+    /// acceptor limit: the first `limit` are counted and dialled over UDP at
+    /// the fallback time, the rest are dropped with no message and counted as
+    /// over the cap. A `Udp` response after them is still dialled.
     #[tokio::test(start_paused = true)]
     async fn native_decisions_past_the_acceptor_limit_are_dropped_and_counted() {
         use crate::operations::connect::native::{NativeDecision, NativeOffer};
@@ -4904,16 +4907,24 @@ mod driver_timing_tests {
             limit < NATIVE,
             "premise: more Native responses than the limit"
         );
-        assert_eq!(run.connect_failed, run.all[..limit].to_vec());
+        assert!(run.connect_failed.is_empty(), "{:?}", run.connect_failed);
         assert_eq!(
             decision_failures_here(),
             (before.0.0, before.0.1 + limit as u64)
         );
         assert_eq!(over_cap(), before.1 + (NATIVE - limit) as u64);
-        assert_eq!(run.dialled, vec![run.all[NATIVE]]);
+        let mut dialled = run.dialled.clone();
+        dialled.sort();
+        let mut want: Vec<_> = run.all[..limit].to_vec();
+        want.push(run.all[NATIVE]);
+        want.sort();
+        assert_eq!(
+            dialled, want,
+            "the refused ones within the cap, and the Udp one"
+        );
     }
 
-    /// A duplicate of a `Native` response is ignored: one count, one report.
+    /// A duplicate of a `Native` response is ignored: one count, one dial.
     #[tokio::test(start_paused = true)]
     async fn a_duplicate_native_decision_counts_once() {
         use crate::operations::connect::native::{NativeDecision, NativeOffer};
@@ -4928,13 +4939,17 @@ mod driver_timing_tests {
             ],
         )
         .await;
-        assert_eq!(run.dialled, vec![run.all[1]]);
-        assert_eq!(run.connect_failed, vec![run.all[0]]);
+        assert_eq!(run.dialled, vec![run.all[1], run.all[0]]);
+        assert!(run.connect_failed.is_empty(), "{:?}", run.connect_failed);
         assert_eq!(decision_failures_here(), (before.0, before.1 + 1));
     }
 
-    /// The same for a joiner that offered above 0: counted as unsupported,
-    /// since this build has no native dial.
+    /// A joiner that offered above 0 but cannot dial native when the `Native`
+    /// response comes (this test's node has no native dial, as a demoted one)
+    /// counts it as unsupported and dials that acceptor over UDP at the
+    /// fallback time, when the acceptor's own UDP fallback starts, instead of
+    /// reporting it failed: a lone punch from the acceptor cannot pass a
+    /// restricted NAT.
     #[tokio::test(start_paused = true)]
     async fn a_native_decision_to_a_real_offer_fails_the_attempt() {
         use crate::operations::connect::native::{NativeDecision, NativeOffer};
@@ -4948,9 +4963,24 @@ mod driver_timing_tests {
             ],
         )
         .await;
-        assert_eq!(run.dialled, run.all[1..].to_vec());
-        assert_eq!(run.connect_failed, vec![run.all[0]]);
+        assert_eq!(run.dialled, vec![run.all[1], run.all[0]]);
+        assert!(run.connect_failed.is_empty(), "{:?}", run.connect_failed);
         assert_eq!(decision_failures_here(), (before.0, before.1 + 1));
+        let refused_at = run
+            .dial_times
+            .iter()
+            .find(|(addr, _)| *addr == run.all[0])
+            .map(|(_, at)| *at)
+            .expect("the refused acceptor was dialled");
+        assert!(
+            refused_at >= crate::transport::NATIVE_FALLBACK_AFTER,
+            "dialled at {refused_at:?}, before the acceptor's fallback ({:?})",
+            crate::transport::NATIVE_FALLBACK_AFTER
+        );
+        assert!(
+            refused_at < crate::transport::NATIVE_FALLBACK_AFTER + Duration::from_secs(1),
+            "dialled at {refused_at:?}, not at the fallback time"
+        );
     }
 
     /// When the waiter closes, acceptors already taken are still dialled,
