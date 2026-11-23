@@ -2490,6 +2490,13 @@ Demotion: one principle for both roles: a STRIKE needs evidence that native
   whose plan for an acceptor was UDP at the fallback time (UdpAt, the
   response arrived late in the window) never dials native but does dial UDP,
   so that acceptor sees an unearned rescue; bounded by response travel time.
+  Likewise a joiner whose own native setup was refused locally (TooLate,
+  OverBudget*, SetupsFull, AlreadyWaiting, AllowSetFull, KeyConflict,
+  UnusableKey) falls back to UDP: no joiner strike (not a path failure), but
+  the acceptor's setup timed out and its UDP fallback connects, an unearned
+  acceptor rescue. A rescue with one of the node's configured gateways
+  strikes nothing (record_native_rescue_strike checks; callers pass the
+  CONNECT role).
   Two streaks, one per role, that never feed each other; three strikes with
   distinct peers (DEMOTION_FAILURES, ACCEPTOR_DEMOTION_FAILURES) inside
   STRIKE_WINDOW (6 h, = DEMOTION_COOLDOWN: strikes older than that age out)

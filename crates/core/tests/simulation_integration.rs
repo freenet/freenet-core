@@ -23615,6 +23615,9 @@ fn test_quic_native_broken_acceptor_demotes_on_rescues() {
         demoted_at.is_some(),
         "the broken node demoted its acceptor role"
     );
+    // Not decisive here (in this run no request reaches the node after its
+    // demotion, so `after` is usually empty); kept as a guard should one do
+    // so. The decisive check is the RelayEnv test named in the doc comment.
     assert!(
         after.iter().all(|(_, native, _)| !native),
         "the broken node decided native after its acceptor role demoted: {after:?}"

@@ -4473,6 +4473,50 @@ mod driver_timing_tests {
         );
     }
 
+    /// A rescue against one of this node's configured gateways strikes no
+    /// streak, though the caller passes the CONNECT role (the driver passes
+    /// `ConnectJoiner` for every acceptor): the connection lifecycle labels a
+    /// dial to a configured gateway `Gateway`, which strikes nothing. A
+    /// rescue against an ordinary peer does strike.
+    #[tokio::test(start_paused = true)]
+    async fn a_rescue_against_a_configured_gateway_strikes_nothing() {
+        let (op_manager, _events, _endpoint) = native_joiner("rescue-gateway").await;
+        let native = op_manager.ring.connection_manager.native_connect();
+        let gateway = op_manager
+            .configured_gateways
+            .first()
+            .cloned()
+            .expect("premise: gateways configured");
+        for origin in [
+            crate::transport::NatAttemptOrigin::ConnectJoiner,
+            crate::transport::NatAttemptOrigin::ConnectAcceptor,
+        ] {
+            super::super::record_native_rescue_strike(&op_manager, origin, &gateway);
+            // Same address, key not the gateway's: matched by address too.
+            let same_addr = PeerKeyLocation::new(
+                TransportKeypair::new().public().clone(),
+                gateway.socket_addr().expect("addressed"),
+            );
+            super::super::record_native_rescue_strike(&op_manager, origin, &same_addr);
+        }
+        assert_eq!(
+            native.joiner_streak(),
+            0,
+            "no joiner strike against a gateway"
+        );
+        assert_eq!(native.acceptor_streak(), 0, "no acceptor strike either");
+        super::super::record_native_rescue_strike(
+            &op_manager,
+            crate::transport::NatAttemptOrigin::ConnectJoiner,
+            &peer(24889),
+        );
+        assert_eq!(
+            native.joiner_streak(),
+            1,
+            "premise: an ordinary peer strikes"
+        );
+    }
+
     /// The node's relay context, which the CONNECT decision reads, is off
     /// while the acceptor role is demoted (three rescue strikes with distinct
     /// joiners), while the node's own offer as joiner stays on: the decision
@@ -4494,7 +4538,7 @@ mod driver_timing_tests {
             super::super::record_native_rescue_strike(
                 &op_manager,
                 crate::transport::NatAttemptOrigin::ConnectAcceptor,
-                &peer(24880 + port),
+                &peer(24884 + port),
             );
         }
         assert_eq!(native.acceptor_demotions(), 1);

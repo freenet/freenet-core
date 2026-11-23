@@ -1716,18 +1716,34 @@ pub(super) async fn dispatch_expect_connection_from(
 /// that counts toward demotion (`native::DEMOTION_FAILURES`). Strikes that
 /// role's streak (the joiner's or the acceptor's), each across distinct peers,
 /// so the same rescue seen at two sites counts once. Other origins strike
-/// nothing.
+/// nothing, and nor does a rescue with one of this node's configured gateways
+/// (matched by address or key, as the connection lifecycle labels a dial to
+/// one `Gateway`): callers pass the CONNECT role, which does not say whether
+/// the peer is a gateway.
 ///
-/// Known residual: a joiner whose plan for this acceptor was a UDP dial at the
-/// fallback time (`AcceptorDialPlan::UdpAt`: the response arrived with less
-/// than `NATIVE_MIN_WINDOW_LEFT` of the acceptor's window left) never dials
-/// native but does dial UDP, so the acceptor sees a rescue it did not earn.
-/// Bounded by the response's travel time (10.2 item 6).
+/// Known residuals, both giving the ACCEPTOR a rescue it did not earn, since
+/// the joiner never dialled native but does dial UDP:
+/// - the joiner's plan for this acceptor was a UDP dial at the fallback time
+///   (`AcceptorDialPlan::UdpAt`: the response arrived with less than
+///   `NATIVE_MIN_WINDOW_LEFT` of the acceptor's window left); bounded by the
+///   response's travel time (10.2 item 6);
+/// - the joiner's own native setup was refused locally (`TooLate`,
+///   `OverBudget*`, `SetupsFull`, `AlreadyWaiting`, `AllowSetFull`,
+///   `KeyConflict`, `UnusableKey`) and it fell back to UDP; the joiner's
+///   streak does not count those (not a path failure), but the acceptor's
+///   setup timed out and its UDP fallback connected.
 pub(crate) fn record_native_rescue_strike(
     op_manager: &OpManager,
     origin: crate::transport::NatAttemptOrigin,
     peer: &PeerKeyLocation,
 ) {
+    let is_configured_gateway = op_manager.configured_gateways.iter().any(|gw| {
+        gw.pub_key() == peer.pub_key()
+            || (gw.socket_addr().is_some() && gw.socket_addr() == peer.socket_addr())
+    });
+    if is_configured_gateway {
+        return;
+    }
     let native_connect = op_manager.ring.connection_manager.native_connect();
     // (whether the acceptor's streak counted it, whether it demoted)
     let (as_acceptor, demoted) = match origin {
