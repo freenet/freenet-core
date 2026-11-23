@@ -409,8 +409,9 @@ async fn drive_client_connect(
     };
 
     let mut accepted: HashSet<PeerKeyLocation> = HashSet::with_capacity(target_connections);
-    // Acceptors that decided `Native`, which this build cannot dial: each is
-    // counted and reported upstream once, whatever duplicates arrive. The
+    // Acceptors that decided `Native`, which this node cannot dial: each is
+    // counted and handled once (dialled over UDP at its fallback time, or
+    // reported upstream), whatever duplicates arrive. The
     // acceptor in a response is named by whoever sent it, so this holds at
     // most `refused_native_cap` (the most acceptors this CONNECT takes);
     // further `Native` responses are dropped unanswered and counted, so a
@@ -972,11 +973,14 @@ async fn drive_client_connect(
 
                 // `None` and `Udp` dial UDP as today; `Native` dials native
                 // when this node offered and can still dial. A `Native` this
-                // node cannot honour fails the attempt with this acceptor, is
-                // counted by why, and is reported upstream as `ConnectFailed`
-                // like a failed punch, so the relay marks the acceptor visited
-                // and re-routes. The acceptor's native wait then times out and
-                // falls back to UDP.
+                // node cannot honour is counted by why. When the node offered
+                // and has since lost native (demoted, endpoint down), it dials
+                // the acceptor over UDP at the time the acceptor's own
+                // fallback starts, so the punches overlap
+                // (`native::refused_decision_plan`). A `Native` that answered
+                // no offer is reported upstream as `ConnectFailed` like a
+                // failed punch, so the relay marks the acceptor visited and
+                // re-routes.
                 let can_dial = op_manager
                     .ring
                     .connection_manager
@@ -1003,6 +1007,35 @@ async fn drive_client_connect(
                         }
                         crate::transport::metrics::TRANSPORT_METRICS
                             .record_connect_native_decision_failure(failure);
+                        refused_native.insert(payload.acceptor.clone());
+                        let plan = super::native::refused_decision_plan(failure, Instant::now());
+                        if let (
+                            super::native::RefusedDecisionPlan::DialUdpAt(at),
+                            Some(acceptor_addr),
+                        ) = (plan, payload.acceptor.socket_addr())
+                        {
+                            // The acceptor punches UDP alone when its native
+                            // wait ends; dial it at the same time so the two
+                            // punches overlap, as after a native dial that
+                            // failed. Waits outside the dial queue, as that
+                            // fallback does.
+                            tracing::info!(
+                                tx = %tx,
+                                acceptor = %payload.acceptor,
+                                ?failure,
+                                "connect driver: acceptor decided a native connection this node \
+                                 cannot set up; dialling UDP at its fallback time"
+                            );
+                            dials.push(futures::future::Either::Right(udp_fallback_dial(
+                                op_manager.clone(),
+                                tx,
+                                payload.acceptor.clone(),
+                                acceptor_addr,
+                                at,
+                                Some(false),
+                            )));
+                            continue;
+                        }
                         tracing::warn!(
                             tx = %tx,
                             acceptor = %payload.acceptor,
@@ -1010,7 +1043,6 @@ async fn drive_client_connect(
                             "connect driver: acceptor decided a native connection this node \
                              cannot set up; reporting it failed"
                         );
-                        refused_native.insert(payload.acceptor.clone());
                         if collection_end.is_none() {
                             if let Some(failed_acceptor_addr) = payload.acceptor.socket_addr() {
                                 let failed_msg = ConnectMsg::ConnectFailed {
@@ -3835,6 +3867,47 @@ mod driver_timing_tests {
         assert!(flat.contains(
             "tokio::time::sleep_until(decided_at+crate::transport::NATIVE_FALLBACK_AFTER).await;"
         ));
+    }
+
+    /// A joiner that cannot use an acceptor's `Native` decision because it lost
+    /// native after offering (demoted, endpoint down) dials that acceptor over
+    /// UDP at the fallback time instead of reporting it failed: otherwise the
+    /// acceptor's UDP fallback punches alone and cannot pass a restricted NAT
+    /// (`test_quic_native_blocked_pairs_connect_over_udp_behind_nats` failed
+    /// that way). Code lines only, so a commented-out dial does not satisfy it.
+    #[test]
+    fn a_refused_native_decision_is_dialled_over_udp_at_the_fallback_time() {
+        const SOURCE: &str = include_str!("op_ctx_task.rs");
+        let prod = &SOURCE[..SOURCE.find("\n#[cfg(test)]\n").expect("test module")];
+        let start = prod
+            .find("record_connect_native_decision_failure(failure);")
+            .expect("the refusal arm");
+        let end = start
+            + prod[start..]
+                .find("\"connect driver: failed to emit ConnectFailed\"")
+                .expect("the end of the refusal arm");
+        let flat: String = prod[start..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .concat()
+            .split_whitespace()
+            .collect();
+        let plan = flat
+            .find("letplan=super::native::refused_decision_plan(failure,Instant::now());")
+            .expect("the arm asks for the plan");
+        let dial = flat
+            .find(
+                "dials.push(futures::future::Either::Right(udp_fallback_dial(op_manager.clone(),tx,payload.acceptor.clone(),acceptor_addr,at,Some(false),)));",
+            )
+            .expect("the arm dials UDP at the planned time");
+        let report = flat
+            .find("ConnectMsg::ConnectFailed{")
+            .expect("the arm still reports a decision without an offer");
+        assert!(
+            plan < dial && dial < report,
+            "plan, then dial, then the report for the other case"
+        );
     }
 
     /// The joiner plans a native acceptor's dial against the acceptor's own
