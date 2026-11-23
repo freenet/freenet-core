@@ -87,9 +87,9 @@ delegates without a manifest are untouched.
 Inter-delegate messages (SendDelegateMessage) are delivered from EVERY run
 kind, including node-started ones (notifications, lifecycle, wake-ups); Ian,
 2026-11-20. The receiver sees MessageOrigin::Delegate(caller), which the
-runtime attests, and a DelegateMessage whose `sender` the core sets to the
-caller on delivery. The receiver decides whom to trust. The core does not protect
-delegates from each other. Background consent is therefore transitive: a
+runtime attests. The core also sets the delivered DelegateMessage's `sender`
+to the caller. Each receiver decides whom to trust; the core does not
+protect delegates from each other. Background consent is therefore transitive: a
 delegate allowed to run in the background can run any delegate by messaging
 it. A client-driven hop carries the originating connection scope, so an
 off-host client gets no attested origin through it. Hosted nodes start no
@@ -101,11 +101,16 @@ the caller is delivered to the caller as an inbound DelegateMessage in its
 next iteration (carried across a park), with `sender` set by the core to the
 target (split_hop_output), in a call of its own so the caller sees
 MessageOrigin::Delegate(target) while handling it (plan_round), never the
-run's WebApp or inherited origin. Every other SendDelegateMessage from the
-target is dropped, counted and logged once per iteration, and so is a reply
-over MAX_HOP_REPLY_BYTES (64 KiB) or past MAX_HOP_REPLY_BYTES_PER_RUN. The
-reply never runs the target again; hops the caller makes while handling it
-count against its own cap. From a background run the target's other output is dropped
+run's WebApp or inherited origin. The target's key travels BESIDE the reply
+(PendingReply), never read from the message. A prompt the caller raises
+while handling a reply is shown under the run's own app identity. Every
+other SendDelegateMessage from the target is dropped, counted and logged
+once per iteration, and so is a reply over MAX_HOP_REPLY_BYTES (64 KiB),
+past MAX_HOP_REPLY_BYTES_PER_RUN, still waiting at the iteration cap, or
+one the caller fails on. Each reply call after an iteration's first counts
+as an iteration, so a run still makes at most MAX_CONTRACT_REQUEST_ITERATIONS
+calls into the caller. The reply never runs the target again; hops the
+caller makes while handling it count against its own cap. From a background run the target's other output is dropped
 (counted, one info! per hop), never merged into the caller's output, which
 would fan it out to the caller's apps under the caller's name. A background run
 attempts at most MAX_UNPROMPTED_HOPS_PER_RUN (16) hops, manifest or not;

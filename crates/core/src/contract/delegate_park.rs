@@ -130,8 +130,8 @@ use either::Either;
 use freenet_stdlib::client_api::DelegateRequest;
 use freenet_stdlib::prelude::{
     ContractContainer, ContractInstanceId, ContractKey, DelegateContext, DelegateKey,
-    InboundDelegateMsg, OutboundDelegateMsg, Parameters, RelatedContracts, StateDelta, UpdateData,
-    WrappedState,
+    DelegateMessage, InboundDelegateMsg, OutboundDelegateMsg, Parameters, RelatedContracts,
+    StateDelta, UpdateData, WrappedState,
 };
 
 use super::executor::ExecutorError;
@@ -415,6 +415,17 @@ pub(super) fn continuation_bytes(continuation: &Continuation) -> ByteCount {
             .sum::<ByteCount>()
         // `params` is delegate-supplied and retained for the life of the park.
         // Omitting it was one of three ways this "byte bound" failed to bound.
+        // Hop replies awaiting the resumed iteration: delegate-supplied
+        // payloads (and contexts), held for the life of the park.
+        + continuation
+            .pending_replies
+            .iter()
+            .map(|r| {
+                ELEMENT_OVERHEAD_BYTES
+                    + ByteCount::new(r.msg.payload.len())
+                    + ByteCount::new(r.msg.context.as_ref().len())
+            })
+            .sum::<ByteCount>()
         + ByteCount::new(continuation.params.as_ref().len())
         // The parked run's delegate context, held here while it waits.
         + ByteCount::new(continuation.context.as_ref().map_or(0, Vec::len))
@@ -1072,6 +1083,18 @@ pub(super) enum Delivery {
     Apps,
 }
 
+/// A hop target's reply waiting for its caller's next iteration
+/// (`split_hop_output` in `contract.rs`).
+///
+/// `from` is the delegate the node ran, recorded by the node when the hop
+/// returned. It is carried BESIDE the message, never read back out of it, so
+/// the origin a reply is delivered under (`MessageOrigin::Delegate(from)`)
+/// does not depend on any field of the message.
+pub(super) struct PendingReply {
+    pub from: DelegateKey,
+    pub msg: DelegateMessage,
+}
+
 /// Everything needed to re-enter a parked delegate on a later loop iteration.
 ///
 /// `params` is carried explicitly and is NOT optional: `DelegateKey` identity
@@ -1123,6 +1146,10 @@ pub(super) struct Continuation {
     pub accumulated: Vec<OutboundDelegateMsg>,
     /// Responses already computed for this iteration, awaiting the parked one.
     pub inbound_so_far: Vec<InboundDelegateMsg<'static>>,
+    /// Hop replies produced in the parked iteration, delivered in the resumed
+    /// run's first iteration (each in a call of its own, under its sender's
+    /// origin).
+    pub pending_replies: Vec<PendingReply>,
     /// The parked client's responder, if this run descends from a client
     /// request. Attached by the caller immediately after parking (it owns the
     /// channel the responder is taken from), and re-attached by the resume
@@ -1782,9 +1809,10 @@ pub(super) struct DelegateParkCtx {
     /// its flags, so it is an upper bound on real sends the target attempted.
     /// Counted for every run kind. Disjoint from `dropped_hop_outputs`.
     dropped_hop_sends: u64,
-    /// Replies from hop targets that were not delivered: over
-    /// `MAX_HOP_REPLY_BYTES` or `MAX_HOP_REPLY_BYTES_PER_RUN`, or still
-    /// waiting when the run reached `MAX_CONTRACT_REQUEST_ITERATIONS`.
+    /// Replies from hop targets that were not delivered or not handled: over
+    /// `MAX_HOP_REPLY_BYTES` or `MAX_HOP_REPLY_BYTES_PER_RUN`, still waiting
+    /// when the run reached `MAX_CONTRACT_REQUEST_ITERATIONS`, the caller
+    /// failed while handling it, or the caller failed on the batch before it.
     dropped_hop_replies: u64,
     /// Inter-delegate messages refused because a delegate addressed them to
     /// itself.
@@ -3325,6 +3353,7 @@ mod tests {
             trigger: super::super::RunTrigger::Client,
             accumulated: Vec::new(),
             inbound_so_far: Vec::new(),
+            pending_replies: Vec::new(),
             responder: None,
             delivery: Delivery::Client,
             node_wide_duty: false,

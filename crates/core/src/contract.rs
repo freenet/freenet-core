@@ -132,24 +132,21 @@ const MAX_UNPROMPTED_HOPS_PER_RUN: usize = 16;
 /// can GET rather than in a reply.
 const MAX_HOP_REPLY_BYTES: usize = 64 * 1024;
 
-/// Bytes charged against `MAX_HOP_REPLY_BYTES_PER_RUN` for each reply on top
-/// of its payload, so empty replies are bounded too: each delivered reply
-/// costs the caller one `process()` call whatever its size.
-const HOP_REPLY_OVERHEAD_BYTES: usize = 256;
-
-/// Most reply bytes (payload plus `HOP_REPLY_OVERHEAD_BYTES` each) one
-/// delegate run, across all its iterations and parks, accepts from its hops'
-/// targets. Further replies are dropped and counted.
+/// Most reply payload bytes one delegate run, across all its iterations and
+/// parks, accepts from its hops' targets. Further replies are dropped and
+/// counted.
 ///
-/// Sized at `MAX_UNPROMPTED_HOPS_PER_RUN` maximal replies (about 1 MiB), so an
+/// Sized at `MAX_UNPROMPTED_HOPS_PER_RUN` maximal replies (1 MiB), so an
 /// unprompted run is never limited by this before it reaches its hop cap. A
-/// client run, which the hop cap does not bound, is bounded by this instead:
-/// at most this many bytes of replies, and at most
-/// `MAX_HOP_REPLY_BYTES_PER_RUN / HOP_REPLY_OVERHEAD_BYTES` (about 4100)
-/// reply deliveries, where `MAX_CONTRACT_REQUEST_ITERATIONS` x
-/// `MAX_OUTBOUND_MSGS_PER_RUN` hops could otherwise each return one.
-const MAX_HOP_REPLY_BYTES_PER_RUN: usize =
-    MAX_UNPROMPTED_HOPS_PER_RUN * (MAX_HOP_REPLY_BYTES + HOP_REPLY_OVERHEAD_BYTES);
+/// client run, which the hop cap does not bound, is bounded by this instead.
+///
+/// The NUMBER of replies needs no separate cap: each reply is delivered in an
+/// executor call of its own, and every call after an iteration's first counts
+/// as an iteration against `MAX_CONTRACT_REQUEST_ITERATIONS` (`plan_round`).
+/// So a run still makes at most `MAX_CONTRACT_REQUEST_ITERATIONS` calls into
+/// the delegate, each under the runtime's per-call output budget, the same
+/// ceiling as before replies existed.
+const MAX_HOP_REPLY_BYTES_PER_RUN: usize = MAX_UNPROMPTED_HOPS_PER_RUN * MAX_HOP_REPLY_BYTES;
 
 /// Maximum delegate notifications to drain per iteration.
 /// Matches the same bounded-drain pattern as MAX_DRAIN_BATCH for contract events,
@@ -1513,6 +1510,10 @@ struct RunSeed {
     /// `MAX_HOP_REPLY_BYTES_PER_RUN` bounds the whole run across iterations
     /// and parks, like `hops_attempted`.
     reply_bytes_accepted: usize,
+    /// Hop replies to deliver in this run's first iteration: those a parked
+    /// iteration produced, carried by the continuation. Empty for a fresh
+    /// run.
+    replies: Vec<delegate_park::PendingReply>,
     /// What the delegate lane's `process()` call already returned for this
     /// round-trip's first leg, when the lane handed the round-trip to the
     /// loop (`delegate_lane`). The first iteration uses it instead of calling
@@ -1650,67 +1651,61 @@ struct RoundCall {
     reply_from: Option<DelegateKey>,
 }
 
-/// Plan the executor calls for one iteration of a delegate round-trip.
+/// Plan the executor calls for one iteration of a delegate round-trip: the
+/// iteration's batch `req`, then one call per hop reply in `replies`.
 ///
 /// Hop replies (`split_hop_output`) are delivered EACH IN A CALL OF ITS OWN,
-/// after the rest of the batch, with the replying delegate as
-/// `caller_delegate`. So while the delegate processes a reply it sees
-/// `MessageOrigin::Delegate(target)`, the same origin every other inbound
-/// `DelegateMessage` carries (`resolve_message_origin`: an inter-delegate
-/// message replaces any WebApp or inherited origin, and a non-local
-/// connection still gets none). Delivering it in the main batch would hand
-/// the target's content to the delegate under the RUN's origin, for instance
-/// a web app's attestation. Any prompt the delegate raises while handling a
-/// reply is still shown under the run's own app identity
-/// (`caller_identity_from_origin`), since the run is the one prompting.
+/// after the batch, naming the replying delegate as `caller_delegate`. So
+/// while the delegate processes a reply it sees `MessageOrigin::Delegate(
+/// target)`, the same origin every other inbound `DelegateMessage` carries
+/// (`resolve_message_origin`: an inter-delegate message replaces any WebApp
+/// or inherited origin, and a non-local connection still gets none).
+/// Delivering it in the batch would hand the target's content to the
+/// delegate under the RUN's origin, for instance a web app's attestation.
+/// Any prompt the delegate raises while handling a reply is still shown
+/// under the run's own app identity (`caller_identity_from_origin`), since
+/// the run is the one prompting.
 ///
-/// Every inbound `DelegateMessage` in a round-trip is a reply the loop built:
-/// a client cannot hand one in (`node_only_inbound`), a node-started run
-/// begins from its own event (a notification, a lifecycle event, a wake-up),
-/// and a resumed run's inbound is what the loop carried plus the park's
-/// results. So its `sender` is the key the core set, naming the delegate
-/// that produced the reply.
+/// The origin comes from [`delegate_park::PendingReply::from`], recorded by
+/// the hop that ran the target, never from a field of the message, and only
+/// `replies` are delivered this way. A `DelegateMessage` that reached `req`
+/// by any other route would run in the batch under the run's origin, the
+/// same as before replies existed.
 ///
-/// With no replies the plan is the single call it replaced, including a call
-/// with an empty inbound after an iteration that only sent messages.
-fn plan_round(req: DelegateRequest<'static>) -> Vec<RoundCall> {
-    let (key, params, inbound) = match req {
-        DelegateRequest::ApplicationMessages {
-            key,
-            params,
-            inbound,
-        } => (key, params, inbound),
-        other @ (DelegateRequest::RegisterDelegate { .. }
-        | DelegateRequest::UnregisterDelegate(_)
-        | _) => {
-            return vec![RoundCall {
-                req: other,
-                reply_from: None,
-            }];
-        }
-    };
-    let (replies, rest): (Vec<_>, Vec<_>) = inbound
-        .into_iter()
-        .partition(|m| matches!(m, InboundDelegateMsg::DelegateMessage(_)));
+/// With no replies the plan is `req` alone, the single call it replaced,
+/// including a call with an empty inbound after an iteration that only sent
+/// messages. With replies, an empty batch is skipped.
+///
+/// The caller counts every call after the first against
+/// `MAX_CONTRACT_REQUEST_ITERATIONS`, so replies never let a run make more
+/// calls into the delegate than it could before they existed.
+fn plan_round(
+    req: DelegateRequest<'static>,
+    replies: Vec<delegate_park::PendingReply>,
+    delegate_key: &DelegateKey,
+    params: &Parameters<'static>,
+) -> Vec<RoundCall> {
+    if replies.is_empty() {
+        return vec![RoundCall {
+            req,
+            reply_from: None,
+        }];
+    }
+    let empty_batch = matches!(
+        &req,
+        DelegateRequest::ApplicationMessages { inbound, .. } if inbound.is_empty()
+    );
     let mut calls = Vec::with_capacity(1 + replies.len());
-    if !rest.is_empty() || replies.is_empty() {
+    if !empty_batch {
         calls.push(RoundCall {
-            req: DelegateRequest::ApplicationMessages {
-                key: key.clone(),
-                params: params.clone(),
-                inbound: rest,
-            },
+            req,
             reply_from: None,
         });
     }
-    for reply in replies {
-        let InboundDelegateMsg::DelegateMessage(msg) = reply else {
-            continue; // `partition` above kept only `DelegateMessage`s.
-        };
-        let from = msg.sender.clone();
+    for delegate_park::PendingReply { from, msg } in replies {
         calls.push(RoundCall {
             req: DelegateRequest::ApplicationMessages {
-                key: key.clone(),
+                key: delegate_key.clone(),
                 params: params.clone(),
                 inbound: vec![InboundDelegateMsg::DelegateMessage(msg)],
             },
@@ -1718,18 +1713,6 @@ fn plan_round(req: DelegateRequest<'static>) -> Vec<RoundCall> {
         });
     }
     calls
-}
-
-/// Hop replies waiting in `req`'s inbound (each inbound `DelegateMessage` in
-/// a round-trip is one; see [`plan_round`]).
-fn pending_reply_count(req: &DelegateRequest<'_>) -> u64 {
-    match req {
-        DelegateRequest::ApplicationMessages { inbound, .. } => inbound
-            .iter()
-            .filter(|m| matches!(m, InboundDelegateMsg::DelegateMessage(_)))
-            .count() as u64,
-        DelegateRequest::RegisterDelegate { .. } | DelegateRequest::UnregisterDelegate(_) | _ => 0,
-    }
 }
 
 /// A hop target's output, split by [`split_hop_output`].
@@ -1744,16 +1727,16 @@ struct HopOutput {
     other: Vec<OutboundDelegateMsg>,
 }
 
-/// Split what a hop's target emitted: the first `SendDelegateMessage` it
-/// addressed back to `caller` is the reply; every other
-/// `SendDelegateMessage` is dropped (counted only); the rest is returned
-/// untouched for the caller's run to route.
+/// Split what a hop's target emitted: the first unprocessed
+/// `SendDelegateMessage` it addressed back to `caller` is the reply; every
+/// other `SendDelegateMessage` (including one marked processed, which is
+/// not a send) is dropped (counted only); the rest is returned untouched for
+/// the caller's run to route.
 ///
 /// The reply is normalized here rather than trusted as the target built it:
 /// - `sender` is set to `target`, the delegate the node just ran. The caller
 ///   authorizes the reply on this field, so it is set on the path that
 ///   delivers it, from the key the node itself ran.
-/// - `processed` is cleared: the reply is an undelivered inbound message.
 /// - `context` is cleared, as the runtime clears it on an outbound
 ///   `ApplicationMessage`: the target's context is not the caller's.
 fn split_hop_output(
@@ -1769,10 +1752,9 @@ fn split_hop_output(
     for value in values {
         match value {
             OutboundDelegateMsg::SendDelegateMessage(mut msg)
-                if out.reply.is_none() && msg.target == *caller =>
+                if out.reply.is_none() && !msg.processed && msg.target == *caller =>
             {
                 msg.sender = target.clone();
-                msg.processed = false;
                 msg.context = DelegateContext::default();
                 out.reply = Some(msg);
             }
@@ -1862,8 +1844,12 @@ where
         mut self_heal_fetches_started,
         mut hops_attempted,
         mut reply_bytes_accepted,
+        replies: mut current_replies,
         mut first_values,
     } = seed;
+    // The lane hands the loop only fresh client round-trips, which carry no
+    // replies; a resumed run (which may) never has `first_values`.
+    debug_assert!(first_values.is_none() || current_replies.is_empty());
 
     loop {
         iterations += 1;
@@ -1914,7 +1900,7 @@ where
             // Hop replies still waiting for this iteration are lost with the
             // rest of its inbound; count them, so a caller missing a reply
             // shows up somewhere.
-            let lost_replies = pending_reply_count(&current_req);
+            let lost_replies = current_replies.len() as u64;
             if lost_replies > 0 {
                 let total = parking
                     .as_mut()
@@ -1941,7 +1927,34 @@ where
             None => {
                 let mut values = Vec::new();
                 let mut failure = None;
-                for call in plan_round(current_req) {
+                // Replies not delivered this round, each kind counted and
+                // logged once below.
+                let mut lost_at_cap: u64 = 0;
+                let mut failed_replies: u64 = 0;
+                let mut unrun_after_failure: u64 = 0;
+                let mut calls = plan_round(
+                    current_req,
+                    std::mem::take(&mut current_replies),
+                    delegate_key,
+                    &current_params,
+                )
+                .into_iter();
+                let mut first_call = true;
+                while let Some(call) = calls.next() {
+                    // EVERY CALL AFTER THE FIRST IS AN ITERATION of its own,
+                    // so a run makes at most MAX_CONTRACT_REQUEST_ITERATIONS
+                    // calls into the delegate, each under the runtime's
+                    // per-call output budget, as before replies existed.
+                    // Only reply calls follow the first, so what the cap
+                    // cuts off is replies.
+                    if !std::mem::take(&mut first_call) {
+                        iterations += 1;
+                        if iterations > MAX_CONTRACT_REQUEST_ITERATIONS {
+                            lost_at_cap = 1 + calls.len() as u64;
+                            break;
+                        }
+                    }
+                    let is_reply = call.reply_from.is_some();
                     // At most one of `origin_contract` and `caller_delegate`
                     // (`delegate_request_as`'s invariant): a reply names its
                     // sender, the batch carries the run's origin.
@@ -1964,10 +1977,46 @@ where
                     );
                     match out {
                         Ok(out) => values.extend(out),
+                        // A failed REPLY call is a dropped reply, not a
+                        // failed run: the batch and the other replies have
+                        // already run (and may have saved state expecting
+                        // their outputs to be handled), and the target, whose
+                        // reply this was, must not be able to fail the
+                        // caller's run. `delegate_response_values` logged the
+                        // error itself.
+                        Err(_) if is_reply => failed_replies += 1,
                         Err(err) => {
+                            // Only the batch, the first call, gets here, so
+                            // every call left is an undelivered reply.
+                            unrun_after_failure = calls.len() as u64;
                             failure = Some(err);
                             break;
                         }
+                    }
+                }
+                for (dropped, why) in [
+                    (
+                        lost_at_cap,
+                        "the run reached MAX_CONTRACT_REQUEST_ITERATIONS before \
+                         delivering them",
+                    ),
+                    (failed_replies, "the delegate failed while handling them"),
+                    (
+                        unrun_after_failure,
+                        "the delegate failed on the batch before them",
+                    ),
+                ] {
+                    if dropped > 0 {
+                        let total = parking
+                            .as_mut()
+                            .map(|ctx| ctx.park.count_dropped_hop_replies(dropped));
+                        tracing::info!(
+                            delegate_key = %delegate_key,
+                            dropped,
+                            total_dropped = ?total,
+                            why,
+                            "Dropped replies to this delegate's inter-delegate messages"
+                        );
                     }
                 }
                 match failure {
@@ -2049,6 +2098,9 @@ where
         }
 
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
+        // Hop replies produced this iteration, each with the delegate that
+        // produced it; delivered next iteration (`plan_round`).
+        let mut pending_replies: Vec<delegate_park::PendingReply> = Vec::new();
 
         // UNPROMPTED-RUN BUDGET (`delegate_capabilities`). For a delegate that
         // opted into capabilities (a manifest, registered by an app that holds
@@ -2879,12 +2931,17 @@ where
         //   counted against A's hop cap on an unprompted run, inside A's
         //   MAX_CONTRACT_REQUEST_ITERATIONS. This prevents unbounded
         //   recursion between delegates.
-        // - The reply applies to every run kind. If A parks in the same
-        //   iteration, the reply rides the continuation with A's other
-        //   responses (`inbound_so_far`) and is delivered on resume, and it
-        //   is charged against the park byte budget while parked. A reply
-        //   still waiting when the run reaches MAX_CONTRACT_REQUEST_ITERATIONS
-        //   is lost with the rest of that iteration's inbound, and counted.
+        // - The reply applies to every run kind. It is kept beside A's other
+        //   responses with B's key recorded next to it (`PendingReply`); if A
+        //   parks in the same iteration it rides the continuation
+        //   (`pending_replies`) and is delivered on resume, charged against
+        //   the park byte budget while parked. Each reply call after an
+        //   iteration's first call counts as an iteration; a reply still
+        //   waiting when the run reaches MAX_CONTRACT_REQUEST_ITERATIONS is
+        //   dropped and counted. If A fails while handling a reply, that
+        //   reply is dropped and counted and the run goes on; if A fails on
+        //   the batch, the replies after it are dropped and counted, and the
+        //   run fails as before.
         // - Target delegate runs with the params IT was registered with on this node
         //   (`registered_delegate_params`, #5616), never the caller's and never empty
         //   ones: a delegate key is `BLAKE3(code_hash ‖ params)`, so other params would
@@ -2909,10 +2966,13 @@ where
         //   if the delegate lane handed the loop a pending round-trip of the
         //   target, that round-trip first (see the lane paragraph below). The
         //   target's own contract requests in its reply are NOT executed.
-        // - Bounds. One reply, no chaining (above). An UNPROMPTED run makes at
-        //   most `MAX_UNPROMPTED_HOPS_PER_RUN` hops, for every delegate with
-        //   or without a manifest; client runs are bounded by
-        //   MAX_CONTRACT_REQUEST_ITERATIONS x `MAX_OUTBOUND_MSGS_PER_RUN`. The
+        // - Bounds. One reply per hop, no chaining (above). An UNPROMPTED run
+        //   makes at most `MAX_UNPROMPTED_HOPS_PER_RUN` hops, for every
+        //   delegate with or without a manifest; client runs are bounded by
+        //   MAX_CONTRACT_REQUEST_ITERATIONS x `MAX_OUTBOUND_MSGS_PER_RUN`,
+        //   which still holds with replies because every executor call into
+        //   the caller, reply calls included, counts as an iteration and each
+        //   is under the runtime's per-call output budget. The
         //   hop's loop time (including a target lane round-trip it runs first,
         //   which counts as one hop) is part of the caller's run. For a
         //   BUDGETED caller (a manifest delegate with the Background grant) it
@@ -3011,8 +3071,8 @@ where
                 // registration-record refusal — GHSA-824h-7x5x-wfmf) at an
                 // arbitrarily later time under a scope captured earlier, and
                 // deferring an attestation is not something to introduce as a
-                // side effect of a stall fix. Losing a fire-and-forget message
-                // beats corrupting the target's state.
+                // side effect of a stall fix. Losing a message whose delivery
+                // was never guaranteed beats corrupting the target's state.
                 //
                 // `info!`, not `debug!`: the crate sets `release_max_level_info`
                 // so a `debug!` compiles out of shipped binaries and a delegate
@@ -3190,9 +3250,8 @@ where
                         dropped_sends += sends;
                         if let Some(reply) = reply {
                             let len = reply.payload.len();
-                            let charge = len.saturating_add(HOP_REPLY_OVERHEAD_BYTES);
                             if len > MAX_HOP_REPLY_BYTES
-                                || reply_bytes_accepted.saturating_add(charge)
+                                || reply_bytes_accepted.saturating_add(len)
                                     > MAX_HOP_REPLY_BYTES_PER_RUN
                             {
                                 // Over a byte bound: see the constants.
@@ -3200,12 +3259,17 @@ where
                             } else {
                                 // Delivered to the caller in its next
                                 // iteration, after the other responses, in a
-                                // call of its own (`plan_round`). If the
-                                // caller parks in this iteration the reply
-                                // rides the continuation (`inbound_so_far`)
-                                // and is delivered on resume.
-                                reply_bytes_accepted += charge;
-                                inbound_responses.push(InboundDelegateMsg::DelegateMessage(reply));
+                                // call of its own (`plan_round`), under the
+                                // origin of `target_key`, recorded here beside
+                                // the message. If the caller parks in this
+                                // iteration the reply rides the continuation
+                                // (`pending_replies`) and is delivered on
+                                // resume.
+                                reply_bytes_accepted += len;
+                                pending_replies.push(delegate_park::PendingReply {
+                                    from: target_key.clone(),
+                                    msg: reply,
+                                });
                             }
                         }
                         if is_unprompted_run(trigger) {
@@ -3362,6 +3426,7 @@ where
                     trigger,
                     accumulated: std::mem::take(&mut accumulated_messages),
                     inbound_so_far: std::mem::take(&mut inbound_responses),
+                    pending_replies: std::mem::take(&mut pending_replies),
                     // Carry the counts so the caps bound the ROUND-TRIP, not
                     // each leg (#5544 S1 for iterations; #5542 finding B1 for
                     // the fan-out budget).
@@ -3605,6 +3670,7 @@ where
                         let continuation = *continuation;
                         accumulated_messages = continuation.accumulated;
                         inbound_responses = continuation.inbound_so_far;
+                        pending_replies = continuation.pending_replies;
                         iterations = continuation.iterations;
                         self_heal_fetches_started = continuation.self_heal_fetches_started;
                         hops_attempted = continuation.hops_attempted;
@@ -3675,6 +3741,7 @@ where
             inbound: inbound_responses,
             params: current_params.clone(),
         };
+        current_replies = pending_replies;
     }
 }
 
@@ -6825,6 +6892,7 @@ where
         trigger,
         accumulated,
         inbound_so_far,
+        pending_replies,
         responder,
         delivery,
         node_wide_duty,
@@ -6927,10 +6995,12 @@ where
 
     let mut carried_responder = responder;
     #[allow(clippy::if_not_else)]
-    let outcome = if all_inbound.is_empty() {
+    let outcome = if all_inbound.is_empty() && pending_replies.is_empty() {
         // Nothing to feed back — a dropped park that had computed no responses
         // before it. Do NOT re-enter the delegate with an empty inbound; that
         // would run `process()` for no reason. Terminate with what we had.
+        // (Pending hop replies are something to feed back: with an empty
+        // inbound, `plan_round` delivers only them.)
         DelegateRunOutcome::Completed(accumulated)
     } else {
         let req = DelegateRequest::ApplicationMessages {
@@ -6964,6 +7034,7 @@ where
                 self_heal_fetches_started,
                 hops_attempted,
                 reply_bytes_accepted,
+                replies: pending_replies,
                 first_values: None,
             },
         )
@@ -15614,6 +15685,7 @@ mod hol_4391_tests {
             trigger: RunTrigger::Client,
             accumulated: Vec::new(),
             inbound_so_far: Vec::new(),
+            pending_replies: Vec::new(),
             responder: None,
             delivery: delegate_park::Delivery::Client,
             node_wide_duty: false,
@@ -16883,6 +16955,7 @@ mod hol_4391_tests {
             trigger: RunTrigger::Client,
             accumulated: Vec::new(),
             inbound_so_far: Vec::new(),
+            pending_replies: Vec::new(),
             responder: None,
             delivery: delegate_park::Delivery::Client,
             node_wide_duty: false,

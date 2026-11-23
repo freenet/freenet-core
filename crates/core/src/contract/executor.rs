@@ -2776,11 +2776,6 @@ mod tests {
                  parked)",
             ),
             (
-                "HOP_REPLY_OVERHEAD_BYTES",
-                "per-reply charge against one delegate run's reply allowance, not \
-                 a memory budget",
-            ),
-            (
                 "MAX_GUEST_ERROR_TEXT_BYTES",
                 "length cap on one guest-supplied error or log string, not a memory budget",
             ),
