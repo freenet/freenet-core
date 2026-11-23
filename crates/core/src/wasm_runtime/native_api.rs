@@ -3673,6 +3673,56 @@ mod secret_read_memo_tests {
         );
     }
 
+    /// `get_secret_len` host fn over an unreadable blob: `ERR_STORAGE_FAILED`
+    /// and a poisoned call, while an absent secret stays `ERR_SECRET_NOT_FOUND`
+    /// (#5857).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_secret_len_host_fn_fails_the_call_on_an_unreadable_blob() {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        const ID: i64 = 0x5857_0003;
+
+        let mut f = fixture().await;
+        let dk = delegate_key();
+        let key_bytes = b"k".to_vec();
+        let id = SecretsId::new(key_bytes.clone());
+        let blob = f
+            .secret_store
+            .scope_dir(&dk, &SecretScope::Local)
+            .join(id.encode());
+        std::fs::create_dir_all(&blob).unwrap();
+
+        // SAFETY: the env is moved into `DELEGATE_ENV` and removed again before
+        // `f` is dropped at the end of this test.
+        let env = unsafe { env_of(&mut f) };
+        MEM_ADDR.insert(
+            ID,
+            InstanceInfo::new(
+                key_bytes.as_ptr() as i64,
+                key_bytes.len(),
+                Key::Delegate(dk.clone()),
+            ),
+        );
+        DELEGATE_ENV.insert(ID, DelegateEnvSlot::new(env));
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(ID));
+
+        let failed = delegate_secrets::get_secret_len(0, 1);
+        let poisoned = DELEGATE_ENV
+            .get(&ID)
+            .map(|e| e.secret_reads_poisoned())
+            .unwrap_or(false);
+        std::fs::remove_dir(&blob).unwrap();
+        let absent = delegate_secrets::get_secret_len(0, 1);
+
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        DELEGATE_ENV.remove(&ID);
+        MEM_ADDR.remove(&ID);
+
+        assert_eq!(failed, error_codes::ERR_STORAGE_FAILED);
+        assert!(poisoned, "the failed read must poison the call");
+        assert_eq!(absent, error_codes::ERR_SECRET_NOT_FOUND);
+    }
+
     /// The memo is keyed on the secret's hash. Without that check a read of a
     /// different key would be served the previous secret's bytes — a
     /// cross-secret leak inside a single `process()` call.
