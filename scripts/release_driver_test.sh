@@ -557,26 +557,28 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# N. The default handshake floor is the committed one, never the previous
-#    release (#5833)
+# N. The handshake floor is the committed one unless --min-compatible is
+#    given, and an unreadable or malformed floor refuses (#5833)
 # ---------------------------------------------------------------------------
 # Defaulting --min-compatible to the version before the bump made every updated
 # peer refuse every peer that had not updated yet: a network split on an
 # ordinary release. The default must be the value already committed in
 # crates/core/Cargo.toml, so the floor moves only when asked.
-FLOOR_FN="$(awk '/^current_min_compatible\(\) \{/,/^\}/' "$RELEASE_SH")"
-if [[ -z "$FLOOR_FN" ]] || [[ "$FLOOR_FN" != *"min-compatible-version"* ]]; then
-    fail "could not extract current_min_compatible() from release.sh" \
-        "Every floor case below runs it, so an empty extraction would make them" \
+FLOOR_FNS="$(awk '/^current_min_compatible\(\) \{/,/^\}/' "$RELEASE_SH")
+$(awk '/^resolve_min_compatible\(\) \{/,/^\}/' "$RELEASE_SH")"
+if [[ "$FLOOR_FNS" != *"current_min_compatible() {"* ]] \
+    || [[ "$FLOOR_FNS" != *"resolve_min_compatible() {"* ]]; then
+    fail "could not extract current_min_compatible()/resolve_min_compatible() from release.sh" \
+        "Every floor case below runs them, so an empty extraction would make them" \
         "all pass vacuously."
 else
-    eval "$FLOOR_FN"
+    eval "$FLOOR_FNS"
+    # floor_case <desc> <explicit or ""> <Cargo.toml body> <expected output or FAIL>
     floor_case() {
-        # floor_case <desc> <Cargo.toml body> <expected output or FAIL>
-        local desc="$1" body="$2" want="$3" work got
+        local desc="$1" explicit="$2" body="$3" want="$4" work got
         work="$(mktemp -d)"
         printf '%s\n' "$body" > "$work/Cargo.toml"
-        if got="$(current_min_compatible "$work/Cargo.toml")"; then :; else got="FAIL"; fi
+        if got="$(resolve_min_compatible "$explicit" "$work/Cargo.toml" 2>/dev/null)"; then :; else got="FAIL"; fi
         rm -rf "$work"
         if [[ "$got" == "$want" ]]; then
             pass "$desc"
@@ -584,40 +586,74 @@ else
             fail "$desc" "got '$got', expected '$want'"
         fi
     }
+    TOML_OK=$'[package]\nname = "freenet"\nversion = "0.2.200"\n\n[package.metadata.freenet]\nmin-compatible-version = "0.2.122"'
     floor_case "default floor is the committed min-compatible-version, not the package version" \
-        $'[package]\nname = "freenet"\nversion = "0.2.200"\n\n[package.metadata.freenet]\nmin-compatible-version = "0.2.122"' \
-        "0.2.122"
+        "" "$TOML_OK" "0.2.122"
+    floor_case "a committed floor written without spaces around '=' is read" \
+        "" $'[package]\nversion = "0.2.200"\n[package.metadata.freenet]\nmin-compatible-version="0.2.150"' "0.2.150"
     floor_case "a missing min-compatible-version refuses instead of guessing" \
-        $'[package]\nname = "freenet"\nversion = "0.2.200"' \
-        "FAIL"
+        "" $'[package]\nname = "freenet"\nversion = "0.2.200"' "FAIL"
     floor_case "a malformed min-compatible-version refuses instead of guessing" \
-        $'[package]\nversion = "0.2.200"\n[package.metadata.freenet]\nmin-compatible-version = "next"' \
-        "FAIL"
+        "" $'[package]\nversion = "0.2.200"\n[package.metadata.freenet]\nmin-compatible-version = "next"' "FAIL"
+    floor_case "an explicit --min-compatible wins over the committed floor" \
+        "0.2.165" "$TOML_OK" "0.2.165"
+    floor_case "a malformed explicit --min-compatible refuses" \
+        "0.2" "$TOML_OK" "FAIL"
 
-    # The real Cargo.toml must resolve to its own committed floor.
+    # The real Cargo.toml must carry a readable floor, or every default run refuses.
     REAL_TOML="$SCRIPT_DIR/../crates/core/Cargo.toml"
-    REAL_FLOOR="$(grep -E '^min-compatible-version' "$REAL_TOML" | head -1 | cut -d'"' -f2)"
-    if got="$(current_min_compatible "$REAL_TOML")" && [[ -n "$REAL_FLOOR" && "$got" == "$REAL_FLOOR" ]]; then
-        pass "the real crates/core/Cargo.toml resolves to its committed floor ($got)"
+    if got="$(resolve_min_compatible "" "$REAL_TOML" 2>/dev/null)" && [[ -n "$got" ]]; then
+        pass "the real crates/core/Cargo.toml has a readable floor ($got)"
     else
-        fail "the real crates/core/Cargo.toml did not resolve to its committed floor" \
-            "got '${got:-}', expected '$REAL_FLOOR'"
+        fail "the real crates/core/Cargo.toml has no readable min-compatible-version" \
+            "Every release.sh run without --min-compatible would refuse."
     fi
+fi
 
-    # The default branch must actually use it. A top-level block cannot be run
-    # in isolation, so this one checks the text: the only assignment to
-    # MIN_COMPATIBLE outside argument parsing calls current_min_compatible.
-    DEFAULT_ASSIGNS="$(code_lines "$RELEASE_SH" \
-        | grep -E 'MIN_COMPATIBLE=' \
-        | grep -vE 'MIN_COMPATIBLE=""|MIN_COMPATIBLE="\$2"|FREENET_MIN_COMPATIBLE_VERSION=')"
-    if [[ -n "$DEFAULT_ASSIGNS" ]] && ! grep -qv 'current_min_compatible' <<< "$DEFAULT_ASSIGNS"; then
-        pass "the --min-compatible default is taken from current_min_compatible"
+# The call site, run for real: copy release.sh into a throwaway repo and check
+# that an unreadable floor or a malformed --min-compatible stops the driver
+# before it does anything else. A caller that swallowed the refusal (an
+# `|| MIN_COMPATIBLE=...` fallback, or a dropped `exit 1`) would carry on to
+# the version lookup with no floor or a guessed one.
+floor_refusal_case() {
+    local desc="$1" toml_body="$2" out rc work
+    shift 2
+    work="$(mktemp -d)"
+    mkdir -p "$work/scripts" "$work/crates/core" "$work/bin"
+    cp "$RELEASE_SH" "$work/scripts/release.sh"
+    printf '%s\n' "$toml_body" > "$work/crates/core/Cargo.toml"
+    # Anything past the floor check would call cargo first; make that visible.
+    printf '#!/usr/bin/env bash\necho REACHED_CARGO >&2\nexit 1\n' > "$work/bin/cargo"
+    chmod +x "$work/bin/cargo"
+    (cd "$work" && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git init -q .)
+    rc=0
+    out="$(cd "$work" && PATH="$work/bin:$PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        bash scripts/release.sh "$@" 2>&1)" || rc=$?
+    rm -rf "$work"
+    if [[ "$rc" -ne 0 ]] && [[ "$out" == *"min-compatible"* ]] && [[ "$out" != *REACHED_CARGO* ]]; then
+        pass "$desc"
     else
-        fail "the --min-compatible default is not (only) taken from current_min_compatible" \
-            "${DEFAULT_ASSIGNS:-<no default assignment found>}" \
-            "Deriving it from the package version moves the handshake floor on every" \
-            "release and splits the network (#5833)."
+        fail "$desc" "exit=$rc" "$out"
     fi
+}
+floor_refusal_case "release.sh refuses before any work when Cargo.toml has no floor" \
+    $'[package]\nname = "freenet"\nversion = "0.2.200"' \
+    --version 0.2.201 --dry-run
+floor_refusal_case "release.sh refuses before any work on a malformed --min-compatible" \
+    $'[package]\nname = "freenet"\nversion = "0.2.200"\n[package.metadata.freenet]\nmin-compatible-version = "0.2.122"' \
+    --version 0.2.201 --min-compatible 0.2 --dry-run
+
+# The default must not be exported: builds then read the floor committed on
+# main after the driver checks it out, not whatever tree it was started in.
+EXPORTS="$(code_lines "$RELEASE_SH" | grep -E 'export[[:space:]]+FREENET_MIN_COMPATIBLE_VERSION' || true)"
+EXPORT_GUARD="$(awk '/^if \[\[ -n "\$MIN_COMPATIBLE_EXPLICIT" \]\]; then$/,/^fi$/' "$RELEASE_SH")"
+if [[ "$(grep -c . <<< "$EXPORTS")" -eq 1 ]] \
+    && [[ "$(grep -cE '^[[:space:]]+export FREENET_MIN_COMPATIBLE_VERSION="\$MIN_COMPATIBLE"$' <<< "$EXPORT_GUARD")" -eq 1 ]] \
+    && [[ "$EXPORT_GUARD" == *"unset FREENET_MIN_COMPATIBLE_VERSION"* ]]; then
+    pass "FREENET_MIN_COMPATIBLE_VERSION is exported only for an explicit --min-compatible"
+else
+    fail "FREENET_MIN_COMPATIBLE_VERSION export is not limited to an explicit --min-compatible" \
+        "exports: ${EXPORTS:-<none>}"
 fi
 
 echo

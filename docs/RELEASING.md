@@ -1000,8 +1000,9 @@ above: it refuses the connection outright, rather than deciding which message
 variants a peer can receive.
 
 `release.yml` ships the committed value unchanged, so raising it is its own
-reviewed PR, never a side effect of a release. (`scripts/release.sh` still
-rewrites it; see #5833.) `build.rs` requires an `X.Y.Z` value no higher than
+reviewed PR, never a side effect of a release. `scripts/release.sh` keeps it
+too; only an explicit `--min-compatible X.Y.Z` makes it write a different
+floor, into the release bump (#5833). `build.rs` requires an `X.Y.Z` value no higher than
 the package version. A floor in the same major.minor series is carried as a
 patch number (wire format 1). A floor in a different series (for example a
 1.0.0 build keeping floor 0.2.N) uses wire format 2 and is accepted only if

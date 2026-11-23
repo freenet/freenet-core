@@ -154,17 +154,42 @@ current_min_compatible() {
     printf '%s\n' "$value"
 }
 
-if [[ -z "$MIN_COMPATIBLE" ]]; then
-    if ! MIN_COMPATIBLE=$(current_min_compatible "$PROJECT_ROOT/crates/core/Cargo.toml"); then
-        echo "Error: could not read min-compatible-version from crates/core/Cargo.toml;"
-        echo "       pass --min-compatible X.Y.Z explicitly."
-        exit 1
+# resolve_min_compatible <explicit or ""> <Cargo.toml> -- print the floor this
+# run uses: the explicit --min-compatible value when given (it must be X.Y.Z),
+# otherwise the committed one. Returns 1, with the reason on stderr, rather
+# than guess: a wrong floor partitions the network.
+resolve_min_compatible() {
+    local explicit="$1" cargo_toml="$2"
+    if [[ -n "$explicit" ]]; then
+        if [[ ! "$explicit" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: --min-compatible must be X.Y.Z (got '$explicit')." >&2
+            return 1
+        fi
+        printf '%s\n' "$explicit"
+        return 0
     fi
-    echo "Min-compatible version: $MIN_COMPATIBLE (unchanged; committed floor in Cargo.toml)"
-else
-    echo "Min-compatible version: $MIN_COMPATIBLE (explicitly set)"
+    if ! current_min_compatible "$cargo_toml"; then
+        echo "Error: could not read min-compatible-version from $cargo_toml;" >&2
+        echo "       pass --min-compatible X.Y.Z explicitly." >&2
+        return 1
+    fi
+}
+
+MIN_COMPATIBLE_EXPLICIT="$MIN_COMPATIBLE"
+if ! MIN_COMPATIBLE=$(resolve_min_compatible "$MIN_COMPATIBLE_EXPLICIT" "$PROJECT_ROOT/crates/core/Cargo.toml"); then
+    exit 1
 fi
-export FREENET_MIN_COMPATIBLE_VERSION="$MIN_COMPATIBLE"
+if [[ -n "$MIN_COMPATIBLE_EXPLICIT" ]]; then
+    echo "Min-compatible version: $MIN_COMPATIBLE (explicitly set; written into the release bump)"
+    export FREENET_MIN_COMPATIBLE_VERSION="$MIN_COMPATIBLE"
+else
+    # Not exported: builds read the floor committed on main after the driver
+    # checks main out, which is the value release.yml ships. Exporting what was
+    # read here would carry a stale floor from whatever tree the driver was
+    # started in.
+    echo "Min-compatible version: $MIN_COMPATIBLE (unchanged; committed floor in Cargo.toml)"
+    unset FREENET_MIN_COMPATIBLE_VERSION
+fi
 
 # Get the most recently published version from crates.io (most authoritative source).
 #
@@ -797,6 +822,12 @@ update_versions() {
     # Check if version is already updated in Cargo.toml
     if grep -q "^version = \"$VERSION\"" "$PROJECT_ROOT/crates/core/Cargo.toml" 2>/dev/null; then
         echo "  ✓ Versions already updated (skipping)"
+        if [[ -n "$MIN_COMPATIBLE_EXPLICIT" ]] \
+            && [[ "$(current_min_compatible "$PROJECT_ROOT/crates/core/Cargo.toml" || true)" != "$MIN_COMPATIBLE" ]]; then
+            echo "  ✗ --min-compatible $MIN_COMPATIBLE was given, but the version bump is"
+            echo "    already committed with a different floor. Raise the floor in its own PR."
+            return 1
+        fi
         # The version bump is already on main (a resume after the bump
         # commit, or a main whose nested lock went stale). Re-sync the locks
         # (idempotent); create_release_pr commits any repair.
@@ -824,11 +855,20 @@ update_versions() {
     sed_inplace "s/^version = \".*\"/version = \"$VERSION\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
     echo "✓"
 
-    # Update min-compatible-version in Cargo.toml metadata so cross-compile CI
-    # builds (which don't have the env var) get the correct min-compatible version.
-    echo -n "  Setting min-compatible-version to $MIN_COMPATIBLE... "
-    sed_inplace "s/^min-compatible-version = \".*\"/min-compatible-version = \"$MIN_COMPATIBLE\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
-    echo "✓"
+    # The floor is written only when --min-compatible was given (#5833); by
+    # default the committed value ships unchanged. Cross-compile CI builds
+    # read it from Cargo.toml (they don't have the env var), so read it back:
+    # a line the sed pattern does not match would otherwise be skipped silently.
+    if [[ -n "$MIN_COMPATIBLE_EXPLICIT" ]]; then
+        echo -n "  Setting min-compatible-version to $MIN_COMPATIBLE... "
+        sed_inplace "s/^min-compatible-version[[:space:]]*=[[:space:]]*\".*\"/min-compatible-version = \"$MIN_COMPATIBLE\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
+        if [[ "$(current_min_compatible "$PROJECT_ROOT/crates/core/Cargo.toml" || true)" != "$MIN_COMPATIBLE" ]]; then
+            echo "✗"
+            echo "  Error: crates/core/Cargo.toml does not carry min-compatible-version = \"$MIN_COMPATIBLE\" after the update."
+            return 1
+        fi
+        echo "✓"
+    fi
 
     # Update fdev version and its freenet dependency
     echo -n "  Updating fdev to $FDEV_VERSION... "
