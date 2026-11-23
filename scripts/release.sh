@@ -100,8 +100,8 @@ while [[ $# -gt 0 ]]; do
             echo "      Gateways are now updated automatically after binaries are available."
             shift
             ;;
-        --min-compatible)
-            # Refused on sight, with or without a value (#5833).
+        --min-compatible|--min-compatible=*)
+            # Refused on sight, in any spelling, with or without a value (#5833).
             echo "Error: --min-compatible is no longer supported. This script never changes"
             echo "       the handshake floor; raise min-compatible-version in"
             echo "       crates/core/Cargo.toml in its own reviewed PR (docs/RELEASING.md)."
@@ -165,7 +165,7 @@ if ! MIN_COMPATIBLE=$(current_min_compatible "$PROJECT_ROOT/crates/core/Cargo.to
     echo "Error: could not read an X.Y.Z min-compatible-version from crates/core/Cargo.toml."
     exit 1
 fi
-echo "Handshake floor (min-compatible-version): $MIN_COMPATIBLE (unchanged; shipped as committed)"
+echo "Handshake floor (min-compatible-version): $MIN_COMPATIBLE (unchanged, shipped as committed)"
 unset FREENET_MIN_COMPATIBLE_VERSION
 
 # Get the most recently published version from crates.io (most authoritative source).

@@ -664,17 +664,22 @@ floor_run_case "release.sh refuses an empty --min-compatible too" \
 floor_run_case "release.sh refuses --min-compatible given without a value" \
     refuse "Error: --min-compatible is no longer supported" \
     "$TOML_FLOOR" --version 0.2.201 --dry-run --min-compatible
+floor_run_case "release.sh refuses --min-compatible=X.Y.Z with the same message" \
+    refuse "Error: --min-compatible is no longer supported" \
+    "$TOML_FLOOR" --version 0.2.201 --dry-run --min-compatible=0.2.165
 
 # The runs above stop at the first cargo call, and update_versions cannot run
 # on its own (it defines its helpers inline and edits the tree), so these two
 # read the code, by allow-list rather than by the tool a writer would use:
 #   - min-compatible-version may appear only in the reader's grep and in
-#     messages, so a sed, perl, awk or toml-tool rewrite anywhere fails;
+#     echo lines whose whole argument is one quoted string, so a sed,
+#     perl, awk, toml-tool or `echo > file` rewrite anywhere fails. These are
+#     tripwires for mistakes, not proof against deliberate evasion;
 #   - FREENET_MIN_COMPATIBLE_VERSION may appear only in the one `unset`, so
 #     an export or assignment added anywhere later fails.
 FLOOR_LINES="$(code_lines "$RELEASE_SH" \
     | grep -F 'min-compatible-version' \
-    | grep -vE "^[0-9]+:[[:space:]]*echo " \
+    | grep -vE '^[0-9]+:[[:space:]]*echo "[^"]*"$' \
     | grep -vF "value=\$(grep -E '^min-compatible-version[[:space:]]*=' \"\$1\"" || true)"
 if [[ -z "$FLOOR_LINES" ]]; then
     pass "release.sh never rewrites min-compatible-version (only the reader and messages name it)"
