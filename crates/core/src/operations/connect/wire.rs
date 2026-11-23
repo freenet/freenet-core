@@ -382,10 +382,11 @@ pub mod sim_trace {
         /// A node turned its own native connects off.
         NativeDemoted,
         /// The node `own`, as acceptor, decided an offered request: `Native`
-        /// or not, and whether the pair's bucket was below the offered
-        /// percent (so a ready acceptor at that percent would decide
-        /// `Native`). Recorded where it decides, not when the answer goes
-        /// out.
+        /// or not, and `in_slice`: the pair's bucket was below the offered
+        /// percent and the acceptor held no transport to the joiner, so a
+        /// ready, undemoted acceptor at a release percent at or above the
+        /// offer would decide `Native`. Recorded where it decides, not when
+        /// the answer goes out.
         Decided {
             own: SocketAddr,
             native: bool,

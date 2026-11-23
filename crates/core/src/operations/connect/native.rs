@@ -309,9 +309,10 @@ pub(crate) struct NativeReadiness {
     pub ready: bool,
     /// The effective percent ([`effective_native_percent`]).
     pub percent: u8,
-    /// A demotion is running in the role this readiness was read for (other
-    /// causes may hold native off as well). [`acceptor_arm`] then counts the
-    /// pair in neither arm.
+    /// A demotion holds native off for this readiness (other causes may as
+    /// well): the joiner streak for [`NativeConnectState::readiness`], either
+    /// streak for [`NativeConnectState::acceptor_readiness`].
+    /// [`acceptor_arm`] then counts the pair in neither arm.
     pub demoted: bool,
 }
 
@@ -412,9 +413,12 @@ pub(crate) fn acceptor_arm(
 /// to UDP is not counted here (the acceptor's own count has it), and nor is
 /// one with no decision (an acceptor or a relay below the floor).
 ///
-/// It includes pairs where the acceptor already held a transport to the
-/// joiner and reused it without dialling ([`acceptor_arm`] gives `None`): the
-/// joiner cannot see that, so the acceptor's counters are the ones for rates.
+/// It includes pairs the acceptor leaves out of both arms ([`acceptor_arm`]
+/// gives `None`), which the joiner cannot see: those where it already held a
+/// transport to the joiner and reused it without dialling, and those decided
+/// while it was demoted. It also includes every UDP-answered pair of a
+/// demoted joiner, whose offer reads percent 0. So the acceptor's counters
+/// are the ones for rates.
 pub(crate) fn joiner_in_control(
     sent: Option<NativeOffer>,
     decision: Option<NativeDecision>,

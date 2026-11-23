@@ -2510,7 +2510,8 @@ Demotion: recorded in the connection lifecycle, where the outcome is known
   rates, do not collect the pairs where native fails. Limits: an acceptor
   still counts a demoted joiner's request as control (that offer reads
   percent 0 with no reason on the wire), and the joiner-side arm counts
-  still include pairs whose acceptor is demoted. Either streak's effect is a 6 h downgrade to UDP,
+  (joiner_in_control, not read for rates) still include pairs whose
+  acceptor is demoted and every UDP-answered pair of a demoted joiner. Either streak's effect is a 6 h downgrade to UDP,
   never a failed join.
 Existing transport: a native dial does not drop a connection the node
   already has to that peer; the joiner may have connected another way since
