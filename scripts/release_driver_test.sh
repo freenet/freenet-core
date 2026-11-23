@@ -556,6 +556,70 @@ else
     fi
 fi
 
+# ---------------------------------------------------------------------------
+# N. The default handshake floor is the committed one, never the previous
+#    release (#5833)
+# ---------------------------------------------------------------------------
+# Defaulting --min-compatible to the version before the bump made every updated
+# peer refuse every peer that had not updated yet: a network split on an
+# ordinary release. The default must be the value already committed in
+# crates/core/Cargo.toml, so the floor moves only when asked.
+FLOOR_FN="$(awk '/^current_min_compatible\(\) \{/,/^\}/' "$RELEASE_SH")"
+if [[ -z "$FLOOR_FN" ]] || [[ "$FLOOR_FN" != *"min-compatible-version"* ]]; then
+    fail "could not extract current_min_compatible() from release.sh" \
+        "Every floor case below runs it, so an empty extraction would make them" \
+        "all pass vacuously."
+else
+    eval "$FLOOR_FN"
+    floor_case() {
+        # floor_case <desc> <Cargo.toml body> <expected output or FAIL>
+        local desc="$1" body="$2" want="$3" work got
+        work="$(mktemp -d)"
+        printf '%s\n' "$body" > "$work/Cargo.toml"
+        if got="$(current_min_compatible "$work/Cargo.toml")"; then :; else got="FAIL"; fi
+        rm -rf "$work"
+        if [[ "$got" == "$want" ]]; then
+            pass "$desc"
+        else
+            fail "$desc" "got '$got', expected '$want'"
+        fi
+    }
+    floor_case "default floor is the committed min-compatible-version, not the package version" \
+        $'[package]\nname = "freenet"\nversion = "0.2.200"\n\n[package.metadata.freenet]\nmin-compatible-version = "0.2.122"' \
+        "0.2.122"
+    floor_case "a missing min-compatible-version refuses instead of guessing" \
+        $'[package]\nname = "freenet"\nversion = "0.2.200"' \
+        "FAIL"
+    floor_case "a malformed min-compatible-version refuses instead of guessing" \
+        $'[package]\nversion = "0.2.200"\n[package.metadata.freenet]\nmin-compatible-version = "next"' \
+        "FAIL"
+
+    # The real Cargo.toml must resolve to its own committed floor.
+    REAL_TOML="$SCRIPT_DIR/../crates/core/Cargo.toml"
+    REAL_FLOOR="$(grep -E '^min-compatible-version' "$REAL_TOML" | head -1 | cut -d'"' -f2)"
+    if got="$(current_min_compatible "$REAL_TOML")" && [[ -n "$REAL_FLOOR" && "$got" == "$REAL_FLOOR" ]]; then
+        pass "the real crates/core/Cargo.toml resolves to its committed floor ($got)"
+    else
+        fail "the real crates/core/Cargo.toml did not resolve to its committed floor" \
+            "got '${got:-}', expected '$REAL_FLOOR'"
+    fi
+
+    # The default branch must actually use it. A top-level block cannot be run
+    # in isolation, so this one checks the text: the only assignment to
+    # MIN_COMPATIBLE outside argument parsing calls current_min_compatible.
+    DEFAULT_ASSIGNS="$(code_lines "$RELEASE_SH" \
+        | grep -E 'MIN_COMPATIBLE=' \
+        | grep -vE 'MIN_COMPATIBLE=""|MIN_COMPATIBLE="\$2"|FREENET_MIN_COMPATIBLE_VERSION=')"
+    if [[ -n "$DEFAULT_ASSIGNS" ]] && ! grep -qv 'current_min_compatible' <<< "$DEFAULT_ASSIGNS"; then
+        pass "the --min-compatible default is taken from current_min_compatible"
+    else
+        fail "the --min-compatible default is not (only) taken from current_min_compatible" \
+            "${DEFAULT_ASSIGNS:-<no default assignment found>}" \
+            "Deriving it from the package version moves the handshake floor on every" \
+            "release and splits the network (#5833)."
+    fi
+fi
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
     echo "All release driver behaviour assertions passed."

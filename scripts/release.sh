@@ -69,7 +69,8 @@ show_help() {
     echo "Options:"
     echo "  --version X.Y.Z           Target version (required)"
     echo "  --min-compatible X.Y.Z    Minimum compatible version for range-based"
-    echo "                            version checking (default: previous release)"
+    echo "                            version checking (default: keep the floor"
+    echo "                            already in crates/core/Cargo.toml)"
     echo "  --skip-tests              Skip pre-release tests"
     echo "  --dry-run                 Show what would be done without executing"
     echo "  --help                    Show this help"
@@ -135,11 +136,31 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     exit 1
 fi
 
-# Default min-compatible to the current version in Cargo.toml (the version before the bump).
-# This means gateways running the new version will still accept peers on the previous version.
+# current_min_compatible <Cargo.toml> -- print the handshake floor already
+# committed in `package.metadata.freenet.min-compatible-version`.
+#
+# This is the default for --min-compatible, so a release never moves the floor
+# unless asked to (#5833). The default used to be the PREVIOUS RELEASE, which
+# made every updated peer refuse every peer that had not updated yet, including
+# peers that were about to auto-update: a network split on an ordinary release.
+# release.yml has always shipped the committed value; this keeps the manual
+# driver consistent with it. Raise the floor deliberately with --min-compatible.
+current_min_compatible() {
+    local value
+    value=$(grep -E '^min-compatible-version[[:space:]]*=' "$1" 2>/dev/null | head -1 | cut -d'"' -f2)
+    if [[ ! "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
 if [[ -z "$MIN_COMPATIBLE" ]]; then
-    MIN_COMPATIBLE=$(grep "^version" "$PROJECT_ROOT/crates/core/Cargo.toml" 2>/dev/null | head -1 | cut -d'"' -f2)
-    echo "Min-compatible version: $MIN_COMPATIBLE (defaulting to current version before bump)"
+    if ! MIN_COMPATIBLE=$(current_min_compatible "$PROJECT_ROOT/crates/core/Cargo.toml"); then
+        echo "Error: could not read min-compatible-version from crates/core/Cargo.toml;"
+        echo "       pass --min-compatible X.Y.Z explicitly."
+        exit 1
+    fi
+    echo "Min-compatible version: $MIN_COMPATIBLE (unchanged; committed floor in Cargo.toml)"
 else
     echo "Min-compatible version: $MIN_COMPATIBLE (explicitly set)"
 fi

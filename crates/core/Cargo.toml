@@ -12,7 +12,8 @@ readme = "README.md"
 [package.metadata.freenet]
 # Minimum compatible protocol version. Peers older than this are rejected at
 # the handshake, in both directions. The release workflow (release.yml) ships
-# this value unchanged; scripts/release.sh rewrites it. The env var
+# this value unchanged; scripts/release.sh also keeps it unless given an
+# explicit --min-compatible (#5833). The env var
 # FREENET_MIN_COMPATIBLE_VERSION overrides this at build time.
 #
 # 0.2.122: 0.2.120 and 0.2.121 cannot detect updates themselves (they parse
