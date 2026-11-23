@@ -174,11 +174,33 @@ echo
 check_privileges
 
 # Wait for binary to be released by all processes
+# Units that are restarted later, on their own schedule (#6336), and so keep
+# running the OLD binary through the swap. The swap below is rm + cp, which gives
+# the new binary a fresh inode, so a process still executing the old inode is
+# harmless and must not make us wait.
+STAGGERED_UNITS=(freenet-gateway-2.service)
+
+# PIDs holding $INSTALL_PATH open, excluding the staggered units' processes.
+binary_holders() {
+    local pid unit
+    local -a pids
+    mapfile -t pids < <(sudo lsof -t "$INSTALL_PATH" 2>/dev/null || true)
+    for pid in "${pids[@]}"; do
+        [[ -n "$pid" ]] || continue
+        for unit in "${STAGGERED_UNITS[@]}"; do
+            if sudo grep -q "/$unit\$" "/proc/$pid/cgroup" 2>/dev/null; then
+                continue 2
+            fi
+        done
+        echo "$pid"
+    done
+}
+
 wait_for_binary_release() {
     local max_wait=30
     local waited=0
 
-    while sudo lsof "$INSTALL_PATH" &>/dev/null; do
+    while [[ -n "$(binary_holders)" ]]; do
         if [[ $waited -ge $max_wait ]]; then
             echo "⚠️  Timeout waiting for binary to be released"
             echo "     Processes still using $INSTALL_PATH:"

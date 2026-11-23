@@ -514,6 +514,30 @@ cleanup() {
 }
 
 # Main function
+# Hosts with a companion gateway (nova: freenet-gateway-2) install
+# freenet-gateway-stagger.service. The companion is deliberately NOT tied to the
+# primary's stop/start, so after a successful primary update this queues a
+# restart of the companion that waits until the primary has been up and healthy
+# for ~10 minutes (#6336: restarting both gateways together doubled the share of
+# SUBSCRIBEs needing extra hops for 10+ hours). `--no-block` returns at once; the
+# stagger unit logs to the journal and fails visibly if the restart does not
+# land. Hosts without the unit are unaffected.
+schedule_companion_restart() {
+    local stagger_unit="${STAGGER_UNIT:-freenet-gateway-stagger.service}"
+
+    if [[ "$ALL_INSTANCES" == "true" || "$SERVICE_NAME" != "freenet-gateway" ]]; then
+        return 0
+    fi
+    if ! systemctl list-unit-files "$stagger_unit" 2>/dev/null | grep -q "$stagger_unit"; then
+        return 0
+    fi
+    if ! systemctl start --no-block "$stagger_unit"; then
+        log ERROR "Could not queue $stagger_unit; the companion gateway is still on the OLD binary"
+        return 1
+    fi
+    log INFO "Queued $stagger_unit: the companion gateway restarts once '$SERVICE_NAME' has been healthy for ~10 min (journalctl -u $stagger_unit)"
+}
+
 main() {
     log INFO "Freenet Gateway Auto-Update starting..."
 
@@ -586,6 +610,7 @@ main() {
             new_version=$(get_current_version)
             if [[ "$new_version" == "$latest_version" ]]; then
                 log INFO "Successfully updated to v$latest_version"
+                schedule_companion_restart || exit 1
             else
                 log ERROR "Update failed: expected v$latest_version on disk but found v$new_version"
                 exit 1
