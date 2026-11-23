@@ -3737,7 +3737,9 @@ fn next_call_picks_the_batch_then_one_reply() {
     };
     let inbound_of = |req: &DelegateRequest<'static>| match req {
         DelegateRequest::ApplicationMessages { inbound, .. } => inbound.len(),
-        _ => usize::MAX,
+        DelegateRequest::RegisterDelegate { .. } | DelegateRequest::UnregisterDelegate(_) | _ => {
+            usize::MAX
+        }
     };
 
     let mut none = std::collections::VecDeque::new();
