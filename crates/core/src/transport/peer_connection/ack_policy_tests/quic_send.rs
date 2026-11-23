@@ -731,6 +731,70 @@ fn a_stream_that_stalls_after_opening_is_dropped() {
     );
 }
 
+/// A response charged to the outbound budget that stalls on the path is
+/// dropped like any other stream, and its bytes, and so its charge, are
+/// returned: through the connection's send, and through the native
+/// connection's (`send_stream_with` with no UDP fallback).
+#[test]
+fn a_charged_stream_that_stalls_on_the_path_returns_its_charge() {
+    use crate::node::outbound_budget::{OutboundPayloadBudget, SharedPayloadKey};
+    run(
+        "quic-send-charged-stalled",
+        QuicPathLimits::DEFAULT,
+        |mut rig| async move {
+            let budget = OutboundPayloadBudget::with_caps(1 << 30, 1 << 29);
+            let to = rig.e.conn.remote_conn.remote_addr;
+            let len = 8 * 1024 * 1024;
+            let charge = |n: u8| {
+                budget
+                    .try_reserve_shared(to, SharedPayloadKey::for_test(n), len as u64, || {
+                        Ok::<_, std::convert::Infallible>(vec![n; len])
+                    })
+                    .expect("charged")
+            };
+            let silenced = DropFrom::new("quic-send-charged-stalled", &[rig.path.peer_addr()]);
+
+            // The connection's send, with the route up.
+            let (done, heard) = oneshot::channel();
+            rig.e
+                .conn
+                .outbound_stream_with_id(StreamId::next(), charge(1), None, Some(done), None)
+                .await;
+
+            // A native connection's send: no UDP to fall back on.
+            let native = tokio::spawn(super::super::quic_send::send_stream_with(
+                rig.route.clone(),
+                StreamId::next(),
+                charge(2),
+                None,
+                None,
+                None,
+                None,
+                to,
+                rig.e.conn.time_source.clone(),
+            ));
+
+            // Both are in flight and stalled, well before any deadline:
+            // their charges are held.
+            rig.path.settle(Duration::from_secs(1)).await;
+            assert_eq!(
+                budget.node_total(),
+                2 * len as u64,
+                "held while the streams run"
+            );
+            assert_eq!(budget.charged_to(to), 2 * len as u64);
+
+            rig.path.settle(Duration::from_secs(10)).await;
+            drop(silenced);
+            rig.collect_tasks().await;
+            assert_eq!(heard.await.unwrap(), StreamSendOutcome::Dropped);
+            assert!(native.await.unwrap().is_err(), "the native send failed");
+            assert_eq!(budget.node_total(), 0, "both charges came back");
+            assert_eq!(budget.charged_to(to), 0);
+        },
+    );
+}
+
 /// A pipe that cannot open reads its stream again from the start for UDP, though
 /// the path already took the first chunk from its source.
 #[test]

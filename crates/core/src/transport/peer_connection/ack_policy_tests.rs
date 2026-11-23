@@ -3803,3 +3803,96 @@ async fn a_sessions_pacer_runs_on_the_path_clock() {
         "a second of the path's clock paid a second of the debt: {after:?}"
     );
 }
+
+/// Bytes charged to the outbound budget are returned when the stream they
+/// were handed to ends, however it ends: through the trait the event loop
+/// dispatches on, on a real connection, after delivery, after the receiving
+/// side of the wire is gone mid-stream, and after the connection itself is
+/// dropped. While a stream is still running its charge is held.
+#[tokio::test(start_paused = true)]
+async fn charged_stream_bytes_are_returned_when_the_stream_ends() {
+    use crate::node::outbound_budget::{OutboundPayloadBudget, SharedPayloadKey};
+    use crate::transport::{PeerConnectionApi, StreamSendOutcome};
+    use tokio::sync::oneshot;
+
+    let budget = OutboundPayloadBudget::with_caps(1 << 30, 1 << 29);
+    let to = addr(2);
+    let charge = |n: u8, len: usize| {
+        budget
+            .try_reserve_shared(to, SharedPayloadKey::for_test(n), len as u64, || {
+                Ok::<_, std::convert::Infallible>(vec![n; len])
+            })
+            .expect("charged")
+    };
+    async fn settle(budget: &OutboundPayloadBudget) {
+        for _ in 0..2000 {
+            if budget.node_total() == 0 {
+                return;
+            }
+            tokio::time::advance(Duration::from_millis(10)).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    // Completed.
+    let mut e = single(CAPABLE);
+    let (done, rx) = oneshot::channel();
+    PeerConnectionApi::send_stream_data(
+        &mut e.conn,
+        StreamId::next(),
+        charge(1, 200_000),
+        None,
+        Some(done),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(budget.node_total(), 200_000);
+    settle(&budget).await;
+    assert_eq!(rx.await.unwrap(), StreamSendOutcome::Delivered);
+    assert_eq!(budget.node_total(), 0, "returned after delivery");
+    assert_eq!(budget.charged_to(to), 0);
+
+    // The receiving side of the wire closes mid-stream. The charge is still
+    // held while the stream is running.
+    let mut e = single(CAPABLE);
+    PeerConnectionApi::send_stream_data(
+        &mut e.conn,
+        StreamId::next(),
+        charge(2, 2_000_000),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    tokio::time::advance(Duration::from_millis(10)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(budget.node_total(), 2_000_000, "held while streaming");
+    drop(e.wire);
+    settle(&budget).await;
+    assert_eq!(budget.node_total(), 0, "returned after the wire closed");
+    assert_eq!(budget.charged_to(to), 0);
+
+    // The connection is dropped mid-stream.
+    let mut e = single(CAPABLE);
+    PeerConnectionApi::send_stream_data(
+        &mut e.conn,
+        StreamId::next(),
+        charge(3, 2_000_000),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(budget.node_total(), 2_000_000);
+    drop(e);
+    settle(&budget).await;
+    assert_eq!(
+        budget.node_total(),
+        0,
+        "returned after the connection dropped"
+    );
+    assert_eq!(budget.charged_to(to), 0);
+}

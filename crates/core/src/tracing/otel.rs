@@ -1352,6 +1352,18 @@ neither: a complete stream its consumer still holds past the age limit",
             }
         })
         .build();
+
+    let _outbound_budget = meter
+        .u64_observable_counter("freenet.get.outbound_budget_refusals")
+        .with_description(
+            "GET responses not sent because the outbound payload budget had no room, by reason",
+        )
+        .with_callback(|observer| {
+            let (source, node) = crate::node::outbound_budget::refused_totals_process();
+            observer.observe(source, &[KeyValue::new("reason", "source_cap")]);
+            observer.observe(node, &[KeyValue::new("reason", "node_cap")]);
+        })
+        .build();
 }
 
 /// Ring / topology state, mirroring the dashboard's connection-status tiles.
@@ -3054,6 +3066,7 @@ mod tests {
             "freenet.transport.transfers",
             "freenet.transport.nat_traversal",
             "freenet.transport.inbound_stream_limits",
+            "freenet.get.outbound_budget_refusals",
             "freenet.contract.queue.depth",
             "freenet.contract.queue.depth.high_water",
             "freenet.contract.queue.rejected",
