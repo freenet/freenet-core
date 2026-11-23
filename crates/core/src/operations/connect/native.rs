@@ -520,6 +520,7 @@ pub(crate) fn joiner_response_action(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SetupSource {
     Host(crate::operations::put::stream_admission::Source),
+    #[cfg(any(test, feature = "testing"))]
     Exact(std::net::SocketAddr),
 }
 
