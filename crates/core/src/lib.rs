@@ -26,6 +26,8 @@ mod message;
 
 /// Node configuration, implementations and execution (entry points for the binaries).
 mod node;
+#[doc(hidden)]
+pub use node::QUIC_RESTART_EXIT_CODE;
 pub use node::{
     EventLoopExitReason, Node, ShutdownHandle, enable_abort_on_fatal_listener_exit,
     enable_abort_on_redb_poison, enable_fast_crash_exit_code, listener_exit_is_graceful,
@@ -274,8 +276,22 @@ pub mod dev_tool {
     pub use crate::operations::put::op_ctx_task::RELAY_PUT_STREAMING_FAILURES_REPORTED;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::put::op_ctx_task::relay_stream_fault_injection as put_relay_stream_fault_injection;
+    // Silent loss of a node's inline UPDATE legs for one contract (#6143).
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::update::inline_leg_fault_injection::seam as inline_leg_fault_injection;
+    // Per-contract record of the summary-mismatch heal path (#6143).
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::node::stale_peer_heal_observations;
     #[cfg(any(test, feature = "testing"))]
     pub use crate::operations::subscribe::op_ctx_task::RELAY_SUBSCRIBE_DRIVER_CALL_COUNT;
+
+    // Per-contract off switch for the verify-soon check, for control arms (#6143).
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::update::verify_soon::PERSISTENT_FAULT_BOUND as VERIFY_SOON_PERSISTENT_FAULT_BOUND;
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::update::verify_soon::SLOT_WAIT_BOUND as VERIFY_SOON_SLOT_WAIT_BOUND;
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::operations::update::verify_soon::test_switch as verify_soon_switch;
 
     // Test hooks for the relay-hop routing-event plumbing. Each counter
     // increments every time `operations::record_relay_route_event` fires

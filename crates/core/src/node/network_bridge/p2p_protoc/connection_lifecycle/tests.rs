@@ -5988,11 +5988,45 @@ async fn an_unpromoted_transient_dial_holds_its_slot_past_the_ttl() {
     assert!(cm.is_transient(addr));
 }
 
+/// How long `nodes` joiners behind one address need to all get into a ring
+/// whose gateway holds `budget` transient connections, on the production
+/// connect-failure backoff.
+///
+/// A round seats at most `budget` joiners, so at least `ceil(nodes / budget)`
+/// rounds are needed. Each joiner that is evicted before it is promoted
+/// records a failure against the gateway and waits the backoff for its next
+/// failure before it retries, so a round it loses costs it
+/// `delay_for_failures(k)` for its k-th failure. The bound allows one lost
+/// round for every round needed (`2 * rounds - 1`; the five waves seen in the
+/// slowest run were 0, 32, 56, 200 and 310 s, with victims evicted twice) and
+/// adds the 3 s the controlled-event client waits before it starts.
+///
+/// This is a bound read off the retry schedule and checked against the seeds
+/// below (slowest run 343 s of the 363 s this gives for 24 and 8), not a
+/// proof: nothing stops a joiner being evicted a third time.
+fn join_time_budget(nodes: usize, budget: usize) -> Duration {
+    use crate::ring::PeerConnectionBackoff;
+    use crate::util::backoff::ExponentialBackoff;
+    let schedule = ExponentialBackoff::new(
+        PeerConnectionBackoff::DEFAULT_BASE_INTERVAL,
+        PeerConnectionBackoff::DEFAULT_MAX_BACKOFF,
+    );
+    let rounds = nodes.div_ceil(budget);
+    let failures = u32::try_from(2 * rounds - 1).expect("a few rounds");
+    let waits: Duration = (1..=failures).map(|k| schedule.delay_for_failures(k)).sum();
+    Duration::from_secs(3) + waits
+}
+
 /// End to end, on the simulated network: every node outside a NAT listens on
 /// `::1`, so a gateway sees all its joiners come from one source. Runs
-/// `nodes` joiners against one gateway with transient budget `budget` and
+/// `nodes` joiners against one gateway with transient budget `budget` until
+/// all have a ring connection, or [`join_time_budget`] has passed, and
 /// returns the gateway's evictions and the nodes that ended with no ring
 /// connection.
+///
+/// The connect-failure backoff is pinned to the production default: CI sets
+/// `FREENET_BACKOFF_BASE_SECS=5`, and how long an evicted joiner waits is
+/// what decides when the last one gets in.
 fn join_behind_one_address(
     name: &'static str,
     seed: u64,
@@ -6000,6 +6034,7 @@ fn join_behind_one_address(
     budget: usize,
 ) -> (u64, Vec<crate::node::testing_impl::NodeLabel>) {
     use crate::node::testing_impl::{NodeLabel, SimNetwork};
+    use crate::ring::PeerConnectionBackoff;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -6007,11 +6042,15 @@ fn join_behind_one_address(
     let mut sim = rt.block_on(SimNetwork::new(name, 1, nodes, 7, 3, 10, 2, seed));
     sim.with_start_backoff(Duration::ZERO);
     sim.with_transient_budget(budget);
+    sim.with_connect_backoff_base(PeerConnectionBackoff::DEFAULT_BASE_INTERVAL);
+    let allowed = join_time_budget(nodes, budget);
+    // Ends the run as soon as every node has a ring connection.
+    sim.wait_for_join_convergence_before_ops(1.0, allowed);
     let result = sim.run_controlled_simulation(
         seed,
         Vec::new(),
-        Duration::from_secs(600),
-        Duration::from_secs(300),
+        allowed + Duration::from_secs(60),
+        Duration::ZERO,
     );
     assert!(
         result.turmoil_result.is_ok(),
@@ -6045,19 +6084,35 @@ fn join_behind_one_address(
 /// budget (8, below the per-source share): a joiner at the budget evicts the
 /// oldest unpromoted connection, and every joiner still joins the ring.
 ///
+/// One test per seed, because how late the last joiner is depends on the
+/// seed: with the connect backoff at its default the last joiner got in at
+/// 38 to 343 s across seeds, and a single seed that happened to finish early
+/// hid that for as long as nothing disturbed its random stream.
+///
 /// The share itself is not reached here: the gateway's start-up admission
 /// ramp (5 handshakes a second) keeps far fewer than 16 joiners unpromoted at
 /// once. `one_address_saturating_its_transient_share_leaves_others_admitted`
 /// covers it through the bridge's real handlers.
-#[test]
-fn joiners_behind_one_address_get_past_transient_eviction() {
-    let (evicted, unconnected) =
-        join_behind_one_address("transient-evict-one-address", 0x7A45_0002, 24, 8);
-    assert!(
-        evicted > 0,
-        "the budget was never reached; the test would be vacuous"
-    );
-    assert!(unconnected.is_empty(), "never joined: {unconnected:?}");
+macro_rules! joiners_behind_one_address_test {
+    ($($test:ident: $seed:expr),+ $(,)?) => {$(
+        #[test]
+        fn $test() {
+            let (evicted, unconnected) =
+                join_behind_one_address("transient-evict-one-address", $seed, 24, 8);
+            assert!(
+                evicted > 0,
+                "the budget was never reached; the test would be vacuous"
+            );
+            assert!(unconnected.is_empty(), "never joined: {unconnected:?}");
+        }
+    )+};
+}
+
+joiners_behind_one_address_test! {
+    joiners_behind_one_address_get_past_transient_eviction: 0x7A45_0002,
+    joiners_behind_one_address_get_past_transient_eviction_seed_1: 1,
+    joiners_behind_one_address_get_past_transient_eviction_seed_2: 2,
+    joiners_behind_one_address_get_past_transient_eviction_seed_3: 3,
 }
 
 /// A non-gateway node (so a transient dial stays out of the ring) with

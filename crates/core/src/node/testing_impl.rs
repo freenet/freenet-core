@@ -269,6 +269,26 @@ pub enum SimOperation {
     /// anti-entropy. Handled specially by `run_controlled_simulation` (it is not
     /// a client request).
     RecoverNode,
+    /// Have the scheduled node send `InterestMessage::SummaryRequest` for
+    /// `key` to `to`, through `NodeEvent::SendInterestMessage`, in-order with
+    /// the surrounding events. The peer answers with a full-bytes `Summaries`,
+    /// which the sender runs through its usual staleness check and heal.
+    /// Handled specially by `run_controlled_simulation` (it is not a client
+    /// request).
+    SendSummaryRequest {
+        /// The contract whose summary is requested.
+        key: ContractKey,
+        /// The peer asked for its summary.
+        to: NodeLabel,
+    },
+    /// Stop the inline-leg fault seam dropping legs for `key`
+    /// (`dev_tool::inline_leg_fault_injection::lift`), in-order with the
+    /// surrounding events. The `node` on the [`ScheduledOperation`] is only a
+    /// sequencing placeholder. Handled specially by `run_controlled_simulation`.
+    LiftInlineLegFault {
+        /// The contract whose rules are removed.
+        key: ContractKey,
+    },
 }
 
 impl SimOperation {
@@ -398,6 +418,12 @@ impl SimOperation {
                 panic!(
                     "AdvanceHostingClock is not a client request — it must be handled \
                      by run_controlled_simulation during event dispatch"
+                )
+            }
+            SimOperation::SendSummaryRequest { .. } | SimOperation::LiftInlineLegFault { .. } => {
+                panic!(
+                    "SendSummaryRequest/LiftInlineLegFault are not client requests — they \
+                     must be handled by run_controlled_simulation during event dispatch"
                 )
             }
             SimOperation::CrashNode => {
@@ -1715,6 +1741,9 @@ pub struct SimNetwork {
     /// Transient connection budget (`--transient-budget`) for every node this
     /// network builds, when set ([`SimNetwork::with_transient_budget`]).
     transient_budget_override: Option<usize>,
+    /// Base interval of every node's connect-failure backoff, when set
+    /// ([`SimNetwork::with_connect_backoff_base`]).
+    connect_backoff_base_override: Option<Duration>,
     /// Per-node capture slots for the live `Arc<Ring>`, populated by
     /// `run_controlled_simulation` so governance sim tests can read each
     /// node's `contract_ban_list` after the simulation completes. Keyed by
@@ -1937,6 +1966,7 @@ impl SimNetwork {
             hosting_clock: None,
             hosting_budget_override: None,
             transient_budget_override: None,
+            connect_backoff_base_override: None,
             shared_rings: HashMap::new(),
             node_port_override,
             quic_datagram_drops: Vec::new(),
@@ -2314,6 +2344,26 @@ impl SimNetwork {
     pub fn with_native_connect(&mut self, percent: u8) -> &mut Self {
         for label in self.pending_labels() {
             self.node_config_mut(&label).native_connect_override = Some(percent);
+        }
+        self
+    }
+
+    /// Turns native gateway joins (phase B) on for every node, at `percent`
+    /// (the share of joiner-gateway pairs that dial native first), in place of
+    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, which are off,
+    /// and marks every gateway each node knows native, as the published index
+    /// does for a gateway that admits native joins. A joiner with a QUIC
+    /// endpoint (see [`Self::with_transport_quic`]) then tries a native join
+    /// first, and falls back to the UDP join when it fails. Call before the
+    /// simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_native_gateway_join(&mut self, percent: u8) -> &mut Self {
+        for label in self.pending_labels() {
+            let config = self.node_config_mut(&label);
+            config.native_gateway_join_override = Some(percent);
+            for gateway in &mut config.gateways {
+                gateway.native = true;
+            }
         }
         self
     }
@@ -2813,6 +2863,22 @@ impl SimNetwork {
         self
     }
 
+    /// Give every node this network builds `base` as the base interval of its
+    /// connect-failure backoff, in place of `FREENET_BACKOFF_BASE_SECS` (which
+    /// the CI workflow sets to 5 s). A test whose outcome depends on how long
+    /// a failed joiner waits pins it here, so it means the same on every
+    /// machine. Call before `start*`.
+    pub fn with_connect_backoff_base(&mut self, base: Duration) -> &mut Self {
+        self.connect_backoff_base_override = Some(base);
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.connect_backoff_base = Some(base);
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.connect_backoff_base = Some(base);
+        }
+        self
+    }
+
     /// Set the per-node hosting-cache byte budget (`max_hosting_storage`) for
     /// every node this network builds. A tiny budget forces cache pressure so a
     /// test can observe demand-driven eviction of low-demand contracts
@@ -3102,6 +3168,22 @@ impl SimNetwork {
         }
         for (builder, _) in self.nodes.iter_mut() {
             builder.config.broadcast_target_list_floor_override = floor;
+        }
+        self
+    }
+
+    /// Set the hash-first summary floor on every node, so a peer advertising a
+    /// version below `floor` (see `with_node_advertised_version`) is treated as
+    /// pre-hash-first: it is sent full-bytes summaries and no `SummaryRequest`.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_hash_first_summaries_floor(&mut self, floor: (u8, u8, u16)) -> &mut Self {
+        let floor = Some(floor);
+        self.hash_first_summaries_floor_override = floor;
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.hash_first_summaries_floor_override = floor;
         }
         self
     }
@@ -3837,6 +3919,7 @@ impl SimNetwork {
             if let Some(budget) = self.transient_budget_override {
                 config.transient_budget = budget;
             }
+            config.connect_backoff_base = self.connect_backoff_base_override;
             config.key_pair = keypair;
             config.network_listener_ip = ip.into();
             config.network_listener_port = port;
@@ -3947,6 +4030,7 @@ impl SimNetwork {
             if let Some(budget) = self.transient_budget_override {
                 config.transient_budget = budget;
             }
+            config.connect_backoff_base = self.connect_backoff_base_override;
             for GatewayConfig {
                 peer_key_location,
                 location,
@@ -5848,7 +5932,9 @@ impl SimNetwork {
                 // client-request generator.
                 | SimOperation::AdvanceHostingClock { .. }
                 | SimOperation::CrashNode
-                | SimOperation::RecoverNode => event_ops.push(scheduled_op),
+                | SimOperation::RecoverNode
+                | SimOperation::SendSummaryRequest { .. }
+                | SimOperation::LiftInlineLegFault { .. } => event_ops.push(scheduled_op),
             }
         }
 
@@ -5914,6 +6000,12 @@ impl SimNetwork {
             AdvanceHostingClock(Duration),
             CrashNode(SocketAddr),
             RecoverNode(SocketAddr),
+            SendSummaryRequest {
+                from: NodeLabel,
+                target: SocketAddr,
+                key: ContractKey,
+            },
+            LiftInlineLegFault(ContractKey),
         }
 
         // Build a map of label -> list of (event_id, operation)
@@ -5955,6 +6047,22 @@ impl SimNetwork {
                             )
                         });
                     special_ops.insert(event_id, SpecialDispatch::RecoverNode(addr));
+                }
+                SimOperation::SendSummaryRequest { key, ref to } => {
+                    let target = *self.node_addresses.get(to).unwrap_or_else(|| {
+                        panic!("SendSummaryRequest: node {to:?} has no known address")
+                    });
+                    special_ops.insert(
+                        event_id,
+                        SpecialDispatch::SendSummaryRequest {
+                            from: scheduled_op.node.clone(),
+                            target,
+                            key,
+                        },
+                    );
+                }
+                SimOperation::LiftInlineLegFault { key } => {
+                    special_ops.insert(event_id, SpecialDispatch::LiftInlineLegFault(key));
                 }
                 op @ (SimOperation::Put { .. }
                 | SimOperation::Get { .. }
@@ -6228,6 +6336,8 @@ impl SimNetwork {
         // Clone the network name for the client closure (the outer
         // `network_name` is still needed after the run for topology capture).
         let network_name_for_client = network_name.clone();
+        // Ring slots, so `SendSummaryRequest` can reach the sender's OpManager.
+        let rings_for_client = self.shared_rings.clone();
 
         // Optional pre-operation join-convergence barrier (see
         // `wait_for_join_convergence_before_ops`). Captured by value into the
@@ -6365,6 +6475,35 @@ impl SimNetwork {
                                     "RecoverNode scheduled but no fault injector registered"
                                 );
                             }
+                        }
+                        SpecialDispatch::SendSummaryRequest { from, target, key } => {
+                            let op_manager = rings_for_client
+                                .get(from)
+                                .and_then(|slot| slot.lock().clone())
+                                .and_then(|ring| ring.upgrade_op_manager());
+                            let Some(op_manager) = op_manager else {
+                                panic!("SendSummaryRequest: node {from:?} has no live OpManager");
+                            };
+                            let sent = op_manager.try_notify_node_event(
+                                crate::message::NodeEvent::SendInterestMessage {
+                                    target: *target,
+                                    message: crate::message::InterestMessage::SummaryRequest {
+                                        hashes: vec![crate::ring::interest::contract_hash(key)],
+                                    },
+                                },
+                            );
+                            tracing::info!(
+                                event_id,
+                                node = %from,
+                                %target,
+                                contract = %key,
+                                queued = sent.is_ok(),
+                                "Sent SummaryRequest from a controlled event"
+                            );
+                        }
+                        SpecialDispatch::LiftInlineLegFault(key) => {
+                            crate::operations::update::inline_leg_fault_injection::seam::lift(key);
+                            tracing::info!(event_id, contract = %key, "Lifted inline-leg fault");
                         }
                     }
                     // Let the effect settle before the next event.

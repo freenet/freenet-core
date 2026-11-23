@@ -148,6 +148,25 @@ impl SymmetricMessage {
         Ok(packet.encrypt_symmetric(outbound_sym_key))
     }
 
+    /// The version-mismatch ack in its shortest form, naming `version`, for the
+    /// stateless legacy responder. Released nodes read only the text after
+    /// "expected version", so the longer prose of [`Self::ack_error`] is
+    /// dropped to keep the packet small.
+    pub(crate) fn ack_error_for_version(
+        outbound_sym_key: &Aes128Gcm,
+        version: &str,
+    ) -> Result<PacketData<SymmetricAES>, bincode::Error> {
+        let message = Self {
+            packet_id: Self::FIRST_PACKET_ID,
+            confirm_receipt: Vec::new(),
+            payload: SymmetricMessagePayload::AckConnection {
+                result: Err(Cow::Owned(format!("expected version {version}"))),
+            },
+        };
+        let packet = PacketData::from_buf_plain(bincode::serialize(&message)?);
+        Ok(packet.encrypt_symmetric(outbound_sym_key))
+    }
+
     pub fn ack_ok(
         outbound_sym_key: &Aes128Gcm,
         our_inbound_key: [u8; 16],

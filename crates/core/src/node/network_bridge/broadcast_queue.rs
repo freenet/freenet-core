@@ -1517,6 +1517,25 @@ mod queue {
             }
         }
 
+        /// Whether a leg for (`key`, `peer`) is queued, waiting for a permit or
+        /// sending (#6143 verify-soon: such a pair is not lost, its leg is
+        /// waiting). A contended queue lock answers `true`, the conservative
+        /// side: the caller then does not force a resend.
+        pub(crate) fn has_pending_for(
+            &self,
+            key: &ContractKey,
+            peer: &crate::ring::PeerKey,
+        ) -> bool {
+            let Ok(state) = self.queue.try_lock() else {
+                return true;
+            };
+            state
+                .entries
+                .keys()
+                .chain(state.active.keys())
+                .any(|(k, p)| k == key && p.pub_key() == &peer.0)
+        }
+
         pub(crate) fn with_spacing(spacing: Arc<BroadcastSpacing>) -> Self {
             Self {
                 queue: Arc::new(Mutex::new(QueueState::new())),
@@ -2032,6 +2051,35 @@ mod queue {
                 "first later mutation clears the handle"
             );
             assert_eq!(hol.finish_at(start + Duration::from_millis(40)), None);
+        }
+
+        /// The verify-soon pending-leg probe (#6143): a pair with a leg sending
+        /// is busy, another pair is not, and a contended lock reads as busy.
+        #[tokio::test]
+        async fn has_pending_for_sees_sending_pairs_and_reads_contention_as_busy() {
+            let queue = BroadcastQueue::new();
+            let code = freenet_stdlib::prelude::ContractCode::from(vec![7]);
+            let params = freenet_stdlib::prelude::Parameters::from(vec![9]);
+            let key = ContractKey::from_params_and_code(&params, &code);
+            let sending = PeerKeyLocation::random();
+            let peer = crate::ring::PeerKey::from(sending.pub_key().clone());
+            // Not `PeerKeyLocation::random()`: it reuses one key per thread.
+            let other = crate::ring::PeerKey::from(
+                crate::transport::TransportKeypair::new().public().clone(),
+            );
+            assert!(!queue.has_pending_for(&key, &peer));
+            {
+                let mut state = queue.queue.lock().await;
+                assert!(state.track_active((key, sending)));
+            }
+            assert!(queue.has_pending_for(&key, &peer));
+            assert!(!queue.has_pending_for(&key, &other));
+            let held = queue.queue.lock().await;
+            assert!(
+                queue.has_pending_for(&key, &other),
+                "a contended lock reads as busy"
+            );
+            drop(held);
         }
 
         #[test]
@@ -4601,6 +4649,28 @@ pub(super) async fn broadcast_to_single_peer(
 
     let peer_key = PeerKey::from(target.pub_key().clone());
 
+    // #6143 verify-soon: this peer was still stale in the confirm round and
+    // passed every force condition, so neither the original legs nor a delta
+    // heal reached it. Send
+    // full state on the caller-named stream whatever its size (the path that
+    // kept working in #6143), and skip the converged check: the belief it reads
+    // is what the escalation distrusts.
+    let forced_slot =
+        op_manager
+            .verify_soon
+            .take_forced(&key, &peer_key, op_manager.ring.time_source.now());
+    let forced_full = forced_slot.is_some();
+    // Reports the forced stream's outcome: `delivered()` below records a
+    // delivery, and dropping it on any other exit records a failure. Either
+    // frees the node's forced slot.
+    let mut forced_leg = forced_slot.map(|taken_at| {
+        crate::operations::update::verify_soon::ForcedLeg::new(
+            op_manager.verify_soon.clone(),
+            op_manager.ring.time_source.clone(),
+            taken_at,
+        )
+    });
+
     // A leg queued in the small lane may find the stored state has since grown
     // past `LARGE_STATE_LANE_THRESHOLD` (a later write replaced it). The
     // summary and delta below run against the stored state, so take a
@@ -4693,7 +4763,7 @@ pub(super) async fn broadcast_to_single_peer(
     // fan-out is the nondeterministic-summary heal storm. `fanout_send_needed`
     // asks the shared delta cache / the contract itself (bounded probe)
     // whether the peer actually lacks state we hold.
-    if let (Some(ours), Some(theirs)) = (&our_summary, &their_summary) {
+    if let (false, Some(ours), Some(theirs)) = (forced_full, &our_summary, &their_summary) {
         // Per-invocation probe budget: one (contract, peer) pair per call, so
         // at most one WASM probe per queue entry (see `fanout_send_needed`).
         let mut staleness_probes_used = 0usize;
@@ -4786,6 +4856,13 @@ pub(super) async fn broadcast_to_single_peer(
     // #4961: WHY a tracked peer has no cached summary. Set only on the
     // `FullNoTheirSummaryTracked` arm below, where the entry exists to be read.
     let (payload, sent_delta, payload_arm) = match (&our_summary, &their_summary) {
+        // #6143 verify-soon escalation: full state whatever the summaries say.
+        // Checked first so it is attributed to its own arm.
+        _ if forced_full => (
+            LegPayload::FullState(new_state.clone()),
+            false,
+            PayloadArm::FullVerifyForced,
+        ),
         // Scoped to the both-summaries-present case ON PURPOSE. When a summary
         // is missing a delta was impossible regardless of the memo, so letting
         // the suppression guard win there would credit the memo for a full
@@ -5031,8 +5108,18 @@ pub(super) async fn broadcast_to_single_peer(
     let update_tx = crate::message::Transaction::new::<crate::operations::update::UpdateMsg>();
 
     // Check if we should use streaming for full state broadcasts
+    // A verify-soon escalation always streams, whatever its size.
     let use_streaming = matches!(&payload, LegPayload::FullState(_))
-        && crate::operations::should_use_streaming(op_manager.streaming_threshold, payload_size);
+        && (forced_full
+            || crate::operations::should_use_streaming(
+                op_manager.streaming_threshold,
+                payload_size,
+            ));
+    if forced_full {
+        record_propagation_event(op_manager, key.id(), PropagationEvent::VerifyForcedFullSent);
+        #[cfg(any(test, feature = "testing"))]
+        crate::node::stale_peer_heal_observations::record_forced_leg(&key);
+    }
 
     // Each branch below tracks whether the message was *actually delivered* to
     // the peer, as distinct from merely being enqueued for dispatch, and applies
@@ -5121,7 +5208,18 @@ pub(super) async fn broadcast_to_single_peer(
             }
         };
 
-        let send_res = bridge.send(peer_addr, net_msg).await;
+        // Test seam: refuse this stream as a failed metadata send would.
+        let send_res =
+            if crate::operations::update::inline_leg_fault_injection::broadcast_stream_refused(
+                op_manager, &key,
+            ) {
+                Err(crate::node::network_bridge::ConnectionError::SendNotCompleted(peer_addr))
+            } else {
+                // channel-safety: ok — unchanged send, on the detached
+                // broadcast-queue task (not the event loop); only the seam
+                // branch above is new.
+                bridge.send(peer_addr, net_msg).await
+            };
         if send_res.is_err() {
             // Telemetry gauge (#4440): the initial metadata send failed, so the
             // streaming broadcast never landed. This is a real streaming-
@@ -5214,6 +5312,13 @@ pub(super) async fn broadcast_to_single_peer(
                 // v0.2.73 incident.
                 BROADCAST_STREAM_METRICS.record_attempt(delivered);
                 if delivered {
+                    if forced_leg.take().is_some_and(|leg| leg.delivered()) {
+                        record_propagation_event(
+                            op_manager,
+                            key.id(),
+                            PropagationEvent::VerifyForcedDelivered,
+                        );
+                    }
                     if let Some(guard) = missing_attempt_guard.as_mut() {
                         guard.mark_delivered(payload_size);
                     }
@@ -5276,7 +5381,32 @@ pub(super) async fn broadcast_to_single_peer(
                     .unwrap_or_default(),
             },
         };
-        let res = bridge.send(peer_addr, msg.into()).await;
+        // Test seam for the #6143 failure class: the bridge "accepts" the
+        // leg and it never arrives, or arrives late. Always `Send` outside
+        // test builds.
+        use crate::operations::update::inline_leg_fault_injection::{LegFate, inline_leg_fate};
+        let res = match inline_leg_fate(op_manager, &key) {
+            // channel-safety: ok — the same send as before the test seam
+            // wrapped it: broadcast_to_single_peer runs on the detached
+            // broadcast-queue task, not the event loop (see above).
+            LegFate::Send => bridge.send(peer_addr, msg.into()).await,
+            LegFate::Swallow => Ok(()),
+            LegFate::Delay(delay) => {
+                let bridge = bridge.clone();
+                let msg: NetMessage = msg.into();
+                // Fire-and-forget on purpose: a test-only late delivery that
+                // ends after one send; nothing needs its handle.
+                drop(crate::config::GlobalExecutor::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    // channel-safety: ok — test-only delayed leg on its own
+                    // detached task; nothing waits on it.
+                    if let Err(e) = bridge.send(peer_addr, msg).await {
+                        tracing::debug!(error = %e, "delayed test leg not sent");
+                    }
+                }));
+                Ok(())
+            }
+        };
         // Non-streaming inline broadcasts have no separate transfer phase: a
         // successful enqueue is the terminal state we can observe, so delivery
         // tracks the send result (unchanged pre-#4235 behavior for this path).
@@ -6876,6 +7006,7 @@ mod tests {
             "PayloadArm::FullNoOurSummary",
             "PayloadArm::FullNoTheirSummaryUntracked",
             "PayloadArm::FullNoTheirSummaryTracked",
+            "PayloadArm::FullVerifyForced",
         ] {
             assert!(
                 body.contains(arm),

@@ -400,6 +400,7 @@ pub(super) fn gate<T>(
     now: SystemTime,
     role: BreakerRole,
     udp_fallback: bool,
+    backoff: &super::Backoff,
 ) -> (Gated<T>, Counted) {
     if settings.is_none() {
         return (
@@ -464,7 +465,7 @@ pub(super) fn gate<T>(
                 );
             }
             PENDING.lock().marker = marker.map(|marker| (path, marker));
-            super::note_backoff(delay);
+            backoff.note(delay);
             metrics.record_quic_breaker_trip();
             tracing::warn!(
                 short_runs = decision.short_runs,
@@ -587,14 +588,19 @@ async fn clear_after_short_run(time: &impl TimeSource, path: PathBuf, nonce: u64
 /// Whether a panic at `file` (a panic location's path) is in QUIC code: quinn
 /// or quinn-proto (a crate directory named `quinn` or `quinn-proto`, or
 /// starting `quinn-`, as cargo names a registry or versioned vendored crate),
-/// or this crate's QUIC transport. Paths use either separator, since a Windows
+/// or their `freenet-quinn` / `freenet-quinn-proto` fork (a directory
+/// starting `freenet-quinn`: its package names differ from upstream's), or
+/// this crate's QUIC transport. Paths use either separator, since a Windows
 /// build reports backslashes. The fallback to [`QuicCode`]: a panic in
 /// QUIC code on a thread that is not inside a guarded call.
 pub(super) fn quic_attributed(file: &str) -> bool {
     let file = file.replace('\\', "/");
-    file.split('/')
-        .any(|part| part == "quinn" || part == "quinn-proto" || part.starts_with("quinn-"))
-        || file.contains("src/transport/quic/")
+    file.split('/').any(|part| {
+        part == "quinn"
+            || part == "quinn-proto"
+            || part.starts_with("quinn-")
+            || part.starts_with("freenet-quinn")
+    }) || file.contains("src/transport/quic/")
         || file.ends_with("src/transport/quic.rs")
 }
 
@@ -791,7 +797,16 @@ pub(super) fn panic_place(file: &str, line: u32) -> String {
 /// (`.cargo/registry/src/<index>/<crate>`) or its git checkouts
 /// (`.cargo/git/checkouts/...`), whose layout cargo chooses.
 fn crate_dir(parts: &[&str], at: usize) -> bool {
-    const KNOWN: [&str; 6] = ["core", "alloc", "std", "quinn", "quinn-proto", "quinn-udp"];
+    const KNOWN: [&str; 8] = [
+        "core",
+        "alloc",
+        "std",
+        "quinn",
+        "quinn-proto",
+        "quinn-udp",
+        "freenet-quinn",
+        "freenet-quinn-proto",
+    ];
     let before = &parts[..at];
     let registry = before.len() >= 3 && before[before.len() - 3..][..2] == ["registry", "src"];
     let git_checkout = before.windows(2).any(|pair| pair == ["git", "checkouts"]);
@@ -1596,6 +1611,7 @@ mod tests {
             now,
             BreakerRole::Peer,
             super::super::UDP_FALLBACK,
+            &super::super::Backoff::new(),
         );
         assert_eq!(empty.settings, None);
         assert_eq!(empty.breaker, BreakerOutcome::NotConsulted);
@@ -1610,6 +1626,7 @@ mod tests {
             now,
             BreakerRole::Peer,
             super::super::UDP_FALLBACK,
+            &super::super::Backoff::new(),
         );
         assert_eq!(gated.breaker, BreakerOutcome::NotConsulted);
     }
@@ -1642,6 +1659,7 @@ mod tests {
             now,
             BreakerRole::Peer,
             super::super::UDP_FALLBACK,
+            &super::super::Backoff::new(),
         );
         assert_eq!(gated.settings, None);
         assert_eq!(gated.breaker, BreakerOutcome::Decided(Verdict::Trip));
@@ -1655,6 +1673,7 @@ mod tests {
             now,
             BreakerRole::Peer,
             super::super::UDP_FALLBACK,
+            &super::super::Backoff::new(),
         );
         assert_eq!(cooling.settings, None);
         assert_eq!(
@@ -1700,6 +1719,7 @@ mod tests {
             now,
             BreakerRole::Peer,
             super::super::UDP_FALLBACK,
+            &super::super::Backoff::new(),
         );
         assert_eq!(gated.settings, None);
         assert_eq!(
@@ -1900,6 +1920,10 @@ mod tests {
             "/build/vendor/quinn-udp-0.5.14/src/lib.rs",
             "/build/vendor/quinn/src/endpoint.rs",
             "/build/vendor/quinn-proto/src/connection/mod.rs",
+            "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/freenet-quinn-0.11.13/src/endpoint.rs",
+            "C:\\Users\\u\\.cargo\\registry\\src\\x\\freenet-quinn-proto-0.11.13\\src\\connection\\mod.rs",
+            "/build/vendor/freenet-quinn/src/endpoint.rs",
+            "/build/vendor/freenet-quinn-proto/src/connection/mod.rs",
             "crates/core/src/transport/quic/runtime.rs",
             "crates\\core\\src\\transport\\quic\\path\\route.rs",
             "crates/core/src/transport/quic.rs",
@@ -1975,6 +1999,14 @@ mod tests {
             (
                 "/home/someone/.cargo/git/checkouts/quinn-0a1b2c/d3e4f5/quinn-proto/src/x.rs",
                 "quinn-proto/src/x.rs:7",
+            ),
+            (
+                "/home/someone/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/freenet-quinn-0.11.13/src/endpoint.rs",
+                "freenet-quinn-0.11.13/src/endpoint.rs:7",
+            ),
+            (
+                "/build/vendor/freenet-quinn-proto/src/connection/mod.rs",
+                "freenet-quinn-proto/src/connection/mod.rs:7",
             ),
             (
                 "crates/core/src/transport/quic/socket.rs",

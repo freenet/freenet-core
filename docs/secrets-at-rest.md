@@ -372,11 +372,15 @@ describes:
 - Bounded at 4096 keys per scope to cap amplification; over-cap keys are
   still stored and readable as values but are not enumerable.
 
-The registry is **best-effort and independent of the value path**: it is
-written strictly AFTER the durable value+index commit, and a failed or
-unreadable registry only degrades future enumeration — it never blocks
-or loses a secret VALUE. A transient read error or a corrupt/undecryptable
-`.keys` blob is FAIL-SAFE: the on-disk registry is left untouched rather
+The registry is **independent of the value path**: it is written
+strictly AFTER the durable value+index commit, and a failed or unreadable
+registry never blocks or loses a secret VALUE. A corrupt or undecryptable
+`.keys` blob is best-effort: it enumerates as empty (policy tracked in
+#6323). A transient I/O error reading the registry (EIO, EACCES, EMFILE)
+is NOT reported as an empty list: `list_secrets` returns
+`ERR_STORAGE_FAILED` and fails that delegate call, so a delegate cannot
+mistake an unreadable registry for "no secrets" (#5857). Either way the
+registry is FAIL-SAFE: the on-disk registry is left untouched rather
 than overwritten from empty, so a momentary IO hiccup cannot permanently
 shrink the enumerable key set (it recovers on the next readable write).
 

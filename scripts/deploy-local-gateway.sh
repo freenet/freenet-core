@@ -174,11 +174,39 @@ echo
 check_privileges
 
 # Wait for binary to be released by all processes
+# Units that are restarted later, on their own schedule (#6336), and so keep
+# running the OLD binary through the swap. The swap below is rm + cp, which gives
+# the new binary a fresh inode, so a process still executing the old inode is
+# harmless and must not make us wait.
+STAGGERED_UNITS=(freenet-gateway-2.service)
+
+# True if PID belongs to one of the staggered units.
+is_staggered_pid() {
+    local pid="$1" unit
+    for unit in "${STAGGERED_UNITS[@]}"; do
+        if sudo grep -q "/$unit\$" "/proc/$pid/cgroup" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# PIDs holding $INSTALL_PATH open, excluding the staggered units' processes.
+binary_holders() {
+    local pid
+    local -a pids
+    mapfile -t pids < <(sudo lsof -t "$INSTALL_PATH" 2>/dev/null || true)
+    for pid in "${pids[@]}"; do
+        [[ -n "$pid" ]] || continue
+        is_staggered_pid "$pid" || echo "$pid"
+    done
+}
+
 wait_for_binary_release() {
     local max_wait=30
     local waited=0
 
-    while sudo lsof "$INSTALL_PATH" &>/dev/null; do
+    while [[ -n "$(binary_holders)" ]]; do
         if [[ $waited -ge $max_wait ]]; then
             echo "⚠️  Timeout waiting for binary to be released"
             echo "     Processes still using $INSTALL_PATH:"
@@ -409,7 +437,13 @@ verify_service() {
                             freenet_pid="$child_pid"
                         else
                             # Try to find any freenet process
-                            local any_freenet=$(pgrep -f "$INSTALL_PATH" | head -1)
+                            # Skip the staggered companion's process: it keeps the old binary on
+                            # purpose and must not be mistaken for this unit's.
+                            local any_freenet="" cand
+                            while IFS= read -r cand; do
+                                [[ -n "$cand" ]] || continue
+                                if ! is_staggered_pid "$cand"; then any_freenet="$cand"; break; fi
+                            done < <(pgrep -f "$INSTALL_PATH" || true)
                             if [[ -n "$any_freenet" ]]; then
                                 running_binary=$(sudo readlink -f /proc/$any_freenet/exe 2>/dev/null || echo "unknown")
                                 freenet_pid="$any_freenet"

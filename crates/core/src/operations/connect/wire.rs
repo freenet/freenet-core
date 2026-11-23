@@ -344,6 +344,10 @@ pub mod sim_trace {
         /// without one ([`NativeWireEvent::NativeHoldExpired`]).
         native_held: AtomicU64,
         native_hold_expired: AtomicU64,
+        gateway_join_native_established: AtomicU64,
+        gateway_join_native_failed: AtomicU64,
+        gateway_join_fallback_connected: AtomicU64,
+        gateway_join_fallback_failed: AtomicU64,
     }
 
     /// How each end's native setup in a CONNECT ended: by (transaction, lower
@@ -452,6 +456,12 @@ pub mod sim_trace {
         /// frame (window passed, or its UDP entry went), and the UDP entry
         /// stayed.
         NativeHoldExpired,
+        /// A joiner's native join to the gateway at the recorded address
+        /// ended, with a connection or not (phase B).
+        GatewayNativeJoin { established: bool },
+        /// The UDP join that followed a failed native gateway join ended,
+        /// connected or not.
+        GatewayJoinFallback { connected: bool },
     }
 
     static TRACES: LazyLock<dashmap::DashMap<String, NativeWireTrace>> =
@@ -553,6 +563,18 @@ pub mod sim_trace {
             }
             NativeWireEvent::NativeHeld => &c.native_held,
             NativeWireEvent::NativeHoldExpired => &c.native_hold_expired,
+            NativeWireEvent::GatewayNativeJoin { established: true } => {
+                &c.gateway_join_native_established
+            }
+            NativeWireEvent::GatewayNativeJoin { established: false } => {
+                &c.gateway_join_native_failed
+            }
+            NativeWireEvent::GatewayJoinFallback { connected: true } => {
+                &c.gateway_join_fallback_connected
+            }
+            NativeWireEvent::GatewayJoinFallback { connected: false } => {
+                &c.gateway_join_fallback_failed
+            }
             NativeWireEvent::Survivor { swapped: true, .. } => &c.survivor_swapped,
             NativeWireEvent::Survivor {
                 swapped: false,
@@ -784,6 +806,24 @@ pub mod sim_trace {
         /// connection held the peer.
         pub fn survivor_udp_dropped(&self) -> u64 {
             Self::get(&self.0.survivor_udp_dropped)
+        }
+        /// Native gateway joins that gave a connection.
+        pub fn gateway_join_native_established(&self) -> u64 {
+            Self::get(&self.0.gateway_join_native_established)
+        }
+        /// Native gateway joins that gave no connection (each is followed
+        /// by the UDP join).
+        pub fn gateway_join_native_failed(&self) -> u64 {
+            Self::get(&self.0.gateway_join_native_failed)
+        }
+        /// UDP joins after a failed native gateway join that connected: each
+        /// is a join the native attempt alone would have lost.
+        pub fn gateway_join_fallback_connected(&self) -> u64 {
+            Self::get(&self.0.gateway_join_fallback_connected)
+        }
+        /// UDP joins after a failed native gateway join that failed too.
+        pub fn gateway_join_fallback_failed(&self) -> u64 {
+            Self::get(&self.0.gateway_join_fallback_failed)
         }
         /// Native connections kept beside a UDP entry to wait for a frame.
         pub fn native_held(&self) -> u64 {
