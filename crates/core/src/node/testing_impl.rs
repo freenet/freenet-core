@@ -2335,8 +2335,8 @@ impl SimNetwork {
 
     /// Turns QUIC-native connects on for every node, at `percent` (the share
     /// of joins an acceptor decides native), in place of this release's
-    /// `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, which are on (25) in production. Pair it
-    /// with [`Self::with_quic_native_floor`], since without the native wire
+    /// `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, which are on (25) in
+    /// production. Pair it with [`Self::with_quic_native_floor`], since without the native wire
     /// variants no decision reaches a joiner, and with
     /// [`Self::with_transport_quic`], since a node without a QUIC endpoint
     /// cannot set one up. Call before the simulation starts.

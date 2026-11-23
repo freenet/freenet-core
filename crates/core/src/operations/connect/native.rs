@@ -54,7 +54,8 @@ pub(crate) const QUIC_NATIVE_PERCENT: u8 = 25;
 /// gateway is marked native in the gateway index and this node can dial
 /// native. Any failure falls back at once to today's join. The joiner alone
 /// decides (there is no connection to the gateway yet to ask it), so the
-/// joiner's release governs. At 0 no join tries native.
+/// joiner's release governs. At 0 no join tries native. `NATIVE_DIAL_READY`
+/// is true since A+ step 1, so this 0 alone keeps gateway-native off.
 pub(crate) const GATEWAY_NATIVE_JOIN_PERCENT: u8 = 0;
 
 /// After a native join with a gateway fails, joins to that gateway go

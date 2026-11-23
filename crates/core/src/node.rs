@@ -553,8 +553,10 @@ pub struct NodeConfig {
     #[serde(skip)]
     pub(crate) native_joiner_off: bool,
     /// Simulation-only: native gateway joins on, at this percent, in place of
-    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, both off in
-    /// production until phase B (`SimNetwork::with_native_gateway_join`).
+    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`. In production
+    /// `NATIVE_DIAL_READY` is true since A+ step 1, and only
+    /// `GATEWAY_NATIVE_JOIN_PERCENT` (0) keeps gateway-native off until
+    /// phase B (`SimNetwork::with_native_gateway_join`).
     /// Read into the node's `NativeConnectState`. `None` in production.
     /// `#[serde(skip)]`.
     #[serde(skip)]
