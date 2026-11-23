@@ -2386,6 +2386,19 @@ impl SimNetwork {
         self
     }
 
+    /// Sets every gateway's `max_connections` to `max`, leaving the regular
+    /// nodes at the network's value. Production gateways carry many more
+    /// connections than peers; a sparse simulation that gives the gateway the
+    /// peers' cap can saturate, after which a late joiner is refused by every
+    /// node. Call before the simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_gateway_max_connections(&mut self, max: usize) -> &mut Self {
+        for (builder, _) in &mut self.gateways {
+            builder.config.max_number_of_connections(max);
+        }
+        self
+    }
+
     /// Sets `quic-max-paths` to `limit` on every node, as `config.toml` would.
     /// Call before the simulation starts. No effect on a node with QUIC off.
     #[cfg(any(test, feature = "testing"))]

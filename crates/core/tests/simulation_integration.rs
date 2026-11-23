@@ -13846,10 +13846,10 @@ fn run_sparse_stranded_holder(
             4,
             4,
             // max_connections: sparse, so the holder is not a neighbour of the
-            // key region, but not so tight that joining is a capacity lottery.
-            // At 4, 16 peers have ~48 endpoint slots for 16 joiners and which
-            // ones fit depends on join timing; late joiners could be refused
-            // by every acceptor (open + reserved + 1 >= max) and never join.
+            // key region. At 4, 16 peers have ~48 endpoint slots for 16
+            // joiners and which ones fit depends on join timing; late joiners
+            // could be refused by every acceptor (open + reserved + 1 >= max)
+            // and never join. The gateway gets more room below.
             6,
             2,
             seed,
@@ -13857,6 +13857,16 @@ fn run_sparse_stranded_holder(
         )
         .await
     });
+    // Even at 6 the peers saturate, and the holder is the joiner most likely
+    // to be left out: the partition below spends its first acceptance on a
+    // key-cluster peer it cannot reach, and by its retry every peer has
+    // 5 or 6 links, so every acceptor refuses it. Whether it then joined
+    // depended on a random topology swap freeing a slot on the gateway
+    // (one draw in ten per minute), so the test passed or failed on a
+    // GlobalRng draw in any transport mode. A gateway with room for every
+    // peer, as production gateways have, always leaves the holder a place
+    // to join; the peers keep the sparse cap that strands it.
+    sim.with_gateway_max_connections(NUM_NODES + 2);
     sim.disable_placement_migration();
     sim.enable_seeded_host_advertisements();
     sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
@@ -13887,12 +13897,12 @@ fn run_sparse_stranded_holder(
     let holder = NodeLabel::node(network_name, holder_no);
     let reader = NodeLabel::node(network_name, reader_no);
     let reader_addr = sim.node_address(&reader).expect("reader address");
+    let holder_addr = sim.node_address(&holder).expect("holder address");
     // Strand the holder: it cannot reach the key cluster, so it never links
     // to it. At six connections it otherwise can, and its subscribe then
     // lands next to the key with no recovery at all.
     {
         use freenet::simulation::{FaultConfig, Partition};
-        let holder_addr = sim.node_address(&holder).expect("holder address");
         let cluster: HashSet<SocketAddr> = nearest_addrs.iter().map(|(_, a)| *a).collect();
         sim.with_fault_injection(
             FaultConfig::builder()
@@ -13946,8 +13956,22 @@ fn run_sparse_stranded_holder(
         "precondition: the reader must have joined the ring (ring connections: \
          {reader_links:?}); a capacity shortfall, not the recovery, is then the cause"
     );
+    // Precondition: the holder joined the ring. A holder that never joined is
+    // the capacity failure above, not a stranded holder.
+    let holder_links = result
+        .topology_snapshots
+        .iter()
+        .find(|snap| snap.peer_addr == holder_addr)
+        .map(|snap| snap.connection_count);
+    assert!(
+        holder_links.is_some_and(|n| n > 0),
+        "precondition: the holder must have joined the ring (ring connections: \
+         {holder_links:?})"
+    );
     // Precondition: the holder is stranded. Linked straight to a peer of the
-    // key cluster, its subscribe would land there without any recovery.
+    // key cluster, its subscribe would land there without any recovery. The
+    // partition drops every packet between them from the start, so no such
+    // link can form at any point in the run, not only at the end.
     let holder_near_links: Vec<usize> = nearest_set
         .iter()
         .copied()
