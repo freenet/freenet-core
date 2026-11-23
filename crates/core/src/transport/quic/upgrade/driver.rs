@@ -81,9 +81,8 @@ use super::machine::{
     Action, BackoffSeed, CONTROL_SEND_TIMEOUT, Event, FALLBACK_CHURN_WINDOW, FallbackCause, Inputs,
     Outcome, RECENT_FALLBACKS_MAX, Role, UpgradeMachine,
 };
-use super::policy::QuicPolicy;
+use super::policy::{QuicPathPermits, QuicPolicy};
 use crate::config::{GlobalExecutor, GlobalRng};
-use crate::node::background_task_monitor::LateRegistrar;
 use crate::simulation::{RealTime, TimeSource, VirtualTime};
 use crate::transport::boundary::QuicPathEnd;
 use crate::transport::crypto::TransportPublicKey;
@@ -694,9 +693,13 @@ impl QuicUpgrades {
     /// session of its address. It holds this value weakly, so it does not keep
     /// the endpoint alive, and it parks when `attempts` closes, as the accept loop
     /// does, since the monitor reads any end of a registered task as a failure.
-    pub(in crate::transport) fn spawn_attempt_router(
+    ///
+    /// Each task it starts is handed to `register`: the node's monitor for
+    /// the first endpoint, the rebuild loop for one built in place of a dead
+    /// one (`quic::rebuild`).
+    pub(in crate::transport) fn spawn_attempt_router_with(
         self: &Arc<Self>,
-        registrar: &LateRegistrar,
+        register: &mut dyn FnMut(&'static str, JoinHandle<()>),
         mut attempts: mpsc::Receiver<EndpointAttempt>,
     ) {
         let hub = Arc::downgrade(self);
@@ -721,14 +724,14 @@ impl QuicUpgrades {
             drop(attempts);
             std::future::pending::<()>().await;
         });
-        registrar.register("quic_attempt_router", handle);
+        register("quic_attempt_router", handle);
         if self.endpoint.gateway_admission_enabled() {
             let (joins, queue) = mpsc::channel(GATEWAY_JOIN_QUEUE);
             if self.gateway_joins.set(joins).is_ok() {
                 let clock = self.path_clock.clone();
                 let handle =
                     GlobalExecutor::spawn(run_gateway_joins(queue, clock, Arc::downgrade(self)));
-                registrar.register("quic_gateway_joins", handle);
+                register("quic_gateway_joins", handle);
             }
         }
     }
@@ -751,6 +754,13 @@ impl QuicUpgrades {
         } else {
             self.route(incoming);
         }
+    }
+
+    /// The node's QUIC path permits, which an endpoint built in place of this
+    /// one's counts against too (`quic::rebuild`), so the cap holds across
+    /// endpoints.
+    pub(in crate::transport) fn permits(&self) -> &QuicPathPermits {
+        self.policy.permits()
     }
 
     /// The native waiters the router hands native attempts to.
@@ -1965,9 +1975,12 @@ async fn drive<S: Socket, T: TimeSource>(
 /// How a new connection joins its node's upgrades. With QUIC off, or with an
 /// endpoint that could not be built, it holds no upgrades. Holds them weakly: the
 /// listener owns them, and a handler must not keep the endpoint alive after it.
+/// Clones share one place: when the node rebuilds its endpoint
+/// (`quic::rebuild`) the listener points it at the new upgrades
+/// ([`Self::replace`]), and every clone sees them.
 #[derive(Clone, Default)]
 pub(in crate::transport) struct UpgradeSite {
-    upgrades: Weak<QuicUpgrades>,
+    upgrades: Arc<parking_lot::RwLock<Weak<QuicUpgrades>>>,
     #[cfg(any(test, feature = "testing"))]
     trace: Option<super::sim_trace::NodeTrace>,
 }
@@ -1979,14 +1992,22 @@ impl UpgradeSite {
         local_addr: SocketAddr,
     ) -> Self {
         Self {
-            upgrades: upgrades.map_or_else(Weak::new, Arc::downgrade),
+            upgrades: Arc::new(parking_lot::RwLock::new(
+                upgrades.map_or_else(Weak::new, Arc::downgrade),
+            )),
             #[cfg(any(test, feature = "testing"))]
             trace: crate::transport::in_memory_socket::quic_upgrade_trace_at(local_addr),
         }
     }
 
     pub(in crate::transport) fn upgrades(&self) -> Option<Arc<QuicUpgrades>> {
-        self.upgrades.upgrade()
+        self.upgrades.read().upgrade()
+    }
+
+    /// Point this site, and every clone of it, at `upgrades`: those of an
+    /// endpoint the node built in place of a dead one (`quic::rebuild`).
+    pub(in crate::transport) fn replace(&self, upgrades: Option<&Arc<QuicUpgrades>>) {
+        *self.upgrades.write() = upgrades.map_or_else(Weak::new, Arc::downgrade);
     }
 
     /// Where this node's upgrade messages are recorded for a test.

@@ -111,6 +111,7 @@ pub(crate) mod neighbor_hosting;
 pub(crate) mod network_status;
 pub use network_status::set_auto_update_state;
 mod op_state_manager;
+pub(crate) mod outbound_budget;
 mod p2p_impl;
 mod request_router;
 pub(crate) mod resource_metrics;
@@ -546,6 +547,11 @@ pub struct NodeConfig {
     /// `#[serde(skip)]`.
     #[serde(skip)]
     pub(crate) native_connect_override: Option<u8>,
+    /// Simulation-only: this node never offers QUIC-native as joiner, but
+    /// decides as acceptor as usual (`SimNetwork::with_node_native_joiner_off`),
+    /// standing in for a node that rarely joins. `false` in production.
+    #[serde(skip)]
+    pub(crate) native_joiner_off: bool,
     /// Simulation-only: native gateway joins on, at this percent, in place of
     /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, both off in
     /// production until phase B (`SimNetwork::with_native_gateway_join`).
@@ -924,6 +930,7 @@ impl NodeConfig {
             advertised_version_override: None,
             quic_native_floor_override: None,
             native_connect_override: None,
+            native_joiner_off: false,
             native_gateway_join_override: None,
             native_wire_pre_floor: false,
             quic_idle_timeout_override: None,

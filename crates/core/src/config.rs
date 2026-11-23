@@ -4539,27 +4539,33 @@ pub struct ConfigPathsArgs {
 /// Directory under which `ConfigPathsArgs::default_dirs` places the
 /// `freenet-{id}` temp data dirs.
 ///
-/// Outside unit tests this is the OS temp dir, unchanged. In a unit-test
-/// build it is a directory private to this process
+/// Outside tests this is the OS temp dir, unchanged. In a unit-test build,
+/// and in a build with the `simulation_tests` feature (the simulation
+/// integration tests), it is a directory private to this process
 /// (`$TMPDIR/freenet-test-<pid>`, see [`test_temp_root`]). `default_dirs`
 /// deletes any existing `freenet-{id}` dir before reusing the name, and the
 /// ids are fixed strings in the tests, so with a shared root a second test
 /// process (another worktree's `cargo test` on the same machine, or a second
 /// binary run in parallel) deleted this process's live data dirs mid-test and
-/// the test failed with `build Config: No such file or directory`.
-#[cfg(not(test))]
+/// the test failed with `build Config: No such file or directory`. A
+/// simulation could also start from files a concurrent run of the same test
+/// had just written there: a node loaded another process's persisted peer
+/// cache, its bootstrap changed, and a fixed-seed run took a different path
+/// (`test_quic_native_blocked_pairs_connect_over_udp_behind_nats` failed
+/// that way on a busy machine and passed in CI).
+#[cfg(not(any(test, feature = "simulation_tests")))]
 fn default_temp_root() -> PathBuf {
     std::env::temp_dir()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "simulation_tests"))]
 fn default_temp_root() -> PathBuf {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| test_temp_root::claim(&std::env::temp_dir()))
         .clone()
 }
 
-/// Per-process temp roots for unit-test builds.
+/// Per-process temp roots for unit-test builds and `simulation_tests` builds.
 ///
 /// A root is `freenet-test-<pid>`, or `freenet-test-<pid>-<n>` if that name
 /// is held by another live process (for example one with the same pid in
@@ -4600,7 +4606,7 @@ fn default_temp_root() -> PathBuf {
 /// the right name only by the same age rule, skipping this process's own.
 /// A live test process older than that age can therefore lose its root on
 /// non-unix.
-#[cfg(test)]
+#[cfg(any(test, feature = "simulation_tests"))]
 mod test_temp_root {
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -4709,6 +4715,13 @@ mod test_temp_root {
     /// The non-unix sweep (no `flock` there): remove root-named real
     /// directories other than `own` whose mtime is older than
     /// [`LOCKLESS_ROOT_MAX_AGE`]. Compiled everywhere so unix tests cover it.
+    #[cfg_attr(
+        all(unix, not(test)),
+        allow(
+            dead_code,
+            reason = "unix calls it only from its tests; a unix simulation_tests build compiles it unused"
+        )
+    )]
     pub(super) fn sweep_aged_roots(tmp: &Path, own: &Path, now: SystemTime) {
         let Ok(entries) = fs::read_dir(tmp) else {
             return;

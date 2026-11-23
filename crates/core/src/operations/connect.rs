@@ -437,13 +437,30 @@ pub(crate) trait RelayContext {
     ) -> Option<PeerKeyLocation>;
 
     /// This node's readiness for QUIC-native connections, read when it
-    /// decides as acceptor.
+    /// decides as acceptor: off while either its joiner or its acceptor
+    /// demotion runs (`NativeConnectState::acceptor_readiness`).
     fn native_readiness(&self) -> native::NativeReadiness;
 
     /// Whether this node holds a transport to the joiner, by key or by
     /// address, read when it decides as acceptor. An existing transport is
     /// reused, so the decision is then `Udp`.
     fn holds_transport_to(&self, joiner: &PeerKeyLocation) -> bool;
+
+    /// Admits a native setup with the joiner before this node, as acceptor,
+    /// decides `Native` (`NativeConnectState::admit_acceptor_setup`); a
+    /// refusal makes the decision `Udp`. The ticket rides in the
+    /// `AcceptOutcome` and is dropped at the acceptor's native dial deadline.
+    fn admit_native_setup(
+        &self,
+        joiner: &PeerKeyLocation,
+    ) -> Result<native::SetupTicket, native::SetupAdmissionRefusal>;
+
+    /// Whether a native setup with the joiner would be admitted now, without
+    /// taking one (`NativeConnectState::acceptor_setup_room`).
+    fn native_setup_room(
+        &self,
+        joiner: &PeerKeyLocation,
+    ) -> Result<(), native::SetupAdmissionRefusal>;
 }
 
 /// Bundle of the two side-effects a relay must emit atomically when it
@@ -466,6 +483,10 @@ pub(crate) struct AcceptOutcome {
     /// The comparison arm of the decision in `response`
     /// ([`native::acceptor_arm`]), kept for the dial's outcome.
     pub native_arm: Option<crate::transport::ConnectArm>,
+    /// The native setup admission a `Native` decision holds until the
+    /// acceptor's native dial deadline; dropped with an accept that is never
+    /// dispatched, which releases it.
+    pub native_admission: Option<native::SetupTicket>,
 }
 
 /// Why a relay at terminus could not accept and rejected the request.
@@ -644,17 +665,51 @@ impl RelayState {
     ) -> (
         Option<native::NativeDecision>,
         Option<crate::transport::ConnectArm>,
+        Option<native::SetupTicket>,
     ) {
         let Some(offer) = self.request.native_offer else {
-            return (None, None);
+            return (None, None, None);
         };
         let bucket = native::native_bucket(own_key, self.request.joiner.pub_key());
         let readiness = ctx.native_readiness();
         let holds = ctx.holds_transport_to(&self.request.joiner);
-        let decision = native::decide_native(Some(offer), readiness, bucket, holds);
-        let arm = native::acceptor_arm(Some(offer), readiness, bucket, holds);
+        let mut decision = native::decide_native(Some(offer), readiness, bucket, holds);
+        let mut arm = native::acceptor_arm(Some(offer), readiness, bucket, holds);
+        // A `Native` decision holds a native setup slot and an allow-set slot
+        // here for up to the server's window. Admit it first; with no room
+        // (or too many pending from the joiner's source) decide `Udp`, so the
+        // joiner dials UDP at once instead of waiting out the fallback. The
+        // pair is then in neither arm: it left the treated arm for a reason
+        // other than the slice, and a control pair at an acceptor with no room
+        // leaves the control arm the same way.
+        let mut admission = None;
+        if decision == native::NativeDecision::Native {
+            match ctx.admit_native_setup(&self.request.joiner) {
+                Ok(ticket) => admission = Some(ticket),
+                Err(_) => {
+                    decision = native::NativeDecision::Udp;
+                    arm = None;
+                }
+            }
+        } else if arm == Some(crate::transport::ConnectArm::Control)
+            && ctx.native_setup_room(&self.request.joiner).is_err()
+        {
+            arm = None;
+            crate::transport::metrics::TRANSPORT_METRICS.record_connect_native_control_dropped();
+        }
         crate::transport::metrics::TRANSPORT_METRICS.record_connect_native_decided(decision);
-        (Some(decision), arm)
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(own) = ctx.self_location().socket_addr() {
+            native_wire_trace::record_at(
+                own,
+                native_wire_trace::NativeWireEvent::Decided {
+                    own,
+                    native: decision == native::NativeDecision::Native,
+                    in_slice: !holds && bucket < offer.effective_percent(),
+                },
+            );
+        }
+        (Some(decision), arm, admission)
     }
 
     /// Helper to prepare and execute forwarding to a peer.
@@ -808,7 +863,7 @@ impl RelayState {
                                     let acceptor = PeerKeyLocation::with_unknown_addr(
                                         self_loc.pub_key().clone(),
                                     );
-                                    let (native_decision, native_arm) =
+                                    let (native_decision, native_arm, native_admission) =
                                         self.native_decision(ctx, self_loc.pub_key());
                                     actions.accept = Some(AcceptOutcome {
                                         response: ConnectResponse {
@@ -817,6 +872,7 @@ impl RelayState {
                                         },
                                         joiner: self.request.joiner.clone(),
                                         native_arm,
+                                        native_admission,
                                     });
                                     tracing::info!(
                                         acceptor_loc = ?self_loc.location(),
@@ -868,7 +924,8 @@ impl RelayState {
             let self_loc = ctx.self_location();
             let acceptor = PeerKeyLocation::with_unknown_addr(self_loc.pub_key().clone());
             let dist = ring_distance(self_loc.location(), self.request.joiner.location());
-            let (native_decision, native_arm) = self.native_decision(ctx, self_loc.pub_key());
+            let (native_decision, native_arm, native_admission) =
+                self.native_decision(ctx, self_loc.pub_key());
             actions.accept = Some(AcceptOutcome {
                 response: ConnectResponse {
                     acceptor,
@@ -876,6 +933,7 @@ impl RelayState {
                 },
                 joiner: self.request.joiner.clone(),
                 native_arm,
+                native_admission,
             });
             // Response is routed hop-by-hop via upstream_addr, no target embedded in message
             tracing::info!(
@@ -1009,7 +1067,29 @@ impl RelayContext for RelayEnv<'_> {
             .ring
             .connection_manager
             .native_connect()
-            .readiness()
+            .acceptor_readiness()
+    }
+
+    fn admit_native_setup(
+        &self,
+        joiner: &PeerKeyLocation,
+    ) -> Result<native::SetupTicket, native::SetupAdmissionRefusal> {
+        self.op_manager
+            .ring
+            .connection_manager
+            .native_connect()
+            .admit_acceptor_setup(joiner.socket_addr())
+    }
+
+    fn native_setup_room(
+        &self,
+        joiner: &PeerKeyLocation,
+    ) -> Result<(), native::SetupAdmissionRefusal> {
+        self.op_manager
+            .ring
+            .connection_manager
+            .native_connect()
+            .acceptor_setup_room(joiner.socket_addr())
     }
 
     /// A ring connection to the joiner's key, or any transport the bridge
@@ -1534,6 +1614,7 @@ pub(super) async fn dispatch_expect_connection_from(
     peer: PeerKeyLocation,
     decision: Option<native::NativeDecision>,
     arm: Option<crate::transport::ConnectArm>,
+    admission: Option<native::SetupTicket>,
 ) -> Result<(), OpError> {
     let Some(addr) = peer.socket_addr() else {
         // Protocol invariant violation: `handle_request` only sets
@@ -1593,6 +1674,12 @@ pub(super) async fn dispatch_expect_connection_from(
         "connect: acceptor accepted joiner, setting up a QUIC-native connection"
     );
     let decided_at = Instant::now();
+    // The dial's absolute deadline ends every window its setup can run in:
+    // the setup runs for what is left of it when it starts, cut to its own
+    // window, and does not start with less than `NATIVE_MIN_WINDOW_LEFT`
+    // left, however late it starts behind the event loop and the handshake
+    // driver.
+    let dial_deadline = tokio::time::Instant::now() + native::NATIVE_CONNECT_WITHIN;
     let (callback, mut rx) = mpsc::channel(1);
     op_manager
         .notify_node_event(NodeEvent::ConnectPeer {
@@ -1601,9 +1688,24 @@ pub(super) async fn dispatch_expect_connection_from(
             callback,
             is_gw: false,
             origin: crate::transport::NatAttemptOrigin::ConnectAcceptor,
-            transport: native::DialTransport::native_now(),
+            transport: native::DialTransport::Native {
+                deadline: dial_deadline,
+            },
         })
         .await?;
+    // The admission (`RelayContext::admit_native_setup`) is released at the
+    // dial's deadline, after which the setup can hold no setup slot. Not at
+    // the dial's answer: that can come before the setup ends (a UDP
+    // connection beside it or from the joiner, a transient-budget refusal),
+    // or never (a native request queued behind a stalled UDP dial to the same
+    // address). If the dispatch above failed, the admission was dropped with
+    // it.
+    if let Some(ticket) = admission {
+        GlobalExecutor::spawn(async move {
+            tokio::time::sleep_until(dial_deadline).await;
+            drop(ticket);
+        });
+    }
     // Test-only: a UDP dial beside the native one, at once.
     #[cfg(any(test, feature = "testing"))]
     if native_wire_trace::udp_beside_forced(addr, true) {
@@ -1615,8 +1717,9 @@ pub(super) async fn dispatch_expect_connection_from(
     }
     let op_manager = op_manager.clone();
     // Not registered with the task monitor, like the UDP branch's task above:
-    // it ends within `NATIVE_FALLBACK_AFTER` plus one dial, and an event loop
-    // that has gone fails its sends.
+    // it ends when the native dial is answered (within its deadline unless
+    // queued behind a stalled dial) and, after a failure, one UDP dial; an
+    // event loop that has gone fails its sends.
     GlobalExecutor::spawn(async move {
         // Demotion is recorded where the setup's end is known (the
         // connection lifecycle); this task only falls back.
@@ -1668,6 +1771,11 @@ pub(super) async fn dispatch_expect_connection_from(
                                 .record_connect_native_rescued_by_udp(
                                     crate::transport::NativeConnectSide::Acceptor,
                                 );
+                            record_native_rescue_strike(
+                                &op_manager,
+                                crate::transport::NatAttemptOrigin::ConnectAcceptor,
+                                &peer,
+                            );
                         }
                         #[cfg(any(test, feature = "testing"))]
                         native_wire_trace::record_at(
@@ -1692,6 +1800,78 @@ pub(super) async fn dispatch_expect_connection_from(
         }
     });
     Ok(())
+}
+
+/// A native setup with `peer`, made in the role `origin` names, failed on the
+/// path and UDP to the same peer then connected: a rescue, the only evidence
+/// that counts toward demotion (`native::DEMOTION_FAILURES`). Strikes that
+/// role's streak (the joiner's or the acceptor's), each across distinct peers,
+/// so the same rescue seen at two sites counts once. Other origins strike
+/// nothing, and nor does a rescue with one of this node's configured gateways
+/// (matched by address or key, as the connection lifecycle labels a dial to
+/// one `Gateway`): callers pass the CONNECT role, which does not say whether
+/// the peer is a gateway.
+///
+/// Known residuals, both giving the ACCEPTOR a rescue it did not earn, since
+/// the joiner never dialled native but does dial UDP:
+/// - the joiner's plan for this acceptor was a UDP dial at the fallback time
+///   (`AcceptorDialPlan::UdpAt`: the response arrived with less than
+///   `NATIVE_MIN_WINDOW_LEFT` of the acceptor's window left); bounded by the
+///   response's travel time (10.2 item 6);
+/// - the joiner's own native setup was refused locally (`TooLate`,
+///   `OverBudget*`, `SetupsFull`, `AlreadyWaiting`, `AllowSetFull`,
+///   `KeyConflict`, `UnusableKey`) and it fell back to UDP; the joiner's
+///   streak does not count those (not a path failure), but the acceptor's
+///   setup timed out and its UDP fallback connected.
+pub(crate) fn record_native_rescue_strike(
+    op_manager: &OpManager,
+    origin: crate::transport::NatAttemptOrigin,
+    peer: &PeerKeyLocation,
+) {
+    let is_configured_gateway = op_manager.configured_gateways.iter().any(|gw| {
+        gw.pub_key() == peer.pub_key()
+            || (gw.socket_addr().is_some() && gw.socket_addr() == peer.socket_addr())
+    });
+    if is_configured_gateway {
+        return;
+    }
+    let native_connect = op_manager.ring.connection_manager.native_connect();
+    // (whether the acceptor's streak counted it, whether it demoted)
+    let (as_acceptor, demoted) = match origin {
+        crate::transport::NatAttemptOrigin::ConnectJoiner => {
+            (false, native_connect.record_failure(peer.pub_key()))
+        }
+        crate::transport::NatAttemptOrigin::ConnectAcceptor => {
+            (true, native_connect.record_acceptor_failure(peer.pub_key()))
+        }
+        crate::transport::NatAttemptOrigin::Gateway
+        | crate::transport::NatAttemptOrigin::RingPeerNoTransport => return,
+    };
+    #[cfg(any(test, feature = "testing"))]
+    {
+        use native_wire_trace::{NativeWireEvent, record_at};
+        let own = op_manager.ring.connection_manager.get_own_addr();
+        match (as_acceptor, own, peer.socket_addr()) {
+            (true, Some(own), _) => {
+                record_at(
+                    own,
+                    NativeWireEvent::AcceptorStreak {
+                        own,
+                        len: native_connect.acceptor_streak(),
+                    },
+                );
+                if demoted {
+                    record_at(own, NativeWireEvent::AcceptorDemoted { own });
+                }
+            }
+            (false, _, Some(addr)) if demoted => {
+                record_at(addr, NativeWireEvent::NativeDemoted);
+            }
+            _ => {}
+        }
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = (as_acceptor, demoted);
 }
 
 /// The acceptor's UDP hole punch towards `peer` at `addr`: an expected-inbound
@@ -3907,6 +4087,7 @@ mod tests {
         uphill_hop: Option<PeerKeyLocation>,
         native: Option<native::NativeReadiness>,
         holds_transport: bool,
+        admission: Result<(), native::SetupAdmissionRefusal>,
     }
 
     impl TestRelayContext {
@@ -3918,7 +4099,14 @@ mod tests {
                 uphill_hop: None,
                 native: None,
                 holds_transport: false,
+                admission: Ok(()),
             }
+        }
+
+        /// What admitting a native setup answers.
+        fn admission(mut self, admission: Result<(), native::SetupAdmissionRefusal>) -> Self {
+            self.admission = admission;
+            self
         }
 
         /// Whether the acceptor holds a transport to the joiner.
@@ -3984,6 +4172,21 @@ mod tests {
 
         fn holds_transport_to(&self, _joiner: &PeerKeyLocation) -> bool {
             self.holds_transport
+        }
+
+        fn admit_native_setup(
+            &self,
+            joiner: &PeerKeyLocation,
+        ) -> Result<native::SetupTicket, native::SetupAdmissionRefusal> {
+            self.admission
+                .map(|()| native::SetupTicket::detached(joiner.socket_addr().expect("known")))
+        }
+
+        fn native_setup_room(
+            &self,
+            _joiner: &PeerKeyLocation,
+        ) -> Result<(), native::SetupAdmissionRefusal> {
+            self.admission
         }
     }
 
@@ -4260,6 +4463,7 @@ mod tests {
         let self_loc = make_peer(4000);
         let joiner = make_peer(5000);
         let ready = native::NativeReadiness {
+            demoted: false,
             ready: true,
             percent: 100,
         };
@@ -4280,6 +4484,78 @@ mod tests {
         );
     }
 
+    /// A pair the acceptor would decide `Native` for, but whose native setup
+    /// it cannot admit (no room, or its source has too many pending), is
+    /// decided `Udp` at once and counted in neither arm; admitted, it is
+    /// `Native` and treated.
+    #[test]
+    fn acceptor_decides_udp_when_it_cannot_admit_the_setup() {
+        let self_loc = make_peer(4000);
+        let joiner = make_peer(5000);
+        let ready = native::NativeReadiness {
+            demoted: false,
+            ready: true,
+            percent: 100,
+        };
+        let offer = Some(native::NativeOffer::capable(100));
+        let admitted = TestRelayContext::new(self_loc.clone()).native(ready);
+        let accept = accept_once(&mut native_relay_state(&joiner, offer), &admitted);
+        assert_eq!(
+            accept.response.native_decision,
+            Some(native::NativeDecision::Native)
+        );
+        assert_eq!(
+            accept.native_arm,
+            Some(crate::transport::ConnectArm::Treated)
+        );
+        for refusal in [
+            native::SetupAdmissionRefusal::Full,
+            native::SetupAdmissionRefusal::SourceFull,
+            native::SetupAdmissionRefusal::NoAddress,
+        ] {
+            let refused = TestRelayContext::new(self_loc.clone())
+                .native(ready)
+                .admission(Err(refusal));
+            let accept = accept_once(&mut native_relay_state(&joiner, offer), &refused);
+            assert_eq!(
+                accept.response.native_decision,
+                Some(native::NativeDecision::Udp),
+                "{refusal:?}"
+            );
+            assert_eq!(accept.native_arm, None, "{refusal:?}");
+            assert!(accept.native_admission.is_none(), "{refusal:?}");
+        }
+        // A control pair (this acceptor at percent 0) at an acceptor with no
+        // room leaves the control arm too, so the two arms see the same load.
+        let at_zero = native::NativeReadiness {
+            demoted: false,
+            ready: true,
+            percent: 0,
+        };
+        let control = TestRelayContext::new(self_loc.clone()).native(at_zero);
+        let accept = accept_once(&mut native_relay_state(&joiner, offer), &control);
+        assert_eq!(
+            accept.native_arm,
+            Some(crate::transport::ConnectArm::Control)
+        );
+        let dropped_before =
+            crate::transport::metrics::NATIVE_CONTROL_DROPPED_ON_THIS_THREAD.with(|c| c.get());
+        let full = TestRelayContext::new(self_loc)
+            .native(at_zero)
+            .admission(Err(native::SetupAdmissionRefusal::Full));
+        let accept = accept_once(&mut native_relay_state(&joiner, offer), &full);
+        assert_eq!(
+            accept.response.native_decision,
+            Some(native::NativeDecision::Udp)
+        );
+        assert_eq!(accept.native_arm, None, "a control pair with no room");
+        assert_eq!(
+            crate::transport::metrics::NATIVE_CONTROL_DROPPED_ON_THIS_THREAD.with(|c| c.get()),
+            dropped_before + 1,
+            "the drop is counted"
+        );
+    }
+
     /// The "already connected" input is read when this node accepts, not
     /// when the request first arrived: the joiner connects while the request
     /// is forwarded, the forward is rejected, and the local accept that
@@ -4290,6 +4566,7 @@ mod tests {
         let joiner = make_peer(5000);
         let peer_a = make_peer(6000);
         let ready = native::NativeReadiness {
+            demoted: false,
             ready: true,
             percent: 100,
         };
@@ -4362,6 +4639,7 @@ mod tests {
         let peer_b = make_peer(7000);
         let offer = Some(native::NativeOffer::capable(100));
         let ready = native::NativeReadiness {
+            demoted: false,
             ready: true,
             percent: 100,
         };

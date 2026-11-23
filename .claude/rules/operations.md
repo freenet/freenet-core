@@ -229,6 +229,16 @@ tier remote peers feed) from indefinitely starving Background. Both are
 backstops only: tag each send site with the class it belongs to.
 ```
 
+**Outbound GET response budget.** A streamed GET response is charged to
+`node::outbound_budget::OutboundPayloadBudget` (node-wide G, per-source P = G/4,
+a reserve for idle sources, one oversize slot) BEFORE its `ResponseStreaming`
+header is sent, so a refusal returns `Err` and the driver answers NotFound with
+no header outstanding. The charge is owned by the bytes handed to `send_stream`
+and released when the transport drops them, so the memory bound holds whatever
+the peer does. How long one response is held is bounded on QUIC paths only
+(`QuicPath::stream_deadlines`). A response at or below the streaming threshold, and every other
+outbound send, is not budgeted.
+
 **Admission lanes in front of the fair queue (ANT-2026-K0YQ8CG4).** Events
 reach `contract_handling` over four channels, chosen by `handler::Lane::of`:
 control (`ClientDisconnect`, `EvictContract`, by event type and whatever

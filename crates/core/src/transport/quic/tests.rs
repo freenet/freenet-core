@@ -3338,6 +3338,279 @@ fn the_transport_reports_quic_availability() {
     })
 }
 
+/// #6272: a node that does not exit for its supervisor, with endpoint
+/// rebuilding on, builds a new endpoint on its socket after the first dies,
+/// and the node reads `Up` again. A supervised node never rebuilds: its
+/// endpoint's death stays `Down` and still ends its listener with
+/// `QuicEndpointDown`. With rebuilding off (`ENDPOINT_REBUILD`, the shipped
+/// value) nothing changes: no rebuild task, and `Down` stays. On simulation
+/// sockets, with the clock moved by hand past many backoff waits.
+#[test]
+fn only_an_unsupervised_node_with_rebuilding_on_rebuilds_its_endpoint() {
+    bounded(|| async move {
+        use crate::node::background_task_monitor::BackgroundTaskMonitor;
+        use crate::transport::ListenerExit;
+        use crate::transport::connection_handler::{
+            UdpTransportConfig, bind_udp_listener, gateway_quic_restart, listener_liveness,
+        };
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Case {
+            Unsupervised,
+            Supervised,
+            Off,
+        }
+        let network = "quic-endpoint-rebuild";
+        let time = VirtualTime::new();
+        let _clock = Registration::time_source(network, time.clone());
+        let trace = crate::transport::in_memory_socket::quic_upgrade_trace(network);
+        let net = crate::transport::test_net::subnet();
+        for (port, case) in [
+            (5000, Case::Unsupervised),
+            (5001, Case::Supervised),
+            (5002, Case::Off),
+        ] {
+            let local = net.addr_port(1, port);
+            let _registered = Registration::address(local, network);
+            if case != Case::Off {
+                trace.rebuild_endpoint(local);
+            }
+            if case == Case::Supervised {
+                trace.supervise(local);
+            }
+            let monitor = BackgroundTaskMonitor::new();
+            let registrar = monitor.late_registrar();
+            let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
+                crate::transport::TransportKeypair::new(),
+                local.ip(),
+                port,
+                false,
+                UdpTransportConfig {
+                    quic: Some(settings()),
+                    task_registrar: Some(registrar.clone()),
+                    ..UdpTransportConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+            let rebuilds = case == Case::Unsupervised;
+            // A rebuilding node's monitor watches the rebuild loop, which
+            // owns the accept loop; every other node's watches the accept
+            // loop itself.
+            let expected: &[&str] = if rebuilds {
+                &["quic_endpoint_rebuild"]
+            } else {
+                &["quic_accept_loop"]
+            };
+            assert_eq!(registrar.registered(), expected, "{case:?}");
+            let first = outbound.quic_endpoint().expect("an endpoint").clone();
+            let mut availability = outbound.quic_availability();
+            assert_eq!(availability.get(), QuicAvailability::Up);
+            first.fail_driver();
+            let seen = tokio::time::timeout(Duration::from_secs(30), availability.not_up())
+                .await
+                .expect("the driver's death is reported");
+            assert_eq!(seen, QuicAvailability::Down, "{case:?}");
+            // Ten minutes in 100 ms steps: past the first rebuild (1 s ±20%)
+            // and, had it failed, many later ones.
+            let mut up_after = None;
+            for step in 1..=6_000u64 {
+                time.advance(Duration::from_millis(100));
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+                if up_after.is_none() && availability.get() == QuicAvailability::Up {
+                    up_after = Some(Duration::from_millis(100 * step));
+                }
+            }
+            let current = outbound.current_quic_endpoint().expect("the listener runs");
+            if rebuilds {
+                let up_after = up_after.unwrap_or_else(|| panic!("{case:?}: never Up again"));
+                assert!(
+                    up_after >= Duration::from_millis(800)
+                        && up_after <= Duration::from_millis(1_300),
+                    "the first rebuild follows the first wait: {up_after:?}"
+                );
+                assert_eq!(availability.get(), QuicAvailability::Up, "and stays up");
+                assert!(!current.same_endpoint(&first), "a new endpoint");
+                assert_eq!(current.availability().get(), QuicAvailability::Up);
+                assert_eq!(
+                    trace.matching(local, "rebuilt the endpoint at ").len(),
+                    1,
+                    "{:#?}",
+                    trace.records()
+                );
+            } else {
+                assert_eq!(up_after, None, "{case:?}: no rebuild");
+                assert_eq!(availability.get(), QuicAvailability::Down, "{case:?}");
+                assert!(current.same_endpoint(&first), "{case:?}: the dead endpoint");
+                assert!(trace.matching(local, "rebuilt the endpoint").is_empty());
+            }
+            if case == Case::Supervised {
+                // The watch the supervised node's listener exits on
+                // (`open_udp_transport`), recording the exit.
+                let restart = gateway_quic_restart(
+                    true,
+                    true,
+                    false,
+                    outbound.quic_availability(),
+                    None,
+                    std::time::SystemTime::now(),
+                );
+                let exit = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    listener_liveness(listener, restart, |_| true),
+                )
+                .await
+                .expect("the listener exits");
+                assert!(matches!(exit, ListenerExit::QuicEndpointDown), "{exit:?}");
+            } else {
+                assert!(
+                    !listener.is_finished(),
+                    "{case:?}: the listener keeps running"
+                );
+                listener.abort();
+            }
+        }
+        crate::transport::in_memory_socket::clear_quic_endpoint_clocks(network);
+    })
+}
+
+/// Bind a rebuilding listener (rebuild on through the trace) with upgrades,
+/// on `network`/`port`; the handler, the listener task, the monitor and the
+/// trace.
+async fn rebuilding_listener(
+    network: &'static str,
+    port: u16,
+    time: &VirtualTime,
+) -> (
+    crate::transport::connection_handler::OutboundConnectionHandler<DemuxSocket<SimulationSocket>>,
+    tokio::task::JoinHandle<crate::transport::TransportError>,
+    crate::node::background_task_monitor::BackgroundTaskMonitor,
+    Registration,
+    Registration,
+) {
+    use crate::node::background_task_monitor::BackgroundTaskMonitor;
+    use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
+    use crate::transport::quic::breaker::BreakerOutcome;
+    use crate::transport::quic::upgrade::policy::QuicPolicyConfig;
+    let clock = Registration::time_source(network, time.clone());
+    let trace = crate::transport::in_memory_socket::quic_upgrade_trace(network);
+    let net = crate::transport::test_net::subnet();
+    let local = net.addr_port(1, port);
+    let registered = Registration::address(local, network);
+    trace.rebuild_endpoint(local);
+    let monitor = BackgroundTaskMonitor::new();
+    let mut config: crate::config::NetworkApiConfig = toml::from_str("").expect("default config");
+    config.transport_quic = Some("shadow".to_string());
+    let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
+        crate::transport::TransportKeypair::new(),
+        local.ip(),
+        port,
+        false,
+        UdpTransportConfig {
+            quic: Some(settings()),
+            quic_policy: Some(QuicPolicyConfig::new(&config, BreakerOutcome::NotConsulted)),
+            task_registrar: Some(monitor.late_registrar()),
+            ..UdpTransportConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    (outbound, listener, monitor, clock, registered)
+}
+
+/// Move the clock in 100 ms steps until the node's view reads `Up`; panics
+/// after ten virtual minutes.
+async fn advance_until_up(time: &VirtualTime, availability: QuicAvailabilityWatch) {
+    for _ in 0..6_000u64 {
+        time.advance(Duration::from_millis(100));
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        if availability.get() == QuicAvailability::Up {
+            return;
+        }
+    }
+    panic!("the endpoint was not rebuilt");
+}
+
+/// Two consecutive rebuilds carry the node's path permits over: a permit
+/// taken before the first death is still held, and counted, on the endpoint
+/// the second rebuild built, whose cap is the same one.
+#[test]
+fn consecutive_rebuilds_keep_one_path_permit_cap() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let (outbound, listener, _monitor, _clock, _registered) =
+            rebuilding_listener("quic-rebuild-permits", 5010, &time).await;
+        let permits = outbound.current_quic_permits().expect("upgrades");
+        let limit = permits.limit();
+        let held = permits.try_acquire().expect("a permit");
+        let mut availability = outbound.quic_availability();
+        let mut previous = outbound.current_quic_endpoint().expect("an endpoint");
+        for round in 1..=2 {
+            previous.fail_driver();
+            tokio::time::timeout(Duration::from_secs(30), availability.not_up())
+                .await
+                .expect("the death is reported");
+            advance_until_up(&time, availability.clone()).await;
+            let current = outbound.current_quic_endpoint().expect("an endpoint");
+            assert!(
+                !current.same_endpoint(&previous),
+                "round {round}: a new endpoint"
+            );
+            let now = outbound.current_quic_permits().expect("upgrades");
+            assert_eq!(now.limit(), limit, "round {round}");
+            assert_eq!(now.in_use(), 1, "round {round}: the permit carried over");
+            previous = current;
+        }
+        drop(held);
+        let now = outbound.current_quic_permits().expect("upgrades");
+        assert_eq!(now.in_use(), 0, "released through the shared count");
+        listener.abort();
+    })
+}
+
+/// A real panic in quinn's endpoint driver (the lock poisoned, as in #6184)
+/// on a node that rebuilds: the node's monitor does not see the node fail
+/// (the rebuild loop owns the accept loop and router), and a new endpoint is
+/// built. A task that panics on the poisoned lock just before `Down` is the
+/// loop's unit test (`a_task_ending_as_the_endpoint_dies_is_the_death`) and
+/// the accept loop's own parking.
+#[test]
+fn a_quinn_driver_panic_on_a_rebuilding_node_is_rebuilt_from() {
+    in_child(
+        "a_quinn_driver_panic_on_a_rebuilding_node_is_rebuilt_from",
+        || {
+            bounded(|| async move {
+                let _seed = GlobalRng::seed_guard(SEED);
+                let time = VirtualTime::new();
+                let (outbound, listener, monitor, _clock, _registered) =
+                    rebuilding_listener("quic-rebuild-panic", 5011, &time).await;
+                let first = outbound.current_quic_endpoint().expect("an endpoint");
+                let mut availability = outbound.quic_availability();
+                first.faults().panic_receive_in_quinn();
+                let seen = tokio::time::timeout(Duration::from_secs(30), availability.not_up())
+                    .await
+                    .expect("the panic is reported");
+                assert_eq!(seen, QuicAvailability::Down);
+                advance_until_up(&time, availability.clone()).await;
+                let current = outbound.current_quic_endpoint().expect("an endpoint");
+                assert!(!current.same_endpoint(&first), "a new endpoint");
+                assert_eq!(current.availability().get(), QuicAvailability::Up);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), monitor.wait_for_any_exit())
+                        .await
+                        .is_err(),
+                    "the node's monitor saw no failure"
+                );
+                assert!(!listener.is_finished());
+                listener.abort();
+            });
+        },
+    );
+}
+
 /// When the node opens the transport with an endpoint, the endpoint's
 /// accept loop is started and registered through the node's late
 /// registrar, so the monitor, already waiting by then, watches it. Without

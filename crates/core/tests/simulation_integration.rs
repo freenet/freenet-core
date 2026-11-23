@@ -22853,6 +22853,52 @@ fn test_quic_replacement_session_upgrades_after_the_backoff() {
     );
 }
 
+/// #6272: the gateway's endpoint dies at 30 s, after its path to the node is up.
+/// A gateway that rebuilds its endpoint (as one with no supervisor does once
+/// rebuilding is on) builds a new one about a second later, and when the node
+/// restarts at 41 s its new session is offered and upgraded over the new
+/// endpoint. Without the rebuild the same run carries no path after the death.
+#[test_log::test]
+fn test_quic_rebuilt_endpoint_carries_a_new_path() {
+    const FAIL_AT: Duration = Duration::from_secs(30);
+    for rebuild in [true, false] {
+        let (trace, gateway, replaced_at) = run_quic_restart_sim_with(
+            &format!("quic-endpoint-rebuilt-{rebuild}"),
+            0x6272_E5B0_0001,
+            None,
+            Duration::from_secs(240),
+            |trace, gateway| {
+                trace.fail_endpoint_at(gateway, FAIL_AT);
+                if rebuild {
+                    trace.rebuild_endpoint(gateway);
+                }
+            },
+        );
+        let dump = format!("{:#?}", trace.records());
+        let established = trace.matching(gateway, "Established");
+        let failed = trace.matching(gateway, "failed the endpoint at ");
+        assert_eq!(failed.len(), 1, "the endpoint failed once: {dump}");
+        assert!(
+            established.iter().any(|e| e.at < failed[0].at),
+            "a path was up before the death: {dump}"
+        );
+        assert!(
+            !trace.matching(gateway, "Fallback(EndpointDown)").is_empty(),
+            "the death closed it: {dump}"
+        );
+        let rebuilt = trace.matching(gateway, "rebuilt the endpoint at ");
+        let after = established.iter().filter(|e| e.at > replaced_at).count();
+        if rebuild {
+            assert_eq!(rebuilt.len(), 1, "one rebuild: {dump}");
+            assert!(rebuilt[0].at < replaced_at, "{dump}");
+            assert!(after >= 1, "a new path over the rebuilt endpoint: {dump}");
+        } else {
+            assert!(rebuilt.is_empty(), "{dump}");
+            assert_eq!(after, 0, "no path once the endpoint is dead: {dump}");
+        }
+    }
+}
+
 /// One gateway and one node in shadow, with the path up by 40 s: the node crashes
 /// and restarts with its identity, and the run goes on for `then`. `quiet_from`
 /// stops QUIC datagrams between them. Returns the trace, the gateway's address and
@@ -22862,6 +22908,18 @@ fn run_quic_restart_sim(
     seed: u64,
     quiet_from: Option<Duration>,
     then: Duration,
+) -> (freenet::dev_tool::QuicUpgradeTrace, SocketAddr, Duration) {
+    run_quic_restart_sim_with(name, seed, quiet_from, then, |_, _| {})
+}
+
+/// [`run_quic_restart_sim`], with `set_up` given the trace and the gateway's
+/// address before the nodes start.
+fn run_quic_restart_sim_with(
+    name: &str,
+    seed: u64,
+    quiet_from: Option<Duration>,
+    then: Duration,
+    set_up: impl FnOnce(&freenet::dev_tool::QuicUpgradeTrace, SocketAddr),
 ) -> (freenet::dev_tool::QuicUpgradeTrace, SocketAddr, Duration) {
     setup_deterministic_state(seed);
     freenet::config::SimulationIdleTimeout::enable();
@@ -22882,6 +22940,7 @@ fn run_quic_restart_sim(
         if let Some(from) = quiet_from {
             sim.drop_quic_datagrams_between(&gateway, &node, from);
         }
+        set_up(&trace, labels[&gateway]);
         let time = sim.virtual_time().clone();
         let driver = tokio::spawn(async move {
             let start = tokio::time::Instant::now();
@@ -23769,6 +23828,99 @@ fn test_quic_native_gateway_join_dead_before_a_frame_goes_legacy_next() {
     assert!(connected);
 }
 
+/// 10.2 item 2: one node whose native path is broken (every QUIC datagram to
+/// and from it dropped, UDP working) collects a strike on every native setup
+/// UDP then rescues, and demotes its ACCEPTOR role after three with distinct
+/// joiners. The node offers nothing native as joiner
+/// (`with_node_native_joiner_off`), standing in for the node this streak is
+/// for: one that rarely joins (a gateway, a peer at its target). A node that
+/// joins natively demotes its joiner role on its own rescues first, which
+/// would hide the acceptor streak. Every other pair keeps native.
+///
+/// This pins the path from a rescue to the acceptor demotion end to end. That
+/// a demoted acceptor then decides `Udp` is pinned by
+/// `a_demoted_acceptor_decides_udp_through_the_relay_env` (connect driver
+/// tests): in a 10-node run the mesh has settled by the time a rescue-driven
+/// demotion lands (it waits for the UDP fallback), so no request reaches the
+/// node afterwards to decide. Fails closed: the broken node must have decided
+/// native at least 3 times before it demoted, and other pairs must still form
+/// native connections.
+#[test_log::test]
+fn test_quic_native_broken_acceptor_demotes_on_rescues() {
+    use freenet::dev_tool::NodeLabel;
+    const SEED: u64 = 0x0059_40A5_00F1;
+    const THRESHOLD: usize = 3;
+    let name = "native-broken-acceptor";
+    // The third node by label (the first regular node after the two
+    // gateways): on this seed it is the busiest acceptor of a healthy run,
+    // so with its path broken it meets enough distinct joiners to demote.
+    let broken_index = 2;
+    let mut broken = None;
+    let run = run_native_connect_sim(name, SEED, 200, |sim| {
+        sim.with_native_connect(100);
+        let mut labels: Vec<(NodeLabel, std::net::SocketAddr)> = sim
+            .all_node_addresses()
+            .iter()
+            .map(|(l, a)| (l.clone(), *a))
+            .collect();
+        labels.sort();
+        let (label, addr) = labels[broken_index].clone();
+        assert!(!label.is_gateway(), "premise: a regular node");
+        broken = Some(addr);
+        sim.with_node_native_joiner_off(&label);
+        for (other, _) in &labels {
+            if *other != label {
+                sim.drop_quic_datagrams_between(&label, other, Duration::ZERO);
+            }
+        }
+    });
+    log_native_connect(name, &run);
+    let broken = broken.expect("premise: the broken node was chosen");
+    let t = &run.wire.trace;
+    let decisions = t.decisions();
+    let demoted_at = t
+        .acceptor_demotions()
+        .iter()
+        .filter(|(own, _)| *own == broken)
+        .map(|(_, seq)| *seq)
+        .min();
+    let before = decisions
+        .iter()
+        .filter(|(own, seq, native, _)| {
+            *own == broken && *native && demoted_at.is_none_or(|at| *seq < at)
+        })
+        .count();
+    // (order, native, in the slice) for each decision after the demotion.
+    let after: Vec<(u64, bool, bool)> = decisions
+        .iter()
+        .filter(|(own, seq, _, _)| *own == broken && demoted_at.is_some_and(|at| *seq > at))
+        .map(|(_, seq, native, in_slice)| (*seq, *native, *in_slice))
+        .collect();
+    tracing::info!(%broken, before, ?after, ?demoted_at, "broken acceptor run");
+    assert!(
+        before >= THRESHOLD,
+        "premise: the broken node decided native at least {THRESHOLD} times before demoting ({before})"
+    );
+    assert!(
+        demoted_at.is_some(),
+        "the broken node demoted its acceptor role"
+    );
+    // Not decisive here (in this run no request reaches the node after its
+    // demotion, so `after` is usually empty); kept as a guard should one do
+    // so. The decisive check is the RelayEnv test named in the doc comment.
+    assert!(
+        after.iter().all(|(_, native, _)| !native),
+        "the broken node decided native after its acceptor role demoted: {after:?}"
+    );
+    assert!(
+        t.native_established() > 0,
+        "premise: pairs without the broken node still connect natively"
+    );
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined");
+    assert!(connected);
+}
+
 /// Behind each NAT filtering class, native connections form between peers
 /// (the setup's punches open both NATs), carry messages, and every node
 /// joins. Fails closed: native connections must have formed, and the
@@ -24232,6 +24384,64 @@ fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
         }
     });
     log_native_connect(name, &run);
+    // 10.2 item 2: no port-restricted node (nor a gateway) demotes its
+    // acceptor role, though half the regular nodes are symmetric and every
+    // native setup with one fails. UDP fails on those pairs too, so they are
+    // no rescue and no strike. Counting every path failure (the rule before
+    // rescue-only strikes) demoted port-restricted nodes here.
+    let healthy_demoted: Vec<_> = run
+        .wire
+        .trace
+        .acceptor_demotions()
+        .into_iter()
+        .filter(|(own, _)| !symmetric_ips.contains(&own.ip()))
+        .collect();
+    assert_eq!(
+        healthy_demoted,
+        Vec::<(SocketAddr, u64)>::new(),
+        "port-restricted acceptors demoted by joiners whose native setups fail"
+    );
+    // The same for the joiner role: native setups with symmetric peers fail,
+    // and UDP to them fails too, so no joiner takes a strike either.
+    assert!(
+        run.wire.trace.native_failed() > 0,
+        "premise: native setups failed"
+    );
+    assert_eq!(
+        run.wire.trace.native_demotions(),
+        0,
+        "joiners demoted by native failures UDP did not rescue"
+    );
+    // Premise: some port-restricted node failed native setups with three
+    // distinct symmetric peers, enough to demote it if those counted.
+    let gateway_ips_early: std::collections::BTreeSet<_> =
+        run.gateways.iter().map(|a| a.ip()).collect();
+    let mut symmetric_partners: std::collections::BTreeMap<
+        std::net::IpAddr,
+        std::collections::BTreeSet<std::net::IpAddr>,
+    > = Default::default();
+    for (a, b) in run.wire.trace.native_failed_pairs() {
+        for (own, other) in [(a, b), (b, a)] {
+            if !symmetric_ips.contains(&own.ip())
+                && !gateway_ips_early.contains(&own.ip())
+                && symmetric_ips.contains(&other.ip())
+            {
+                symmetric_partners
+                    .entry(own.ip())
+                    .or_default()
+                    .insert(other.ip());
+            }
+        }
+    }
+    let most = symmetric_partners
+        .values()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        most >= 3,
+        "premise: a port-restricted node failed native setups with 3 symmetric peers ({most})"
+    );
     // Counted from this run's own wire trace, for both sides: the
     // process-wide transport counters are shared with every other sim in a
     // plain `cargo test` process, so they cannot be compared with one run.
@@ -25377,5 +25587,45 @@ fn test_verify_soon_large_state_escalates_to_a_stream() {
         "versions: {:?} {:?}",
         o.versions(),
         o.obs
+    );
+}
+
+/// A simulation's node data dirs live under a root private to this process,
+/// not directly in the shared temp dir. With the shared `/tmp/freenet-{id}`
+/// path, a concurrent run of the same test could delete this run's dirs or
+/// leave files this run then loaded: a node loaded the other process's
+/// persisted peer cache, its bootstrap changed, and a fixed-seed run of
+/// `test_quic_native_blocked_pairs_connect_over_udp_behind_nats` took a
+/// different path and failed on a busy machine.
+#[test]
+fn simulation_data_dirs_are_private_to_this_process() {
+    const NAME: &str = "tmp-isolation-probe";
+    let tmp = std::env::temp_dir();
+    let dir_name = format!("freenet-{NAME}-gateway-0");
+    // Only a run of this test from before the fix could have left it.
+    let shared = tmp.join(&dir_name);
+    let _cleanup = std::fs::remove_dir_all(&shared);
+
+    let rt = create_runtime();
+    let _sim = rt.block_on(SimNetwork::new(NAME, 1, 1, 7, 3, 10, 2, 0x7E57_0001));
+
+    assert!(
+        !shared.exists(),
+        "the gateway's data dir is in the shared temp dir: {}",
+        shared.display()
+    );
+    let own_root = format!("freenet-test-{}", std::process::id());
+    let private = std::fs::read_dir(&tmp)
+        .expect("read the temp dir")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == own_root || name.starts_with(&format!("{own_root}-"))
+        })
+        .any(|root| root.path().join(&dir_name).is_dir());
+    assert!(
+        private,
+        "the gateway's data dir is not under this process's root {own_root}"
     );
 }

@@ -3923,17 +3923,95 @@ where
             contract,
         },
     };
-    let payload_bytes = match bincode::serialize(&payload) {
-        Ok(b) => b,
+    // The length, without allocating, so a response the budget refuses is
+    // never serialized.
+    let payload_len = match bincode::serialized_size(&payload) {
+        Ok(len) => len,
         Err(e) => {
             return Err(OpError::NotificationChannelError(format!(
-                "Failed to serialize GET relay forward payload: {e}"
+                "Failed to size GET relay forward payload: {e}"
             )));
         }
     };
 
-    if crate::operations::should_use_streaming(op_manager.streaming_threshold, payload_bytes.len())
+    if crate::operations::should_use_streaming(op_manager.streaming_threshold, payload_len as usize)
     {
+        // The relay dedup gate bounds requests, not queued response bytes.
+        // Charge this response to the recipient's source and to the node
+        // BEFORE the header goes out; concurrent streams of the same response
+        // share one serialized copy. The charge lives as long as the transport
+        // holds the bytes. A refusal is an `Err`, which `drive_relay_get` answers
+        // upstream with NotFound, so the requester moves on to its next peer.
+        // A response the budget has no room for is refused on its length
+        // alone, before the state is hashed.
+        if let Err(refusal) = op_manager.outbound_payload_budget.precheck(
+            upstream_addr,
+            key,
+            includes_contract,
+            payload_len,
+        ) {
+            tracing::debug!(
+                tx = %tx,
+                contract = %key,
+                target = %upstream_addr,
+                total_size = payload_len,
+                reason = %refusal,
+                "GET relay: response refused by the outbound payload budget"
+            );
+            return Err(OpError::NotificationChannelError(format!(
+                "GET response of {payload_len} bytes for {key} to {upstream_addr} \
+                 refused: {refusal}"
+            )));
+        }
+        // The state's hash names the serialized copy that concurrent streams
+        // of this response share. Only an admitted streamed response needs it.
+        let state_hash: [u8; 32] = payload
+            .value
+            .state
+            .as_ref()
+            .map(|state| blake3::hash(state.as_ref()).into())
+            .unwrap_or([0; 32]);
+        let shared_key = crate::node::outbound_budget::SharedPayloadKey {
+            contract: key,
+            state_hash,
+            includes_contract,
+        };
+        let payload_bytes = match op_manager.outbound_payload_budget.try_reserve_shared(
+            upstream_addr,
+            shared_key,
+            payload_len,
+            || bincode::serialize(&payload),
+        ) {
+            Ok(bytes) => bytes,
+            Err(crate::node::outbound_budget::SharedReserveError::Refused(refusal)) => {
+                // Debug: the driver logs the returned error at warn already.
+                tracing::debug!(
+                    tx = %tx,
+                    contract = %key,
+                    target = %upstream_addr,
+                    total_size = payload_len,
+                    reason = %refusal,
+                    "GET relay: response refused by the outbound payload budget"
+                );
+                return Err(OpError::NotificationChannelError(format!(
+                    "GET response of {payload_len} bytes for {key} to {upstream_addr} \
+                     refused: {refusal}"
+                )));
+            }
+            Err(crate::node::outbound_budget::SharedReserveError::Serialize(e)) => {
+                return Err(OpError::NotificationChannelError(format!(
+                    "Failed to serialize GET relay forward payload: {e}"
+                )));
+            }
+            Err(crate::node::outbound_budget::SharedReserveError::LengthMismatch {
+                charged,
+                produced,
+            }) => {
+                return Err(OpError::NotificationChannelError(format!(
+                    "GET relay payload serialized to {produced} bytes, charged {charged}"
+                )));
+            }
+        };
         let sid = StreamId::next();
         tracing::info!(
             tx = %tx,
@@ -3981,12 +4059,7 @@ where
             .await
             .map_err(|_| OpError::NotificationError)?;
         conn_manager
-            .send_stream(
-                upstream_addr,
-                sid,
-                bytes::Bytes::from(payload_bytes),
-                embedded,
-            )
+            .send_stream(upstream_addr, sid, payload_bytes, embedded)
             .await
             .map_err(|e| {
                 OpError::NotificationChannelError(format!("get relay send_stream failed: {e}"))
@@ -8083,9 +8156,37 @@ mod tests {
              metadata header on the streaming branch (#4307)."
         );
         assert!(
-            body.contains("conn_manager") && body.contains("send_stream"),
+            body.contains("conn_manager") && body.contains(".send_stream("),
             "`relay_send_found` must call `conn_manager.send_stream(..)` to \
              push raw fragments on the streaming branch (#4307)."
+        );
+        // The response is charged before anything is sent, and refused on its
+        // length before the state is hashed.
+        // Search the code only: comment text cannot satisfy these.
+        let code: String = body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let precheck = code.find("outbound_payload_budget.precheck(");
+        let hash = code.find("blake3::hash(");
+        let reserve = code.find("try_reserve_shared(");
+        let header = code.find("GetMsg::ResponseStreaming {");
+        let send = code.find(".send_stream(");
+        assert!(
+            precheck.is_some() && hash.is_some() && reserve.is_some(),
+            "`relay_send_found` must precheck, hash and reserve against the outbound \
+             payload budget"
+        );
+        assert!(
+            precheck < hash && hash < reserve,
+            "`relay_send_found` must refuse on length (`precheck`) before hashing \
+             the state, and reserve after"
+        );
+        assert!(
+            reserve < header && header < send,
+            "`relay_send_found` must charge the response before the \
+             `ResponseStreaming` header goes out, and send the stream after it"
         );
     }
 
@@ -13324,5 +13425,209 @@ mod relay_overload_tests {
             crate::operations::relay_admission::telemetry_counts().1 > before,
             "the overload NotFound is counted"
         );
+    }
+}
+
+/// `relay_send_found` charges every response it streams to
+/// the node's outbound payload budget before the header goes out, and
+/// concurrent streams of one response share one serialized copy.
+#[cfg(test)]
+mod outbound_budget_relay_tests {
+    use super::*;
+    use crate::node::OpExecutionPayload;
+    use crate::operations::route_attempt::driver_test_support::op_manager_with_peers;
+    use crate::operations::test_utils::{MockNetworkBridge, make_contract_key};
+
+    /// Above the 64 KiB streaming threshold.
+    const STATE_LEN: usize = 100_000;
+
+    fn upstream(host: u8, port: u16) -> SocketAddr {
+        SocketAddr::from(([10, 9, 0, host], port))
+    }
+
+    /// Streaming headers the driver handed to the event loop, by target.
+    fn headers(rx: &mut tokio::sync::mpsc::Receiver<OpExecutionPayload>) -> Vec<SocketAddr> {
+        let mut out = Vec::new();
+        while let Ok((_, msg, target)) = rx.try_recv() {
+            if matches!(
+                msg,
+                NetMessage::V1(crate::message::NetMessageV1::Get(
+                    GetMsg::ResponseStreaming { .. }
+                ))
+            ) {
+                out.push(target.expect("a wire-bound header"));
+            }
+        }
+        out
+    }
+
+    async fn send(
+        op_manager: &OpManager,
+        bridge: &MockNetworkBridge,
+        to: SocketAddr,
+        seed: u8,
+    ) -> Result<(), OpError> {
+        let key = make_contract_key(seed);
+        relay_send_found(
+            op_manager,
+            bridge,
+            Transaction::new::<GetMsg>(),
+            *key.id(),
+            to,
+            key,
+            WrappedState::new(vec![seed; STATE_LEN]),
+            None,
+            1,
+        )
+        .await
+    }
+
+    /// A response over the source's cap is refused BEFORE its header is sent:
+    /// a header with no stream behind it would leave the upstream waiting.
+    #[tokio::test]
+    async fn a_refused_response_sends_nothing() {
+        let (op_manager, mut rx, _peers, _guards) =
+            op_manager_with_peers("get-budget-refuse", 1).await;
+        // P fits one response, not two.
+        op_manager
+            .outbound_payload_budget
+            .set_caps_for_test(64 * STATE_LEN as u64, 3 * STATE_LEN as u64 / 2);
+        let bridge = MockNetworkBridge::new();
+        let to = upstream(1, 1000);
+        send(&op_manager, &bridge, to, 1).await.expect("first fits");
+        assert_eq!(headers(&mut rx), vec![to]);
+        assert_eq!(bridge.sent_streams().len(), 1);
+
+        // A different contract, another port on the same host: same source.
+        let refused = send(&op_manager, &bridge, upstream(1, 2000), 2).await;
+        assert!(refused.is_err(), "over the source's cap");
+        assert!(
+            headers(&mut rx).is_empty(),
+            "no header for a refused response"
+        );
+        assert_eq!(bridge.sent_streams().len(), 1, "no stream either");
+        assert_eq!(op_manager.outbound_payload_budget.refused_totals().0, 1);
+    }
+
+    /// Two sources that each fill their share do not lock a third out.
+    #[tokio::test]
+    async fn two_saturated_sources_leave_a_third_served() {
+        let (op_manager, mut rx, _peers, _guards) =
+            op_manager_with_peers("get-budget-three", 1).await;
+        let len = STATE_LEN as u64;
+        // P holds two responses; G holds nine.
+        op_manager
+            .outbound_payload_budget
+            .set_caps_for_test(9 * len, 5 * len / 2);
+        let bridge = MockNetworkBridge::new();
+        for host in 1..=2u8 {
+            let mut served = 0;
+            for seed in 0..10u8 {
+                let to = upstream(host, 1000 + u16::from(seed));
+                if send(&op_manager, &bridge, to, 10 * host + seed)
+                    .await
+                    .is_ok()
+                {
+                    served += 1;
+                }
+            }
+            assert_eq!(served, 2, "source {host} is held to its cap");
+        }
+        send(&op_manager, &bridge, upstream(3, 1), 99)
+            .await
+            .expect("a third source is still served");
+        assert_eq!(headers(&mut rx).len(), 5);
+    }
+
+    /// The bound must not break legitimate large GETs: with the budget a
+    /// typical 8 GiB host gets (G = 512 MiB, P = 128 MiB), a contract at
+    /// MAX_STATE_SIZE is served to several peers at once, and a second
+    /// largest contract to a peer that already holds one.
+    #[tokio::test]
+    async fn a_largest_state_get_is_served_to_several_peers_at_once() {
+        let (op_manager, mut rx, _peers, _guards) =
+            op_manager_with_peers("get-budget-large", 1).await;
+        let max = crate::wasm_runtime::MAX_STATE_SIZE;
+        op_manager
+            .outbound_payload_budget
+            .set_caps_for_test(512 * 1024 * 1024, 128 * 1024 * 1024);
+        let bridge = MockNetworkBridge::new();
+        let key = make_contract_key(5);
+        let mut targets = Vec::new();
+        for host in 1..=4u8 {
+            let to = upstream(host, 1000);
+            relay_send_found(
+                &op_manager,
+                &bridge,
+                Transaction::new::<GetMsg>(),
+                *key.id(),
+                to,
+                key,
+                WrappedState::new(vec![5; max]),
+                None,
+                1,
+            )
+            .await
+            .expect("a largest-state response is served");
+            targets.push(to);
+        }
+        // Another contract of the largest size to a peer already holding one.
+        let key2 = make_contract_key(6);
+        relay_send_found(
+            &op_manager,
+            &bridge,
+            Transaction::new::<GetMsg>(),
+            *key2.id(),
+            upstream(1, 2000),
+            key2,
+            WrappedState::new(vec![6; max]),
+            None,
+            1,
+        )
+        .await
+        .expect("a second largest state to a source holding one is served");
+        assert_eq!(headers(&mut rx).len(), 5);
+        assert_eq!(bridge.sent_streams().len(), 5);
+        assert_eq!(op_manager.outbound_payload_budget.refused_totals(), (0, 0));
+        // Four streams of one copy plus the other contract's copy.
+        assert!(op_manager.outbound_payload_budget.node_total() <= 2 * (max as u64 + 4096));
+    }
+
+    /// Concurrent GETs for one contract to different peers share one
+    /// serialized copy: the node is charged once and both streams carry the
+    /// same bytes. The charge goes when the transport drops them.
+    #[tokio::test]
+    async fn concurrent_streams_share_one_copy() {
+        let (op_manager, _rx, _peers, _guards) = op_manager_with_peers("get-budget-share", 1).await;
+        let budget = op_manager.outbound_payload_budget.clone();
+        let bridge = MockNetworkBridge::new();
+        send(&op_manager, &bridge, upstream(1, 1), 5).await.unwrap();
+        send(&op_manager, &bridge, upstream(2, 1), 5).await.unwrap();
+        let streams = bridge.sent_streams();
+        assert_eq!(streams.len(), 2);
+        assert_eq!(streams[0].2.as_ptr(), streams[1].2.as_ptr(), "one copy");
+        let len = streams[0].2.len() as u64;
+        let key = make_contract_key(5);
+        let shared = crate::node::outbound_budget::SharedPayloadKey {
+            contract: key,
+            state_hash: blake3::hash(&[5u8; STATE_LEN]).into(),
+            includes_contract: false,
+        };
+        assert_eq!(budget.shared_strong_count(&shared), 2);
+        assert_eq!(budget.node_total(), len, "counted once");
+        assert_eq!(
+            budget.charged_to(upstream(1, 9)),
+            len,
+            "each source per stream"
+        );
+        assert_eq!(budget.charged_to(upstream(2, 9)), len);
+        // The bytes decode as the response the upstream expects.
+        let decoded: GetStreamingPayload = bincode::deserialize(&streams[0].2).unwrap();
+        assert_eq!(decoded.key, key);
+        drop(streams);
+        bridge.clear();
+        assert_eq!(budget.node_total(), 0, "released with the last reference");
+        assert_eq!(budget.charged_to(upstream(1, 9)), 0);
+        assert_eq!(budget.shared_entries(), 0);
     }
 }

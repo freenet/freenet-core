@@ -3105,6 +3105,18 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.connect_native_demotions),
             );
             m.insert(
+                "connect_native_acceptor_demotions".into(),
+                serde_json::json!(snapshot.connect_native_acceptor_demotions),
+            );
+            m.insert(
+                "connect_native_admission_refused".into(),
+                serde_json::json!(snapshot.connect_native_admission_refused),
+            );
+            m.insert(
+                "connect_native_admission_control_dropped".into(),
+                serde_json::json!(snapshot.connect_native_admission_control_dropped),
+            );
+            m.insert(
                 "connect_native_rescued_by_udp_joiner".into(),
                 serde_json::json!(snapshot.connect_native_rescued_by_udp_joiner),
             );

@@ -368,6 +368,14 @@ impl QuicPolicy {
         }
     }
 
+    /// This policy, counting its paths against `permits` (another policy's)
+    /// instead of its own: an endpoint built in place of a dead one
+    /// (`quic::rebuild`) keeps the node's one cap.
+    pub(crate) fn sharing_permits(mut self, permits: QuicPathPermits) -> Self {
+        self.permits = permits;
+        self
+    }
+
     /// The most QUIC-native setups the node runs at once:
     /// `setup::NATIVE_SETUPS_MAX`, lowered to the node's connection limit
     /// (`NetworkApiConfig::connection_limit`).

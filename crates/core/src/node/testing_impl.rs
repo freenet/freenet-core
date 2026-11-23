@@ -2417,6 +2417,17 @@ impl SimNetwork {
         self
     }
 
+    /// Makes the node `label` never offer QUIC-native as joiner while it
+    /// still decides as acceptor, standing in for a node that rarely joins
+    /// (a gateway, a peer at its target). Its joiner role then never
+    /// demotes, so its acceptor role's own demotion shows. Call before the
+    /// simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_node_native_joiner_off(&mut self, label: &NodeLabel) -> &mut Self {
+        self.node_config_mut(label).native_joiner_off = true;
+        self
+    }
+
     /// Makes the node `label` decode the QUIC-native connect variants as a
     /// release below their floor does: such a message fails to decode and the
     /// connection is closed. It also never sends them. Pair it with

@@ -1172,6 +1172,16 @@ pub struct TransportMetrics {
     /// failures with distinct peers (`connect::native::NativeDemotion`)
     /// (reset each snapshot).
     connect_native_demotions: AtomicU64,
+    /// Times this node stopped deciding QUIC-native as acceptor after its
+    /// native setups failed with distinct joiners (reset each snapshot).
+    connect_native_acceptor_demotions: AtomicU64,
+    /// Native setups this node did not admit as acceptor, deciding UDP
+    /// instead (`connect::native::NativeSetupAdmission`) (reset each
+    /// snapshot).
+    connect_native_admission_refused: AtomicU64,
+    /// Control pairs this node left out of the connect arms as acceptor
+    /// because it had no room for a native setup (reset each snapshot).
+    connect_native_admission_control_dropped: AtomicU64,
     /// A UDP dial that followed a failed native setup connected, by the side
     /// this node had in the CONNECT (reset each snapshot).
     connect_native_rescued_by_udp_joiner: AtomicU64,
@@ -1604,6 +1614,19 @@ thread_local! {
     pub(crate) static CONNECT_ARM_ON_THIS_THREAD: std::cell::Cell<[u64; ConnectArmCounter::COUNT]> =
         const { std::cell::Cell::new([0; ConnectArmCounter::COUNT]) };
 
+    /// Test-only: control pairs dropped for lack of setup room on this thread.
+    pub(crate) static NATIVE_CONTROL_DROPPED_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Test-only: native setups not admitted as acceptor on this thread.
+    pub(crate) static NATIVE_ADMISSIONS_REFUSED_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Test-only: acceptor-role demotions recorded on this thread, so a test
+    /// can see its own increment of the process-wide counter.
+    pub(crate) static ACCEPTOR_DEMOTIONS_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
     /// Test-only: native setups rescued by UDP on this thread, as joiner and
     /// as acceptor, for the same reason.
     pub(crate) static NATIVE_RESCUES_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
@@ -1726,6 +1749,9 @@ impl TransportMetrics {
             connect_native_decision_native_unsupported: AtomicU64::new(0),
             connect_native_decision_over_cap: AtomicU64::new(0),
             connect_native_demotions: AtomicU64::new(0),
+            connect_native_acceptor_demotions: AtomicU64::new(0),
+            connect_native_admission_refused: AtomicU64::new(0),
+            connect_native_admission_control_dropped: AtomicU64::new(0),
             connect_native_rescued_by_udp_joiner: AtomicU64::new(0),
             connect_native_rescued_by_udp_acceptor: AtomicU64::new(0),
             connect_native_fallback_connected_joiner: AtomicU64::new(0),
@@ -2242,8 +2268,8 @@ impl TransportMetrics {
     }
 
     /// Record the QUIC endpoint's state. [`QuicEndpointState::Died`] is final
-    /// for the process: an endpoint that died is never rebuilt, so nothing
-    /// set after it replaces it.
+    /// for the process: nothing set after it replaces it, except a rebuilt
+    /// endpoint ([`Self::record_quic_endpoint_rebuilt`]).
     pub(crate) fn set_quic_endpoint_state(&self, state: QuicEndpointState) {
         let died = QuicEndpointState::Died as u8;
         // An `Err` is a death already recorded, which stays.
@@ -2252,6 +2278,17 @@ impl TransportMetrics {
                 (current != died).then_some(state as u8)
             })
             .ok();
+    }
+
+    /// The node built a new QUIC endpoint in place of one that died
+    /// (`quic::rebuild`): the state is `Up` again, replacing `Died`, unless
+    /// the new endpoint already died (`still_up` false): its death is then
+    /// the state.
+    pub(crate) fn record_quic_endpoint_rebuilt(&self, still_up: bool) {
+        if still_up {
+            self.quic_endpoint_state
+                .store(QuicEndpointState::Up as u8, Ordering::Relaxed);
+        }
     }
 
     /// The QUIC endpoint's state as last recorded.
@@ -2359,6 +2396,32 @@ impl TransportMetrics {
     pub(crate) fn record_connect_native_demotion(&self) {
         self.connect_native_demotions
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// This node, as acceptor, left a control pair out of the connect arms:
+    /// it had no room for a native setup, as a treated pair would have been
+    /// refused.
+    pub(crate) fn record_connect_native_control_dropped(&self) {
+        self.connect_native_admission_control_dropped
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_CONTROL_DROPPED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    }
+
+    /// This node did not admit a native setup as acceptor and decided UDP.
+    pub(crate) fn record_connect_native_admission_refused(&self) {
+        self.connect_native_admission_refused
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_ADMISSIONS_REFUSED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    }
+
+    /// This node stopped deciding QUIC-native as acceptor.
+    pub(crate) fn record_connect_native_acceptor_demotion(&self) {
+        self.connect_native_acceptor_demotions
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        ACCEPTOR_DEMOTIONS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     }
 
     /// A `Native` response was dropped unanswered: the CONNECT had already
@@ -3388,6 +3451,11 @@ impl TransportMetrics {
             ),
             connect_native_decision_over_cap: get64(&self.connect_native_decision_over_cap),
             connect_native_demotions: get64(&self.connect_native_demotions),
+            connect_native_acceptor_demotions: get64(&self.connect_native_acceptor_demotions),
+            connect_native_admission_refused: get64(&self.connect_native_admission_refused),
+            connect_native_admission_control_dropped: get64(
+                &self.connect_native_admission_control_dropped,
+            ),
             connect_native_rescued_by_udp_joiner: get64(&self.connect_native_rescued_by_udp_joiner),
             connect_native_rescued_by_udp_acceptor: get64(
                 &self.connect_native_rescued_by_udp_acceptor,
@@ -3917,7 +3985,9 @@ pub(crate) enum QuicEndpointState {
     /// The crash-loop breaker keeps QUIC off for this run.
     OffBreaker = 6,
     /// The endpoint died while the node held it: its driver ended, or its
-    /// socket adapter caught a panic (`quic::liveness`). Final.
+    /// socket adapter caught a panic (`quic::liveness`). Final, unless the
+    /// node rebuilds its endpoint (`quic::rebuild`, dark until the UDP
+    /// removal), which records `Up` again.
     Died = 7,
 }
 
@@ -4119,6 +4189,12 @@ pub struct TransportSnapshot {
     pub connect_native_decision_over_cap: u64,
     /// Times the node turned its own native connects off after failures.
     pub connect_native_demotions: u64,
+    /// Times the node stopped deciding native as acceptor after failures.
+    pub connect_native_acceptor_demotions: u64,
+    /// Native setups not admitted as acceptor (decided UDP instead).
+    pub connect_native_admission_refused: u64,
+    /// Control pairs left out of the arms for lack of setup room.
+    pub connect_native_admission_control_dropped: u64,
     /// UDP dials that connected after a native setup that failed on the
     /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
@@ -4584,6 +4660,9 @@ impl TransportSnapshot {
             connect_native_decision_native_unsupported,
             connect_native_decision_over_cap,
             connect_native_demotions,
+            connect_native_acceptor_demotions,
+            connect_native_admission_refused,
+            connect_native_admission_control_dropped,
             connect_native_rescued_by_udp_joiner,
             connect_native_rescued_by_udp_acceptor,
             connect_native_fallback_connected_joiner,
@@ -4766,6 +4845,9 @@ impl TransportSnapshot {
             connect_native_decision_native_unsupported;
         self.connect_native_decision_over_cap = connect_native_decision_over_cap;
         self.connect_native_demotions = connect_native_demotions;
+        self.connect_native_acceptor_demotions = connect_native_acceptor_demotions;
+        self.connect_native_admission_refused = connect_native_admission_refused;
+        self.connect_native_admission_control_dropped = connect_native_admission_control_dropped;
         self.connect_native_rescued_by_udp_joiner = connect_native_rescued_by_udp_joiner;
         self.connect_native_rescued_by_udp_acceptor = connect_native_rescued_by_udp_acceptor;
         self.connect_native_fallback_connected_joiner = connect_native_fallback_connected_joiner;
@@ -5018,6 +5100,12 @@ struct SnapshotExtras {
     pub connect_native_decision_over_cap: u64,
     /// Times the node turned its own native connects off after failures.
     pub connect_native_demotions: u64,
+    /// Times the node stopped deciding native as acceptor after failures.
+    pub connect_native_acceptor_demotions: u64,
+    /// Native setups not admitted as acceptor (decided UDP instead).
+    pub connect_native_admission_refused: u64,
+    /// Control pairs left out of the arms for lack of setup room.
+    pub connect_native_admission_control_dropped: u64,
     /// UDP dials that connected after a native setup that failed on the
     /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
@@ -5298,6 +5386,9 @@ impl SnapshotExtras {
             || self.connect_native_decision_native_unsupported != 0
             || self.connect_native_decision_over_cap != 0
             || self.connect_native_demotions != 0
+            || self.connect_native_acceptor_demotions != 0
+            || self.connect_native_admission_refused != 0
+            || self.connect_native_admission_control_dropped != 0
             || self.connect_native_rescued_by_udp_joiner != 0
             || self.connect_native_rescued_by_udp_acceptor != 0
             || self.connect_native_fallback_connected_joiner != 0
@@ -6526,6 +6617,19 @@ mod tests {
         assert_eq!(snap.quic_endpoint, "died", "the state is not reset");
     }
 
+    /// A rebuilt endpoint makes the state `Up` again, except one that
+    /// already died: its death stays the state.
+    #[test]
+    fn a_rebuilt_endpoint_replaces_died_only_while_it_is_up() {
+        let metrics = TransportMetrics::new();
+        metrics.record_quic_endpoint_down("127.0.0.1:1".parse().unwrap());
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Died);
+        metrics.record_quic_endpoint_rebuilt(false);
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Died);
+        metrics.record_quic_endpoint_rebuilt(true);
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Up);
+    }
+
     /// Every endpoint state has its own label and survives the round trip
     /// through the atomic.
     #[test]
@@ -6689,6 +6793,54 @@ mod tests {
             |m, slot, remote| m.record_connect_native_setup(NativeSetupOutcome::ALL[slot], remote),
             |snap| snap.connect_native_setup,
         );
+    }
+
+    /// The two admission counters (treated refusals, control drops) are each
+    /// activity, reach the snapshot and its JSON under their own keys, and
+    /// reset with the snapshot.
+    #[test]
+    fn native_admission_counters_count_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.record_connect_native_admission_refused();
+        metrics.record_connect_native_control_dropped();
+        metrics.record_connect_native_control_dropped();
+        let snap = metrics.take_snapshot().expect("activity");
+        assert_eq!(snap.connect_native_admission_refused, 1);
+        assert_eq!(snap.connect_native_admission_control_dropped, 2);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["connect_native_admission_control_dropped"], 2);
+        assert!(metrics.take_snapshot().is_none(), "both reset");
+    }
+
+    /// Each demotion counter (joiner role, acceptor role) is activity on its
+    /// own, reaches the snapshot and its JSON under its own key, leaves the
+    /// other at 0, and resets with the snapshot.
+    #[test]
+    fn native_demotion_counters_count_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.record_connect_native_demotion();
+        let snap = metrics.take_snapshot().expect("a demotion is activity");
+        assert_eq!(snap.connect_native_demotions, 1);
+        assert_eq!(snap.connect_native_acceptor_demotions, 0);
+        assert!(metrics.take_snapshot().is_none(), "the count resets");
+        metrics.record_connect_native_acceptor_demotion();
+        metrics.record_connect_native_acceptor_demotion();
+        let snap = metrics
+            .take_snapshot()
+            .expect("an acceptor demotion is activity");
+        assert_eq!(snap.connect_native_acceptor_demotions, 2);
+        assert_eq!(snap.connect_native_demotions, 0);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["connect_native_acceptor_demotions"], 2);
+        assert!(metrics.take_snapshot().is_none(), "the count resets");
     }
 
     #[test]
@@ -7999,6 +8151,9 @@ mod tests {
             "connect_native_decision_native_unsupported",
             "connect_native_decision_over_cap",
             "connect_native_demotions",
+            "connect_native_acceptor_demotions",
+            "connect_native_admission_refused",
+            "connect_native_admission_control_dropped",
             "connect_native_rescued_by_udp_joiner",
             "connect_native_rescued_by_udp_acceptor",
             "connect_native_fallback_connected_joiner",

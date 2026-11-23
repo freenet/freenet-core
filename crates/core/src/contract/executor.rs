@@ -2840,6 +2840,45 @@ mod tests {
                 "per-record length cap on a native app grant's display name, in a table \
                  bounded at MAX_NATIVE_GRANTS (64) rows; not a cache budget",
             ),
+            // Outbound GET responses in flight (`node::outbound_budget`). A
+            // node-wide bound on transfer memory, released as each stream
+            // ends, NOT a cache. A recorded exception, not summed here and
+            // not in `declared_caches_plus_hosting_budget_leave_room_for_the_runtime`
+            // either: it is transient send memory held only while a response
+            // is being sent, so the budget caps a worst case rather than
+            // adding to a committed total, and its floor, which keeps a
+            // multi-megabyte web app servable, does not fit the headroom of
+            // the smallest hosts those two tests cover. Same kind of
+            // exception as inbound reassembly (`MAX_STREAM_TOTAL_BYTES`
+            // below). The hosting budget is its own share of the memory limit
+            // and is not derived from this sum, so leaving this out does not
+            // enlarge it. The oversize slot sits outside the budget by design
+            // (`OVERSIZE_RESPONSE_MAX_BYTES`).
+            (
+                "outbound_payload_budget_for",
+                "node-wide bound on outbound GET responses in flight; transfer memory \
+                 released as streams end, not a cache (see comment)",
+            ),
+            (
+                "for_memory_limit",
+                "OutboundPayloadBudget constructor: outbound_payload_budget_for, see above",
+            ),
+            (
+                "OVERSIZE_RESPONSE_MAX_BYTES",
+                "size limit of the one oversize slot beside outbound_payload_budget_for, see above",
+            ),
+            (
+                "OUTBOUND_PAYLOAD_BUDGET_MIN_BYTES",
+                "clamp inside outbound_payload_budget_for",
+            ),
+            (
+                "OUTBOUND_PAYLOAD_BUDGET_MAX_BYTES",
+                "clamp inside outbound_payload_budget_for",
+            ),
+            (
+                "OUTBOUND_PAYLOAD_FALLBACK_TOTAL_RAM_BYTES",
+                "RAM fallback for outbound_payload_budget_for",
+            ),
             // Functions.
             ("disk_budget_for", "DISK, not resident memory"),
             (
