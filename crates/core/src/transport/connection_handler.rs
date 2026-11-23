@@ -9994,6 +9994,7 @@ mod native_dial_unavailable_tests {
             quic_availability: super::super::quic::QuicAvailabilityWatch::disabled(),
             upgrade_site: Default::default(),
             quic_endpoint: None,
+            quic_stack: std::sync::Weak::new(),
         };
         let dial = super::super::NativeDial {
             addr,
