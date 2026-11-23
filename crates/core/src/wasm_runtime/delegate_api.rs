@@ -748,6 +748,93 @@ mod tests {
         // and the window before it did was the #4813 flake.
     }
 
+    /// Creating a delegate that is already registered returns the same key and
+    /// leaves its inherited origins and creation count unchanged.
+    #[tokio::test]
+    async fn test_create_delegate_existing_keeps_origin() {
+        let mut env_holder = TestEnv::new().await;
+        let origins = env_holder.inherited_origins.clone();
+        let counter = env_holder.created_delegates_count.clone();
+        let first = ContractInstanceId::new([1u8; 32]);
+        let second = ContractInstanceId::new([2u8; 32]);
+        let wasm = minimal_delegate_wasm();
+        let (cipher, nonce) = ([0u8; 32], [0u8; 24]);
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let key = unsafe { env_holder.make_env_with_attestations(vec![first]) }
+            .create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .unwrap();
+        assert_eq!(counter.count(), 1);
+
+        // SAFETY: as above
+        let again = unsafe { env_holder.make_env_with_attestations(vec![second]) }
+            .create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .unwrap();
+        assert_eq!(again, key, "same key is returned");
+        assert_eq!(origins.get(&key).unwrap().value().origins, vec![first]);
+        assert_eq!(counter.count(), 1, "no second creation is counted");
+    }
+
+    /// With no inherited-origins entry (after a restart or expiry), creating an
+    /// already-registered delegate does not add one.
+    #[tokio::test]
+    async fn test_create_delegate_existing_without_entry_stays_without() {
+        let mut env_holder = TestEnv::new().await;
+        let origins = env_holder.inherited_origins.clone();
+        let wasm = minimal_delegate_wasm();
+        let (cipher, nonce) = ([0u8; 32], [0u8; 24]);
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let key = unsafe { env_holder.make_env() }
+            .create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .unwrap();
+        assert!(origins.get(&key).is_none());
+
+        // SAFETY: as above
+        let again = unsafe {
+            env_holder.make_env_with_attestations(vec![ContractInstanceId::new([2u8; 32])])
+        }
+        .create_delegate_sync(&wasm, &[1], cipher, nonce)
+        .unwrap();
+        assert_eq!(again, key);
+        assert!(origins.get(&key).is_none(), "no entry may be added");
+    }
+
+    /// Repeated creates of one key count toward the per-call limit but hold a
+    /// single node-wide slot.
+    #[tokio::test]
+    async fn test_create_delegate_existing_counts_per_call_only() {
+        let mut env_holder = TestEnv::new().await;
+        let counter = env_holder.created_delegates_count.clone();
+        let wasm = minimal_delegate_wasm();
+        let (cipher, nonce) = ([0u8; 32], [0u8; 24]);
+
+        // SAFETY: env_holder is alive for the duration of this test
+        let env = unsafe { env_holder.make_env() };
+        env.create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .unwrap();
+        env.create_delegate_sync(&wasm, &[1], cipher, nonce)
+            .unwrap();
+        assert_eq!(env.creations_this_call.get(), 2);
+        assert_eq!(counter.count(), 1);
+
+        // Looping on the existing key succeeds until the per-call limit
+        // (two creations are already counted), then is refused.
+        let limit = crate::contract::MAX_DELEGATE_CREATIONS_PER_CALL;
+        for i in 2..limit + 2 {
+            let result = env.create_delegate_sync(&wasm, &[1], cipher, nonce);
+            if i < limit {
+                assert!(result.is_ok(), "call {i} is within the limit");
+            } else {
+                assert!(
+                    matches!(result, Err(DelegateCreateError::CreationsExceeded)),
+                    "call {i} is over the limit"
+                );
+            }
+        }
+        assert_eq!(counter.count(), 1, "the node-wide count is unchanged");
+    }
+
     /// Child created by non-attested parent gets no attestation entry, but
     /// still counts toward the per-node limit.
     ///

@@ -542,6 +542,9 @@ pub(crate) fn prune_expired_contexts(cache: &DelegateContextCache) {
 /// `created_at` cap drops the entry at a fixed age regardless, so an always-busy
 /// entry can't be refreshed forever.
 ///
+/// An already-registered child is never given an entry by `create_delegate`,
+/// so after a restart or expiry it stays without one.
+///
 /// Dropping an entry never loses identity: secrets live in the SecretsStore
 /// keyed by delegate key (not here) and the DEK is re-derived from the node KEK.
 /// `tokio::time::Instant` mirrors [`DelegateContextEntry`].
@@ -1492,7 +1495,8 @@ impl DelegateCallEnv {
     /// Create a new delegate synchronously during process() execution.
     ///
     /// Validates resource limits, constructs a DelegateContainer from the raw WASM bytes,
-    /// registers it in the delegate store and secret store, and records creator attestation.
+    /// registers it in the delegate store and secret store, and records creator
+    /// attestation for a newly created delegate.
     ///
     /// Note: WASM bytes are stored as-is. Validation is deferred to execution time
     /// (when the delegate is actually invoked). Depth tracking is per-call only — child
@@ -1506,6 +1510,12 @@ impl DelegateCallEnv {
     ///   delegate's DEK from the node KEK; it is not key material and any
     ///   value works. See `SecretsStore::register_delegate`.
     /// * `nonce_bytes` - 24-byte field, discarded for the same reason.
+    ///
+    /// If the delegate is already registered, its key is returned and its
+    /// inherited origins are left unchanged, whether or not an entry exists.
+    /// After a restart or TTL expiry an already-registered child therefore has
+    /// no inherited origin, and tokenless callers resolve to no origin, as
+    /// after the idle TTL. The call counts toward the per-call creation limit.
     ///
     /// # Returns
     /// The new delegate's `DelegateKey` on success, or a `DelegateCreateError`.
@@ -1581,6 +1591,24 @@ impl DelegateCallEnv {
         let container = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate));
 
         let child_key = container.key().clone();
+
+        // An already-registered delegate is left exactly as it is: return its
+        // key without registering again or touching its inherited origins.
+        // The call still counts toward the per-call creation limit, so a guest
+        // cannot loop on existing keys, but not toward the node-wide count of
+        // created delegates, which holds one slot per delegate.
+        // Deliberately not insert-if-absent: a missing inherited-origins entry
+        // (after a restart or TTL expiry) cannot be told apart from "never
+        // created by this parent", so filling it in here would let any creator
+        // set the attribution of a delegate it did not create.
+        if self
+            .delegate_store_mut()
+            .fetch_delegate(&child_key, &params_owned)
+            .is_some()
+        {
+            self.creations_this_call.set(current + 1);
+            return Ok(child_key);
+        }
 
         // Build cipher and nonce
         let cipher = XChaCha20Poly1305::new((&cipher_bytes).into());
