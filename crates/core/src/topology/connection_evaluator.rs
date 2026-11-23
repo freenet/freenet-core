@@ -1,19 +1,28 @@
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::Instant;
 
 /// `ConnectionEvaluator` is used to evaluate connection scores within a specified time window.
 ///
 /// The evaluator records scores and determines whether a given score is better (higher) than
-/// any other scores within a predefined time window. A score is considered better if it's higher
-/// than all other scores in the time window, or if no scores were recorded within the window's
-/// duration.
+/// the other candidates' scores within a predefined time window. A score is considered better if
+/// it's higher than every other candidate's score in the time window, or if no other candidate
+/// was recorded within the window's duration.
 ///
 /// In the Freenet context, this will be used to titrate the rate of new connection requests accepted
 /// by a node. The node will only accept a new connection if the score of the connection is better
-/// than all other scores within the time window.
+/// than all other candidates' scores within the time window.
+///
+/// Each candidate (by address) holds at most one entry, its latest score. A
+/// candidate is compared only with the OTHER candidates' entries, and its
+/// retry replaces its own. Before this, a rejected candidate's score stayed in
+/// the window, and its retry, carrying the same score, could never be strictly
+/// greater than it: a joiner retrying one node every 25-30 s was refused there
+/// for as long as it kept retrying, with no other candidate involved.
 pub(super) struct ConnectionEvaluator {
-    scores: VecDeque<(Instant, f64)>,
+    /// Oldest first, at most one entry per candidate.
+    scores: VecDeque<(Instant, SocketAddr, f64)>,
     window_duration: Duration,
 }
 
@@ -25,24 +34,41 @@ impl ConnectionEvaluator {
         }
     }
 
-    pub fn record_only_with_current_time(&mut self, score: f64, current_time: Instant) {
+    pub fn record_only_with_current_time(
+        &mut self,
+        candidate: SocketAddr,
+        score: f64,
+        current_time: Instant,
+    ) {
         self.remove_outdated_scores(current_time);
-        self.scores.push_back((current_time, score));
+        // The new entry is the latest, so replacing at the back keeps the
+        // order `remove_outdated_scores` relies on.
+        self.scores.retain(|(_, addr, _)| *addr != candidate);
+        self.scores.push_back((current_time, candidate, score));
     }
 
-    pub fn record_and_eval_with_current_time(&mut self, score: f64, current_time: Instant) -> bool {
+    pub fn record_and_eval_with_current_time(
+        &mut self,
+        candidate: SocketAddr,
+        score: f64,
+        current_time: Instant,
+    ) -> bool {
         self.remove_outdated_scores(current_time);
 
-        let is_better = self.scores.is_empty() || self.scores.iter().all(|&(_, s)| score > s);
+        let is_better = self
+            .scores
+            .iter()
+            .filter(|(_, addr, _)| *addr != candidate)
+            .all(|&(_, _, s)| score > s);
 
         // Important to add new score *after* checking if it's better than all other scores
-        self.record_only_with_current_time(score, current_time);
+        self.record_only_with_current_time(candidate, score, current_time);
 
         is_better
     }
 
     fn remove_outdated_scores(&mut self, current_time: Instant) {
-        while let Some(&(time, _)) = self.scores.front() {
+        while let Some(&(time, _, _)) = self.scores.front() {
             if current_time.duration_since(time) > self.window_duration {
                 self.scores.pop_front();
             } else {
@@ -56,14 +82,18 @@ impl ConnectionEvaluator {
 mod tests {
     use super::*;
 
+    fn peer(n: u16) -> SocketAddr {
+        SocketAddr::from(([10, 0, 0, 1], n))
+    }
+
     #[test]
     fn test_record_first_score() {
         let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(10));
         let current_time = Instant::now();
-        assert!(evaluator.record_and_eval_with_current_time(5.0, current_time));
+        assert!(evaluator.record_and_eval_with_current_time(peer(1), 5.0, current_time));
         // Assert evaluator.scores contains the new score
         assert_eq!(evaluator.scores.len(), 1);
-        assert_eq!(evaluator.scores[0].1, 5.0);
+        assert_eq!(evaluator.scores[0].2, 5.0);
         assert_eq!(evaluator.scores[0].0, current_time);
     }
 
@@ -72,10 +102,12 @@ mod tests {
         let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(10));
 
         let start_time = Instant::now();
-        evaluator.record_and_eval_with_current_time(5.0, start_time);
-        assert!(
-            !evaluator.record_and_eval_with_current_time(4.0, start_time + Duration::from_secs(5)),
-        );
+        evaluator.record_and_eval_with_current_time(peer(1), 5.0, start_time);
+        assert!(!evaluator.record_and_eval_with_current_time(
+            peer(2),
+            4.0,
+            start_time + Duration::from_secs(5)
+        ));
     }
 
     #[test]
@@ -83,10 +115,12 @@ mod tests {
         let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(10));
 
         let start_time = Instant::now();
-        evaluator.record_and_eval_with_current_time(5.0, start_time);
-        assert!(
-            evaluator.record_and_eval_with_current_time(4.0, start_time + Duration::from_secs(11)),
-        );
+        evaluator.record_and_eval_with_current_time(peer(1), 5.0, start_time);
+        assert!(evaluator.record_and_eval_with_current_time(
+            peer(2),
+            4.0,
+            start_time + Duration::from_secs(11)
+        ));
     }
 
     #[test]
@@ -94,9 +128,17 @@ mod tests {
         let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(10));
 
         let start_time = Instant::now();
-        evaluator.record_and_eval_with_current_time(5.0, start_time);
-        evaluator.record_and_eval_with_current_time(6.0, start_time + Duration::from_secs(5));
-        evaluator.record_and_eval_with_current_time(4.5, start_time + Duration::from_secs(11));
+        evaluator.record_and_eval_with_current_time(peer(1), 5.0, start_time);
+        evaluator.record_and_eval_with_current_time(
+            peer(2),
+            6.0,
+            start_time + Duration::from_secs(5),
+        );
+        evaluator.record_and_eval_with_current_time(
+            peer(3),
+            4.5,
+            start_time + Duration::from_secs(11),
+        );
         assert_eq!(evaluator.scores.len(), 2);
     }
 
@@ -104,46 +146,124 @@ mod tests {
     fn test_empty_window_duration() {
         let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(0));
         let current_time = Instant::now();
-        assert!(evaluator.record_and_eval_with_current_time(5.0, current_time));
-        assert!(!evaluator.record_and_eval_with_current_time(4.0, current_time));
+        assert!(evaluator.record_and_eval_with_current_time(peer(1), 5.0, current_time));
+        assert!(!evaluator.record_and_eval_with_current_time(peer(2), 4.0, current_time));
     }
 
     #[test]
     fn test_multiple_scores_same_timestamp() {
         let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(10));
         let current_time = Instant::now();
-        evaluator.record_only_with_current_time(5.0, current_time);
-        evaluator.record_only_with_current_time(6.0, current_time);
+        evaluator.record_only_with_current_time(peer(1), 5.0, current_time);
+        evaluator.record_only_with_current_time(peer(2), 6.0, current_time);
         assert_eq!(evaluator.scores.len(), 2);
-        assert!(
-            !evaluator
-                .record_and_eval_with_current_time(4.0, current_time + Duration::from_secs(5)),
-        );
+        assert!(!evaluator.record_and_eval_with_current_time(
+            peer(3),
+            4.0,
+            current_time + Duration::from_secs(5)
+        ));
     }
 
     #[test]
     fn test_negative_scores() {
         let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(10));
         let start_time = Instant::now();
-        assert!(evaluator.record_and_eval_with_current_time(-5.0, start_time),);
-        assert!(
-            evaluator.record_and_eval_with_current_time(-4.0, start_time + Duration::from_secs(5)),
-        );
-        assert!(
-            !evaluator.record_and_eval_with_current_time(-6.0, start_time + Duration::from_secs(5)),
-        );
+        assert!(evaluator.record_and_eval_with_current_time(peer(1), -5.0, start_time));
+        assert!(evaluator.record_and_eval_with_current_time(
+            peer(2),
+            -4.0,
+            start_time + Duration::from_secs(5)
+        ));
+        assert!(!evaluator.record_and_eval_with_current_time(
+            peer(3),
+            -6.0,
+            start_time + Duration::from_secs(5)
+        ));
     }
 
     #[test]
     fn test_large_number_of_scores() {
         let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(10));
         let start_time = Instant::now();
-        for i in 0..1000 {
-            evaluator.record_only_with_current_time(i as f64, start_time + Duration::from_secs(i));
+        for i in 0..1000u16 {
+            evaluator.record_only_with_current_time(
+                peer(i),
+                i as f64,
+                start_time + Duration::from_secs(i as u64),
+            );
         }
+        assert!(evaluator.record_and_eval_with_current_time(
+            peer(1000),
+            1000.0,
+            start_time + Duration::from_secs(1001)
+        ));
+    }
+
+    /// The stranded-holder simulation: a joiner refused once retried the same
+    /// node every 25-30 s with the same score. Each retry was compared with its
+    /// own earlier entry, so it was refused for as long as it kept retrying,
+    /// with no other candidate in the window.
+    #[test]
+    fn a_retry_inside_the_window_is_not_refused_by_its_own_earlier_score() {
+        let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(60));
+        let start = Instant::now();
+        // Refused the first time: a better candidate is in the window.
+        evaluator.record_only_with_current_time(peer(1), 0.9, start);
+        assert!(!evaluator.record_and_eval_with_current_time(
+            peer(2),
+            0.5,
+            start + Duration::from_secs(30)
+        ));
+        // The better candidate's entry ages out at t=61; the joiner's own
+        // (t=30) is still inside the window when it retries at t=62.
         assert!(
-            evaluator
-                .record_and_eval_with_current_time(1000.0, start_time + Duration::from_secs(1001)),
+            evaluator.record_and_eval_with_current_time(
+                peer(2),
+                0.5,
+                start + Duration::from_secs(62)
+            ),
+            "the retry ties only with its own earlier score"
         );
+    }
+
+    #[test]
+    fn a_retry_is_still_compared_with_the_other_candidates() {
+        let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(60));
+        let start = Instant::now();
+        evaluator.record_and_eval_with_current_time(peer(2), 0.5, start);
+        evaluator.record_only_with_current_time(peer(1), 0.9, start + Duration::from_secs(10));
+        assert!(
+            !evaluator.record_and_eval_with_current_time(
+                peer(2),
+                0.5,
+                start + Duration::from_secs(20)
+            ),
+            "a better other candidate in the window still wins"
+        );
+    }
+
+    /// One entry per candidate: a retry replaces its earlier entry, so a
+    /// candidate retrying many times holds one slot, and its fresh timestamp
+    /// keeps the deque in order for `remove_outdated_scores`.
+    #[test]
+    fn a_retry_replaces_the_candidate_s_earlier_entry() {
+        let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(60));
+        let start = Instant::now();
+        evaluator.record_and_eval_with_current_time(peer(2), 0.5, start);
+        evaluator.record_only_with_current_time(peer(1), 0.9, start + Duration::from_secs(10));
+        for k in 2..6 {
+            evaluator.record_and_eval_with_current_time(
+                peer(2),
+                0.5,
+                start + Duration::from_secs(10 * k),
+            );
+        }
+        let entries: Vec<_> = evaluator.scores.iter().map(|(_, a, _)| *a).collect();
+        assert_eq!(entries, vec![peer(1), peer(2)], "oldest first, one each");
+        // peer(1)'s entry (t=10) ages out at t=71 although peer(2) kept
+        // retrying after it: the order held.
+        evaluator.record_only_with_current_time(peer(3), 0.1, start + Duration::from_secs(71));
+        let entries: Vec<_> = evaluator.scores.iter().map(|(_, a, _)| *a).collect();
+        assert_eq!(entries, vec![peer(2), peer(3)]);
     }
 }
