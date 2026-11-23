@@ -8877,11 +8877,8 @@ shutdown-drain-secs = 42
         );
     }
 
-    /// `host_address` is `gateways.toml`'s OTHER key with this history — the
-    /// legacy single-string address form, and what the node emits for
-    /// `Address::HostAddress`. Hyphenating the key their own file contains gave
-    /// operators `gateway address must specify one of ...` naming the key they
-    /// had just specified.
+    /// The `native` mark defaults to off, is written only when set, and
+    /// survives the cache round trip.
     #[test]
     fn gateways_toml_native_mark_defaults_off_and_round_trips() {
         // The published index today: no mark, so no gateway is native.
@@ -8911,6 +8908,11 @@ shutdown-drain-secs = 42
         assert_eq!(gateways.gateways.len(), 1);
     }
 
+    /// `host_address` is `gateways.toml`'s OTHER key with this history — the
+    /// legacy single-string address form, and what the node emits for
+    /// `Address::HostAddress`. Hyphenating the key their own file contains gave
+    /// operators `gateway address must specify one of ...` naming the key they
+    /// had just specified.
     #[test]
     fn gateways_toml_host_address_is_accepted_in_both_spellings() {
         for key in ["host_address", "host-address"] {

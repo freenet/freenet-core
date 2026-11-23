@@ -1182,7 +1182,7 @@ pub struct InitPeerNode {
     location: Location,
     /// The gateway index marks this gateway native (`GatewayConfig::native`).
     #[serde(default)]
-    native: bool,
+    pub(crate) native: bool,
 }
 
 impl InitPeerNode {
@@ -7743,6 +7743,33 @@ mod tests {
             .await
             .expect("a gateway with no resolvable bootstrap peer must still start");
         assert!(gateway.gateways.is_empty());
+    }
+
+    /// An `InitPeerNode` written before the `native` mark existed reads as
+    /// unmarked, and a marked one keeps its mark through a round trip.
+    #[test]
+    fn an_init_peer_node_without_a_native_key_reads_as_unmarked() {
+        let keypair = TransportKeypair::new();
+        let addr: SocketAddr = "192.0.2.1:31337".parse().unwrap();
+        let peer = PeerKeyLocation::new(keypair.public().clone(), addr);
+        let location = Location::from_address(&addr);
+        let marked = InitPeerNode::new(peer, location).with_native(true);
+
+        let mut older = serde_json::to_value(&marked).unwrap();
+        assert!(
+            older.as_object_mut().unwrap().remove("native").is_some(),
+            "premise: the mark is a key of its own"
+        );
+        let older: InitPeerNode = serde_json::from_value(older).unwrap();
+        assert_eq!(
+            older.native_addr(),
+            None,
+            "a record without the key is unmarked"
+        );
+
+        let again: InitPeerNode =
+            serde_json::from_value(serde_json::to_value(&marked).unwrap()).unwrap();
+        assert_eq!(again.native_addr(), Some(addr));
     }
 
     /// A gateway whose public key is unusable (wrong length, not hex, or the

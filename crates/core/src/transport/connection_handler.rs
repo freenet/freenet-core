@@ -1255,8 +1255,10 @@ impl<S: Socket> super::OutboundConnector for OutboundConnectionHandler<S> {
             let Some(upgrades) = upgrades else {
                 // A gateway join is counted by its caller, not here.
                 if !dial.join {
-                    super::TRANSPORT_METRICS
-                        .record_connect_native_setup(super::NativeSetupOutcome::Unavailable);
+                    super::TRANSPORT_METRICS.record_connect_native_setup(
+                        super::NativeSetupOutcome::Unavailable,
+                        dial.addr,
+                    );
                 }
                 return Err(super::NativeSetupOutcome::Unavailable);
             };
@@ -9321,5 +9323,54 @@ pub mod mock_transport {
                 Ok(())
             }
         }
+    }
+}
+
+/// A native dial on a transport with no QUIC upgrades is refused as
+/// `Unavailable`. A peer-to-peer dial counts as a native setup; a gateway join
+/// does not (its caller counts it), so the A+ pair comparison never sees it.
+#[cfg(test)]
+mod native_dial_unavailable_tests {
+    use super::*;
+    use crate::transport::OutboundConnector as _;
+
+    async fn unavailable_dial(addr: SocketAddr, join: bool) -> Vec<String> {
+        let (send_queue, _rx) = mpsc::channel(1);
+        let handler: OutboundConnectionHandler = OutboundConnectionHandler {
+            send_queue,
+            expected_non_gateway: Default::default(),
+            quic_availability: super::super::quic::QuicAvailabilityWatch::disabled(),
+            upgrade_site: Default::default(),
+            quic_endpoint: None,
+        };
+        let dial = super::super::NativeDial {
+            addr,
+            key: super::super::TransportKeypair::new().public().clone(),
+            is_gateway: join,
+            within: std::time::Duration::from_secs(8),
+            join,
+        };
+        let result = handler.connect_native(dial).await;
+        assert!(matches!(
+            result,
+            Err(super::super::NativeSetupOutcome::Unavailable)
+        ));
+        super::super::TRANSPORT_METRICS
+            .quic_events_of(addr)
+            .into_iter()
+            .filter(|event| event.starts_with("(\"setup\""))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_gateway_join_is_not_counted_as_a_native_setup() {
+        let peer_to_peer = unavailable_dial("203.0.113.71:4401".parse().unwrap(), false).await;
+        assert_eq!(
+            peer_to_peer,
+            ["(\"setup\", Unavailable)"],
+            "premise: a peer-to-peer dial is counted"
+        );
+        let join = unavailable_dial("203.0.113.72:4401".parse().unwrap(), true).await;
+        assert!(join.is_empty(), "a gateway join is not counted: {join:?}");
     }
 }

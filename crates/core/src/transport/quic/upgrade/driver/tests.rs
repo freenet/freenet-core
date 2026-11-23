@@ -2221,8 +2221,22 @@ fn a_native_setup_through_the_hub_gives_a_connection() {
             .await
             .expect("the client task");
         assert!(client.is_ok(), "{client:?}");
+        assert_eq!(
+            counted_setups(h.remote),
+            ["(\"setup\", Established)"],
+            "a peer-to-peer setup is counted as a native setup"
+        );
         router.abort();
     });
+}
+
+/// The native setups counted for `remote` (test builds keep them per remote).
+fn counted_setups(remote: SocketAddr) -> Vec<String> {
+    TRANSPORT_METRICS
+        .quic_events_of(remote)
+        .into_iter()
+        .filter(|event| event.starts_with("(\"setup\""))
+        .collect()
 }
 
 /// A gateway join through the hub (`NativeDial::join`): the hub's key is the
@@ -2274,6 +2288,9 @@ fn a_gateway_join_through_the_hub_dials_as_the_client() {
             .await
             .expect("the gateway task");
         assert_eq!(admitted, GatewayAdmission::Joined);
+        // The join is counted by the handshake driver, never as a native
+        // setup: the A+ pair comparison reads those.
+        assert_eq!(counted_setups(h.remote), Vec::<String>::new());
     });
 }
 

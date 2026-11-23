@@ -62,7 +62,7 @@ impl QuicUpgrades {
         // A gateway join is counted by the handshake driver, which also runs
         // its fallback; the peer-to-peer comparison reads this count only.
         if !dial.join {
-            TRANSPORT_METRICS.record_connect_native_setup(outcome);
+            TRANSPORT_METRICS.record_connect_native_setup(outcome, dial.addr);
         }
         result
     }
