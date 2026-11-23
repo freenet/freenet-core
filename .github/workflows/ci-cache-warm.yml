@@ -193,6 +193,7 @@ jobs:
     env:
       RUST_LOG: error
       RUST_MIN_STACK: 268435456
+      FREENET_GIT_IS_DIRTY: "1"
 
     steps:
       - uses: actions/checkout@v7

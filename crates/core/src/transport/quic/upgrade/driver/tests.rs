@@ -2657,3 +2657,42 @@ fn a_churned_fallback_keeps_the_label_its_fallback_had() {
         );
     });
 }
+
+/// The body of `quic::tests::attempts_queued_before_a_driver_panic_are_dropped`,
+/// which runs it in a child process because it panics inside quinn (#6184):
+/// an attempt queued for the attempt router before a panic in quinn's
+/// endpoint driver is dropped, not answered. With no session for its address
+/// the router would `ignore` it, which unwraps the poisoned endpoint lock and
+/// panics the monitored router.
+pub(in crate::transport) async fn route_attempts_queued_before_a_driver_panic() {
+    use crate::node::background_task_monitor::BackgroundTaskMonitor;
+    let h = Harness::server("driver-panic-queued-attempt").await;
+    let rig = RetryRig::of(&h);
+    let _permit = rig.ours.allow_peer(h.remote, &h.peer).expect("room");
+    let _dial = rig.dial();
+    let attempt = rig.next_attempt().await;
+    let (attempts, queued) = mpsc::channel(4);
+    attempts
+        .try_send(crate::transport::quic::EndpointAttempt::Allowed(attempt))
+        .unwrap_or_else(|_| panic!("queued"));
+    rig.ours.faults().panic_receive_in_quinn();
+    let mut availability = rig.ours.availability();
+    let state = drive(&rig.time, Duration::from_secs(1), async move {
+        availability.not_up().await
+    })
+    .await;
+    assert_eq!(state, QuicAvailability::Down);
+    let monitor = BackgroundTaskMonitor::new();
+    h.hub
+        .spawn_attempt_router(&monitor.late_registrar(), queued);
+    let failed = tokio::spawn(monitor.wait_for_any_exit());
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(attempts.capacity(), 4, "the router took the queued attempt");
+    assert!(
+        !failed.is_finished(),
+        "the router panicked on the queued attempt"
+    );
+    failed.abort();
+}

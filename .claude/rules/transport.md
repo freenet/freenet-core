@@ -158,11 +158,11 @@ pass took the datagram of a newer admission and cleared that admission as
 its own (2 to 37 of 3200 takes lost in
 an_admitted_take_is_not_lost_to_another_thread). A QUIC take is named too:
 QuicPoller::poll_ready hands its admission number to QuicSocket::try_send
-through a thread-local (quic/socket.rs HANDED_ADMISSION), relying on quinn
-0.11.12 calling poll_writable then try_send back to back on one thread
-(connection.rs:1048-1057; a quinn bump must re-check it,
+through a thread-local (quic/socket.rs HANDED_ADMISSION), relying on
+freenet-quinn 0.11.13 calling poll_writable then try_send back to back on one
+thread (connection.rs:1138-1145; a quinn bump must re-check it,
 a_poller_hands_its_admission_to_the_transmit_that_follows). quinn's
-endpoint respond (endpoint.rs:584) sends with no poll, finds no handoff and
+endpoint respond (endpoint.rs:606) sends with no poll, finds no handoff and
 leaves every admission alone. No take ever uses an admission it does not
 name. The queue holds a waker
 and a place, never bytes. So connections share the cap by their number of
@@ -2628,7 +2628,7 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
     the connection's shared flow control and send window (quinn-proto
     write_limit).
   → The division uses this node's MAX_UNI_STREAMS, not the limit the peer
-    advertised (quinn 0.11.12 does not expose it). A data path's peer starts
+    advertised (freenet-quinn 0.11.13 does not expose it). A data path's peer starts
     at DATA_START_UNI_STREAMS (16) and raises toward 64 only once its streams
     are all busy, so the sender keeps its 48 permits: capping it below the
     peer's limit would stop the raise. Until the peer has raised, the reserve
@@ -2788,14 +2788,18 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   Each locally reset stream leaves one Arc<Notify> in quinn's per-
   connection `stopped` map until the connection closes (quinn 0.11.12:
   stopped() registers it, and a local reset produces neither the Finished
-  nor the Stopped event that removes it). Bounded by the sends aborted on
+  nor the Stopped event that removes it; freenet-quinn 0.11.13 also removes
+  it when the stopped() future is dropped, so a reset stream whose waiter
+  was cancelled leaves none, measured 0 B, and only a waiter still alive
+  across the reset, such as an ack-wait task, keeps one). Bounded by the sends aborted on
   the connection: the path counts its own resets (a stop the peer sent,
   surfaced through a write or through stopped(), is not one; nor is a reset
   on a closed connection) and closes the connection past
   recycle::SEND_ABORT_LIMIT (4096) with close code SEND_ABORT_LIMIT (M6).
   The fixed charge per connection (config::QUIC_CONNECTION_CHARGE_BYTES,
   930 KiB) takes the map at that worst case, 4096 x QUIC_STOPPED_ENTRY_BYTES
-  (104 B, measured 88 B). Polling stopped() only after finish() would not
+  (104 B, an upper bound: 88 B with quinn 0.11.12, 0 B with
+  freenet-quinn). Polling stopped() only after finish() would not
   avoid the entries: a writer blocked on connection credit must still race
   stopped() (below), so the poll stays on every wait and the common resets
   register anyway.
@@ -3008,7 +3012,7 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
   one of this connection's (or held one since the previous sample;
   socket::CapHolds, one record per connection since #6128, handed to the
   poller quinn creates inside connect_with / accept_with by
-  socket::with_poller_holds, which relies on quinn 0.11.12 building that
+  socket::with_poller_holds, which relies on freenet-quinn 0.11.13 building that
   poller synchronously on the calling thread; a poller built elsewhere is
   counted per endpoint, CapHolds::fallback_pollers, and the path tests
   assert 0) no window runs on that path (pinned per connection by
@@ -3742,7 +3746,7 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     CONNECTION_CLOSE reaches any peer, and peers find out from their own
     idle timeout. Sending one would not work anyway: EndpointDriver::drop
     drops each connection's event channel, and a connection driver that
-    sees that ends with INTERNAL_ERROR before it transmits (quinn 0.11.12
+    sees that ends with INTERNAL_ERROR before it transmits (freenet-quinn 0.11.13
     ConnectionDriver::poll). Pinned by
     an_adapter_panic_ends_every_connection_and_counts_once.
   → On EVERY Down (a returned driver too) each connection's watcher closes
@@ -3767,8 +3771,19 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     respond() path (stateless reset, version negotiation, Retry, a close
     for a refused attempt), which calls try_send with no poll_writable
     (pinned by the_adapter_refuses_sends_after_a_panic_without_running).
-  → These claims depend on quinn 0.11.12 internals, so quinn is pinned
-    "=0.11.12" in crates/core/Cargo.toml; re-check them before bumping it.
+  → These claims depend on quinn internals, so quinn is pinned
+    `freenet-quinn = "=0.11.13"` (and `freenet-quinn-proto`, same version)
+    in crates/core/Cargo.toml; re-check them before bumping it. It is a
+    temporary fork of quinn's 0.11.x branch (freenet/quinn, branch
+    freenet-0.11.13, upstream a9ae122f) published only to carry
+    quinn-rs/quinn#2987, which upstream has merged and not released: switch
+    back to upstream `quinn` once it does. Re-checked against it for the
+    switch to the fork: the poller handoff (connection.rs:1138-1145),
+    `respond` (endpoint.rs:606), `ConnectionRef::new` building the poller
+    synchronously (connection.rs:1010; rebind 1187), `ConnectionRef::drop`
+    (connection.rs:1032), the INTERNAL_ERROR on a dropped event channel
+    (connection.rs:1196-1201), the spawn order and the driver poll are
+    unchanged; the destructors are the change (below).
   → A handshake in flight ends with an error that reads as EndpointDown,
     through quinn: an adapter panic in that connection's driver ends the
     driver with an error, and dropping it drops the second-to-last
@@ -3780,30 +3795,77 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
   → QUIC stays off until the node restarts. Also contained, per
     connection: a panic in the path's receive task (DOWNGRADE that
     connection, receive_task_panicked, not quic_adapter_panicked).
-  → NOT CONTAINED: a panic in quinn's own endpoint- or connection-driver
-    code, or in the node's runtime adapter that quinn calls under the same
+  → A panic in the node's runtime adapter that quinn calls under its state
     lock (QuicRuntime::now, QuicTimer::reset/poll and the TimeSource's
-    sleep_until; they have no error to return a panic as). quinn 0.11.12
-    polls each driver holding a std Mutex it locks with .lock().unwrap(),
-    so the panic poisons it, and quinn's destructors unwrap the poisoned
-    lock. quinn spawns the endpoint driver inside its own async block, the
-    unwind drops it there (before any catch around the spawned future),
-    and EndpointDriver::drop (endpoint.rs:403) then EndpointRef::drop
-    (:724) lock the poisoned mutex: always an abort, pinned by
-    a_panic_unwinding_through_the_endpoint_driver_still_aborts. SendStream,
-    RecvStream and the last Connection handle lock in Drop, so a
-    connection-driver panic can abort when another task drops one. The
-    fix is upstream in quinn (tolerate a poisoned lock in those
-    destructors, both :403 and :724 for the endpoint driver). Do not add
-    catch-and-leak machinery around quinn here: it cannot cover the
-    stream and connection destructors, which run in the node's own tasks.
+    sleep_until; they have no error to return a panic as, so they are not
+    wrapped) behaves as one in quinn's own code: see the next two items.
+  → A panic in quinn's own ENDPOINT- or CONNECTION-driver code is an
+    ENDPOINT DEATH, a controlled exit (#6184). quinn polls each driver
+    holding a std Mutex it locks with .lock().unwrap(), so the panic
+    poisons it. quinn spawns the endpoint driver inside its own async block
+    and the unwind drops it there, so EndpointDriver::drop (endpoint.rs:399)
+    and EndpointRef::drop (endpoint.rs:770) lock the poisoned mutex during
+    the unwind: they unwrapped it, which always aborted the process; since
+    quinn#2987 (freenet-quinn) they use unwrap_or_else(PoisonError::into_inner),
+    and the connection's destructors (SendStream, RecvStream, ConnectionRef,
+    ConnectionDriver, StoppedRegistration) skip a poisoned lock. The panic
+    reaches the driver's watcher (liveness::watch_endpoint_driver, or
+    watch_connection_driver from QuicRuntime::spawn), which catches it and
+    calls EndpointHealth::quinn_panicked: ERROR log, quic_endpoint_down,
+    endpoint Down, the adapter-panic flag and signal so every connection's
+    watcher closes locally; quic_adapter_panicked stays 0. From Down the
+    existing path takes over: a supervised node exits through
+    ListenerExit::QuicEndpointDown and is restarted, counted by the crash
+    breaker (ENDPOINT_DOWN_EXITS_TO_TRIP); an unsupervised one moves its QUIC
+    paths back to UDP. Pinned by
+    a_panic_unwinding_through_the_endpoint_driver_is_contained and
+    a_panic_in_a_quinn_connection_driver_drives_the_endpoint_down.
+  → The node does NOT wrap its calls into quinn, by decision: every review
+    round of a per-call containment (a catch around accept, a guarded
+    Incoming, a guarded connect, a catch in the closer) found a new panic
+    path in the added code. Every other quinn call that takes the poisoned
+    lock (accept, connect, local_addr, Incoming::ignore/retry/accept on the
+    endpoint; a read, write, reset or close on the connection) unwraps it
+    and panics in its caller. Instead the node stops making those calls
+    once the endpoint is not Up: connect checks refuses_connects first; the
+    accept loop's select is biased to the availability, so it never polls
+    accept again (EndpointDriver::drop wakes the pending accept during the
+    unwind, before the watcher reports Down); the attempt router DROPS an
+    attempt instead of answering it (Incoming::drop skips a poisoned lock;
+    attempts_queued_before_a_driver_panic_are_dropped). Nothing it runs
+    during an unwind calls quinn: Outgoing::drop skips the reset (also after
+    a reported quinn panic), and QuicCloser::close_inner sends a close made
+    during an unwind from a task, which covers QuicConnection::drop and a
+    session's EndOnExit::drop / QuicPathState::drop tearing its path down
+    (a_close_during_an_unwind_on_a_poisoned_connection_does_not_abort);
+    QuicConnection::drop leaves the close to the watcher after a report. It
+    does not skip closes on the endpoint-wide quinn_may_be_poisoned flag,
+    which would skip the watcher's close of sound connections. A reset or
+    close from a Drop during an unwind was a second panic, an abort: a send
+    blocked on flow control when its connection's driver panicked is polled
+    at its deadline, poll_write panics on the lock, and the unwind drops the
+    unfinished Outgoing (a_send_in_flight_on_a_poisoned_connection_does_not_abort).
+    A call that still reaches the lock (another worker polling accept in the
+    moment between quinn's panic and its watcher's report, a session or
+    native waiter acting on an attempt handed to it before the death, a
+    session whose path is on the poisoned connection tearing it down on Down
+    before the watcher's close, log noise in an unmonitored task)
+    panics in QUIC code, which breaker::short_runs::quic_attributed
+    attributes to QUIC (it recognises the freenet-quinn crate paths), so the
+    breaker turns QUIC off after the restart. If that panic kills a
+    monitored task on a node whose listener exits for an endpoint death,
+    the background monitor's arm in run_node exits as for the death
+    (liveness::driver_death_restart: 42, recorded once in the breaker
+    marker, not a crash to the post-update rollback). Do not add per-call
+    guards or catch-and-leak machinery around quinn here.
   → Telling them apart: a caught adapter panic leaves the process running
     (ERROR log, quic_adapter_panicked, quic_endpoint_down) and leaves no
     crash-loop breaker state, so QUIC comes back on the next start, and a
     deterministic fault recurs once per start. The exception is a
     supervised gateway, which records the death in the breaker marker and
-    exits (see above). A panic that is not
-    contained aborts the process. On a gateway on Linux or macOS the next start trips the
+    exits (see above). A caught panic in a quinn driver looks the same
+    (ERROR "A QUIC driver panicked inside quinn", quic_endpoint_down, no
+    quic_adapter_panicked). A panic that is not contained aborts the process. On a gateway on Linux or macOS the next start trips the
     breaker (quic_breaker_trips, see quic/breaker.rs): QUIC off for 15 min
     (doubling on repeat trips up to 4 h), and a supervised gateway restarts
     itself with exit 42 at the cooldown's end (breaker::quic_restore_at).

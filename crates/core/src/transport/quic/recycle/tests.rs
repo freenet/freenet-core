@@ -1286,14 +1286,16 @@ fn quinn_proto_from_metadata(manifest: &str) -> Result<std::path::PathBuf, Strin
 fn quinn_proto_from_registry() -> Result<std::path::PathBuf, String> {
     let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
         .map_err(|error| format!("read Cargo.lock: {error}"))?;
-    let marker = "name = \"quinn-proto\"\nversion = \"";
+    let marker = "name = \"freenet-quinn-proto\"\nversion = \"";
     let mut versions = lock.match_indices(marker).map(|(at, _)| {
         let rest = &lock[at + marker.len()..];
         rest[..rest.find('"').unwrap_or(0)].to_string()
     });
-    let version = versions.next().ok_or("quinn-proto is not in Cargo.lock")?;
+    let version = versions
+        .next()
+        .ok_or("freenet-quinn-proto is not in Cargo.lock")?;
     if versions.next().is_some() {
-        return Err("Cargo.lock holds more than one quinn-proto".to_string());
+        return Err("Cargo.lock holds more than one freenet-quinn-proto".to_string());
     }
     let cargo_home = std::env::var("CARGO_HOME")
         .or_else(|_| std::env::var("HOME").map(|home| format!("{home}/.cargo")))
@@ -1305,10 +1307,15 @@ fn quinn_proto_from_registry() -> Result<std::path::PathBuf, String> {
         .map(|index| {
             index
                 .path()
-                .join(format!("quinn-proto-{version}/src/congestion.rs"))
+                .join(format!("freenet-quinn-proto-{version}/src/congestion.rs"))
         })
         .find(|path| path.is_file())
-        .ok_or_else(|| format!("quinn-proto {version} is not under {}", registry.display()))
+        .ok_or_else(|| {
+            format!(
+                "freenet-quinn-proto {version} is not under {}",
+                registry.display()
+            )
+        })
 }
 
 /// Pin: `impl Controller for CappedCubic` implements every method of the

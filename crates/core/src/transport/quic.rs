@@ -494,7 +494,7 @@ impl EndpointCore {
 
     /// Connection pollers this endpoint's socket built outside
     /// `socket::with_poller_holds`: their cap holds go into a record nobody
-    /// reads. Expected 0 (quinn 0.11.12 builds one elsewhere only on a
+    /// reads. Expected 0 (freenet-quinn 0.11.13 builds one elsewhere only on a
     /// rebind, which needs migration, which is off).
     #[cfg(test)]
     pub(crate) fn fallback_pollers(&self) -> u64 {
@@ -777,8 +777,10 @@ impl QuicEndpoint {
     /// reads any end of a registered task as a node failure and an
     /// endpoint's end must not stop the node. Endpoint death is reported by
     /// the driver's watcher ([`Self::availability`]), not by this task. A
-    /// panic here is still a node failure, as for every monitored task; a
-    /// quinn panic is not contained (see `liveness`).
+    /// panic here is still a node failure, as for every monitored task,
+    /// including one from quinn's poisoned endpoint lock; the loop checks the
+    /// availability before every poll of quinn's `accept` so that a driver
+    /// panic, which turns it `Down`, stops the loop instead (see `liveness`).
     ///
     /// The registrar is a [`LateRegistrar`] because in `run_node` the
     /// monitor starts waiting before the event listener opens the transport,
@@ -815,9 +817,17 @@ impl QuicEndpoint {
         let full = self.owner.accept_queue_full.clone();
         let handle = GlobalExecutor::spawn(async move {
             loop {
+                // `biased`, availability first: once the endpoint is not Up,
+                // quinn's `accept` is never polled again. After a panic in
+                // quinn's endpoint driver its state lock is poisoned and
+                // `Accept::poll` unwraps it, and `EndpointDriver::drop` wakes
+                // this very future during that unwind (see `liveness`). Nothing can
+                // starve: the first arm ends the loop, so no per-iteration cap is
+                // needed, and dropping `accept_attempt()` is cancel-safe.
                 let incoming = tokio::select! {
-                    incoming = core.accept_attempt() => incoming,
+                    biased;
                     _ = availability.not_up() => None,
+                    incoming = core.accept_attempt() => incoming,
                 };
                 let Some(incoming) = incoming else { break };
                 match attempts.try_send(incoming) {
@@ -1388,7 +1398,7 @@ impl QuicIncoming {
     /// handshake (write readiness or send) ends the driver with an error,
     /// which skips quinn's own terminate. The handshake still ends: dropping
     /// the driver drops the second-to-last reference to the connection, and
-    /// quinn's `ConnectionRef::drop` (quinn 0.11.12, `connection.rs:946`)
+    /// quinn's `ConnectionRef::drop` (freenet-quinn 0.11.13, `connection.rs:1032`)
     /// then closes it implicitly, so this returns `LocallyClosed` (read as
     /// `EndpointDown` through `QuicEndpoint::error_kind`) and the permit
     /// goes with it. A panic anywhere else in the adapter (another
@@ -1543,6 +1553,13 @@ impl QuicConnection {
 
 impl Drop for QuicConnection {
     fn drop(&mut self) {
+        // #6184: after a panic in a quinn driver is reported, the
+        // connection's watcher closes it (see `new`), and its state lock may
+        // be poisoned. During an unwind `close_inner` moves the close to a
+        // task.
+        if self.closer.quinn_may_be_poisoned() {
+            return;
+        }
         self.closer.close(QuicCloseCode::NodeDroppedPeer);
     }
 }
@@ -1587,6 +1604,15 @@ pub(crate) struct QuicCloser {
 }
 
 impl QuicCloser {
+    /// Whether a panic in a quinn driver of this connection's endpoint was
+    /// reported (`EndpointHealth::quinn_panicked`, which also sets the
+    /// adapter-panic flag read here; after a socket-adapter panic this is
+    /// `true` too). The panic may have poisoned this connection's state
+    /// lock, which most quinn calls unwrap (#6184).
+    pub(crate) fn quinn_may_be_poisoned(&self) -> bool {
+        self.health.has_adapter_panicked()
+    }
+
     /// The connection's smoothed round trip, as quinn estimates it.
     pub(crate) fn rtt(&self) -> std::time::Duration {
         self.connection.rtt()
@@ -1617,6 +1643,9 @@ impl QuicCloser {
     /// one). That covers the
     /// close the connection's watcher makes on Down, and a close after a
     /// panic that left the endpoint Released.
+    ///
+    /// During an unwind the close is sent from a task (`close_inner`), and
+    /// `true` means only that this call took it.
     pub(crate) fn close(&self, code: QuicCloseCode) -> bool {
         self.close_with_reason(code, code.reason())
     }
@@ -1648,6 +1677,36 @@ impl QuicCloser {
         if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return false;
         }
+        // #6184: `close_reason` and `close` unwrap the connection's state
+        // lock, which a panic in a quinn driver may have poisoned. During an
+        // unwind (a `Drop` that tears a path down, such as a session's
+        // `EndOnExit`) a second panic would abort the process, so the close
+        // runs in a task of its own, where a panic ends only that task. Not
+        // skipped on `quinn_may_be_poisoned`: that flag is endpoint-wide, and
+        // the watcher's close of every sound connection goes through here.
+        // With no runtime the node is stopping, and nothing is closed.
+        if std::thread::panicking() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let (closer, reason) = (self.clone(), reason.to_vec());
+                // Intentionally detached and unmonitored: short-lived, and a
+                // panic in it ends only this task.
+                drop(GlobalExecutor::spawn(async move {
+                    closer.send_close(code, &reason, cause);
+                }));
+            }
+            return true;
+        }
+        self.send_close(code, reason, cause)
+    }
+
+    /// The part of [`Self::close_inner`] that calls quinn, once this closer
+    /// has taken the close.
+    fn send_close(
+        &self,
+        code: QuicCloseCode,
+        reason: &[u8],
+        cause: Option<crate::transport::boundary::QuicPathEnd>,
+    ) -> bool {
         if self.connection.close_reason().is_some() {
             return false;
         }

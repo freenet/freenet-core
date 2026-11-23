@@ -1126,6 +1126,16 @@ pub(crate) fn note_endpoint_down_exit(now: SystemTime) -> bool {
     false
 }
 
+/// [`note_endpoint_down_exit`] at most once per process, every later call
+/// returning the first answer. Two paths exit the node for one endpoint death
+/// (the listener's `QuicEndpointDown`, and a monitored task that a driver
+/// panic killed, `liveness::driver_death_restart`); whichever comes first
+/// records it, and the exit is counted once.
+pub(crate) fn note_endpoint_down_exit_once(now: SystemTime) -> bool {
+    static NOTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NOTED.get_or_init(|| note_endpoint_down_exit(now))
+}
+
 /// [`note_endpoint_down_exit`] with the armed marker `armed` (the static
 /// [`ARMED`] outside tests), the not-yet-written marker in `pending`, whether
 /// the breaker was `overridden`, and on Windows the marker as armed, to

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use quinn::{AsyncTimer, AsyncUdpSocket, Runtime};
 
 use super::breaker::QuicCode;
-use super::liveness::{EndpointHealth, watch_endpoint_driver};
+use super::liveness::{EndpointHealth, watch_connection_driver, watch_endpoint_driver};
 use crate::config::GlobalExecutor;
 use crate::simulation::TimeSource;
 
@@ -72,6 +72,8 @@ pub(crate) struct QuicRuntime<T> {
     clock: Arc<Clock<T>>,
     /// Taken by the first spawn, quinn's endpoint driver.
     endpoint_driver: parking_lot::Mutex<Option<Arc<EndpointHealth>>>,
+    /// Where a panic in a connection driver is reported.
+    health: Arc<EndpointHealth>,
 }
 
 impl<T: TimeSource> QuicRuntime<T> {
@@ -80,7 +82,8 @@ impl<T: TimeSource> QuicRuntime<T> {
     pub(crate) fn new(time: T, health: Arc<EndpointHealth>) -> Self {
         Self {
             clock: Arc::new(Clock::new(time)),
-            endpoint_driver: parking_lot::Mutex::new(Some(health)),
+            endpoint_driver: parking_lot::Mutex::new(Some(health.clone())),
+            health,
         }
     }
 }
@@ -115,7 +118,7 @@ impl<T: TimeSource> Runtime for QuicRuntime<T> {
                 GlobalExecutor::spawn(watch_endpoint_driver(future, health));
             }
             None => {
-                GlobalExecutor::spawn(future);
+                GlobalExecutor::spawn(watch_connection_driver(future, self.health.clone()));
             }
         }
     }

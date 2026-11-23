@@ -221,6 +221,58 @@ else
 fi
 ALL_INSTANCES=false
 
+# ── schedule_companion_restart (#6336) ───────────────────────────────
+# The companion gateway is restarted by freenet-gateway-stagger.service, queued
+# after a primary update (and again on the "already latest" path).
+SC="$TMP/sc"
+mkdir -p "$SC"
+cat > "$SC/systemctl" <<EOF
+#!/bin/bash
+case "\$1" in
+  list-unit-files) [[ -f "$SC/has-unit" ]] && echo "\$2 static"; exit 0 ;;
+  start) echo "\$*" >> "$SC/started"; [[ -f "$SC/start-fails" ]] && exit 1; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$SC/systemctl"
+sc_reset() { rm -f "$SC/has-unit" "$SC/started" "$SC/start-fails"; }
+sc_run() { ( PATH="$SC:$PATH"; SERVICE_NAME="${1:-freenet-gateway}"; ALL_INSTANCES="${2:-false}"; schedule_companion_restart >/dev/null 2>&1 ); }
+
+sc_reset; touch "$SC/has-unit"
+if sc_run && grep -q 'start --no-block freenet-gateway-stagger.service' "$SC/started" 2>/dev/null; then
+    pass "schedule_companion_restart: queues the stagger unit with --no-block"
+else
+    fail "schedule_companion_restart: should queue freenet-gateway-stagger.service"
+fi
+
+sc_reset
+if sc_run && [[ ! -e "$SC/started" ]]; then
+    pass "schedule_companion_restart: no stagger unit installed -> skipped, success"
+else
+    fail "schedule_companion_restart: must skip hosts without the stagger unit"
+fi
+
+sc_reset; touch "$SC/has-unit"
+if sc_run freenet-gateway-hector && [[ ! -e "$SC/started" ]]; then
+    pass "schedule_companion_restart: a non-default service is skipped"
+else
+    fail "schedule_companion_restart: must not act for a non-default unit"
+fi
+
+sc_reset; touch "$SC/has-unit"
+if sc_run freenet-gateway true && grep -q 'start --no-block freenet-gateway-stagger.service' "$SC/started" 2>/dev/null; then
+    pass "schedule_companion_restart: --all-instances also queues the stagger"
+else
+    fail "schedule_companion_restart: --all-instances deploys the primary too, so it must queue the stagger"
+fi
+
+sc_reset; touch "$SC/has-unit" "$SC/start-fails"
+if ! sc_run; then
+    pass "schedule_companion_restart: failure to queue -> non-zero"
+else
+    fail "schedule_companion_restart: a failed queue must not be reported as success"
+fi
+
 # ── result ────────────────────────────────────────────────────────────
 
 if (( FAILURES > 0 )); then

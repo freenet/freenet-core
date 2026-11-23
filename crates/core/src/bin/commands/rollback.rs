@@ -2021,6 +2021,17 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_quic_restart_exit_is_not_a_crash() {
+        // #5940 / #6184: a gateway's restart for QUIC, including the exit a
+        // quinn driver panic takes (the endpoint death, or a monitored task the
+        // panic killed, `liveness::driver_death_restart`), must never count
+        // toward a post-update rollback: several early quinn panics would roll
+        // a good release back. The crash breaker bounds those restarts instead.
+        let code = freenet::QUIC_RESTART_EXIT_CODE.to_string();
+        assert_eq!(classify_stop(&code), StopClass::NotCrash, "exit {code}");
+    }
+
+    #[test]
     fn classify_stop_crash_vs_not() {
         // Clean / voluntary-update / already-running: never a crash.
         for s in ["0", "2", "42", "43", "44", " 42 ", "0\n"] {
