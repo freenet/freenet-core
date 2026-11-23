@@ -200,23 +200,27 @@ impl TopologyManager {
     ///
     /// Used by `should_accept` to feed the Kleinberg gap score through the
     /// same windowed comparison mechanism that rate-limits connection acceptance.
+    ///
+    /// `candidate` identifies the peer asking: its retry replaces its earlier
+    /// score instead of competing with it (see [`ConnectionEvaluator`]).
     pub(crate) fn evaluate_new_connection_with_score(
         &mut self,
+        candidate: std::net::SocketAddr,
         score: f64,
         current_time: Instant,
     ) -> bool {
         match self.connection_acquisition_strategy {
             ConnectionAcquisitionStrategy::Slow => {
                 self.fast_connection_evaluator
-                    .record_only_with_current_time(score, current_time);
+                    .record_only_with_current_time(candidate, score, current_time);
                 self.slow_connection_evaluator
-                    .record_and_eval_with_current_time(score, current_time)
+                    .record_and_eval_with_current_time(candidate, score, current_time)
             }
             ConnectionAcquisitionStrategy::Fast => {
                 self.slow_connection_evaluator
-                    .record_only_with_current_time(score, current_time);
+                    .record_only_with_current_time(candidate, score, current_time);
                 self.fast_connection_evaluator
-                    .record_and_eval_with_current_time(score, current_time)
+                    .record_and_eval_with_current_time(candidate, score, current_time)
             }
         }
     }
@@ -1445,6 +1449,34 @@ mod tests {
             max_connections: 200,
             min_connections: 5,
         }
+    }
+
+    /// `evaluate_new_connection_with_score` must name the candidate to BOTH
+    /// evaluators: the active one compares, the other only records. A retry
+    /// after the strategy switches is compared with what the now-active
+    /// evaluator recorded while it was inactive, so a wrong address recorded
+    /// there would make the candidate tie with its own entry and be refused.
+    #[test]
+    fn a_retry_after_a_strategy_switch_is_not_refused_by_its_own_entry() {
+        let mut topo = TopologyManager::new(test_limits());
+        let a: std::net::SocketAddr = "10.0.0.1:1".parse().unwrap();
+        let b: std::net::SocketAddr = "10.0.0.2:1".parse().unwrap();
+        let start = Instant::now();
+        // Fast (the default): `a` sets a high bar in both windows.
+        assert!(topo.evaluate_new_connection_with_score(a, 0.9, start));
+        // `a` ages out of the 60 s fast window; `b` is accepted and recorded
+        // in the slow window too.
+        assert!(topo.evaluate_new_connection_with_score(b, 0.5, start + Duration::from_secs(200)));
+        // Slow now. `a` (t=0) has aged out of the 5 min slow window, `b`'s
+        // own entry (t=200) has not: `b`'s retry is compared with nobody.
+        topo.update_connection_acquisition_strategy(ConnectionAcquisitionStrategy::Slow);
+        assert!(
+            topo.evaluate_new_connection_with_score(b, 0.5, start + Duration::from_secs(310)),
+            "the retry must not tie with its own entry in the slow window"
+        );
+        // A different candidate with the same score still loses to `b`.
+        let c: std::net::SocketAddr = "10.0.0.3:1".parse().unwrap();
+        assert!(!topo.evaluate_new_connection_with_score(c, 0.5, start + Duration::from_secs(311)));
     }
 
     /// Encode a u32 into a distinct `ContractInstanceId` so we can mint more

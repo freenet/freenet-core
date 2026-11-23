@@ -49,6 +49,7 @@ async fn udp_handle_shares_one_expected_ip_set_and_reports_the_listener() {
         quic_availability: crate::transport::quic::QuicAvailabilityWatch::disabled(),
         upgrade_site: Default::default(),
         quic_endpoint: None,
+        quic_stack: std::sync::Weak::new(),
     };
     let (inbound_tx, inbound_rx) = mpsc::channel(1);
     let inbound = InboundConnectionHandler {
@@ -111,6 +112,7 @@ async fn listener_outlives_a_dropped_connector_while_a_clone_remains() {
         false,
         addr,
         UdpTransportConfig::default(),
+        None,
         None,
     )
     .map(|(o, rx, task)| {
@@ -176,6 +178,7 @@ async fn udp_transport_config_reaches_the_listener_by_name() {
             advertised_version_override: Some((0, 2, 148)),
             task_registrar: None,
         },
+        None,
         None,
     );
     assert_eq!(listener.bandwidth_limit, Some(1_111));

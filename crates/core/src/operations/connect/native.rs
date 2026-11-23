@@ -121,6 +121,20 @@ pub(crate) const STRIKE_WINDOW: Duration = DEMOTION_COOLDOWN;
 /// How long a demoted node offers (or decides) nothing native.
 pub(crate) const DEMOTION_COOLDOWN: Duration = Duration::from_secs(6 * 3600);
 
+/// Native setups this node may have decided as acceptor and not yet seen end,
+/// at a connection limit of `max_connections`: half of the node's native
+/// setup slots (`QuicPolicy::native_setups_max`, which is
+/// [`crate::transport::NATIVE_SETUPS_MAX`] lowered to the connection limit),
+/// so its own dials as joiner keep the other half; at least 1.
+pub(crate) fn acceptor_pending_setups_max(max_connections: usize) -> usize {
+    (crate::transport::NATIVE_SETUPS_MAX.min(max_connections) / 2).max(1)
+}
+
+/// Of the acceptor's pending setups, how many may be for joiner addresses
+/// in one source: an IPv4 address, or an IPv6 /64 (what one host or one
+/// customer line usually gets). Provisional.
+pub(crate) const ACCEPTOR_PENDING_SETUPS_PER_SOURCE: usize = 4;
+
 const SLICE_DOMAIN: &[u8] = b"freenet-quic-native-slice-v1";
 
 /// What a joiner offers in its `ConnectRequest`.
@@ -336,8 +350,11 @@ impl DialTransport {
 
 /// How long a native dial may wait when its caller has no deadline of its
 /// own. The setup's own window is shorter and ends it first (8 s for the
-/// client, 12 s for the server), so this only bounds a setup that never
-/// reports.
+/// client, 12 s for the server), so for the setup this only bounds one that
+/// never reports. It ALSO sets how long an acceptor holds a native setup
+/// admission ([`SetupTicket`]): from the dispatch of its native dial to this
+/// long after it. Changing it changes the acceptor's admission throughput
+/// (pending cap / this duration).
 pub(crate) const NATIVE_CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// This node's readiness for native connections in one role: as joiner
@@ -562,6 +579,168 @@ pub(crate) fn joiner_response_action(
     }
 }
 
+/// Where a joiner's native setup is counted for
+/// [`ACCEPTOR_PENDING_SETUPS_PER_SOURCE`]: the crate's per-host source unit
+/// (`put::stream_admission::Source`: an IPv4 address or an IPv6 /64). In test
+/// builds only, a loopback or unspecified address is counted per port, since
+/// local test networks run every node on one such address; a release build
+/// counts it as one host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupSource {
+    Host(crate::operations::put::stream_admission::Source),
+    #[cfg(any(test, feature = "testing"))]
+    Exact(std::net::SocketAddr),
+}
+
+impl SetupSource {
+    fn of(addr: std::net::SocketAddr) -> Self {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            let ip = addr.ip().to_canonical();
+            if ip.is_loopback() || ip.is_unspecified() {
+                return Self::Exact(addr);
+            }
+        }
+        Self::Host(crate::operations::put::stream_admission::Source::of(addr))
+    }
+}
+
+/// Why the acceptor decided `Udp` for a pair it would otherwise have decided
+/// `Native`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SetupAdmissionRefusal {
+    /// The acceptor's pending setups are at its cap
+    /// ([`acceptor_pending_setups_max`]).
+    Full,
+    /// [`ACCEPTOR_PENDING_SETUPS_PER_SOURCE`] joiner addresses are pending
+    /// from the joiner's source.
+    SourceFull,
+    /// The joiner's address is not known, so there is nothing to count it by
+    /// (or to dial).
+    NoAddress,
+}
+
+/// The native setups this node decided as acceptor and has not yet seen end
+/// ([`NativeConnectState::admit_acceptor_setup`]), by joiner address: the
+/// unit the node's native setups, allow-set slots and dial coalescing all
+/// use. A `Native` decision holds a native setup slot and an allow-set slot
+/// for up to the server's window, so the acceptor admits a setup before
+/// deciding `Native` rather than finding the slots taken when its setup
+/// starts. A joiner that was refused is decided `Udp` at once: it never waits
+/// out the native fallback because the acceptor had no room.
+#[derive(Debug)]
+pub(crate) struct NativeSetupAdmission {
+    /// By joiner address: its source and how many tickets hold it (CONNECTs
+    /// to one address share its one setup, since dials to one address
+    /// coalesce).
+    pending: std::collections::HashMap<std::net::SocketAddr, (SetupSource, usize)>,
+    cap: usize,
+}
+
+impl NativeSetupAdmission {
+    fn new(cap: usize) -> Self {
+        Self {
+            pending: std::collections::HashMap::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Whether a ticket for `addr` would be admitted now, without taking one.
+    fn check(&self, addr: Option<std::net::SocketAddr>) -> Result<(), SetupAdmissionRefusal> {
+        let Some(addr) = addr else {
+            return Err(SetupAdmissionRefusal::NoAddress);
+        };
+        if self.pending.contains_key(&addr) {
+            return Ok(());
+        }
+        if self.pending.len() >= self.cap {
+            return Err(SetupAdmissionRefusal::Full);
+        }
+        let source = SetupSource::of(addr);
+        let from_source = self.pending.values().filter(|(s, _)| *s == source).count();
+        if from_source >= ACCEPTOR_PENDING_SETUPS_PER_SOURCE {
+            return Err(SetupAdmissionRefusal::SourceFull);
+        }
+        Ok(())
+    }
+
+    /// Takes a hold on `addr`'s entry, creating it if admitted.
+    fn admit(
+        &mut self,
+        addr: Option<std::net::SocketAddr>,
+    ) -> Result<std::net::SocketAddr, SetupAdmissionRefusal> {
+        self.check(addr)?;
+        let Some(addr) = addr else {
+            return Err(SetupAdmissionRefusal::NoAddress);
+        };
+        self.pending
+            .entry(addr)
+            .or_insert((SetupSource::of(addr), 0))
+            .1 += 1;
+        Ok(addr)
+    }
+
+    /// Gives back one hold on `addr`'s entry, removing it with the last.
+    fn release(&mut self, addr: std::net::SocketAddr) {
+        if let Some((_, holds)) = self.pending.get_mut(&addr) {
+            *holds = holds.saturating_sub(1);
+            if *holds == 0 {
+                self.pending.remove(&addr);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.pending.len()
+    }
+}
+
+/// One admitted native setup as acceptor, held from the decision until the
+/// acceptor's native dial deadline, [`NATIVE_CONNECT_WITHIN`] after the dial
+/// is dispatched (when the setup can no longer hold a setup slot); dropping
+/// it releases the admission, so an accept that is never dispatched (or whose
+/// dispatch fails) releases it at once.
+///
+/// Residuals: the cap bounds distinct pending joiner ADDRESSES, not
+/// decisions (CONNECTs to one address share an entry); the node's own native
+/// dials as joiner take setup slots uncapped (the other half is left for
+/// them, not reserved); and once UDP is removed (phase D), "refused, so
+/// decide UDP" no longer has a UDP to decide, so a refusal will need another
+/// answer (a `Rejected`).
+pub(crate) struct SetupTicket {
+    /// `None` for a ticket a test made with no admission behind it.
+    admission: Option<std::sync::Arc<parking_lot::Mutex<NativeSetupAdmission>>>,
+    addr: std::net::SocketAddr,
+}
+
+impl SetupTicket {
+    /// A ticket with no admission behind it, for tests of the decision.
+    #[cfg(test)]
+    pub(crate) fn detached(addr: std::net::SocketAddr) -> Self {
+        Self {
+            admission: None,
+            addr,
+        }
+    }
+}
+
+impl std::fmt::Debug for SetupTicket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetupTicket")
+            .field("addr", &self.addr)
+            .finish()
+    }
+}
+
+impl Drop for SetupTicket {
+    fn drop(&mut self) {
+        if let Some(admission) = &self.admission {
+            admission.lock().release(self.addr);
+        }
+    }
+}
+
 /// A node's QUIC-native connect state: whether it may dial native and at what
 /// percent, and the demotion its native failures drive. One per node, in the
 /// `ConnectionManager`.
@@ -584,6 +763,8 @@ pub(crate) struct NativeConnectState {
     /// unless the acceptor is one of its configured gateways, whose dials are
     /// labelled `Gateway`).
     acceptor_demotion: parking_lot::Mutex<NativeDemotion>,
+    /// Native setups decided as acceptor and not yet ended.
+    setup_admission: std::sync::Arc<parking_lot::Mutex<NativeSetupAdmission>>,
     /// Simulation only: this node never offers native as joiner, but decides
     /// as acceptor as usual (`NodeConfig::native_joiner_off`), standing in
     /// for a node that rarely joins. `false` in production.
@@ -616,6 +797,11 @@ impl NativeConnectState {
             demotion: parking_lot::Mutex::new(NativeDemotion::new(DEMOTION_FAILURES)),
             acceptor_demotion: parking_lot::Mutex::new(NativeDemotion::new(
                 ACCEPTOR_DEMOTION_FAILURES,
+            )),
+            setup_admission: std::sync::Arc::new(parking_lot::Mutex::new(
+                NativeSetupAdmission::new(acceptor_pending_setups_max(
+                    crate::transport::NATIVE_SETUPS_MAX,
+                )),
             )),
             joiner_off: false,
             refuses_decisions: false,
@@ -833,6 +1019,55 @@ impl NativeConnectState {
             );
         }
         demoted
+    }
+
+    /// Sizes the acceptor's pending setups for a node whose connection
+    /// limit is `max_connections` ([`acceptor_pending_setups_max`]).
+    pub(crate) fn with_acceptor_setup_limit(self, max_connections: usize) -> Self {
+        self.setup_admission.lock().cap = acceptor_pending_setups_max(max_connections);
+        self
+    }
+
+    /// Admits a native setup with the joiner at `addr` before this node, as
+    /// acceptor, decides `Native` for it; on a refusal it decides `Udp`,
+    /// which is counted. The ticket holds the admission until it is dropped,
+    /// at the acceptor's native dial deadline.
+    pub(crate) fn admit_acceptor_setup(
+        &self,
+        addr: Option<std::net::SocketAddr>,
+    ) -> Result<SetupTicket, SetupAdmissionRefusal> {
+        let result = self.setup_admission.lock().admit(addr);
+        match result {
+            Ok(addr) => Ok(SetupTicket {
+                admission: Some(std::sync::Arc::clone(&self.setup_admission)),
+                addr,
+            }),
+            Err(refusal) => {
+                TRANSPORT_METRICS.record_connect_native_admission_refused();
+                tracing::debug!(
+                    ?addr,
+                    ?refusal,
+                    "QUIC-native setup not admitted; deciding UDP"
+                );
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Whether a native setup with the joiner at `addr` would be admitted
+    /// now, without taking one: a control pair at an acceptor with no room
+    /// is left out of the arms, as a refused treated pair is.
+    pub(crate) fn acceptor_setup_room(
+        &self,
+        addr: Option<std::net::SocketAddr>,
+    ) -> Result<(), SetupAdmissionRefusal> {
+        self.setup_admission.lock().check(addr)
+    }
+
+    /// Joiner addresses with an admitted native setup as acceptor.
+    #[cfg(test)]
+    pub(crate) fn pending_acceptor_setups(&self) -> usize {
+        self.setup_admission.lock().len()
     }
 
     /// A native setup this node made as acceptor succeeded: the acceptor
@@ -1569,6 +1804,144 @@ mod tests {
         assert!(!state.readiness().demoted);
         assert!(state.acceptor_readiness().ready);
         assert_eq!(state.acceptor_readiness().percent, 100);
+    }
+
+    fn v4(a: u8, b: u8, port: u16) -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([198, 51, a, b], port))
+    }
+
+    /// The acceptor admits native setups up to its cap and its per-source
+    /// cap, by joiner address, only with a known address. Holds on one
+    /// address share its entry; the entry goes with the last hold.
+    #[test]
+    fn native_setup_admission_bounds_pending_setups() {
+        let cap = 8;
+        let mut admission = NativeSetupAdmission::new(cap);
+        let per = ACCEPTOR_PENDING_SETUPS_PER_SOURCE as u16;
+        // One source: up to the per-source cap, any ports.
+        for port in 0..per {
+            assert!(admission.admit(Some(v4(0, 1, 1000 + port))).is_ok());
+        }
+        assert_eq!(
+            admission.admit(Some(v4(0, 1, 2000))),
+            Err(SetupAdmissionRefusal::SourceFull)
+        );
+        assert_eq!(admission.admit(None), Err(SetupAdmissionRefusal::NoAddress));
+        // Another hold on a pending address shares its entry, whatever the
+        // caps say.
+        assert!(admission.admit(Some(v4(0, 1, 1000))).is_ok());
+        assert_eq!(admission.len(), per as usize);
+        // The first release leaves the shared entry; the second removes it.
+        admission.release(v4(0, 1, 1000));
+        assert_eq!(admission.len(), per as usize);
+        admission.release(v4(0, 1, 1000));
+        assert_eq!(admission.len(), per as usize - 1);
+        assert!(admission.admit(Some(v4(0, 1, 2000))).is_ok(), "room again");
+        // Fill the cap from distinct sources.
+        let mut b = 0u8;
+        while admission.len() < cap {
+            assert!(admission.admit(Some(v4(1, b, 1))).is_ok());
+            b += 1;
+        }
+        assert_eq!(
+            admission.admit(Some(v4(2, 1, 1))),
+            Err(SetupAdmissionRefusal::Full)
+        );
+        assert_eq!(
+            admission.check(Some(v4(2, 1, 1))),
+            Err(SetupAdmissionRefusal::Full)
+        );
+        assert_eq!(
+            admission.check(Some(v4(1, 0, 1))),
+            Ok(()),
+            "a pending address"
+        );
+        // A release of an address with no entry changes nothing.
+        admission.release(v4(9, 9, 9));
+        assert_eq!(admission.len(), cap);
+    }
+
+    /// The acceptor's cap is half its native setup slots, which are
+    /// `NATIVE_SETUPS_MAX` lowered to the connection limit, and at least 1.
+    #[test]
+    fn the_acceptor_setup_cap_follows_the_connection_limit() {
+        let max = crate::transport::NATIVE_SETUPS_MAX;
+        assert_eq!(acceptor_pending_setups_max(200), max / 2);
+        assert_eq!(acceptor_pending_setups_max(max), max / 2);
+        assert_eq!(acceptor_pending_setups_max(16), 8);
+        assert_eq!(acceptor_pending_setups_max(1), 1);
+        let state = NativeConnectState::new(Some(100)).with_acceptor_setup_limit(4);
+        let _first = state
+            .admit_acceptor_setup(Some(v4(3, 1, 1)))
+            .expect("first");
+        let _second = state
+            .admit_acceptor_setup(Some(v4(3, 2, 1)))
+            .expect("second");
+        assert_eq!(
+            state.acceptor_setup_room(Some(v4(3, 3, 1))),
+            Err(SetupAdmissionRefusal::Full),
+            "a connection limit of 4 gives 2 acceptor setups"
+        );
+    }
+
+    /// IPv6 joiners in one /64 share the per-source cap and another /64 does
+    /// not; IPv4-mapped addresses count as IPv4; loopback (a local test
+    /// network) is counted per port.
+    #[test]
+    fn native_setup_sources_group_by_v4_address_and_v6_prefix() {
+        let v6 = |s: &str| std::net::SocketAddr::new(s.parse().unwrap(), 1);
+        assert_eq!(
+            SetupSource::of(v6("2001:db8:1:2::1")),
+            SetupSource::of(v6("2001:db8:1:2:ffff::9"))
+        );
+        assert_ne!(
+            SetupSource::of(v6("2001:db8:1:2::1")),
+            SetupSource::of(v6("2001:db8:1:3::1"))
+        );
+        assert_eq!(
+            SetupSource::of(v6("::ffff:198.51.0.1")),
+            SetupSource::of(v4(0, 1, 7))
+        );
+        assert_eq!(SetupSource::of(v4(0, 1, 7)), SetupSource::of(v4(0, 1, 8)));
+        let lo = |port| std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        assert_ne!(SetupSource::of(lo(1)), SetupSource::of(lo(2)));
+        assert_ne!(
+            SetupSource::of("[::1]:1".parse().unwrap()),
+            SetupSource::of("[::1]:2".parse().unwrap())
+        );
+    }
+
+    /// A ticket holds its admission until it is dropped; a refusal is
+    /// counted for telemetry.
+    #[test]
+    fn a_ticket_holds_its_admission_and_a_refusal_is_counted() {
+        let state = NativeConnectState::new(Some(100));
+        let counted = || {
+            crate::transport::metrics::NATIVE_ADMISSIONS_REFUSED_ON_THIS_THREAD.with(|c| c.get())
+        };
+        let before = counted();
+        let ticket = state
+            .admit_acceptor_setup(Some(v4(9, 9, 1)))
+            .expect("admitted");
+        let shared = state
+            .admit_acceptor_setup(Some(v4(9, 9, 1)))
+            .expect("shared");
+        assert_eq!(counted(), before);
+        assert_eq!(state.pending_acceptor_setups(), 1);
+        drop(ticket);
+        assert_eq!(
+            state.pending_acceptor_setups(),
+            1,
+            "still held by the other"
+        );
+        drop(shared);
+        assert_eq!(state.pending_acceptor_setups(), 0);
+        assert_eq!(
+            state.admit_acceptor_setup(None).map(|_| ()),
+            Err(SetupAdmissionRefusal::NoAddress)
+        );
+        assert_eq!(counted(), before + 1);
+        assert_eq!(state.pending_acceptor_setups(), 0);
     }
 
     /// Phase B ships dark: no join tries native in this release.

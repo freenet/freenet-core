@@ -800,6 +800,20 @@ labelled_counters! {
     }
 }
 
+labelled_counters! {
+    /// What the Kleinberg connection evaluator did that differs from before
+    /// #6347 (`topology::connection_evaluator`). Exported per period as
+    /// `connect_evaluator_<label>`.
+    pub(crate) enum EvaluatorEvent {
+        /// A candidate was accepted although its own earlier entry, which
+        /// the evaluator no longer compares it with, would have refused it.
+        AcceptedOverOwnEntry => "accepted_over_own_entry",
+        /// The window held more than its cap of candidates and dropped the
+        /// lowest-scoring one.
+        CapEviction => "cap_eviction",
+    }
+}
+
 impl NativeSetupOutcome {
     /// Whether this end says native does not work on the path to that peer,
     /// so it counts toward the node's demotion. A refusal by this node's own
@@ -1167,6 +1181,13 @@ pub struct TransportMetrics {
     /// Times this node stopped deciding QUIC-native as acceptor after its
     /// native setups failed with distinct joiners (reset each snapshot).
     connect_native_acceptor_demotions: AtomicU64,
+    /// Native setups this node did not admit as acceptor, deciding UDP
+    /// instead (`connect::native::NativeSetupAdmission`) (reset each
+    /// snapshot).
+    connect_native_admission_refused: AtomicU64,
+    /// Control pairs this node left out of the connect arms as acceptor
+    /// because it had no room for a native setup (reset each snapshot).
+    connect_native_admission_control_dropped: AtomicU64,
     /// A UDP dial that followed a failed native setup connected, by the side
     /// this node had in the CONNECT (reset each snapshot).
     connect_native_rescued_by_udp_joiner: AtomicU64,
@@ -1228,6 +1249,8 @@ pub struct TransportMetrics {
     connect_arm: [AtomicU64; ConnectArmCounter::COUNT],
     /// Gateway admission of native joins this period, by [`GatewayAdmission`].
     quic_gateway_admission: [AtomicU64; GatewayAdmission::COUNT],
+    /// Connection evaluator events this period, by [`EvaluatorEvent`].
+    connect_evaluator: [AtomicU64; EvaluatorEvent::COUNT],
     /// Native gateway joins this period, by [`GatewayNativeJoin`].
     gateway_native_join: [AtomicU64; GatewayNativeJoin::COUNT],
     /// Why native gateway joins gave no connection this period, by
@@ -1599,6 +1622,14 @@ thread_local! {
     pub(crate) static CONNECT_ARM_ON_THIS_THREAD: std::cell::Cell<[u64; ConnectArmCounter::COUNT]> =
         const { std::cell::Cell::new([0; ConnectArmCounter::COUNT]) };
 
+    /// Test-only: control pairs dropped for lack of setup room on this thread.
+    pub(crate) static NATIVE_CONTROL_DROPPED_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
+    /// Test-only: native setups not admitted as acceptor on this thread.
+    pub(crate) static NATIVE_ADMISSIONS_REFUSED_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
     /// Test-only: acceptor-role demotions recorded on this thread, so a test
     /// can see its own increment of the process-wide counter.
     pub(crate) static ACCEPTOR_DEMOTIONS_ON_THIS_THREAD: std::cell::Cell<u64> =
@@ -1727,6 +1758,8 @@ impl TransportMetrics {
             connect_native_decision_over_cap: AtomicU64::new(0),
             connect_native_demotions: AtomicU64::new(0),
             connect_native_acceptor_demotions: AtomicU64::new(0),
+            connect_native_admission_refused: AtomicU64::new(0),
+            connect_native_admission_control_dropped: AtomicU64::new(0),
             connect_native_rescued_by_udp_joiner: AtomicU64::new(0),
             connect_native_rescued_by_udp_acceptor: AtomicU64::new(0),
             connect_native_fallback_connected_joiner: AtomicU64::new(0),
@@ -1750,6 +1783,7 @@ impl TransportMetrics {
             connect_native_setup_acceptor: Default::default(),
             connect_arm: Default::default(),
             quic_gateway_admission: Default::default(),
+            connect_evaluator: Default::default(),
             gateway_native_join: Default::default(),
             gateway_native_join_failure: Default::default(),
             gateway_native_join_time: Default::default(),
@@ -2243,8 +2277,8 @@ impl TransportMetrics {
     }
 
     /// Record the QUIC endpoint's state. [`QuicEndpointState::Died`] is final
-    /// for the process: an endpoint that died is never rebuilt, so nothing
-    /// set after it replaces it.
+    /// for the process: nothing set after it replaces it, except a rebuilt
+    /// endpoint ([`Self::record_quic_endpoint_rebuilt`]).
     pub(crate) fn set_quic_endpoint_state(&self, state: QuicEndpointState) {
         let died = QuicEndpointState::Died as u8;
         // An `Err` is a death already recorded, which stays.
@@ -2253,6 +2287,17 @@ impl TransportMetrics {
                 (current != died).then_some(state as u8)
             })
             .ok();
+    }
+
+    /// The node built a new QUIC endpoint in place of one that died
+    /// (`quic::rebuild`): the state is `Up` again, replacing `Died`, unless
+    /// the new endpoint already died (`still_up` false): its death is then
+    /// the state.
+    pub(crate) fn record_quic_endpoint_rebuilt(&self, still_up: bool) {
+        if still_up {
+            self.quic_endpoint_state
+                .store(QuicEndpointState::Up as u8, Ordering::Relaxed);
+        }
     }
 
     /// The QUIC endpoint's state as last recorded.
@@ -2360,6 +2405,24 @@ impl TransportMetrics {
     pub(crate) fn record_connect_native_demotion(&self) {
         self.connect_native_demotions
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// This node, as acceptor, left a control pair out of the connect arms:
+    /// it had no room for a native setup, as a treated pair would have been
+    /// refused.
+    pub(crate) fn record_connect_native_control_dropped(&self) {
+        self.connect_native_admission_control_dropped
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_CONTROL_DROPPED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
+    }
+
+    /// This node did not admit a native setup as acceptor and decided UDP.
+    pub(crate) fn record_connect_native_admission_refused(&self) {
+        self.connect_native_admission_refused
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_ADMISSIONS_REFUSED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     }
 
     /// This node stopped deciding QUIC-native as acceptor.
@@ -2510,6 +2573,11 @@ impl TransportMetrics {
     /// A gateway's admission of a native join did `outcome`.
     pub(crate) fn record_gateway_admission(&self, outcome: GatewayAdmission) {
         self.quic_gateway_admission[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The connection evaluator did `event`.
+    pub(crate) fn record_connect_evaluator(&self, event: EvaluatorEvent) {
+        self.connect_evaluator[event as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// A joiner's native join to the gateway at `remote` did `outcome`
@@ -3398,6 +3466,10 @@ impl TransportMetrics {
             connect_native_decision_over_cap: get64(&self.connect_native_decision_over_cap),
             connect_native_demotions: get64(&self.connect_native_demotions),
             connect_native_acceptor_demotions: get64(&self.connect_native_acceptor_demotions),
+            connect_native_admission_refused: get64(&self.connect_native_admission_refused),
+            connect_native_admission_control_dropped: get64(
+                &self.connect_native_admission_control_dropped,
+            ),
             connect_native_rescued_by_udp_joiner: get64(&self.connect_native_rescued_by_udp_joiner),
             connect_native_rescued_by_udp_acceptor: get64(
                 &self.connect_native_rescued_by_udp_acceptor,
@@ -3464,6 +3536,7 @@ impl TransportMetrics {
             }),
             connect_arm: std::array::from_fn(|i| get64(&self.connect_arm[i])),
             quic_gateway_admission: std::array::from_fn(|i| get64(&self.quic_gateway_admission[i])),
+            connect_evaluator: std::array::from_fn(|i| get64(&self.connect_evaluator[i])),
             gateway_native_join: std::array::from_fn(|i| get64(&self.gateway_native_join[i])),
             gateway_native_join_failure: std::array::from_fn(|i| {
                 get64(&self.gateway_native_join_failure[i])
@@ -3927,7 +4000,9 @@ pub(crate) enum QuicEndpointState {
     /// The crash-loop breaker keeps QUIC off for this run.
     OffBreaker = 6,
     /// The endpoint died while the node held it: its driver ended, or its
-    /// socket adapter caught a panic (`quic::liveness`). Final.
+    /// socket adapter caught a panic (`quic::liveness`). Final, unless the
+    /// node rebuilds its endpoint (`quic::rebuild`, dark until the UDP
+    /// removal), which records `Up` again.
     Died = 7,
 }
 
@@ -4131,6 +4206,10 @@ pub struct TransportSnapshot {
     pub connect_native_demotions: u64,
     /// Times the node stopped deciding native as acceptor after failures.
     pub connect_native_acceptor_demotions: u64,
+    /// Native setups not admitted as acceptor (decided UDP instead).
+    pub connect_native_admission_refused: u64,
+    /// Control pairs left out of the arms for lack of setup room.
+    pub connect_native_admission_control_dropped: u64,
     /// UDP dials that connected after a native setup that failed on the
     /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
@@ -4210,6 +4289,10 @@ pub struct TransportSnapshot {
     /// Gateway admission of native joins, by [`GatewayAdmission`]
     /// (`quic_gateway_admission_<label>`).
     pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
+    /// Connection evaluator events, by [`EvaluatorEvent`]
+    /// (`connect_evaluator_<label>`).
+    #[serde(default)]
+    pub connect_evaluator: [u64; EvaluatorEvent::COUNT],
     /// Native gateway joins, by [`GatewayNativeJoin`]
     /// (`gateway_native_join_<label>`).
     #[serde(default)]
@@ -4597,6 +4680,8 @@ impl TransportSnapshot {
             connect_native_decision_over_cap,
             connect_native_demotions,
             connect_native_acceptor_demotions,
+            connect_native_admission_refused,
+            connect_native_admission_control_dropped,
             connect_native_rescued_by_udp_joiner,
             connect_native_rescued_by_udp_acceptor,
             connect_native_fallback_connected_joiner,
@@ -4630,6 +4715,7 @@ impl TransportSnapshot {
             connect_native_setup_acceptor,
             connect_arm,
             quic_gateway_admission,
+            connect_evaluator,
             gateway_native_join,
             gateway_native_join_failure,
             gateway_native_join_time,
@@ -4780,6 +4866,8 @@ impl TransportSnapshot {
         self.connect_native_decision_over_cap = connect_native_decision_over_cap;
         self.connect_native_demotions = connect_native_demotions;
         self.connect_native_acceptor_demotions = connect_native_acceptor_demotions;
+        self.connect_native_admission_refused = connect_native_admission_refused;
+        self.connect_native_admission_control_dropped = connect_native_admission_control_dropped;
         self.connect_native_rescued_by_udp_joiner = connect_native_rescued_by_udp_joiner;
         self.connect_native_rescued_by_udp_acceptor = connect_native_rescued_by_udp_acceptor;
         self.connect_native_fallback_connected_joiner = connect_native_fallback_connected_joiner;
@@ -4816,6 +4904,7 @@ impl TransportSnapshot {
         self.connect_native_setup_acceptor = connect_native_setup_acceptor;
         self.connect_arm = connect_arm;
         self.quic_gateway_admission = quic_gateway_admission;
+        self.connect_evaluator = connect_evaluator;
         self.gateway_native_join = gateway_native_join;
         self.gateway_native_join_failure = gateway_native_join_failure;
         self.gateway_native_join_time = gateway_native_join_time;
@@ -5034,6 +5123,10 @@ struct SnapshotExtras {
     pub connect_native_demotions: u64,
     /// Times the node stopped deciding native as acceptor after failures.
     pub connect_native_acceptor_demotions: u64,
+    /// Native setups not admitted as acceptor (decided UDP instead).
+    pub connect_native_admission_refused: u64,
+    /// Control pairs left out of the arms for lack of setup room.
+    pub connect_native_admission_control_dropped: u64,
     /// UDP dials that connected after a native setup that failed on the
     /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
@@ -5110,6 +5203,9 @@ struct SnapshotExtras {
     /// Gateway admission of native joins, by [`GatewayAdmission`]
     /// (`quic_gateway_admission_<label>`).
     pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
+    /// Connection evaluator events, by [`EvaluatorEvent`]
+    /// (`connect_evaluator_<label>`).
+    pub connect_evaluator: [u64; EvaluatorEvent::COUNT],
     /// Native gateway joins, by [`GatewayNativeJoin`]
     /// (`gateway_native_join_<label>`).
     pub gateway_native_join: [u64; GatewayNativeJoin::COUNT],
@@ -5315,6 +5411,8 @@ impl SnapshotExtras {
             || self.connect_native_decision_over_cap != 0
             || self.connect_native_demotions != 0
             || self.connect_native_acceptor_demotions != 0
+            || self.connect_native_admission_refused != 0
+            || self.connect_native_admission_control_dropped != 0
             || self.connect_native_rescued_by_udp_joiner != 0
             || self.connect_native_rescued_by_udp_acceptor != 0
             || self.connect_native_fallback_connected_joiner != 0
@@ -5351,6 +5449,7 @@ impl SnapshotExtras {
             || self.connect_native_setup_acceptor.iter().any(|n| *n != 0)
             || self.connect_arm.iter().any(|n| *n != 0)
             || self.quic_gateway_admission.iter().any(|n| *n != 0)
+            || self.connect_evaluator.iter().any(|n| *n != 0)
             || self.gateway_native_join.iter().any(|n| *n != 0)
             || self.gateway_native_join_failure.iter().any(|n| *n != 0)
             || self.gateway_native_join_time.iter().any(|n| *n != 0)
@@ -6543,6 +6642,19 @@ mod tests {
         assert_eq!(snap.quic_endpoint, "died", "the state is not reset");
     }
 
+    /// A rebuilt endpoint makes the state `Up` again, except one that
+    /// already died: its death stays the state.
+    #[test]
+    fn a_rebuilt_endpoint_replaces_died_only_while_it_is_up() {
+        let metrics = TransportMetrics::new();
+        metrics.record_quic_endpoint_down("127.0.0.1:1".parse().unwrap());
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Died);
+        metrics.record_quic_endpoint_rebuilt(false);
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Died);
+        metrics.record_quic_endpoint_rebuilt(true);
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Up);
+    }
+
     /// Every endpoint state has its own label and survives the round trip
     /// through the atomic.
     #[test]
@@ -6708,6 +6820,27 @@ mod tests {
         );
     }
 
+    /// The two admission counters (treated refusals, control drops) are each
+    /// activity, reach the snapshot and its JSON under their own keys, and
+    /// reset with the snapshot.
+    #[test]
+    fn native_admission_counters_count_snapshot_and_reset() {
+        let metrics = TransportMetrics::new();
+        assert!(
+            metrics.take_snapshot().is_none(),
+            "a fresh instance is idle"
+        );
+        metrics.record_connect_native_admission_refused();
+        metrics.record_connect_native_control_dropped();
+        metrics.record_connect_native_control_dropped();
+        let snap = metrics.take_snapshot().expect("activity");
+        assert_eq!(snap.connect_native_admission_refused, 1);
+        assert_eq!(snap.connect_native_admission_control_dropped, 2);
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["connect_native_admission_control_dropped"], 2);
+        assert!(metrics.take_snapshot().is_none(), "both reset");
+    }
+
     /// Each demotion counter (joiner role, acceptor role) is activity on its
     /// own, reaches the snapshot and its JSON under its own key, leaves the
     /// other at 0, and resets with the snapshot.
@@ -6801,6 +6934,14 @@ mod tests {
             assert_eq!(snap.connect_arm, want, "{arm:?} {side:?} connected dial");
             assert!(metrics.take_snapshot().is_none(), "reset");
         }
+    }
+
+    #[test]
+    fn connect_evaluator_events_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, _| m.record_connect_evaluator(EvaluatorEvent::ALL[slot]),
+            |snap| snap.connect_evaluator,
+        );
     }
 
     #[test]
@@ -8044,6 +8185,8 @@ mod tests {
             "connect_native_decision_over_cap",
             "connect_native_demotions",
             "connect_native_acceptor_demotions",
+            "connect_native_admission_refused",
+            "connect_native_admission_control_dropped",
             "connect_native_rescued_by_udp_joiner",
             "connect_native_rescued_by_udp_acceptor",
             "connect_native_fallback_connected_joiner",

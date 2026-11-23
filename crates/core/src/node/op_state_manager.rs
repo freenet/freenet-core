@@ -329,6 +329,11 @@ pub(crate) struct OpManager {
     /// amplification observed in workflow run 24600634908 (6.8M spawns
     /// in 100s, 63GB RSS).
     pub(crate) active_relay_get_txs: Arc<DashSet<Transaction>>,
+    /// Bytes of GET responses this node has serialized and not yet finished
+    /// sending, per recipient source and node-wide. The relay dedup above
+    /// does not bound how many responses one peer can have queued; this does.
+    /// See `node::outbound_budget`.
+    pub(crate) outbound_payload_budget: Arc<super::outbound_budget::OutboundPayloadBudget>,
     /// Same role as `active_relay_get_txs` but for UPDATE relay.
     /// UPDATE relay has no retry loop and no upstream reply, so the
     /// amplification risk is structurally lower than GET — the gate
@@ -440,6 +445,7 @@ impl Clone for OpManager {
             // one node look like two to the delegate-interest hold map.
             node_identity: self.node_identity,
             active_relay_get_txs: self.active_relay_get_txs.clone(),
+            outbound_payload_budget: self.outbound_payload_budget.clone(),
             active_relay_update_txs: self.active_relay_update_txs.clone(),
             recent_relay_update_requests: self.recent_relay_update_requests.clone(),
             relay_put_stream_admission: self.relay_put_stream_admission.clone(),
@@ -900,6 +906,12 @@ impl OpManager {
             pending_contract_fetches,
             node_identity,
             active_relay_get_txs,
+            outbound_payload_budget:
+                super::outbound_budget::OutboundPayloadBudget::for_memory_limit(
+                    crate::wasm_runtime::read_total_ram_bytes().unwrap_or(
+                        super::outbound_budget::OUTBOUND_PAYLOAD_FALLBACK_TOTAL_RAM_BYTES,
+                    ),
+                ),
             active_relay_update_txs,
             recent_relay_update_requests: Arc::new(
                 crate::operations::update::recent_requests::RecentRelayedRequests::new(),

@@ -111,6 +111,7 @@ pub(crate) mod neighbor_hosting;
 pub(crate) mod network_status;
 pub use network_status::set_auto_update_state;
 mod op_state_manager;
+pub(crate) mod outbound_budget;
 mod p2p_impl;
 mod request_router;
 pub(crate) mod resource_metrics;

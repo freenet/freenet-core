@@ -68,6 +68,7 @@ Registered in `tracing/otel.rs::register_metrics`.
 | `freenet.bootstrap.time_to_min_connections_seconds` | gauge | — | `NetworkStatus::bootstrap_churn_stats` (#4787) |
 | `freenet.bootstrap.completed` | gauge | — | `NetworkStatus::bootstrap_churn_stats` (#4787) |
 | `freenet.bootstrap.startup_rounds` | counter | `outcome` | `NetworkStatus::bootstrap_churn_stats` (#4787) |
+| `freenet.get.outbound_budget_refusals` | counter | `reason` | `node::outbound_budget::refused_totals_process` |
 
 `freenet.bootstrap.startup_rounds`'s `outcome` label takes
 `connect_issued_gateway`, `connect_issued_routed`, `backoff_blocked` and

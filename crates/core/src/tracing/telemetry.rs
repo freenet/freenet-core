@@ -3109,6 +3109,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.connect_native_acceptor_demotions),
             );
             m.insert(
+                "connect_native_admission_refused".into(),
+                serde_json::json!(snapshot.connect_native_admission_refused),
+            );
+            m.insert(
+                "connect_native_admission_control_dropped".into(),
+                serde_json::json!(snapshot.connect_native_admission_control_dropped),
+            );
+            m.insert(
                 "connect_native_rescued_by_udp_joiner".into(),
                 serde_json::json!(snapshot.connect_native_rescued_by_udp_joiner),
             );
@@ -3265,6 +3273,12 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         format!("quic_gateway_admission_{}", outcome.label()),
                         count.into(),
                     );
+                }
+                for (event, count) in crate::transport::metrics::EvaluatorEvent::ALL
+                    .iter()
+                    .zip(snapshot.connect_evaluator)
+                {
+                    m.insert(format!("connect_evaluator_{}", event.label()), count.into());
                 }
                 for (outcome, count) in crate::transport::metrics::GatewayNativeJoin::ALL
                     .iter()
@@ -8046,6 +8060,7 @@ mod tests {
             "connect_native_setup_acceptor",
             "connect_arm",
             "quic_gateway_admission",
+            "connect_evaluator",
             "gateway_native_join",
             "gateway_native_join_failure",
             "gateway_native_join_time",
@@ -8105,6 +8120,11 @@ mod tests {
             crate::transport::metrics::GatewayAdmission::ALL
                 .iter()
                 .map(|outcome| format!("quic_gateway_admission_{}", outcome.label())),
+        );
+        expected.extend(
+            crate::transport::metrics::EvaluatorEvent::ALL
+                .iter()
+                .map(|event| format!("connect_evaluator_{}", event.label())),
         );
         expected.extend(
             crate::transport::metrics::GatewayNativeJoin::ALL
@@ -8535,6 +8555,7 @@ mod tests {
         fill(&mut snapshot.connect_native_setup_acceptor);
         fill(&mut snapshot.connect_arm);
         fill(&mut snapshot.quic_gateway_admission);
+        fill(&mut snapshot.connect_evaluator);
         fill(&mut snapshot.gateway_native_join);
         fill(&mut snapshot.gateway_native_join_failure);
         fill(&mut snapshot.gateway_native_join_time);
@@ -8598,6 +8619,12 @@ mod tests {
         {
             expected.push((format!("quic_gateway_admission_{}", outcome.label()), count));
         }
+        for (event, count) in crate::transport::metrics::EvaluatorEvent::ALL
+            .iter()
+            .zip(snapshot.connect_evaluator)
+        {
+            expected.push((format!("connect_evaluator_{}", event.label()), count));
+        }
         for (outcome, count) in crate::transport::metrics::GatewayNativeJoin::ALL
             .iter()
             .zip(snapshot.gateway_native_join)
@@ -8643,6 +8670,7 @@ mod tests {
                 + 2 * NativeSetupOutcome::COUNT
                 + crate::transport::metrics::ConnectArmCounter::COUNT
                 + crate::transport::metrics::GatewayAdmission::COUNT
+                + crate::transport::metrics::EvaluatorEvent::COUNT
                 + crate::transport::metrics::GatewayNativeJoin::COUNT
                 + NativeSetupOutcome::COUNT
                 + crate::transport::metrics::GatewayNativeJoinTime::COUNT
