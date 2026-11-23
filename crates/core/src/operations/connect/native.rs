@@ -626,8 +626,8 @@ impl NativeConnectState {
         }
     }
 
-    /// Simulation only: as [`Self::new`], never offering native as joiner
-    /// when `joiner_off` (`NodeConfig::native_joiner_off`).
+    /// Simulation only: offering native as joiner but refusing every `Native`
+    /// decision when `refuses` (`NodeConfig::native_refuses_decisions`).
     pub(crate) fn with_refuses_decisions(mut self, refuses: bool) -> Self {
         self.refuses_decisions = refuses;
         self
@@ -640,6 +640,8 @@ impl NativeConnectState {
         self.readiness().ready && !self.refuses_decisions
     }
 
+    /// Simulation only: as [`Self::new`], never offering native as joiner
+    /// when `joiner_off` (`NodeConfig::native_joiner_off`).
     pub(crate) fn with_joiner_off(mut self, joiner_off: bool) -> Self {
         self.joiner_off = joiner_off;
         self
@@ -1482,10 +1484,8 @@ mod tests {
         );
     }
 
-    /// An acceptor whose readiness is demoted (by either role's streak)
-    /// counts its pairs in neither arm, so
-    /// the control arm does not collect the pairs where native failed; one
-    /// at release percent 0 is control as before.
+    /// A joiner that offered and lost native dials the acceptor over UDP at
+    /// the fallback time; a decision that answered no offer is reported.
     #[test]
     fn a_refused_native_decision_dials_udp_only_when_the_joiner_offered() {
         let answered_at = Instant::now();
@@ -1501,6 +1501,10 @@ mod tests {
         );
     }
 
+    /// An acceptor whose readiness is demoted (by either role's streak)
+    /// counts its pairs in neither arm, so
+    /// the control arm does not collect the pairs where native failed; one
+    /// at release percent 0 is control as before.
     #[test]
     fn a_demoted_acceptor_is_in_neither_arm() {
         let offer = Some(NativeOffer::capable(100));

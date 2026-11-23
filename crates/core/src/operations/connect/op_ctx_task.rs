@@ -548,6 +548,7 @@ async fn drive_client_connect(
             tracing::debug!(
                 %tx,
                 accepted = accepted.len(),
+                refused_native = refused_native.len(),
                 target_connections,
                 "connect driver: transaction timed out; finishing started dials"
             );
@@ -659,8 +660,11 @@ async fn drive_client_connect(
                 // (`dispatch_expect_connection_from`), so the two hole punches
                 // overlap. It waits outside the dial queue: the slot goes to
                 // the next acceptor at once, whose own punch window is already
-                // running, so a joiner with a connection can briefly have two
-                // dials in flight. A strike toward demotion is recorded when
+                // running. So a joiner can have more dials in flight than the
+                // queue allows: the queue's own, plus these fallbacks, plus
+                // the UDP dials to acceptors whose `Native` decision it
+                // refused (at most `refused_native_cap`, also outside the
+                // queue). A strike toward demotion is recorded when
                 // that UDP dial connects after a path failure (a rescue,
                 // below), or by the connection lifecycle when a UDP connection
                 // to the acceptor already exists as the setup fails.
@@ -862,6 +866,7 @@ async fn drive_client_connect(
                     tracing::info!(
                         tx = %tx,
                         accepted = accepted.len(),
+                        refused_native = refused_native.len(),
                         target_connections,
                         "connect driver: target reached, completing"
                     );
@@ -898,6 +903,7 @@ async fn drive_client_connect(
                     %tx,
                     %peer,
                     accepted = accepted.len(),
+                    refused_native = refused_native.len(),
                     "connect driver: gateway disconnected mid-connect; ending reply collection"
                 );
                 collection_end = Some((CollectionEnd::Ended, Instant::now()));
@@ -907,6 +913,7 @@ async fn drive_client_connect(
                 tracing::debug!(
                     tx = %tx,
                     accepted = accepted.len(),
+                    refused_native = refused_native.len(),
                     target_connections,
                     gateway = %gateway.pub_key(),
                     "connect driver: receiver closed"
@@ -1017,7 +1024,14 @@ async fn drive_client_connect(
                             // wait ends; dial it at the same time so the two
                             // punches overlap, as after a native dial that
                             // failed. Waits outside the dial queue, as that
-                            // fallback does.
+                            // fallback does. Not a fallback after a native
+                            // attempt (`after_native` None): this node made
+                            // none, so the dial is not counted as one.
+                            #[cfg(any(test, feature = "testing"))]
+                            super::native_wire_trace::record_at(
+                                acceptor_addr,
+                                super::native_wire_trace::NativeWireEvent::DecisionRefused,
+                            );
                             tracing::info!(
                                 tx = %tx,
                                 acceptor = %payload.acceptor,
@@ -1031,7 +1045,7 @@ async fn drive_client_connect(
                                 payload.acceptor.clone(),
                                 acceptor_addr,
                                 at,
-                                Some(false),
+                                None,
                             )));
                             continue;
                         }
@@ -3897,7 +3911,7 @@ mod driver_timing_tests {
             .expect("the arm asks for the plan");
         let dial = flat
             .find(
-                "dials.push(futures::future::Either::Right(udp_fallback_dial(op_manager.clone(),tx,payload.acceptor.clone(),acceptor_addr,at,Some(false),)));",
+                "dials.push(futures::future::Either::Right(udp_fallback_dial(op_manager.clone(),tx,payload.acceptor.clone(),acceptor_addr,at,None,)));",
             )
             .expect("the arm dials UDP at the planned time");
         let report = flat
@@ -4951,7 +4965,7 @@ mod driver_timing_tests {
     /// reporting it failed: a lone punch from the acceptor cannot pass a
     /// restricted NAT.
     #[tokio::test(start_paused = true)]
-    async fn a_native_decision_to_a_real_offer_fails_the_attempt() {
+    async fn a_native_decision_the_joiner_lost_is_dialled_over_udp() {
         use crate::operations::connect::native::{NativeDecision, NativeOffer};
         let before = decision_failures_here();
         let run = dials_for_decisions(
