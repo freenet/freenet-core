@@ -423,8 +423,13 @@ fn a_node_never_both_exits_for_a_death_and_rebuilds() {
             }
         }
     }
-    let src = include_str!("../../connection_handler.rs");
-    let flat: String = src.split_whitespace().collect();
+    // Scoped to `new_listener`'s body with comments stripped, so neither a
+    // call elsewhere in the file nor a commented-out one satisfies it.
+    let body = crate::transport::peer_connection::inbound_budget::pin::fn_body(
+        include_str!("../../connection_handler.rs"),
+        "fn new_listener(",
+    );
+    let flat: String = body.split_whitespace().collect();
     assert!(
         flat.contains(
             "rebuild::enabled_at(super::quic::liveness::gateway_quic_restarts(is_gateway),"
