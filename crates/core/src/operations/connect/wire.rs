@@ -344,6 +344,13 @@ pub mod sim_trace {
         gateway_join_skipped_cooldown: AtomicU64,
         gateway_link_dead_before_frame: AtomicU64,
         native_joiners_promoted: AtomicU64,
+        /// (node, peer) pairs where the node gave a native connection's
+        /// transport the key the ring holds the peer under
+        /// ([`NativeWireEvent::NativeKeySent`]).
+        native_keys_sent: parking_lot::Mutex<std::collections::BTreeSet<(SocketAddr, SocketAddr)>>,
+        /// (node, peer) pairs in each node's ring when the run ended
+        /// ([`NativeWireEvent::Ring`], frozen with `transports`).
+        rings: parking_lot::Mutex<std::collections::BTreeSet<(SocketAddr, SocketAddr)>>,
     }
 
     /// How each end's native setup in a CONNECT ended: by (transaction, lower
@@ -451,6 +458,12 @@ pub mod sim_trace {
         /// A gateway's native joiner at the recorded address was promoted
         /// under its proven key: its joiner charge became a path's.
         NativeJoinerPromoted,
+        /// The node `own` gave the native connection to the recorded
+        /// address the key the ring holds that peer under.
+        NativeKeySent { own: SocketAddr },
+        /// The node `own` added the peer at the recorded address to its ring
+        /// (`member`), or removed it.
+        Ring { own: SocketAddr, member: bool },
     }
 
     static TRACES: LazyLock<dashmap::DashMap<String, NativeWireTrace>> =
@@ -547,6 +560,21 @@ pub mod sim_trace {
             NativeWireEvent::GatewayJoinSkippedCooldown => &c.gateway_join_skipped_cooldown,
             NativeWireEvent::GatewayLinkDeadBeforeFrame => &c.gateway_link_dead_before_frame,
             NativeWireEvent::NativeJoinerPromoted => &c.native_joiners_promoted,
+            NativeWireEvent::NativeKeySent { own } => {
+                c.native_keys_sent.lock().insert((own, addr));
+                return;
+            }
+            NativeWireEvent::Ring { own, member } => {
+                if !c.transports_frozen.load(Ordering::Relaxed) {
+                    let mut rings = c.rings.lock();
+                    if member {
+                        rings.insert((own, addr));
+                    } else {
+                        rings.remove(&(own, addr));
+                    }
+                }
+                return;
+            }
             NativeWireEvent::Survivor { swapped: true, .. } => &c.survivor_swapped,
             NativeWireEvent::Survivor {
                 swapped: false,
@@ -796,6 +824,15 @@ pub mod sim_trace {
         /// path's.
         pub fn native_joiners_promoted(&self) -> u64 {
             Self::get(&self.0.native_joiners_promoted)
+        }
+        /// (node, peer) pairs in each node's ring when the run ended.
+        pub fn rings(&self) -> std::collections::BTreeSet<(SocketAddr, SocketAddr)> {
+            self.0.rings.lock().clone()
+        }
+        /// (node, peer) pairs where the node gave its native connection to
+        /// the peer the key the ring holds the peer under.
+        pub fn native_keys_sent(&self) -> std::collections::BTreeSet<(SocketAddr, SocketAddr)> {
+            self.0.native_keys_sent.lock().clone()
         }
         /// Native connections kept beside a UDP entry to wait for a frame.
         pub fn native_held(&self) -> u64 {

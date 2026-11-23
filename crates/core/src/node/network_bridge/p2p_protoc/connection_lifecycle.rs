@@ -616,6 +616,22 @@ impl P2pConnManager {
                 return;
             }
         };
+        #[cfg(any(test, feature = "testing"))]
+        if entry.native {
+            let own = self
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .get_own_addr()
+                .unwrap_or_else(|| SocketAddr::new(self.listening_ip, self.listening_port));
+            crate::operations::connect::native_wire_trace::record_at(
+                addr,
+                crate::operations::connect::native_wire_trace::NativeWireEvent::NativeKeySent {
+                    own,
+                },
+            );
+        }
         notify_connection_task(
             entry.sender.clone(),
             Right(ConnEvent::SetPeerIdentity(bound)),

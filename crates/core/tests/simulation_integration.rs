@@ -23652,39 +23652,56 @@ fn test_quic_native_gateway_join_with_admission_joins_over_quic() {
         run.gateways
     );
     // A gateway that has a peer nearer the joiner's location forwards the
-    // join instead of accepting it, as for a UDP join: its connection to the
-    // joiner then stays a transient one outside the ring until the transient
-    // TTL (30 s, longer than this run) closes it. So not every pair a gateway
-    // holds natively is promoted; which joins a gateway accepts depends on the
-    // topology when each arrives, and it changed when every node gained a
-    // verify-soon task (#6305). What must hold: the joiner holds each such
-    // connection natively too, at least one join was promoted into the ring
-    // under its proven key, and a promotion never happens without the pair
-    // being in the ring.
-    let mut in_ring = 0u64;
+    // join instead of accepting it, as for a UDP join: its native connection
+    // to the joiner then stays outside its ring until the transient TTL
+    // (30 s, longer than this run) closes it. So for every pair a gateway
+    // holds natively when the run ends (`rings` is each node's ring then;
+    // the `Connected` events behind `mesh` are logged by the joiner when an
+    // acceptor answers, so they cannot say which node holds whom):
+    // - if the joiner is in the gateway's ring, the gateway gave that
+    //   native connection the key, which promotes the joiner's charge to a
+    //   path's (a ring member must never keep a joiner's charge);
+    // - if not, and the gateway never gave it a key (still a joiner), the
+    //   join was forwarded: the joiner is in some other peer's ring.
+    let keys_sent = t.native_keys_sent();
+    let rings = t.rings();
+    let mut promoted = Vec::new();
     for (gateway, joiner) in &joined_natively {
         assert_eq!(
             transports.get(&(*joiner, *gateway)),
             Some(&true),
             "the joiner {joiner} holds its gateway {gateway} natively too"
         );
-        let pair = if gateway <= joiner {
-            (*gateway, *joiner)
-        } else {
-            (*joiner, *gateway)
-        };
-        if run.wire.mesh.contains(&pair) {
-            in_ring += 1;
+        if rings.contains(&(*gateway, *joiner)) {
+            assert!(
+                keys_sent.contains(&(*gateway, *joiner)),
+                "gateway {gateway} has the native joiner {joiner} in its ring \
+                 without having promoted it; keys sent: {keys_sent:?}"
+            );
+            promoted.push((*gateway, *joiner));
+        } else if !keys_sent.contains(&(*gateway, *joiner)) {
+            // (A pair given its key and no longer in the ring was promoted
+            // and later dropped from it; its charge is a path's, so it is
+            // not this check's concern.)
+            assert!(
+                rings.iter().any(|(a, b)| {
+                    (*a == *joiner && !run.gateways.contains(b))
+                        || (*b == *joiner && !run.gateways.contains(a))
+                }),
+                "the native join {joiner} -> {gateway} was neither accepted nor \
+                 forwarded to a peer that took it; rings: {rings:?}"
+            );
         }
     }
     assert!(
-        t.native_joiners_promoted() > 0,
-        "no native join was promoted; held natively: {joined_natively:?}"
+        !promoted.is_empty(),
+        "no native join was accepted into a gateway's ring; held natively: {joined_natively:?}"
     );
+    // And the transport promoted each such joiner's charge.
     assert!(
-        t.native_joiners_promoted() <= in_ring,
-        "promoted joiners {} > native joins in the ring {in_ring}",
-        t.native_joiners_promoted(),
+        t.native_joiners_promoted() >= promoted.len() as u64,
+        "charges promoted {} < native joins in a gateway's ring {promoted:?}",
+        t.native_joiners_promoted()
     );
     assert!(t.native_replaced_by_udp().is_empty());
     assert_eq!(t.undecodable_closes(), 0);

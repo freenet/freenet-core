@@ -2797,6 +2797,16 @@ impl ConnectionManager {
                 connection_count = count_after,
                 "add_connection: successfully added to ring"
             );
+            #[cfg(any(test, feature = "testing"))]
+            if let Some(own) = self.get_own_addr() {
+                crate::operations::connect::native_wire_trace::record_at(
+                    addr,
+                    crate::operations::connect::native_wire_trace::NativeWireEvent::Ring {
+                        own,
+                        member: true,
+                    },
+                );
+            }
         }
 
         // Remove from transient connections if present, since we're now a full ring connection.
@@ -2893,6 +2903,16 @@ impl ConnectionManager {
     /// shared by the normal path and the no-mapping (ghost) path so they
     /// cannot drift apart.
     fn forget_pruned_peer(&self, addr: SocketAddr) {
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(own) = self.get_own_addr() {
+            crate::operations::connect::native_wire_trace::record_at(
+                addr,
+                crate::operations::connect::native_wire_trace::NativeWireEvent::Ring {
+                    own,
+                    member: false,
+                },
+            );
+        }
         // Readiness state
         self.ready_peers.remove(&addr);
         // Connection timestamp for optimistic readiness
