@@ -2141,15 +2141,15 @@ fn app_out(bytes: &[u8]) -> OutboundDelegateMsg {
 /// payload, anything else by its variant.
 fn labels(msgs: &[OutboundDelegateMsg]) -> Vec<String> {
     msgs.iter()
-        .map(|m| match m {
-            OutboundDelegateMsg::ApplicationMessage(a) => {
-                format!("app:{}", String::from_utf8_lossy(&a.payload))
+        .map(|m| {
+            if let OutboundDelegateMsg::ApplicationMessage(a) = m {
+                return format!("app:{}", String::from_utf8_lossy(&a.payload));
             }
-            other => format!("{other:?}")
+            format!("{m:?}")
                 .split(['(', ' ', '{'])
                 .next()
                 .unwrap_or_default()
-                .to_string(),
+                .to_string()
         })
         .collect()
 }
