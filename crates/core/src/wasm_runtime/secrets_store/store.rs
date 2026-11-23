@@ -1266,7 +1266,11 @@ impl SecretsStore {
     }
 
     /// Path of the encrypted key registry for `(delegate, scope)`.
-    fn key_registry_path(&self, delegate: &DelegateKey, scope: &SecretScope<'_>) -> PathBuf {
+    pub(in crate::wasm_runtime) fn key_registry_path(
+        &self,
+        delegate: &DelegateKey,
+        scope: &SecretScope<'_>,
+    ) -> PathBuf {
         self.scope_dir(delegate, scope).join(KEY_REGISTRY_FILE)
     }
 

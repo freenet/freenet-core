@@ -2544,9 +2544,8 @@ pub(super) mod delegate_secrets {
     /// Remove a secret by key.
     ///
     /// ## Returns
-    /// - `SUCCESS` (0): remove succeeded
+    /// - `SUCCESS` (0): remove succeeded, or the secret was already absent
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
-    /// - `ERR_SECRET_NOT_FOUND`: secret doesn't exist
     /// - `ERR_STORAGE_FAILED`: storage operation failed, or an earlier secret
     ///   read in this call failed (the call is poisoned, #5857)
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
@@ -3568,6 +3567,60 @@ mod secret_read_memo_tests {
             matches!(&res, Err(DelegateCreateError::StoreFailed(m)) if m.contains("earlier secret read failed")),
             "create_delegate must be refused after a failed read, got {res:?}"
         );
+    }
+
+    /// #5857, host-function layer: `list_secrets_len` / `list_secrets` over an
+    /// UNREADABLE key registry must fail with `ERR_STORAGE_FAILED` and poison
+    /// the call, not return 0 ("no keys"). Registers a real instance in the
+    /// process-global maps (under a private id) and calls the host functions a
+    /// guest would. Fails if `collect_list_secrets` swallows the error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_secrets_host_fn_fails_the_call_on_an_unreadable_registry() {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        const ID: i64 = 0x5857_0001;
+
+        let mut f = fixture().await;
+        let dk = delegate_key();
+        f.secret_store
+            .store_secret(
+                &dk,
+                &SecretsId::new(b"room:a".to_vec()),
+                SecretScope::Local,
+                Zeroizing::new(b"v".to_vec()),
+            )
+            .unwrap();
+        let reg_path = f.secret_store.key_registry_path(&dk, &SecretScope::Local);
+        let good = std::fs::read(&reg_path).unwrap();
+
+        // SAFETY: the env is moved into `DELEGATE_ENV` and removed again before
+        // `f` is dropped at the end of this test.
+        let env = unsafe { env_of(&mut f) };
+        MEM_ADDR.insert(ID, InstanceInfo::new(0, 0, Key::Delegate(dk.clone())));
+        DELEGATE_ENV.insert(ID, DelegateEnvSlot::new(env));
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(ID));
+
+        let healthy = delegate_secrets::list_secrets_len(0, 0);
+
+        std::fs::remove_file(&reg_path).unwrap();
+        std::fs::create_dir(&reg_path).unwrap();
+        let len_res = delegate_secrets::list_secrets_len(0, 0);
+        let list_res = delegate_secrets::list_secrets(0, 0, 0, 64);
+        let poisoned = DELEGATE_ENV
+            .get(&ID)
+            .map(|e| e.secret_reads_poisoned())
+            .unwrap_or(false);
+
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        DELEGATE_ENV.remove(&ID);
+        MEM_ADDR.remove(&ID);
+        std::fs::remove_dir(&reg_path).unwrap();
+        std::fs::write(&reg_path, good).unwrap();
+
+        assert!(healthy > 0, "control: a readable registry lists its key");
+        assert_eq!(len_res, error_codes::ERR_STORAGE_FAILED);
+        assert_eq!(list_res, error_codes::ERR_STORAGE_FAILED);
+        assert!(poisoned, "the failed enumeration must poison the call");
     }
 
     /// The memo is keyed on the secret's hash. Without that check a read of a
