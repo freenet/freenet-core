@@ -3698,9 +3698,9 @@ mod secret_read_memo_tests {
     ///  - `!Sync` and load-bearing for the argument: `secret_store`,
     ///    `delegate_store` (`UnsafeCell<*mut _>`), `contract_store`
     ///    (`*const _`), `context`, `secret_read_memo` and `secret_read_failure`
-    ///    (`RefCell`), `creations_this_call` (`Cell`). Seven, not three — an earlier draft of
-    ///    the SAFETY block miscounted, which is exactly the kind of slip that
-    ///    makes a reader stop trusting a soundness argument.
+    ///    (`RefCell`), `creations_this_call` (`Cell`). Seven, not three: an
+    ///    earlier draft of the SAFETY block miscounted, which is exactly the
+    ///    kind of slip that makes a reader stop trusting a soundness argument.
     ///  - Plain owned data, safe by construction: everything else.
     #[test]
     fn every_call_env_field_is_named_in_the_safety_argument() {
