@@ -4715,6 +4715,13 @@ mod test_temp_root {
     /// The non-unix sweep (no `flock` there): remove root-named real
     /// directories other than `own` whose mtime is older than
     /// [`LOCKLESS_ROOT_MAX_AGE`]. Compiled everywhere so unix tests cover it.
+    #[cfg_attr(
+        all(unix, not(test)),
+        allow(
+            dead_code,
+            reason = "unix calls it only from its tests; a unix simulation_tests build compiles it unused"
+        )
+    )]
     pub(super) fn sweep_aged_roots(tmp: &Path, own: &Path, now: SystemTime) {
         let Ok(entries) = fs::read_dir(tmp) else {
             return;
