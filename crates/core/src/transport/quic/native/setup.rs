@@ -264,6 +264,41 @@ pub(in crate::transport) async fn connect_native<T: TimeSource>(
     }
 }
 
+/// Join the gateway `peer` with a native connection (#5940, phase B): the
+/// client's setup ([`connect_native`]) whatever the key order, since a
+/// gateway admits a joiner it was never told about only as the server
+/// (`quic::admission`), and without punching, since a gateway is reachable at
+/// its address and drops a punch from an unknown source. The overlapping
+/// second attempt is kept; a gateway admits one attempt per source address
+/// per second, and the second starts later than that. The Hello exchange
+/// treats `peer` as a gateway whatever `peer.is_gateway` says, so a refusal
+/// of this node's version sets the version-mismatch signal as on UDP.
+pub(in crate::transport) async fn join_native<T: TimeSource>(
+    endpoint: &QuicEndpoint,
+    budget: &PunchBudget,
+    peer: NativePeer<'_>,
+    caps: u32,
+    clock: &T,
+    deadline: Duration,
+) -> Result<NativeConnection, NativeSetupError> {
+    let peer = NativePeer {
+        is_gateway: true,
+        ..peer
+    };
+    let end = window_end(clock, deadline, NATIVE_WINDOW)?;
+    PeerKey::of(peer.key).map_err(QuicConnectError::from)?;
+    // The dial's Initials still go to the destination, so they are charged
+    // as a client's are.
+    budget
+        .charge(peer.addr, CLIENT_BYTES_PER_DIAL, clock.now())
+        .map_err(NativeSetupError::OverBudget)?;
+    let attempt = || async {
+        let connection = endpoint.dial_native(peer.addr, peer.key).await?;
+        finish(connection, peer, caps, clock, end).await
+    };
+    race_attempts(attempt, budget, peer.addr, clock, end).await
+}
+
 /// The client's attempts: `attempt` runs at once, and a second `attempt`
 /// starts at [`overlap_at`] if the first has not finished, charged to
 /// `budget` for `addr`. The first to succeed is returned and the other is

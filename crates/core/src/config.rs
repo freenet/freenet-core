@@ -1268,6 +1268,7 @@ impl ConfigArgs {
                         address: Address::HostAddress(cfg.address),
                         public_key_path: cfg.public_key_path,
                         location: cfg.location,
+                        native: false,
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2754,6 +2755,7 @@ fn compiled_fallback_gateways(entries: &[(&str, &str)], secrets_dir: &Path) -> G
             address: Address::Hostname(hostname.to_string()),
             public_key_path: key_path,
             location: None,
+            native: false,
         });
     }
     Gateways { gateways }
@@ -2814,6 +2816,7 @@ fn parse_gateway(input: &str, secrets_dir: &Path) -> anyhow::Result<GatewayConfi
         address: Address::HostAddress(addr),
         public_key_path: key_path,
         location: None,
+        native: false,
     })
 }
 
@@ -5301,6 +5304,16 @@ pub struct GatewayConfig {
     /// Optional location of the gateway.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<f64>,
+
+    /// Whether the gateway takes QUIC-native joins (#5940, phase B): a joiner
+    /// may then try a native connection to it before today's join
+    /// (`operations::connect::native::GATEWAY_NATIVE_JOIN_PERCENT`). Set in
+    /// the published index only once the gateway admits native joins. Absent
+    /// means false, and false is not written, so a cache with no marked
+    /// gateway is written as before. A release without this field ignores
+    /// the key (serde skips unknown keys here).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native: bool,
 }
 
 impl PartialEq for GatewayConfig {
@@ -8864,6 +8877,37 @@ shutdown-drain-secs = 42
         );
     }
 
+    /// The `native` mark defaults to off, is written only when set, and
+    /// survives the cache round trip.
+    #[test]
+    fn gateways_toml_native_mark_defaults_off_and_round_trips() {
+        // The published index today: no mark, so no gateway is native.
+        let today = "[[gateways]]\npublic_key = \"keys/public.nova.gw.pem\"\n\
+                     \n[gateways.address]\nhostname = \"nova.locut.us:31337\"\n";
+        let gateways = parse_gateways_toml(today, "gateways.toml").unwrap();
+        assert!(!gateways.gateways[0].native);
+        // An unmarked gateway is written as before: no `native` key, so a
+        // cache this release writes is the cache the last one wrote.
+        let written = toml::to_string(&gateways).unwrap();
+        assert!(!written.contains("native"), "{written}");
+
+        let marked = "[[gateways]]\npublic_key = \"keys/public.nova.gw.pem\"\nnative = true\n\
+                      \n[gateways.address]\nhostname = \"nova.locut.us:31337\"\n";
+        let gateways = parse_gateways_toml(marked, "gateways.toml").unwrap();
+        assert!(gateways.gateways[0].native);
+        let reread =
+            parse_gateways_toml(&toml::to_string(&gateways).unwrap(), "gateways.toml").unwrap();
+        assert!(reread.gateways[0].native, "the cache keeps the mark");
+
+        // A release before this field reads a marked index as it reads any
+        // key it does not know: ignored. Shown here with a key this release
+        // does not know.
+        let later = "[[gateways]]\npublic_key = \"keys/public.nova.gw.pem\"\nnot_yet_a_key = 3\n\
+                     \n[gateways.address]\nhostname = \"nova.locut.us:31337\"\n";
+        let gateways = parse_gateways_toml(later, "gateways.toml").unwrap();
+        assert_eq!(gateways.gateways.len(), 1);
+    }
+
     /// `host_address` is `gateways.toml`'s OTHER key with this history — the
     /// legacy single-string address form, and what the node emits for
     /// `Address::HostAddress`. Hyphenating the key their own file contains gave
@@ -10553,6 +10597,7 @@ shutdown-drain-secs = 42
                 },
                 public_key_path: PathBuf::from("/dev/null"),
                 location: None,
+                native: false,
             }
         }
 
@@ -11736,6 +11781,7 @@ shutdown-drain-secs = 42
             address: Address::Hostname(host.to_string()),
             public_key_path: PathBuf::from(key),
             location: None,
+            native: false,
         };
         let loaded = Gateways {
             gateways: vec![gw("a", "/local/a.pub")],
@@ -11802,11 +11848,13 @@ shutdown-drain-secs = 42
                     ),
                     public_key_path: PathBuf::from("path/to/key"),
                     location: None,
+                    native: false,
                 },
                 GatewayConfig {
                     address: Address::Hostname("gw1.freenet.org".to_string()),
                     public_key_path: PathBuf::from("path/to/key"),
                     location: None,
+                    native: false,
                 },
             ],
         };
@@ -11982,6 +12030,7 @@ shutdown-drain-secs = 42
                 },
                 public_key_path: PathBuf::from("keys/k.pem"),
                 location: None,
+                native: false,
             }],
         };
         let serialized = toml::to_string(&gateways).unwrap();
@@ -12014,6 +12063,7 @@ shutdown-drain-secs = 42
                 address: Address::Hostname("gw1.freenet.org:31337".to_string()),
                 public_key_path: PathBuf::from("keys/k.pem"),
                 location: None,
+                native: false,
             }],
         };
         let s = toml::to_string(&hostname).unwrap();
@@ -12027,6 +12077,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress("203.0.113.1:31337".parse().unwrap()),
                 public_key_path: PathBuf::from("keys/k.pem"),
                 location: None,
+                native: false,
             }],
         };
         let s = toml::to_string(&host_addr).unwrap();
@@ -12316,6 +12367,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(addr),
                 public_key_path: PathBuf::from("old/key/path"),
                 location: None,
+                native: false,
             }],
         };
 
@@ -12419,6 +12471,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(addr),
                 public_key_path: PathBuf::from("old/stale/key.pub"),
                 location: None,
+                native: false,
             }],
         };
 
@@ -12715,6 +12768,7 @@ shutdown-drain-secs = 42
                 address: Address::Hostname(hostname.to_string()),
                 public_key_path: dir.join(key_file),
                 location: None,
+                native: false,
             })
             .collect();
         fs::write(
@@ -12992,6 +13046,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(public_gateway_addr),
                 public_key_path: PathBuf::from("public_gateway.pub"),
                 location: None,
+                native: false,
             }],
         })
         .unwrap();
@@ -13053,6 +13108,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(test_gateway_addr),
                 public_key_path: PathBuf::from("test_gateway.pub"),
                 location: None,
+                native: false,
             }],
         })
         .unwrap();
@@ -13105,6 +13161,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(leaked_addr),
                 public_key_path: PathBuf::from("leaked.pub"),
                 location: None,
+                native: false,
             }],
         })
         .unwrap();
@@ -13153,6 +13210,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(leaked_addr),
                 public_key_path: PathBuf::from("leaked.pub"),
                 location: None,
+                native: false,
             }],
         })
         .unwrap();
@@ -13233,6 +13291,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(leaked_addr),
                 public_key_path: PathBuf::from("leaked.pub"),
                 location: None,
+                native: false,
             }],
         })
         .unwrap();

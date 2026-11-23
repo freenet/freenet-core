@@ -2348,6 +2348,26 @@ impl SimNetwork {
         self
     }
 
+    /// Turns native gateway joins (phase B) on for every node, at `percent`
+    /// (the share of joiner-gateway pairs that dial native first), in place of
+    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, which are off,
+    /// and marks every gateway each node knows native, as the published index
+    /// does for a gateway that admits native joins. A joiner with a QUIC
+    /// endpoint (see [`Self::with_transport_quic`]) then tries a native join
+    /// first, and falls back to the UDP join when it fails. Call before the
+    /// simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_native_gateway_join(&mut self, percent: u8) -> &mut Self {
+        for label in self.pending_labels() {
+            let config = self.node_config_mut(&label);
+            config.native_gateway_join_override = Some(percent);
+            for gateway in &mut config.gateways {
+                gateway.native = true;
+            }
+        }
+        self
+    }
+
     /// As [`Self::with_native_connect`], for the node `label` only.
     #[cfg(any(test, feature = "testing"))]
     pub fn with_node_native_connect(&mut self, label: &NodeLabel, percent: u8) -> &mut Self {
