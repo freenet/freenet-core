@@ -2038,7 +2038,11 @@ impl P2pConnManager {
                 .await;
         }
         if let Some(entry) = self.connections.get(&remote_addr) {
-            watch_native_join(entry.sender.clone(), entry.link_use.clone(), remote_addr);
+            watch_native_join(
+                entry.sender.downgrade(),
+                entry.link_use.clone(),
+                remote_addr,
+            );
         }
         Ok(())
     }
@@ -3519,17 +3523,22 @@ const NATIVE_JOIN_REQUEST_WITHIN: Duration = Duration::from_secs(5);
 /// (a ConnectRequest, `zombie_sweep::is_link_use_request`) within
 /// [`NATIVE_JOIN_REQUEST_WITHIN`]. The drop notice goes to that
 /// connection's own task, so a later connection at the address is not
-/// touched. The task ends after one wait.
+/// touched. The task ends after one wait. It holds the channel weakly, so a
+/// connection replaced or dropped in the meantime closes at once rather than
+/// at the deadline, and is not counted.
 fn watch_native_join(
-    sender: PeerConnChannelSender,
+    sender: tokio::sync::mpsc::WeakSender<Either<NetMessage, ConnEvent>>,
     link_use: zombie_sweep::LinkUseStamp,
     peer_addr: SocketAddr,
 ) {
     drop(GlobalExecutor::spawn(async move {
         sleep(NATIVE_JOIN_REQUEST_WITHIN).await;
-        if link_use.requested() || sender.is_closed() {
+        if link_use.requested() {
             return;
         }
+        let Some(sender) = sender.upgrade().filter(|sender| !sender.is_closed()) else {
+            return;
+        };
         tracing::debug!(%peer_addr, "Native join sent no ConnectRequest in time; closing it");
         TRANSPORT_METRICS.record_gateway_admission(
             crate::transport::metrics::GatewayAdmission::NoConnectRequest,

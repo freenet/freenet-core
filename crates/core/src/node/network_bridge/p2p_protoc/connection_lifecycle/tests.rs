@@ -6328,7 +6328,8 @@ async fn a_native_join_replaces_a_native_entry_for_its_key() {
     let joiner = key();
     native_join(&mut h, addr, &joiner).await;
     let first = h.mgr.connections[&addr].connection_id;
-    let first_sender = h.mgr.connections[&addr].sender.clone();
+    // Weak, so this test does not keep the first connection's channel open.
+    let first_sender = h.mgr.connections[&addr].sender.downgrade();
     let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
     let transients = cm.transient_count();
     native_join(&mut h, addr, &joiner).await;
@@ -6348,7 +6349,7 @@ async fn a_native_join_replaces_a_native_entry_for_its_key() {
         "no transient slot taken or leaked"
     );
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !first_sender.is_closed() {
+        while first_sender.upgrade().is_some() {
             tokio::task::yield_now().await;
         }
     })
@@ -6397,14 +6398,20 @@ async fn a_native_joins_connect_request_must_name_its_proven_key() {
 
 /// The native join's deadline for a ConnectRequest: a join that sends none
 /// in time gets a drop notice on its own connection's channel; one that sent
-/// a request, or whose connection has already gone, gets nothing.
+/// a request, or whose entry has already gone, gets nothing.
 #[tokio::test(start_paused = true)]
 async fn a_native_join_without_a_connect_request_is_closed_after_the_deadline() {
     let addr: SocketAddr = "198.51.100.231:7504".parse().unwrap();
     let now = Instant::now();
 
-    let (sender, mut notices) = mpsc::channel(4);
-    super::watch_native_join(sender, zombie_sweep::LinkUseStamp::new(now), addr);
+    // `entry` stands for the connection entry's sender, which the watcher
+    // holds only weakly.
+    let (entry, mut notices) = mpsc::channel(4);
+    super::watch_native_join(
+        entry.downgrade(),
+        zombie_sweep::LinkUseStamp::new(now),
+        addr,
+    );
     tokio::time::sleep(super::NATIVE_JOIN_REQUEST_WITHIN - Duration::from_millis(1)).await;
     assert!(notices.try_recv().is_err(), "not before the deadline");
     tokio::time::sleep(Duration::from_millis(2)).await;
@@ -6414,15 +6421,35 @@ async fn a_native_join_without_a_connect_request_is_closed_after_the_deadline() 
         }
         other => panic!("expected a drop notice, got {other:?}"),
     }
+    drop(entry);
 
     // A request, even one at the instant of the hand-over, keeps it.
-    let (sender, mut notices) = mpsc::channel(4);
+    let (entry, mut notices) = mpsc::channel(4);
     let stamp = zombie_sweep::LinkUseStamp::new(now);
-    super::watch_native_join(sender, stamp.clone(), addr);
+    super::watch_native_join(entry.downgrade(), stamp.clone(), addr);
     stamp.record(now);
     tokio::time::sleep(super::NATIVE_JOIN_REQUEST_WITHIN * 2).await;
     assert!(
         notices.try_recv().is_err(),
         "a join that sent a request is kept"
     );
+    drop(entry);
+
+    // The watcher does not keep a replaced or dropped connection's channel
+    // open until the deadline.
+    let (entry, mut notices) = mpsc::channel(4);
+    super::watch_native_join(
+        entry.downgrade(),
+        zombie_sweep::LinkUseStamp::new(now),
+        addr,
+    );
+    drop(entry);
+    assert!(
+        matches!(
+            notices.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ),
+        "the channel closes as soon as the entry drops it"
+    );
+    tokio::time::sleep(super::NATIVE_JOIN_REQUEST_WITHIN * 2).await;
 }
