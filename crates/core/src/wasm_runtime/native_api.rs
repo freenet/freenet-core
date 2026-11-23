@@ -1072,9 +1072,9 @@ pub(super) struct DelegateCallEnv {
     /// after an unrelated release-profile change.
     ///
     secret_read_memo: std::cell::RefCell<SecretReadMemo>,
-    /// Set the first time a secret READ fails for any reason other than the
-    /// secret being absent (an I/O error, an authentication failure on a blob
-    /// that exists). #5857.
+    /// Set the first time a secret READ fails with an I/O error rather than the
+    /// secret being absent. #5857. (A blob that reads but fails to
+    /// authenticate keeps its old answer, see #6323.)
     ///
     /// A delegate cannot be trusted to tell that apart from "no such secret":
     /// every stdlib guest to date maps ANY negative return of `get_secret` /
@@ -1089,6 +1089,7 @@ pub(super) struct DelegateCallEnv {
     /// returns, so no guest can handle the code and carry on. Effects made
     /// BEFORE the failed read (an earlier `set_secret`) are not rolled back, so
     /// a retried call must be safe to repeat.
+    ///
     /// Holds the first failure's text. Behind a `RefCell` like `context`, for
     /// the same reason: nothing needs a `&mut DelegateCallEnv`.
     secret_read_failure: std::cell::RefCell<Option<String>>,
@@ -1409,9 +1410,10 @@ impl DelegateCallEnv {
     }
 
     /// Classify a failed secret read (#5857). Returns the host error code to
-    /// hand the guest: `ERR_SECRET_NOT_FOUND` only for a genuinely absent
-    /// secret, otherwise `ERR_STORAGE_FAILED`, and in that case the call is
-    /// poisoned (see [`Self::secret_read_failure`](Self)'s field docs).
+    /// hand the guest: `ERR_STORAGE_FAILED` for an I/O failure, in which case
+    /// the call is poisoned (see the `secret_read_failure` field docs), and
+    /// `ERR_SECRET_NOT_FOUND` for everything else, including a blob that fails
+    /// to authenticate (#6323).
     fn classify_secret_read_error(&self, secret_id: &SecretsId, e: &SecretStoreError) -> i32 {
         // Scope: I/O failures, which are transient and retryable. A blob that
         // reads but does not authenticate is deterministic corruption or a key
@@ -2467,7 +2469,8 @@ pub(super) mod delegate_secrets {
     /// ## Returns
     /// - 1: secret exists
     /// - 0: secret doesn't exist
-    /// - `ERR_STORAGE_FAILED`: the read failed (I/O); the call is poisoned
+    /// - `ERR_STORAGE_FAILED`: the read failed (I/O); the call is poisoned.
+    ///   A blob that fails to authenticate still returns 0 (#6323).
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
     pub(crate) fn has_secret(key_ptr: i64, key_len: i32) -> i32 {

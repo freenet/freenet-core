@@ -2526,9 +2526,10 @@ async fn a_failed_secret_read_fails_the_call_and_blocks_writes_not_reads_as_abse
 
     // has_secret must not answer "no" for a read that failed.
     let res = send(&mut runtime, &InboundAppMessage::HasSecret(key.clone()));
+    let err = res.expect_err("has_secret on an unreadable secret must fail the call");
     assert!(
-        res.is_err(),
-        "has_secret on an unreadable secret must fail the call, not return false"
+        format!("{err}").contains("secret storage read failed"),
+        "has_secret must fail via the poisoned-read error, not return false: {err}"
     );
 
     // Poisoning is per invocation: once the blob is readable again the very
@@ -2558,7 +2559,7 @@ async fn a_failed_secret_read_fails_the_call_and_blocks_writes_not_reads_as_abse
 /// is deterministic corruption or a key mismatch, not a transient I/O failure.
 /// It keeps its historical answer (absent, call succeeds) rather than failing
 /// every call that touches it. Follow-up for refusing writes over it is tracked
-/// separately.
+/// in #6323.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_corrupt_secret_blob_keeps_its_old_answer_and_does_not_poison_the_call()
 -> Result<(), Box<dyn std::error::Error>> {
