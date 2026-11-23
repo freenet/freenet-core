@@ -252,6 +252,104 @@ pub(crate) fn quic_endpoint_clock(network: &str, addr: SocketAddr) -> Option<&'s
         .map(|clock| *clock)
 }
 
+/// What a simulated node's egress cap reads, for a test.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EgressCapReading {
+    pub(crate) rate_bytes_per_sec: u64,
+    pub(crate) burst_bytes: u64,
+    /// The cap's own clock, nanoseconds.
+    pub(crate) now_nanos: u64,
+    /// Bytes charged to the cap since it was built.
+    pub(crate) charged_bytes: u64,
+}
+
+/// What a test asks of a node's cap: read it, or take `bytes` from its bucket
+/// as a sender would (charged on success).
+#[cfg(test)]
+enum EgressCapAsk {
+    Read,
+    Take(usize),
+}
+
+#[cfg(test)]
+enum EgressCapAnswer {
+    Reading(EgressCapReading),
+    Taken(Result<(), Duration>),
+}
+
+#[cfg(test)]
+type EgressCapProbe = Box<dyn Fn(EgressCapAsk) -> Option<Option<EgressCapAnswer>> + Send + Sync>;
+
+/// A reader of the egress cap of the node at each `(network, address)`.
+/// `None` once the node's socket is gone; `Some(None)` for a node with no cap.
+#[cfg(test)]
+static EGRESS_CAP_PROBES: LazyLock<DashMap<(String, SocketAddr), EgressCapProbe>> =
+    LazyLock::new(DashMap::new);
+
+/// Records a reader of the egress cap of the socket bound at `addr`, if
+/// `addr` belongs to a simulation network (keyed as
+/// [`record_quic_endpoint_clock`] is).
+#[cfg(test)]
+pub(crate) fn record_egress_cap_probe<S: crate::transport::Socket>(
+    addr: SocketAddr,
+    socket: std::sync::Weak<S>,
+) {
+    if let Ok(network) = resolve_address_network(&addr) {
+        EGRESS_CAP_PROBES.insert(
+            (network, addr),
+            Box::new(move |ask| {
+                let socket = socket.upgrade()?;
+                Some(socket.egress_cap().map(|cap| {
+                    match ask {
+                        EgressCapAsk::Read => EgressCapAnswer::Reading(EgressCapReading {
+                            rate_bytes_per_sec: cap.rate_bytes_per_sec(),
+                            burst_bytes: cap.burst_bytes(),
+                            now_nanos: cap.now_nanos(),
+                            charged_bytes: cap.stats().bytes,
+                        }),
+                        EgressCapAsk::Take(bytes) => EgressCapAnswer::Taken(
+                            cap.try_take(bytes, Duration::ZERO)
+                                .map(|take| take.sent(bytes)),
+                        ),
+                    }
+                }))
+            }),
+        );
+    }
+}
+
+/// The reading of the egress cap of the node at `addr` in `network`: `None`
+/// if no socket is bound there, `Some(None)` if it has no cap.
+#[cfg(test)]
+pub(crate) fn egress_cap_reading(
+    network: &str,
+    addr: SocketAddr,
+) -> Option<Option<EgressCapReading>> {
+    let probe = EGRESS_CAP_PROBES.get(&(network.to_string(), addr))?;
+    Some(match probe(EgressCapAsk::Read)? {
+        Some(EgressCapAnswer::Reading(reading)) => Some(reading),
+        _ => None,
+    })
+}
+
+/// Takes `bytes` from the egress cap of the node at `addr` in `network`, as
+/// one datagram's send would: `Ok(())` if the bucket held them (they are
+/// charged), else the wait the bucket asks for, in the cap's time. `None` if
+/// no socket is bound there or it has no cap.
+#[cfg(test)]
+pub(crate) fn egress_cap_take(
+    network: &str,
+    addr: SocketAddr,
+    bytes: usize,
+) -> Option<Result<(), Duration>> {
+    let probe = EGRESS_CAP_PROBES.get(&(network.to_string(), addr))?;
+    match probe(EgressCapAsk::Take(bytes))?? {
+        EgressCapAnswer::Taken(taken) => Some(taken),
+        EgressCapAnswer::Reading(_) => None,
+    }
+}
+
 /// The simulated nodes whose transport started its QUIC endpoint's accept
 /// loop, keyed like [`QUIC_ENDPOINT_CLOCKS`]. Written by the transport when
 /// it starts the loop; read by tests to check the node passes its task
@@ -327,6 +425,8 @@ pub(crate) fn clear_quic_endpoint_clocks(network: &str) {
     crate::operations::connect::native_wire_trace::remove(network);
     QUIC_ACCEPT_LOOPS.retain(|(owner, _)| owner != network);
     QUIC_ENDPOINT_CLOCKS.retain(|(owner, _), _| owner != network);
+    #[cfg(test)]
+    EGRESS_CAP_PROBES.retain(|(owner, _), _| owner != network);
 }
 
 /// Clears all network time sources, for EVERY network in the process.

@@ -463,6 +463,9 @@ pub(crate) trait RelayContext {
 pub(crate) struct AcceptOutcome {
     pub response: ConnectResponse,
     pub joiner: PeerKeyLocation,
+    /// The comparison arm of the decision in `response`
+    /// ([`native::acceptor_arm`]), kept for the dial's outcome.
+    pub native_arm: Option<crate::transport::ConnectArm>,
 }
 
 /// Why a relay at terminus could not accept and rejected the request.
@@ -638,17 +641,20 @@ impl RelayState {
         &self,
         ctx: &C,
         own_key: &crate::transport::TransportPublicKey,
-    ) -> Option<native::NativeDecision> {
-        let offer = self.request.native_offer?;
+    ) -> (
+        Option<native::NativeDecision>,
+        Option<crate::transport::ConnectArm>,
+    ) {
+        let Some(offer) = self.request.native_offer else {
+            return (None, None);
+        };
         let bucket = native::native_bucket(own_key, self.request.joiner.pub_key());
-        let decision = native::decide_native(
-            Some(offer),
-            ctx.native_readiness(),
-            bucket,
-            ctx.holds_transport_to(&self.request.joiner),
-        );
+        let readiness = ctx.native_readiness();
+        let holds = ctx.holds_transport_to(&self.request.joiner);
+        let decision = native::decide_native(Some(offer), readiness, bucket, holds);
+        let arm = native::acceptor_arm(Some(offer), readiness, bucket, holds);
         crate::transport::metrics::TRANSPORT_METRICS.record_connect_native_decided(decision);
-        Some(decision)
+        (Some(decision), arm)
     }
 
     /// Helper to prepare and execute forwarding to a peer.
@@ -802,7 +808,7 @@ impl RelayState {
                                     let acceptor = PeerKeyLocation::with_unknown_addr(
                                         self_loc.pub_key().clone(),
                                     );
-                                    let native_decision =
+                                    let (native_decision, native_arm) =
                                         self.native_decision(ctx, self_loc.pub_key());
                                     actions.accept = Some(AcceptOutcome {
                                         response: ConnectResponse {
@@ -810,6 +816,7 @@ impl RelayState {
                                             native_decision,
                                         },
                                         joiner: self.request.joiner.clone(),
+                                        native_arm,
                                     });
                                     tracing::info!(
                                         acceptor_loc = ?self_loc.location(),
@@ -861,13 +868,14 @@ impl RelayState {
             let self_loc = ctx.self_location();
             let acceptor = PeerKeyLocation::with_unknown_addr(self_loc.pub_key().clone());
             let dist = ring_distance(self_loc.location(), self.request.joiner.location());
-            let native_decision = self.native_decision(ctx, self_loc.pub_key());
+            let (native_decision, native_arm) = self.native_decision(ctx, self_loc.pub_key());
             actions.accept = Some(AcceptOutcome {
                 response: ConnectResponse {
                     acceptor,
                     native_decision,
                 },
                 joiner: self.request.joiner.clone(),
+                native_arm,
             });
             // Response is routed hop-by-hop via upstream_addr, no target embedded in message
             tracing::info!(
@@ -1525,6 +1533,7 @@ pub(super) async fn dispatch_expect_connection_from(
     tx: Transaction,
     peer: PeerKeyLocation,
     decision: Option<native::NativeDecision>,
+    arm: Option<crate::transport::ConnectArm>,
 ) -> Result<(), OpError> {
     let Some(addr) = peer.socket_addr() else {
         // Protocol invariant violation: `handle_request` only sets
@@ -1547,8 +1556,26 @@ pub(super) async fn dispatch_expect_connection_from(
             "connect: acceptor accepted joiner, initiating hole punch"
         );
         let mut rx = acceptor_udp_dial(op_manager, tx, &peer, addr).await?;
+        // This side's own dial of a pair the slice sent to UDP: the control
+        // arm. It is the decided transport, not a fallback, so it is counted
+        // here and nowhere else. The attempt is counted now, so a dial whose
+        // callback closes or fails early is still an attempt.
+        let control = arm == Some(crate::transport::ConnectArm::Control);
+        if control {
+            crate::transport::TRANSPORT_METRICS.record_connect_arm_started(
+                crate::transport::ConnectArm::Control,
+                crate::transport::NativeConnectSide::Acceptor,
+            );
+        }
         GlobalExecutor::spawn(async move {
-            log_acceptor_dial(&peer, tx, rx.recv().await);
+            let result = rx.recv().await;
+            if let (true, Some(Ok(_))) = (control, &result) {
+                crate::transport::TRANSPORT_METRICS.record_connect_arm_established(
+                    crate::transport::ConnectArm::Control,
+                    crate::transport::NativeConnectSide::Acceptor,
+                );
+            }
+            log_acceptor_dial(&peer, tx, result);
         });
         return Ok(());
     }

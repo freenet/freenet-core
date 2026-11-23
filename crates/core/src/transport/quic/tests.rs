@@ -3525,29 +3525,32 @@ fn the_transport_endpoint_runs_on_virtual_time_only_in_simulation() {
     })
 }
 
-/// A simulated node with both `transport-quic` and an egress cap is
-/// refused: the cap runs on `RealTime` and the simulated endpoint on
-/// `VirtualTime`. Either one alone binds, and so does QUIC with
-/// `total-bandwidth-limit = 0`, which builds no cap.
+/// The clock of a simulated node's egress cap. With `transport-quic` the cap
+/// runs on the network's `VirtualTime`, the clock of the node's endpoint, so
+/// the node binds and advancing the simulated clock moves the cap's. Without
+/// QUIC the cap keeps `RealTime`, which a simulated clock does not move. QUIC
+/// with `total-bandwidth-limit = 0` builds no cap.
 #[test]
-fn a_simulated_node_with_quic_and_an_egress_cap_is_refused() {
+fn a_simulated_node_with_quic_runs_its_egress_cap_on_virtual_time() {
     bounded(|| async move {
         use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
         use crate::transport::global_bandwidth::GlobalBandwidthManager;
+        use crate::transport::in_memory_socket::egress_cap_reading;
+        const RATE: usize = 1_000_000;
         let network = "quic-sim-egress-cap";
         let time = VirtualTime::new();
         let _clock = Registration::time_source(network, time.clone());
         let cap = |limit| Some(Arc::new(GlobalBandwidthManager::new(limit, None)));
-        for (port, quic, global_bandwidth, refused) in [
-            (5000, Some(settings()), cap(1_000_000), true),
-            (5001, Some(settings()), None, false),
-            (5002, None, cap(1_000_000), false),
-            (5003, Some(settings()), cap(0), false),
+        for (port, quic, global_bandwidth, expected) in [
+            (5000, Some(settings()), cap(RATE), Some(true)),
+            (5001, Some(settings()), None, None),
+            (5002, None, cap(RATE), Some(false)),
+            (5003, Some(settings()), cap(0), None),
         ] {
             let net = crate::transport::test_net::subnet();
             let local = net.addr_port(1, port);
             let _registered = Registration::address(local, network);
-            let bound = bind_udp_listener::<SimulationSocket>(
+            let (_, _, listener) = bind_udp_listener::<SimulationSocket>(
                 crate::transport::TransportKeypair::new(),
                 local.ip(),
                 port,
@@ -3558,21 +3561,34 @@ fn a_simulated_node_with_quic_and_an_egress_cap_is_refused() {
                     ..UdpTransportConfig::default()
                 },
             )
-            .await;
-            match bound {
-                Ok((_, _, listener)) => {
-                    assert!(!refused, "port {port}: QUIC plus a cap must be refused");
-                    listener.abort();
-                }
-                Err(error) => {
-                    assert!(refused, "port {port}: refused: {error}");
-                    let text = error.to_string();
-                    assert!(
-                        text.contains("transport-quic") && text.contains("total-bandwidth-limit"),
-                        "the error names both settings: {text}"
-                    );
+            .await
+            .unwrap_or_else(|error| panic!("port {port}: {error}"));
+            let before = egress_cap_reading(network, local)
+                .unwrap_or_else(|| panic!("port {port}: no socket"));
+            match expected {
+                None => assert!(before.is_none(), "port {port}: no cap is built"),
+                Some(on_virtual_time) => {
+                    let before = before.unwrap_or_else(|| panic!("port {port}: no cap"));
+                    assert_eq!(before.rate_bytes_per_sec, RATE as u64);
+                    time.advance(Duration::from_secs(100));
+                    let after = egress_cap_reading(network, local).unwrap().unwrap();
+                    let moved = after.now_nanos.saturating_sub(before.now_nanos);
+                    if on_virtual_time {
+                        assert_eq!(
+                            after.now_nanos,
+                            time.now_nanos(),
+                            "port {port}: the cap reads the simulated clock"
+                        );
+                        assert_eq!(moved, 100_000_000_000, "port {port}");
+                    } else {
+                        assert!(
+                            moved < 50_000_000_000,
+                            "port {port}: a cap without QUIC stays on RealTime"
+                        );
+                    }
                 }
             }
+            listener.abort();
         }
     })
 }

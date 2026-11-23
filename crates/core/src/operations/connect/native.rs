@@ -33,6 +33,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use crate::transport::TransportPublicKey;
+use crate::transport::metrics::ConnectArm;
 use crate::transport::metrics::TRANSPORT_METRICS;
 
 /// Whether this build can dial a native connection. False until the native
@@ -342,14 +343,56 @@ pub(crate) fn decide_native(
     bucket: u8,
     holds_transport: bool,
 ) -> NativeDecision {
-    let offered = offer.map_or(0, NativeOffer::effective_percent);
-    let native =
-        offered > 0 && own.ready && bucket < offered.min(own.percent.min(100)) && !holds_transport;
-    if native {
+    if acceptor_arm(offer, own, bucket, holds_transport) == Some(ConnectArm::Treated) {
         NativeDecision::Native
     } else {
         NativeDecision::Udp
     }
+}
+
+/// The comparison arm of the acceptor's decision (QUIC-NATIVE-CONNECT 3.2),
+/// from the same inputs as [`decide_native`], which takes its answer from it:
+/// `Treated` is exactly a `Native` decision. `Control` is a request that
+/// carried an offer, where the acceptor holds no transport to the joiner and
+/// the bucket is at or above the lower of the two percents, so the pair dials
+/// UDP because of the slice (every such pair while that percent is 0).
+/// `None`: no offer, a transport already held (reused, so no dial is decided),
+/// or a pair below the percent that this node is not ready to dial.
+pub(crate) fn acceptor_arm(
+    offer: Option<NativeOffer>,
+    own: NativeReadiness,
+    bucket: u8,
+    holds_transport: bool,
+) -> Option<ConnectArm> {
+    let offered = offer?.effective_percent();
+    if holds_transport {
+        return None;
+    }
+    if bucket < offered.min(own.percent.min(100)) {
+        own.ready.then_some(ConnectArm::Treated)
+    } else {
+        Some(ConnectArm::Control)
+    }
+}
+
+/// Whether the joiner's dial to an acceptor that answered `decision` is in
+/// the control arm. The joiner knows its own percent, not the acceptor's, so
+/// it counts a pair only when the bucket is at or above its own: that is at
+/// or above the lower of the two too, so such a pair is control at the
+/// acceptor as well. A pair below the joiner's percent that the acceptor sent
+/// to UDP is not counted here (the acceptor's own count has it), and nor is
+/// one with no decision (an acceptor or a relay below the floor).
+///
+/// It includes pairs where the acceptor already held a transport to the
+/// joiner and reused it without dialling ([`acceptor_arm`] gives `None`): the
+/// joiner cannot see that, so the acceptor's counters are the ones for rates.
+pub(crate) fn joiner_in_control(
+    sent: Option<NativeOffer>,
+    decision: Option<NativeDecision>,
+    bucket: u8,
+) -> bool {
+    matches!(decision, Some(NativeDecision::Udp))
+        && sent.is_some_and(|offer| bucket >= offer.effective_percent())
 }
 
 /// What an acceptor that has no UDP path answers.
@@ -662,6 +705,140 @@ mod tests {
                 .count();
             assert!((low..=high).contains(&held), "{percent}%: {held} of 2000");
         }
+    }
+
+    /// The arm is the decision's own: `Treated` exactly when it says `Native`,
+    /// for every offer, readiness, bucket and held-transport input.
+    #[test]
+    fn acceptor_arm_treated_is_exactly_a_native_decision() {
+        let offers = [
+            None,
+            Some(NativeOffer::capable(0)),
+            Some(NativeOffer::capable(25)),
+            Some(NativeOffer::capable(100)),
+        ];
+        let readiness = [
+            ready(0),
+            ready(25),
+            ready(100),
+            NativeReadiness {
+                ready: false,
+                percent: 25,
+            },
+        ];
+        for offer in offers {
+            for own in readiness {
+                for bucket in 0..100u8 {
+                    for holds in [false, true] {
+                        // The formula `decide_native` had before it took its
+                        // answer from `acceptor_arm`, kept here as the oracle.
+                        let offered = offer.map_or(0, NativeOffer::effective_percent);
+                        let native = offered > 0
+                            && own.ready
+                            && bucket < offered.min(own.percent.min(100))
+                            && !holds;
+                        assert_eq!(
+                            acceptor_arm(offer, own, bucket, holds) == Some(ConnectArm::Treated),
+                            native,
+                            "arm {offer:?} {own:?} bucket {bucket} holds {holds}"
+                        );
+                        assert_eq!(
+                            decide_native(offer, own, bucket, holds) == NativeDecision::Native,
+                            native,
+                            "decision {offer:?} {own:?} bucket {bucket} holds {holds}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Treated below the lower percent, control at or above it, nothing with
+    /// no offer or with a transport already held.
+    #[test]
+    fn acceptor_arm_splits_at_the_lower_percent() {
+        let offer = Some(NativeOffer::capable(50));
+        assert_eq!(
+            acceptor_arm(offer, ready(25), 24, false),
+            Some(ConnectArm::Treated)
+        );
+        assert_eq!(
+            acceptor_arm(offer, ready(25), 25, false),
+            Some(ConnectArm::Control)
+        );
+        assert_eq!(
+            acceptor_arm(offer, ready(100), 49, false),
+            Some(ConnectArm::Treated)
+        );
+        assert_eq!(
+            acceptor_arm(offer, ready(100), 50, false),
+            Some(ConnectArm::Control)
+        );
+        assert_eq!(acceptor_arm(None, ready(100), 99, false), None);
+        assert_eq!(acceptor_arm(offer, ready(100), 0, true), None);
+        // Below the percent but not ready to dial: in neither arm.
+        let not_ready = NativeReadiness {
+            ready: false,
+            percent: 50,
+        };
+        assert_eq!(acceptor_arm(offer, not_ready, 0, false), None);
+    }
+
+    /// While the release's percent is 0 (0.2.163), every pair where both ends
+    /// offered is control, at every bucket, so the control counters are
+    /// non-zero in the field before any pair is treated.
+    #[test]
+    fn at_percent_zero_every_offered_pair_is_control() {
+        let at_release = NativeReadiness::from_parts(true, true, false, 0);
+        let not_dialling = NativeReadiness::from_parts(false, false, false, 0);
+        for own in [at_release, not_dialling] {
+            assert_eq!(own.percent, 0);
+            for bucket in 0..100u8 {
+                assert_eq!(
+                    acceptor_arm(Some(own.offer()), own, bucket, false),
+                    Some(ConnectArm::Control),
+                    "bucket {bucket}"
+                );
+                assert!(joiner_in_control(
+                    Some(own.offer()),
+                    Some(NativeDecision::Udp),
+                    bucket
+                ));
+            }
+        }
+    }
+
+    /// The joiner counts a pair as control only when it can be sure: a `Udp`
+    /// decision to its offer, and a bucket at or above its own percent.
+    #[test]
+    fn joiner_in_control_needs_an_offer_a_udp_decision_and_a_high_bucket() {
+        let sent = Some(NativeOffer::capable(25));
+        let udp = Some(NativeDecision::Udp);
+        assert!(joiner_in_control(sent, udp, 25));
+        assert!(joiner_in_control(sent, udp, 99));
+        assert!(
+            !joiner_in_control(sent, udp, 24),
+            "may be the acceptor's lower percent"
+        );
+        assert!(!joiner_in_control(sent, Some(NativeDecision::Native), 99));
+        assert!(!joiner_in_control(
+            sent,
+            Some(NativeDecision::Unknown(7)),
+            99
+        ));
+        assert!(
+            !joiner_in_control(sent, None, 99),
+            "an acceptor or relay below the floor"
+        );
+        assert!(!joiner_in_control(None, udp, 99), "no offer was sent");
+        // The acceptor held a transport and reused it: it counts no arm, but
+        // the joiner sees the same `Udp` decision and counts control.
+        let ready_acceptor = ready(100);
+        assert_eq!(acceptor_arm(sent, ready_acceptor, 99, true), None);
+        assert!(
+            joiner_in_control(sent, udp, 99),
+            "joiner control includes transport reuse"
+        );
     }
 
     /// The decision's truth table: each condition alone keeps it at `Udp`.

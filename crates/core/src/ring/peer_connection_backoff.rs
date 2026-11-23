@@ -36,7 +36,7 @@ impl PeerConnectionBackoff {
     /// 5 s apart at first, settling to one per ~30 s (`operations::connect::bootstrap`,
     /// #5858), so a 30-second base blocks the next one to two rounds through a gateway
     /// that failed, rather than half of them.
-    const DEFAULT_BASE_INTERVAL: Duration = Duration::from_secs(30);
+    pub(crate) const DEFAULT_BASE_INTERVAL: Duration = Duration::from_secs(30);
 
     /// Default maximum backoff interval (90 seconds).
     ///
@@ -52,7 +52,7 @@ impl PeerConnectionBackoff {
     /// tracker.  If it is ever reused for ring peers, per-peer-class caps should
     /// be introduced via `with_config()` rather than raising this default.
     /// See issues #2595 and #3304.
-    const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(90);
+    pub(crate) const DEFAULT_MAX_BACKOFF: Duration = Duration::from_secs(90);
 
     /// Default maximum number of tracked entries
     const DEFAULT_MAX_ENTRIES: usize = 1024;
@@ -70,6 +70,22 @@ impl PeerConnectionBackoff {
         let config = ExponentialBackoff::new(base, Self::DEFAULT_MAX_BACKOFF);
         Self {
             inner: TrackedBackoff::new(config, Self::DEFAULT_MAX_ENTRIES),
+        }
+    }
+
+    /// A tracker with `base` as its base interval when one is given, else
+    /// [`Self::new`], which reads `FREENET_BACKOFF_BASE_SECS`. A simulation
+    /// gives its base explicitly so that a variable the CI workflow sets (5 s)
+    /// cannot change what a simulated join does.
+    pub(crate) fn with_optional_base(base: Option<Duration>) -> Self {
+        match base {
+            Some(base) => Self {
+                inner: TrackedBackoff::new(
+                    ExponentialBackoff::new(base, Self::DEFAULT_MAX_BACKOFF),
+                    Self::DEFAULT_MAX_ENTRIES,
+                ),
+            },
+            None => Self::new(),
         }
     }
 

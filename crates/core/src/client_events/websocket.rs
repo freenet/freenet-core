@@ -2227,6 +2227,33 @@ fn is_rate_limited_op(req: &ClientRequest<'_>) -> bool {
     )
 }
 
+/// The contract or delegate a rate-limited request targets, for the rejection
+/// text (`contract <id>` / `delegate <key>`). `None` for requests with no single
+/// target, such as node queries.
+fn rate_limited_target(req: &ClientRequest<'_>) -> Option<String> {
+    match req {
+        ClientRequest::ContractOp(op) => match op {
+            ContractRequest::Put { contract, .. } => {
+                Some(format!("contract {}", contract.key().id()))
+            }
+            ContractRequest::Update { key, .. } => Some(format!("contract {}", key.id())),
+            ContractRequest::Get { key, .. } | ContractRequest::Subscribe { key, .. } => {
+                Some(format!("contract {key}"))
+            }
+            // `ContractRequest` is `#[non_exhaustive]`, so a variant added in
+            // freenet-stdlib lands here and falls back to the unnamed message.
+            _ => None,
+        },
+        ClientRequest::DelegateOp(op) => Some(format!("delegate {}", op.key())),
+        ClientRequest::Disconnect { .. }
+        | ClientRequest::Authenticate { .. }
+        | ClientRequest::NodeQueries(_)
+        | ClientRequest::Close
+        | ClientRequest::StreamChunk { .. }
+        | _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_client_request(
     client_id: ClientId,
@@ -2441,8 +2468,22 @@ async fn process_client_request(
                 user_id = ?user_context.user_id(),
                 "Rejecting operation: per-user operation rate limit exceeded"
             );
+            // Name the refused request's target so the client can match the
+            // rejection to the request it sent. Without it a client with many
+            // requests in flight cannot tell which one to retry, and each
+            // rejected request sits out its own timeout (River on
+            // try.freenet.org: nothing arrived for 10 s). The key is in the
+            // message text, the same way `missing delegate <key>` and the
+            // delegate backoff error carry theirs, so the error stays an
+            // `OperationError` and no wire format changes.
+            let cause = match rate_limited_target(&req) {
+                Some(target) => {
+                    format!("operation rate limit exceeded for {target}; retry shortly")
+                }
+                None => "operation rate limit exceeded; retry shortly".to_string(),
+            };
             let error: ClientError = ErrorKind::OperationError {
-                cause: std::borrow::Cow::Borrowed("operation rate limit exceeded; retry shortly"),
+                cause: std::borrow::Cow::Owned(cause),
             }
             .into();
             let serialized = match conn_state.encoding_protoc {
@@ -5684,6 +5725,185 @@ mod tests {
                 false
             }
             Some(other) => panic!("unexpected non-binary response: {other:?}"),
+        }
+    }
+
+    /// Drive one already-encoded request through `process_client_request` with
+    /// a limiter whose bucket is already empty, and return the text of the
+    /// rate-limit rejection the client receives.
+    async fn rejection_text(msg: Message) -> String {
+        let limiter = UserOpRateLimiter::new(10, 1, 0);
+        let ctx = test_user_context(b"rejection-text-user");
+        // Spend the single burst token so `msg` is the over-rate request.
+        assert!(drive_msg(encoded_get_op(), Some(&ctx), Some(&limiter)).await);
+
+        let (tx, _rx) = mpsc::channel::<ClientConnection>(64);
+        let mut delegate_rate_limiter = DelegateRateLimiter::new();
+        let mut conn_state = test_conn_state(EncodingProtocol::Native);
+        let mut auth_token: Option<AuthToken> = None;
+        let out = process_client_request(
+            ClientId::next(),
+            Ok(msg),
+            &tx,
+            &mut auth_token,
+            None,
+            ConnectionScope::Local,
+            Some(&ctx),
+            Some(&limiter),
+            None,
+            ApiVersion::V1,
+            &mut delegate_rate_limiter,
+            &mut conn_state,
+        )
+        .await
+        .expect("process_client_request should not error on a valid request")
+        .expect("an over-rate request must be answered with a rejection");
+        let Message::Binary(bytes) = out else {
+            panic!("unexpected non-binary response: {out:?}");
+        };
+        let decoded: Result<HostResponse, ClientError> =
+            bincode::deserialize(&bytes).expect("rejection must be a native error frame");
+        let err = decoded.expect_err("rejection frame must be an Err");
+        assert!(
+            matches!(err.kind(), ErrorKind::OperationError { .. }),
+            "the rejection stays an OperationError (wire-compatible), got {:?}",
+            err.kind()
+        );
+        err.to_string()
+    }
+
+    /// A rate-limit rejection must name the request it refused, or a client with
+    /// many requests in flight cannot tell which one to retry (River waited out a
+    /// 10 s timeout per rejected request on try.freenet.org). The text keeps the
+    /// original `operation rate limit exceeded` prefix, so a prefix or substring
+    /// match on that phrase still works (the full old string, which ended
+    /// `; retry shortly` directly after it, no longer appears when a target is
+    /// named).
+    #[tokio::test]
+    async fn ws_rate_limit_rejection_names_the_contract_key() {
+        let text = rejection_text(encoded_get_op()).await;
+        let key = ContractInstanceId::new([7u8; 32]).to_string();
+        assert!(text.contains("operation rate limit exceeded"), "{text}");
+        assert!(text.contains(&key), "GET rejection must name {key}: {text}");
+    }
+
+    #[tokio::test]
+    async fn ws_rate_limit_rejection_names_the_delegate_key() {
+        use freenet_stdlib::prelude::{CodeHash, DelegateKey};
+        let key = DelegateKey::new([9u8; 32], CodeHash::new([0u8; 32]));
+        let text = rejection_text(encoded_delegate_op()).await;
+        assert!(text.contains("operation rate limit exceeded"), "{text}");
+        assert!(
+            text.contains(&key.to_string()),
+            "delegate rejection must name {key}: {text}"
+        );
+        assert!(
+            text.contains(&bs58::encode([9u8; 32]).into_string()),
+            "delegate rejection must carry the key's base58 form: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_rate_limit_rejection_names_subscribe_and_update_keys() {
+        use freenet_stdlib::prelude::{ContractCode, ContractContainer, ContractWasmAPIVersion};
+        let id = ContractInstanceId::new([5u8; 32]);
+        let text = rejection_text(encode_req(ClientRequest::ContractOp(
+            ContractRequest::Subscribe {
+                key: id,
+                summary: None,
+            },
+        )))
+        .await;
+        assert!(text.contains(&id.to_string()), "SUBSCRIBE: {text}");
+
+        let code = ContractContainer::from(freenet_stdlib::prelude::ContractWasmAPIVersion::V1(
+            freenet_stdlib::prelude::WrappedContract::new(
+                std::sync::Arc::new(ContractCode::from(vec![1u8, 2, 3])),
+                vec![].into(),
+            ),
+        ));
+        let key = code.key();
+        let text = rejection_text(encode_req(ClientRequest::ContractOp(
+            ContractRequest::Update {
+                key,
+                data: freenet_stdlib::prelude::UpdateData::State(vec![1u8].into()),
+            },
+        )))
+        .await;
+        assert!(
+            text.contains(&key.id().to_string()),
+            "UPDATE must name {}: {text}",
+            key.id()
+        );
+
+        let text = rejection_text(encode_req(ClientRequest::ContractOp(
+            ContractRequest::Put {
+                contract: code,
+                state: vec![1u8].into(),
+                related_contracts: Default::default(),
+                subscribe: false,
+                blocking_subscribe: false,
+            },
+        )))
+        .await;
+        assert!(
+            text.contains(&key.id().to_string()),
+            "PUT must name {}: {text}",
+            key.id()
+        );
+        let _ = ContractWasmAPIVersion::V1;
+    }
+
+    /// The Flatbuffers path (the default encoding, used by browser clients)
+    /// serializes the error through `into_fbs_bytes`; the longer, owned message
+    /// must come through it intact.
+    #[test]
+    fn rate_limit_rejection_text_survives_flatbuffers_encoding() {
+        let key = ContractInstanceId::new([7u8; 32]).to_string();
+        let error: ClientError = ErrorKind::OperationError {
+            cause: std::borrow::Cow::Owned(format!(
+                "operation rate limit exceeded for contract {key}; retry shortly"
+            )),
+        }
+        .into();
+        let bytes = error.into_fbs_bytes().expect("fbs encoding");
+        assert!(
+            bytes.windows(key.len()).any(|w| w == key.as_bytes()),
+            "the key must appear in the Flatbuffers frame"
+        );
+    }
+
+    /// A request with no single target (a node query) is still refused with the
+    /// plain message; nothing to name.
+    #[tokio::test]
+    async fn ws_rate_limit_rejection_of_node_query_is_plain() {
+        let text = rejection_text(encoded_node_query()).await;
+        assert!(text.contains("operation rate limit exceeded"), "{text}");
+        assert!(
+            !text.contains("contract ") && !text.contains("delegate "),
+            "a node query has no target to name: {text}"
+        );
+    }
+
+    /// The default burst must admit one normal app load. Measured on
+    /// try.freenet.org: a River load sends 135 ops in its first 1.3 s (startup
+    /// delegate reads plus a legacy-delegate migration sweep) and the old burst
+    /// of 100 rejected 17 of them. Heavier accounts (more rooms, more legacy
+    /// delegates) send more, so require generous headroom over the measurement.
+    #[tokio::test]
+    async fn default_burst_admits_a_normal_app_load() {
+        use crate::client_events::user_op_rate_limit::{
+            DEFAULT_PER_USER_OP_BURST, DEFAULT_PER_USER_OP_RATE_LIMIT,
+        };
+        const MEASURED_RIVER_LOAD_OPS: u64 = 135;
+        let limiter =
+            UserOpRateLimiter::new(DEFAULT_PER_USER_OP_RATE_LIMIT, DEFAULT_PER_USER_OP_BURST, 0);
+        let ctx = test_user_context(b"normal-load-user");
+        for i in 0..MEASURED_RIVER_LOAD_OPS {
+            assert!(
+                limiter.try_acquire_op(ctx.user_id()),
+                "op {i} of a normal app load was rate limited"
+            );
         }
     }
 

@@ -739,6 +739,22 @@ impl P2pConnManager {
             // interval is handed to the held-legs timer instead.
             let peer_key = crate::ring::PeerKey::from(target.pub_key().clone());
             match op_manager.broadcast_spacing.try_begin(key.id(), &peer_key) {
+                Ok(claim)
+                    if op_manager.verify_soon.has_forced(
+                        &key,
+                        &peer_key,
+                        op_manager.ring.time_source.now(),
+                    ) =>
+                {
+                    Self::spawn_forced_leg(
+                        self.bridge.clone(),
+                        op_manager.clone(),
+                        key,
+                        new_state,
+                        target,
+                        claim,
+                    );
+                }
                 Ok(_claim) => {
                     super::super::broadcast_queue::broadcast_to_single_peer(
                         &self.bridge,
@@ -774,6 +790,38 @@ impl P2pConnManager {
                 }
             }
         }
+    }
+
+    /// Send a verify-soon forced full-state leg (#6143) on its own task.
+    ///
+    /// Simulation only. Production sends every leg from the broadcast queue's
+    /// tasks; the simulation sends heals inline on the event loop, and a stream
+    /// leg awaits its completion signal, which this same event loop has to
+    /// drive. Awaiting it here would stall the node. The task holds the pair's
+    /// spacing `claim` until the send ends, as an inline send would.
+    #[cfg(feature = "simulation_tests")]
+    fn spawn_forced_leg(
+        bridge: P2pBridge,
+        op_manager: Arc<OpManager>,
+        key: freenet_stdlib::prelude::ContractKey,
+        new_state: freenet_stdlib::prelude::WrappedState,
+        target: crate::ring::PeerKeyLocation,
+        claim: super::super::broadcast_spacing::SendClaim,
+    ) {
+        // A sim-only, single-send task that ends when the stream does.
+        drop(crate::config::GlobalExecutor::spawn(async move {
+            let _claim = claim;
+            super::super::broadcast_queue::broadcast_to_single_peer(
+                &bridge,
+                &op_manager,
+                key,
+                new_state,
+                target,
+                None,
+                super::super::broadcast_queue::no_fanout(),
+            )
+            .await;
+        }));
     }
 
     #[cfg(feature = "simulation_tests")]
@@ -911,6 +959,24 @@ impl P2pConnManager {
                     continue;
                 }
             };
+
+            // #6143 verify-soon: a pair marked for a forced full-state stream
+            // goes through the production single-peer path, which owns that
+            // choice, so this simulation copy does not have to duplicate it.
+            if op_manager
+                .verify_soon
+                .has_forced(&key, &peer_key, op_manager.ring.time_source.now())
+            {
+                Self::spawn_forced_leg(
+                    bridge.clone(),
+                    op_manager.clone(),
+                    key,
+                    new_state.clone(),
+                    target.clone(),
+                    _claim,
+                );
+                continue;
+            }
 
             // Get peer's cached summary
             let their_summary = op_manager
@@ -1180,10 +1246,33 @@ impl P2pConnManager {
                             .unwrap_or_default(),
                     },
                 };
-                // channel-safety: ok — sim-only path (see the
-                // `#[cfg(feature = "simulation_tests")]` gate on this fn); never
-                // compiled into the production binary.
-                bridge.send(peer_addr, msg.into()).await
+                // Test seam for the #6143 failure class: the bridge "accepts"
+                // the leg and it never arrives, or arrives late.
+                use crate::operations::update::inline_leg_fault_injection::{
+                    LegFate, inline_leg_fate,
+                };
+                match inline_leg_fate(op_manager, &key) {
+                    // channel-safety: ok — sim-only path (see the
+                    // `#[cfg(feature = "simulation_tests")]` gate on this fn); never
+                    // compiled into the production binary.
+                    LegFate::Send => bridge.send(peer_addr, msg.into()).await,
+                    LegFate::Swallow => Ok(()),
+                    LegFate::Delay(delay) => {
+                        let bridge = bridge.clone();
+                        let msg: crate::message::NetMessage = msg.into();
+                        // Fire-and-forget on purpose: a test-only late delivery that
+                        // ends after one send; nothing needs its handle.
+                        drop(crate::config::GlobalExecutor::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            // channel-safety: ok — test-only delayed leg on its
+                            // own detached task; nothing waits on it.
+                            if let Err(e) = bridge.send(peer_addr, msg).await {
+                                tracing::debug!(error = %e, "delayed test leg not sent");
+                            }
+                        }));
+                        Ok(())
+                    }
+                }
             };
 
             if let Err(err) = send_result {

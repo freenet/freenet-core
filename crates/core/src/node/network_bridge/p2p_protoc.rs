@@ -1218,8 +1218,8 @@ use crate::operations::connect::native::NativeWire;
 /// one, so `connect::wire::encode_for_peer` emits them only to a peer whose
 /// negotiated version is known and at least this; every other encode emits
 /// today's variants without the fields. Per the wire-gated-floor rule in
-/// `docs/RELEASING.md`, this is the release that first ships the decoder, then
-/// frozen. Bias HIGH: too low closes connections to the release below it, too
+/// `docs/RELEASING.md`, the floor is the first release that emits them (the
+/// decoder itself shipped in 0.2.157), then frozen. Bias HIGH: too low closes connections to the release below it, too
 /// high only delays the offer.
 /// Raised from 0.2.158 to 0.2.159 by the QUIC data ramp PR (#6224): 0.2.158
 /// starts the data ramp, and turning on the native connect offer in the same
@@ -1228,20 +1228,29 @@ use crate::operations::connect::native::NativeWire;
 /// for 0.2.160: native connect is still off (`QUIC_NATIVE_PERCENT` is 0) and
 /// its wire fields may change before it is enabled, so no release is frozen
 /// as the floor yet. Raised to 0.2.162 for 0.2.161 for the same reasons, and
-/// to 0.2.163 for 0.2.162.
+/// to 0.2.163 for 0.2.162. Frozen at 0.2.163: that release ships the variants
+/// (`QUIC_NATIVE_SHIPPED_IN`), with every offer at percent 0, so a later
+/// release can turn the native path on. Do not raise it again.
 pub(crate) const QUIC_NATIVE_MIN_VERSION: (u8, u8, u16) = (0, 2, 163);
 
-/// Has the decoder for the QUIC-native `ConnectMsg` variants shipped, and in
-/// which release?
+/// Has the release that first emits the QUIC-native `ConnectMsg` variants
+/// shipped, and which one is it?
 ///
 /// Same contract as [`HASH_FIRST_SHIPPED_IN`], checked by
 /// `quic_native_floor_tracks_the_shipping_release`: `None` means
 /// [`QUIC_NATIVE_MIN_VERSION`] is a prediction that must stay strictly ABOVE
-/// the crate version; `Some(v)` means it shipped in `v`, which must equal the
+/// the crate version; `Some(v)` means it ships in `v`, which must equal the
 /// floor. Write the literal release when it ships, not
 /// `Some(QUIC_NATIVE_MIN_VERSION)`, which would compare the floor with itself.
+///
+/// `Some((0, 2, 163))`: 0.2.163 is the release that first puts the V2 variants
+/// on the wire (every offer at percent 0). Unlike the hash-first test, this
+/// tracker test accepts the marker one release ahead of the crate version, so
+/// it holds both on the 0.2.162 main that precedes the release bump and on
+/// 0.2.163 itself. Only the test reads this constant; the emission gate reads
+/// the floor.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const QUIC_NATIVE_SHIPPED_IN: Option<(u8, u8, u16)> = None;
+pub(crate) const QUIC_NATIVE_SHIPPED_IN: Option<(u8, u8, u16)> = Some((0, 2, 163));
 
 /// Upper bound on the number of hosted contracts examined per new-peer
 /// migration trigger. Each examined contract may emit a best-effort
@@ -1656,6 +1665,8 @@ impl P2pConnManager {
         );
 
         let mut state = EventListenerState::new(expected_inbound);
+        state.peer_backoff =
+            PeerConnectionBackoff::with_optional_base(op_manager.connect_backoff_base);
 
         let (conn_event_tx, conn_event_rx) = mpsc::channel(1024);
 
@@ -1743,6 +1754,15 @@ impl P2pConnManager {
 
         // Start the broadcast queue worker (production only).
         // In simulation tests, broadcasts are sent inline for deterministic ordering.
+        #[cfg(not(feature = "simulation_tests"))]
+        {
+            // The verify-soon check (#6143) does not force a resend to a pair
+            // whose leg is still queued or sending here.
+            let queue = broadcast_queue.clone();
+            op_manager
+                .verify_soon
+                .set_pending_leg_probe(Box::new(move |key, peer| queue.has_pending_for(key, peer)));
+        }
         #[cfg(not(feature = "simulation_tests"))]
         let _broadcast_worker_handles =
             broadcast_queue.start_worker(ctx.bridge.clone(), op_manager.clone());
@@ -1862,10 +1882,17 @@ impl P2pConnManager {
                     ring_connections,
                     "Event loop stats"
                 );
-                // Detect transport/ring divergence: transport has connections but ring doesn't
-                if transport_connections > 0 && ring_connections == 0 {
+                if let Some(unexpected) = ring_transport_desync(
+                    ctx.connections.keys().copied(),
+                    ring_connections,
+                    |addr| {
+                        op_manager.ring.connection_manager.is_transient(addr)
+                            || ctx.gateways.iter().any(|gw| gw.socket_addr() == Some(addr))
+                    },
+                ) {
                     tracing::error!(
                         transport_connections,
+                        unexpected_transport_connections = unexpected,
                         ring_connections,
                         "RING_TRANSPORT_DESYNC: transport has connections but ring topology is empty - \
                          connections are not being promoted or are being immediately pruned"
@@ -4280,6 +4307,32 @@ fn warn_transient_send_failure(
     }
 }
 
+/// The number of transport connections that should have reached the ring but
+/// did not, when the ring is empty; `None` when there is no such connection.
+///
+/// A node that is joining holds a connection to its gateway outside the ring
+/// for as long as the join takes: a transient one, or one whose transient
+/// entry expired while the node keeps routing CONNECTs through it. Neither is
+/// a divergence between transport and ring, so `expected_outside_ring` (a
+/// transient connection, or one to a configured gateway) excludes them.
+/// Counting them made every node still joining at a stats tick log
+/// RING_TRANSPORT_DESYNC, including a peer that every acceptor refused for
+/// lack of capacity.
+fn ring_transport_desync(
+    transport_addrs: impl IntoIterator<Item = SocketAddr>,
+    ring_connections: usize,
+    expected_outside_ring: impl Fn(SocketAddr) -> bool,
+) -> Option<usize> {
+    if ring_connections > 0 {
+        return None;
+    }
+    let unexpected = transport_addrs
+        .into_iter()
+        .filter(|addr| !expected_outside_ring(*addr))
+        .count();
+    (unexpected > 0).then_some(unexpected)
+}
+
 /// Whether the `count`th transient send failure on a connection is logged.
 fn transient_failure_warns(count: u64) -> bool {
     count.is_power_of_two()
@@ -4416,6 +4469,93 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
 }
 
 // TODO: add testing for the network loop, now it should be possible to do since we don't depend upon having real connections
+
+#[cfg(test)]
+mod ring_transport_desync_tests {
+    use super::ring_transport_desync;
+    use std::net::SocketAddr;
+
+    fn addr(port: u16) -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// A joining node holds only its gateway connection, which is transient
+    /// (or, once its transient entry expires, still a connection to a
+    /// configured gateway). The stranded-holder simulation logged ten false
+    /// RING_TRANSPORT_DESYNC errors from exactly this state.
+    #[test]
+    fn a_joiner_holding_only_its_gateway_connection_is_not_a_desync() {
+        let gateway = addr(31337);
+        assert_eq!(
+            ring_transport_desync([gateway], 0, |a| a == gateway),
+            None,
+            "the gateway connection a joiner holds is expected outside the ring"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_should_be_in_the_ring_is_a_desync() {
+        let gateway = addr(31337);
+        let peer = addr(40000);
+        assert_eq!(
+            ring_transport_desync([gateway, peer], 0, |a| a == gateway),
+            Some(1),
+            "only the connection outside the expected set is counted"
+        );
+    }
+
+    #[test]
+    fn a_non_empty_ring_is_never_a_desync() {
+        assert_eq!(ring_transport_desync([addr(40000)], 1, |_| false), None);
+    }
+
+    #[test]
+    fn no_transport_connections_is_not_a_desync() {
+        assert_eq!(ring_transport_desync([], 0, |_| false), None);
+    }
+
+    /// The stats block must decide through `ring_transport_desync`, passing
+    /// the transient and gateway exclusions. Reverting to a raw
+    /// `connections.len() > 0` test brings the false errors back, and the
+    /// helper tests above would stay green.
+    #[test]
+    fn the_stats_block_decides_through_the_helper_with_both_exclusions() {
+        let source = include_str!("p2p_protoc.rs");
+        let production = &source[..source
+            .find("#[cfg(test)]\nmod ring_transport_desync_tests")
+            .expect("this test module's own header")];
+        let start = production
+            .find("// Periodic stats logging")
+            .expect("the stats block");
+        let end = start
+            + production[start..]
+                .find("\"RING_TRANSPORT_DESYNC:")
+                .expect("the desync error inside the stats block");
+        // Code lines only, so a commented-out exclusion does not satisfy it.
+        let block: String = production[start..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let call = block.lines().any(|line| {
+            line.trim_start()
+                .starts_with("if let Some(unexpected) = ring_transport_desync(")
+        });
+        assert!(call, "the desync error is gated by ring_transport_desync");
+        assert!(
+            block.contains(".is_transient(addr)"),
+            "transients are excluded"
+        );
+        assert!(
+            block.contains(".gateways"),
+            "gateway connections are excluded"
+        );
+        assert!(
+            !block.contains("transport_connections > 0"),
+            "the raw transport count no longer decides the error"
+        );
+    }
+}
 
 #[cfg(test)]
 mod quic_native_floor_tests {
