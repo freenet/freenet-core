@@ -3475,6 +3475,142 @@ fn only_an_unsupervised_node_with_rebuilding_on_rebuilds_its_endpoint() {
     })
 }
 
+/// Bind a rebuilding listener (rebuild on through the trace) with upgrades,
+/// on `network`/`port`; the handler, the listener task, the monitor and the
+/// trace.
+async fn rebuilding_listener(
+    network: &'static str,
+    port: u16,
+    time: &VirtualTime,
+) -> (
+    crate::transport::connection_handler::OutboundConnectionHandler<DemuxSocket<SimulationSocket>>,
+    tokio::task::JoinHandle<crate::transport::TransportError>,
+    crate::node::background_task_monitor::BackgroundTaskMonitor,
+    Registration,
+    Registration,
+) {
+    use crate::node::background_task_monitor::BackgroundTaskMonitor;
+    use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
+    use crate::transport::quic::breaker::BreakerOutcome;
+    use crate::transport::quic::upgrade::policy::QuicPolicyConfig;
+    let clock = Registration::time_source(network, time.clone());
+    let trace = crate::transport::in_memory_socket::quic_upgrade_trace(network);
+    let net = crate::transport::test_net::subnet();
+    let local = net.addr_port(1, port);
+    let registered = Registration::address(local, network);
+    trace.rebuild_endpoint(local);
+    let monitor = BackgroundTaskMonitor::new();
+    let mut config: crate::config::NetworkApiConfig = toml::from_str("").expect("default config");
+    config.transport_quic = Some("shadow".to_string());
+    let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
+        crate::transport::TransportKeypair::new(),
+        local.ip(),
+        port,
+        false,
+        UdpTransportConfig {
+            quic: Some(settings()),
+            quic_policy: Some(QuicPolicyConfig::new(&config, BreakerOutcome::NotConsulted)),
+            task_registrar: Some(monitor.late_registrar()),
+            ..UdpTransportConfig::default()
+        },
+    )
+    .await
+    .unwrap();
+    (outbound, listener, monitor, clock, registered)
+}
+
+/// Move the clock in 100 ms steps until the node's view reads `Up`; panics
+/// after ten virtual minutes.
+async fn advance_until_up(time: &VirtualTime, availability: QuicAvailabilityWatch) {
+    for _ in 0..6_000u64 {
+        time.advance(Duration::from_millis(100));
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        if availability.get() == QuicAvailability::Up {
+            return;
+        }
+    }
+    panic!("the endpoint was not rebuilt");
+}
+
+/// Two consecutive rebuilds carry the node's path permits over: a permit
+/// taken before the first death is still held, and counted, on the endpoint
+/// the second rebuild built, whose cap is the same one.
+#[test]
+fn consecutive_rebuilds_keep_one_path_permit_cap() {
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let (outbound, listener, _monitor, _clock, _registered) =
+            rebuilding_listener("quic-rebuild-permits", 5010, &time).await;
+        let permits = outbound.current_quic_permits().expect("upgrades");
+        let limit = permits.limit();
+        let held = permits.try_acquire().expect("a permit");
+        let mut availability = outbound.quic_availability();
+        let mut previous = outbound.current_quic_endpoint().expect("an endpoint");
+        for round in 1..=2 {
+            previous.fail_driver();
+            tokio::time::timeout(Duration::from_secs(30), availability.not_up())
+                .await
+                .expect("the death is reported");
+            advance_until_up(&time, availability.clone()).await;
+            let current = outbound.current_quic_endpoint().expect("an endpoint");
+            assert!(
+                !current.same_endpoint(&previous),
+                "round {round}: a new endpoint"
+            );
+            let now = outbound.current_quic_permits().expect("upgrades");
+            assert_eq!(now.limit(), limit, "round {round}");
+            assert_eq!(now.in_use(), 1, "round {round}: the permit carried over");
+            previous = current;
+        }
+        drop(held);
+        let now = outbound.current_quic_permits().expect("upgrades");
+        assert_eq!(now.in_use(), 0, "released through the shared count");
+        listener.abort();
+    })
+}
+
+/// A real panic in quinn's endpoint driver (the lock poisoned, as in #6184)
+/// on a node that rebuilds: the node's monitor does not see the node fail
+/// (the rebuild loop owns the accept loop and router), and a new endpoint is
+/// built. A task that panics on the poisoned lock just before `Down` is the
+/// loop's unit test (`a_task_ending_as_the_endpoint_dies_is_the_death`) and
+/// the accept loop's own parking.
+#[test]
+fn a_quinn_driver_panic_on_a_rebuilding_node_is_rebuilt_from() {
+    in_child(
+        "a_quinn_driver_panic_on_a_rebuilding_node_is_rebuilt_from",
+        || {
+            bounded(|| async move {
+                let _seed = GlobalRng::seed_guard(SEED);
+                let time = VirtualTime::new();
+                let (outbound, listener, monitor, _clock, _registered) =
+                    rebuilding_listener("quic-rebuild-panic", 5011, &time).await;
+                let first = outbound.current_quic_endpoint().expect("an endpoint");
+                let mut availability = outbound.quic_availability();
+                first.faults().panic_receive_in_quinn();
+                let seen = tokio::time::timeout(Duration::from_secs(30), availability.not_up())
+                    .await
+                    .expect("the panic is reported");
+                assert_eq!(seen, QuicAvailability::Down);
+                advance_until_up(&time, availability.clone()).await;
+                let current = outbound.current_quic_endpoint().expect("an endpoint");
+                assert!(!current.same_endpoint(&first), "a new endpoint");
+                assert_eq!(current.availability().get(), QuicAvailability::Up);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), monitor.wait_for_any_exit())
+                        .await
+                        .is_err(),
+                    "the node's monitor saw no failure"
+                );
+                assert!(!listener.is_finished());
+                listener.abort();
+            });
+        },
+    );
+}
+
 /// When the node opens the transport with an endpoint, the endpoint's
 /// accept loop is started and registered through the node's late
 /// registrar, so the monitor, already waiting by then, watches it. Without
@@ -4347,19 +4483,6 @@ fn a_task_a_driver_panic_kills_exits_as_the_endpoint_death() {
                 assert_eq!(records.into_inner(), 1, "the death is recorded");
             });
         },
-    );
-}
-
-/// With rebuilding on, the process-wide driver-panic flag that
-/// `driver_death_restart` reads goes stale once the endpoint it described is
-/// rebuilt; the rebuild loop clears it, so the backstop does not take an
-/// unrelated later task failure for an endpoint death. (Body in
-/// `rebuild::tests`.)
-#[test]
-fn a_rebuilt_endpoint_does_not_leave_a_stale_driver_panic_flag() {
-    in_child(
-        "a_rebuilt_endpoint_does_not_leave_a_stale_driver_panic_flag",
-        super::rebuild::tests::stale_driver_panic_flag_body,
     );
 }
 

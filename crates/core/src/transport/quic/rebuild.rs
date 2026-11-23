@@ -199,7 +199,7 @@ pub(crate) async fn run<T: TimeSource>(
         let seen = tokio::select! {
             biased;
             _ = &mut stop => return RebuildEnd::Stopped,
-            name = tasks.any_ended() => {
+            (name, how) = tasks.any_ended() => {
                 // The ended task is not polled again: a rebuild replaces
                 // it, and every other way out returns.
                 tokio::select! {
@@ -208,12 +208,20 @@ pub(crate) async fn run<T: TimeSource>(
                     seen = current.not_up() => {
                         tracing::warn!(
                             task = name,
+                            ended = %how,
                             availability = ?seen,
                             "A task serving the QUIC endpoint ended as the endpoint went down"
                         );
                         seen
                     }
-                    () = time.sleep(TASK_END_DEATH_WAIT) => return RebuildEnd::TaskEnded(name),
+                    () = time.sleep(TASK_END_DEATH_WAIT) => {
+                        tracing::error!(
+                            task = name,
+                            ended = %how,
+                            "A task serving the QUIC endpoint ended while it stayed up"
+                        );
+                        return RebuildEnd::TaskEnded(name);
+                    }
                 }
             }
             seen = current.not_up() => seen,
@@ -239,7 +247,6 @@ pub(crate) async fn run<T: TimeSource>(
                 _ = &mut stop => return RebuildEnd::Stopped,
                 () = time.sleep(wait) => {}
             }
-            super::liveness::note_endpoint_rebuilding();
             match rebuild() {
                 Some(rebuilt) => {
                     tasks.replace(rebuilt.tasks);
@@ -251,7 +258,8 @@ pub(crate) async fn run<T: TimeSource>(
                     break;
                 }
                 None => {
-                    tracing::warn!(attempt, "Could not rebuild the QUIC endpoint; retrying");
+                    // The factory logged why, at WARN.
+                    tracing::debug!(attempt, "Could not rebuild the QUIC endpoint; retrying");
                 }
             }
         }
@@ -272,11 +280,16 @@ impl OwnedTasks {
 
     /// Resolve with the name of the first task that ends; never while there
     /// is none. A task that ended is not polled again: the caller returns.
-    async fn any_ended(&mut self) -> &'static str {
+    async fn any_ended(&mut self) -> (&'static str, String) {
         std::future::poll_fn(|cx| {
             for (name, task) in &mut self.0 {
-                if std::pin::Pin::new(task).poll(cx).is_ready() {
-                    return std::task::Poll::Ready(*name);
+                if let std::task::Poll::Ready(outcome) = std::pin::Pin::new(task).poll(cx) {
+                    let how = match outcome {
+                        Ok(()) => "returned".to_string(),
+                        // The task's panic or cancellation, as tokio words it.
+                        Err(error) => error.to_string(),
+                    };
+                    return std::task::Poll::Ready((*name, how));
                 }
             }
             std::task::Poll::Pending
@@ -294,4 +307,4 @@ impl Drop for OwnedTasks {
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+mod tests;

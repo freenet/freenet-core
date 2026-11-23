@@ -741,7 +741,8 @@ fn spawn_endpoint_rebuild(
         // Dropped outside the lock: the dead endpoint, its upgrades and its
         // queued attempts.
         drop(dead);
-        super::TRANSPORT_METRICS.record_quic_endpoint_rebuilt();
+        super::TRANSPORT_METRICS
+            .record_quic_endpoint_rebuilt(availability.get() == super::quic::QuicAvailability::Up);
         #[cfg(any(test, feature = "testing"))]
         if let Some(trace) = &trace {
             let ms = trace_clock.now_nanos() / 1_000_000;
@@ -796,6 +797,8 @@ fn build_quic_upgrades(
     arm_faults: bool,
 ) -> Option<Arc<super::quic::upgrade::driver::QuicUpgrades>> {
     use super::quic::upgrade::driver::{PathClock, QuicUpgrades};
+    #[cfg(not(any(test, feature = "testing")))]
+    let _ = arm_faults;
     let (endpoint, policy) = (endpoint?, policy?);
     if !has_registrar {
         return None;
@@ -1177,6 +1180,18 @@ impl<S, TS: TimeSource> OutboundConnectionHandler<S, TS> {
     #[cfg(test)]
     pub(crate) fn quic_endpoint(&self) -> Option<&super::quic::QuicEndpoint> {
         self.quic_endpoint.as_ref()
+    }
+
+    /// The path permits of the listener's current upgrades, when it has
+    /// some (tests).
+    #[cfg(test)]
+    pub(crate) fn current_quic_permits(
+        &self,
+    ) -> Option<super::quic::upgrade::policy::QuicPathPermits> {
+        let stack = self.quic_stack.upgrade()?;
+        let stack = stack.lock();
+        let upgrades = stack.as_ref()?.upgrades.as_ref()?;
+        Some(upgrades.permits().clone())
     }
 
     /// The listener's current QUIC endpoint: the one it rebuilt last, or the

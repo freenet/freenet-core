@@ -2016,6 +2016,72 @@ mod tests {
         drop(receiver);
     }
 
+    /// `with_replaced_quic_ingress` (a rebuilt endpoint, `quic::rebuild`):
+    /// the old ingress is disabled (its allow-set emptied, its receiver
+    /// ended) and a new one with an empty allow-set takes over; a failed
+    /// build leaves the ingress disabled; with no ingress ever enabled it
+    /// returns `None` and changes nothing.
+    #[tokio::test]
+    async fn a_replaced_ingress_disables_the_old_one_and_starts_empty() {
+        let from: SocketAddr = "10.254.2.8:4108".parse().unwrap();
+        let socket =
+            DemuxSocket::wrap(ScriptedSocket::new(vec![Step::Packet(from, quic(1))]), None);
+        assert!(
+            socket
+                .with_replaced_quic_ingress(|_| Ok::<(), ()>(()))
+                .is_none(),
+            "nothing to replace"
+        );
+        assert!(socket.ingress_for_test().is_none(), "and nothing changed");
+
+        let mut old = socket.enable_quic_ingress().expect("first enable");
+        let old_permit = socket.allow_quic_source(from).expect("allowed");
+        assert!(socket.is_quic_source_allowed(from));
+        let mut fresh = socket
+            .with_replaced_quic_ingress(Ok::<_, ()>)
+            .expect("replaced")
+            .expect("built");
+        assert!(
+            !socket.is_quic_source_allowed(from),
+            "allow-set starts empty"
+        );
+        assert!(
+            old.shared.disabled.load(Ordering::Acquire),
+            "the old ingress is disabled"
+        );
+        assert!(
+            old.queue.recv().await.is_none(),
+            "the old endpoint's receiver ends"
+        );
+        // The old permit releases nothing in the new ingress.
+        let new_permit = socket
+            .allow_quic_source(from)
+            .expect("the new ingress works");
+        drop(old_permit);
+        assert!(
+            socket.is_quic_source_allowed(from),
+            "kept by the new permit"
+        );
+        let mut buf = [0u8; 2048];
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert!(
+            fresh.queue.try_recv().is_ok(),
+            "datagrams reach the new queue"
+        );
+        drop(new_permit);
+
+        // A failed build leaves the replaced ingress disabled.
+        let failed: Result<(), &str> = socket
+            .with_replaced_quic_ingress(|_| Err("no endpoint"))
+            .expect("replaced");
+        assert!(failed.is_err());
+        assert!(socket.allow_quic_source(from).is_none(), "disabled");
+        assert!(
+            fresh.queue.recv().await.is_none(),
+            "the replaced receiver ends"
+        );
+    }
+
     /// `try_send_to` returns the inner socket's `WouldBlock` unchanged and
     /// charges nothing for it; a send that goes through is charged once,
     /// unpaced, like `send_to`.

@@ -401,31 +401,34 @@ fn delay_scales_by_the_clamped_sample() {
     }
 }
 
-/// The body of `a_rebuilt_endpoint_does_not_leave_a_stale_driver_panic_flag`,
-/// which runs it in a child process: the flag and the exit switch it uses
-/// are process-wide.
-///
-/// A driver panic killed the first endpoint and the loop rebuilt it. A task
-/// failure after that, with the new endpoint up, is not that panic's
-/// consequence, though `driver_death_restart` (the monitor's backstop for a
-/// node that exits for a death) would read the stale flag as one.
-pub(in crate::transport::quic) fn stale_driver_panic_flag_body() {
-    bounded(|| async move {
-        use crate::transport::quic::liveness::{
-            driver_death_restart, exit_for_endpoint_death, mark_driver_panicked_for_test,
-        };
-        exit_for_endpoint_death();
-        mark_driver_panicked_for_test();
-        let mut lp = start(|_| Some(QuicAvailability::Up), |_| Vec::new(), vec![1.0]);
-        lp.first.send(QuicAvailability::Down).unwrap();
-        lp.next_attempts(1).await;
-        Loop::settle().await;
-        assert_eq!(lp.node.get(), QuicAvailability::Up, "rebuilt");
-        let restart = driver_death_restart(|_| true).await;
-        assert!(
-            !restart,
-            "a task failure after a rebuild is not the old endpoint's death"
-        );
-        drop(lp.stop.take());
-    })
+/// The backstop `liveness::driver_death_restart` reads a process-wide flag
+/// that only a node that exits for an endpoint death can have set, so it is
+/// sound only while no node both exits for a death and rebuilds: the switch
+/// that makes the listener exit (`gateway_quic_restarts`, which also decides
+/// `exit_for_endpoint_death`'s caller) turns rebuilding off, in every role
+/// and configuration, and the listener passes exactly that switch.
+#[test]
+fn a_node_never_both_exits_for_a_death_and_rebuilds() {
+    use crate::transport::quic::liveness::gateway_quic_restarts_with;
+    for is_gateway in [false, true] {
+        for enabled in [false, true] {
+            for udp_fallback in [false, true] {
+                let exits = gateway_quic_restarts_with(is_gateway, enabled, udp_fallback);
+                for switch in [false, true] {
+                    assert!(
+                        !(exits && enabled_with(exits, switch)),
+                        "gateway={is_gateway} enabled={enabled} udp_fallback={udp_fallback}"
+                    );
+                }
+            }
+        }
+    }
+    let src = include_str!("../../connection_handler.rs");
+    let flat: String = src.split_whitespace().collect();
+    assert!(
+        flat.contains(
+            "rebuild::enabled_at(super::quic::liveness::gateway_quic_restarts(is_gateway),"
+        ),
+        "the listener must feed enabled_at the switch that arms its exit"
+    );
 }

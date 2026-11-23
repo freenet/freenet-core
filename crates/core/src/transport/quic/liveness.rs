@@ -205,22 +205,6 @@ pub(crate) async fn driver_death_restart(
     reported && record(std::time::SystemTime::now())
 }
 
-/// A node that rebuilds its endpoint (`super::rebuild`) is about to build a
-/// new one after a death: the driver panic that may have caused it is
-/// consumed, so [`driver_death_restart`] must not read it again as the cause
-/// of a later, unrelated task failure. The flag is process-wide and nothing
-/// else clears it. Called BEFORE the new endpoint exists, so a panic in
-/// that endpoint's drivers sets it afresh.
-pub(crate) fn note_endpoint_rebuilding() {
-    DRIVER_PANICKED.send_replace(false);
-}
-
-/// Set the flag a quinn driver panic's report sets (tests).
-#[cfg(test)]
-pub(crate) fn mark_driver_panicked_for_test() {
-    DRIVER_PANICKED.send_replace(true);
-}
-
 /// Whether [`note_gateway_supervisor_unverified`] was called.
 pub(crate) fn gateway_supervisor_unverified() -> bool {
     SUPERVISOR_UNVERIFIED.load(Ordering::Relaxed)
@@ -248,7 +232,11 @@ fn restarts_for_quic_with(is_gateway: bool, udp_fallback: bool) -> bool {
     is_gateway || !udp_fallback
 }
 
-fn gateway_quic_restarts_with(is_gateway: bool, enabled: bool, udp_fallback: bool) -> bool {
+pub(in crate::transport::quic) fn gateway_quic_restarts_with(
+    is_gateway: bool,
+    enabled: bool,
+    udp_fallback: bool,
+) -> bool {
     enabled && restarts_for_quic_with(is_gateway, udp_fallback)
 }
 

@@ -2090,10 +2090,14 @@ impl TransportMetrics {
     }
 
     /// The node built a new QUIC endpoint in place of one that died
-    /// (`quic::rebuild`): the state is `Up` again, replacing `Died`.
-    pub(crate) fn record_quic_endpoint_rebuilt(&self) {
-        self.quic_endpoint_state
-            .store(QuicEndpointState::Up as u8, Ordering::Relaxed);
+    /// (`quic::rebuild`): the state is `Up` again, replacing `Died`, unless
+    /// the new endpoint already died (`still_up` false): its death is then
+    /// the state.
+    pub(crate) fn record_quic_endpoint_rebuilt(&self, still_up: bool) {
+        if still_up {
+            self.quic_endpoint_state
+                .store(QuicEndpointState::Up as u8, Ordering::Relaxed);
+        }
     }
 
     /// The QUIC endpoint's state as last recorded.
@@ -6187,6 +6191,19 @@ mod tests {
         }
         let snap = metrics.take_snapshot().expect("the death is activity");
         assert_eq!(snap.quic_endpoint, "died", "the state is not reset");
+    }
+
+    /// A rebuilt endpoint makes the state `Up` again, except one that
+    /// already died: its death stays the state.
+    #[test]
+    fn a_rebuilt_endpoint_replaces_died_only_while_it_is_up() {
+        let metrics = TransportMetrics::new();
+        metrics.record_quic_endpoint_down("127.0.0.1:1".parse().unwrap());
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Died);
+        metrics.record_quic_endpoint_rebuilt(false);
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Died);
+        metrics.record_quic_endpoint_rebuilt(true);
+        assert_eq!(metrics.quic_endpoint_state(), QuicEndpointState::Up);
     }
 
     /// Every endpoint state has its own label and survives the round trip
