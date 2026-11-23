@@ -737,6 +737,20 @@ labelled_counters! {
     }
 }
 
+labelled_counters! {
+    /// What the Kleinberg connection evaluator did that differs from before
+    /// #6347 (`topology::connection_evaluator`). Exported per period as
+    /// `connect_evaluator_<label>`.
+    pub(crate) enum EvaluatorEvent {
+        /// A candidate was accepted although its own earlier entry, which
+        /// the evaluator no longer compares it with, would have refused it.
+        AcceptedOverOwnEntry => "accepted_over_own_entry",
+        /// The window held more than its cap of candidates and dropped the
+        /// lowest-scoring one.
+        CapEviction => "cap_eviction",
+    }
+}
+
 impl NativeSetupOutcome {
     /// Whether this end says native does not work on the path to that peer,
     /// so it counts toward the node's demotion. A refusal by this node's own
@@ -1162,6 +1176,8 @@ pub struct TransportMetrics {
     connect_arm: [AtomicU64; ConnectArmCounter::COUNT],
     /// Gateway admission of native joins this period, by [`GatewayAdmission`].
     quic_gateway_admission: [AtomicU64; GatewayAdmission::COUNT],
+    /// Connection evaluator events this period, by [`EvaluatorEvent`].
+    connect_evaluator: [AtomicU64; EvaluatorEvent::COUNT],
     /// Establish latencies this period in ms (bounded), and how many there
     /// were.
     quic_establish_ms: parking_lot::Mutex<Vec<u64>>,
@@ -1670,6 +1686,7 @@ impl TransportMetrics {
             connect_native_setup_acceptor: Default::default(),
             connect_arm: Default::default(),
             quic_gateway_admission: Default::default(),
+            connect_evaluator: Default::default(),
             quic_establish_ms: Default::default(),
             quic_establish_samples: AtomicU64::new(0),
             quic_paths_offered_or_dialing: AtomicU64::new(0),
@@ -2406,6 +2423,11 @@ impl TransportMetrics {
     /// A gateway's admission of a native join did `outcome`.
     pub(crate) fn record_gateway_admission(&self, outcome: GatewayAdmission) {
         self.quic_gateway_admission[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The connection evaluator did `event`.
+    pub(crate) fn record_connect_evaluator(&self, event: EvaluatorEvent) {
+        self.connect_evaluator[event as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn record_quic_close_sent(&self, code: QuicCloseCode, remote: SocketAddr) {
@@ -3316,6 +3338,7 @@ impl TransportMetrics {
             }),
             connect_arm: std::array::from_fn(|i| get64(&self.connect_arm[i])),
             quic_gateway_admission: std::array::from_fn(|i| get64(&self.quic_gateway_admission[i])),
+            connect_evaluator: std::array::from_fn(|i| get64(&self.connect_evaluator[i])),
             quic_establish_ms_p50: establish_p50,
             quic_establish_ms_p90: establish_p90,
             quic_establish_samples: get64(&self.quic_establish_samples),
@@ -4053,6 +4076,9 @@ pub struct TransportSnapshot {
     /// Gateway admission of native joins, by [`GatewayAdmission`]
     /// (`quic_gateway_admission_<label>`).
     pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
+    /// Connection evaluator events, by [`EvaluatorEvent`]
+    /// (`connect_evaluator_<label>`).
+    pub connect_evaluator: [u64; EvaluatorEvent::COUNT],
     /// Median and p90 of this period's establish latencies, in ms (the
     /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
     /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
@@ -4460,6 +4486,7 @@ impl TransportSnapshot {
             connect_native_setup_acceptor,
             connect_arm,
             quic_gateway_admission,
+            connect_evaluator,
             quic_establish_ms_p50,
             quic_establish_ms_p90,
             quic_establish_samples,
@@ -4642,6 +4669,7 @@ impl TransportSnapshot {
         self.connect_native_setup_acceptor = connect_native_setup_acceptor;
         self.connect_arm = connect_arm;
         self.quic_gateway_admission = quic_gateway_admission;
+        self.connect_evaluator = connect_evaluator;
         self.quic_establish_ms_p50 = quic_establish_ms_p50;
         self.quic_establish_ms_p90 = quic_establish_ms_p90;
         self.quic_establish_samples = quic_establish_samples;
@@ -4931,6 +4959,9 @@ struct SnapshotExtras {
     /// Gateway admission of native joins, by [`GatewayAdmission`]
     /// (`quic_gateway_admission_<label>`).
     pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
+    /// Connection evaluator events, by [`EvaluatorEvent`]
+    /// (`connect_evaluator_<label>`).
+    pub connect_evaluator: [u64; EvaluatorEvent::COUNT],
     /// Median and p90 of this period's establish latencies, in ms (the
     /// first `QUIC_ESTABLISH_SAMPLES_MAX` of them), and how many there were.
     /// Both roles are mixed: a server times from its Offer to `ReadyAck`, a
@@ -5162,6 +5193,7 @@ impl SnapshotExtras {
             || self.connect_native_setup_acceptor.iter().any(|n| *n != 0)
             || self.connect_arm.iter().any(|n| *n != 0)
             || self.quic_gateway_admission.iter().any(|n| *n != 0)
+            || self.connect_evaluator.iter().any(|n| *n != 0)
             || self.quic_establish_samples != 0
             || self.quic_paths_offered_or_dialing != 0
             || self.quic_paths_active != 0
@@ -6582,6 +6614,14 @@ mod tests {
             assert_eq!(snap.connect_arm, want, "{arm:?} {side:?} connected dial");
             assert!(metrics.take_snapshot().is_none(), "reset");
         }
+    }
+
+    #[test]
+    fn connect_evaluator_events_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, _| m.record_connect_evaluator(EvaluatorEvent::ALL[slot]),
+            |snap| snap.connect_evaluator,
+        );
     }
 
     #[test]

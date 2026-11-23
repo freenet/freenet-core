@@ -13904,6 +13904,9 @@ fn run_sparse_stranded_holder(
     let reader = NodeLabel::node(network_name, reader_no);
     let reader_addr = sim.node_address(&reader).expect("reader address");
     let holder_addr = sim.node_address(&holder).expect("holder address");
+    let gateway_addr = sim
+        .node_address(&NodeLabel::gateway(network_name, 0))
+        .expect("gateway address");
     // Strand the holder: it cannot reach the key cluster, so it never links
     // to it. At six connections it otherwise can, and its subscribe then
     // lands next to the key with no recovery at all.
@@ -13949,6 +13952,57 @@ fn run_sparse_stranded_holder(
         result.turmoil_result.is_ok(),
         "simulation failed: {:?}",
         result.turmoil_result.err()
+    );
+
+    // Precondition: every peer, the holder included, had joined BEFORE the
+    // operations started. The barrier carries on at its cap otherwise, and a
+    // holder that joined after its own subscribe would still pass the
+    // end-of-run checks below.
+    let join = result
+        .join_convergence
+        .expect("the test set a join-convergence barrier");
+    tracing::info!(
+        network_name,
+        waited_secs = join.waited.as_secs(),
+        joined = join.joined,
+        target = join.target,
+        "stranded-holder join convergence"
+    );
+    let gateway_links = result
+        .topology_snapshots
+        .iter()
+        .find(|snap| snap.peer_addr == gateway_addr)
+        .map(|snap| snap.connection_count);
+    tracing::info!(
+        network_name,
+        ?gateway_links,
+        "stranded-holder gateway links"
+    );
+    assert!(
+        join.reached,
+        "precondition: every peer must join before the operations start \
+         ({} of {} after {:?})",
+        join.joined, join.target, join.waited
+    );
+    // The gateway admits about one candidate per 60 s evaluator window, so
+    // the last joiner can wait several windows. Measured over six seeds in
+    // both transport modes (#6347): 0 to 435 s; 245 s (QUIC off) and 85 s
+    // (QUIC on) on this test's seed. The bound leaves about three windows
+    // above the slowest while still failing a join that has slowed toward
+    // the 900 s cap.
+    assert!(
+        join.waited <= Duration::from_secs(600),
+        "joining took {:?}, beyond the 600 s bound",
+        join.waited
+    );
+    // The gateway's acceptance is rate-limited: with room for every peer it
+    // still admits about one candidate per window, best score first. On this
+    // seed it ends the run with 9 links (QUIC off) or 8 (QUIC on); with the
+    // evaluator made to accept every candidate it ends with 14 or 15. An
+    // over-permissive evaluator fails here.
+    assert!(
+        gateway_links.is_some_and(|n| n <= 12),
+        "the gateway holds {gateway_links:?} links: its admission is no longer rate-limited"
     );
 
     // Precondition: the reader is on the ring, so a join-capacity shortfall

@@ -3262,6 +3262,12 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         count.into(),
                     );
                 }
+                for (event, count) in crate::transport::metrics::EvaluatorEvent::ALL
+                    .iter()
+                    .zip(snapshot.connect_evaluator)
+                {
+                    m.insert(format!("connect_evaluator_{}", event.label()), count.into());
+                }
             }
             m.insert(
                 "quic_establish_ms_p50".into(),
@@ -8015,6 +8021,7 @@ mod tests {
             "connect_native_setup_acceptor",
             "connect_arm",
             "quic_gateway_admission",
+            "connect_evaluator",
         ] {
             assert!(expected.remove(family), "{family} is in the snapshot");
         }
@@ -8071,6 +8078,11 @@ mod tests {
             crate::transport::metrics::GatewayAdmission::ALL
                 .iter()
                 .map(|outcome| format!("quic_gateway_admission_{}", outcome.label())),
+        );
+        expected.extend(
+            crate::transport::metrics::EvaluatorEvent::ALL
+                .iter()
+                .map(|event| format!("connect_evaluator_{}", event.label())),
         );
         let actual: std::collections::BTreeSet<String> = event_kind_to_json(
             &super::super::EventKind::TransportSnapshot(Box::new(snapshot)),
@@ -8486,6 +8498,7 @@ mod tests {
         fill(&mut snapshot.connect_native_setup_acceptor);
         fill(&mut snapshot.connect_arm);
         fill(&mut snapshot.quic_gateway_admission);
+        fill(&mut snapshot.connect_evaluator);
         snapshot.quic_establish_ms_p50 = Some(901);
         snapshot.quic_establish_ms_p90 = Some(902);
         snapshot.quic_establish_samples = 903;
@@ -8546,6 +8559,12 @@ mod tests {
         {
             expected.push((format!("quic_gateway_admission_{}", outcome.label()), count));
         }
+        for (event, count) in crate::transport::metrics::EvaluatorEvent::ALL
+            .iter()
+            .zip(snapshot.connect_evaluator)
+        {
+            expected.push((format!("connect_evaluator_{}", event.label()), count));
+        }
         for (key, value) in [
             ("quic_establish_ms_p50", 901),
             ("quic_establish_ms_p90", 902),
@@ -8567,6 +8586,7 @@ mod tests {
                 + 2 * NativeSetupOutcome::COUNT
                 + crate::transport::metrics::ConnectArmCounter::COUNT
                 + crate::transport::metrics::GatewayAdmission::COUNT
+                + crate::transport::metrics::EvaluatorEvent::COUNT
                 + 6
         );
         for (key, value) in expected {

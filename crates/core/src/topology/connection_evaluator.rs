@@ -29,10 +29,11 @@ pub(super) struct ConnectionEvaluator {
 
 /// Most candidates the window holds. Candidates are peer addresses, which a
 /// remote party can vary, so the window is bounded by count as well as by
-/// time. A retry moves its entry to the back, so dropping from the front
-/// drops the least recently seen candidate (refusing newcomers instead would
-/// let busy candidates hold the window forever). Dropping an old entry only
-/// lowers the bar the next candidate must beat.
+/// time. Past the cap the LOWEST-scoring entry is dropped: the bar a
+/// candidate must beat is the highest other entry, and dropping the lowest
+/// never lowers it, so a flood of low-scoring evaluations cannot switch the
+/// rate limit off. (Dropping the oldest instead would let such a flood push
+/// the strong entries out.)
 pub(super) const MAX_TRACKED_CANDIDATES: usize = 1024;
 
 impl ConnectionEvaluator {
@@ -55,7 +56,26 @@ impl ConnectionEvaluator {
         self.scores.retain(|(_, addr, _)| *addr != candidate);
         self.scores.push_back((current_time, candidate, score));
         while self.scores.len() > MAX_TRACKED_CANDIDATES {
-            self.scores.pop_front();
+            // The first of the lowest scores, so ties drop the oldest.
+            // Removing from the middle keeps the time order.
+            let lowest = self
+                .scores
+                .iter()
+                .enumerate()
+                .fold(None::<(usize, f64)>, |low, (i, &(_, _, s))| match low {
+                    Some((_, l)) if l <= s => low,
+                    _ => Some((i, s)),
+                })
+                .map(|(i, _)| i);
+            match lowest {
+                Some(i) => {
+                    self.scores.remove(i);
+                    crate::transport::metrics::TRANSPORT_METRICS.record_connect_evaluator(
+                        crate::transport::metrics::EvaluatorEvent::CapEviction,
+                    );
+                }
+                None => break,
+            }
         }
     }
 
@@ -72,6 +92,17 @@ impl ConnectionEvaluator {
             .iter()
             .filter(|(_, addr, _)| *addr != candidate)
             .all(|&(_, _, s)| score > s);
+        if is_better
+            && self
+                .scores
+                .iter()
+                .any(|&(_, addr, s)| addr == candidate && score <= s)
+        {
+            // Before #6347 this candidate's own earlier entry refused it.
+            crate::transport::metrics::TRANSPORT_METRICS.record_connect_evaluator(
+                crate::transport::metrics::EvaluatorEvent::AcceptedOverOwnEntry,
+            );
+        }
 
         // Important to add new score *after* checking if it's better than all other scores
         self.record_only_with_current_time(candidate, score, current_time);
@@ -271,8 +302,49 @@ mod tests {
         ));
     }
 
-    /// Distinct candidates inside one window cannot grow it past the cap; the
-    /// least recently seen candidate is the one dropped.
+    /// Two distinct candidates with the same score refuse each other: the
+    /// comparison is strict. Peers sharing a /24 (or one peer changing ports)
+    /// derive the same location and so the same score.
+    #[test]
+    fn distinct_candidates_with_equal_scores_refuse_each_other() {
+        let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(60));
+        let start = Instant::now();
+        assert!(evaluator.record_and_eval_with_current_time(peer(1), 0.5, start));
+        assert!(!evaluator.record_and_eval_with_current_time(
+            peer(2),
+            0.5,
+            start + Duration::from_secs(1)
+        ));
+    }
+
+    /// A flood of more than the cap of low-scoring evaluations inside one
+    /// window must not push out the strong entry that sets the bar: the cap
+    /// drops the lowest entries, never the highest.
+    #[test]
+    fn a_flood_of_low_scores_does_not_lower_the_bar() {
+        let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(300));
+        let start = Instant::now();
+        evaluator.record_only_with_current_time(peer(1), 0.9, start);
+        for i in 0..(MAX_TRACKED_CANDIDATES + 100) {
+            evaluator.record_only_with_current_time(
+                SocketAddr::from(([10, 1, (i >> 8) as u8, (i & 0xff) as u8], 2)),
+                0.1,
+                start + Duration::from_millis(1 + i as u64),
+            );
+        }
+        assert_eq!(evaluator.scores.len(), MAX_TRACKED_CANDIDATES);
+        assert!(
+            !evaluator.record_and_eval_with_current_time(
+                peer(3),
+                0.5,
+                start + Duration::from_secs(10)
+            ),
+            "0.5 must still lose to the 0.9 entry the flood came after"
+        );
+    }
+
+    /// Distinct candidates inside one window cannot grow it past the cap; with
+    /// equal scores the oldest is the one dropped.
     #[test]
     fn the_window_holds_at_most_the_cap_of_candidates() {
         let mut evaluator = ConnectionEvaluator::new(Duration::from_secs(3600));
