@@ -8928,58 +8928,6 @@ mod tests {
         assert_eq!(enclosing_fn(code, idx), "allowed");
     }
 
-    /// PIN, half 1 of 2: the LOOP's delegate runs all go through one
-    /// chokepoint, and that chokepoint is entered only from the loop.
-    ///
-    /// The invariant, since the delegate lane (`delegate_lane`):
-    ///
-    /// > At most one delegate `process()` executes node-wide at any instant,
-    /// > and every one executes on the node's ONE delegate executor, under its
-    /// > lock (`PooledDelegateRunner`). A delegate's round-trip is never
-    /// > interleaved with another run of the same delegate.
-    ///
-    /// The first sentence is held by the LOCK, pinned by half 2,
-    /// `every_delegate_process_runs_on_the_one_delegate_executor`. It used to
-    /// be held by every route to `process()` being awaited from the one
-    /// `contract_handling` task, with no lock at all; the lane is a second task
-    /// that starts delegate runs, so the lock replaced that argument.
-    ///
-    /// The second sentence is what `DelegateContextCache`'s last-write-wins
-    /// keying needs. It is held between the lane and the loop by
-    /// `DelegateGate` (every loop entry claims the delegate, a park entry holds
-    /// a claim, the lane runs only a delegate with no claim), and on the loop
-    /// by this chokepoint plus `DelegateParkCtx`'s exclusion. The loop side is
-    /// what this test pins: a loop run that bypassed the chokepoint would also
-    /// bypass the claims taken by its callers.
-    ///
-    /// What else rests on the single executor: every delegate secret write
-    /// going through one `SecretsStore`, whose in-memory index and the hosted
-    /// per-user quota counter assume one serialized writer
-    /// (`secrets_store::quota`), and the live secret import, which takes the
-    /// same lock.
-    ///
-    /// Anchored on the PROPERTY, not on a helper's name: it asserts the
-    /// chokepoint is still a chokepoint, and that the set of functions allowed
-    /// to enter it is still the documented on-loop set. Adding a caller is not
-    /// forbidden — it fails this test, which asks you to confirm the new caller
-    /// is awaited from `contract_handling` and then to say so here.
-    ///
-    /// FALSIFY: add a call to `handle_delegate_with_contract_requests` in a new
-    /// function, call `execute_delegate_request` from anywhere but the
-    /// chokepoint, or — the case checks 1 and 2 could not see — put either
-    /// call inside a `GlobalExecutor::spawn` body WITHIN one of the
-    /// allowed functions. All three fail. Verified by doing all three.
-    ///
-    /// Two further falsifications, added after a post-merge audit found this
-    /// pin GREEN under both. Each defeated a SCAN rather than the property, so
-    /// the fix was to the scan and each now has its own unit test beside the
-    /// helper it belongs to:
-    ///  * `tokio::task::spawn_local(async move { ..chokepoint.. })` inside an
-    ///    allowed function — an unenumerated spawn token, skipped rather than
-    ///    panicked on (see `spawned_bodies`);
-    ///  * `.execute_delegate_request(` in a new `pub async fn` declared
-    ///    immediately after the chokepoint — a declaration form the owner scan
-    ///    could not see (see `enclosing_fn`).
     /// A hop reply (`delegate_park::PendingReply`) is BUILT in exactly one
     /// place: the hop, which records the delegate it ran as the reply's
     /// origin. `next_call` turns `from` into an attested
@@ -9059,6 +9007,58 @@ mod tests {
         );
     }
 
+    /// PIN, half 1 of 2: the LOOP's delegate runs all go through one
+    /// chokepoint, and that chokepoint is entered only from the loop.
+    ///
+    /// The invariant, since the delegate lane (`delegate_lane`):
+    ///
+    /// > At most one delegate `process()` executes node-wide at any instant,
+    /// > and every one executes on the node's ONE delegate executor, under its
+    /// > lock (`PooledDelegateRunner`). A delegate's round-trip is never
+    /// > interleaved with another run of the same delegate.
+    ///
+    /// The first sentence is held by the LOCK, pinned by half 2,
+    /// `every_delegate_process_runs_on_the_one_delegate_executor`. It used to
+    /// be held by every route to `process()` being awaited from the one
+    /// `contract_handling` task, with no lock at all; the lane is a second task
+    /// that starts delegate runs, so the lock replaced that argument.
+    ///
+    /// The second sentence is what `DelegateContextCache`'s last-write-wins
+    /// keying needs. It is held between the lane and the loop by
+    /// `DelegateGate` (every loop entry claims the delegate, a park entry holds
+    /// a claim, the lane runs only a delegate with no claim), and on the loop
+    /// by this chokepoint plus `DelegateParkCtx`'s exclusion. The loop side is
+    /// what this test pins: a loop run that bypassed the chokepoint would also
+    /// bypass the claims taken by its callers.
+    ///
+    /// What else rests on the single executor: every delegate secret write
+    /// going through one `SecretsStore`, whose in-memory index and the hosted
+    /// per-user quota counter assume one serialized writer
+    /// (`secrets_store::quota`), and the live secret import, which takes the
+    /// same lock.
+    ///
+    /// Anchored on the PROPERTY, not on a helper's name: it asserts the
+    /// chokepoint is still a chokepoint, and that the set of functions allowed
+    /// to enter it is still the documented on-loop set. Adding a caller is not
+    /// forbidden — it fails this test, which asks you to confirm the new caller
+    /// is awaited from `contract_handling` and then to say so here.
+    ///
+    /// FALSIFY: add a call to `handle_delegate_with_contract_requests` in a new
+    /// function, call `execute_delegate_request` from anywhere but the
+    /// chokepoint, or — the case checks 1 and 2 could not see — put either
+    /// call inside a `GlobalExecutor::spawn` body WITHIN one of the
+    /// allowed functions. All three fail. Verified by doing all three.
+    ///
+    /// Two further falsifications, added after a post-merge audit found this
+    /// pin GREEN under both. Each defeated a SCAN rather than the property, so
+    /// the fix was to the scan and each now has its own unit test beside the
+    /// helper it belongs to:
+    ///  * `tokio::task::spawn_local(async move { ..chokepoint.. })` inside an
+    ///    allowed function — an unenumerated spawn token, skipped rather than
+    ///    panicked on (see `spawned_bodies`);
+    ///  * `.execute_delegate_request(` in a new `pub async fn` declared
+    ///    immediately after the chokepoint — a declaration form the owner scan
+    ///    could not see (see `enclosing_fn`).
     #[test]
     fn every_loop_delegate_run_goes_through_the_round_trip_chokepoint() {
         // Production text only, comments stripped. Both needles occur in this
