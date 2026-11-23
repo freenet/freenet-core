@@ -45,8 +45,8 @@ fn main() {
 
 fn emit_min_compatible_version() {
     // Priority for min-compatible version:
-    // 1. FREENET_MIN_COMPATIBLE_VERSION env var (release.sh exports it; it
-    //    equals the Cargo.toml value unless --min-compatible raised it)
+    // 1. FREENET_MIN_COMPATIBLE_VERSION env var (a manual override; the
+    //    release paths never set it, and release.sh clears it)
     // 2. package.metadata.freenet.min-compatible-version in Cargo.toml
     // 3. CARGO_PKG_VERSION (strict match — same as old behavior)
     //
