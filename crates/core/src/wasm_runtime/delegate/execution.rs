@@ -196,6 +196,11 @@ pub(crate) fn decode_delegate_result(
 /// arm alone was #3282). Centralizing the drain here keeps all terminal arms
 /// consistent so a future arm cannot silently reintroduce the blind-drain.
 ///
+/// The contract loop sets `sender` again on every message it delivers (the
+/// hop and the reply path in `contract.rs`), from the key of the delegate it
+/// ran. That delivery-time assignment is what receivers rely on; this one is
+/// kept as a second layer.
+///
 /// The match lists every `OutboundDelegateMsg` variant exhaustively (rather
 /// than a generic passthrough) so that adding a variant to the enum forces a
 /// compile-time decision here instead of silently dropping or forwarding it.
@@ -729,7 +734,10 @@ impl Runtime {
                         target_delegate = %msg.target,
                         "Passing SendDelegateMessage to executor for delivery"
                     );
-                    // Sender attestation: overwrite sender with the actual delegate key
+                    // Sender attestation: overwrite sender with the actual delegate
+                    // key. The contract loop sets it again on delivery, and that is
+                    // the layer receivers rely on (see
+                    // `drain_remaining_with_attestation`).
                     msg.sender = delegate_key.clone();
                     results.push(OutboundDelegateMsg::SendDelegateMessage(msg));
                     // Attest any remaining SendDelegateMessage variants to prevent

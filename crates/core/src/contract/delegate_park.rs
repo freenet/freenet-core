@@ -1109,6 +1109,9 @@ pub(super) struct Continuation {
     /// Inter-delegate hops the run has attempted, so
     /// `MAX_UNPROMPTED_HOPS_PER_RUN` bounds the whole run, not each leg.
     pub hops_attempted: usize,
+    /// Payload bytes of hop replies the run has accepted, so
+    /// `MAX_HOP_REPLY_BYTES_PER_RUN` bounds the whole run, not each leg.
+    pub reply_bytes_accepted: usize,
     pub params: Parameters<'static>,
     pub origin_contract: Option<ContractInstanceId>,
     pub connection_scope: ConnectionScope,
@@ -1775,8 +1778,14 @@ pub(super) struct DelegateParkCtx {
     dropped_hop_outputs: u64,
     /// `SendDelegateMessage`s in hop targets' output that were not delivered:
     /// every one except the first addressed back to the caller (the reply).
+    /// It counts every `SendDelegateMessage` variant in the output, whatever
+    /// its flags, so it is an upper bound on real sends the target attempted.
     /// Counted for every run kind. Disjoint from `dropped_hop_outputs`.
     dropped_hop_sends: u64,
+    /// Replies from hop targets that were not delivered: over
+    /// `MAX_HOP_REPLY_BYTES` or `MAX_HOP_REPLY_BYTES_PER_RUN`, or still
+    /// waiting when the run reached `MAX_CONTRACT_REQUEST_ITERATIONS`.
+    dropped_hop_replies: u64,
     /// Inter-delegate messages refused because a delegate addressed them to
     /// itself.
     refused_self_hops: u64,
@@ -1840,6 +1849,7 @@ impl DelegateParkCtx {
             refused_unprompted_hops: 0,
             dropped_hop_outputs: 0,
             dropped_hop_sends: 0,
+            dropped_hop_replies: 0,
             refused_self_hops: 0,
         }
     }
@@ -1923,6 +1933,17 @@ impl DelegateParkCtx {
     #[cfg(test)]
     pub(super) fn dropped_hop_sends(&self) -> u64 {
         self.dropped_hop_sends
+    }
+
+    /// Count `n` hop replies that were not delivered; returns the new total.
+    pub(super) fn count_dropped_hop_replies(&mut self, n: u64) -> u64 {
+        self.dropped_hop_replies = self.dropped_hop_replies.saturating_add(n);
+        self.dropped_hop_replies
+    }
+
+    #[cfg(test)]
+    pub(super) fn dropped_hop_replies(&self) -> u64 {
+        self.dropped_hop_replies
     }
 
     /// Count `n` inter-delegate messages a delegate addressed to itself;
@@ -3296,6 +3317,7 @@ mod tests {
         Continuation {
             self_heal_fetches_started: 0,
             hops_attempted: 0,
+            reply_bytes_accepted: 0,
             params: Parameters::from(Vec::new()),
             origin_contract: None,
             connection_scope: ConnectionScope::Local,

@@ -1058,20 +1058,26 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
-        _caller_delegate: Option<&DelegateKey>,
+        caller_delegate: Option<&DelegateKey>,
         connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
         if let Some(runner) = self.runtime.delegate_lane.clone() {
             use crate::contract::delegate_lane::DelegateRunner;
             return runner
-                .run(req, origin_contract, None, connection_scope, user_context)
+                .run(
+                    req,
+                    origin_contract,
+                    caller_delegate,
+                    connection_scope,
+                    user_context,
+                )
                 .await;
         }
         let user = user_context.map(|u| *u.user_id());
         let attestation = Attestation {
             origin_contract,
-            caller_delegate: None,
+            caller_delegate,
             connection_scope,
         };
         scripted_delegate_request(&self.runtime.delegate_state(), req, user, user, attestation)
