@@ -1,0 +1,6 @@
+[Unit]
+Description=Log loudly that the staggered companion-gateway restart failed (#6336)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger -p daemon.crit -t freenet-gateway-stagger-ALERT "freenet-gateway-stagger.service FAILED: the companion gateway (freenet-gateway-2) may still run the OLD binary. See journalctl -u freenet-gateway-stagger. Retry: systemctl start freenet-gateway-stagger"

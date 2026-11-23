@@ -94,6 +94,36 @@ install -m 0755 -o root -g root \
     "$ANNOUNCE_SCRIPT"
 echo "  Installed $ANNOUNCE_SCRIPT (endpoint disabled until config opts in)"
 
+echo "==> Installing the staggered companion-gateway restart (#6336)"
+# gateway-auto-update.sh queues freenet-gateway-stagger.service after a primary
+# update; the hook skips hosts where that unit does not exist. Install the
+# script everywhere (harmless), and the units only on nova, which runs a second
+# gateway process (freenet-gateway-2) that must restart AFTER the primary, not
+# with it. The gw2 unit carries nova's addresses and key paths, and expects
+# /home/freenet/.ssh/gw2.x25519.pem and the supervised.conf drop-in
+# (FREENET_SUPERVISED=1) to be provisioned separately.
+install -m 0755 -o root -g root \
+    "$SCRIPT_DIR/../gateway-staggered-restart.sh" \
+    /usr/local/bin/gateway-staggered-restart.sh
+if [[ "$HOSTNAME_TAG" == "nova" ]]; then
+    for unit in freenet-gateway-2 freenet-gateway-stagger freenet-gateway-stagger-alert; do
+        install -m 0644 -o root -g root \
+            "$SCRIPT_DIR/$unit.service" "/etc/systemd/system/$unit.service"
+    done
+    systemctl daemon-reload
+    # The primary must be enabled itself: deploy-local-gateway.sh only re-enables
+    # a unit that was enabled when the deploy began, so it never repairs this.
+    if systemctl cat freenet-gateway.service >/dev/null 2>&1; then
+        systemctl enable freenet-gateway.service
+    else
+        echo "  WARNING: freenet-gateway.service does not exist yet; enable it once it does" >&2
+    fi
+    # reenable (not enable) so an upgrade of an install made before #6336 also
+    # drops the old freenet-gateway.service.wants/freenet-gateway-2.service link.
+    systemctl reenable freenet-gateway-2.service
+    echo "  Installed gw2 + stagger units (not started; no gateway is restarted)"
+fi
+
 echo "==> Installing sudoers entry"
 install -m 0440 -o root -g root \
     "$SCRIPT_DIR/sudoers.freenet-release-agent" \

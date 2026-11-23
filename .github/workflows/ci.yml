@@ -202,6 +202,12 @@ jobs:
       - name: Self-test deploy-local-gateway verify_service
         run: bash scripts/release-agent/deploy-local-gateway_test.sh
 
+      # The companion gateway (nova's freenet-gateway-2) restarts a few minutes
+      # AFTER the primary, not with it (#6336). Pins: no restart while the
+      # primary is young or down, and every failure exits non-zero.
+      - name: Self-test gateway-staggered-restart
+        run: bash scripts/release-agent/gateway-staggered-restart_test.sh
+
       # Regression gate for the release-announce River post (the
       # v0.2.74/v0.2.75 incident: the announce raced the gateway self-update,
       # a WS-port probe passed, but riverctl's room GET hit a mid-teardown
