@@ -838,7 +838,7 @@ async fn a_hop_into_a_parameterized_delegate_runs_it() {
 /// with B as the attested origin, carrying B's payload.
 ///
 /// This covers a CLIENT run on the real runtime. Background runs (notification,
-/// queued, lifecycle, wake-up) take the same delivery path (`plan_round`) and
+/// queued, lifecycle, wake-up) take the same delivery path (`next_call`) and
 /// are covered against the mock runtime in `capability_loop_tests`.
 ///
 /// FALSIFY by dropping the reply in `split_hop_output`'s caller, or by

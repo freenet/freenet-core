@@ -97,19 +97,21 @@ background runs. A hop runs the target's process() (after the target's
 pending lane round-trip, if the lane handed one to the loop); the target's
 own contract requests are not executed. One reply per hop (per message), no
 further chaining: the target's first SendDelegateMessage addressed back to
-the caller is delivered to the caller as an inbound DelegateMessage in its
-next iteration (carried across a park), with `sender` set by the core to the
-target (split_hop_output), in a call of its own so the caller sees
-MessageOrigin::Delegate(target) while handling it (plan_round), never the
+the caller is queued and delivered to the caller as an inbound DelegateMessage
+in a later iteration of its own (carried across a park), with `sender` set by
+the core to the target (split_hop_output), so the caller sees
+MessageOrigin::Delegate(target) while handling it (next_call), never the
 run's WebApp or inherited origin. The target's key travels BESIDE the reply
 (PendingReply), never read from the message. A prompt the caller raises
 while handling a reply is shown under the run's own app identity. Every
 other SendDelegateMessage from the target is dropped, counted and logged
 once per iteration, and so is a reply over MAX_HOP_REPLY_BYTES (64 KiB),
 past MAX_HOP_REPLY_BYTES_PER_RUN, still waiting at the iteration cap, or
-one the caller fails on. Each reply call after an iteration's first counts
-as an iteration, so a run still makes at most MAX_CONTRACT_REQUEST_ITERATIONS
-calls into the caller. The reply never runs the target again; hops the
+one the caller fails on (that call's context is not persisted; secrets it
+wrote before failing stay written). Every iteration makes ONE executor call
+(a batch or one reply) and processes its output before the next, so a run
+still makes at most MAX_CONTRACT_REQUEST_ITERATIONS calls into the caller and
+holds at most one call's output at a time. The reply never runs the target again; hops the
 caller makes while handling it count against its own cap. From a background run the target's other output is dropped
 (counted, one info! per hop), never merged into the caller's output, which
 would fan it out to the caller's apps under the caller's name. A background run

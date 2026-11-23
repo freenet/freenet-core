@@ -141,11 +141,11 @@ const MAX_HOP_REPLY_BYTES: usize = 64 * 1024;
 /// client run, which the hop cap does not bound, is bounded by this instead.
 ///
 /// The NUMBER of replies needs no separate cap: each reply is delivered in an
-/// executor call of its own, and every call after an iteration's first counts
-/// as an iteration against `MAX_CONTRACT_REQUEST_ITERATIONS` (`plan_round`).
-/// So a run still makes at most `MAX_CONTRACT_REQUEST_ITERATIONS` calls into
-/// the delegate, each under the runtime's per-call output budget, the same
-/// ceiling as before replies existed.
+/// iteration of its own (`next_call`), and an iteration makes exactly one
+/// executor call whose output is processed before the next. So a run still
+/// makes at most `MAX_CONTRACT_REQUEST_ITERATIONS` calls into the delegate,
+/// and holds at most one call's output (the runtime's per-call budget) at a
+/// time, the same ceilings as before replies existed.
 const MAX_HOP_REPLY_BYTES_PER_RUN: usize = MAX_UNPROMPTED_HOPS_PER_RUN * MAX_HOP_REPLY_BYTES;
 
 /// Maximum delegate notifications to drain per iteration.
@@ -1641,78 +1641,97 @@ fn delegate_response_values(
     }
 }
 
-/// One executor call of a round-trip iteration, planned by [`plan_round`].
+/// The executor call an iteration of a delegate round-trip makes, chosen by
+/// [`next_call`].
 struct RoundCall {
     req: DelegateRequest<'static>,
     /// `Some(target)` when this call delivers a hop reply from `target`: the
     /// call then names `target` as `caller_delegate` (and no origin
-    /// contract). `None` for the iteration's ordinary batch, which carries
-    /// the run's own origin.
+    /// contract). `None` for the iteration's batch, which carries the run's
+    /// own origin.
     reply_from: Option<DelegateKey>,
 }
 
-/// Plan the executor calls for one iteration of a delegate round-trip: the
-/// iteration's batch `req`, then one call per hop reply in `replies`.
+/// Choose the ONE executor call an iteration makes: the batch `req` when it
+/// has inbound, otherwise the oldest queued hop reply, otherwise `req` with
+/// its empty inbound (the call an iteration that only sent messages has
+/// always made).
 ///
-/// Hop replies (`split_hop_output`) are delivered EACH IN A CALL OF ITS OWN,
-/// after the batch, naming the replying delegate as `caller_delegate`. So
-/// while the delegate processes a reply it sees `MessageOrigin::Delegate(
-/// target)`, the same origin every other inbound `DelegateMessage` carries
-/// (`resolve_message_origin`: an inter-delegate message replaces any WebApp
-/// or inherited origin, and a non-local connection still gets none).
-/// Delivering it in the batch would hand the target's content to the
-/// delegate under the RUN's origin, for instance a web app's attestation.
-/// Any prompt the delegate raises while handling a reply is still shown
-/// under the run's own app identity (`caller_identity_from_origin`), since
-/// the run is the one prompting.
+/// One call per iteration is what bounds a run's work: each call's output is
+/// processed before the next call, so an iteration holds at most one call's
+/// output (the runtime's per-call budget), and a run makes at most
+/// `MAX_CONTRACT_REQUEST_ITERATIONS` calls, the same ceiling as before
+/// replies existed. The batch goes first because it answers the delegate's
+/// own requests; queued replies follow, one per iteration.
+///
+/// A reply is delivered in a call of its own, naming the replying delegate as
+/// `caller_delegate`. So while the delegate processes a reply it sees
+/// `MessageOrigin::Delegate(target)`, the same origin every other inbound
+/// `DelegateMessage` carries (`resolve_message_origin`: an inter-delegate
+/// message replaces any WebApp or inherited origin, and a non-local
+/// connection still gets none). In the batch it would run under the RUN's
+/// origin, for instance a web app's attestation. Any prompt the delegate
+/// raises while handling a reply is still shown under the run's own app
+/// identity (`caller_identity_from_origin`), since the run is the one
+/// prompting.
 ///
 /// The origin comes from [`delegate_park::PendingReply::from`], recorded by
-/// the hop that ran the target, never from a field of the message, and only
-/// `replies` are delivered this way. A `DelegateMessage` that reached `req`
-/// by any other route would run in the batch under the run's origin, the
-/// same as before replies existed.
-///
-/// With no replies the plan is `req` alone, the single call it replaced,
-/// including a call with an empty inbound after an iteration that only sent
-/// messages. With replies, an empty batch is skipped.
-///
-/// The caller counts every call after the first against
-/// `MAX_CONTRACT_REQUEST_ITERATIONS`, so replies never let a run make more
-/// calls into the delegate than it could before they existed.
-fn plan_round(
+/// the hop that ran the target, never from a field of the message. A
+/// `DelegateMessage` that reached `req` by any other route would run in the
+/// batch under the run's origin, the same as before replies existed.
+fn next_call(
     req: DelegateRequest<'static>,
-    replies: Vec<delegate_park::PendingReply>,
+    replies: &mut std::collections::VecDeque<delegate_park::PendingReply>,
     delegate_key: &DelegateKey,
     params: &Parameters<'static>,
-) -> Vec<RoundCall> {
-    if replies.is_empty() {
-        return vec![RoundCall {
-            req,
-            reply_from: None,
-        }];
-    }
+) -> RoundCall {
     let empty_batch = matches!(
         &req,
         DelegateRequest::ApplicationMessages { inbound, .. } if inbound.is_empty()
     );
-    let mut calls = Vec::with_capacity(1 + replies.len());
-    if !empty_batch {
-        calls.push(RoundCall {
-            req,
-            reply_from: None,
-        });
-    }
-    for delegate_park::PendingReply { from, msg } in replies {
-        calls.push(RoundCall {
+    if empty_batch && let Some(delegate_park::PendingReply { from, msg }) = replies.pop_front() {
+        // The hop sets both from the key it ran (`split_hop_output` and the
+        // `PendingReply` it builds); a second producer that let them drift
+        // would show a receiver one delegate in `sender` and another as its
+        // attested origin.
+        debug_assert_eq!(
+            from, msg.sender,
+            "a hop reply's recorded origin and its sender must agree"
+        );
+        return RoundCall {
             req: DelegateRequest::ApplicationMessages {
                 key: delegate_key.clone(),
                 params: params.clone(),
                 inbound: vec![InboundDelegateMsg::DelegateMessage(msg)],
             },
             reply_from: Some(from),
-        });
+        };
     }
-    calls
+    RoundCall {
+        req,
+        reply_from: None,
+    }
+}
+
+/// Count and log, once, `n` hop replies to `delegate_key` that were not
+/// delivered or not handled, and why.
+fn note_dropped_replies(
+    parking: Option<&mut ParkingCtx<'_>>,
+    delegate_key: &DelegateKey,
+    n: u64,
+    why: &'static str,
+) {
+    if n == 0 {
+        return;
+    }
+    let total = parking.map(|ctx| ctx.park.count_dropped_hop_replies(n));
+    tracing::info!(
+        delegate_key = %delegate_key,
+        dropped = n,
+        total_dropped = ?total,
+        why,
+        "Dropped replies to this delegate's inter-delegate messages"
+    );
 }
 
 /// A hop target's output, split by [`split_hop_output`].
@@ -1844,9 +1863,12 @@ where
         mut self_heal_fetches_started,
         mut hops_attempted,
         mut reply_bytes_accepted,
-        replies: mut current_replies,
+        replies: current_replies,
         mut first_values,
     } = seed;
+    // Hop replies waiting for a call of their own, oldest first (`next_call`).
+    let mut current_replies: std::collections::VecDeque<delegate_park::PendingReply> =
+        current_replies.into();
     // The lane hands the loop only fresh client round-trips, which carry no
     // replies; a resumed run (which may) never has `first_values`.
     debug_assert!(first_values.is_none() || current_replies.is_empty());
@@ -1900,20 +1922,12 @@ where
             // Hop replies still waiting for this iteration are lost with the
             // rest of its inbound; count them, so a caller missing a reply
             // shows up somewhere.
-            let lost_replies = current_replies.len() as u64;
-            if lost_replies > 0 {
-                let total = parking
-                    .as_mut()
-                    .map(|ctx| ctx.park.count_dropped_hop_replies(lost_replies));
-                tracing::info!(
-                    delegate_key = %delegate_key,
-                    dropped = lost_replies,
-                    total_dropped = ?total,
-                    "Dropped replies to this delegate's inter-delegate messages: \
-                     the run reached MAX_CONTRACT_REQUEST_ITERATIONS before \
-                     delivering them"
-                );
-            }
+            note_dropped_replies(
+                parking.as_mut(),
+                delegate_key,
+                current_replies.len() as u64,
+                "the run reached MAX_CONTRACT_REQUEST_ITERATIONS before delivering it",
+            );
             return DelegateRunOutcome::Completed(accumulated_messages);
         }
 
@@ -1923,105 +1937,69 @@ where
         // `process()` is not entered twice for one inbound batch.
         let result = match first_values.take() {
             Some(values) => Ok(values),
-            // Usually one call; one more per hop reply (`plan_round`).
+            // ONE executor call per iteration: the batch, or one queued hop
+            // reply (`next_call`). Each call's output is processed before the
+            // next call is made, so an iteration holds at most one call's
+            // output (the runtime's per-call budget) and a run makes at most
+            // MAX_CONTRACT_REQUEST_ITERATIONS calls, as before replies existed.
             None => {
-                let mut values = Vec::new();
-                let mut failure = None;
-                // Replies not delivered this round, each kind counted and
-                // logged once below.
-                let mut lost_at_cap: u64 = 0;
-                let mut failed_replies: u64 = 0;
-                let mut unrun_after_failure: u64 = 0;
-                let mut calls = plan_round(
+                let call = next_call(
                     current_req,
-                    std::mem::take(&mut current_replies),
+                    &mut current_replies,
                     delegate_key,
                     &current_params,
-                )
-                .into_iter();
-                let mut first_call = true;
-                while let Some(call) = calls.next() {
-                    // EVERY CALL AFTER THE FIRST IS AN ITERATION of its own,
-                    // so a run makes at most MAX_CONTRACT_REQUEST_ITERATIONS
-                    // calls into the delegate, each under the runtime's
-                    // per-call output budget, as before replies existed.
-                    // Only reply calls follow the first, so what the cap
-                    // cuts off is replies.
-                    if !std::mem::take(&mut first_call) {
-                        iterations += 1;
-                        if iterations > MAX_CONTRACT_REQUEST_ITERATIONS {
-                            lost_at_cap = 1 + calls.len() as u64;
-                            break;
-                        }
-                    }
-                    let is_reply = call.reply_from.is_some();
-                    // At most one of `origin_contract` and `caller_delegate`
-                    // (`delegate_request_as`'s invariant): a reply names its
-                    // sender, the batch carries the run's origin.
-                    let (call_origin, call_caller) = match &call.reply_from {
-                        Some(from) => (None, Some(from)),
-                        None => (origin_contract, None),
-                    };
-                    let out = delegate_response_values(
-                        contract_handler
-                            .executor()
-                            .execute_delegate_request(
-                                call.req,
-                                call_origin,
-                                call_caller,
-                                connection_scope,
-                                user_context,
-                            )
-                            .await,
-                        delegate_key,
-                    );
-                    match out {
-                        Ok(out) => values.extend(out),
-                        // A failed REPLY call is a dropped reply, not a
-                        // failed run: the batch and the other replies have
-                        // already run (and may have saved state expecting
-                        // their outputs to be handled), and the target, whose
-                        // reply this was, must not be able to fail the
-                        // caller's run. `delegate_response_values` logged the
-                        // error itself.
-                        Err(_) if is_reply => failed_replies += 1,
-                        Err(err) => {
-                            // Only the batch, the first call, gets here, so
-                            // every call left is an undelivered reply.
-                            unrun_after_failure = calls.len() as u64;
-                            failure = Some(err);
-                            break;
-                        }
-                    }
-                }
-                for (dropped, why) in [
-                    (
-                        lost_at_cap,
-                        "the run reached MAX_CONTRACT_REQUEST_ITERATIONS before \
-                         delivering them",
-                    ),
-                    (failed_replies, "the delegate failed while handling them"),
-                    (
-                        unrun_after_failure,
-                        "the delegate failed on the batch before them",
-                    ),
-                ] {
-                    if dropped > 0 {
-                        let total = parking
-                            .as_mut()
-                            .map(|ctx| ctx.park.count_dropped_hop_replies(dropped));
-                        tracing::info!(
-                            delegate_key = %delegate_key,
-                            dropped,
-                            total_dropped = ?total,
-                            why,
-                            "Dropped replies to this delegate's inter-delegate messages"
+                );
+                let is_reply = call.reply_from.is_some();
+                // At most one of `origin_contract` and `caller_delegate`
+                // (`delegate_request_as`'s invariant): a reply names the
+                // delegate that sent it, the batch carries the run's origin.
+                let (call_origin, call_caller) = match &call.reply_from {
+                    Some(from) => (None, Some(from)),
+                    None => (origin_contract, None),
+                };
+                let out = delegate_response_values(
+                    contract_handler
+                        .executor()
+                        .execute_delegate_request(
+                            call.req,
+                            call_origin,
+                            call_caller,
+                            connection_scope,
+                            user_context,
+                        )
+                        .await,
+                    delegate_key,
+                );
+                match out {
+                    Ok(out) => Ok(out),
+                    // A failed REPLY call is a dropped reply, not a failed
+                    // run: earlier iterations have run (and may have saved
+                    // state expecting their outputs to be handled), and the
+                    // target, whose reply this was, must not be able to fail
+                    // the caller's run. The failed call's context is not
+                    // persisted (the runtime keeps the context from before
+                    // the call), but secrets it wrote before failing stay
+                    // written. `delegate_response_values` logged the error.
+                    Err(_) if is_reply => {
+                        note_dropped_replies(
+                            parking.as_mut(),
+                            delegate_key,
+                            1,
+                            "the delegate failed while handling it",
                         );
+                        Ok(Vec::new())
                     }
-                }
-                match failure {
-                    Some(err) => Err(err),
-                    None => Ok(values),
+                    Err(err) => {
+                        // The run fails as before; replies still queued
+                        // behind it are never delivered.
+                        note_dropped_replies(
+                            parking.as_mut(),
+                            delegate_key,
+                            current_replies.len() as u64,
+                            "the delegate failed on an earlier batch of this run",
+                        );
+                        Err(err)
+                    }
                 }
             }
         };
@@ -2086,20 +2064,23 @@ where
             }
         }
 
-        // If no contract requests, delegate messages, or user input requests, we're done
+        // If no contract requests, delegate messages, or user input requests,
+        // and no hop replies still queued for a call of their own, we're done
         if get_requests.is_empty()
             && put_requests.is_empty()
             && update_requests.is_empty()
             && subscribe_requests.is_empty()
             && delegate_messages.is_empty()
             && user_input_requests.is_empty()
+            && current_replies.is_empty()
         {
             return DelegateRunOutcome::Completed(accumulated_messages);
         }
 
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
         // Hop replies produced this iteration, each with the delegate that
-        // produced it; delivered next iteration (`plan_round`).
+        // produced it; queued, then delivered one per later iteration
+        // (`next_call`).
         let mut pending_replies: Vec<delegate_park::PendingReply> = Vec::new();
 
         // UNPROMPTED-RUN BUDGET (`delegate_capabilities`). For a delegate that
@@ -2915,9 +2896,9 @@ where
         // - ONE REPLY per hop (per message delivered). If target delegate B's
         //   output contains a SendDelegateMessage addressed back to this
         //   delegate (the caller, A), the FIRST such message is delivered to
-        //   A as an inbound `DelegateMessage` in A's next iteration, after
-        //   A's other responses and in a call of its own, so A sees
-        //   `MessageOrigin::Delegate(B)` while handling it (`plan_round`).
+        //   A as an inbound `DelegateMessage` in a later iteration of its own
+        //   (after any batch of A's other responses), so A sees
+        //   `MessageOrigin::Delegate(B)` while handling it (`next_call`).
         //   Its `sender` is set to B (`split_hop_output`). Every other
         //   SendDelegateMessage from B (to a third delegate, or a second
         //   reply to A) is dropped, counted (`count_dropped_hop_sends`) and
@@ -2935,13 +2916,14 @@ where
         //   responses with B's key recorded next to it (`PendingReply`); if A
         //   parks in the same iteration it rides the continuation
         //   (`pending_replies`) and is delivered on resume, charged against
-        //   the park byte budget while parked. Each reply call after an
-        //   iteration's first call counts as an iteration; a reply still
-        //   waiting when the run reaches MAX_CONTRACT_REQUEST_ITERATIONS is
-        //   dropped and counted. If A fails while handling a reply, that
-        //   reply is dropped and counted and the run goes on; if A fails on
-        //   the batch, the replies after it are dropped and counted, and the
-        //   run fails as before.
+        //   the park byte budget while parked. Each reply is delivered in an
+        //   iteration of its own (one executor call per iteration, after any
+        //   batch); a reply still queued when the run reaches
+        //   MAX_CONTRACT_REQUEST_ITERATIONS is dropped and counted. If A
+        //   fails while handling a reply, that reply is dropped and counted
+        //   and the run goes on (the failed call's context is not persisted,
+        //   secrets it wrote stay written); if A fails on a batch, the run
+        //   fails as before and the replies still queued are counted.
         // - Target delegate runs with the params IT was registered with on this node
         //   (`registered_delegate_params`, #5616), never the caller's and never empty
         //   ones: a delegate key is `BLAKE3(code_hash ‖ params)`, so other params would
@@ -2970,9 +2952,10 @@ where
         //   makes at most `MAX_UNPROMPTED_HOPS_PER_RUN` hops, for every
         //   delegate with or without a manifest; client runs are bounded by
         //   MAX_CONTRACT_REQUEST_ITERATIONS x `MAX_OUTBOUND_MSGS_PER_RUN`,
-        //   which still holds with replies because every executor call into
-        //   the caller, reply calls included, counts as an iteration and each
-        //   is under the runtime's per-call output budget. The
+        //   which still holds with replies because each iteration makes ONE
+        //   executor call into the caller (a batch or one reply, `next_call`)
+        //   whose output, under the runtime's per-call budget, is processed
+        //   before the next call. The
         //   hop's loop time (including a target lane round-trip it runs first,
         //   which counts as one hop) is part of the caller's run. For a
         //   BUDGETED caller (a manifest delegate with the Background grant) it
@@ -3257,9 +3240,9 @@ where
                                 // Over a byte bound: see the constants.
                                 dropped_replies += 1;
                             } else {
-                                // Delivered to the caller in its next
-                                // iteration, after the other responses, in a
-                                // call of its own (`plan_round`), under the
+                                // Queued for the caller and delivered in a
+                                // later iteration of its own, after any batch
+                                // (`next_call`), under the
                                 // origin of `target_key`, recorded here beside
                                 // the message. If the caller parks in this
                                 // iteration the reply rides the continuation
@@ -3426,7 +3409,13 @@ where
                     trigger,
                     accumulated: std::mem::take(&mut accumulated_messages),
                     inbound_so_far: std::mem::take(&mut inbound_responses),
-                    pending_replies: std::mem::take(&mut pending_replies),
+                    // Replies still queued from earlier iterations first,
+                    // then this iteration's, so the resumed run delivers
+                    // them oldest first.
+                    pending_replies: std::mem::take(&mut current_replies)
+                        .into_iter()
+                        .chain(std::mem::take(&mut pending_replies))
+                        .collect(),
                     // Carry the counts so the caps bound the ROUND-TRIP, not
                     // each leg (#5544 S1 for iterations; #5542 finding B1 for
                     // the fan-out budget).
@@ -3670,7 +3659,10 @@ where
                         let continuation = *continuation;
                         accumulated_messages = continuation.accumulated;
                         inbound_responses = continuation.inbound_so_far;
-                        pending_replies = continuation.pending_replies;
+                        // The continuation held the queue and this
+                        // iteration's replies together, oldest first.
+                        current_replies = continuation.pending_replies.into();
+                        pending_replies = Vec::new();
                         iterations = continuation.iterations;
                         self_heal_fetches_started = continuation.self_heal_fetches_started;
                         hops_attempted = continuation.hops_attempted;
@@ -3741,7 +3733,7 @@ where
             inbound: inbound_responses,
             params: current_params.clone(),
         };
-        current_replies = pending_replies;
+        current_replies.extend(pending_replies);
     }
 }
 
@@ -7000,7 +6992,7 @@ where
         // before it. Do NOT re-enter the delegate with an empty inbound; that
         // would run `process()` for no reason. Terminate with what we had.
         // (Pending hop replies are something to feed back: with an empty
-        // inbound, `plan_round` delivers only them.)
+        // inbound, `next_call` delivers them one per iteration.)
         DelegateRunOutcome::Completed(accumulated)
     } else {
         let req = DelegateRequest::ApplicationMessages {
