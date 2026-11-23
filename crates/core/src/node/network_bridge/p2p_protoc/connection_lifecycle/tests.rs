@@ -3654,38 +3654,69 @@ async fn a_native_connection_binds_its_proven_key() {
 
 /// A failed native setup: the connect op dials UDP next, so the address is
 /// not marked failed and the peer gets no backoff, either of which would
-/// refuse that dial. Only an outcome that says native does not work on the
-/// path, seen as joiner, counts toward demotion: three joiner timeouts with
-/// distinct peers demote the node; three refusals by its own punch budget do
-/// not, nor do three timeouts as acceptor (a joiner chose this node, and
-/// could fail on purpose).
+/// refuse that dial. With no UDP connection to the peer, no failure strikes
+/// either streak, whatever its outcome or role: a strike needs evidence that
+/// native failed where UDP worked (a rescue), and UDP may fail for the same
+/// reason (an incompatible pair, a peer that never dialled).
 #[tokio::test]
-async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_path_failures() {
+async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_strikes_nothing_alone() {
     use crate::operations::connect::native::DialTransport;
     use crate::transport::NativeSetupOutcome;
     let mut h = Harness::new("native-failure").await;
     use crate::transport::NatAttemptOrigin;
-    for (round, outcome, origin, demotions) in [
+    // (round, outcome, origin, joiner demotions, acceptor demotions). Each
+    // round fails with as many distinct peers as either threshold; none
+    // demotes anything.
+    for (round, outcome, origin, demotions, acceptor_demotions) in [
         (
             0u16,
             NativeSetupOutcome::OverBudgetDestination,
             NatAttemptOrigin::ConnectJoiner,
             0,
-        ),
-        (
-            1,
-            NativeSetupOutcome::TimedOut,
-            NatAttemptOrigin::ConnectAcceptor,
             0,
         ),
         (
+            1,
+            NativeSetupOutcome::OverBudgetDestination,
+            NatAttemptOrigin::ConnectAcceptor,
+            0,
+            0,
+        ),
+        // Before any role is demoted, so a leak into either streak would
+        // demote it (a demoted streak ignores further failures).
+        (
             2,
             NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::Gateway,
+            0,
+            0,
+        ),
+        (
+            3,
+            NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::RingPeerNoTransport,
+            0,
+            0,
+        ),
+        (
+            4,
+            NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::ConnectAcceptor,
+            0,
+            0,
+        ),
+        (
+            5,
+            NativeSetupOutcome::HandshakeFailed,
             NatAttemptOrigin::ConnectJoiner,
-            1,
+            0,
+            0,
         ),
     ] {
-        for i in 0..3u16 {
+        for i in 0..crate::operations::connect::native::DEMOTION_FAILURES
+            .max(crate::operations::connect::native::ACCEPTOR_DEMOTION_FAILURES)
+            as u16
+        {
             let addr: SocketAddr = format!("203.0.113.231:{}", 6210 + round * 10 + i)
                 .parse()
                 .unwrap();
@@ -3728,14 +3759,199 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
             demotions,
             "{outcome:?} as {origin:?}"
         );
+        assert_eq!(
+            h.mgr
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .native_connect()
+                .acceptor_demotions(),
+            acceptor_demotions,
+            "{outcome:?} as {origin:?}: acceptor role"
+        );
+    }
+}
+
+/// A UDP connection to `peer` is established, then a native setup with it,
+/// made in the role `origin`, ends with `outcome`: a rescue when the outcome
+/// is a path failure (the other side's UDP fallback, or this one's, connected
+/// first).
+async fn native_failure_beside_udp(
+    h: &mut Harness,
+    peer: PeerKeyLocation,
+    origin: crate::transport::NatAttemptOrigin,
+    outcome: crate::transport::NativeSetupOutcome,
+) {
+    use crate::operations::connect::native::DialTransport;
+    let addr = peer.socket_addr().expect("addressed");
+    let _udp = pending_connect_peer_over(h, peer.clone(), DialTransport::Udp).await;
+    h.handshake_event(HandshakeEvent::OutboundEstablished {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: peer.clone(),
+        connection: Box::new(IdleConnection::new(addr)),
+        transient: false,
+        transport: DialTransport::Udp,
+        origin,
+    })
+    .await;
+    assert!(
+        h.mgr.connections.get(&addr).is_some_and(|e| !e.native),
+        "premise: a UDP entry"
+    );
+    h.handshake_event(HandshakeEvent::OutboundFailed {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer,
+        error: ConnectionError::FailedConnectOp,
+        transient: false,
+        transport: DialTransport::native_now(),
+        native_outcome: Some(outcome),
+        origin,
+    })
+    .await;
+}
+
+/// A native path failure while a UDP connection to the same peer exists is
+/// a rescue, and strikes the streak of the role the setup was made in; three
+/// with distinct peers demote that role only. A refusal by the node's own
+/// limits beside a UDP connection is no strike, and gateway or no-transport
+/// dials strike nothing.
+#[tokio::test]
+async fn a_native_path_failure_beside_a_udp_connection_is_a_strike() {
+    use crate::transport::{NatAttemptOrigin, NativeSetupOutcome};
+    let mut h = Harness::new("native-rescue-strike").await;
+    // (round, outcome, origin, joiner demotions, acceptor demotions),
+    // cumulative; the rows that must strike nothing come first, before any
+    // role is demoted (a demoted streak ignores further strikes).
+    for (round, outcome, origin, demotions, acceptor_demotions) in [
+        (
+            0u16,
+            NativeSetupOutcome::OverBudgetDestination,
+            NatAttemptOrigin::ConnectAcceptor,
+            0,
+            0,
+        ),
+        (
+            1,
+            NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::Gateway,
+            0,
+            0,
+        ),
+        (
+            2,
+            NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::RingPeerNoTransport,
+            0,
+            0,
+        ),
+        (
+            3,
+            NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::ConnectAcceptor,
+            0,
+            1,
+        ),
+        (
+            4,
+            NativeSetupOutcome::HelloLost,
+            NatAttemptOrigin::ConnectJoiner,
+            1,
+            1,
+        ),
+    ] {
+        for i in 0..crate::operations::connect::native::DEMOTION_FAILURES as u16 {
+            let addr: SocketAddr = format!("203.0.113.237:{}", 6400 + round * 10 + i)
+                .parse()
+                .unwrap();
+            native_failure_beside_udp(&mut h, PeerKeyLocation::new(key(), addr), origin, outcome)
+                .await;
+        }
+        let native = h
+            .mgr
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .native_connect();
+        assert_eq!(native.demotions(), demotions, "{outcome:?} as {origin:?}");
+        assert_eq!(
+            native.acceptor_demotions(),
+            acceptor_demotions,
+            "{outcome:?} as {origin:?}: acceptor role"
+        );
+    }
+}
+
+/// 10.2 item 2: the acceptor role's streak is reset only by a native success
+/// as acceptor, the mirror of the joiner rule below. One acceptor strike (a
+/// rescue) short of the threshold, a success as joiner and one more acceptor
+/// strike demote the acceptor role (and the node then decides Udp); a
+/// success as acceptor in the same place resets the streak.
+#[tokio::test]
+async fn only_an_acceptors_native_success_resets_its_acceptor_streak() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::{NatAttemptOrigin, NativeSetupOutcome};
+    for (case, success_origin, demotions) in [
+        (0u16, NatAttemptOrigin::ConnectJoiner, 1),
+        (1, NatAttemptOrigin::ConnectAcceptor, 0),
+    ] {
+        let mut h = Harness::new(&format!("native-acceptor-success-origin-{case}")).await;
+        let addr = |i: u16| -> SocketAddr {
+            format!("203.0.113.236:{}", 6340 + case * 100 + i)
+                .parse()
+                .unwrap()
+        };
+        let short = crate::operations::connect::native::ACCEPTOR_DEMOTION_FAILURES as u16 - 1;
+        for i in 0..short {
+            native_failure_beside_udp(
+                &mut h,
+                PeerKeyLocation::new(key(), addr(i)),
+                NatAttemptOrigin::ConnectAcceptor,
+                NativeSetupOutcome::TimedOut,
+            )
+            .await;
+        }
+        let winner = PeerKeyLocation::new(key(), addr(50));
+        let _result =
+            pending_connect_peer_over(&mut h, winner.clone(), DialTransport::native_now()).await;
+        h.handshake_event(HandshakeEvent::OutboundEstablished {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: winner,
+            connection: Box::new(IdleConnection::new(addr(50))),
+            transient: false,
+            transport: DialTransport::native_now(),
+            origin: success_origin,
+        })
+        .await;
+        native_failure_beside_udp(
+            &mut h,
+            PeerKeyLocation::new(key(), addr(60)),
+            NatAttemptOrigin::ConnectAcceptor,
+            NativeSetupOutcome::TimedOut,
+        )
+        .await;
+        let native = h
+            .mgr
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .native_connect();
+        assert_eq!(
+            native.acceptor_demotions(),
+            demotions,
+            "a native success as {success_origin:?}"
+        );
+        assert_eq!(native.demotions(), 0, "the joiner role saw no failure");
     }
 }
 
 /// Review round 2: demotion is attributed by the same rule for successes as
-/// for failures. A native success as acceptor does not reset the joiner
-/// streak (its failures never count), so two joiner timeouts, an acceptor
-/// success and a third joiner timeout demote the node; a success as joiner
-/// in the same place resets the streak and the node is not demoted.
+/// for strikes. A native success as acceptor does not reset the joiner
+/// streak, so two joiner strikes (rescues), an acceptor success and a third
+/// joiner strike demote the node; a success as joiner in the same place
+/// resets the streak and the node is not demoted.
 #[tokio::test]
 async fn only_a_joiners_native_success_resets_its_demotion_streak() {
     use crate::operations::connect::native::DialTransport;
@@ -3750,17 +3966,15 @@ async fn only_a_joiners_native_success_resets_its_demotion_streak() {
                 .parse()
                 .unwrap()
         };
-        let fail = |i: u16| HandshakeEvent::OutboundFailed {
-            transaction: Transaction::new::<ConnectMsg>(),
-            peer: PeerKeyLocation::new(key(), addr(i)),
-            error: ConnectionError::FailedConnectOp,
-            transient: false,
-            transport: DialTransport::native_now(),
-            native_outcome: Some(NativeSetupOutcome::TimedOut),
-            origin: NatAttemptOrigin::ConnectJoiner,
-        };
-        h.handshake_event(fail(0)).await;
-        h.handshake_event(fail(1)).await;
+        for i in 0..2 {
+            native_failure_beside_udp(
+                &mut h,
+                PeerKeyLocation::new(key(), addr(i)),
+                NatAttemptOrigin::ConnectJoiner,
+                NativeSetupOutcome::TimedOut,
+            )
+            .await;
+        }
         let winner = PeerKeyLocation::new(key(), addr(2));
         let _result =
             pending_connect_peer_over(&mut h, winner.clone(), DialTransport::native_now()).await;
@@ -3773,7 +3987,13 @@ async fn only_a_joiners_native_success_resets_its_demotion_streak() {
             origin: success_origin,
         })
         .await;
-        h.handshake_event(fail(3)).await;
+        native_failure_beside_udp(
+            &mut h,
+            PeerKeyLocation::new(key(), addr(3)),
+            NatAttemptOrigin::ConnectJoiner,
+            NativeSetupOutcome::TimedOut,
+        )
+        .await;
         assert_eq!(
             h.mgr
                 .bridge
@@ -5768,11 +5988,45 @@ async fn an_unpromoted_transient_dial_holds_its_slot_past_the_ttl() {
     assert!(cm.is_transient(addr));
 }
 
+/// How long `nodes` joiners behind one address need to all get into a ring
+/// whose gateway holds `budget` transient connections, on the production
+/// connect-failure backoff.
+///
+/// A round seats at most `budget` joiners, so at least `ceil(nodes / budget)`
+/// rounds are needed. Each joiner that is evicted before it is promoted
+/// records a failure against the gateway and waits the backoff for its next
+/// failure before it retries, so a round it loses costs it
+/// `delay_for_failures(k)` for its k-th failure. The bound allows one lost
+/// round for every round needed (`2 * rounds - 1`; the five waves seen in the
+/// slowest run were 0, 32, 56, 200 and 310 s, with victims evicted twice) and
+/// adds the 3 s the controlled-event client waits before it starts.
+///
+/// This is a bound read off the retry schedule and checked against the seeds
+/// below (slowest run 343 s of the 363 s this gives for 24 and 8), not a
+/// proof: nothing stops a joiner being evicted a third time.
+fn join_time_budget(nodes: usize, budget: usize) -> Duration {
+    use crate::ring::PeerConnectionBackoff;
+    use crate::util::backoff::ExponentialBackoff;
+    let schedule = ExponentialBackoff::new(
+        PeerConnectionBackoff::DEFAULT_BASE_INTERVAL,
+        PeerConnectionBackoff::DEFAULT_MAX_BACKOFF,
+    );
+    let rounds = nodes.div_ceil(budget);
+    let failures = u32::try_from(2 * rounds - 1).expect("a few rounds");
+    let waits: Duration = (1..=failures).map(|k| schedule.delay_for_failures(k)).sum();
+    Duration::from_secs(3) + waits
+}
+
 /// End to end, on the simulated network: every node outside a NAT listens on
 /// `::1`, so a gateway sees all its joiners come from one source. Runs
-/// `nodes` joiners against one gateway with transient budget `budget` and
+/// `nodes` joiners against one gateway with transient budget `budget` until
+/// all have a ring connection, or [`join_time_budget`] has passed, and
 /// returns the gateway's evictions and the nodes that ended with no ring
 /// connection.
+///
+/// The connect-failure backoff is pinned to the production default: CI sets
+/// `FREENET_BACKOFF_BASE_SECS=5`, and how long an evicted joiner waits is
+/// what decides when the last one gets in.
 fn join_behind_one_address(
     name: &'static str,
     seed: u64,
@@ -5780,6 +6034,7 @@ fn join_behind_one_address(
     budget: usize,
 ) -> (u64, Vec<crate::node::testing_impl::NodeLabel>) {
     use crate::node::testing_impl::{NodeLabel, SimNetwork};
+    use crate::ring::PeerConnectionBackoff;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -5787,11 +6042,15 @@ fn join_behind_one_address(
     let mut sim = rt.block_on(SimNetwork::new(name, 1, nodes, 7, 3, 10, 2, seed));
     sim.with_start_backoff(Duration::ZERO);
     sim.with_transient_budget(budget);
+    sim.with_connect_backoff_base(PeerConnectionBackoff::DEFAULT_BASE_INTERVAL);
+    let allowed = join_time_budget(nodes, budget);
+    // Ends the run as soon as every node has a ring connection.
+    sim.wait_for_join_convergence_before_ops(1.0, allowed);
     let result = sim.run_controlled_simulation(
         seed,
         Vec::new(),
-        Duration::from_secs(600),
-        Duration::from_secs(300),
+        allowed + Duration::from_secs(60),
+        Duration::ZERO,
     );
     assert!(
         result.turmoil_result.is_ok(),
@@ -5825,19 +6084,42 @@ fn join_behind_one_address(
 /// budget (8, below the per-source share): a joiner at the budget evicts the
 /// oldest unpromoted connection, and every joiner still joins the ring.
 ///
+/// One test per seed, because how late the last joiner is depends on the
+/// seed: with the connect backoff at its default the last joiner got in at
+/// 38 to 343 s across seeds, and a single seed that happened to finish early
+/// hid that for as long as nothing disturbed its random stream.
+///
 /// The share itself is not reached here: the gateway's start-up admission
 /// ramp (5 handshakes a second) keeps far fewer than 16 joiners unpromoted at
 /// once. `one_address_saturating_its_transient_share_leaves_others_admitted`
 /// covers it through the bridge's real handlers.
-#[test]
-fn joiners_behind_one_address_get_past_transient_eviction() {
-    let (evicted, unconnected) =
-        join_behind_one_address("transient-evict-one-address", 0x7A45_0002, 24, 8);
-    assert!(
-        evicted > 0,
-        "the budget was never reached; the test would be vacuous"
-    );
-    assert!(unconnected.is_empty(), "never joined: {unconnected:?}");
+macro_rules! joiners_behind_one_address_test {
+    ($($test:ident: $seed:expr),+ $(,)?) => {$(
+        #[test]
+        fn $test() {
+            // The network name is per variant: the per-network data directory
+            // and virtual-time registration are keyed on it, so variants
+            // sharing a name collide when they share a process.
+            let (evicted, unconnected) = join_behind_one_address(
+                concat!("transient-evict-one-address-", stringify!($test)),
+                $seed,
+                24,
+                8,
+            );
+            assert!(
+                evicted > 0,
+                "the budget was never reached; the test would be vacuous"
+            );
+            assert!(unconnected.is_empty(), "never joined: {unconnected:?}");
+        }
+    )+};
+}
+
+joiners_behind_one_address_test! {
+    joiners_behind_one_address_get_past_transient_eviction: 0x7A45_0002,
+    joiners_behind_one_address_get_past_transient_eviction_seed_1: 1,
+    joiners_behind_one_address_get_past_transient_eviction_seed_2: 2,
+    joiners_behind_one_address_get_past_transient_eviction_seed_3: 3,
 }
 
 /// A non-gateway node (so a transient dial stays out of the ring) with

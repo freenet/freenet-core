@@ -1268,6 +1268,7 @@ impl ConfigArgs {
                         address: Address::HostAddress(cfg.address),
                         public_key_path: cfg.public_key_path,
                         location: cfg.location,
+                        native: false,
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -2754,6 +2755,7 @@ fn compiled_fallback_gateways(entries: &[(&str, &str)], secrets_dir: &Path) -> G
             address: Address::Hostname(hostname.to_string()),
             public_key_path: key_path,
             location: None,
+            native: false,
         });
     }
     Gateways { gateways }
@@ -2814,6 +2816,7 @@ fn parse_gateway(input: &str, secrets_dir: &Path) -> anyhow::Result<GatewayConfi
         address: Address::HostAddress(addr),
         public_key_path: key_path,
         location: None,
+        native: false,
     })
 }
 
@@ -4536,27 +4539,33 @@ pub struct ConfigPathsArgs {
 /// Directory under which `ConfigPathsArgs::default_dirs` places the
 /// `freenet-{id}` temp data dirs.
 ///
-/// Outside unit tests this is the OS temp dir, unchanged. In a unit-test
-/// build it is a directory private to this process
+/// Outside tests this is the OS temp dir, unchanged. In a unit-test build,
+/// and in a build with the `simulation_tests` feature (the simulation
+/// integration tests), it is a directory private to this process
 /// (`$TMPDIR/freenet-test-<pid>`, see [`test_temp_root`]). `default_dirs`
 /// deletes any existing `freenet-{id}` dir before reusing the name, and the
 /// ids are fixed strings in the tests, so with a shared root a second test
 /// process (another worktree's `cargo test` on the same machine, or a second
 /// binary run in parallel) deleted this process's live data dirs mid-test and
-/// the test failed with `build Config: No such file or directory`.
-#[cfg(not(test))]
+/// the test failed with `build Config: No such file or directory`. A
+/// simulation could also start from files a concurrent run of the same test
+/// had just written there: a node loaded another process's persisted peer
+/// cache, its bootstrap changed, and a fixed-seed run took a different path
+/// (`test_quic_native_blocked_pairs_connect_over_udp_behind_nats` failed
+/// that way on a busy machine and passed in CI).
+#[cfg(not(any(test, feature = "simulation_tests")))]
 fn default_temp_root() -> PathBuf {
     std::env::temp_dir()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "simulation_tests"))]
 fn default_temp_root() -> PathBuf {
     static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| test_temp_root::claim(&std::env::temp_dir()))
         .clone()
 }
 
-/// Per-process temp roots for unit-test builds.
+/// Per-process temp roots for unit-test builds and `simulation_tests` builds.
 ///
 /// A root is `freenet-test-<pid>`, or `freenet-test-<pid>-<n>` if that name
 /// is held by another live process (for example one with the same pid in
@@ -4597,7 +4606,7 @@ fn default_temp_root() -> PathBuf {
 /// the right name only by the same age rule, skipping this process's own.
 /// A live test process older than that age can therefore lose its root on
 /// non-unix.
-#[cfg(test)]
+#[cfg(any(test, feature = "simulation_tests"))]
 mod test_temp_root {
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -4706,6 +4715,13 @@ mod test_temp_root {
     /// The non-unix sweep (no `flock` there): remove root-named real
     /// directories other than `own` whose mtime is older than
     /// [`LOCKLESS_ROOT_MAX_AGE`]. Compiled everywhere so unix tests cover it.
+    #[cfg_attr(
+        all(unix, not(test)),
+        allow(
+            dead_code,
+            reason = "unix calls it only from its tests; a unix simulation_tests build compiles it unused"
+        )
+    )]
     pub(super) fn sweep_aged_roots(tmp: &Path, own: &Path, now: SystemTime) {
         let Ok(entries) = fs::read_dir(tmp) else {
             return;
@@ -5301,6 +5317,16 @@ pub struct GatewayConfig {
     /// Optional location of the gateway.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<f64>,
+
+    /// Whether the gateway takes QUIC-native joins (#5940, phase B): a joiner
+    /// may then try a native connection to it before today's join
+    /// (`operations::connect::native::GATEWAY_NATIVE_JOIN_PERCENT`). Set in
+    /// the published index only once the gateway admits native joins. Absent
+    /// means false, and false is not written, so a cache with no marked
+    /// gateway is written as before. A release without this field ignores
+    /// the key (serde skips unknown keys here).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native: bool,
 }
 
 impl PartialEq for GatewayConfig {
@@ -8864,6 +8890,37 @@ shutdown-drain-secs = 42
         );
     }
 
+    /// The `native` mark defaults to off, is written only when set, and
+    /// survives the cache round trip.
+    #[test]
+    fn gateways_toml_native_mark_defaults_off_and_round_trips() {
+        // The published index today: no mark, so no gateway is native.
+        let today = "[[gateways]]\npublic_key = \"keys/public.nova.gw.pem\"\n\
+                     \n[gateways.address]\nhostname = \"nova.locut.us:31337\"\n";
+        let gateways = parse_gateways_toml(today, "gateways.toml").unwrap();
+        assert!(!gateways.gateways[0].native);
+        // An unmarked gateway is written as before: no `native` key, so a
+        // cache this release writes is the cache the last one wrote.
+        let written = toml::to_string(&gateways).unwrap();
+        assert!(!written.contains("native"), "{written}");
+
+        let marked = "[[gateways]]\npublic_key = \"keys/public.nova.gw.pem\"\nnative = true\n\
+                      \n[gateways.address]\nhostname = \"nova.locut.us:31337\"\n";
+        let gateways = parse_gateways_toml(marked, "gateways.toml").unwrap();
+        assert!(gateways.gateways[0].native);
+        let reread =
+            parse_gateways_toml(&toml::to_string(&gateways).unwrap(), "gateways.toml").unwrap();
+        assert!(reread.gateways[0].native, "the cache keeps the mark");
+
+        // A release before this field reads a marked index as it reads any
+        // key it does not know: ignored. Shown here with a key this release
+        // does not know.
+        let later = "[[gateways]]\npublic_key = \"keys/public.nova.gw.pem\"\nnot_yet_a_key = 3\n\
+                     \n[gateways.address]\nhostname = \"nova.locut.us:31337\"\n";
+        let gateways = parse_gateways_toml(later, "gateways.toml").unwrap();
+        assert_eq!(gateways.gateways.len(), 1);
+    }
+
     /// `host_address` is `gateways.toml`'s OTHER key with this history — the
     /// legacy single-string address form, and what the node emits for
     /// `Address::HostAddress`. Hyphenating the key their own file contains gave
@@ -10553,6 +10610,7 @@ shutdown-drain-secs = 42
                 },
                 public_key_path: PathBuf::from("/dev/null"),
                 location: None,
+                native: false,
             }
         }
 
@@ -11736,6 +11794,7 @@ shutdown-drain-secs = 42
             address: Address::Hostname(host.to_string()),
             public_key_path: PathBuf::from(key),
             location: None,
+            native: false,
         };
         let loaded = Gateways {
             gateways: vec![gw("a", "/local/a.pub")],
@@ -11802,11 +11861,13 @@ shutdown-drain-secs = 42
                     ),
                     public_key_path: PathBuf::from("path/to/key"),
                     location: None,
+                    native: false,
                 },
                 GatewayConfig {
                     address: Address::Hostname("gw1.freenet.org".to_string()),
                     public_key_path: PathBuf::from("path/to/key"),
                     location: None,
+                    native: false,
                 },
             ],
         };
@@ -11982,6 +12043,7 @@ shutdown-drain-secs = 42
                 },
                 public_key_path: PathBuf::from("keys/k.pem"),
                 location: None,
+                native: false,
             }],
         };
         let serialized = toml::to_string(&gateways).unwrap();
@@ -12014,6 +12076,7 @@ shutdown-drain-secs = 42
                 address: Address::Hostname("gw1.freenet.org:31337".to_string()),
                 public_key_path: PathBuf::from("keys/k.pem"),
                 location: None,
+                native: false,
             }],
         };
         let s = toml::to_string(&hostname).unwrap();
@@ -12027,6 +12090,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress("203.0.113.1:31337".parse().unwrap()),
                 public_key_path: PathBuf::from("keys/k.pem"),
                 location: None,
+                native: false,
             }],
         };
         let s = toml::to_string(&host_addr).unwrap();
@@ -12316,6 +12380,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(addr),
                 public_key_path: PathBuf::from("old/key/path"),
                 location: None,
+                native: false,
             }],
         };
 
@@ -12419,6 +12484,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(addr),
                 public_key_path: PathBuf::from("old/stale/key.pub"),
                 location: None,
+                native: false,
             }],
         };
 
@@ -12715,6 +12781,7 @@ shutdown-drain-secs = 42
                 address: Address::Hostname(hostname.to_string()),
                 public_key_path: dir.join(key_file),
                 location: None,
+                native: false,
             })
             .collect();
         fs::write(
@@ -12992,6 +13059,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(public_gateway_addr),
                 public_key_path: PathBuf::from("public_gateway.pub"),
                 location: None,
+                native: false,
             }],
         })
         .unwrap();
@@ -13053,6 +13121,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(test_gateway_addr),
                 public_key_path: PathBuf::from("test_gateway.pub"),
                 location: None,
+                native: false,
             }],
         })
         .unwrap();
@@ -13105,6 +13174,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(leaked_addr),
                 public_key_path: PathBuf::from("leaked.pub"),
                 location: None,
+                native: false,
             }],
         })
         .unwrap();
@@ -13153,6 +13223,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(leaked_addr),
                 public_key_path: PathBuf::from("leaked.pub"),
                 location: None,
+                native: false,
             }],
         })
         .unwrap();
@@ -13233,6 +13304,7 @@ shutdown-drain-secs = 42
                 address: Address::HostAddress(leaked_addr),
                 public_key_path: PathBuf::from("leaked.pub"),
                 location: None,
+                native: false,
             }],
         })
         .unwrap();

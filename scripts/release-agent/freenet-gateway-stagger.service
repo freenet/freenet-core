@@ -1,0 +1,14 @@
+[Unit]
+Description=Restart the companion Freenet gateway after the primary is healthy (#6336)
+Documentation=https://github.com/freenet/freenet-core/issues/6336
+After=freenet-gateway.service
+# A failed run leaves the companion on its OLD binary. Nothing else would tell
+# anyone, so log at crit priority (journalctl -p crit) on top of the failed unit.
+OnFailure=freenet-gateway-stagger-alert.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gateway-staggered-restart.sh --primary freenet-gateway --companion freenet-gateway-2
+# Waits up to 25 min for the primary, plus the restart and its health check.
+TimeoutStartSec=2100
+SyslogIdentifier=freenet-gateway-stagger

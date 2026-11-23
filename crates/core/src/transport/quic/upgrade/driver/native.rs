@@ -21,7 +21,7 @@ use crate::transport::peer_connection::native_connection::NativePeerConnection;
 use crate::transport::quic::native::exchange::HelloFailure;
 use crate::transport::quic::native::punch::PunchRefusal;
 use crate::transport::quic::native::setup::{
-    NativePeer, NativeSetupError, accept_native, connect_native,
+    NativePeer, NativeSetupError, accept_native, connect_native, join_native,
 };
 use crate::transport::quic::upgrade::data_route::RouteNote;
 use crate::transport::quic::upgrade::machine::Role;
@@ -39,6 +39,11 @@ pub(crate) struct NativeDial {
     /// (`setup::NATIVE_WINDOW`), and a setup with less than
     /// `setup::MIN_WINDOW_LEFT` of it left is not started.
     pub(crate) within: Duration,
+    /// A join to a gateway (phase B): this node is the client whatever the
+    /// key order, and nothing is punched (`setup::join_native`). Counted as
+    /// `gateway_native_join_failure_<label>` by its caller, not as
+    /// `connect_native_setup_<label>`.
+    pub(crate) join: bool,
 }
 
 impl QuicUpgrades {
@@ -54,7 +59,11 @@ impl QuicUpgrades {
             Ok(_) => NativeSetupOutcome::Established,
             Err(outcome) => *outcome,
         };
-        TRANSPORT_METRICS.record_connect_native_setup(outcome);
+        // A gateway join is counted by the handshake driver, which also runs
+        // its fallback; the peer-to-peer comparison reads this count only.
+        if !dial.join {
+            TRANSPORT_METRICS.record_connect_native_setup(outcome, dial.addr);
+        }
         result
     }
 
@@ -75,7 +84,21 @@ impl QuicUpgrades {
         };
         // No capability bits are defined yet.
         let caps = 0;
-        let setup = match Role::of(&self.local_key, &dial.key) {
+        let role = Role::of(&self.local_key, &dial.key);
+        let setup = match role {
+            // The peer's key is this node's own: there is no one to connect to.
+            None => return Err(NativeSetupOutcome::UnusableKey),
+            Some(_) if dial.join => {
+                join_native(
+                    &self.endpoint,
+                    &self.punch_budget,
+                    peer,
+                    caps,
+                    &clock,
+                    deadline,
+                )
+                .await
+            }
             Some(Role::Server) => {
                 accept_native(
                     &self.endpoint,
@@ -99,8 +122,6 @@ impl QuicUpgrades {
                 )
                 .await
             }
-            // The peer's key is this node's own: there is no one to connect to.
-            None => return Err(NativeSetupOutcome::UnusableKey),
         };
         let native = setup.map_err(|error| {
             tracing::debug!(addr = %dial.addr, %error, "A QUIC-native setup gave no connection");

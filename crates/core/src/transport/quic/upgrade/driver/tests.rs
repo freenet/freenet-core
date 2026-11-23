@@ -2199,6 +2199,7 @@ fn a_native_setup_through_the_hub_gives_a_connection() {
             key: h.peer.clone(),
             is_gateway: false,
             within: Duration::from_secs(30),
+            join: false,
         };
         let hub = Arc::clone(&h.hub);
         let server = drive(&h.pair.time, Duration::from_secs(60), async move {
@@ -2220,7 +2221,76 @@ fn a_native_setup_through_the_hub_gives_a_connection() {
             .await
             .expect("the client task");
         assert!(client.is_ok(), "{client:?}");
+        assert_eq!(
+            counted_setups(h.remote),
+            ["(\"setup\", Established)"],
+            "a peer-to-peer setup is counted as a native setup"
+        );
         router.abort();
+    });
+}
+
+/// The native setups counted for `remote` (test builds keep them per remote).
+fn counted_setups(remote: SocketAddr) -> Vec<String> {
+    TRANSPORT_METRICS
+        .quic_events_of(remote)
+        .into_iter()
+        .filter(|event| event.starts_with("(\"setup\""))
+        .collect()
+}
+
+/// A gateway join through the hub (`NativeDial::join`): the hub's key is the
+/// higher, which would make it the server of a peer-to-peer setup, yet it
+/// dials as the client, and the peer, a gateway admitting joins, accepts it
+/// as an unknown joiner. Without the override the hub would wait for an
+/// attempt the gateway never makes.
+#[test]
+fn a_gateway_join_through_the_hub_dials_as_the_client() {
+    use crate::transport::PeerConnectionApi;
+    use crate::transport::metrics::GatewayAdmission;
+    use crate::transport::quic::upgrade::driver::join_gateway;
+    bounded(|| async {
+        let h = Harness::server("driver-native-join").await;
+        let rig = RetryRig::of(&h);
+        assert!(rig.our_key > h.peer, "premise: the hub's key is the higher");
+        assert!(
+            rig.theirs.attach_joiner_cap(
+                crate::transport::quic::upgrade::policy::QuicPathPermits::new(64)
+            )
+        );
+        assert!(rig.theirs.enable_gateway_admission(rig.time.clone()));
+        let (theirs, time) = (rig.theirs.clone(), h.time());
+        let gateway = tokio::spawn(async move {
+            match theirs.accept_attempt().await {
+                Some(crate::transport::quic::EndpointAttempt::Joiner(joiner)) => {
+                    join_gateway(joiner, &time).await
+                }
+                Some(crate::transport::quic::EndpointAttempt::Allowed(_)) | None => {
+                    panic!("an admitted joiner")
+                }
+            }
+        });
+        let dial = NativeDial {
+            addr: h.remote,
+            key: h.peer.clone(),
+            is_gateway: true,
+            within: Duration::from_secs(30),
+            join: true,
+        };
+        let hub = Arc::clone(&h.hub);
+        let joined = drive(&h.pair.time, Duration::from_secs(60), async move {
+            hub.setup_native(dial).await
+        })
+        .await;
+        let conn = joined.expect("the hub's join gives a connection");
+        assert_eq!(conn.remote_addr(), h.remote);
+        let admitted = drive(&h.pair.time, Duration::from_secs(30), gateway)
+            .await
+            .expect("the gateway task");
+        assert_eq!(admitted, GatewayAdmission::Joined);
+        // The join is counted by the handshake driver, never as a native
+        // setup: the A+ pair comparison reads those.
+        assert_eq!(counted_setups(h.remote), Vec::<String>::new());
     });
 }
 
@@ -2243,6 +2313,7 @@ fn a_native_setup_past_the_cap_is_refused_at_once() {
             key: h.peer.clone(),
             is_gateway: false,
             within: Duration::from_secs(30),
+            join: false,
         };
         let refused = h.hub.setup_native(dial).await;
         assert!(
@@ -2474,4 +2545,43 @@ fn a_churned_fallback_keeps_the_label_its_fallback_had() {
             ]
         );
     });
+}
+
+/// The body of `quic::tests::attempts_queued_before_a_driver_panic_are_dropped`,
+/// which runs it in a child process because it panics inside quinn (#6184):
+/// an attempt queued for the attempt router before a panic in quinn's
+/// endpoint driver is dropped, not answered. With no session for its address
+/// the router would `ignore` it, which unwraps the poisoned endpoint lock and
+/// panics the monitored router.
+pub(in crate::transport) async fn route_attempts_queued_before_a_driver_panic() {
+    use crate::node::background_task_monitor::BackgroundTaskMonitor;
+    let h = Harness::server("driver-panic-queued-attempt").await;
+    let rig = RetryRig::of(&h);
+    let _permit = rig.ours.allow_peer(h.remote, &h.peer).expect("room");
+    let _dial = rig.dial();
+    let attempt = rig.next_attempt().await;
+    let (attempts, queued) = mpsc::channel(4);
+    attempts
+        .try_send(crate::transport::quic::EndpointAttempt::Allowed(attempt))
+        .unwrap_or_else(|_| panic!("queued"));
+    rig.ours.faults().panic_receive_in_quinn();
+    let mut availability = rig.ours.availability();
+    let state = drive(&rig.time, Duration::from_secs(1), async move {
+        availability.not_up().await
+    })
+    .await;
+    assert_eq!(state, QuicAvailability::Down);
+    let monitor = BackgroundTaskMonitor::new();
+    h.hub
+        .spawn_attempt_router(&monitor.late_registrar(), queued);
+    let failed = tokio::spawn(monitor.wait_for_any_exit());
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(attempts.capacity(), 4, "the router took the queued attempt");
+    assert!(
+        !failed.is_finished(),
+        "the router panicked on the queued attempt"
+    );
+    failed.abort();
 }

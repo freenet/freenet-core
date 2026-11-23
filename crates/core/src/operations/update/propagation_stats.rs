@@ -69,7 +69,9 @@
 //! A client update whose legs were all skipped as converged
 //! (`skip_summary_equal` and the like) is suspect: it changed this node's
 //! state, so no peer can already hold it, and the skip says this node's
-//! belief about the peer is wrong. That is the leading hypothesis for #6143.
+//! belief about the peer is wrong. (The #6143 root cause was transport stream
+//! ids, #6269. A belief poisoned by lost legs is what the verify-soon check's
+//! `verify_*` events measure and repair; see `verify_soon`.)
 //! One exception: a contract whose summary is lossy (two different states can
 //! share one) can legitimately match a peer's summary after a real change.
 //!
@@ -100,16 +102,16 @@ const TOP_K: usize = 8;
 /// capacity, rather than letting a key churn grow the map without bound.
 /// 4096 is comfortably above the active-contract count of a busy gateway.
 /// Each entry is at most [`MAX_COUNTERS_SIZE`] plus its key (pinned by
-/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.3 MB of
+/// `a_tracked_contract_stays_within_its_memory_bound`), about 1.9 MB of
 /// entries at the cap. A hash table holds 4096 entries in 8192 buckets
 /// (hashbrown's 7/8 load factor rounds up to the next power of two), so the
-/// map is about 2.6 MB at the cap.
+/// map is about 3.8 MB at the cap.
 const MAX_TRACKED_CONTRACTS: usize = 4096;
 
 /// Upper bound on `size_of::<ContractCounters>()` and
 /// `size_of::<ContractSummary>()`, for the memory estimate above.
 #[cfg(test)]
-const MAX_COUNTERS_SIZE: usize = 288;
+const MAX_COUNTERS_SIZE: usize = 432;
 
 /// One countable thing that happened to an UPDATE's propagation for a
 /// contract, other than the fan-out target resolution `record_broadcast`
@@ -203,12 +205,69 @@ pub(crate) enum PropagationEvent {
     /// Receiver: an inbound broadcast skipped because this node does not host
     /// the contract (`Ring::may_merge_relayed_update`), so it was not merged.
     RxNotHosted,
+    /// Verify-soon (#6143): an originated write scheduled a check of its fan-out
+    /// targets (`verify_soon`). A write coalesced into an existing check is
+    /// not counted.
+    VerifyScheduled,
+    /// Verify-soon: an originated write was not checked because the table of
+    /// checks was full.
+    VerifyDroppedCap,
+    /// Verify-soon: a `SummaryRequest` for the contract was queued to one
+    /// target.
+    VerifyRequestSent,
+    /// Verify-soon: a target's reply found it stale, in either round. Each
+    /// is a stale verdict, not a heal: the `Summaries` arm's heal for it may
+    /// still be skipped (emit budget, ban, no local state).
+    VerifyPeerStale,
+    /// Verify-soon: a target's reply found it converged.
+    VerifyPeerConverged,
+    /// Verify-soon: a target still stale in the confirm round passed every
+    /// force condition; its heal is forced to full state on the stream.
+    VerifyForcedFull,
+    /// Verify-soon: a leg carrying a forced full state was built for the
+    /// stream.
+    VerifyForcedFullSent,
+    /// Verify-soon: stale in the confirm round but not forced, because the
+    /// verdict was a byte-compare fallback rather than real evidence.
+    VerifyNotForcedEvidence,
+    /// Verify-soon: stale in the confirm round but not forced, because the
+    /// pair was forced within the 60 s floor.
+    VerifyNotForcedFloor,
+    /// Verify-soon: stale in the confirm round but not forced, because the
+    /// table of forced pairs is full.
+    VerifyNotForcedCap,
+    /// Verify-soon: stale in the confirm round but not forced, because a leg
+    /// for the pair is queued or sending.
+    VerifyNotForcedBusy,
+    /// Verify-soon: a `SummaryRequest` the event channel refused.
+    VerifyRequestDropped,
+    /// Verify-soon: a round had more eligible targets than it asks.
+    VerifyPeersTruncated,
+    /// Verify-soon: a round ended at its deadline with a target unanswered.
+    VerifyRoundTimedOut,
+    /// Verify-soon: stale in the confirm round but not forced, because the
+    /// pair was forced within the cooldown and its summary has not moved.
+    VerifyNotForcedNoProgress,
+    /// Verify-soon: a target still stale in the confirm round (also counted in
+    /// `VerifyPeerStale`). Read against `VerifyPeerStale` to see how many first-round
+    /// stale peers the delta heal did not repair.
+    VerifyPeerStaleConfirm,
+    /// Verify-soon: stale in the confirm round but not forced, because the
+    /// node's one forced slot is held by another forced leg.
+    VerifyNotForcedSlot,
+    /// Verify-soon: a forced stream was delivered, arming its pair's floor
+    /// and cooldown. Read against `VerifyForcedFullSent`.
+    VerifyForcedDelivered,
+    /// Verify-soon: stale in the confirm round but not forced, because the
+    /// peer's last forced stream failed and it is barred from the forced
+    /// slot. Not retried.
+    VerifyNotForcedPeerFailed,
 }
 
 impl PropagationEvent {
     /// Every event, in reporting order. Kept in lockstep with
     /// [`Self::index`] by `propagation_events_are_densely_indexed`.
-    pub(crate) const ALL: [PropagationEvent; 26] = [
+    pub(crate) const ALL: [PropagationEvent; 45] = [
         PropagationEvent::ClientOriginated,
         PropagationEvent::SentDelta,
         PropagationEvent::SentFull,
@@ -235,6 +294,25 @@ impl PropagationEvent {
         PropagationEvent::RxAlreadyApplied,
         PropagationEvent::RxBackoff,
         PropagationEvent::RxNotHosted,
+        PropagationEvent::VerifyScheduled,
+        PropagationEvent::VerifyDroppedCap,
+        PropagationEvent::VerifyRequestSent,
+        PropagationEvent::VerifyPeerStale,
+        PropagationEvent::VerifyPeerConverged,
+        PropagationEvent::VerifyForcedFull,
+        PropagationEvent::VerifyForcedFullSent,
+        PropagationEvent::VerifyNotForcedEvidence,
+        PropagationEvent::VerifyNotForcedFloor,
+        PropagationEvent::VerifyNotForcedCap,
+        PropagationEvent::VerifyNotForcedBusy,
+        PropagationEvent::VerifyRequestDropped,
+        PropagationEvent::VerifyPeersTruncated,
+        PropagationEvent::VerifyRoundTimedOut,
+        PropagationEvent::VerifyNotForcedNoProgress,
+        PropagationEvent::VerifyPeerStaleConfirm,
+        PropagationEvent::VerifyNotForcedSlot,
+        PropagationEvent::VerifyForcedDelivered,
+        PropagationEvent::VerifyNotForcedPeerFailed,
     ];
 
     pub(crate) const COUNT: usize = Self::ALL.len();
@@ -267,6 +345,25 @@ impl PropagationEvent {
             PropagationEvent::RxAlreadyApplied => 23,
             PropagationEvent::RxBackoff => 24,
             PropagationEvent::RxNotHosted => 25,
+            PropagationEvent::VerifyScheduled => 26,
+            PropagationEvent::VerifyDroppedCap => 27,
+            PropagationEvent::VerifyRequestSent => 28,
+            PropagationEvent::VerifyPeerStale => 29,
+            PropagationEvent::VerifyPeerConverged => 30,
+            PropagationEvent::VerifyForcedFull => 31,
+            PropagationEvent::VerifyForcedFullSent => 32,
+            PropagationEvent::VerifyNotForcedEvidence => 33,
+            PropagationEvent::VerifyNotForcedFloor => 34,
+            PropagationEvent::VerifyNotForcedCap => 35,
+            PropagationEvent::VerifyNotForcedBusy => 36,
+            PropagationEvent::VerifyRequestDropped => 37,
+            PropagationEvent::VerifyPeersTruncated => 38,
+            PropagationEvent::VerifyRoundTimedOut => 39,
+            PropagationEvent::VerifyNotForcedNoProgress => 40,
+            PropagationEvent::VerifyPeerStaleConfirm => 41,
+            PropagationEvent::VerifyNotForcedSlot => 42,
+            PropagationEvent::VerifyForcedDelivered => 43,
+            PropagationEvent::VerifyNotForcedPeerFailed => 44,
         }
     }
 
@@ -327,13 +424,39 @@ impl PropagationEvent {
             PropagationEvent::RxAlreadyApplied => "rx_already_applied",
             PropagationEvent::RxBackoff => "rx_backoff",
             PropagationEvent::RxNotHosted => "rx_not_hosted",
+            PropagationEvent::VerifyScheduled => "verify_scheduled",
+            PropagationEvent::VerifyDroppedCap => "verify_dropped_cap",
+            PropagationEvent::VerifyRequestSent => "verify_request_sent",
+            PropagationEvent::VerifyPeerStale => "verify_peer_stale",
+            PropagationEvent::VerifyPeerConverged => "verify_peer_converged",
+            PropagationEvent::VerifyForcedFull => "verify_forced_full",
+            PropagationEvent::VerifyForcedFullSent => "verify_forced_full_sent",
+            PropagationEvent::VerifyNotForcedEvidence => "verify_not_forced_evidence",
+            PropagationEvent::VerifyNotForcedFloor => "verify_not_forced_floor",
+            PropagationEvent::VerifyNotForcedCap => "verify_not_forced_cap",
+            PropagationEvent::VerifyNotForcedBusy => "verify_not_forced_busy",
+            PropagationEvent::VerifyRequestDropped => "verify_request_dropped",
+            PropagationEvent::VerifyPeersTruncated => "verify_peers_truncated",
+            PropagationEvent::VerifyRoundTimedOut => "verify_round_timed_out",
+            PropagationEvent::VerifyNotForcedNoProgress => "verify_not_forced_no_progress",
+            PropagationEvent::VerifyPeerStaleConfirm => "verify_peer_stale_confirm",
+            PropagationEvent::VerifyNotForcedSlot => "verify_not_forced_slot",
+            PropagationEvent::VerifyForcedDelivered => "verify_forced_delivered",
+            PropagationEvent::VerifyNotForcedPeerFailed => "verify_not_forced_peer_failed",
         }
     }
 }
 
 /// Per-event counts, indexed by [`PropagationEvent::index`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EventCounts([u64; PropagationEvent::COUNT]);
+
+// Written out: `Default` is derived for arrays of at most 32 elements.
+impl Default for EventCounts {
+    fn default() -> Self {
+        Self([0; PropagationEvent::COUNT])
+    }
+}
 
 impl EventCounts {
     pub(crate) fn get(&self, ev: PropagationEvent) -> u64 {
@@ -811,6 +934,55 @@ impl UpdatePropagationStats {
             phase = "summary",
             "update_propagation_summary"
         );
+        // Verify-soon (#6143) on its own line: the line above is at tracing's
+        // field limit. All of these are also exported as `prop_*`.
+        let verify_events = [
+            PropagationEvent::VerifyScheduled,
+            PropagationEvent::VerifyDroppedCap,
+            PropagationEvent::VerifyRequestSent,
+            PropagationEvent::VerifyPeerStale,
+            PropagationEvent::VerifyPeerConverged,
+            PropagationEvent::VerifyForcedFull,
+            PropagationEvent::VerifyForcedFullSent,
+            PropagationEvent::VerifyNotForcedEvidence,
+            PropagationEvent::VerifyNotForcedFloor,
+            PropagationEvent::VerifyNotForcedCap,
+            PropagationEvent::VerifyNotForcedBusy,
+            PropagationEvent::VerifyRequestDropped,
+            PropagationEvent::VerifyPeersTruncated,
+            PropagationEvent::VerifyRoundTimedOut,
+            PropagationEvent::VerifyNotForcedNoProgress,
+            PropagationEvent::VerifyPeerStaleConfirm,
+            PropagationEvent::VerifyNotForcedSlot,
+            PropagationEvent::VerifyForcedDelivered,
+            PropagationEvent::VerifyNotForcedPeerFailed,
+        ];
+        if verify_events.iter().any(|ev| e.get(*ev) > 0) {
+            tracing::info!(
+                verify_scheduled = e.get(PropagationEvent::VerifyScheduled),
+                verify_dropped_cap = e.get(PropagationEvent::VerifyDroppedCap),
+                verify_request_sent = e.get(PropagationEvent::VerifyRequestSent),
+                verify_peer_stale = e.get(PropagationEvent::VerifyPeerStale),
+                verify_peer_converged = e.get(PropagationEvent::VerifyPeerConverged),
+                verify_forced_full = e.get(PropagationEvent::VerifyForcedFull),
+                verify_forced_full_sent = e.get(PropagationEvent::VerifyForcedFullSent),
+                verify_not_forced_evidence = e.get(PropagationEvent::VerifyNotForcedEvidence),
+                verify_not_forced_floor = e.get(PropagationEvent::VerifyNotForcedFloor),
+                verify_not_forced_cap = e.get(PropagationEvent::VerifyNotForcedCap),
+                verify_not_forced_busy = e.get(PropagationEvent::VerifyNotForcedBusy),
+                verify_request_dropped = e.get(PropagationEvent::VerifyRequestDropped),
+                verify_peers_truncated = e.get(PropagationEvent::VerifyPeersTruncated),
+                verify_round_timed_out = e.get(PropagationEvent::VerifyRoundTimedOut),
+                verify_not_forced_no_progress = e.get(PropagationEvent::VerifyNotForcedNoProgress),
+                verify_peer_stale_confirm = e.get(PropagationEvent::VerifyPeerStaleConfirm),
+                verify_not_forced_slot = e.get(PropagationEvent::VerifyNotForcedSlot),
+                verify_forced_delivered = e.get(PropagationEvent::VerifyForcedDelivered),
+                verify_not_forced_peer_failed = e.get(PropagationEvent::VerifyNotForcedPeerFailed),
+                window_s = SUMMARY_WINDOW.as_secs(),
+                phase = "summary_verify",
+                "update_propagation_summary verify"
+            );
+        }
 
         for c in &summary.top {
             let e = &c.events;
@@ -1969,6 +2141,7 @@ mod tests {
             include_str!("../../node/op_state_manager.rs"),
             include_str!("../update.rs"),
             include_str!("op_ctx_task.rs"),
+            include_str!("verify_soon.rs"),
         ];
         // Production code only: everything above the first top-level test
         // module, whatever its visibility.

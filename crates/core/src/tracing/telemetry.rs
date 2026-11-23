@@ -3105,6 +3105,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.connect_native_demotions),
             );
             m.insert(
+                "connect_native_acceptor_demotions".into(),
+                serde_json::json!(snapshot.connect_native_acceptor_demotions),
+            );
+            m.insert(
                 "connect_native_rescued_by_udp_joiner".into(),
                 serde_json::json!(snapshot.connect_native_rescued_by_udp_joiner),
             );
@@ -3267,6 +3271,33 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     .zip(snapshot.connect_evaluator)
                 {
                     m.insert(format!("connect_evaluator_{}", event.label()), count.into());
+                }
+                for (outcome, count) in crate::transport::metrics::GatewayNativeJoin::ALL
+                    .iter()
+                    .zip(snapshot.gateway_native_join)
+                {
+                    m.insert(
+                        format!("gateway_native_join_{}", outcome.label()),
+                        count.into(),
+                    );
+                }
+                for (outcome, count) in NativeSetupOutcome::ALL
+                    .iter()
+                    .zip(snapshot.gateway_native_join_failure)
+                {
+                    m.insert(
+                        format!("gateway_native_join_failure_{}", outcome.label()),
+                        count.into(),
+                    );
+                }
+                for (bucket, count) in crate::transport::metrics::GatewayNativeJoinTime::ALL
+                    .iter()
+                    .zip(snapshot.gateway_native_join_time)
+                {
+                    m.insert(
+                        format!("gateway_native_join_time_{}", bucket.label()),
+                        count.into(),
+                    );
                 }
             }
             m.insert(
@@ -8022,6 +8053,9 @@ mod tests {
             "connect_arm",
             "quic_gateway_admission",
             "connect_evaluator",
+            "gateway_native_join",
+            "gateway_native_join_failure",
+            "gateway_native_join_time",
         ] {
             assert!(expected.remove(family), "{family} is in the snapshot");
         }
@@ -8083,6 +8117,21 @@ mod tests {
             crate::transport::metrics::EvaluatorEvent::ALL
                 .iter()
                 .map(|event| format!("connect_evaluator_{}", event.label())),
+        );
+        expected.extend(
+            crate::transport::metrics::GatewayNativeJoin::ALL
+                .iter()
+                .map(|outcome| format!("gateway_native_join_{}", outcome.label())),
+        );
+        expected.extend(
+            NativeSetupOutcome::ALL
+                .iter()
+                .map(|outcome| format!("gateway_native_join_failure_{}", outcome.label())),
+        );
+        expected.extend(
+            crate::transport::metrics::GatewayNativeJoinTime::ALL
+                .iter()
+                .map(|bucket| format!("gateway_native_join_time_{}", bucket.label())),
         );
         let actual: std::collections::BTreeSet<String> = event_kind_to_json(
             &super::super::EventKind::TransportSnapshot(Box::new(snapshot)),
@@ -8499,6 +8548,9 @@ mod tests {
         fill(&mut snapshot.connect_arm);
         fill(&mut snapshot.quic_gateway_admission);
         fill(&mut snapshot.connect_evaluator);
+        fill(&mut snapshot.gateway_native_join);
+        fill(&mut snapshot.gateway_native_join_failure);
+        fill(&mut snapshot.gateway_native_join_time);
         snapshot.quic_establish_ms_p50 = Some(901);
         snapshot.quic_establish_ms_p90 = Some(902);
         snapshot.quic_establish_samples = 903;
@@ -8565,6 +8617,30 @@ mod tests {
         {
             expected.push((format!("connect_evaluator_{}", event.label()), count));
         }
+        for (outcome, count) in crate::transport::metrics::GatewayNativeJoin::ALL
+            .iter()
+            .zip(snapshot.gateway_native_join)
+        {
+            expected.push((format!("gateway_native_join_{}", outcome.label()), count));
+        }
+        for (outcome, count) in NativeSetupOutcome::ALL
+            .iter()
+            .zip(snapshot.gateway_native_join_failure)
+        {
+            expected.push((
+                format!("gateway_native_join_failure_{}", outcome.label()),
+                count,
+            ));
+        }
+        for (bucket, count) in crate::transport::metrics::GatewayNativeJoinTime::ALL
+            .iter()
+            .zip(snapshot.gateway_native_join_time)
+        {
+            expected.push((
+                format!("gateway_native_join_time_{}", bucket.label()),
+                count,
+            ));
+        }
         for (key, value) in [
             ("quic_establish_ms_p50", 901),
             ("quic_establish_ms_p90", 902),
@@ -8587,6 +8663,9 @@ mod tests {
                 + crate::transport::metrics::ConnectArmCounter::COUNT
                 + crate::transport::metrics::GatewayAdmission::COUNT
                 + crate::transport::metrics::EvaluatorEvent::COUNT
+                + crate::transport::metrics::GatewayNativeJoin::COUNT
+                + NativeSetupOutcome::COUNT
+                + crate::transport::metrics::GatewayNativeJoinTime::COUNT
                 + 6
         );
         for (key, value) in expected {

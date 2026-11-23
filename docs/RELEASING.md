@@ -6,10 +6,13 @@
 > they explain why a check exists. It is no longer a rollout target: the release
 > matrix, the manual SSH driver in `release.sh`, and `RELEASE_AGENT_HMAC_VEGA`
 > have all been removed. nova now runs two gateway processes; the second,
-> `freenet-gateway-2`, has no release-agent of its own and is brought up by the
-> primary's stop/start cycle, with `gateway-auto-update.sh` verifying it via the
-> `.wants` symlinks so a companion that fails to start is not reported as a
-> successful update.
+> `freenet-gateway-2`, has no release-agent of its own. It is deliberately not
+> tied to the primary's stop/start (#6336: restarting both together doubled the
+> share of subscribes needing extra hops for 10+ hours). After the primary is
+> updated, `gateway-auto-update.sh` queues `freenet-gateway-stagger.service`,
+> which restarts gw2 once the primary has been active for 10 minutes and exits
+> non-zero (unit `failed`, crit-priority journal line) if gw2 does not come up
+> on the new binary.
 
 
 The release pipeline is fully automated: one workflow trigger cascades into
@@ -1466,10 +1469,13 @@ verification skill if you have it):
    published (not draft) with 14 assets.
 3. `curl https://nova.locut.us/release-agent/version` returns the new version,
    and `systemctl is-active freenet-gateway freenet-gateway-2` on nova reports
-   both units `active`. These are two separate checks: the first confirms the
-   binary was swapped, the second that BOTH gateway processes came back up —
-   the second gateway follows the first via `WantedBy=`, and a companion that
-   fails to start is the case `verify_service_active` now catches.
+   both units `active`. These are separate checks: the first confirms the
+   binary was swapped and the primary is up. The second gateway restarts about
+   10-12 minutes after the primary (`freenet-gateway-stagger.service`), so check
+   it after that: `systemctl show freenet-gateway-stagger -p Result` is
+   `success` and `readlink /proc/<gw2 MainPID>/exe` does not end in
+   `(deleted)`. If gw2 is stuck on the old binary, run
+   `sudo systemctl start freenet-gateway-stagger`; do not restart the primary.
 4. Matrix room shows the announcement.
 5. `sudo journalctl -u freenet-gateway --since "30 min ago"` on each
    gateway shows no errors.

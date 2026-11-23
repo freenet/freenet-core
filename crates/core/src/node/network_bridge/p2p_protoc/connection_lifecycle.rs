@@ -1137,6 +1137,8 @@ impl P2pConnManager {
                     transient,
                     origin,
                     transport,
+                    // The beside dial exists to be UDP.
+                    gateway_join: false,
                 }) {
                     tracing::warn!(
                         tx = %tx,
@@ -1213,6 +1215,12 @@ impl P2pConnManager {
         // parking. The connect op can retry on a later attempt; this failure is
         // LOCAL channel contention, not a remote connection failure, so we do
         // NOT record peer backoff.
+        // Only the joiner's own dial to a gateway (the event loop's dial for
+        // a message to a gateway it has no transport to) may try a native join
+        // first. It carries the `Gateway` origin as the CALLER's, before
+        // `dial_origin` widens it: a CONNECT acceptor's dial to a gateway's
+        // address does not.
+        let gateway_join = origin == crate::transport::NatAttemptOrigin::Gateway;
         let origin = dial_origin(origin, transient, peer_addr, &self.gateways);
         if !handshake_commands.try_send(HandshakeCommand::Connect {
             peer: peer.clone(),
@@ -1220,6 +1228,7 @@ impl P2pConnManager {
             transient,
             origin,
             transport,
+            gateway_join,
         }) {
             tracing::warn!(
                 tx = %tx,
@@ -1540,10 +1549,10 @@ impl P2pConnManager {
                 }
 
                 // A native dial ends here whatever follows, so it is no longer
-                // pending, and its setup worked, so a joiner's success resets
-                // the demotion streak before anything decides which
-                // connection to keep (only a joiner's failures count toward
-                // it). Then, if the peer already has an entry under the same
+                // pending, and its setup worked, so it resets the demotion
+                // streak of the role it was made in (joiner or acceptor, each
+                // counted apart) before anything decides which connection to
+                // keep. Then, if the peer already has an entry under the same
                 // key:
                 // - a UDP one: the survivor rule (`native_holds_peer`) swaps
                 //   this native connection in for it, in place, without
@@ -1557,13 +1566,21 @@ impl P2pConnManager {
                 if transport.is_native() {
                     state.native_pending.remove(&peer_addr);
                     let after_beside_udp = state.beside_udp_connected.remove(&peer_addr);
-                    if origin == crate::transport::NatAttemptOrigin::ConnectJoiner {
-                        self.bridge
-                            .op_manager
-                            .ring
-                            .connection_manager
-                            .native_connect()
-                            .record_success();
+                    let native_connect = self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .native_connect();
+                    match origin {
+                        crate::transport::NatAttemptOrigin::ConnectJoiner => {
+                            native_connect.record_success();
+                        }
+                        crate::transport::NatAttemptOrigin::ConnectAcceptor => {
+                            native_connect.record_acceptor_success();
+                        }
+                        crate::transport::NatAttemptOrigin::Gateway
+                        | crate::transport::NatAttemptOrigin::RingPeerNoTransport => {}
                     }
                     #[cfg(any(test, feature = "testing"))]
                     {
@@ -1682,38 +1699,30 @@ impl P2pConnManager {
                         origin,
                     );
                 }
-                // Demotion counts only an end that says native does not work
-                // on the path (`counts_toward_demotion`), and only as joiner
-                // (a success resets the streak only as joiner too). A joiner's
-                // acceptors come from responses routed back along its CONNECT,
-                // while an acceptor's joiner chose it, so a joiner that
-                // decided to fail (any number of free keys) could otherwise
-                // demote an honest acceptor. This narrows who can demote a
-                // joiner, not to no one: the acceptor in a response is named
-                // by whoever sent it, so a relay on the CONNECT's path can name
-                // acceptors that never serve. The effect is a downgrade to
-                // UDP. An acceptor's own failures never demote it, which is a
-                // gap to close before native is enabled. The connect op then
-                // falls back to UDP.
-                if origin == crate::transport::NatAttemptOrigin::ConnectJoiner
-                    && native_outcome.is_some_and(|o| o.counts_toward_demotion())
+                // A strike needs evidence that native specifically failed
+                // where UDP worked (a rescue, `native::DEMOTION_FAILURES`).
+                // Here: the setup failed on the path while a UDP connection to
+                // the same peer already exists (its UDP fallback, or the
+                // other side's, connected first; the setup then ends
+                // superseded below). The other rescue, the fallback
+                // connecting after this failure, is counted where that dial
+                // ends (`connect::record_native_rescue_strike` callers). A
+                // failure with no UDP connection is no strike: UDP may fail
+                // for the same reason (an incompatible pair, a peer that never
+                // dialled), which says nothing against native.
+                if native_outcome.is_some_and(|o| o.counts_toward_demotion())
+                    && peer
+                        .socket_addr()
+                        .and_then(|addr| self.connections.get(&addr))
+                        .is_some_and(|entry| {
+                            !entry.native && entry.pub_key().is_none_or(|key| key == peer.pub_key())
+                        })
                 {
-                    let demoted = self
-                        .bridge
-                        .op_manager
-                        .ring
-                        .connection_manager
-                        .native_connect()
-                        .record_failure(peer.pub_key());
-                    #[cfg(any(test, feature = "testing"))]
-                    if let (true, Some(addr)) = (demoted, peer.socket_addr()) {
-                        crate::operations::connect::native_wire_trace::record_at(
-                            addr,
-                            crate::operations::connect::native_wire_trace::NativeWireEvent::NativeDemoted,
-                        );
-                    }
-                    #[cfg(not(any(test, feature = "testing")))]
-                    let _ = demoted;
+                    crate::operations::connect::record_native_rescue_strike(
+                        &self.bridge.op_manager,
+                        origin,
+                        &peer,
+                    );
                 }
                 // Outbound peers must have known addresses - extract once for reuse
                 let peer_addr = match KnownPeerKeyLocation::try_from(&peer) {
@@ -1808,8 +1817,9 @@ impl P2pConnManager {
                 // must not touch that connection: the in-transit prune below
                 // removes an address's ring entry whether or not it is in
                 // transit, and nothing waits on this dial any more (the
-                // connection answered its callback). Counted toward demotion
-                // above; nothing else to do.
+                // connection answered its callback). A path failure here is a
+                // rescue when that connection is UDP, struck above; nothing
+                // else to do.
                 if native && self.connections.contains_key(&peer_addr) {
                     tracing::debug!(
                         remote = %peer_addr,
@@ -2045,8 +2055,8 @@ impl P2pConnManager {
     /// one end and dropped at the other. That needs the native connection to
     /// have been silent for about two keepalive intervals (the window is at
     /// least twice the interval, asserted below), so about two lost
-    /// keepalives in a row; it is rare and tracked as a gate before native
-    /// connects are enabled.
+    /// keepalives in a row; it is rare, and the first enable step measures it
+    /// by joining both ends' setup outcomes (gate 22).
     ///
     /// The address of the live native connection that holds the peer a UDP
     /// connection at `addr` claims as `key`, if one does: the entry bound to
@@ -3638,12 +3648,30 @@ mod dial_origin_tests {
         assert!(end > open && end < tests_at, "unbalanced body slice");
         let code: String = SOURCE[open..end].split_whitespace().collect();
         let applied = code
-            .find("letorigin=dial_origin(origin,transient,peer_addr,&self.gateways);")
+            .rfind("letorigin=dial_origin(origin,transient,peer_addr,&self.gateways);")
             .expect("handle_connect_peer must apply dial_origin");
         let sent = code
-            .find("HandshakeCommand::Connect{peer:peer.clone(),transaction:tx,transient,origin,transport,}")
+            .find("HandshakeCommand::Connect{peer:peer.clone(),transaction:tx,transient,origin,transport,gateway_join,}")
             .expect("the handshake command carries the origin");
         assert!(applied < sent, "applied before it is sent");
+        // Only the joiner's own join dial may try native first: the flag is
+        // read from the caller's origin BEFORE `dial_origin` widens it to
+        // `Gateway` for any dial to a gateway's address, and the UDP dial
+        // beside a pending native one is never a join.
+        let flag = code
+            .find("letgateway_join=origin==crate::transport::NatAttemptOrigin::Gateway;")
+            .expect("the join flag comes from the caller's origin");
+        assert!(flag < applied, "read before the origin is widened");
+        assert_eq!(
+            code.matches("gateway_join,}").count(),
+            1,
+            "the handshake command carries the flag"
+        );
+        assert_eq!(
+            code.matches("gateway_join:false,").count(),
+            1,
+            "the UDP dial beside a native one is not a join"
+        );
     }
 
     /// Any other dial keeps its origin, including one to another port of a
