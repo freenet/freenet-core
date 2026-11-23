@@ -74,10 +74,11 @@ pub(crate) fn enabled(is_gateway: bool) -> bool {
 }
 
 /// [`enabled`] for the listener bound at `bind_addr`, which a test can turn
-/// on for that one listener ([`force_on_for_test`]); in a build without
-/// tests it is [`enabled`].
+/// on for that one listener ([`force_on_for_test`], also reached by a
+/// simulation through `SimNetwork::with_gateway_native_admission`); in a
+/// build without tests or the `testing` feature it is [`enabled`].
 pub(crate) fn enabled_at(is_gateway: bool, bind_addr: SocketAddr) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     if is_gateway && FORCED_ON.contains(&bind_addr) {
         return true;
     }
@@ -91,23 +92,23 @@ fn enabled_with(is_gateway: bool, switch: bool) -> bool {
 
 /// Listener addresses a test turned admission on for, keyed by address so
 /// tests running in one process cannot turn it on for each other.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 static FORCED_ON: std::sync::LazyLock<dashmap::DashSet<SocketAddr>> =
     std::sync::LazyLock::new(dashmap::DashSet::new);
 
 /// Turn admission on for a gateway listener bound at `addr`, while the
-/// returned guard lives (tests).
-#[cfg(test)]
+/// returned guard lives (tests and simulations).
+#[cfg(any(test, feature = "testing"))]
 pub(crate) fn force_on_for_test(addr: SocketAddr) -> ForcedOn {
     FORCED_ON.insert(addr);
     ForcedOn(addr)
 }
 
 /// Undoes [`force_on_for_test`] when dropped.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub(crate) struct ForcedOn(SocketAddr);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl Drop for ForcedOn {
     fn drop(&mut self) {
         FORCED_ON.remove(&self.0);

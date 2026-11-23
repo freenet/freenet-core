@@ -1563,6 +1563,11 @@ pub struct SimNetwork {
     running_nodes: HashMap<NodeLabel, RunningNode>,
     /// Map from label to socket address for quick lookup
     node_addresses: HashMap<NodeLabel, SocketAddr>,
+    /// Gateways whose QUIC listener admits native joins
+    /// ([`Self::with_gateway_native_admission`]), held until the network is
+    /// dropped.
+    #[cfg(any(test, feature = "testing"))]
+    gateway_native_admission: Vec<crate::transport::quic::admission::ForcedOn>,
     /// Each node's state store, registered by [`Self::run_simulation`] so a
     /// convergence check can read what every node ACTUALLY holds at the end
     /// of the run. See [`FinalStateHandle`].
@@ -1894,6 +1899,8 @@ impl SimNetwork {
             virtual_time,
             running_nodes: HashMap::new(),
             node_addresses: HashMap::new(),
+            #[cfg(any(test, feature = "testing"))]
+            gateway_native_admission: Vec::new(),
             final_states: FinalStateHandle::default(),
             restartable_configs: HashMap::new(),
             all_gateway_configs: Vec::new(),
@@ -2315,6 +2322,23 @@ impl SimNetwork {
         for label in self.pending_labels() {
             self.node_config_mut(&label).native_connect_override = Some(percent);
         }
+        self
+    }
+
+    /// Turns on admission of native joins (`transport::quic::admission`) at
+    /// the gateway `label`'s QUIC listener, in place of this release's
+    /// `GATEWAY_NATIVE_ADMISSION`, which is off. A joiner reaches it with
+    /// [`Self::with_native_gateway_join`] when the gateway is marked native.
+    /// Call before the simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_gateway_native_admission(&mut self, label: &NodeLabel) -> &mut Self {
+        assert!(label.is_gateway(), "only a gateway admits native joins");
+        let addr = *self
+            .node_addresses
+            .get(label)
+            .expect("the gateway must have an address in this network");
+        self.gateway_native_admission
+            .push(crate::transport::quic::admission::force_on_for_test(addr));
         self
     }
 

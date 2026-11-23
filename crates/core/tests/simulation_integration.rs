@@ -23531,6 +23531,84 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
     assert!(connected);
 }
 
+/// A gateway the index marks native that admits native joins: joiners join
+/// it over QUIC, the gateway hands each completed join to its node, the
+/// joiner's ConnectRequest arrives on that connection, and the gateway's
+/// connect op promotes it into the ring, so the pair ends the run holding a
+/// native connection at both ends and connected in the ring. Fails closed:
+/// native joins must have connected, and the gateway can hold a native
+/// connection only through the hand-off (peer-to-peer native connects are
+/// off here).
+#[test_log::test]
+fn test_quic_native_gateway_join_with_admission_joins_over_quic() {
+    use freenet::dev_tool::NodeLabel;
+    const SEED: u64 = 0x0059_40B0_0002;
+    let run = run_native_connect_sim("native-gateway-join-on", SEED, 200, |sim| {
+        sim.with_native_gateway_join(100);
+        let gateways: Vec<NodeLabel> = sim
+            .all_node_addresses()
+            .keys()
+            .filter(|label| label.is_gateway())
+            .cloned()
+            .collect();
+        for gateway in &gateways {
+            sim.with_gateway_native_admission(gateway);
+        }
+    });
+    let t = &run.wire.trace;
+    tracing::info!(
+        native_established = t.gateway_join_native_established(),
+        native_failed = t.gateway_join_native_failed(),
+        rescued = t.gateway_join_fallback_connected(),
+        fallback_failed = t.gateway_join_fallback_failed(),
+        "native gateway join trace"
+    );
+    assert!(
+        t.gateway_join_native_established() > 0,
+        "native joins to an admitting gateway connected"
+    );
+    assert_eq!(
+        t.gateway_join_fallback_failed(),
+        0,
+        "no join was lost to the native attempt"
+    );
+    // A pair the gateway holds natively at the end of the run: the joiner
+    // holds it natively too, and the two are connected in the ring.
+    let transports = t.transports();
+    let joined_natively: Vec<_> = transports
+        .iter()
+        .filter(|((own, peer), native)| {
+            **native && run.gateways.contains(own) && !run.gateways.contains(peer)
+        })
+        .map(|((gateway, joiner), _)| (*gateway, *joiner))
+        .collect();
+    assert!(
+        !joined_natively.is_empty(),
+        "a gateway holds a joiner over a native connection"
+    );
+    for (gateway, joiner) in &joined_natively {
+        assert_eq!(
+            transports.get(&(*joiner, *gateway)),
+            Some(&true),
+            "the joiner {joiner} holds its gateway {gateway} natively too"
+        );
+        let pair = if gateway <= joiner {
+            (*gateway, *joiner)
+        } else {
+            (*joiner, *gateway)
+        };
+        assert!(
+            run.wire.mesh.contains(&pair),
+            "the native join {joiner} -> {gateway} was promoted into the ring"
+        );
+    }
+    assert!(t.native_replaced_by_udp().is_empty());
+    assert_eq!(t.undecodable_closes(), 0);
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined");
+    assert!(connected);
+}
+
 /// Behind each NAT filtering class, native connections form between peers
 /// (the setup's punches open both NATs), carry messages, and every node
 /// joins. Fails closed: native connections must have formed, and the
