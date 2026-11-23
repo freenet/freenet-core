@@ -84,7 +84,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -241,7 +241,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         if: steps.present.outputs.run == 'true'
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - uses: Swatinem/rust-cache@v2
         if: steps.present.outputs.run == 'true'
@@ -354,7 +354,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - name: Install riverctl
         run: cargo install riverctl

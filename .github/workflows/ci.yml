@@ -149,7 +149,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           components: rustfmt
 
       - name: Check code formatting
@@ -882,7 +882,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           components: clippy
           targets: wasm32-unknown-unknown
 
@@ -989,7 +989,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
@@ -1040,7 +1040,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
@@ -1261,7 +1261,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
@@ -1361,7 +1361,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -1496,7 +1496,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         if: steps.skip_check.outputs.skip != 'true'
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       # Restore-only on PRs. This used to save on every PR run, which wrote a
       # ~2.2 GB entry scoped to that PR's branch: readable by later pushes to
@@ -1781,7 +1781,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         if: steps.skip_check.outputs.skip != 'true'
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           targets: wasm32-unknown-unknown
 
       # Restore-only on PRs; the main-scoped entry is written by
