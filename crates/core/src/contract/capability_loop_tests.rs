@@ -2683,6 +2683,44 @@ fn trace(obs: &super::executor::mock_wasm_runtime::DelegateObservations) -> RunT
         .collect()
 }
 
+/// The core sets the sender on delivery: a message from A to B arrives with
+/// `sender == A`, whatever A wrote into the field. Both run kinds.
+#[tokio::test]
+async fn the_core_sets_the_sender_on_delivery() {
+    let key = DelegateKey::new([0xAD; 32], CodeHash::new([0xAD; 32]));
+    let other = DelegateKey::new([0xAE; 32], CodeHash::new([0xAE; 32]));
+    let claimed = DelegateKey::new([0xAF; 32], CodeHash::new([0xAF; 32]));
+    for trigger in [super::RunTrigger::Unprompted, super::RunTrigger::Client] {
+        let (mut handler, observations, _send) = direct_handler(
+            "sender_on_delivery",
+            vec![
+                ScriptedRun::from(vec![send(&other, &claimed)]),
+                ScriptedRun::default(),
+                ScriptedRun::default(),
+            ],
+        )
+        .await;
+        let mut park = new_park();
+        run_direct(
+            &mut handler,
+            &mut park,
+            &key,
+            trigger,
+            crate::client_events::ConnectionScope::Local,
+        )
+        .await;
+        assert_eq!(
+            trace(&observations),
+            vec![
+                (key.clone(), vec!["ApplicationMessage"], vec![]),
+                (other.clone(), vec!["DelegateMessage"], vec![key.clone()]),
+                (key.clone(), vec![], vec![]),
+            ],
+            "{trigger:?}: B receives the message with A as its sender"
+        );
+    }
+}
+
 /// A hop target can answer its caller once. B replies to A during a hop, and
 /// A receives the reply as an inbound `DelegateMessage` in its next
 /// iteration, with `sender == B` even though B wrote another key into the

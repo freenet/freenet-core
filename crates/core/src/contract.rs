@@ -2945,6 +2945,11 @@ where
                         continue;
                     }
                 };
+                // The core sets the sender of every delivered message itself,
+                // so receivers never depend on the runtime's drain for it. The
+                // same rule as for a reply (`split_hop_output`).
+                let mut msg = msg;
+                msg.sender = delegate_key.clone();
                 let target_req = DelegateRequest::ApplicationMessages {
                     key: target_key.clone(),
                     params: target_params,
@@ -2977,12 +2982,11 @@ where
                     // (behaviour).
                     //
                     // Scope nulls the `origin` ARGUMENT only. `msg.sender` still
-                    // rides through unchanged on every path, so the target can
-                    // always see which delegate sent it — that field is
-                    // runtime-attested (`execution.rs` overwrites it with the key
-                    // of the delegate that actually ran) and is a hash of that
-                    // delegate's own code, so it is self-authenticating rather
-                    // than borrowed authority.
+                    // rides through on every path, so the target can always see
+                    // which delegate sent it. The core sets that field to the
+                    // key of the delegate that actually ran (above), and that
+                    // key is a hash of the delegate's own code, so it is
+                    // self-authenticating rather than borrowed authority.
                     //
                     .execute_delegate_hop(target_req, delegate_key, connection_scope, user_context)
                     .await

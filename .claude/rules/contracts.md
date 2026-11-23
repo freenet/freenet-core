@@ -87,7 +87,8 @@ delegates without a manifest are untouched.
 Inter-delegate messages (SendDelegateMessage) are delivered from EVERY run
 kind, including node-started ones (notifications, lifecycle, wake-ups); Ian,
 2026-11-20. The receiver sees MessageOrigin::Delegate(caller), which the
-runtime attests, and decides whom to trust; the core does not protect
+runtime attests, and a DelegateMessage whose `sender` the core sets to the
+caller on delivery; it decides whom to trust. The core does not protect
 delegates from each other. Background consent is therefore transitive: a
 delegate allowed to run in the background can run any delegate by messaging
 it. A client-driven hop carries the originating connection scope, so an
