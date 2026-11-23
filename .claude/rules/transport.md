@@ -527,6 +527,10 @@ dropped unanswered past the per-CONNECT cap on refused acceptors,
 turned its own native connects off,
 `connect_native_acceptor_demotions` for each time it stopped deciding native
 as acceptor,
+`connect_native_admission_refused` for each native setup it did not admit as
+acceptor (deciding UDP instead),
+`connect_native_admission_control_dropped` for each control pair it left out
+of the arms as acceptor for lack of setup room,
 `connect_native_rescued_by_udp_{joiner,acceptor}` for each UDP dial that
 connected after a native setup that failed ON THE PATH (timed out,
 handshake failed, Hello lost: `counts_toward_demotion`; R5: a connection a
@@ -2539,6 +2543,41 @@ Demotion: one principle for both roles: a STRIKE needs evidence that native
   counts (joiner_in_control, not read for rates) still include pairs whose
   acceptor is demoted and every UDP-answered pair of a demoted joiner.
   Either streak's effect is a 6 h downgrade to UDP, never a failed join.
+Setup admission: before deciding Native, the acceptor admits the setup
+  (NativeConnectState::admit_acceptor_setup, through
+  RelayContext::admit_native_setup), by joiner ADDRESS, the unit native
+  setups, allow-set slots and dial coalescing all use: at most
+  acceptor_pending_setups_max(max_connections) addresses pending (half of
+  the node's native setup slots, NATIVE_SETUPS_MAX lowered to the connection
+  limit as QuicPolicy::native_setups_max is, so the node's own dials as
+  joiner keep the rest), at most ACCEPTOR_PENDING_SETUPS_PER_SOURCE (4) from
+  one source (put::stream_admission::Source: an IPv4 address or an IPv6 /64;
+  loopback counted per port for local test networks), and only with a known
+  address. Another CONNECT to a pending address shares its entry (a
+  refcount). A refusal decides Udp at once (counted
+  connect_native_admission_refused), so a joiner never waits out the native
+  fallback because the acceptor had no room; the pair is in neither arm, and
+  a control pair at an acceptor with no room (acceptor_setup_room) leaves
+  the control arm too. The admission is a SetupTicket carried in the
+  AcceptOutcome into dispatch_expect_connection_from and dropped at the
+  acceptor's native dial deadline (NATIVE_CONNECT_WITHIN after the dispatch,
+  which ends every window the setup can run in, however late it starts), not
+  at the dial's answer, which can come before the setup ends (a UDP
+  connection beside it or from the joiner, a transient-budget refusal) or
+  never (a native request queued behind a stalled UDP dial); an
+  accept never dispatched (the retry branches drop one when they forward)
+  or a failed dispatch drops it and releases it. The source is the address
+  the CONNECT carries, which the joiner or a relay on its path chooses, so
+  the per-source cap bounds honest crowding (one host, one CGNAT line), not
+  a sender that forges addresses; what holds either way is the node cap,
+  and that a refused pair dials UDP at once. A control pair dropped for lack
+  of room is counted (connect_native_admission_control_dropped), so step 1
+  sees how much of the control arm load removed, beside the treated
+  refusals (connect_native_admission_refused). Residuals: the cap bounds
+  distinct pending addresses, not decisions; the node's own native dials as
+  joiner take setup slots uncapped; loopback is counted per port only in
+  test builds; and after phase D a refusal cannot "decide UDP", so it will
+  need another answer (a Rejected).
 Existing transport: a native dial does not drop a connection the node
   already has to that peer; the joiner may have connected another way since
   the acceptor decided.

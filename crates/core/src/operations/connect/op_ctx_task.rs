@@ -1611,7 +1611,7 @@ async fn drive_relay_connect(
     // across the decision (handle_request + initial outbound emits) so
     // the slot count tracks "concurrent admissions" not "in-flight
     // relay drivers" — the receive loop below runs without the guard.
-    let initial_actions = {
+    let mut initial_actions = {
         let _admission = match op_manager.ring.connection_manager.try_admit_connect() {
             Some(g) => g,
             None => {
@@ -1685,13 +1685,14 @@ async fn drive_relay_connect(
 
     // Local accept (promote joiner BEFORE sending Response upstream;
     // legacy connect.rs:1636).
-    if let Some(ref accept) = initial_actions.accept {
+    if let Some(accept) = initial_actions.accept.as_mut() {
         dispatch_expect_connection_from(
             op_manager,
             incoming_tx,
             accept.joiner.clone(),
             accept.response.native_decision,
             accept.native_arm,
+            accept.native_admission.take(),
         )
         .await?;
     }
@@ -1942,6 +1943,7 @@ async fn drive_relay_connect(
                         accept.joiner,
                         accept.response.native_decision,
                         accept.native_arm,
+                        accept.native_admission,
                     )
                     .await?;
                     trace_accept(upstream_addr, &accept.response, joiner_addr, true);
@@ -2122,6 +2124,7 @@ async fn drive_relay_connect(
                         accept.joiner,
                         accept.response.native_decision,
                         accept.native_arm,
+                        accept.native_admission,
                     )
                     .await?;
                     trace_accept(upstream_addr, &accept.response, joiner_addr, true);
@@ -2539,9 +2542,9 @@ mod tests {
         // 3. The happy-path accept branch must dispatch too, so the pin is
         //    not satisfied solely by the retry branches.
         let happy_pos = prod
-            .find("if let Some(ref accept) = initial_actions.accept {")
+            .find("if let Some(accept) = initial_actions.accept.as_mut() {")
             .expect(
-                "happy-path accept branch `if let Some(ref accept) = initial_actions.accept` \
+                "happy-path accept branch `if let Some(accept) = initial_actions.accept.as_mut()` \
                  not found — renamed or removed; update this pin and verify it still \
                  promotes the joiner.",
             );
@@ -2567,7 +2570,27 @@ mod tests {
                 "a `dispatch_expect_connection_from` call does not pass \
                  `accept.response.native_decision`: {call}"
             );
+            // 5. ... and the decision's native setup admission (#6345). A
+            //    site passing `None` leaves the ticket in the accept, which
+            //    drops when the response block ends: the admission would be
+            //    held for milliseconds, not to the dial deadline, and the
+            //    acceptor's cap would bound nothing.
+            let flat: String = call.split_whitespace().collect();
+            assert!(
+                flat.contains(",accept.native_admission") && !flat.contains(",None,)"),
+                "a `dispatch_expect_connection_from` call does not hand over \
+                 `accept.native_admission`: {call}"
+            );
         }
+        // The happy path borrows the accept (it is read after the dispatch),
+        // so it must take the ticket out of it.
+        let happy_call = &happy_window[happy_dispatch.expect("checked above")..];
+        let happy_call = &happy_call[..happy_call.find(".await").expect("awaited")];
+        let happy_flat: String = happy_call.split_whitespace().collect();
+        assert!(
+            happy_flat.contains(",accept.native_admission.take(),"),
+            "the happy-path dispatch must pass `accept.native_admission.take()`: {happy_call}"
+        );
     }
 
     /// Pins the wiring of the lattice-probe miss report (#5814), which the
@@ -3671,9 +3694,16 @@ mod driver_timing_tests {
         let (op_manager, mut events) = op_manager_with_events("acceptor-origin").await;
         let joiner = peer(24880);
         let tx = Transaction::new::<ConnectMsg>();
-        super::super::dispatch_expect_connection_from(&op_manager, tx, joiner.clone(), None, None)
-            .await
-            .expect("dispatch");
+        super::super::dispatch_expect_connection_from(
+            &op_manager,
+            tx,
+            joiner.clone(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dispatch");
         loop {
             let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
                 .await
@@ -3713,6 +3743,7 @@ mod driver_timing_tests {
             tx,
             joiner.clone(),
             Some(NativeDecision::Native),
+            None,
             None,
         )
         .await
@@ -4164,6 +4195,164 @@ mod driver_timing_tests {
         assert_eq!(arm_moved(before), vec![]);
     }
 
+    /// The node sizes its acceptor setup cap from its connection limit
+    /// (`ConnectionManager::new` passes `max_connections`), so a node with a
+    /// low limit refuses past half its real setup slots.
+    #[tokio::test]
+    async fn the_connection_manager_sizes_the_acceptor_setup_cap() {
+        let config_args = crate::config::ConfigArgs {
+            id: Some("admission-cap-wiring".to_string()),
+            mode: Some(crate::contract::OperationMode::Local),
+            ..Default::default()
+        };
+        let mut node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        node_config.max_number_conn = Some(4);
+        let cm = crate::ring::ConnectionManager::new(&node_config);
+        let cap = super::super::native::acceptor_pending_setups_max(cm.max_connections);
+        assert!(
+            cap < crate::transport::NATIVE_SETUPS_MAX / 2,
+            "premise: the limit lowers the cap ({cap})"
+        );
+        let native = cm.native_connect();
+        let tickets: Vec<_> = (0..cap as u8)
+            .map(|i| {
+                native
+                    .admit_acceptor_setup(Some(SocketAddr::from(([198, 51, 7, i], 1))))
+                    .expect("within the cap")
+            })
+            .collect();
+        assert_eq!(
+            native.acceptor_setup_room(Some(SocketAddr::from(([198, 51, 8, 1], 1)))),
+            Err(super::super::native::SetupAdmissionRefusal::Full)
+        );
+        drop(tickets);
+    }
+
+    /// The node's relay context admits a native setup by the joiner's
+    /// address into the node's own admission state, and an accept that is
+    /// never dispatched (dropped, as the retry branches drop an accept when
+    /// they forward instead) releases it with its ticket.
+    #[tokio::test(start_paused = true)]
+    async fn the_relay_env_admits_by_address_and_a_dropped_accept_releases_it() {
+        use super::super::RelayContext;
+        let (op_manager, _events, _endpoint) = native_joiner("admission-relay-env").await;
+        let native = op_manager.ring.connection_manager.native_connect();
+        let joiner = peer(24873);
+        let env = super::super::RelayEnv::new(&op_manager);
+        let ticket = env.admit_native_setup(&joiner).expect("admitted");
+        assert_eq!(native.pending_acceptor_setups(), 1);
+        assert_eq!(env.native_setup_room(&joiner), Ok(()), "its own address");
+        let accept = super::super::AcceptOutcome {
+            response: super::super::ConnectResponse {
+                acceptor: peer(24874),
+                native_decision: Some(super::super::native::NativeDecision::Native),
+            },
+            joiner: joiner.clone(),
+            native_arm: None,
+            native_admission: Some(ticket),
+        };
+        drop(accept);
+        assert_eq!(
+            native.pending_acceptor_setups(),
+            0,
+            "released with the accept"
+        );
+        let unaddressed = PeerKeyLocation::with_unknown_addr(joiner.pub_key().clone());
+        assert_eq!(
+            env.admit_native_setup(&unaddressed).map(|_| ()),
+            Err(super::super::native::SetupAdmissionRefusal::NoAddress)
+        );
+    }
+
+    /// The acceptor's native setup admission is released at the native
+    /// dial's deadline (`NATIVE_CONNECT_WITHIN` after the dispatch), when the
+    /// setup can no longer hold a setup slot: not at the dial's answer, which
+    /// can come before the setup ends or never. Answered connected, failed,
+    /// callback dropped, or not answered at all.
+    #[tokio::test(start_paused = true)]
+    async fn an_acceptors_native_setup_admission_is_released_at_the_dial_deadline() {
+        use super::super::native::NativeDecision;
+        let (op_manager, mut events) = op_manager_with_events("admission-release").await;
+        // (port, how the dial is answered: Some(Some(connected)), Some(None)
+        // for a callback dropped unanswered, None for one kept and never
+        // answered)
+        let mut unanswered = Vec::new();
+        for (port, connects) in [
+            (24870u16, Some(Some(true))),
+            (24871, Some(Some(false))),
+            (24872, Some(None)),
+            (24875, None),
+        ] {
+            let joiner = peer(port);
+            let joiner_addr = joiner.socket_addr().unwrap();
+            let native = op_manager.ring.connection_manager.native_connect();
+            let ticket = native
+                .admit_acceptor_setup(joiner.socket_addr())
+                .expect("admitted");
+            assert_eq!(native.pending_acceptor_setups(), 1);
+            let start = tokio::time::Instant::now();
+            super::super::dispatch_expect_connection_from(
+                &op_manager,
+                Transaction::new::<ConnectMsg>(),
+                joiner,
+                Some(NativeDecision::Native),
+                None,
+                Some(ticket),
+            )
+            .await
+            .expect("dispatch");
+            loop {
+                if let NodeEvent::ConnectPeer {
+                    callback,
+                    transport,
+                    ..
+                } = next_node_event(&mut events).await
+                {
+                    // The previous case's UDP fallback dial can come first.
+                    if !transport.is_native() {
+                        continue;
+                    }
+                    assert_eq!(
+                        native.pending_acceptor_setups(),
+                        1,
+                        "held while the setup runs"
+                    );
+                    match connects {
+                        Some(Some(true)) => callback
+                            .send(Ok((joiner_addr, None)))
+                            .await
+                            .expect("the dial waits"),
+                        Some(Some(false)) => callback
+                            .send(Err(Some(crate::transport::NativeSetupOutcome::TimedOut)))
+                            .await
+                            .expect("the dial waits"),
+                        Some(None) => drop(callback),
+                        None => unanswered.push(callback),
+                    }
+                    break;
+                }
+            }
+            // The deadline is set at the dispatch, which on the paused clock
+            // is `start`.
+            let deadline = start + super::super::native::NATIVE_CONNECT_WITHIN;
+            tokio::time::sleep_until(deadline - Duration::from_millis(10)).await;
+            assert_eq!(
+                native.pending_acceptor_setups(),
+                1,
+                "still held just before the deadline: a late setup may run ({connects:?})"
+            );
+            tokio::time::sleep_until(deadline + Duration::from_millis(10)).await;
+            assert_eq!(
+                native.pending_acceptor_setups(),
+                0,
+                "released at the dial's deadline ({connects:?})"
+            );
+        }
+    }
+
     /// The acceptor counts the result of its own UDP dial for a pair its
     /// decision put in the control arm, and nothing for a decision outside
     /// every arm. A dial that connected moves attempts and established, one
@@ -4183,6 +4372,7 @@ mod driver_timing_tests {
                 joiner,
                 decision,
                 arm,
+                None,
             )
             .await
             .expect("dispatch");
@@ -4374,6 +4564,7 @@ mod driver_timing_tests {
             tx,
             joiner.clone(),
             Some(NativeDecision::Native),
+            None,
             None,
         )
         .await

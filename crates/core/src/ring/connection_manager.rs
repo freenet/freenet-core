@@ -782,7 +782,8 @@ impl ConnectionManager {
             config.native_connect_override,
         )
         .with_gateway_join_override(config.native_gateway_join_override)
-        .with_joiner_off(config.native_joiner_off);
+        .with_joiner_off(config.native_joiner_off)
+        .with_acceptor_setup_limit(cm.max_connections);
         native_connect.set_native_gateways(
             config
                 .gateways
