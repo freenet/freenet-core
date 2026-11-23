@@ -31,6 +31,15 @@ name: Claude PR Rule Review
 # purpose: nothing else can report it.
 # Covered by scripts/claude_pr_review_post_step_test.sh.
 #
+# The same rule applies one step earlier, where the review is decided against
+# rather than attempted (#6181). "Determine applicable rules" skips the review
+# when the PR changed nothing, and a `git diff` that FAILED used to produce that
+# same empty answer, so an unreviewed PR got the green "No relevant files
+# changed". The diff's exit status is now checked: a failure sets
+# `diff_failed=true`, which routes to the FAILURE status below instead of the
+# success one. The job still passes, as above, because only the status is
+# advisory. Covered by scripts/claude_pr_review_rules_step_test.sh.
+#
 # Triggers:
 # - pull_request_target: runs for all PRs (including forks) with base-repo
 #   secrets available. Safe because we only read the diff — we never execute
@@ -213,9 +222,26 @@ jobs:
       - name: Determine applicable rules
         if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true'
         id: rules
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          # Get changed files relative to the PR base
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.event.pull_request.base.ref }}...HEAD 2>/dev/null || echo "")
+          # Get changed files relative to the PR base.
+          #
+          # A diff that FAILED must not read as a diff that found nothing. The
+          # old form ended in `2>/dev/null || echo ""`, so a missing base ref or
+          # a transient git error produced an empty list, which set skip=true and
+          # left "Set status to success if skipped" posting
+          # `rule-review/warnings` as SUCCESS: a review that never ran read as
+          # one that ran and found nothing to review (#6181). The trusted step
+          # below already checks its own diff; this reports a non-run the way
+          # #6180 does, so a broken workflow is visible on the PR without
+          # blocking merge.
+          if ! CHANGED_FILES=$(git diff --name-only "origin/${BASE_REF}...HEAD"); then
+            echo "::error::git diff against origin/${BASE_REF} failed, so no rules could be selected and this PR was not reviewed (#6181)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "diff_failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if [ -z "$CHANGED_FILES" ]; then
             echo "No changed files detected"
@@ -908,7 +934,10 @@ jobs:
             }
 
       - name: Set status to success if skipped
-        if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip == 'true'
+        # `diff_failed` is excluded on purpose: skip=true means the review did
+        # not run, and only an EMPTY diff makes that the right answer. See the
+        # step below for the other reason skip can be set (#6181).
+        if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip == 'true' && steps.rules.outputs.diff_failed != 'true'
         uses: actions/github-script@v9
         with:
           script: |
@@ -919,4 +948,25 @@ jobs:
               state: 'success',
               context: 'rule-review/warnings',
               description: 'No relevant files changed',
+            });
+
+      - name: Set status to failure if the diff did not run
+        # Companion to the step above. Both fire on skip=true and the only
+        # difference is WHY: a failed diff selected no rules, so nothing was
+        # reviewed, and reporting that as "No relevant files changed" is the
+        # failure-reads-as-pass shape #5628 and #6181 describe. Mirrors the
+        # non-run status the post step sets for a reviewer that did not run
+        # (#6180): red on the PR, the required job still green, not a merge gate.
+        if: github.event_name != 'merge_group' && steps.override.outputs.overridden != 'true' && steps.rules.outputs.skip == 'true' && steps.rules.outputs.diff_failed == 'true'
+        uses: actions/github-script@v9
+        with:
+          script: |
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: '${{ github.event.pull_request.head.sha }}',
+              state: 'failure',
+              context: 'rule-review/warnings',
+              description: 'Review did not run; re-run it or add review-override (not a merge gate)',
+              target_url: '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}',
             });
