@@ -13846,10 +13846,10 @@ fn run_sparse_stranded_holder(
             4,
             4,
             // max_connections: sparse, so the holder is not a neighbour of the
-            // key region, but not so tight that joining is a capacity lottery.
-            // At 4, 16 peers have ~48 endpoint slots for 16 joiners and which
-            // ones fit depends on join timing; late joiners could be refused
-            // by every acceptor (open + reserved + 1 >= max) and never join.
+            // key region. At 4, 16 peers have ~48 endpoint slots for 16
+            // joiners and which ones fit depends on join timing; late joiners
+            // could be refused by every acceptor (open + reserved + 1 >= max)
+            // and never join. The gateway gets more room below.
             6,
             2,
             seed,
@@ -13857,9 +13857,25 @@ fn run_sparse_stranded_holder(
         )
         .await
     });
+    // Even at 6 the peers saturate, and the holder is the joiner most likely
+    // to be left out: the partition below spends its first acceptance on a
+    // key-cluster peer it cannot reach, and by its retry every peer has
+    // 5 or 6 links, so every acceptor refuses it. Whether it then joined
+    // depended on a random topology swap freeing a slot on the gateway
+    // (one draw in ten per minute), so the test passed or failed on a
+    // GlobalRng draw in any transport mode. A gateway with room for every
+    // peer, as production gateways have, always leaves the holder a place
+    // to join; the peers keep the sparse cap that strands it.
+    sim.with_gateway_max_connections(NUM_NODES + 2);
     sim.disable_placement_migration();
     sim.enable_seeded_host_advertisements();
-    sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
+    // The gateway admits about one candidate per evaluator window (60 s)
+    // while several retry at once, best score first, so the holder can wait
+    // several windows for its turn; measured up to 248 s. The wait ends as
+    // soon as every peer has joined, so the cap costs nothing when joining
+    // is quick. Operations must not start before the holder joins: its
+    // subscribe and the reader's GET are scheduled 150 s apart from then.
+    sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(900));
     // Time for the chain to re-form hop by hop (each new host re-roots after
     // the renewal path's 0-15 s jitter) before the reader asks.
     sim.with_controlled_op_interval(Duration::from_secs(150));
@@ -13887,12 +13903,15 @@ fn run_sparse_stranded_holder(
     let holder = NodeLabel::node(network_name, holder_no);
     let reader = NodeLabel::node(network_name, reader_no);
     let reader_addr = sim.node_address(&reader).expect("reader address");
+    let holder_addr = sim.node_address(&holder).expect("holder address");
+    let gateway_addr = sim
+        .node_address(&NodeLabel::gateway(network_name, 0))
+        .expect("gateway address");
     // Strand the holder: it cannot reach the key cluster, so it never links
     // to it. At six connections it otherwise can, and its subscribe then
     // lands next to the key with no recovery at all.
     {
         use freenet::simulation::{FaultConfig, Partition};
-        let holder_addr = sim.node_address(&holder).expect("holder address");
         let cluster: HashSet<SocketAddr> = nearest_addrs.iter().map(|(_, a)| *a).collect();
         sim.with_fault_injection(
             FaultConfig::builder()
@@ -13924,7 +13943,8 @@ fn run_sparse_stranded_holder(
     let result = sim.run_controlled_simulation(
         seed,
         operations,
-        Duration::from_secs(600),
+        // Room for the full join wait plus three operations 150 s apart.
+        Duration::from_secs(1500),
         Duration::from_secs(30),
     );
     freenet::dev_tool::clear_crdt_contracts();
@@ -13932,6 +13952,57 @@ fn run_sparse_stranded_holder(
         result.turmoil_result.is_ok(),
         "simulation failed: {:?}",
         result.turmoil_result.err()
+    );
+
+    // Precondition: every peer, the holder included, had joined BEFORE the
+    // operations started. The barrier carries on at its cap otherwise, and a
+    // holder that joined after its own subscribe would still pass the
+    // end-of-run checks below.
+    let join = result
+        .join_convergence
+        .expect("the test set a join-convergence barrier");
+    tracing::info!(
+        network_name,
+        waited_secs = join.waited.as_secs(),
+        joined = join.joined,
+        target = join.target,
+        "stranded-holder join convergence"
+    );
+    let gateway_links = result
+        .topology_snapshots
+        .iter()
+        .find(|snap| snap.peer_addr == gateway_addr)
+        .map(|snap| snap.connection_count);
+    tracing::info!(
+        network_name,
+        ?gateway_links,
+        "stranded-holder gateway links"
+    );
+    assert!(
+        join.reached,
+        "precondition: every peer must join before the operations start \
+         ({} of {} after {:?})",
+        join.joined, join.target, join.waited
+    );
+    // The gateway admits about one candidate per 60 s evaluator window, so
+    // the last joiner can wait several windows. Measured over six seeds in
+    // both transport modes (#6347): 0 to 435 s; 245 s (QUIC off) and 85 s
+    // (QUIC on) on this test's seed. The bound leaves about three windows
+    // above the slowest while still failing a join that has slowed toward
+    // the 900 s cap.
+    assert!(
+        join.waited <= Duration::from_secs(600),
+        "joining took {:?}, beyond the 600 s bound",
+        join.waited
+    );
+    // The gateway's acceptance is rate-limited: with room for every peer it
+    // still admits about one candidate per window, best score first. On this
+    // seed it ends the run with 9 links (QUIC off) or 8 (QUIC on); with the
+    // evaluator made to accept every candidate it ends with 14 or 15. An
+    // over-permissive evaluator fails here.
+    assert!(
+        gateway_links.is_some_and(|n| n <= 12),
+        "the gateway holds {gateway_links:?} links: its admission is no longer rate-limited"
     );
 
     // Precondition: the reader is on the ring, so a join-capacity shortfall
@@ -13946,8 +14017,22 @@ fn run_sparse_stranded_holder(
         "precondition: the reader must have joined the ring (ring connections: \
          {reader_links:?}); a capacity shortfall, not the recovery, is then the cause"
     );
+    // Precondition: the holder joined the ring. A holder that never joined is
+    // the capacity failure above, not a stranded holder.
+    let holder_links = result
+        .topology_snapshots
+        .iter()
+        .find(|snap| snap.peer_addr == holder_addr)
+        .map(|snap| snap.connection_count);
+    assert!(
+        holder_links.is_some_and(|n| n > 0),
+        "precondition: the holder must have joined the ring (ring connections: \
+         {holder_links:?})"
+    );
     // Precondition: the holder is stranded. Linked straight to a peer of the
-    // key cluster, its subscribe would land there without any recovery.
+    // key cluster, its subscribe would land there without any recovery. The
+    // partition drops every packet between them from the start, so no such
+    // link can form at any point in the run, not only at the end.
     let holder_near_links: Vec<usize> = nearest_set
         .iter()
         .copied()

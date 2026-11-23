@@ -1154,7 +1154,7 @@ impl ConnectionManager {
                 let score = self.compute_kleinberg_score(me, location);
                 self.topology_manager
                     .write()
-                    .evaluate_new_connection_with_score(score, Instant::now())
+                    .evaluate_new_connection_with_score(addr, score, Instant::now())
             } else {
                 true
             };
@@ -4779,6 +4779,37 @@ mod tests {
         // `_nn_guard` restores the production default (flag ON, floor RE-ARMED) on
         // drop — even on panic — so this test's `set_nn_lattice_enabled(false)`
         // cannot leak to a later same-thread test.
+    }
+
+    /// `should_accept` must name the candidate to the evaluator. With a
+    /// constant (or no) address every candidate would share one entry, and
+    /// the window would stop rate-limiting arrivals; with no identity at all,
+    /// a candidate's retry competes with its own earlier score and is refused
+    /// for as long as it keeps retrying (the stranded-holder simulation).
+    #[test]
+    fn should_accept_names_the_candidate_to_the_evaluator() {
+        let source = include_str!("connection_manager.rs");
+        let production = &source[..source
+            .find("#[cfg(test)]\nmod tests {")
+            .expect("the test module")];
+        let start = production
+            .find("pub fn should_accept(&self, location: Location, addr: SocketAddr)")
+            .expect("should_accept");
+        let end = start
+            + production[start..]
+                .find("\n    }\n")
+                .expect("the end of should_accept");
+        let code: String = production[start..end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .split_whitespace()
+            .collect();
+        assert!(
+            code.contains(".evaluate_new_connection_with_score(addr,score,"),
+            "should_accept passes the candidate's address to the evaluator"
+        );
     }
 
     #[test]

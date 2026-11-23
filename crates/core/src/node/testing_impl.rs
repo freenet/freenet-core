@@ -636,6 +636,23 @@ pub struct ControlledSimulationResult {
         (std::net::SocketAddr, std::net::SocketAddr),
         crate::ring::topology_registry::ZombieSweepObservation,
     >,
+    /// How the join-convergence barrier ended, when the test asked for one
+    /// (`wait_for_join_convergence_before_ops`); `None` otherwise. Lets a test
+    /// fail when its operations started against a partly-formed network
+    /// instead of only logging it.
+    pub join_convergence: Option<JoinConvergence>,
+}
+
+/// How a controlled simulation's join-convergence barrier ended.
+#[derive(Debug, Clone, Copy)]
+pub struct JoinConvergence {
+    /// Whether the target fraction of peers had joined before the cap.
+    pub reached: bool,
+    /// Virtual time the barrier waited (after the client's initial 3 s).
+    pub waited: Duration,
+    /// Peers joined when the barrier ended, and the target.
+    pub joined: usize,
+    pub target: usize,
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -2444,6 +2461,19 @@ impl SimNetwork {
         Arc::make_mut(&mut config.config)
             .network_api
             .quic_data_percent = Some(percent.to_string());
+        self
+    }
+
+    /// Sets every gateway's `max_connections` to `max`, leaving the regular
+    /// nodes at the network's value. Production gateways carry many more
+    /// connections than peers; a sparse simulation that gives the gateway the
+    /// peers' cap can saturate, after which a late joiner is refused by every
+    /// node. Call before the simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_gateway_max_connections(&mut self, max: usize) -> &mut Self {
+        for (builder, _) in &mut self.gateways {
+            builder.config.max_number_of_connections(max);
+        }
         self
     }
 
@@ -6363,6 +6393,8 @@ impl SimNetwork {
         // barrier's wall-clock for no change in what the metric measures.
         const PEER_READY_MIN_CONNECTIONS: usize = 1;
         let join_conn_threshold = PEER_READY_MIN_CONNECTIONS;
+        let join_record: Arc<std::sync::Mutex<Option<JoinConvergence>>> = Default::default();
+        let join_record_client = join_record.clone();
 
         // Register the test client that triggers controlled events
         sim.client("test", async move {
@@ -6397,9 +6429,21 @@ impl SimNetwork {
                             waited_secs = waited.as_secs(),
                             "controlled sim: ring join-convergence reached — firing operations"
                         );
+                        *join_record_client.lock().unwrap() = Some(JoinConvergence {
+                            reached: true,
+                            waited,
+                            joined,
+                            target,
+                        });
                         break;
                     }
                     if waited >= max_wait {
+                        *join_record_client.lock().unwrap() = Some(JoinConvergence {
+                            reached: false,
+                            waited,
+                            joined,
+                            target,
+                        });
                         tracing::warn!(
                             joined,
                             target,
@@ -6596,6 +6640,7 @@ impl SimNetwork {
             crash_packets_dropped,
             summarize_wasm_calls,
             zombie_sweep_observations,
+            join_convergence: *join_record.lock().unwrap(),
         }
     }
 

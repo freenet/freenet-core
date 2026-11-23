@@ -800,6 +800,20 @@ labelled_counters! {
     }
 }
 
+labelled_counters! {
+    /// What the Kleinberg connection evaluator did that differs from before
+    /// #6347 (`topology::connection_evaluator`). Exported per period as
+    /// `connect_evaluator_<label>`.
+    pub(crate) enum EvaluatorEvent {
+        /// A candidate was accepted although its own earlier entry, which
+        /// the evaluator no longer compares it with, would have refused it.
+        AcceptedOverOwnEntry => "accepted_over_own_entry",
+        /// The window held more than its cap of candidates and dropped the
+        /// lowest-scoring one.
+        CapEviction => "cap_eviction",
+    }
+}
+
 impl NativeSetupOutcome {
     /// Whether this end says native does not work on the path to that peer,
     /// so it counts toward the node's demotion. A refusal by this node's own
@@ -1235,6 +1249,8 @@ pub struct TransportMetrics {
     connect_arm: [AtomicU64; ConnectArmCounter::COUNT],
     /// Gateway admission of native joins this period, by [`GatewayAdmission`].
     quic_gateway_admission: [AtomicU64; GatewayAdmission::COUNT],
+    /// Connection evaluator events this period, by [`EvaluatorEvent`].
+    connect_evaluator: [AtomicU64; EvaluatorEvent::COUNT],
     /// Native gateway joins this period, by [`GatewayNativeJoin`].
     gateway_native_join: [AtomicU64; GatewayNativeJoin::COUNT],
     /// Why native gateway joins gave no connection this period, by
@@ -1767,6 +1783,7 @@ impl TransportMetrics {
             connect_native_setup_acceptor: Default::default(),
             connect_arm: Default::default(),
             quic_gateway_admission: Default::default(),
+            connect_evaluator: Default::default(),
             gateway_native_join: Default::default(),
             gateway_native_join_failure: Default::default(),
             gateway_native_join_time: Default::default(),
@@ -2556,6 +2573,11 @@ impl TransportMetrics {
     /// A gateway's admission of a native join did `outcome`.
     pub(crate) fn record_gateway_admission(&self, outcome: GatewayAdmission) {
         self.quic_gateway_admission[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The connection evaluator did `event`.
+    pub(crate) fn record_connect_evaluator(&self, event: EvaluatorEvent) {
+        self.connect_evaluator[event as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// A joiner's native join to the gateway at `remote` did `outcome`
@@ -3514,6 +3536,7 @@ impl TransportMetrics {
             }),
             connect_arm: std::array::from_fn(|i| get64(&self.connect_arm[i])),
             quic_gateway_admission: std::array::from_fn(|i| get64(&self.quic_gateway_admission[i])),
+            connect_evaluator: std::array::from_fn(|i| get64(&self.connect_evaluator[i])),
             gateway_native_join: std::array::from_fn(|i| get64(&self.gateway_native_join[i])),
             gateway_native_join_failure: std::array::from_fn(|i| {
                 get64(&self.gateway_native_join_failure[i])
@@ -4266,6 +4289,10 @@ pub struct TransportSnapshot {
     /// Gateway admission of native joins, by [`GatewayAdmission`]
     /// (`quic_gateway_admission_<label>`).
     pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
+    /// Connection evaluator events, by [`EvaluatorEvent`]
+    /// (`connect_evaluator_<label>`).
+    #[serde(default)]
+    pub connect_evaluator: [u64; EvaluatorEvent::COUNT],
     /// Native gateway joins, by [`GatewayNativeJoin`]
     /// (`gateway_native_join_<label>`).
     #[serde(default)]
@@ -4688,6 +4715,7 @@ impl TransportSnapshot {
             connect_native_setup_acceptor,
             connect_arm,
             quic_gateway_admission,
+            connect_evaluator,
             gateway_native_join,
             gateway_native_join_failure,
             gateway_native_join_time,
@@ -4876,6 +4904,7 @@ impl TransportSnapshot {
         self.connect_native_setup_acceptor = connect_native_setup_acceptor;
         self.connect_arm = connect_arm;
         self.quic_gateway_admission = quic_gateway_admission;
+        self.connect_evaluator = connect_evaluator;
         self.gateway_native_join = gateway_native_join;
         self.gateway_native_join_failure = gateway_native_join_failure;
         self.gateway_native_join_time = gateway_native_join_time;
@@ -5174,6 +5203,9 @@ struct SnapshotExtras {
     /// Gateway admission of native joins, by [`GatewayAdmission`]
     /// (`quic_gateway_admission_<label>`).
     pub quic_gateway_admission: [u64; GatewayAdmission::COUNT],
+    /// Connection evaluator events, by [`EvaluatorEvent`]
+    /// (`connect_evaluator_<label>`).
+    pub connect_evaluator: [u64; EvaluatorEvent::COUNT],
     /// Native gateway joins, by [`GatewayNativeJoin`]
     /// (`gateway_native_join_<label>`).
     pub gateway_native_join: [u64; GatewayNativeJoin::COUNT],
@@ -5417,6 +5449,7 @@ impl SnapshotExtras {
             || self.connect_native_setup_acceptor.iter().any(|n| *n != 0)
             || self.connect_arm.iter().any(|n| *n != 0)
             || self.quic_gateway_admission.iter().any(|n| *n != 0)
+            || self.connect_evaluator.iter().any(|n| *n != 0)
             || self.gateway_native_join.iter().any(|n| *n != 0)
             || self.gateway_native_join_failure.iter().any(|n| *n != 0)
             || self.gateway_native_join_time.iter().any(|n| *n != 0)
@@ -6901,6 +6934,14 @@ mod tests {
             assert_eq!(snap.connect_arm, want, "{arm:?} {side:?} connected dial");
             assert!(metrics.take_snapshot().is_none(), "reset");
         }
+    }
+
+    #[test]
+    fn connect_evaluator_events_count_snapshot_and_reset() {
+        check_quic_family(
+            |m, slot, _| m.record_connect_evaluator(EvaluatorEvent::ALL[slot]),
+            |snap| snap.connect_evaluator,
+        );
     }
 
     #[test]
