@@ -821,7 +821,9 @@ impl QuicEndpoint {
                 // quinn's `accept` is never polled again. After a panic in
                 // quinn's endpoint driver its state lock is poisoned and
                 // `Accept::poll` unwraps it, and `EndpointDriver::drop` wakes
-                // this very future during that unwind (see `liveness`).
+                // this very future during that unwind (see `liveness`). Nothing can
+                // starve: the first arm ends the loop, so no per-iteration cap is
+                // needed, and dropping `accept_attempt()` is cancel-safe.
                 let incoming = tokio::select! {
                     biased;
                     _ = availability.not_up() => None,
@@ -1687,6 +1689,8 @@ impl QuicCloser {
         if std::thread::panicking() {
             if tokio::runtime::Handle::try_current().is_ok() {
                 let (closer, reason) = (self.clone(), reason.to_vec());
+                // Intentionally detached and unmonitored: short-lived, and a
+                // panic in it ends only this task.
                 drop(GlobalExecutor::spawn(async move {
                     closer.send_close(code, &reason, cause);
                 }));
