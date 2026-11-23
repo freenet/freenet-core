@@ -3623,6 +3623,56 @@ mod secret_read_memo_tests {
         assert!(poisoned, "the failed enumeration must poison the call");
     }
 
+    /// `remove_secret` host fn: a store failure is `ERR_STORAGE_FAILED`, not
+    /// `ERR_SECRET_NOT_FOUND`, and an absent secret is `SUCCESS` (#5857). The
+    /// failure is a non-empty directory at the blob path (`remove_file` fails).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_secret_host_fn_reports_store_failure_as_storage_failed() {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        const ID: i64 = 0x5857_0002;
+
+        let mut f = fixture().await;
+        let dk = delegate_key();
+        let key_bytes = b"k".to_vec();
+        let id = SecretsId::new(key_bytes.clone());
+        let blob = f
+            .secret_store
+            .scope_dir(&dk, &SecretScope::Local)
+            .join(id.encode());
+        std::fs::create_dir_all(blob.join("child")).unwrap();
+
+        // SAFETY: the env is moved into `DELEGATE_ENV` and removed again before
+        // `f` is dropped at the end of this test.
+        let env = unsafe { env_of(&mut f) };
+        // The guest "memory" is `key_bytes` itself: pointer 0 is its first byte.
+        MEM_ADDR.insert(
+            ID,
+            InstanceInfo::new(
+                key_bytes.as_ptr() as i64,
+                key_bytes.len(),
+                Key::Delegate(dk.clone()),
+            ),
+        );
+        DELEGATE_ENV.insert(ID, DelegateEnvSlot::new(env));
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(ID));
+
+        let failed = delegate_secrets::remove_secret(0, 1);
+        std::fs::remove_dir_all(&blob).unwrap();
+        let absent = delegate_secrets::remove_secret(0, 1);
+
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        DELEGATE_ENV.remove(&ID);
+        MEM_ADDR.remove(&ID);
+
+        assert_eq!(failed, error_codes::ERR_STORAGE_FAILED);
+        assert_eq!(
+            absent,
+            error_codes::SUCCESS,
+            "an absent secret removes cleanly"
+        );
+    }
+
     /// The memo is keyed on the secret's hash. Without that check a read of a
     /// different key would be served the previous secret's bytes — a
     /// cross-secret leak inside a single `process()` call.

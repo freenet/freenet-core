@@ -500,7 +500,11 @@ impl SecretsStore {
     ///   or the `.snapshots` directory, because those are siblings of
     ///   `users/`, and a `SecretsId::encode()` (bs58 of a 32-byte hash) is
     ///   never the ASCII string "users".
-    fn scope_dir(&self, delegate: &DelegateKey, scope: &SecretScope<'_>) -> PathBuf {
+    pub(in crate::wasm_runtime) fn scope_dir(
+        &self,
+        delegate: &DelegateKey,
+        scope: &SecretScope<'_>,
+    ) -> PathBuf {
         let delegate_dir = self.base_path.join(delegate.encode());
         match scope {
             SecretScope::Local => delegate_dir,
@@ -1530,6 +1534,9 @@ impl SecretsStore {
     /// begins with `prefix` (an empty prefix lists all). Returns the raw key
     /// bytes the delegate originally supplied to `store_secret`, deduplicated
     /// and capped at [`MAX_REGISTERED_KEYS_PER_SCOPE`] by construction.
+    ///
+    /// # Errors
+    /// An I/O error reading the registry (anything but absent or corrupt).
     ///
     /// This is the host-side backing for the `__frnt__delegate__list_secrets`
     /// hostcall (#4355): it lets a delegate rediscover an open-ended key family
@@ -9886,6 +9893,61 @@ mod test {
         // Predecessor untouched, still readable.
         let pred_still = store.get_secret(pred.key(), &secret_id, SecretScope::Local)?;
         assert_eq!(pred_still.to_vec(), plaintext);
+        Ok(())
+    }
+
+    /// #5857: a crate-format marker that cannot be READ says nothing about
+    /// whether the pair migrated, so copy-forward must fail closed (skip, report
+    /// the error) rather than treat it as "not migrated" and copy again, which
+    /// reopens the resurrection window. The failure is injected with a directory
+    /// at the marker's path (EISDIR). Fails if the `Err(e)` arm is removed.
+    #[tokio::test]
+    async fn migrate_fails_closed_when_the_crate_marker_is_unreadable()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let secret_id = SecretsId::new(b"room:bob".to_vec());
+        store.store_secret(
+            pred.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"v1".to_vec()),
+        )?;
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+
+        // Make the successor's marker unreadable (present, but a directory).
+        let marker_path = store
+            .scope_dir(succ.key(), &SecretScope::Local)
+            .join(pred_done_marker_secret_id(pred.key()).encode());
+        std::fs::create_dir_all(&marker_path)?;
+
+        let report = store.migrate_secrets(
+            std::slice::from_ref(pred.key()),
+            succ.key(),
+            Some(TEST_ORIGIN),
+        );
+        let pm = &report.per_predecessor[0];
+        assert!(pm.already_migrated, "an unreadable marker must fail closed");
+        assert!(
+            pm.errors.iter().any(|e| e.contains("marker read failed")),
+            "the read failure must be reported, got {:?}",
+            pm.errors
+        );
+        assert_eq!(report.total_copied(), 0, "nothing may be copied");
+        assert!(
+            store
+                .get_secret(succ.key(), &secret_id, SecretScope::Local)
+                .is_err(),
+            "the secret must not have been copied forward"
+        );
         Ok(())
     }
 
