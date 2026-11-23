@@ -1715,6 +1715,9 @@ pub struct SimNetwork {
     /// Transient connection budget (`--transient-budget`) for every node this
     /// network builds, when set ([`SimNetwork::with_transient_budget`]).
     transient_budget_override: Option<usize>,
+    /// Base interval of every node's connect-failure backoff, when set
+    /// ([`SimNetwork::with_connect_backoff_base`]).
+    connect_backoff_base_override: Option<Duration>,
     /// Per-node capture slots for the live `Arc<Ring>`, populated by
     /// `run_controlled_simulation` so governance sim tests can read each
     /// node's `contract_ban_list` after the simulation completes. Keyed by
@@ -1937,6 +1940,7 @@ impl SimNetwork {
             hosting_clock: None,
             hosting_budget_override: None,
             transient_budget_override: None,
+            connect_backoff_base_override: None,
             shared_rings: HashMap::new(),
             node_port_override,
             quic_datagram_drops: Vec::new(),
@@ -2798,6 +2802,22 @@ impl SimNetwork {
         }
         for (builder, _) in self.nodes.iter_mut() {
             builder.config.transient_budget = budget;
+        }
+        self
+    }
+
+    /// Give every node this network builds `base` as the base interval of its
+    /// connect-failure backoff, in place of `FREENET_BACKOFF_BASE_SECS` (which
+    /// the CI workflow sets to 5 s). A test whose outcome depends on how long
+    /// a failed joiner waits pins it here, so it means the same on every
+    /// machine. Call before `start*`.
+    pub fn with_connect_backoff_base(&mut self, base: Duration) -> &mut Self {
+        self.connect_backoff_base_override = Some(base);
+        for (builder, _) in self.gateways.iter_mut() {
+            builder.config.connect_backoff_base = Some(base);
+        }
+        for (builder, _) in self.nodes.iter_mut() {
+            builder.config.connect_backoff_base = Some(base);
         }
         self
     }
@@ -3826,6 +3846,7 @@ impl SimNetwork {
             if let Some(budget) = self.transient_budget_override {
                 config.transient_budget = budget;
             }
+            config.connect_backoff_base = self.connect_backoff_base_override;
             config.key_pair = keypair;
             config.network_listener_ip = ip.into();
             config.network_listener_port = port;
@@ -3936,6 +3957,7 @@ impl SimNetwork {
             if let Some(budget) = self.transient_budget_override {
                 config.transient_budget = budget;
             }
+            config.connect_backoff_base = self.connect_backoff_base_override;
             for GatewayConfig {
                 peer_key_location,
                 location,
