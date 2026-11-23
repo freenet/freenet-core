@@ -4561,6 +4561,13 @@ fn ack_ok_parts(
 fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
     if let Some(expected) = err.split("expected version").nth(1) {
         let remote_version_str = expected.trim();
+        // The version is echoed in logs and in a suggested install command,
+        // so only a well-formed version is ever carried forward.
+        if semver::Version::parse(remote_version_str).is_err() {
+            return TransportError::ConnectionEstablishmentFailure {
+                cause: Cow::Borrowed("remote reported an unrecognised protocol version"),
+            };
+        }
         // Check if this old peer's rejection actually means we need to update.
         // Old peers do strict exact-match. If they're compatible with our range
         // but just don't support range-checking, we should NOT self-update.
@@ -4873,6 +4880,23 @@ pub mod mock_transport {
             | TransportError::Udp(UdpError(UdpErrorKind::Serialization(_)))
             | TransportError::Quic(_) => {
                 panic!("Expected ProtocolVersionMismatch error")
+            }
+        }
+
+        // A refusal whose version is not a well-formed version is not carried
+        // into the mismatch error (which is rendered as an install command).
+        for bad in [
+            "expected version 1.2.3 --git https://example.invalid/x",
+            "expected version 1.2.3; echo hi",
+            "expected version <b>1.2.3</b>",
+            "expected version 1.2",
+            "expected version ",
+        ] {
+            match handle_ack_connection_error(bad.to_string().into()) {
+                TransportError::ConnectionEstablishmentFailure { cause } => {
+                    assert!(!cause.contains("example.invalid") && !cause.contains("echo"));
+                }
+                other => panic!("expected generic failure for {bad:?}, got {other:?}"),
             }
         }
 

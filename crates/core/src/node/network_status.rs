@@ -2643,13 +2643,7 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
             address: f.address,
             reason_html: match &f.reason {
                 FailureReason::VersionMismatch { local, gateway } => {
-                    let local = html_escape(local);
-                    let gateway = html_escape(gateway);
-                    format!(
-                        "<strong>Version mismatch</strong>: Your version: <code>{local}</code> \
-                         — Gateway requires: <code>{gateway}</code><br>\
-                         Run: <code>cargo install --force freenet --version {gateway}</code>"
-                    )
+                    version_mismatch_html(local, gateway)
                 }
                 FailureReason::NatTraversalFailed => {
                     let has_peer_connections = s.connected_peers.iter().any(|p| !p.is_gateway);
@@ -2784,6 +2778,29 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
     })
 }
 
+/// True when `s` is a well-formed version string, the only kind that may be
+/// placed into a suggested install command.
+fn is_plain_version(s: &str) -> bool {
+    semver::Version::parse(s).is_ok()
+}
+
+/// Dashboard text for a version mismatch. The install command is only offered
+/// when both versions are well-formed.
+fn version_mismatch_html(local: &str, gateway: &str) -> String {
+    if !(is_plain_version(local) && is_plain_version(gateway)) {
+        return "<strong>Version mismatch</strong>: the gateway reported a version \
+                this node could not read. Update Freenet to the latest release."
+            .to_string();
+    }
+    let local = html_escape(local);
+    let gateway = html_escape(gateway);
+    format!(
+        "<strong>Version mismatch</strong>: Your version: <code>{local}</code> \
+         — Gateway requires: <code>{gateway}</code><br>\
+         Run: <code>cargo install --force freenet --version {gateway}</code>"
+    )
+}
+
 /// Classify a ConnectionError::TransportError string into a FailureReason.
 pub fn classify_transport_error(error_msg: &str) -> FailureReason {
     if error_msg.contains("Version incompatibility") {
@@ -2801,7 +2818,11 @@ pub fn classify_transport_error(error_msg: &str) -> FailureReason {
             .and_then(|s| s.split('\n').next())
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        FailureReason::VersionMismatch { local, gateway }
+        if is_plain_version(&local) && is_plain_version(&gateway) {
+            FailureReason::VersionMismatch { local, gateway }
+        } else {
+            FailureReason::Other("version mismatch (version text not recognised)".to_string())
+        }
     } else if error_msg.contains("max connection attempts reached") {
         FailureReason::NatTraversalFailed
     } else {
@@ -2897,6 +2918,27 @@ mod tests {
             | FailureReason::Timeout
             | FailureReason::Other(_) => panic!("expected VersionMismatch from {message:?}"),
         }
+    }
+
+    #[test]
+    fn test_classify_version_mismatch_rejects_unrecognised_text() {
+        let msg = "Version incompatibility with gateway\n  Your client version: 0.1.133\n  Gateway version: 0.1.135 --git https://example.invalid/x\n  \n";
+        assert!(matches!(
+            classify_transport_error(msg),
+            FailureReason::Other(_)
+        ));
+        let msg = "Version incompatibility with gateway\n  Your client version: 0.1.133\n  Gateway version: \n";
+        assert!(matches!(
+            classify_transport_error(msg),
+            FailureReason::Other(_)
+        ));
+    }
+
+    #[test]
+    fn test_version_mismatch_html_omits_command_for_unrecognised_text() {
+        let html = version_mismatch_html("0.1.133", "1.0.0 --git https://example.invalid/x");
+        assert!(!html.contains("cargo install"));
+        assert!(!html.contains("example.invalid"));
     }
 
     #[test]
