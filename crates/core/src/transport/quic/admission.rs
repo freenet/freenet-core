@@ -61,9 +61,9 @@ use crate::transport::normalize_mapped_addr;
 ///   the handshake-phase charge, and all unpromoted joiners held to one small
 ///   share of the QUIC ingress queue
 ///   (`demux::QUIC_INGRESS_JOINER_DATAGRAMS`);
-/// - phase B: the node takes the admitted connection (`ConnectRequest` on
-///   it, transient to promoted). Until then a join that completes is closed
-///   at the hook (`driver::join_gateway`);
+/// - (done, phase B PR 2) the node takes the admitted connection
+///   (`QuicUpgrades::hand_off_join`): its ConnectRequest arrives on it, and
+///   the connect op promotes it;
 /// - the rest of the B prerequisites (QUIC-NATIVE-CONNECT 3.7).
 pub(crate) const GATEWAY_NATIVE_ADMISSION: bool = false;
 

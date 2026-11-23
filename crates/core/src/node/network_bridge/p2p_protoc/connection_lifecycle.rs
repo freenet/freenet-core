@@ -2365,6 +2365,22 @@ impl P2pConnManager {
             self.trace_transport(peer_addr, Some(true));
         }
         self.record_native_gateway_join(peer_addr, held.remote_version);
+        // The swapped-in transport has not been told the key the ring holds
+        // it under: the promotion's SetPeerIdentity went to the connection
+        // it replaced, and a ConnectPeer for a peer already in the ring
+        // sends none. A gateway's native joiner promotes its joiner charge
+        // on it (`NativePeerConnection::set_peer_identity`); any other native
+        // connection already holds this key and only counts it. Either
+        // order of arrival ends here (`swap_udp_in_beside_native`).
+        if self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .is_in_ring(peer_addr)
+        {
+            self.tell_transport_peer_identity(peer_addr, &held.key);
+        }
     }
 
     /// Drops every held native connection that has waited
@@ -3528,8 +3544,9 @@ async fn fail_awaiting_connection_callbacks(state: &mut EventListenerState, addr
 /// sent a request and was never promoted, as for a legacy join.
 const NATIVE_JOIN_REQUEST_WITHIN: Duration = Duration::from_secs(5);
 
-/// Close the native join at `peer_addr` unless its peer sends a request
-/// (a ConnectRequest, `zombie_sweep::is_link_use_request`) within
+/// Close the native join at `peer_addr` unless its peer sends a
+/// ConnectRequest (`zombie_sweep::LinkUseStamp::connect_requested`; any
+/// other request does not count) within
 /// [`NATIVE_JOIN_REQUEST_WITHIN`]. The drop notice goes to that
 /// connection's own task, so a later connection at the address is not
 /// touched. The task ends after one wait. It holds the channel weakly, so a
@@ -3542,7 +3559,7 @@ fn watch_native_join(
 ) {
     drop(GlobalExecutor::spawn(async move {
         sleep(NATIVE_JOIN_REQUEST_WITHIN).await;
-        if link_use.requested() {
+        if link_use.connect_requested() {
             return;
         }
         let Some(sender) = sender.upgrade().filter(|sender| !sender.is_closed()) else {

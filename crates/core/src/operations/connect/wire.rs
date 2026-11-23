@@ -343,6 +343,7 @@ pub mod sim_trace {
         gateway_join_fallback_failed: AtomicU64,
         gateway_join_skipped_cooldown: AtomicU64,
         gateway_link_dead_before_frame: AtomicU64,
+        native_joiners_promoted: AtomicU64,
     }
 
     /// How each end's native setup in a CONNECT ended: by (transaction, lower
@@ -447,6 +448,9 @@ pub mod sim_trace {
         /// removed before it carried a frame from the gateway, which counts
         /// as a failed native join.
         GatewayLinkDeadBeforeFrame,
+        /// A gateway's native joiner at the recorded address was promoted
+        /// under its proven key: its joiner charge became a path's.
+        NativeJoinerPromoted,
     }
 
     static TRACES: LazyLock<dashmap::DashMap<String, NativeWireTrace>> =
@@ -542,6 +546,7 @@ pub mod sim_trace {
             }
             NativeWireEvent::GatewayJoinSkippedCooldown => &c.gateway_join_skipped_cooldown,
             NativeWireEvent::GatewayLinkDeadBeforeFrame => &c.gateway_link_dead_before_frame,
+            NativeWireEvent::NativeJoinerPromoted => &c.native_joiners_promoted,
             NativeWireEvent::Survivor { swapped: true, .. } => &c.survivor_swapped,
             NativeWireEvent::Survivor {
                 swapped: false,
@@ -786,6 +791,11 @@ pub mod sim_trace {
         /// from it.
         pub fn gateway_link_dead_before_frame(&self) -> u64 {
             Self::get(&self.0.gateway_link_dead_before_frame)
+        }
+        /// Gateway native joiners whose joiner charge was promoted to a
+        /// path's.
+        pub fn native_joiners_promoted(&self) -> u64 {
+            Self::get(&self.0.native_joiners_promoted)
         }
         /// Native connections kept beside a UDP entry to wait for a frame.
         pub fn native_held(&self) -> u64 {

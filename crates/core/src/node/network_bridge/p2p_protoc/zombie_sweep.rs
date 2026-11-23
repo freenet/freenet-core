@@ -261,16 +261,20 @@ pub(super) fn is_link_use_request(msg: &NetMessage) -> bool {
 /// the request waits in the queue, and a sweep planned in that window saw a
 /// stale stamp and reaped a transport with a request already waiting (#5654).
 ///
-/// Stored as one more than the microseconds after `base` (the transport's
-/// `created_at`, so both are readings of the same `tokio::time::Instant`
-/// clock; virtual time under the simulation's paused runtime), so zero means
-/// no request yet, even when a request arrives at `base` itself. Writes use
+/// Stored as microseconds after `base` (the transport's `created_at`, so both
+/// are readings of the same `tokio::time::Instant` clock; virtual time under
+/// the simulation's paused runtime). Zero means no request yet. Writes use
 /// `fetch_max`, so the stamp never moves backwards. A request costs one
 /// classification match, one clock read and one atomic write.
+///
+/// It also records whether a ConnectRequest has arrived, which a gateway's
+/// native join must send in time (`connection_lifecycle::watch_native_join`,
+/// #5940 phase B).
 #[derive(Clone, Debug)]
 pub(super) struct LinkUseStamp {
     base: Instant,
     micros_since_base: Arc<std::sync::atomic::AtomicU64>,
+    connect_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LinkUseStamp {
@@ -278,23 +282,27 @@ impl LinkUseStamp {
         Self {
             base,
             micros_since_base: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            connect_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Records that a ConnectRequest arrived.
+    pub(super) fn record_connect_request(&self) {
+        self.connect_requested
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether a ConnectRequest has arrived over the transport.
+    pub(super) fn connect_requested(&self) -> bool {
+        self.connect_requested
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(super) fn record(&self, now: Instant) {
         let micros =
             u64::try_from(now.saturating_duration_since(self.base).as_micros()).unwrap_or(u64::MAX);
-        self.micros_since_base.fetch_max(
-            micros.saturating_add(1),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-    }
-
-    /// Whether the remote has sent a request over the transport yet.
-    pub(super) fn requested(&self) -> bool {
         self.micros_since_base
-            .load(std::sync::atomic::Ordering::Relaxed)
-            != 0
+            .fetch_max(micros, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// The instant of the most recent request, or `base` if there has been none.
@@ -303,8 +311,7 @@ impl LinkUseStamp {
     pub(super) fn last_use(&self) -> Instant {
         let micros = self
             .micros_since_base
-            .load(std::sync::atomic::Ordering::Relaxed)
-            .saturating_sub(1);
+            .load(std::sync::atomic::Ordering::Relaxed);
         self.base
             .checked_add(Duration::from_micros(micros))
             .unwrap_or(self.base)
@@ -323,6 +330,12 @@ pub(super) fn record_link_use_request(
 ) -> bool {
     if !is_link_use_request(msg) {
         return false;
+    }
+    if matches!(
+        msg,
+        NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request { .. }))
+    ) {
+        stamp.record_connect_request();
     }
     stamp.record(now);
     true
@@ -2378,6 +2391,27 @@ mod tests {
                 false,
             ),
         ]
+    }
+
+    /// Only a ConnectRequest marks the stamp `connect_requested`, which a
+    /// gateway's native join must earn (#5940, phase B); every other request
+    /// still stamps link use.
+    #[test]
+    fn only_a_connect_request_marks_connect_requested() {
+        let now = Instant::now();
+        for (name, msg, link_use) in &every_variant() {
+            let stamp = LinkUseStamp::new(now);
+            assert_eq!(
+                record_link_use_request(&stamp, msg, now),
+                *link_use,
+                "{name}"
+            );
+            assert_eq!(
+                stamp.connect_requested(),
+                *name == "Connect::Request",
+                "{name}"
+            );
+        }
     }
 
     #[test]

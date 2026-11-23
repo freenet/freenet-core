@@ -457,7 +457,14 @@ impl PeerConnectionApi for NativePeerConnection {
             // charge it keeps the joiner's.
             if let Some(JoinerHold::Joiner(charge)) = self.joiner.take() {
                 self.joiner = Some(match charge.promote() {
-                    Ok(path) => JoinerHold::Promoted(path),
+                    Ok(path) => {
+                        #[cfg(any(test, feature = "testing"))]
+                        crate::operations::connect::native_wire_trace::record_at(
+                            self.remote_addr,
+                            crate::operations::connect::native_wire_trace::NativeWireEvent::NativeJoinerPromoted,
+                        );
+                        JoinerHold::Promoted(path)
+                    }
                     Err(charge) => {
                         tracing::debug!(
                             peer_addr = %self.remote_addr,

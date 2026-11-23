@@ -949,12 +949,23 @@ impl NodeLabel {
 
     /// Returns true if this is a gateway label.
     pub fn is_gateway(&self) -> bool {
-        self.0.contains("-gateway-")
+        self.role() == Some("gateway")
     }
 
     /// Returns true if this is a regular node label.
     pub fn is_node(&self) -> bool {
-        self.0.contains("-node-")
+        self.role() == Some("node")
+    }
+
+    /// The role segment of `{network_name}-{gateway|node}-{id}` (or of
+    /// `{gateway|node}-{id}`): the one before the numeric id. Read from the
+    /// end, so a network name that itself contains "-gateway-" or "-node-"
+    /// does not change any label's role.
+    fn role(&self) -> Option<&str> {
+        let mut parts = self.0.rsplitn(3, '-');
+        let id = parts.next()?;
+        id.parse::<usize>().ok()?;
+        parts.next()
     }
 
     pub fn number(&self) -> usize {
@@ -7937,6 +7948,28 @@ use crate::contract::OperationMode;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A label's role is the segment before its id, whatever the network is
+    /// called: a network name containing "-gateway-" or "-node-" makes no
+    /// node a gateway, or the reverse.
+    #[test]
+    fn node_label_role_ignores_the_network_name() {
+        for network in [
+            "sim",
+            "native-gateway-join-off",
+            "a-node-b",
+            "x-gateway-1-node-2",
+        ] {
+            let gateway = NodeLabel::gateway(network, 3);
+            let node = NodeLabel::node(network, 4);
+            assert!(gateway.is_gateway() && !gateway.is_node(), "{gateway}");
+            assert!(node.is_node() && !node.is_gateway(), "{node}");
+            assert_eq!((gateway.number(), node.number()), (3, 4));
+        }
+        let (gateway, node) = (NodeLabel::from("gateway-0"), NodeLabel::from("node-7"));
+        assert!(gateway.is_gateway() && !gateway.is_node());
+        assert!(node.is_node() && !node.is_gateway());
+    }
 
     /// The helper moves VirtualTime with turmoil's clock: after a run whose client
     /// sleeps 5 s, VirtualTime reads 5 s, within a tick or two.

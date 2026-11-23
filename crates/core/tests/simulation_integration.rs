@@ -23587,9 +23587,7 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
 fn test_quic_native_gateway_join_with_admission_joins_over_quic() {
     use freenet::dev_tool::NodeLabel;
     const SEED: u64 = 0x0059_40B0_0002;
-    // Not "...-gateway-...": `NodeLabel::is_gateway` matches that in the
-    // network name, which would make every node a gateway label.
-    let run = run_native_connect_sim("native-gw-join-on", SEED, 200, |sim| {
+    let run = run_native_connect_sim("native-gateway-join-on", SEED, 200, |sim| {
         sim.with_native_gateway_join(100);
         let gateways: Vec<NodeLabel> = sim
             .all_node_addresses()
@@ -23649,6 +23647,14 @@ fn test_quic_native_gateway_join_with_admission_joins_over_quic() {
             "the native join {joiner} -> {gateway} was promoted into the ring"
         );
     }
+    // Each such join was promoted under its proven key, so its transport
+    // turned the joiner's charge into a path's.
+    assert!(
+        t.native_joiners_promoted() >= joined_natively.len() as u64,
+        "promoted joiners {} < joined natively {}",
+        t.native_joiners_promoted(),
+        joined_natively.len()
+    );
     assert!(t.native_replaced_by_udp().is_empty());
     assert_eq!(t.undecodable_closes(), 0);
     let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
@@ -23666,8 +23672,7 @@ fn test_quic_native_gateway_join_with_admission_joins_over_quic() {
 fn test_quic_native_gateway_join_dead_before_a_frame_goes_legacy_next() {
     use freenet::dev_tool::NodeLabel;
     const SEED: u64 = 0x0059_40B0_0003;
-    // Not "...-gateway-...": see the test above.
-    let run = run_native_connect_sim("native-gw-join-closed", SEED, 300, |sim| {
+    let run = run_native_connect_sim("native-gateway-join-closed", SEED, 300, |sim| {
         sim.with_native_gateway_join(100);
         let gateways: Vec<NodeLabel> = sim
             .all_node_addresses()
