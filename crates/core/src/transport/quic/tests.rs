@@ -6218,9 +6218,9 @@ fn with_admission_off_no_joiner_is_charged() {
 /// it took: the endpoint admits and the join task is registered), the
 /// listener's demux, accept loop, attempt router and registered join task
 /// carry a native dial from an address nobody named through the handshake
-/// and the Hello exchange, and the join is closed at the phase-B hook.
+/// and the Hello exchange, and the join is handed to the node (phase B).
 #[test]
-fn a_gateway_listener_with_admission_carries_a_join_to_the_hook() {
+fn a_gateway_listener_with_admission_hands_a_join_to_the_node() {
     bounded(|| async move {
         use crate::node::background_task_monitor::BackgroundTaskMonitor;
         use crate::transport::connection_handler::{UdpTransportConfig, bind_udp_listener};
@@ -6243,7 +6243,7 @@ fn a_gateway_listener_with_admission_carries_a_join_to_the_hook() {
             toml::from_str("").expect("default network config");
         network_config.transport_quic = Some("shadow".to_string());
         let gateway_keys = TransportKeypair::new();
-        let (outbound, _inbound, listener) = bind_udp_listener::<SimulationSocket>(
+        let (outbound, mut inbound, listener) = bind_udp_listener::<SimulationSocket>(
             gateway_keys.clone(),
             gateway.ip(),
             gateway.port(),
@@ -6295,6 +6295,7 @@ fn a_gateway_listener_with_admission_carries_a_join_to_the_hook() {
             .unwrap();
         let client_config = client.client_config(Arc::new(tls));
         let clock = time.clone();
+        let client_key = client_keys.public().clone();
         let closed = drive(&time, Duration::from_secs(60), async move {
             let connection = client
                 .connect_with(gateway, client_config, server_peer)
@@ -6310,6 +6311,14 @@ fn a_gateway_listener_with_admission_carries_a_join_to_the_hook() {
             )
             .await;
             assert!(hello.is_ok(), "{hello:?}");
+            // The join reaches the node as an inbound connection with the
+            // key the client proved; the node dropping it closes it.
+            let handed = crate::transport::InboundAcceptor::next_connection(&mut inbound)
+                .await
+                .expect("the join is handed to the node");
+            assert_eq!(handed.native_joiner_key(), Some(client_key));
+            assert_eq!(handed.remote_addr(), client_addr);
+            drop(handed);
             connection.inner().closed().await
         })
         .await;

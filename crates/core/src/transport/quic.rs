@@ -1246,7 +1246,6 @@ impl JoinerCharge {
     /// The joiner becomes a normal connection: charged as a data path at the
     /// full rate and counted as an established source from now on. If the
     /// cap has no room for the full charge the joiner stays as it was.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn promote(self) -> Result<QuicPathPermit, Self> {
         match self.cap.promote() {
             Ok(path) => Ok(path),
@@ -1282,7 +1281,7 @@ impl JoinerIncoming {
         self.permit.addr()
     }
 
-    /// Record when the join was queued, on the clock `join_gateway` runs on,
+    /// Record when the join was queued, on the clock `establish_gateway_join` runs on,
     /// so time spent waiting for a free join slot comes out of the join
     /// window instead of extending the joiner's charge.
     pub(crate) fn stamp(&mut self, now_nanos: u64) {

@@ -206,7 +206,7 @@ const GATEWAY_JOIN_QUEUE: usize = 64;
 const GATEWAY_JOINS_MAX: usize = 512;
 
 /// The registered task that runs every admitted gateway join
-/// ([`join_gateway`]) as a future of its own, at most [`GATEWAY_JOINS_MAX`]
+/// ([`establish_gateway_join`], then [`QuicUpgrades::hand_off_join`]) as a future of its own, at most [`GATEWAY_JOINS_MAX`]
 /// at once (the queue backs up past that, and a full queue gives admissions
 /// back). A join that panics is counted (`join_panicked`) and logged, and the
 /// task goes on. Once the queue's sender is gone (the hub dropped), it

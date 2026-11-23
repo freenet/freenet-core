@@ -2295,18 +2295,13 @@ fn a_completed_gateway_join_is_handed_to_the_node_with_its_charge() {
         let permits = QuicPathPermits::new(64);
         assert!(rig.theirs.attach_joiner_cap(permits.clone()));
         assert!(rig.theirs.enable_gateway_admission(rig.time.clone()));
-        // `h.hub` joins `rig.theirs` natively; the gateway's half of the join
-        // comes back for the test to hand off, with the hub's half, which
-        // must stay open meanwhile.
+        // `rig.ours` joins `rig.theirs` natively, with a fresh punch budget
+        // each time (one budget charges each destination); the gateway's half
+        // of the join comes back for the test to hand off, with the joiner's
+        // half, which must stay open meanwhile.
         let join = || {
-            let (theirs, time, hub) = (rig.theirs.clone(), h.time(), Arc::clone(&h.hub));
-            let dial = NativeDial {
-                addr: h.remote,
-                key: h.peer.clone(),
-                is_gateway: true,
-                within: Duration::from_secs(30),
-                join: true,
-            };
+            let (theirs, ours, time) = (rig.theirs.clone(), rig.ours.clone(), h.time());
+            let (gateway_addr, gateway_key) = (h.remote, h.peer.clone());
             drive(&h.pair.time, Duration::from_secs(60), async move {
                 // The gateway admits one attempt per source address a second.
                 time.sleep(Duration::from_secs(2)).await;
@@ -2320,10 +2315,23 @@ fn a_completed_gateway_join_is_handed_to_the_node_with_its_charge() {
                         }
                     }
                 };
-                let (joined, ours) = tokio::join!(gateway, hub.setup_native(dial));
+                let joiner = async {
+                    let budget = crate::transport::quic::native::punch::PunchBudget::default();
+                    let peer = crate::transport::quic::native::setup::NativePeer {
+                        addr: gateway_addr,
+                        key: &gateway_key,
+                        is_gateway: true,
+                    };
+                    let deadline = time.now() + Duration::from_secs(20);
+                    crate::transport::quic::native::setup::join_native(
+                        &ours, &budget, peer, 0, &time, deadline,
+                    )
+                    .await
+                };
+                let (joined, ours) = tokio::join!(gateway, joiner);
                 (
                     joined.unwrap_or_else(|o| panic!("a completed join, got {o:?}")),
-                    ours.expect("the hub's side"),
+                    ours.expect("the joiner's side"),
                 )
             })
         };
