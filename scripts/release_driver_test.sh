@@ -616,30 +616,35 @@ fi
 # `|| MIN_COMPATIBLE=...` fallback, or a dropped `exit 1`) would carry on to
 # the version lookup with no floor or a guessed one.
 floor_refusal_case() {
-    local desc="$1" toml_body="$2" out rc work
-    shift 2
+    local desc="$1" want_err="$2" toml_body="$3" out rc work
+    shift 3
     work="$(mktemp -d)"
     mkdir -p "$work/scripts" "$work/crates/core" "$work/bin"
     cp "$RELEASE_SH" "$work/scripts/release.sh"
     printf '%s\n' "$toml_body" > "$work/crates/core/Cargo.toml"
-    # Anything past the floor check would call cargo first; make that visible.
-    printf '#!/usr/bin/env bash\necho REACHED_CARGO >&2\nexit 1\n' > "$work/bin/cargo"
+    # Anything past the floor check calls cargo first. The driver discards
+    # cargo's stderr there, so the stub leaves a file behind instead.
+    printf '#!/usr/bin/env bash\ntouch "%s/reached_cargo"\nexit 1\n' "$work" > "$work/bin/cargo"
     chmod +x "$work/bin/cargo"
     (cd "$work" && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git init -q .)
     rc=0
     out="$(cd "$work" && PATH="$work/bin:$PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
         bash scripts/release.sh "$@" 2>&1)" || rc=$?
+    local reached=no
+    [[ -e "$work/reached_cargo" ]] && reached=yes
     rm -rf "$work"
-    if [[ "$rc" -ne 0 ]] && [[ "$out" == *"min-compatible"* ]] && [[ "$out" != *REACHED_CARGO* ]]; then
+    if [[ "$rc" -ne 0 ]] && [[ "$reached" == no ]] && [[ "$out" == *"$want_err"* ]]; then
         pass "$desc"
     else
-        fail "$desc" "exit=$rc" "$out"
+        fail "$desc" "exit=$rc, reached cargo=$reached, wanted '$want_err'" "$out"
     fi
 }
 floor_refusal_case "release.sh refuses before any work when Cargo.toml has no floor" \
+    "Error: could not read min-compatible-version" \
     $'[package]\nname = "freenet"\nversion = "0.2.200"' \
     --version 0.2.201 --dry-run
 floor_refusal_case "release.sh refuses before any work on a malformed --min-compatible" \
+    "Error: --min-compatible must be X.Y.Z" \
     $'[package]\nname = "freenet"\nversion = "0.2.200"\n[package.metadata.freenet]\nmin-compatible-version = "0.2.122"' \
     --version 0.2.201 --min-compatible 0.2 --dry-run
 
