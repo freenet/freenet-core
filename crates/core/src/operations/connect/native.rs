@@ -54,11 +54,23 @@ pub(crate) const LEVEL_NATIVE_CAPABLE: u8 = 1;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const LEVEL_NATIVE_ONLY: u8 = 2;
 
-/// Consecutive native failures, across distinct peers, after which a node
-/// stops using native in that role for [`DEMOTION_COOLDOWN`]: as joiner, with
-/// distinct acceptors, it offers percent 0; as acceptor, with distinct
-/// joiners, it decides `Udp`.
+/// Consecutive native failures, across distinct acceptors, after which a
+/// joiner offers percent 0 for [`DEMOTION_COOLDOWN`].
 pub(crate) const DEMOTION_FAILURES: usize = 3;
+
+/// Consecutive native failures, across distinct joiners and with no native
+/// success as acceptor in between, after which a node decides `Udp` as
+/// acceptor for [`DEMOTION_COOLDOWN`]. Provisional, chosen by arithmetic, not
+/// measured: an acceptor cannot tell its own fault from a joiner that never
+/// dialled (the joiner planned UDP because the window had passed, lost its
+/// readiness, or refused by its own limits), so a healthy acceptor sees a
+/// failure share f from joiner-side causes alone. A run of K failures then
+/// comes every 1/f + ... + 1/f^K decisions: at f = 0.2, about 155 for K = 3
+/// (hours for a busy acceptor, so it would sit demoted most of the time) and
+/// about 490,000 for K = 8; at f = 0.3, about 22,000. An acceptor whose own
+/// path is broken (f = 1) demotes after 8 joiners. Read
+/// `connect_native_acceptor_demotions` per node-hour in the first enable step.
+pub(crate) const ACCEPTOR_DEMOTION_FAILURES: usize = 8;
 
 /// How long a demoted node offers (or decides) nothing native.
 pub(crate) const DEMOTION_COOLDOWN: Duration = Duration::from_secs(6 * 3600);
@@ -290,6 +302,10 @@ pub(crate) struct NativeReadiness {
     pub ready: bool,
     /// The effective percent ([`effective_native_percent`]).
     pub percent: u8,
+    /// Native is off because of a demotion (in the role this readiness was
+    /// read for), not because of the build, the endpoint or the release.
+    /// [`acceptor_arm`] then counts the pair in neither arm.
+    pub demoted: bool,
 }
 
 impl NativeReadiness {
@@ -316,6 +332,7 @@ impl NativeReadiness {
     ) -> Self {
         Self {
             ready: dial_ready && endpoint_up && !demoted,
+            demoted,
             percent: effective_native_percent(
                 dial_ready,
                 endpoint_up,
@@ -359,7 +376,10 @@ pub(crate) fn decide_native(
 /// the bucket is at or above the lower of the two percents, so the pair dials
 /// UDP because of the slice (every such pair while that percent is 0).
 /// `None`: no offer, a transport already held (reused, so no dial is decided),
-/// or a pair below the percent that this node is not ready to dial.
+/// a pair below the percent that this node is not ready to dial, or a node
+/// that is demoted (either role). A demoted node is left out of both arms:
+/// demotion follows native failures, so counting its pairs as control would
+/// fill the control arm with exactly the pairs where native fails.
 pub(crate) fn acceptor_arm(
     offer: Option<NativeOffer>,
     own: NativeReadiness,
@@ -367,7 +387,7 @@ pub(crate) fn acceptor_arm(
     holds_transport: bool,
 ) -> Option<ConnectArm> {
     let offered = offer?.effective_percent();
-    if holds_transport {
+    if holds_transport || own.demoted {
         return None;
     }
     if bucket < offered.min(own.percent.min(100)) {
@@ -477,6 +497,10 @@ pub(crate) struct NativeConnectState {
     /// otherwise keep deciding `Native` for every joiner, and each of those
     /// joiners would wait out the fallback and take a strike against it.
     acceptor_demotion: parking_lot::Mutex<NativeDemotion>,
+    /// Simulation only: this node never offers native as joiner, but decides
+    /// as acceptor as usual (`NodeConfig::native_joiner_off`), standing in
+    /// for a node that rarely joins. `false` in production.
+    joiner_off: bool,
     /// This node's QUIC endpoint, set when its transport opens. Until then,
     /// and when it is not up, the node cannot dial native. Read per node, not
     /// from the process-wide endpoint metric, which several simulated nodes
@@ -488,10 +512,31 @@ impl NativeConnectState {
     pub(crate) fn new(release_override: Option<u8>) -> Self {
         Self {
             release_override,
-            demotion: parking_lot::Mutex::new(NativeDemotion::new()),
-            acceptor_demotion: parking_lot::Mutex::new(NativeDemotion::new()),
+            demotion: parking_lot::Mutex::new(NativeDemotion::new(DEMOTION_FAILURES)),
+            acceptor_demotion: parking_lot::Mutex::new(NativeDemotion::new(
+                ACCEPTOR_DEMOTION_FAILURES,
+            )),
+            joiner_off: false,
             endpoint: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Simulation only: as [`Self::new`], never offering native as joiner
+    /// when `joiner_off` (`NodeConfig::native_joiner_off`).
+    pub(crate) fn with_joiner_off(mut self, joiner_off: bool) -> Self {
+        self.joiner_off = joiner_off;
+        self
+    }
+
+    /// Simulation only: as [`Self::new`], with the acceptor role demoting
+    /// after `failures` in place of [`ACCEPTOR_DEMOTION_FAILURES`]
+    /// (`NodeConfig::native_acceptor_demotion_failures`), so a small
+    /// simulation, whose nodes accept few distinct joiners, can reach it.
+    pub(crate) fn with_acceptor_demotion_failures(mut self, failures: Option<usize>) -> Self {
+        if let Some(failures) = failures {
+            self.acceptor_demotion = parking_lot::Mutex::new(NativeDemotion::new(failures.max(1)));
+        }
+        self
     }
 
     /// The node's transport opened with this QUIC endpoint. Only the first
@@ -521,10 +566,16 @@ impl NativeConnectState {
             Some(percent) => (true, percent),
             None => (NATIVE_DIAL_READY, QUIC_NATIVE_PERCENT),
         };
+        let dial_ready = dial_ready && (as_acceptor || !self.joiner_off);
         let now = Instant::now();
-        let demoted = self.demotion.lock().is_demoted(now)
-            || (as_acceptor && self.acceptor_demotion.lock().is_demoted(now));
-        NativeReadiness::from_parts(dial_ready, endpoint_up, demoted, release_percent)
+        let joiner_demoted = self.demotion.lock().is_demoted(now);
+        let acceptor_demoted = as_acceptor && self.acceptor_demotion.lock().is_demoted(now);
+        NativeReadiness::from_parts(
+            dial_ready,
+            endpoint_up,
+            joiner_demoted || acceptor_demoted,
+            release_percent,
+        )
     }
 
     /// A native setup with `peer` failed in a way that says native does not
@@ -550,7 +601,8 @@ impl NativeConnectState {
     /// A native setup this node made as ACCEPTOR, with `joiner`, failed in a
     /// way that says native does not work on that path. Counted apart from
     /// the joiner streak, across distinct joiners, so one joiner failing on
-    /// purpose counts once. Returns whether this failure demoted the
+    /// purpose counts once; [`ACCEPTOR_DEMOTION_FAILURES`] in a row demote.
+    /// Returns whether this failure demoted the
     /// acceptor role, which is counted.
     pub(crate) fn record_acceptor_failure(&self, joiner: &TransportPublicKey) -> bool {
         let demoted = self
@@ -591,24 +643,26 @@ impl NativeConnectState {
 /// acceptor role). A failure is always followed by a UDP dial to the same
 /// peer, so demotion only stops new native attempts.
 ///
-/// [`DEMOTION_FAILURES`] failures in a row, each with a different peer,
+/// `threshold` failures in a row ([`DEMOTION_FAILURES`] as joiner,
+/// [`ACCEPTOR_DEMOTION_FAILURES`] as acceptor), each with a different peer,
 /// demote the role for [`DEMOTION_COOLDOWN`]; a success in that role resets
 /// the streak. Repeated failures with one peer count once, so one broken peer
 /// cannot demote a node. It only ever lowers: it can make a node offer 0 or
 /// decide `Udp`, never more.
 #[derive(Debug)]
 pub(crate) struct NativeDemotion {
-    /// Distinct peers in the current failure streak, at most
-    /// [`DEMOTION_FAILURES`].
+    /// Distinct peers in the current failure streak, at most `threshold`.
     streak: Vec<TransportPublicKey>,
+    threshold: usize,
     demoted_until: Option<Instant>,
     demotions: u64,
 }
 
 impl NativeDemotion {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(threshold: usize) -> Self {
         Self {
-            streak: Vec::with_capacity(DEMOTION_FAILURES),
+            streak: Vec::with_capacity(threshold),
+            threshold,
             demoted_until: None,
             demotions: 0,
         }
@@ -623,7 +677,7 @@ impl NativeDemotion {
         if !self.streak.contains(peer) {
             self.streak.push(peer.clone());
         }
-        if self.streak.len() >= DEMOTION_FAILURES {
+        if self.streak.len() >= self.threshold {
             self.streak.clear();
             self.demoted_until = Some(now + DEMOTION_COOLDOWN);
             self.demotions += 1;
@@ -727,6 +781,7 @@ mod tests {
 
     fn ready(percent: u8) -> NativeReadiness {
         NativeReadiness {
+            demoted: false,
             ready: true,
             percent,
         }
@@ -780,6 +835,7 @@ mod tests {
             ready(25),
             ready(100),
             NativeReadiness {
+                demoted: false,
                 ready: false,
                 percent: 25,
             },
@@ -836,6 +892,7 @@ mod tests {
         assert_eq!(acceptor_arm(offer, ready(100), 0, true), None);
         // Below the percent but not ready to dial: in neither arm.
         let not_ready = NativeReadiness {
+            demoted: false,
             ready: false,
             percent: 50,
         };
@@ -918,6 +975,7 @@ mod tests {
         );
         // Not ready, even with a percent.
         let not_ready = NativeReadiness {
+            demoted: false,
             ready: false,
             percent: 50,
         };
@@ -1084,37 +1142,51 @@ mod tests {
         );
     }
 
+    fn up_state(release: u8) -> NativeConnectState {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        // A watch keeps its last value after its sender drops.
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let state = NativeConnectState::new(Some(release));
+        state.set_endpoint(watch);
+        state
+    }
+
     /// The acceptor role has its own streak (10.2 item 2). Failures as
-    /// acceptor with three distinct joiners stop the node DECIDING native
-    /// (its acceptor readiness, which `decide_native` reads, goes to percent
-    /// 0) while its own offer as joiner is untouched; repeats with one joiner
-    /// count once; an acceptor success restarts the streak, and a joiner
-    /// success does not touch it. The two streaks never feed each other.
+    /// acceptor with `ACCEPTOR_DEMOTION_FAILURES` distinct joiners stop the
+    /// node DECIDING native (its acceptor readiness, which `decide_native`
+    /// reads, goes to percent 0 and counts as demoted) while its own offer as
+    /// joiner is untouched; repeats with one joiner count once; one failure
+    /// fewer does not demote; a joiner success does not touch the acceptor
+    /// streak, and an acceptor success restarts it. The two streaks never feed
+    /// each other.
     #[test]
     fn acceptor_failures_turn_off_only_the_acceptor_decision() {
-        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
-        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
-        let on = NativeConnectState::new(Some(100));
-        on.set_endpoint(watch);
-        let joiner = key(9);
+        let on = up_state(100);
         for _ in 0..5 {
-            assert!(!on.record_acceptor_failure(&joiner));
+            assert!(!on.record_acceptor_failure(&key(9)));
         }
-        assert!(on.acceptor_readiness().ready, "one joiner counts once");
-        assert!(!on.record_acceptor_failure(&key(10)));
+        for i in 10..(10 + ACCEPTOR_DEMOTION_FAILURES as u32 - 2) {
+            assert!(!on.record_acceptor_failure(&key(i)));
+        }
+        assert!(
+            on.acceptor_readiness().ready,
+            "one failure short: one joiner counted once"
+        );
         on.record_success();
         assert!(
-            on.record_acceptor_failure(&key(11)),
-            "a joiner success does not reset the acceptor streak, so this is the third"
+            on.record_acceptor_failure(&key(100)),
+            "a joiner success does not reset the acceptor streak, so this is the last"
         );
-        assert_eq!(on.acceptor_demotions(), 1, "three distinct joiners");
+        assert_eq!(on.acceptor_demotions(), 1);
         assert_eq!(on.demotions(), 0, "the joiner streak saw nothing");
-        assert!(on.readiness().ready, "its own offer is untouched");
-        assert_eq!(on.readiness().percent, 100);
+        let joiner = on.readiness();
+        assert!(joiner.ready, "its own offer is untouched");
+        assert_eq!(joiner.percent, 100);
+        assert!(!joiner.demoted);
         let acceptor = on.acceptor_readiness();
         assert!(!acceptor.ready);
         assert_eq!(acceptor.percent, 0);
-        // 0 against any offer: every bucket is at or above 0, so Udp.
+        assert!(acceptor.demoted);
         for bucket in [0u8, 50, 99] {
             assert_eq!(
                 decide_native(Some(NativeOffer::capable(100)), acceptor, bucket, false),
@@ -1122,19 +1194,92 @@ mod tests {
             );
         }
 
-        let fresh = NativeConnectState::new(Some(100));
-        let (_endpoint2, watch2) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
-        fresh.set_endpoint(watch2);
-        fresh.record_acceptor_failure(&key(1));
-        fresh.record_acceptor_failure(&key(2));
+        let fresh = up_state(100);
+        for i in 1..ACCEPTOR_DEMOTION_FAILURES as u32 {
+            fresh.record_acceptor_failure(&key(i));
+        }
         fresh.record_acceptor_success();
-        fresh.record_acceptor_failure(&key(3));
+        fresh.record_acceptor_failure(&key(50));
         assert_eq!(fresh.acceptor_demotions(), 0, "an acceptor success resets");
         assert!(fresh.acceptor_readiness().ready);
         for i in 20..23 {
             fresh.record_failure(&key(i));
         }
         assert_eq!(fresh.acceptor_demotions(), 0, "joiner failures never count");
+        assert!(
+            fresh.acceptor_readiness().demoted,
+            "but they stop decisions"
+        );
+    }
+
+    /// The acceptor threshold is the one the arithmetic on
+    /// `ACCEPTOR_DEMOTION_FAILURES` assumes, and the joiner's is unchanged.
+    #[test]
+    fn demotion_thresholds_have_these_values() {
+        assert_eq!(DEMOTION_FAILURES, 3);
+        assert_eq!(ACCEPTOR_DEMOTION_FAILURES, 8);
+        assert_eq!(DEMOTION_COOLDOWN, Duration::from_secs(6 * 3600));
+    }
+
+    /// A demoted node, in either role, counts its pairs in neither arm, so
+    /// the control arm does not collect the pairs where native failed; a
+    /// node that is merely not ready below the percent is also in neither,
+    /// and one at release percent 0 is control as before.
+    #[test]
+    fn a_demoted_acceptor_is_in_neither_arm() {
+        let offer = Some(NativeOffer::capable(100));
+        let demoted = NativeReadiness::from_parts(true, true, true, 100);
+        assert!(demoted.demoted);
+        for bucket in [0u8, 24, 50, 99] {
+            assert_eq!(acceptor_arm(offer, demoted, bucket, false), None);
+        }
+        let at_zero = NativeReadiness::from_parts(true, true, false, 0);
+        assert_eq!(
+            acceptor_arm(offer, at_zero, 10, false),
+            Some(ConnectArm::Control)
+        );
+    }
+
+    /// The acceptor demotion lasts `DEMOTION_COOLDOWN` and then ends on its
+    /// own, while a joiner demotion started later still holds decisions off:
+    /// each role's cooldown is read separately.
+    #[tokio::test(start_paused = true)]
+    async fn each_roles_cooldown_ends_on_its_own() {
+        let on = up_state(100);
+        for i in 0..ACCEPTOR_DEMOTION_FAILURES as u32 {
+            on.record_acceptor_failure(&key(i));
+        }
+        assert!(!on.acceptor_readiness().ready);
+        tokio::time::advance(DEMOTION_COOLDOWN - Duration::from_secs(1)).await;
+        assert!(!on.acceptor_readiness().ready, "still in the cooldown");
+        for i in 40..43 {
+            on.record_failure(&key(i));
+        }
+        assert_eq!(on.demotions(), 1);
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(
+            !on.acceptor_readiness().ready,
+            "the acceptor cooldown ended, the joiner one holds"
+        );
+        tokio::time::advance(DEMOTION_COOLDOWN).await;
+        assert!(on.acceptor_readiness().ready, "both ended");
+        assert!(on.readiness().ready);
+    }
+
+    /// A node with its joiner role off (simulation only) offers 0 and cannot
+    /// dial a `Native` decision, but still decides as acceptor at its
+    /// release percent.
+    #[test]
+    fn joiner_off_keeps_the_acceptor_deciding() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let state = NativeConnectState::new(Some(100)).with_joiner_off(true);
+        state.set_endpoint(watch);
+        assert!(!state.readiness().ready);
+        assert_eq!(state.readiness().offer().percent, 0);
+        assert!(!state.readiness().demoted);
+        assert!(state.acceptor_readiness().ready);
+        assert_eq!(state.acceptor_readiness().percent, 100);
     }
 
     /// Every level and percent decodes and re-encodes to the same bytes, so a
@@ -1193,7 +1338,7 @@ mod tests {
     #[test]
     fn demotion_after_three_distinct_acceptors() {
         let now = Instant::now();
-        let mut demotion = NativeDemotion::new();
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
         demotion.record_failure(&key(1), now);
         demotion.record_failure(&key(2), now);
         assert!(!demotion.is_demoted(now));
@@ -1208,7 +1353,7 @@ mod tests {
     #[test]
     fn one_acceptor_repeated_counts_once() {
         let now = Instant::now();
-        let mut demotion = NativeDemotion::new();
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
         for _ in 0..10 {
             demotion.record_failure(&key(1), now);
         }
@@ -1221,7 +1366,7 @@ mod tests {
     #[test]
     fn a_success_resets_the_streak() {
         let now = Instant::now();
-        let mut demotion = NativeDemotion::new();
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
         demotion.record_failure(&key(1), now);
         demotion.record_failure(&key(2), now);
         demotion.record_success();
@@ -1237,7 +1382,7 @@ mod tests {
     #[test]
     fn failures_during_the_cooldown_do_not_carry_over() {
         let now = Instant::now();
-        let mut demotion = NativeDemotion::new();
+        let mut demotion = NativeDemotion::new(DEMOTION_FAILURES);
         for i in 1..=3 {
             demotion.record_failure(&key(i), now);
         }

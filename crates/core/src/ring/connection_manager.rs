@@ -778,9 +778,13 @@ impl ConnectionManager {
             config.quic_native_floor_override,
             config.native_wire_pre_floor,
         );
-        cm.native_connect = Arc::new(crate::operations::connect::native::NativeConnectState::new(
-            config.native_connect_override,
-        ));
+        cm.native_connect = Arc::new(
+            crate::operations::connect::native::NativeConnectState::new(
+                config.native_connect_override,
+            )
+            .with_joiner_off(config.native_joiner_off)
+            .with_acceptor_demotion_failures(config.native_acceptor_demotion_failures),
+        );
         cm.broadcast_target_list_floor_override = config.broadcast_target_list_floor_override;
         cm
     }

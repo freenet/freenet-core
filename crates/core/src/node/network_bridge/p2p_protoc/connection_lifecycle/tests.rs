@@ -3666,9 +3666,12 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
     let mut h = Harness::new("native-failure").await;
     use crate::transport::NatAttemptOrigin;
     // (round, outcome, origin, joiner demotions, acceptor demotions), both
-    // cumulative over the rounds. Three path failures as acceptor demote only
-    // the acceptor role; three as joiner only the joiner role; a refusal by
-    // the node's own limits demotes neither.
+    // cumulative over the rounds. Each round fails with
+    // ACCEPTOR_DEMOTION_FAILURES distinct peers: path failures as acceptor
+    // demote only the acceptor role, as joiner only the joiner role (at its
+    // own, lower threshold); a refusal by the node's own limits demotes
+    // neither, and a gateway dial or a dial to a ring peer with no transport
+    // feeds neither streak.
     for (round, outcome, origin, demotions, acceptor_demotions) in [
         (
             0u16,
@@ -3694,12 +3697,26 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
         (
             3,
             NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::Gateway,
+            0,
+            1,
+        ),
+        (
+            4,
+            NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::RingPeerNoTransport,
+            0,
+            1,
+        ),
+        (
+            5,
+            NativeSetupOutcome::TimedOut,
             NatAttemptOrigin::ConnectJoiner,
             1,
             1,
         ),
     ] {
-        for i in 0..3u16 {
+        for i in 0..crate::operations::connect::native::ACCEPTOR_DEMOTION_FAILURES as u16 {
             let addr: SocketAddr = format!("203.0.113.231:{}", 6210 + round * 10 + i)
                 .parse()
                 .unwrap();
@@ -3757,10 +3774,10 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
 }
 
 /// 10.2 item 2: the acceptor role's streak is reset only by a native success
-/// as acceptor, the mirror of the joiner rule below. Two acceptor timeouts, a
-/// success as joiner and a third acceptor timeout demote the acceptor role
-/// (and the node then decides Udp); a success as acceptor in the same place
-/// resets the streak.
+/// as acceptor, the mirror of the joiner rule below. One acceptor timeout
+/// short of the threshold, a success as joiner and one more acceptor timeout
+/// demote the acceptor role (and the node then decides Udp); a success as
+/// acceptor in the same place resets the streak.
 #[tokio::test]
 async fn only_an_acceptors_native_success_resets_its_acceptor_streak() {
     use crate::operations::connect::native::DialTransport;
@@ -3771,7 +3788,7 @@ async fn only_an_acceptors_native_success_resets_its_acceptor_streak() {
     ] {
         let mut h = Harness::new(&format!("native-acceptor-success-origin-{case}")).await;
         let addr = |i: u16| -> SocketAddr {
-            format!("203.0.113.236:{}", 6340 + case * 10 + i)
+            format!("203.0.113.236:{}", 6340 + case * 100 + i)
                 .parse()
                 .unwrap()
         };
@@ -3784,21 +3801,23 @@ async fn only_an_acceptors_native_success_resets_its_acceptor_streak() {
             native_outcome: Some(NativeSetupOutcome::TimedOut),
             origin: NatAttemptOrigin::ConnectAcceptor,
         };
-        h.handshake_event(fail(0)).await;
-        h.handshake_event(fail(1)).await;
-        let winner = PeerKeyLocation::new(key(), addr(2));
+        let short = crate::operations::connect::native::ACCEPTOR_DEMOTION_FAILURES as u16 - 1;
+        for i in 0..short {
+            h.handshake_event(fail(i)).await;
+        }
+        let winner = PeerKeyLocation::new(key(), addr(50));
         let _result =
             pending_connect_peer_over(&mut h, winner.clone(), DialTransport::native_now()).await;
         h.handshake_event(HandshakeEvent::OutboundEstablished {
             transaction: Transaction::new::<ConnectMsg>(),
             peer: winner,
-            connection: Box::new(IdleConnection::new(addr(2))),
+            connection: Box::new(IdleConnection::new(addr(50))),
             transient: false,
             transport: DialTransport::native_now(),
             origin: success_origin,
         })
         .await;
-        h.handshake_event(fail(3)).await;
+        h.handshake_event(fail(60)).await;
         let native = h
             .mgr
             .bridge

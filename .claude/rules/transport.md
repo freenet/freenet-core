@@ -2364,8 +2364,9 @@ Readiness: NativeConnectState, one per node in the ConnectionManager. Ready
   when dialling is on (NATIVE_DIAL_READY, or the override), this node's own
   QUIC endpoint is up (its QuicAvailabilityWatch from TransportHandle, read
   per node: the process-wide quic_endpoint metric is shared by simulated
-  nodes) and the node is not demoted. The relay's decision and the joiner's
-  offer both read it.
+  nodes) and the node is not demoted. The joiner's offer reads
+  readiness() (joiner demotion only); the relay's decision reads
+  acceptor_readiness() (either role's demotion).
 Dial: NodeEvent::ConnectPeer and HandshakeCommand::Connect carry a
   DialTransport. A native dial registers no UDP expectation and runs
   OutboundConnector::connect_native -> QuicUpgrades::setup_native: the
@@ -2480,17 +2481,27 @@ Demotion: recorded in the connection lifecycle, where the outcome is known
   routed back along its CONNECT; that narrows who can drive it, not to no
   one: the acceptor in a response is named by whoever sent it, so a relay on
   the CONNECT's path can name acceptors that decide Native and never serve.
-  Acceptor (10.2 item 2): three such failures with distinct joiners stop the
-  node DECIDING Native for 6 h (NativeConnectState::acceptor_readiness, read
-  by RelayEnv::native_readiness; connect_native_acceptor_demotions); its own
+  Acceptor (10.2 item 2): ACCEPTOR_DEMOTION_FAILURES (8) such failures with
+  distinct joiners, no acceptor success between, stop the node DECIDING
+  Native for 6 h (NativeConnectState::acceptor_readiness, read by
+  RelayEnv::native_readiness; connect_native_acceptor_demotions); its own
   offer as joiner is untouched. Without it an acceptor whose own native path
   is broken (a gateway, a node at its target that rarely joins) kept
   deciding Native for every joiner, each of which waited out the fallback.
-  Its joiners chose it, so joiners holding three keys can turn an honest
-  acceptor's decisions off. A joiner cannot tell an acceptor-side failure
-  from its own (same outcomes, no health bit on the wire), so it still takes
-  a strike; the acceptor's demotion bounds that at three joiners per broken
-  acceptor per cooldown. Either streak's effect is a 6 h downgrade to UDP,
+  The threshold is higher than the joiner's because an acceptor cannot tell
+  its own fault from a joiner that never dialled (planned UDP past the
+  window, lost its readiness, refused by its own limits) or one behind a
+  symmetric NAT: at 3, healthy acceptors in
+  test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join demoted,
+  and the arithmetic on the constant's rustdoc puts a busy healthy acceptor
+  demoted most of the time; 8 is provisional until step 1 measures it. Its
+  joiners chose it, so joiners holding 8 keys can turn an honest acceptor's
+  decisions off. A joiner cannot tell an acceptor-side failure from its own
+  (same outcomes, no health bit on the wire), so it still takes a strike;
+  the acceptor's demotion bounds that at 8 joiners per broken acceptor per
+  cooldown. A demoted node (either role) is counted in neither connect arm
+  (acceptor_arm returns None), so the control arm does not collect the pairs
+  where native fails. Either streak's effect is a 6 h downgrade to UDP,
   never a failed join.
 Existing transport: a native dial does not drop a connection the node
   already has to that peer; the joiner may have connected another way since

@@ -4261,6 +4261,7 @@ mod tests {
         let self_loc = make_peer(4000);
         let joiner = make_peer(5000);
         let ready = native::NativeReadiness {
+            demoted: false,
             ready: true,
             percent: 100,
         };
@@ -4291,6 +4292,7 @@ mod tests {
         let joiner = make_peer(5000);
         let peer_a = make_peer(6000);
         let ready = native::NativeReadiness {
+            demoted: false,
             ready: true,
             percent: 100,
         };
@@ -4363,6 +4365,7 @@ mod tests {
         let peer_b = make_peer(7000);
         let offer = Some(native::NativeOffer::capable(100));
         let ready = native::NativeReadiness {
+            demoted: false,
             ready: true,
             percent: 100,
         };

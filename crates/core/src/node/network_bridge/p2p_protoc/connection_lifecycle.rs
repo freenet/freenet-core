@@ -1701,12 +1701,15 @@ impl P2pConnManager {
                 //   the acceptor in a response is named by whoever sent it, so
                 //   a relay on the CONNECT's path can name acceptors that never
                 //   serve.
-                // - As acceptor: three failures with distinct joiners turn its
-                //   `Native` decisions off, so an acceptor whose own native
-                //   path is broken stops costing every joiner the fallback
-                //   wait. Its joiners chose it and can fail on purpose, so
-                //   joiners holding three keys can turn an honest acceptor's
-                //   decisions off.
+                // - As acceptor: `ACCEPTOR_DEMOTION_FAILURES` failures with
+                //   distinct joiners turn its `Native` decisions off, so an
+                //   acceptor whose own native path is broken stops costing
+                //   every joiner the fallback wait. The threshold is higher
+                //   because a joiner that never dialled (or sits behind a
+                //   symmetric NAT) also ends this setup as `TimedOut`, and the
+                //   acceptor cannot tell. Its joiners chose it and can fail on
+                //   purpose, so joiners holding that many keys can turn an
+                //   honest acceptor's decisions off.
                 // Either way the effect is a downgrade to UDP for the
                 // cooldown, never a failed join. The connect op then falls
                 // back to UDP.
