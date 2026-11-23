@@ -443,8 +443,10 @@ deploy_update() {
 # gateway is silently down. Same shape as the v0.2.71 incident this function
 # exists for.
 #
-# nova runs exactly that: freenet-gateway-2 is a second gateway process with
-# `WantedBy=freenet-gateway.service` and no release-agent of its own.
+# On hosts that still use that wiring (a companion `WantedBy=` the primary) this
+# check applies. nova's freenet-gateway-2 no longer does (#6336): it is restarted
+# after the primary by freenet-gateway-stagger.service, which fails visibly on
+# its own, so this loop finds no companion there.
 #
 # Companions are read from the `.wants` SYMLINKS on disk, deliberately NOT from
 # `systemctl show -p ConsistsOf`. ConsistsOf reflects the LOADED unit graph and
@@ -620,6 +622,13 @@ main() {
         fi
     else
         log INFO "No update needed"
+        # The companion may still be on an old binary (primary not healthy in
+        # time, a failed stagger run, a second release during the settle wait).
+        # Queueing the stagger again is idempotent: it exits at once when the
+        # companion already runs the installed binary.
+        if [[ "$CHECK_ONLY" != "true" && "$DRY_RUN" != "true" ]]; then
+            schedule_companion_restart || exit 1
+        fi
     fi
 
     log INFO "Auto-update check complete"

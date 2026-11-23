@@ -64,6 +64,8 @@ unit_uptime() {
     echo $(( (now - since) / 1000000 ))
 }
 
+unit_prop() { "$SYSTEMCTL" show -p "$2" --value "$1.service" 2>/dev/null || true; }
+
 # True if the unit's main process runs the binary that is on disk now (not a
 # deleted inode left over from before the swap).
 runs_installed_binary() {
@@ -74,6 +76,11 @@ runs_installed_binary() {
     [[ -n "$exe" && "$exe" != *"(deleted)" ]] || return 1
     [[ "$(readlink -f "$exe")" == "$(readlink -f "$INSTALL_PATH")" ]]
 }
+
+if runs_installed_binary "$COMPANION"; then
+    log "$COMPANION already runs the installed binary; nothing to do"
+    exit 0
+fi
 
 log "waiting for $PRIMARY to be active for >= ${MIN_PRIMARY_UPTIME}s (timeout ${PRIMARY_TIMEOUT}s)"
 start=$SECONDS
@@ -88,11 +95,6 @@ while :; do
     sleep "$POLL"
 done
 
-if runs_installed_binary "$COMPANION"; then
-    log "$COMPANION already runs the installed binary; nothing to do"
-    exit 0
-fi
-
 if [[ "$DRY_RUN" == "true" ]]; then
     log "[DRY RUN] would run: $SYSTEMCTL restart $COMPANION.service"
     exit 0
@@ -101,10 +103,17 @@ fi
 log "restarting $COMPANION"
 "$SYSTEMCTL" restart "$COMPANION.service" || die "systemctl restart $COMPANION failed"
 
-# The unit has Restart=always, so a crash loop can look active for a moment.
-# Require it to stay active and to be running the installed binary.
+# The unit has Restart=always and RestartSec=10, so a process that crashes right
+# after start is replaced by a new, active one and a single check would pass.
+# Require the same main PID and an unchanged restart counter across the wait.
+pid_before=$(unit_prop "$COMPANION" MainPID)
+nr_before=$(unit_prop "$COMPANION" NRestarts)
 sleep "$SETTLE"
 state=$("$SYSTEMCTL" is-active "$COMPANION.service" 2>/dev/null || true)
 [[ "$state" == "active" ]] || die "$COMPANION is '$state' ${SETTLE}s after restart"
+pid_after=$(unit_prop "$COMPANION" MainPID)
+nr_after=$(unit_prop "$COMPANION" NRestarts)
+[[ "$pid_before" == "$pid_after" && "$nr_before" == "$nr_after" ]] \
+    || die "$COMPANION is crash-looping: MainPID $pid_before -> $pid_after, NRestarts $nr_before -> $nr_after within ${SETTLE}s"
 runs_installed_binary "$COMPANION" || die "$COMPANION is active but not running the installed binary $INSTALL_PATH"
 log "OK: $COMPANION restarted onto the installed binary"

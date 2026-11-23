@@ -1,0 +1,67 @@
+[Unit]
+Description=Freenet Gateway 2 (migrated from vega, 2026-08-29)
+After=network-online.target freenet-gateway.service
+Wants=network-online.target
+
+# Restart staggering (freenet-core#6336, 2026-11-23). This unit is deliberately
+# NOT PartOf= or WantedBy= freenet-gateway.service any more. It used to be, so
+# the updater's stop/swap/start of gateway 1 stopped and started this unit in the
+# same second, and restarting both gateways at once roughly doubled the share of
+# SUBSCRIBEs needing extra hops for 10+ hours.
+#
+# Binary updates now reach this unit like this: gateway-auto-update.sh (run by
+# the release agent) queues freenet-gateway-stagger.service after it has updated
+# gateway 1. That runs gateway-staggered-restart.sh, which waits until gateway 1
+# has been active for 10 min, then restarts this unit onto the new binary and
+# fails visibly (non-zero, journal, `systemctl --failed`) if that does not work.
+# The shared binary is replaced by rm + cp, so this unit keeps running the old
+# inode until that restart. A crash-restart (Restart=always) in the meantime
+# also picks up the new binary, which is fine.
+# Boot is unchanged: WantedBy=multi-user.target below, After= gateway 1.
+
+[Service]
+Type=simple
+User=freenet
+WorkingDirectory=/home/freenet
+
+# Three settings MUST differ from gateway 1. The first is the dangerous one:
+# --data-dir/--config-dir both default to the SAME `ProjectDirs` path, and
+# `secrets_dir` under it holds the transport keypair — sharing it would make
+# both gateways load the SAME node identity.
+# --ws-api-port also defaults to 7509 on both (a plain bind conflict).
+#
+# This gateway has its OWN identity (public key a7e93b2b…beaf690c), not vega's.
+# Carrying vega's keypair over was considered and rejected: it preserves nothing
+# useful (the address changes anyway, so every peer reconnects regardless, and
+# ring Location is address-derived) while making a stale-gateways.toml peer dial
+# vega.locut.us:31337, reach THIS host's first gateway, and fail the handshake on
+# a key mismatch. A separate identity lets the old vega entry keep working until
+# peers refetch, so the changeover has no failure window.
+ExecStart=/usr/local/bin/freenet network \
+  --skip-load-from-network \
+  --is-gateway \
+  --transport-keypair /home/freenet/.ssh/gw2.x25519.pem \
+  --network-port 31338 \
+  --public-network-address 5.9.111.215 \
+  --public-network-port 31338 \
+  --ws-api-port 7510 \
+  --config-dir /home/freenet/gw2/config \
+  --data-dir /home/freenet/gw2/data \
+  --telemetry-endpoint http://nova.locut.us:4318 \
+  --reference-ping-enabled \
+  --gateways '{ "address": "5.9.111.215:31337", "public_key": "/home/freenet/.ssh/public.nova.gw.pem" }'
+
+Environment="RUST_BACKTRACE=1"
+Environment="RUST_LOG=freenet=info"
+Restart=always
+RestartSec=10
+LimitNOFILE=524288
+
+# Sized for nova, NOT copied from vega. Vega used 11G/13G against ~2GB actual
+# RSS on a box doing nothing else; nova carries CI runners, several test peers
+# and a hosted node, and has had all 8GB of swap consumed with earlyoom armed.
+MemoryHigh=6G
+MemoryMax=8G
+
+[Install]
+WantedBy=multi-user.target
