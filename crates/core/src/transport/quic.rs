@@ -1552,6 +1552,23 @@ impl QuicConnection {
 
 impl Drop for QuicConnection {
     fn drop(&mut self) {
+        // #6184: the close unwraps the connection's state lock, which a panic
+        // in a quinn driver may have poisoned. After such a panic is
+        // reported, the connection's watcher closes it (see `new`). During an
+        // unwind a second panic would abort the process, so the close runs
+        // in a task of its own, where a panic ends only that task.
+        if self.closer.quinn_may_be_poisoned() {
+            return;
+        }
+        if std::thread::panicking() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let closer = self.closer.clone();
+                drop(GlobalExecutor::spawn(async move {
+                    closer.close(QuicCloseCode::NodeDroppedPeer);
+                }));
+            }
+            return;
+        }
         self.closer.close(QuicCloseCode::NodeDroppedPeer);
     }
 }
@@ -1596,6 +1613,15 @@ pub(crate) struct QuicCloser {
 }
 
 impl QuicCloser {
+    /// Whether a panic in a quinn driver of this connection's endpoint was
+    /// reported (`EndpointHealth::quinn_panicked`, which also sets the
+    /// adapter-panic flag read here; after a socket-adapter panic this is
+    /// `true` too). The panic may have poisoned this connection's state
+    /// lock, which most quinn calls unwrap (#6184).
+    pub(crate) fn quinn_may_be_poisoned(&self) -> bool {
+        self.health.has_adapter_panicked()
+    }
+
     /// The connection's smoothed round trip, as quinn estimates it.
     pub(crate) fn rtt(&self) -> std::time::Duration {
         self.connection.rtt()

@@ -4154,15 +4154,13 @@ fn the_accept_loop_stops_without_polling_quinn_after_a_driver_panic() {
     );
 }
 
-/// #6184: a monitored task that a quinn driver panic kills (here the accept
-/// call quinn's poisoned endpoint lock panics, as the accept loop's would in
-/// the moment before the watcher reports Down, or the attempt router's on an
-/// attempt queued before the death) ends the node with the code the
-/// listener's `QuicEndpointDown` exit takes, recorded once in the breaker
-/// marker, not with a crash code the post-update rollback counts. The
-/// background monitor and the exit decision are the node's own
-/// (`p2p_impl`'s monitor arm calls `background_exit` with
-/// `driver_death_restart`); only `process::exit` is left out.
+/// #6184 backstop: a monitored task that a quinn driver panic kills (here
+/// the accept call quinn's poisoned endpoint lock panics, as the accept
+/// loop's would on another worker in the moment before the watcher reports
+/// Down) is recognised by `driver_death_restart`, which records the death
+/// once, so the node exits with the listener's `QuicEndpointDown` code
+/// (`p2p_impl`'s monitor arm, pinned there), which the post-update rollback
+/// does not count (pinned in `rollback`).
 #[test]
 fn a_task_a_driver_panic_kills_exits_as_the_endpoint_death() {
     in_child(
@@ -4171,10 +4169,6 @@ fn a_task_a_driver_panic_kills_exits_as_the_endpoint_death() {
             bounded(|| async move {
                 use crate::config::GlobalExecutor;
                 use crate::node::background_task_monitor::BackgroundTaskMonitor;
-                use crate::node::{
-                    FAST_CRASH_EXIT_CODE, FATAL_LISTENER_EXIT_CODE, background_exit,
-                    listener_exit_code,
-                };
                 use crate::transport::quic::liveness::{
                     driver_death_restart, exit_for_endpoint_death,
                 };
@@ -4206,28 +4200,14 @@ fn a_task_a_driver_panic_kills_exits_as_the_endpoint_death() {
                 )
                 .await;
                 assert!(failed.to_string().contains("panic"), "{failed:#}");
-                // The control: the same failure without the decision would
-                // exit as a fast crash on a 45-aware unit.
-                assert_eq!(
-                    listener_exit_code(&failed, Duration::ZERO, true),
-                    FAST_CRASH_EXIT_CODE
-                );
                 let records = std::sync::atomic::AtomicU32::new(0);
                 let restart = driver_death_restart(|_| {
                     records.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     true
                 })
                 .await;
-                let exit = background_exit(failed, restart);
+                assert!(restart, "the failure exits as the endpoint death");
                 assert_eq!(records.into_inner(), 1, "the death is recorded");
-                for fast_crash in [true, false] {
-                    assert_eq!(
-                        listener_exit_code(&exit, Duration::ZERO, fast_crash),
-                        FATAL_LISTENER_EXIT_CODE,
-                        "{exit:#}"
-                    );
-                }
-                assert_eq!(FATAL_LISTENER_EXIT_CODE, crate::QUIC_RESTART_EXIT_CODE);
             });
         },
     );
@@ -4243,7 +4223,7 @@ fn a_task_failure_with_no_driver_panic_keeps_its_exit() {
             use crate::transport::quic::liveness::{driver_death_restart, exit_for_endpoint_death};
             exit_for_endpoint_death();
             let restart = driver_death_restart(|_| panic!("nothing to record")).await;
-            assert!(restart.is_none());
+            assert!(!restart);
         });
     });
 }
@@ -4297,6 +4277,98 @@ fn a_panic_in_a_quinn_connection_driver_drives_the_endpoint_down() {
             });
         },
     );
+}
+
+/// #6184: a send still writing when its connection's driver panics does not
+/// abort the process. The panic poisons the connection's state lock with the
+/// send blocked on flow control; at the send's deadline `bounded_send` polls
+/// it once more, `SendStream::poll_write` unwraps the poisoned lock and
+/// panics, and the unwind drops the unfinished `Outgoing`. Its Drop used to
+/// reset the stream, which unwraps the same lock: a second panic during the
+/// unwind, which aborts. The child dies with SIGABRT without the skip in
+/// `Outgoing::drop`. The send's own panic is allowed (see `liveness`).
+#[test]
+fn a_send_in_flight_on_a_poisoned_connection_does_not_abort() {
+    in_child(
+        "a_send_in_flight_on_a_poisoned_connection_does_not_abort",
+        || {
+            bounded(|| async move {
+                use super::path::QuicPath;
+                let _seed = GlobalRng::seed_guard(SEED);
+                let net = crate::transport::test_net::subnet();
+                let pair = pair("quic-panic-send-in-flight", net.addr(1), net.addr(2), None).await;
+                let (_, client, server) =
+                    pair.transfer(payload(100), Duration::from_secs(60)).await;
+                let (path, _inbound) = QuicPath::new(client, pair.time.clone());
+                // Larger than the peer's stream window (at most 8 MiB), which
+                // nobody reads: the write blocks on flow control.
+                let time = pair.time.clone();
+                let send = tokio::spawn(async move {
+                    let sent = path
+                        .send_stream_bounded(
+                            &time,
+                            Duration::from_secs(120),
+                            crate::transport::StreamId::next(),
+                            None,
+                            bytes::Bytes::from(vec![7u8; 32 << 20]),
+                            None,
+                        )
+                        .await;
+                    drop(path);
+                    sent
+                });
+                let time = pair.time.clone();
+                drive(&pair.time, Duration::from_secs(10), async move {
+                    time.sleep(Duration::from_secs(2)).await;
+                })
+                .await;
+                if send.is_finished() {
+                    panic!("the send was not blocked: {:?}", send.await);
+                }
+                pair.a.faults().panic_next_writable_in_quinn();
+                // An empty stream from the peer makes this side's connection
+                // driver transmit (its acknowledgement) at once, while the
+                // send is blocked.
+                let peer = server.inner().clone();
+                let poke = tokio::spawn(async move {
+                    let mut stream = peer.open_uni().await.ok()?;
+                    stream.finish().ok()
+                });
+                let mut availability = pair.a.availability();
+                let state = drive(&pair.time, Duration::from_secs(1), async move {
+                    availability.not_up().await
+                })
+                .await;
+                assert_eq!(state, QuicAvailability::Down);
+                if send.is_finished() {
+                    panic!("the send ended before its deadline: {:?}", send.await);
+                }
+                // Past the send's deadline: it is polled on the poisoned lock.
+                let time = pair.time.clone();
+                drive(&pair.time, Duration::from_secs(300), async move {
+                    time.sleep(Duration::from_secs(200)).await;
+                })
+                .await;
+                assert!(send.is_finished(), "the send outlived its deadline");
+                let _sent_or_panicked = send.await;
+                poke.abort();
+                drop(server);
+            });
+        },
+    );
+}
+
+/// #6184: attempts queued for the attempt router before a quinn driver
+/// panic are dropped once the endpoint is not Up, never answered on its
+/// poisoned lock (body in `upgrade::driver::tests`).
+#[test]
+fn attempts_queued_before_a_driver_panic_are_dropped() {
+    in_child("attempts_queued_before_a_driver_panic_are_dropped", || {
+        bounded(|| async move {
+            let _seed = GlobalRng::seed_guard(SEED);
+            super::upgrade::driver::tests::route_attempts_queued_before_a_driver_panic().await;
+        });
+    });
 }
 
 /// End to end, after a real socket-adapter panic in a connection driver: a
