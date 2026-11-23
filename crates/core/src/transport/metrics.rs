@@ -1104,6 +1104,10 @@ pub struct TransportMetrics {
     /// Times this node stopped deciding QUIC-native as acceptor after its
     /// native setups failed with distinct joiners (reset each snapshot).
     connect_native_acceptor_demotions: AtomicU64,
+    /// Native setups this node did not admit as acceptor, deciding UDP
+    /// instead (`connect::native::NativeSetupAdmission`) (reset each
+    /// snapshot).
+    connect_native_admission_refused: AtomicU64,
     /// A UDP dial that followed a failed native setup connected, by the side
     /// this node had in the CONNECT (reset each snapshot).
     connect_native_rescued_by_udp_joiner: AtomicU64,
@@ -1528,6 +1532,10 @@ thread_local! {
     pub(crate) static CONNECT_ARM_ON_THIS_THREAD: std::cell::Cell<[u64; ConnectArmCounter::COUNT]> =
         const { std::cell::Cell::new([0; ConnectArmCounter::COUNT]) };
 
+    /// Test-only: native setups not admitted as acceptor on this thread.
+    pub(crate) static NATIVE_ADMISSIONS_REFUSED_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
     /// Test-only: acceptor-role demotions recorded on this thread, so a test
     /// can see its own increment of the process-wide counter.
     pub(crate) static ACCEPTOR_DEMOTIONS_ON_THIS_THREAD: std::cell::Cell<u64> =
@@ -1656,6 +1664,7 @@ impl TransportMetrics {
             connect_native_decision_over_cap: AtomicU64::new(0),
             connect_native_demotions: AtomicU64::new(0),
             connect_native_acceptor_demotions: AtomicU64::new(0),
+            connect_native_admission_refused: AtomicU64::new(0),
             connect_native_rescued_by_udp_joiner: AtomicU64::new(0),
             connect_native_rescued_by_udp_acceptor: AtomicU64::new(0),
             connect_native_fallback_connected_joiner: AtomicU64::new(0),
@@ -2286,6 +2295,14 @@ impl TransportMetrics {
     pub(crate) fn record_connect_native_demotion(&self) {
         self.connect_native_demotions
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// This node did not admit a native setup as acceptor and decided UDP.
+    pub(crate) fn record_connect_native_admission_refused(&self) {
+        self.connect_native_admission_refused
+            .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        NATIVE_ADMISSIONS_REFUSED_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     }
 
     /// This node stopped deciding QUIC-native as acceptor.
@@ -3268,6 +3285,7 @@ impl TransportMetrics {
             connect_native_decision_over_cap: get64(&self.connect_native_decision_over_cap),
             connect_native_demotions: get64(&self.connect_native_demotions),
             connect_native_acceptor_demotions: get64(&self.connect_native_acceptor_demotions),
+            connect_native_admission_refused: get64(&self.connect_native_admission_refused),
             connect_native_rescued_by_udp_joiner: get64(&self.connect_native_rescued_by_udp_joiner),
             connect_native_rescued_by_udp_acceptor: get64(
                 &self.connect_native_rescued_by_udp_acceptor,
@@ -3994,6 +4012,8 @@ pub struct TransportSnapshot {
     pub connect_native_demotions: u64,
     /// Times the node stopped deciding native as acceptor after failures.
     pub connect_native_acceptor_demotions: u64,
+    /// Native setups not admitted as acceptor (decided UDP instead).
+    pub connect_native_admission_refused: u64,
     /// UDP dials that connected after a native setup that failed on the
     /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
@@ -4448,6 +4468,7 @@ impl TransportSnapshot {
             connect_native_decision_over_cap,
             connect_native_demotions,
             connect_native_acceptor_demotions,
+            connect_native_admission_refused,
             connect_native_rescued_by_udp_joiner,
             connect_native_rescued_by_udp_acceptor,
             connect_native_fallback_connected_joiner,
@@ -4628,6 +4649,7 @@ impl TransportSnapshot {
         self.connect_native_decision_over_cap = connect_native_decision_over_cap;
         self.connect_native_demotions = connect_native_demotions;
         self.connect_native_acceptor_demotions = connect_native_acceptor_demotions;
+        self.connect_native_admission_refused = connect_native_admission_refused;
         self.connect_native_rescued_by_udp_joiner = connect_native_rescued_by_udp_joiner;
         self.connect_native_rescued_by_udp_acceptor = connect_native_rescued_by_udp_acceptor;
         self.connect_native_fallback_connected_joiner = connect_native_fallback_connected_joiner;
@@ -4879,6 +4901,8 @@ struct SnapshotExtras {
     pub connect_native_demotions: u64,
     /// Times the node stopped deciding native as acceptor after failures.
     pub connect_native_acceptor_demotions: u64,
+    /// Native setups not admitted as acceptor (decided UDP instead).
+    pub connect_native_admission_refused: u64,
     /// UDP dials that connected after a native setup that failed on the
     /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
@@ -5151,6 +5175,7 @@ impl SnapshotExtras {
             || self.connect_native_decision_over_cap != 0
             || self.connect_native_demotions != 0
             || self.connect_native_acceptor_demotions != 0
+            || self.connect_native_admission_refused != 0
             || self.connect_native_rescued_by_udp_joiner != 0
             || self.connect_native_rescued_by_udp_acceptor != 0
             || self.connect_native_fallback_connected_joiner != 0
@@ -7827,6 +7852,7 @@ mod tests {
             "connect_native_decision_over_cap",
             "connect_native_demotions",
             "connect_native_acceptor_demotions",
+            "connect_native_admission_refused",
             "connect_native_rescued_by_udp_joiner",
             "connect_native_rescued_by_udp_acceptor",
             "connect_native_fallback_connected_joiner",
