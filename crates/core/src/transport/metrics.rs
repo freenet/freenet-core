@@ -1101,6 +1101,9 @@ pub struct TransportMetrics {
     /// failures with distinct peers (`connect::native::NativeDemotion`)
     /// (reset each snapshot).
     connect_native_demotions: AtomicU64,
+    /// Times this node stopped deciding QUIC-native as acceptor after its
+    /// native setups failed with distinct joiners (reset each snapshot).
+    connect_native_acceptor_demotions: AtomicU64,
     /// A UDP dial that followed a failed native setup connected, by the side
     /// this node had in the CONNECT (reset each snapshot).
     connect_native_rescued_by_udp_joiner: AtomicU64,
@@ -1647,6 +1650,7 @@ impl TransportMetrics {
             connect_native_decision_native_unsupported: AtomicU64::new(0),
             connect_native_decision_over_cap: AtomicU64::new(0),
             connect_native_demotions: AtomicU64::new(0),
+            connect_native_acceptor_demotions: AtomicU64::new(0),
             connect_native_rescued_by_udp_joiner: AtomicU64::new(0),
             connect_native_rescued_by_udp_acceptor: AtomicU64::new(0),
             connect_native_fallback_connected_joiner: AtomicU64::new(0),
@@ -2276,6 +2280,12 @@ impl TransportMetrics {
     /// This node turned its own QUIC-native connects off.
     pub(crate) fn record_connect_native_demotion(&self) {
         self.connect_native_demotions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// This node stopped deciding QUIC-native as acceptor.
+    pub(crate) fn record_connect_native_acceptor_demotion(&self) {
+        self.connect_native_acceptor_demotions
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3250,6 +3260,7 @@ impl TransportMetrics {
             ),
             connect_native_decision_over_cap: get64(&self.connect_native_decision_over_cap),
             connect_native_demotions: get64(&self.connect_native_demotions),
+            connect_native_acceptor_demotions: get64(&self.connect_native_acceptor_demotions),
             connect_native_rescued_by_udp_joiner: get64(&self.connect_native_rescued_by_udp_joiner),
             connect_native_rescued_by_udp_acceptor: get64(
                 &self.connect_native_rescued_by_udp_acceptor,
@@ -3974,6 +3985,8 @@ pub struct TransportSnapshot {
     pub connect_native_decision_over_cap: u64,
     /// Times the node turned its own native connects off after failures.
     pub connect_native_demotions: u64,
+    /// Times the node stopped deciding native as acceptor after failures.
+    pub connect_native_acceptor_demotions: u64,
     /// UDP dials that connected after a native setup that failed on the
     /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
@@ -4427,6 +4440,7 @@ impl TransportSnapshot {
             connect_native_decision_native_unsupported,
             connect_native_decision_over_cap,
             connect_native_demotions,
+            connect_native_acceptor_demotions,
             connect_native_rescued_by_udp_joiner,
             connect_native_rescued_by_udp_acceptor,
             connect_native_fallback_connected_joiner,
@@ -4606,6 +4620,7 @@ impl TransportSnapshot {
             connect_native_decision_native_unsupported;
         self.connect_native_decision_over_cap = connect_native_decision_over_cap;
         self.connect_native_demotions = connect_native_demotions;
+        self.connect_native_acceptor_demotions = connect_native_acceptor_demotions;
         self.connect_native_rescued_by_udp_joiner = connect_native_rescued_by_udp_joiner;
         self.connect_native_rescued_by_udp_acceptor = connect_native_rescued_by_udp_acceptor;
         self.connect_native_fallback_connected_joiner = connect_native_fallback_connected_joiner;
@@ -4855,6 +4870,8 @@ struct SnapshotExtras {
     pub connect_native_decision_over_cap: u64,
     /// Times the node turned its own native connects off after failures.
     pub connect_native_demotions: u64,
+    /// Times the node stopped deciding native as acceptor after failures.
+    pub connect_native_acceptor_demotions: u64,
     /// UDP dials that connected after a native setup that failed on the
     /// path, as joiner and as acceptor (R5's rescue).
     pub connect_native_rescued_by_udp_joiner: u64,
@@ -5126,6 +5143,7 @@ impl SnapshotExtras {
             || self.connect_native_decision_native_unsupported != 0
             || self.connect_native_decision_over_cap != 0
             || self.connect_native_demotions != 0
+            || self.connect_native_acceptor_demotions != 0
             || self.connect_native_rescued_by_udp_joiner != 0
             || self.connect_native_rescued_by_udp_acceptor != 0
             || self.connect_native_fallback_connected_joiner != 0
@@ -7774,6 +7792,7 @@ mod tests {
             "connect_native_decision_native_unsupported",
             "connect_native_decision_over_cap",
             "connect_native_demotions",
+            "connect_native_acceptor_demotions",
             "connect_native_rescued_by_udp_joiner",
             "connect_native_rescued_by_udp_acceptor",
             "connect_native_fallback_connected_joiner",

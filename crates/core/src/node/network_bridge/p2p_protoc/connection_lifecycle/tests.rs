@@ -3665,23 +3665,37 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
     use crate::transport::NativeSetupOutcome;
     let mut h = Harness::new("native-failure").await;
     use crate::transport::NatAttemptOrigin;
-    for (round, outcome, origin, demotions) in [
+    // (round, outcome, origin, joiner demotions, acceptor demotions), both
+    // cumulative over the rounds. Three path failures as acceptor demote only
+    // the acceptor role; three as joiner only the joiner role; a refusal by
+    // the node's own limits demotes neither.
+    for (round, outcome, origin, demotions, acceptor_demotions) in [
         (
             0u16,
             NativeSetupOutcome::OverBudgetDestination,
             NatAttemptOrigin::ConnectJoiner,
             0,
+            0,
         ),
         (
             1,
-            NativeSetupOutcome::TimedOut,
+            NativeSetupOutcome::OverBudgetDestination,
             NatAttemptOrigin::ConnectAcceptor,
+            0,
             0,
         ),
         (
             2,
             NativeSetupOutcome::TimedOut,
+            NatAttemptOrigin::ConnectAcceptor,
+            0,
+            1,
+        ),
+        (
+            3,
+            NativeSetupOutcome::TimedOut,
             NatAttemptOrigin::ConnectJoiner,
+            1,
             1,
         ),
     ] {
@@ -3728,6 +3742,76 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
             demotions,
             "{outcome:?} as {origin:?}"
         );
+        assert_eq!(
+            h.mgr
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .native_connect()
+                .acceptor_demotions(),
+            acceptor_demotions,
+            "{outcome:?} as {origin:?}: acceptor role"
+        );
+    }
+}
+
+/// 10.2 item 2: the acceptor role's streak is reset only by a native success
+/// as acceptor, the mirror of the joiner rule below. Two acceptor timeouts, a
+/// success as joiner and a third acceptor timeout demote the acceptor role
+/// (and the node then decides Udp); a success as acceptor in the same place
+/// resets the streak.
+#[tokio::test]
+async fn only_an_acceptors_native_success_resets_its_acceptor_streak() {
+    use crate::operations::connect::native::DialTransport;
+    use crate::transport::{NatAttemptOrigin, NativeSetupOutcome};
+    for (case, success_origin, demotions) in [
+        (0u16, NatAttemptOrigin::ConnectJoiner, 1),
+        (1, NatAttemptOrigin::ConnectAcceptor, 0),
+    ] {
+        let mut h = Harness::new(&format!("native-acceptor-success-origin-{case}")).await;
+        let addr = |i: u16| -> SocketAddr {
+            format!("203.0.113.236:{}", 6340 + case * 10 + i)
+                .parse()
+                .unwrap()
+        };
+        let fail = |i: u16| HandshakeEvent::OutboundFailed {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: PeerKeyLocation::new(key(), addr(i)),
+            error: ConnectionError::FailedConnectOp,
+            transient: false,
+            transport: DialTransport::native_now(),
+            native_outcome: Some(NativeSetupOutcome::TimedOut),
+            origin: NatAttemptOrigin::ConnectAcceptor,
+        };
+        h.handshake_event(fail(0)).await;
+        h.handshake_event(fail(1)).await;
+        let winner = PeerKeyLocation::new(key(), addr(2));
+        let _result =
+            pending_connect_peer_over(&mut h, winner.clone(), DialTransport::native_now()).await;
+        h.handshake_event(HandshakeEvent::OutboundEstablished {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: winner,
+            connection: Box::new(IdleConnection::new(addr(2))),
+            transient: false,
+            transport: DialTransport::native_now(),
+            origin: success_origin,
+        })
+        .await;
+        h.handshake_event(fail(3)).await;
+        let native = h
+            .mgr
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .native_connect();
+        assert_eq!(
+            native.acceptor_demotions(),
+            demotions,
+            "a native success as {success_origin:?}"
+        );
+        assert_eq!(native.demotions(), 0, "the joiner role saw no failure");
     }
 }
 

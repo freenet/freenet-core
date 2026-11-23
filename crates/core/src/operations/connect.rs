@@ -437,7 +437,8 @@ pub(crate) trait RelayContext {
     ) -> Option<PeerKeyLocation>;
 
     /// This node's readiness for QUIC-native connections, read when it
-    /// decides as acceptor.
+    /// decides as acceptor: off while either its joiner or its acceptor
+    /// demotion runs (`NativeConnectState::acceptor_readiness`).
     fn native_readiness(&self) -> native::NativeReadiness;
 
     /// Whether this node holds a transport to the joiner, by key or by
@@ -1009,7 +1010,7 @@ impl RelayContext for RelayEnv<'_> {
             .ring
             .connection_manager
             .native_connect()
-            .readiness()
+            .acceptor_readiness()
     }
 
     /// A ring connection to the joiner's key, or any transport the bridge

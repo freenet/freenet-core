@@ -1540,10 +1540,10 @@ impl P2pConnManager {
                 }
 
                 // A native dial ends here whatever follows, so it is no longer
-                // pending, and its setup worked, so a joiner's success resets
-                // the demotion streak before anything decides which
-                // connection to keep (only a joiner's failures count toward
-                // it). Then, if the peer already has an entry under the same
+                // pending, and its setup worked, so it resets the demotion
+                // streak of the role it was made in (joiner or acceptor, each
+                // counted apart) before anything decides which connection to
+                // keep. Then, if the peer already has an entry under the same
                 // key:
                 // - a UDP one: the survivor rule (`native_holds_peer`) swaps
                 //   this native connection in for it, in place, without
@@ -1557,13 +1557,21 @@ impl P2pConnManager {
                 if transport.is_native() {
                     state.native_pending.remove(&peer_addr);
                     let after_beside_udp = state.beside_udp_connected.remove(&peer_addr);
-                    if origin == crate::transport::NatAttemptOrigin::ConnectJoiner {
-                        self.bridge
-                            .op_manager
-                            .ring
-                            .connection_manager
-                            .native_connect()
-                            .record_success();
+                    let native_connect = self
+                        .bridge
+                        .op_manager
+                        .ring
+                        .connection_manager
+                        .native_connect();
+                    match origin {
+                        crate::transport::NatAttemptOrigin::ConnectJoiner => {
+                            native_connect.record_success();
+                        }
+                        crate::transport::NatAttemptOrigin::ConnectAcceptor => {
+                            native_connect.record_acceptor_success();
+                        }
+                        crate::transport::NatAttemptOrigin::Gateway
+                        | crate::transport::NatAttemptOrigin::RingPeerNoTransport => {}
                     }
                     #[cfg(any(test, feature = "testing"))]
                     {
@@ -1683,34 +1691,60 @@ impl P2pConnManager {
                     );
                 }
                 // Demotion counts only an end that says native does not work
-                // on the path (`counts_toward_demotion`), and only as joiner
-                // (a success resets the streak only as joiner too). A joiner's
-                // acceptors come from responses routed back along its CONNECT,
-                // while an acceptor's joiner chose it, so a joiner that
-                // decided to fail (any number of free keys) could otherwise
-                // demote an honest acceptor. This narrows who can demote a
-                // joiner, not to no one: the acceptor in a response is named
-                // by whoever sent it, so a relay on the CONNECT's path can name
-                // acceptors that never serve. The effect is a downgrade to
-                // UDP. An acceptor's own failures never demote it, which is a
-                // gap to close before native is enabled. The connect op then
-                // falls back to UDP.
-                if origin == crate::transport::NatAttemptOrigin::ConnectJoiner
-                    && native_outcome.is_some_and(|o| o.counts_toward_demotion())
-                {
-                    let demoted = self
+                // on the path (`counts_toward_demotion`: a refusal by this
+                // node's own limits never counts), in two streaks kept apart,
+                // each across distinct peers and reset only by a success in
+                // its own role:
+                // - As joiner: three failures turn the offer off. A joiner's
+                //   acceptors come from responses routed back along its
+                //   CONNECT. That narrows who can demote it, not to no one:
+                //   the acceptor in a response is named by whoever sent it, so
+                //   a relay on the CONNECT's path can name acceptors that never
+                //   serve.
+                // - As acceptor: three failures with distinct joiners turn its
+                //   `Native` decisions off, so an acceptor whose own native
+                //   path is broken stops costing every joiner the fallback
+                //   wait. Its joiners chose it and can fail on purpose, so
+                //   joiners holding three keys can turn an honest acceptor's
+                //   decisions off.
+                // Either way the effect is a downgrade to UDP for the
+                // cooldown, never a failed join. The connect op then falls
+                // back to UDP.
+                if native_outcome.is_some_and(|o| o.counts_toward_demotion()) {
+                    let native_connect = self
                         .bridge
                         .op_manager
                         .ring
                         .connection_manager
-                        .native_connect()
-                        .record_failure(peer.pub_key());
+                        .native_connect();
+                    let demoted = match origin {
+                        crate::transport::NatAttemptOrigin::ConnectJoiner => native_connect
+                            .record_failure(peer.pub_key())
+                            .then_some(false),
+                        crate::transport::NatAttemptOrigin::ConnectAcceptor => native_connect
+                            .record_acceptor_failure(peer.pub_key())
+                            .then_some(true),
+                        crate::transport::NatAttemptOrigin::Gateway
+                        | crate::transport::NatAttemptOrigin::RingPeerNoTransport => None,
+                    };
                     #[cfg(any(test, feature = "testing"))]
-                    if let (true, Some(addr)) = (demoted, peer.socket_addr()) {
-                        crate::operations::connect::native_wire_trace::record_at(
-                            addr,
-                            crate::operations::connect::native_wire_trace::NativeWireEvent::NativeDemoted,
-                        );
+                    if let (Some(as_acceptor), Some(addr)) = (demoted, peer.socket_addr()) {
+                        use crate::operations::connect::native_wire_trace::{
+                            NativeWireEvent, record_at,
+                        };
+                        if as_acceptor {
+                            if let Some(own) = self
+                                .bridge
+                                .op_manager
+                                .ring
+                                .connection_manager
+                                .get_own_addr()
+                            {
+                                record_at(own, NativeWireEvent::AcceptorDemoted { own });
+                            }
+                        } else {
+                            record_at(addr, NativeWireEvent::NativeDemoted);
+                        }
                     }
                     #[cfg(not(any(test, feature = "testing")))]
                     let _ = demoted;
@@ -2045,8 +2079,8 @@ impl P2pConnManager {
     /// one end and dropped at the other. That needs the native connection to
     /// have been silent for about two keepalive intervals (the window is at
     /// least twice the interval, asserted below), so about two lost
-    /// keepalives in a row; it is rare and tracked as a gate before native
-    /// connects are enabled.
+    /// keepalives in a row; it is rare, and the first enable step measures it
+    /// by joining both ends' setup outcomes (gate 22).
     ///
     /// The address of the live native connection that holds the peer a UDP
     /// connection at `addr` claims as `key`, if one does: the entry bound to

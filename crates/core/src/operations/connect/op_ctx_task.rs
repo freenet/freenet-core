@@ -1203,7 +1203,8 @@ enum CollectionEnd {
 /// directly (`plan_acceptor_dial`), so a native failure costs that time once
 /// per acceptor dialled native, not once per queued acceptor. Acceptors still
 /// queued at the limit are not dialled, as for UDP today. Revisit with the
-/// A5c soak's numbers before native is enabled.
+/// first enable step's joiner CONNECT outcomes (#6317) before native goes
+/// wider.
 pub(crate) const DIAL_DRAIN_LIMIT: std::time::Duration = std::time::Duration::from_secs(
     10 * crate::transport::connection_handler::NAT_TRAVERSAL_DEADLINE.as_secs(),
 );
@@ -1352,11 +1353,21 @@ fn plan_acceptor_dial(
 /// and whether it was accepted after a `Rejected` or `ConnectFailed` re-route.
 /// Called once the accept is dispatched, so a failed dispatch is not traced.
 fn trace_accept(
+    own: Option<SocketAddr>,
     upstream: SocketAddr,
     response: &super::ConnectResponse,
     joiner: Option<SocketAddr>,
     retry: bool,
 ) {
+    #[cfg(any(test, feature = "testing"))]
+    if let (Some(own), Some(super::native::NativeDecision::Native)) =
+        (own, response.native_decision)
+    {
+        super::native_wire_trace::record_at(
+            own,
+            super::native_wire_trace::NativeWireEvent::DecidedNative { own },
+        );
+    }
     #[cfg(any(test, feature = "testing"))]
     super::native_wire_trace::record_at(
         upstream,
@@ -1367,7 +1378,7 @@ fn trace_accept(
         },
     );
     #[cfg(not(any(test, feature = "testing")))]
-    let _ = (upstream, response, joiner, retry);
+    let _ = (own, upstream, response, joiner, retry);
 }
 
 /// Starts the hole punch to `acceptor`, whose Response arrived at
@@ -1748,6 +1759,7 @@ async fn drive_relay_connect(
             op_manager.ring.register_events(Either::Left(event)).await;
         }
         trace_accept(
+            op_manager.ring.connection_manager.get_own_addr(),
             upstream_addr,
             &accept.response,
             accept.joiner.socket_addr(),
@@ -1936,7 +1948,13 @@ async fn drive_relay_connect(
                         accept.native_arm,
                     )
                     .await?;
-                    trace_accept(upstream_addr, &accept.response, joiner_addr, true);
+                    trace_accept(
+                        op_manager.ring.connection_manager.get_own_addr(),
+                        upstream_addr,
+                        &accept.response,
+                        joiner_addr,
+                        true,
+                    );
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
                         upstream_addr,
@@ -2116,7 +2134,13 @@ async fn drive_relay_connect(
                         accept.native_arm,
                     )
                     .await?;
-                    trace_accept(upstream_addr, &accept.response, joiner_addr, true);
+                    trace_accept(
+                        op_manager.ring.connection_manager.get_own_addr(),
+                        upstream_addr,
+                        &accept.response,
+                        joiner_addr,
+                        true,
+                    );
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
                         upstream_addr,

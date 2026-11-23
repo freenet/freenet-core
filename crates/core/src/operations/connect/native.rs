@@ -54,8 +54,10 @@ pub(crate) const LEVEL_NATIVE_CAPABLE: u8 = 1;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const LEVEL_NATIVE_ONLY: u8 = 2;
 
-/// Consecutive native failures, across distinct acceptors, after which a
-/// joiner offers percent 0 for [`DEMOTION_COOLDOWN`].
+/// Consecutive native failures, across distinct peers, after which a node
+/// stops using native in that role for [`DEMOTION_COOLDOWN`]: as joiner, with
+/// distinct acceptors, it offers percent 0; as acceptor, with distinct
+/// joiners, it decides `Udp`.
 pub(crate) const DEMOTION_FAILURES: usize = 3;
 
 /// How long a demoted node offers (or decides) nothing native.
@@ -465,7 +467,16 @@ pub(crate) struct NativeConnectState {
     /// [`NATIVE_DIAL_READY`] and [`QUIC_NATIVE_PERCENT`]
     /// (`NodeConfig::native_connect_override`). `None` in production.
     release_override: Option<u8>,
+    /// Driven by native setups this node made as joiner. Lowers its offer
+    /// and, through [`Self::readiness`], its decisions as acceptor too.
     demotion: parking_lot::Mutex<NativeDemotion>,
+    /// Driven only by native setups this node made as acceptor, across
+    /// distinct joiners. Lowers only its decisions as acceptor
+    /// ([`Self::acceptor_readiness`]): an acceptor whose own native path is
+    /// broken (a gateway, a node at its target that rarely joins) would
+    /// otherwise keep deciding `Native` for every joiner, and each of those
+    /// joiners would wait out the fallback and take a strike against it.
+    acceptor_demotion: parking_lot::Mutex<NativeDemotion>,
     /// This node's QUIC endpoint, set when its transport opens. Until then,
     /// and when it is not up, the node cannot dial native. Read per node, not
     /// from the process-wide endpoint metric, which several simulated nodes
@@ -478,6 +489,7 @@ impl NativeConnectState {
         Self {
             release_override,
             demotion: parking_lot::Mutex::new(NativeDemotion::new()),
+            acceptor_demotion: parking_lot::Mutex::new(NativeDemotion::new()),
             endpoint: std::sync::OnceLock::new(),
         }
     }
@@ -488,8 +500,19 @@ impl NativeConnectState {
         self.endpoint.get_or_init(|| endpoint);
     }
 
-    /// This node's readiness now, as joiner and as acceptor.
+    /// This node's readiness now, as joiner: the offer it sends and whether
+    /// it can dial a `Native` decision. Demoted only by its joiner failures.
     pub(crate) fn readiness(&self) -> NativeReadiness {
+        self.readiness_with(false)
+    }
+
+    /// This node's readiness now, as acceptor, read when it decides: as
+    /// [`Self::readiness`], and also off while its acceptor demotion runs.
+    pub(crate) fn acceptor_readiness(&self) -> NativeReadiness {
+        self.readiness_with(true)
+    }
+
+    fn readiness_with(&self, as_acceptor: bool) -> NativeReadiness {
         let endpoint_up = self
             .endpoint
             .get()
@@ -498,7 +521,9 @@ impl NativeConnectState {
             Some(percent) => (true, percent),
             None => (NATIVE_DIAL_READY, QUIC_NATIVE_PERCENT),
         };
-        let demoted = self.demotion.lock().is_demoted(Instant::now());
+        let now = Instant::now();
+        let demoted = self.demotion.lock().is_demoted(now)
+            || (as_acceptor && self.acceptor_demotion.lock().is_demoted(now));
         NativeReadiness::from_parts(dial_ready, endpoint_up, demoted, release_percent)
     }
 
@@ -522,25 +547,58 @@ impl NativeConnectState {
         self.demotion.lock().record_success();
     }
 
+    /// A native setup this node made as ACCEPTOR, with `joiner`, failed in a
+    /// way that says native does not work on that path. Counted apart from
+    /// the joiner streak, across distinct joiners, so one joiner failing on
+    /// purpose counts once. Returns whether this failure demoted the
+    /// acceptor role, which is counted.
+    pub(crate) fn record_acceptor_failure(&self, joiner: &TransportPublicKey) -> bool {
+        let demoted = self
+            .acceptor_demotion
+            .lock()
+            .record_failure(joiner, Instant::now());
+        if demoted {
+            TRANSPORT_METRICS.record_connect_native_acceptor_demotion();
+            tracing::info!(
+                cooldown_secs = DEMOTION_COOLDOWN.as_secs(),
+                "QUIC-native decisions off as acceptor after native failures with distinct joiners"
+            );
+        }
+        demoted
+    }
+
+    /// A native setup this node made as acceptor succeeded: the acceptor
+    /// streak starts over.
+    pub(crate) fn record_acceptor_success(&self) {
+        self.acceptor_demotion.lock().record_success();
+    }
+
     /// How many times this node was demoted.
     #[cfg(test)]
     pub(crate) fn demotions(&self) -> u64 {
         self.demotion.lock().demotions()
     }
+
+    /// How many times this node's acceptor role was demoted.
+    #[cfg(test)]
+    pub(crate) fn acceptor_demotions(&self) -> u64 {
+        self.acceptor_demotion.lock().demotions()
+    }
 }
 
-/// Lowers a node's native offer (or, on an acceptor, its decisions) after
-/// repeated native failures, as joiner or as acceptor
-/// ([`NativeConnectState`]). A failure is always followed by a UDP dial to
-/// the same peer, so demotion only stops new native attempts.
+/// One role's demotion after repeated native failures
+/// ([`NativeConnectState`] holds one for the joiner role and one for the
+/// acceptor role). A failure is always followed by a UDP dial to the same
+/// peer, so demotion only stops new native attempts.
 ///
-/// [`DEMOTION_FAILURES`] failures in a row, each with a different acceptor,
-/// demote the node for [`DEMOTION_COOLDOWN`]; a success resets the streak.
-/// Repeated failures with one acceptor count once, so one broken peer cannot
-/// demote a node. It only ever lowers: it can make a node offer 0, never more.
+/// [`DEMOTION_FAILURES`] failures in a row, each with a different peer,
+/// demote the role for [`DEMOTION_COOLDOWN`]; a success in that role resets
+/// the streak. Repeated failures with one peer count once, so one broken peer
+/// cannot demote a node. It only ever lowers: it can make a node offer 0 or
+/// decide `Udp`, never more.
 #[derive(Debug)]
 pub(crate) struct NativeDemotion {
-    /// Distinct acceptors in the current failure streak, at most
+    /// Distinct peers in the current failure streak, at most
     /// [`DEMOTION_FAILURES`].
     streak: Vec<TransportPublicKey>,
     demoted_until: Option<Instant>,
@@ -556,14 +614,14 @@ impl NativeDemotion {
         }
     }
 
-    /// A native attempt with `acceptor` failed. Returns whether it demoted
-    /// the node.
-    pub(crate) fn record_failure(&mut self, acceptor: &TransportPublicKey, now: Instant) -> bool {
+    /// A native attempt with `peer` failed. Returns whether it demoted the
+    /// role.
+    pub(crate) fn record_failure(&mut self, peer: &TransportPublicKey, now: Instant) -> bool {
         if self.is_demoted(now) {
             return false;
         }
-        if !self.streak.contains(acceptor) {
-            self.streak.push(acceptor.clone());
+        if !self.streak.contains(peer) {
+            self.streak.push(peer.clone());
         }
         if self.streak.len() >= DEMOTION_FAILURES {
             self.streak.clear();
@@ -1020,6 +1078,63 @@ mod tests {
         assert_eq!(on.demotions(), 1);
         assert!(!on.readiness().ready, "demoted");
         assert_eq!(on.readiness().percent, 0);
+        assert!(
+            !on.acceptor_readiness().ready,
+            "a demoted joiner does not decide native as acceptor either"
+        );
+    }
+
+    /// The acceptor role has its own streak (10.2 item 2). Failures as
+    /// acceptor with three distinct joiners stop the node DECIDING native
+    /// (its acceptor readiness, which `decide_native` reads, goes to percent
+    /// 0) while its own offer as joiner is untouched; repeats with one joiner
+    /// count once; an acceptor success restarts the streak, and a joiner
+    /// success does not touch it. The two streaks never feed each other.
+    #[test]
+    fn acceptor_failures_turn_off_only_the_acceptor_decision() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let on = NativeConnectState::new(Some(100));
+        on.set_endpoint(watch);
+        let joiner = key(9);
+        for _ in 0..5 {
+            assert!(!on.record_acceptor_failure(&joiner));
+        }
+        assert!(on.acceptor_readiness().ready, "one joiner counts once");
+        assert!(!on.record_acceptor_failure(&key(10)));
+        on.record_success();
+        assert!(
+            on.record_acceptor_failure(&key(11)),
+            "a joiner success does not reset the acceptor streak, so this is the third"
+        );
+        assert_eq!(on.acceptor_demotions(), 1, "three distinct joiners");
+        assert_eq!(on.demotions(), 0, "the joiner streak saw nothing");
+        assert!(on.readiness().ready, "its own offer is untouched");
+        assert_eq!(on.readiness().percent, 100);
+        let acceptor = on.acceptor_readiness();
+        assert!(!acceptor.ready);
+        assert_eq!(acceptor.percent, 0);
+        // 0 against any offer: every bucket is at or above 0, so Udp.
+        for bucket in [0u8, 50, 99] {
+            assert_eq!(
+                decide_native(Some(NativeOffer::capable(100)), acceptor, bucket, false),
+                NativeDecision::Udp
+            );
+        }
+
+        let fresh = NativeConnectState::new(Some(100));
+        let (_endpoint2, watch2) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        fresh.set_endpoint(watch2);
+        fresh.record_acceptor_failure(&key(1));
+        fresh.record_acceptor_failure(&key(2));
+        fresh.record_acceptor_success();
+        fresh.record_acceptor_failure(&key(3));
+        assert_eq!(fresh.acceptor_demotions(), 0, "an acceptor success resets");
+        assert!(fresh.acceptor_readiness().ready);
+        for i in 20..23 {
+            fresh.record_failure(&key(i));
+        }
+        assert_eq!(fresh.acceptor_demotions(), 0, "joiner failures never count");
     }
 
     /// Every level and percent decodes and re-encodes to the same bytes, so a

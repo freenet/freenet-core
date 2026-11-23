@@ -23538,6 +23538,89 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
     assert!(connected);
 }
 
+/// 10.2 item 2: one node whose native path is broken (every QUIC datagram to
+/// and from it dropped) demotes its ACCEPTOR role after native failures with
+/// distinct joiners, and from then on decides `Udp`, so the joiners it
+/// accepts stop waiting out the native fallback against it. Every other pair
+/// keeps native. Fails closed: the broken node must have decided native and
+/// failed before it demoted, and other pairs must still form native
+/// connections.
+#[test_log::test]
+fn test_quic_native_broken_acceptor_stops_deciding_native() {
+    use freenet::dev_tool::NodeLabel;
+    const SEED: u64 = 0x0059_40A5_00F1;
+    let name = "native-broken-acceptor";
+    // The third node by label: on this seed it is the busiest acceptor of a
+    // healthy run (11 native decisions), so with its path broken it meets
+    // enough distinct joiners to demote. A node that accepts little demotes
+    // its JOINER role first, which also stops its decisions and would not
+    // show the acceptor streak.
+    let broken_index = 2;
+    let mut broken = None;
+    let run = run_native_connect_sim(name, SEED, 200, |sim| {
+        sim.with_native_connect(100);
+        let mut labels: Vec<(NodeLabel, std::net::SocketAddr)> = sim
+            .all_node_addresses()
+            .iter()
+            .map(|(l, a)| (l.clone(), *a))
+            .collect();
+        labels.sort();
+        let (label, addr) = labels[broken_index].clone();
+        broken = Some(addr);
+        for (other, _) in &labels {
+            if *other != label {
+                sim.drop_quic_datagrams_between(&label, other, Duration::ZERO);
+            }
+        }
+    });
+    log_native_connect(name, &run);
+    let broken = broken.expect("premise: the broken node was chosen");
+    let t = &run.wire.trace;
+    let decisions = t.native_decisions();
+    let demoted = t.acceptor_demotions();
+    let mut per_node = std::collections::BTreeMap::new();
+    for (own, _) in &decisions {
+        *per_node.entry(*own).or_insert(0usize) += 1;
+    }
+    tracing::info!(?broken, ?per_node, ?demoted, "broken acceptor run");
+    let demoted_at = demoted
+        .iter()
+        .filter(|(own, _)| *own == broken)
+        .map(|(_, seq)| *seq)
+        .min();
+    let before: Vec<u64> = decisions
+        .iter()
+        .filter(|(own, seq)| *own == broken && demoted_at.is_none_or(|at| *seq < at))
+        .map(|(_, seq)| *seq)
+        .collect();
+    let after: Vec<u64> = decisions
+        .iter()
+        .filter(|(own, seq)| *own == broken && demoted_at.is_some_and(|at| *seq > at))
+        .map(|(_, seq)| *seq)
+        .collect();
+    assert!(
+        before.len() >= 3,
+        "premise: the broken node decided native at least three times before demoting ({})",
+        before.len()
+    );
+    assert!(
+        demoted_at.is_some(),
+        "the broken node demoted its acceptor role"
+    );
+    assert_eq!(
+        after,
+        Vec::<u64>::new(),
+        "the broken node decided native after its acceptor role demoted"
+    );
+    assert!(
+        t.native_established() > 0,
+        "premise: pairs without the broken node still connect natively"
+    );
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined");
+    assert!(connected);
+}
+
 /// Behind each NAT filtering class, native connections form between peers
 /// (the setup's punches open both NATs), carry messages, and every node
 /// joins. Fails closed: native connections must have formed, and the
@@ -23983,7 +24066,12 @@ fn test_quic_native_without_frames_keeps_udp() {
 #[test_log::test]
 fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
     use freenet::dev_tool::{NatFiltering, SimNat};
-    const SEED: u64 = 0x0059_40A5_00E1;
+    // Was ..00E1. Its one UDP dial that connected after a native failure (a
+    // gateway acceptor's, the "fallback > 0" premise below) does not occur
+    // once symmetric acceptors demote their acceptor role (10.2 item 2) and
+    // the run takes another course. With the demotion, 6 of seeds ..00E1 to
+    // ..00E8 produce such a dial; ..00E1 and ..00E7 do not.
+    const SEED: u64 = 0x0059_40A5_00E2;
     let name = "native-nat-symmetric";
     let nat = SimNat {
         classes: vec![NatFiltering::Symmetric, NatFiltering::PortRestricted],

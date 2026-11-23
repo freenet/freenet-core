@@ -287,6 +287,10 @@ pub mod sim_trace {
         native_established: AtomicU64,
         native_failed: AtomicU64,
         native_demotions: AtomicU64,
+        /// `Native` decisions, as (acceptor, `seq` when it answered).
+        native_decisions: parking_lot::Mutex<Vec<(SocketAddr, u64)>>,
+        /// Acceptor-role demotions, as (node, `seq`).
+        acceptor_demotions: parking_lot::Mutex<Vec<(SocketAddr, u64)>>,
         /// Native failures, as (transaction, node, peer), whose node has not
         /// yet asked for a UDP dial to that peer in that transaction.
         fallbacks_pending: parking_lot::Mutex<
@@ -374,6 +378,11 @@ pub mod sim_trace {
         NativeDial { established: bool },
         /// A node turned its own native connects off.
         NativeDemoted,
+        /// The node `own` answered a request as acceptor with `Native`.
+        DecidedNative { own: SocketAddr },
+        /// The node `own` stopped deciding `Native` as acceptor after native
+        /// failures with distinct joiners.
+        AcceptorDemoted { own: SocketAddr },
         /// The node `own` failed a native setup with `peer` in `tx`; the
         /// connect op must dial UDP to that peer next.
         NativeFailedFor {
@@ -485,6 +494,16 @@ pub mod sim_trace {
                         c.transport_seqs.lock().remove(&(own, addr));
                     }
                 }
+                return;
+            }
+            NativeWireEvent::DecidedNative { own } => {
+                let seq = c.seq.fetch_add(1, Ordering::Relaxed);
+                c.native_decisions.lock().push((own, seq));
+                return;
+            }
+            NativeWireEvent::AcceptorDemoted { own } => {
+                let seq = c.seq.fetch_add(1, Ordering::Relaxed);
+                c.acceptor_demotions.lock().push((own, seq));
                 return;
             }
             NativeWireEvent::NativeReplacedByUdp { own } => {
@@ -691,6 +710,15 @@ pub mod sim_trace {
         /// Times a node demoted itself.
         pub fn native_demotions(&self) -> u64 {
             Self::get(&self.0.native_demotions)
+        }
+        /// `Native` decisions, as (acceptor, order), in the order made.
+        pub fn native_decisions(&self) -> Vec<(SocketAddr, u64)> {
+            self.0.native_decisions.lock().clone()
+        }
+        /// Acceptor-role demotions, as (node, order), on the same order as
+        /// [`Self::native_decisions`].
+        pub fn acceptor_demotions(&self) -> Vec<(SocketAddr, u64)> {
+            self.0.acceptor_demotions.lock().clone()
         }
         /// Native failures followed by a UDP dial from the same node to the
         /// same peer in the same transaction.
