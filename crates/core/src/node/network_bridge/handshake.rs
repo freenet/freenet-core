@@ -662,6 +662,7 @@ async fn join_gateway_native(
             Err(_) => Err(crate::transport::NativeSetupOutcome::TimedOut),
         };
     policy.native.record_gateway_join(addr, result.is_ok());
+    #[cfg(any(test, feature = "testing"))]
     crate::operations::connect::native_wire_trace::record_at(
         addr,
         crate::operations::connect::native_wire_trace::NativeWireEvent::GatewayNativeJoin {
@@ -748,6 +749,7 @@ async fn connect_outbound(
                             crate::transport::TRANSPORT_METRICS
                                 .record_gateway_native_join_time(started.elapsed(), addr);
                         }
+                        #[cfg(any(test, feature = "testing"))]
                         crate::operations::connect::native_wire_trace::record_at(
                             addr,
                             crate::operations::connect::native_wire_trace::NativeWireEvent::GatewayJoinFallback {
@@ -1274,7 +1276,9 @@ mod tests {
                     transport: crate::operations::connect::native::DialTransport::Native {
                         deadline: tokio::time::Instant::now() + Duration::from_secs(5),
                     },
+                    join: false,
                 },
+                None,
                 None,
             )
             .await;
