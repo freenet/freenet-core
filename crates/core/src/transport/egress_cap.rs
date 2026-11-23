@@ -2181,8 +2181,9 @@ impl StreamPacing {
     /// cut, so a stream still fails at [`PACED_WAIT_DEADLINE`] (counted as
     /// abandoned) while it waits. One waiter per stream, so streams and QUIC
     /// connections are admitted in the order they queued (see "Node-wide
-    /// egress cap" in `.claude/rules/transport.md` for why this replaced the
-    /// race of jittered sleeps). After [`Admission::Waited`] the caller
+    /// egress cap" in `.claude/rules/transport.md`, and the measurements in
+    /// `docs/architecture/transport/rules-reference.md`, for why this replaced
+    /// the race of jittered sleeps). After [`Admission::Waited`] the caller
     /// re-checks cwnd and calls again; that call takes the turn it was given
     /// without queueing, within [`ADMISSION_PASS`].
     pub(crate) async fn wait_for_admission<T: TimeSource>(

@@ -5615,7 +5615,7 @@ fn a_path_dark_in_both_directions_is_closed_as_dark() {
 /// (with one round, outages of 26 s to 40 s closed here).
 /// A path that stays dark is closed as dark. Prints the close latency
 /// at 50, 300 and 800 ms round trips for a path that stays dark (the figures
-/// in `transport.md`).
+/// in `docs/architecture/transport/rules-reference.md`).
 #[test]
 fn the_dark_rule_waits_out_the_probe_backoff_of_an_ack_only_peer() {
     use crate::transport::in_memory_socket::{
