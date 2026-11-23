@@ -118,7 +118,9 @@ if [[ "$HOSTNAME_TAG" == "nova" ]]; then
     else
         echo "  WARNING: freenet-gateway.service does not exist yet; enable it once it does" >&2
     fi
-    systemctl enable freenet-gateway-2.service
+    # reenable (not enable) so an upgrade of an install made before #6336 also
+    # drops the old freenet-gateway.service.wants/freenet-gateway-2.service link.
+    systemctl reenable freenet-gateway-2.service
     echo "  Installed gw2 + stagger units (not started; no gateway is restarted)"
 fi
 

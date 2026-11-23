@@ -527,7 +527,8 @@ cleanup() {
 schedule_companion_restart() {
     local stagger_unit="${STAGGER_UNIT:-freenet-gateway-stagger.service}"
 
-    if [[ "$ALL_INSTANCES" == "true" || "$SERVICE_NAME" != "freenet-gateway" ]]; then
+    # --all-instances always deploys freenet-gateway, so it queues too.
+    if [[ "$ALL_INSTANCES" != "true" && "$SERVICE_NAME" != "freenet-gateway" ]]; then
         return 0
     fi
     if ! systemctl list-unit-files "$stagger_unit" 2>/dev/null | grep -q "$stagger_unit"; then

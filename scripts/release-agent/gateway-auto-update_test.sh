@@ -253,10 +253,17 @@ else
 fi
 
 sc_reset; touch "$SC/has-unit"
-if sc_run freenet-gateway-hector && sc_run freenet-gateway true && [[ ! -e "$SC/started" ]]; then
-    pass "schedule_companion_restart: other service or --all-instances -> skipped"
+if sc_run freenet-gateway-hector && [[ ! -e "$SC/started" ]]; then
+    pass "schedule_companion_restart: a non-default service is skipped"
 else
-    fail "schedule_companion_restart: must only act for the default unit without --all-instances"
+    fail "schedule_companion_restart: must not act for a non-default unit"
+fi
+
+sc_reset; touch "$SC/has-unit"
+if sc_run freenet-gateway true && grep -q 'start --no-block freenet-gateway-stagger.service' "$SC/started" 2>/dev/null; then
+    pass "schedule_companion_restart: --all-instances also queues the stagger"
+else
+    fail "schedule_companion_restart: --all-instances deploys the primary too, so it must queue the stagger"
 fi
 
 sc_reset; touch "$SC/has-unit" "$SC/start-fails"
