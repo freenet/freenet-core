@@ -63,6 +63,16 @@ pub const SECRET_PREFIX: &[u8] = b"SECRET:";
 /// Where a deposited secret lands.
 pub const DEPOSITED_SECRET_KEY: &[u8] = b"deposited-secret";
 
+/// A delegate message whose payload begins with this prefix is ANSWERED: the
+/// receiver sends one delegate message back to the message's sender, with
+/// payload `REPLY_ACK_PREFIX` followed by the rest. The caller receives it
+/// as an ordinary delegate message (the echo branch below), so its output
+/// reports the reply's sender, payload and attested origin.
+pub const REPLY_PREFIX: &[u8] = b"REPLY:";
+
+/// Prefix of the payload a `REPLY_PREFIX` message is answered with.
+pub const REPLY_ACK_PREFIX: &[u8] = b"ack:";
+
 struct Delegate;
 
 #[delegate]
@@ -140,6 +150,17 @@ impl DelegateInterface for Delegate {
                     Some(MessageOrigin::WebApp(_)) | None => None,
                     Some(_) => None,
                 };
+
+                // REPLY PATH: answer the sender once. The sender field is a
+                // placeholder; the node sets it to this delegate's key.
+                if let Some(rest) = msg.payload.strip_prefix(REPLY_PREFIX) {
+                    let mut payload = REPLY_ACK_PREFIX.to_vec();
+                    payload.extend_from_slice(rest);
+                    let placeholder = DelegateKey::new([0u8; 32], CodeHash::new([0u8; 32]));
+                    return Ok(vec![OutboundDelegateMsg::SendDelegateMessage(
+                        DelegateMessage::new(msg.sender, placeholder, payload),
+                    )]);
+                }
 
                 // SECRET DEPOSIT PATH. Store the payload and report a COUNT ONLY.
                 //
