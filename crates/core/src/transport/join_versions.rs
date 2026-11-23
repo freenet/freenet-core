@@ -113,8 +113,9 @@ pub(crate) enum JoinTransport {
     /// Today's UDP gateway handshake (intro packet, then ack).
     LegacyIntro,
     /// A join made over QUIC directly: a gateway records it when its native
-    /// dial gives a connection. Zero in production until native connects
-    /// are on.
+    /// dial gives a connection, or when the node takes a native join its
+    /// transport admitted (#5940, phase B). Zero in production until native
+    /// connects are on.
     Native,
 }
 

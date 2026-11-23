@@ -1976,11 +1976,14 @@ impl P2pConnManager {
     /// A native join handed over by this gateway's transport (#5940, phase
     /// B), with the key the joiner proved in its handshake.
     ///
-    /// - An entry for the same key at the address that is native already:
-    ///   the first is kept and this one closed.
-    /// - A UDP entry for the same key: this one is held beside it until it
-    ///   carries a frame (`hold_native`), as for a native dial.
-    /// - Otherwise it becomes the entry, native, bound to the proven key
+    /// - A UDP entry for the same key at the address: this one is held
+    ///   beside it until it carries a frame (`hold_native`), as for a native
+    ///   dial. The UDP survivor rule does not apply to a proven native join.
+    /// - Otherwise, including a native entry for the same key (the joiner
+    ///   joined again, so the older connection is taken to be stale), it
+    ///   replaces any entry at the address with the full cleanup of
+    ///   `handle_successful_connection`, and becomes the entry, native,
+    ///   bound to the proven key
     ///   without promotion, which is where a legacy join stands once its
     ///   ConnectRequest named it: the connect op promotes it (ConnectPeer),
     ///   and a ConnectRequest naming another key closes it
@@ -1995,28 +1998,16 @@ impl P2pConnManager {
         handshake_commands: &HandshakeCommandSender,
     ) -> anyhow::Result<()> {
         let remote_addr = connection.remote_addr();
-        let existing_native = self
+        let udp_entry_for_key = self
             .connections
             .get(&remote_addr)
-            .filter(|entry| entry.pub_key() == Some(&key))
-            .map(|entry| entry.native);
-        match existing_native {
-            Some(true) => {
-                tracing::info!(
-                    remote = %remote_addr,
-                    "Native join from a peer this node holds natively; keeping the first"
-                );
-                drop(connection);
-                return Ok(());
-            }
-            Some(false) => {
-                tracing::info!(
-                    remote = %remote_addr,
-                    "Native join from a peer this node holds over UDP; holding it beside"
-                );
-                return self.hold_native(remote_addr, connection, key).await;
-            }
-            None => {}
+            .is_some_and(|entry| !entry.native && entry.pub_key() == Some(&key));
+        if udp_entry_for_key {
+            tracing::info!(
+                remote = %remote_addr,
+                "Native join from a peer this node holds over UDP; holding it beside"
+            );
+            return self.hold_native(remote_addr, connection, key).await;
         }
         tracing::info!(remote = %remote_addr, pub_key = %key, "Native join established");
         self.record_native_gateway_join(remote_addr, connection.remote_version());
@@ -3511,16 +3502,17 @@ async fn fail_awaiting_connection_callbacks(state: &mut EventListenerState, addr
     fail_udp_beside_native(state, addr).await;
 }
 
-/// Sends the first-frame probe on a native connection's channel: a message
-/// the peer's listener decodes and the event loop ignores (`Aborted` of a
-/// transaction nothing owns), so each end's native connection carries a frame
-/// whatever else is or is not sent. `try_send` on a channel this call has
-/// just made (or a fresh entry's) cannot find it full; if it somehow did, the
-/// peer's hold window expires and UDP stays, which is the safe outcome.
 /// How long a gateway's native joiner has, from the hand-over, to send its
 /// ConnectRequest (#5940, phase B). A joiner sends it as soon as its
 /// connection is up, so this only closes a connection that is not used for
-/// a join, sooner than the zombie sweep would.
+/// a join.
+///
+/// A one-shot timer per join ([`watch_native_join`]) enforces it, not the
+/// zombie sweep: the sweep runs on the 30 s stats tick (backlog slices can be
+/// spaced up to 4x a 6.4 s slice), so through it the bound would be 30 s or
+/// more. The timer closes such a join 5 s after the hand-over, which follows
+/// the joiner's Hello at once; the sweep stays the backstop for a join that
+/// sent a request and was never promoted, as for a legacy join.
 const NATIVE_JOIN_REQUEST_WITHIN: Duration = Duration::from_secs(5);
 
 /// Close the native join at `peer_addr` unless its peer sends a request
@@ -3533,8 +3525,8 @@ fn watch_native_join(
     link_use: zombie_sweep::LinkUseStamp,
     peer_addr: SocketAddr,
 ) {
-    drop(tokio::spawn(async move {
-        tokio::time::sleep(NATIVE_JOIN_REQUEST_WITHIN).await;
+    drop(GlobalExecutor::spawn(async move {
+        sleep(NATIVE_JOIN_REQUEST_WITHIN).await;
         if link_use.requested() || sender.is_closed() {
             return;
         }
@@ -3550,6 +3542,12 @@ fn watch_native_join(
     }));
 }
 
+/// Sends the first-frame probe on a native connection's channel: a message
+/// the peer's listener decodes and the event loop ignores (`Aborted` of a
+/// transaction nothing owns), so each end's native connection carries a frame
+/// whatever else is or is not sent. `try_send` on a channel this call has
+/// just made (or a fresh entry's) cannot find it full; if it somehow did, the
+/// peer's hold window expires and UDP stays, which is the safe outcome.
 fn send_native_probe(sender: &PeerConnChannelSender, peer_addr: SocketAddr) {
     #[cfg(any(test, feature = "testing"))]
     if crate::operations::connect::native_wire_trace::native_probe_suppressed(peer_addr) {

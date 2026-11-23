@@ -6283,7 +6283,27 @@ async fn a_native_join_is_bound_to_its_proven_key_and_not_promoted() {
     let addr: SocketAddr = "198.51.100.231:7501".parse().unwrap();
     h.use_addr(addr);
     let joiner = key();
+    let own = h
+        .mgr
+        .bridge
+        .op_manager
+        .ring
+        .connection_manager
+        .get_own_addr()
+        .unwrap_or(addr);
+    let counters = crate::transport::join_versions::test_registry::isolate(own);
     native_join(&mut h, addr, &joiner).await;
+    let native = crate::transport::join_versions::JoinTransport::ALL
+        .iter()
+        .position(|t| *t == crate::transport::join_versions::JoinTransport::Native)
+        .unwrap();
+    let counts = counters.take();
+    assert_eq!(
+        counts[native].iter().sum::<u64>(),
+        1,
+        "counted as a native join"
+    );
+    assert_eq!(counts.iter().flatten().sum::<u64>(), 1, "and nothing else");
     let entry = &h.mgr.connections[&addr];
     assert!(entry.native, "a native entry");
     assert!(!entry.frame_seen, "it has to carry a frame first");
@@ -6297,18 +6317,43 @@ async fn a_native_join_is_bound_to_its_proven_key_and_not_promoted() {
 }
 
 /// A second native join from a peer this node already holds natively at the
-/// address is dropped; the first connection stays the entry.
+/// address replaces the first: the joiner joined again, so the first
+/// connection is stale. The first's task loses its channel, and the maps hold
+/// only the newer connection.
 #[tokio::test]
-async fn a_native_join_beside_a_native_entry_for_its_key_is_dropped() {
+async fn a_native_join_replaces_a_native_entry_for_its_key() {
     let mut h = Harness::new("native-join-twice").await;
     let addr: SocketAddr = "198.51.100.231:7502".parse().unwrap();
     h.use_addr(addr);
     let joiner = key();
     native_join(&mut h, addr, &joiner).await;
     let first = h.mgr.connections[&addr].connection_id;
+    let first_sender = h.mgr.connections[&addr].sender.clone();
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    let transients = cm.transient_count();
     native_join(&mut h, addr, &joiner).await;
-    assert_eq!(h.mgr.connections[&addr].connection_id, first);
+    let entry = &h.mgr.connections[&addr];
+    assert_ne!(
+        entry.connection_id, first,
+        "the newer connection is the entry"
+    );
+    assert!(entry.native, "a native entry");
+    assert_eq!(entry.pub_key(), Some(&joiner), "bound to the proven key");
+    assert_eq!(h.mgr.addr_by_pub_key.get(&joiner), Some(&addr));
+    assert_eq!(h.mgr.connections.len(), 1, "one entry");
     assert!(h.mgr.held_native.is_empty(), "nothing held beside it");
+    assert_eq!(
+        cm.transient_count(),
+        transients,
+        "no transient slot taken or leaked"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !first_sender.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first connection's task ends");
 }
 
 /// A native join from a peer this node holds over UDP at the address is held
