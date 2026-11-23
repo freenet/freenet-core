@@ -1034,7 +1034,16 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         // listener's new connections (#5940, phase B).
         let native_joins = quic_upgrades.as_ref().map(|upgrades| {
             let (to_node, native_joins) = mpsc::channel(NATIVE_JOIN_HANDOFF);
-            upgrades.set_join_handoff(to_node);
+            // A simulation can stand in for a release without the hand-off,
+            // which closes every completed join after its Hello.
+            #[cfg(any(test, feature = "testing"))]
+            let to_node = (!super::in_memory_socket::gateway_closes_native_joins(socket_addr))
+                .then_some(to_node);
+            #[cfg(not(any(test, feature = "testing")))]
+            let to_node = Some(to_node);
+            if let Some(to_node) = to_node {
+                upgrades.set_join_handoff(to_node);
+            }
             native_joins
         });
         let upgrade_site =

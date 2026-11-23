@@ -2334,6 +2334,21 @@ impl SimNetwork {
         self
     }
 
+    /// Makes the gateway `label` close every native join it completes, right
+    /// after the Hello, as a release before the hand-off to the node did.
+    /// Pair it with [`Self::with_gateway_native_admission`]. Call before the
+    /// simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_gateway_closing_native_joins(&mut self, label: &NodeLabel) -> &mut Self {
+        assert!(label.is_gateway(), "only a gateway admits native joins");
+        let addr = *self
+            .node_addresses
+            .get(label)
+            .expect("the gateway must have an address in this network");
+        crate::transport::in_memory_socket::force_gateway_closing_native_joins(&self.name, addr);
+        self
+    }
+
     /// Turns native gateway joins (phase B) on for every node, at `percent`
     /// (the share of joiner-gateway pairs that dial native first), in place of
     /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, which are off,

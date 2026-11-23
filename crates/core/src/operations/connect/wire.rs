@@ -341,6 +341,8 @@ pub mod sim_trace {
         gateway_join_native_failed: AtomicU64,
         gateway_join_fallback_connected: AtomicU64,
         gateway_join_fallback_failed: AtomicU64,
+        gateway_join_skipped_cooldown: AtomicU64,
+        gateway_link_dead_before_frame: AtomicU64,
     }
 
     /// How each end's native setup in a CONNECT ended: by (transaction, lower
@@ -437,6 +439,14 @@ pub mod sim_trace {
         /// The UDP join that followed a failed native gateway join ended,
         /// connected or not.
         GatewayJoinFallback { connected: bool },
+        /// A join to the marked gateway at the recorded address went
+        /// straight to UDP, because a recent native failure with it is
+        /// cooling down.
+        GatewayJoinSkippedCooldown,
+        /// A native link to the marked gateway at the recorded address was
+        /// removed before it carried a frame from the gateway, which counts
+        /// as a failed native join.
+        GatewayLinkDeadBeforeFrame,
     }
 
     static TRACES: LazyLock<dashmap::DashMap<String, NativeWireTrace>> =
@@ -530,6 +540,8 @@ pub mod sim_trace {
             NativeWireEvent::GatewayJoinFallback { connected: false } => {
                 &c.gateway_join_fallback_failed
             }
+            NativeWireEvent::GatewayJoinSkippedCooldown => &c.gateway_join_skipped_cooldown,
+            NativeWireEvent::GatewayLinkDeadBeforeFrame => &c.gateway_link_dead_before_frame,
             NativeWireEvent::Survivor { swapped: true, .. } => &c.survivor_swapped,
             NativeWireEvent::Survivor {
                 swapped: false,
@@ -764,6 +776,16 @@ pub mod sim_trace {
         /// UDP joins after a failed native gateway join that failed too.
         pub fn gateway_join_fallback_failed(&self) -> u64 {
             Self::get(&self.0.gateway_join_fallback_failed)
+        }
+        /// Joins to a marked gateway that went straight to UDP during the
+        /// cooldown after a native failure with it.
+        pub fn gateway_join_skipped_cooldown(&self) -> u64 {
+            Self::get(&self.0.gateway_join_skipped_cooldown)
+        }
+        /// Native links to a marked gateway removed before carrying a frame
+        /// from it.
+        pub fn gateway_link_dead_before_frame(&self) -> u64 {
+            Self::get(&self.0.gateway_link_dead_before_frame)
         }
         /// Native connections kept beside a UDP entry to wait for a frame.
         pub fn native_held(&self) -> u64 {

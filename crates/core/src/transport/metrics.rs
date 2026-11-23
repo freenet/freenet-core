@@ -651,8 +651,9 @@ labelled_counters! {
     /// tried native first are timed. A join to a marked gateway that went
     /// straight to UDP (cooldown, outside the slice) is not, so these
     /// counters have no legacy control arm; compare against the
-    /// `gateway_joins` totals instead. Joins that gave no connection are not
-    /// counted. Exported per period as `gateway_native_join_time_<label>`.
+    /// [`GatewayNativeJoin`] counts instead (`established`,
+    /// `fallback_connected`, `fallback_failed`, `skipped_cooldown`). Joins
+    /// that gave no connection are not counted. Exported per period as `gateway_native_join_time_<label>`.
     pub(crate) enum GatewayNativeJoinTime {
         /// Under 1 second.
         Lt1S => "lt_1s",
