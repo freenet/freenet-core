@@ -1072,6 +1072,27 @@ pub(super) struct DelegateCallEnv {
     /// after an unrelated release-profile change.
     ///
     secret_read_memo: std::cell::RefCell<SecretReadMemo>,
+    /// Set the first time a secret READ fails with an I/O error rather than the
+    /// secret being absent. #5857. (A blob that reads but fails to
+    /// authenticate keeps its old answer, see #6323.)
+    ///
+    /// A delegate cannot be trusted to tell that apart from "no such secret":
+    /// every stdlib guest to date maps ANY negative return of `get_secret` /
+    /// `get_secret_len` to `None`, so a new error code would be read as absence
+    /// by every delegate already deployed, and those are the ones that matter
+    /// (frozen predecessor generations are never rebuilt). Acting on "absent"
+    /// by initialising or overwriting the secret is the data-loss shape.
+    ///
+    /// So the call is POISONED: the read returns `ERR_STORAGE_FAILED`, secret
+    /// writes, removals and delegate creation are refused for the rest of the
+    /// call, and `exec_inbound_with_env` fails the whole call once `process()`
+    /// returns, so no guest can handle the code and carry on. Effects made
+    /// BEFORE the failed read (an earlier `set_secret`) are not rolled back, so
+    /// a retried call must be safe to repeat.
+    ///
+    /// Holds the first failure's text. Behind a `RefCell` like `context`, for
+    /// the same reason: nothing needs a `&mut DelegateCallEnv`.
+    secret_read_failure: std::cell::RefCell<Option<String>>,
 }
 
 // SAFETY: `DELEGATE_ENV` is a `static`, so its `DashMap` must be `Sync`, which
@@ -1301,6 +1322,7 @@ impl DelegateCallEnv {
             created_delegates_count,
             inherited_origins,
             secret_read_memo: std::cell::RefCell::new(None),
+            secret_read_failure: std::cell::RefCell::new(None),
         }
     }
 
@@ -1387,6 +1409,56 @@ impl DelegateCallEnv {
         Ok(out)
     }
 
+    /// Classify a failed secret read (#5857). Returns the host error code to
+    /// hand the guest: `ERR_STORAGE_FAILED` for an I/O failure, in which case
+    /// the call is poisoned (see the `secret_read_failure` field docs), and
+    /// `ERR_SECRET_NOT_FOUND` for everything else, including a blob that fails
+    /// to authenticate (#6323).
+    fn classify_secret_read_error(&self, secret_id: &SecretsId, e: &SecretStoreError) -> i32 {
+        // Scope: I/O failures, which are transient and retryable. A blob that
+        // reads but does not authenticate is deterministic corruption or a key
+        // mismatch; retrying cannot help and failing the call would leave the
+        // delegate unable to run at all, so it keeps its historical answer.
+        if !matches!(e, SecretStoreError::IO(_)) {
+            return error_codes::ERR_SECRET_NOT_FOUND;
+        }
+        tracing::error!(
+            delegate = %self.delegate_key,
+            secret_id = ?secret_id,
+            error = %e,
+            "secret read I/O failure (not an absent secret); poisoning this delegate call"
+        );
+        self.secret_read_failure
+            .borrow_mut()
+            .get_or_insert_with(|| e.to_string());
+        error_codes::ERR_STORAGE_FAILED
+    }
+
+    /// Record a failed secret-key enumeration (an I/O error reading the key
+    /// registry) as a read failure of this call (#5857) and return the host
+    /// error code for the guest.
+    fn record_secret_enumeration_failure(&self, e: &std::io::Error) -> i32 {
+        tracing::error!(
+            delegate = %self.delegate_key,
+            error = %e,
+            "secret enumeration I/O failure (not an empty set); poisoning this delegate call"
+        );
+        self.secret_read_failure
+            .borrow_mut()
+            .get_or_insert_with(|| format!("key registry read failed: {e}"));
+        error_codes::ERR_STORAGE_FAILED
+    }
+
+    /// The first non-absence secret read failure of this call, if any.
+    pub(super) fn secret_read_failure(&self) -> Option<String> {
+        self.secret_read_failure.borrow().clone()
+    }
+
+    /// Whether a secret read has failed during this call (it is poisoned).
+    fn secret_reads_poisoned(&self) -> bool {
+        self.secret_read_failure.borrow().is_some()
+    }
+
     /// Drop the read memo.
     ///
     /// Called by every host function that can change what a read of ANY secret
@@ -1452,6 +1524,15 @@ impl DelegateCallEnv {
         use freenet_stdlib::prelude::{
             Delegate, DelegateCode, DelegateContainer, DelegateWasmAPIVersion, Parameters,
         };
+
+        // A failed secret read poisons the call (#5857): the guest may be
+        // acting on a belief that something is absent, and a created delegate
+        // is durable, while the call is about to fail and be retried.
+        if self.secret_reads_poisoned() {
+            return Err(DelegateCreateError::StoreFailed(
+                "an earlier secret read failed in this call".to_string(),
+            ));
+        }
 
         // Check per-call creation limit
         let current = self.creations_this_call.get();
@@ -2132,7 +2213,11 @@ pub(super) mod delegate_context {
 /// - Returns non-negative values on success (usually byte counts)
 /// - Returns `ERR_NOT_IN_PROCESS` (-1) if called outside process()
 /// - Returns `ERR_SECRET_NOT_FOUND` (-2) if secret doesn't exist
-/// - Returns `ERR_STORAGE_FAILED` (-3) if storage operation failed
+/// - Returns `ERR_STORAGE_FAILED` (-3) if storage operation failed. A secret
+///   READ that fails with an I/O error (as opposed to the secret being absent)
+///   also returns this, and additionally poisons the call: later
+///   `set_secret` / `remove_secret` / `create_delegate` are refused and the
+///   whole `process()` call fails when it returns (#5857).
 /// - Returns `ERR_INVALID_PARAM` (-4) for invalid parameters (negative length)
 /// - Returns `ERR_BUFFER_TOO_SMALL` (-6) if output buffer is too small
 pub(super) mod delegate_secrets {
@@ -2145,6 +2230,7 @@ pub(super) mod delegate_secrets {
     /// - Non-negative: secret length in bytes
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_SECRET_NOT_FOUND`: secret doesn't exist
+    /// - `ERR_STORAGE_FAILED`: the read failed (I/O); the call is poisoned
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative key length)
     pub(crate) fn get_secret_len(key_ptr: i64, key_len: i32) -> i32 {
         let id = current_instance_id();
@@ -2204,7 +2290,7 @@ pub(super) mod delegate_secrets {
                     error = %e,
                     "get_secret_len: secret not found or storage error"
                 );
-                error_codes::ERR_SECRET_NOT_FOUND
+                env.classify_secret_read_error(&secret_id, &e)
             }
         }
     }
@@ -2216,6 +2302,7 @@ pub(super) mod delegate_secrets {
     /// - Non-negative: number of bytes written
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_SECRET_NOT_FOUND`: secret doesn't exist
+    /// - `ERR_STORAGE_FAILED`: the read failed (I/O); the call is poisoned
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
     /// - `ERR_BUFFER_TOO_SMALL`: output buffer is too small (use get_secret_len first)
     pub(crate) fn get_secret(key_ptr: i64, key_len: i32, out_ptr: i64, out_len: i32) -> i32 {
@@ -2305,7 +2392,7 @@ pub(super) mod delegate_secrets {
                     error = %e,
                     "get_secret: secret not found or storage error"
                 );
-                error_codes::ERR_SECRET_NOT_FOUND
+                env.classify_secret_read_error(&secret_id, &e)
             }
         }
     }
@@ -2316,7 +2403,8 @@ pub(super) mod delegate_secrets {
     /// ## Returns
     /// - `SUCCESS` (0): store succeeded
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
-    /// - `ERR_STORAGE_FAILED`: storage operation failed
+    /// - `ERR_STORAGE_FAILED`: storage operation failed, or an earlier secret
+    ///   read in this call failed (the call is poisoned, #5857)
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
     pub(crate) fn set_secret(key_ptr: i64, key_len: i32, val_ptr: i64, val_len: i32) -> i32 {
         let id = current_instance_id();
@@ -2369,6 +2457,12 @@ pub(super) mod delegate_secrets {
             unsafe { std::slice::from_raw_parts(val_src, val_len as usize) }.to_vec(),
         );
 
+        if env.secret_reads_poisoned() {
+            // A read failed earlier in this call and the delegate may have
+            // taken it for absence; do not let it write on that belief (#5857).
+            tracing::error!("delegate set_secret refused: an earlier secret read failed");
+            return error_codes::ERR_STORAGE_FAILED;
+        }
         let scope = env.secret_scope();
         // A write changes what a read returns, so the read memo must go before
         // the store is touched at all.
@@ -2390,6 +2484,8 @@ pub(super) mod delegate_secrets {
     /// ## Returns
     /// - 1: secret exists
     /// - 0: secret doesn't exist
+    /// - `ERR_STORAGE_FAILED`: the read failed (I/O); the call is poisoned.
+    ///   A blob that fails to authenticate still returns 0 (#6323).
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
     pub(crate) fn has_secret(key_ptr: i64, key_len: i32) -> i32 {
@@ -2434,7 +2530,13 @@ pub(super) mod delegate_secrets {
                     error = %e,
                     "has_secret: secret not found or storage error"
                 );
-                0
+                // 0 is "absent". A failed read must not be reported as that
+                // (#5857): the negative code is read by every stdlib guest as
+                // "no" too, but the poisoned call fails once process() returns.
+                match env.classify_secret_read_error(&secret_id, &e) {
+                    error_codes::ERR_SECRET_NOT_FOUND => 0,
+                    code => code,
+                }
             }
         }
     }
@@ -2442,10 +2544,10 @@ pub(super) mod delegate_secrets {
     /// Remove a secret by key.
     ///
     /// ## Returns
-    /// - `SUCCESS` (0): remove succeeded
+    /// - `SUCCESS` (0): remove succeeded, or the secret was already absent
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
-    /// - `ERR_SECRET_NOT_FOUND`: secret doesn't exist
-    /// - `ERR_STORAGE_FAILED`: storage operation failed
+    /// - `ERR_STORAGE_FAILED`: storage operation failed, or an earlier secret
+    ///   read in this call failed (the call is poisoned, #5857)
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
     pub(crate) fn remove_secret(key_ptr: i64, key_len: i32) -> i32 {
         let id = current_instance_id();
@@ -2480,6 +2582,10 @@ pub(super) mod delegate_secrets {
         let key_bytes = unsafe { std::slice::from_raw_parts(key_src, key_len as usize) };
         let secret_id = SecretsId::new(key_bytes.to_vec());
 
+        if env.secret_reads_poisoned() {
+            tracing::error!("delegate remove_secret refused: an earlier secret read failed");
+            return error_codes::ERR_STORAGE_FAILED;
+        }
         let scope = env.secret_scope();
         // A removal changes what a read returns; drop the memo first.
         env.invalidate_secret_memo();
@@ -2489,13 +2595,15 @@ pub(super) mod delegate_secrets {
         {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
-                tracing::debug!(
+                // `SecretsStore::remove_secret` is Ok for an absent blob, so
+                // any error here is a real storage failure, not absence.
+                tracing::error!(
                     delegate = %env.delegate_key,
                     secret_id = ?secret_id,
                     error = %e,
-                    "remove_secret: secret not found or storage error"
+                    "delegate remove_secret failed"
                 );
-                error_codes::ERR_SECRET_NOT_FOUND
+                error_codes::ERR_STORAGE_FAILED
             }
         }
     }
@@ -2544,9 +2652,16 @@ pub(super) mod delegate_secrets {
             unsafe { std::slice::from_raw_parts(prefix_src, prefix_len as usize) }.to_vec()
         };
 
-        let keys =
-            env.secret_store()
-                .list_secret_keys(&env.delegate_key, env.secret_scope(), &prefix);
+        let keys = match env.secret_store().list_secret_keys(
+            &env.delegate_key,
+            env.secret_scope(),
+            &prefix,
+        ) {
+            Ok(keys) => keys,
+            // An unreadable registry is not "no secrets" (#5857): fail the
+            // call like any other failed secret read.
+            Err(e) => return Err(env.record_secret_enumeration_failure(&e)),
+        };
         Ok(encode_secret_key_list(keys.iter().map(|k| k.as_slice())))
     }
 
@@ -3425,6 +3540,189 @@ mod secret_read_memo_tests {
         );
     }
 
+    /// #5857: a failed enumeration poisons the call like a failed read, and a
+    /// poisoned call cannot create a delegate (a created delegate is durable
+    /// while the call is about to fail and be retried). Fails if the
+    /// `create_delegate_sync` gate or the enumeration poisoning is deleted.
+    #[tokio::test]
+    async fn failed_enumeration_poisons_the_call_and_blocks_create_delegate() {
+        let mut f = fixture().await;
+        // SAFETY: `env` is dropped at the end of this test, before `f`.
+        let env = unsafe { env_of(&mut f) };
+        assert!(env.secret_read_failure().is_none());
+
+        let io = std::io::Error::from_raw_os_error(5);
+        assert_eq!(
+            env.record_secret_enumeration_failure(&io),
+            error_codes::ERR_STORAGE_FAILED
+        );
+        assert!(
+            env.secret_read_failure()
+                .is_some_and(|m| m.contains("key registry read failed")),
+            "an enumeration I/O failure must poison the call"
+        );
+
+        let res = env.create_delegate_sync(&[0u8; 8], &[], [0u8; 32], [0u8; 24]);
+        assert!(
+            matches!(&res, Err(DelegateCreateError::StoreFailed(m)) if m.contains("earlier secret read failed")),
+            "create_delegate must be refused after a failed read, got {res:?}"
+        );
+    }
+
+    /// #5857, host-function layer: `list_secrets_len` / `list_secrets` over an
+    /// UNREADABLE key registry must fail with `ERR_STORAGE_FAILED` and poison
+    /// the call, not return 0 ("no keys"). Registers a real instance in the
+    /// process-global maps (under a private id) and calls the host functions a
+    /// guest would. Fails if `collect_list_secrets` swallows the error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_secrets_host_fn_fails_the_call_on_an_unreadable_registry() {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        const ID: i64 = 0x5857_0001;
+
+        let mut f = fixture().await;
+        let dk = delegate_key();
+        f.secret_store
+            .store_secret(
+                &dk,
+                &SecretsId::new(b"room:a".to_vec()),
+                SecretScope::Local,
+                Zeroizing::new(b"v".to_vec()),
+            )
+            .unwrap();
+        let reg_path = f.secret_store.key_registry_path(&dk, &SecretScope::Local);
+        let good = std::fs::read(&reg_path).unwrap();
+
+        // SAFETY: the env is moved into `DELEGATE_ENV` and removed again before
+        // `f` is dropped at the end of this test.
+        let env = unsafe { env_of(&mut f) };
+        MEM_ADDR.insert(ID, InstanceInfo::new(0, 0, Key::Delegate(dk.clone())));
+        DELEGATE_ENV.insert(ID, DelegateEnvSlot::new(env));
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(ID));
+
+        let healthy = delegate_secrets::list_secrets_len(0, 0);
+
+        std::fs::remove_file(&reg_path).unwrap();
+        std::fs::create_dir(&reg_path).unwrap();
+        let len_res = delegate_secrets::list_secrets_len(0, 0);
+        let list_res = delegate_secrets::list_secrets(0, 0, 0, 64);
+        let poisoned = DELEGATE_ENV
+            .get(&ID)
+            .map(|e| e.secret_reads_poisoned())
+            .unwrap_or(false);
+
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        DELEGATE_ENV.remove(&ID);
+        MEM_ADDR.remove(&ID);
+        std::fs::remove_dir(&reg_path).unwrap();
+        std::fs::write(&reg_path, good).unwrap();
+
+        assert!(healthy > 0, "control: a readable registry lists its key");
+        assert_eq!(len_res, error_codes::ERR_STORAGE_FAILED);
+        assert_eq!(list_res, error_codes::ERR_STORAGE_FAILED);
+        assert!(poisoned, "the failed enumeration must poison the call");
+    }
+
+    /// `remove_secret` host fn: a store failure is `ERR_STORAGE_FAILED`, not
+    /// `ERR_SECRET_NOT_FOUND`, and an absent secret is `SUCCESS` (#5857). The
+    /// failure is a non-empty directory at the blob path (`remove_file` fails).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remove_secret_host_fn_reports_store_failure_as_storage_failed() {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        const ID: i64 = 0x5857_0002;
+
+        let mut f = fixture().await;
+        let dk = delegate_key();
+        let key_bytes = b"k".to_vec();
+        let id = SecretsId::new(key_bytes.clone());
+        let blob = f
+            .secret_store
+            .scope_dir(&dk, &SecretScope::Local)
+            .join(id.encode());
+        std::fs::create_dir_all(blob.join("child")).unwrap();
+
+        // SAFETY: the env is moved into `DELEGATE_ENV` and removed again before
+        // `f` is dropped at the end of this test.
+        let env = unsafe { env_of(&mut f) };
+        // The guest "memory" is `key_bytes` itself: pointer 0 is its first byte.
+        MEM_ADDR.insert(
+            ID,
+            InstanceInfo::new(
+                key_bytes.as_ptr() as i64,
+                key_bytes.len(),
+                Key::Delegate(dk.clone()),
+            ),
+        );
+        DELEGATE_ENV.insert(ID, DelegateEnvSlot::new(env));
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(ID));
+
+        let failed = delegate_secrets::remove_secret(0, 1);
+        std::fs::remove_dir_all(&blob).unwrap();
+        let absent = delegate_secrets::remove_secret(0, 1);
+
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        DELEGATE_ENV.remove(&ID);
+        MEM_ADDR.remove(&ID);
+
+        assert_eq!(failed, error_codes::ERR_STORAGE_FAILED);
+        assert_eq!(
+            absent,
+            error_codes::SUCCESS,
+            "an absent secret removes cleanly"
+        );
+    }
+
+    /// `get_secret_len` host fn over an unreadable blob: `ERR_STORAGE_FAILED`
+    /// and a poisoned call, while an absent secret stays `ERR_SECRET_NOT_FOUND`
+    /// (#5857).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn get_secret_len_host_fn_fails_the_call_on_an_unreadable_blob() {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        const ID: i64 = 0x5857_0003;
+
+        let mut f = fixture().await;
+        let dk = delegate_key();
+        let key_bytes = b"k".to_vec();
+        let id = SecretsId::new(key_bytes.clone());
+        let blob = f
+            .secret_store
+            .scope_dir(&dk, &SecretScope::Local)
+            .join(id.encode());
+        std::fs::create_dir_all(&blob).unwrap();
+
+        // SAFETY: the env is moved into `DELEGATE_ENV` and removed again before
+        // `f` is dropped at the end of this test.
+        let env = unsafe { env_of(&mut f) };
+        MEM_ADDR.insert(
+            ID,
+            InstanceInfo::new(
+                key_bytes.as_ptr() as i64,
+                key_bytes.len(),
+                Key::Delegate(dk.clone()),
+            ),
+        );
+        DELEGATE_ENV.insert(ID, DelegateEnvSlot::new(env));
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(ID));
+
+        let failed = delegate_secrets::get_secret_len(0, 1);
+        let poisoned = DELEGATE_ENV
+            .get(&ID)
+            .map(|e| e.secret_reads_poisoned())
+            .unwrap_or(false);
+        std::fs::remove_dir(&blob).unwrap();
+        let absent = delegate_secrets::get_secret_len(0, 1);
+
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        DELEGATE_ENV.remove(&ID);
+        MEM_ADDR.remove(&ID);
+
+        assert_eq!(failed, error_codes::ERR_STORAGE_FAILED);
+        assert!(poisoned, "the failed read must poison the call");
+        assert_eq!(absent, error_codes::ERR_SECRET_NOT_FOUND);
+    }
+
     /// The memo is keyed on the secret's hash. Without that check a read of a
     /// different key would be served the previous secret's bytes — a
     /// cross-secret leak inside a single `process()` call.
@@ -3552,10 +3850,10 @@ mod secret_read_memo_tests {
     /// The current fields divide as follows, which is the review this forces:
     ///  - `!Sync` and load-bearing for the argument: `secret_store`,
     ///    `delegate_store` (`UnsafeCell<*mut _>`), `contract_store`
-    ///    (`*const _`), `context` and `secret_read_memo` (`RefCell`),
-    ///    `creations_this_call` (`Cell`). Six, not three — an earlier draft of
-    ///    the SAFETY block miscounted, which is exactly the kind of slip that
-    ///    makes a reader stop trusting a soundness argument.
+    ///    (`*const _`), `context`, `secret_read_memo` and `secret_read_failure`
+    ///    (`RefCell`), `creations_this_call` (`Cell`). Seven, not three: an
+    ///    earlier draft of the SAFETY block miscounted, which is exactly the
+    ///    kind of slip that makes a reader stop trusting a soundness argument.
     ///  - Plain owned data, safe by construction: everything else.
     #[test]
     fn every_call_env_field_is_named_in_the_safety_argument() {
@@ -3576,6 +3874,7 @@ mod secret_read_memo_tests {
                 created_delegates_count,
                 inherited_origins,
                 secret_read_memo,
+                secret_read_failure,
             } = env;
 
             let _ = (
@@ -3592,6 +3891,7 @@ mod secret_read_memo_tests {
                 created_delegates_count,
                 inherited_origins,
                 secret_read_memo,
+                secret_read_failure,
             );
         }
     }

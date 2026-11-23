@@ -376,6 +376,9 @@ pub struct NodeConfig {
     pub(crate) max_downstream_bandwidth: Option<Rate>,
     pub(crate) blocked_addresses: Option<HashSet<SocketAddr>>,
     pub(crate) transient_budget: usize,
+    /// Base interval of the connect-failure backoff. `None` reads
+    /// `FREENET_BACKOFF_BASE_SECS`, then the default. Set only by a simulation.
+    pub(crate) connect_backoff_base: Option<Duration>,
     pub(crate) transient_ttl: Duration,
     /// Minimum ring connections before this peer advertises readiness
     /// to accept non-CONNECT operations. `None` or `Some(0)` disables the gate.
@@ -903,6 +906,7 @@ impl NodeConfig {
             max_downstream_bandwidth: None,
             blocked_addresses: config.network_api.blocked_addresses.clone(),
             transient_budget: config.network_api.transient_budget,
+            connect_backoff_base: None,
             transient_ttl: Duration::from_secs(config.network_api.transient_ttl_secs),
             relay_ready_connections: if config.network_api.skip_load_from_network {
                 Some(0) // Local/test networks: disable relay gate
@@ -4303,9 +4307,13 @@ async fn emit_stale_peer_syncs(
         // Targeted heal: `stale_peer_sync_event` builds a `SyncStateToPeer`
         // aimed at exactly `source`, NEVER an all-subscriber fan-out. Pinned
         // by `stale_peer_sync_event_is_targeted_not_broadcast` (#3791/#3796).
-        if let Err(e) =
-            op_manager.try_notify_node_event(stale_peer_sync_event(contract, state, source))
-        {
+        let queued =
+            op_manager.try_notify_node_event(stale_peer_sync_event(contract, state, source));
+        #[cfg(any(test, feature = "testing"))]
+        if queued.is_ok() {
+            stale_peer_heal_observations::record_heal_emitted(&contract);
+        }
+        if let Err(e) = queued {
             // Best-effort by design (see comment above); log at debug to keep
             // the caller layer in step with the helper-internal downgrade
             // (#4238).
@@ -4315,6 +4323,147 @@ async fn emit_stale_peer_syncs(
                 "Failed to emit SyncStateToPeer for stale peer correction (best-effort)"
             );
         }
+    }
+}
+
+/// Per-contract record of the summary-mismatch heal path, for simulation
+/// tests (#6143). Keyed by contract because simulation tests share one
+/// process; each test uses its own contract.
+#[cfg(any(test, feature = "testing"))]
+pub mod stale_peer_heal_observations {
+    use freenet_stdlib::prelude::ContractKey;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// What the `Summaries` arm, `emit_stale_peer_syncs` and the verify-soon
+    /// check decided for one contract, summed over every node in the process.
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    pub struct Observations {
+        /// Two-sided comparisons in the `Summaries` arm that found the peer
+        /// stale.
+        pub peers_found_stale: u64,
+        /// Two-sided comparisons in the `Summaries` arm that found the peer
+        /// converged.
+        pub peers_converged: u64,
+        /// `SyncStateToPeer` heals queued by `emit_stale_peer_syncs`.
+        pub heals_emitted: u64,
+        /// Verify-soon `SummaryRequest`s queued, per target address.
+        pub verify_requests_to: std::collections::BTreeMap<std::net::SocketAddr, u64>,
+        /// Verify-soon replies that found the peer stale (including
+        /// escalations).
+        pub verify_stale: u64,
+        /// Verify-soon replies that found the peer converged.
+        pub verify_converged: u64,
+        /// Verify-soon escalations to a forced full-state stream.
+        pub verify_forced: u64,
+        /// Legs built carrying a forced full state on the stream.
+        pub verify_forced_legs: u64,
+        /// Forced streams delivered (each arms its pair).
+        pub verify_forced_delivered: u64,
+        /// Stale in a confirm round but not forced, by reason.
+        pub verify_not_forced_evidence: u64,
+        pub verify_not_forced_floor: u64,
+        pub verify_not_forced_no_progress: u64,
+        pub verify_not_forced_cap: u64,
+        pub verify_not_forced_busy: u64,
+        pub verify_not_forced_slot: u64,
+        pub verify_not_forced_peer_failed: u64,
+        /// Stale verdicts in a confirm round (also in `verify_stale`).
+        pub verify_stale_confirm: u64,
+        /// Rounds that ended at their deadline with a target unanswered.
+        pub verify_rounds_timed_out: u64,
+    }
+
+    impl Observations {
+        /// Every verify-soon `SummaryRequest` queued, to any target.
+        pub fn verify_requests(&self) -> u64 {
+            self.verify_requests_to.values().sum()
+        }
+    }
+
+    pub(crate) fn record_verify_request(key: &ContractKey, target: std::net::SocketAddr) {
+        *state()
+            .entry(*key)
+            .or_default()
+            .verify_requests_to
+            .entry(target)
+            .or_default() += 1;
+    }
+
+    pub(crate) fn record_verify_verdict(
+        key: &ContractKey,
+        verdict: crate::operations::update::verify_soon::Verdict,
+    ) {
+        use crate::operations::update::verify_soon::{Hold, Verdict};
+        let mut state = state();
+        let obs = state.entry(*key).or_default();
+        match verdict {
+            Verdict::Ignored => {}
+            Verdict::Converged => obs.verify_converged += 1,
+            Verdict::Stale => obs.verify_stale += 1,
+            Verdict::Escalate => {
+                obs.verify_stale += 1;
+                obs.verify_stale_confirm += 1;
+                obs.verify_forced += 1;
+            }
+            Verdict::Held(hold) => {
+                obs.verify_stale += 1;
+                obs.verify_stale_confirm += 1;
+                match hold {
+                    Hold::Evidence => obs.verify_not_forced_evidence += 1,
+                    Hold::Floor => obs.verify_not_forced_floor += 1,
+                    Hold::NoProgress => obs.verify_not_forced_no_progress += 1,
+                    Hold::Cap => obs.verify_not_forced_cap += 1,
+                    Hold::Busy => obs.verify_not_forced_busy += 1,
+                    Hold::Slot => obs.verify_not_forced_slot += 1,
+                    Hold::PeerFailed => obs.verify_not_forced_peer_failed += 1,
+                }
+            }
+        }
+    }
+
+    pub(crate) fn record_verify_timeout(key: &ContractKey) {
+        state().entry(*key).or_default().verify_rounds_timed_out += 1;
+    }
+
+    pub(crate) fn record_forced_delivered(key: &ContractKey) {
+        state().entry(*key).or_default().verify_forced_delivered += 1;
+    }
+
+    pub(crate) fn record_forced_leg(key: &ContractKey) {
+        state().entry(*key).or_default().verify_forced_legs += 1;
+    }
+
+    fn state() -> std::sync::MutexGuard<'static, HashMap<ContractKey, Observations>> {
+        static STATE: OnceLock<Mutex<HashMap<ContractKey, Observations>>> = OnceLock::new();
+        STATE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn record_comparison(key: &ContractKey, stale: bool) {
+        let mut state = state();
+        let obs = state.entry(*key).or_default();
+        if stale {
+            obs.peers_found_stale += 1;
+        } else {
+            obs.peers_converged += 1;
+        }
+    }
+
+    pub(crate) fn record_heal_emitted(key: &ContractKey) {
+        state().entry(*key).or_default().heals_emitted += 1;
+    }
+
+    /// Everything recorded for `key` since it was last cleared.
+    pub fn get(key: &ContractKey) -> Observations {
+        state().get(key).cloned().unwrap_or_default()
+    }
+
+    /// Forget everything recorded for `key`.
+    pub fn clear(key: &ContractKey) {
+        state().remove(key);
     }
 }
 
@@ -4932,6 +5081,20 @@ async fn handle_interest_sync_message(
                             op_manager
                                 .interest_manager
                                 .record_repair_outcome(&contract, &pk, !is_stale, evidence);
+                            #[cfg(any(test, feature = "testing"))]
+                            stale_peer_heal_observations::record_comparison(&contract, is_stale);
+                            // #6143 verify-soon: an answer to a check of our own
+                            // originated write. Decided BEFORE the heal below is
+                            // emitted, so an escalation's force mark is in place
+                            // when that heal's leg is built.
+                            crate::operations::update::verify_soon::on_summary_comparison(
+                                op_manager,
+                                &contract,
+                                &pk,
+                                is_stale,
+                                evidence,
+                                their_summary.as_ref().map_or(&[][..], |s| s.as_ref()),
+                            );
                         }
 
                         // #4952: upsert (not update) when the peer reported a

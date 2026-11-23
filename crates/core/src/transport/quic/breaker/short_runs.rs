@@ -400,6 +400,7 @@ pub(super) fn gate<T>(
     now: SystemTime,
     role: BreakerRole,
     udp_fallback: bool,
+    backoff: &super::Backoff,
 ) -> (Gated<T>, Counted) {
     if settings.is_none() {
         return (
@@ -464,7 +465,7 @@ pub(super) fn gate<T>(
                 );
             }
             PENDING.lock().marker = marker.map(|marker| (path, marker));
-            super::note_backoff(delay);
+            backoff.note(delay);
             metrics.record_quic_breaker_trip();
             tracing::warn!(
                 short_runs = decision.short_runs,
@@ -1596,6 +1597,7 @@ mod tests {
             now,
             BreakerRole::Peer,
             super::super::UDP_FALLBACK,
+            &super::super::Backoff::new(),
         );
         assert_eq!(empty.settings, None);
         assert_eq!(empty.breaker, BreakerOutcome::NotConsulted);
@@ -1610,6 +1612,7 @@ mod tests {
             now,
             BreakerRole::Peer,
             super::super::UDP_FALLBACK,
+            &super::super::Backoff::new(),
         );
         assert_eq!(gated.breaker, BreakerOutcome::NotConsulted);
     }
@@ -1642,6 +1645,7 @@ mod tests {
             now,
             BreakerRole::Peer,
             super::super::UDP_FALLBACK,
+            &super::super::Backoff::new(),
         );
         assert_eq!(gated.settings, None);
         assert_eq!(gated.breaker, BreakerOutcome::Decided(Verdict::Trip));
@@ -1655,6 +1659,7 @@ mod tests {
             now,
             BreakerRole::Peer,
             super::super::UDP_FALLBACK,
+            &super::super::Backoff::new(),
         );
         assert_eq!(cooling.settings, None);
         assert_eq!(
@@ -1700,6 +1705,7 @@ mod tests {
             now,
             BreakerRole::Peer,
             super::super::UDP_FALLBACK,
+            &super::super::Backoff::new(),
         );
         assert_eq!(gated.settings, None);
         assert_eq!(

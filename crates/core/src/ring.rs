@@ -561,7 +561,7 @@ impl Drop for SubscriptionRecoveryGuard {
 /// upgrades (attached then dropped) must terminate the loop. Conflating the
 /// two leaves the maintenance task spinning forever on a dead `Weak` —
 /// the #3308 zombie.
-enum OpManagerState<T> {
+pub(crate) enum OpManagerState<T> {
     /// `attach_op_manager` has not run yet — normal startup window. The
     /// maintenance loop should keep waiting for attachment.
     NotAttached,
@@ -1179,7 +1179,7 @@ impl Ring {
     /// This is the sole production instantiation of the generic
     /// [`classify_op_manager_ref`] (with `T = OpManager`); the unit tests
     /// instantiate it with a stand-in `Arc` to exercise the same logic.
-    fn op_manager_state(&self) -> OpManagerState<OpManager> {
+    pub(crate) fn op_manager_state(&self) -> OpManagerState<OpManager> {
         classify_op_manager_ref(&self.op_manager)
     }
 
