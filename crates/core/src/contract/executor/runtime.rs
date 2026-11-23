@@ -16,6 +16,7 @@ use super::{
 };
 use crate::wasm_runtime::default_wasmtime_cache_size_bytes_for_dir;
 pub(crate) use contract_ops::ReclaimOutcome;
+pub(in crate::contract::executor) use delegates::resolve_message_origin;
 pub use pool::RuntimePool;
 pub(crate) use pool::{ExportAdmission, ExportDone, MAX_CONCURRENT_EXPORTS};
 #[cfg(test)]

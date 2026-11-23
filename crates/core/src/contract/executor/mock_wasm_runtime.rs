@@ -327,16 +327,21 @@ impl crate::contract::delegate_lane::DelegateRunner for MockDelegateRunner {
     fn run<'a>(
         &'a self,
         req: DelegateRequest<'a>,
-        _origin_contract: Option<&'a ContractInstanceId>,
-        _caller_delegate: Option<&'a DelegateKey>,
-        _connection_scope: crate::client_events::ConnectionScope,
+        origin_contract: Option<&'a ContractInstanceId>,
+        caller_delegate: Option<&'a DelegateKey>,
+        connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&'a UserSecretContext>,
     ) -> futures::future::BoxFuture<'a, Response> {
         Box::pin(async move {
             let result = {
                 let _serial = self.lock.lock().await;
                 let user = user_context.map(|u| *u.user_id());
-                scripted_delegate_request(&self.state, req, user, user)
+                let attestation = Attestation {
+                    origin_contract,
+                    caller_delegate,
+                    connection_scope,
+                };
+                scripted_delegate_request(&self.state, req, user, user, attestation)
             };
             let pause = self
                 .state
@@ -421,6 +426,20 @@ pub(crate) struct DelegateObservation {
     /// The hosted user whose secrets the run was given, or `None` for a run
     /// with no user (`SecretScope::Local`).
     pub secret_user: Option<crate::wasm_runtime::UserId>,
+    /// The `MessageOrigin` the real runtime would hand this run, resolved by
+    /// the production `resolve_message_origin` from what the executor was
+    /// given (with an empty inherited-origin map). Lets a test see, for
+    /// instance, that an inter-delegate hop's target observes
+    /// `MessageOrigin::Delegate(caller)`.
+    pub origin: Option<MessageOrigin>,
+}
+
+/// What the executor was told about who is calling, for [`DelegateObservation::origin`].
+#[derive(Clone, Copy)]
+struct Attestation<'a> {
+    origin_contract: Option<&'a ContractInstanceId>,
+    caller_delegate: Option<&'a DelegateKey>,
+    connection_scope: crate::client_events::ConnectionScope,
 }
 
 /// Shared handle to a mock delegate's scripted runs.
@@ -809,6 +828,7 @@ fn scripted_delegate_request(
     req: DelegateRequest<'_>,
     secret_user: Option<crate::wasm_runtime::UserId>,
     context_user: Option<crate::wasm_runtime::UserId>,
+    attestation: Attestation<'_>,
 ) -> Response {
     // Scripted, for the #5544 park/resume tests. Without a script this
     // stays the "not supported" error it has always been, so no existing
@@ -866,6 +886,13 @@ fn scripted_delegate_request(
         }
     };
 
+    let origin = super::runtime::resolve_message_origin(
+        &crate::wasm_runtime::new_inherited_origins(),
+        attestation.caller_delegate,
+        attestation.origin_contract,
+        &key,
+        attestation.connection_scope,
+    );
     let script = state.script.lock().unwrap().pop_front();
     let record = |rt: &MockDelegateState, writes: Option<Vec<u8>>| {
         rt.calls.lock().unwrap().push(key.clone());
@@ -875,6 +902,7 @@ fn scripted_delegate_request(
             observed_context: observed_context.clone(),
             params: params.clone(),
             secret_user,
+            origin: origin.clone(),
         });
         if let Some(bytes) = writes {
             rt.contexts
@@ -1011,19 +1039,24 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
     async fn execute_delegate_request(
         &mut self,
         req: DelegateRequest<'_>,
-        _origin_contract: Option<&ContractInstanceId>,
+        origin_contract: Option<&ContractInstanceId>,
         _caller_delegate: Option<&DelegateKey>,
-        _connection_scope: crate::client_events::ConnectionScope,
+        connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
         if let Some(runner) = self.runtime.delegate_lane.clone() {
             use crate::contract::delegate_lane::DelegateRunner;
             return runner
-                .run(req, None, None, _connection_scope, user_context)
+                .run(req, origin_contract, None, connection_scope, user_context)
                 .await;
         }
         let user = user_context.map(|u| *u.user_id());
-        scripted_delegate_request(&self.runtime.delegate_state(), req, user, user)
+        let attestation = Attestation {
+            origin_contract,
+            caller_delegate: None,
+            connection_scope,
+        };
+        scripted_delegate_request(&self.runtime.delegate_state(), req, user, user, attestation)
     }
 
     fn delegate_runner(
@@ -1057,7 +1090,12 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
                 .await;
         }
         let user = user_context.map(|u| *u.user_id());
-        scripted_delegate_request(&self.runtime.delegate_state(), req, user, user)
+        let attestation = Attestation {
+            origin_contract: None,
+            caller_delegate: Some(caller_delegate),
+            connection_scope,
+        };
+        scripted_delegate_request(&self.runtime.delegate_state(), req, user, user, attestation)
     }
 
     fn hosted_mode(&self) -> bool {
