@@ -1772,6 +1772,9 @@ pub(super) struct DelegateParkCtx {
     /// Messages in hop targets' replies dropped because the hop came from an
     /// unprompted run (which has no client to return them to).
     dropped_hop_outputs: u64,
+    /// Inter-delegate messages refused because a delegate addressed them to
+    /// itself.
+    refused_self_hops: u64,
 }
 
 /// See [`DelegateParkCtx::enter_hop_unit`]. Derefs to the park context, so the
@@ -1831,6 +1834,7 @@ impl DelegateParkCtx {
             dropped_hops: 0,
             refused_unprompted_hops: 0,
             dropped_hop_outputs: 0,
+            refused_self_hops: 0,
         }
     }
 
@@ -1901,6 +1905,18 @@ impl DelegateParkCtx {
     #[cfg(test)]
     pub(super) fn dropped_hop_outputs(&self) -> u64 {
         self.dropped_hop_outputs
+    }
+
+    /// Count `n` inter-delegate messages a delegate addressed to itself;
+    /// returns the new total.
+    pub(super) fn count_refused_self_hops(&mut self, n: u64) -> u64 {
+        self.refused_self_hops = self.refused_self_hops.saturating_add(n);
+        self.refused_self_hops
+    }
+
+    #[cfg(test)]
+    pub(super) fn refused_self_hops(&self) -> u64 {
+        self.refused_self_hops
     }
 
     /// The byte budget this registry is enforcing. Tests assert against THIS

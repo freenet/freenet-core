@@ -89,9 +89,15 @@ use crate::wasm_runtime::UserSecretContext;
 const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
 
 /// Most inter-delegate hops one UNPROMPTED run (a contract notification, a
-/// queued notification, a lifecycle event or a wake-up) may make, across all of
-/// its iterations and parks. Further `SendDelegateMessage`s in that run are
+/// queued notification, a lifecycle event or a wake-up) may ATTEMPT, across all
+/// of its iterations and parks. Further `SendDelegateMessage`s in that run are
 /// refused, counted and logged.
+///
+/// It counts attempts, not deliveries: a hop that is then dropped (target
+/// parked or mid-round-trip, target params unavailable, delivery error) uses up
+/// one, as does a hop that first runs the target's pending lane round-trip
+/// (that counts as one hop). Messages refused at this cap and self-hops (refused
+/// before the cap check) do not.
 ///
 /// Why a separate bound: an iteration that only emits `SendDelegateMessage`
 /// re-enters the caller with no input, and the unprompted budget
@@ -2651,8 +2657,12 @@ where
         //   most `MAX_UNPROMPTED_HOPS_PER_RUN` hops, for every delegate with
         //   or without a manifest; client runs are bounded by
         //   MAX_CONTRACT_REQUEST_ITERATIONS x `MAX_OUTBOUND_MSGS_PER_RUN`. The
-        //   hop's loop time is part of the caller's run and is charged to the
-        //   caller's duty budget with the rest of the run.
+        //   hop's loop time (including a target lane round-trip it runs first,
+        //   which counts as one hop) is part of the caller's run. For a
+        //   BUDGETED caller (a manifest delegate with the Background grant) it
+        //   is charged to the caller's duty budget with the rest of the run; a
+        //   manifest-less caller has no duty budget, so for it the hop cap is
+        //   the only bound. The target is never charged for a hop it receives.
         // - The target's reply on an UNPROMPTED run is DROPPED, counted and
         //   logged once per hop. There is no client to return it to, and the
         //   caller's residual output is fanned out to the CALLER's registered
@@ -2702,21 +2712,20 @@ where
             // Refused hops, tallied per iteration and logged once below so a
             // delegate emitting thousands cannot flood the log.
             let mut refused_over_cap: u64 = 0;
+            let mut refused_self: u64 = 0;
             for msg in delegate_messages {
                 let target_key = msg.target.clone();
-                // No self-hops; see the design notes above.
+                // No self-hops; see the design notes above. Checked first and
+                // not charged to the hop cap: it runs nothing.
                 if target_key == *delegate_key {
-                    tracing::info!(
-                        delegate_key = %delegate_key,
-                        "Refused an inter-delegate message a delegate addressed \
-                         to itself"
-                    );
+                    refused_self += 1;
                     continue;
                 }
                 // Per-run hop cap for unprompted runs
-                // (`MAX_UNPROMPTED_HOPS_PER_RUN`). Counted before every other
-                // check, so an attempt that is later dropped still uses it up:
-                // the cap bounds attempts, which is what costs loop time.
+                // (`MAX_UNPROMPTED_HOPS_PER_RUN`). Counted before every check
+                // below (only the self-hop refusal above comes first), so an
+                // attempt that is later dropped still uses it up: the cap
+                // bounds attempts, which is what costs loop time.
                 if is_unprompted_run(trigger) && hops_attempted >= MAX_UNPROMPTED_HOPS_PER_RUN {
                     refused_over_cap += 1;
                     continue;
@@ -2941,6 +2950,17 @@ where
                         );
                     }
                 }
+            }
+            if refused_self > 0 {
+                let total = parking
+                    .as_mut()
+                    .map(|ctx| ctx.park.count_refused_self_hops(refused_self));
+                tracing::info!(
+                    delegate_key = %delegate_key,
+                    refused = refused_self,
+                    total_refused = ?total,
+                    "Refused inter-delegate messages a delegate addressed to itself"
+                );
             }
             if refused_over_cap > 0 {
                 let total = parking

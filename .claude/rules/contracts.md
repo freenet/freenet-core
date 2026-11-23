@@ -98,8 +98,12 @@ own contract requests are not executed. From a background run the target's
 reply is dropped (counted, one info! per hop), never merged into the
 caller's output, which would fan it out to the caller's apps under the
 caller's name; there is no reply path to the caller yet. A background run
-makes at most MAX_UNPROMPTED_HOPS_PER_RUN (16) hops, manifest or not;
-refusals are counted and logged. Self-hops are refused for every run kind.
+attempts at most MAX_UNPROMPTED_HOPS_PER_RUN (16) hops, manifest or not;
+refusals are counted and logged once per iteration. Hop time (including a
+target lane round-trip the hop runs first) is charged to the caller's duty
+budget only for a budgeted (manifest) caller; a manifest-less caller is
+bounded by the cap alone, and the target is never charged. Self-hops are
+refused for every run kind, counted and logged once per iteration.
 Do not reintroduce suppression for background runs (it was the
 GHSA-824h-7x5x-wfmf "scope-laundering guard").
 

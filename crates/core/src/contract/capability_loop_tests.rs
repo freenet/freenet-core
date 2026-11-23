@@ -2387,7 +2387,7 @@ async fn a_delegate_cannot_message_itself() {
         let (mut handler, observations, _send) = direct_handler(
             "self_hop",
             vec![
-                ScriptedRun::from(vec![send(&key, &key)]),
+                ScriptedRun::from(vec![send(&key, &key), send(&key, &key)]),
                 ScriptedRun::default(),
             ],
         )
@@ -2411,6 +2411,12 @@ async fn a_delegate_cannot_message_itself() {
             kinds,
             vec![vec!["ApplicationMessage"], vec![]],
             "{trigger:?}: the run and its follow-up, no self-delivery"
+        );
+        assert_eq!(park.refused_self_hops(), 2, "{trigger:?}: both counted");
+        assert_eq!(
+            park.refused_unprompted_hops(),
+            0,
+            "{trigger:?}: a self-hop does not use up the hop cap"
         );
     }
 }
@@ -2518,4 +2524,132 @@ async fn a_lifecycle_run_can_message_a_delegate() {
     assert_eq!(reached.len(), 1, "{obs:?}");
     assert_eq!(reached[0].inbound_kinds, vec!["DelegateMessage"]);
     assert_eq!(reached[0].origin, Some(MessageOrigin::Delegate(key)));
+}
+
+/// A caller script that hops on every iteration: `delivered` hops that reach
+/// the target (caller run, then the target's run), then `refused` caller runs
+/// whose hop is refused at the cap (no target run), then a final empty run.
+fn hop_every_iteration(
+    key: &DelegateKey,
+    other: &DelegateKey,
+    delivered: usize,
+    refused: usize,
+) -> Vec<ScriptedRun> {
+    let mut runs = Vec::new();
+    for _ in 0..delivered {
+        runs.push(ScriptedRun::from(vec![send(other, key)]));
+        runs.push(ScriptedRun::default());
+    }
+    for _ in 0..refused {
+        runs.push(ScriptedRun::from(vec![send(other, key)]));
+    }
+    runs.push(ScriptedRun::default());
+    runs
+}
+
+fn runs_of(
+    obs: &super::executor::mock_wasm_runtime::DelegateObservations,
+    key: &DelegateKey,
+) -> usize {
+    obs.lock()
+        .unwrap()
+        .iter()
+        .filter(|o| o.delegate_key == *key)
+        .count()
+}
+
+/// The hop cap bounds the whole background RUN, across a park and resume: a
+/// notification run that hops 10 times, parks on a prompt, and keeps hopping
+/// after the resume gets 6 more hops, not 16 fresh ones.
+#[tokio::test]
+async fn the_hop_cap_holds_across_a_park() {
+    let cap = super::MAX_UNPROMPTED_HOPS_PER_RUN;
+    let before_park = 10;
+    let extra = 2;
+    let key = DelegateKey::new([0x9B; 32], CodeHash::new([0x9B; 32]));
+    let other = DelegateKey::new([0x9C; 32], CodeHash::new([0x9C; 32]));
+    let mut script = Vec::new();
+    for _ in 0..before_park {
+        script.push(ScriptedRun::from(vec![send(&other, &key)]));
+        script.push(ScriptedRun::default());
+    }
+    // Parks on the prompt.
+    script.push(user_input_run());
+    // After the resume: the rest of the cap, then refusals.
+    script.extend(hop_every_iteration(&key, &other, cap - before_park, extra));
+    let (mut handler, observations, _send) = direct_handler("hop_cap_park", script).await;
+    let (resume_tx, mut resume_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut park = super::delegate_park::DelegateParkCtx::new(resume_tx);
+    let prompter = Arc::new(CapabilityPrompter::answering(None));
+
+    super::handle_delegate_notification(
+        &mut handler,
+        super::executor::DelegateNotification {
+            delegate_key: key.clone(),
+            contract_id: ContractInstanceId::new([0x9D; 32]),
+            new_state: Arc::new(WrappedState::new(vec![1])),
+        },
+        &prompter,
+        Some(&mut park),
+    )
+    .await;
+    assert!(park.is_parked(&key), "the run parked on its prompt");
+    assert_eq!(runs_of(&observations, &other), before_park);
+
+    let resume = tokio::time::timeout(Duration::from_secs(10), resume_rx.recv())
+        .await
+        .expect("the prompt is answered")
+        .expect("resume");
+    super::handle_delegate_resume(&mut handler, &mut park, &prompter, resume).await;
+    assert!(!park.is_parked(&key), "the resumed run finished");
+    assert_eq!(
+        runs_of(&observations, &other),
+        cap,
+        "the target runs cap times over the whole run, both legs together"
+    );
+    assert_eq!(
+        park.refused_unprompted_hops(),
+        extra as u64,
+        "the hops past the cap, after the resume, are refused"
+    );
+}
+
+/// The cap also bounds a QUEUED notification run (`run_queued_notification`,
+/// the path a notification takes when it arrived while its delegate was
+/// parked).
+#[tokio::test]
+async fn the_hop_cap_applies_to_a_queued_notification_run() {
+    let cap = super::MAX_UNPROMPTED_HOPS_PER_RUN;
+    let extra = 2;
+    let key = DelegateKey::new([0x9E; 32], CodeHash::new([0x9E; 32]));
+    let other = DelegateKey::new([0x9F; 32], CodeHash::new([0x9F; 32]));
+    let (mut handler, observations, _send) = direct_handler(
+        "hop_cap_queued",
+        hop_every_iteration(&key, &other, cap, extra),
+    )
+    .await;
+    let mut park = new_park();
+    let prompter = Arc::new(CapabilityPrompter::answering(None));
+    let contract_id = ContractInstanceId::new([0xA0; 32]);
+    super::run_queued_notification(
+        &mut handler,
+        Some(&mut park),
+        &prompter,
+        &key,
+        contract_id,
+        DelegateRequest::ApplicationMessages {
+            key: key.clone(),
+            params: Parameters::from(Vec::new()),
+            inbound: vec![InboundDelegateMsg::ContractNotification(
+                ContractNotification {
+                    contract_id,
+                    new_state: WrappedState::new(vec![1]),
+                    context: DelegateContext::default(),
+                },
+            )],
+        },
+    )
+    .await;
+    assert_eq!(runs_of(&observations, &other), cap);
+    assert_eq!(park.refused_unprompted_hops(), extra as u64);
 }
