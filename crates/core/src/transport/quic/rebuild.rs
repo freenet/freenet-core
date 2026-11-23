@@ -239,6 +239,7 @@ pub(crate) async fn run<T: TimeSource>(
                 _ = &mut stop => return RebuildEnd::Stopped,
                 () = time.sleep(wait) => {}
             }
+            super::liveness::note_endpoint_rebuilding();
             match rebuild() {
                 Some(rebuilt) => {
                     tasks.replace(rebuilt.tasks);
@@ -293,4 +294,4 @@ impl Drop for OwnedTasks {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

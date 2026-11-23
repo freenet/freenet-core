@@ -400,3 +400,32 @@ fn delay_scales_by_the_clamped_sample() {
         assert!((0.8..=1.2).contains(&sample), "{sample}");
     }
 }
+
+/// The body of `a_rebuilt_endpoint_does_not_leave_a_stale_driver_panic_flag`,
+/// which runs it in a child process: the flag and the exit switch it uses
+/// are process-wide.
+///
+/// A driver panic killed the first endpoint and the loop rebuilt it. A task
+/// failure after that, with the new endpoint up, is not that panic's
+/// consequence, though `driver_death_restart` (the monitor's backstop for a
+/// node that exits for a death) would read the stale flag as one.
+pub(in crate::transport::quic) fn stale_driver_panic_flag_body() {
+    bounded(|| async move {
+        use crate::transport::quic::liveness::{
+            driver_death_restart, exit_for_endpoint_death, mark_driver_panicked_for_test,
+        };
+        exit_for_endpoint_death();
+        mark_driver_panicked_for_test();
+        let mut lp = start(|_| Some(QuicAvailability::Up), |_| Vec::new(), vec![1.0]);
+        lp.first.send(QuicAvailability::Down).unwrap();
+        lp.next_attempts(1).await;
+        Loop::settle().await;
+        assert_eq!(lp.node.get(), QuicAvailability::Up, "rebuilt");
+        let restart = driver_death_restart(|_| true).await;
+        assert!(
+            !restart,
+            "a task failure after a rebuild is not the old endpoint's death"
+        );
+        drop(lp.stop.take());
+    })
+}

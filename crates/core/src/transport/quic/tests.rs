@@ -4350,6 +4350,19 @@ fn a_task_a_driver_panic_kills_exits_as_the_endpoint_death() {
     );
 }
 
+/// With rebuilding on, the process-wide driver-panic flag that
+/// `driver_death_restart` reads goes stale once the endpoint it described is
+/// rebuilt; the rebuild loop clears it, so the backstop does not take an
+/// unrelated later task failure for an endpoint death. (Body in
+/// `rebuild::tests`.)
+#[test]
+fn a_rebuilt_endpoint_does_not_leave_a_stale_driver_panic_flag() {
+    in_child(
+        "a_rebuilt_endpoint_does_not_leave_a_stale_driver_panic_flag",
+        super::rebuild::tests::stale_driver_panic_flag_body,
+    );
+}
+
 /// A failed monitored task that no driver panic explains keeps its own exit:
 /// `driver_death_restart` waits for a driver panic's report and, with none,
 /// records nothing.
