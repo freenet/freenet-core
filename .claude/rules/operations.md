@@ -717,8 +717,7 @@ free (one forced leg pending or in flight per node, released by the stream's
 outcome or the mark's expiry). Only a DELIVERED forced stream arms the floor
 and cooldown (`ForcedLeg`); a FAILED one bars the peer, for every contract,
 for at least as long as the stream held the slot and at least 60 s, doubling
-with each consecutive failure up to 24 hours (so 16 failing peers holding the slot 270 s each take about 5% of it at the cap), until a forced stream to it is
-delivered (a leg the 30-minute slot backstop gives up on counts as a failure). A barred peer's confirm verdict is not retried. A floor, busy, slot or cap hold retries the held
+with each consecutive failure up to 24 hours (so 16 failing peers holding the slot 270 s each take about 5% of it at the cap). The bar ends by time; a delivered forced stream to the peer ends it early (a leg the 30-minute slot backstop gives up on counts as a failure, and a delivery reported late for that slot clears the bar). A barred peer's confirm verdict is retried when its bar ends within 5 minutes, and not retried otherwise. A floor, busy, slot or cap hold retries the held
 peers only, at most 3 times plus a final retry at the latest holder's clearing
 time. One check per contract, never postponed by later writes; a write during
 a check merges into it, and a fresh first round for the write starts when the

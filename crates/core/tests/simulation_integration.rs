@@ -25121,6 +25121,13 @@ fn test_verify_soon_a_failed_forced_stream_bars_the_peer_then_converges() {
         o.obs
     );
     assert!(o.obs.verify_forced_delivered >= 1, "{:?}", o.obs);
+    // Only the per-peer bar produces this hold: the refused peer was stale in
+    // a Confirm round inside its bar and was kept off the slot.
+    assert!(
+        o.obs.verify_not_forced_peer_failed >= 1,
+        "the failed peer's bar never held a confirm verdict: {:?}",
+        o.obs
+    );
     assert!(
         o.all_converged(),
         "versions: {:?} {:?}",
