@@ -3294,3 +3294,84 @@ fn split_hop_output_takes_the_first_reply_and_resets_it() {
     );
     assert_eq!(labels(&out.other), vec!["app:between".to_string()]);
 }
+
+/// The per-run reply allowance bounds the whole RUN, across a park: a client
+/// run takes 10 maximal replies, parks on a prompt, and after the resume gets
+/// only the 6 more that fit, not a fresh allowance.
+#[tokio::test]
+async fn the_reply_allowance_holds_across_a_park() {
+    let key = DelegateKey::new([0xC4; 32], CodeHash::new([0xC4; 32]));
+    let other = DelegateKey::new([0xC5; 32], CodeHash::new([0xC5; 32]));
+    let max = super::MAX_HOP_REPLY_BYTES;
+    let fit = super::MAX_HOP_REPLY_BYTES_PER_RUN / (max + super::HOP_REPLY_OVERHEAD_BYTES);
+    let before_park = 10;
+    let mut script = vec![ScriptedRun::from(vec![send(&other, &key)])];
+    for _ in 0..before_park - 1 {
+        script.push(ScriptedRun::from(vec![reply_sized(&key, &other, max)]));
+        script.push(ScriptedRun::from(vec![send(&other, &key)]));
+    }
+    // The 10th reply; handling it, the caller prompts and parks.
+    script.push(ScriptedRun::from(vec![reply_sized(&key, &other, max)]));
+    script.push(user_input_run());
+    // After the resume: hop again until the allowance is spent, plus one.
+    script.push(ScriptedRun::from(vec![send(&other, &key)]));
+    for _ in 0..fit - before_park - 1 {
+        script.push(ScriptedRun::from(vec![reply_sized(&key, &other, max)]));
+        script.push(ScriptedRun::from(vec![send(&other, &key)]));
+    }
+    script.push(ScriptedRun::from(vec![reply_sized(&key, &other, max)]));
+    script.push(ScriptedRun::from(vec![send(&other, &key)]));
+    script.push(ScriptedRun::from(vec![reply_sized(&key, &other, max)]));
+    script.push(ScriptedRun::default());
+    let (mut handler, observations, _send) = direct_handler("reply_allowance_park", script).await;
+    let (resume_tx, mut resume_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut park = super::delegate_park::DelegateParkCtx::new(resume_tx);
+    let prompter = Arc::new(CapabilityPrompter::answering(None));
+    let mut no_responder = None;
+    let outcome = super::handle_delegate_with_contract_requests(
+        &mut handler,
+        DelegateRequest::ApplicationMessages {
+            key: key.clone(),
+            params: Parameters::from(Vec::new()),
+            inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(b"go".to_vec()),
+            )],
+        },
+        None,
+        crate::client_events::ConnectionScope::Local,
+        super::RunTrigger::Client,
+        None,
+        &key,
+        &prompter,
+        Some(super::ParkingCtx {
+            park: &mut park,
+            delivery: super::delegate_park::Delivery::Client,
+            node_wide_duty: false,
+            carried_responder: &mut no_responder,
+        }),
+        super::RunSeed::default(),
+    )
+    .await;
+    assert!(matches!(outcome, super::DelegateRunOutcome::Parked));
+    let received = |obs: &super::executor::mock_wasm_runtime::DelegateObservations| {
+        obs.lock()
+            .unwrap()
+            .iter()
+            .filter(|o| o.delegate_key == key && o.inbound_kinds == vec!["DelegateMessage"])
+            .count()
+    };
+    assert_eq!(received(&observations), before_park);
+
+    let resume = tokio::time::timeout(Duration::from_secs(10), resume_rx.recv())
+        .await
+        .expect("the prompt is answered")
+        .expect("resume");
+    super::handle_delegate_resume(&mut handler, &mut park, &prompter, resume).await;
+    assert!(!park.is_parked(&key), "the resumed run finished");
+    assert_eq!(
+        received(&observations),
+        fit,
+        "both legs together accept exactly the allowance"
+    );
+    assert_eq!(park.dropped_hop_replies(), 1, "the one past it is counted");
+}
