@@ -1672,6 +1672,11 @@ jobs:
     env:
       RUST_LOG: error
       RUST_MIN_STACK: 268435456
+      # Auto-update off in the Docker test nodes (#6341). They run the built
+      # binary with no supervisor, so a release newer than the branch makes
+      # every node exit 42 and the network never connects. `build.rs` reads
+      # this at build time; set job-wide so no step rebuilds on a changed env.
+      FREENET_GIT_IS_DIRTY: "1"
 
     steps:
       # Skip every real step on non-release merge_group entries. PR-level CI
