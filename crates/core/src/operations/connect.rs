@@ -655,6 +655,16 @@ impl RelayState {
         let decision = native::decide_native(Some(offer), readiness, bucket, holds);
         let arm = native::acceptor_arm(Some(offer), readiness, bucket, holds);
         crate::transport::metrics::TRANSPORT_METRICS.record_connect_native_decided(decision);
+        #[cfg(any(test, feature = "testing"))]
+        if let Some(own) = ctx.self_location().socket_addr() {
+            native_wire_trace::record_at(
+                own,
+                native_wire_trace::NativeWireEvent::Decided {
+                    own,
+                    native: decision == native::NativeDecision::Native,
+                },
+            );
+        }
         (Some(decision), arm)
     }
 

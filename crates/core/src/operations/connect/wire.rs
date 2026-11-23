@@ -287,10 +287,13 @@ pub mod sim_trace {
         native_established: AtomicU64,
         native_failed: AtomicU64,
         native_demotions: AtomicU64,
-        /// `Native` decisions, as (acceptor, `seq` when it answered).
-        native_decisions: parking_lot::Mutex<Vec<(SocketAddr, u64)>>,
+        /// Decisions on an offered request, as (acceptor, `seq` when it
+        /// decided, native).
+        decisions: parking_lot::Mutex<Vec<(SocketAddr, u64, bool)>>,
         /// Acceptor-role demotions, as (node, `seq`).
         acceptor_demotions: parking_lot::Mutex<Vec<(SocketAddr, u64)>>,
+        /// The longest acceptor failure streak each node reached.
+        acceptor_streak_peaks: parking_lot::Mutex<std::collections::BTreeMap<SocketAddr, usize>>,
         /// Native failures, as (transaction, node, peer), whose node has not
         /// yet asked for a UDP dial to that peer in that transaction.
         fallbacks_pending: parking_lot::Mutex<
@@ -378,11 +381,15 @@ pub mod sim_trace {
         NativeDial { established: bool },
         /// A node turned its own native connects off.
         NativeDemoted,
-        /// The node `own` answered a request as acceptor with `Native`.
-        DecidedNative { own: SocketAddr },
+        /// The node `own`, as acceptor, decided an offered request: `Native`
+        /// or not. Recorded where it decides, not when the answer goes out.
+        Decided { own: SocketAddr, native: bool },
         /// The node `own` stopped deciding `Native` as acceptor after native
         /// failures with distinct joiners.
         AcceptorDemoted { own: SocketAddr },
+        /// The node `own` counted a native failure as acceptor; its streak is
+        /// now `len` distinct joiners (0 if this failure demoted it).
+        AcceptorStreak { own: SocketAddr, len: usize },
         /// The node `own` failed a native setup with `peer` in `tx`; the
         /// connect op must dial UDP to that peer next.
         NativeFailedFor {
@@ -496,9 +503,15 @@ pub mod sim_trace {
                 }
                 return;
             }
-            NativeWireEvent::DecidedNative { own } => {
+            NativeWireEvent::Decided { own, native } => {
                 let seq = c.seq.fetch_add(1, Ordering::Relaxed);
-                c.native_decisions.lock().push((own, seq));
+                c.decisions.lock().push((own, seq, native));
+                return;
+            }
+            NativeWireEvent::AcceptorStreak { own, len } => {
+                let mut peaks = c.acceptor_streak_peaks.lock();
+                let peak = peaks.entry(own).or_insert(0);
+                *peak = (*peak).max(len);
                 return;
             }
             NativeWireEvent::AcceptorDemoted { own } => {
@@ -711,14 +724,20 @@ pub mod sim_trace {
         pub fn native_demotions(&self) -> u64 {
             Self::get(&self.0.native_demotions)
         }
-        /// `Native` decisions, as (acceptor, order), in the order made.
-        pub fn native_decisions(&self) -> Vec<(SocketAddr, u64)> {
-            self.0.native_decisions.lock().clone()
+        /// Acceptors' decisions on offered requests, as (acceptor, order,
+        /// native), in the order made.
+        pub fn decisions(&self) -> Vec<(SocketAddr, u64, bool)> {
+            self.0.decisions.lock().clone()
         }
         /// Acceptor-role demotions, as (node, order), on the same order as
         /// [`Self::native_decisions`].
         pub fn acceptor_demotions(&self) -> Vec<(SocketAddr, u64)> {
             self.0.acceptor_demotions.lock().clone()
+        }
+        /// The longest acceptor failure streak each node reached without
+        /// demoting (a demotion clears the streak).
+        pub fn acceptor_streak_peaks(&self) -> std::collections::BTreeMap<SocketAddr, usize> {
+            self.0.acceptor_streak_peaks.lock().clone()
         }
         /// Native failures followed by a UDP dial from the same node to the
         /// same peer in the same transaction.

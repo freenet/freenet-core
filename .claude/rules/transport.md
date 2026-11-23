@@ -2499,9 +2499,12 @@ Demotion: recorded in the connection lifecycle, where the outcome is known
   decisions off. A joiner cannot tell an acceptor-side failure from its own
   (same outcomes, no health bit on the wire), so it still takes a strike;
   the acceptor's demotion bounds that at 8 joiners per broken acceptor per
-  cooldown. A demoted node (either role) is counted in neither connect arm
-  (acceptor_arm returns None), so the control arm does not collect the pairs
-  where native fails. Either streak's effect is a 6 h downgrade to UDP,
+  cooldown. A node demoted in either role counts none of its own decisions
+  or dials in a connect arm (acceptor_arm returns None as acceptor; the
+  joiner skips joiner_in_control), so the control arm does not collect the
+  pairs where native fails. Limit: an acceptor still counts a demoted
+  joiner's request as control, since that offer reads percent 0 with no
+  reason on the wire. Either streak's effect is a 6 h downgrade to UDP,
   never a failed join.
 Existing transport: a native dial does not drop a connection the node
   already has to that peer; the joiner may have connected another way since

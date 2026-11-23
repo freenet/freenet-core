@@ -68,7 +68,10 @@ pub(crate) const DEMOTION_FAILURES: usize = 3;
 /// comes every 1/f + ... + 1/f^K decisions: at f = 0.2, about 155 for K = 3
 /// (hours for a busy acceptor, so it would sit demoted most of the time) and
 /// about 490,000 for K = 8; at f = 0.3, about 22,000. An acceptor whose own
-/// path is broken (f = 1) demotes after 8 joiners. Read
+/// path is broken (f = 1) demotes after 8 joiners. The arithmetic treats
+/// failures as independent; it holds even where many joiners fail with
+/// everyone (symmetric NATs) mostly because each such joiner demotes itself
+/// after 3 failures, which caps the strikes it can hand out. Read
 /// `connect_native_acceptor_demotions` per node-hour in the first enable step.
 pub(crate) const ACCEPTOR_DEMOTION_FAILURES: usize = 8;
 
@@ -302,9 +305,10 @@ pub(crate) struct NativeReadiness {
     pub ready: bool,
     /// The effective percent ([`effective_native_percent`]).
     pub percent: u8,
-    /// Native is off because of a demotion (in the role this readiness was
-    /// read for), not because of the build, the endpoint or the release.
-    /// [`acceptor_arm`] then counts the pair in neither arm.
+    /// A demotion is running in the role this readiness was read for (other
+    /// causes may hold native off as well). [`acceptor_arm`] then counts the
+    /// pair in neither arm, and a joiner that sent its offer while demoted
+    /// counts none of its pairs.
     pub demoted: bool,
 }
 
@@ -601,7 +605,8 @@ impl NativeConnectState {
     /// A native setup this node made as ACCEPTOR, with `joiner`, failed in a
     /// way that says native does not work on that path. Counted apart from
     /// the joiner streak, across distinct joiners, so one joiner failing on
-    /// purpose counts once; [`ACCEPTOR_DEMOTION_FAILURES`] in a row demote.
+    /// purpose counts once; the acceptor threshold
+    /// ([`ACCEPTOR_DEMOTION_FAILURES`] outside simulations) in a row demotes.
     /// Returns whether this failure demoted the
     /// acceptor role, which is counted.
     pub(crate) fn record_acceptor_failure(&self, joiner: &TransportPublicKey) -> bool {
@@ -635,6 +640,12 @@ impl NativeConnectState {
     #[cfg(test)]
     pub(crate) fn acceptor_demotions(&self) -> u64 {
         self.acceptor_demotion.lock().demotions()
+    }
+
+    /// Distinct joiners in the acceptor role's current failure streak.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn acceptor_streak(&self) -> usize {
+        self.acceptor_demotion.lock().streak.len()
     }
 }
 
@@ -1222,9 +1233,8 @@ mod tests {
     }
 
     /// A demoted node, in either role, counts its pairs in neither arm, so
-    /// the control arm does not collect the pairs where native failed; a
-    /// node that is merely not ready below the percent is also in neither,
-    /// and one at release percent 0 is control as before.
+    /// the control arm does not collect the pairs where native failed; one
+    /// at release percent 0 is control as before.
     #[test]
     fn a_demoted_acceptor_is_in_neither_arm() {
         let offer = Some(NativeOffer::capable(100));
@@ -1261,7 +1271,16 @@ mod tests {
             !on.acceptor_readiness().ready,
             "the acceptor cooldown ended, the joiner one holds"
         );
-        tokio::time::advance(DEMOTION_COOLDOWN).await;
+        // The acceptor streak counts again, which it does not while demoted.
+        for i in 100..(100 + ACCEPTOR_DEMOTION_FAILURES as u32) {
+            on.record_acceptor_failure(&key(i));
+        }
+        assert_eq!(
+            on.acceptor_demotions(),
+            2,
+            "the acceptor cooldown had ended"
+        );
+        tokio::time::advance(DEMOTION_COOLDOWN + Duration::from_secs(1)).await;
         assert!(on.acceptor_readiness().ready, "both ended");
         assert!(on.readiness().ready);
     }

@@ -23588,7 +23588,7 @@ fn test_quic_native_broken_acceptor_stops_deciding_native() {
     log_native_connect(name, &run);
     let broken = broken.expect("premise: the broken node was chosen");
     let t = &run.wire.trace;
-    let decisions = t.native_decisions();
+    let decisions = t.decisions();
     let demoted_at = t
         .acceptor_demotions()
         .iter()
@@ -23597,12 +23597,14 @@ fn test_quic_native_broken_acceptor_stops_deciding_native() {
         .min();
     let before = decisions
         .iter()
-        .filter(|(own, seq)| *own == broken && demoted_at.is_none_or(|at| *seq < at))
+        .filter(|(own, seq, native)| {
+            *own == broken && *native && demoted_at.is_none_or(|at| *seq < at)
+        })
         .count();
-    let after: Vec<u64> = decisions
+    let after: Vec<(u64, bool)> = decisions
         .iter()
-        .filter(|(own, seq)| *own == broken && demoted_at.is_some_and(|at| *seq > at))
-        .map(|(_, seq)| *seq)
+        .filter(|(own, seq, _)| *own == broken && demoted_at.is_some_and(|at| *seq > at))
+        .map(|(_, seq, native)| (*seq, *native))
         .collect();
     tracing::info!(%broken, before, ?after, ?demoted_at, "broken acceptor run");
     assert!(
@@ -23613,10 +23615,13 @@ fn test_quic_native_broken_acceptor_stops_deciding_native() {
         demoted_at.is_some(),
         "the broken node demoted its acceptor role"
     );
-    assert_eq!(
-        after,
-        Vec::<u64>::new(),
-        "the broken node decided native after its acceptor role demoted"
+    assert!(
+        !after.is_empty(),
+        "premise: the broken node still decided offered requests after demoting"
+    );
+    assert!(
+        after.iter().all(|(_, native)| !native),
+        "the broken node decided native after its acceptor role demoted: {after:?}"
     );
     assert!(
         t.native_established() > 0,
@@ -24105,6 +24110,21 @@ fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
         healthy_demoted,
         Vec::<(SocketAddr, u64)>::new(),
         "healthy acceptors demoted by joiners whose native setups fail"
+    );
+    // Premise: healthy acceptors did build failure streaks here, so the
+    // assertion above measures the threshold rather than an idle run.
+    let healthy_peak = run
+        .wire
+        .trace
+        .acceptor_streak_peaks()
+        .into_iter()
+        .filter(|(own, _)| !symmetric_ips.contains(&own.ip()))
+        .map(|(_, len)| len)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        healthy_peak >= 3,
+        "premise: a healthy acceptor reached a streak of 3 (peak {healthy_peak})"
     );
     // Counted from this run's own wire trace, for both sides: the
     // process-wide transport counters are shared with every other sim in a

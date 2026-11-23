@@ -1720,37 +1720,50 @@ impl P2pConnManager {
                         .ring
                         .connection_manager
                         .native_connect();
-                    let demoted = match origin {
-                        crate::transport::NatAttemptOrigin::ConnectJoiner => native_connect
-                            .record_failure(peer.pub_key())
-                            .then_some(false),
-                        crate::transport::NatAttemptOrigin::ConnectAcceptor => native_connect
-                            .record_acceptor_failure(peer.pub_key())
-                            .then_some(true),
+                    // (the role whose streak counted it, whether it demoted)
+                    let (counted_as_acceptor, demoted) = match origin {
+                        crate::transport::NatAttemptOrigin::ConnectJoiner => {
+                            (Some(false), native_connect.record_failure(peer.pub_key()))
+                        }
+                        crate::transport::NatAttemptOrigin::ConnectAcceptor => (
+                            Some(true),
+                            native_connect.record_acceptor_failure(peer.pub_key()),
+                        ),
                         crate::transport::NatAttemptOrigin::Gateway
-                        | crate::transport::NatAttemptOrigin::RingPeerNoTransport => None,
+                        | crate::transport::NatAttemptOrigin::RingPeerNoTransport => (None, false),
                     };
                     #[cfg(any(test, feature = "testing"))]
-                    if let (Some(as_acceptor), Some(addr)) = (demoted, peer.socket_addr()) {
+                    {
                         use crate::operations::connect::native_wire_trace::{
                             NativeWireEvent, record_at,
                         };
-                        if as_acceptor {
-                            if let Some(own) = self
-                                .bridge
-                                .op_manager
-                                .ring
-                                .connection_manager
-                                .get_own_addr()
-                            {
-                                record_at(own, NativeWireEvent::AcceptorDemoted { own });
+                        let own = self
+                            .bridge
+                            .op_manager
+                            .ring
+                            .connection_manager
+                            .get_own_addr();
+                        match (counted_as_acceptor, own, peer.socket_addr()) {
+                            (Some(true), Some(own), _) => {
+                                record_at(
+                                    own,
+                                    NativeWireEvent::AcceptorStreak {
+                                        own,
+                                        len: native_connect.acceptor_streak(),
+                                    },
+                                );
+                                if demoted {
+                                    record_at(own, NativeWireEvent::AcceptorDemoted { own });
+                                }
                             }
-                        } else {
-                            record_at(addr, NativeWireEvent::NativeDemoted);
+                            (Some(false), _, Some(addr)) if demoted => {
+                                record_at(addr, NativeWireEvent::NativeDemoted);
+                            }
+                            _ => {}
                         }
                     }
                     #[cfg(not(any(test, feature = "testing")))]
-                    let _ = demoted;
+                    let _ = (counted_as_acceptor, demoted);
                 }
                 // Outbound peers must have known addresses - extract once for reuse
                 let peer_addr = match KnownPeerKeyLocation::try_from(&peer) {

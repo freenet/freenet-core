@@ -1031,14 +1031,26 @@ async fn drive_client_connect(
                     }
                 };
 
-                let in_control = super::native::joiner_in_control(
-                    sent_offer,
-                    payload.native_decision,
-                    super::native::native_bucket(
-                        &op_manager.ring.connection_manager.pub_key,
-                        payload.acceptor.pub_key(),
-                    ),
-                );
+                // A demoted joiner counts no pair in an arm: demotion follows
+                // native failures, so its pairs would fill the control arm with
+                // exactly the pairs where native fails (as `acceptor_arm`
+                // leaves out a demoted acceptor). Its acceptors cannot tell
+                // (its offer carries percent 0 and no reason), so they still
+                // count such a pair as control.
+                let in_control = !op_manager
+                    .ring
+                    .connection_manager
+                    .native_connect()
+                    .readiness()
+                    .demoted
+                    && super::native::joiner_in_control(
+                        sent_offer,
+                        payload.native_decision,
+                        super::native::native_bucket(
+                            &op_manager.ring.connection_manager.pub_key,
+                            payload.acceptor.pub_key(),
+                        ),
+                    );
                 // `accepted` only grows with what the queue takes, so both
                 // stay within `acceptor_limit`.
                 match dial_queue.offer((payload.acceptor.clone(), Instant::now())) {
@@ -1353,21 +1365,11 @@ fn plan_acceptor_dial(
 /// and whether it was accepted after a `Rejected` or `ConnectFailed` re-route.
 /// Called once the accept is dispatched, so a failed dispatch is not traced.
 fn trace_accept(
-    own: Option<SocketAddr>,
     upstream: SocketAddr,
     response: &super::ConnectResponse,
     joiner: Option<SocketAddr>,
     retry: bool,
 ) {
-    #[cfg(any(test, feature = "testing"))]
-    if let (Some(own), Some(super::native::NativeDecision::Native)) =
-        (own, response.native_decision)
-    {
-        super::native_wire_trace::record_at(
-            own,
-            super::native_wire_trace::NativeWireEvent::DecidedNative { own },
-        );
-    }
     #[cfg(any(test, feature = "testing"))]
     super::native_wire_trace::record_at(
         upstream,
@@ -1378,7 +1380,7 @@ fn trace_accept(
         },
     );
     #[cfg(not(any(test, feature = "testing")))]
-    let _ = (own, upstream, response, joiner, retry);
+    let _ = (upstream, response, joiner, retry);
 }
 
 /// Starts the hole punch to `acceptor`, whose Response arrived at
@@ -1759,7 +1761,6 @@ async fn drive_relay_connect(
             op_manager.ring.register_events(Either::Left(event)).await;
         }
         trace_accept(
-            op_manager.ring.connection_manager.get_own_addr(),
             upstream_addr,
             &accept.response,
             accept.joiner.socket_addr(),
@@ -1948,13 +1949,7 @@ async fn drive_relay_connect(
                         accept.native_arm,
                     )
                     .await?;
-                    trace_accept(
-                        op_manager.ring.connection_manager.get_own_addr(),
-                        upstream_addr,
-                        &accept.response,
-                        joiner_addr,
-                        true,
-                    );
+                    trace_accept(upstream_addr, &accept.response, joiner_addr, true);
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
                         upstream_addr,
@@ -2134,13 +2129,7 @@ async fn drive_relay_connect(
                         accept.native_arm,
                     )
                     .await?;
-                    trace_accept(
-                        op_manager.ring.connection_manager.get_own_addr(),
-                        upstream_addr,
-                        &accept.response,
-                        joiner_addr,
-                        true,
-                    );
+                    trace_accept(upstream_addr, &accept.response, joiner_addr, true);
                     let mut ctx = op_manager.op_ctx(incoming_tx);
                     ctx.send_fire_and_forget(
                         upstream_addr,
@@ -4158,6 +4147,37 @@ mod driver_timing_tests {
         );
     }
 
+    /// A joiner whose own native connects are demoted counts none of its
+    /// pairs, even those it would place in control: demotion follows native
+    /// failures, so its pairs would fill the control arm with exactly the
+    /// pairs where native fails. The same responses as the percent-zero case
+    /// above, which counts two.
+    #[tokio::test(start_paused = true)]
+    async fn a_demoted_joiner_counts_no_pair_in_an_arm() {
+        use crate::operations::connect::native::{NativeDecision, NativeOffer};
+        let before = arm_counts_here();
+        let run = dials_for_decisions_after(
+            "arm-joiner-demoted",
+            Some(NativeOffer::capable(0)),
+            vec![
+                (0, Some(NativeDecision::Udp)),
+                (1, Some(NativeDecision::Udp)),
+            ],
+            |op_manager| {
+                let native = op_manager.ring.connection_manager.native_connect();
+                for seed in 0..crate::operations::connect::native::DEMOTION_FAILURES as u32 {
+                    native.record_failure(&crate::transport::TransportPublicKey::from_bytes(
+                        *blake3::hash(&seed.to_be_bytes()).as_bytes(),
+                    ));
+                }
+                assert!(native.readiness().demoted, "premise: demoted");
+            },
+        )
+        .await;
+        assert_eq!(run.dialled.len(), 2, "both are dialled over UDP");
+        assert_eq!(arm_moved(before), vec![], "no arm counts a demoted joiner");
+    }
+
     /// At 100 every bucket is below the offered percent, so the joiner cannot
     /// tell a control pair from one the acceptor sent to UDP for another
     /// reason, and counts none, however the acceptors answer; a `Native` one
@@ -4638,7 +4658,22 @@ mod driver_timing_tests {
             Option<crate::operations::connect::native::NativeDecision>,
         )>,
     ) -> DecisionRun {
+        dials_for_decisions_after(name, sent_offer, responses, |_| {}).await
+    }
+
+    /// [`dials_for_decisions`], with `prepare` run on the joiner's
+    /// `OpManager` first.
+    async fn dials_for_decisions_after(
+        name: &str,
+        sent_offer: Option<crate::operations::connect::native::NativeOffer>,
+        responses: Vec<(
+            usize,
+            Option<crate::operations::connect::native::NativeDecision>,
+        )>,
+        prepare: impl FnOnce(&OpManager),
+    ) -> DecisionRun {
         let (op_manager, events) = op_manager_with_events(name).await;
+        prepare(&op_manager);
         connect_existing_peer(&op_manager, 24949);
         let log = scripted_event_loop(events, vec![]);
         let tx = Transaction::new::<ConnectMsg>();
