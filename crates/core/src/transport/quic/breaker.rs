@@ -307,19 +307,83 @@ fn backoff_first() -> Duration {
     BACKOFF_FIRST
 }
 
-/// The start delay [`gate`] decided for this run, until the transport waits
-/// it out ([`wait_out_crash_loop_backoff`]).
-static BACKOFF: parking_lot::Mutex<Option<Duration>> = parking_lot::Mutex::new(None);
+/// The crash-loop backoff of one start: the delay [`gate`] decided, whether
+/// the wait is still pending, whether the update check should hurry, and the
+/// wakeup for [`Backoff::wait_for_transport_open`].
+///
+/// The binary has exactly one, [`BACKOFF`]. It is a value rather than four
+/// loose statics so a test can own its own and decide a backoff without
+/// touching the one every node built in the same test process reads
+/// ([`wait_out_crash_loop_backoff`] runs at the start of every node's event
+/// loop), which would take the test's delay and sleep through it.
+pub(super) struct Backoff {
+    /// The start delay, until the transport waits it out.
+    delay: parking_lot::Mutex<Option<Duration>>,
+    /// Set from [`Backoff::note`] until [`Backoff::wait_out`] ends.
+    pending: AtomicBool,
+    /// Set when this start is in a crash-loop backoff, so the binary's startup
+    /// update check runs after a few seconds of jitter instead of its 0-60 s
+    /// one ([`quic_crash_loop_update_now`]).
+    update_now: AtomicBool,
+    /// Wakes [`Backoff::wait_for_transport_open`] when the backoff wait ends.
+    over: tokio::sync::Notify,
+}
 
-/// Set when this start is in a crash-loop backoff, so the binary's startup
-/// update check runs after a few seconds of jitter instead of its 0-60 s one
-/// ([`quic_crash_loop_update_now`]).
-static UPDATE_NOW: AtomicBool = AtomicBool::new(false);
+/// The binary's backoff: what [`gate`] decides and what the transport,
+/// the update check and the update probation read.
+static BACKOFF: Backoff = Backoff::new();
 
-fn note_backoff(delay: Duration) {
-    *BACKOFF.lock() = Some(delay);
-    BACKOFF_PENDING.store(true, Ordering::SeqCst);
-    UPDATE_NOW.store(true, Ordering::Relaxed);
+impl Backoff {
+    pub(super) const fn new() -> Self {
+        Self {
+            delay: parking_lot::Mutex::new(None),
+            pending: AtomicBool::new(false),
+            update_now: AtomicBool::new(false),
+            over: tokio::sync::Notify::const_new(),
+        }
+    }
+
+    pub(super) fn note(&self, delay: Duration) {
+        *self.delay.lock() = Some(delay);
+        self.pending.store(true, Ordering::SeqCst);
+        self.update_now.store(true, Ordering::Relaxed);
+    }
+
+    /// See [`wait_out_crash_loop_backoff`].
+    async fn wait_out(&self, shutting_down: &AtomicBool) -> bool {
+        let Some(delay) = self.delay.lock().take() else {
+            return false;
+        };
+        use crate::simulation::TimeSource;
+        let time = crate::simulation::RealTime::new();
+        let waited = wait_unless(
+            delay,
+            HOLDER_POLL,
+            || shutting_down.load(Ordering::SeqCst),
+            |d| time.sleep(d),
+        )
+        .await;
+        let stopped = shutting_down.load(Ordering::SeqCst);
+        self.pending.store(false, Ordering::SeqCst);
+        self.over.notify_waiters();
+        if stopped {
+            tracing::info!(
+                waited_secs = waited.as_secs(),
+                "Stopped during the QUIC crash-loop backoff; the transport is not opened"
+            );
+        } else {
+            tracing::info!(
+                waited_secs = waited.as_secs(),
+                "QUIC crash-loop backoff over; opening the transport"
+            );
+        }
+        stopped
+    }
+
+    /// See [`wait_for_transport_open`].
+    async fn wait_for_transport_open(&self) -> bool {
+        wait_while_pending(&self.pending, &self.over).await
+    }
 }
 
 /// Whether this start found the node in a QUIC crash loop with no UDP to fall
@@ -330,7 +394,7 @@ fn note_backoff(delay: Duration) {
 /// through the same claim: a release pinned bad, the lockout, a release
 /// cooling down and the download budget all still refuse it.
 pub fn quic_crash_loop_update_now() -> bool {
-    UPDATE_NOW.load(Ordering::Relaxed)
+    BACKOFF.update_now.load(Ordering::Relaxed)
 }
 
 /// Wait out this start's crash-loop backoff, if [`gate`] decided one, before
@@ -340,40 +404,8 @@ pub fn quic_crash_loop_update_now() -> bool {
 /// wait again. Real time: only the binary sets a backoff. Returns true when a
 /// stop ended the wait: the caller must not open the transport.
 pub(crate) async fn wait_out_crash_loop_backoff(shutting_down: &AtomicBool) -> bool {
-    let Some(delay) = BACKOFF.lock().take() else {
-        return false;
-    };
-    use crate::simulation::TimeSource;
-    let time = crate::simulation::RealTime::new();
-    let waited = wait_unless(
-        delay,
-        HOLDER_POLL,
-        || shutting_down.load(Ordering::SeqCst),
-        |d| time.sleep(d),
-    )
-    .await;
-    let stopped = shutting_down.load(Ordering::SeqCst);
-    BACKOFF_PENDING.store(false, Ordering::SeqCst);
-    TRANSPORT_WAIT_OVER.notify_waiters();
-    if stopped {
-        tracing::info!(
-            waited_secs = waited.as_secs(),
-            "Stopped during the QUIC crash-loop backoff; the transport is not opened"
-        );
-    } else {
-        tracing::info!(
-            waited_secs = waited.as_secs(),
-            "QUIC crash-loop backoff over; opening the transport"
-        );
-    }
-    stopped
+    BACKOFF.wait_out(shutting_down).await
 }
-
-/// Set from [`note_backoff`] until [`wait_out_crash_loop_backoff`] ends.
-static BACKOFF_PENDING: AtomicBool = AtomicBool::new(false);
-
-/// Wakes [`wait_for_transport_open`] when the backoff wait ends.
-static TRANSPORT_WAIT_OVER: tokio::sync::Notify = tokio::sync::Notify::const_new();
 
 /// Return once no crash-loop backoff wait is pending: at once when this start
 /// has none, otherwise when the wait ends. The binary's update probation
@@ -388,7 +420,7 @@ static TRANSPORT_WAIT_OVER: tokio::sync::Notify = tokio::sync::Notify::const_new
 /// did, and calls this only after a first window, by when the breaker (which
 /// runs early in the node's build) has decided.
 pub async fn wait_for_transport_open() -> bool {
-    wait_while_pending(&BACKOFF_PENDING, &TRANSPORT_WAIT_OVER).await
+    BACKOFF.wait_for_transport_open().await
 }
 
 async fn wait_while_pending(pending: &AtomicBool, over: &tokio::sync::Notify) -> bool {
@@ -1094,6 +1126,16 @@ pub(crate) fn note_endpoint_down_exit(now: SystemTime) -> bool {
     false
 }
 
+/// [`note_endpoint_down_exit`] at most once per process, every later call
+/// returning the first answer. Two paths exit the node for one endpoint death
+/// (the listener's `QuicEndpointDown`, and a monitored task that a driver
+/// panic killed, `liveness::driver_death_restart`); whichever comes first
+/// records it, and the exit is counted once.
+pub(crate) fn note_endpoint_down_exit_once(now: SystemTime) -> bool {
+    static NOTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NOTED.get_or_init(|| note_endpoint_down_exit(now))
+}
+
 /// [`note_endpoint_down_exit`] with the armed marker `armed` (the static
 /// [`ARMED`] outside tests), the not-yet-written marker in `pending`, whether
 /// the breaker was `overridden`, and on Windows the marker as armed, to
@@ -1336,6 +1378,7 @@ pub(crate) async fn gate<T>(
             now,
             role,
             udp_fallback(),
+            &BACKOFF,
         );
         if let BreakerOutcome::Decided(verdict) = gated.breaker {
             set_start_report(StartReport {
@@ -3532,7 +3575,7 @@ mod tests {
             "letlegacy=ifcfg!(unix){legacy_shadow(settings.is_some(),data_dir,ignore_breaker,now)}else{None};",
         );
         let short_runs = at(
-            "let(gated,counted)=short_runs::gate(settings,data_dir,ignore_breaker,now,role,udp_fallback(),);",
+            "let(gated,counted)=short_runs::gate(settings,data_dir,ignore_breaker,now,role,udp_fallback(),&BACKOFF,);",
         );
         let returned = at("returngated;}");
         assert!(enabled < dispatch && dispatch < shadow && shadow < short_runs);
@@ -4363,25 +4406,39 @@ mod tests {
         );
     }
 
-    /// Held by the tests that read or write the process-global marker slot and
-    /// backoff state (`PENDING`, `BACKOFF`, `UPDATE_NOW`), which run on threads
-    /// of one process under plain `cargo test`.
+    /// Held by the tests that read or write the process-global marker slot
+    /// (`PENDING`), which run on threads of one process under plain
+    /// `cargo test`. The backoff state is not behind it: each test owns a
+    /// [`Backoff`], because production code that other tests reach (every
+    /// node's event loop calls [`wait_out_crash_loop_backoff`]) reads the
+    /// global one and would take a delay set there.
     static BACKOFF_GLOBALS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// A start the short-run decision backs off, end to end through `gate`
     /// (#6151): QUIC stays on, the start delay and the update-now flag are set,
     /// the update probation is held until the wait ends, and a stop during the
     /// wait returns without opening the transport and releases the probation.
-    /// Peer and gateway alike. FALSIFY: delete the `UPDATE_NOW.store` in
-    /// `note_backoff` (the update check keeps its full jitter), the
-    /// `BACKOFF_PENDING` store (the probation commits during the wait), or
-    /// the `BACKOFF_PENDING` clear after the wait.
+    /// Peer and gateway alike. FALSIFY: delete the `update_now.store` in
+    /// `Backoff::note` (the update check keeps its full jitter), the
+    /// `pending` store (the probation commits during the wait), or
+    /// the `pending` clear after the wait.
     ///
-    /// Process globals, so one test owns them all and resets them.
+    /// The marker slot is a process global, so the test holds
+    /// [`BACKOFF_GLOBALS`] and clears the slot even when an assertion fails,
+    /// or a later test reads the marker this one left.
     #[tokio::test]
     async fn a_backed_off_start_sets_the_delay_the_update_flag_and_holds_the_probation() {
         let _globals = BACKOFF_GLOBALS.lock().await;
+        struct ClearMarker;
+        impl Drop for ClearMarker {
+            fn drop(&mut self) {
+                // `gate` leaves the marker pending; other tests read `PENDING`.
+                PENDING.lock().marker = None;
+            }
+        }
+        let _clear = ClearMarker;
         for role in [BreakerRole::Peer, BreakerRole::Gateway] {
+            let backoff = Backoff::new();
             let dir = tempfile::tempdir().unwrap();
             write_marker(
                 &marker_path(dir.path()),
@@ -4398,18 +4455,19 @@ mod tests {
             )
             .unwrap();
             let now = SystemTime::UNIX_EPOCH + Duration::from_secs(T0);
-            assert!(!quic_crash_loop_update_now());
-            let (gated, _) = short_runs::gate(Some(7u8), dir.path(), false, now, role, false);
+            assert!(!backoff.update_now.load(Ordering::Relaxed));
+            let (gated, _) =
+                short_runs::gate(Some(7u8), dir.path(), false, now, role, false, &backoff);
             assert_eq!(gated.settings, Some(7), "{role:?}: QUIC stays on");
             assert!(
-                quic_crash_loop_update_now(),
+                backoff.update_now.load(Ordering::Relaxed),
                 "{role:?}: the update check does not wait for its full jitter"
             );
-            assert_eq!(*BACKOFF.lock(), Some(backoff_delay(1)), "{role:?}");
-            assert!(BACKOFF_PENDING.load(Ordering::SeqCst), "{role:?}");
+            assert_eq!(*backoff.delay.lock(), Some(backoff_delay(1)), "{role:?}");
+            assert!(backoff.pending.load(Ordering::SeqCst), "{role:?}");
             // The probation is held while the wait is pending.
             assert!(
-                tokio::time::timeout(Duration::from_millis(50), wait_for_transport_open())
+                tokio::time::timeout(Duration::from_millis(50), backoff.wait_for_transport_open())
                     .await
                     .is_err(),
                 "{role:?}: the probation window must not start during the wait"
@@ -4417,19 +4475,16 @@ mod tests {
             // A stop during the wait ends it at once, without opening the
             // transport, and releases the probation.
             let stopping = AtomicBool::new(true);
-            assert!(wait_out_crash_loop_backoff(&stopping).await, "{role:?}");
-            assert!(!BACKOFF_PENDING.load(Ordering::SeqCst), "{role:?}");
-            assert!(BACKOFF.lock().is_none(), "{role:?}");
+            assert!(backoff.wait_out(&stopping).await, "{role:?}");
+            assert!(!backoff.pending.load(Ordering::SeqCst), "{role:?}");
+            assert!(backoff.delay.lock().is_none(), "{role:?}");
             assert!(
-                !wait_for_transport_open().await,
+                !backoff.wait_for_transport_open().await,
                 "{role:?}: nothing to wait for"
             );
-            UPDATE_NOW.store(false, Ordering::Relaxed);
-            // `gate` left the marker pending; other tests read `PENDING`.
-            PENDING.lock().marker = None;
         }
         // With nothing decided, the wait is a no-op that opens the transport.
-        assert!(!wait_out_crash_loop_backoff(&AtomicBool::new(false)).await);
+        assert!(!Backoff::new().wait_out(&AtomicBool::new(false)).await);
     }
 
     /// `wait_while_pending` returns at once when nothing is pending, and

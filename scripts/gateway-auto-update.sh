@@ -443,8 +443,10 @@ deploy_update() {
 # gateway is silently down. Same shape as the v0.2.71 incident this function
 # exists for.
 #
-# nova runs exactly that: freenet-gateway-2 is a second gateway process with
-# `WantedBy=freenet-gateway.service` and no release-agent of its own.
+# On hosts that still use that wiring (a companion `WantedBy=` the primary) this
+# check applies. nova's freenet-gateway-2 no longer does (#6336): it is restarted
+# after the primary by freenet-gateway-stagger.service, which fails visibly on
+# its own, so this loop finds no companion there.
 #
 # Companions are read from the `.wants` SYMLINKS on disk, deliberately NOT from
 # `systemctl show -p ConsistsOf`. ConsistsOf reflects the LOADED unit graph and
@@ -514,6 +516,31 @@ cleanup() {
 }
 
 # Main function
+# Hosts with a companion gateway (nova: freenet-gateway-2) install
+# freenet-gateway-stagger.service. The companion is deliberately NOT tied to the
+# primary's stop/start, so after a successful primary update this queues a
+# restart of the companion that waits until the primary has been up and healthy
+# for ~10 minutes (#6336: restarting both gateways together doubled the share of
+# SUBSCRIBEs needing extra hops for 10+ hours). `--no-block` returns at once; the
+# stagger unit logs to the journal and fails visibly if the restart does not
+# land. Hosts without the unit are unaffected.
+schedule_companion_restart() {
+    local stagger_unit="${STAGGER_UNIT:-freenet-gateway-stagger.service}"
+
+    # --all-instances always deploys freenet-gateway, so it queues too.
+    if [[ "$ALL_INSTANCES" != "true" && "$SERVICE_NAME" != "freenet-gateway" ]]; then
+        return 0
+    fi
+    if ! systemctl list-unit-files "$stagger_unit" 2>/dev/null | grep -q "$stagger_unit"; then
+        return 0
+    fi
+    if ! systemctl start --no-block "$stagger_unit"; then
+        log ERROR "Could not queue $stagger_unit; the companion gateway is still on the OLD binary"
+        return 1
+    fi
+    log INFO "Queued $stagger_unit: the companion gateway restarts once '$SERVICE_NAME' has been healthy for ~10 min (journalctl -u $stagger_unit)"
+}
+
 main() {
     log INFO "Freenet Gateway Auto-Update starting..."
 
@@ -586,6 +613,7 @@ main() {
             new_version=$(get_current_version)
             if [[ "$new_version" == "$latest_version" ]]; then
                 log INFO "Successfully updated to v$latest_version"
+                schedule_companion_restart || exit 1
             else
                 log ERROR "Update failed: expected v$latest_version on disk but found v$new_version"
                 exit 1
@@ -595,6 +623,13 @@ main() {
         fi
     else
         log INFO "No update needed"
+        # The companion may still be on an old binary (primary not healthy in
+        # time, a failed stagger run, a second release during the settle wait).
+        # Queueing the stagger again is idempotent: it exits at once when the
+        # companion already runs the installed binary.
+        if [[ "$CHECK_ONLY" != "true" && "$DRY_RUN" != "true" ]]; then
+            schedule_companion_restart || exit 1
+        fi
     fi
 
     log INFO "Auto-update check complete"

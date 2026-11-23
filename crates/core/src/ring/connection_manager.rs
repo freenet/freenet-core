@@ -778,12 +778,18 @@ impl ConnectionManager {
             config.quic_native_floor_override,
             config.native_wire_pre_floor,
         );
-        cm.native_connect = Arc::new(
-            crate::operations::connect::native::NativeConnectState::new(
-                config.native_connect_override,
-            )
-            .with_joiner_off(config.native_joiner_off),
+        let native_connect = crate::operations::connect::native::NativeConnectState::new(
+            config.native_connect_override,
+        )
+        .with_gateway_join_override(config.native_gateway_join_override)
+        .with_joiner_off(config.native_joiner_off);
+        native_connect.set_native_gateways(
+            config
+                .gateways
+                .iter()
+                .filter_map(crate::node::InitPeerNode::native_addr),
         );
+        cm.native_connect = Arc::new(native_connect);
         cm.broadcast_target_list_floor_override = config.broadcast_target_list_floor_override;
         cm
     }
@@ -1694,6 +1700,13 @@ impl ConnectionManager {
     /// How this node encodes and decodes the QUIC-native connect variants.
     pub(crate) fn native_wire(&self) -> crate::operations::connect::native::NativeWire {
         self.native_wire
+    }
+
+    /// [`Self::native_connect`], shared, for a task that outlives the borrow.
+    pub(crate) fn native_connect_shared(
+        &self,
+    ) -> Arc<crate::operations::connect::native::NativeConnectState> {
+        Arc::clone(&self.native_connect)
     }
 
     /// This node's QUIC-native connect state.

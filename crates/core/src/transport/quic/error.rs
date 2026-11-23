@@ -230,8 +230,8 @@ const CONNECTION_REFUSED: u64 = 0x2;
 /// alert is a refused handshake, `NO_ERROR` an ordinary close,
 /// `CONNECTION_REFUSED` a refusal by the peer's stack, anything else a
 /// protocol error. That includes a LOCAL `INTERNAL_ERROR`: quinn raises it
-/// for an endpoint whose driver was dropped (quinn 0.11.12 connection.rs
-/// line 1112), but quinn-proto 0.11.19 also raises it on a healthy
+/// for an endpoint whose driver was dropped (freenet-quinn 0.11.13 connection.rs
+/// line 1201), but quinn-proto (0.11.19 and the fork) also raises it on a healthy
 /// endpoint for a peer that leaves too many gaps in a stream or crypto
 /// buffer (connection/streams/recv.rs line 83, connection/mod.rs line
 /// 2134). Only the endpoint's availability tells the two apart, so the

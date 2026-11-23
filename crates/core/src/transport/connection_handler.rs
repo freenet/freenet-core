@@ -18,13 +18,10 @@ use futures::{
     future::BoxFuture,
     stream::{FuturesUnordered, StreamExt},
 };
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use recv_errors::{RecvErrorAction, RecvErrorLog, RecvErrorPause, RecvErrorTracker};
 use tokio::{
     net::UdpSocket,
     sync::{mpsc, oneshot},
-    task_local,
 };
 use tracing::{Instrument, span};
 use version_cmp::PROTOC_VERSION;
@@ -306,6 +303,7 @@ pub async fn create_connection_handler<S: Socket>(
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
+            legacy_responder_override: None,
             // `create_connection_handler` is the test and tool entry point;
             // the node opens the transport through `open_udp_transport`.
             quic: None,
@@ -331,6 +329,10 @@ pub(crate) struct UdpTransportConfig {
     pub(crate) congestion_config: Option<CongestionControlConfig>,
     /// The #5161 version-carrying-ack floor override; `None` in production.
     pub(crate) ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// Test override for `legacy_responder::LEGACY_RESPONDER_ENABLED`:
+    /// `Some(version)` turns the responder on and names that version in its
+    /// reply. `None` uses the constant.
+    pub(crate) legacy_responder_override: Option<String>,
     /// QUIC endpoint settings when `transport-quic` is on, `None` (no
     /// endpoint, no QUIC ingress) when it is off. See `transport::quic`.
     pub(crate) quic: Option<super::quic::QuicSettings>,
@@ -731,6 +733,12 @@ pub(crate) fn udp_transport_handle<S: Socket>(
     listen_task: tokio::task::JoinHandle<TransportError>,
     restart: Option<GatewayQuicRestartWatch>,
 ) -> super::TransportHandle {
+    if restart
+        .as_ref()
+        .is_some_and(|watch| watch.endpoint.is_some())
+    {
+        super::quic::liveness::exit_for_endpoint_death();
+    }
     super::TransportHandle {
         quic_endpoint: outbound.quic_availability().get()
             != super::quic::liveness::QuicAvailability::Disabled,
@@ -741,7 +749,7 @@ pub(crate) fn udp_transport_handle<S: Socket>(
         listener: Box::pin(listener_liveness(
             listen_task,
             restart,
-            super::quic::breaker::note_endpoint_down_exit,
+            super::quic::breaker::note_endpoint_down_exit_once,
         )),
     }
 }
@@ -753,7 +761,7 @@ pub(crate) fn udp_transport_handle<S: Socket>(
 /// first. A death ends it only once `record` noted it in the crash-loop
 /// breaker's marker (`breaker::note_endpoint_down_exit`), so the next start
 /// can count it; a death that cannot be noted leaves the node running.
-async fn listener_liveness(
+pub(in crate::transport) async fn listener_liveness(
     mut listen_task: tokio::task::JoinHandle<TransportError>,
     restart: Option<GatewayQuicRestartWatch>,
     record: fn(std::time::SystemTime) -> bool,
@@ -912,7 +920,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         config: UdpTransportConfig,
         quic_endpoint: Option<super::quic::QuicEndpoint>,
     ) -> Result<ListenerSetup<S>, TransportError> {
-        let (transport, connection_handler, new_connection_notifier) = Self::new_listener(
+        let (mut transport, connection_handler, new_connection_notifier) = Self::new_listener(
             socket,
             keypair,
             is_gateway,
@@ -923,15 +931,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         // Packets are now sent directly to socket from each connection,
         // bypassing the centralized rate limiter that was causing serialization bottlenecks.
         // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
-        let listen_handle = GlobalExecutor::spawn(RANDOM_U64.scope(
-            {
-                // Use GlobalRng for deterministic simulation
-                let seed = GlobalRng::random_u64();
-                let mut rng = StdRng::seed_from_u64(seed);
-                rng.random()
-            },
-            transport.listen(),
-        ));
+        transport.accepted_keys = AcceptedKeys::for_new_listener();
+        let listen_handle = GlobalExecutor::spawn(transport.listen());
 
         Ok((connection_handler, new_connection_notifier, listen_handle))
     }
@@ -956,6 +957,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
+            legacy_responder_override,
             // Used by `bind_udp_listener`, which built `quic_endpoint` from it.
             quic: _,
             quic_policy,
@@ -1010,6 +1012,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         let upgrade_site =
             super::quic::upgrade::driver::UpgradeSite::new(quic_upgrades.as_ref(), socket_addr);
         let transport = UdpPacketsListener {
+            accepted_keys: AcceptedKeys::default(),
             is_gateway,
             socket_listener: socket,
             this_peer_keypair: keypair,
@@ -1033,6 +1036,10 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             gw_rate_limiter: GatewayConnectionRateLimiter::new(
                 time_source.clone(),
                 get_socket_virtual_time(&socket_addr),
+            ),
+            legacy_responder: legacy_responder::build(
+                time_source.clone(),
+                legacy_responder_override,
             ),
             time_source,
             congestion_config: Some(congestion_config.unwrap_or_default()),
@@ -1215,8 +1222,13 @@ impl<S: Socket> super::OutboundConnector for OutboundConnectionHandler<S> {
         let upgrades = self.upgrade_site.upgrades();
         Box::pin(async move {
             let Some(upgrades) = upgrades else {
-                super::TRANSPORT_METRICS
-                    .record_connect_native_setup(super::NativeSetupOutcome::Unavailable);
+                // A gateway join is counted by its caller, not here.
+                if !dial.join {
+                    super::TRANSPORT_METRICS.record_connect_native_setup(
+                        super::NativeSetupOutcome::Unavailable,
+                        dial.addr,
+                    );
+                }
                 return Err(super::NativeSetupOutcome::Unavailable);
             };
             upgrades
@@ -1293,7 +1305,8 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
         let (new_connection_sender, new_connection_notifier) = mpsc::channel(10);
         let expected_non_gateway = Arc::new(DashSet::new());
 
-        let transport = UdpPacketsListener {
+        let mut transport = UdpPacketsListener {
+            accepted_keys: AcceptedKeys::default(),
             is_gateway,
             socket_listener: socket,
             this_peer_keypair: keypair,
@@ -1311,6 +1324,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             // This listener's `time_source` is already VirtualTime, so the admission
             // clock needs no override.
             gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone(), None),
+            legacy_responder: legacy_responder::build(time_source.clone(), None),
             _quic_endpoint: None,
             _quic_attempts: None,
             _quic_upgrades: None,
@@ -1336,14 +1350,8 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
         // Per-connection rate limiting is handled by TokenBucket and LEDBAT in RemoteConnection.
         // Note: In test/bench code, the listen handle is intentionally dropped by callers
         // since mock sockets manage their own lifetimes.
-        let _listen_handle = GlobalExecutor::spawn(RANDOM_U64.scope(
-            {
-                let seed = GlobalRng::random_u64();
-                let mut rng = StdRng::seed_from_u64(seed);
-                rng.random()
-            },
-            transport.listen(),
-        ));
+        transport.accepted_keys = AcceptedKeys::for_new_listener();
+        let _listen_handle = GlobalExecutor::spawn(transport.listen());
 
         Ok((connection_handler, new_connection_notifier))
     }
@@ -1452,6 +1460,8 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
 /// Handles UDP transport internally.
 struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     socket_listener: Arc<S>,
+    /// Source of the inbound session key for each accepted intro.
+    accepted_keys: AcceptedKeys,
     /// Unified state manager for all remote connections.
     /// Ensures atomic state transitions during connection lifecycle
     /// (handshake → established → closed) to prevent race conditions.
@@ -1490,6 +1500,9 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// Ramps up connection acceptance rate to prevent thundering herd.
     /// Only active when `is_gateway` is true.
     gw_rate_limiter: GatewayConnectionRateLimiter<T>,
+    /// The stateless reply to a legacy intro, which replaces the gateway
+    /// handshake when present. `None` (the handshake runs) until D-8.
+    legacy_responder: Option<legacy_responder::LegacyResponder<T>>,
     /// Test-only override for [`version_cmp::GATEWAY_ACK_VERSION_MIN_VERSION`]
     /// (#5161). `None` in production, where the real floor applies.
     ///
@@ -2175,9 +2188,6 @@ impl<S, T: TimeSource> Drop for UdpPacketsListener<S, T> {
         tracing::info!(%self.this_addr, "Dropping UdpPacketsListener");
     }
 }
-task_local! {
-    static RANDOM_U64: [u8; 8];
-}
 
 /// The amount of times to retry NAT traversal before giving up. It should be sufficient
 /// so we give peers enough time for the other party to start the connection on its end.
@@ -2441,6 +2451,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                             // Gateway intro packet handling
                             if self.is_gateway {
+                                if self.legacy_responder.is_some() && packet_data.is_intro_packet() {
+                                    self.answer_legacy_intro(&packet_data, remote_addr);
+                                    continue;
+                                }
                                 if self.connections.has_gateway_handshake(&remote_addr) {
                                     tracing::debug!(peer_addr = %remote_addr, "Gateway connection already in progress");
                                     continue;
@@ -2481,7 +2495,9 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                                 self.connections.record_asym_attempt(remote_addr);
 
-                                let inbound_key_bytes = key_from_addr(&remote_addr);
+                                let Some(inbound_key_bytes) = self.accepted_keys.next() else {
+                                    continue;
+                                };
                                 let (gw_ongoing_connection, packets_sender) = self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
                                 if !self.connections.start_gateway_handshake(remote_addr, packets_sender) {
                                     continue; // State transition failed (e.g., RecentlyClosed still draining)
@@ -2825,7 +2841,7 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             Result<(RemoteConnection<S, T>, InboundRemoteConnection), (TransportError, SocketAddr)>,
         >,
     > {
-        let inbound_key_bytes = key_from_addr(&remote_addr);
+        let inbound_key_bytes = self.accepted_keys.next()?;
         let (gw_ongoing_connection, packets_sender) =
             self.gateway_connection(packet_data, remote_addr, inbound_key_bytes);
         if !self
@@ -2842,6 +2858,39 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     (error, remote_addr)
                 }),
         ))
+    }
+
+    /// Answer a legacy intro without a handshake (see `legacy_responder`).
+    /// The reply is sent from its own task so the listener loop never waits on
+    /// the socket; it is bounded by the responder's global bucket.
+    fn answer_legacy_intro(
+        &mut self,
+        packet_data: &PacketData<UnknownEncryption>,
+        remote_addr: SocketAddr,
+    ) {
+        let Some(responder) = self.legacy_responder.as_mut() else {
+            return;
+        };
+        match responder.respond(&self.this_peer_keypair.secret, packet_data.data()) {
+            legacy_responder::Outcome::RateLimited => {
+                tracing::trace!(peer_addr = %remote_addr, "Legacy intro dropped: responder rate limit");
+            }
+            legacy_responder::Outcome::Invalid => {
+                tracing::trace!(peer_addr = %remote_addr, "Legacy intro dropped: not a valid intro");
+            }
+            legacy_responder::Outcome::Reply(packet) => {
+                let socket = self.socket_listener.clone();
+                GlobalExecutor::spawn(async move {
+                    if let Err(err) = socket.send_to(&packet.prepared_send(), remote_addr).await {
+                        tracing::debug!(
+                            peer_addr = %remote_addr,
+                            error = %err,
+                            "Failed to send legacy intro reply"
+                        );
+                    }
+                });
+            }
+        }
     }
 
     /// Count an intro packet dropped because nothing exists for its exact
@@ -3231,9 +3280,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
             let start_time_nanos = time_source.now_nanos();
             let overall_deadline = NAT_TRAVERSAL_DEADLINE;
 
-            // Generate symmetric key using GlobalRng for deterministic simulation
-            let mut inbound_sym_key_bytes = [0u8; 16];
-            GlobalRng::fill_bytes(&mut inbound_sym_key_bytes);
+            let inbound_sym_key_bytes = new_inbound_key().ok_or_else(|| {
+                TransportError::ConnectionEstablishmentFailure {
+                    cause: "no entropy for the session key".into(),
+                }
+            })?;
             let inbound_sym_key = Aes128Gcm::new(&inbound_sym_key_bytes.into());
 
             let mut outbound_sym_key: Option<Aes128Gcm> = None;
@@ -4202,33 +4253,150 @@ fn split_asym_intro_payload(data: &[u8]) -> Option<([u8; 8], [u8; ASYM_INTRO_SYM
     Some((protoc_bytes, key_bytes))
 }
 
-fn key_from_addr(addr: &SocketAddr) -> [u8; 16] {
-    let current_time = chrono::Utc::now();
-    let mut hasher = blake3::Hasher::new();
-    match addr {
-        SocketAddr::V4(v4) => {
-            hasher.update(&v4.ip().octets());
-            hasher.update(&v4.port().to_le_bytes());
-        }
-        SocketAddr::V6(v6) => {
-            hasher.update(&v6.ip().octets());
-            hasher.update(&v6.port().to_le_bytes());
+/// Fresh random inbound session key for one handshake. This is AEAD key
+/// material, so it comes from the OS entropy pool (`OsRng`, the cryptographic
+/// exception in `.claude/rules/code-style.md`): a seeded `GlobalRng` is known
+/// to anyone who reads a test's seed. Only a run that has seeded `GlobalRng`
+/// (the deterministic simulation harness) draws from it, so simulations stay
+/// reproducible. Called once per handshake, never per packet.
+///
+/// Returns `None` if the OS entropy source fails, so the caller drops that one
+/// handshake instead of panicking the listener loop.
+fn new_inbound_key() -> Option<[u8; 16]> {
+    new_key_with(|key| GlobalRng::fill_bytes(key))
+}
+
+/// Source of the inbound session key for each handshake a listener accepts
+/// from a remote's intro (the gateway path and the restart path).
+///
+/// Under a seeded simulation the key comes from a side stream of the seed
+/// keyed by `(base, count)`. `base` is the one value the listener takes from
+/// the main seeded stream when it starts (the draw the listener has always
+/// taken at that point), so accepting handshakes consumes nothing further
+/// from the main stream: the number of intros a node accepts depends on
+/// timing, and drawing from the main stream per handshake would shift every
+/// later seeded choice in the run. The count is per listener, so the same
+/// seed gives the same keys on any thread and in any run. Unseeded, keys come
+/// from the OS entropy pool.
+#[derive(Default)]
+struct AcceptedKeys {
+    base: u64,
+    count: u64,
+}
+
+impl AcceptedKeys {
+    fn for_new_listener() -> Self {
+        Self {
+            base: GlobalRng::random_u64(),
+            count: 0,
         }
     }
-    hasher.update(
-        current_time
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
-            .and_utc()
-            .timestamp()
-            .to_le_bytes()
-            .as_ref(),
-    );
-    RANDOM_U64.with(|&random_value| {
-        hasher.update(random_value.as_ref());
-    });
-    hasher.finalize().as_bytes()[..16].try_into().unwrap()
+
+    /// A remote can trigger a draw only with an intro that passes the per-IP
+    /// intro throttle (gateway path) or the restart-intro rate limit (restart
+    /// path), so the draw rate a remote controls is bounded by those.
+    fn next(&mut self) -> Option<[u8; 16]> {
+        let stream = self
+            .base
+            .wrapping_add(self.count.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        self.count = self.count.wrapping_add(1);
+        new_key_with(|key| GlobalRng::with_side_stream(stream, || GlobalRng::fill_bytes(key)))
+    }
+}
+
+/// OS entropy when `GlobalRng` is unseeded, otherwise `seeded_draw`.
+fn new_key_with(seeded_draw: impl FnOnce(&mut [u8; 16])) -> Option<[u8; 16]> {
+    let mut key = [0u8; 16];
+    if GlobalRng::is_seeded() {
+        seeded_draw(&mut key);
+    } else {
+        use chacha20poly1305::aead::{OsRng, rand_core::RngCore};
+        if let Err(error) = OsRng.try_fill_bytes(&mut key) {
+            tracing::warn!(%error, "OS entropy unavailable; dropping this handshake");
+            return None;
+        }
+    }
+    Some(key)
+}
+
+#[cfg(test)]
+mod inbound_key_tests {
+    use super::*;
+
+    /// Each listener takes its one main-stream draw through
+    /// `AcceptedKeys::for_new_listener()` right before it starts. Deleting
+    /// the call at either construction site silently drops that draw and
+    /// shifts every later seeded choice in a simulation run, so pin both.
+    #[test]
+    fn both_listener_construction_sites_take_the_listener_draw() {
+        let source = include_str!("connection_handler.rs");
+        let production = source
+            .split("mod inbound_key_tests")
+            .next()
+            .expect("split yields a first part");
+        // Built at run time so this test's own text does not match.
+        let call = ["accepted_keys = Accepted", "Keys::for_new_listener();"].concat();
+        assert_eq!(
+            production.matches(call.as_str()).count(),
+            2,
+            "both UdpPacketsListener construction sites must call it before spawning"
+        );
+    }
+
+    #[test]
+    fn seeded_keys_are_deterministic_for_the_seed() {
+        let first = {
+            let _seed = GlobalRng::seed_guard(7);
+            new_inbound_key().expect("seeded draw cannot fail")
+        };
+        let again = {
+            let _seed = GlobalRng::seed_guard(7);
+            new_inbound_key().expect("seeded draw cannot fail")
+        };
+        let other = {
+            let _seed = GlobalRng::seed_guard(8);
+            new_inbound_key().expect("seeded draw cannot fail")
+        };
+        assert_eq!(first, again, "the same seed must give the same key");
+        assert_ne!(first, other, "a different seed must give a different key");
+    }
+
+    #[test]
+    fn accepted_keys_leave_the_main_seeded_stream_untouched() {
+        let after_accepts = {
+            let _seed = GlobalRng::seed_guard(7);
+            let mut keys = AcceptedKeys::for_new_listener();
+            let a = keys.next().expect("seeded draw cannot fail");
+            let b = keys.next().expect("seeded draw cannot fail");
+            assert_ne!(a, b, "each accepted handshake gets its own key");
+            GlobalRng::random_u64()
+        };
+        let untouched = {
+            let _seed = GlobalRng::seed_guard(7);
+            let _ = AcceptedKeys::for_new_listener();
+            GlobalRng::random_u64()
+        };
+        assert_eq!(after_accepts, untouched);
+    }
+
+    #[test]
+    fn accepted_keys_repeat_for_a_seed_on_one_thread() {
+        let run = |seed| {
+            let _seed = GlobalRng::seed_guard(seed);
+            let mut keys = AcceptedKeys::for_new_listener();
+            [keys.next().unwrap(), keys.next().unwrap()]
+        };
+        assert_eq!(run(7), run(7), "same seed, same keys, on the same thread");
+        assert_ne!(run(7), run(8));
+    }
+
+    #[test]
+    fn unseeded_keys_differ() {
+        assert!(!GlobalRng::is_seeded());
+        let a = new_inbound_key().expect("OS entropy");
+        let b = new_inbound_key().expect("OS entropy");
+        assert_ne!(a, b);
+    }
 }
 
 pub(crate) enum ConnectionEvent<S = UdpSocket, TS: TimeSource = RealTime> {
@@ -4279,6 +4447,7 @@ struct InboundRemoteConnection {
     inbound_packet_sender: mpsc::Sender<InboundPacket>,
 }
 
+mod legacy_responder;
 mod recv_errors;
 mod stray_intro;
 mod version_cmp;
@@ -9122,6 +9291,164 @@ pub mod mock_transport {
                 Ok((conn, gw_addr, gw, gw_key, joiner_key))
             }
 
+            /// Two handshakes from the same IP:port (a joiner that restarted
+            /// from the same address) each get their own gateway inbound key.
+            #[tokio::test]
+            async fn gateway_inbound_key_is_fresh_for_each_handshake() -> anyhow::Result<()> {
+                let vt = VirtualTime::new();
+                let channels: Channels = Arc::new(DashMap::new());
+                let mut remote = ScriptedRemote::new(&channels);
+                let (gw_pub, (_gw, mut gw_conns), gw_addr) = create_mock_peer_internal_vt(
+                    PacketDropPolicy::ReceiveAll,
+                    PacketDelayPolicy::NoDelay,
+                    true,
+                    channels.clone(),
+                    None,
+                    Some(vt.clone()),
+                )
+                .await?;
+
+                let mut keys = Vec::new();
+                let mut conns = Vec::new();
+                for _ in 0..2 {
+                    // The per-IP intro throttle runs on the gateway's clock.
+                    vt.advance(Duration::from_secs(2));
+                    let mut joiner_key = [0u8; 16];
+                    GlobalRng::fill_bytes(&mut joiner_key);
+                    let mut payload = PROTOC_VERSION.to_vec();
+                    payload.extend_from_slice(&joiner_key);
+                    let intro =
+                        PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&payload, &gw_pub);
+                    remote.send(gw_addr, intro.data());
+                    let gw_key = tokio::time::timeout(WAIT, async {
+                        loop {
+                            if let Some(msg) = open(remote.recv().await, joiner_key) {
+                                let (key, _, _) = ack_ok_parts(&msg.payload)
+                                    .expect("the gateway answers with a success ack");
+                                break key;
+                            }
+                        }
+                    })
+                    .await
+                    .expect("the gateway answers the intro");
+                    let ack = SymmetricMessage::ack_ok(&cipher(gw_key), joiner_key, gw_addr)?;
+                    remote.send(gw_addr, ack.data());
+                    let conn = tokio::time::timeout(WAIT, gw_conns.recv())
+                        .await?
+                        .expect("the gateway hands over the connection");
+                    keys.push(gw_key);
+                    conns.push(conn);
+                }
+                assert_ne!(
+                    keys[0], keys[1],
+                    "each handshake must get its own inbound key"
+                );
+                Ok(())
+            }
+
+            /// A peer that restarts from the same IP:port and reconnects
+            /// through `accept_restarted_peer` gets a new inbound key for each
+            /// restart, different from the first session's key and from the
+            /// previous restart's.
+            #[tokio::test]
+            async fn restart_accepted_by_a_peer_gets_a_fresh_inbound_key() -> anyhow::Result<()> {
+                let vt = VirtualTime::new();
+                let channels: Channels = Arc::new(DashMap::new());
+                let mut remote = ScriptedRemote::new(&channels);
+                // The inbound receiver is kept and drained: the listener stops
+                // when it cannot deliver an accepted restart.
+                let (peer_pub, (mut peer, mut inbound_conns), peer_addr) =
+                    create_mock_peer_internal_vt(
+                        PacketDropPolicy::ReceiveAll,
+                        PacketDelayPolicy::NoDelay,
+                        false,
+                        channels.clone(),
+                        None,
+                        Some(vt.clone()),
+                    )
+                    .await?;
+
+                // First session: the peer dials the remote and answers its
+                // intro, so it holds an established connection to the remote.
+                let conn = peer
+                    .connect(remote.keypair.public().clone(), remote.addr)
+                    .await;
+                let conn = tokio::spawn(conn);
+                let intro = remote.recv().await;
+                let decrypted = PacketData::<_, MAX_PACKET_SIZE>::from_buf(&intro)
+                    .try_decrypt_asym(remote.keypair.secret())
+                    .expect("the first packet is the peer's intro");
+                let (_, first_key) =
+                    split_asym_intro_payload(decrypted.data()).expect("well-formed intro");
+                let mut remote_key = [0u8; 16];
+                GlobalRng::fill_bytes(&mut remote_key);
+                let mut payload = PROTOC_VERSION.to_vec();
+                payload.extend_from_slice(&remote_key);
+                let our_intro =
+                    PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&payload, &peer_pub);
+                remote.send(peer_addr, our_intro.data());
+                let ack = SymmetricMessage::ack_ok(&cipher(first_key), remote_key, peer_addr)?;
+                remote.send(peer_addr, ack.data());
+                let _first_conn = established(conn).await;
+
+                // Real-time bound only as a hang guard: the sockets are in-memory
+                // and the peer's clock is virtual, so a healthy run answers at
+                // once. It is generous so a heavily loaded host cannot trip it.
+                const WAIT_REAL: Duration = Duration::from_secs(30);
+
+                // Each restart: the same address sends a new intro. A retry
+                // covers the window in which the previous restart's handshake
+                // has not yet been recorded as an established connection.
+                let mut keys = vec![first_key];
+                let mut restarted = Vec::new();
+                for _ in 0..2 {
+                    let mut joiner_key = [0u8; 16];
+                    GlobalRng::fill_bytes(&mut joiner_key);
+                    let mut payload = PROTOC_VERSION.to_vec();
+                    payload.extend_from_slice(&joiner_key);
+                    let mut accepted = None;
+                    for _ in 0..20 {
+                        // The per-IP intro throttle runs on the peer's clock.
+                        vt.advance(Duration::from_secs(2));
+                        let intro = PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(
+                            &payload, &peer_pub,
+                        );
+                        remote.send(peer_addr, intro.data());
+                        let answer = tokio::time::timeout(WAIT_REAL, async {
+                            loop {
+                                let packet = remote.inbound.recv().await.expect("channel open");
+                                if let Some(msg) = open(packet.data, joiner_key) {
+                                    if let Some((key, _, _)) = ack_ok_parts(&msg.payload) {
+                                        break key;
+                                    }
+                                }
+                            }
+                        })
+                        .await;
+                        if let Ok(key) = answer {
+                            accepted = Some(key);
+                            break;
+                        }
+                    }
+                    let key = accepted.expect("the peer accepts the restarted remote");
+                    let ack = SymmetricMessage::ack_ok(&cipher(key), joiner_key, peer_addr)?;
+                    remote.send(peer_addr, ack.data());
+                    // The restarted session is delivered once its handshake
+                    // completes; until then the address has no recorded state.
+                    restarted.push(
+                        tokio::time::timeout(WAIT_REAL, inbound_conns.recv())
+                            .await
+                            .expect("the restarted session is delivered")
+                            .expect("channel open"),
+                    );
+                    keys.push(key);
+                }
+                assert_ne!(keys[1], keys[0], "a restart must not reuse the first key");
+                assert_ne!(keys[2], keys[1], "each restart must get its own key");
+                assert_ne!(keys[2], keys[0], "a restart must not reuse the first key");
+                Ok(())
+            }
+
             /// Hole punch, the side that answered the remote's intro
             /// (`RemoteInbound` arm): the WAN bench case.
             #[tokio::test]
@@ -9280,5 +9607,54 @@ pub mod mock_transport {
                 Ok(())
             }
         }
+    }
+}
+
+/// A native dial on a transport with no QUIC upgrades is refused as
+/// `Unavailable`. A peer-to-peer dial counts as a native setup; a gateway join
+/// does not (its caller counts it), so the A+ pair comparison never sees it.
+#[cfg(test)]
+mod native_dial_unavailable_tests {
+    use super::*;
+    use crate::transport::OutboundConnector as _;
+
+    async fn unavailable_dial(addr: SocketAddr, join: bool) -> Vec<String> {
+        let (send_queue, _rx) = mpsc::channel(1);
+        let handler: OutboundConnectionHandler = OutboundConnectionHandler {
+            send_queue,
+            expected_non_gateway: Default::default(),
+            quic_availability: super::super::quic::QuicAvailabilityWatch::disabled(),
+            upgrade_site: Default::default(),
+            quic_endpoint: None,
+        };
+        let dial = super::super::NativeDial {
+            addr,
+            key: super::super::TransportKeypair::new().public().clone(),
+            is_gateway: join,
+            within: std::time::Duration::from_secs(8),
+            join,
+        };
+        let result = handler.connect_native(dial).await;
+        assert!(matches!(
+            result,
+            Err(super::super::NativeSetupOutcome::Unavailable)
+        ));
+        super::super::TRANSPORT_METRICS
+            .quic_events_of(addr)
+            .into_iter()
+            .filter(|event| event.starts_with("(\"setup\""))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_gateway_join_is_not_counted_as_a_native_setup() {
+        let peer_to_peer = unavailable_dial("203.0.113.71:4401".parse().unwrap(), false).await;
+        assert_eq!(
+            peer_to_peer,
+            ["(\"setup\", Unavailable)"],
+            "premise: a peer-to-peer dial is counted"
+        );
+        let join = unavailable_dial("203.0.113.72:4401".parse().unwrap(), true).await;
+        assert!(join.is_empty(), "a gateway join is not counted: {join:?}");
     }
 }

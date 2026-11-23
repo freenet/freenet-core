@@ -579,9 +579,15 @@ async fn drive_client_update(
                 .recent_relay_update_requests
                 .first_sighting(client_tx, op_manager.ring.time_source.now());
 
-            // Fire-and-forget send to target peer.
-            let mut ctx = op_manager.op_ctx(client_tx);
-            ctx.send_fire_and_forget(target_addr, msg).await?;
+            // Fire-and-forget send to target peer. The test seam for the #6143
+            // failure class swallows it too: it is an inline message from the
+            // originator, the class that node lost.
+            if super::inline_leg_fault_injection::inline_leg_fate(op_manager, &key)
+                == super::inline_leg_fault_injection::LegFate::Send
+            {
+                let mut ctx = op_manager.op_ctx(client_tx);
+                ctx.send_fire_and_forget(target_addr, msg).await?;
+            }
 
             // No release_pending_op_slot call here: send_client_result()
             // (called by deliver_outcome) emits TransactionCompleted which
