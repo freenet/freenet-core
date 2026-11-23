@@ -514,7 +514,7 @@ off in this process (`quic_breaker_suppressed`, a state that is never reset and
 is not activity by itself) and the endpoint's state (`quic_endpoint`: `up`, or
 `off_config`, `off_platform`, `off_abort`, `off_bind`, `off_breaker`, or `died`;
 `unknown` before the node reaches the bind; set at startup after the breaker
-gate, at the bind, and at the endpoint's death, which is final for the process;
+gate, at the bind, and at the endpoint's death, which is final for the process unless the node rebuilds its endpoint (see "QUIC endpoint rebuild", dark by default);
 a state that is never reset and is not activity by itself) and QUIC connections this node closed, by close code
 (`quic_close_sent_<label>`, one per `QuicCloseCode`), the QUIC-native connect
 offer and decision (`connect_native_offered_{zero,nonzero}` built as joiner,
@@ -3956,11 +3956,27 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
   → QuicAvailabilityWatch (QuicEndpoint::availability, and
     OutboundConnectionHandler::quic_availability, which is Disabled with
     no endpoint): get() any time, not_up() to wait. Disabled, Down and
-    Released are final, and not_up() returns them at once every time.
-    Availability is per endpoint, one per node (so per process in
-    production, per node in simulation).
+    Released are final for an endpoint, and not_up() returns them at once
+    every time. A node that rebuilds its endpoint (quic/rebuild.rs, off
+    unless ENDPOINT_REBUILD or a test turns it on) holds one watch of its
+    own (QuicAvailabilityWatch::settable) that follows the current endpoint
+    and goes from Down back to Up after a rebuild; each dead endpoint's own
+    watch keeps its final Down. Availability is per endpoint, one per
+    node (so per process in production, per node in simulation).
+  → QUIC endpoint rebuild (quic/rebuild.rs, #6272; dark: ENDPOINT_REBUILD is
+    false, so no production node rebuilds, and a supervised node exits for a
+    restart instead): a node with no supervisor whose endpoint died waits
+    1 s doubling to 5 min, +-20% jitter, then builds the endpoint again on
+    the node's one socket (QuicEndpoint::rebuild), starts its accept loop,
+    upgrades and attempt router (spawn_accept_loop_with and
+    spawn_attempt_router_with, which hand their JoinHandles to the rebuild
+    loop instead of the monitor), and swaps them in for the dead endpoint's.
+    The rebuild loop owns these tasks as the task quic_endpoint_rebuild;
+    a task that ends while the endpoint stays up still ends the node. The
+    backoff resets only after a rebuilt endpoint stays up for REBUILD_STABLE.
   → QuicEndpoint::spawn_accept_loop registers the accept loop through a
-    LateRegistrar as quic_accept_loop. The node starts it when it opens the
+    LateRegistrar as quic_accept_loop (a node that rebuilds its endpoint uses
+    spawn_accept_loop_with instead, and the rebuild loop owns the task). The node starts it when it opens the
     transport with an endpoint (UdpTransportConfig::task_registrar; tools
     and tests that pass none start no loop). It holds an EndpointCore
     (no owner share), so it does not keep the endpoint alive: when the

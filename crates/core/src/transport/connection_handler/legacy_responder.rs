@@ -320,6 +320,7 @@ mod tests {
                 ..UdpTransportConfig::default()
             },
             None,
+            None,
         )
         .expect("gateway setup");
 

@@ -2572,8 +2572,9 @@ pub(in crate::transport) async fn route_attempts_queued_before_a_driver_panic() 
     .await;
     assert_eq!(state, QuicAvailability::Down);
     let monitor = BackgroundTaskMonitor::new();
+    let registrar = monitor.late_registrar();
     h.hub
-        .spawn_attempt_router(&monitor.late_registrar(), queued);
+        .spawn_attempt_router_with(&mut |name, handle| registrar.register(name, handle), queued);
     let failed = tokio::spawn(monitor.wait_for_any_exit());
     for _ in 0..16 {
         tokio::task::yield_now().await;

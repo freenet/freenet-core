@@ -12,6 +12,7 @@ fn handler() -> (OutboundConnectionHandler<MockSocket>, Queue) {
         quic_availability: crate::transport::quic::QuicAvailabilityWatch::disabled(),
         upgrade_site: Default::default(),
         quic_endpoint: None,
+        quic_stack: std::sync::Weak::new(),
     };
     (handler, queue)
 }

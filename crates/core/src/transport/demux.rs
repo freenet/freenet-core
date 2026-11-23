@@ -13,10 +13,10 @@
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use dashmap::DashMap;
@@ -377,7 +377,10 @@ pub(crate) fn classify(packet: &[u8]) -> DemuxClass {
 pub struct DemuxSocket<S> {
     inner: S,
     egress: Option<EgressCap>,
-    quic: OnceLock<QuicIngress>,
+    /// The QUIC ingress, once enabled. Replaced only when the node rebuilds
+    /// its QUIC endpoint (`quic::rebuild`, [`Self::with_replaced_quic_ingress`]);
+    /// read once per QUIC-class datagram.
+    quic: parking_lot::RwLock<Option<Arc<QuicIngress>>>,
     /// Datagrams consumed here since the last legacy one, for the yield in
     /// `recv_classified`. Only the listener reads, so relaxed is enough.
     diverted_in_a_row: AtomicU32,
@@ -390,7 +393,7 @@ impl<S> DemuxSocket<S> {
         Self {
             inner,
             egress,
-            quic: OnceLock::new(),
+            quic: parking_lot::RwLock::new(None),
             diverted_in_a_row: AtomicU32::new(0),
             #[cfg(test)]
             quic_outcomes: Default::default(),
@@ -418,13 +421,17 @@ impl<S> DemuxSocket<S> {
         let (unknown, unknown_receiver) =
             mpsc::channel(super::quic::admission::UNKNOWN_SOURCE_QUEUE_DATAGRAMS);
         let shared = Arc::new(IngressShared::default());
-        self.quic
-            .set(QuicIngress {
+        {
+            let mut slot = self.quic.write();
+            if slot.is_some() {
+                return None;
+            }
+            *slot = Some(Arc::new(QuicIngress {
                 queue,
                 unknown,
                 shared: shared.clone(),
-            })
-            .ok()?;
+            }));
+        }
         Some(QuicIngressReceiver {
             queue: receiver,
             unknown: unknown_receiver,
@@ -437,7 +444,7 @@ impl<S> DemuxSocket<S> {
     /// dropping it (`quic::admission`, a gateway admitting native joins).
     /// Whether an ingress was there to take it.
     pub(crate) fn enable_unknown_source_lane(&self) -> bool {
-        match self.live_quic_ingress() {
+        match self.live_quic_ingress().as_deref() {
             Some(ingress) => {
                 ingress.shared.unknown_lane.store(true, Ordering::Release);
                 true
@@ -463,23 +470,66 @@ impl<S> DemuxSocket<S> {
         Some(built)
     }
 
+    /// [`Self::with_quic_ingress`] for an endpoint built to replace one that
+    /// died (`quic::rebuild`): the ingress the dead endpoint read is disabled
+    /// (its allow-set emptied, its permits releasing nothing) and dropped, so
+    /// the dead endpoint's receiver ends, and a new one, with an empty
+    /// allow-set and empty queues, takes its place. If `build` fails the new
+    /// ingress is disabled too, leaving the socket as with QUIC off. `None`,
+    /// with nothing changed, if no ingress was ever enabled: a rebuild only
+    /// replaces an endpoint the node had.
+    pub(crate) fn with_replaced_quic_ingress<R, E>(
+        &self,
+        build: impl FnOnce(QuicIngressReceiver) -> Result<R, E>,
+    ) -> Option<Result<R, E>> {
+        let receiver = {
+            let mut slot = self.quic.write();
+            let old = slot.take()?;
+            disable(&old.shared);
+            let (queue, receiver) = mpsc::channel(QUIC_INGRESS_QUEUE_DATAGRAMS);
+            let (unknown, unknown_receiver) =
+                mpsc::channel(super::quic::admission::UNKNOWN_SOURCE_QUEUE_DATAGRAMS);
+            let shared = Arc::new(IngressShared::default());
+            *slot = Some(Arc::new(QuicIngress {
+                queue,
+                unknown,
+                shared: shared.clone(),
+            }));
+            QuicIngressReceiver {
+                queue: receiver,
+                unknown: unknown_receiver,
+                shared,
+            }
+        };
+        let built = build(receiver);
+        if built.is_err() {
+            self.disable_quic_ingress();
+        }
+        Some(built)
+    }
+
     /// Stop the QUIC ingress for good: refuse new permits, empty the
     /// allow-set, and count every QUIC-class datagram as `no_ingress`.
     /// Permits still held release nothing (their entries are gone).
     fn disable_quic_ingress(&self) {
-        if let Some(ingress) = self.quic.get() {
-            let shared = &ingress.shared;
-            shared.disabled.store(true, Ordering::Release);
-            shared.allowed.clear();
-            shared.allowed_count.store(0, Ordering::Release);
+        if let Some(ingress) = self.quic.read().as_deref() {
+            disable(&ingress.shared);
         }
     }
 
     /// The enabled ingress, unless it was disabled.
-    fn live_quic_ingress(&self) -> Option<&QuicIngress> {
+    fn live_quic_ingress(&self) -> Option<Arc<QuicIngress>> {
         self.quic
-            .get()
+            .read()
+            .as_ref()
             .filter(|ingress| !ingress.shared.disabled.load(Ordering::Acquire))
+            .cloned()
+    }
+
+    /// The ingress, enabled or disabled (tests).
+    #[cfg(test)]
+    fn ingress_for_test(&self) -> Option<Arc<QuicIngress>> {
+        self.quic.read().clone()
     }
 
     /// Let QUIC-class datagrams from `addr` reach the ingress queue while
@@ -552,7 +602,7 @@ impl<S> DemuxSocket<S> {
     /// Whether QUIC-class datagrams from `addr` currently reach the ingress.
     #[cfg(test)]
     pub(crate) fn is_quic_source_allowed(&self, addr: SocketAddr) -> bool {
-        self.quic.get().is_some_and(|ingress| {
+        self.ingress_for_test().is_some_and(|ingress| {
             ingress
                 .shared
                 .allowed
@@ -565,7 +615,12 @@ impl<S> DemuxSocket<S> {
     /// count what happened to it. Never waits, and copies the bytes only
     /// when they are queued.
     fn divert_quic(&self, datagram: &[u8], from: SocketAddr) {
-        let outcome = match self.live_quic_ingress() {
+        // The read guard, not a clone of the `Arc`: one lock per datagram.
+        let slot = self.quic.read();
+        let live = slot
+            .as_deref()
+            .filter(|ingress| !ingress.shared.disabled.load(Ordering::Acquire));
+        let outcome = match live {
             None => QuicIngressOutcome::NoIngress,
             Some(ingress) if !ingress.shared.allowed.contains_key(&from) => {
                 if ingress.shared.unknown_lane.load(Ordering::Acquire) {
@@ -576,6 +631,7 @@ impl<S> DemuxSocket<S> {
             }
             Some(ingress) => ingress.queue_from(datagram, from),
         };
+        drop(slot);
         TRANSPORT_METRICS.record_quic_ingress(outcome);
         #[cfg(test)]
         self.quic_outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
@@ -592,7 +648,7 @@ impl<S> DemuxSocket<S> {
     /// Datagrams holding a slot of the joiners' share (tests).
     #[cfg(test)]
     fn joiner_queued_for_test(&self) -> usize {
-        self.quic.get().map_or(0, |ingress| {
+        self.ingress_for_test().map_or(0, |ingress| {
             ingress.shared.joiner_queued.load(Ordering::Acquire)
         })
     }
@@ -601,6 +657,13 @@ impl<S> DemuxSocket<S> {
     pub(crate) fn inner_for_test(&self) -> &S {
         &self.inner
     }
+}
+
+/// Disable an ingress: see [`DemuxSocket::disable_quic_ingress`].
+fn disable(shared: &IngressShared) {
+    shared.disabled.store(true, Ordering::Release);
+    shared.allowed.clear();
+    shared.allowed_count.store(0, Ordering::Release);
 }
 
 impl QuicIngress {
@@ -1422,7 +1485,7 @@ mod tests {
         );
         assert_eq!(queue.len(), 897);
         while queue.try_recv().is_ok() {}
-        let ingress = socket.quic.get().expect("ingress");
+        let ingress = socket.ingress_for_test().expect("ingress");
         assert!(
             ingress.shared.queued.is_empty(),
             "every per-source count is back to zero"
@@ -1615,7 +1678,12 @@ mod tests {
         let late: SocketAddr = "10.8.8.8:7000".parse().unwrap();
         assert!(full.allow_quic_joiner(late).is_none(), "the set is full");
         assert!(
-            !full.quic.get().unwrap().shared.joiners.contains_key(&late),
+            !full
+                .ingress_for_test()
+                .unwrap()
+                .shared
+                .joiners
+                .contains_key(&late),
             "the refused joiner left no mark"
         );
     }
@@ -1653,7 +1721,7 @@ mod tests {
         let after = outcomes(&socket);
         assert_eq!(after[5], before[5] + 1, "the joiner got reserve_full");
         assert_eq!(after[0], before[0] + 1, "the quiet source used the reserve");
-        let shared = &socket.quic.get().unwrap().shared;
+        let shared = &socket.ingress_for_test().unwrap().shared;
         assert!(
             !shared.queued.contains_key(&joiner),
             "the refused joiner left no queued entry"
@@ -1688,7 +1756,7 @@ mod tests {
         socket.recv_classified(&mut buf).await.unwrap();
         assert_eq!(outcomes(&socket)[4], 2, "both refused as no_ingress");
         assert_eq!(socket.joiner_queued_for_test(), 0, "no joiner slot leaked");
-        let shared = &socket.quic.get().unwrap().shared;
+        let shared = &socket.ingress_for_test().unwrap().shared;
         assert!(!shared.queued.contains_key(&joiner), "no share leaked");
     }
 
@@ -1946,6 +2014,72 @@ mod tests {
             .expect("built");
         assert!(working.allow_quic_source(from).is_some());
         drop(receiver);
+    }
+
+    /// `with_replaced_quic_ingress` (a rebuilt endpoint, `quic::rebuild`):
+    /// the old ingress is disabled (its allow-set emptied, its receiver
+    /// ended) and a new one with an empty allow-set takes over; a failed
+    /// build leaves the ingress disabled; with no ingress ever enabled it
+    /// returns `None` and changes nothing.
+    #[tokio::test]
+    async fn a_replaced_ingress_disables_the_old_one_and_starts_empty() {
+        let from: SocketAddr = "10.254.2.8:4108".parse().unwrap();
+        let socket =
+            DemuxSocket::wrap(ScriptedSocket::new(vec![Step::Packet(from, quic(1))]), None);
+        assert!(
+            socket
+                .with_replaced_quic_ingress(|_| Ok::<(), ()>(()))
+                .is_none(),
+            "nothing to replace"
+        );
+        assert!(socket.ingress_for_test().is_none(), "and nothing changed");
+
+        let mut old = socket.enable_quic_ingress().expect("first enable");
+        let old_permit = socket.allow_quic_source(from).expect("allowed");
+        assert!(socket.is_quic_source_allowed(from));
+        let mut fresh = socket
+            .with_replaced_quic_ingress(Ok::<_, ()>)
+            .expect("replaced")
+            .expect("built");
+        assert!(
+            !socket.is_quic_source_allowed(from),
+            "allow-set starts empty"
+        );
+        assert!(
+            old.shared.disabled.load(Ordering::Acquire),
+            "the old ingress is disabled"
+        );
+        assert!(
+            old.queue.recv().await.is_none(),
+            "the old endpoint's receiver ends"
+        );
+        // The old permit releases nothing in the new ingress.
+        let new_permit = socket
+            .allow_quic_source(from)
+            .expect("the new ingress works");
+        drop(old_permit);
+        assert!(
+            socket.is_quic_source_allowed(from),
+            "kept by the new permit"
+        );
+        let mut buf = [0u8; 2048];
+        socket.recv_classified(&mut buf).await.unwrap();
+        assert!(
+            fresh.queue.try_recv().is_ok(),
+            "datagrams reach the new queue"
+        );
+        drop(new_permit);
+
+        // A failed build leaves the replaced ingress disabled.
+        let failed: Result<(), &str> = socket
+            .with_replaced_quic_ingress(|_| Err("no endpoint"))
+            .expect("replaced");
+        assert!(failed.is_err());
+        assert!(socket.allow_quic_source(from).is_none(), "disabled");
+        assert!(
+            fresh.queue.recv().await.is_none(),
+            "the replaced receiver ends"
+        );
     }
 
     /// `try_send_to` returns the inner socket's `WouldBlock` unchanged and

@@ -22853,6 +22853,52 @@ fn test_quic_replacement_session_upgrades_after_the_backoff() {
     );
 }
 
+/// #6272: the gateway's endpoint dies at 30 s, after its path to the node is up.
+/// A gateway that rebuilds its endpoint (as one with no supervisor does once
+/// rebuilding is on) builds a new one about a second later, and when the node
+/// restarts at 41 s its new session is offered and upgraded over the new
+/// endpoint. Without the rebuild the same run carries no path after the death.
+#[test_log::test]
+fn test_quic_rebuilt_endpoint_carries_a_new_path() {
+    const FAIL_AT: Duration = Duration::from_secs(30);
+    for rebuild in [true, false] {
+        let (trace, gateway, replaced_at) = run_quic_restart_sim_with(
+            &format!("quic-endpoint-rebuilt-{rebuild}"),
+            0x6272_E5B0_0001,
+            None,
+            Duration::from_secs(240),
+            |trace, gateway| {
+                trace.fail_endpoint_at(gateway, FAIL_AT);
+                if rebuild {
+                    trace.rebuild_endpoint(gateway);
+                }
+            },
+        );
+        let dump = format!("{:#?}", trace.records());
+        let established = trace.matching(gateway, "Established");
+        let failed = trace.matching(gateway, "failed the endpoint at ");
+        assert_eq!(failed.len(), 1, "the endpoint failed once: {dump}");
+        assert!(
+            established.iter().any(|e| e.at < failed[0].at),
+            "a path was up before the death: {dump}"
+        );
+        assert!(
+            !trace.matching(gateway, "Fallback(EndpointDown)").is_empty(),
+            "the death closed it: {dump}"
+        );
+        let rebuilt = trace.matching(gateway, "rebuilt the endpoint at ");
+        let after = established.iter().filter(|e| e.at > replaced_at).count();
+        if rebuild {
+            assert_eq!(rebuilt.len(), 1, "one rebuild: {dump}");
+            assert!(rebuilt[0].at < replaced_at, "{dump}");
+            assert!(after >= 1, "a new path over the rebuilt endpoint: {dump}");
+        } else {
+            assert!(rebuilt.is_empty(), "{dump}");
+            assert_eq!(after, 0, "no path once the endpoint is dead: {dump}");
+        }
+    }
+}
+
 /// One gateway and one node in shadow, with the path up by 40 s: the node crashes
 /// and restarts with its identity, and the run goes on for `then`. `quiet_from`
 /// stops QUIC datagrams between them. Returns the trace, the gateway's address and
@@ -22862,6 +22908,18 @@ fn run_quic_restart_sim(
     seed: u64,
     quiet_from: Option<Duration>,
     then: Duration,
+) -> (freenet::dev_tool::QuicUpgradeTrace, SocketAddr, Duration) {
+    run_quic_restart_sim_with(name, seed, quiet_from, then, |_, _| {})
+}
+
+/// [`run_quic_restart_sim`], with `set_up` given the trace and the gateway's
+/// address before the nodes start.
+fn run_quic_restart_sim_with(
+    name: &str,
+    seed: u64,
+    quiet_from: Option<Duration>,
+    then: Duration,
+    set_up: impl FnOnce(&freenet::dev_tool::QuicUpgradeTrace, SocketAddr),
 ) -> (freenet::dev_tool::QuicUpgradeTrace, SocketAddr, Duration) {
     setup_deterministic_state(seed);
     freenet::config::SimulationIdleTimeout::enable();
@@ -22882,6 +22940,7 @@ fn run_quic_restart_sim(
         if let Some(from) = quiet_from {
             sim.drop_quic_datagrams_between(&gateway, &node, from);
         }
+        set_up(&trace, labels[&gateway]);
         let time = sim.virtual_time().clone();
         let driver = tokio::spawn(async move {
             let start = tokio::time::Instant::now();

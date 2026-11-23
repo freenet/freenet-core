@@ -56,6 +56,12 @@ struct TraceData {
     refuse_data: Mutex<BTreeSet<SocketAddr>>,
     /// The version a peer reports, and the release it then reads as.
     release: Mutex<Option<(Version, Version)>>,
+    /// Nodes that rebuild their QUIC endpoint when it dies
+    /// ([`QuicUpgradeTrace::rebuild_endpoint`]).
+    rebuild: Mutex<BTreeSet<SocketAddr>>,
+    /// Nodes treated as exiting for their supervisor when their endpoint
+    /// dies ([`QuicUpgradeTrace::supervise`]).
+    supervised: Mutex<BTreeSet<SocketAddr>>,
 }
 
 /// A network's upgrade records. Clones share them.
@@ -167,6 +173,22 @@ impl QuicUpgradeTrace {
         self.data.down_at.lock().insert(node, at);
     }
 
+    /// `node` rebuilds its QUIC endpoint in process when it dies, as a node
+    /// with no supervisor does once `quic::rebuild::ENDPOINT_REBUILD` is on
+    /// (#6272). The node records `rebuilt the endpoint at <ms> ms` on the path
+    /// clock for each endpoint it builds in place of a dead one. A fault set
+    /// with [`Self::fail_endpoint_at`] fails only the first endpoint.
+    pub fn rebuild_endpoint(&self, node: SocketAddr) {
+        self.data.rebuild.lock().insert(node);
+    }
+
+    /// `node` counts as exiting for its supervisor when its endpoint dies, as
+    /// a node run with `FREENET_SUPERVISED` does, for the decision whether it
+    /// rebuilds the endpoint (`quic::rebuild::enabled_at`): it never does.
+    pub fn supervise(&self, node: SocketAddr) {
+        self.data.supervised.lock().insert(node);
+    }
+
     pub(crate) fn node(&self, addr: SocketAddr) -> NodeTrace {
         NodeTrace {
             trace: self.clone(),
@@ -265,6 +287,16 @@ impl NodeTrace {
 
     pub(crate) fn down_at(&self) -> Option<Duration> {
         self.trace.data.down_at.lock().get(&self.addr).copied()
+    }
+
+    /// Whether this node rebuilds its endpoint ([`QuicUpgradeTrace::rebuild_endpoint`]).
+    pub(crate) fn rebuilds_endpoint(&self) -> bool {
+        self.trace.data.rebuild.lock().contains(&self.addr)
+    }
+
+    /// Whether this node counts as supervised ([`QuicUpgradeTrace::supervise`]).
+    pub(crate) fn supervised(&self) -> bool {
+        self.trace.data.supervised.lock().contains(&self.addr)
     }
 
     pub(crate) fn register_permits(&self, permits: QuicPathPermits) {
