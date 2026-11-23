@@ -26,6 +26,8 @@ mod message;
 
 /// Node configuration, implementations and execution (entry points for the binaries).
 mod node;
+#[doc(hidden)]
+pub use node::QUIC_RESTART_EXIT_CODE;
 pub use node::{
     EventLoopExitReason, Node, ShutdownHandle, enable_abort_on_fatal_listener_exit,
     enable_abort_on_redb_poison, enable_fast_crash_exit_code, listener_exit_is_graceful,

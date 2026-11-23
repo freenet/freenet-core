@@ -733,6 +733,12 @@ pub(crate) fn udp_transport_handle<S: Socket>(
     listen_task: tokio::task::JoinHandle<TransportError>,
     restart: Option<GatewayQuicRestartWatch>,
 ) -> super::TransportHandle {
+    if restart
+        .as_ref()
+        .is_some_and(|watch| watch.endpoint.is_some())
+    {
+        super::quic::liveness::exit_for_endpoint_death();
+    }
     super::TransportHandle {
         quic_endpoint: outbound.quic_availability().get()
             != super::quic::liveness::QuicAvailability::Disabled,
@@ -743,7 +749,7 @@ pub(crate) fn udp_transport_handle<S: Socket>(
         listener: Box::pin(listener_liveness(
             listen_task,
             restart,
-            super::quic::breaker::note_endpoint_down_exit,
+            super::quic::breaker::note_endpoint_down_exit_once,
         )),
     }
 }
@@ -755,7 +761,7 @@ pub(crate) fn udp_transport_handle<S: Socket>(
 /// first. A death ends it only once `record` noted it in the crash-loop
 /// breaker's marker (`breaker::note_endpoint_down_exit`), so the next start
 /// can count it; a death that cannot be noted leaves the node running.
-async fn listener_liveness(
+pub(in crate::transport) async fn listener_liveness(
     mut listen_task: tokio::task::JoinHandle<TransportError>,
     restart: Option<GatewayQuicRestartWatch>,
     record: fn(std::time::SystemTime) -> bool,

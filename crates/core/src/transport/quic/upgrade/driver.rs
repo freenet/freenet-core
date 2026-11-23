@@ -653,8 +653,18 @@ impl QuicUpgrades {
         mut attempts: mpsc::Receiver<EndpointAttempt>,
     ) {
         let hub = Arc::downgrade(self);
+        let availability = self.endpoint.availability();
         let handle = GlobalExecutor::spawn(async move {
             while let Some(incoming) = attempts.recv().await {
+                // #6184: once the endpoint is not Up, a panic in a quinn
+                // driver may have poisoned its lock, which `ignore`, `retry`
+                // and `accept` unwrap: an attempt queued before the death
+                // would panic this monitored task. Dropping it is safe
+                // (quinn's `Incoming::drop` skips a poisoned lock).
+                if availability.get() != crate::transport::quic::QuicAvailability::Up {
+                    drop(incoming);
+                    continue;
+                }
                 match hub.upgrade() {
                     Some(hub) => hub.dispatch(incoming),
                     None => incoming.ignore(),

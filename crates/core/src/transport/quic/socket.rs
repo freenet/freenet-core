@@ -21,8 +21,8 @@
 //! timeout. Sending it would not work anyway: once the endpoint driver
 //! ends, quinn's `EndpointDriver::drop` drops each connection's event
 //! channel, and a connection driver that sees that ends with
-//! INTERNAL_ERROR before it transmits (quinn 0.11.12,
-//! `ConnectionDriver::poll`), which is what usually happens first. Pinned
+//! INTERNAL_ERROR before it transmits (freenet-quinn 0.11.13,
+//! `ConnectionDriver::poll`, `process_conn_events`, `connection.rs:1196-1201`), which is what usually happens first. Pinned
 //! by `an_adapter_panic_ends_every_connection_and_counts_once`.
 //!
 //! The catches use `AssertUnwindSafe`: the state a panic can interrupt here
@@ -243,8 +243,8 @@ impl CapHolds {
 
 thread_local! {
     /// The record [`with_poller_holds`] hands to the poller quinn creates in
-    /// its call. A thread-local works only because quinn 0.11.12 (pinned
-    /// `=0.11.12`) calls `create_io_poller` synchronously, on the calling
+    /// its call. A thread-local works only because freenet-quinn 0.11.13 (pinned
+    /// `=0.11.13`) calls `create_io_poller` synchronously, on the calling
     /// thread, inside `Endpoint::connect_with` and `Incoming::accept_with`
     /// (`ConnectionRef::new`), and otherwise only on a rebind, which needs
     /// migration, which is off. A quinn bump must re-check both; a poller
@@ -264,7 +264,7 @@ pub(crate) fn next_poller_holds() -> Option<Arc<CapHolds>> {
 /// `Incoming::accept_with`), so that the poller quinn creates for it, on this
 /// thread inside the call, counts its holds in `holds`.
 ///
-/// Depends on quinn 0.11.12 (pinned `=0.11.12`): `ConnectionRef::new` calls
+/// Depends on freenet-quinn 0.11.13 (pinned `=0.11.13`): `ConnectionRef::new` (`connection.rs:1010`) calls
 /// `create_io_poller` synchronously inside both calls, and the only other
 /// caller is a rebind, which needs migration, which is off. Re-check both
 /// before bumping quinn; a poller built with no record set logs a warning
@@ -348,6 +348,10 @@ const RECEIVE_PANIC_IN_QUINN: u8 = 3;
 /// Every write-readiness poll panics in the adapter's own code.
 #[cfg(any(test, feature = "testing"))]
 const WRITABLE_PANIC: u8 = 1;
+/// The next write-readiness poll panics so that the panic unwinds through
+/// quinn's connection driver, as one in quinn's own code would.
+#[cfg(any(test, feature = "testing"))]
+const WRITABLE_PANIC_IN_QUINN: u8 = 4;
 /// The next write-readiness poll panics in the adapter's own code, once.
 #[cfg(any(test, feature = "testing"))]
 const WRITABLE_PANIC_ONCE: u8 = 2;
@@ -394,6 +398,14 @@ impl SocketFaults {
     /// code.
     pub(crate) fn panic_next_writable(&self) {
         self.writable.store(WRITABLE_PANIC_ONCE, Ordering::Release);
+    }
+
+    /// Panic in the NEXT write-readiness poll only, outside the adapter's
+    /// catch, so it unwinds through quinn's connection driver while the
+    /// driver holds the connection's state lock.
+    pub(crate) fn panic_next_writable_in_quinn(&self) {
+        self.writable
+            .store(WRITABLE_PANIC_IN_QUINN, Ordering::Release);
     }
 
     /// Write-readiness polls that panicked.
@@ -536,13 +548,13 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
             .with(|next| next.borrow_mut().take())
             .unwrap_or_else(|| {
                 // Only a poller built outside `with_poller_holds`, which quinn
-                // 0.11.12 does only on a rebind (migration is off), gets here;
+                // 0.11.13 does only on a rebind (migration is off), gets here;
                 // its holds go into a record nobody reads, so the stall count,
                 // send gaps and ack watch of its connection would see none.
                 // Counted, not asserted: this runs under quinn's endpoint
-                // lock, and a panic there poisons it and aborts the process
-                // (see "NOT CONTAINED" in the transport rules). Tests read the
-                // count per endpoint.
+                // lock, and a panic there poisons it and ends the endpoint (an
+                // ENDPOINT DEATH, a controlled exit, #6184; see the transport
+                // rules). Tests read the count per endpoint.
                 self.cap_holds
                     .fallback_pollers
                     .fetch_add(1, Ordering::Relaxed);
@@ -768,12 +780,12 @@ impl<S: Socket> QuicSocket<S> {
 
 thread_local! {
     /// The admission a [`QuicPoller`] was just given, for the transmit that
-    /// follows it: `(cap, admission number)`. quinn 0.11.12 calls
+    /// follows it: `(cap, admission number)`. freenet-quinn 0.11.13 calls
     /// `poll_writable` and, when it is `Ready`, `try_send` for the same
     /// transmit back to back on one thread with nothing in between
-    /// (`quinn/src/connection.rs:1048-1057`), so the next `try_send` on this
+    /// (`quinn/src/connection.rs:1138-1145`), so the next `try_send` on this
     /// thread is that connection's, and its take uses exactly that admission.
-    /// quinn's endpoint `respond` (`endpoint.rs:584`) sends with no poll, finds
+    /// quinn's endpoint `respond` (`endpoint.rs:606`) sends with no poll, finds
     /// nothing here, and leaves every admission alone. quinn is pinned; a
     /// quinn bump must re-check this call order
     /// (`a_poller_hands_its_admission_to_the_transmit_that_follows`).
@@ -854,6 +866,20 @@ impl<S: Socket> UdpPoller for QuicPoller<S> {
         let socket = this.socket.clone();
         if socket.health.has_adapter_panicked() {
             return Poll::Ready(Err(adapter_panicked_error()));
+        }
+        #[cfg(any(test, feature = "testing"))]
+        if socket
+            .faults
+            .writable
+            .compare_exchange(
+                WRITABLE_PANIC_IN_QUINN,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            panic!("injected panic in the QUIC connection driver, unwinding through quinn");
         }
         let _quic = super::breaker::QuicCode::enter();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| this.poll_ready(cx))) {
