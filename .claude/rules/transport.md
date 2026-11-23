@@ -2269,7 +2269,8 @@ stays `pub(in crate::transport::quic::native)`, and registering a native
 waiter is private to `setup`. Since A+ step 1 the connect op asks for a
 setup for ready pairs whose bucket is below `QUIC_NATIVE_PERCENT` (25), gated
 on `operations::connect::native::NATIVE_DIAL_READY` (true). There is no
-runtime kill switch: the acceptor's release decides.
+runtime kill switch: the acceptor decides on `min(offered, own)`, so a
+reversal takes effect for a pair once either side has updated.
 
 ```
 ALPN per attempt: an address allowed with allow_native_peer is accepted with

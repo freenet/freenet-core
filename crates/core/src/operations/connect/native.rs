@@ -42,9 +42,11 @@ use crate::transport::metrics::TRANSPORT_METRICS;
 pub(crate) const NATIVE_DIAL_READY: bool = true;
 
 /// This release's share of pairs, 0 to 100, that set up a native connection
-/// when both sides are ready. Each step is its own release; the acceptor's
-/// release governs, since only the acceptor decides, so a reversal takes effect
-/// as acceptors update: there is no runtime kill switch. 25 is A+ step 1.
+/// when both sides are ready. Each step is its own release. Only the acceptor
+/// decides, and it decides on `min(offered, own)`, so a pair goes native only
+/// if both releases allow it: a reversal takes effect for any pair where either
+/// the acceptor or the joiner has updated, as nodes update. There is no runtime
+/// kill switch. 25 is A+ step 1.
 pub(crate) const QUIC_NATIVE_PERCENT: u8 = 25;
 
 /// This release's share, 0 to 100, of (joiner, gateway) pairs whose join

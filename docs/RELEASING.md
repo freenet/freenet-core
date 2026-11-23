@@ -507,7 +507,8 @@ Current wire-gated floors:
   native variants. In 0.2.163 every offer carries percent 0.
   A+ step 1 (0.2.164) sets `NATIVE_DIAL_READY` true and
   `QUIC_NATIVE_PERCENT` 25 and does not touch the floor. The acceptor's
-  release decides, so a reversal takes effect as acceptors update; there is
+  acceptor decides on `min(offered, own)`, so a reversal takes effect for a
+  pair once either the acceptor or the joiner has updated; there is
   no runtime kill switch. Do not raise the floor again unless the V2 layout itself has to change. Same failure mode as the
   application-message floors above: a peer at
   or above the floor without the decoder closes the connection on the variant,

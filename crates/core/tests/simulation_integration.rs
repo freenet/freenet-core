@@ -23591,6 +23591,36 @@ fn test_quic_native_gateway_join_without_admission_falls_back_to_udp() {
     assert!(connected);
 }
 
+/// The shipped default: no override, so each node runs this release's
+/// `QUIC_NATIVE_PERCENT` (25) with its endpoint up. Native-decided and
+/// UDP-decided connects coexist in one mesh, and every node joins. The treated
+/// share is read from the sim: each native pair is two native dials
+/// (`established + failed`, one per side), against `joiner_decisions` decided
+/// joins. It is compared with the 25% bucket share loosely, since a pair that
+/// already holds a transport is decided UDP whatever its bucket.
+#[test_log::test]
+fn test_quic_native_at_the_shipped_percent_mixes_native_and_udp() {
+    const SEED: u64 = 0x0059_40A5_0010;
+    let run = run_native_connect_sim("native-connect-shipped", SEED, 60, |_| {});
+    log_native_connect("shipped", &run);
+    let t = &run.wire.trace;
+    let decided = t.joiner_decisions();
+    let native_dials = t.native_established() + t.native_failed();
+    let treated = native_dials as f64 / 2.0;
+    println!("SHIPPED decided={decided} native_dials={native_dials} treated={treated}");
+    assert!(decided >= 20, "premise: enough decisions to read a share");
+    assert!(native_dials > 0, "some pairs decided native");
+    let share = treated / decided as f64;
+    assert!(
+        (0.05..=0.50).contains(&share),
+        "native share {share:.2} of {decided} decisions is far from the 25% bucket share"
+    );
+    assert_eq!(t.undecodable_closes(), 0);
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined");
+    assert!(connected);
+}
+
 /// Until UDP is removed a failed native setup must never cost the join. Every
 /// QUIC datagram between every pair is dropped, so every native setup times
 /// out; each is followed by today's UDP dial and every node still joins. The
