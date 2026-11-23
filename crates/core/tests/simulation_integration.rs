@@ -22899,6 +22899,100 @@ fn test_quic_rebuilt_endpoint_carries_a_new_path() {
     }
 }
 
+/// A gateway whose endpoint dies and is rebuilt (#6272) still hands
+/// completed native joins to its node (#5940, phase B): every stack it
+/// builds, not only the first, carries the hand-off. The endpoint dies at
+/// 30 s and is rebuilt about a second later; the node crashes at 40 s and
+/// restarts at 41 s with a fresh process, so its join goes to the rebuilt
+/// endpoint natively. Fails closed: the rebuild happened, a native join
+/// connected after the restart, and at the end the gateway holds the node
+/// over a native connection in its ring, promoted under its key, which only
+/// the hand-off can give it (peer-to-peer native connects are off).
+#[test_log::test]
+fn test_quic_rebuilt_endpoint_hands_native_joins_to_the_node() {
+    const FAIL_AT: Duration = Duration::from_secs(30);
+    const SEED: u64 = 0x6272_E5B0_0002;
+    setup_deterministic_state(SEED);
+    freenet::config::SimulationIdleTimeout::enable();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut sim = SimNetwork::new("quic-rebuilt-native-join", 1, 1, 7, 3, 10, 2, SEED).await;
+        sim.enable_gateway_ack_version();
+        sim.with_quic_native_floor(native_floor_for_tests());
+        sim.with_transport_quic("prefer");
+        sim.with_native_gateway_join(100);
+        let labels = sim.all_node_addresses().clone();
+        let gateway = labels.keys().find(|l| l.is_gateway()).unwrap().clone();
+        let node = labels.keys().find(|l| !l.is_gateway()).unwrap().clone();
+        sim.with_gateway_native_admission(&gateway);
+        let (gateway_addr, node_addr) = (labels[&gateway], labels[&node]);
+        let trace = sim.quic_upgrade_trace();
+        let wire = sim.native_wire_trace();
+        trace.fail_endpoint_at(gateway_addr, FAIL_AT);
+        trace.rebuild_endpoint(gateway_addr);
+        let time = sim.virtual_time().clone();
+        let driver = tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                time.advance_to(start.elapsed().as_nanos() as u64);
+            }
+        });
+        let _handles = sim
+            .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+            .await;
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert!(sim.crash_node(&node));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let restarted_at = trace.now();
+        let joined_before = wire.gateway_join_native_established();
+        sim.restart_node::<rand::rngs::SmallRng>(&node, SEED + 1, 1, 1)
+            .await
+            .expect("the node restarts");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        // Read while the network is still up: its teardown closes connections.
+        let (transports, rings, keys_sent) =
+            (wire.transports(), wire.rings(), wire.native_keys_sent());
+        let joined_after = wire.gateway_join_native_established();
+        driver.abort();
+
+        let dump = format!("{:#?}", trace.records());
+        let rebuilt = trace.matching(gateway_addr, "rebuilt the endpoint at ");
+        assert_eq!(rebuilt.len(), 1, "premise: one rebuild: {dump}");
+        assert!(
+            rebuilt[0].at < restarted_at,
+            "premise: rebuilt before the restart: {dump}"
+        );
+        assert!(
+            joined_after > joined_before,
+            "a native join connected after the rebuild ({joined_before} before, \
+             {joined_after} after)"
+        );
+        assert_eq!(
+            transports.get(&(gateway_addr, node_addr)),
+            Some(&true),
+            "the rebuilt gateway holds the node natively: {transports:?}"
+        );
+        assert_eq!(
+            transports.get(&(node_addr, gateway_addr)),
+            Some(&true),
+            "the node holds the rebuilt gateway natively: {transports:?}"
+        );
+        assert!(
+            rings.contains(&(gateway_addr, node_addr)),
+            "the gateway took the node into its ring: {rings:?}"
+        );
+        assert!(
+            keys_sent.contains(&(gateway_addr, node_addr)),
+            "and promoted it under its key: {keys_sent:?}"
+        );
+    });
+}
+
 /// One gateway and one node in shadow, with the path up by 40 s: the node crashes
 /// and restarts with its identity, and the run goes on for `then`. `quiet_from`
 /// stops QUIC datagrams between them. Returns the trace, the gateway's address and

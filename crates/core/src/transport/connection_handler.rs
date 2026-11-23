@@ -1131,7 +1131,9 @@ async fn bind_socket_with_retry<S: Socket>(
 pub struct InboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
     new_connection_notifier: mpsc::Receiver<PeerConnection<S, TS>>,
     /// Gateway joins completed over QUIC (#5940, phase B), handed over by
-    /// the QUIC upgrades. `None` without them, or once their sender is gone.
+    /// every QUIC stack this listener runs (the first and each rebuilt one).
+    /// `Some` whenever the node has a QUIC endpoint; `None` without one, or
+    /// once every sender is gone.
     native_joins:
         Option<mpsc::Receiver<super::peer_connection::native_connection::NativePeerConnection>>,
 }

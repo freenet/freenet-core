@@ -231,9 +231,10 @@ async fn run_gateway_joins(
                             match establish_gateway_join(joiner, &clock).await {
                                 Ok(joined) => match hub.upgrade() {
                                     Some(hub) => hub.hand_off_join(joined),
-                                    // Shutting down: the join is dropped,
-                                    // which closes it.
-                                    None => GatewayAdmission::HandoffFull,
+                                    // The stack is gone (a rebuild replaced
+                                    // it, or the node is stopping): the join
+                                    // is dropped, which closes it.
+                                    None => GatewayAdmission::StackGone,
                                 },
                                 Err(outcome) => outcome,
                             }

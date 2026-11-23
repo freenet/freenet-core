@@ -792,6 +792,11 @@ labelled_counters! {
         /// queue of handed-over joins was full (or the node gone), so it was
         /// closed.
         HandoffFull => "handoff_full",
+        /// A joiner connection reached the end of admission after its QUIC
+        /// stack was gone (the endpoint died and was rebuilt, or the node is
+        /// stopping), so it was closed. Not a full queue: the rebuilt stack
+        /// hands off its own joins.
+        StackGone => "stack_gone",
         /// A joiner connection handed to the node sent no ConnectRequest in
         /// time, so the node closed it.
         NoConnectRequest => "no_connect_request",
