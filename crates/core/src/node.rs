@@ -376,6 +376,9 @@ pub struct NodeConfig {
     pub(crate) max_downstream_bandwidth: Option<Rate>,
     pub(crate) blocked_addresses: Option<HashSet<SocketAddr>>,
     pub(crate) transient_budget: usize,
+    /// Base interval of the connect-failure backoff. `None` reads
+    /// `FREENET_BACKOFF_BASE_SECS`, then the default. Set only by a simulation.
+    pub(crate) connect_backoff_base: Option<Duration>,
     pub(crate) transient_ttl: Duration,
     /// Minimum ring connections before this peer advertises readiness
     /// to accept non-CONNECT operations. `None` or `Some(0)` disables the gate.
@@ -895,6 +898,7 @@ impl NodeConfig {
             max_downstream_bandwidth: None,
             blocked_addresses: config.network_api.blocked_addresses.clone(),
             transient_budget: config.network_api.transient_budget,
+            connect_backoff_base: None,
             transient_ttl: Duration::from_secs(config.network_api.transient_ttl_secs),
             relay_ready_connections: if config.network_api.skip_load_from_network {
                 Some(0) // Local/test networks: disable relay gate

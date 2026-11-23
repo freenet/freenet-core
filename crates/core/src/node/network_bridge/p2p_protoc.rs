@@ -1665,6 +1665,8 @@ impl P2pConnManager {
         );
 
         let mut state = EventListenerState::new(expected_inbound);
+        state.peer_backoff =
+            PeerConnectionBackoff::with_optional_base(op_manager.connect_backoff_base);
 
         let (conn_event_tx, conn_event_rx) = mpsc::channel(1024);
 

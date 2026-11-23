@@ -277,6 +277,9 @@ pub(crate) struct OpManager {
     /// Backoff tracker for failed gateway connection attempts.
     /// Used to implement exponential backoff when retrying connections.
     pub gateway_backoff: Arc<Mutex<PeerConnectionBackoff>>,
+    /// Base interval the connect-failure backoffs were built with, when the
+    /// node was given one (`NodeConfig::connect_backoff_base`).
+    pub(crate) connect_backoff_base: Option<Duration>,
     /// Notifies `initial_join_procedure` when gateway backoff is cleared,
     /// so it can wake from backoff sleep and retry immediately.
     pub gateway_backoff_cleared: Arc<tokio::sync::Notify>,
@@ -423,6 +426,7 @@ impl Clone for OpManager {
             attempt_hop_registry: self.attempt_hop_registry.clone(),
             streaming_threshold: self.streaming_threshold,
             gateway_backoff: self.gateway_backoff.clone(),
+            connect_backoff_base: self.connect_backoff_base,
             gateway_backoff_cleared: self.gateway_backoff_cleared.clone(),
             bootstrap_pacer: self.bootstrap_pacer.clone(),
             blocked_addresses: self.blocked_addresses.clone(),
@@ -861,7 +865,10 @@ impl OpManager {
                 crate::operations::route_attempt::AttemptHopRegistry::new(),
             ),
             streaming_threshold,
-            gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::new())),
+            gateway_backoff: Arc::new(Mutex::new(PeerConnectionBackoff::with_optional_base(
+                config.connect_backoff_base,
+            ))),
+            connect_backoff_base: config.connect_backoff_base,
             gateway_backoff_cleared: Arc::new(tokio::sync::Notify::new()),
             bootstrap_pacer,
             blocked_addresses: config
