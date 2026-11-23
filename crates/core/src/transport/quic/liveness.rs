@@ -88,20 +88,29 @@
 //!   watcher. From there it is handled as any endpoint death (above): a
 //!   supervised node exits through `ListenerExit::QuicEndpointDown` and is
 //!   restarted, counted by the crash breaker; an unsupervised one moves its
-//!   QUIC paths back to UDP. The node does NOT guard its other calls into
-//!   quinn: every other quinn call that takes the poisoned lock (`accept`,
-//!   `connect`, `local_addr`, every `Incoming` method and drop for the
-//!   endpoint; a read, write or `close` for the connection) unwraps it and
-//!   panics in its caller. The node stops making the calls it makes on its
-//!   own once the endpoint is `Down` (`connect` refuses first, the accept
-//!   loop checks the availability before each poll of `accept`), and a call
-//!   that still reaches the lock (an attempt queued before the death, a
-//!   connection dropped after it, a call on another thread in the moment
-//!   between quinn's panic and its watcher's report) panics in QUIC code,
-//!   which the crash breaker attributes to QUIC (`quic_attributed`), so it
+//!   QUIC paths back to UDP. The node does NOT wrap its calls into quinn:
+//!   every other quinn call that takes the poisoned lock (`accept`,
+//!   `connect`, `local_addr`, `Incoming::ignore` / `retry` / `accept` for
+//!   the endpoint; a read, write, `reset` or `close` for the connection)
+//!   unwraps it and panics in its caller. Instead it stops making those
+//!   calls once the endpoint is not `Up`: `connect` refuses first, the
+//!   accept loop checks the availability before each poll of `accept`, and
+//!   the attempt router DROPS an attempt instead of answering it (quinn's
+//!   `Incoming::drop` skips a poisoned lock). Its own destructors never call
+//!   quinn after a reported quinn panic or during an unwind
+//!   (`Outgoing::drop`, `QuicConnection::drop`): a second panic during an
+//!   unwind aborts the process. A call that still reaches the lock (a call
+//!   on another thread in the moment between quinn's panic and its
+//!   watcher's report, a session or waiter acting on an attempt it was
+//!   handed before the death) panics in QUIC code, which the crash breaker
+//!   attributes to QUIC (`quic_attributed`), so it
 //!   turns QUIC off after the restart. Pinned by
-//!   `a_panic_unwinding_through_the_endpoint_driver_is_contained` and
-//!   `a_panic_in_a_quinn_connection_driver_drives_the_endpoint_down`.
+//!   `a_panic_unwinding_through_the_endpoint_driver_is_contained`,
+//!   `a_panic_in_a_quinn_connection_driver_drives_the_endpoint_down`,
+//!   `a_send_in_flight_on_a_poisoned_connection_does_not_abort` and
+//!   `attempts_queued_before_a_driver_panic_are_dropped`. If such a panic
+//!   kills a monitored task on a node that exits for an endpoint death, the
+//!   node exits as for the death ([`driver_death_restart`]).
 //!
 //! With `transport-quic = "off"` no endpoint exists, and the transport
 //! reports [`QuicAvailability::Disabled`].
@@ -163,47 +172,28 @@ pub(crate) fn exit_for_endpoint_death() {
     ENDPOINT_DEATH_EXITS.store(true, Ordering::Relaxed);
 }
 
-/// How long [`driver_death_restart`] waits for a driver panic to be reported.
-/// The report follows the panic within one unwind; a task can only beat it on
-/// another worker thread, by that much.
+/// How long [`driver_death_restart`] waits for a driver panic's report,
+/// which follows the panic within its unwind; a task on another worker can
+/// fail on the poisoned lock just before it.
 const DRIVER_PANIC_REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The exit a node takes when a monitored task failed, if that failure is a
-/// consequence of a quinn driver panic (#6184): `Some` exactly when the
-/// listener would exit for the endpoint death (`QuicEndpointDown`), so the
-/// node exits the same way whichever of the two loses the race.
-///
-/// After a driver panic quinn's lock is poisoned, and any task that still
-/// reaches it panics: the accept loop in the moment before the watcher
-/// reports Down, the attempt router answering an attempt queued before the
-/// death (see the module docs). A monitored task's failure exits the node
-/// through the background monitor, a crash exit that the post-update
-/// rollback counts; the endpoint death exits it with 42, which it does not.
-/// So when this process exits for an endpoint death and a driver panicked
-/// (waiting [`DRIVER_PANIC_REPORT_WAIT`] for its report, which a task on
-/// another thread can beat), the death is recorded in the crash-breaker
-/// marker through `record` (the same once-per-process record the listener
-/// uses, `breaker::note_endpoint_down_exit_once`) and the restart is
-/// returned. `None` leaves the failure as it was: no driver panic, a node
-/// that does not exit for an endpoint death, or a death that could not be
-/// recorded (the listener keeps such a node running; here the task is
-/// already gone, so the node exits as before).
+/// Whether a monitored task's failure is a quinn driver panic's consequence
+/// that should exit the node as the endpoint death (#6184): this process
+/// exits for one ([`exit_for_endpoint_death`]), a driver panic is reported
+/// within [`DRIVER_PANIC_REPORT_WAIT`], and `record` (the listener's
+/// once-per-process `breaker::note_endpoint_down_exit_once`) recorded the
+/// death. Otherwise the failure keeps its own exit.
 pub(crate) async fn driver_death_restart(
     record: impl FnOnce(std::time::SystemTime) -> bool,
-) -> Option<crate::transport::GatewayQuicRestart> {
+) -> bool {
     if !ENDPOINT_DEATH_EXITS.load(Ordering::Relaxed) {
-        return None;
+        return false;
     }
     let mut panicked = DRIVER_PANICKED.subscribe();
     let reported = tokio::time::timeout(DRIVER_PANIC_REPORT_WAIT, panicked.wait_for(|p| *p))
         .await
         .is_ok_and(|seen| seen.is_ok());
-    if !reported || !record(std::time::SystemTime::now()) {
-        return None;
-    }
-    Some(crate::transport::GatewayQuicRestart {
-        reason: "its QUIC endpoint died",
-    })
+    reported && record(std::time::SystemTime::now())
 }
 
 /// Whether [`note_gateway_supervisor_unverified`] was called.

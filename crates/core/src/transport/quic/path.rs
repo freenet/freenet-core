@@ -2145,6 +2145,7 @@ impl QuicPath {
         let epoch = self.meter.as_ref().and_then(|meter| meter.send_epoch());
         let mut send = Outgoing::new(stream, self.aborts.clone(), slot, pacing, progress, epoch);
         send.meter = self.meter.clone();
+        send.closer = Some(self.connection.closer());
         send.writing = Some(self.writers.start());
         send.live = Some(self.writers.live());
         send.sleep = Some((self.sleeper.clone(), self.short_ack_wait));
@@ -2421,6 +2422,9 @@ struct Outgoing {
     /// The path's count of cancelled sends waiting for their acknowledgement
     /// without a permit ([`AckWaits`]).
     ack_waits: Option<Arc<AckWaits>>,
+    /// The connection's closer, which tells whether a quinn panic may have
+    /// poisoned its lock (#6184, [`super::QuicCloser::quinn_may_be_poisoned`]).
+    closer: Option<super::QuicCloser>,
     /// The stream, counted live in its path's counts until this is dropped
     /// (`recycle::LiveStream`), which a stream waiting for its
     /// acknowledgement in a task after its send ended keeps.
@@ -2892,6 +2896,7 @@ impl Outgoing {
             meter: None,
             writing: None,
             ack_waits: None,
+            closer: None,
             live: None,
             sleep: None,
             node: None,
@@ -3235,6 +3240,21 @@ impl Drop for Outgoing {
     /// still held the packet. The Short may then not arrive; it reported
     /// `MaybeDelivered` already, so its sender does not count on it.
     fn drop(&mut self) {
+        // #6184: after a panic in a quinn driver the connection's state lock
+        // may be poisoned, and the quinn calls below unwrap it. During an
+        // unwind (a write that reached the poisoned lock) that second panic
+        // aborts the process, so neither case calls quinn here. quinn's own
+        // `SendStream` drop skips a poisoned lock; on a sound one it may
+        // finish a stream this would have reset, which the receiver refuses
+        // as shorter than its declared length.
+        if std::thread::panicking()
+            || self
+                .closer
+                .as_ref()
+                .is_some_and(super::QuicCloser::quinn_may_be_poisoned)
+        {
+            return;
+        }
         self.reset(reset_code::SENDER_ABORTED);
         if !self.awaiting_ack {
             return;
