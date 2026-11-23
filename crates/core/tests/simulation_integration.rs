@@ -24227,6 +24227,113 @@ fn test_quic_native_blocked_pairs_connect_over_udp_behind_nats() {
     assert!(connected);
 }
 
+/// A joiner that offered QUIC-native but can no longer use a `Native` decision
+/// when the response comes (demoted, or its endpoint went down, in between)
+/// must still meet the acceptor's UDP fallback. The acceptor cannot know: it
+/// waits out its native window and punches UDP. Behind port-restricted NATs a
+/// lone punch never gets through, so before the fix, when the joiner reported
+/// the acceptor failed and did not dial it, every such fallback missed. Every
+/// regular node here offers and then refuses every `Native` decision, which
+/// forces that ordering on every native CONNECT; in the field it needs a
+/// demotion inside a response's travel time (seen once, on nova, as a
+/// `missed` fallback in the blocked-pairs test). Fails closed: acceptors must
+/// have started native setups, the NATs must have dropped datagrams, and
+/// fallbacks between peers must have ended.
+#[test_log::test]
+fn test_quic_native_refused_decision_still_meets_the_acceptors_udp_fallback() {
+    use freenet::dev_tool::{NatFiltering, NodeLabel, SimNat};
+    const SEED: u64 = 0x0059_40A5_00D1;
+    let name = "native-refused-decision";
+    let nat = SimNat::all(NatFiltering::PortRestricted);
+    let run = run_native_connect_sim_with(name, SEED, 200, Some(nat), |sim| {
+        sim.with_native_connect(100);
+        let mut labels: Vec<NodeLabel> = sim.all_node_addresses().keys().cloned().collect();
+        labels.sort();
+        for label in labels.iter().filter(|label| !label.is_gateway()) {
+            sim.with_node_native_refuses_decisions(label);
+        }
+        for (i, a) in labels.iter().enumerate() {
+            for b in &labels[i + 1..] {
+                sim.drop_quic_datagrams_between(a, b, Duration::ZERO);
+            }
+        }
+    });
+    log_native_connect(name, &run);
+    let t = &run.wire.trace;
+    // The knob fired: native fails here anyway (QUIC is dropped), so only
+    // this count shows that joiners refused decisions rather than tried them.
+    assert!(
+        t.decisions_refused() > 0,
+        "premise: joiners refused Native decisions"
+    );
+    assert!(
+        t.native_failed() > 0,
+        "premise: acceptors started native setups that failed"
+    );
+    // Known residual (connect.rs, `record_native_rescue_strike`): the
+    // acceptor cannot tell a refusal from a broken path, so each refused
+    // decision whose UDP fallback connects strikes the acceptor, and three
+    // distinct joiners demote its acceptor role. Logged and pinned, so a
+    // change in this effect shows up here.
+    let acceptor_demotions = t.acceptor_demotions().len();
+    let acceptor_streak_peak = t
+        .acceptor_streak_peaks()
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(0);
+    tracing::info!(
+        decisions_refused = t.decisions_refused(),
+        acceptor_demotions,
+        acceptor_streak_peak,
+        "refused-decision residual: acceptor strikes"
+    );
+    println!(
+        "refused-decision residual: refused={} acceptor_demotions={acceptor_demotions} acceptor_streak_peak={acceptor_streak_peak}",
+        t.decisions_refused()
+    );
+    // Measured on this seed with every joiner refusing every decision (the
+    // worst case; in the field it needs a demotion inside a response's
+    // flight): 37 refusals, 7 acceptor demotions. Re-measure and update
+    // deliberately if the strike rules change.
+    assert_eq!(
+        acceptor_demotions,
+        7,
+        "acceptor demotions caused by refused decisions changed ({} refusals)",
+        t.decisions_refused()
+    );
+    assert_eq!(t.native_established(), 0, "premise: no native setup worked");
+    assert!(
+        run.nat_filtered
+            .get(&NatFiltering::PortRestricted)
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "premise: the NATs dropped unsolicited datagrams"
+    );
+    let between_peers: Vec<_> = t
+        .udp_fallbacks_ended()
+        .into_iter()
+        .filter(|(own, peer, _)| {
+            own.is_some_and(|own| !run.gateways.contains(&own)) && !run.gateways.contains(peer)
+        })
+        .collect();
+    assert!(
+        !between_peers.is_empty(),
+        "premise: fallbacks between peers ended"
+    );
+    let missed: Vec<_> = between_peers.iter().filter(|(_, _, ok)| !ok).collect();
+    assert!(
+        missed.is_empty(),
+        "UDP fallbacks between peers that did not connect ({} of {}): {missed:?}",
+        missed.len(),
+        between_peers.len()
+    );
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined over UDP");
+    assert!(connected);
+}
+
 /// Seeds tried, from the listed one, for a run whose survivor-rule order is a premise.
 const SURVIVOR_SEED_SEARCH: u64 = 32;
 

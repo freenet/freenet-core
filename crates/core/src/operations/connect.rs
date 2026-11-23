@@ -1822,7 +1822,15 @@ pub(super) async fn dispatch_expect_connection_from(
 ///   `OverBudget*`, `SetupsFull`, `AlreadyWaiting`, `AllowSetFull`,
 ///   `KeyConflict`, `UnusableKey`) and it fell back to UDP; the joiner's
 ///   streak does not count those (not a path failure), but the acceptor's
-///   setup timed out and its UDP fallback connected.
+///   setup timed out and its UDP fallback connected;
+/// - the joiner offered native and then lost it (demoted, or its endpoint
+///   went down) before the acceptor's `Native` decision arrived, so it
+///   refused the decision and dialled UDP at the fallback time
+///   (`native::refused_decision_plan`). The acceptor cannot tell a refusal
+///   from a broken path, so this is not fixed on the wire. Bounded: it needs
+///   a demotion within the response's travel time, and the acceptor demotes
+///   only after rescues with `ACCEPTOR_DEMOTION_FAILURES` (3) distinct
+///   joiners within the streak window (6 h).
 pub(crate) fn record_native_rescue_strike(
     op_manager: &OpManager,
     origin: crate::transport::NatAttemptOrigin,

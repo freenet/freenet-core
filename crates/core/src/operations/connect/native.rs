@@ -523,6 +523,38 @@ pub(crate) enum JoinerDecisionFailure {
     NativeUnsupported,
 }
 
+/// What a joiner does about an acceptor whose `Native` decision it cannot use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefusedDecisionPlan {
+    /// Dial the acceptor over UDP at this time: the acceptor falls back to
+    /// UDP when its native wait ends, `NATIVE_FALLBACK_AFTER` after its
+    /// decision at the earliest, and two UDP hole punches through restricted
+    /// NATs connect only when they overlap. A lone punch from the acceptor
+    /// never gets through.
+    DialUdpAt(Instant),
+    /// Report the acceptor failed upstream (`ConnectFailed`), so the relay
+    /// re-routes.
+    ReportFailed,
+}
+
+/// The plan for a `Native` decision the joiner cannot use, answered at
+/// `answered_at`. A joiner that offered native and was demoted (or lost its
+/// endpoint) before the response came still has UDP, and a failed native
+/// setup must never cost the join, so it dials UDP at the common fallback
+/// time, as after a native dial that failed. A decision that answered no
+/// offer comes only from a bug or a misbehaving relay and is reported.
+pub(crate) fn refused_decision_plan(
+    failure: JoinerDecisionFailure,
+    answered_at: Instant,
+) -> RefusedDecisionPlan {
+    match failure {
+        JoinerDecisionFailure::NativeUnsupported => {
+            RefusedDecisionPlan::DialUdpAt(answered_at + crate::transport::NATIVE_FALLBACK_AFTER)
+        }
+        JoinerDecisionFailure::DecisionWithoutOffer => RefusedDecisionPlan::ReportFailed,
+    }
+}
+
 /// How the joiner dials an acceptor, given the offer it sent, the response's
 /// decision and whether it can dial native now (`can_dial`, its current
 /// readiness). `None`, `Udp` and a decision this release does not know keep
@@ -737,6 +769,10 @@ pub(crate) struct NativeConnectState {
     /// as acceptor as usual (`NodeConfig::native_joiner_off`), standing in
     /// for a node that rarely joins. `false` in production.
     joiner_off: bool,
+    /// Simulation only: this node offers native as joiner but cannot use a
+    /// `Native` decision when the response comes
+    /// (`NodeConfig::native_refuses_decisions`). `false` in production.
+    refuses_decisions: bool,
     /// This node's QUIC endpoint, set when its transport opens. Until then,
     /// and when it is not up, the node cannot dial native. Read per node, not
     /// from the process-wide endpoint metric, which several simulated nodes
@@ -768,11 +804,26 @@ impl NativeConnectState {
                 )),
             )),
             joiner_off: false,
+            refuses_decisions: false,
             endpoint: std::sync::OnceLock::new(),
             gateway_join_override: None,
             native_gateways: std::sync::OnceLock::new(),
             gateway_failures: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Simulation only: offering native as joiner but refusing every `Native`
+    /// decision when `refuses` (`NodeConfig::native_refuses_decisions`).
+    pub(crate) fn with_refuses_decisions(mut self, refuses: bool) -> Self {
+        self.refuses_decisions = refuses;
+        self
+    }
+
+    /// Whether this node, as joiner, can dial native for a `Native` decision
+    /// that arrives now: its readiness now, as a demotion or an endpoint that
+    /// went down since the offer would have lowered it.
+    pub(crate) fn joiner_can_dial_now(&self) -> bool {
+        self.readiness().ready && !self.refuses_decisions
     }
 
     /// Simulation only: as [`Self::new`], never offering native as joiner
@@ -1688,6 +1739,23 @@ mod tests {
         assert!(
             close.record_failure(&key(2), last),
             "three inside the window"
+        );
+    }
+
+    /// A joiner that offered and lost native dials the acceptor over UDP at
+    /// the fallback time; a decision that answered no offer is reported.
+    #[test]
+    fn a_refused_native_decision_dials_udp_only_when_the_joiner_offered() {
+        let answered_at = Instant::now();
+        assert_eq!(
+            refused_decision_plan(JoinerDecisionFailure::NativeUnsupported, answered_at),
+            RefusedDecisionPlan::DialUdpAt(answered_at + crate::transport::NATIVE_FALLBACK_AFTER),
+            "an offer it can no longer honour: UDP at the acceptor's fallback time"
+        );
+        assert_eq!(
+            refused_decision_plan(JoinerDecisionFailure::DecisionWithoutOffer, answered_at),
+            RefusedDecisionPlan::ReportFailed,
+            "a decision that answered no offer is reported"
         );
     }
 

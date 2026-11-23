@@ -2434,6 +2434,16 @@ impl SimNetwork {
         self
     }
 
+    /// Makes the node `label` offer QUIC-native as joiner but unable to use a
+    /// `Native` decision when the acceptor's response arrives, standing in
+    /// for a joiner demoted (or whose endpoint went down) between its offer
+    /// and the response. Call before the simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_node_native_refuses_decisions(&mut self, label: &NodeLabel) -> &mut Self {
+        self.node_config_mut(label).native_refuses_decisions = true;
+        self
+    }
+
     /// Makes the node `label` never offer QUIC-native as joiner while it
     /// still decides as acceptor, standing in for a node that rarely joins
     /// (a gateway, a peer at its target). Its joiner role then never

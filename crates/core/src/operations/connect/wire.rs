@@ -287,6 +287,7 @@ pub mod sim_trace {
         native_established: AtomicU64,
         native_failed: AtomicU64,
         native_demotions: AtomicU64,
+        decisions_refused: AtomicU64,
         /// Decisions on an offered request, as (acceptor, `seq` when it
         /// decided, native, in the slice).
         decisions: parking_lot::Mutex<Vec<(SocketAddr, u64, bool, bool)>>,
@@ -423,6 +424,9 @@ pub mod sim_trace {
         /// A native setup failed after its pair had connected another way, so
         /// it needs no fallback. Also counted as a failed native dial.
         NativeSuperseded,
+        /// A joiner refused an acceptor's `Native` decision it could not use
+        /// (`JoinerDecisionFailure::NativeUnsupported`).
+        DecisionRefused,
         /// The node `own` was asked for a UDP dial to `peer` in `tx`.
         UdpDialFor {
             tx: crate::message::Transaction,
@@ -671,6 +675,7 @@ pub mod sim_trace {
             NativeWireEvent::NativeDial { established: true } => &c.native_established,
             NativeWireEvent::NativeDial { established: false } => &c.native_failed,
             NativeWireEvent::NativeDemoted => &c.native_demotions,
+            NativeWireEvent::DecisionRefused => &c.decisions_refused,
             NativeWireEvent::NativeSuperseded => {
                 c.native_failed.fetch_add(1, Ordering::Relaxed);
                 &c.native_superseded
@@ -801,6 +806,10 @@ pub mod sim_trace {
             Self::get(&self.0.native_failed)
         }
         /// Times a node demoted itself.
+        /// `Native` decisions joiners refused as unsupported.
+        pub fn decisions_refused(&self) -> u64 {
+            Self::get(&self.0.decisions_refused)
+        }
         pub fn native_demotions(&self) -> u64 {
             Self::get(&self.0.native_demotions)
         }
