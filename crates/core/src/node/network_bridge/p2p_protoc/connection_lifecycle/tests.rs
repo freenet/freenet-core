@@ -19,6 +19,8 @@ use freenet_stdlib::prelude::ContractInstanceId;
 struct IdleConnection {
     addr: SocketAddr,
     receipt: Option<crate::transport::ReceiptStamp>,
+    /// A gateway's native joiner's proven key (#5940, phase B).
+    native_joiner: Option<TransportPublicKey>,
 }
 
 impl IdleConnection {
@@ -28,6 +30,16 @@ impl IdleConnection {
         Self {
             addr,
             receipt: None,
+            native_joiner: None,
+        }
+    }
+
+    /// A native join a gateway's transport handed over, from a joiner that
+    /// proved `key`.
+    fn native_join(addr: SocketAddr, key: TransportPublicKey) -> Self {
+        Self {
+            native_joiner: Some(key),
+            ..Self::new(addr)
         }
     }
 }
@@ -39,6 +51,10 @@ impl PeerConnectionApi for IdleConnection {
 
     fn receipt_stamp(&self) -> Option<crate::transport::ReceiptStamp> {
         self.receipt.clone()
+    }
+
+    fn native_joiner_key(&self) -> Option<TransportPublicKey> {
+        self.native_joiner.clone()
     }
 
     fn remote_version(&self) -> Option<(u8, u8, u16)> {
@@ -2376,6 +2392,7 @@ impl Harness {
         let connection = IdleConnection {
             addr,
             receipt: Some(clock.stamp()),
+            native_joiner: None,
         };
         self.mgr
             .handle_successful_connection(
@@ -2400,6 +2417,7 @@ impl Harness {
         let connection = IdleConnection {
             addr,
             receipt: Some(clock.stamp()),
+            native_joiner: None,
         };
         self.mgr
             .handle_successful_connection(
@@ -5038,6 +5056,7 @@ fn native_with_receipt(peer: &PeerKeyLocation, clock: &ReceiptClock) -> Handshak
         connection: Box::new(IdleConnection {
             addr,
             receipt: Some(clock.stamp()),
+            native_joiner: None,
         }),
         transient: false,
         transport: crate::operations::connect::native::DialTransport::native_now(),
@@ -6523,4 +6542,307 @@ async fn a_replacement_that_cannot_retake_its_slot_fails_its_waiters() {
         "its waiter is told it failed"
     );
     assert!(!h.state.awaiting_connection.contains_key(&addr));
+}
+
+/// A native join a gateway's transport hands over, as the handshake driver
+/// reports it: an unexpected inbound connection whose key is proven.
+async fn native_join(h: &mut Harness, addr: SocketAddr, key: &TransportPublicKey) {
+    h.handshake_event(HandshakeEvent::InboundConnection {
+        transaction: None,
+        matched: HandshakeInboundMatch::Unexpected,
+        connection: Box::new(IdleConnection::native_join(addr, key.clone())),
+        transient: false,
+    })
+    .await;
+}
+
+/// A native join (#5940, phase B) becomes a native entry bound to the key the
+/// joiner proved, but is not promoted: as a legacy join after its
+/// ConnectRequest, it waits for the connect op to accept it.
+#[tokio::test]
+async fn a_native_join_is_bound_to_its_proven_key_and_not_promoted() {
+    let mut h = Harness::new("native-join-bound").await;
+    let addr: SocketAddr = "198.51.100.231:7501".parse().unwrap();
+    h.use_addr(addr);
+    let joiner = key();
+    let own = h
+        .mgr
+        .bridge
+        .op_manager
+        .ring
+        .connection_manager
+        .get_own_addr()
+        .unwrap_or(addr);
+    let counters = crate::transport::join_versions::test_registry::isolate(own);
+    native_join(&mut h, addr, &joiner).await;
+    let native = crate::transport::join_versions::JoinTransport::ALL
+        .iter()
+        .position(|t| *t == crate::transport::join_versions::JoinTransport::Native)
+        .unwrap();
+    let counts = counters.take();
+    assert_eq!(
+        counts[native].iter().sum::<u64>(),
+        1,
+        "counted as a native join"
+    );
+    assert_eq!(counts.iter().flatten().sum::<u64>(), 1, "and nothing else");
+    let entry = &h.mgr.connections[&addr];
+    assert!(entry.native, "a native entry");
+    assert!(!entry.frame_seen, "it has to carry a frame first");
+    assert_eq!(entry.pub_key(), Some(&joiner), "bound to the proven key");
+    assert_eq!(h.mgr.addr_by_pub_key.get(&joiner), Some(&addr));
+    let cm = &h.mgr.bridge.op_manager.ring.connection_manager;
+    assert!(
+        !cm.is_in_ring(addr),
+        "not promoted before the connect op accepts it"
+    );
+}
+
+/// A second native join from a peer this node already holds natively at the
+/// address replaces the first: the joiner joined again, so the first
+/// connection is stale. The first's task loses its channel, and the maps hold
+/// only the newer connection.
+#[tokio::test]
+async fn a_native_join_replaces_a_native_entry_for_its_key() {
+    let mut h = Harness::new("native-join-twice").await;
+    let addr: SocketAddr = "198.51.100.231:7502".parse().unwrap();
+    h.use_addr(addr);
+    let joiner = key();
+    native_join(&mut h, addr, &joiner).await;
+    let first = h.mgr.connections[&addr].connection_id;
+    // Weak, so this test does not keep the first connection's channel open.
+    let first_sender = h.mgr.connections[&addr].sender.downgrade();
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    let transients = cm.transient_count();
+    native_join(&mut h, addr, &joiner).await;
+    let entry = &h.mgr.connections[&addr];
+    assert_ne!(
+        entry.connection_id, first,
+        "the newer connection is the entry"
+    );
+    assert!(entry.native, "a native entry");
+    assert_eq!(entry.pub_key(), Some(&joiner), "bound to the proven key");
+    assert_eq!(h.mgr.addr_by_pub_key.get(&joiner), Some(&addr));
+    assert_eq!(h.mgr.connections.len(), 1, "one entry");
+    assert!(h.mgr.held_native.is_empty(), "nothing held beside it");
+    assert_eq!(
+        cm.transient_count(),
+        transients,
+        "no transient slot taken or leaked"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while first_sender.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the first connection's task ends");
+}
+
+/// A native join whose key a live connection at another address holds in the
+/// ring waits for the key as a claim that binds WITHOUT promotion: as for a
+/// legacy join, the connect op promotes it, never the bind.
+#[tokio::test]
+async fn a_native_join_whose_key_is_held_elsewhere_waits_unpromoted() {
+    let mut h = Harness::new("native-join-held-elsewhere").await;
+    let first: SocketAddr = "198.51.100.231:7507".parse().unwrap();
+    let second: SocketAddr = "198.51.100.231:7508".parse().unwrap();
+    h.use_addr(second);
+    let peer = key();
+    let _clock = h.accept_with_receipt(first).await;
+    h.connect_request(first, PeerKeyLocation::with_unknown_addr(peer.clone()))
+        .await;
+    h.connect_peer(PeerKeyLocation::new(peer.clone(), first))
+        .await;
+    assert_eq!(h.ring_addr_of(&peer), Some(first), "premise: in the ring");
+    native_join(&mut h, second, &peer).await;
+    assert_eq!(
+        h.pending_on(second),
+        Some(false),
+        "held, to bind without promotion"
+    );
+    assert_eq!(h.ring_addr_of(&peer), Some(first));
+}
+
+/// A native join from a peer this node holds over UDP at the address is held
+/// beside the UDP entry until it carries a frame, as a native dial is.
+#[tokio::test]
+async fn a_native_join_beside_a_udp_entry_for_its_key_is_held() {
+    let mut h = Harness::new("native-join-beside-udp").await;
+    let addr: SocketAddr = "198.51.100.231:7503".parse().unwrap();
+    let joiner = key();
+    h.dial(addr, &joiner).await;
+    let udp = h.mgr.connections[&addr].connection_id;
+    assert!(!h.mgr.connections[&addr].native, "premise: a UDP entry");
+    native_join(&mut h, addr, &joiner).await;
+    assert_eq!(
+        h.mgr.connections[&addr].connection_id, udp,
+        "the UDP entry stays"
+    );
+    assert!(
+        h.mgr.held_native.contains_key(&addr),
+        "the native join is held beside"
+    );
+}
+
+/// A native join held beside a UDP entry that is in the ring, then swapped
+/// in on its first frame, is given the key the ring holds it under, so its
+/// transport promotes the joiner's charge; without that it would keep a
+/// joiner's charge for the life of an in-ring connection.
+#[tokio::test]
+async fn a_held_native_join_swapped_in_is_given_its_key() {
+    let mut h = Harness::new("native-join-held-swapped").await;
+    let addr: SocketAddr = "198.51.100.231:7509".parse().unwrap();
+    let joiner = key();
+    h.dial(addr, &joiner).await;
+    assert_eq!(
+        h.transport_keys(addr).await,
+        vec![joiner.clone()],
+        "premise: the UDP connection was promoted and given the key"
+    );
+    native_join(&mut h, addr, &joiner).await;
+    assert!(
+        h.mgr.held_native.contains_key(&addr),
+        "premise: held beside"
+    );
+    h.prove_native(addr);
+    assert!(h.mgr.connections[&addr].native, "swapped in");
+    assert_eq!(
+        h.transport_keys(addr).await,
+        vec![joiner.clone(), joiner],
+        "the swapped-in native join is given the key too"
+    );
+}
+
+/// The other order: a native join is the entry, a UDP connection from the
+/// peer arrives before the native one carried a frame and becomes the entry
+/// with the native one held beside it, the connect op promotes the peer (the
+/// key goes to the UDP connection), and then the native one carries a frame
+/// and is swapped back in. It is given the key as well.
+#[tokio::test]
+async fn a_native_join_swapped_back_in_after_promotion_is_given_its_key() {
+    let mut h = Harness::new("native-join-swapped-back").await;
+    let addr: SocketAddr = "198.51.100.231:7510".parse().unwrap();
+    h.use_addr(addr);
+    let joiner = key();
+    native_join(&mut h, addr, &joiner).await;
+    h.accept_matched(addr, HandshakeInboundMatch::Unexpected)
+        .await;
+    assert!(
+        !h.mgr.connections[&addr].native && h.mgr.held_native.contains_key(&addr),
+        "premise: the UDP connection is the entry, the native join held beside"
+    );
+    h.connect_request(addr, PeerKeyLocation::new(joiner.clone(), addr))
+        .await;
+    h.connect_peer(PeerKeyLocation::new(joiner.clone(), addr))
+        .await;
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    assert!(cm.is_in_ring(addr), "premise: promoted");
+    assert_eq!(
+        h.transport_keys(addr).await,
+        vec![joiner.clone()],
+        "premise: the promotion's key went to the UDP connection"
+    );
+    h.prove_native(addr);
+    assert!(h.mgr.connections[&addr].native, "swapped back in");
+    assert_eq!(
+        h.transport_keys(addr).await,
+        vec![joiner.clone(), joiner],
+        "the native join is given the key too"
+    );
+}
+
+/// A native join's ConnectRequest naming its proven key is passed on; one
+/// naming any other key closes the connection.
+#[tokio::test]
+async fn a_native_joins_connect_request_must_name_its_proven_key() {
+    let mut h = Harness::new("native-join-request").await;
+    let honest: SocketAddr = "198.51.100.231:7505".parse().unwrap();
+    let liar: SocketAddr = "198.51.100.231:7506".parse().unwrap();
+    let (joiner, other) = (key(), key());
+    native_join(&mut h, honest, &joiner).await;
+    h.connect_request(honest, PeerKeyLocation::new(joiner.clone(), honest))
+        .await;
+    assert!(h.mgr.connections.contains_key(&honest));
+    native_join(&mut h, liar, &other).await;
+    h.refused_connect_request(liar, PeerKeyLocation::new(joiner, liar))
+        .await;
+    assert!(!h.mgr.connections.contains_key(&liar), "closed");
+}
+
+/// The native join's deadline for a ConnectRequest: a join that sends none
+/// in time (another request does not count) gets a drop notice on its own
+/// connection's channel; one that sent a ConnectRequest, or whose entry has
+/// already gone, gets nothing.
+#[tokio::test(start_paused = true)]
+async fn a_native_join_without_a_connect_request_is_closed_after_the_deadline() {
+    let addr: SocketAddr = "198.51.100.231:7504".parse().unwrap();
+    let now = Instant::now();
+
+    // `entry` stands for the connection entry's sender, which the watcher
+    // holds only weakly.
+    let (entry, mut notices) = mpsc::channel(4);
+    super::watch_native_join(
+        entry.downgrade(),
+        zombie_sweep::LinkUseStamp::new(now),
+        addr,
+    );
+    tokio::time::sleep(super::NATIVE_JOIN_REQUEST_WITHIN - Duration::from_millis(1)).await;
+    assert!(notices.try_recv().is_err(), "not before the deadline");
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    match notices.try_recv() {
+        Ok(either::Right(ConnEvent::NodeAction(NodeEvent::DropConnection(at, _)))) => {
+            assert_eq!(at, addr)
+        }
+        other => panic!("expected a drop notice, got {other:?}"),
+    }
+    drop(entry);
+
+    // A ConnectRequest keeps it.
+    let (entry, mut notices) = mpsc::channel(4);
+    let stamp = zombie_sweep::LinkUseStamp::new(now);
+    super::watch_native_join(entry.downgrade(), stamp.clone(), addr);
+    stamp.record(now);
+    stamp.record_connect_request();
+    tokio::time::sleep(super::NATIVE_JOIN_REQUEST_WITHIN * 2).await;
+    assert!(
+        notices.try_recv().is_err(),
+        "a join that sent a ConnectRequest is kept"
+    );
+    drop(entry);
+
+    // Any other request does not.
+    let (entry, mut notices) = mpsc::channel(4);
+    let stamp = zombie_sweep::LinkUseStamp::new(now);
+    super::watch_native_join(entry.downgrade(), stamp.clone(), addr);
+    stamp.record(now);
+    tokio::time::sleep(super::NATIVE_JOIN_REQUEST_WITHIN + Duration::from_millis(1)).await;
+    assert!(
+        matches!(
+            notices.try_recv(),
+            Ok(either::Right(ConnEvent::NodeAction(
+                NodeEvent::DropConnection(..)
+            )))
+        ),
+        "a join that sent only another request is closed"
+    );
+    drop(entry);
+
+    // The watcher does not keep a replaced or dropped connection's channel
+    // open until the deadline.
+    let (entry, mut notices) = mpsc::channel(4);
+    super::watch_native_join(
+        entry.downgrade(),
+        zombie_sweep::LinkUseStamp::new(now),
+        addr,
+    );
+    drop(entry);
+    assert!(
+        matches!(
+            notices.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ),
+        "the channel closes as soon as the entry drops it"
+    );
+    tokio::time::sleep(super::NATIVE_JOIN_REQUEST_WITHIN * 2).await;
 }

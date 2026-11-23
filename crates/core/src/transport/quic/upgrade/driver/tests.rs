@@ -2294,6 +2294,117 @@ fn a_gateway_join_through_the_hub_dials_as_the_client() {
     });
 }
 
+/// A gateway hands a completed native join to the node (#5940, phase B):
+/// the connection arrives on the hand-off queue with the key the joiner
+/// proved, holding the joiner's charge; promotion under that key turns the
+/// charge into a path's, and dropping the connection releases it. With no
+/// hand-off queue, or a full one, the join is closed and counted
+/// `handoff_full`, and its charge released.
+#[test]
+fn a_completed_gateway_join_is_handed_to_the_node_with_its_charge() {
+    use crate::transport::PeerConnectionApi;
+    use crate::transport::metrics::GatewayAdmission;
+    use crate::transport::quic::upgrade::driver::establish_gateway_join;
+    use crate::transport::quic::upgrade::policy::QuicPathPermits;
+    bounded(|| async {
+        let h = Harness::server("driver-native-handoff").await;
+        let rig = RetryRig::of(&h);
+        let permits = QuicPathPermits::new(64);
+        assert!(rig.theirs.attach_joiner_cap(permits.clone()));
+        assert!(rig.theirs.enable_gateway_admission(rig.time.clone()));
+        // `rig.ours` joins `rig.theirs` natively, with a fresh punch budget
+        // each time (one budget charges each destination); the gateway's half
+        // of the join comes back for the test to hand off, with the joiner's
+        // half, which must stay open meanwhile.
+        let join = || {
+            let (theirs, ours, time) = (rig.theirs.clone(), rig.ours.clone(), h.time());
+            let (gateway_addr, gateway_key) = (h.remote, h.peer.clone());
+            drive(&h.pair.time, Duration::from_secs(60), async move {
+                // The gateway admits one attempt per source address a second.
+                time.sleep(Duration::from_secs(2)).await;
+                let gateway = async {
+                    match theirs.accept_attempt().await {
+                        Some(crate::transport::quic::EndpointAttempt::Joiner(joiner)) => {
+                            establish_gateway_join(joiner, &time).await
+                        }
+                        Some(crate::transport::quic::EndpointAttempt::Allowed(_)) | None => {
+                            panic!("an admitted joiner")
+                        }
+                    }
+                };
+                let joiner = async {
+                    let budget = crate::transport::quic::native::punch::PunchBudget::default();
+                    let peer = crate::transport::quic::native::setup::NativePeer {
+                        addr: gateway_addr,
+                        key: &gateway_key,
+                        is_gateway: true,
+                    };
+                    let deadline = time.now() + Duration::from_secs(20);
+                    crate::transport::quic::native::setup::join_native(
+                        &ours, &budget, peer, 0, &time, deadline,
+                    )
+                    .await
+                };
+                let (joined, ours) = tokio::join!(gateway, joiner);
+                (
+                    joined.unwrap_or_else(|o| panic!("a completed join, got {o:?}")),
+                    ours.expect("the joiner's side"),
+                )
+            })
+        };
+
+        // No hand-off queue: closed, counted, charge released.
+        let (joined, _ours) = join().await;
+        assert_eq!(
+            permits.joiners_in_use(),
+            1,
+            "premise: the joiner is charged"
+        );
+        assert_eq!(h.hub.hand_off_join(joined), GatewayAdmission::HandoffFull);
+        assert_eq!(permits.joiners_in_use(), 0);
+
+        let (to_node, mut from_gateway) = tokio::sync::mpsc::channel(1);
+        h.hub.set_join_handoff(to_node.clone());
+        let (joined, _ours) = join().await;
+        assert_eq!(h.hub.hand_off_join(joined), GatewayAdmission::Joined);
+        let mut handed = from_gateway.try_recv().expect("handed to the node");
+        assert_eq!(handed.native_joiner_key(), Some(rig.our_key.clone()));
+        assert!(handed.holds_joiner_charge());
+        assert_eq!((permits.joiners_in_use(), permits.in_use()), (1, 0));
+        // Promotion under another key is refused and changes nothing.
+        handed.set_peer_identity(TransportKeypair::new().public().clone());
+        assert!(handed.holds_joiner_charge());
+        handed.set_peer_identity(rig.our_key.clone());
+        assert!(!handed.holds_joiner_charge());
+        assert_eq!((permits.joiners_in_use(), permits.in_use()), (0, 1));
+        // Told the same key again (a promotion, then a swap-in that tells it
+        // again): the promoted path is kept, not dropped.
+        handed.set_peer_identity(rig.our_key.clone());
+        assert!(!handed.holds_joiner_charge());
+        assert_eq!(
+            (permits.joiners_in_use(), permits.in_use()),
+            (0, 1),
+            "a repeat promotion keeps the path"
+        );
+        drop(handed);
+        assert_eq!((permits.joiners_in_use(), permits.in_use()), (0, 0));
+
+        // A full queue: closed, counted, charge released. The queue's one
+        // slot is reserved here: a second join from this source could not
+        // be admitted while a first, queued, still holds its charge.
+        let _slot = to_node.try_reserve().expect("the queue's one slot");
+        let (joined, _ours) = join().await;
+        assert_eq!(
+            permits.joiners_in_use(),
+            1,
+            "premise: the joiner is charged"
+        );
+        assert_eq!(h.hub.hand_off_join(joined), GatewayAdmission::HandoffFull);
+        assert_eq!(permits.joiners_in_use(), 0);
+        assert!(from_gateway.try_recv().is_err(), "nothing was queued");
+    });
+}
+
 /// With every setup slot taken the hub refuses at once, sending nothing.
 #[test]
 fn a_native_setup_past_the_cap_is_refused_at_once() {

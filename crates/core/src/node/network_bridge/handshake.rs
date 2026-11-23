@@ -447,7 +447,14 @@ async fn run_driver(
                         }
 
                         let remote_addr = conn.remote_addr();
-                        let entry = expected_inbound.consume(remote_addr);
+                        // A gateway's native joiner (#5940, phase B) proved its
+                        // key and was never expected: it leaves any expectation
+                        // for its address to the UDP connection it names.
+                        let entry = if conn.native_joiner_key().is_some() {
+                            None
+                        } else {
+                            expected_inbound.consume(remote_addr)
+                        };
                         let (matched, transaction, transient) = if let Some(entry) = entry {
                             (InboundMatch::Expected(entry.peer_key), entry.transaction, entry.transient)
                         } else {
@@ -921,6 +928,136 @@ mod tests {
         {
             unreachable!("not used by these tests")
         }
+    }
+
+    /// A gateway's native joiner (#5940, phase B), as its transport hands
+    /// it over: a [`NullConnection`] with a proven key.
+    struct JoinConnection(NullConnection, crate::transport::TransportPublicKey);
+
+    impl PeerConnectionApi for JoinConnection {
+        fn native_joiner_key(&self) -> Option<crate::transport::TransportPublicKey> {
+            Some(self.1.clone())
+        }
+
+        fn set_peer_identity(&mut self, key: crate::transport::TransportPublicKey) {
+            self.0.set_peer_identity(key)
+        }
+
+        fn remote_addr(&self) -> SocketAddr {
+            self.0.remote_addr()
+        }
+
+        fn remote_version(&self) -> Option<(u8, u8, u16)> {
+            self.0.remote_version()
+        }
+
+        fn send_bytes(
+            &mut self,
+            data: Vec<u8>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
+        {
+            self.0.send_bytes(data)
+        }
+
+        fn recv(
+            &mut self,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>>
+        {
+            self.0.recv()
+        }
+
+        fn set_inbound_stream_registry(
+            &mut self,
+            registry: Arc<dyn crate::transport::InboundStreamRegistry>,
+        ) {
+            self.0.set_inbound_stream_registry(registry)
+        }
+
+        fn send_stream_data(
+            &mut self,
+            stream_id: crate::transport::StreamId,
+            data: bytes::Bytes,
+            metadata: Option<bytes::Bytes>,
+            completion_tx: Option<
+                tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>,
+            >,
+            progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
+        {
+            self.0
+                .send_stream_data(stream_id, data, metadata, completion_tx, progress)
+        }
+
+        fn pipe_stream_data(
+            &mut self,
+            outbound_stream_id: crate::transport::StreamId,
+            inbound_handle: crate::transport::IncomingStream,
+            metadata: Option<bytes::Bytes>,
+            progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<(), TransportError>> + Send + '_>>
+        {
+            self.0
+                .pipe_stream_data(outbound_stream_id, inbound_handle, metadata, progress)
+        }
+    }
+
+    /// A native join is reported as unexpected and leaves the expectation
+    /// for its address in place, for the UDP connection the expectation
+    /// names.
+    #[tokio::test(start_paused = true)]
+    async fn a_native_join_leaves_an_expectation_for_its_address() {
+        let (conn_tx, conn_rx) = mpsc::channel(4);
+        let (cmd_tx, cmd_rx) = mpsc::channel(4);
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let _driver = GlobalExecutor::spawn(run_driver(
+            Box::new(ChannelAcceptor(conn_rx)),
+            Arc::new(ScriptedConnector {
+                enqueue: Duration::ZERO,
+                handshake: Handshake::Hangs,
+                origins: Default::default(),
+                native_dials: Default::default(),
+            }),
+            cmd_rx,
+            event_tx,
+            None,
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+            None,
+        ));
+        let addr: SocketAddr = "127.0.0.1:4310".parse().unwrap();
+        let expected = TransportKeypair::new().public().clone();
+        cmd_tx
+            .send(Command::ExpectInbound {
+                addr,
+                peer_key: Some(expected.clone()),
+                transaction: None,
+                transient: false,
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        let joiner = TransportKeypair::new().public().clone();
+        conn_tx
+            .send(Box::new(JoinConnection(NullConnection(addr), joiner)))
+            .await
+            .ok()
+            .unwrap();
+        let Some(Event::InboundConnection { matched, .. }) = event_rx.recv().await else {
+            panic!("expected an InboundConnection");
+        };
+        assert_eq!(matched, InboundMatch::Unexpected, "the native join");
+        conn_tx
+            .send(Box::new(NullConnection(addr)))
+            .await
+            .ok()
+            .unwrap();
+        let Some(Event::InboundConnection { matched, .. }) = event_rx.recv().await else {
+            panic!("expected an InboundConnection");
+        };
+        assert_eq!(
+            matched,
+            InboundMatch::Expected(Some(expected)),
+            "the expectation is still there"
+        );
     }
 
     /// An `InboundAcceptor` that yields whatever the test sends it, and

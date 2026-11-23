@@ -517,7 +517,7 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         is_gateway,
         "UDP socket bound successfully"
     );
-    let (och, new_connection_notifier, listen_handle) = OutboundConnectionHandler::config_listener(
+    OutboundConnectionHandler::config_listener(
         socket,
         keypair,
         is_gateway,
@@ -525,14 +525,7 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         config,
         quic_endpoint,
         rebuild_endpoint,
-    )?;
-    Ok((
-        och,
-        InboundConnectionHandler {
-            new_connection_notifier,
-        },
-        listen_handle,
-    ))
+    )
 }
 
 /// Admit native joins from sources nobody named on `endpoint`, on the
@@ -637,6 +630,9 @@ fn start_quic_stack(
     local_key: TransportPublicKey,
     socket_addr: SocketAddr,
     native_rate: super::quic::config::QuicRateLimit,
+    join_handoff: Option<
+        mpsc::Sender<super::peer_connection::native_connection::NativePeerConnection>,
+    >,
     arm_faults: bool,
 ) -> QuicStack {
     // The endpoint's accept loop runs from the start. Its allow-set is empty
@@ -662,6 +658,11 @@ fn start_quic_stack(
         native_rate,
         arm_faults,
     );
+    // Completed gateway joins go to the node's inbound connections
+    // (`InboundConnectionHandler`); without a hand-off they are closed.
+    if let (Some(upgrades), Some(to_node)) = (&upgrades, join_handoff) {
+        upgrades.set_join_handoff(to_node);
+    }
     // With upgrades the router takes the queue; without them the listener
     // holds it, so the accept loop still has a live consumer.
     let attempts = match (&upgrades, register, attempts) {
@@ -688,6 +689,9 @@ struct StackInputs {
     local_key: TransportPublicKey,
     socket_addr: SocketAddr,
     native_rate: super::quic::config::QuicRateLimit,
+    /// Where completed gateway joins go (#5940, phase B).
+    join_handoff:
+        Option<mpsc::Sender<super::peer_connection::native_connection::NativePeerConnection>>,
 }
 
 /// Start the task that rebuilds the endpoint whenever it dies
@@ -743,6 +747,7 @@ fn spawn_endpoint_rebuild(
             inputs.local_key.clone(),
             inputs.socket_addr,
             inputs.native_rate.clone(),
+            inputs.join_handoff.clone(),
             false,
         );
         site.replace(stack.upgrades.as_ref());
@@ -1125,7 +1130,17 @@ async fn bind_socket_with_retry<S: Socket>(
 /// Receives  new inbound connections from the network.
 pub struct InboundConnectionHandler<S = UdpSocket, TS: TimeSource = RealTime> {
     new_connection_notifier: mpsc::Receiver<PeerConnection<S, TS>>,
+    /// Gateway joins completed over QUIC (#5940, phase B), handed over by
+    /// every QUIC stack this listener runs (the first and each rebuilt one).
+    /// `Some` whenever the node has a QUIC endpoint; `None` without one, or
+    /// once every sender is gone.
+    native_joins:
+        Option<mpsc::Receiver<super::peer_connection::native_connection::NativePeerConnection>>,
 }
+
+/// Completed QUIC gateway joins waiting for the node to take them; the
+/// upgrades close one that finds the queue full (`handoff_full`).
+const NATIVE_JOIN_HANDOFF: usize = 64;
 
 impl<S: Send + Sync, TS: TimeSource> InboundConnectionHandler<S, TS> {
     pub async fn next_connection(&mut self) -> Option<PeerConnection<S, TS>> {
@@ -1135,11 +1150,33 @@ impl<S: Send + Sync, TS: TimeSource> InboundConnectionHandler<S, TS> {
 
 impl<S: Socket> super::InboundAcceptor for InboundConnectionHandler<S> {
     fn next_connection(&mut self) -> super::NextConnection<'_> {
-        // `mpsc::Receiver::recv` is cancel-safe, so the boxed future is too.
+        // `mpsc::Receiver::recv` is cancel-safe, so the boxed future is too:
+        // a connection is taken from a channel only by the branch that
+        // returns it.
         Box::pin(async move {
-            InboundConnectionHandler::<S>::next_connection(self)
-                .await
-                .map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>)
+            loop {
+                let native_closed = {
+                    let native = async {
+                        match self.native_joins.as_mut() {
+                            Some(native_joins) => native_joins.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    };
+                    tokio::select! {
+                        conn = self.new_connection_notifier.recv() => {
+                            return conn.map(|conn| Box::new(conn) as Box<dyn super::PeerConnectionApi>);
+                        }
+                        joined = native => match joined {
+                            Some(conn) => return Some(Box::new(conn) as Box<dyn super::PeerConnectionApi>),
+                            None => true,
+                        },
+                    }
+                };
+                // The upgrades are gone: only the UDP listener is left.
+                if native_closed {
+                    self.native_joins = None;
+                }
+            }
         })
     }
 }
@@ -1213,11 +1250,11 @@ impl<S, TS: TimeSource> OutboundConnectionHandler<S, TS> {
     }
 }
 
-/// Return type for `config_listener`: the outbound handler, inbound connection receiver,
+/// Return type for `config_listener`: the outbound handler, inbound connection handler,
 /// and the JoinHandle for the UDP listen task (must be monitored for unexpected exits).
 type ListenerSetup<S> = (
     OutboundConnectionHandler<S>,
-    mpsc::Receiver<PeerConnection<S>>,
+    InboundConnectionHandler<S>,
     tokio::task::JoinHandle<TransportError>,
 );
 
@@ -1232,7 +1269,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         quic_endpoint: Option<super::quic::QuicEndpoint>,
         rebuild_endpoint: Option<super::quic::rebuild::EndpointFactory>,
     ) -> Result<ListenerSetup<S>, TransportError> {
-        let (mut transport, connection_handler, new_connection_notifier) = Self::new_listener(
+        let (mut transport, connection_handler, inbound) = Self::new_listener(
             socket,
             keypair,
             is_gateway,
@@ -1247,7 +1284,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         transport.accepted_keys = AcceptedKeys::for_new_listener();
         let listen_handle = GlobalExecutor::spawn(transport.listen());
 
-        Ok((connection_handler, new_connection_notifier, listen_handle))
+        Ok((connection_handler, inbound, listen_handle))
     }
 
     /// Build the listener (not yet running) and the handles onto it.
@@ -1263,7 +1300,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
     ) -> (
         UdpPacketsListener<S>,
         OutboundConnectionHandler<S>,
-        mpsc::Receiver<PeerConnection<S>>,
+        InboundConnectionHandler<S>,
     ) {
         let UdpTransportConfig {
             bandwidth_limit,
@@ -1315,6 +1352,22 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         let mut keep_for_rebuild = |name: &'static str, handle: tokio::task::JoinHandle<()>| {
             first_tasks.push((name, handle))
         };
+        // Gateway joins completed over QUIC reach the node beside the UDP
+        // listener's new connections (#5940, phase B). Every stack on this
+        // listener, the first and each rebuilt one, hands its joins here.
+        let (join_handoff, native_joins) = if quic_endpoint.is_some() {
+            let (to_node, native_joins) = mpsc::channel(NATIVE_JOIN_HANDOFF);
+            // A simulation can stand in for a release without the hand-off,
+            // which closes every completed join after its Hello.
+            #[cfg(any(test, feature = "testing"))]
+            let to_node = (!super::in_memory_socket::gateway_closes_native_joins(socket_addr))
+                .then_some(to_node);
+            #[cfg(not(any(test, feature = "testing")))]
+            let to_node = Some(to_node);
+            (to_node, Some(native_joins))
+        } else {
+            (None, None)
+        };
         let mut register_with_monitor = task_registrar.clone().map(|registrar| {
             move |name: &'static str, handle: tokio::task::JoinHandle<()>| {
                 registrar.register(name, handle)
@@ -1336,6 +1389,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
                 local_key.clone(),
                 socket_addr,
                 native_rate.clone(),
+                join_handoff.clone(),
                 true,
             )
         });
@@ -1365,6 +1419,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
                         local_key: local_key.clone(),
                         socket_addr,
                         native_rate,
+                        join_handoff,
                     },
                 );
                 (availability, Some(stop))
@@ -1423,7 +1478,14 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             #[cfg(test)]
             quic_stack: transport.quic_stack_for_test.clone(),
         };
-        (transport, connection_handler, new_connection_notifier)
+        (
+            transport,
+            connection_handler,
+            InboundConnectionHandler {
+                new_connection_notifier,
+                native_joins,
+            },
+        )
     }
 
     #[cfg(any(test, feature = "bench"))]
@@ -1458,7 +1520,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
         bandwidth_limit: Option<usize>,
         ack_version_floor_override: Option<(u8, u8, u16)>,
     ) -> Result<(Self, mpsc::Receiver<PeerConnection<S>>), TransportError> {
-        let (handler, receiver, _listen_handle) = Self::config_listener(
+        let (handler, inbound, _listen_handle) = Self::config_listener(
             socket,
             keypair,
             is_gateway,
@@ -1471,7 +1533,8 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             None,
             None,
         )?;
-        Ok((handler, receiver))
+        // No QUIC endpoint here (`None` above), so no native joins.
+        Ok((handler, inbound.new_connection_notifier))
     }
 
     /// Connect with no node-level origin (tests, benchmarks); the attempt

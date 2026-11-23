@@ -838,6 +838,11 @@ impl NativeConnectState {
                     crate::transport::metrics::GatewayNativeJoin::SkippedCooldown,
                     addr,
                 );
+                #[cfg(any(test, feature = "testing"))]
+                crate::operations::connect::native_wire_trace::record_at(
+                    addr,
+                    crate::operations::connect::native_wire_trace::NativeWireEvent::GatewayJoinSkippedCooldown,
+                );
                 GatewayJoinPlan::LegacyCoolingDown
             }
             Some(_) => {
@@ -876,6 +881,15 @@ impl NativeConnectState {
     /// success is the only thing recorded, and a joiner could redial the same
     /// dead native link forever. A link that did carry a frame, or a UDP
     /// one, says nothing about native and is ignored.
+    ///
+    /// It cannot tell why the link went: a local removal before the first
+    /// frame (shutdown, dropping all connections, a dedup or eviction just
+    /// after the join, or `promote_held_native`, which installs a held
+    /// connection with `frame_seen` false) counts the same. The cost is
+    /// bounded: that gateway's next joins within
+    /// [`GATEWAY_NATIVE_FAILURE_COOLDOWN`] go over UDP, as they do today. A
+    /// join that completes is not affected, since the gateway's probe or its
+    /// CONNECT answer marks the frame first.
     pub(crate) fn gateway_link_closed(
         &self,
         addr: std::net::SocketAddr,
@@ -883,6 +897,15 @@ impl NativeConnectState {
         frame_seen: bool,
     ) {
         if native && !frame_seen {
+            #[cfg(any(test, feature = "testing"))]
+            if self.native_gateways.get().is_some_and(|gateways| {
+                gateways.contains(&crate::transport::normalize_mapped_addr(addr))
+            }) {
+                crate::operations::connect::native_wire_trace::record_at(
+                    addr,
+                    crate::operations::connect::native_wire_trace::NativeWireEvent::GatewayLinkDeadBeforeFrame,
+                );
+            }
             self.record_gateway_join(addr, false);
         }
     }

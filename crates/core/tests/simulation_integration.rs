@@ -22984,6 +22984,100 @@ fn test_quic_rebuilt_endpoint_carries_a_new_path() {
     }
 }
 
+/// A gateway whose endpoint dies and is rebuilt (#6272) still hands
+/// completed native joins to its node (#5940, phase B): every stack it
+/// builds, not only the first, carries the hand-off. The endpoint dies at
+/// 30 s and is rebuilt about a second later; the node crashes at 40 s and
+/// restarts at 41 s with a fresh process, so its join goes to the rebuilt
+/// endpoint natively. Fails closed: the rebuild happened, a native join
+/// connected after the restart, and at the end the gateway holds the node
+/// over a native connection in its ring, promoted under its key, which only
+/// the hand-off can give it (peer-to-peer native connects are off).
+#[test_log::test]
+fn test_quic_rebuilt_endpoint_hands_native_joins_to_the_node() {
+    const FAIL_AT: Duration = Duration::from_secs(30);
+    const SEED: u64 = 0x6272_E5B0_0002;
+    setup_deterministic_state(SEED);
+    freenet::config::SimulationIdleTimeout::enable();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut sim = SimNetwork::new("quic-rebuilt-native-join", 1, 1, 7, 3, 10, 2, SEED).await;
+        sim.enable_gateway_ack_version();
+        sim.with_quic_native_floor(native_floor_for_tests());
+        sim.with_transport_quic("prefer");
+        sim.with_native_gateway_join(100);
+        let labels = sim.all_node_addresses().clone();
+        let gateway = labels.keys().find(|l| l.is_gateway()).unwrap().clone();
+        let node = labels.keys().find(|l| !l.is_gateway()).unwrap().clone();
+        sim.with_gateway_native_admission(&gateway);
+        let (gateway_addr, node_addr) = (labels[&gateway], labels[&node]);
+        let trace = sim.quic_upgrade_trace();
+        let wire = sim.native_wire_trace();
+        trace.fail_endpoint_at(gateway_addr, FAIL_AT);
+        trace.rebuild_endpoint(gateway_addr);
+        let time = sim.virtual_time().clone();
+        let driver = tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                time.advance_to(start.elapsed().as_nanos() as u64);
+            }
+        });
+        let _handles = sim
+            .start_with_rand_gen::<rand::rngs::SmallRng>(SEED, 1, 1)
+            .await;
+        tokio::time::sleep(Duration::from_secs(40)).await;
+        assert!(sim.crash_node(&node));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let restarted_at = trace.now();
+        let joined_before = wire.gateway_join_native_established();
+        sim.restart_node::<rand::rngs::SmallRng>(&node, SEED + 1, 1, 1)
+            .await
+            .expect("the node restarts");
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        // Read while the network is still up: its teardown closes connections.
+        let (transports, rings, keys_sent) =
+            (wire.transports(), wire.rings(), wire.native_keys_sent());
+        let joined_after = wire.gateway_join_native_established();
+        driver.abort();
+
+        let dump = format!("{:#?}", trace.records());
+        let rebuilt = trace.matching(gateway_addr, "rebuilt the endpoint at ");
+        assert_eq!(rebuilt.len(), 1, "premise: one rebuild: {dump}");
+        assert!(
+            rebuilt[0].at < restarted_at,
+            "premise: rebuilt before the restart: {dump}"
+        );
+        assert!(
+            joined_after > joined_before,
+            "a native join connected after the rebuild ({joined_before} before, \
+             {joined_after} after)"
+        );
+        assert_eq!(
+            transports.get(&(gateway_addr, node_addr)),
+            Some(&true),
+            "the rebuilt gateway holds the node natively: {transports:?}"
+        );
+        assert_eq!(
+            transports.get(&(node_addr, gateway_addr)),
+            Some(&true),
+            "the node holds the rebuilt gateway natively: {transports:?}"
+        );
+        assert!(
+            rings.contains(&(gateway_addr, node_addr)),
+            "the gateway took the node into its ring: {rings:?}"
+        );
+        assert!(
+            keys_sent.contains(&(gateway_addr, node_addr)),
+            "and promoted it under its key: {keys_sent:?}"
+        );
+    });
+}
+
 /// One gateway and one node in shadow, with the path up by 40 s: the node crashes
 /// and restarts with its identity, and the run goes on for `then`. `quiet_from`
 /// stops QUIC datagrams between them. Returns the trace, the gateway's address and
@@ -23736,6 +23830,180 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
     );
     let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
     assert_eq!(peers.len(), run.wire.nodes, "every node joined over UDP");
+    assert!(connected);
+}
+
+/// A gateway the index marks native that admits native joins: joiners join
+/// it over QUIC, the gateway hands each completed join to its node, the
+/// joiner's ConnectRequest arrives on that connection, and the gateway's
+/// connect op promotes it into the ring, so the pair ends the run holding a
+/// native connection at both ends and connected in the ring. Fails closed:
+/// native joins must have connected, and the gateway can hold a native
+/// connection only through the hand-off (peer-to-peer native connects are
+/// off here).
+#[test_log::test]
+fn test_quic_native_gateway_join_with_admission_joins_over_quic() {
+    use freenet::dev_tool::NodeLabel;
+    const SEED: u64 = 0x0059_40B0_0002;
+    let run = run_native_connect_sim("native-gateway-join-on", SEED, 200, |sim| {
+        sim.with_native_gateway_join(100);
+        let gateways: Vec<NodeLabel> = sim
+            .all_node_addresses()
+            .keys()
+            .filter(|label| label.is_gateway())
+            .cloned()
+            .collect();
+        for gateway in &gateways {
+            sim.with_gateway_native_admission(gateway);
+        }
+    });
+    let t = &run.wire.trace;
+    tracing::info!(
+        native_established = t.gateway_join_native_established(),
+        native_failed = t.gateway_join_native_failed(),
+        rescued = t.gateway_join_fallback_connected(),
+        fallback_failed = t.gateway_join_fallback_failed(),
+        "native gateway join trace"
+    );
+    assert!(
+        t.gateway_join_native_established() > 0,
+        "native joins to an admitting gateway connected"
+    );
+    assert_eq!(
+        t.gateway_join_fallback_failed(),
+        0,
+        "no join was lost to the native attempt"
+    );
+    // A pair the gateway holds natively at the end of the run: the joiner
+    // holds it natively too, and the two are connected in the ring.
+    let transports = t.transports();
+    let joined_natively: Vec<_> = transports
+        .iter()
+        .filter(|((own, peer), native)| {
+            **native && run.gateways.contains(own) && !run.gateways.contains(peer)
+        })
+        .map(|((gateway, joiner), _)| (*gateway, *joiner))
+        .collect();
+    assert!(
+        !joined_natively.is_empty(),
+        "a gateway holds a joiner over a native connection; gateways {:?}, transports {transports:?}",
+        run.gateways
+    );
+    // A gateway that has a peer nearer the joiner's location forwards the
+    // join instead of accepting it, as for a UDP join: its native connection
+    // to the joiner then stays outside its ring until the transient TTL
+    // (30 s, longer than this run) closes it. So for every pair a gateway
+    // holds natively when the run ends (`rings` is each node's ring then;
+    // the `Connected` events behind `mesh` are logged by the joiner when an
+    // acceptor answers, so they cannot say which node holds whom):
+    // - if the joiner is in the gateway's ring, the gateway gave that
+    //   native connection the key, which promotes the joiner's charge to a
+    //   path's (a ring member must never keep a joiner's charge);
+    // - if not, and the gateway never gave it a key (still a joiner), the
+    //   join was forwarded: the joiner is in some other peer's ring.
+    let keys_sent = t.native_keys_sent();
+    let rings = t.rings();
+    let mut promoted = Vec::new();
+    for (gateway, joiner) in &joined_natively {
+        assert_eq!(
+            transports.get(&(*joiner, *gateway)),
+            Some(&true),
+            "the joiner {joiner} holds its gateway {gateway} natively too"
+        );
+        if rings.contains(&(*gateway, *joiner)) {
+            assert!(
+                keys_sent.contains(&(*gateway, *joiner)),
+                "gateway {gateway} has the native joiner {joiner} in its ring \
+                 without having promoted it; keys sent: {keys_sent:?}"
+            );
+            promoted.push((*gateway, *joiner));
+        } else if !keys_sent.contains(&(*gateway, *joiner)) {
+            // (A pair given its key and no longer in the ring was promoted
+            // and later dropped from it; its charge is a path's, so it is
+            // not this check's concern.)
+            assert!(
+                rings.iter().any(|(a, b)| {
+                    (*a == *joiner && !run.gateways.contains(b))
+                        || (*b == *joiner && !run.gateways.contains(a))
+                }),
+                "the native join {joiner} -> {gateway} was neither accepted nor \
+                 forwarded to a peer that took it; rings: {rings:?}"
+            );
+        }
+    }
+    assert!(
+        !promoted.is_empty(),
+        "no native join was accepted into a gateway's ring; held natively: {joined_natively:?}"
+    );
+    // And the transport promoted each such joiner's charge.
+    assert!(
+        t.native_joiners_promoted() >= promoted.len() as u64,
+        "charges promoted {} < native joins in a gateway's ring {promoted:?}",
+        t.native_joiners_promoted()
+    );
+    assert!(t.native_replaced_by_udp().is_empty());
+    assert_eq!(t.undecodable_closes(), 0);
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined");
+    assert!(connected);
+}
+
+/// A gateway that completes native joins but closes each one after the
+/// Hello, as a gateway running a release without the hand-off does: the
+/// joiner's native setup succeeds, the link is removed before it carries a
+/// frame, which counts as a failed native join, and the joiner's next join
+/// to that gateway goes over UDP (the cooldown) instead of redialling the
+/// dead native link. Every node still joins, over UDP to the gateways.
+#[test_log::test]
+fn test_quic_native_gateway_join_dead_before_a_frame_goes_legacy_next() {
+    use freenet::dev_tool::NodeLabel;
+    const SEED: u64 = 0x0059_40B0_0003;
+    let run = run_native_connect_sim("native-gateway-join-closed", SEED, 300, |sim| {
+        sim.with_native_gateway_join(100);
+        let gateways: Vec<NodeLabel> = sim
+            .all_node_addresses()
+            .keys()
+            .filter(|label| label.is_gateway())
+            .cloned()
+            .collect();
+        for gateway in &gateways {
+            sim.with_gateway_native_admission(gateway);
+            sim.with_gateway_closing_native_joins(gateway);
+        }
+    });
+    let t = &run.wire.trace;
+    tracing::info!(
+        native_established = t.gateway_join_native_established(),
+        native_failed = t.gateway_join_native_failed(),
+        dead_before_frame = t.gateway_link_dead_before_frame(),
+        skipped_cooldown = t.gateway_join_skipped_cooldown(),
+        "native gateway join trace"
+    );
+    assert!(
+        t.gateway_join_native_established() > 0,
+        "premise: native setups to the gateways succeeded"
+    );
+    assert!(
+        t.gateway_link_dead_before_frame() > 0,
+        "the closed links counted as failed native joins"
+    );
+    assert!(
+        t.gateway_join_skipped_cooldown() > 0,
+        "a later join to such a gateway went straight to UDP"
+    );
+    let native_to_gateway: Vec<_> = t
+        .transports()
+        .into_iter()
+        .filter(|((own, peer), native)| {
+            *native && (run.gateways.contains(own) || run.gateways.contains(peer))
+        })
+        .collect();
+    assert!(
+        native_to_gateway.is_empty(),
+        "no node ends holding a native link to or from a gateway: {native_to_gateway:?}"
+    );
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined");
     assert!(connected);
 }
 

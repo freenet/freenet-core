@@ -1062,8 +1062,8 @@ Token reservation:
 
 ### WHEN admitting native joiners at a gateway (#5940, A7b; dark behind `GATEWAY_NATIVE_ADMISSION`)
 
-- **A joiner is charged against the node's QUIC path cap from its admission.** `JoinerIncoming` holds a `JoinerCharge` (a `QuicJoinerPermit` from `QuicPathPermits::try_acquire_joiner`, plus a `QuicJoinerMark`). Dropping it releases both, which covers every exit: the handshake failing, the 8 s window passing (the `establish` future is dropped), the connection closing (end of `join_gateway`) and an ignored attempt. `JoinerCharge::promote` re-charges at the full path rate (`QuicJoinerPermit::promote`, one atomic step; on no room the joiner keeps its charge). Do not add a parallel joiner counter: paths and joiners take from ONE unit total in `QuicPathPermits` (`config::PATH_PERMIT_UNITS` for a path, `config::JOINER_PERMIT_UNITS` for the handshake-phase charge, `config::QUIC_HANDSHAKE_PHASE_CHARGE_BYTES`).
-- **Joiners together hold at most 1/`JOINER_SHARE_DIVISOR` (a quarter) of the cap's units**, so established peers' path upgrades always keep the rest; refused joiners are ignored as when the cap is full. **The join window counts from the hub queueing the join** (`JoinerIncoming::stamp`, read by `join_gateway`), so waiting for a join slot does not extend the hold. Promotion moves the `Arc` to the path permit (`QuicJoinerPermit` holds an `Option`); never `mem::forget` it.
+- **A joiner is charged against the node's QUIC path cap from its admission.** `JoinerIncoming` holds a `JoinerCharge` (a `QuicJoinerPermit` from `QuicPathPermits::try_acquire_joiner`, plus a `QuicJoinerMark`). Dropping it releases both, which covers every exit: the handshake failing, the 8 s window passing (the `establish` future is dropped), the connection closing (end of the join, or of the handed-over connection) and an ignored attempt. `JoinerCharge::promote` re-charges at the full path rate (`QuicJoinerPermit::promote`, one atomic step; on no room the joiner keeps its charge). Do not add a parallel joiner counter: paths and joiners take from ONE unit total in `QuicPathPermits` (`config::PATH_PERMIT_UNITS` for a path, `config::JOINER_PERMIT_UNITS` for the handshake-phase charge, `config::QUIC_HANDSHAKE_PHASE_CHARGE_BYTES`).
+- **Joiners together hold at most 1/`JOINER_SHARE_DIVISOR` (a quarter) of the cap's units**, so established peers' path upgrades always keep the rest; refused joiners are ignored as when the cap is full. **The join window counts from the hub queueing the join** (`JoinerIncoming::stamp`, read by `establish_gateway_join`), so waiting for a join slot does not extend the hold. Promotion moves the `Arc` to the path permit (`QuicJoinerPermit` holds an `Option`); never `mem::forget` it.
 - **The cap is attached by the hub** (`QuicUpgrades::new` calls `attach_joiner_cap`). Until then every admitted attempt is ignored (`joiner_cap_full`): a missing cap fails closed.
 - **Order in `EndpointCore::admit`**: Retry, per-address, global, THEN the cap charge, THEN the allow-set. A refusal at any step drops the `AdmissionTicket` (refund) and the charge. Pinned by `with_admission_off_no_joiner_is_charged`.
 - **Unpromoted joiners share one slice of the established ingress queue** (`demux::QUIC_INGRESS_JOINER_DATAGRAMS`, 64 of 1024), not a per-source share and not per-IP keying (QUIC-NATIVE-CONNECT 10.2 item 23, decided in A7b PR 6): one host on many ports cannot take more than 64 slots, and established peers keep the rest. A joiner never uses the quiet reserve. The slot is recorded per datagram (`QuicDatagram::joiner_slot`) so promotion or release cannot leak it. Overflow counts `quic_gateway_admission_joiner_share_full` and `quic_ingress_source_full`.
@@ -1075,7 +1075,8 @@ Token reservation:
 - **Fallback is unconditional and immediate.** Any native failure runs the ordinary UDP dial in the same task; nothing is sticky. A failure cools that gateway down for `GATEWAY_NATIVE_FAILURE_COOLDOWN` (the index is read at startup, so un-marking does not reach running nodes). Gateway join failures must never count toward the peer-to-peer demotion.
 - **The emitted event names the transport that connected** (`DialTransport::native_now()` on a native join), so the lifecycle's native arm handles it; `connection_lifecycle.rs` needs no gateway-join special case.
 - **`setup::join_native` is the client whatever the key order and never punches**; `NativeDial::join` selects it in `QuicUpgrades::run_native_setup`. Its ends are counted as `gateway_native_join_*` by the driver, never as `connect_native_setup_*` (the peer-to-peer comparison reads only that).
-- **Do not mark a gateway until it hands admitted joins to the node.** Before that, `driver::join_gateway` closes a completed join after the Hello, and a joiner whose setup succeeded has no fallback.
+- **A gateway hands a completed native join to the node** (`QuicUpgrades::hand_off_join`, `try_send` onto the listener's `native_joins` queue; full or no node: closed, `quic_gateway_admission_handoff_full`; finished after its stack was replaced by an endpoint rebuild: closed, `stack_gone`). Every stack the listener builds, the first and each rebuilt one, gets the same hand-off (`start_quic_stack`'s `join_handoff`). The connection holds the joiner's charge until the node promotes it under the proven key (`set_peer_identity` calls `JoinerCharge::promote`), and drops it with the connection. Do not mark a gateway in the index before it runs a release with this hand-off: an older gateway closes a completed join after the Hello, and a joiner whose setup succeeded has no fallback.
+- **The node binds a native join to its proven key without promoting it** (`connection_lifecycle::accept_native_join`): the connect op promotes it at ConnectPeer, as for a legacy join, and a ConnectRequest naming another key closes it. A proven native join skips the UDP survivor rule: a newer native join for the same key at the address replaces the older entry, and one beside a UDP entry for its key is held (`hold_native`). A native join that sends no request within `NATIVE_JOIN_REQUEST_WITHIN` (5 s, a one-shot timer; the zombie sweep's 30 s tick is too coarse) is closed. Never pass a native join to `handle_successful_connection` with `Some(peer)`: on a gateway that promotes it into the ring at once, before CONNECT accepts it.
 
 ## Backoff, Jitter, and Recovery Rules
 
@@ -1250,15 +1251,19 @@ starts gives the admission back (`refunded`): the allow-set full, the attempt
 dropped on a full accept or join queue, the node stopping. The attempt router
 hands each admitted join to one registered task, `quic_gateway_joins`
 (`driver::run_gateway_joins`, a 64-join queue, at most 512 joins at once),
-which runs each join (`driver::join_gateway`) as a future of its own:
+which runs each join (`driver::establish_gateway_join`, then `QuicUpgrades::hand_off_join`) as a future of its own:
 handshake, the client's key read from the connection (`proven_client_key`),
 the native Hello exchange, all within `NATIVE_WINDOW`. A join that panics is
-counted and the task goes on. Until phase B hands the connection to the node,
-a join that gets that far is closed (`node_dropped_peer`). Each outcome is
+counted and the task goes on. A join that gets that far is handed to the node
+(`QuicUpgrades::hand_off_join`); with the hand-off queue full or no node it is
+closed. (`driver::join_gateway` remains only as a `#[cfg(test)]` wrapper that
+closes a completed join.) Each outcome is
 counted under `quic_gateway_admission_*`: queued, queue_full, short_header,
 runt, unknown_version, not_initial, retried, throttled_address,
 throttled_global, allow_set_full, admitted, refunded, join_queue_full,
-handshake_failed, unproven, hello_failed, joined, join_panicked,
+handshake_failed, unproven, hello_failed, joined, handoff_full,
+stack_gone (a join that finished after a rebuild replaced its stack),
+no_connect_request, join_panicked,
 joiner_cap_full, joiner_share_full. Joiners are inside the connection cap and
 share one bounded slice of the ingress queue (section "WHEN admitting native
 joiners at a gateway").

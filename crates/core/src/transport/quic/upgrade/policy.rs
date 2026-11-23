@@ -312,7 +312,6 @@ impl QuicJoinerPermit {
     /// units are given up and a path's taken, or, if the path does not fit,
     /// nothing changes and the permit comes back. A promoted joiner holds a
     /// path permit and no joiner charge.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn promote(mut self) -> Result<QuicPathPermit, Self> {
         let count = self.0.take().expect("a live joiner permit holds its count");
         let total = count.total();

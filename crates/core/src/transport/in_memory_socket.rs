@@ -252,6 +252,51 @@ pub(crate) fn quic_endpoint_clock(network: &str, addr: SocketAddr) -> Option<&'s
         .map(|clock| *clock)
 }
 
+/// Gateways whose QUIC listener admits native joins in a simulation
+/// (`SimNetwork::with_gateway_native_admission`), keyed by `(network,
+/// address)` so that simulations sharing an address cannot turn it on for
+/// each other.
+#[cfg(any(test, feature = "testing"))]
+static GATEWAY_NATIVE_ADMISSION: LazyLock<dashmap::DashSet<(String, SocketAddr)>> =
+    LazyLock::new(dashmap::DashSet::new);
+
+/// Turns native-join admission on for the gateway at `addr` in `network`.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn force_gateway_native_admission(network: &str, addr: SocketAddr) {
+    GATEWAY_NATIVE_ADMISSION.insert((network.to_string(), addr));
+}
+
+/// Whether a simulation turned native-join admission on for the listener
+/// bound at `addr`, resolving the network as the socket bind does
+/// ([`resolve_address_network`]), on the binding thread.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn gateway_native_admission_forced(addr: SocketAddr) -> bool {
+    resolve_address_network(&addr)
+        .is_ok_and(|network| GATEWAY_NATIVE_ADMISSION.contains(&(network, addr)))
+}
+
+/// Gateways that close every completed native join after its Hello in a
+/// simulation, as a release before the hand-off to the node did
+/// (`SimNetwork::with_gateway_closing_native_joins`), keyed by `(network,
+/// address)`.
+#[cfg(any(test, feature = "testing"))]
+static GATEWAY_CLOSES_NATIVE_JOINS: LazyLock<dashmap::DashSet<(String, SocketAddr)>> =
+    LazyLock::new(dashmap::DashSet::new);
+
+/// Makes the gateway at `addr` in `network` close its completed native joins.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn force_gateway_closing_native_joins(network: &str, addr: SocketAddr) {
+    GATEWAY_CLOSES_NATIVE_JOINS.insert((network.to_string(), addr));
+}
+
+/// Whether a simulation made the listener bound at `addr` close its
+/// completed native joins, resolving the network as the socket bind does.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn gateway_closes_native_joins(addr: SocketAddr) -> bool {
+    resolve_address_network(&addr)
+        .is_ok_and(|network| GATEWAY_CLOSES_NATIVE_JOINS.contains(&(network, addr)))
+}
+
 /// What a simulated node's egress cap reads, for a test.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy)]
@@ -425,6 +470,8 @@ pub(crate) fn clear_quic_endpoint_clocks(network: &str) {
     crate::operations::connect::native_wire_trace::remove(network);
     QUIC_ACCEPT_LOOPS.retain(|(owner, _)| owner != network);
     QUIC_ENDPOINT_CLOCKS.retain(|(owner, _), _| owner != network);
+    GATEWAY_NATIVE_ADMISSION.retain(|(owner, _)| owner != network);
+    GATEWAY_CLOSES_NATIVE_JOINS.retain(|(owner, _)| owner != network);
     #[cfg(test)]
     EGRESS_CAP_PROBES.retain(|(owner, _), _| owner != network);
 }

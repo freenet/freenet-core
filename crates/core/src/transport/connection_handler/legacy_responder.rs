@@ -344,7 +344,7 @@ mod tests {
             "the client must flag the mismatch so its update check runs"
         );
         assert!(
-            gw_conns.try_recv().is_err(),
+            gw_conns.new_connection_notifier.try_recv().is_err(),
             "the gateway must not accept a connection"
         );
     }

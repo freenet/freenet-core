@@ -348,6 +348,16 @@ pub mod sim_trace {
         gateway_join_native_failed: AtomicU64,
         gateway_join_fallback_connected: AtomicU64,
         gateway_join_fallback_failed: AtomicU64,
+        gateway_join_skipped_cooldown: AtomicU64,
+        gateway_link_dead_before_frame: AtomicU64,
+        native_joiners_promoted: AtomicU64,
+        /// (node, peer) pairs where the node gave a native connection's
+        /// transport the key the ring holds the peer under
+        /// ([`NativeWireEvent::NativeKeySent`]).
+        native_keys_sent: parking_lot::Mutex<std::collections::BTreeSet<(SocketAddr, SocketAddr)>>,
+        /// (node, peer) pairs in each node's ring when the run ended
+        /// ([`NativeWireEvent::Ring`], frozen with `transports`).
+        rings: parking_lot::Mutex<std::collections::BTreeSet<(SocketAddr, SocketAddr)>>,
     }
 
     /// How each end's native setup in a CONNECT ended: by (transaction, lower
@@ -462,6 +472,23 @@ pub mod sim_trace {
         /// The UDP join that followed a failed native gateway join ended,
         /// connected or not.
         GatewayJoinFallback { connected: bool },
+        /// A join to the marked gateway at the recorded address went
+        /// straight to UDP, because a recent native failure with it is
+        /// cooling down.
+        GatewayJoinSkippedCooldown,
+        /// A native link to the marked gateway at the recorded address was
+        /// removed before it carried a frame from the gateway, which counts
+        /// as a failed native join.
+        GatewayLinkDeadBeforeFrame,
+        /// A gateway's native joiner at the recorded address was promoted
+        /// under its proven key: its joiner charge became a path's.
+        NativeJoinerPromoted,
+        /// The node `own` gave the native connection to the recorded
+        /// address the key the ring holds that peer under.
+        NativeKeySent { own: SocketAddr },
+        /// The node `own` added the peer at the recorded address to its ring
+        /// (`member`), or removed it.
+        Ring { own: SocketAddr, member: bool },
     }
 
     static TRACES: LazyLock<dashmap::DashMap<String, NativeWireTrace>> =
@@ -574,6 +601,24 @@ pub mod sim_trace {
             }
             NativeWireEvent::GatewayJoinFallback { connected: false } => {
                 &c.gateway_join_fallback_failed
+            }
+            NativeWireEvent::GatewayJoinSkippedCooldown => &c.gateway_join_skipped_cooldown,
+            NativeWireEvent::GatewayLinkDeadBeforeFrame => &c.gateway_link_dead_before_frame,
+            NativeWireEvent::NativeJoinerPromoted => &c.native_joiners_promoted,
+            NativeWireEvent::NativeKeySent { own } => {
+                c.native_keys_sent.lock().insert((own, addr));
+                return;
+            }
+            NativeWireEvent::Ring { own, member } => {
+                if !c.transports_frozen.load(Ordering::Relaxed) {
+                    let mut rings = c.rings.lock();
+                    if member {
+                        rings.insert((own, addr));
+                    } else {
+                        rings.remove(&(own, addr));
+                    }
+                }
+                return;
             }
             NativeWireEvent::Survivor { swapped: true, .. } => &c.survivor_swapped,
             NativeWireEvent::Survivor {
@@ -824,6 +869,30 @@ pub mod sim_trace {
         /// UDP joins after a failed native gateway join that failed too.
         pub fn gateway_join_fallback_failed(&self) -> u64 {
             Self::get(&self.0.gateway_join_fallback_failed)
+        }
+        /// Joins to a marked gateway that went straight to UDP during the
+        /// cooldown after a native failure with it.
+        pub fn gateway_join_skipped_cooldown(&self) -> u64 {
+            Self::get(&self.0.gateway_join_skipped_cooldown)
+        }
+        /// Native links to a marked gateway removed before carrying a frame
+        /// from it.
+        pub fn gateway_link_dead_before_frame(&self) -> u64 {
+            Self::get(&self.0.gateway_link_dead_before_frame)
+        }
+        /// Gateway native joiners whose joiner charge was promoted to a
+        /// path's.
+        pub fn native_joiners_promoted(&self) -> u64 {
+            Self::get(&self.0.native_joiners_promoted)
+        }
+        /// (node, peer) pairs in each node's ring when the run ended.
+        pub fn rings(&self) -> std::collections::BTreeSet<(SocketAddr, SocketAddr)> {
+            self.0.rings.lock().clone()
+        }
+        /// (node, peer) pairs where the node gave its native connection to
+        /// the peer the key the ring holds the peer under.
+        pub fn native_keys_sent(&self) -> std::collections::BTreeSet<(SocketAddr, SocketAddr)> {
+            self.0.native_keys_sent.lock().clone()
         }
         /// Native connections kept beside a UDP entry to wait for a frame.
         pub fn native_held(&self) -> u64 {

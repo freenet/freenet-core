@@ -616,6 +616,22 @@ impl P2pConnManager {
                 return;
             }
         };
+        #[cfg(any(test, feature = "testing"))]
+        if entry.native {
+            let own = self
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .get_own_addr()
+                .unwrap_or_else(|| SocketAddr::new(self.listening_ip, self.listening_port));
+            crate::operations::connect::native_wire_trace::record_at(
+                addr,
+                crate::operations::connect::native_wire_trace::NativeWireEvent::NativeKeySent {
+                    own,
+                },
+            );
+        }
         notify_connection_task(
             entry.sender.clone(),
             Right(ConnEvent::SetPeerIdentity(bound)),
@@ -1289,6 +1305,15 @@ impl P2pConnManager {
                         );
                         return Ok(());
                     }
+                }
+
+                // A gateway's admitted native joiner (#5940, phase B) has its
+                // own path: its key is proven, and the survivor rule below
+                // applies the other way round.
+                if let Some(key) = connection.native_joiner_key() {
+                    return self
+                        .accept_native_join(connection, key, state, handshake_commands)
+                        .await;
                 }
 
                 // A connection matched to an expectation is taken to be the one
@@ -1974,6 +1999,80 @@ impl P2pConnManager {
         Ok(())
     }
 
+    /// A native join handed over by this gateway's transport (#5940, phase
+    /// B), with the key the joiner proved in its handshake.
+    ///
+    /// - A UDP entry for the same key at the address: this one is held
+    ///   beside it until it carries a frame (`hold_native`), as for a native
+    ///   dial. The UDP survivor rule does not apply to a proven native join.
+    /// - Otherwise, including a native entry for the same key (the joiner
+    ///   joined again, so the older connection is taken to be stale), it
+    ///   replaces any entry at the address with the full cleanup of
+    ///   `handle_successful_connection`, and becomes the entry, native,
+    ///   bound to the proven key
+    ///   without promotion, which is where a legacy join stands once its
+    ///   ConnectRequest named it: the connect op promotes it (ConnectPeer),
+    ///   and a ConnectRequest naming another key closes it
+    ///   (`BindOutcome::Mismatch`). It is counted as a native join, and
+    ///   closed if no ConnectRequest arrives within
+    ///   [`NATIVE_JOIN_REQUEST_WITHIN`].
+    async fn accept_native_join(
+        &mut self,
+        connection: Box<dyn PeerConnectionApi>,
+        key: TransportPublicKey,
+        state: &mut EventListenerState,
+        handshake_commands: &HandshakeCommandSender,
+    ) -> anyhow::Result<()> {
+        let remote_addr = connection.remote_addr();
+        let udp_entry_for_key = self
+            .connections
+            .get(&remote_addr)
+            .is_some_and(|entry| !entry.native && entry.pub_key() == Some(&key));
+        if udp_entry_for_key {
+            tracing::info!(
+                remote = %remote_addr,
+                "Native join from a peer this node holds over UDP; holding it beside"
+            );
+            return self.hold_native(remote_addr, connection, key).await;
+        }
+        tracing::info!(remote = %remote_addr, pub_key = %key, "Native join established");
+        self.record_native_gateway_join(remote_addr, connection.remote_version());
+        if !remote_addr.ip().is_unspecified() {
+            state.peer_backoff.record_success(remote_addr);
+        }
+        self.handle_successful_connection(
+            None,
+            connection,
+            state,
+            None,
+            false,
+            handshake_commands,
+            IdentitySource::Proven,
+        )
+        .await?;
+        let outcome = self.bind_identity(remote_addr, &key, IdentitySource::Proven, Some(false));
+        let kind = match outcome {
+            BindOutcome::Bound => Some(ConnIdentity::SetProven),
+            BindOutcome::Held(_) | BindOutcome::HeldByQuiet(_) => Some(ConnIdentity::ClaimHeld),
+            BindOutcome::Same | BindOutcome::Mismatch(_) | BindOutcome::NoConnection => None,
+        };
+        if let Some(kind) = kind {
+            TRANSPORT_METRICS.record_conn_identity(remote_addr, kind);
+        }
+        if let BindOutcome::HeldByQuiet(quiet) = outcome {
+            self.replace_quiet_holder(quiet, &key, handshake_commands)
+                .await;
+        }
+        if let Some(entry) = self.connections.get(&remote_addr) {
+            watch_native_join(
+                entry.sender.downgrade(),
+                entry.link_use.clone(),
+                remote_addr,
+            );
+        }
+        Ok(())
+    }
+
     /// A gateway counts a native join when a native connection is kept, as
     /// the UDP listener counts a legacy one when its handshake completes.
     fn record_native_gateway_join(
@@ -2283,6 +2382,22 @@ impl P2pConnManager {
             self.trace_transport(peer_addr, Some(true));
         }
         self.record_native_gateway_join(peer_addr, held.remote_version);
+        // The swapped-in transport has not been told the key the ring holds
+        // it under: the promotion's SetPeerIdentity went to the connection
+        // it replaced, and a ConnectPeer for a peer already in the ring
+        // sends none. A gateway's native joiner promotes its joiner charge
+        // on it (`NativePeerConnection::set_peer_identity`); any other native
+        // connection already holds this key and only counts it. Either
+        // order of arrival ends here (`swap_udp_in_beside_native`).
+        if self
+            .bridge
+            .op_manager
+            .ring
+            .connection_manager
+            .is_in_ring(peer_addr)
+        {
+            self.tell_transport_peer_identity(peer_addr, &held.key);
+        }
     }
 
     /// Drops every held native connection that has waited
@@ -3431,6 +3546,52 @@ async fn fail_awaiting_connection_callbacks(state: &mut EventListenerState, addr
     // native eviction thus fails our pending outbound's UDP waiters, as it
     // already does for `awaiting_connection`.
     fail_udp_beside_native(state, addr).await;
+}
+
+/// How long a gateway's native joiner has, from the hand-over, to send its
+/// ConnectRequest (#5940, phase B). A joiner sends it as soon as its
+/// connection is up, so this only closes a connection that is not used for
+/// a join.
+///
+/// A one-shot timer per join ([`watch_native_join`]) enforces it, not the
+/// zombie sweep: the sweep runs on the 30 s stats tick (backlog slices can be
+/// spaced up to 4x a 6.4 s slice), so through it the bound would be 30 s or
+/// more. The timer closes such a join 5 s after the hand-over, which follows
+/// the joiner's Hello at once; the sweep stays the backstop for a join that
+/// sent a request and was never promoted, as for a legacy join.
+const NATIVE_JOIN_REQUEST_WITHIN: Duration = Duration::from_secs(5);
+
+/// Close the native join at `peer_addr` unless its peer sends a
+/// ConnectRequest (`zombie_sweep::LinkUseStamp::connect_requested`; any
+/// other request does not count) within
+/// [`NATIVE_JOIN_REQUEST_WITHIN`]. The drop notice goes to that
+/// connection's own task, so a later connection at the address is not
+/// touched. The task ends after one wait. It holds the channel weakly, so a
+/// connection replaced or dropped in the meantime closes at once rather than
+/// at the deadline, and is not counted.
+fn watch_native_join(
+    sender: tokio::sync::mpsc::WeakSender<Either<NetMessage, ConnEvent>>,
+    link_use: zombie_sweep::LinkUseStamp,
+    peer_addr: SocketAddr,
+) {
+    drop(GlobalExecutor::spawn(async move {
+        sleep(NATIVE_JOIN_REQUEST_WITHIN).await;
+        if link_use.connect_requested() {
+            return;
+        }
+        let Some(sender) = sender.upgrade().filter(|sender| !sender.is_closed()) else {
+            return;
+        };
+        tracing::debug!(%peer_addr, "Native join sent no ConnectRequest in time; closing it");
+        TRANSPORT_METRICS.record_gateway_admission(
+            crate::transport::metrics::GatewayAdmission::NoConnectRequest,
+        );
+        notify_connection_dropped(
+            sender,
+            peer_addr,
+            crate::tracing::DisconnectReason::Explicit("native_join_no_connect_request".into()),
+        );
+    }));
 }
 
 /// Sends the first-frame probe on a native connection's channel: a message

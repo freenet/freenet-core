@@ -710,8 +710,9 @@ labelled_counters! {
     /// tried native first are timed. A join to a marked gateway that went
     /// straight to UDP (cooldown, outside the slice) is not, so these
     /// counters have no legacy control arm; compare against the
-    /// `gateway_joins` totals instead. Joins that gave no connection are not
-    /// counted. Exported per period as `gateway_native_join_time_<label>`.
+    /// [`GatewayNativeJoin`] counts instead (`established`,
+    /// `fallback_connected`, `fallback_failed`, `skipped_cooldown`). Joins
+    /// that gave no connection are not counted. Exported per period as `gateway_native_join_time_<label>`.
     pub(crate) enum GatewayNativeJoinTime {
         /// Under 1 second.
         Lt1S => "lt_1s",
@@ -784,9 +785,21 @@ labelled_counters! {
         Unproven => "unproven",
         /// The Hello exchange failed.
         HelloFailed => "hello_failed",
-        /// A joiner connection reached the end of admission. Until phase B
-        /// hands it to the node, it is closed there.
+        /// A joiner connection reached the end of admission and was handed
+        /// to the node as an inbound connection (#5940, phase B).
         Joined => "joined",
+        /// A joiner connection reached the end of admission, but the node's
+        /// queue of handed-over joins was full (or the node gone), so it was
+        /// closed.
+        HandoffFull => "handoff_full",
+        /// A joiner connection reached the end of admission after its QUIC
+        /// stack was gone (the endpoint died and was rebuilt, or the node is
+        /// stopping), so it was closed. Not a full queue: the rebuilt stack
+        /// hands off its own joins.
+        StackGone => "stack_gone",
+        /// A joiner connection handed to the node sent no ConnectRequest in
+        /// time, so the node closed it.
+        NoConnectRequest => "no_connect_request",
         /// A join panicked; its task's owner caught it and goes on.
         JoinPanicked => "join_panicked",
         /// An attempt was ignored: no room for another joiner inside the

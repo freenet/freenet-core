@@ -845,6 +845,13 @@ pub(crate) trait PeerConnectionApi: Send {
     /// before any messages are processed.
     fn set_inbound_stream_registry(&mut self, registry: std::sync::Arc<dyn InboundStreamRegistry>);
 
+    /// The key a gateway's admitted native joiner proved in its handshake
+    /// (#5940, phase B), which the node binds the connection to. `None` for
+    /// any other connection.
+    fn native_joiner_key(&self) -> Option<TransportPublicKey> {
+        None
+    }
+
     /// Records the peer key the node promoted this connection into the ring
     /// under. The node calls it at promotion, when the transport has a QUIC
     /// endpoint, with the key the node bound to the connection

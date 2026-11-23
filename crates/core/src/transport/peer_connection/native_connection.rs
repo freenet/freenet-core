@@ -90,6 +90,18 @@ pub(crate) struct NativePeerConnection {
     /// registered with while it lives, as a UDP connection is, so the
     /// per-connection share counts it.
     global_bandwidth: Option<Arc<crate::transport::global_bandwidth::GlobalBandwidthManager>>,
+    /// A gateway's admitted native joiner (#5940, phase B): what it holds
+    /// against the node's connection cap. `None` for any other connection.
+    joiner: Option<JoinerHold>,
+}
+
+/// What a native joiner at a gateway holds while its connection lives:
+/// the joiner's charge until the node promotes the connection
+/// ([`PeerConnectionApi::set_peer_identity`] with the proven key), then a
+/// path's. Dropped with the connection, which releases it.
+enum JoinerHold {
+    Joiner(crate::transport::quic::JoinerCharge),
+    Promoted(#[allow(dead_code)] crate::transport::quic::upgrade::policy::QuicPathPermit),
 }
 
 impl NativePeerConnection {
@@ -160,7 +172,25 @@ impl NativePeerConnection {
             outbound: FuturesUnordered::new(),
             close_reason: None,
             global_bandwidth,
+            joiner: None,
         }
+    }
+
+    /// This connection is a gateway's admitted native joiner, holding
+    /// `charge` until the node promotes it (#5940, phase B).
+    pub(crate) fn with_joiner_charge(
+        mut self,
+        charge: crate::transport::quic::JoinerCharge,
+    ) -> Self {
+        self.joiner = Some(JoinerHold::Joiner(charge));
+        self
+    }
+
+    /// Whether this is a gateway's admitted native joiner that the node has
+    /// not promoted yet.
+    #[cfg(test)]
+    pub(crate) fn holds_joiner_charge(&self) -> bool {
+        matches!(self.joiner, Some(JoinerHold::Joiner(_)))
     }
 
     /// The path, for tests.
@@ -359,6 +389,10 @@ impl PeerConnectionApi for NativePeerConnection {
         self.remote_addr
     }
 
+    fn native_joiner_key(&self) -> Option<TransportPublicKey> {
+        self.joiner.as_ref().map(|_| self.peer_key.clone())
+    }
+
     fn remote_version(&self) -> Option<(u8, u8, u16)> {
         Some(self.remote_version)
     }
@@ -418,6 +452,34 @@ impl PeerConnectionApi for NativePeerConnection {
     /// refused and counted, as on a UDP connection that holds a key.
     fn set_peer_identity(&mut self, key: TransportPublicKey) {
         let kind = if key == self.peer_key {
+            // A joiner promoted under the key it proved is charged as a
+            // connection from now on. With no room in the cap for the full
+            // charge it keeps the joiner's.
+            // Only a joiner's charge is taken: a repeat call (a promotion,
+            // then a swap that tells the key again) leaves a promoted
+            // permit in place.
+            if let Some(JoinerHold::Joiner(charge)) = self
+                .joiner
+                .take_if(|hold| matches!(hold, JoinerHold::Joiner(_)))
+            {
+                self.joiner = Some(match charge.promote() {
+                    Ok(path) => {
+                        #[cfg(any(test, feature = "testing"))]
+                        crate::operations::connect::native_wire_trace::record_at(
+                            self.remote_addr,
+                            crate::operations::connect::native_wire_trace::NativeWireEvent::NativeJoinerPromoted,
+                        );
+                        JoinerHold::Promoted(path)
+                    }
+                    Err(charge) => {
+                        tracing::debug!(
+                            peer_addr = %self.remote_addr,
+                            "No room in the connection cap to promote a native joiner's charge"
+                        );
+                        JoinerHold::Joiner(charge)
+                    }
+                });
+            }
             crate::transport::metrics::ConnIdentity::TransportKeySame
         } else {
             tracing::warn!(
