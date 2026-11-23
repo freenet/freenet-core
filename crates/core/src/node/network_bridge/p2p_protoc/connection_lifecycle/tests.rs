@@ -5877,8 +5877,11 @@ macro_rules! joiners_behind_one_address_test {
     ($($test:ident: $seed:expr),+ $(,)?) => {$(
         #[test]
         fn $test() {
+            // One network name per test: the name keys each node's config
+            // and data directories, so tests sharing it in one process (plain
+            // `cargo test`) collide on them ("File exists").
             let (evicted, unconnected) =
-                join_behind_one_address("transient-evict-one-address", $seed, 24, 8);
+                join_behind_one_address(stringify!($test), $seed, 24, 8);
             assert!(
                 evicted > 0,
                 "the budget was never reached; the test would be vacuous"
