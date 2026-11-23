@@ -551,6 +551,13 @@ pub struct NodeConfig {
     /// standing in for a node that rarely joins. `false` in production.
     #[serde(skip)]
     pub(crate) native_joiner_off: bool,
+    /// Simulation-only: this node offers QUIC-native as joiner but cannot use
+    /// a `Native` decision when the response comes, standing in for a joiner
+    /// demoted (or whose endpoint went down) between its offer and the
+    /// acceptor's response (`SimNetwork::with_node_native_refuses_decisions`).
+    /// `false` in production.
+    #[serde(skip)]
+    pub(crate) native_refuses_decisions: bool,
     /// Simulation-only: native gateway joins on, at this percent, in place of
     /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, both off in
     /// production until phase B (`SimNetwork::with_native_gateway_join`).
@@ -930,6 +937,7 @@ impl NodeConfig {
             quic_native_floor_override: None,
             native_connect_override: None,
             native_joiner_off: false,
+            native_refuses_decisions: false,
             native_gateway_join_override: None,
             native_wire_pre_floor: false,
             quic_idle_timeout_override: None,

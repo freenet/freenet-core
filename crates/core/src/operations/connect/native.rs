@@ -588,6 +588,10 @@ pub(crate) struct NativeConnectState {
     /// as acceptor as usual (`NodeConfig::native_joiner_off`), standing in
     /// for a node that rarely joins. `false` in production.
     joiner_off: bool,
+    /// Simulation only: this node offers native as joiner but cannot use a
+    /// `Native` decision when the response comes
+    /// (`NodeConfig::native_refuses_decisions`). `false` in production.
+    refuses_decisions: bool,
     /// This node's QUIC endpoint, set when its transport opens. Until then,
     /// and when it is not up, the node cannot dial native. Read per node, not
     /// from the process-wide endpoint metric, which several simulated nodes
@@ -614,6 +618,7 @@ impl NativeConnectState {
                 ACCEPTOR_DEMOTION_FAILURES,
             )),
             joiner_off: false,
+            refuses_decisions: false,
             endpoint: std::sync::OnceLock::new(),
             gateway_join_override: None,
             native_gateways: std::sync::OnceLock::new(),
@@ -623,6 +628,18 @@ impl NativeConnectState {
 
     /// Simulation only: as [`Self::new`], never offering native as joiner
     /// when `joiner_off` (`NodeConfig::native_joiner_off`).
+    pub(crate) fn with_refuses_decisions(mut self, refuses: bool) -> Self {
+        self.refuses_decisions = refuses;
+        self
+    }
+
+    /// Whether this node, as joiner, can dial native for a `Native` decision
+    /// that arrives now: its readiness now, as a demotion or an endpoint that
+    /// went down since the offer would have lowered it.
+    pub(crate) fn joiner_can_dial_now(&self) -> bool {
+        self.readiness().ready && !self.refuses_decisions
+    }
+
     pub(crate) fn with_joiner_off(mut self, joiner_off: bool) -> Self {
         self.joiner_off = joiner_off;
         self

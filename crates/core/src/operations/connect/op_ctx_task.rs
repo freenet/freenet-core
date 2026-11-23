@@ -985,8 +985,7 @@ async fn drive_client_connect(
                     .ring
                     .connection_manager
                     .native_connect()
-                    .readiness()
-                    .ready;
+                    .joiner_can_dial_now();
                 let transport = match super::native::joiner_response_action(
                     sent_offer,
                     payload.native_decision,
