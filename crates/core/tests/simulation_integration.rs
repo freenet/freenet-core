@@ -23175,6 +23175,12 @@ fn native_floor_for_tests() -> (u8, u8, u16) {
     SimNetwork::min_compatible_protocol_version()
 }
 
+/// A floor no binary meets, so every peer is treated as below it and every
+/// message goes out in today's encoding, whatever version this crate has.
+fn native_floor_above_binary() -> (u8, u8, u16) {
+    (u8::MAX, 0, 0)
+}
+
 /// With the floor injected low on every node and versions known on every
 /// link, offers and decisions reach the wire as `RequestNative` /
 /// `ResponseNative`, every accept decides on an offer (including accepts after
@@ -23286,15 +23292,16 @@ fn test_quic_native_pre_floor_nodes_never_receive_the_native_variants() {
     assert!(connected);
 }
 
-/// At 0% (this release) the native fields change no connection: the same
-/// seed with the variants on the wire and with them never sent (every peer
-/// treated as below the floor, so every message goes out in today's
-/// encoding) forms the same mesh, edge for edge.
+/// At 0% the native fields change no connection: the same seed with the
+/// variants on the wire and with them never sent forms the same mesh, edge
+/// for edge. "Off" models every peer treated as below the floor, whatever the
+/// release, by injecting a floor above the binary's version.
 #[test_log::test]
 fn test_quic_native_zero_percent_forms_the_same_mesh() {
     const SEED: u64 = 0x0059_40A3_0003;
     let off = run_native_wire_sim("native-wire-off", SEED, |sim| {
         sim.enable_gateway_ack_version();
+        sim.with_quic_native_floor(native_floor_above_binary());
     });
     let on = run_native_wire_sim("native-wire-on", SEED, |sim| {
         sim.enable_gateway_ack_version();
