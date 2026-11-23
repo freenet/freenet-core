@@ -86,7 +86,7 @@
 //!   `FORCE_COOLDOWN` for a peer whose summary does not move;
 //! - failing peers: a peer whose `n`-th consecutive forced stream failed after
 //!   holding the slot for `h` is barred for `max(FORCE_FLOOR, h)` times
-//!   `2^(n-1)`, capped at `PEER_BAR_MAX` (30 days) but never below `h`. A
+//!   `2^(n-1)`, capped at `PEER_BAR_MAX` (24 hours) but never below `h`. A
 //!   hold is at most `SLOT_MAX_HOLD` (the backstop bars the peer too), so
 //!   with `b(n) = min(FORCE_FLOOR * 2^(n-1), PEER_BAR_MAX)`, one failing peer
 //!   holds the slot: over its failures, never more than half the time (each
@@ -94,11 +94,15 @@
 //!   failure plus the bar before it, at most `h' / (h' + b(n))` for that
 //!   hold `h'` (when every hold is 270 s, the bars are 270 s times
 //!   `2^(n-1)`, so 50%, 33%, 20%, 11%, then roughly halving, down to 0.01%
-//!   at the cap). `k` failing peers hold it at most the sum of their shares,
-//!   so for any fixed set of failing peers the share falls with their
-//!   failures, and stays below 1 at the cap for up to `MAX_BARRED_PEERS` of
-//!   them (each at most `SLOT_MAX_HOLD / (SLOT_MAX_HOLD + PEER_BAR_MAX)`,
-//!   about 0.07%). A failure up to `PEER_BAR_MAX` after the bar ends counts
+//!   at the cap, 0.3%). `k` failing peers hold it at most the sum of their
+//!   shares, so for any fixed set of failing peers the share falls with their
+//!   failures. At the cap it is `k * h / (h + PEER_BAR_MAX)`: for `h` = 270 s
+//!   about 0.3% per peer (5% for 16 peers, below 1 for fewer than 321 peers);
+//!   for `h` = `SLOT_MAX_HOLD` about 2% per peer (33% for 16, below 1 for
+//!   fewer than 49). `MAX_BARRED_PEERS` does not itself bound the share: a
+//!   thousand peers that all fail slowly enough could hold the slot all the
+//!   time, and no per-peer bar can prevent that. A failure up to
+//!   `PEER_BAR_MAX` after the bar ends counts
 //!   as consecutive, so taking the slot again later than that is itself a
 //!   gap of `PEER_BAR_MAX`. Until each peer has failed a few times, two or
 //!   more failing peers can between them hold the slot all the time;
@@ -141,8 +145,9 @@
 //! - a failed forced stream with no later write is not re-checked, nor is a
 //!   barred peer's confirm verdict: the peer waits for a later write's check
 //!   past its bar, or for anti-entropy. A peer that recovers after many
-//!   failures gets no forced stream until its bar ends (up to 30 days, after
-//!   failing for about as long), though its ordinary legs and anti-entropy
+//!   failures gets no forced stream until its bar ends (up to 24 hours,
+//!   reached after 12 consecutive failures spread over about 34 hours),
+//!   though its ordinary legs and anti-entropy
 //!   still reach it;
 //! - `Summaries` carries no request id, so any two-sided `Summaries` from an
 //!   awaited peer answers its round, including a `Notification` the peer sent
@@ -214,10 +219,13 @@ pub(crate) const MAX_FORCE_PAIRS: usize = 1024;
 /// The longest a peer is barred from the forced slot after a failed forced
 /// stream, unless the failed stream itself held the slot longer; also how long
 /// a bar is remembered after it ends, so a later failure counts as
-/// consecutive. Long enough that `MAX_BARRED_PEERS` peers at the cap, each
-/// holding the slot `SLOT_MAX_HOLD` per bar, hold it less than all the time
-/// (`1024 * 30 min / (30 min + 30 days)` is about 71%).
-pub(crate) const PEER_BAR_MAX: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// consecutive. Chosen so that 16 peers at the cap hold the slot about 5% of
+/// the time when each holds it 270 s (`16 * 270 / (270 + 86400)`), and about
+/// 33% when each holds it `SLOT_MAX_HOLD`. A peer that recovers after it
+/// reached the cap gets no forced stream for up to this long. One hour would
+/// let 16 such peers hold the slot all the time (`16 * 270 / (270 + 3600)` is
+/// 112%); 30 days made the recovery cost far larger than the share needed.
+pub(crate) const PEER_BAR_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 /// Barred peers remembered. At the cap the one whose bar ended longest ago is
 /// evicted (logged); refusing instead would leave a failing peer free to take
 /// the slot again at once.
@@ -1750,10 +1758,10 @@ mod tests {
         let hold = Duration::from_secs(270);
         assert_eq!(peer_bar_length(hold, 1), hold);
         assert_eq!(peer_bar_length(hold, 2), hold * 2);
-        assert_eq!(peer_bar_length(zero, 16), FORCE_FLOOR * (1 << 15));
-        assert!(FORCE_FLOOR * (1 << 15) < PEER_BAR_MAX);
+        assert_eq!(peer_bar_length(zero, 11), FORCE_FLOOR * (1 << 10));
+        assert!(FORCE_FLOOR * (1 << 10) < PEER_BAR_MAX);
         assert_eq!(
-            peer_bar_length(zero, 17),
+            peer_bar_length(zero, 12),
             PEER_BAR_MAX,
             "the cap is reached"
         );
