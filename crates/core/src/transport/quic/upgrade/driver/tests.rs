@@ -2377,6 +2377,15 @@ fn a_completed_gateway_join_is_handed_to_the_node_with_its_charge() {
         handed.set_peer_identity(rig.our_key.clone());
         assert!(!handed.holds_joiner_charge());
         assert_eq!((permits.joiners_in_use(), permits.in_use()), (0, 1));
+        // Told the same key again (a promotion, then a swap-in that tells it
+        // again): the promoted path is kept, not dropped.
+        handed.set_peer_identity(rig.our_key.clone());
+        assert!(!handed.holds_joiner_charge());
+        assert_eq!(
+            (permits.joiners_in_use(), permits.in_use()),
+            (0, 1),
+            "a repeat promotion keeps the path"
+        );
         drop(handed);
         assert_eq!((permits.joiners_in_use(), permits.in_use()), (0, 0));
 

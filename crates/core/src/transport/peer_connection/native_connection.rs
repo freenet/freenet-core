@@ -455,7 +455,13 @@ impl PeerConnectionApi for NativePeerConnection {
             // A joiner promoted under the key it proved is charged as a
             // connection from now on. With no room in the cap for the full
             // charge it keeps the joiner's.
-            if let Some(JoinerHold::Joiner(charge)) = self.joiner.take() {
+            // Only a joiner's charge is taken: a repeat call (a promotion,
+            // then a swap that tells the key again) leaves a promoted
+            // permit in place.
+            if let Some(JoinerHold::Joiner(charge)) = self
+                .joiner
+                .take_if(|hold| matches!(hold, JoinerHold::Joiner(_)))
+            {
                 self.joiner = Some(match charge.promote() {
                     Ok(path) => {
                         #[cfg(any(test, feature = "testing"))]
