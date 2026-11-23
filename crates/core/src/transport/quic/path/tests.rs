@@ -8936,6 +8936,65 @@ fn a_write_held_by_a_silent_peer_fails_at_the_gap() {
     })
 }
 
+/// A response charged to the outbound budget (`node::outbound_budget`) sent
+/// to a peer that has gone silent is aborted by the path's own send deadlines
+/// (`QuicPath::stream_deadlines`, the ones production sends use), and the
+/// abort returns the budget charge, the oversize slot included, and the
+/// path's stream credit.
+#[test]
+fn a_charged_response_to_a_silent_peer_is_aborted_and_its_charge_returned() {
+    use crate::node::outbound_budget::{OutboundPayloadBudget, SharedPayloadKey};
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-path-charged-silent", QuicPathLimits::DEFAULT).await;
+        let _silenced = DropFrom::new("quic-path-charged-silent", &[p.pair.b_addr]);
+        let (a, time) = (p.a.clone(), p.time());
+        let len = over_window().len();
+        // A node budget smaller than the response: it holds the oversize slot.
+        let budget = OutboundPayloadBudget::with_caps(1000, 250);
+        let to = p.pair.b_addr;
+        let body = budget
+            .try_reserve_shared(to, SharedPayloadKey::for_test(1), len as u64, || {
+                Ok::<_, std::convert::Infallible>(payload(len))
+            })
+            .expect("oversize slot");
+        assert_eq!(budget.node_total(), len as u64);
+        let deadlines = a.stream_deadlines(len as u64);
+        let outcome = p
+            .drive(async move {
+                a.send_stream_bounded(&time, deadlines, StreamId::next(), None, body, None)
+                    .await
+            })
+            .await;
+        assert!(
+            matches!(
+                outcome,
+                BoundedSend::Failed(_) | BoundedSend::MaybeDelivered(_)
+            ),
+            "{outcome:?}"
+        );
+        assert_eq!(p.a.send_aborts(), 1, "the send was aborted");
+        assert_eq!(budget.node_total(), 0, "the budget charge came back");
+        assert_eq!(budget.charged_to(to), 0);
+        assert_eq!(
+            p.a.writers().streams_ended(),
+            p.a.writers().streams_opened(),
+            "the stream's credit came back"
+        );
+        // The oversize slot is free: another oversize response is admitted.
+        assert!(
+            budget
+                .try_reserve_shared(
+                    p.pair.a_addr,
+                    SharedPayloadKey::for_test(2),
+                    len as u64,
+                    || Ok::<_, std::convert::Infallible>(vec![0u8; len]),
+                )
+                .is_ok()
+        );
+    })
+}
+
 /// A live, busy path on a node whose total cap binds (100 kB/s, where one held
 /// transmit can wait about 13.3 s, past the 10 s window), its peer reading and
 /// acknowledging: send timeouts settled on it every 2 s, while a bulk stream
