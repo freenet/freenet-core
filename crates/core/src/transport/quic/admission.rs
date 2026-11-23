@@ -61,9 +61,9 @@ use crate::transport::normalize_mapped_addr;
 ///   the handshake-phase charge, and all unpromoted joiners held to one small
 ///   share of the QUIC ingress queue
 ///   (`demux::QUIC_INGRESS_JOINER_DATAGRAMS`);
-/// - (done, phase B PR 2) the node takes the admitted connection
-///   (`QuicUpgrades::hand_off_join`; its `ConnectRequest` on it, then
-///   promotion);
+/// - phase B: the node takes the admitted connection (`ConnectRequest` on
+///   it, transient to promoted). Until then a join that completes is closed
+///   at the hook (`driver::join_gateway`);
 /// - the rest of the B prerequisites (QUIC-NATIVE-CONNECT 3.7).
 pub(crate) const GATEWAY_NATIVE_ADMISSION: bool = false;
 
@@ -74,12 +74,17 @@ pub(crate) fn enabled(is_gateway: bool) -> bool {
 }
 
 /// [`enabled`] for the listener bound at `bind_addr`, which a test can turn
-/// on for that one listener ([`force_on_for_test`], also reached by a
-/// simulation through `SimNetwork::with_gateway_native_admission`); in a
-/// build without tests or the `testing` feature it is [`enabled`].
+/// on for that one listener ([`force_on_for_test`]), as a simulation can
+/// (`SimNetwork::with_gateway_native_admission`); in a build without tests
+/// or the `testing` feature it is [`enabled`].
 pub(crate) fn enabled_at(is_gateway: bool, bind_addr: SocketAddr) -> bool {
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(test)]
     if is_gateway && FORCED_ON.contains(&bind_addr) {
+        return true;
+    }
+    #[cfg(any(test, feature = "testing"))]
+    if is_gateway && crate::transport::in_memory_socket::gateway_native_admission_forced(bind_addr)
+    {
         return true;
     }
     let _ = bind_addr;
@@ -92,23 +97,23 @@ fn enabled_with(is_gateway: bool, switch: bool) -> bool {
 
 /// Listener addresses a test turned admission on for, keyed by address so
 /// tests running in one process cannot turn it on for each other.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 static FORCED_ON: std::sync::LazyLock<dashmap::DashSet<SocketAddr>> =
     std::sync::LazyLock::new(dashmap::DashSet::new);
 
 /// Turn admission on for a gateway listener bound at `addr`, while the
-/// returned guard lives (tests and simulations).
-#[cfg(any(test, feature = "testing"))]
+/// returned guard lives (tests).
+#[cfg(test)]
 pub(crate) fn force_on_for_test(addr: SocketAddr) -> ForcedOn {
     FORCED_ON.insert(addr);
     ForcedOn(addr)
 }
 
 /// Undoes [`force_on_for_test`] when dropped.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 pub(crate) struct ForcedOn(SocketAddr);
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 impl Drop for ForcedOn {
     fn drop(&mut self) {
         FORCED_ON.remove(&self.0);

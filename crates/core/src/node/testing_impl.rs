@@ -1563,11 +1563,6 @@ pub struct SimNetwork {
     running_nodes: HashMap<NodeLabel, RunningNode>,
     /// Map from label to socket address for quick lookup
     node_addresses: HashMap<NodeLabel, SocketAddr>,
-    /// Gateways whose QUIC listener admits native joins
-    /// ([`Self::with_gateway_native_admission`]), held until the network is
-    /// dropped.
-    #[cfg(any(test, feature = "testing"))]
-    gateway_native_admission: Vec<crate::transport::quic::admission::ForcedOn>,
     /// Each node's state store, registered by [`Self::run_simulation`] so a
     /// convergence check can read what every node ACTUALLY holds at the end
     /// of the run. See [`FinalStateHandle`].
@@ -1899,8 +1894,6 @@ impl SimNetwork {
             virtual_time,
             running_nodes: HashMap::new(),
             node_addresses: HashMap::new(),
-            #[cfg(any(test, feature = "testing"))]
-            gateway_native_admission: Vec::new(),
             final_states: FinalStateHandle::default(),
             restartable_configs: HashMap::new(),
             all_gateway_configs: Vec::new(),
@@ -2337,8 +2330,7 @@ impl SimNetwork {
             .node_addresses
             .get(label)
             .expect("the gateway must have an address in this network");
-        self.gateway_native_admission
-            .push(crate::transport::quic::admission::force_on_for_test(addr));
+        crate::transport::in_memory_socket::force_gateway_native_admission(&self.name, addr);
         self
     }
 

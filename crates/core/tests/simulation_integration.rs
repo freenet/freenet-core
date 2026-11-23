@@ -23587,7 +23587,9 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
 fn test_quic_native_gateway_join_with_admission_joins_over_quic() {
     use freenet::dev_tool::NodeLabel;
     const SEED: u64 = 0x0059_40B0_0002;
-    let run = run_native_connect_sim("native-gateway-join-on", SEED, 200, |sim| {
+    // Not "...-gateway-...": `NodeLabel::is_gateway` matches that in the
+    // network name, which would make every node a gateway label.
+    let run = run_native_connect_sim("native-gw-join-on", SEED, 200, |sim| {
         sim.with_native_gateway_join(100);
         let gateways: Vec<NodeLabel> = sim
             .all_node_addresses()
@@ -23628,7 +23630,8 @@ fn test_quic_native_gateway_join_with_admission_joins_over_quic() {
         .collect();
     assert!(
         !joined_natively.is_empty(),
-        "a gateway holds a joiner over a native connection"
+        "a gateway holds a joiner over a native connection; gateways {:?}, transports {transports:?}",
+        run.gateways
     );
     for (gateway, joiner) in &joined_natively {
         assert_eq!(
