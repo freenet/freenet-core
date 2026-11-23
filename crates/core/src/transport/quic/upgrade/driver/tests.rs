@@ -2364,7 +2364,7 @@ fn a_completed_gateway_join_is_handed_to_the_node_with_its_charge() {
         assert_eq!(permits.joiners_in_use(), 0);
 
         let (to_node, mut from_gateway) = tokio::sync::mpsc::channel(1);
-        h.hub.set_join_handoff(to_node);
+        h.hub.set_join_handoff(to_node.clone());
         let (joined, _ours) = join().await;
         assert_eq!(h.hub.hand_off_join(joined), GatewayAdmission::Joined);
         let mut handed = from_gateway.try_recv().expect("handed to the node");
@@ -2380,12 +2380,19 @@ fn a_completed_gateway_join_is_handed_to_the_node_with_its_charge() {
         drop(handed);
         assert_eq!((permits.joiners_in_use(), permits.in_use()), (0, 0));
 
-        // A full queue: closed, counted, charge released.
+        // A full queue: closed, counted, charge released. The queue's one
+        // slot is reserved here: a second join from this source could not
+        // be admitted while a first, queued, still holds its charge.
+        let _slot = to_node.try_reserve().expect("the queue's one slot");
         let (joined, _ours) = join().await;
-        assert_eq!(h.hub.hand_off_join(joined), GatewayAdmission::Joined);
-        let (joined, _ours2) = join().await;
+        assert_eq!(
+            permits.joiners_in_use(),
+            1,
+            "premise: the joiner is charged"
+        );
         assert_eq!(h.hub.hand_off_join(joined), GatewayAdmission::HandoffFull);
-        assert_eq!(permits.joiners_in_use(), 1, "only the queued one");
+        assert_eq!(permits.joiners_in_use(), 0);
+        assert!(from_gateway.try_recv().is_err(), "nothing was queued");
     });
 }
 
