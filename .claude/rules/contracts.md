@@ -86,12 +86,20 @@ delegates without a manifest are untouched.
 
 Inter-delegate messages (SendDelegateMessage) are delivered from EVERY run
 kind, including node-started ones (notifications, lifecycle, wake-ups); Ian,
-2026-11-23. The receiver sees MessageOrigin::Delegate(caller), which the
+2026-11-20. The receiver sees MessageOrigin::Delegate(caller), which the
 runtime attests, and decides whom to trust; the core does not protect
-delegates from each other. A client-driven hop carries the originating
-connection scope, so an off-host client gets no attested origin through it.
-A hop runs only the target's process(): the target's own contract requests
-are not executed, so a hop does no network work outside the caller's budget.
+delegates from each other. Background consent is therefore transitive: a
+delegate allowed to run in the background can run any delegate by messaging
+it. A client-driven hop carries the originating connection scope, so an
+off-host client gets no attested origin through it. Hosted nodes start no
+background runs. A hop runs the target's process() (after the target's
+pending lane round-trip, if the lane handed one to the loop); the target's
+own contract requests are not executed. From a background run the target's
+reply is dropped (counted, one info! per hop), never merged into the
+caller's output, which would fan it out to the caller's apps under the
+caller's name; there is no reply path to the caller yet. A background run
+makes at most MAX_UNPROMPTED_HOPS_PER_RUN (16) hops, manifest or not;
+refusals are counted and logged. Self-hops are refused for every run kind.
 Do not reintroduce suppression for background runs (it was the
 GHSA-824h-7x5x-wfmf "scope-laundering guard").
 

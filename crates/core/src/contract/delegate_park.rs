@@ -1106,6 +1106,9 @@ pub(super) struct Continuation {
     /// lets the loop continue, so nothing serialises it and the count has to be
     /// carried explicitly.
     pub self_heal_fetches_started: usize,
+    /// Inter-delegate hops the run has attempted, so
+    /// `MAX_UNPROMPTED_HOPS_PER_RUN` bounds the whole run, not each leg.
+    pub hops_attempted: usize,
     pub params: Parameters<'static>,
     pub origin_contract: Option<ContractInstanceId>,
     pub connection_scope: ConnectionScope,
@@ -1763,6 +1766,12 @@ pub(super) struct DelegateParkCtx {
     /// (parked, or nested in the hop that delivers it). Counted, not only
     /// logged.
     dropped_hops: u64,
+    /// Inter-delegate messages refused because an unprompted run reached
+    /// `MAX_UNPROMPTED_HOPS_PER_RUN`.
+    refused_unprompted_hops: u64,
+    /// Messages in hop targets' replies dropped because the hop came from an
+    /// unprompted run (which has no client to return them to).
+    dropped_hop_outputs: u64,
 }
 
 /// See [`DelegateParkCtx::enter_hop_unit`]. Derefs to the park context, so the
@@ -1820,6 +1829,8 @@ impl DelegateParkCtx {
             gate: None,
             hop_unit_stack: Vec::new(),
             dropped_hops: 0,
+            refused_unprompted_hops: 0,
+            dropped_hop_outputs: 0,
         }
     }
 
@@ -1866,6 +1877,30 @@ impl DelegateParkCtx {
     #[cfg(test)]
     pub(super) fn dropped_hops(&self) -> u64 {
         self.dropped_hops
+    }
+
+    /// Count `n` inter-delegate messages refused at the unprompted per-run hop
+    /// cap; returns the new total.
+    pub(super) fn count_refused_unprompted_hops(&mut self, n: u64) -> u64 {
+        self.refused_unprompted_hops = self.refused_unprompted_hops.saturating_add(n);
+        self.refused_unprompted_hops
+    }
+
+    #[cfg(test)]
+    pub(super) fn refused_unprompted_hops(&self) -> u64 {
+        self.refused_unprompted_hops
+    }
+
+    /// Count `n` messages dropped from a hop target's reply on an unprompted
+    /// run; returns the new total.
+    pub(super) fn count_dropped_hop_output(&mut self, n: usize) -> u64 {
+        self.dropped_hop_outputs = self.dropped_hop_outputs.saturating_add(n as u64);
+        self.dropped_hop_outputs
+    }
+
+    #[cfg(test)]
+    pub(super) fn dropped_hop_outputs(&self) -> u64 {
+        self.dropped_hop_outputs
     }
 
     /// The byte budget this registry is enforcing. Tests assert against THIS
@@ -3226,6 +3261,7 @@ mod tests {
     fn continuation() -> Continuation {
         Continuation {
             self_heal_fetches_started: 0,
+            hops_attempted: 0,
             params: Parameters::from(Vec::new()),
             origin_contract: None,
             connection_scope: ConnectionScope::Local,

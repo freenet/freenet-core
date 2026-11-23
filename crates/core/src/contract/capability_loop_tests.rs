@@ -1529,7 +1529,7 @@ async fn a_record_written_without_wakeups_is_refreshed_from_the_code_at_start() 
 /// A wake-up run CAN write a contract (its UPDATE goes through the
 /// unprompted-op admission, and a refusal is answered), and CAN reach another
 /// delegate, which sees the waking delegate as the attested
-/// `MessageOrigin::Delegate` (Ian, 2026-11-23: background runs may message
+/// `MessageOrigin::Delegate` (Ian, 2026-11-20: background runs may message
 /// other delegates; River's chat delegate asks a key-vault delegate to sign
 /// from a background run).
 #[tokio::test(start_paused = true)]
@@ -1601,7 +1601,7 @@ async fn a_wakeup_run_can_update_a_contract_and_message_a_delegate() {
 /// A contract-NOTIFICATION run can message another delegate, and the target
 /// sees the notified delegate as the attested `MessageOrigin::Delegate`. This
 /// was the GHSA-824h-7x5x-wfmf suppression's path (removed on Ian's decision,
-/// 2026-11-23): see "BACKGROUND RUNS MAY MESSAGE OTHER DELEGATES" in
+/// 2026-11-20): see "BACKGROUND RUNS MAY MESSAGE OTHER DELEGATES" in
 /// `handle_delegate_with_contract_requests`.
 #[tokio::test]
 async fn a_notification_run_can_message_a_delegate() {
@@ -1659,29 +1659,29 @@ async fn a_notification_run_can_message_a_delegate() {
 }
 
 /// A hop from a background run cannot launder network work out of the
-/// unprompted budget. The hop runs only the target's `process()`; the target's
-/// own contract requests are not executed (not admitted, not refused, not
-/// answered), so the only network operations the run performs are the
-/// caller's, and they are admitted against the caller's allowance exactly as
-/// they would be without the hop.
+/// unprompted budget, in either direction. The hop runs only the target's
+/// `process()`; the target's own contract requests are not executed (not
+/// admitted, not refused, not answered).
+///
+/// The allowance is 2 and the caller makes exactly 2 GETs, so `refused == 0`
+/// depends on the hop: had the target's two GETs been admitted against the
+/// caller's allowance, the target's second GET and the caller's second GET
+/// would both be refused (2). Had they run outside the budget, the target
+/// would be re-entered with `GetContractResponse`s, which the
+/// one-observation assertion catches.
 #[tokio::test(start_paused = true)]
 async fn a_hop_from_a_background_run_does_no_unbudgeted_network_work() {
     let caps = paused_caps(BudgetLimits {
-        ops_per_delegate_per_min: 1,
+        ops_per_delegate_per_min: 2,
         ..BudgetLimits::default()
     });
     let key = granted_with_wakeups(&caps, &[("hb", 60)], b"p", 54);
     let other = DelegateKey::new([0x46; 32], CodeHash::new([0x46; 32]));
-    let get = |n: u8| {
-        OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(ContractInstanceId::new(
-            [n; 32],
-        )))
-    };
     let lp = start(
         "wake_hop_budget",
         caps.clone(),
         vec![
-            // Wake-up run: one GET (within the allowance) and a hop.
+            // Wake-up run: one GET and a hop.
             ScriptedRun::from(vec![
                 get(0x81),
                 OutboundDelegateMsg::SendDelegateMessage(DelegateMessage::new(
@@ -1692,7 +1692,8 @@ async fn a_hop_from_a_background_run_does_no_unbudgeted_network_work() {
             ]),
             // The hop's target asks for network work of its own.
             ScriptedRun::from(vec![get(0x82), get(0x83)]),
-            // The caller's follow-up: one more GET, past the allowance.
+            // The caller's follow-up: its second GET, the last within the
+            // allowance.
             ScriptedRun::from(vec![get(0x84)]),
             // The caller's last follow-up.
             ScriptedRun::default(),
@@ -1723,9 +1724,9 @@ async fn a_hop_from_a_background_run_does_no_unbudgeted_network_work() {
     );
     assert_eq!(
         caps.stats.refused_delegate_ops.load(Ordering::Relaxed),
-        1,
-        "only the caller's second GET is refused: the target's GETs were never \
-         admitted against any budget because they were never run"
+        0,
+        "the caller's two GETs fit its allowance of two: the target's GETs \
+         were not charged to it"
     );
     assert_eq!(caps.stats.refused_node_ops.load(Ordering::Relaxed), 0);
 }
@@ -2116,4 +2117,405 @@ async fn a_parked_notification_run_is_charged_to_its_delegate_only() {
         "the resumed leg is charged to the delegate"
     );
     assert_eq!(node_after, node_parked, "and never to the node bucket");
+}
+
+fn get(n: u8) -> OutboundDelegateMsg {
+    OutboundDelegateMsg::GetContractRequest(GetContractRequest::new(ContractInstanceId::new(
+        [n; 32],
+    )))
+}
+
+fn send(to: &DelegateKey, from: &DelegateKey) -> OutboundDelegateMsg {
+    OutboundDelegateMsg::SendDelegateMessage(DelegateMessage::new(
+        to.clone(),
+        from.clone(),
+        b"msg".to_vec(),
+    ))
+}
+
+fn app_out(bytes: &[u8]) -> OutboundDelegateMsg {
+    OutboundDelegateMsg::ApplicationMessage(ApplicationMessage::new(bytes.to_vec()))
+}
+
+/// Each message as a comparable label: an application message by its
+/// payload, anything else by its variant.
+fn labels(msgs: &[OutboundDelegateMsg]) -> Vec<String> {
+    msgs.iter()
+        .map(|m| match m {
+            OutboundDelegateMsg::ApplicationMessage(a) => {
+                format!("app:{}", String::from_utf8_lossy(&a.payload))
+            }
+            other => format!("{other:?}")
+                .split(['(', ' ', '{'])
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+        })
+        .collect()
+}
+
+/// A handler with no loop behind it, for driving one run directly.
+async fn direct_handler(
+    name: &str,
+    script: Vec<ScriptedRun>,
+) -> (
+    MockWasmContractHandler,
+    super::executor::mock_wasm_runtime::DelegateObservations,
+    handler::ContractHandlerChannel<handler::SenderHalve>,
+) {
+    let (send, rcv, _) = handler::contract_handler_channel();
+    let mut handler = MockWasmContractHandler::new_test(rcv, None, name).await;
+    let rt = handler.runtime_mut();
+    rt.delegate_script.lock().unwrap().extend(script);
+    let observations = rt.delegate_observations.clone();
+    (handler, observations, send)
+}
+
+/// Run `key` once, from an application message, with the given trigger and
+/// scope, and return what the run would hand on: to the client for a
+/// `Client` run, to `route_notification_outbound` (the caller's registered
+/// apps) for an unprompted one.
+async fn run_direct(
+    handler: &mut MockWasmContractHandler,
+    park: &mut super::delegate_park::DelegateParkCtx,
+    key: &DelegateKey,
+    trigger: super::RunTrigger,
+    scope: crate::client_events::ConnectionScope,
+) -> Vec<OutboundDelegateMsg> {
+    let prompter = Arc::new(CapabilityPrompter::answering(None));
+    let mut no_responder = None;
+    let delivery = if trigger == super::RunTrigger::Client {
+        super::delegate_park::Delivery::Client
+    } else {
+        super::delegate_park::Delivery::Apps
+    };
+    let outcome = super::handle_delegate_with_contract_requests(
+        handler,
+        DelegateRequest::ApplicationMessages {
+            key: key.clone(),
+            params: Parameters::from(Vec::new()),
+            inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(b"go".to_vec()),
+            )],
+        },
+        None,
+        scope,
+        trigger,
+        None,
+        key,
+        &prompter,
+        Some(super::ParkingCtx {
+            park,
+            delivery,
+            node_wide_duty: false,
+            carried_responder: &mut no_responder,
+        }),
+        super::RunSeed::default(),
+    )
+    .await;
+    match outcome {
+        super::DelegateRunOutcome::Completed(msgs) => msgs,
+        super::DelegateRunOutcome::Parked => panic!("the run parked"),
+        super::DelegateRunOutcome::Failed(err) => panic!("the run failed: {err}"),
+    }
+}
+
+fn new_park() -> super::delegate_park::DelegateParkCtx {
+    let (resume_tx, _resume_rx) = tokio::sync::mpsc::unbounded_channel();
+    super::delegate_park::DelegateParkCtx::new(resume_tx)
+}
+
+/// What a hop target replies with on a BACKGROUND run reaches nobody: its
+/// application message is not handed on with the caller's output (which
+/// would fan it out to the caller's apps labelled as the caller), its prompt
+/// is not raised, and its GET is not executed. It is dropped and counted.
+/// On a CLIENT run the target's reply still goes back to the client with the
+/// caller's, as before.
+#[tokio::test]
+async fn a_background_hops_reply_reaches_no_app() {
+    let key = DelegateKey::new([0x91; 32], CodeHash::new([0x91; 32]));
+    let other = DelegateKey::new([0x92; 32], CodeHash::new([0x92; 32]));
+    let message = NotificationMessage::try_from(&serde_json::json!({"message": "ok?"}))
+        .expect("notification message");
+    let target_reply = || {
+        ScriptedRun::from(vec![
+            app_out(b"from target"),
+            OutboundDelegateMsg::RequestUserInput(UserInputRequest {
+                request_id: 7,
+                message: message.clone(),
+                responses: vec![ClientResponse::new(b"yes".to_vec())],
+            }),
+            get(0x93),
+        ])
+    };
+    let script = |_: ()| {
+        vec![
+            ScriptedRun::from(vec![send(&other, &key)]),
+            target_reply(),
+            ScriptedRun::from(vec![app_out(b"from caller")]),
+        ]
+    };
+
+    // Background run.
+    let (mut handler, observations, _send) = direct_handler("hop_reply_bg", script(())).await;
+    let mut park = new_park();
+    let out = run_direct(
+        &mut handler,
+        &mut park,
+        &key,
+        super::RunTrigger::Unprompted,
+        crate::client_events::ConnectionScope::Local,
+    )
+    .await;
+    assert_eq!(
+        labels(&out),
+        vec!["app:from caller".to_string()],
+        "only the caller's own output is handed on to its apps"
+    );
+    let obs = observations.lock().unwrap().clone();
+    assert_eq!(
+        obs.iter()
+            .map(|o| (o.delegate_key.clone(), o.inbound_kinds.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (key.clone(), vec!["ApplicationMessage"]),
+            (other.clone(), vec!["DelegateMessage"]),
+            (key.clone(), vec![]),
+        ],
+        "the target ran once and was never answered (no GET, no prompt)"
+    );
+    assert_eq!(
+        park.dropped_hop_outputs(),
+        3,
+        "all three reply messages counted"
+    );
+
+    // Client run: unchanged, the target's reply goes back to the client.
+    let (mut handler, _observations, _send) = direct_handler("hop_reply_client", script(())).await;
+    let mut park = new_park();
+    let out = run_direct(
+        &mut handler,
+        &mut park,
+        &key,
+        super::RunTrigger::Client,
+        crate::client_events::ConnectionScope::Local,
+    )
+    .await;
+    let out = labels(&out);
+    assert!(
+        out.contains(&"app:from target".to_string())
+            && out.contains(&"app:from caller".to_string()),
+        "a client run returns the target's reply with the caller's: {out:?}"
+    );
+    assert_eq!(park.dropped_hop_outputs(), 0);
+}
+
+/// A background run that hops on every iteration stops at
+/// `MAX_UNPROMPTED_HOPS_PER_RUN`; the rest are refused and counted. A client
+/// run is not capped.
+#[tokio::test]
+async fn a_background_run_stops_hopping_at_the_cap() {
+    let cap = super::MAX_UNPROMPTED_HOPS_PER_RUN;
+    let key = DelegateKey::new([0x94; 32], CodeHash::new([0x94; 32]));
+    let other = DelegateKey::new([0x95; 32], CodeHash::new([0x95; 32]));
+    let extra = 2;
+    // Each scripted caller run is one iteration; after the cap the target no
+    // longer runs, so its scripted replies stop being consumed.
+    let script = |hops_delivered: usize| {
+        let mut runs = Vec::new();
+        for _ in 0..hops_delivered {
+            runs.push(ScriptedRun::from(vec![send(&other, &key)]));
+            runs.push(ScriptedRun::default());
+        }
+        for _ in hops_delivered..cap + extra {
+            runs.push(ScriptedRun::from(vec![send(&other, &key)]));
+        }
+        runs.push(ScriptedRun::default());
+        runs
+    };
+    let target_runs = |obs: &super::executor::mock_wasm_runtime::DelegateObservations| {
+        obs.lock()
+            .unwrap()
+            .iter()
+            .filter(|o| o.delegate_key == other)
+            .count()
+    };
+
+    let (mut handler, observations, _send) = direct_handler("hop_cap_bg", script(cap)).await;
+    let mut park = new_park();
+    run_direct(
+        &mut handler,
+        &mut park,
+        &key,
+        super::RunTrigger::Unprompted,
+        crate::client_events::ConnectionScope::Local,
+    )
+    .await;
+    assert_eq!(target_runs(&observations), cap, "the target runs cap times");
+    assert_eq!(
+        park.refused_unprompted_hops(),
+        extra as u64,
+        "the hops past the cap are refused and counted"
+    );
+
+    let (mut handler, observations, _send) =
+        direct_handler("hop_cap_client", script(cap + extra)).await;
+    let mut park = new_park();
+    run_direct(
+        &mut handler,
+        &mut park,
+        &key,
+        super::RunTrigger::Client,
+        crate::client_events::ConnectionScope::Local,
+    )
+    .await;
+    assert_eq!(
+        target_runs(&observations),
+        cap + extra,
+        "a client run is not capped"
+    );
+    assert_eq!(park.refused_unprompted_hops(), 0);
+}
+
+/// A delegate cannot message itself: the self-hop is refused, so the
+/// delegate is never re-entered with a `DelegateMessage` naming itself as the
+/// attested caller.
+#[tokio::test]
+async fn a_delegate_cannot_message_itself() {
+    let key = DelegateKey::new([0x96; 32], CodeHash::new([0x96; 32]));
+    for trigger in [super::RunTrigger::Unprompted, super::RunTrigger::Client] {
+        let (mut handler, observations, _send) = direct_handler(
+            "self_hop",
+            vec![
+                ScriptedRun::from(vec![send(&key, &key)]),
+                ScriptedRun::default(),
+            ],
+        )
+        .await;
+        let mut park = new_park();
+        run_direct(
+            &mut handler,
+            &mut park,
+            &key,
+            trigger,
+            crate::client_events::ConnectionScope::Local,
+        )
+        .await;
+        let kinds: Vec<_> = observations
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|o| o.inbound_kinds.clone())
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![vec!["ApplicationMessage"], vec![]],
+            "{trigger:?}: the run and its follow-up, no self-delivery"
+        );
+    }
+}
+
+/// The accepted trade-off, pinned so that re-tightening it is a visible
+/// decision: a remote client drives delegate A, and A's hop then reaches B
+/// with no attested origin; when A later runs in the background (a contract
+/// notification), its hop reaches B as `MessageOrigin::Delegate(A)`.
+#[tokio::test]
+async fn a_remote_clients_delegate_later_attests_itself_from_a_background_run() {
+    let key = DelegateKey::new([0x97; 32], CodeHash::new([0x97; 32]));
+    let other = DelegateKey::new([0x98; 32], CodeHash::new([0x98; 32]));
+    let leg = || {
+        vec![
+            ScriptedRun::from(vec![send(&other, &key)]),
+            ScriptedRun::default(),
+            ScriptedRun::default(),
+        ]
+    };
+    let mut script = leg();
+    script.extend(leg());
+    let (mut handler, observations, _send) = direct_handler("remote_then_bg", script).await;
+    let mut park = new_park();
+    run_direct(
+        &mut handler,
+        &mut park,
+        &key,
+        super::RunTrigger::Client,
+        crate::client_events::ConnectionScope::Remote,
+    )
+    .await;
+    let prompter = Arc::new(CapabilityPrompter::answering(None));
+    super::handle_delegate_notification(
+        &mut handler,
+        super::executor::DelegateNotification {
+            delegate_key: key.clone(),
+            contract_id: ContractInstanceId::new([0x99; 32]),
+            new_state: Arc::new(WrappedState::new(vec![1])),
+        },
+        &prompter,
+        Some(&mut park),
+    )
+    .await;
+    let origins: Vec<_> = observations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|o| o.delegate_key == other)
+        .map(|o| o.origin.clone())
+        .collect();
+    assert_eq!(
+        origins,
+        vec![None, Some(MessageOrigin::Delegate(key.clone()))],
+        "remote client run: unattested at B; A's later background run: attested as A"
+    );
+}
+
+/// A LIFECYCLE run (here `NodeStarted`) can message another delegate too, and
+/// the target sees the delegate as its attested caller.
+#[tokio::test]
+async fn a_lifecycle_run_can_message_a_delegate() {
+    let caps = DelegateCapabilities::in_memory();
+    let other = DelegateKey::new([0x9A; 32], CodeHash::new([0x9A; 32]));
+    let lp = start(
+        "lifecycle_hop",
+        caps.clone(),
+        vec![
+            ScriptedRun::default(),
+            ScriptedRun::default(),
+            ScriptedRun::default(),
+        ],
+        CapabilityPrompter::answering(None),
+    )
+    .await;
+    // Granted AFTER the loop started, so the start-up seed holds nothing for it
+    // and the run below is due at once.
+    let key = granted(&caps, vec![LifecycleKind::NodeStarted], b"p", 55);
+    {
+        // The lifecycle run's own script, now that its key is known.
+        let mut script = lp.script.lock().unwrap();
+        script.clear();
+        script.push_back(ScriptedRun::from(vec![send(&other, &key)]));
+        script.push_back(ScriptedRun::default());
+        script.push_back(ScriptedRun::default());
+    }
+    assert!(
+        caps.queue(LifecycleRun {
+            key: key.clone(),
+            event: LifecycleEvent::NodeStarted {
+                down_since_ms: None
+            }
+            .into(),
+        })
+    );
+    wait_until("the lifecycle run's hop", || {
+        lp.observations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|o| o.delegate_key == other)
+    })
+    .await;
+    let obs = lp.observations.lock().unwrap().clone();
+    let reached: Vec<_> = obs.iter().filter(|o| o.delegate_key == other).collect();
+    assert_eq!(reached.len(), 1, "{obs:?}");
+    assert_eq!(reached[0].inbound_kinds, vec!["DelegateMessage"]);
+    assert_eq!(reached[0].origin, Some(MessageOrigin::Delegate(key)));
 }
