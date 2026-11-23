@@ -647,25 +647,31 @@ fn within_fetch_allowance(
     delegate_park::FetchDisposition::Resolved(Ok(states))
 }
 
-/// Whether a delegate run may deliver delegate-to-delegate messages.
+/// Who started a delegate run: a client, or the node itself.
 ///
-/// This exists because the callers of
-/// [`handle_delegate_with_contract_requests`] differ in a security-relevant way:
-/// some descend from a client connection whose scope is known, others do not
-/// descend from a connection at all (GHSA-824h-7x5x-wfmf).
+/// The callers of [`handle_delegate_with_contract_requests`] differ in one way
+/// that matters here: some descend from a client request, others are runs the
+/// node starts on its own (contract notifications, queued notifications,
+/// lifecycle events, wake-ups). Node-started runs are budgeted
+/// (`is_unprompted_run`); client-driven runs are not.
 ///
-/// Stated without a count on purpose. This said "the two callers" and there are
-/// now five — the same tally rot retired from `delegate_park`'s module doc, one
-/// file over. What matters is the PROVENANCE split, which survives a new caller;
-/// the number does not.
+/// This does NOT decide whether the run may message other delegates. Every
+/// run may (Ian, 2026-11-23): the runtime makes the caller's identity
+/// unforgeable (`MessageOrigin::Delegate(caller_key)`) and each receiving
+/// delegate decides whom to trust. See the delivery block in
+/// `handle_delegate_with_contract_requests`. This enum used to be
+/// `InterDelegateDispatch { Allowed, Suppressed }`, when node-started runs had
+/// their hops dropped (GHSA-824h-7x5x-wfmf); the "unprompted" meaning it also
+/// carried is all that is left.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InterDelegateDispatch {
-    /// Client-driven run. The hop carries the ORIGINATING connection scope, so a
-    /// non-local caller cannot obtain an attested `MessageOrigin::Delegate`.
-    Allowed,
-    /// Contract-notification-driven run. Suppressed — see the rationale at the
-    /// dispatch site.
-    Suppressed,
+enum RunTrigger {
+    /// Client-driven run. Not budgeted. Its hops carry the ORIGINATING
+    /// connection scope, so a non-local caller cannot obtain an attested
+    /// `MessageOrigin::Delegate` through them.
+    Client,
+    /// A run the node started with no client asking: budgeted. Its hops carry
+    /// the node-local scope, the scope the run itself has.
+    Unprompted,
 }
 
 /// Build the delegate-facing response for a PUT/UPDATE upsert.
@@ -1580,7 +1586,7 @@ async fn handle_delegate_with_contract_requests<CH, P>(
     initial_req: DelegateRequest<'static>,
     origin_contract: Option<&ContractInstanceId>,
     connection_scope: crate::client_events::ConnectionScope,
-    inter_delegate: InterDelegateDispatch,
+    trigger: RunTrigger,
     user_context: Option<&UserSecretContext>,
     delegate_key: &DelegateKey,
     prompter: &std::sync::Arc<P>,
@@ -1788,7 +1794,7 @@ where
         // that caps the #5558 self-notification loop. Refused operations are
         // answered at once with a refusal the delegate can see (GET has no
         // error channel, so it reads as "not found"), and counted.
-        if is_unprompted_run(inter_delegate)
+        if is_unprompted_run(trigger)
             && !(get_requests.is_empty()
                 && put_requests.is_empty()
                 && update_requests.is_empty()
@@ -2600,14 +2606,46 @@ where
         //   sees `MessageOrigin::Delegate(caller_key)` and can authorize on it
         //   (issue #3860). The runtime attests this identity — the calling delegate
         //   cannot forge it.
-        // - Inter-delegate delivery runs ONLY for a client-driven run
-        //   (`InterDelegateDispatch::Allowed`). It is SUPPRESSED for a
-        //   contract-notification-driven run — see the guard below. An earlier
-        //   version of this comment asserted that notification-driven runs did
-        //   not reach this code; that was false, because
-        //   `handle_delegate_notification` calls THIS function, and the guard is
-        //   what finally makes the statement true.
-        if !delegate_messages.is_empty() && inter_delegate == InterDelegateDispatch::Allowed {
+        // - Delivery runs for EVERY run kind: client-driven runs, and runs the
+        //   node starts itself (contract notifications, queued notifications,
+        //   lifecycle events, wake-ups). See "BACKGROUND RUNS MAY MESSAGE OTHER
+        //   DELEGATES" below for why node-started runs are included.
+        // - Bounds: delivery is single-hop (above); the caller's loop runs at
+        //   most MAX_CONTRACT_REQUEST_ITERATIONS times per run and each
+        //   `process()` call emits at most `MAX_OUTBOUND_MSGS_PER_RUN`
+        //   messages (`wasm_runtime::delegate::execution`), the same for every
+        //   run kind. A hop runs only the target's `process()`: the target's
+        //   own contract requests are NOT executed here (they land in
+        //   `accumulated_messages` with its other output, see the reply
+        //   handling below), so a hop cannot perform network work outside the
+        //   caller's unprompted budget. The hop's `process()` time is loop time
+        //   inside the caller's run and is charged to the caller's duty budget
+        //   with the rest of the run.
+        //
+        // BACKGROUND RUNS MAY MESSAGE OTHER DELEGATES (Ian, 2026-11-23: "the
+        // core's job isn't to protect delegates from themselves"). Until then a
+        // node-started run had its hops dropped (the GHSA-824h-7x5x-wfmf
+        // "scope-laundering guard"). The concern was this: an off-host caller
+        // drives a delegate, correctly getting NO attested origin; that
+        // delegate later runs in the background under the node-local scope,
+        // and its hop reaches another delegate carrying the attested
+        // `MessageOrigin::Delegate(caller_key)`. That still happens, and it is
+        // accepted by design: what the receiver sees is the CALLING DELEGATE's
+        // identity, which the runtime attests and which is a hash of that
+        // delegate's own code and parameters, never a client's identity. A
+        // delegate that once handled an unattested caller's request can later
+        // speak as itself; it cannot speak as anything else. Each receiving
+        // delegate authorizes on that identity and must check what it acts on,
+        // including whether the calling delegate could have been steered by
+        // input it received earlier. The motivating case is River's chat
+        // delegate rotating private-room secrets in the background and asking
+        // a separate key-vault delegate to sign. What stays enforced for
+        // CLIENT-driven runs: a hop forwards the ORIGINATING connection scope,
+        // so a request arriving over a non-local connection yields no attested
+        // origin at the target (`resolve_message_origin`); that is unchanged.
+        // A node-started run has no connection; its hops use the node-local
+        // scope it runs under.
+        if !delegate_messages.is_empty() {
             tracing::debug!(
                 delegate_key = %delegate_key,
                 count = delegate_messages.len(),
@@ -2627,9 +2665,9 @@ where
                 // corruption the exclusion exists to prevent, reached through a
                 // different door.
                 //
-                // DROPPED rather than queued, deliberately. The hop is already
-                // single-hop, fire-and-forget, and entirely suppressed on
-                // notification-driven runs, so callers cannot rely on delivery.
+                // DROPPED rather than queued, deliberately. The hop is
+                // single-hop and fire-and-forget, so callers cannot rely on
+                // delivery.
                 // Queueing it would mean replaying an ATTESTED caller identity
                 // (`Some(delegate_key)`, the control that replaced the deleted
                 // registration-record refusal — GHSA-824h-7x5x-wfmf) at an
@@ -2640,8 +2678,7 @@ where
                 //
                 // `info!`, not `debug!`: the crate sets `release_max_level_info`
                 // so a `debug!` compiles out of shipped binaries and a delegate
-                // author would have no way to see why their message vanished —
-                // the same reasoning as the suppression log below.
+                // author would have no way to see why their message vanished.
                 //
                 // The same holds for a target whose round-trip is SUSPENDED in
                 // a hop further up this call chain (see the lane paragraph
@@ -2772,14 +2809,16 @@ where
                     // run under the node-local secrets. The target sees the
                     // caller as the attested origin and decides what to allow.
                     //
-                    // The ORIGINATING connection's scope rides along, never a
-                    // literal `Local`: a hop driven by an off-host caller must
-                    // not manufacture an attested `MessageOrigin::Delegate` that
+                    // The run's own scope rides along, never a literal
+                    // `Local`: for a client-driven run that is the ORIGINATING
+                    // connection's scope, so a hop driven by an off-host caller
+                    // does not manufacture an attested `MessageOrigin::Delegate`
                     // the caller could not have obtained directly
-                    // (GHSA-824h-7x5x-wfmf). This forwarding is the control that
-                    // REPLACED the deleted registration-record refusal, so it is
-                    // source-pinned by
-                    // `inter_delegate_hop_forwards_the_originating_scope`.
+                    // (GHSA-824h-7x5x-wfmf). For a node-started run it is the
+                    // node-local scope that run was started with. Pinned by
+                    // `inter_delegate_hop_forwards_the_runs_scope` (source) and
+                    // `a_remote_client_hop_reaches_the_target_unattested`
+                    // (behaviour).
                     //
                     // Scope nulls the `origin` ARGUMENT only. `msg.sender` still
                     // rides through unchanged on every path, so the target can
@@ -2814,64 +2853,6 @@ where
                     }
                 }
             }
-        } else if !delegate_messages.is_empty() {
-            // SCOPE-LAUNDERING GUARD (GHSA-824h-7x5x-wfmf).
-            //
-            // `handle_delegate_notification` invokes this function for a run that
-            // descends from a contract state change rather than from any client
-            // connection, so it has no connection scope to pass and hardcodes
-            // `Local`. That made the notification path a laundry: a non-local
-            // caller drives its own delegate (correctly resolving to NO attested
-            // origin), the delegate emits `SubscribeContractRequest`, and on the
-            // next state change of that contract the SAME delegate re-executes
-            // under `Local` — at which point its `SendDelegateMessage` would
-            // reach a victim carrying a fully attested
-            // `MessageOrigin::Delegate(caller)`. The scope the caller was
-            // refused would have been handed back to it one hop later.
-            //
-            // Suppressing the hop on this path removes the laundering route
-            // outright, which is stronger than propagating a scope and is what
-            // the function's own design notes always claimed happened.
-            //
-            // TEST COVERAGE, precisely: this suppression has NO behavioural
-            // test. It is covered only by the source scrape
-            // `inter_delegate_hop_forwards_the_originating_scope`, which asserts
-            // that this call site passes `InterDelegateDispatch::Suppressed` and
-            // that the hop forwards a scope variable rather than a literal.
-            // Both halves were checked non-vacuous by mutation. What that does
-            // NOT cover is the runtime behaviour — that a delegate emitting
-            // `SendDelegateMessage` from a notification run really is not
-            // delivered to. Exercising that needs a delegate that subscribes,
-            // then messages, under a notification-driven run; if you add one,
-            // this comment should shrink.
-            //
-            // Safe to suppress because nothing first-party emits here, verified
-            // by reading the delegates rather than by observing tests: River's
-            // chat delegate returns only empty or `UpdateContractRequest` from
-            // `ContractNotification` and never constructs a `DelegateMessage`,
-            // ghostkeys rejects notifications in its catch-all, and the only
-            // in-tree emitter of `SendDelegateMessage` sits in the
-            // `ApplicationMessage` arm and errors on notifications. "No test
-            // relied on it" is deliberately NOT the grounds here — that is the
-            // same reasoning that let the tokenless-CLI break through.
-            //
-            // If
-            // notification-driven inter-delegate messaging is ever wanted, it
-            // must come back with the originating scope RECORDED ON THE
-            // SUBSCRIPTION (both `delegate_subscriptions` registration paths) and
-            // propagated here — never with a hardcoded `Local`.
-            //
-            // `info!`, not `debug!`: the crate sets `release_max_level_info`, so
-            // a `debug!` would compile out of shipped binaries and a delegate
-            // author would have no way to see why their message vanished.
-            tracing::info!(
-                delegate_key = %delegate_key,
-                count = delegate_messages.len(),
-                "Suppressed delegate-to-delegate messages from a \
-                 notification-driven run (GHSA-824h-7x5x-wfmf): this path carries \
-                 no client connection scope, so it must not confer an attested \
-                 caller identity"
-            );
         }
 
         // Off-load this iteration's SLOW work rather than awaiting it on the
@@ -2936,7 +2917,7 @@ where
                     origin_contract: origin_contract.copied(),
                     connection_scope,
                     user_context: user_context.cloned(),
-                    inter_delegate,
+                    trigger,
                     accumulated: std::mem::take(&mut accumulated_messages),
                     inbound_so_far: std::mem::take(&mut inbound_responses),
                     // Carry the counts so the caps bound the ROUND-TRIP, not
@@ -4968,13 +4949,13 @@ async fn handle_delegate_notification<CH, P>(
         // this hardcodes `Local` to keep the delegate's own inherited
         // attestation intact exactly as before.
         //
-        // That hardcoded `Local` is why the inter-delegate hop is SUPPRESSED
-        // for this run: which delegate runs here is not tied to the scope of
-        // any caller, so a hop from it may not carry a scope at all. A hop
-        // carries only the originating connection's scope. See the guard in
-        // `handle_delegate_with_contract_requests`.
+        // An inter-delegate hop from this run carries that `Local` scope, so
+        // its target sees the attested `MessageOrigin::Delegate` of this
+        // delegate. That is deliberate even if an off-host caller drove this
+        // delegate earlier: see "BACKGROUND RUNS MAY MESSAGE OTHER DELEGATES"
+        // in `handle_delegate_with_contract_requests`.
         crate::client_events::ConnectionScope::Local,
-        InterDelegateDispatch::Suppressed,
+        RunTrigger::Unprompted,
         // Contract-state-change notification: not driven by a client
         // connection, so there is no user token and no per-user secret
         // namespace. Secrets stay `SecretScope::Local`.
@@ -5155,14 +5136,13 @@ fn notification_recipients(
 
 /// Whether a delegate run was started by the node rather than by a client.
 ///
-/// Notification runs, queued notification runs and lifecycle runs are the
-/// callers that pass `InterDelegateDispatch::Suppressed`, and every one of
-/// them is unprompted; client-driven runs pass `Allowed`. The continuation of
-/// a parked run carries the value across the park, so a resumed run is
-/// classified like the run it continues. Pinned by
-/// `unprompted_runs_are_exactly_the_suppressed_ones`.
-fn is_unprompted_run(inter_delegate: InterDelegateDispatch) -> bool {
-    inter_delegate == InterDelegateDispatch::Suppressed
+/// Notification runs, queued notification runs and lifecycle/wake-up runs are
+/// the callers that pass `RunTrigger::Unprompted`; client-driven runs pass
+/// `RunTrigger::Client`. The continuation of a parked run carries the value
+/// across the park, so a resumed run is classified like the run it continues.
+/// Pinned by `unprompted_runs_are_exactly_the_unprompted_triggers`.
+fn is_unprompted_run(trigger: RunTrigger) -> bool {
+    trigger == RunTrigger::Unprompted
 }
 
 /// Apply the unprompted-run budget to one iteration's network operations,
@@ -5486,10 +5466,10 @@ enum LifecycleOutcome {
 
 /// Deliver one lifecycle event or wake-up, on the loop.
 ///
-/// Runs like a notification run: no origin, no client, `Local` scope with the
-/// inter-delegate hop SUPPRESSED (the node, not a caller, chose to run it, so
-/// there is no caller scope to forward), residual `ApplicationMessage`s fanned
-/// out to registered apps. Unlike a notification run it has no user, which is
+/// Runs like a notification run: no origin, no client, `Local` scope (the
+/// node, not a caller, chose to run it, so there is no caller scope to
+/// forward; its inter-delegate hops carry `Local` too), residual
+/// `ApplicationMessage`s fanned out to registered apps. Unlike a notification run it has no user, which is
 /// why only a node that is not hosted starts one: a hosted node has no
 /// delegate capabilities, and on a hosted node every delegate run belongs to a
 /// user (the executor refuses one without, and its output would reach
@@ -5660,7 +5640,7 @@ where
         None,
         crate::client_events::ConnectionScope::Local,
         // Unprompted run: see `is_unprompted_run`.
-        InterDelegateDispatch::Suppressed,
+        RunTrigger::Unprompted,
         None,
         &key,
         prompter,
@@ -5927,7 +5907,7 @@ async fn dispatch_delegate_request<CH, P>(
             req,
             origin_contract.as_ref(),
             connection_scope,
-            InterDelegateDispatch::Allowed,
+            RunTrigger::Client,
             user_context.as_ref(),
             &delegate_key,
             prompter,
@@ -6046,7 +6026,7 @@ async fn dispatch_delegate_request<CH, P>(
         // Client-driven: the hop forwards THIS connection's scope, so a
         // non-local caller cannot obtain an attested caller identity
         // through it.
-        InterDelegateDispatch::Allowed,
+        RunTrigger::Client,
         user_context.as_ref(),
         &delegate_key,
         prompter,
@@ -6394,7 +6374,7 @@ where
         origin_contract,
         connection_scope,
         user_context,
-        inter_delegate,
+        trigger,
         accumulated,
         inbound_so_far,
         responder,
@@ -6418,7 +6398,7 @@ where
     // off-loop contract fetch or network op does, not only prompts) spends
     // its resumed leg free, every time, and the "1% of loop time" bound does
     // not hold for exactly the delegates the budget exists for.
-    let leg_clock = is_unprompted_run(inter_delegate)
+    let leg_clock = is_unprompted_run(trigger)
         .then(|| contract_handler.executor().delegate_capabilities())
         .flatten()
         .filter(|caps| caps.is_budgeted(&delegate_key))
@@ -6515,7 +6495,7 @@ where
             req,
             origin_contract.as_ref(),
             connection_scope,
-            inter_delegate,
+            trigger,
             user_context.as_ref(),
             &delegate_key,
             prompter,
@@ -6694,7 +6674,7 @@ async fn run_queued_notification<CH, P>(
         req,
         None,
         crate::client_events::ConnectionScope::Local,
-        InterDelegateDispatch::Suppressed,
+        RunTrigger::Unprompted,
         None,
         delegate_key,
         prompter,
@@ -9219,30 +9199,28 @@ mod tests {
     /// H2 — the control that REPLACED the deleted registration-record gate.
     ///
     /// Removing a control is only safe if the thing standing in for it is
-    /// itself pinned. The inter-delegate hop is safe because it forwards the
-    /// ORIGINATING connection scope, so a non-local caller cannot launder its
-    /// lack of attestation through a delegate. Nothing enforced that: passing a
-    /// literal `ConnectionScope::Local` at the hop compiled and broke nothing.
+    /// itself pinned. The inter-delegate hop is safe for client-driven runs
+    /// because it forwards the ORIGINATING connection scope, so a non-local
+    /// caller cannot launder its lack of attestation through a delegate.
+    /// Nothing enforced that: passing a literal `ConnectionScope::Local` at
+    /// the hop compiled and broke nothing.
     ///
-    /// Two properties, because the hop has two callers with different scope
-    /// provenance:
-    ///  1. the hop forwards the `connection_scope` VARIABLE, never a literal; and
-    ///  2. the notification path — which has no connection and therefore
-    ///     hardcodes `Local` — is `InterDelegateDispatch::Suppressed`, so that
-    ///     hardcoded value can never reach the hop.
+    /// The hop forwards the run's `connection_scope` VARIABLE, never a literal.
+    /// For a node-started run that variable is `Local` (it has no connection),
+    /// and its hops are delivered by design (Ian, 2026-11-23); that half is
+    /// covered behaviourally by
+    /// `background_runs_message_other_delegates` in `capability_loop_tests`.
+    /// The behavioural counterpart of THIS pin, for a client run over a
+    /// non-local connection, is
+    /// `a_remote_client_hop_reaches_the_target_unattested`.
     ///
     /// KNOWN LIMIT, the same one carried by
-    /// `consent_prompt_identity_comes_from_the_gated_origin`: property 1 is a
-    /// claim about the TOKEN at the call site, not about the value it carries.
-    /// It forbids the literal `ConnectionScope::Local` in the hop's arguments,
-    /// which rebinding `connection_scope` to that literal beforehand satisfies
-    /// while laundering the scope exactly as the literal would have. What it
-    /// does catch — the hop being changed to hardcode a scope, and the
-    /// scopeless notification path being allowed to reach it — is what it is
-    /// for; do not read it as proving the forwarded value is the originating
-    /// one.
+    /// `consent_prompt_identity_comes_from_the_gated_origin`: this is a claim
+    /// about the TOKEN at the call site, not about the value it carries.
+    /// Rebinding `connection_scope` to a literal beforehand satisfies it; the
+    /// behavioural test above is what catches that.
     #[test]
-    fn inter_delegate_hop_forwards_the_originating_scope() {
+    fn inter_delegate_hop_forwards_the_runs_scope() {
         // Comments stripped (`production_code`): without that, commenting the
         // hop out left every assertion below satisfied by the commented text,
         // so the scope-laundering bug could be reinstated under a green pin.
@@ -9251,13 +9229,12 @@ mod tests {
 
         // The forbidden literal must EXIST somewhere in production, or the
         // negative assertion below is satisfied by a rename rather than by the
-        // code being right. It legitimately appears on the notification path,
-        // which is the third assertion's whole subject.
+        // code being right. It legitimately appears on the node-started paths.
         assert!(
             src.contains("ConnectionScope::Local"),
             "the literal this pin forbids at the hop no longer appears anywhere \
              in production. Either the variant was renamed — in which case this \
-             pin now forbids nothing — or the notification path stopped \
+             pin now forbids nothing — or the node-started paths stopped \
              hardcoding it, in which case rewrite this pin deliberately."
         );
 
@@ -9273,29 +9250,17 @@ mod tests {
             .next()
             .expect("the call is bounded by its .await");
         assert!(
-            hop_args.contains("connection_scope"),
-            "the hop must forward the originating connection scope; got args: {hop_args}"
-        );
-        assert!(
             !hop_args.contains("ConnectionScope::Local"),
             "the hop must NOT hardcode a scope — that is the laundering bug this \
              replaced the removed registration-record gate to avoid; got args: {hop_args}"
         );
         // The whole argument list, in order: the target request, the calling
-        // delegate, the originating scope, and the originating user, under
-        // whose secrets and delegate context the target runs.
+        // delegate, the run's scope, and the originating user, under whose
+        // secrets and delegate context the target runs.
         let args: String = hop_args.chars().filter(|c| !c.is_whitespace()).collect();
         assert_eq!(
             args, "target_req,delegate_key,connection_scope,user_context)",
             "the hop's arguments; got: {hop_args}"
-        );
-
-        // And the scopeless caller must not be able to reach it at all.
-        let notification = fn_region(&src, "async fn handle_delegate_notification");
-        assert!(
-            notification.contains("InterDelegateDispatch::Suppressed"),
-            "the notification path hardcodes ConnectionScope::Local, so it MUST \
-             suppress inter-delegate dispatch or that literal reaches the hop"
         );
     }
 
@@ -11935,7 +11900,7 @@ mod hol_4391_tests {
             req,
             None,
             crate::client_events::ConnectionScope::Local,
-            InterDelegateDispatch::Allowed,
+            RunTrigger::Client,
             Some(&user),
             &key,
             &prompter,
@@ -11998,7 +11963,7 @@ mod hol_4391_tests {
             req,
             None,
             crate::client_events::ConnectionScope::Local,
-            InterDelegateDispatch::Allowed,
+            RunTrigger::Client,
             None,
             &key,
             &Arc::new(crate::contract::user_input::AutoApprovePrompter),
@@ -12839,9 +12804,13 @@ mod hol_4391_tests {
         let script = rt.delegate_script.clone();
         {
             let mut script = script.lock().unwrap();
-            // Notification, first leg: a (suppressed) inter-delegate message,
-            // so the round-trip continues with a second leg.
+            // Notification, first leg: an inter-delegate message, so the
+            // round-trip continues with a second leg after the hop.
             script.push_back(vec![send_to(&delegate_key_n(0x67), &key)].into());
+            // The hop's target (another delegate, so not an interleaving of
+            // this one).
+            script.push_back(Vec::new().into());
+            // Notification, second leg.
             script.push_back(Vec::new().into());
             script.push_back(ScriptedRun {
                 outbound: vec![app_out(b"lane")],
@@ -12920,8 +12889,13 @@ mod hol_4391_tests {
             .collect();
         assert_eq!(
             kinds,
-            vec![vec!["ContractNotification"], Vec::new()],
-            "nothing ran between (or after) the notification's two legs on the lane"
+            vec![
+                vec!["ContractNotification"],
+                vec!["DelegateMessage"],
+                Vec::new()
+            ],
+            "nothing but the hop's target ran between (or after) the \
+             notification's two legs on the lane"
         );
         lane.abort();
     }
@@ -15092,7 +15066,7 @@ mod hol_4391_tests {
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
-            inter_delegate: InterDelegateDispatch::Allowed,
+            trigger: RunTrigger::Client,
             accumulated: Vec::new(),
             inbound_so_far: Vec::new(),
             responder: None,
@@ -16357,7 +16331,7 @@ mod hol_4391_tests {
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
             user_context: None,
-            inter_delegate: InterDelegateDispatch::Allowed,
+            trigger: RunTrigger::Client,
             accumulated: Vec::new(),
             inbound_so_far: Vec::new(),
             responder: None,

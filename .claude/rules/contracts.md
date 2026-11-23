@@ -81,8 +81,19 @@ back to the client, which cannot answer it; such a delegate does not continue.
 Grants are per app (the web app's ContractInstanceId, attested only for LOCAL
 connections) and remembered; the prompt is node-authored (PromptAuthor::Node,
 "Freenet asks:") and raised off the contract loop. Unprompted runs
-(InterDelegateDispatch::Suppressed) of delegates that opted in are budgeted;
+(RunTrigger::Unprompted) of delegates that opted in are budgeted;
 delegates without a manifest are untouched.
+
+Inter-delegate messages (SendDelegateMessage) are delivered from EVERY run
+kind, including node-started ones (notifications, lifecycle, wake-ups); Ian,
+2026-11-23. The receiver sees MessageOrigin::Delegate(caller), which the
+runtime attests, and decides whom to trust; the core does not protect
+delegates from each other. A client-driven hop carries the originating
+connection scope, so an off-host client gets no attested origin through it.
+A hop runs only the target's process(): the target's own contract requests
+are not executed, so a hop does no network work outside the caller's budget.
+Do not reintroduce suppression for background runs (it was the
+GHSA-824h-7x5x-wfmf "scope-laundering guard").
 
 Wake-ups (#3972): WakeupFired (tag 9) goes only to a delegate whose manifest
 declares `wakeups = [tag = secs]`, under the same two conditions, re-checked at

@@ -1110,7 +1110,7 @@ pub(super) struct Continuation {
     pub origin_contract: Option<ContractInstanceId>,
     pub connection_scope: ConnectionScope,
     pub user_context: Option<UserSecretContext>,
-    pub inter_delegate: super::InterDelegateDispatch,
+    pub trigger: super::RunTrigger,
     /// Outbound messages the delegate produced before it parked. Carried so the
     /// client sees ONE response covering the whole round-trip rather than a
     /// partial one now and the rest out-of-band.
@@ -3230,7 +3230,7 @@ mod tests {
             origin_contract: None,
             connection_scope: ConnectionScope::Local,
             user_context: None,
-            inter_delegate: super::super::InterDelegateDispatch::Allowed,
+            trigger: super::super::RunTrigger::Client,
             accumulated: Vec::new(),
             inbound_so_far: Vec::new(),
             responder: None,
