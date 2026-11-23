@@ -6357,6 +6357,31 @@ async fn a_native_join_replaces_a_native_entry_for_its_key() {
     .expect("the first connection's task ends");
 }
 
+/// A native join whose key a live connection at another address holds in the
+/// ring waits for the key as a claim that binds WITHOUT promotion: as for a
+/// legacy join, the connect op promotes it, never the bind.
+#[tokio::test]
+async fn a_native_join_whose_key_is_held_elsewhere_waits_unpromoted() {
+    let mut h = Harness::new("native-join-held-elsewhere").await;
+    let first: SocketAddr = "198.51.100.231:7507".parse().unwrap();
+    let second: SocketAddr = "198.51.100.231:7508".parse().unwrap();
+    h.use_addr(second);
+    let peer = key();
+    let _clock = h.accept_with_receipt(first).await;
+    h.connect_request(first, PeerKeyLocation::with_unknown_addr(peer.clone()))
+        .await;
+    h.connect_peer(PeerKeyLocation::new(peer.clone(), first))
+        .await;
+    assert_eq!(h.ring_addr_of(&peer), Some(first), "premise: in the ring");
+    native_join(&mut h, second, &peer).await;
+    assert_eq!(
+        h.pending_on(second),
+        Some(false),
+        "held, to bind without promotion"
+    );
+    assert_eq!(h.ring_addr_of(&peer), Some(first));
+}
+
 /// A native join from a peer this node holds over UDP at the address is held
 /// beside the UDP entry until it carries a frame, as a native dial is.
 #[tokio::test]
