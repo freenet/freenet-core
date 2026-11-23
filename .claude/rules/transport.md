@@ -1063,6 +1063,14 @@ Token reservation:
 - **Unpromoted joiners share one slice of the established ingress queue** (`demux::QUIC_INGRESS_JOINER_DATAGRAMS`, 64 of 1024), not a per-source share and not per-IP keying (QUIC-NATIVE-CONNECT 10.2 item 23, decided in A7b PR 6): one host on many ports cannot take more than 64 slots, and established peers keep the rest. A joiner never uses the quiet reserve. The slot is recorded per datagram (`QuicDatagram::joiner_slot`) so promotion or release cannot leak it. Overflow counts `quic_gateway_admission_joiner_share_full` and `quic_ingress_source_full`.
 - **Never `std::mem::forget` a charge or a mark.** A leaked charge shrinks the cap for the life of the process.
 
+### WHEN a joiner dials a gateway natively (#5940, phase B; dark behind `GATEWAY_NATIVE_JOIN_PERCENT`)
+
+- **The joiner alone decides**, in the handshake driver (`handshake::connect_outbound`, `GatewayJoinPolicy`): a UDP dial with origin `Gateway` tries a native join first only if `NativeConnectState::plan_gateway_join` says `NativeFirst` (can dial native, gateway marked `native = true` in the index, pair bucket below the percent, gateway not cooling down). Do not move the decision into the connect op or the event loop.
+- **Fallback is unconditional and immediate.** Any native failure runs the ordinary UDP dial in the same task; nothing is sticky. A failure cools that gateway down for `GATEWAY_NATIVE_FAILURE_COOLDOWN` (the index is read at startup, so un-marking does not reach running nodes). Gateway join failures must never count toward the peer-to-peer demotion.
+- **The emitted event names the transport that connected** (`DialTransport::native_now()` on a native join), so the lifecycle's native arm handles it; `connection_lifecycle.rs` needs no gateway-join special case.
+- **`setup::join_native` is the client whatever the key order and never punches**; `NativeDial::join` selects it in `QuicUpgrades::run_native_setup`. Its ends are counted as `gateway_native_join_*` by the driver, never as `connect_native_setup_*` (the peer-to-peer comparison reads only that).
+- **Do not mark a gateway until it hands admitted joins to the node.** Before that, `driver::join_gateway` closes a completed join after the Hello, and a joiner whose setup succeeded has no fallback.
+
 ## Backoff, Jitter, and Recovery Rules
 
 ### WHEN implementing retry/backoff
@@ -2246,8 +2254,9 @@ either side, and a man in the middle with its own key on either leg.
 
 #### QUIC-native setup (`quic/native/`, #5940 QUIC-native connect, A4)
 
-`setup::connect_native` and `setup::accept_native` are
-`pub(in crate::transport)`, called only by the upgrades hub's
+`setup::connect_native`, `setup::accept_native` and `setup::join_native` (a
+gateway join, phase B) are `pub(in crate::transport)`, called only by the
+upgrades hub's
 `QuicUpgrades::setup_native` (A5b, below); the endpoint's native side
 (`native/endpoint.rs`: `allow_native_peer`, `dial_native`, `send_punch`)
 stays `pub(in crate::transport::quic::native)`, and registering a native

@@ -1329,6 +1329,16 @@ impl P2pConnManager {
     /// Removes a transport from the connection map and the open-transport set.
     fn remove_connection(&mut self, addr: SocketAddr) -> Option<ConnectionEntry> {
         let removed = self.connections.remove(addr);
+        // A native link that closes before a frame from the peer is a failed
+        // gateway join if the peer is a marked gateway (#5940).
+        if let Some(entry) = &removed {
+            self.bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .native_connect()
+                .gateway_link_closed(addr, entry.native, entry.frame_seen);
+        }
         // A native connection held beside the entry belongs to its session:
         // it must never be promoted onto a later entry at this address.
         self.held_native.remove(&addr);

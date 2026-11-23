@@ -23481,6 +23481,50 @@ fn test_quic_native_connections_form_and_carry_messages() {
     assert!(connected);
 }
 
+/// A gateway the index marks native, whose side is not built yet (native
+/// admission is off, so it ignores a joiner it does not know): each joiner's
+/// native join times out in its window and falls back to the UDP join, which
+/// joins as it does today, and every fallback that connects is counted as a
+/// rescue. Fails closed: native joins must have been tried and failed, and
+/// none may have connected.
+#[test_log::test]
+fn test_quic_native_gateway_join_without_admission_falls_back_to_udp() {
+    const SEED: u64 = 0x0059_40B0_0001;
+    // Longer than the native window (8 s), which every join pays once.
+    let run = run_native_connect_sim("native-gateway-join-off", SEED, 300, |sim| {
+        sim.with_native_gateway_join(100);
+    });
+    let t = &run.wire.trace;
+    tracing::info!(
+        native_established = t.gateway_join_native_established(),
+        native_failed = t.gateway_join_native_failed(),
+        rescued = t.gateway_join_fallback_connected(),
+        fallback_failed = t.gateway_join_fallback_failed(),
+        "native gateway join trace"
+    );
+    assert!(
+        t.gateway_join_native_failed() > 0,
+        "premise: joiners tried a native join to a marked gateway"
+    );
+    assert_eq!(
+        t.gateway_join_native_established(),
+        0,
+        "premise: the gateway side does not admit"
+    );
+    assert!(
+        t.gateway_join_fallback_connected() > 0,
+        "the UDP fallback joined, and is counted as a rescue"
+    );
+    assert_eq!(
+        t.gateway_join_fallback_failed(),
+        0,
+        "no join was lost to the native attempt"
+    );
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined");
+    assert!(connected);
+}
+
 /// Until UDP is removed a failed native setup must never cost the join. Every
 /// QUIC datagram between every pair is dropped, so every native setup times
 /// out; each is followed by today's UDP dial and every node still joins. The

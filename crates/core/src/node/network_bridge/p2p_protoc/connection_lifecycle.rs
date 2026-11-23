@@ -1137,6 +1137,8 @@ impl P2pConnManager {
                     transient,
                     origin,
                     transport,
+                    // The beside dial exists to be UDP.
+                    gateway_join: false,
                 }) {
                     tracing::warn!(
                         tx = %tx,
@@ -1213,6 +1215,12 @@ impl P2pConnManager {
         // parking. The connect op can retry on a later attempt; this failure is
         // LOCAL channel contention, not a remote connection failure, so we do
         // NOT record peer backoff.
+        // Only the joiner's own dial to a gateway (the event loop's dial for
+        // a message to a gateway it has no transport to) may try a native join
+        // first. It carries the `Gateway` origin as the CALLER's, before
+        // `dial_origin` widens it: a CONNECT acceptor's dial to a gateway's
+        // address does not.
+        let gateway_join = origin == crate::transport::NatAttemptOrigin::Gateway;
         let origin = dial_origin(origin, transient, peer_addr, &self.gateways);
         if !handshake_commands.try_send(HandshakeCommand::Connect {
             peer: peer.clone(),
@@ -1220,6 +1228,7 @@ impl P2pConnManager {
             transient,
             origin,
             transport,
+            gateway_join,
         }) {
             tracing::warn!(
                 tx = %tx,
@@ -3638,12 +3647,30 @@ mod dial_origin_tests {
         assert!(end > open && end < tests_at, "unbalanced body slice");
         let code: String = SOURCE[open..end].split_whitespace().collect();
         let applied = code
-            .find("letorigin=dial_origin(origin,transient,peer_addr,&self.gateways);")
+            .rfind("letorigin=dial_origin(origin,transient,peer_addr,&self.gateways);")
             .expect("handle_connect_peer must apply dial_origin");
         let sent = code
-            .find("HandshakeCommand::Connect{peer:peer.clone(),transaction:tx,transient,origin,transport,}")
+            .find("HandshakeCommand::Connect{peer:peer.clone(),transaction:tx,transient,origin,transport,gateway_join,}")
             .expect("the handshake command carries the origin");
         assert!(applied < sent, "applied before it is sent");
+        // Only the joiner's own join dial may try native first: the flag is
+        // read from the caller's origin BEFORE `dial_origin` widens it to
+        // `Gateway` for any dial to a gateway's address, and the UDP dial
+        // beside a pending native one is never a join.
+        let flag = code
+            .find("letgateway_join=origin==crate::transport::NatAttemptOrigin::Gateway;")
+            .expect("the join flag comes from the caller's origin");
+        assert!(flag < applied, "read before the origin is widened");
+        assert_eq!(
+            code.matches("gateway_join,}").count(),
+            1,
+            "the handshake command carries the flag"
+        );
+        assert_eq!(
+            code.matches("gateway_join:false,").count(),
+            1,
+            "the UDP dial beside a native one is not a join"
+        );
     }
 
     /// Any other dial keeps its origin, including one to another port of a
