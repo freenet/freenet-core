@@ -200,23 +200,27 @@ impl TopologyManager {
     ///
     /// Used by `should_accept` to feed the Kleinberg gap score through the
     /// same windowed comparison mechanism that rate-limits connection acceptance.
+    ///
+    /// `candidate` identifies the peer asking: its retry replaces its earlier
+    /// score instead of competing with it (see [`ConnectionEvaluator`]).
     pub(crate) fn evaluate_new_connection_with_score(
         &mut self,
+        candidate: std::net::SocketAddr,
         score: f64,
         current_time: Instant,
     ) -> bool {
         match self.connection_acquisition_strategy {
             ConnectionAcquisitionStrategy::Slow => {
                 self.fast_connection_evaluator
-                    .record_only_with_current_time(score, current_time);
+                    .record_only_with_current_time(candidate, score, current_time);
                 self.slow_connection_evaluator
-                    .record_and_eval_with_current_time(score, current_time)
+                    .record_and_eval_with_current_time(candidate, score, current_time)
             }
             ConnectionAcquisitionStrategy::Fast => {
                 self.slow_connection_evaluator
-                    .record_only_with_current_time(score, current_time);
+                    .record_only_with_current_time(candidate, score, current_time);
                 self.fast_connection_evaluator
-                    .record_and_eval_with_current_time(score, current_time)
+                    .record_and_eval_with_current_time(candidate, score, current_time)
             }
         }
     }
