@@ -5896,8 +5896,12 @@ macro_rules! joiners_behind_one_address_test {
     ($($test:ident: $seed:expr),+ $(,)?) => {$(
         #[test]
         fn $test() {
+            // A network name of its own (the test's): these run concurrently under
+            // `cargo test`, and a shared name shares the nodes' config dirs,
+            // which one run removes while another is still building its
+            // nodes.
             let (evicted, unconnected) =
-                join_behind_one_address("transient-evict-one-address", $seed, 24, 8);
+                join_behind_one_address(stringify!($test), $seed, 24, 8);
             assert!(
                 evicted > 0,
                 "the budget was never reached; the test would be vacuous"
