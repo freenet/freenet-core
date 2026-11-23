@@ -13858,6 +13858,9 @@ fn run_sparse_stranded_holder(
         .await
     });
     sim.disable_placement_migration();
+    if std::env::var("DESYNC_QUIC").as_deref() == Ok("off") {
+        sim.with_transport_quic("off");
+    }
     sim.enable_seeded_host_advertisements();
     sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
     // Time for the chain to re-form hop by hop (each new host re-roots after
@@ -14021,7 +14024,7 @@ fn run_sparse_stranded_holder(
 fn test_stranded_holder_recovery_on_sparse_ring_places_contract_near_key() {
     const NETWORK_NAME: &str = "stranded-holder-sparse";
     let (_run, recoveries, not_found, reader_has_state, nearest_recovered) =
-        run_sparse_stranded_holder(NETWORK_NAME, 0x5D_B000_0003);
+        run_sparse_stranded_holder(NETWORK_NAME, std::env::var("DESYNC_SEED").ok().map(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).unwrap()).unwrap_or(0x5D_B000_0003));
 
     assert!(
         nearest_recovered,
