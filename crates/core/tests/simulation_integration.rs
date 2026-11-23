@@ -25356,3 +25356,43 @@ fn test_verify_soon_large_state_escalates_to_a_stream() {
         o.obs
     );
 }
+
+/// A simulation's node data dirs live under a root private to this process,
+/// not directly in the shared temp dir. With the shared `/tmp/freenet-{id}`
+/// path, a concurrent run of the same test could delete this run's dirs or
+/// leave files this run then loaded: a node loaded the other process's
+/// persisted peer cache, its bootstrap changed, and a fixed-seed run of
+/// `test_quic_native_blocked_pairs_connect_over_udp_behind_nats` took a
+/// different path and failed on a busy machine.
+#[test]
+fn simulation_data_dirs_are_private_to_this_process() {
+    const NAME: &str = "tmp-isolation-probe";
+    let tmp = std::env::temp_dir();
+    let dir_name = format!("freenet-{NAME}-gateway-0");
+    // Only a run of this test from before the fix could have left it.
+    let shared = tmp.join(&dir_name);
+    let _cleanup = std::fs::remove_dir_all(&shared);
+
+    let rt = create_runtime();
+    let _sim = rt.block_on(SimNetwork::new(NAME, 1, 1, 7, 3, 10, 2, 0x7E57_0001));
+
+    assert!(
+        !shared.exists(),
+        "the gateway's data dir is in the shared temp dir: {}",
+        shared.display()
+    );
+    let own_root = format!("freenet-test-{}", std::process::id());
+    let private = std::fs::read_dir(&tmp)
+        .expect("read the temp dir")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == own_root || name.starts_with(&format!("{own_root}-"))
+        })
+        .any(|root| root.path().join(&dir_name).is_dir());
+    assert!(
+        private,
+        "the gateway's data dir is not under this process's root {own_root}"
+    );
+}
