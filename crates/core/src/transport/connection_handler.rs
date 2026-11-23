@@ -303,6 +303,7 @@ pub async fn create_connection_handler<S: Socket>(
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
+            legacy_responder_override: None,
             // `create_connection_handler` is the test and tool entry point;
             // the node opens the transport through `open_udp_transport`.
             quic: None,
@@ -328,6 +329,10 @@ pub(crate) struct UdpTransportConfig {
     pub(crate) congestion_config: Option<CongestionControlConfig>,
     /// The #5161 version-carrying-ack floor override; `None` in production.
     pub(crate) ack_version_floor_override: Option<(u8, u8, u16)>,
+    /// Test override for `legacy_responder::LEGACY_RESPONDER_ENABLED`:
+    /// `Some(version)` turns the responder on and names that version in its
+    /// reply. `None` uses the constant.
+    pub(crate) legacy_responder_override: Option<String>,
     /// QUIC endpoint settings when `transport-quic` is on, `None` (no
     /// endpoint, no QUIC ingress) when it is off. See `transport::quic`.
     pub(crate) quic: Option<super::quic::QuicSettings>,
@@ -1266,6 +1271,7 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             ledbat_min_ssthresh,
             congestion_config,
             ack_version_floor_override,
+            legacy_responder_override,
             // Used by `bind_udp_listener`, which built `quic_endpoint` from it.
             quic: _,
             quic_policy,
@@ -1391,6 +1397,10 @@ impl<S: Socket> OutboundConnectionHandler<S> {
             gw_rate_limiter: GatewayConnectionRateLimiter::new(
                 time_source.clone(),
                 get_socket_virtual_time(&socket_addr),
+            ),
+            legacy_responder: legacy_responder::build(
+                time_source.clone(),
+                legacy_responder_override,
             ),
             time_source,
             congestion_config: Some(congestion_config.unwrap_or_default()),
@@ -1674,6 +1684,7 @@ impl<S: Socket> OutboundConnectionHandler<S, crate::simulation::VirtualTime> {
             // This listener's `time_source` is already VirtualTime, so the admission
             // clock needs no override.
             gw_rate_limiter: GatewayConnectionRateLimiter::new(time_source.clone(), None),
+            legacy_responder: legacy_responder::build(time_source.clone(), None),
             #[cfg(test)]
             quic_stack_for_test: std::sync::Weak::new(),
             _quic_rebuild_stop: None,
@@ -1852,6 +1863,9 @@ struct UdpPacketsListener<S = UdpSocket, T: TimeSource = RealTime> {
     /// Ramps up connection acceptance rate to prevent thundering herd.
     /// Only active when `is_gateway` is true.
     gw_rate_limiter: GatewayConnectionRateLimiter<T>,
+    /// The stateless reply to a legacy intro, which replaces the gateway
+    /// handshake when present. `None` (the handshake runs) until D-8.
+    legacy_responder: Option<legacy_responder::LegacyResponder<T>>,
     /// Test-only override for [`version_cmp::GATEWAY_ACK_VERSION_MIN_VERSION`]
     /// (#5161). `None` in production, where the real floor applies.
     ///
@@ -2798,6 +2812,10 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
 
                             // Gateway intro packet handling
                             if self.is_gateway {
+                                if self.legacy_responder.is_some() && packet_data.is_intro_packet() {
+                                    self.answer_legacy_intro(&packet_data, remote_addr);
+                                    continue;
+                                }
                                 if self.connections.has_gateway_handshake(&remote_addr) {
                                     tracing::debug!(peer_addr = %remote_addr, "Gateway connection already in progress");
                                     continue;
@@ -3201,6 +3219,39 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                     (error, remote_addr)
                 }),
         ))
+    }
+
+    /// Answer a legacy intro without a handshake (see `legacy_responder`).
+    /// The reply is sent from its own task so the listener loop never waits on
+    /// the socket; it is bounded by the responder's global bucket.
+    fn answer_legacy_intro(
+        &mut self,
+        packet_data: &PacketData<UnknownEncryption>,
+        remote_addr: SocketAddr,
+    ) {
+        let Some(responder) = self.legacy_responder.as_mut() else {
+            return;
+        };
+        match responder.respond(&self.this_peer_keypair.secret, packet_data.data()) {
+            legacy_responder::Outcome::RateLimited => {
+                tracing::trace!(peer_addr = %remote_addr, "Legacy intro dropped: responder rate limit");
+            }
+            legacy_responder::Outcome::Invalid => {
+                tracing::trace!(peer_addr = %remote_addr, "Legacy intro dropped: not a valid intro");
+            }
+            legacy_responder::Outcome::Reply(packet) => {
+                let socket = self.socket_listener.clone();
+                GlobalExecutor::spawn(async move {
+                    if let Err(err) = socket.send_to(&packet.prepared_send(), remote_addr).await {
+                        tracing::debug!(
+                            peer_addr = %remote_addr,
+                            error = %err,
+                            "Failed to send legacy intro reply"
+                        );
+                    }
+                });
+            }
+        }
     }
 
     /// Count an intro packet dropped because nothing exists for its exact
@@ -4757,6 +4808,7 @@ struct InboundRemoteConnection {
     inbound_packet_sender: mpsc::Sender<InboundPacket>,
 }
 
+mod legacy_responder;
 mod recv_errors;
 mod stray_intro;
 mod version_cmp;

@@ -260,6 +260,31 @@ else
 fi
 rm -f "$TMP/cgroup-4241" "$TMP/cgroup-4242"
 
+# ── binary_holders: the staggered companion must not block the swap (#6336) ──
+# The script cannot be sourced (it runs main), so lift the helper block out of it.
+HELPERS="$(sed -n '/^STAGGERED_UNITS=/,/^wait_for_binary_release()/p' "$DEPLOY_SH" | sed '$d')"
+if [[ -z "$HELPERS" ]]; then
+    fail "binary_holders: could not extract helper block from $DEPLOY_SH"
+else
+    holders=$(
+        INSTALL_PATH=/fake/freenet
+        # pid 1001 is in the companion's cgroup, 1002 in the primary's.
+        sudo() {
+            case "$1" in
+                lsof) printf '%s\n' 1001 1002 ;;
+                grep) [[ "${@: -1}" == "/proc/1001/cgroup" ]] ;;
+            esac
+        }
+        eval "$HELPERS"
+        binary_holders
+    )
+    if [[ "$holders" == "1002" ]]; then
+        pass "binary_holders: drops the companion's pid, keeps the primary's"
+    else
+        fail "binary_holders: expected only 1002, got '$holders'"
+    fi
+fi
+
 # ── result ────────────────────────────────────────────────────────────
 if (( FAILURES > 0 )); then
     echo "$FAILURES deploy-local-gateway.sh test(s) failed" >&2
