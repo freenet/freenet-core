@@ -572,6 +572,27 @@ impl NativeConnectState {
         }
     }
 
+    /// A transport to `addr` was removed from the node's connection map.
+    /// A native connection that closed before it carried one frame from the
+    /// peer never worked: the setup and Hello completed, but nothing came
+    /// back (a middlebox that lets the QUIC handshake through and drops the
+    /// rest, or a gateway that closes an admitted join). That is a failed
+    /// gateway join, so it starts the gateway's cooldown and the next join
+    /// goes over UDP, as a failed setup does. Without this the setup's
+    /// success is the only thing recorded, and a joiner could redial the same
+    /// dead native link forever. A link that did carry a frame, or a UDP
+    /// one, says nothing about native and is ignored.
+    pub(crate) fn gateway_link_closed(
+        &self,
+        addr: std::net::SocketAddr,
+        native: bool,
+        frame_seen: bool,
+    ) {
+        if native && !frame_seen {
+            self.record_gateway_join(addr, false);
+        }
+    }
+
     fn endpoint_up(&self) -> bool {
         self.endpoint
             .get()
@@ -1167,6 +1188,80 @@ mod tests {
             state.gateway_failures.lock().len(),
             1,
             "only marked gateways"
+        );
+    }
+
+    /// A failure recorded under the IPv4-mapped spelling of a gateway's
+    /// address cools down the IPv4 dial: `record_gateway_join` normalises
+    /// the address as `plan_gateway_join` and `set_native_gateways` do.
+    #[test]
+    fn a_failure_recorded_under_the_mapped_address_cools_down_the_ipv4_dial() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let v4: std::net::SocketAddr = "192.0.2.1:31337".parse().unwrap();
+        let mapped = std::net::SocketAddr::new(
+            std::net::Ipv4Addr::new(192, 0, 2, 1)
+                .to_ipv6_mapped()
+                .into(),
+            31337,
+        );
+        let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
+        state.set_endpoint(watch);
+        state.set_native_gateways([v4]);
+        state.record_gateway_join(mapped, false);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), v4, &key(10_000)),
+            GatewayJoinPlan::LegacyCoolingDown
+        );
+    }
+
+    /// A native gateway link that closes before it carried a frame from the
+    /// gateway never worked, whatever its setup said: it cools the gateway
+    /// down, so the next join goes over UDP. A link that carried a frame, and
+    /// a UDP link, say nothing about native.
+    #[test]
+    fn a_native_gateway_link_that_closes_before_a_frame_cools_the_gateway_down() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let marked: std::net::SocketAddr = "192.0.2.1:31337".parse().unwrap();
+        let gateway = key(10_000);
+        let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
+        state.set_endpoint(watch);
+        state.set_native_gateways([marked]);
+        for (native, frame_seen) in [(true, true), (false, false), (false, true)] {
+            state.gateway_link_closed(marked, native, frame_seen);
+            assert_eq!(
+                state.plan_gateway_join(&key(1), marked, &gateway),
+                GatewayJoinPlan::NativeFirst,
+                "native {native}, frame seen {frame_seen}"
+            );
+        }
+        state.gateway_link_closed(marked, true, false);
+        assert_eq!(
+            state.plan_gateway_join(&key(1), marked, &gateway),
+            GatewayJoinPlan::LegacyCoolingDown
+        );
+    }
+
+    /// `P2pConnManager::remove_connection`, the one place a transport leaves
+    /// the connection map, tells the native state about the closed link.
+    #[test]
+    fn removing_a_connection_reports_the_closed_link_to_the_native_state() {
+        const SOURCE: &str = include_str!("../../node/network_bridge/p2p_protoc.rs");
+        let start = SOURCE
+            .find("fn remove_connection(&mut self, addr: SocketAddr)")
+            .expect("remove_connection renamed");
+        let body = &SOURCE[start..start + 900];
+        let body: String = body.split_whitespace().collect();
+        assert!(
+            body.contains(
+                ".native_connect().gateway_link_closed(addr,entry.native,entry.frame_seen)"
+            ),
+            "remove_connection must report the closed link: {body}"
+        );
+        assert!(
+            body.find("gateway_link_closed").unwrap() < body.find("held_native.remove").unwrap(),
+            "reported before the entry's session state goes"
         );
     }
 

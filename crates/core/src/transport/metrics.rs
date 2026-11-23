@@ -645,11 +645,14 @@ labelled_counters! {
 }
 
 labelled_counters! {
-    /// How long a joiner's join to a gateway marked native took, from the
-    /// start of the native attempt to a connection, whichever join gave it
-    /// (#5940, phase B): a fallback's time includes the failed native
-    /// attempt. Joins that gave no connection are not counted. Exported per
-    /// period as `gateway_native_join_time_<label>`.
+    /// How long a joiner's join took, from the start of the native attempt
+    /// to a connection, whichever join gave it (#5940, phase B): a
+    /// fallback's time includes the failed native attempt. ONLY joins that
+    /// tried native first are timed. A join to a marked gateway that went
+    /// straight to UDP (cooldown, outside the slice) is not, so these
+    /// counters have no legacy control arm; compare against the
+    /// `gateway_joins` totals instead. Joins that gave no connection are not
+    /// counted. Exported per period as `gateway_native_join_time_<label>`.
     pub(crate) enum GatewayNativeJoinTime {
         /// Under 1 second.
         Lt1S => "lt_1s",
@@ -2329,7 +2332,20 @@ impl TransportMetrics {
     /// This node closed a QUIC connection to `remote` with `code`
     /// (`remote` is never exported).
     /// A QUIC-native setup ended with `outcome`.
-    pub(crate) fn record_connect_native_setup(&self, outcome: NativeSetupOutcome) {
+    ///
+    /// `remote` is the peer's address, kept only in test builds, where
+    /// `quic_events_of(remote)` shows the setups counted for it (as
+    /// `("setup", outcome)`): the A+ pair comparison reads these counts, and
+    /// a gateway join must stay out of them.
+    pub(crate) fn record_connect_native_setup(
+        &self,
+        outcome: NativeSetupOutcome,
+        remote: SocketAddr,
+    ) {
+        #[cfg(test)]
+        self.note_quic_event(remote, ("setup", outcome));
+        #[cfg(not(test))]
+        let _ = remote;
         self.connect_native_setup[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
@@ -6491,7 +6507,7 @@ mod tests {
     #[test]
     fn connect_native_setup_outcomes_count_snapshot_and_reset() {
         check_quic_family(
-            |m, slot, _| m.record_connect_native_setup(NativeSetupOutcome::ALL[slot]),
+            |m, slot, remote| m.record_connect_native_setup(NativeSetupOutcome::ALL[slot], remote),
             |snap| snap.connect_native_setup,
         );
     }

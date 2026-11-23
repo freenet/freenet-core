@@ -6445,3 +6445,55 @@ fn a_native_join_to_a_gateway_without_admission_times_out_in_its_window() {
         assert_eq!(elapsed, NATIVE_WINDOW);
     })
 }
+
+/// A native join checks the gateway's key against the one the index names: a
+/// gateway that proves another key is refused by the joiner's TLS, however
+/// willing it is to admit joins, so the join ends in a handshake failure and
+/// the joiner's UDP fallback runs.
+#[test]
+fn a_native_join_refuses_a_gateway_that_proves_another_key() {
+    use super::native::punch::PunchBudget;
+    use super::native::setup::{NativePeer, NativeSetupError, join_native};
+    use super::upgrade::driver::join_gateway;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let net = crate::transport::test_net::subnet();
+        let pair = pair("quic-native-join-key", net.addr(1), net.addr(2), None).await;
+        assert!(enable_admission(&pair.b, pair.time.clone()));
+        let (a, b, b_addr, time) = (
+            pair.a.clone(),
+            pair.b.clone(),
+            pair.b_addr,
+            pair.time.clone(),
+        );
+        // The index names a key that is not the gateway's.
+        let named = TransportKeypair::new().public().clone();
+        assert_ne!(&named, pair.b_keys.public(), "premise: another key");
+        let result = drive(&pair.time, Duration::from_secs(60), async move {
+            let client = async {
+                let budget = PunchBudget::default();
+                let peer = NativePeer {
+                    addr: b_addr,
+                    key: &named,
+                    is_gateway: false,
+                };
+                let deadline = time.now() + Duration::from_secs(20);
+                join_native(&a, &budget, peer, 0, &time, deadline).await
+            };
+            // The gateway side admits the joiner and then fails or waits;
+            // only the joiner's end is under test.
+            let server = async {
+                if let Some(super::EndpointAttempt::Joiner(joiner)) = b.accept_attempt().await {
+                    let _ = join_gateway(joiner, &time).await;
+                }
+            };
+            let (result, ()) = tokio::join!(client, server);
+            result
+        })
+        .await;
+        assert!(
+            !matches!(result, Ok(_) | Err(NativeSetupError::TooLate)),
+            "a join to a gateway proving another key must not connect: {result:?}"
+        );
+    })
+}
