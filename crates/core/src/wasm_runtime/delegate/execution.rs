@@ -380,6 +380,26 @@ impl Runtime {
         // rather than on a per-field exception.
         let outbound = result?;
 
+        // #5857: a secret read that failed for a reason other than the secret
+        // being absent poisoned this call. The guest may have taken it for
+        // absence (every stdlib guest to date does), so its answer cannot be
+        // trusted. Fail the whole call: a frozen delegate then becomes loud
+        // with no change to its code, and the caller can retry. Checked here,
+        // after the guest has finished, so the env is read by one thread only.
+        if let Some(failure) = DELEGATE_ENV
+            .get(&instance_id)
+            .and_then(|env| env.secret_read_failure())
+        {
+            return Err(
+                DelegateExecError::from(freenet_stdlib::prelude::DelegateError::Other(format!(
+                    "delegate secret storage read failed (not a missing secret); \
+                     the call was aborted so it cannot be mistaken for an empty \
+                     store, retry it: {failure}"
+                )))
+                .into(),
+            );
+        }
+
         // Reached only on success, which means `execute_wasm_blocking` received
         // the guest's result. The job sends that result only after the guest
         // closure has returned and dropped its captures, so the guest has

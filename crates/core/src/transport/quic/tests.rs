@@ -5622,9 +5622,9 @@ fn a_gateways_admission_decides_on_the_endpoints_clock() {
     })
 }
 
-/// The gateway's whole join (`driver::join_gateway`): handshake and Hello
-/// exchange within the window, then, until phase B hands the connection to
-/// the node, a close at the hook counted as `joined`. A client that never
+/// The gateway's whole join as the test-only `driver::join_gateway` runs it:
+/// handshake and Hello exchange within the window, then a close at the hook
+/// counted as `joined` (production hands the connection to the node instead). A client that never
 /// sends its Hello ends as `hello_failed` once the window is over.
 #[test]
 fn an_admitted_join_exchanges_hellos_and_is_closed_at_the_hook() {

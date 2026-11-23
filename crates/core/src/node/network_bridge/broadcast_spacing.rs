@@ -185,6 +185,12 @@ impl BroadcastSpacing {
         })
     }
 
+    /// Whether a send to `(contract, peer)` holds its claim right now.
+    #[cfg(feature = "simulation_tests")]
+    pub(crate) fn is_in_flight(&self, contract: &ContractInstanceId, peer: &PeerKey) -> bool {
+        self.in_flight.contains_key(&(*contract, peer.clone()))
+    }
+
     fn prune(&self, now: Instant) {
         let spacing = self.spacing;
         self.last_sent

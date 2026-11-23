@@ -691,12 +691,57 @@ analysis there. Diagnose from the INFO line and telemetry instead:
 - All legs of a client update skipped as converged (`skip_summary_equal` and
   the like) is suspect: the update changed this node's state, so no peer can
   already hold it, and the skip means this node's belief about the peer is
-  stale. That is the leading #6143 hypothesis. Exception: a contract with a
-  lossy summary (two states can share one) can legitimately match.
+  stale. Exception: a contract with a lossy summary (two states can share
+  one) can legitimately match. (The #6143 root cause was transport stream ids,
+  #6269; a belief poisoned by lost legs is what the `verify_*` counters of the
+  verify-soon check measure and repair.)
 - Loss at or after the transport (a stream that fails after the bridge took
   it, a single packet abandoned after its retransmits, a lost QUIC message)
   shows in the `wire_*` counts and the receivers' `rx_*` counts across the
   fleet.
+
+### Verify-soon check of originated updates (`update/verify_soon.rs`)
+
+A node that originates an UPDATE asks its fan-out targets for their summary
+`CHECK_DELAY` (5 s) later, with the existing `SummaryRequest` (only to peers
+at or above the hash-first floor). Replies go through the `Summaries` arm's
+staleness check and targeted heal, unchanged. A peer found stale in that
+round and stale again in a confirm round 5 s later has its heal forced to full
+state on the caller-named stream (payload arm `full_verify_forced`, whose bytes
+are the forced bytes delivered), when the confirm verdict is real evidence
+(`OutcomeEvidence::Verdict`), no forced stream to the pair was delivered in the
+last 60 s, the peer's summary has moved since one delivered in the last 10 min,
+the peer is not barred by a failed forced stream, no leg for the pair is queued
+or sending (its own forced leg included), and the node's single forced slot is
+free (one forced leg pending or in flight per node, released by the stream's
+outcome or the mark's expiry). Only a DELIVERED forced stream arms the floor
+and cooldown (`ForcedLeg`); a FAILED one bars the peer, for every contract,
+for at least as long as the stream held the slot and at least 60 s, doubling
+with each consecutive failure up to 24 hours (so 16 failing peers holding the slot 270 s each take about 5% of it at the cap). The bar ends by time; a delivered forced stream to the peer ends it early (a leg the 30-minute slot backstop gives up on counts as a failure, and a delivery reported late for that slot clears the bar). A barred peer's confirm verdict is retried when its bar ends within 5 minutes, and not retried otherwise. A floor, busy, slot or cap hold retries the held
+peers only, at most 3 times plus a final retry at the latest holder's clearing
+time. One check per contract, never postponed by later writes; a write during
+a check merges into it, and a fresh first round for the write starts when the
+check would otherwise end, not before the earliest held peer can clear (a
+write before the check's first round goes out is covered by that round). Requests leave through a token bucket (128
+per 250 ms). Counters (`verify_*`, on their own
+`update_propagation_summary verify` INFO line): scheduled (new checks and
+checks restarted for writes they had not covered), dropped_cap,
+request_sent, request_dropped, peers_truncated, round_timed_out, peer_stale (any
+round; a stale verdict, not a heal), peer_stale_confirm (confirm round only),
+peer_converged, forced_full, forced_full_sent, forced_delivered, and
+not_forced_{evidence,floor,no_progress,cap,busy,slot,peer_failed}. Floor, busy, slot and cap holds are retried,
+each retry delayed by 0 to 40% of its wait (jitter, never before the peer clears); a
+peer-failed hold is retried (also with jitter) only when its bar ends within 5 minutes; an evidence or
+no-progress hold is not retried. Bounds, the
+`PERSISTENT_FAULT_BOUND` assumptions and residuals are in the `verify_soon`
+module doc.
+
+Do not hook it anywhere but `update_contract`'s `ClientLocal` +
+`state_changed` branch, and keep the escalation decision in the `Summaries`
+arm BEFORE `emit_stale_peer_syncs`: the force mark must exist when that heal's
+leg is built. In simulations the forced leg is spawned rather than awaited
+(`spawn_forced_leg`): the simulation sends heals inline on the event loop,
+and a stream leg awaits a completion signal that loop has to drive.
 
 The INFO summary's per-contract lines are the top 8 by update activity, so a
 contract can fall into the "...and N others" rollup behind busier ones; the

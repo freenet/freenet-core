@@ -355,7 +355,7 @@ impl From<SocketAddr> for ObservedAddr {
 #[cfg(test)]
 pub(crate) use self::boundary::NativeConnectFuture;
 pub(crate) use self::boundary::TransportHandle;
-pub(crate) use self::metrics::{NativeConnectSide, NativeSetupOutcome};
+pub(crate) use self::metrics::{ConnectArm, NativeConnectSide, NativeSetupOutcome};
 pub(crate) use self::quic::native::setup::{
     MIN_WINDOW_LEFT as NATIVE_MIN_WINDOW_LEFT, NATIVE_FALLBACK_AFTER,
     window_of as native_setup_window,
