@@ -2,10 +2,12 @@
 
 > **nova runs TWO gateway processes**, `freenet-gateway` (:31337) and
 > `freenet-gateway-2` (:31338). Only the first has a release-agent. The second
-> carries `WantedBy=freenet-gateway.service`, so the same stop/start cycle brings
-> it up, and `gateway-auto-update.sh` verifies companion units found in the
-> primary's `.wants` directories — a companion that fails to start now fails the
-> update rather than being reported as a success. Do NOT install a second
+> is deliberately NOT `PartOf=`/`WantedBy=` the primary (#6336): after the
+> primary is updated, `gateway-auto-update.sh` queues
+> `freenet-gateway-stagger.service`, which restarts it about 10 minutes later,
+> once the primary has been healthy, and fails visibly if it does not land.
+> `install.sh nova` installs `gateway-staggered-restart.sh` and the gw2, stagger
+> and stagger-alert units, and enables the primary and gw2. Do NOT install a second
 > release-agent for it.
 
 
