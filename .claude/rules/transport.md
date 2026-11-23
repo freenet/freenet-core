@@ -2497,14 +2497,20 @@ Demotion: recorded in the connection lifecycle, where the outcome is known
   demoted most of the time; 8 is provisional until step 1 measures it. Its
   joiners chose it, so joiners holding 8 keys can turn an honest acceptor's
   decisions off. A joiner cannot tell an acceptor-side failure from its own
-  (same outcomes, no health bit on the wire), so it still takes a strike;
-  the acceptor's demotion bounds that at 8 joiners per broken acceptor per
-  cooldown. A node demoted in either role counts none of its own decisions
-  or dials in a connect arm (acceptor_arm returns None as acceptor; the
-  joiner skips joiner_in_control), so the control arm does not collect the
-  pairs where native fails. Limit: an acceptor still counts a demoted
-  joiner's request as control, since that offer reads percent 0 with no
-  reason on the wire. Either streak's effect is a 6 h downgrade to UDP,
+  (same outcomes, no health bit on the wire), so it still takes a strike
+  (none against a configured gateway: dial_origin labels those dials
+  Gateway); the acceptor's demotion bounds that at about 8 joiners per
+  broken acceptor per cooldown, plus those it decided Native for while the
+  outcomes arrived. The count is of native setups (in-slice pairs with no
+  transport held), so at a low release percent a broken acceptor that
+  accepts few joins takes days to demote; its acceptor-side timed_out setup
+  outcomes show the cost first. A node whose acceptor readiness is demoted
+  (either role's streak) counts none of its decisions in a connect arm
+  (acceptor_arm returns None), so the acceptor-side arms, the ones read for
+  rates, do not collect the pairs where native fails. Limits: an acceptor
+  still counts a demoted joiner's request as control (that offer reads
+  percent 0 with no reason on the wire), and the joiner-side arm counts
+  still include pairs whose acceptor is demoted. Either streak's effect is a 6 h downgrade to UDP,
   never a failed join.
 Existing transport: a native dial does not drop a connection the node
   already has to that peer; the joiner may have connected another way since

@@ -662,6 +662,7 @@ impl RelayState {
                 native_wire_trace::NativeWireEvent::Decided {
                     own,
                     native: decision == native::NativeDecision::Native,
+                    in_slice: bucket < offer.effective_percent(),
                 },
             );
         }

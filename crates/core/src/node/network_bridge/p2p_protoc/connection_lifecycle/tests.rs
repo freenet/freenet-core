@@ -3655,10 +3655,11 @@ async fn a_native_connection_binds_its_proven_key() {
 /// A failed native setup: the connect op dials UDP next, so the address is
 /// not marked failed and the peer gets no backoff, either of which would
 /// refuse that dial. Only an outcome that says native does not work on the
-/// path, seen as joiner, counts toward demotion: three joiner timeouts with
-/// distinct peers demote the node; three refusals by its own punch budget do
-/// not, nor do three timeouts as acceptor (a joiner chose this node, and
-/// could fail on purpose).
+/// path counts toward demotion, and only in the streak of the role the dial
+/// was made in: timeouts as acceptor with distinct joiners demote the
+/// acceptor role, timeouts as joiner the joiner role; refusals by the node's
+/// own punch budget demote neither, and gateway or no-transport dials feed
+/// neither streak.
 #[tokio::test]
 async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_path_failures() {
     use crate::operations::connect::native::DialTransport;
@@ -3687,24 +3688,26 @@ async fn a_failed_native_setup_leaves_the_udp_fallback_open_and_demotes_only_on_
             0,
             0,
         ),
+        // Before any role is demoted, so a leak into either streak would
+        // demote it (a demoted streak ignores further failures).
         (
             2,
             NativeSetupOutcome::TimedOut,
-            NatAttemptOrigin::ConnectAcceptor,
+            NatAttemptOrigin::Gateway,
             0,
-            1,
+            0,
         ),
         (
             3,
             NativeSetupOutcome::TimedOut,
-            NatAttemptOrigin::Gateway,
+            NatAttemptOrigin::RingPeerNoTransport,
             0,
-            1,
+            0,
         ),
         (
             4,
             NativeSetupOutcome::TimedOut,
-            NatAttemptOrigin::RingPeerNoTransport,
+            NatAttemptOrigin::ConnectAcceptor,
             0,
             1,
         ),

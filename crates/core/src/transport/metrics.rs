@@ -1528,6 +1528,11 @@ thread_local! {
     pub(crate) static CONNECT_ARM_ON_THIS_THREAD: std::cell::Cell<[u64; ConnectArmCounter::COUNT]> =
         const { std::cell::Cell::new([0; ConnectArmCounter::COUNT]) };
 
+    /// Test-only: acceptor-role demotions recorded on this thread, so a test
+    /// can see its own increment of the process-wide counter.
+    pub(crate) static ACCEPTOR_DEMOTIONS_ON_THIS_THREAD: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+
     /// Test-only: native setups rescued by UDP on this thread, as joiner and
     /// as acceptor, for the same reason.
     pub(crate) static NATIVE_RESCUES_ON_THIS_THREAD: std::cell::Cell<[u64; 2]> =
@@ -2287,6 +2292,8 @@ impl TransportMetrics {
     pub(crate) fn record_connect_native_acceptor_demotion(&self) {
         self.connect_native_acceptor_demotions
             .fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        ACCEPTOR_DEMOTIONS_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
     }
 
     /// A `Native` response was dropped unanswered: the CONNECT had already

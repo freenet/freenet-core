@@ -23597,14 +23597,15 @@ fn test_quic_native_broken_acceptor_stops_deciding_native() {
         .min();
     let before = decisions
         .iter()
-        .filter(|(own, seq, native)| {
+        .filter(|(own, seq, native, _)| {
             *own == broken && *native && demoted_at.is_none_or(|at| *seq < at)
         })
         .count();
-    let after: Vec<(u64, bool)> = decisions
+    // (order, native, in the slice) for each decision after the demotion.
+    let after: Vec<(u64, bool, bool)> = decisions
         .iter()
-        .filter(|(own, seq, _)| *own == broken && demoted_at.is_some_and(|at| *seq > at))
-        .map(|(_, seq, native)| (*seq, *native))
+        .filter(|(own, seq, _, _)| *own == broken && demoted_at.is_some_and(|at| *seq > at))
+        .map(|(_, seq, native, in_slice)| (*seq, *native, *in_slice))
         .collect();
     tracing::info!(%broken, before, ?after, ?demoted_at, "broken acceptor run");
     assert!(
@@ -23616,11 +23617,12 @@ fn test_quic_native_broken_acceptor_stops_deciding_native() {
         "the broken node demoted its acceptor role"
     );
     assert!(
-        !after.is_empty(),
-        "premise: the broken node still decided offered requests after demoting"
+        after.iter().any(|(_, _, in_slice)| *in_slice),
+        "premise: after demoting, the broken node still decided a request it \
+         would have answered Native: {after:?}"
     );
     assert!(
-        after.iter().all(|(_, native)| !native),
+        after.iter().all(|(_, native, _)| !native),
         "the broken node decided native after its acceptor role demoted: {after:?}"
     );
     assert!(

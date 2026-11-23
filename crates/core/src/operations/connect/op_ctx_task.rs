@@ -1031,26 +1031,14 @@ async fn drive_client_connect(
                     }
                 };
 
-                // A demoted joiner counts no pair in an arm: demotion follows
-                // native failures, so its pairs would fill the control arm with
-                // exactly the pairs where native fails (as `acceptor_arm`
-                // leaves out a demoted acceptor). Its acceptors cannot tell
-                // (its offer carries percent 0 and no reason), so they still
-                // count such a pair as control.
-                let in_control = !op_manager
-                    .ring
-                    .connection_manager
-                    .native_connect()
-                    .readiness()
-                    .demoted
-                    && super::native::joiner_in_control(
-                        sent_offer,
-                        payload.native_decision,
-                        super::native::native_bucket(
-                            &op_manager.ring.connection_manager.pub_key,
-                            payload.acceptor.pub_key(),
-                        ),
-                    );
+                let in_control = super::native::joiner_in_control(
+                    sent_offer,
+                    payload.native_decision,
+                    super::native::native_bucket(
+                        &op_manager.ring.connection_manager.pub_key,
+                        payload.acceptor.pub_key(),
+                    ),
+                );
                 // `accepted` only grows with what the queue takes, so both
                 // stay within `acceptor_limit`.
                 match dial_queue.offer((payload.acceptor.clone(), Instant::now())) {
@@ -4147,37 +4135,6 @@ mod driver_timing_tests {
         );
     }
 
-    /// A joiner whose own native connects are demoted counts none of its
-    /// pairs, even those it would place in control: demotion follows native
-    /// failures, so its pairs would fill the control arm with exactly the
-    /// pairs where native fails. The same responses as the percent-zero case
-    /// above, which counts two.
-    #[tokio::test(start_paused = true)]
-    async fn a_demoted_joiner_counts_no_pair_in_an_arm() {
-        use crate::operations::connect::native::{NativeDecision, NativeOffer};
-        let before = arm_counts_here();
-        let run = dials_for_decisions_after(
-            "arm-joiner-demoted",
-            Some(NativeOffer::capable(0)),
-            vec![
-                (0, Some(NativeDecision::Udp)),
-                (1, Some(NativeDecision::Udp)),
-            ],
-            |op_manager| {
-                let native = op_manager.ring.connection_manager.native_connect();
-                for seed in 0..crate::operations::connect::native::DEMOTION_FAILURES as u32 {
-                    native.record_failure(&crate::transport::TransportPublicKey::from_bytes(
-                        *blake3::hash(&seed.to_be_bytes()).as_bytes(),
-                    ));
-                }
-                assert!(native.readiness().demoted, "premise: demoted");
-            },
-        )
-        .await;
-        assert_eq!(run.dialled.len(), 2, "both are dialled over UDP");
-        assert_eq!(arm_moved(before), vec![], "no arm counts a demoted joiner");
-    }
-
     /// At 100 every bucket is below the offered percent, so the joiner cannot
     /// tell a control pair from one the acceptor sent to UDP for another
     /// reason, and counts none, however the acceptors answer; a `Native` one
@@ -4658,22 +4615,7 @@ mod driver_timing_tests {
             Option<crate::operations::connect::native::NativeDecision>,
         )>,
     ) -> DecisionRun {
-        dials_for_decisions_after(name, sent_offer, responses, |_| {}).await
-    }
-
-    /// [`dials_for_decisions`], with `prepare` run on the joiner's
-    /// `OpManager` first.
-    async fn dials_for_decisions_after(
-        name: &str,
-        sent_offer: Option<crate::operations::connect::native::NativeOffer>,
-        responses: Vec<(
-            usize,
-            Option<crate::operations::connect::native::NativeDecision>,
-        )>,
-        prepare: impl FnOnce(&OpManager),
-    ) -> DecisionRun {
         let (op_manager, events) = op_manager_with_events(name).await;
-        prepare(&op_manager);
         connect_existing_peer(&op_manager, 24949);
         let log = scripted_event_loop(events, vec![]);
         let tx = Transaction::new::<ConnectMsg>();

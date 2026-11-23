@@ -64,15 +64,17 @@ pub(crate) const DEMOTION_FAILURES: usize = 3;
 /// measured: an acceptor cannot tell its own fault from a joiner that never
 /// dialled (the joiner planned UDP because the window had passed, lost its
 /// readiness, or refused by its own limits), so a healthy acceptor sees a
-/// failure share f from joiner-side causes alone. A run of K failures then
-/// comes every 1/f + ... + 1/f^K decisions: at f = 0.2, about 155 for K = 3
-/// (hours for a busy acceptor, so it would sit demoted most of the time) and
-/// about 490,000 for K = 8; at f = 0.3, about 22,000. An acceptor whose own
-/// path is broken (f = 1) demotes after 8 joiners. The arithmetic treats
-/// failures as independent; it holds even where many joiners fail with
-/// everyone (symmetric NATs) mostly because each such joiner demotes itself
-/// after 3 failures, which caps the strikes it can hand out. Read
-/// `connect_native_acceptor_demotions` per node-hour in the first enable step.
+/// failure share f of its native setups from joiner-side causes alone. A run
+/// of K failures then comes every 1/f + ... + 1/f^K native setups (only
+/// in-slice pairs with no transport held get one): at f = 0.2, about 155 for
+/// K = 3 (hours for a busy acceptor, so it would sit demoted most of the
+/// time) and about 490,000 for K = 8; at f = 0.3, about 22,000. The
+/// arithmetic treats failures as independent. An acceptor whose own path is
+/// broken (f = 1) demotes after 8 native setups with distinct joiners, plus
+/// the decisions it makes while those outcomes arrive. At a low release
+/// percent that can take days for an acceptor that accepts few joins, so a
+/// broken acceptor's cost shows first as acceptor-side `timed_out` setup
+/// outcomes, not as `connect_native_acceptor_demotions`.
 pub(crate) const ACCEPTOR_DEMOTION_FAILURES: usize = 8;
 
 /// How long a demoted node offers (or decides) nothing native.
@@ -297,7 +299,9 @@ impl DialTransport {
 /// reports.
 pub(crate) const NATIVE_CONNECT_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// This node's readiness for native connections, as both joiner and acceptor.
+/// This node's readiness for native connections in one role: as joiner
+/// ([`NativeConnectState::readiness`]) or as acceptor
+/// ([`NativeConnectState::acceptor_readiness`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct NativeReadiness {
     /// The build can dial native, the endpoint is up and the node is not
@@ -307,8 +311,7 @@ pub(crate) struct NativeReadiness {
     pub percent: u8,
     /// A demotion is running in the role this readiness was read for (other
     /// causes may hold native off as well). [`acceptor_arm`] then counts the
-    /// pair in neither arm, and a joiner that sent its offer while demoted
-    /// counts none of its pairs.
+    /// pair in neither arm.
     pub demoted: bool,
 }
 
@@ -492,14 +495,17 @@ pub(crate) struct NativeConnectState {
     /// (`NodeConfig::native_connect_override`). `None` in production.
     release_override: Option<u8>,
     /// Driven by native setups this node made as joiner. Lowers its offer
-    /// and, through [`Self::readiness`], its decisions as acceptor too.
+    /// and, through [`Self::acceptor_readiness`], its decisions as acceptor
+    /// too.
     demotion: parking_lot::Mutex<NativeDemotion>,
     /// Driven only by native setups this node made as acceptor, across
     /// distinct joiners. Lowers only its decisions as acceptor
     /// ([`Self::acceptor_readiness`]): an acceptor whose own native path is
     /// broken (a gateway, a node at its target that rarely joins) would
     /// otherwise keep deciding `Native` for every joiner, and each of those
-    /// joiners would wait out the fallback and take a strike against it.
+    /// joiners would wait out the fallback (and take a strike against it,
+    /// unless the acceptor is one of its configured gateways, whose dials are
+    /// labelled `Gateway`).
     acceptor_demotion: parking_lot::Mutex<NativeDemotion>,
     /// Simulation only: this node never offers native as joiner, but decides
     /// as acceptor as usual (`NodeConfig::native_joiner_off`), standing in
@@ -1184,11 +1190,19 @@ mod tests {
             "one failure short: one joiner counted once"
         );
         on.record_success();
+        let counted =
+            || crate::transport::metrics::ACCEPTOR_DEMOTIONS_ON_THIS_THREAD.with(|c| c.get());
+        let before = counted();
         assert!(
             on.record_acceptor_failure(&key(100)),
             "a joiner success does not reset the acceptor streak, so this is the last"
         );
         assert_eq!(on.acceptor_demotions(), 1);
+        assert_eq!(
+            counted(),
+            before + 1,
+            "the demotion is counted for telemetry"
+        );
         assert_eq!(on.demotions(), 0, "the joiner streak saw nothing");
         let joiner = on.readiness();
         assert!(joiner.ready, "its own offer is untouched");
@@ -1232,7 +1246,8 @@ mod tests {
         assert_eq!(DEMOTION_COOLDOWN, Duration::from_secs(6 * 3600));
     }
 
-    /// A demoted node, in either role, counts its pairs in neither arm, so
+    /// An acceptor whose readiness is demoted (by either role's streak)
+    /// counts its pairs in neither arm, so
     /// the control arm does not collect the pairs where native failed; one
     /// at release percent 0 is control as before.
     #[test]

@@ -288,8 +288,8 @@ pub mod sim_trace {
         native_failed: AtomicU64,
         native_demotions: AtomicU64,
         /// Decisions on an offered request, as (acceptor, `seq` when it
-        /// decided, native).
-        decisions: parking_lot::Mutex<Vec<(SocketAddr, u64, bool)>>,
+        /// decided, native, in the slice).
+        decisions: parking_lot::Mutex<Vec<(SocketAddr, u64, bool, bool)>>,
         /// Acceptor-role demotions, as (node, `seq`).
         acceptor_demotions: parking_lot::Mutex<Vec<(SocketAddr, u64)>>,
         /// The longest acceptor failure streak each node reached.
@@ -382,13 +382,21 @@ pub mod sim_trace {
         /// A node turned its own native connects off.
         NativeDemoted,
         /// The node `own`, as acceptor, decided an offered request: `Native`
-        /// or not. Recorded where it decides, not when the answer goes out.
-        Decided { own: SocketAddr, native: bool },
+        /// or not, and whether the pair's bucket was below the offered
+        /// percent (so a ready acceptor at that percent would decide
+        /// `Native`). Recorded where it decides, not when the answer goes
+        /// out.
+        Decided {
+            own: SocketAddr,
+            native: bool,
+            in_slice: bool,
+        },
         /// The node `own` stopped deciding `Native` as acceptor after native
         /// failures with distinct joiners.
         AcceptorDemoted { own: SocketAddr },
-        /// The node `own` counted a native failure as acceptor; its streak is
-        /// now `len` distinct joiners (0 if this failure demoted it).
+        /// The node `own` had a native failure as acceptor; its streak is now
+        /// `len` distinct joiners (0 if this failure demoted it, or if it was
+        /// already demoted and so counted nothing).
         AcceptorStreak { own: SocketAddr, len: usize },
         /// The node `own` failed a native setup with `peer` in `tx`; the
         /// connect op must dial UDP to that peer next.
@@ -503,9 +511,13 @@ pub mod sim_trace {
                 }
                 return;
             }
-            NativeWireEvent::Decided { own, native } => {
+            NativeWireEvent::Decided {
+                own,
+                native,
+                in_slice,
+            } => {
                 let seq = c.seq.fetch_add(1, Ordering::Relaxed);
-                c.decisions.lock().push((own, seq, native));
+                c.decisions.lock().push((own, seq, native, in_slice));
                 return;
             }
             NativeWireEvent::AcceptorStreak { own, len } => {
@@ -725,12 +737,12 @@ pub mod sim_trace {
             Self::get(&self.0.native_demotions)
         }
         /// Acceptors' decisions on offered requests, as (acceptor, order,
-        /// native), in the order made.
-        pub fn decisions(&self) -> Vec<(SocketAddr, u64, bool)> {
+        /// native, in the slice), in the order made.
+        pub fn decisions(&self) -> Vec<(SocketAddr, u64, bool, bool)> {
             self.0.decisions.lock().clone()
         }
         /// Acceptor-role demotions, as (node, order), on the same order as
-        /// [`Self::native_decisions`].
+        /// [`Self::decisions`].
         pub fn acceptor_demotions(&self) -> Vec<(SocketAddr, u64)> {
             self.0.acceptor_demotions.lock().clone()
         }
