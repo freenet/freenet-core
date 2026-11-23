@@ -21380,6 +21380,13 @@ fn run_quic_shadow_sim_waiting(
         // A joiner learns its gateway's version only from this ack, and a peer of
         // unknown version is not offered.
         sim.enable_gateway_ack_version();
+        // These tests exercise the post-connect UDP-to-QUIC upgrade offers.
+        // Since A+ step 1 production decides some connects native, which
+        // never go through an upgrade offer, so which pairs meet in an offer
+        // would depend on the seed's native draws. Native at 0% keeps the
+        // native wire fields but decides none, isolating the upgrade path;
+        // native connects are covered by the `test_quic_native_*` sims.
+        sim.with_native_connect(0);
         let trace = sim.quic_upgrade_trace();
         let mut labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
         labels.sort_by_key(|label| (!label.is_gateway(), label.number()));
@@ -24402,16 +24409,25 @@ fn test_quic_native_mixed_network_joins() {
 
 /// Native connects on at 0% change no connection: every node may dial
 /// native but every offer is at 0, so no acceptor decides native, and the
-/// same seed forms the same mesh, edge for edge, as with native off.
+/// same seed forms the same mesh, edge for edge, as with native off. Since
+/// A+ step 1 production is no longer off (25%), so "off" is modelled as every
+/// peer being below the floor: no native variant is ever sent.
 #[test_log::test]
 fn test_quic_native_on_at_zero_percent_forms_the_same_mesh() {
     const SEED: u64 = 0x0059_40A5_0004;
-    let off = run_native_connect_sim("native-connect-zero-off", SEED, 40, |_| {});
+    let off = run_native_connect_sim("native-connect-zero-off", SEED, 40, |sim| {
+        sim.with_quic_native_floor(native_floor_above_binary());
+    });
     let zero = run_native_connect_sim("native-connect-zero-on", SEED, 40, |sim| {
         sim.with_native_connect(0);
     });
+    assert_eq!(
+        off.wire.trace.responses_native(),
+        0,
+        "premise: off sends no native variants"
+    );
     assert!(
-        off.wire.trace.responses_native() > 0,
+        zero.wire.trace.responses_native() > 0,
         "premise: decisions sent"
     );
     assert_eq!(zero.wire.trace.native_established(), 0);
