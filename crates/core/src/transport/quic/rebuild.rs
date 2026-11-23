@@ -24,9 +24,11 @@
 //!   dead endpoint, its upgrades and their tasks are dropped by the swap.
 //! - It owns the tasks serving the endpoint, the first one's included,
 //!   rather than the node's task monitor: after a quinn driver panic, a task
-//!   that still reaches quinn's poisoned lock panics as the endpoint dies
-//!   (#6184), and on this node that is the death to repair, not a failure
-//!   that ends the node. A task that ends while the endpoint stays up
+//!   that still reaches quinn's poisoned lock (the accept loop, polled on
+//!   another worker just before `Down` is reported) panics as the endpoint
+//!   dies (#6184), and on this node that is the death to repair, not a
+//!   failure that ends the node. (A node that exits for a death instead
+//!   takes the monitor's backstop, `liveness::driver_death_restart`.) A task that ends while the endpoint stays up
 //!   ([`TASK_END_DEATH_WAIT`]) still ends the node.
 //! - The backoff starts again from 1 s only after a rebuilt endpoint has
 //!   stayed up for [`REBUILD_STABLE`]. An endpoint that dies sooner keeps
@@ -78,14 +80,15 @@ pub(crate) const REBUILD_JITTER: f64 = 0.2;
 pub(crate) const REBUILD_STABLE: Duration = Duration::from_secs(600);
 
 /// How long [`run`] waits, after a task serving the endpoint ended, for the
-/// endpoint's death to be reported before it takes the end for a failure.
-/// After a panic in a quinn driver poisons quinn's lock, a task that still
-/// reaches it (the accept loop in the moment before the watcher reports
-/// `Down`, the attempt router answering an attempt queued before the death;
-/// see `liveness`) panics, and can do so just before the report, which
-/// follows the panic within one unwind (as `liveness::driver_death_restart`
-/// waits for it).
-pub(crate) const TASK_END_DEATH_WAIT: Duration = Duration::from_secs(1);
+/// endpoint's death to be reported before it takes the end for a failure:
+/// the wait a node that exits for a death takes for the same report
+/// (`liveness::driver_death_restart`). After a panic in a quinn driver
+/// poisons quinn's lock, a task that still reaches it (the accept loop
+/// polled on another worker in the moment before the watcher reports
+/// `Down`) panics, and can do so just before the report, which follows the
+/// panic within its unwind. The two never apply to one node: a node that
+/// exits for a death never rebuilds ([`enabled_at`]).
+pub(crate) const TASK_END_DEATH_WAIT: Duration = super::liveness::DRIVER_PANIC_REPORT_WAIT;
 
 /// Whether the node bound at `bind_addr` rebuilds its endpoint when it dies.
 /// Never one that exits for its supervisor to restart it (`supervised_exit`,

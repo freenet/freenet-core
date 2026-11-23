@@ -110,7 +110,11 @@
 //!   `a_send_in_flight_on_a_poisoned_connection_does_not_abort` and
 //!   `attempts_queued_before_a_driver_panic_are_dropped`. If such a panic
 //!   kills a monitored task on a node that exits for an endpoint death, the
-//!   node exits as for the death ([`driver_death_restart`]).
+//!   node exits as for the death ([`driver_death_restart`]). A node that
+//!   rebuilds its endpoint instead (`super::rebuild`, never one that exits
+//!   for a death) has those tasks owned by its rebuild loop, which takes
+//!   such an end for the death and rebuilds, waiting the same
+//!   [`DRIVER_PANIC_REPORT_WAIT`] for the report.
 //!
 //! With `transport-quic = "off"` no endpoint exists, and the transport
 //! reports [`QuicAvailability::Disabled`].
@@ -175,7 +179,7 @@ pub(crate) fn exit_for_endpoint_death() {
 /// How long [`driver_death_restart`] waits for a driver panic's report,
 /// which follows the panic within its unwind; a task on another worker can
 /// fail on the poisoned lock just before it.
-const DRIVER_PANIC_REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+pub(crate) const DRIVER_PANIC_REPORT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Whether a monitored task's failure is a quinn driver panic's consequence
 /// that should exit the node as the endpoint death (#6184): this process
