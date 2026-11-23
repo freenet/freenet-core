@@ -21368,7 +21368,8 @@ fn run_quic_shadow_sim_waiting(
         // These runs exercise the negotiation itself, so every node starts with
         // QUIC off and `set_up` turns it on where the test wants it. The harness
         // default is `prefer` at 100%.
-        sim.with_transport_quic("off").with_release_quic_data_share();
+        sim.with_transport_quic("off")
+            .with_release_quic_data_share();
         let trace = sim.quic_upgrade_trace();
         let mut labels: Vec<_> = sim.all_node_addresses().keys().cloned().collect();
         labels.sort_by_key(|label| (!label.is_gateway(), label.number()));
@@ -21672,7 +21673,8 @@ fn run_quic_data_ramp(
         let mut sim = SimNetwork::new(network, 1, 3, 7, 3, 10, 2, seed).await;
         sim.enable_gateway_ack_version();
         let trace = sim.quic_upgrade_trace();
-        sim.with_transport_quic("prefer").with_release_quic_data_share();
+        sim.with_transport_quic("prefer")
+            .with_release_quic_data_share();
         trace.ramp_data_started_before(started_before);
         run_as_first_negotiating_release(&trace);
         let nodes: Vec<_> = sim.all_node_addresses().values().copied().collect();
