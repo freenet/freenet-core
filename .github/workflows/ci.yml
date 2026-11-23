@@ -951,7 +951,12 @@ jobs:
     # the one heavy gate kept on every merge_group entry (release or not), so the
     # tiered model (#3973) doesn't apply here.
     runs-on: ubicloud-standard-16
-    timeout-minutes: 30
+    # 45, not 30: a stopgap (#6346). The rust-cache restore of the ~1.7 GiB
+    # entry measured 445-799 s at 2-4 MB/s on 2026-11-23, and the worst case
+    # is about restore plus ~14 min of tests plus build, which fits under 45.
+    # The real fix (shrink or speed up the cache, or drop it and the warm job
+    # deliberately) is tracked in #6346.
+    timeout-minutes: 45
     # Skip on push to main (PR already validated) and on release branches
     # themselves (the release version-bump PR is gated by its merge_group entry,
     # which runs the full suite). The release merge_group entry IS the
