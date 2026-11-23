@@ -23880,6 +23880,16 @@ fn test_quic_native_refused_decision_still_meets_the_acceptors_udp_fallback() {
         "refused-decision residual: refused={} acceptor_demotions={acceptor_demotions} acceptor_streak_peak={acceptor_streak_peak}",
         t.decisions_refused()
     );
+    // Measured on this seed with every joiner refusing every decision (the
+    // worst case; in the field it needs a demotion inside a response's
+    // flight): 37 refusals, 7 acceptor demotions. Re-measure and update
+    // deliberately if the strike rules change.
+    assert_eq!(
+        acceptor_demotions,
+        7,
+        "acceptor demotions caused by refused decisions changed ({} refusals)",
+        t.decisions_refused()
+    );
     assert_eq!(t.native_established(), 0, "premise: no native setup worked");
     assert!(
         run.nat_filtered
