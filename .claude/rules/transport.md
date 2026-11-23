@@ -525,6 +525,8 @@ dropped unanswered past the per-CONNECT cap on refused acceptors,
 `connect_native_setup_<label>` for how each native setup ended (one per
 `NativeSetupOutcome`), `connect_native_demotions` for each time the node
 turned its own native connects off,
+`connect_native_acceptor_demotions` for each time it stopped deciding native
+as acceptor,
 `connect_native_rescued_by_udp_{joiner,acceptor}` for each UDP dial that
 connected after a native setup that failed ON THE PATH (timed out,
 handshake failed, Hello lost: `counts_toward_demotion`; R5: a connection a
@@ -2371,8 +2373,9 @@ Readiness: NativeConnectState, one per node in the ConnectionManager. Ready
   when dialling is on (NATIVE_DIAL_READY, or the override), this node's own
   QUIC endpoint is up (its QuicAvailabilityWatch from TransportHandle, read
   per node: the process-wide quic_endpoint metric is shared by simulated
-  nodes) and the node is not demoted. The relay's decision and the joiner's
-  offer both read it.
+  nodes) and the node is not demoted. The joiner's offer reads
+  readiness() (joiner demotion only); the relay's decision reads
+  acceptor_readiness() (either role's demotion).
 Dial: NodeEvent::ConnectPeer and HandshakeCommand::Connect carry a
   DialTransport. A native dial registers no UDP expectation and runs
   OutboundConnector::connect_native -> QuicUpgrades::setup_native: the
@@ -2426,7 +2429,8 @@ Fallback: a failed native setup is followed by today's UDP dial to the same
   kept at one end and dropped at the other; that needs the native
   connection silent for about two keepalive intervals (HOLD_WINDOW >= 2 x
   KEEPALIVE_INTERVAL is a const assert in identity.rs), so about two lost
-  keepalives. Rare; a gate before native is enabled (design note 10.2 item
+  keepalives. Rare; measured in the first enable step by joining both ends'
+  setup outcomes (gate 22) before native goes wider (design note 10.2 item
   18). Native only wins once it has carried a frame from the peer (option
   (b), #6294): each native connection sends one probe when it starts
   (send_native_probe) and its listener reports its first decoded message once
@@ -2474,21 +2478,67 @@ Fallback: a failed native setup is followed by today's UDP dial to the same
   in-transit prune would remove the live peer's ring entry).
 Success: the connection's key is bound as IdentitySource::Proven; a
   gateway records a JoinTransport::Native join.
-Demotion: recorded in the connection lifecycle, where the outcome is known,
-  and only for a dial the node made as joiner (OutboundEstablished and
-  OutboundFailed carry the origin), successes and failures alike. A joiner's
-  acceptors come from responses routed back along its CONNECT, while an
-  acceptor's joiner chose it and could fail on purpose with free keys. This
-  narrows who can drive a demotion; it does not exclude everyone: the
-  acceptor in a response is named by whoever sent it, so a relay on the
-  CONNECT's path can name acceptors that decide Native and never serve. The
-  effect is a 6 h downgrade to UDP, not a failed join. An acceptor's own
-  native failures never demote it (before-enabling item). Only
-  timed_out, handshake_failed and hello_lost count
-  (NativeSetupOutcome::counts_toward_demotion): a refusal by the node's own
-  limits, or a Hello the peer answered, says nothing about the path. Three
-  such failures with distinct peers turn native off for 6 h
-  (connect_native_demotions); a success as joiner resets the streak.
+Demotion: one principle for both roles: a STRIKE needs evidence that native
+  specifically failed where UDP worked, a RESCUE. A native setup that failed
+  on the path (timed_out, handshake_failed, hello_lost:
+  NativeSetupOutcome::counts_toward_demotion; a refusal by the node's own
+  limits or a Hello the peer answered says nothing about the path) and then
+  UDP to the same peer connected. Recorded by
+  connect::record_native_rescue_strike, called where that shows: the joiner's
+  UDP fallback ending connected (op_ctx_task), the acceptor's UDP fallback
+  ending connected (connect.rs), and the connection lifecycle when the setup
+  fails while a UDP connection to that peer already exists (a fallback
+  connected first). A native failure where UDP fails too is no strike: an
+  endpoint-dependent (symmetric) peer, a pair whose NATs do not fit, a peer
+  that never dialled (it could not honour the decision, the response was
+  lost, it planned UDP past the window), a peer gone. Field data (0.2.162,
+  independent-mapping nodes) put a healthy acceptor's raw failure share near
+  71% of the dials it takes and a healthy joiner's near 24%, mostly the
+  peer's doing; counting those demoted most healthy acceptors within hours
+  at 25% and made arm assignment depend on outcomes. Known residual: a joiner
+  whose plan for an acceptor was UDP at the fallback time (UdpAt, the
+  response arrived late in the window) never dials native but does dial UDP,
+  so that acceptor sees an unearned rescue; bounded by response travel time.
+  Likewise a joiner whose own native setup was refused locally (TooLate,
+  OverBudget*, SetupsFull, AlreadyWaiting, AllowSetFull, KeyConflict,
+  UnusableKey) falls back to UDP: no joiner strike (not a path failure), but
+  the acceptor's setup timed out and its UDP fallback connects, an unearned
+  acceptor rescue. A rescue with one of the node's configured gateways
+  strikes nothing (record_native_rescue_strike checks; callers pass the
+  CONNECT role).
+  Two streaks, one per role, that never feed each other; three strikes with
+  distinct peers (DEMOTION_FAILURES, ACCEPTOR_DEMOTION_FAILURES) inside
+  STRIKE_WINDOW (6 h, = DEMOTION_COOLDOWN: strikes older than that age out)
+  demote the role for 6 h; each streak is reset only by a native success in
+  its own role.
+  Joiner: the offer goes to percent 0 (connect_native_demotions), which also
+  stops the node deciding Native as acceptor. A joiner's acceptors come from
+  responses routed back along its CONNECT; that narrows who can drive it,
+  not to no one: the acceptor in a response is named by whoever sent it, so
+  a relay on the CONNECT's path can name acceptors that decide Native and
+  never serve, and whose UDP then works.
+  Acceptor (10.2 item 2): the node stops DECIDING Native
+  (NativeConnectState::acceptor_readiness, read by RelayEnv::native_readiness;
+  connect_native_acceptor_demotions); its own offer as joiner is untouched.
+  Without it an acceptor whose own native path is broken (a gateway, a node
+  at its target that rarely joins) kept deciding Native for every joiner,
+  each of which waited out the fallback. Such an acceptor collects a rescue
+  on every pair UDP connects. Joiners chose it, so joiners holding three
+  keys whose native fails and UDP works can turn an honest acceptor's
+  decisions off. A joiner cannot tell an acceptor-side failure from its own
+  (same outcomes, no health bit on the wire), so it still takes a strike
+  when UDP then works (none against a configured gateway: dial_origin
+  labels those dials Gateway); the acceptor's demotion bounds that at about
+  three joiners per broken acceptor per cooldown, plus those it decided
+  Native for while the outcomes arrived. A node whose acceptor readiness is
+  demoted (either role's streak) counts none of its decisions in a connect
+  arm (acceptor_arm returns None), so the acceptor-side arms, the ones read
+  for rates, do not collect the pairs where native fails. Limits: an
+  acceptor still counts a demoted joiner's request as control (that offer
+  reads percent 0 with no reason on the wire), and the joiner-side arm
+  counts (joiner_in_control, not read for rates) still include pairs whose
+  acceptor is demoted and every UDP-answered pair of a demoted joiner.
+  Either streak's effect is a 6 h downgrade to UDP, never a failed join.
 Existing transport: a native dial does not drop a connection the node
   already has to that peer; the joiner may have connected another way since
   the acceptor decided.

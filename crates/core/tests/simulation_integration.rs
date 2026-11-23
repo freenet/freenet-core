@@ -23595,6 +23595,99 @@ fn test_quic_native_failed_setups_fall_back_to_udp() {
     assert!(connected);
 }
 
+/// 10.2 item 2: one node whose native path is broken (every QUIC datagram to
+/// and from it dropped, UDP working) collects a strike on every native setup
+/// UDP then rescues, and demotes its ACCEPTOR role after three with distinct
+/// joiners. The node offers nothing native as joiner
+/// (`with_node_native_joiner_off`), standing in for the node this streak is
+/// for: one that rarely joins (a gateway, a peer at its target). A node that
+/// joins natively demotes its joiner role on its own rescues first, which
+/// would hide the acceptor streak. Every other pair keeps native.
+///
+/// This pins the path from a rescue to the acceptor demotion end to end. That
+/// a demoted acceptor then decides `Udp` is pinned by
+/// `a_demoted_acceptor_decides_udp_through_the_relay_env` (connect driver
+/// tests): in a 10-node run the mesh has settled by the time a rescue-driven
+/// demotion lands (it waits for the UDP fallback), so no request reaches the
+/// node afterwards to decide. Fails closed: the broken node must have decided
+/// native at least 3 times before it demoted, and other pairs must still form
+/// native connections.
+#[test_log::test]
+fn test_quic_native_broken_acceptor_demotes_on_rescues() {
+    use freenet::dev_tool::NodeLabel;
+    const SEED: u64 = 0x0059_40A5_00F1;
+    const THRESHOLD: usize = 3;
+    let name = "native-broken-acceptor";
+    // The third node by label (the first regular node after the two
+    // gateways): on this seed it is the busiest acceptor of a healthy run,
+    // so with its path broken it meets enough distinct joiners to demote.
+    let broken_index = 2;
+    let mut broken = None;
+    let run = run_native_connect_sim(name, SEED, 200, |sim| {
+        sim.with_native_connect(100);
+        let mut labels: Vec<(NodeLabel, std::net::SocketAddr)> = sim
+            .all_node_addresses()
+            .iter()
+            .map(|(l, a)| (l.clone(), *a))
+            .collect();
+        labels.sort();
+        let (label, addr) = labels[broken_index].clone();
+        assert!(!label.is_gateway(), "premise: a regular node");
+        broken = Some(addr);
+        sim.with_node_native_joiner_off(&label);
+        for (other, _) in &labels {
+            if *other != label {
+                sim.drop_quic_datagrams_between(&label, other, Duration::ZERO);
+            }
+        }
+    });
+    log_native_connect(name, &run);
+    let broken = broken.expect("premise: the broken node was chosen");
+    let t = &run.wire.trace;
+    let decisions = t.decisions();
+    let demoted_at = t
+        .acceptor_demotions()
+        .iter()
+        .filter(|(own, _)| *own == broken)
+        .map(|(_, seq)| *seq)
+        .min();
+    let before = decisions
+        .iter()
+        .filter(|(own, seq, native, _)| {
+            *own == broken && *native && demoted_at.is_none_or(|at| *seq < at)
+        })
+        .count();
+    // (order, native, in the slice) for each decision after the demotion.
+    let after: Vec<(u64, bool, bool)> = decisions
+        .iter()
+        .filter(|(own, seq, _, _)| *own == broken && demoted_at.is_some_and(|at| *seq > at))
+        .map(|(_, seq, native, in_slice)| (*seq, *native, *in_slice))
+        .collect();
+    tracing::info!(%broken, before, ?after, ?demoted_at, "broken acceptor run");
+    assert!(
+        before >= THRESHOLD,
+        "premise: the broken node decided native at least {THRESHOLD} times before demoting ({before})"
+    );
+    assert!(
+        demoted_at.is_some(),
+        "the broken node demoted its acceptor role"
+    );
+    // Not decisive here (in this run no request reaches the node after its
+    // demotion, so `after` is usually empty); kept as a guard should one do
+    // so. The decisive check is the RelayEnv test named in the doc comment.
+    assert!(
+        after.iter().all(|(_, native, _)| !native),
+        "the broken node decided native after its acceptor role demoted: {after:?}"
+    );
+    assert!(
+        t.native_established() > 0,
+        "premise: pairs without the broken node still connect natively"
+    );
+    let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
+    assert_eq!(peers.len(), run.wire.nodes, "every node joined");
+    assert!(connected);
+}
+
 /// Behind each NAT filtering class, native connections form between peers
 /// (the setup's punches open both NATs), carry messages, and every node
 /// joins. Fails closed: native connections must have formed, and the
@@ -24058,6 +24151,64 @@ fn test_quic_native_symmetric_nat_pairs_fail_and_nodes_still_join() {
         }
     });
     log_native_connect(name, &run);
+    // 10.2 item 2: no port-restricted node (nor a gateway) demotes its
+    // acceptor role, though half the regular nodes are symmetric and every
+    // native setup with one fails. UDP fails on those pairs too, so they are
+    // no rescue and no strike. Counting every path failure (the rule before
+    // rescue-only strikes) demoted port-restricted nodes here.
+    let healthy_demoted: Vec<_> = run
+        .wire
+        .trace
+        .acceptor_demotions()
+        .into_iter()
+        .filter(|(own, _)| !symmetric_ips.contains(&own.ip()))
+        .collect();
+    assert_eq!(
+        healthy_demoted,
+        Vec::<(SocketAddr, u64)>::new(),
+        "port-restricted acceptors demoted by joiners whose native setups fail"
+    );
+    // The same for the joiner role: native setups with symmetric peers fail,
+    // and UDP to them fails too, so no joiner takes a strike either.
+    assert!(
+        run.wire.trace.native_failed() > 0,
+        "premise: native setups failed"
+    );
+    assert_eq!(
+        run.wire.trace.native_demotions(),
+        0,
+        "joiners demoted by native failures UDP did not rescue"
+    );
+    // Premise: some port-restricted node failed native setups with three
+    // distinct symmetric peers, enough to demote it if those counted.
+    let gateway_ips_early: std::collections::BTreeSet<_> =
+        run.gateways.iter().map(|a| a.ip()).collect();
+    let mut symmetric_partners: std::collections::BTreeMap<
+        std::net::IpAddr,
+        std::collections::BTreeSet<std::net::IpAddr>,
+    > = Default::default();
+    for (a, b) in run.wire.trace.native_failed_pairs() {
+        for (own, other) in [(a, b), (b, a)] {
+            if !symmetric_ips.contains(&own.ip())
+                && !gateway_ips_early.contains(&own.ip())
+                && symmetric_ips.contains(&other.ip())
+            {
+                symmetric_partners
+                    .entry(own.ip())
+                    .or_default()
+                    .insert(other.ip());
+            }
+        }
+    }
+    let most = symmetric_partners
+        .values()
+        .map(|s| s.len())
+        .max()
+        .unwrap_or(0);
+    assert!(
+        most >= 3,
+        "premise: a port-restricted node failed native setups with 3 symmetric peers ({most})"
+    );
     // Counted from this run's own wire trace, for both sides: the
     // process-wide transport counters are shared with every other sim in a
     // plain `cargo test` process, so they cannot be compared with one run.

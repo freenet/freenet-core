@@ -781,7 +781,8 @@ impl ConnectionManager {
         let native_connect = crate::operations::connect::native::NativeConnectState::new(
             config.native_connect_override,
         )
-        .with_gateway_join_override(config.native_gateway_join_override);
+        .with_gateway_join_override(config.native_gateway_join_override)
+        .with_joiner_off(config.native_joiner_off);
         native_connect.set_native_gateways(
             config
                 .gateways
