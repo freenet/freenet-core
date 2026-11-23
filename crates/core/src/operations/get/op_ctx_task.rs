@@ -536,6 +536,7 @@ async fn drive_client_get_inner(
                         state.size() + contract.as_ref().map(|c| c.data().len()).unwrap_or(0);
                     let state_stored = cache_contract_locally(
                         op_manager,
+                        &instance_id,
                         *key,
                         state.clone(),
                         contract.clone(),
@@ -1938,6 +1939,7 @@ fn stored_state_and_code_match(
 // hosting-* AFTER 0.2.94. See .claude/rules/hosting-invariants.md + epic #4642.
 async fn cache_contract_locally(
     op_manager: &OpManager,
+    requested: &ContractInstanceId,
     key: ContractKey,
     state: WrappedState,
     contract: Option<ContractContainer>,
@@ -1955,6 +1957,16 @@ async fn cache_contract_locally(
         // Experiment suppressed the relay-path store, so no state was cached
         // here — report not-present so a caller gating registration on the
         // return value does not register a downstream against uncached state.
+        return false;
+    }
+    // A reply for some other contract is not this GET's answer: nothing about it
+    // may reach the hosting cache.
+    if key.id() != requested {
+        tracing::warn!(
+            requested = %requested,
+            replied = %key,
+            "get: reply is for a different contract; not hosting it"
+        );
         return false;
     }
     let state_size = state.size() as u64;
@@ -2033,8 +2045,7 @@ async fn cache_contract_locally(
         }
     } else {
         // No contract code + state differs — we can't cache (issue #2306).
-        // Still refresh hosting side effects below so re-GET TTL bookkeeping
-        // isn't gated on the write path.
+        // Nothing is held, so the hosting side effects below are skipped too.
         tracing::debug!(
             %key,
             "get: skipping local cache — contract code missing"
@@ -2042,10 +2053,14 @@ async fn cache_contract_locally(
         false
     };
 
-    // (3) Hosting side effects ALWAYS run (state_matches, put_persisted,
-    // or put failed). This mirrors the legacy invariant that a
-    // successful wire-level GET must refresh the hosting LRU/TTL
-    // regardless of what the local executor did with the state.
+    // (3) Hosting side effects run only for state this node actually holds
+    // (it already matched, or the executor accepted it). A reply the executor
+    // rejected, or one we cannot store for lack of contract code, is not a
+    // genuine read of a held contract and must not enter the hosting cache,
+    // where it would compete with (and evict) contracts that are hosted.
+    if !(state_matches || put_persisted) {
+        return false;
+    }
     let access_result = op_manager.ring.record_get_access(key, state_size, cause);
     // Sticky flag gating subscription renewal; only the client-originating
     // node sets it. Relays that pass through a Found MUST NOT taint their
@@ -2390,6 +2405,7 @@ async fn assemble_and_cache_stream(
     let is_client_requester = matches!(cause, crate::ring::HostingCause::ClientGet);
     let state_stored = cache_contract_locally(
         op_manager,
+        expected_key.id(),
         payload.key,
         state,
         contract,
@@ -3009,6 +3025,7 @@ async fn drive_sub_op_get(
                 } => {
                     cache_contract_locally(
                         op_manager,
+                        &instance_id,
                         *key,
                         state.clone(),
                         contract.clone(),
@@ -4369,7 +4386,16 @@ where
             hop_count,
         )
         .await;
-        cache_contract_locally(op_manager, key, state, contract, false, hosting_cause).await;
+        cache_contract_locally(
+            op_manager,
+            &instance_id,
+            key,
+            state,
+            contract,
+            false,
+            hosting_cause,
+        )
+        .await;
         send_result?;
         return Ok(());
     }
@@ -4491,8 +4517,16 @@ where
                         hop_count,
                     )
                     .await;
-                    cache_contract_locally(op_manager, key, state, contract, false, hosting_cause)
-                        .await;
+                    cache_contract_locally(
+                        op_manager,
+                        &instance_id,
+                        key,
+                        state,
+                        contract,
+                        false,
+                        hosting_cause,
+                    )
+                    .await;
                     send_result?;
                     return Ok(());
                 }
@@ -4908,9 +4942,16 @@ where
                 // state held locally (`forms_host`), so first-time hosting at
                 // a relay is still broadcast (matches legacy `get.rs:2370`,
                 // which announces on any first-time relay cache).
-                let state_present =
-                    cache_contract_locally(op_manager, key, state, contract, false, hosting_cause)
-                        .await;
+                let state_present = cache_contract_locally(
+                    op_manager,
+                    &instance_id,
+                    key,
+                    state,
+                    contract,
+                    false,
+                    hosting_cause,
+                )
+                .await;
                 // Existence proof (#5657) requires state this node stored; it
                 // settles earlier NotFounds as failures.
                 if state_present
@@ -5049,6 +5090,7 @@ where
                                     };
                                     let stored = cache_contract_locally(
                                         op_manager,
+                                        &instance_id,
                                         payload.key,
                                         state,
                                         contract,
@@ -5196,6 +5238,7 @@ where
                                 };
                                 let stored = cache_contract_locally(
                                     op_manager,
+                                    &instance_id,
                                     payload.key,
                                     state,
                                     contract,
@@ -13629,5 +13672,92 @@ mod outbound_budget_relay_tests {
         assert_eq!(budget.node_total(), 0, "released with the last reference");
         assert_eq!(budget.charged_to(upstream(1, 9)), 0);
         assert_eq!(budget.shared_entries(), 0);
+    }
+}
+
+/// A GET reply reaches the hosting cache only if this node ends up holding its
+/// state and it is the contract that was asked for.
+#[cfg(test)]
+mod reply_hosting_gate_tests {
+    use super::*;
+    use crate::operations::route_attempt::driver_test_support::{
+        op_manager_with_peers_and_store, reject_stores,
+    };
+    use crate::operations::test_utils::make_contract_key;
+
+    fn code() -> Option<ContractContainer> {
+        Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
+            WrappedContract::new(
+                std::sync::Arc::new(ContractCode::from(vec![1u8, 2, 3])),
+                Parameters::from(vec![]),
+            ),
+        )))
+    }
+
+    /// Host an incumbent contract, then deliver a reply for `reply_seed` while
+    /// answering a GET for `requested_seed`. Returns (stored, reply hosted,
+    /// incumbent hosted, hosted count).
+    async fn deliver(
+        label: &str,
+        reject: bool,
+        requested_seed: u8,
+        reply_seed: u8,
+    ) -> (bool, bool, bool, usize) {
+        let (op_manager, _rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store(label, 1).await;
+        let incumbent = make_contract_key(90);
+        op_manager.ring.host_contract(
+            incumbent,
+            8,
+            crate::ring::AccessType::Get,
+            crate::ring::HostingCause::Other,
+        );
+        assert_eq!(op_manager.ring.hosting_contracts_count(), 1);
+        if reject {
+            reject_stores(label);
+        }
+        let requested = *make_contract_key(requested_seed).id();
+        let reply_key = make_contract_key(reply_seed);
+        let stored = cache_contract_locally(
+            &op_manager,
+            &requested,
+            reply_key,
+            WrappedState::new(vec![9; 16]),
+            code(),
+            false,
+            crate::ring::HostingCause::Other,
+        )
+        .await;
+        (
+            stored,
+            op_manager.ring.is_hosting_contract(&reply_key),
+            op_manager.ring.is_hosting_contract(&incumbent),
+            op_manager.ring.hosting_contracts_count(),
+        )
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_accepted_reply_is_hosted() {
+        let (stored, hosted, incumbent, count) = deliver("gate-accept", false, 11, 11).await;
+        assert!(stored && hosted && incumbent);
+        assert_eq!(count, 2);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_reply_the_executor_rejects_is_not_hosted() {
+        let (stored, hosted, incumbent, count) = deliver("gate-reject", true, 12, 12).await;
+        assert!(!stored);
+        assert!(!hosted, "a rejected reply must not enter the hosting cache");
+        assert!(incumbent, "the hosted contract is untouched");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_reply_for_a_different_contract_is_not_hosted() {
+        let (stored, hosted, incumbent, count) = deliver("gate-mismatch", false, 13, 14).await;
+        assert!(!stored);
+        assert!(!hosted, "a reply for another contract must not be hosted");
+        assert!(incumbent);
+        assert_eq!(count, 1);
     }
 }
