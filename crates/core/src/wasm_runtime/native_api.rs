@@ -1434,6 +1434,21 @@ impl DelegateCallEnv {
         error_codes::ERR_STORAGE_FAILED
     }
 
+    /// Record a failed secret-key enumeration (an I/O error reading the key
+    /// registry) as a read failure of this call (#5857) and return the host
+    /// error code for the guest.
+    fn record_secret_enumeration_failure(&self, e: &std::io::Error) -> i32 {
+        tracing::error!(
+            delegate = %self.delegate_key,
+            error = %e,
+            "secret enumeration I/O failure (not an empty set); poisoning this delegate call"
+        );
+        self.secret_read_failure
+            .borrow_mut()
+            .get_or_insert_with(|| format!("key registry read failed: {e}"));
+        error_codes::ERR_STORAGE_FAILED
+    }
+
     /// The first non-absence secret read failure of this call, if any.
     pub(super) fn secret_read_failure(&self) -> Option<String> {
         self.secret_read_failure.borrow().clone()
@@ -2581,13 +2596,15 @@ pub(super) mod delegate_secrets {
         {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
-                tracing::debug!(
+                // `SecretsStore::remove_secret` is Ok for an absent blob, so
+                // any error here is a real storage failure, not absence.
+                tracing::error!(
                     delegate = %env.delegate_key,
                     secret_id = ?secret_id,
                     error = %e,
-                    "remove_secret: secret not found or storage error"
+                    "delegate remove_secret failed"
                 );
-                error_codes::ERR_SECRET_NOT_FOUND
+                error_codes::ERR_STORAGE_FAILED
             }
         }
     }
@@ -2636,9 +2653,16 @@ pub(super) mod delegate_secrets {
             unsafe { std::slice::from_raw_parts(prefix_src, prefix_len as usize) }.to_vec()
         };
 
-        let keys =
-            env.secret_store()
-                .list_secret_keys(&env.delegate_key, env.secret_scope(), &prefix);
+        let keys = match env.secret_store().list_secret_keys(
+            &env.delegate_key,
+            env.secret_scope(),
+            &prefix,
+        ) {
+            Ok(keys) => keys,
+            // An unreadable registry is not "no secrets" (#5857): fail the
+            // call like any other failed secret read.
+            Err(e) => return Err(env.record_secret_enumeration_failure(&e)),
+        };
         Ok(encode_secret_key_list(keys.iter().map(|k| k.as_slice())))
     }
 
@@ -3514,6 +3538,35 @@ mod secret_read_memo_tests {
             b"v2".to_vec(),
             "invalidation must drop the memo, or a write followed by a read \
              inside one process() call would serve the pre-write plaintext"
+        );
+    }
+
+    /// #5857: a failed enumeration poisons the call like a failed read, and a
+    /// poisoned call cannot create a delegate (a created delegate is durable
+    /// while the call is about to fail and be retried). Fails if the
+    /// `create_delegate_sync` gate or the enumeration poisoning is deleted.
+    #[tokio::test]
+    async fn failed_enumeration_poisons_the_call_and_blocks_create_delegate() {
+        let mut f = fixture().await;
+        // SAFETY: `env` is dropped at the end of this test, before `f`.
+        let env = unsafe { env_of(&mut f) };
+        assert!(env.secret_read_failure().is_none());
+
+        let io = std::io::Error::from_raw_os_error(5);
+        assert_eq!(
+            env.record_secret_enumeration_failure(&io),
+            error_codes::ERR_STORAGE_FAILED
+        );
+        assert!(
+            env.secret_read_failure()
+                .is_some_and(|m| m.contains("key registry read failed")),
+            "an enumeration I/O failure must poison the call"
+        );
+
+        let res = env.create_delegate_sync(&[0u8; 8], &[], [0u8; 32], [0u8; 24]);
+        assert!(
+            matches!(&res, Err(DelegateCreateError::StoreFailed(m)) if m.contains("earlier secret read failed")),
+            "create_delegate must be refused after a failed read, got {res:?}"
         );
     }
 

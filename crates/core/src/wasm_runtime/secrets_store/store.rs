@@ -1535,14 +1535,24 @@ impl SecretsStore {
         delegate: &DelegateKey,
         scope: SecretScope<'_>,
         prefix: &[u8],
-    ) -> Vec<Vec<u8>> {
-        // Enumeration is best-effort: an unreadable registry (transient IO
-        // error, malformed header, or decrypt failure) yields an empty list
-        // for this call rather than an error, since the value read/write paths
-        // are independent of the registry. `read_key_registry` already logged
-        // the cause loudly and, critically, did NOT overwrite the on-disk blob
-        // — so a later call can still recover the full set once it is readable.
-        let mut keys = self.read_key_registry(delegate, &scope).unwrap_or_default();
+    ) -> std::io::Result<Vec<Vec<u8>>> {
+        // A registry that is present but corrupt (malformed header or AEAD
+        // failure, reported as `InvalidData`) enumerates as empty: that is
+        // deterministic, retrying cannot help, and the value read/write paths
+        // are independent of the registry (policy for corrupt blobs: #6323).
+        // `read_key_registry` already logged the cause loudly and did NOT
+        // overwrite the on-disk blob.
+        //
+        // Any OTHER failure is an I/O error (EIO, EACCES, EMFILE, ...). That
+        // must not read as "this delegate has no secrets": a delegate that
+        // rediscovers its rooms through this call would conclude it holds
+        // none and could seal a migration as empty (#5857). It is returned
+        // so the host function can fail the call.
+        let mut keys = match self.read_key_registry(delegate, &scope) {
+            Ok(keys) => keys,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Vec::new(),
+            Err(e) => return Err(e),
+        };
         // Defense-in-depth (#4117 L2): never surface the reserved
         // `\0freenet-migrate/` coordination namespace to a delegate. These are
         // node/app copy-forward markers, not user keys — a consumer must never
@@ -1551,7 +1561,7 @@ impl SecretsStore {
         if !prefix.is_empty() {
             keys.retain(|k| k.starts_with(prefix));
         }
-        keys
+        Ok(keys)
     }
 
     /// Enumerate the snapshot history for a given `(delegate, secret_id)`
@@ -3877,11 +3887,13 @@ mod test {
         assert!(
             store
                 .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+                .expect("enumerate keys")
                 .is_empty()
         );
         assert!(
             store
                 .list_secret_keys(delegate.key(), SecretScope::Local, b"room:")
+                .expect("enumerate keys")
                 .is_empty()
         );
         Ok(())
@@ -3913,14 +3925,18 @@ mod test {
         }
 
         // All keys returned, as RAW bytes, deduped, order-independent.
-        let mut all = store.list_secret_keys(delegate.key(), SecretScope::Local, b"");
+        let mut all = store
+            .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+            .expect("enumerate keys");
         all.sort();
         let mut expected = keys.clone();
         expected.sort();
         assert_eq!(all, expected);
 
         // Prefix filter selects only the room:* family.
-        let mut rooms = store.list_secret_keys(delegate.key(), SecretScope::Local, b"room:");
+        let mut rooms = store
+            .list_secret_keys(delegate.key(), SecretScope::Local, b"room:")
+            .expect("enumerate keys");
         rooms.sort();
         assert_eq!(rooms, vec![b"room:alice".to_vec(), b"room:bob".to_vec()]);
 
@@ -3928,6 +3944,7 @@ mod test {
         assert!(
             store
                 .list_secret_keys(delegate.key(), SecretScope::Local, b"nope")
+                .expect("enumerate keys")
                 .is_empty()
         );
 
@@ -3941,6 +3958,7 @@ mod test {
         assert_eq!(
             store
                 .list_secret_keys(delegate.key(), SecretScope::Local, b"room:")
+                .expect("enumerate keys")
                 .len(),
             2
         );
@@ -3951,7 +3969,9 @@ mod test {
             &SecretsId::new(b"room:alice".to_vec()),
             SecretScope::Local,
         )?;
-        let rooms_after = store.list_secret_keys(delegate.key(), SecretScope::Local, b"room:");
+        let rooms_after = store
+            .list_secret_keys(delegate.key(), SecretScope::Local, b"room:")
+            .expect("enumerate keys");
         assert_eq!(rooms_after, vec![b"room:bob".to_vec()]);
         Ok(())
     }
@@ -3987,18 +4007,22 @@ mod test {
         )?;
 
         assert_eq!(
-            store.list_secret_keys(delegate.key(), SecretScope::Local, b""),
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+                .expect("enumerate keys"),
             vec![b"local-only".to_vec()]
         );
         assert_eq!(
-            store.list_secret_keys(
-                delegate.key(),
-                SecretScope::User {
-                    id: &alice,
-                    dek_secret: &alice_dek,
-                },
-                b"",
-            ),
+            store
+                .list_secret_keys(
+                    delegate.key(),
+                    SecretScope::User {
+                        id: &alice,
+                        dek_secret: &alice_dek,
+                    },
+                    b"",
+                )
+                .expect("enumerate keys"),
             vec![b"user-only".to_vec()]
         );
         Ok(())
@@ -4029,6 +4053,7 @@ mod test {
         assert_eq!(
             store
                 .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+                .expect("enumerate keys")
                 .len(),
             3
         );
@@ -4047,7 +4072,9 @@ mod test {
                 .is_ok(),
             "overflow secret value must still be stored and readable"
         );
-        let listed = store.list_secret_keys(delegate.key(), SecretScope::Local, b"");
+        let listed = store
+            .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+            .expect("enumerate keys");
         assert_eq!(listed.len(), 3, "registry stays bounded at cap");
         assert!(
             !listed.iter().any(|k| k.as_slice() == b"overflow"),
@@ -4079,7 +4106,9 @@ mod test {
         let db = create_test_db(temp_dir.path()).await;
         let store = SecretsStore::new(secrets_dir, Default::default(), db)?;
         assert_eq!(
-            store.list_secret_keys(delegate.key(), SecretScope::Local, b""),
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+                .expect("enumerate keys"),
             vec![b"room:carol".to_vec()]
         );
         Ok(())
@@ -4133,7 +4162,9 @@ mod test {
 
         // And the registry is still functional after the corrected write.
         assert_eq!(
-            store.list_secret_keys(delegate.key(), SecretScope::Local, b""),
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+                .expect("enumerate keys"),
             vec![b"room:dave".to_vec()]
         );
         Ok(())
@@ -4169,6 +4200,7 @@ mod test {
         assert_eq!(
             store
                 .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+                .expect("enumerate keys")
                 .len(),
             2,
             "precondition: two keys registered"
@@ -4226,6 +4258,71 @@ mod test {
             std::fs::read(&reg_path)?,
             bogus,
             "deregister must also leave the corrupt registry intact"
+        );
+        Ok(())
+    }
+
+    /// #5857: enumeration must not report a registry it could not READ as an
+    /// empty set. A delegate that rediscovers its rooms through
+    /// `list_secret_keys` would otherwise conclude it holds none. The failure
+    /// is injected with a directory at the registry path (`EISDIR`, the same
+    /// for root and non-root). A registry that reads but is corrupt keeps its
+    /// historical empty answer (#6323).
+    #[tokio::test]
+    async fn list_secret_keys_surfaces_io_failure_but_not_corruption()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let delegate = Delegate::from((&vec![14].into(), &vec![].into()));
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(b"room:alice".to_vec()),
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+        assert_eq!(
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"")?
+                .len(),
+            1,
+            "precondition: one key registered"
+        );
+
+        let reg_path = store.key_registry_path(delegate.key(), &SecretScope::Local);
+        let good = std::fs::read(&reg_path)?;
+
+        // Corrupt but readable: still enumerates as empty.
+        let mut bogus = vec![VERSION_V1];
+        bogus.extend_from_slice(&[0u8; 24]);
+        bogus.extend_from_slice(&[0xAB; 32]);
+        std::fs::write(&reg_path, &bogus)?;
+        assert!(
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"")?
+                .is_empty(),
+            "a corrupt registry keeps its historical empty answer (#6323)"
+        );
+
+        // Unreadable: an error, not an empty list.
+        std::fs::remove_file(&reg_path)?;
+        std::fs::create_dir(&reg_path)?;
+        let err = store
+            .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+            .expect_err("an unreadable registry must not enumerate as empty");
+        assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_ne!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // Recovers once readable again; nothing was lost.
+        std::fs::remove_dir(&reg_path)?;
+        std::fs::write(&reg_path, &good)?;
+        assert_eq!(
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"")?
+                .len(),
+            1
         );
         Ok(())
     }
@@ -4295,7 +4392,9 @@ mod test {
             // (carol's registration was aborted during the unreadable window,
             // which is the intended fail-safe — its VALUE is stored regardless,
             // and a later store under a readable registry would re-register it).
-            let listed = store.list_secret_keys(delegate.key(), SecretScope::Local, b"");
+            let listed = store
+                .list_secret_keys(delegate.key(), SecretScope::Local, b"")
+                .expect("enumerate keys");
             assert!(
                 listed.len() >= 2,
                 "original keys must survive a transient read error, got {listed:?}"
@@ -4334,14 +4433,16 @@ mod test {
         let db = create_test_db(temp_dir.path()).await;
         let store = SecretsStore::new(secrets_dir, Default::default(), db)?;
         assert_eq!(
-            store.list_secret_keys(
-                delegate.key(),
-                SecretScope::User {
-                    id: &alice,
-                    dek_secret: &alice_dek,
-                },
-                b"",
-            ),
+            store
+                .list_secret_keys(
+                    delegate.key(),
+                    SecretScope::User {
+                        id: &alice,
+                        dek_secret: &alice_dek,
+                    },
+                    b"",
+                )
+                .expect("enumerate keys"),
             vec![b"room:erin".to_vec()]
         );
         Ok(())
@@ -10184,6 +10285,7 @@ mod test {
         assert!(
             store
                 .list_secret_keys(succ.key(), SecretScope::Local, b"room:")
+                .expect("enumerate keys")
                 .is_empty()
         );
 
@@ -10197,7 +10299,9 @@ mod test {
         );
         assert_eq!(report.total_copied(), 2);
 
-        let mut keys = store.list_secret_keys(succ.key(), SecretScope::Local, b"room:");
+        let mut keys = store
+            .list_secret_keys(succ.key(), SecretScope::Local, b"room:")
+            .expect("enumerate keys");
         keys.sort();
         assert_eq!(
             keys,
@@ -10553,11 +10657,13 @@ mod test {
         // carry its own `pred-done:` marker for `pred` — expected bookkeeping —
         // so we assert the WIP key specifically is absent, not that the namespace
         // is empty.)
-        let reserved = store.list_secret_keys(
-            succ.key(),
-            SecretScope::Local,
-            MIGRATE_RESERVED_NAMESPACE_PREFIX,
-        );
+        let reserved = store
+            .list_secret_keys(
+                succ.key(),
+                SecretScope::Local,
+                MIGRATE_RESERVED_NAMESPACE_PREFIX,
+            )
+            .expect("enumerate keys");
         assert!(
             !reserved.contains(&wip_raw),
             "the WIP key must not be enumerable under the successor"

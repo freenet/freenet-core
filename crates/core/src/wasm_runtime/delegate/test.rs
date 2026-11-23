@@ -43,11 +43,24 @@ mod delegate2_messages {
         IncrementCounter,
         HasSecret(Vec<u8>),
         GetNonExistentSecret(Vec<u8>),
-        StoreSecret { key: Vec<u8>, value: Vec<u8> },
+        StoreSecret {
+            key: Vec<u8>,
+            value: Vec<u8>,
+        },
         RemoveSecret(Vec<u8>),
         WriteLargeContext(usize),
-        StoreLargeSecret { key: Vec<u8>, size: usize },
-        ReadWriteRead { key: Vec<u8>, value: Vec<u8> },
+        StoreLargeSecret {
+            key: Vec<u8>,
+            size: usize,
+        },
+        ReadWriteRead {
+            key: Vec<u8>,
+            value: Vec<u8>,
+        },
+        ReadThenRemove {
+            read_key: Vec<u8>,
+            remove_key: Vec<u8>,
+        },
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -2552,6 +2565,68 @@ async fn a_failed_secret_read_fails_the_call_and_blocks_writes_not_reads_as_abse
         "the call after a transient failure must work normally"
     );
 
+    Ok(())
+}
+
+/// #5857: a removal after a failed read in the same call is refused, so a
+/// delegate that took the failed read for absence cannot delete a different
+/// secret on that belief. Guest-driven: the guest reads an unreadable secret,
+/// then removes a healthy one. Fails if the `remove_secret` gate is deleted.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_secret_read_blocks_a_later_remove_in_the_same_call()
+-> Result<(), Box<dyn std::error::Error>> {
+    use delegate2_messages::InboundAppMessage;
+
+    let (delegate, mut runtime, temp_dir) = setup_runtime(TEST_DELEGATE_2).await?;
+    let send = |runtime: &mut Runtime, msg: &InboundAppMessage| {
+        let payload = bincode::serialize(msg).expect("serialize");
+        runtime.inbound_app_message(
+            delegate.key(),
+            &vec![].into(),
+            None,
+            None,
+            vec![InboundDelegateMsg::ApplicationMessage(
+                ApplicationMessage::new(payload),
+            )],
+        )
+    };
+    let blob_of = |key: &[u8]| {
+        temp_dir
+            .path()
+            .join("secrets")
+            .join(delegate.key().encode())
+            .join(freenet_stdlib::prelude::SecretsId::new(key.to_vec()).encode())
+    };
+
+    let unreadable = b"unreadable".to_vec();
+    let healthy = b"healthy".to_vec();
+    for key in [&unreadable, &healthy] {
+        send(
+            &mut runtime,
+            &InboundAppMessage::StoreSecret {
+                key: key.clone(),
+                value: b"real data".to_vec(),
+            },
+        )?;
+    }
+    let target = temp_dir.path().join("unreadable-target");
+    std::fs::create_dir(&target)?;
+    std::fs::remove_file(blob_of(&unreadable))?;
+    std::os::unix::fs::symlink(&target, blob_of(&unreadable))?;
+
+    let res = send(
+        &mut runtime,
+        &InboundAppMessage::ReadThenRemove {
+            read_key: unreadable,
+            remove_key: healthy.clone(),
+        },
+    );
+    assert!(res.is_err(), "the call with a failed read must fail");
+    assert!(
+        blob_of(&healthy).is_file(),
+        "a remove after a failed read must be refused, not delete the secret"
+    );
     Ok(())
 }
 

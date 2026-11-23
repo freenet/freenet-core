@@ -48,6 +48,9 @@ pub enum InboundAppMessage {
     /// `DelegateCallEnv` per inbound message, so two messages get two memos
     /// and cannot observe a stale one. It has to happen in a single call.
     ReadWriteRead { key: Vec<u8>, value: Vec<u8> },
+    /// Read `read_key`, then remove `remove_key`, in ONE `process()` call.
+    /// If the read fails the host must refuse the removal (#5857).
+    ReadThenRemove { read_key: Vec<u8>, remove_key: Vec<u8> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -233,6 +236,22 @@ impl DelegateInterface for Delegate {
                         let response_msg_content = OutboundAppMessage::SecretStored;
                         let payload = bincode::serialize(&response_msg_content)
                             .map_err(|err| DelegateError::Other(format!("{err}")))?;
+                        let response = ApplicationMessage::new(payload).processed(true);
+                        Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
+                    }
+
+                    InboundAppMessage::ReadThenRemove {
+                        read_key,
+                        remove_key,
+                    } => {
+                        let _first = ctx.get_secret(&read_key);
+                        let removed = ctx.remove_secret(&remove_key);
+                        let payload = bincode::serialize(&if removed {
+                            OutboundAppMessage::SecretRemoved
+                        } else {
+                            OutboundAppMessage::SecretStoreFailed
+                        })
+                        .map_err(|err| DelegateError::Other(format!("{err}")))?;
                         let response = ApplicationMessage::new(payload).processed(true);
                         Ok(vec![OutboundDelegateMsg::ApplicationMessage(response)])
                     }
