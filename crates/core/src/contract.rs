@@ -9233,8 +9233,8 @@ mod tests {
         assert!(
             src.contains("ConnectionScope::Local"),
             "the literal this pin forbids at the hop no longer appears anywhere \
-             in production. Either the variant was renamed — in which case this \
-             pin now forbids nothing — or the node-started paths stopped \
+             in production. Either the variant was renamed (in which case this \
+             pin now forbids nothing) or the node-started paths stopped \
              hardcoding it, in which case rewrite this pin deliberately."
         );
 
