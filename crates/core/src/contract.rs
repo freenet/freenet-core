@@ -2945,9 +2945,9 @@ where
                         continue;
                     }
                 };
-                // The core sets the sender of every delivered message itself,
-                // so receivers never depend on the runtime's drain for it. The
-                // same rule as for a reply (`split_hop_output`).
+                // The core sets the sender of every delivered message from the
+                // delegate it ran, so receivers never depend on anything else
+                // for it. The same rule as for a reply (`split_hop_output`).
                 let mut msg = msg;
                 msg.sender = delegate_key.clone();
                 let target_req = DelegateRequest::ApplicationMessages {
