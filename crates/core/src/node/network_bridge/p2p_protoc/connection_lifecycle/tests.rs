@@ -5101,6 +5101,234 @@ async fn a_held_native_connection_that_closes_leaves_the_udp_entry() {
     assert_eq!(PairState::of(&h, addr), pair, "the peer is still connected");
 }
 
+/// A native connection whose `recv` ends, with a chosen [`CloseReason`], when
+/// told to: what a real `NativePeerConnection` does when quinn ends its path
+/// (the idle timeout, the peer's close, a loss), which
+/// `transport::peer_connection::native_connection::tests` pins against a
+/// real QUIC connection. The node's real `peer_connection_listener` runs over
+/// it, so what these tests cover is the node's side of a dead native
+/// connection (gate 21).
+struct DyingNative {
+    inner: IdleConnection,
+    end: tokio::sync::oneshot::Receiver<crate::transport::CloseReason>,
+    reason: Option<crate::transport::CloseReason>,
+}
+
+impl DyingNative {
+    fn new(
+        addr: SocketAddr,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Sender<crate::transport::CloseReason>,
+    ) {
+        let (kill, end) = tokio::sync::oneshot::channel();
+        (
+            Self {
+                inner: IdleConnection::new(addr),
+                end,
+                reason: None,
+            },
+            kill,
+        )
+    }
+}
+
+impl PeerConnectionApi for DyingNative {
+    fn remote_addr(&self) -> SocketAddr {
+        self.inner.remote_addr()
+    }
+
+    fn remote_version(&self) -> Option<(u8, u8, u16)> {
+        None
+    }
+
+    fn close_reason(&self) -> Option<crate::transport::CloseReason> {
+        self.reason
+    }
+
+    fn send_bytes(
+        &mut self,
+        data: Vec<u8>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+        self.inner.send_bytes(data)
+    }
+
+    fn recv(
+        &mut self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, TransportError>> + Send + '_>> {
+        let addr = self.inner.addr;
+        Box::pin(async move {
+            // Cancel-safe: the receiver is polled in place, never consumed.
+            let reason = (&mut self.end).await;
+            self.reason = reason.ok();
+            Err(TransportError::ConnectionClosed(addr))
+        })
+    }
+
+    fn set_inbound_stream_registry(
+        &mut self,
+        registry: Arc<dyn crate::transport::InboundStreamRegistry>,
+    ) {
+        self.inner.set_inbound_stream_registry(registry);
+    }
+
+    fn set_peer_identity(&mut self, key: TransportPublicKey) {
+        self.inner.set_peer_identity(key);
+    }
+
+    fn send_stream_data(
+        &mut self,
+        stream_id: StreamId,
+        data: bytes::Bytes,
+        metadata: Option<bytes::Bytes>,
+        completion_tx: Option<tokio::sync::oneshot::Sender<crate::transport::StreamSendOutcome>>,
+        progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+        self.inner
+            .send_stream_data(stream_id, data, metadata, completion_tx, progress)
+    }
+
+    fn pipe_stream_data(
+        &mut self,
+        outbound_stream_id: StreamId,
+        inbound_handle: crate::transport::IncomingStream,
+        metadata: Option<bytes::Bytes>,
+        progress: Option<Arc<dyn crate::transport::StreamProgressObserver>>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + '_>> {
+        self.inner
+            .pipe_stream_data(outbound_stream_id, inbound_handle, metadata, progress)
+    }
+}
+
+/// Every way a native path can end, as `recv` reports it.
+fn native_end_reasons() -> Vec<crate::transport::CloseReason> {
+    use crate::transport::{CloseReason, QuicPathEnd};
+    vec![
+        CloseReason::IdleTimeout,
+        CloseReason::QuicPath(QuicPathEnd::ClosedByPeer),
+        CloseReason::QuicPath(QuicPathEnd::ClosedLocally),
+        CloseReason::QuicPath(QuicPathEnd::Lost),
+        CloseReason::QuicPath(QuicPathEnd::NotAcknowledging),
+        CloseReason::QuicPath(QuicPathEnd::Stalled),
+    ]
+}
+
+/// Delivers the next `TransportClosed` the connections' listeners report.
+async fn next_transport_closed(h: &mut Harness) -> ConnEvent {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match h._conn_events_rx.recv().await {
+                Some(event @ ConnEvent::TransportClosed { .. }) => return event,
+                Some(_) => continue,
+                None => panic!("the listeners' event channel closed"),
+            }
+        }
+    })
+    .await
+    .expect("the listener reported the dead native connection")
+}
+
+/// Gate 21: a native connection whose path ends, for any reason, leaves no
+/// entry at this end. The listener reports the end, the entry is removed, the
+/// peer is pruned from the ring and every map keyed by it is cleaned. Both
+/// ends of a native connection are built by one path (`OutboundEstablished`
+/// with a native transport, whichever end dialled), so this is each end.
+#[tokio::test]
+async fn a_native_connection_that_dies_leaves_no_entry() {
+    let mut h = Harness::new("native-dies").await;
+    for (i, reason) in native_end_reasons().into_iter().enumerate() {
+        let addr: SocketAddr = format!("203.0.113.236:{}", 6600 + i).parse().unwrap();
+        let peer = PeerKeyLocation::new(key(), addr);
+        let (conn, kill) = DyingNative::new(addr);
+        h.handshake_event(HandshakeEvent::OutboundEstablished {
+            transaction: Transaction::new::<ConnectMsg>(),
+            peer: peer.clone(),
+            connection: Box::new(conn),
+            transient: false,
+            transport: crate::operations::connect::native::DialTransport::native_now(),
+            origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
+        })
+        .await;
+        h.prove_native(addr);
+        let case = format!("{reason:?}");
+        assert!(h.mgr.connections[&addr].native, "{case}: premise");
+        assert_eq!(
+            h.ring_key_at(addr).as_ref(),
+            Some(peer.pub_key()),
+            "{case}: premise, in the ring"
+        );
+
+        kill.send(reason).expect("the connection is listening");
+        let closed = next_transport_closed(&mut h).await;
+        // The reason the handler passes to `prune_connection` is the event's.
+        let ConnEvent::TransportClosed {
+            reason: reported, ..
+        } = &closed
+        else {
+            panic!("{case}: not a close");
+        };
+        assert_eq!(
+            reported.to_string(),
+            disconnect_reason_for_close(Some(reason)).to_string(),
+            "{case}: the disconnect reason"
+        );
+        h.mgr
+            .handle_transport_event(Some(closed), &mut h.state, &h.handshake)
+            .await
+            .expect("handle_transport_event");
+
+        assert!(!h.mgr.connections.contains_key(&addr), "{case}: entry");
+        assert!(h.mgr.held_native.is_empty(), "{case}: nothing held");
+        assert!(
+            !h.mgr.addr_by_pub_key.contains_key(peer.pub_key()),
+            "{case}: key map"
+        );
+        assert_eq!(h.ring_key_at(addr), None, "{case}: pruned from the ring");
+        assert!(
+            !h.mgr
+                .bridge
+                .op_manager
+                .ring
+                .connection_manager
+                .has_connection_or_pending(addr),
+            "{case}: no connection or reservation"
+        );
+        h.assert_open_transports_match();
+    }
+}
+
+/// Gate 21: a native connection held beside the UDP entry whose path dies is
+/// forgotten, by its own listener's report, and the UDP entry stays.
+#[tokio::test]
+async fn a_held_native_connection_that_dies_is_forgotten() {
+    let mut h = Harness::new("native-held-dies").await;
+    let addr: SocketAddr = "203.0.113.236:6620".parse().unwrap();
+    let peer = PeerKeyLocation::new(key(), addr);
+    h.handshake_event(Arrival::OutboundUdp.event(&peer, false))
+        .await;
+    let udp_id = h.mgr.connections[&addr].connection_id;
+    let (conn, kill) = DyingNative::new(addr);
+    h.handshake_event(HandshakeEvent::OutboundEstablished {
+        transaction: Transaction::new::<ConnectMsg>(),
+        peer: peer.clone(),
+        connection: Box::new(conn),
+        transient: false,
+        transport: crate::operations::connect::native::DialTransport::native_now(),
+        origin: crate::transport::NatAttemptOrigin::ConnectJoiner,
+    })
+    .await;
+    assert!(h.mgr.held_native.contains_key(&addr), "premise: held");
+    kill.send(crate::transport::CloseReason::IdleTimeout)
+        .expect("the connection is listening");
+    let closed = next_transport_closed(&mut h).await;
+    h.mgr
+        .handle_transport_event(Some(closed), &mut h.state, &h.handshake)
+        .await
+        .expect("handle_transport_event");
+    assert!(h.mgr.held_native.is_empty(), "forgotten");
+    assert_eq!(h.mgr.connections[&addr].connection_id, udp_id);
+}
+
 /// A frame reported by a connection that is neither the entry nor the held
 /// one (a replaced connection's listener) changes nothing, and a held
 /// native connection is dropped once its UDP entry is removed, whatever the
@@ -5540,11 +5768,45 @@ async fn an_unpromoted_transient_dial_holds_its_slot_past_the_ttl() {
     assert!(cm.is_transient(addr));
 }
 
+/// How long `nodes` joiners behind one address need to all get into a ring
+/// whose gateway holds `budget` transient connections, on the production
+/// connect-failure backoff.
+///
+/// A round seats at most `budget` joiners, so at least `ceil(nodes / budget)`
+/// rounds are needed. Each joiner that is evicted before it is promoted
+/// records a failure against the gateway and waits the backoff for its next
+/// failure before it retries, so a round it loses costs it
+/// `delay_for_failures(k)` for its k-th failure. The bound allows one lost
+/// round for every round needed (`2 * rounds - 1`; the five waves seen in the
+/// slowest run were 0, 32, 56, 200 and 310 s, with victims evicted twice) and
+/// adds the 3 s the controlled-event client waits before it starts.
+///
+/// This is a bound read off the retry schedule and checked against the seeds
+/// below (slowest run 343 s of the 363 s this gives for 24 and 8), not a
+/// proof: nothing stops a joiner being evicted a third time.
+fn join_time_budget(nodes: usize, budget: usize) -> Duration {
+    use crate::ring::PeerConnectionBackoff;
+    use crate::util::backoff::ExponentialBackoff;
+    let schedule = ExponentialBackoff::new(
+        PeerConnectionBackoff::DEFAULT_BASE_INTERVAL,
+        PeerConnectionBackoff::DEFAULT_MAX_BACKOFF,
+    );
+    let rounds = nodes.div_ceil(budget);
+    let failures = u32::try_from(2 * rounds - 1).expect("a few rounds");
+    let waits: Duration = (1..=failures).map(|k| schedule.delay_for_failures(k)).sum();
+    Duration::from_secs(3) + waits
+}
+
 /// End to end, on the simulated network: every node outside a NAT listens on
 /// `::1`, so a gateway sees all its joiners come from one source. Runs
-/// `nodes` joiners against one gateway with transient budget `budget` and
+/// `nodes` joiners against one gateway with transient budget `budget` until
+/// all have a ring connection, or [`join_time_budget`] has passed, and
 /// returns the gateway's evictions and the nodes that ended with no ring
 /// connection.
+///
+/// The connect-failure backoff is pinned to the production default: CI sets
+/// `FREENET_BACKOFF_BASE_SECS=5`, and how long an evicted joiner waits is
+/// what decides when the last one gets in.
 fn join_behind_one_address(
     name: &'static str,
     seed: u64,
@@ -5552,6 +5814,7 @@ fn join_behind_one_address(
     budget: usize,
 ) -> (u64, Vec<crate::node::testing_impl::NodeLabel>) {
     use crate::node::testing_impl::{NodeLabel, SimNetwork};
+    use crate::ring::PeerConnectionBackoff;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -5559,11 +5822,15 @@ fn join_behind_one_address(
     let mut sim = rt.block_on(SimNetwork::new(name, 1, nodes, 7, 3, 10, 2, seed));
     sim.with_start_backoff(Duration::ZERO);
     sim.with_transient_budget(budget);
+    sim.with_connect_backoff_base(PeerConnectionBackoff::DEFAULT_BASE_INTERVAL);
+    let allowed = join_time_budget(nodes, budget);
+    // Ends the run as soon as every node has a ring connection.
+    sim.wait_for_join_convergence_before_ops(1.0, allowed);
     let result = sim.run_controlled_simulation(
         seed,
         Vec::new(),
-        Duration::from_secs(600),
-        Duration::from_secs(300),
+        allowed + Duration::from_secs(60),
+        Duration::ZERO,
     );
     assert!(
         result.turmoil_result.is_ok(),
@@ -5597,19 +5864,35 @@ fn join_behind_one_address(
 /// budget (8, below the per-source share): a joiner at the budget evicts the
 /// oldest unpromoted connection, and every joiner still joins the ring.
 ///
+/// One test per seed, because how late the last joiner is depends on the
+/// seed: with the connect backoff at its default the last joiner got in at
+/// 38 to 343 s across seeds, and a single seed that happened to finish early
+/// hid that for as long as nothing disturbed its random stream.
+///
 /// The share itself is not reached here: the gateway's start-up admission
 /// ramp (5 handshakes a second) keeps far fewer than 16 joiners unpromoted at
 /// once. `one_address_saturating_its_transient_share_leaves_others_admitted`
 /// covers it through the bridge's real handlers.
-#[test]
-fn joiners_behind_one_address_get_past_transient_eviction() {
-    let (evicted, unconnected) =
-        join_behind_one_address("transient-evict-one-address", 0x7A45_0002, 24, 8);
-    assert!(
-        evicted > 0,
-        "the budget was never reached; the test would be vacuous"
-    );
-    assert!(unconnected.is_empty(), "never joined: {unconnected:?}");
+macro_rules! joiners_behind_one_address_test {
+    ($($test:ident: $seed:expr),+ $(,)?) => {$(
+        #[test]
+        fn $test() {
+            let (evicted, unconnected) =
+                join_behind_one_address("transient-evict-one-address", $seed, 24, 8);
+            assert!(
+                evicted > 0,
+                "the budget was never reached; the test would be vacuous"
+            );
+            assert!(unconnected.is_empty(), "never joined: {unconnected:?}");
+        }
+    )+};
+}
+
+joiners_behind_one_address_test! {
+    joiners_behind_one_address_get_past_transient_eviction: 0x7A45_0002,
+    joiners_behind_one_address_get_past_transient_eviction_seed_1: 1,
+    joiners_behind_one_address_get_past_transient_eviction_seed_2: 2,
+    joiners_behind_one_address_get_past_transient_eviction_seed_3: 3,
 }
 
 /// A non-gateway node (so a transient dial stays out of the ring) with
@@ -5700,13 +5983,14 @@ async fn eviction_takes_from_the_source_holding_the_most_slots() {
     }
 }
 
-/// (a) Eviction never takes a native leg. With a UDP entry that has a native
-/// connection held beside it, an unpromoted QUIC-native entry, and one plain
-/// unpromoted UDP entry holding the budget, an arrival evicts the plain entry
-/// even though both native legs are older; once only native legs remain, an
-/// arrival is refused rather than closing one of them.
+/// Eviction spares only a UDP entry with a native connection held beside it
+/// (the hold lasts `HELD_NATIVE_WINDOW`), and takes a QUIC-native entry like
+/// a UDP one, oldest first. So legs a few sources hold cannot make the pool
+/// non-evictable: here the native entry is older than the plain one and goes
+/// first, then the plain one, then the arrivals; the held pair, older than all
+/// of them, is never the victim.
 #[tokio::test]
-async fn eviction_leaves_native_legs_alone() {
+async fn eviction_takes_native_entries_and_spares_only_a_held_pair() {
     let mut h = non_gateway_with_budget("transient-evict-native-legs", 3).await;
     let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
     let pair = SocketAddr::from(([198, 51, 100, 223], 7375));
@@ -5730,37 +6014,55 @@ async fn eviction_leaves_native_legs_alone() {
     let first = SocketAddr::from(([198, 51, 100, 224], 7376));
     unexpected_inbound(&mut h, first).await;
     assert!(
-        !h.mgr.connections.contains_key(&plain),
-        "the plain entry is evicted"
+        !h.mgr.connections.contains_key(&native),
+        "the older native entry is evicted"
     );
     assert!(
-        h.mgr.connections.contains_key(&first),
-        "and the arrival admitted"
+        h.mgr.connections.contains_key(&plain),
+        "the plain one stays"
     );
+    assert!(h.mgr.connections.contains_key(&first), "arrival admitted");
+
+    let second = SocketAddr::from(([198, 51, 100, 240], 7388));
+    unexpected_inbound(&mut h, second).await;
+    assert!(!h.mgr.connections.contains_key(&plain));
+    let third = SocketAddr::from(([198, 51, 100, 241], 7389));
+    unexpected_inbound(&mut h, third).await;
+    assert!(!h.mgr.connections.contains_key(&first));
+    assert!(h.mgr.connections.contains_key(&second));
+    assert!(h.mgr.connections.contains_key(&third));
     assert!(h.mgr.connections.contains_key(&pair), "the pair stays");
     assert!(
         h.mgr.held_native.contains_key(&pair),
         "with its held native connection"
     );
-    assert!(
-        h.mgr.connections.contains_key(&native),
-        "the native entry stays"
-    );
+    assert_eq!(cm.transient_evictions(), 3);
+}
 
-    // Now the oldest evictable entry is the arrival itself; the next one
-    // evicts it, and with only native legs left the one after is refused.
-    let second = SocketAddr::from(([198, 51, 100, 240], 7388));
-    unexpected_inbound(&mut h, second).await;
-    assert!(!h.mgr.connections.contains_key(&first));
-    assert!(h.mgr.connections.contains_key(&second));
-    assert!(cm.drop_transient(second).is_some());
-    assert!(cm.try_register_transient(SocketAddr::from(([198, 51, 100, 241], 1)), None));
-    let refused = SocketAddr::from(([198, 51, 100, 242], 7389));
-    unexpected_inbound(&mut h, refused).await;
-    assert!(!h.mgr.connections.contains_key(&refused), "refused");
-    assert!(h.mgr.held_native.contains_key(&pair));
-    assert!(h.mgr.connections.contains_key(&native));
-    assert_eq!(cm.transient_evictions(), 2);
+/// Callbacks queued for a UDP dial beside a native one are failed when the
+/// transient budget closes that address by eviction, instead of waiting out
+/// their own timeout; the entry is removed from `udp_beside_native` too.
+#[tokio::test]
+async fn an_evicted_address_fails_its_udp_beside_native_callbacks() {
+    let mut h = non_gateway_with_budget("transient-evict-fails-beside", 1).await;
+    let victim = SocketAddr::from(([198, 51, 100, 245], 7401));
+    unexpected_inbound(&mut h, victim).await;
+    let (callback, mut waiter) = mpsc::channel::<crate::message::ConnectResult>(1);
+    h.state
+        .udp_beside_native
+        .entry(victim)
+        .or_default()
+        .push((Transaction::new::<ConnectMsg>(), Box::new(callback)));
+
+    let arrival = SocketAddr::from(([198, 51, 100, 246], 7402));
+    unexpected_inbound(&mut h, arrival).await;
+    assert!(!h.mgr.connections.contains_key(&victim), "premise: evicted");
+    assert!(h.mgr.connections.contains_key(&arrival), "arrival admitted");
+    assert!(
+        matches!(waiter.try_recv(), Ok(Err(_))),
+        "the beside waiter is told"
+    );
+    assert!(!h.state.udp_beside_native.contains_key(&victim));
 }
 
 /// A connection the transient budget closes tells whoever still waits for a
@@ -5789,6 +6091,12 @@ async fn a_budget_close_fails_the_waiters_for_its_address() {
         .entry(remote)
         .or_default()
         .push(Box::new(callback));
+    let (beside_callback, mut beside_waiter) = mpsc::channel::<crate::message::ConnectResult>(1);
+    h.state
+        .udp_beside_native
+        .entry(remote)
+        .or_default()
+        .push((Transaction::new::<ConnectMsg>(), Box::new(beside_callback)));
 
     assert!(
         !h.try_connect_peer(PeerKeyLocation::new(key(), remote))
@@ -5800,6 +6108,37 @@ async fn a_budget_close_fails_the_waiters_for_its_address() {
         "the waiter is told"
     );
     assert!(!h.state.awaiting_connection.contains_key(&remote));
+    assert!(
+        matches!(beside_waiter.try_recv(), Ok(Err(_))),
+        "the beside waiter is told"
+    );
+    assert!(!h.state.udp_beside_native.contains_key(&remote));
+}
+
+/// The refused arrival's own address: with the budget spent and no victim to
+/// evict, the arrival is dropped and the UDP dials queued beside a native one
+/// for its address are failed, not left to their timeout.
+#[tokio::test]
+async fn a_refused_arrival_fails_its_udp_beside_native_callbacks() {
+    let mut h = non_gateway_with_budget("transient-refused-fails-beside", 2).await;
+    let cm = h.mgr.bridge.op_manager.ring.connection_manager.clone();
+    for port in [7411, 7412] {
+        assert!(cm.try_register_transient(SocketAddr::from(([198, 51, 100, 247], port)), None));
+    }
+    let addr = SocketAddr::from(([198, 51, 100, 248], 7413));
+    let (callback, mut waiter) = mpsc::channel::<crate::message::ConnectResult>(1);
+    h.state
+        .udp_beside_native
+        .entry(addr)
+        .or_default()
+        .push((Transaction::new::<ConnectMsg>(), Box::new(callback)));
+    unexpected_inbound(&mut h, addr).await;
+    assert!(!h.mgr.connections.contains_key(&addr), "premise: refused");
+    assert!(
+        matches!(waiter.try_recv(), Ok(Err(_))),
+        "the beside waiter is told"
+    );
+    assert!(!h.state.udp_beside_native.contains_key(&addr));
 }
 
 /// (b) The same when the entry is closed because a promotion was refused at

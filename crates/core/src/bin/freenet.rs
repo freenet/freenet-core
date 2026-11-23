@@ -1777,6 +1777,8 @@ fn run_node(config_args: ConfigArgs) -> anyhow::Result<()> {
         // Same reason: a loopback `network-address` dropped from config.toml
         // (#5798) is reported only on the boot that moved it.
         config.log_network_address_migration();
+        // UDP-only tuning keys are accepted-and-ignored once legacy UDP is removed.
+        config.log_udp_only_settings();
         // The logger is needed before this info which is why it's here instead of above
         tracing::info!(
             max_blocking_threads,

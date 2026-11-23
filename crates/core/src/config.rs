@@ -2250,6 +2250,25 @@ impl Config {
         }
     }
 
+    /// Warn that UDP-only transport settings will stop having any effect.
+    ///
+    /// **Call this AFTER [`set_logger`]**, like the other `log_*` replays here:
+    /// `build()` runs with no subscriber, so a warning emitted there is lost.
+    /// Called once per start. The settings keep their current effect until the
+    /// legacy UDP transport is removed.
+    pub fn log_udp_only_settings(&self) {
+        let keys = self.network_api.udp_only_settings_in_use();
+        if keys.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            keys = %keys.join(", "),
+            "These settings tune the legacy UDP transport, which a future release removes. \
+             After that release they are accepted and ignored, so you can delete them \
+             from your config."
+        );
+    }
+
     /// Report how the client (HTTP/WebSocket) API's exposure was decided.
     ///
     /// **Call this AFTER [`set_logger`].** These messages cannot live in
@@ -3199,6 +3218,37 @@ impl NetworkApiConfig {
         }
     }
 
+    /// Names of the UDP-only transport settings this node was given a
+    /// non-default value for (D-1 of the legacy-UDP removal).
+    ///
+    /// Each still takes effect today. They tune the legacy UDP data path, which
+    /// a later release removes; from then on the keys are accepted and ignored,
+    /// so a config file or flag written for this release keeps parsing after a
+    /// rollback or an upgrade. Defaults are not reported, so a node that never
+    /// set them hears nothing.
+    pub fn udp_only_settings_in_use(&self) -> Vec<&'static str> {
+        let mut set = Vec::new();
+        if self.min_bandwidth_per_connection.is_some() {
+            set.push("min-bandwidth-per-connection");
+        }
+        if self.streaming_threshold != default_streaming_threshold() {
+            set.push("streaming-threshold");
+        }
+        if self.ledbat_min_ssthresh != default_ledbat_min_ssthresh() {
+            set.push("ledbat-min-ssthresh");
+        }
+        if !self
+            .congestion_control
+            .eq_ignore_ascii_case(&default_congestion_control())
+        {
+            set.push("congestion-control");
+        }
+        if self.bbr_startup_rate != default_bbr_startup_rate() {
+            set.push("bbr-startup-rate");
+        }
+        set
+    }
+
     /// Build a `CongestionControlConfig` from the current network API configuration.
     ///
     /// This parses the `congestion_control` string to determine the algorithm
@@ -3632,7 +3682,7 @@ pub struct WebsocketApiArgs {
 
     /// Per-user operation burst capacity for hosted mode: how many operations an
     /// idle user can issue back to back before being throttled to
-    /// `--per-user-op-rate-limit`. Default: 100. Only meaningful when operation
+    /// `--per-user-op-rate-limit`. Default: 500. Only meaningful when operation
     /// rate limiting is on.
     // Internal: #4561.
     #[arg(long = "per-user-op-burst", env = "PER_USER_OP_BURST")]
@@ -4002,7 +4052,7 @@ pub struct WebsocketApiConfig {
 
     /// Per-user operation burst capacity for hosted mode (#4561). Max ops a
     /// previously-idle user may issue back-to-back before being throttled to
-    /// the sustained rate. Default 100.
+    /// the sustained rate. Default 500.
     #[serde(default = "default_per_user_op_burst", rename = "per-user-op-burst")]
     pub per_user_op_burst: u64,
 
@@ -8437,6 +8487,48 @@ shutdown-drain-secs = 42
                 "no key is spelled twice here, so nothing may be dropped"
             );
         }
+    }
+
+    /// The UDP-only transport keys (D-1) must keep parsing in a config file
+    /// after the legacy UDP transport is removed, where they are accepted and
+    /// ignored. Parse each one, in every spelling, and check it is reported as
+    /// in use. When a key is removed from `NetworkApiConfig` instead of
+    /// ignored, this fails to parse and the rollback case it guards breaks.
+    #[test]
+    fn udp_only_transport_keys_still_parse_and_are_reported() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "min_bandwidth_per_connection",
+                "2000000",
+                "min-bandwidth-per-connection",
+            ),
+            (
+                "min-bandwidth-per-connection",
+                "2000000",
+                "min-bandwidth-per-connection",
+            ),
+            ("streaming-threshold", "131072", "streaming-threshold"),
+            ("ledbat-min-ssthresh", "204800", "ledbat-min-ssthresh"),
+            ("congestion-control", "\"bbr\"", "congestion-control"),
+            ("bbr-startup-rate", "5000000", "bbr-startup-rate"),
+        ];
+        for (key, value, reported) in cases {
+            let cfg: NetworkApiConfig = toml::from_str(&format!("{key} = {value}\n"))
+                .unwrap_or_else(|e| panic!("`{key}` no longer parses in config.toml: {e}"));
+            assert_eq!(
+                cfg.udp_only_settings_in_use(),
+                vec![*reported],
+                "`{key}` set to {value} must be reported, and nothing else"
+            );
+        }
+    }
+
+    #[test]
+    fn udp_only_settings_report_nothing_at_their_defaults() {
+        let cfg: NetworkApiConfig = toml::from_str("").unwrap();
+        assert!(cfg.udp_only_settings_in_use().is_empty());
+        let cfg: NetworkApiConfig = toml::from_str("congestion-control = \"FixedRate\"").unwrap();
+        assert!(cfg.udp_only_settings_in_use().is_empty());
     }
 
     /// [`CONFIG_KEY_SPELLINGS`] drives the duplicate-spelling normalization,
@@ -14453,6 +14545,74 @@ shutdown-drain-secs = 42
             "log_network_address_migration must run after set_logger (or its one-shot \
              warning has no subscriber) and before the node starts (or a startup failure \
              loses it, with config.toml already rewritten)"
+        );
+    }
+
+    /// The UDP-only keys must also keep parsing as CLI flags (a rollback must
+    /// not meet an unknown flag in a service unit), in the shapes `ConfigArgs`
+    /// accepts today.
+    #[test]
+    fn udp_only_transport_flags_still_parse() {
+        let args = <ConfigArgs as clap::Parser>::try_parse_from([
+            "freenet",
+            "--min-bandwidth-per-connection",
+            "2000000",
+            "--streaming-threshold",
+            "131072",
+            "--ledbat-min-ssthresh",
+            "204800",
+            "--congestion-control",
+            "bbr",
+            "--bbr-startup-rate",
+            "5000000",
+        ])
+        .expect("UDP-only transport flags must keep parsing");
+        assert_eq!(
+            args.network_api.min_bandwidth_per_connection,
+            Some(2_000_000)
+        );
+        assert_eq!(args.network_api.streaming_threshold, Some(131_072));
+        assert_eq!(args.network_api.ledbat_min_ssthresh, Some(204_800));
+        assert_eq!(args.network_api.congestion_control.as_deref(), Some("bbr"));
+        assert_eq!(args.network_api.bbr_startup_rate, Some(5_000_000));
+    }
+
+    /// The warning must be CALLED from `run_node`, at statement position,
+    /// after `set_logger` (`build()` has no subscriber, so an earlier call is
+    /// silently lost) and before the node starts.
+    #[test]
+    fn udp_only_settings_are_reported_after_the_logger_in_run_node() {
+        let main_src = include_str!("bin/freenet.rs");
+        let run_node = extract_fn_body(
+            main_src,
+            "fn run_node(config_args: ConfigArgs) -> anyhow::Result<()>",
+        );
+        let at_statement = |needle: &str| {
+            run_node
+                .match_indices(needle)
+                .find(|(i, _)| {
+                    let line_start = run_node[..*i].rfind('\n').map_or(0, |n| n + 1);
+                    run_node[line_start..*i].trim().is_empty()
+                })
+                .map(|(i, _)| i)
+                .unwrap_or_else(|| {
+                    panic!("run_node does not call `{needle}` at statement position")
+                })
+        };
+        let logger = at_statement("freenet::config::set_logger(");
+        let report = at_statement("config.log_udp_only_settings();");
+        let node = at_statement("run(config).await");
+        assert!(
+            logger < report && report < node,
+            "log_udp_only_settings must run after set_logger and before the node starts"
+        );
+        let body = extract_fn_body(
+            include_str!("config.rs"),
+            "pub fn log_udp_only_settings(&self)",
+        );
+        assert!(
+            body.contains("udp_only_settings_in_use()") && body.contains("tracing::warn!"),
+            "log_udp_only_settings no longer warns about the keys it finds"
         );
     }
 

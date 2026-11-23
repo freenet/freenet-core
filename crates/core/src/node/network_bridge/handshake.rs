@@ -596,6 +596,34 @@ async fn connect_outbound(
         }
     };
 
+    // A native dial ended: the treated arm, and the setup's outcome by the side
+    // the origin names. A dial of another origin (a gateway join) is in the
+    // total only. Counted here, where the dial's own result is known, not
+    // derived from other counters.
+    if transport.is_native() {
+        use crate::transport::{ConnectArm, NativeConnectSide, NativeSetupOutcome};
+        let side = match origin {
+            crate::transport::NatAttemptOrigin::ConnectJoiner => Some(NativeConnectSide::Joiner),
+            crate::transport::NatAttemptOrigin::ConnectAcceptor => {
+                Some(NativeConnectSide::Acceptor)
+            }
+            crate::transport::NatAttemptOrigin::Gateway
+            | crate::transport::NatAttemptOrigin::RingPeerNoTransport => None,
+        };
+        let outcome = if result.is_ok() {
+            Some(NativeSetupOutcome::Established)
+        } else {
+            native_outcome
+        };
+        if let Some(side) = side {
+            let metrics = &crate::transport::TRANSPORT_METRICS;
+            metrics.record_connect_arm(ConnectArm::Treated, side, result.is_ok());
+            if let Some(outcome) = outcome {
+                metrics.record_connect_native_setup_by_side(side, outcome);
+            }
+        }
+    }
+
     // Only mark peer as ready after a successful connection
     if result.is_ok() {
         if let Some(flag) = peer_ready {
@@ -955,6 +983,129 @@ mod tests {
             elapsed: start.elapsed(),
             origins: connector.origins.into_inner(),
         }
+    }
+
+    /// A connector whose native setup gives a connection or `TimedOut`.
+    struct NativeOnly {
+        succeeds: bool,
+    }
+
+    impl OutboundConnector for NativeOnly {
+        // Two stages by design: see `OutboundConnector::connect`.
+        #[allow(clippy::async_yields_async)]
+        fn connect(
+            &self,
+            _remote_public_key: crate::transport::TransportPublicKey,
+            _remote_addr: SocketAddr,
+            _origin: crate::transport::NatAttemptOrigin,
+        ) -> Pin<
+            Box<dyn std::future::Future<Output = crate::transport::PendingConnection> + Send + '_>,
+        > {
+            Box::pin(async {
+                let pending: crate::transport::PendingConnection = Box::pin(std::future::pending());
+                pending
+            })
+        }
+
+        fn connect_native(
+            &self,
+            dial: crate::transport::NativeDial,
+        ) -> crate::transport::NativeConnectFuture<'_> {
+            let succeeds = self.succeeds;
+            Box::pin(async move {
+                if succeeds {
+                    Ok(Box::new(NullConnection(dial.addr)) as Box<dyn PeerConnectionApi>)
+                } else {
+                    Err(crate::transport::NativeSetupOutcome::TimedOut)
+                }
+            })
+        }
+    }
+
+    /// A native dial of a CONNECT counts as the treated arm and under its
+    /// setup outcome, by the side its origin names; a native dial of another
+    /// origin (a gateway join) counts for neither; a UDP dial for neither.
+    #[tokio::test(start_paused = true)]
+    async fn a_native_dial_counts_as_treated_by_the_side_of_its_origin() {
+        use crate::transport::NatAttemptOrigin as Origin;
+        use crate::transport::NativeSetupOutcome as Outcome;
+        use crate::transport::metrics::{
+            CONNECT_ARM_ON_THIS_THREAD, CONNECT_SETUP_BY_SIDE_ON_THIS_THREAD, ConnectArmCounter,
+        };
+        let cases = [
+            (
+                Origin::ConnectJoiner,
+                true,
+                vec![
+                    ConnectArmCounter::TreatedAttemptsJoiner,
+                    ConnectArmCounter::TreatedEstablishedJoiner,
+                ],
+                Some((0, Outcome::Established)),
+            ),
+            (
+                Origin::ConnectJoiner,
+                false,
+                vec![ConnectArmCounter::TreatedAttemptsJoiner],
+                Some((0, Outcome::TimedOut)),
+            ),
+            (
+                Origin::ConnectAcceptor,
+                true,
+                vec![
+                    ConnectArmCounter::TreatedAttemptsAcceptor,
+                    ConnectArmCounter::TreatedEstablishedAcceptor,
+                ],
+                Some((1, Outcome::Established)),
+            ),
+            (
+                Origin::ConnectAcceptor,
+                false,
+                vec![ConnectArmCounter::TreatedAttemptsAcceptor],
+                Some((1, Outcome::TimedOut)),
+            ),
+            (Origin::Gateway, true, vec![], None),
+            (Origin::Gateway, false, vec![], None),
+        ];
+        for (origin, succeeds, arm_moves, setup_moves) in cases {
+            let arm_before = CONNECT_ARM_ON_THIS_THREAD.with(|c| c.get());
+            let setup_before = CONNECT_SETUP_BY_SIDE_ON_THIS_THREAD.with(|c| c.get());
+            let _ = connect_outbound(
+                &NativeOnly { succeeds },
+                super::OutboundDial {
+                    peer: make_peer(4210),
+                    transaction: Transaction::new::<ConnectMsg>(),
+                    transient: false,
+                    origin,
+                    transport: crate::operations::connect::native::DialTransport::Native {
+                        deadline: tokio::time::Instant::now() + Duration::from_secs(5),
+                    },
+                },
+                None,
+            )
+            .await;
+            let mut want_arm = arm_before;
+            for counter in &arm_moves {
+                want_arm[*counter as usize] += 1;
+            }
+            assert_eq!(
+                CONNECT_ARM_ON_THIS_THREAD.with(|c| c.get()),
+                want_arm,
+                "{origin:?} succeeds {succeeds}: arm"
+            );
+            let mut want_setup = setup_before;
+            if let Some((side, outcome)) = setup_moves {
+                want_setup[side][outcome as usize] += 1;
+            }
+            assert_eq!(
+                CONNECT_SETUP_BY_SIDE_ON_THIS_THREAD.with(|c| c.get()),
+                want_setup,
+                "{origin:?} succeeds {succeeds}: setup by side"
+            );
+        }
+        // A UDP dial counts for neither.
+        let arm_before = CONNECT_ARM_ON_THIS_THREAD.with(|c| c.get());
+        let _ = run_connect(Duration::ZERO, Handshake::Succeeds).await;
+        assert_eq!(CONNECT_ARM_ON_THIS_THREAD.with(|c| c.get()), arm_before);
     }
 
     /// A native dial hands the setup what is left of its deadline when the

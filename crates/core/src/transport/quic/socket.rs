@@ -552,9 +552,9 @@ impl<S: Socket> AsyncUdpSocket for QuicSocket<S> {
                 // its holds go into a record nobody reads, so the stall count,
                 // send gaps and ack watch of its connection would see none.
                 // Counted, not asserted: this runs under quinn's endpoint
-                // lock, and a panic there poisons it and aborts the process
-                // (see "NOT CONTAINED" in the transport rules). Tests read the
-                // count per endpoint.
+                // lock, and a panic there poisons it and ends the endpoint (an
+                // ENDPOINT DEATH, a controlled exit, #6184; see the transport
+                // rules). Tests read the count per endpoint.
                 self.cap_holds
                     .fallback_pollers
                     .fetch_add(1, Ordering::Relaxed);

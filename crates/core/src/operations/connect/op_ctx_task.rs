@@ -421,6 +421,10 @@ async fn drive_client_connect(
     // out when their dial starts (`start_dials!`). A subset of `accepted`, so it stays
     // within `acceptor_limit`.
     let mut native_acceptors: HashSet<PeerKeyLocation> = HashSet::new();
+    // Acceptors that decided UDP for a pair in the control arm
+    // (`native::joiner_in_control`), taken out when their dial ends. A subset
+    // of `accepted`, like `native_acceptors`.
+    let mut control_acceptors: HashSet<PeerKeyLocation> = HashSet::new();
     // `connected_dials`: acceptors actually connected. `accepted` also holds
     // acceptors still queued or being dialled, so it cannot decide that the
     // target is reached.
@@ -634,6 +638,18 @@ async fn drive_client_connect(
                 holds_slot,
                 after_native,
             })) => {
+                // The decided UDP dial of a control pair ends here. Only an
+                // acceptor that decided UDP is in `control_acceptors`, so the UDP
+                // dial after a failed native setup (the rescue) is never in an
+                // arm. A dial with no result (it could not start, or its
+                // callback closed) is not counted.
+                if let (true, Some(result)) = (control_acceptors.remove(&acceptor), &result) {
+                    crate::transport::TRANSPORT_METRICS.record_connect_arm(
+                        crate::transport::ConnectArm::Control,
+                        crate::transport::NativeConnectSide::Joiner,
+                        result.is_ok(),
+                    );
+                }
                 // A native dial that failed is followed by a UDP dial to the
                 // same acceptor, before anything counts it as failed: until
                 // UDP is removed a failed native setup must never cost the
@@ -1015,6 +1031,14 @@ async fn drive_client_connect(
                     }
                 };
 
+                let in_control = super::native::joiner_in_control(
+                    sent_offer,
+                    payload.native_decision,
+                    super::native::native_bucket(
+                        &op_manager.ring.connection_manager.pub_key,
+                        payload.acceptor.pub_key(),
+                    ),
+                );
                 // `accepted` only grows with what the queue takes, so both
                 // stay within `acceptor_limit`.
                 match dial_queue.offer((payload.acceptor.clone(), Instant::now())) {
@@ -1022,6 +1046,8 @@ async fn drive_client_connect(
                         accepted.insert(acceptor.clone());
                         if transport.is_native() {
                             native_acceptors.insert(acceptor.clone());
+                        } else if in_control {
+                            control_acceptors.insert(acceptor.clone());
                         }
                         start_dials!(Some((acceptor, answered_at)));
                     }
@@ -1029,6 +1055,8 @@ async fn drive_client_connect(
                         accepted.insert(payload.acceptor.clone());
                         if transport.is_native() {
                             native_acceptors.insert(payload.acceptor.clone());
+                        } else if in_control {
+                            control_acceptors.insert(payload.acceptor.clone());
                         }
                     }
                     Offer::Refused => {
@@ -1655,6 +1683,7 @@ async fn drive_relay_connect(
             incoming_tx,
             accept.joiner.clone(),
             accept.response.native_decision,
+            accept.native_arm,
         )
         .await?;
     }
@@ -1904,6 +1933,7 @@ async fn drive_relay_connect(
                         incoming_tx,
                         accept.joiner,
                         accept.response.native_decision,
+                        accept.native_arm,
                     )
                     .await?;
                     trace_accept(upstream_addr, &accept.response, joiner_addr, true);
@@ -2083,6 +2113,7 @@ async fn drive_relay_connect(
                         incoming_tx,
                         accept.joiner,
                         accept.response.native_decision,
+                        accept.native_arm,
                     )
                     .await?;
                     trace_accept(upstream_addr, &accept.response, joiner_addr, true);
@@ -3632,7 +3663,7 @@ mod driver_timing_tests {
         let (op_manager, mut events) = op_manager_with_events("acceptor-origin").await;
         let joiner = peer(24880);
         let tx = Transaction::new::<ConnectMsg>();
-        super::super::dispatch_expect_connection_from(&op_manager, tx, joiner.clone(), None)
+        super::super::dispatch_expect_connection_from(&op_manager, tx, joiner.clone(), None, None)
             .await
             .expect("dispatch");
         loop {
@@ -3674,6 +3705,7 @@ mod driver_timing_tests {
             tx,
             joiner.clone(),
             Some(NativeDecision::Native),
+            None,
         )
         .await
         .expect("dispatch");
@@ -4053,6 +4085,164 @@ mod driver_timing_tests {
         assert_eq!(fallbacks_here(), (fallbacks.0 + 1, fallbacks.1), "counted");
     }
 
+    /// CONNECT dials counted per arm and side on this thread.
+    fn arm_counts_here() -> [u64; crate::transport::metrics::ConnectArmCounter::COUNT] {
+        crate::transport::metrics::CONNECT_ARM_ON_THIS_THREAD.with(|c| c.get())
+    }
+
+    /// What moved between two readings of [`arm_counts_here`], by label.
+    fn arm_moved(
+        before: [u64; crate::transport::metrics::ConnectArmCounter::COUNT],
+    ) -> Vec<(&'static str, u64)> {
+        let after = arm_counts_here();
+        crate::transport::metrics::ConnectArmCounter::ALL
+            .iter()
+            .zip(before.into_iter().zip(after))
+            .filter(|(_, (b, a))| a != b)
+            .map(|(counter, (b, a))| (counter.label(), a - b))
+            .collect()
+    }
+
+    /// The joiner counts its decided UDP dials to acceptors that answered a
+    /// `Udp` decision to its offer as control, when the pair's bucket is at or
+    /// above its offered percent. At 0 every pair is: the two answered UDP
+    /// dials are control attempts that connected, as joiner, and nothing else
+    /// moves (an acceptor with no decision is not both-offered, an unknown
+    /// decision is not a `Udp` one).
+    #[tokio::test(start_paused = true)]
+    async fn a_joiner_counts_decided_udp_dials_at_percent_zero_as_control() {
+        use crate::operations::connect::native::{NativeDecision, NativeOffer};
+        let before = arm_counts_here();
+        let run = dials_for_decisions(
+            "arm-joiner-zero",
+            Some(NativeOffer::capable(0)),
+            vec![
+                (0, Some(NativeDecision::Udp)),
+                (1, Some(NativeDecision::Udp)),
+                (2, None),
+                (3, Some(NativeDecision::Unknown(9))),
+            ],
+        )
+        .await;
+        assert_eq!(run.dialled.len(), 4, "all four are dialled over UDP");
+        assert_eq!(
+            arm_moved(before),
+            vec![
+                ("control_attempts_joiner", 2),
+                ("control_established_joiner", 2)
+            ]
+        );
+    }
+
+    /// At 100 every bucket is below the offered percent, so the joiner cannot
+    /// tell a control pair from one the acceptor sent to UDP for another
+    /// reason, and counts none, however the acceptors answer; a `Native` one
+    /// is dialled native (treated is counted by the dial, not here) and its
+    /// UDP fallback is in no arm.
+    #[tokio::test(start_paused = true)]
+    async fn a_joiner_counts_nothing_for_pairs_it_cannot_place_in_control() {
+        use crate::operations::connect::native::{NativeDecision, NativeOffer};
+        let before = arm_counts_here();
+        let _ = dials_for_decisions(
+            "arm-joiner-hundred",
+            Some(NativeOffer::capable(100)),
+            vec![
+                (0, Some(NativeDecision::Udp)),
+                (1, Some(NativeDecision::Native)),
+                (2, None),
+            ],
+        )
+        .await;
+        assert_eq!(arm_moved(before), vec![]);
+    }
+
+    /// The acceptor counts the result of its own UDP dial for a pair its
+    /// decision put in the control arm, and nothing for a decision outside
+    /// every arm. A dial that connected moves attempts and established, one
+    /// that failed only attempts.
+    #[tokio::test(start_paused = true)]
+    async fn an_acceptor_counts_its_decided_udp_dial_by_arm() {
+        use super::super::native::NativeDecision;
+        use crate::transport::ConnectArm;
+        let (op_manager, mut events) = op_manager_with_events("arm-acceptor").await;
+        let mut dispatch = async |port, decision, arm, reply: Option<bool>| {
+            let joiner = peer(port);
+            let joiner_addr = joiner.socket_addr().unwrap();
+            let before = arm_counts_here();
+            super::super::dispatch_expect_connection_from(
+                &op_manager,
+                Transaction::new::<ConnectMsg>(),
+                joiner,
+                decision,
+                arm,
+            )
+            .await
+            .expect("dispatch");
+            loop {
+                if let NodeEvent::ConnectPeer { callback, .. } = next_node_event(&mut events).await
+                {
+                    let result = match reply {
+                        Some(true) => Some(Ok((joiner_addr, None))),
+                        Some(false) => Some(Err(None)),
+                        None => None,
+                    };
+                    if let Some(result) = result {
+                        callback.send(result).await.expect("the dial waits");
+                    }
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            arm_moved(before)
+        };
+        assert_eq!(
+            dispatch(
+                24860,
+                Some(NativeDecision::Udp),
+                Some(ConnectArm::Control),
+                Some(true)
+            )
+            .await,
+            vec![
+                ("control_attempts_acceptor", 1),
+                ("control_established_acceptor", 1)
+            ],
+            "a control dial that connected"
+        );
+        assert_eq!(
+            dispatch(
+                24861,
+                Some(NativeDecision::Udp),
+                Some(ConnectArm::Control),
+                Some(false)
+            )
+            .await,
+            vec![("control_attempts_acceptor", 1)],
+            "a control dial that failed"
+        );
+        assert_eq!(
+            dispatch(
+                24864,
+                Some(NativeDecision::Udp),
+                Some(ConnectArm::Control),
+                None
+            )
+            .await,
+            vec![("control_attempts_acceptor", 1)],
+            "a control dial whose callback closed unanswered is still an attempt"
+        );
+        assert_eq!(
+            dispatch(24862, Some(NativeDecision::Udp), None, Some(true)).await,
+            vec![],
+            "a UDP decision in no arm (a transport already held)"
+        );
+        assert_eq!(
+            dispatch(24863, None, None, Some(true)).await,
+            vec![],
+            "a request with no offer"
+        );
+    }
+
     /// Native setups rescued by UDP on this thread: (as joiner, as acceptor).
     fn rescues_here() -> (u64, u64) {
         let [joiner, acceptor] =
@@ -4176,6 +4366,7 @@ mod driver_timing_tests {
             tx,
             joiner.clone(),
             Some(NativeDecision::Native),
+            None,
         )
         .await
         .expect("dispatch");

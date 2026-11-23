@@ -54,13 +54,24 @@ pub const DEFAULT_PER_USER_OP_RATE_LIMIT: u64 = 10;
 /// who has been idle can issue up to this many ops back-to-back before being
 /// throttled to the sustained [`DEFAULT_PER_USER_OP_RATE_LIMIT`].
 ///
-/// Set generously (100): a heavy-room hosted user's app-load — room list +
-/// per-room state + member lists + delegate secret reads across many rooms —
-/// can plausibly burst past 50 ops in the first second after page load. A
-/// false-positive throttle there breaks the UX worse than allowing a slightly
-/// larger ONE-TIME burst; the sustained [`DEFAULT_PER_USER_OP_RATE_LIMIT`]
-/// (10/sec) is the real flood cap, the burst is just the initial allowance.
-pub const DEFAULT_PER_USER_OP_BURST: u64 = 100;
+/// Set generously (500). Measured on try.freenet.org: one River page load sends
+/// 135 operations in its first 1.3 s (startup delegate reads plus a
+/// legacy-delegate migration sweep), and the previous default of 100 rejected 17
+/// of them. The count grows with the number of rooms and legacy delegates an
+/// account has, so 500 leaves ~3.7x headroom over that measurement. A
+/// false-positive throttle during app load stalls the whole UI, while a larger
+/// ONE-TIME burst costs little: the sustained [`DEFAULT_PER_USER_OP_RATE_LIMIT`]
+/// (10/sec) is the real flood cap for one identity, and a drained bucket takes
+/// `burst / rate` = 50 s of idleness to refill. The burst is per token, and a
+/// fresh token starts with a full bucket, so it also sets how many ops each
+/// newly minted token gets for free; that token-rotation gap exists at any
+/// burst (see [`MAX_TRACKED_USERS`]) and is not closed by this limiter.
+///
+/// Downstream queues still bound a burst aimed at one contract: the contract
+/// handler's per-contract queue (`MAX_QUEUED_PER_CONTRACT`, 100) sheds the excess
+/// of a single-contract flood, while an app load spreads its ops over many
+/// contracts and delegates.
+pub const DEFAULT_PER_USER_OP_BURST: u64 = 500;
 
 /// Minimum seconds between hosted-export downloads per user (export is far more
 /// expensive than a single op, so it gets a separate, tighter limit). `0`

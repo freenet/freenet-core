@@ -589,7 +589,7 @@ impl Executor<Runtime> {
 /// directly without standing up a full `Executor`. `inherited_origins` is the
 /// node's attestation map, passed in rather than reached for globally so a
 /// test's map is its own (#4813).
-fn resolve_message_origin(
+pub(in crate::contract::executor) fn resolve_message_origin(
     inherited_origins: &crate::wasm_runtime::SharedInheritedOrigins,
     caller_delegate: Option<&DelegateKey>,
     origin_contract: Option<&ContractInstanceId>,

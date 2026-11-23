@@ -3236,6 +3236,23 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         count.into(),
                     );
                 }
+                for (side, counts) in [
+                    ("joiner", snapshot.connect_native_setup_joiner),
+                    ("acceptor", snapshot.connect_native_setup_acceptor),
+                ] {
+                    for (outcome, count) in NativeSetupOutcome::ALL.iter().zip(counts) {
+                        m.insert(
+                            format!("connect_native_setup_{side}_{}", outcome.label()),
+                            count.into(),
+                        );
+                    }
+                }
+                for (counter, count) in crate::transport::metrics::ConnectArmCounter::ALL
+                    .iter()
+                    .zip(snapshot.connect_arm)
+                {
+                    m.insert(format!("connect_arm_{}", counter.label()), count.into());
+                }
                 for (outcome, count) in crate::transport::metrics::GatewayAdmission::ALL
                     .iter()
                     .zip(snapshot.quic_gateway_admission)
@@ -7994,6 +8011,9 @@ mod tests {
             "quic_carried_fallback",
             "quic_path_age_at_close",
             "connect_native_setup",
+            "connect_native_setup_joiner",
+            "connect_native_setup_acceptor",
+            "connect_arm",
             "quic_gateway_admission",
         ] {
             assert!(expected.remove(family), "{family} is in the snapshot");
@@ -8034,6 +8054,18 @@ mod tests {
             NativeSetupOutcome::ALL
                 .iter()
                 .map(|outcome| format!("connect_native_setup_{}", outcome.label())),
+        );
+        for side in ["joiner", "acceptor"] {
+            expected.extend(
+                NativeSetupOutcome::ALL
+                    .iter()
+                    .map(|outcome| format!("connect_native_setup_{side}_{}", outcome.label())),
+            );
+        }
+        expected.extend(
+            crate::transport::metrics::ConnectArmCounter::ALL
+                .iter()
+                .map(|counter| format!("connect_arm_{}", counter.label())),
         );
         expected.extend(
             crate::transport::metrics::GatewayAdmission::ALL
@@ -8450,6 +8482,9 @@ mod tests {
         fill(&mut snapshot.quic_carried_fallback);
         fill(&mut snapshot.quic_path_age_at_close);
         fill(&mut snapshot.connect_native_setup);
+        fill(&mut snapshot.connect_native_setup_joiner);
+        fill(&mut snapshot.connect_native_setup_acceptor);
+        fill(&mut snapshot.connect_arm);
         fill(&mut snapshot.quic_gateway_admission);
         snapshot.quic_establish_ms_p50 = Some(901);
         snapshot.quic_establish_ms_p90 = Some(902);
@@ -8488,6 +8523,23 @@ mod tests {
         {
             expected.push((format!("connect_native_setup_{}", outcome.label()), count));
         }
+        for (side, counts) in [
+            ("joiner", snapshot.connect_native_setup_joiner),
+            ("acceptor", snapshot.connect_native_setup_acceptor),
+        ] {
+            for (outcome, count) in NativeSetupOutcome::ALL.iter().zip(counts) {
+                expected.push((
+                    format!("connect_native_setup_{side}_{}", outcome.label()),
+                    count,
+                ));
+            }
+        }
+        for (counter, count) in crate::transport::metrics::ConnectArmCounter::ALL
+            .iter()
+            .zip(snapshot.connect_arm)
+        {
+            expected.push((format!("connect_arm_{}", counter.label()), count));
+        }
         for (outcome, count) in crate::transport::metrics::GatewayAdmission::ALL
             .iter()
             .zip(snapshot.quic_gateway_admission)
@@ -8512,6 +8564,8 @@ mod tests {
                 + 3 * QuicFallback::COUNT
                 + QuicPathAge::COUNT
                 + NativeSetupOutcome::COUNT
+                + 2 * NativeSetupOutcome::COUNT
+                + crate::transport::metrics::ConnectArmCounter::COUNT
                 + crate::transport::metrics::GatewayAdmission::COUNT
                 + 6
         );
