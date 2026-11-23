@@ -4286,7 +4286,11 @@ fn a_panic_in_a_quinn_connection_driver_drives_the_endpoint_down() {
 /// panics, and the unwind drops the unfinished `Outgoing`. Its Drop used to
 /// reset the stream, which unwraps the same lock: a second panic during the
 /// unwind, which aborts. The child dies with SIGABRT without the skip in
-/// `Outgoing::drop`. The send's own panic is allowed (see `liveness`).
+/// `Outgoing::drop`. The send's own panic is allowed (see `liveness`), and
+/// required: it is what makes the drop run during an unwind. The panic is
+/// reported before the deadline, so this pins the guard's
+/// `quinn_may_be_poisoned` half; its `panicking()` half covers a poll that
+/// beats the report on another worker, which no deterministic test reaches.
 #[test]
 fn a_send_in_flight_on_a_poisoned_connection_does_not_abort() {
     in_child(
@@ -4350,9 +4354,69 @@ fn a_send_in_flight_on_a_poisoned_connection_does_not_abort() {
                 })
                 .await;
                 assert!(send.is_finished(), "the send outlived its deadline");
-                let _sent_or_panicked = send.await;
+                let ended = send.await;
+                assert!(
+                    ended.as_ref().is_err_and(|ended| ended.is_panic()),
+                    "the send did not reach the poisoned lock: {ended:?}"
+                );
                 poke.abort();
                 drop(server);
+            });
+        },
+    );
+}
+
+/// #6184: a close made during an unwind on a connection whose state lock a
+/// quinn panic poisoned, before the connection's watcher closed it, does not
+/// abort: `QuicCloser::close_inner` moves the close to a task, where its
+/// panic on the lock ends only that task. In the node this is a session's
+/// `EndOnExit::drop` (or `QuicPathState::drop`) tearing down its path while
+/// the session's task unwinds. A second closer on the connection stands in
+/// for the path's, so the watcher's close does not take the close first.
+/// Without the deferral the child dies with SIGABRT.
+#[test]
+fn a_close_during_an_unwind_on_a_poisoned_connection_does_not_abort() {
+    in_child(
+        "a_close_during_an_unwind_on_a_poisoned_connection_does_not_abort",
+        || {
+            bounded(|| async move {
+                struct CloseOnDrop(QuicCloser);
+                impl Drop for CloseOnDrop {
+                    fn drop(&mut self) {
+                        self.0.close(QuicCloseCode::Downgrade);
+                    }
+                }
+                let _seed = GlobalRng::seed_guard(SEED);
+                let net = crate::transport::test_net::subnet();
+                let pair = pair("quic-panic-close-unwind", net.addr(1), net.addr(2), None).await;
+                let (_, client, server) =
+                    pair.transfer(payload(100), Duration::from_secs(60)).await;
+                let closer = QuicCloser::new(client.inner().clone(), pair.a.owner.health.clone());
+                pair.a.faults().panic_next_writable_in_quinn();
+                // An empty stream from the peer makes this side's connection
+                // driver transmit (its acknowledgement) at once.
+                let peer = server.inner().clone();
+                let poke = tokio::spawn(async move {
+                    let mut stream = peer.open_uni().await.ok()?;
+                    stream.finish().ok()
+                });
+                let mut availability = pair.a.availability();
+                let state = drive(&pair.time, Duration::from_secs(1), async move {
+                    availability.not_up().await
+                })
+                .await;
+                assert_eq!(state, QuicAvailability::Down);
+                let unwound = tokio::spawn(async move {
+                    let _close = CloseOnDrop(closer);
+                    panic!("a panic unrelated to quinn, unwinding through the close");
+                });
+                assert!(unwound.await.is_err_and(|unwound| unwound.is_panic()));
+                // The deferred close runs, and panics on the lock in its task.
+                for _ in 0..16 {
+                    tokio::task::yield_now().await;
+                }
+                poke.abort();
+                drop((client, server));
             });
         },
     );

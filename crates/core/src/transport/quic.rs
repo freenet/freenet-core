@@ -1552,21 +1552,11 @@ impl QuicConnection {
 
 impl Drop for QuicConnection {
     fn drop(&mut self) {
-        // #6184: the close unwraps the connection's state lock, which a panic
-        // in a quinn driver may have poisoned. After such a panic is
-        // reported, the connection's watcher closes it (see `new`). During an
-        // unwind a second panic would abort the process, so the close runs
-        // in a task of its own, where a panic ends only that task.
+        // #6184: after a panic in a quinn driver is reported, the
+        // connection's watcher closes it (see `new`), and its state lock may
+        // be poisoned. During an unwind `close_inner` moves the close to a
+        // task.
         if self.closer.quinn_may_be_poisoned() {
-            return;
-        }
-        if std::thread::panicking() {
-            if tokio::runtime::Handle::try_current().is_ok() {
-                let closer = self.closer.clone();
-                drop(GlobalExecutor::spawn(async move {
-                    closer.close(QuicCloseCode::NodeDroppedPeer);
-                }));
-            }
             return;
         }
         self.closer.close(QuicCloseCode::NodeDroppedPeer);
@@ -1652,6 +1642,9 @@ impl QuicCloser {
     /// one). That covers the
     /// close the connection's watcher makes on Down, and a close after a
     /// panic that left the endpoint Released.
+    ///
+    /// During an unwind the close is sent from a task (`close_inner`), and
+    /// `true` means only that this call took it.
     pub(crate) fn close(&self, code: QuicCloseCode) -> bool {
         self.close_with_reason(code, code.reason())
     }
@@ -1683,6 +1676,34 @@ impl QuicCloser {
         if self.closing.swap(true, std::sync::atomic::Ordering::AcqRel) {
             return false;
         }
+        // #6184: `close_reason` and `close` unwrap the connection's state
+        // lock, which a panic in a quinn driver may have poisoned. During an
+        // unwind (a `Drop` that tears a path down, such as a session's
+        // `EndOnExit`) a second panic would abort the process, so the close
+        // runs in a task of its own, where a panic ends only that task. Not
+        // skipped on `quinn_may_be_poisoned`: that flag is endpoint-wide, and
+        // the watcher's close of every sound connection goes through here.
+        // With no runtime the node is stopping, and nothing is closed.
+        if std::thread::panicking() {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                let (closer, reason) = (self.clone(), reason.to_vec());
+                drop(GlobalExecutor::spawn(async move {
+                    closer.send_close(code, &reason, cause);
+                }));
+            }
+            return true;
+        }
+        self.send_close(code, reason, cause)
+    }
+
+    /// The part of [`Self::close_inner`] that calls quinn, once this closer
+    /// has taken the close.
+    fn send_close(
+        &self,
+        code: QuicCloseCode,
+        reason: &[u8],
+        cause: Option<crate::transport::boundary::QuicPathEnd>,
+    ) -> bool {
         if self.connection.close_reason().is_some() {
             return false;
         }

@@ -92,18 +92,23 @@
 //!   calls once the endpoint is not `Up`: `connect` refuses first, the
 //!   accept loop checks the availability before each poll of `accept`, and
 //!   the attempt router DROPS an attempt instead of answering it (quinn's
-//!   `Incoming::drop` skips a poisoned lock). Its own destructors never call
-//!   quinn after a reported quinn panic or during an unwind
-//!   (`Outgoing::drop`, `QuicConnection::drop`): a second panic during an
-//!   unwind aborts the process. A call that still reaches the lock (a call
-//!   on another thread in the moment between quinn's panic and its
-//!   watcher's report, a session or waiter acting on an attempt it was
-//!   handed before the death) panics in QUIC code, which the crash breaker
-//!   attributes to QUIC (`quic_attributed`), so it
+//!   `Incoming::drop` skips a poisoned lock). Nothing it runs during an
+//!   unwind calls quinn, since a second panic then aborts the process:
+//!   `Outgoing::drop` skips its reset (also after a reported quinn panic),
+//!   and a close made during an unwind (`QuicConnection::drop`, a session's
+//!   `EndOnExit::drop` or `QuicPathState::drop` tearing its path down) is
+//!   sent from a task (`QuicCloser::close_inner`). A call that still reaches
+//!   the lock (a call on another thread in the moment between quinn's panic
+//!   and its watcher's report, a session acting on an attempt it was handed
+//!   before the death, a session whose path is on the poisoned connection
+//!   tearing it down on Down before the watcher's close) panics in QUIC
+//!   code (only the first in a monitored task; the others are log noise),
+//!   which the crash breaker attributes to QUIC (`quic_attributed`), so it
 //!   turns QUIC off after the restart. Pinned by
 //!   `a_panic_unwinding_through_the_endpoint_driver_is_contained`,
 //!   `a_panic_in_a_quinn_connection_driver_drives_the_endpoint_down`,
-//!   `a_send_in_flight_on_a_poisoned_connection_does_not_abort` and
+//!   `a_send_in_flight_on_a_poisoned_connection_does_not_abort`,
+//!   `a_close_during_an_unwind_on_a_poisoned_connection_does_not_abort` and
 //!   `attempts_queued_before_a_driver_panic_are_dropped`. If such a panic
 //!   kills a monitored task on a node that exits for an endpoint death, the
 //!   node exits as for the death ([`driver_death_restart`]).

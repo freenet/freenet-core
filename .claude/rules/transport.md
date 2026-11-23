@@ -3818,17 +3818,24 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     accept again (EndpointDriver::drop wakes the pending accept during the
     unwind, before the watcher reports Down); the attempt router DROPS an
     attempt instead of answering it (Incoming::drop skips a poisoned lock;
-    attempts_queued_before_a_driver_panic_are_dropped). Its destructors
-    never call quinn after a reported quinn panic or during an unwind:
-    Outgoing::drop skips the reset, QuicConnection::drop leaves the close to
-    the watcher (after a report) or to a task (during an unwind). A reset or
+    attempts_queued_before_a_driver_panic_are_dropped). Nothing it runs
+    during an unwind calls quinn: Outgoing::drop skips the reset (also after
+    a reported quinn panic), and QuicCloser::close_inner sends a close made
+    during an unwind from a task, which covers QuicConnection::drop and a
+    session's EndOnExit::drop / QuicPathState::drop tearing its path down
+    (a_close_during_an_unwind_on_a_poisoned_connection_does_not_abort);
+    QuicConnection::drop leaves the close to the watcher after a report. It
+    does not skip closes on the endpoint-wide quinn_may_be_poisoned flag,
+    which would skip the watcher's close of sound connections. A reset or
     close from a Drop during an unwind was a second panic, an abort: a send
     blocked on flow control when its connection's driver panicked is polled
     at its deadline, poll_write panics on the lock, and the unwind drops the
     unfinished Outgoing (a_send_in_flight_on_a_poisoned_connection_does_not_abort).
     A call that still reaches the lock (another worker polling accept in the
     moment between quinn's panic and its watcher's report, a session or
-    native waiter acting on an attempt handed to it before the death)
+    native waiter acting on an attempt handed to it before the death, a
+    session whose path is on the poisoned connection tearing it down on Down
+    before the watcher's close, log noise in an unmonitored task)
     panics in QUIC code, which breaker::short_runs::quic_attributed
     attributes to QUIC (it recognises the freenet-quinn crate paths), so the
     breaker turns QUIC off after the restart. If that panic kills a
