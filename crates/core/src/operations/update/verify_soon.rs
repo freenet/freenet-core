@@ -67,9 +67,11 @@
 //! A hold by the floor, a busy pair, the slot or the pair cap retries the held
 //! peers only, at the earliest time any of them can clear, at most
 //! `MAX_RETRIES_PER_CHECK` times; when the retries run out while a held peer's
-//! clearing time is later still, one final retry runs at that time. Retries
-//! carry no jitter: their count is bounded, and each node schedules them off
-//! its own writes, so nodes do not fall into step.
+//! clearing time is later still, one final retry runs at that time. Each
+//! retry is delayed by a random 0% to 40% of its wait (`RETRY_JITTER_PERCENT`
+//! either side of a centre 20% late), never earlier than the time the held
+//! peer clears, so nodes that held the same peer at the same moment do not
+//! retry in step.
 //!
 //! Bounds:
 //! - later writes never move a scheduled check; a write after the check's
@@ -126,7 +128,7 @@
 //! a check that is waiting on held peers gets its own `First` round only when
 //! the check ends, so a peer the write's legs missed, and which the check is
 //! not already asking, waits for that (worst case a few minutes: a `Confirm`,
-//! three retries each up to `FORCE_FLOOR + REPLY_TIMEOUT`, and the final
+//! three retries each up to `FORCE_FLOOR` plus its jitter and `REPLY_TIMEOUT`, and the final
 //! round) before it is asked.
 //!
 //! Residuals:
@@ -242,6 +244,11 @@ pub(crate) const PEER_BAR_RETRY_WITHIN: Duration = Duration::from_secs(300);
 /// many distinct failing peers. Refusing instead would leave a failing peer
 /// free to take the slot again at once.
 pub(crate) const MAX_BARRED_PEERS: usize = 1024;
+/// Jitter of a `Confirm` retry: the wait until the held peer clears is
+/// stretched by a random 0 to `2 * RETRY_JITTER_PERCENT` percent, which is
+/// +/-`RETRY_JITTER_PERCENT` around a centre that many percent late. It is
+/// one-sided because a retry before the peer clears only meets the same hold.
+pub(crate) const RETRY_JITTER_PERCENT: u64 = 20;
 /// Retry `Confirm` rounds one check may run after floor, busy, slot or cap
 /// holds, before the final one.
 pub(crate) const MAX_RETRIES_PER_CHECK: u8 = 3;
@@ -251,19 +258,23 @@ pub(crate) const MAX_RETRIES_PER_CHECK: u8 = 3;
 /// of those come on top: the floor is armed when the previous forced stream
 /// is DELIVERED, so a write made while that stream is in flight waits for its
 /// transfer, then the floor, then its own transfer. From the write (or that
-/// delivery): the floor ends at most `FORCE_FLOOR` later; the retry `Confirm`
+/// delivery): the floor ends at most `FORCE_FLOOR` later, plus the retry
+/// jitter (`2 * RETRY_JITTER_PERCENT` percent of it); the retry `Confirm`
 /// round runs then and waits up to `REPLY_TIMEOUT` for the reply; the force
 /// is decided on that reply. Each slot wait (another forced leg in flight)
-/// adds a retry of up to `CONFIRM_DELAY + REPLY_TIMEOUT`, so a simulation
+/// adds a retry of up to `CONFIRM_DELAY` plus its jitter, plus
+/// `REPLY_TIMEOUT`, so a simulation
 /// with `n` stale peers allows `n - 1` of them. A peer whose forced stream
 /// FAILED is barred (`PeerBar`) and not covered by this figure.
 #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
-pub const PERSISTENT_FAULT_BOUND: Duration =
-    Duration::from_secs(FORCE_FLOOR.as_secs() + REPLY_TIMEOUT.as_secs());
+pub const PERSISTENT_FAULT_BOUND: Duration = Duration::from_secs(
+    FORCE_FLOOR.as_secs() * (100 + 2 * RETRY_JITTER_PERCENT) / 100 + REPLY_TIMEOUT.as_secs(),
+);
 /// What each slot wait adds to [`PERSISTENT_FAULT_BOUND`].
 #[cfg_attr(not(any(test, feature = "testing")), allow(dead_code))]
-pub const SLOT_WAIT_BOUND: Duration =
-    Duration::from_secs(CONFIRM_DELAY.as_secs() + REPLY_TIMEOUT.as_secs());
+pub const SLOT_WAIT_BOUND: Duration = Duration::from_secs(
+    CONFIRM_DELAY.as_secs() * (100 + 2 * RETRY_JITTER_PERCENT) / 100 + REPLY_TIMEOUT.as_secs(),
+);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Round {
@@ -998,7 +1009,7 @@ fn resolve(check: &mut Check, now: Instant) -> Resolved {
                 Some(at) => {
                     check.retries += 1;
                     check.phase = Phase::Scheduled {
-                        due: at.max(now + CONFIRM_DELAY),
+                        due: jittered_retry(now, at.max(now + CONFIRM_DELAY)),
                     };
                     Resolved::Continues
                 }
@@ -1006,6 +1017,14 @@ fn resolve(check: &mut Check, now: Instant) -> Resolved {
             }
         }
     }
+}
+
+/// `due` (when a held peer can be asked again) stretched by up to
+/// `2 * RETRY_JITTER_PERCENT` percent of the wait from `now`; never earlier.
+fn jittered_retry(now: Instant, due: Instant) -> Instant {
+    let wait = due.saturating_duration_since(now);
+    let percent = crate::config::GlobalRng::random_range(0..=2 * RETRY_JITTER_PERCENT);
+    due + wait * percent as u32 / 100
 }
 
 fn summary_hash(bytes: &[u8]) -> u64 {
@@ -1394,6 +1413,18 @@ mod tests {
         false
     }
 
+    /// The scheduled retry time: the next wake, which must lie in the jitter
+    /// window `[earliest, earliest + wait * 2 * RETRY_JITTER_PERCENT / 100]`.
+    fn retry_time(vs: &VerifySoon, earliest: Instant, wait: Duration) -> Instant {
+        let at = vs.next_wake().expect("a retry is scheduled");
+        let latest = earliest + wait * (2 * RETRY_JITTER_PERCENT) as u32 / 100;
+        assert!(
+            at >= earliest && at <= latest,
+            "retry at {at:?} outside [{earliest:?}, {latest:?}]"
+        );
+        at
+    }
+
     /// Answer the round due at `t` for `k` with one stale reply per peer, in
     /// order, and return the verdicts.
     fn answer_round(
@@ -1616,14 +1647,14 @@ mod tests {
         assert_eq!(verdict, Verdict::Held(Hold::Slot));
         // Still taken while the stream is in flight.
         let taken = vs.take_forced(&key(1), &a, t2).expect("a live mark");
-        let t3 = t2 + CONFIRM_DELAY;
+        let t3 = retry_time(&vs, t2 + CONFIRM_DELAY, CONFIRM_DELAY);
         assert_eq!(
             answer_round(&vs, key(2), t3, &[(&b, false, &[0])]),
             vec![Verdict::Held(Hold::Slot)]
         );
         // Freed by the outcome; the held peer's retry then forces it.
         vs.forced_outcome(taken, true, t3);
-        let t4 = t3 + CONFIRM_DELAY;
+        let t4 = retry_time(&vs, t3 + CONFIRM_DELAY, CONFIRM_DELAY);
         assert_eq!(
             answer_round(&vs, key(2), t4, &[(&b, false, &[0])]),
             vec![Verdict::Escalate]
@@ -1685,11 +1716,12 @@ mod tests {
         let failed = force_and_report(&vs, key(1), &a, t0, &[7], false);
         let until = failed + FORCE_FLOOR;
         // The last write lands inside the bar; no later write follows.
-        let (verdict, _) = run_check(&vs, key(2), &a, failed, false, &[7]);
+        let (verdict, t2) = run_check(&vs, key(2), &a, failed, false, &[7]);
         assert_eq!(verdict, Verdict::Held(Hold::PeerFailed));
-        assert_eq!(vs.next_wake(), Some(until), "retried when the bar ends");
+        // Retried when the bar ends (within the jitter window).
+        let retry = retry_time(&vs, until, until - t2);
         assert_eq!(
-            answer_round(&vs, key(2), until, &[(&a, false, &[7])]),
+            answer_round(&vs, key(2), retry, &[(&a, false, &[7])]),
             vec![Verdict::Escalate],
             "the peer is forced once the bar ends"
         );
@@ -2032,6 +2064,34 @@ mod tests {
         );
     }
 
+    /// A retry is delayed by a random 0 to `2 * RETRY_JITTER_PERCENT` percent
+    /// of its wait, never before the held peer clears (rule-review warning:
+    /// retries need jitter).
+    #[tokio::test]
+    async fn retries_are_jittered_and_never_early() {
+        let t0 = Instant::now();
+        let wait = FORCE_FLOOR;
+        let mut offsets = HashSet::new();
+        for _ in 0..64 {
+            let vs = VerifySoon::new();
+            let a = peer();
+            let sent = force_and_report(&vs, key(1), &a, t0, &[1], true);
+            let t1 = sent + Duration::from_secs(1);
+            vs.note_originated(key(1), t1);
+            let t2 = t1 + CHECK_DELAY;
+            answer_round(&vs, key(1), t2, &[(&a, false, &[2])]);
+            let t3 = t2 + CONFIRM_DELAY;
+            assert_eq!(
+                answer_round(&vs, key(1), t3, &[(&a, false, &[2])]),
+                vec![Verdict::Held(Hold::Floor)]
+            );
+            let at = retry_time(&vs, sent + FORCE_FLOOR, sent + FORCE_FLOOR - t3);
+            assert!(sent + wait - t3 > Duration::ZERO);
+            offsets.insert(at - (sent + FORCE_FLOOR));
+        }
+        assert!(offsets.len() > 8, "retry times are spread: {offsets:?}");
+    }
+
     #[tokio::test]
     async fn a_busy_pair_is_retried_asking_only_the_held_peers() {
         let vs = VerifySoon::new();
@@ -2043,7 +2103,7 @@ mod tests {
         let t2 = t1 + CONFIRM_DELAY;
         let v = answer_round(&vs, key(1), t2, &[(&a, true, &[0]), (&b, false, &[0])]);
         assert_eq!(v, vec![Verdict::Held(Hold::Busy), Verdict::Escalate]);
-        let t3 = t2 + CONFIRM_DELAY;
+        let t3 = retry_time(&vs, t2 + CONFIRM_DELAY, CONFIRM_DELAY);
         let due = vs.take_due(t3).rounds;
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].round, Round::Confirm, "a retry skips First");
@@ -2070,8 +2130,7 @@ mod tests {
         );
         // Each retry waits for the EARLIEST holder (b, busy): CONFIRM_DELAY.
         for _ in 0..MAX_RETRIES_PER_CHECK {
-            t += CONFIRM_DELAY;
-            assert_eq!(vs.next_wake(), Some(t));
+            t = retry_time(&vs, t + CONFIRM_DELAY, CONFIRM_DELAY);
             let v = answer_round(&vs, key(1), t, &[(&a, false, &[2]), (&b, true, &[2])]);
             assert_eq!(
                 v,
@@ -2079,13 +2138,8 @@ mod tests {
             );
         }
         // Out of retries: one final round when a's floor clears, not before.
-        assert_eq!(vs.next_wake(), Some(sent + FORCE_FLOOR));
-        let v = answer_round(
-            &vs,
-            key(1),
-            sent + FORCE_FLOOR,
-            &[(&a, false, &[2]), (&b, true, &[2])],
-        );
+        let last = retry_time(&vs, sent + FORCE_FLOOR, sent + FORCE_FLOOR - t);
+        let v = answer_round(&vs, key(1), last, &[(&a, false, &[2]), (&b, true, &[2])]);
         assert_eq!(v, vec![Verdict::Escalate, Verdict::Held(Hold::Busy)]);
         assert_eq!(vs.tracked(), 0, "nothing after the final round");
     }
@@ -2167,8 +2221,8 @@ mod tests {
             answer_round(&vs, key(1), t3, &[(&a, false, &[2])]),
             vec![Verdict::Held(Hold::Floor)]
         );
-        assert_eq!(vs.next_wake(), Some(sent + FORCE_FLOOR));
-        let due = vs.take_due(sent + FORCE_FLOOR).rounds;
+        let retry = retry_time(&vs, sent + FORCE_FLOOR, sent + FORCE_FLOOR - t3);
+        let due = vs.take_due(retry).rounds;
         assert_eq!(due[0].round, Round::Confirm);
     }
 
@@ -2259,7 +2313,8 @@ mod tests {
             vs.on_comparison(&key(1), &a, false, true, &[0], idle, t2),
             Verdict::Converged
         );
-        let due = vs.take_due(t2 + CONFIRM_DELAY).rounds;
+        let retry = retry_time(&vs, t2 + CONFIRM_DELAY, CONFIRM_DELAY);
+        let due = vs.take_due(retry).rounds;
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].peers, vec![b.clone()], "b is asked, not dropped");
     }
