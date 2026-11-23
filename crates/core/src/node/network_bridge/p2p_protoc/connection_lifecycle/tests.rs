@@ -6097,8 +6097,15 @@ macro_rules! joiners_behind_one_address_test {
     ($($test:ident: $seed:expr),+ $(,)?) => {$(
         #[test]
         fn $test() {
-            let (evicted, unconnected) =
-                join_behind_one_address("transient-evict-one-address", $seed, 24, 8);
+            // The network name is per variant: the per-network data directory
+            // and virtual-time registration are keyed on it, so variants
+            // sharing a name collide when they share a process.
+            let (evicted, unconnected) = join_behind_one_address(
+                concat!("transient-evict-one-address-", stringify!($test)),
+                $seed,
+                24,
+                8,
+            );
             assert!(
                 evicted > 0,
                 "the budget was never reached; the test would be vacuous"
