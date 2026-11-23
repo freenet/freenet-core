@@ -115,6 +115,17 @@ impl<T: TimeSource> LegacyResponder<T> {
 
     /// Handle one intro packet (the raw datagram).
     pub(super) fn respond(&mut self, secret: &TransportSecretKey, intro: &[u8]) -> Outcome {
+        self.respond_then(secret, intro, crate::transport::signal_urgent_update)
+    }
+
+    /// [`Self::respond`] with the urgent-update signal as `urgent`, so a test
+    /// can see it fire without latching the process-wide flag.
+    fn respond_then(
+        &mut self,
+        secret: &TransportSecretKey,
+        intro: &[u8],
+        urgent: impl FnOnce(),
+    ) -> Outcome {
         if !self.bucket.try_take() {
             return Outcome::RateLimited;
         }
@@ -133,6 +144,11 @@ impl<T: TimeSource> LegacyResponder<T> {
             crate::transport::report_peer_version(
                 version_cmp::parse_version_bytes(&version).version,
             );
+            // As the handshake this replaces: a sender whose floor is above
+            // this build asks it to update.
+            if version_cmp::remote_requires_newer_than_us(&version_cmp::PROTOC_VERSION, &version) {
+                urgent();
+            }
         }
         let Ok(key) = Aes128Gcm::new_from_slice(key) else {
             return Outcome::Invalid;
@@ -266,12 +282,12 @@ mod tests {
         assert_eq!(admitted as u64, LEGACY_RESPONDER_DECRYPTS_PER_SEC);
     }
 
+    /// Dark until D-8, which flips this constant together with the switch-on
+    /// of D-3 and D-4.
     #[test]
     fn responder_is_off_by_default() {
-        assert_eq!(
-            build(VirtualTime::new(), None).is_some(),
-            LEGACY_RESPONDER_ENABLED
-        );
+        const { assert!(!LEGACY_RESPONDER_ENABLED) };
+        assert!(build(VirtualTime::new(), None).is_none());
         assert!(build(VirtualTime::new(), Some("1.2.3".into())).is_some());
     }
 
@@ -329,6 +345,61 @@ mod tests {
         assert!(
             gw_conns.try_recv().is_err(),
             "the gateway must not accept a connection"
+        );
+    }
+
+    /// An intro naming a build whose floor is above this one makes the
+    /// gateway ask to update, as the handshake it replaces does; an intro at
+    /// this build's own version does not.
+    #[test]
+    fn newer_sender_signals_urgent_update() {
+        let gw = TransportKeypair::new();
+        let own = version_cmp::PROTOC_VERSION;
+        let (major, minor) = (own[1], own[2]);
+        let patch = u16::from_be_bytes([own[3], own[4]]);
+        let [p_hi, p_lo] = (patch + 2).to_be_bytes();
+        let [f_hi, f_lo] = (patch + 1).to_be_bytes();
+        let newer = [0xFF, major, minor, p_hi, p_lo, f_hi, f_lo, own[7]];
+        assert!(
+            version_cmp::remote_requires_newer_than_us(&own, &newer),
+            "premise"
+        );
+
+        let intro_with = |version: [u8; 8]| {
+            let mut plain = vec![7u8; 24];
+            plain[..8].copy_from_slice(&version);
+            let p = PacketData::<_, MAX_PACKET_SIZE>::encrypt_with_pubkey(&plain, &gw.public);
+            PacketData::<UnknownEncryption>::from_buf(p.data())
+        };
+        let fired = std::cell::Cell::new(0);
+        let mut r = responder(&VirtualTime::new());
+        let out = r.respond_then(&gw.secret, intro_with(newer).data(), || {
+            fired.set(fired.get() + 1)
+        });
+        assert!(matches!(out, Outcome::Reply(_)));
+        assert_eq!(fired.get(), 1);
+        r.respond_then(&gw.secret, intro_with(own).data(), || {
+            fired.set(fired.get() + 1)
+        });
+        assert_eq!(
+            fired.get(),
+            1,
+            "an intro at our own version must not signal"
+        );
+    }
+
+    /// The listener must `continue` after answering, or the legacy handshake
+    /// would also run on the same intro. The behavioural test cannot see this
+    /// deterministically, so pin it in the source.
+    #[test]
+    fn listener_stops_after_answering_a_legacy_intro() {
+        let src: String = include_str!("../connection_handler.rs")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            src.contains("self.answer_legacy_intro(&packet_data, remote_addr); continue;"),
+            "the listener must continue after answer_legacy_intro"
         );
     }
 }
