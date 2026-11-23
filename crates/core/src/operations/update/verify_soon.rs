@@ -166,7 +166,7 @@
 //!   waits ran long (see `SLOT_MAX_HOLD`); two forced streams can then be on
 //!   the wire at once.
 
-use std::collections::{HashMap, HashSet};
+use crate::util::decision_hasher::{DecisionHashMap, DecisionHashSet};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -295,11 +295,11 @@ struct Check {
     round: Round,
     phase: Phase,
     /// Peers asked in the current `Sent` round that have not answered.
-    awaiting: HashSet<PeerKey>,
+    awaiting: DecisionHashSet<PeerKey>,
     /// Peers the next `Confirm` round asks. After `First`: the stale peers,
     /// with no time. After a `Confirm`: the peers held by something that
     /// clears, with the time it can.
-    stale: HashMap<PeerKey, Option<Instant>>,
+    stale: DecisionHashMap<PeerKey, Option<Instant>>,
     /// An originated write landed that no `First` round of this check covers:
     /// after the check's `First` round went out.
     rewritten: bool,
@@ -312,8 +312,8 @@ impl Check {
         Self {
             round: Round::First,
             phase: Phase::Scheduled { due },
-            awaiting: HashSet::new(),
-            stale: HashMap::new(),
+            awaiting: Default::default(),
+            stale: Default::default(),
             rewritten: false,
             retries: 0,
         }
@@ -463,12 +463,12 @@ pub(crate) enum Verdict {
 
 #[derive(Default)]
 struct Inner {
-    checks: HashMap<ContractKey, Check>,
+    checks: DecisionHashMap<ContractKey, Check>,
     /// Pairs a DELIVERED forced stream armed: when it was delivered, and the
     /// summary it was decided on.
-    armed: HashMap<(ContractKey, PeerKey), (Instant, u64)>,
+    armed: DecisionHashMap<(ContractKey, PeerKey), (Instant, u64)>,
     /// Peers whose last forced stream failed, whatever the contract.
-    barred: HashMap<PeerKey, PeerBar>,
+    barred: DecisionHashMap<PeerKey, PeerBar>,
     /// The node's one forced leg, pending or in flight.
     slot: Option<Slot>,
     /// Checks restarted outside `take_due` (by a reply or by firing a round),
@@ -867,8 +867,8 @@ fn prune(inner: &mut Inner, now: Instant) {
 }
 
 fn prune_pairs(
-    armed: &mut HashMap<(ContractKey, PeerKey), (Instant, u64)>,
-    barred: &mut HashMap<PeerKey, PeerBar>,
+    armed: &mut DecisionHashMap<(ContractKey, PeerKey), (Instant, u64)>,
+    barred: &mut DecisionHashMap<PeerKey, PeerBar>,
     slot: &mut Option<Slot>,
     now: Instant,
 ) {
@@ -887,7 +887,7 @@ fn prune_pairs(
 
 /// Bar `peer` after a failed forced stream that held the slot for `hold`.
 fn bar_peer(
-    barred: &mut HashMap<PeerKey, PeerBar>,
+    barred: &mut DecisionHashMap<PeerKey, PeerBar>,
     peer: PeerKey,
     hold: Duration,
     now: Instant,
@@ -1396,6 +1396,7 @@ mod tests {
     use freenet_stdlib::prelude::{CodeHash, ContractInstanceId};
     use futures::FutureExt;
     use std::cell::Cell;
+    use std::collections::HashSet;
 
     fn key(n: u8) -> ContractKey {
         ContractKey::from_id_and_code(ContractInstanceId::new([n; 32]), CodeHash::new([n; 32]))
