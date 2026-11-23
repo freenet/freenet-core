@@ -1664,7 +1664,10 @@ impl P2pConnManager {
             .ring
             .connection_manager
             .native_connect()
-            .set_endpoint(quic_availability);
+            .set_endpoint(
+                quic_availability,
+                quic_policy.mode() == crate::transport::quic::QuicMode::Prefer,
+            );
 
         tracing::info!(
             listening_port,
