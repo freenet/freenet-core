@@ -541,8 +541,8 @@ pub struct NodeConfig {
     #[serde(skip)]
     pub(crate) quic_native_floor_override: Option<(u8, u8, u16)>,
     /// Simulation-only: QUIC-native connects on, at this release percent, in
-    /// place of `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, both off in
-    /// production until the A+ ramp (`SimNetwork::with_native_connect`). Read
+    /// place of `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, in production
+    /// they are true and 25 (A+ step 1; `SimNetwork::with_native_connect`). Read
     /// into the node's `NativeConnectState`. `None` in production.
     /// `#[serde(skip)]`.
     #[serde(skip)]
@@ -560,8 +560,10 @@ pub struct NodeConfig {
     #[serde(skip)]
     pub(crate) native_refuses_decisions: bool,
     /// Simulation-only: native gateway joins on, at this percent, in place of
-    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, both off in
-    /// production until phase B (`SimNetwork::with_native_gateway_join`).
+    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`. In production
+    /// `NATIVE_DIAL_READY` is true since A+ step 1, and only
+    /// `GATEWAY_NATIVE_JOIN_PERCENT` (0) keeps gateway-native off until
+    /// phase B (`SimNetwork::with_native_gateway_join`).
     /// Read into the node's `NativeConnectState`. `None` in production.
     /// `#[serde(skip)]`.
     #[serde(skip)]

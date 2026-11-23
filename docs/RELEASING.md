@@ -504,9 +504,13 @@ Current wire-gated floors:
   (which accepts the marker one release ahead of the crate version, so it
   holds on 0.2.162 main and on 0.2.163). 0.2.157 to 0.2.162 carry the decoder
   but were cut with the floor raised past them, so they never emitted the
-  native variants. In 0.2.163 every offer carries percent 0
-  (`QUIC_NATIVE_PERCENT` 0, `NATIVE_DIAL_READY` false); the step that turns
-  the native path on is a later release. Do not raise the floor again unless the V2 layout itself has to change. Same failure mode as the
+  native variants. In 0.2.163 every offer carries percent 0.
+  A+ step 1 (0.2.164) sets `NATIVE_DIAL_READY` true and
+  `QUIC_NATIVE_PERCENT` 25 and does not touch the floor. The
+  acceptor decides on `min(offered, own)`, so a reversal takes effect for a
+  pair once either the acceptor or the joiner has updated; there is no
+  runtime kill switch. Do not raise the floor again unless the V2 layout
+  itself has to change. Same failure mode as the
   application-message floors above: a peer at
   or above the floor without the decoder closes the connection on the variant,
   so bias high. Only `connect::wire::encode_for_peer`, at the one peer-bound

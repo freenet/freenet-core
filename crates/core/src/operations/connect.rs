@@ -4449,7 +4449,7 @@ mod tests {
     }
 
     /// The acceptor answers a request that carried an offer with a decision
-    /// (`Udp` in this build), and one without an offer with none.
+    /// (`Udp` here: the offer is at percent 0), and one without an offer with none.
     #[test]
     fn acceptor_decides_only_when_offered() {
         let self_loc = make_peer(4000);
@@ -4698,7 +4698,7 @@ mod tests {
 
     /// Every join request, including a bootstrap join through a gateway, is
     /// built by `prepare_join_request` and carries an offer, at percent 0 in
-    /// this build, and each offer is counted.
+    /// a bare test (no endpoint up), and each offer is counted.
     #[test]
     fn every_join_request_carries_an_offer() {
         let offers =

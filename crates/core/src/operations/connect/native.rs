@@ -9,9 +9,9 @@
 //!
 //! On `Native` the joiner and the acceptor each dial a native connection
 //! ([`DialTransport::Native`]), and a failed setup falls back to today's UDP
-//! dial. In production nothing changes yet: [`NATIVE_DIAL_READY`] is false,
-//! so every offer carries percent 0 and every decision is
-//! [`NativeDecision::Udp`]; a simulation turns it on per node
+//! dial. In production [`NATIVE_DIAL_READY`] is true and
+//! [`QUIC_NATIVE_PERCENT`] is 25 (A+ step 1), so a ready pair whose bucket is
+//! below 25 decides `Native`; a simulation sets both per node
 //! ([`NativeConnectState`]). A `Native` the joiner cannot honour fails that
 //! attempt ([`joiner_response_action`]).
 //!
@@ -36,22 +36,26 @@ use crate::transport::TransportPublicKey;
 use crate::transport::metrics::ConnectArm;
 use crate::transport::metrics::TRANSPORT_METRICS;
 
-/// Whether this build can dial a native connection. False until the native
-/// connection exists and is wired into the connect op; while false, every offer
-/// this node sends carries percent 0 and it never decides `Native`.
-pub(crate) const NATIVE_DIAL_READY: bool = false;
+/// Whether this build can dial a native connection. True since A+ step 1;
+/// while false, every offer this node sends carries percent 0 and it never
+/// decides `Native`.
+pub(crate) const NATIVE_DIAL_READY: bool = true;
 
 /// This release's share of pairs, 0 to 100, that set up a native connection
-/// when both sides are ready. Each step is its own release; the acceptor's
-/// release governs, since only the acceptor decides.
-pub(crate) const QUIC_NATIVE_PERCENT: u8 = 0;
+/// when both sides are ready. Each step is its own release. Only the acceptor
+/// decides, and it decides on `min(offered, own)`, so a pair goes native only
+/// if both releases allow it: a reversal takes effect for any pair where either
+/// the acceptor or the joiner has updated, as nodes update. There is no runtime
+/// kill switch. 25 is A+ step 1.
+pub(crate) const QUIC_NATIVE_PERCENT: u8 = 25;
 
 /// This release's share, 0 to 100, of (joiner, gateway) pairs whose join
 /// tries a native connection to the gateway first (#5940, phase B), when the
 /// gateway is marked native in the gateway index and this node can dial
 /// native. Any failure falls back at once to today's join. The joiner alone
 /// decides (there is no connection to the gateway yet to ask it), so the
-/// joiner's release governs. At 0 no join tries native.
+/// joiner's release governs. At 0 no join tries native. `NATIVE_DIAL_READY`
+/// is true since A+ step 1, so this 0 alone keeps gateway-native off.
 pub(crate) const GATEWAY_NATIVE_JOIN_PERCENT: u8 = 0;
 
 /// After a native join with a gateway fails, joins to that gateway go
@@ -777,7 +781,7 @@ pub(crate) struct NativeConnectState {
     /// and when it is not up, the node cannot dial native. Read per node, not
     /// from the process-wide endpoint metric, which several simulated nodes
     /// in one process share.
-    endpoint: std::sync::OnceLock<crate::transport::QuicAvailabilityWatch>,
+    endpoint: std::sync::OnceLock<(crate::transport::QuicAvailabilityWatch, bool)>,
     /// Simulation only: native gateway joins on, at this percent, in place of
     /// [`NATIVE_DIAL_READY`] and [`GATEWAY_NATIVE_JOIN_PERCENT`]
     /// (`NodeConfig::native_gateway_join_override`). `None` in production.
@@ -964,13 +968,21 @@ impl NativeConnectState {
     fn endpoint_up(&self) -> bool {
         self.endpoint
             .get()
-            .is_some_and(|e| e.get() == crate::transport::QuicAvailability::Up)
+            .is_some_and(|(e, prefer)| *prefer && e.get() == crate::transport::QuicAvailability::Up)
     }
 
     /// The node's transport opened with this QUIC endpoint. Only the first
-    /// call counts: a node opens one transport.
-    pub(crate) fn set_endpoint(&self, endpoint: crate::transport::QuicAvailabilityWatch) {
-        self.endpoint.get_or_init(|| endpoint);
+    /// call counts: a node opens one transport. `prefer` is whether the
+    /// configured `transport-quic` mode is `prefer`: a native connection
+    /// carries application data, which `shadow` promises to keep on UDP, so a
+    /// node in any other mode is never ready, as joiner, acceptor or gateway
+    /// joiner, however up its endpoint is.
+    pub(crate) fn set_endpoint(
+        &self,
+        endpoint: crate::transport::QuicAvailabilityWatch,
+        prefer: bool,
+    ) {
+        self.endpoint.get_or_init(|| (endpoint, prefer));
     }
 
     /// This node's readiness now, as joiner: the offer it sends and whether
@@ -1532,23 +1544,35 @@ mod tests {
         );
     }
 
-    /// This build cannot dial native, so it offers 0 and never decides
-    /// `Native`, whatever the endpoint state.
+    /// A+ step 1: this build dials native and offers 25 once its endpoint is
+    /// up. A node whose endpoint is down offers 0 and decides UDP; an up node
+    /// decides `Native` exactly for buckets below 25.
     #[test]
-    fn this_release_offers_zero_and_decides_udp() {
-        const { assert!(!NATIVE_DIAL_READY) };
-        for endpoint_up in [false, true] {
-            let own = NativeReadiness::from_inputs(NATIVE_DIAL_READY, endpoint_up, false);
-            assert!(!own.ready);
-            assert_eq!(own.offer(), NativeOffer::capable(0));
-            for bucket in 0..100 {
-                assert_eq!(
-                    decide_native(Some(NativeOffer::capable(100)), own, bucket, false),
-                    NativeDecision::Udp
-                );
-            }
+    fn this_release_offers_25_when_up_and_decides_native_below_25() {
+        const { assert!(NATIVE_DIAL_READY) };
+        const { assert!(QUIC_NATIVE_PERCENT == 25) };
+        let down = NativeReadiness::from_inputs(NATIVE_DIAL_READY, false, false);
+        assert!(!down.ready);
+        assert_eq!(down.offer(), NativeOffer::capable(0));
+        let up = NativeReadiness::from_inputs(NATIVE_DIAL_READY, true, false);
+        assert!(up.ready);
+        assert_eq!(up.offer(), NativeOffer::capable(25));
+        for bucket in 0..100 {
+            assert_eq!(
+                decide_native(Some(NativeOffer::capable(100)), down, bucket, false),
+                NativeDecision::Udp
+            );
+            let want = if bucket < 25 {
+                NativeDecision::Native
+            } else {
+                NativeDecision::Udp
+            };
+            assert_eq!(
+                decide_native(Some(NativeOffer::capable(100)), up, bucket, false),
+                want,
+                "bucket {bucket}"
+            );
         }
-        assert_eq!(NativeReadiness::current().offer().percent, 0);
     }
 
     #[test]
@@ -1608,12 +1632,22 @@ mod tests {
         use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
         let (endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
         let off = NativeConnectState::new(None);
-        off.set_endpoint(watch.clone());
-        assert!(!off.readiness().ready, "production: not ready to dial");
+        off.set_endpoint(watch.clone(), true);
+        assert!(
+            off.readiness().ready,
+            "production: ready once the endpoint is up"
+        );
+        assert_eq!(off.readiness().percent, QUIC_NATIVE_PERCENT);
+        let no_endpoint = NativeConnectState::new(None);
+        assert!(
+            !no_endpoint.readiness().ready,
+            "production: no transport yet"
+        );
+        assert_eq!(no_endpoint.readiness().percent, 0);
         let on = NativeConnectState::new(Some(100));
         assert!(!on.readiness().ready, "no transport yet");
         assert_eq!(on.readiness().percent, 0);
-        on.set_endpoint(watch);
+        on.set_endpoint(watch, true);
         assert!(on.readiness().ready);
         assert_eq!(on.readiness().percent, 100);
         endpoint.send(QuicAvailability::Down).unwrap();
@@ -1637,7 +1671,7 @@ mod tests {
         // A watch keeps its last value after its sender drops.
         let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
         let state = NativeConnectState::new(Some(release));
-        state.set_endpoint(watch);
+        state.set_endpoint(watch, true);
         state
     }
 
@@ -1821,7 +1855,7 @@ mod tests {
         use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
         let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
         let state = NativeConnectState::new(Some(100)).with_joiner_off(true);
-        state.set_endpoint(watch);
+        state.set_endpoint(watch, true);
         assert!(!state.readiness().ready);
         assert_eq!(state.readiness().offer().percent, 0);
         assert!(!state.readiness().demoted);
@@ -1975,7 +2009,7 @@ mod tests {
         let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
         // Production state, with every other condition met.
         let state = NativeConnectState::new(None);
-        state.set_endpoint(watch);
+        state.set_endpoint(watch, true);
         let gateway = "192.0.2.1:31337".parse().unwrap();
         state.set_native_gateways([gateway]);
         for seed in 0..200 {
@@ -1984,6 +2018,50 @@ mod tests {
                 GatewayJoinPlan::Legacy
             );
         }
+    }
+
+    /// A native connection carries application data, which `transport-quic =
+    /// shadow` promises to keep on UDP. A shadow (or off) node's endpoint can
+    /// be up, yet it must offer 0, decide UDP and join gateways over UDP, in
+    /// production state (no percent override), while a `prefer` node with the
+    /// same endpoint does not.
+    #[test]
+    fn a_node_not_in_prefer_mode_never_goes_native() {
+        use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
+        let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
+        let gateway = "192.0.2.1:31337".parse().unwrap();
+        let build = |prefer: bool| {
+            let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
+            state.set_endpoint(watch.clone(), prefer);
+            state.set_native_gateways([gateway]);
+            state
+        };
+        let shadow = build(false);
+        for readiness in [shadow.readiness(), shadow.acceptor_readiness()] {
+            assert!(!readiness.ready);
+            assert_eq!(readiness.offer(), NativeOffer::capable(0));
+            for bucket in 0..100 {
+                assert_eq!(
+                    decide_native(Some(NativeOffer::capable(100)), readiness, bucket, false),
+                    NativeDecision::Udp
+                );
+            }
+        }
+        for seed in 0..100 {
+            assert_eq!(
+                shadow.plan_gateway_join(&key(seed), gateway, &key(10_000)),
+                GatewayJoinPlan::Legacy
+            );
+        }
+        let prefer = build(true);
+        assert!(prefer.readiness().ready, "premise: prefer, same endpoint");
+        assert!(
+            (0..100).any(|seed| {
+                prefer.plan_gateway_join(&key(seed), gateway, &key(10_000))
+                    != GatewayJoinPlan::Legacy
+            }),
+            "premise: the gateway override reaches native for a prefer node"
+        );
     }
 
     /// A join tries native only when the node can dial, the gateway is
@@ -2022,7 +2100,7 @@ mod tests {
             GatewayJoinPlan::Legacy,
             "no transport yet"
         );
-        state.set_endpoint(watch);
+        state.set_endpoint(watch, true);
         assert_eq!(
             state.plan_gateway_join(&key(1), marked, &gateway),
             GatewayJoinPlan::NativeFirst
@@ -2061,7 +2139,7 @@ mod tests {
         // At 50%, exactly the joiners whose pair bucket is below 50.
         let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
         let half = NativeConnectState::new(None).with_gateway_join_override(Some(50));
-        half.set_endpoint(watch);
+        half.set_endpoint(watch, true);
         half.set_native_gateways([marked]);
         let mut native = 0;
         for seed in 0..400 {
@@ -2093,7 +2171,7 @@ mod tests {
         );
         let v4: std::net::SocketAddr = "192.0.2.1:31337".parse().unwrap();
         let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
-        state.set_endpoint(watch);
+        state.set_endpoint(watch, true);
         state.set_native_gateways([mapped]);
         assert_eq!(
             state.plan_gateway_join(&key(1), v4, &key(10_000)),
@@ -2113,7 +2191,7 @@ mod tests {
         let other: std::net::SocketAddr = "192.0.2.3:31337".parse().unwrap();
         let gateway = key(10_000);
         let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
-        state.set_endpoint(watch);
+        state.set_endpoint(watch, true);
         state.set_native_gateways([marked, other]);
         state.record_gateway_join(marked, false);
         assert_eq!(
@@ -2171,7 +2249,7 @@ mod tests {
             31337,
         );
         let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
-        state.set_endpoint(watch);
+        state.set_endpoint(watch, true);
         state.set_native_gateways([v4]);
         state.record_gateway_join(mapped, false);
         assert_eq!(
@@ -2191,7 +2269,7 @@ mod tests {
         let marked: std::net::SocketAddr = "192.0.2.1:31337".parse().unwrap();
         let gateway = key(10_000);
         let state = NativeConnectState::new(None).with_gateway_join_override(Some(100));
-        state.set_endpoint(watch);
+        state.set_endpoint(watch, true);
         state.set_native_gateways([marked]);
         for (native, frame_seen) in [(true, true), (false, false), (false, true)] {
             state.gateway_link_closed(marked, native, frame_seen);

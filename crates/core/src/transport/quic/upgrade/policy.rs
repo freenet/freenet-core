@@ -185,6 +185,11 @@ pub(crate) struct QuicPolicyConfig {
 }
 
 impl QuicPolicyConfig {
+    /// The configured `transport-quic` mode.
+    pub(crate) fn mode(&self) -> QuicMode {
+        self.mode
+    }
+
     /// The policy inputs for a node configured by `config`, whose crash-loop
     /// breaker decided `breaker` ([`breaker::gate`]).
     ///

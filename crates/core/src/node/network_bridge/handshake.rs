@@ -1954,7 +1954,7 @@ mod tests {
         let (endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
         let native = crate::operations::connect::native::NativeConnectState::new(None)
             .with_gateway_join_override(Some(100));
-        native.set_endpoint(watch);
+        native.set_endpoint(watch, true);
         native.set_native_gateways(marked.iter().copied());
         let own = TransportKeypair::new().public().clone();
         (
@@ -2262,7 +2262,9 @@ mod tests {
         node_config.native_gateway_join_override = Some(100);
         let connection_manager = ConnectionManager::new(&node_config);
         let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
-        connection_manager.native_connect().set_endpoint(watch);
+        connection_manager
+            .native_connect()
+            .set_endpoint(watch, true);
 
         let connector = Arc::new(GatewayConnector::new(true, Handshake::Succeeds));
         let (_conn_tx, conn_rx) = mpsc::channel(1);

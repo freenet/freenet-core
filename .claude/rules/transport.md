@@ -2271,9 +2271,11 @@ upgrades hub's
 `QuicUpgrades::setup_native` (A5b, below); the endpoint's native side
 (`native/endpoint.rs`: `allow_native_peer`, `dial_native`, `send_punch`)
 stays `pub(in crate::transport::quic::native)`, and registering a native
-waiter is private to `setup`. In production nothing asks for a setup: the
-connect op gates on `operations::connect::native::NATIVE_DIAL_READY` (pinned
-false) and `QUIC_NATIVE_PERCENT` (0).
+waiter is private to `setup`. Since A+ step 1 the connect op asks for a
+setup for ready pairs whose bucket is below `QUIC_NATIVE_PERCENT` (25), gated
+on `operations::connect::native::NATIVE_DIAL_READY` (true). There is no
+runtime kill switch: the acceptor decides on `min(offered, own)`, so a
+reversal takes effect for a pair once either side has updated.
 
 ```
 ALPN per attempt: an address allowed with allow_native_peer is accepted with
@@ -2373,16 +2375,21 @@ The transient-send warn in peer_connection_listener is throttled per
 
 Native connect (`operations/connect/native.rs`, `quic/upgrade/driver/native.rs`,
 A5b): the connect op asks for a native connection when the acceptor decides
-`Native`. Off in production (gates above); a simulation turns it on per node
-with `SimNetwork::with_native_connect` / `with_node_native_connect`
-(`NodeConfig::native_connect_override`).
+`Native`. On in production since A+ step 1 at `QUIC_NATIVE_PERCENT` (25), for
+`transport-quic = prefer` nodes only (gates above); a simulation sets the
+percent per node with `SimNetwork::with_native_connect` /
+`with_node_native_connect` (`NodeConfig::native_connect_override`). Native
+gateway joins stay off (`GATEWAY_NATIVE_JOIN_PERCENT` 0).
 
 ```
 Readiness: NativeConnectState, one per node in the ConnectionManager. Ready
   when dialling is on (NATIVE_DIAL_READY, or the override), this node's own
   QUIC endpoint is up (its QuicAvailabilityWatch from TransportHandle, read
   per node: the process-wide quic_endpoint metric is shared by simulated
-  nodes) and the node is not demoted. The joiner's offer reads
+  nodes), the configured transport-quic mode is prefer (set_endpoint's
+  `prefer`: a native connection carries application data, which shadow
+  keeps on UDP, so a shadow or off node is never ready in any role,
+  including gateway joins) and the node is not demoted. The joiner's offer reads
   readiness() (joiner demotion only); the relay's decision reads
   acceptor_readiness() (either role's demotion).
 Dial: NodeEvent::ConnectPeer and HandshakeCommand::Connect carry a

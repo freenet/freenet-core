@@ -4041,7 +4041,7 @@ mod driver_timing_tests {
             crate::transport::QuicAvailability::Up,
         );
         let connect = op_manager.ring.connection_manager.native_connect();
-        connect.set_endpoint(watch);
+        connect.set_endpoint(watch, true);
         assert!(
             connect.readiness().ready,
             "premise: the joiner can dial native"

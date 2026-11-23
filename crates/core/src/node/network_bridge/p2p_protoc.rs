@@ -1225,7 +1225,7 @@ use crate::operations::connect::native::NativeWire;
 /// starts the data ramp, and turning on the native connect offer in the same
 /// release would change two things at once. Raised to 0.2.160 for 0.2.159,
 /// which ships while the data ramp is still under watch. Raised to 0.2.161
-/// for 0.2.160: native connect is still off (`QUIC_NATIVE_PERCENT` is 0) and
+/// for 0.2.160: native connect was still off (`QUIC_NATIVE_PERCENT` was 0) and
 /// its wire fields may change before it is enabled, so no release is frozen
 /// as the floor yet. Raised to 0.2.162 for 0.2.161 for the same reasons, and
 /// to 0.2.163 for 0.2.162. Frozen at 0.2.163: that release ships the variants
@@ -1664,7 +1664,10 @@ impl P2pConnManager {
             .ring
             .connection_manager
             .native_connect()
-            .set_endpoint(quic_availability);
+            .set_endpoint(
+                quic_availability,
+                quic_policy.mode() == crate::transport::quic::QuicMode::Prefer,
+            );
 
         tracing::info!(
             listening_port,
