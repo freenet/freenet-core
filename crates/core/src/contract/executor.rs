@@ -2770,6 +2770,12 @@ mod tests {
             ("MAX_EVIDENCE_INPUT_BYTES", "per-request input limit"),
             ("MAX_IMPORT_BUNDLE_BYTES", "per-request import limit"),
             (
+                "MAX_HOP_REPLY_BYTES",
+                "size cap on one inter-delegate reply, held for one delegate \
+                 iteration (or charged to the park budget, which is summed, while \
+                 parked)",
+            ),
+            (
                 "MAX_GUEST_ERROR_TEXT_BYTES",
                 "length cap on one guest-supplied error or log string, not a memory budget",
             ),

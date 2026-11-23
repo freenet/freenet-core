@@ -432,6 +432,9 @@ pub(crate) struct DelegateObservation {
     /// instance, that an inter-delegate hop's target observes
     /// `MessageOrigin::Delegate(caller)`.
     pub origin: Option<MessageOrigin>,
+    /// The `sender` of each inbound `DelegateMessage`, in order: what a
+    /// delegate reads to tell which delegate a message (or a reply) came from.
+    pub delegate_message_senders: Vec<DelegateKey>,
 }
 
 /// What the executor was told about who is calling, for [`DelegateObservation::origin`].
@@ -874,15 +877,29 @@ fn scripted_delegate_request(
     // registration variants carry none. The wildcard is required by
     // `#[non_exhaustive]` and is listed alongside the known variants so a
     // future one is not silently swallowed.
-    let (inbound_kinds, params): (Vec<&'static str>, Vec<u8>) = match &req {
+    let (inbound_kinds, params, delegate_message_senders): (
+        Vec<&'static str>,
+        Vec<u8>,
+        Vec<DelegateKey>,
+    ) = match &req {
         DelegateRequest::ApplicationMessages {
             inbound, params, ..
         } => (
             inbound.iter().map(inbound_kind).collect(),
             params.as_ref().to_vec(),
+            inbound
+                .iter()
+                .filter_map(|m| {
+                    if let InboundDelegateMsg::DelegateMessage(dm) = m {
+                        Some(dm.sender.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
         ),
         DelegateRequest::RegisterDelegate { .. } | DelegateRequest::UnregisterDelegate(_) | _ => {
-            (Vec::new(), Vec::new())
+            (Vec::new(), Vec::new(), Vec::new())
         }
     };
 
@@ -903,6 +920,7 @@ fn scripted_delegate_request(
             params: params.clone(),
             secret_user,
             origin: origin.clone(),
+            delegate_message_senders: delegate_message_senders.clone(),
         });
         if let Some(bytes) = writes {
             rt.contexts
@@ -1040,20 +1058,26 @@ impl ContractExecutor for Executor<MockWasmRuntime, MockStateStorage> {
         &mut self,
         req: DelegateRequest<'_>,
         origin_contract: Option<&ContractInstanceId>,
-        _caller_delegate: Option<&DelegateKey>,
+        caller_delegate: Option<&DelegateKey>,
         connection_scope: crate::client_events::ConnectionScope,
         user_context: Option<&UserSecretContext>,
     ) -> Response {
         if let Some(runner) = self.runtime.delegate_lane.clone() {
             use crate::contract::delegate_lane::DelegateRunner;
             return runner
-                .run(req, origin_contract, None, connection_scope, user_context)
+                .run(
+                    req,
+                    origin_contract,
+                    caller_delegate,
+                    connection_scope,
+                    user_context,
+                )
                 .await;
         }
         let user = user_context.map(|u| *u.user_id());
         let attestation = Attestation {
             origin_contract,
-            caller_delegate: None,
+            caller_delegate,
             connection_scope,
         };
         scripted_delegate_request(&self.runtime.delegate_state(), req, user, user, attestation)

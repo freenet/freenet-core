@@ -115,6 +115,46 @@ const MAX_CONTRACT_REQUEST_ITERATIONS: usize = 100;
 /// client paces them).
 const MAX_UNPROMPTED_HOPS_PER_RUN: usize = 16;
 
+/// Largest payload, in bytes, of one reply a hop's target sends back to its
+/// caller (`split_hop_output`). A larger reply is dropped and counted.
+///
+/// Why a separate bound: the runtime caps one `process()` call's output at
+/// `MAX_OUTBOUND_BYTES_PER_RUN` (128 MiB). Before replies existed a target's
+/// output was dropped or handed on right after each hop; a reply is instead
+/// RETAINED until the caller's next iteration (and across a park), and is
+/// then handed into the caller's WASM memory, where a reply near the runtime
+/// cap could fail the caller's whole `process()` call and lose the other
+/// responses in its batch.
+///
+/// Why 64 KiB: the motivating reply is a signature from a key-vault delegate,
+/// tens to hundreds of bytes. 64 KiB leaves room for a certificate chain or a
+/// small encrypted blob, and anything larger belongs in a contract the caller
+/// can GET rather than in a reply.
+const MAX_HOP_REPLY_BYTES: usize = 64 * 1024;
+
+/// Most reply payload bytes one delegate run, across all its iterations and
+/// parks, accepts from its hops' targets. Further replies are dropped and
+/// counted.
+///
+/// Sized at `MAX_UNPROMPTED_HOPS_PER_RUN` maximal replies (1 MiB), so an
+/// unprompted run is never limited by this before it reaches its hop cap. A
+/// client run, which the hop cap does not bound, is bounded by this instead.
+///
+/// The NUMBER of replies is bounded separately, because a reply may be empty
+/// and this byte bound then does not limit it. Each reply is delivered in an
+/// iteration of its own (`next_call`), so at enqueue a reply is dropped and
+/// counted once the queue already holds as many replies as the run has
+/// iterations left: the queue never holds more than
+/// `MAX_CONTRACT_REQUEST_ITERATIONS` replies, and none it cannot deliver.
+///
+/// An iteration makes exactly one executor call, whose output is processed
+/// before the next call. So a run makes at most
+/// `MAX_CONTRACT_REQUEST_ITERATIONS` calls into the delegate and holds at
+/// most one call's output (the runtime's per-call budget) at a time, plus a
+/// reply queue bounded as above: at most that many replies, and at most this
+/// many payload bytes.
+const MAX_HOP_REPLY_BYTES_PER_RUN: usize = MAX_UNPROMPTED_HOPS_PER_RUN * MAX_HOP_REPLY_BYTES;
+
 /// Maximum delegate notifications to drain per iteration.
 /// Matches the same bounded-drain pattern as MAX_DRAIN_BATCH for contract events,
 /// preventing delegate notification channel growth under sustained contract load.
@@ -1473,6 +1513,14 @@ struct RunSeed {
     /// and parks, like `iterations`. Counted for every run; enforced only for
     /// an unprompted one.
     hops_attempted: usize,
+    /// Payload bytes of hop replies this run has already accepted, so
+    /// `MAX_HOP_REPLY_BYTES_PER_RUN` bounds the whole run across iterations
+    /// and parks, like `hops_attempted`.
+    reply_bytes_accepted: usize,
+    /// Hop replies to deliver in this run's first iteration: those a parked
+    /// iteration produced, carried by the continuation. Empty for a fresh
+    /// run.
+    replies: Vec<delegate_park::PendingReply>,
     /// What the delegate lane's `process()` call already returned for this
     /// round-trip's first leg, when the lane handed the round-trip to the
     /// loop (`delegate_lane`). The first iteration uses it instead of calling
@@ -1600,6 +1648,156 @@ fn delegate_response_values(
     }
 }
 
+/// The executor call an iteration of a delegate round-trip makes, chosen by
+/// [`next_call`].
+struct RoundCall {
+    req: DelegateRequest<'static>,
+    /// `Some(target)` when this call delivers a hop reply from `target`: the
+    /// call then names `target` as `caller_delegate` (and no origin
+    /// contract). `None` for the iteration's batch, which carries the run's
+    /// own origin.
+    reply_from: Option<DelegateKey>,
+}
+
+/// Choose the ONE executor call an iteration makes: the batch `req` when it
+/// has inbound, otherwise the oldest queued hop reply, otherwise `req` with
+/// its empty inbound (the call an iteration that only sent messages has
+/// always made).
+///
+/// One call per iteration is what bounds a run's work: each call's output is
+/// processed before the next call, so an iteration holds at most one call's
+/// output (the runtime's per-call budget), and a run makes at most
+/// `MAX_CONTRACT_REQUEST_ITERATIONS` calls, the same ceiling as before
+/// replies existed. The batch goes first because it answers the delegate's
+/// own requests; queued replies follow, one per iteration.
+///
+/// A reply is delivered in a call of its own, naming the replying delegate as
+/// `caller_delegate`. So while the delegate processes a reply it sees
+/// `MessageOrigin::Delegate(target)`, the same origin every other inbound
+/// `DelegateMessage` carries (`resolve_message_origin`: an inter-delegate
+/// message replaces any WebApp or inherited origin, and a non-local
+/// connection still gets none). In the batch it would run under the RUN's
+/// origin, for instance a web app's attestation. Any prompt the delegate
+/// raises while handling a reply is still shown under the run's own app
+/// identity (`caller_identity_from_origin`), since the run is the one
+/// prompting.
+///
+/// The origin comes from [`delegate_park::PendingReply::from`], recorded by
+/// the hop that ran the target, never from a field of the message. A
+/// `DelegateMessage` that reached `req` by any other route would run in the
+/// batch under the run's origin, the same as before replies existed.
+fn next_call(
+    req: DelegateRequest<'static>,
+    replies: &mut std::collections::VecDeque<delegate_park::PendingReply>,
+    delegate_key: &DelegateKey,
+    params: &Parameters<'static>,
+) -> RoundCall {
+    let empty_batch = matches!(
+        &req,
+        DelegateRequest::ApplicationMessages { inbound, .. } if inbound.is_empty()
+    );
+    if empty_batch && let Some(delegate_park::PendingReply { from, msg }) = replies.pop_front() {
+        // The hop sets both from the key it ran (`split_hop_output` and the
+        // `PendingReply` it builds); a second producer that let them drift
+        // would show a receiver one delegate in `sender` and another as its
+        // attested origin.
+        debug_assert_eq!(
+            from, msg.sender,
+            "a hop reply's recorded origin and its sender must agree"
+        );
+        return RoundCall {
+            req: DelegateRequest::ApplicationMessages {
+                key: delegate_key.clone(),
+                params: params.clone(),
+                inbound: vec![InboundDelegateMsg::DelegateMessage(msg)],
+            },
+            reply_from: Some(from),
+        };
+    }
+    RoundCall {
+        req,
+        reply_from: None,
+    }
+}
+
+/// Count and log, once, `n` hop replies to `delegate_key` that were not
+/// delivered or not handled, and why.
+fn note_dropped_replies(
+    parking: Option<&mut ParkingCtx<'_>>,
+    delegate_key: &DelegateKey,
+    n: u64,
+    why: &'static str,
+) {
+    if n == 0 {
+        return;
+    }
+    let total = parking.map(|ctx| ctx.park.count_dropped_hop_replies(n));
+    tracing::info!(
+        delegate_key = %delegate_key,
+        dropped = n,
+        total_dropped = ?total,
+        why,
+        "Dropped replies to this delegate's inter-delegate messages"
+    );
+}
+
+/// A hop target's output, split by [`split_hop_output`].
+struct HopOutput {
+    /// The one reply to the caller, if the target sent one, ready to deliver
+    /// as an inbound `DelegateMessage`.
+    reply: Option<DelegateMessage>,
+    /// `SendDelegateMessage`s that are not delivered: to any delegate other
+    /// than the caller, or a second reply.
+    dropped_sends: u64,
+    /// Everything else the target emitted, in order.
+    other: Vec<OutboundDelegateMsg>,
+}
+
+/// Split what a hop's target emitted: the first unprocessed
+/// `SendDelegateMessage` it addressed back to `caller` is the reply; every
+/// other `SendDelegateMessage` (including one marked processed, which is
+/// not a send) is dropped (counted only); the rest is returned untouched for
+/// the caller's run to route.
+///
+/// The reply is normalized here rather than trusted as the target built it:
+/// - `sender` is set to `target`, the delegate the node just ran. The caller
+///   authorizes the reply on this field, so it is set on the path that
+///   delivers it, from the key the node itself ran.
+/// - `context` is cleared, as the runtime clears it on an outbound
+///   `ApplicationMessage`: the target's context is not the caller's.
+fn split_hop_output(
+    values: Vec<OutboundDelegateMsg>,
+    caller: &DelegateKey,
+    target: &DelegateKey,
+) -> HopOutput {
+    let mut out = HopOutput {
+        reply: None,
+        dropped_sends: 0,
+        other: Vec::new(),
+    };
+    for value in values {
+        match value {
+            OutboundDelegateMsg::SendDelegateMessage(mut msg)
+                if out.reply.is_none() && !msg.processed && msg.target == *caller =>
+            {
+                msg.sender = target.clone();
+                msg.context = DelegateContext::default();
+                out.reply = Some(msg);
+            }
+            OutboundDelegateMsg::SendDelegateMessage(_) => out.dropped_sends += 1,
+            other @ (OutboundDelegateMsg::ApplicationMessage(_)
+            | OutboundDelegateMsg::RequestUserInput(_)
+            | OutboundDelegateMsg::ContextUpdated(_)
+            | OutboundDelegateMsg::GetContractRequest(_)
+            | OutboundDelegateMsg::PutContractRequest(_)
+            | OutboundDelegateMsg::UpdateContractRequest(_)
+            | OutboundDelegateMsg::SubscribeContractRequest(_)
+            | OutboundDelegateMsg::UnsubscribeContractRequest(_)) => out.other.push(other),
+        }
+    }
+    out
+}
+
 /// Handle a delegate request, including any contract request messages in the response.
 ///
 /// When a delegate emits contract request messages, this function:
@@ -1671,8 +1869,16 @@ where
         mut iterations,
         mut self_heal_fetches_started,
         mut hops_attempted,
+        mut reply_bytes_accepted,
+        replies: current_replies,
         mut first_values,
     } = seed;
+    // Hop replies waiting for a call of their own, oldest first (`next_call`).
+    let mut current_replies: std::collections::VecDeque<delegate_park::PendingReply> =
+        current_replies.into();
+    // The lane hands the loop only fresh client round-trips, which carry no
+    // replies; a resumed run (which may) never has `first_values`.
+    debug_assert!(first_values.is_none() || current_replies.is_empty());
 
     loop {
         iterations += 1;
@@ -1719,6 +1925,16 @@ where
             // gap named at `MAX_CONTRACT_REQUEST_ITERATIONS`: the delegate is
             // not told it was cut short, which is the same question from the
             // delegate's side rather than the client's.
+            //
+            // Hop replies still waiting for this iteration are lost with the
+            // rest of its inbound; count them, so a caller missing a reply
+            // shows up somewhere.
+            note_dropped_replies(
+                parking.as_mut(),
+                delegate_key,
+                current_replies.len() as u64,
+                "the run reached MAX_CONTRACT_REQUEST_ITERATIONS before delivering it",
+            );
             return DelegateRunOutcome::Completed(accumulated_messages);
         }
 
@@ -1728,19 +1944,71 @@ where
         // `process()` is not entered twice for one inbound batch.
         let result = match first_values.take() {
             Some(values) => Ok(values),
-            None => delegate_response_values(
-                contract_handler
-                    .executor()
-                    .execute_delegate_request(
-                        current_req,
-                        origin_contract,
-                        None,
-                        connection_scope,
-                        user_context,
-                    )
-                    .await,
-                delegate_key,
-            ),
+            // ONE executor call per iteration: the batch, or one queued hop
+            // reply (`next_call`). Each call's output is processed before the
+            // next call is made, so an iteration holds at most one call's
+            // output (the runtime's per-call budget) and a run makes at most
+            // MAX_CONTRACT_REQUEST_ITERATIONS calls, as before replies existed.
+            None => {
+                let call = next_call(
+                    current_req,
+                    &mut current_replies,
+                    delegate_key,
+                    &current_params,
+                );
+                let is_reply = call.reply_from.is_some();
+                // At most one of `origin_contract` and `caller_delegate`
+                // (`delegate_request_as`'s invariant): a reply names the
+                // delegate that sent it, the batch carries the run's origin.
+                let (call_origin, call_caller) = match &call.reply_from {
+                    Some(from) => (None, Some(from)),
+                    None => (origin_contract, None),
+                };
+                let out = delegate_response_values(
+                    contract_handler
+                        .executor()
+                        .execute_delegate_request(
+                            call.req,
+                            call_origin,
+                            call_caller,
+                            connection_scope,
+                            user_context,
+                        )
+                        .await,
+                    delegate_key,
+                );
+                match out {
+                    Ok(out) => Ok(out),
+                    // A failed REPLY call is a dropped reply, not a failed
+                    // run: earlier iterations have run (and may have saved
+                    // state expecting their outputs to be handled), and the
+                    // target, whose reply this was, must not be able to fail
+                    // the caller's run. The failed call's context is not
+                    // persisted (the runtime keeps the context from before
+                    // the call), but secrets it wrote before failing stay
+                    // written. `delegate_response_values` logged the error.
+                    Err(_) if is_reply => {
+                        note_dropped_replies(
+                            parking.as_mut(),
+                            delegate_key,
+                            1,
+                            "the delegate failed while handling it",
+                        );
+                        Ok(Vec::new())
+                    }
+                    Err(err) => {
+                        // The run fails as before; replies still queued
+                        // behind it are never delivered.
+                        note_dropped_replies(
+                            parking.as_mut(),
+                            delegate_key,
+                            current_replies.len() as u64,
+                            "the delegate failed on an earlier batch of this run",
+                        );
+                        Err(err)
+                    }
+                }
+            }
         };
         let values = match result {
             Ok(values) => values,
@@ -1791,6 +2059,14 @@ where
                         contract_id = %req.contract_id,
                         "Delegate requested UnsubscribeContractRequest, which this node does not implement yet (see #5600)"
                     );
+                    // The run ends here; replies still queued are never
+                    // delivered.
+                    note_dropped_replies(
+                        parking.as_mut(),
+                        delegate_key,
+                        current_replies.len() as u64,
+                        "the run failed on an UnsubscribeContractRequest first",
+                    );
                     return DelegateRunOutcome::Failed(ExecutorError::other(anyhow::anyhow!(
                         "UnsubscribeContractRequest is not implemented by this node yet (#5600)"
                     )));
@@ -1803,18 +2079,24 @@ where
             }
         }
 
-        // If no contract requests, delegate messages, or user input requests, we're done
+        // If no contract requests, delegate messages, or user input requests,
+        // and no hop replies still queued for a call of their own, we're done
         if get_requests.is_empty()
             && put_requests.is_empty()
             && update_requests.is_empty()
             && subscribe_requests.is_empty()
             && delegate_messages.is_empty()
             && user_input_requests.is_empty()
+            && current_replies.is_empty()
         {
             return DelegateRunOutcome::Completed(accumulated_messages);
         }
 
         let mut inbound_responses: Vec<InboundDelegateMsg<'static>> = Vec::new();
+        // Hop replies produced this iteration, each with the delegate that
+        // produced it; queued, then delivered one per later iteration
+        // (`next_call`).
+        let mut pending_replies: Vec<delegate_park::PendingReply> = Vec::new();
 
         // UNPROMPTED-RUN BUDGET (`delegate_capabilities`). For a delegate that
         // opted into capabilities (a manifest, registered by an app that holds
@@ -2622,13 +2904,41 @@ where
             }
         }
 
-        // Deliver delegate-to-delegate messages (fire-and-forget, single-hop).
+        // Deliver delegate-to-delegate messages: one reply to the caller, no
+        // further chaining.
         //
         // Design notes:
-        // - Delivery is intentionally single-hop: if target delegate B emits its own
-        //   SendDelegateMessage in response, it is filtered out (not delivered). This
-        //   prevents infinite recursion between delegates. We use execute_delegate_hop
-        //   (not the full delivery loop) for the same reason.
+        // - ONE REPLY per hop (per message delivered). If target delegate B's
+        //   output contains a SendDelegateMessage addressed back to this
+        //   delegate (the caller, A), the FIRST such message is delivered to
+        //   A as an inbound `DelegateMessage` in a later iteration of its own
+        //   (after any batch of A's other responses), so A sees
+        //   `MessageOrigin::Delegate(B)` while handling it (`next_call`).
+        //   Its `sender` is set to B (`split_hop_output`). Every other
+        //   SendDelegateMessage from B (to a third delegate, or a second
+        //   reply to A) is dropped, counted (`count_dropped_hop_sends`) and
+        //   logged once per iteration. A reply over `MAX_HOP_REPLY_BYTES`, or
+        //   past `MAX_HOP_REPLY_BYTES_PER_RUN` for the run, is dropped and
+        //   counted too (`count_dropped_hop_replies`).
+        // - No further chaining. Delivering the reply does not run B again,
+        //   and B's messages are never hopped themselves; we use
+        //   execute_delegate_hop (not the full delivery loop) for that reason.
+        //   A, handling the reply, may hop again: those are A's own hops,
+        //   counted against A's hop cap on an unprompted run, inside A's
+        //   MAX_CONTRACT_REQUEST_ITERATIONS. This prevents unbounded
+        //   recursion between delegates.
+        // - The reply applies to every run kind. It is kept beside A's other
+        //   responses with B's key recorded next to it (`PendingReply`); if A
+        //   parks in the same iteration it rides the continuation
+        //   (`pending_replies`) and is delivered on resume, charged against
+        //   the park byte budget while parked. Each reply is delivered in an
+        //   iteration of its own (one executor call per iteration, after any
+        //   batch); a reply still queued when the run reaches
+        //   MAX_CONTRACT_REQUEST_ITERATIONS is dropped and counted. If A
+        //   fails while handling a reply, that reply is dropped and counted
+        //   and the run goes on (the failed call's context is not persisted,
+        //   secrets it wrote stay written); if A fails on a batch, the run
+        //   fails as before and the replies still queued are counted.
         // - Target delegate runs with the params IT was registered with on this node
         //   (`registered_delegate_params`, #5616), never the caller's and never empty
         //   ones: a delegate key is `BLAKE3(code_hash ‖ params)`, so other params would
@@ -2653,24 +2963,28 @@ where
         //   if the delegate lane handed the loop a pending round-trip of the
         //   target, that round-trip first (see the lane paragraph below). The
         //   target's own contract requests in its reply are NOT executed.
-        // - Bounds. Delivery is single-hop (above). An UNPROMPTED run makes at
-        //   most `MAX_UNPROMPTED_HOPS_PER_RUN` hops, for every delegate with
-        //   or without a manifest; client runs are bounded by
-        //   MAX_CONTRACT_REQUEST_ITERATIONS x `MAX_OUTBOUND_MSGS_PER_RUN`. The
+        // - Bounds. One reply per hop, no chaining (above). An UNPROMPTED run
+        //   makes at most `MAX_UNPROMPTED_HOPS_PER_RUN` hops, for every
+        //   delegate with or without a manifest; client runs are bounded by
+        //   MAX_CONTRACT_REQUEST_ITERATIONS x `MAX_OUTBOUND_MSGS_PER_RUN`,
+        //   which still holds with replies because each iteration makes ONE
+        //   executor call into the caller (a batch or one reply, `next_call`)
+        //   whose output, under the runtime's per-call budget, is processed
+        //   before the next call. The
         //   hop's loop time (including a target lane round-trip it runs first,
         //   which counts as one hop) is part of the caller's run. For a
         //   BUDGETED caller (a manifest delegate with the Background grant) it
         //   is charged to the caller's duty budget with the rest of the run; a
         //   manifest-less caller has no duty budget, so for it the hop cap is
         //   the only bound. The target is never charged for a hop it receives.
-        // - The target's reply on an UNPROMPTED run is DROPPED, counted and
-        //   logged once per hop. There is no client to return it to, and the
-        //   caller's residual output is fanned out to the CALLER's registered
-        //   apps labelled as the caller (`route_notification_outbound`), so
-        //   merging it would publish the target's output under the caller's
-        //   name. The target cannot reply to the caller either; a reply path
-        //   is a separate, undecided feature. On a client run the target's
-        //   reply (minus its own `SendDelegateMessage`s) still goes back to the
+        // - The target's other output (everything but SendDelegateMessages)
+        //   on an UNPROMPTED run is DROPPED, counted and logged once per hop.
+        //   There is no client to return it to, and the caller's residual
+        //   output is fanned out to the CALLER's registered apps labelled as
+        //   the caller (`route_notification_outbound`), so merging it would
+        //   publish the target's output under the caller's name. The one
+        //   reply above is the target's only way back to the caller. On a
+        //   client run the target's other output still goes back to the
         //   client with the caller's, as before.
         //
         // BACKGROUND RUNS MAY MESSAGE OTHER DELEGATES (Ian, 2026-11-20: "the
@@ -2713,6 +3027,11 @@ where
             // delegate emitting thousands cannot flood the log.
             let mut refused_over_cap: u64 = 0;
             let mut refused_self: u64 = 0;
+            // Targets' `SendDelegateMessage`s other than the one reply each,
+            // tallied and logged once per iteration for the same reason.
+            let mut dropped_sends: u64 = 0;
+            // Replies over a byte bound, tallied the same way.
+            let mut dropped_replies: u64 = 0;
             for msg in delegate_messages {
                 let target_key = msg.target.clone();
                 // No self-hops; see the design notes above. Checked first and
@@ -2742,16 +3061,16 @@ where
                 // corruption the exclusion exists to prevent, reached through a
                 // different door.
                 //
-                // DROPPED rather than queued, deliberately. The hop is
-                // single-hop and fire-and-forget, so callers cannot rely on
-                // delivery.
+                // DROPPED rather than queued, deliberately. Delivery is not
+                // guaranteed (no reply arrives for a dropped message), so
+                // callers cannot rely on it.
                 // Queueing it would mean replaying an ATTESTED caller identity
                 // (`Some(delegate_key)`, the control that replaced the deleted
                 // registration-record refusal — GHSA-824h-7x5x-wfmf) at an
                 // arbitrarily later time under a scope captured earlier, and
                 // deferring an attestation is not something to introduce as a
-                // side effect of a stall fix. Losing a fire-and-forget message
-                // beats corrupting the target's state.
+                // side effect of a stall fix. Losing a message whose delivery
+                // was never guaranteed beats corrupting the target's state.
                 //
                 // `info!`, not `debug!`: the crate sets `release_max_level_info`
                 // so a `debug!` compiles out of shipped binaries and a delegate
@@ -2866,6 +3185,14 @@ where
                         continue;
                     }
                 };
+                // The core sets the sender of every delivered message from the
+                // delegate it ran, so receivers never depend on anything else
+                // for it. Only `sender` is set here; the message's other
+                // fields reach the target as the caller wrote them, as they
+                // always have (a reply also has `context` and `processed`
+                // reset, see `split_hop_output`).
+                let mut msg = msg;
+                msg.sender = delegate_key.clone();
                 let target_req = DelegateRequest::ApplicationMessages {
                     key: target_key.clone(),
                     params: target_params,
@@ -2898,12 +3225,11 @@ where
                     // (behaviour).
                     //
                     // Scope nulls the `origin` ARGUMENT only. `msg.sender` still
-                    // rides through unchanged on every path, so the target can
-                    // always see which delegate sent it — that field is
-                    // runtime-attested (`execution.rs` overwrites it with the key
-                    // of the delegate that actually ran) and is a hash of that
-                    // delegate's own code, so it is self-authenticating rather
-                    // than borrowed authority.
+                    // rides through on every path, so the target can always see
+                    // which delegate sent it. The core sets that field to the
+                    // key of the delegate that actually ran (above), and that
+                    // key is a hash of the delegate's own code, so it is
+                    // self-authenticating rather than borrowed authority.
                     //
                     .execute_delegate_hop(target_req, delegate_key, connection_scope, user_context)
                     .await
@@ -2912,33 +3238,72 @@ where
                         values,
                         ..
                     }) => {
+                        // ONE REPLY to the caller, no further chaining: see
+                        // the design notes above.
+                        let HopOutput {
+                            reply,
+                            dropped_sends: sends,
+                            other,
+                        } = split_hop_output(values, delegate_key, &target_key);
+                        dropped_sends += sends;
+                        if let Some(reply) = reply {
+                            let len = reply.payload.len();
+                            // Each queued reply needs an iteration of its own
+                            // (`next_call`), so a queue already as long as the
+                            // iterations this run has left can never deliver
+                            // another: count it now rather than retain it
+                            // until the cap. This bounds the queue's LENGTH,
+                            // which the byte bounds do not (a reply may be
+                            // empty).
+                            let queued = current_replies.len() + pending_replies.len();
+                            let iterations_left =
+                                MAX_CONTRACT_REQUEST_ITERATIONS.saturating_sub(iterations);
+                            if len > MAX_HOP_REPLY_BYTES
+                                || reply_bytes_accepted.saturating_add(len)
+                                    > MAX_HOP_REPLY_BYTES_PER_RUN
+                                || queued >= iterations_left
+                            {
+                                // Over a byte bound (see the constants) or
+                                // past what the run can still deliver.
+                                dropped_replies += 1;
+                            } else {
+                                // Queued for the caller and delivered in a
+                                // later iteration of its own, after any batch
+                                // (`next_call`), under the
+                                // origin of `target_key`, recorded here beside
+                                // the message. If the caller parks in this
+                                // iteration the reply rides the continuation
+                                // (`pending_replies`) and is delivered on
+                                // resume.
+                                reply_bytes_accepted += len;
+                                pending_replies.push(delegate_park::PendingReply {
+                                    from: target_key.clone(),
+                                    msg: reply,
+                                });
+                            }
+                        }
                         if is_unprompted_run(trigger) {
                             // Dropped, not merged: see the design notes above.
                             // One log line per hop, not per message.
-                            if !values.is_empty() {
+                            if !other.is_empty() {
                                 let total = parking
                                     .as_mut()
-                                    .map(|ctx| ctx.park.count_dropped_hop_output(values.len()));
+                                    .map(|ctx| ctx.park.count_dropped_hop_output(other.len()));
                                 tracing::info!(
                                     from_delegate = %delegate_key,
                                     target_delegate = %target_key,
-                                    dropped = values.len(),
+                                    dropped = other.len(),
                                     total_dropped = ?total,
-                                    "Dropped the reply of an inter-delegate message \
-                                     from a background run: there is no client to \
-                                     return it to, and it must not reach the \
+                                    "Dropped the output of an inter-delegate message's \
+                                     target from a background run: there is no client \
+                                     to return it to, and it must not reach the \
                                      caller's apps under the caller's name"
                                 );
                             }
                         } else {
-                            // Filter out SendDelegateMessage from target's output to enforce
-                            // single-hop delivery. The rest goes back to the client with the
+                            // The rest goes back to the client with the
                             // caller's output.
-                            for value in values {
-                                if !matches!(value, OutboundDelegateMsg::SendDelegateMessage(_)) {
-                                    accumulated_messages.push(value);
-                                }
-                            }
+                            accumulated_messages.extend(other);
                         }
                     }
                     Ok(_) => {}
@@ -2946,7 +3311,8 @@ where
                         tracing::warn!(
                             target_delegate = %target_key,
                             error = %err,
-                            "Failed to deliver delegate message (fire-and-forget)"
+                            "Failed to deliver an inter-delegate message; the caller \
+                             gets no reply to it"
                         );
                     }
                 }
@@ -2960,6 +3326,35 @@ where
                     refused = refused_self,
                     total_refused = ?total,
                     "Refused inter-delegate messages a delegate addressed to itself"
+                );
+            }
+            if dropped_sends > 0 {
+                let total = parking
+                    .as_mut()
+                    .map(|ctx| ctx.park.count_dropped_hop_sends(dropped_sends));
+                tracing::info!(
+                    delegate_key = %delegate_key,
+                    dropped = dropped_sends,
+                    total_dropped = ?total,
+                    "Dropped inter-delegate messages sent by the targets of this \
+                     delegate's messages: a target may send one reply to its caller \
+                     per message, and nothing else"
+                );
+            }
+            if dropped_replies > 0 {
+                let total = parking
+                    .as_mut()
+                    .map(|ctx| ctx.park.count_dropped_hop_replies(dropped_replies));
+                tracing::info!(
+                    delegate_key = %delegate_key,
+                    dropped = dropped_replies,
+                    total_dropped = ?total,
+                    max_reply_bytes = MAX_HOP_REPLY_BYTES,
+                    max_run_bytes = MAX_HOP_REPLY_BYTES_PER_RUN,
+                    "Dropped replies to this delegate's inter-delegate messages: \
+                     over MAX_HOP_REPLY_BYTES, past MAX_HOP_REPLY_BYTES_PER_RUN \
+                     for this run, or more than the run's remaining iterations \
+                     can deliver"
                 );
             }
             if refused_over_cap > 0 {
@@ -3042,12 +3437,20 @@ where
                     trigger,
                     accumulated: std::mem::take(&mut accumulated_messages),
                     inbound_so_far: std::mem::take(&mut inbound_responses),
+                    // Replies still queued from earlier iterations first,
+                    // then this iteration's, so the resumed run delivers
+                    // them oldest first.
+                    pending_replies: std::mem::take(&mut current_replies)
+                        .into_iter()
+                        .chain(std::mem::take(&mut pending_replies))
+                        .collect(),
                     // Carry the counts so the caps bound the ROUND-TRIP, not
                     // each leg (#5544 S1 for iterations; #5542 finding B1 for
                     // the fan-out budget).
                     iterations,
                     self_heal_fetches_started,
                     hops_attempted,
+                    reply_bytes_accepted,
                     // Attached by the caller right after we return `Parked` (it
                     // owns the channel), or carried straight through if this run
                     // is itself a resume that is parking again.
@@ -3284,9 +3687,14 @@ where
                         let continuation = *continuation;
                         accumulated_messages = continuation.accumulated;
                         inbound_responses = continuation.inbound_so_far;
+                        // The continuation held the queue and this
+                        // iteration's replies together, oldest first.
+                        current_replies = continuation.pending_replies.into();
+                        pending_replies = Vec::new();
                         iterations = continuation.iterations;
                         self_heal_fetches_started = continuation.self_heal_fetches_started;
                         hops_attempted = continuation.hops_attempted;
+                        reply_bytes_accepted = continuation.reply_bytes_accepted;
                         *ctx.carried_responder = continuation.responder;
                         // The run continues inline on this loop, so its
                         // context goes back to the cache now.
@@ -3353,6 +3761,7 @@ where
             inbound: inbound_responses,
             params: current_params.clone(),
         };
+        current_replies.extend(pending_replies);
     }
 }
 
@@ -6495,6 +6904,7 @@ where
         iterations,
         self_heal_fetches_started,
         hops_attempted,
+        reply_bytes_accepted,
         params,
         origin_contract,
         connection_scope,
@@ -6502,6 +6912,7 @@ where
         trigger,
         accumulated,
         inbound_so_far,
+        pending_replies,
         responder,
         delivery,
         node_wide_duty,
@@ -6604,10 +7015,12 @@ where
 
     let mut carried_responder = responder;
     #[allow(clippy::if_not_else)]
-    let outcome = if all_inbound.is_empty() {
+    let outcome = if all_inbound.is_empty() && pending_replies.is_empty() {
         // Nothing to feed back — a dropped park that had computed no responses
         // before it. Do NOT re-enter the delegate with an empty inbound; that
         // would run `process()` for no reason. Terminate with what we had.
+        // (Pending hop replies are something to feed back: with an empty
+        // inbound, `next_call` delivers them one per iteration.)
         DelegateRunOutcome::Completed(accumulated)
     } else {
         let req = DelegateRequest::ApplicationMessages {
@@ -6640,6 +7053,8 @@ where
                 iterations,
                 self_heal_fetches_started,
                 hops_attempted,
+                reply_bytes_accepted,
+                replies: pending_replies,
                 first_values: None,
             },
         )
@@ -8511,6 +8926,85 @@ mod tests {
         let code = "async fn allowed() {\n    let f: fn (u8) = g;\n    NEEDLE\n}\n";
         let idx = code.find("NEEDLE").expect("needle");
         assert_eq!(enclosing_fn(code, idx), "allowed");
+    }
+
+    /// A hop reply (`delegate_park::PendingReply`) is BUILT in exactly one
+    /// place: the hop, which records the delegate it ran as the reply's
+    /// origin. `next_call` turns `from` into an attested
+    /// `MessageOrigin::Delegate(from)`, so a second producer could mint that
+    /// attestation for any key. `PendingReply` is `pub(super)` in
+    /// `delegate_park`, so only the `contract` module tree can build one;
+    /// this scans all of its production sources.
+    ///
+    /// FALSIFY: build a `PendingReply` anywhere else in `contract`
+    /// production code, or record anything but `target_key` as `from`.
+    #[test]
+    fn a_hop_reply_is_built_in_one_place() {
+        fn sites_in(code: &str, file: &str, out: &mut Vec<(String, usize)>) {
+            for (idx, _) in code.match_indices("PendingReply {") {
+                let rest = &code[idx..];
+                // The definition and the destructuring pattern in
+                // `next_call` are not constructions.
+                if code[..idx].ends_with("struct ")
+                    || rest.starts_with("PendingReply { from, msg }")
+                {
+                    continue;
+                }
+                out.push((file.to_string(), idx));
+            }
+        }
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("readable source directory") {
+                let path = entry.expect("directory entry").path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let mut sites = Vec::new();
+        let code = production_code();
+        sites_in(&code, "contract.rs", &mut sites);
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/contract");
+        let mut files = Vec::new();
+        rust_files(&dir, &mut files);
+        assert!(
+            files.len() > 5,
+            "the scan found almost no files under {}, so it measures nothing",
+            dir.display()
+        );
+        for path in files {
+            let name = path.display().to_string();
+            // Test-only files may build replies for their own fixtures.
+            if name.ends_with("tests.rs") || name.ends_with("test.rs") {
+                continue;
+            }
+            let full = std::fs::read_to_string(&path).expect("readable source file");
+            let production = match full.find("mod tests {") {
+                Some(cut) => &full[..cut],
+                None => &full[..],
+            };
+            sites_in(&strip_comments(production), &name, &mut sites);
+        }
+
+        assert_eq!(
+            sites.len(),
+            1,
+            "a hop reply must be built in exactly one place, the hop: {sites:?}"
+        );
+        let (file, idx) = &sites[0];
+        assert_eq!(file, "contract.rs", "{sites:?}");
+        assert_eq!(
+            enclosing_fn(&code, *idx),
+            "handle_delegate_with_contract_requests"
+        );
+        let built = &code[*idx..(*idx + 200).min(code.len())];
+        assert!(
+            built.contains("from: target_key.clone()"),
+            "the hop must record the delegate it ran as the reply's origin: {built}"
+        );
     }
 
     /// PIN, half 1 of 2: the LOOP's delegate runs all go through one
@@ -12120,6 +12614,100 @@ mod hol_4391_tests {
         );
     }
 
+    /// A hop reply survives the refused-park FALLBACK: the caller hops and
+    /// prompts in one iteration with the park registry full, so the prompt
+    /// runs inline, and the next iteration still delivers the reply (from the
+    /// restored `inbound_so_far`), under the target's origin.
+    #[tokio::test]
+    async fn a_reply_survives_the_refused_park_fallback() {
+        let _guard = TEST_GUARD.lock().await;
+        let (mut handler, _send) = build_handler(vec![]).await;
+        let script = handler.runtime_mut().delegate_script.clone();
+        let observations = handler.runtime_mut().delegate_observations.clone();
+        let key = test_delegate_key();
+        let target = DelegateKey::new(
+            [0xD7; 32],
+            freenet_stdlib::prelude::CodeHash::new([0xD7; 32]),
+        );
+        let mut first = prompt_outbound();
+        first.push(OutboundDelegateMsg::SendDelegateMessage(
+            DelegateMessage::new(target.clone(), key.clone(), b"sign".to_vec()),
+        ));
+        script.lock().unwrap().extend([
+            ScriptedRun::from(first),
+            ScriptedRun::from(vec![OutboundDelegateMsg::SendDelegateMessage(
+                DelegateMessage::new(key.clone(), target.clone(), b"signature".to_vec()),
+            )]),
+            ScriptedRun::default(),
+            ScriptedRun::default(),
+        ]);
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut park = delegate_park::DelegateParkCtx::new(tx);
+        for n in 0..delegate_park::MAX_PARKED_DELEGATES {
+            let filler = DelegateKey::new(
+                [0xE1; 32],
+                freenet_stdlib::prelude::CodeHash::new([n as u8; 32]),
+            );
+            assert!(matches!(
+                park.park(
+                    filler,
+                    parked_continuation(),
+                    delegate_park::ByteCount::default()
+                ),
+                delegate_park::ParkAdmission::Admitted { .. }
+            ));
+        }
+        let ContractHandlerEvent::DelegateRequest { req, .. } = delegate_event(&key) else {
+            panic!("delegate_event builds a DelegateRequest");
+        };
+        let mut carried = None;
+        let outcome = handle_delegate_with_contract_requests(
+            &mut handler,
+            req,
+            None,
+            crate::client_events::ConnectionScope::Local,
+            RunTrigger::Client,
+            None,
+            &key,
+            &Arc::new(crate::contract::user_input::AutoApprovePrompter),
+            Some(ParkingCtx {
+                park: &mut park,
+                delivery: delegate_park::Delivery::Client,
+                carried_responder: &mut carried,
+                node_wide_duty: false,
+            }),
+            RunSeed::default(),
+        )
+        .await;
+        assert!(matches!(outcome, DelegateRunOutcome::Completed(_)));
+        assert!(!park.is_parked(&key), "the park was refused");
+        let obs = observations.lock().unwrap().clone();
+        let seen: Vec<_> = obs
+            .iter()
+            .map(|o| {
+                (
+                    o.delegate_key.clone(),
+                    o.inbound_kinds.clone(),
+                    o.delegate_message_senders.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen[1..].to_vec(),
+            vec![
+                (target.clone(), vec!["DelegateMessage"], vec![key.clone()]),
+                (key.clone(), vec!["UserResponse"], vec![]),
+                (key.clone(), vec!["DelegateMessage"], vec![target.clone()]),
+            ],
+            "the hop, then the inline prompt's answer, then the reply: {seen:?}"
+        );
+        assert_eq!(
+            obs[3].origin,
+            Some(freenet_stdlib::prelude::MessageOrigin::Delegate(target))
+        );
+    }
+
     /// `run_user_input_prompts` hands every prompt the owner it was given.
     ///
     /// FALSIFY: pass `None` instead of `owner` to `prompter.prompt` in
@@ -15196,11 +15784,13 @@ mod hol_4391_tests {
             trigger: RunTrigger::Client,
             accumulated: Vec::new(),
             inbound_so_far: Vec::new(),
+            pending_replies: Vec::new(),
             responder: None,
             delivery: delegate_park::Delivery::Client,
             node_wide_duty: false,
             self_heal_fetches_started: 0,
             hops_attempted: 0,
+            reply_bytes_accepted: 0,
             context: None,
         }
     }
@@ -16456,6 +17046,7 @@ mod hol_4391_tests {
             iterations: 0,
             self_heal_fetches_started: 0,
             hops_attempted: 0,
+            reply_bytes_accepted: 0,
             params: Parameters::from(Vec::new()),
             origin_contract: None,
             connection_scope: crate::client_events::ConnectionScope::Local,
@@ -16463,6 +17054,7 @@ mod hol_4391_tests {
             trigger: RunTrigger::Client,
             accumulated: Vec::new(),
             inbound_so_far: Vec::new(),
+            pending_replies: Vec::new(),
             responder: None,
             delivery: delegate_park::Delivery::Client,
             node_wide_duty: false,

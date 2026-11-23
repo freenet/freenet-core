@@ -831,3 +831,93 @@ async fn a_hop_into_a_parameterized_delegate_runs_it() {
         "the hop stored the secret under the target's own key"
     );
 }
+
+/// A hop target's reply reaches the caller on the REAL runtime: A messages B,
+/// B answers with one delegate message back to A (the fixture's `REPLY:`
+/// branch), and A, handling it, reports to the client that it came from B,
+/// with B as the attested origin, carrying B's payload.
+///
+/// This covers a CLIENT run on the real runtime. Background runs (notification,
+/// queued, lifecycle, wake-up) take the same delivery path (`next_call`) and
+/// are covered against the mock runtime in `capability_loop_tests`.
+///
+/// FALSIFY by dropping the reply in `split_hop_output`'s caller, or by
+/// delivering it under the run's origin: A's report is missing, or its origin
+/// is not B.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hop_target_replies_to_its_caller_on_the_real_runtime() {
+    use messaging::{Inbound, Outbound};
+
+    let node = Node::start("hop-reply-wasm-e2e").await;
+    let code = tokio::task::spawn_blocking(|| {
+        crate::wasm_runtime::tests::get_test_module("test_delegate_messaging")
+            .expect("build the fixture delegate")
+    })
+    .await
+    .expect("join fixture build");
+
+    let mut keys = Vec::new();
+    for params in [b"chat".to_vec(), b"vault".to_vec()] {
+        let delegate = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(Delegate::from((
+            &code.clone().into(),
+            &params.into(),
+        ))));
+        keys.push(delegate.key().clone());
+        node.request(ContractHandlerEvent::DelegateRequest {
+            req: DelegateRequest::RegisterDelegate {
+                delegate,
+                cipher: [0u8; 32],
+                nonce: [0u8; 24],
+            },
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+            lane_ticket: Default::default(),
+        })
+        .await;
+    }
+    let (chat, vault) = (keys[0].clone(), keys[1].clone());
+
+    let msg = Inbound::SendToDelegate {
+        target_key_bytes: vault.bytes().to_vec(),
+        target_code_hash: vault.code_hash().as_ref().to_vec(),
+        payload: b"REPLY:sign-this".to_vec(),
+    };
+    #[allow(clippy::wildcard_enum_match_arm)]
+    let replies: Vec<Outbound> = node
+        .request(ContractHandlerEvent::DelegateRequest {
+            req: DelegateRequest::ApplicationMessages {
+                key: chat.clone(),
+                params: Parameters::from(b"chat".to_vec()),
+                inbound: vec![InboundDelegateMsg::ApplicationMessage(
+                    ApplicationMessage::new(bincode::serialize(&msg).unwrap()),
+                )],
+            },
+            origin_contract: None,
+            connection_scope: crate::client_events::ConnectionScope::Local,
+            user_context: None,
+            lane_ticket: Default::default(),
+        })
+        .await
+        .into_iter()
+        .filter_map(|m| match m {
+            OutboundDelegateMsg::ApplicationMessage(m) => {
+                Some(bincode::deserialize::<Outbound>(&m.payload).expect("fixture reply"))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        replies.contains(&Outbound::MessageSent),
+        "the caller ran: {replies:?}"
+    );
+    assert!(
+        replies.contains(&Outbound::DelegateMessageReceived {
+            sender_key_bytes: vault.bytes().to_vec(),
+            payload: b"ack:sign-this".to_vec(),
+            origin_delegate_key_bytes: Some(vault.bytes().to_vec()),
+        }),
+        "the caller received the target's reply, from the target, under the \
+         target's origin: {replies:?}"
+    );
+}
