@@ -713,7 +713,11 @@ anything is created, and refuses when:
   skill's P0 still does;
 - **tag `vX.Y.Z` already exists**, or **freenet X.Y.Z is already on crates.io**
   (an unreadable answer refuses too);
-- **X.Y.Z is not above `crates/core/Cargo.toml`** on the dispatched ref. Equal
+- **X.Y.Z is not above `crates/core/Cargo.toml`** on the dispatched ref.
+  (A blank version auto-bumps from crates.io, or from the tree when it is one
+  patch ahead after a blocked cut. Dispatched while the previous release is
+  still building, before its crates.io upload, that skips a number, so always
+  pass the version explicitly, as the `freenet:release` skill does.) Equal
   means the bump already merged without a published release: see
   "Re-cutting the same version" in `scripts/RELEASE_RECOVERY.md`.
 
