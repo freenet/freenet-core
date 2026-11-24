@@ -5876,7 +5876,7 @@ mod tests {
         // tests concurrent). See `TEST_GLOBAL_STATE_LOCK` rustdoc.
         let _global = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
             .lock()
-            .expect("TEST_GLOBAL_STATE_LOCK poisoned by an earlier test panic");
+            .unwrap_or_else(|p| p.into_inner());
         let cm = make_connection_manager(None, 1, 10, false);
 
         let addr = make_addr(8000);
@@ -5958,7 +5958,7 @@ mod tests {
         // even if another test already initialized the global.
         let _global = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
             .lock()
-            .expect("TEST_GLOBAL_STATE_LOCK poisoned by an earlier test panic");
+            .unwrap_or_else(|p| p.into_inner());
         crate::node::network_status::init(0, HashSet::new(), "test".to_string());
 
         // Use a single ConnectionManager across all rounds: the bug is a

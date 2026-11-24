@@ -1973,6 +1973,11 @@ fn rearming_a_scheduled_wakeup_at_the_cap_is_not_a_refusal() {
 /// schedule: once the store reads again, the delegate is woken again.
 #[tokio::test(start_paused = true)]
 async fn a_storage_error_at_fire_time_skips_the_fire_but_keeps_the_schedule() {
+    // The first fire lands at a random point in [5 s, 65 s) after start-up, so
+    // with an unseeded RNG a second fire falls inside the 66 s window for
+    // about one draw in sixty and the exact count below fails (#6365). Pin the
+    // draws, as `revoking_stops_wakeups_and_a_new_grant_rearms_them` does.
+    let _seed = crate::config::GlobalRng::seed_guard(0x5eed_0001);
     let storage = Arc::new(super::delegate_capabilities::FlakyCapabilityStorage::default());
     let caps = DelegateCapabilities::with_time_source(
         storage.clone(),
