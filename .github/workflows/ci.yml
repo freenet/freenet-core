@@ -125,8 +125,11 @@ jobs:
   fmt_check:
     name: Fmt
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    # Run in parallel with conventional_commits (both are fast GitHub-hosted checks)
+    # 10, not 5: besides `cargo fmt --check` (~16 s) this job runs the script
+    # self-tests, which have grown the job to roughly 4-5 min, so a slightly
+    # slow runner crossed 5 min and the job was cancelled mid-self-test.
+    timeout-minutes: 10
+    # Runs in parallel with conventional_commits (both GitHub-hosted, no Rust build)
     #
     # DO NOT add `needs: fmt_check` to a test or build job (#5621). Rule Lint
     # enforces this for every required-context job, with an allowlist for the
