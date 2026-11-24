@@ -24,6 +24,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read # list a PR's files in the select job
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
