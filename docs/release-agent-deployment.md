@@ -98,14 +98,16 @@ the Matrix secrets are absent — useful while bootstrapping.
 
 ## Prerequisites per gateway
 
-1. **`gateway-auto-update.sh` installed at `/usr/local/bin/`**, owned by
-   root, perms ≤ 755. `install.sh` installs it from the checkout it runs
-   from, and aborts if the result is not root-owned. **Nothing updates it
-   automatically**: after a change to `scripts/gateway-auto-update.sh` merges,
-   re-install it by hand from an up-to-date `main` checkout, on each gateway:
+1. **`gateway-auto-update.sh` and `deploy-local-gateway.sh` installed at
+   `/usr/local/bin/`**, root:root 0755, in a directory only root can write
+   (the updater runs the deploy script from its own directory, as root).
+   `install.sh` installs both from the checkout it runs from and aborts if
+   `/usr/local/bin` is writable by anyone but root. **Nothing updates them
+   automatically**: after a change to either script merges, refresh both on
+   each gateway from an up-to-date `main` checkout, by re-running `install.sh`
+   (or `scripts/install-auto-update.sh`), or by hand:
    `sudo install -m 0755 -o root -g root scripts/gateway-auto-update.sh
-   /usr/local/bin/` (or re-run `install.sh`). The same applies to
-   `deploy-local-gateway.sh`, which it calls from the same directory.
+   scripts/deploy-local-gateway.sh /usr/local/bin/`.
 2. **OpenSSL >= 3.0** (`openssl version`). `gateway-auto-update.sh` verifies
    each release's signed `SHA256SUMS.txt` with `openssl pkeyutl -rawin`, and
    refuses every update, before downloading, if OpenSSL is missing or older.

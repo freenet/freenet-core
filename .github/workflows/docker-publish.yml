@@ -398,9 +398,12 @@ jobs:
       # remains is the few seconds between this listing and the retag.
       #
       # On a `release` event the tag counts as published even if the listing
-      # lags behind the publish. Fails closed: if the list cannot be read or is
-      # empty, neither floating tag moves (the versioned tags are already
-      # pushed), with a warning, since a stale `latest` is worth noticing.
+      # lags behind the publish. Only plain vX.Y.Z tags count, so a release
+      # someone forgot to flag as a prerelease (v0.3.0-beta) cannot pin
+      # `latest`. Fails closed: if the list cannot be read or is empty, neither
+      # floating tag moves, and the step FAILS so notify-publish-failure says
+      # `latest` is stale (the versioned tags are already pushed). A tag that
+      # is simply not the highest is a warning, not a failure.
       - name: Move the floating tags
         id: floating
         env:
@@ -427,13 +430,13 @@ jobs:
           if ! published=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --exclude-drafts \
               --json tagName,isPrerelease \
               --jq '.[] | select(.isPrerelease | not) | .tagName'); then
-            echo "::warning::Could not list published releases; \`latest\` and \`${MINOR}\` were NOT moved to ${RELEASE_TAG}."
-            finish; exit 0
+            echo "::error::Could not list published releases; \`latest\` and \`${MINOR}\` were NOT moved to ${RELEASE_TAG}. Re-run this workflow once the GitHub API answers."
+            finish; exit 1
           fi
-          published=$(printf '%s\n' "$published" | sed '/^$/d')
+          published=$(printf '%s\n' "$published" | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/')
           if [ -z "$published" ]; then
-            echo "::warning::The published release list came back empty; \`latest\` and \`${MINOR}\` were NOT moved to ${RELEASE_TAG}."
-            finish; exit 0
+            echo "::error::The published release list has no vX.Y.Z release; \`latest\` and \`${MINOR}\` were NOT moved to ${RELEASE_TAG}."
+            finish; exit 1
           fi
           candidates="$published"
           if [ "$EVENT_NAME" = release ]; then

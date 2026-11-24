@@ -454,11 +454,17 @@ if load_step "$DOCKER_YML" publish "Move the floating tags" "$FLOAT"; then
         "rc=0 latest=true minor=true retags=0.2<-v0.2.151,latest<-v0.2.151" LIST_OUT='v0.2.150\n'
     float_case "a dispatched tag absent from the list (e.g. a draft) moves nothing" v0.2.151 workflow_dispatch true \
         "rc=0 latest=false minor=false retags=" LIST_OUT='v0.2.150\n'
-    float_case "a failed listing fails closed: nothing moves, step still succeeds" v0.2.150 release true \
-        "rc=0 latest=false minor=false retags=" LIST_RC=1
-    check "Floating tags: a failed listing warns" "$(grep -c '^::warning::Could not list published releases' "$FLOAT/out")" "1"
-    float_case "an empty listing fails closed" v0.2.150 release true \
-        "rc=0 latest=false minor=false retags=" LIST_OUT=''
+    float_case "a failed listing moves nothing and FAILS the step (stale latest is noticed)" v0.2.150 release true \
+        "rc=1 latest=false minor=false retags=" LIST_RC=1
+    check "Floating tags: a failed listing is an ::error::" "$(grep -c '^::error::Could not list published releases' "$FLOAT/out")" "1"
+    float_case "an empty listing moves nothing and fails the step" v0.2.150 release true \
+        "rc=1 latest=false minor=false retags=" LIST_OUT=''
+    # A release not flagged as a prerelease but named like one must not count.
+    float_case "an unflagged v0.3.0-beta does not pin latest" v0.2.150 workflow_dispatch true \
+        "rc=0 latest=true minor=true retags=0.2<-v0.2.150,latest<-v0.2.150" \
+        LIST_JSON='[{"tagName":"v0.3.0-beta","isPrerelease":false},{"tagName":"v0.2.150","isPrerelease":false}]'
+    float_case "a listing with only non-vX.Y.Z tags fails the step" v0.2.150 workflow_dispatch true \
+        "rc=1 latest=false minor=false retags=" LIST_OUT='v0.3.0-beta\nnightly\n'
     float_case "a prerelease moves nothing and lists nothing" v0.3.0-rc1 release false \
         "rc=0 latest=false minor=false retags=" LIST_OUT='v0.3.0-rc1\n'
     check "Floating tags: a prerelease makes no gh call" "$(grep -c '^release list' "$FLOAT/calls")" "0"

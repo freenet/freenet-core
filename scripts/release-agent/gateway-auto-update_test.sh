@@ -345,7 +345,7 @@ make_archive() {
     chmod +x "$d/freenet"
     tar -czf "$E2E/archive-$v.tar.gz" -C "$d" freenet
 }
-for v in 0.2.999 0.2.998 0.2.5; do
+for v in 0.2.999 0.2.998 0.2.5 0.2.999-rc1; do
     make_archive "$v" || { echo "FAIL: could not build the fixture archive for $v" >&2; exit 1; }
 done
 cp "$E2E/archive-0.2.999.tar.gz" "$E2E/good.tar.gz"
@@ -625,10 +625,62 @@ RU_DLDIR="$E2E/link-dl"
 rc=$(run_update)
 expect_refused "DOWNLOAD_DIR override that is a symlink" "$rc" "must be an existing directory"
 mkdir -p "$E2E/private-dl" && chmod 700 "$E2E/private-dl"
+echo keep > "$E2E/private-dl/operator-file"
 RU_DLDIR="$E2E/private-dl"
 rc=$(run_update)
 expect_installed "DOWNLOAD_DIR override that is private (0700, ours)" "$rc" 0.2.999
+# Only the run's own subdirectory is removed; the operator's directory and
+# what was already in it stay.
+if [[ -f "$E2E/private-dl/operator-file" ]] \
+    && [[ "$(find "$E2E/private-dl" -mindepth 1 | wc -l)" == 1 ]] \
+    && grep -qE -- '-o '"$E2E"'/private-dl/freenet-update\.[A-Za-z0-9]{6}/' "$E2E/curl-argv"; then
+    pass "downloads: an override gets a fresh subdirectory, removed afterwards; its own contents are kept"
+else
+    fail "downloads: cleanup must remove only the run's subdirectory of DOWNLOAD_DIR"
+    find "$E2E/private-dl" >&2
+fi
 ru_reset
+
+# (15) Prereleases. A prerelease ranks BELOW its release, and an rc install
+# reads back as itself (not as "Update failed").
+rc1_sha=$(sha256sum "$E2E/archive-0.2.999-rc1.tar.gz" | awk '{print $1}')
+write_release "$(printf '%s  %s' "$rc1_sha" "$ASSET")" "$E2E/archive-0.2.999-rc1.tar.gz"
+RU_TARGET=0.2.999-rc1
+rc=$(run_update)
+expect_installed "an rc release (0.2.1 -> 0.2.999-rc1)" "$rc" 0.2.999-rc1
+RU_INSTALLED=0.2.999 RU_FORCE=true
+rc=$(run_update)
+expect_refused "--force from 0.2.999 to its own rc (a downgrade)" "$rc" "Refusing to downgrade"
+ru_reset
+write_release "$(printf '%s  %s' "$GOOD_SHA" "$ASSET")"
+RU_INSTALLED=0.2.999-rc1
+rc=$(run_update)
+expect_installed "rc to its release (0.2.999-rc1 -> 0.2.999), no --force needed" "$rc" 0.2.999
+ru_reset
+
+# semver_cmp, directly: SemVer 2.0 precedence, not `sort -V`.
+sv_fail=0
+while read -r a b want; do
+    got=$(semver_cmp "$a" "$b")
+    if [[ "$got" != "$want" ]]; then
+        fail "semver_cmp $a $b: got $got, want $want"
+        sv_fail=1
+    fi
+done <<'EOF'
+0.2.150-rc1 0.2.150 -1
+0.2.150 0.2.150-rc1 1
+0.2.150 0.2.150 0
+0.2.150+build.7 0.2.150 0
+0.2.100 0.2.99 1
+0.2.9 0.2.10 -1
+1.0.0-alpha 1.0.0-alpha.1 -1
+1.0.0-alpha.1 1.0.0-alpha.beta -1
+1.0.0-alpha.beta 1.0.0-beta -1
+1.0.0-beta.2 1.0.0-beta.11 -1
+1.0.0-beta.11 1.0.0-rc.1 -1
+1.0.0-rc.1 1.0.0 -1
+EOF
+(( sv_fail )) || pass "semver_cmp: SemVer precedence, prereleases below their release"
 
 # ── verify_release_download, called directly ─────────────────────────
 VD="$E2E/direct"

@@ -313,8 +313,10 @@ get_current_version() {
     fi
 
     local version
-    version=$("$INSTALL_PATH" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "0.0.0")
-    echo "$version"
+    # Keeps a prerelease suffix (0.2.150-rc1), so an rc install compares equal
+    # to its own target instead of reading as a failed update.
+    version=$("$INSTALL_PATH" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' | head -1 || true)
+    echo "${version:-0.0.0}"
 }
 
 # Get latest release version from GitHub
@@ -351,16 +353,58 @@ get_latest_version() {
     echo "$version"
 }
 
-# Compare versions (returns 0 if $1 > $2)
-version_gt() {
-    local v1="$1"
-    local v2="$2"
+# Compare two semver versions (build metadata ignored). Prints -1, 0 or 1.
+# Unlike `sort -V`, a prerelease ranks BELOW its release (0.2.150-rc1 <
+# 0.2.150), and prerelease identifiers compare as SemVer 2.0 says: numeric ones
+# numerically, below alphanumeric ones, and a shorter list below a longer one
+# with the same prefix.
+semver_cmp() {
+    local LC_ALL=C  # alphanumeric identifiers compare in ASCII order
+    local a="${1%%+*}" b="${2%%+*}"
+    local a_core="${a%%-*}" b_core="${b%%-*}" a_pre="" b_pre=""
+    [[ "$a" == *-* ]] && a_pre="${a#*-}"
+    [[ "$b" == *-* ]] && b_pre="${b#*-}"
+    local -a ac bc
+    IFS=. read -r -a ac <<< "$a_core"
+    IFS=. read -r -a bc <<< "$b_core"
+    local i x y
+    for i in 0 1 2; do
+        x="${ac[i]:-0}" y="${bc[i]:-0}"
+        [[ "$x" =~ ^[0-9]+$ ]] || x=0
+        [[ "$y" =~ ^[0-9]+$ ]] || y=0
+        if (( 10#$x > 10#$y )); then echo 1; return; fi
+        if (( 10#$x < 10#$y )); then echo -1; return; fi
+    done
+    if [[ "$a_pre" == "$b_pre" ]]; then echo 0; return; fi
+    if [[ -z "$a_pre" ]]; then echo 1; return; fi
+    if [[ -z "$b_pre" ]]; then echo -1; return; fi
+    local -a ap bp
+    IFS=. read -r -a ap <<< "$a_pre"
+    IFS=. read -r -a bp <<< "$b_pre"
+    for (( i = 0; i < ${#ap[@]} || i < ${#bp[@]}; i++ )); do
+        if (( i >= ${#ap[@]} )); then echo -1; return; fi
+        if (( i >= ${#bp[@]} )); then echo 1; return; fi
+        x="${ap[i]}" y="${bp[i]}"
+        [[ "$x" == "$y" ]] && continue
+        if [[ "$x" =~ ^[0-9]+$ && "$y" =~ ^[0-9]+$ ]]; then
+            if (( 10#$x > 10#$y )); then echo 1; else echo -1; fi
+        elif [[ "$x" =~ ^[0-9]+$ ]]; then
+            echo -1
+        elif [[ "$y" =~ ^[0-9]+$ ]]; then
+            echo 1
+        elif [[ "$x" > "$y" ]]; then
+            echo 1
+        else
+            echo -1
+        fi
+        return
+    done
+    echo 0
+}
 
-    # Use sort -V for version comparison
-    if [[ "$(printf '%s\n%s' "$v1" "$v2" | sort -V | tail -1)" == "$v1" ]] && [[ "$v1" != "$v2" ]]; then
-        return 0
-    fi
-    return 1
+# Returns 0 if $1 > $2 (semver order, see semver_cmp).
+version_gt() {
+    [[ "$(semver_cmp "$1" "$2")" == 1 ]]
 }
 
 # Detect system architecture
@@ -394,7 +438,6 @@ download_release() {
     log INFO "Downloading $asset_name from release v$version..."
     log DEBUG "URL: $download_url"
 
-    mkdir -p "$DOWNLOAD_DIR"
     local archive_path="$DOWNLOAD_DIR/$asset_name"
 
     if [[ "$DRY_RUN" == "true" ]]; then
@@ -704,26 +747,32 @@ verify_service_active() {
     return 1
 }
 
-# Use DOWNLOAD_DIR if the caller set a safe one, else create a private one.
-# Sets DOWNLOAD_DIR. Returns non-zero (with a log line) on an unsafe override.
+# Points DOWNLOAD_DIR at a fresh mktemp directory this run owns and will
+# remove: under /tmp by default, or under a caller-supplied DOWNLOAD_DIR, which
+# must be an existing directory (not a symlink) owned by the running uid with
+# mode 0700. The caller's directory itself is never removed. Returns non-zero
+# (with a log line) on an unsafe override.
 prepare_download_dir() {
-    if [[ -z "$DOWNLOAD_DIR" ]]; then
-        if ! DOWNLOAD_DIR=$(mktemp -d /tmp/freenet-update.XXXXXX); then
-            log ERROR "Could not create a private download directory"
+    local parent="/tmp"
+    if [[ -n "$DOWNLOAD_DIR" ]]; then
+        if [[ -L "$DOWNLOAD_DIR" || ! -d "$DOWNLOAD_DIR" ]] \
+            || [[ "$(stat -c '%u %a' "$DOWNLOAD_DIR" 2>/dev/null)" != "$EUID 700" ]]; then
+            log ERROR "DOWNLOAD_DIR=$DOWNLOAD_DIR must be an existing directory (not a symlink) owned by uid $EUID with mode 0700; refusing to download into it"
             return 1
         fi
-        return 0
+        parent="$DOWNLOAD_DIR"
     fi
-    if [[ -L "$DOWNLOAD_DIR" || ! -d "$DOWNLOAD_DIR" ]] \
-        || [[ "$(stat -c '%u %a' "$DOWNLOAD_DIR" 2>/dev/null)" != "$EUID 700" ]]; then
-        log ERROR "DOWNLOAD_DIR=$DOWNLOAD_DIR must be an existing directory (not a symlink) owned by uid $EUID with mode 0700; refusing to download into it"
+    if ! DOWNLOAD_DIR=$(mktemp -d "$parent/freenet-update.XXXXXX"); then
+        log ERROR "Could not create a private download directory under $parent"
         return 1
     fi
+    DOWNLOAD_DIR_CREATED=true
 }
 
-# Cleanup temporary files
+# Cleanup temporary files: only the directory this run created.
+DOWNLOAD_DIR_CREATED=false
 cleanup() {
-    if [[ -d "$DOWNLOAD_DIR" ]]; then
+    if [[ "$DOWNLOAD_DIR_CREATED" == true && -d "$DOWNLOAD_DIR" ]]; then
         log DEBUG "Cleaning up $DOWNLOAD_DIR"
         rm -rf "$DOWNLOAD_DIR"
     fi
@@ -791,7 +840,7 @@ main() {
     elif version_gt "$latest_version" "$current_version"; then
         log INFO "Update available: $current_version -> $latest_version"
         needs_update=true
-    elif [[ "$latest_version" == "$current_version" ]]; then
+    elif [[ "$(semver_cmp "$latest_version" "$current_version")" == 0 ]]; then
         log INFO "Already running latest version"
     else
         log WARN "Current version ($current_version) is newer than latest release ($latest_version)"
@@ -843,7 +892,7 @@ main() {
             # old binary in place still exited 0 and was reported as success.
             local new_version
             new_version=$(get_current_version)
-            if [[ "$new_version" == "$latest_version" ]]; then
+            if [[ "$(semver_cmp "$new_version" "$latest_version")" == 0 ]]; then
                 log INFO "Successfully updated to v$latest_version"
                 schedule_companion_restart || exit 1
             else
