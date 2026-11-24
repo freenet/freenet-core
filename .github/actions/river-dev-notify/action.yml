@@ -33,7 +33,7 @@ runs:
       uses: dtolnay/rust-toolchain@stable
       continue-on-error: true
       with:
-        toolchain: 1.93.0
+        toolchain: 1.95.0
 
     - name: Install riverctl
       shell: bash

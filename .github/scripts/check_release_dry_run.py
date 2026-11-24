@@ -1373,7 +1373,7 @@ def self_test() -> int:
         run("gh pr update-branch is a write", body("run: gh pr update-branch 1"), "gh pr write")
         run("gh api with an attached method", body("run: gh api -XPUT repos/o/r/pulls/1/merge"), "gh api write")
         run("a GraphQL query from a variable is uninspectable", body('run: gh api graphql -f query="$Q"'), "gh api write")
-        run("cargo with a toolchain before publish", body("run: cargo +1.93.0 publish -p freenet"), "cargo publish")
+        run("cargo with a toolchain before publish", body("run: cargo +1.95.0 publish -p freenet"), "cargo publish")
         run("curl -d@file is a write", body("run: curl -d@body.json https://x"), "curl write")
         run("python calling gh", body("run: python3 -c \"import subprocess; subprocess.run(['gh', 'pr', 'merge'])\""), "python gh call")
         run("echo piped into a shell", body('run: echo "gh pr merge 1 --auto" | bash'), "piped into a shell")

@@ -633,7 +633,7 @@ jobs:
         run: sudo apt-get install -y mold
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         # a comment inside the step
@@ -678,7 +678,7 @@ jobs:
           sudo apt-get install -y mold
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
@@ -752,7 +752,7 @@ def _cases() -> list[tuple[str, str, str, str | None]]:
     ("rust-cache moved before the toolchain step in warm only",
      _CI, _sub(_WARM, """      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
@@ -764,7 +764,7 @@ def _cases() -> list[tuple[str, str, str, str | None]]:
           key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           targets: wasm32-unknown-unknown
 """), "in order"),
     ("checkout and toolchain swapped in warm only (same set, new order)",
@@ -779,13 +779,13 @@ def _cases() -> list[tuple[str, str, str, str | None]]:
      _sub(_WARM, "          save-if: ${{ github.ref == 'refs/heads/main' }}\n          key: ci-",
           "          key: ci-"),
      "does not need from it"),
-    ("toolchain bumped in CI only", _sub(_CI, "1.93.0", "1.94.0"), _WARM,
+    ("toolchain bumped in CI only", _sub(_CI, "1.95.0", "1.94.0"), _WARM,
      "rust-toolchain inputs"),
     ("toolchain target dropped from warm",
      _CI, _sub(_WARM, "          targets: wasm32-unknown-unknown\n", ""),
      "rust-toolchain inputs"),
     ("CI job lost its toolchain step",
-     _sub(_CI, "      - uses: dtolnay/rust-toolchain@stable\n        with:\n          toolchain: 1.93.0\n          targets: wasm32-unknown-unknown\n", ""),
+     _sub(_CI, "      - uses: dtolnay/rust-toolchain@stable\n        with:\n          toolchain: 1.95.0\n          targets: wasm32-unknown-unknown\n", ""),
      _WARM, "no dtolnay/rust-toolchain step"),
     ("rust-cache key changed in CI only",
      _sub(_CI, "key: ci-", "key: v2-"), _WARM, "rust-cache reference"),

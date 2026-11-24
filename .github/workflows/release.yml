@@ -343,7 +343,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - name: Update Cargo.lock
         # apps/freenet-ping is a separate nested workspace with its own
@@ -497,7 +497,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - name: Verify freenet packages cleanly (dry run)
         run: |
@@ -653,7 +653,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       # No CARGO_REGISTRY_TOKEN here on purpose: a dry run does not upload, and
       # this job must not be able to publish even by accident. The real publish

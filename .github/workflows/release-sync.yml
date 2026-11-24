@@ -105,7 +105,7 @@ jobs:
         if: steps.version.outputs.skip != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - name: Open or refresh the sync PR
         if: steps.version.outputs.skip != 'true'
