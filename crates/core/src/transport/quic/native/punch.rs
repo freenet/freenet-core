@@ -327,7 +327,23 @@ impl PunchBudget {
     pub(crate) fn mark_proven(&self, to: SocketAddr, key: &TransportPublicKey, now: Duration) {
         let peer = ProvenPeer::of(to, key);
         let mut state = self.state.lock();
-        Self::insert_proof(&mut state.proven, peer, now);
+        // A joined peer that now completes a setup this node dialed moves
+        // to the dialed set with its allowance as it stands, so the move
+        // never refills it. If there is no room, it stays joined.
+        let moved = state.joined.pop(&peer);
+        let entry = moved.map(|mut entry| {
+            entry.at = now;
+            entry
+        });
+        let kept = entry.as_ref().map(|entry| Proven {
+            at: entry.at,
+            allowance: entry.allowance,
+        });
+        if !Self::insert_proof(&mut state.proven, peer.clone(), now, entry) {
+            if let Some(entry) = kept {
+                state.joined.put(peer, entry);
+            }
+        }
     }
 
     /// [`Self::mark_proven`] for a peer a gateway admitted as a joiner, kept
@@ -345,13 +361,20 @@ impl PunchBudget {
             entry.at = now;
             return;
         }
-        Self::insert_proof(&mut state.joined, peer, now);
+        Self::insert_proof(&mut state.joined, peer, now, None);
     }
 
-    fn insert_proof(set: &mut lru::LruCache<ProvenPeer, Proven>, peer: ProvenPeer, now: Duration) {
-        if let Some(entry) = set.get_mut(&peer) {
-            entry.at = now;
-            return;
+    /// Add `peer` to `set` with `entry` (a whole allowance if `None`);
+    /// whether it is there afterwards.
+    fn insert_proof(
+        set: &mut lru::LruCache<ProvenPeer, Proven>,
+        peer: ProvenPeer,
+        now: Duration,
+        entry: Option<Proven>,
+    ) -> bool {
+        if let Some(existing) = set.get_mut(&peer) {
+            existing.at = now;
+            return true;
         }
         if set.len() == set.cap().get() {
             // An expired proof goes before a live one.
@@ -368,7 +391,7 @@ impl PunchBudget {
                         .peek_lru()
                         .is_some_and(|(_, oldest)| oldest.refilled(now))
                     {
-                        return;
+                        return false;
                     }
                     set.pop_lru();
                 }
@@ -376,11 +399,12 @@ impl PunchBudget {
         }
         set.put(
             peer,
-            Proven {
+            entry.unwrap_or(Proven {
                 at: now,
                 allowance: Bucket::full(ALLOWANCE_BYTES, now),
-            },
+            }),
         );
+        true
     }
 
     /// Whether the peer at `to` holding `key` is proven at `now`.
@@ -833,6 +857,27 @@ mod tests {
         let ip = format!("203.0.113.{}", last + 1);
         exhaust_shared(&budget, &ip, now);
         assert_eq!(dial(&budget, &ip, &joiners[last], now), (Ok(()), used()));
+    }
+
+    /// A joined peer that then completes a setup this node dialed keeps the
+    /// allowance it had: moving it does not refill it.
+    #[test]
+    fn dialing_a_joined_peer_does_not_refill_its_allowance() {
+        let budget = PunchBudget::default();
+        let k = key();
+        let t0 = Duration::from_secs(100);
+        budget.mark_proven_joined(to(PEER), &k, t0);
+        for _ in 0..ALLOWANCE_BYTES / CLIENT_BYTES_PER_DIAL {
+            assert_eq!(dial(&budget, PEER, &k, t0), (Ok(()), used()));
+        }
+        budget.mark_proven(to(PEER), &k, t0);
+        {
+            let state = budget.state.lock();
+            assert!(state.joined.peek(&ProvenPeer::of(to(PEER), &k)).is_none());
+            assert!(state.proven.peek(&ProvenPeer::of(to(PEER), &k)).is_some());
+        }
+        exhaust_shared(&budget, PEER, t0);
+        assert!(dial(&budget, PEER, &k, t0).1.exhausted_peer);
     }
 
     /// Allowance charges leave the shared budgets alone.
