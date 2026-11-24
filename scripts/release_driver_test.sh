@@ -997,8 +997,11 @@ fi
 # working could not act on this checkout; gh, cargo and curl are stubs that
 # record any call.
 LIVE_WORK="$(mktemp -d)"
-mkdir -p "$LIVE_WORK/repo/scripts" "$LIVE_WORK/bin"
+mkdir -p "$LIVE_WORK/repo/scripts" "$LIVE_WORK/repo/crates/core" "$LIVE_WORK/bin"
 cp "$RELEASE_SH" "$LIVE_WORK/repo/scripts/release.sh"
+# The real core manifest, so the dry run gets past release.sh's committed
+# handshake-floor read (#6355) to its first external call.
+cp "$SCRIPT_DIR/../crates/core/Cargo.toml" "$LIVE_WORK/repo/crates/core/Cargo.toml"
 git -C "$LIVE_WORK/repo" init -q -b main
 for tool in gh cargo curl; do
     printf '#!/usr/bin/env bash\necho "%s $*" >> "%s/calls"\nexit 1\n' "$tool" "$LIVE_WORK" > "$LIVE_WORK/bin/$tool"
