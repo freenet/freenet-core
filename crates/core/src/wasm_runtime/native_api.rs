@@ -2501,7 +2501,17 @@ pub(super) mod delegate_secrets {
         {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
-                tracing::error!("delegate set_secret failed: {e}");
+                // A refusal to replace a blob that does not authenticate
+                // (#6323) is already counted and logged, rate-limited, by the
+                // store; the guest sees the ordinary storage-failure code.
+                if !matches!(
+                    e.deref(),
+                    crate::wasm_runtime::RuntimeInnerError::SecretStoreError(
+                        SecretStoreError::ExistingBlobUnauthenticated(_)
+                    )
+                ) {
+                    tracing::error!("delegate set_secret failed: {e}");
+                }
                 error_codes::ERR_STORAGE_FAILED
             }
         }
@@ -3463,7 +3473,7 @@ mod secret_read_memo_tests {
     use super::*;
     use crate::contract::storages::Storage;
     use crate::util::tests::get_temp_dir;
-    use freenet_stdlib::prelude::CodeHash;
+    use freenet_stdlib::prelude::{CodeHash, Delegate, DelegateCode, Parameters};
     use zeroize::Zeroizing;
 
     /// Real stores on a temp dir, mirroring `delegate_api::tests::TestEnv`.
@@ -3749,6 +3759,218 @@ mod secret_read_memo_tests {
         assert_eq!(failed, error_codes::ERR_STORAGE_FAILED);
         assert!(poisoned, "the failed read must poison the call");
         assert_eq!(absent, error_codes::ERR_SECRET_NOT_FOUND);
+    }
+
+    /// Run `run` as a guest would: with a real instance registered in the
+    /// process-global maps under a private id, `mem` as its linear memory
+    /// (pointer 0 is its first byte), and `f`'s stores behind the env.
+    fn as_guest<R>(f: &mut Fixture, id: i64, mem: &[u8], run: impl FnOnce() -> R) -> R {
+        use crate::wasm_runtime::runtime::{InstanceInfo, Key};
+        let dk = delegate_key();
+        // SAFETY: the env is moved into `DELEGATE_ENV` and removed again below,
+        // before `f` can be dropped by the caller.
+        let env = unsafe { env_of(f) };
+        MEM_ADDR.insert(
+            id,
+            InstanceInfo::new(mem.as_ptr() as i64, mem.len(), Key::Delegate(dk)),
+        );
+        DELEGATE_ENV.insert(id, DelegateEnvSlot::new(env));
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(id));
+        let out = run();
+        CURRENT_DELEGATE_INSTANCE.with(|c| c.set(-1));
+        DELEGATE_ENV.remove(&id);
+        MEM_ADDR.remove(&id);
+        out
+    }
+
+    fn blob_path(f: &Fixture, id: &SecretsId) -> std::path::PathBuf {
+        f.secret_store
+            .scope_dir(&delegate_key(), &SecretScope::Local)
+            .join(id.encode())
+    }
+
+    /// Flip the last byte, so the header and length stay valid and only the
+    /// AEAD check rejects it. Returns the corrupted bytes.
+    fn corrupt(path: &std::path::Path) -> Vec<u8> {
+        let mut bytes = std::fs::read(path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(path, &bytes).unwrap();
+        bytes
+    }
+
+    fn put(f: &mut Fixture, key: &[u8], value: &[u8]) {
+        f.secret_store
+            .store_secret(
+                &delegate_key(),
+                &SecretsId::new(key.to_vec()),
+                SecretScope::Local,
+                Zeroizing::new(value.to_vec()),
+            )
+            .unwrap();
+    }
+
+    /// Guest memory laid out as `key | value`.
+    fn kv_mem(key: &[u8], value: &[u8]) -> Vec<u8> {
+        [key, value].concat()
+    }
+
+    fn host_set(key: &[u8], value: &[u8]) -> i32 {
+        delegate_secrets::set_secret(0, key.len() as i32, key.len() as i64, value.len() as i32)
+    }
+
+    /// #6323 headline, through the host function a delegate calls: a set over
+    /// a blob that does not authenticate is refused with the ordinary
+    /// storage-failure code even though the key was never read in this call,
+    /// the bytes on disk are untouched, a read still reports "absent" without
+    /// failing the call, and the refusal is counted. Fails if the guard in
+    /// `SecretsStore::store_secret` is removed.
+    #[tokio::test]
+    async fn set_secret_host_fn_refuses_to_overwrite_an_undecryptable_blob() {
+        let mut f = fixture().await;
+        put(&mut f, b"vault-index", b"real data");
+        let path = blob_path(&f, &SecretsId::new(b"vault-index".to_vec()));
+        let corrupted = corrupt(&path);
+
+        let before = crate::wasm_runtime::secrets_store::refused_unauthenticated_overwrites();
+        let mem = kv_mem(b"vault-index", b"fresh empty index");
+        let (set, len, poisoned) = as_guest(&mut f, 0x6323_0001, &mem, || {
+            let set = host_set(b"vault-index", b"fresh empty index");
+            let len = delegate_secrets::get_secret_len(0, 11);
+            let poisoned = DELEGATE_ENV
+                .get(&0x6323_0001)
+                .map(|e| e.secret_reads_poisoned())
+                .unwrap_or(true);
+            (set, len, poisoned)
+        });
+
+        assert_eq!(set, error_codes::ERR_STORAGE_FAILED);
+        assert_eq!(std::fs::read(&path).unwrap(), corrupted, "bytes untouched");
+        assert_eq!(
+            len,
+            error_codes::ERR_SECRET_NOT_FOUND,
+            "reads of an undecryptable blob still report absent"
+        );
+        assert!(!poisoned, "a corrupt blob must not fail the whole call");
+        assert!(
+            crate::wasm_runtime::secrets_store::refused_unauthenticated_overwrites() > before,
+            "the refusal must be counted"
+        );
+    }
+
+    /// #6323: explicit delete stays allowed on an undecryptable blob, and the
+    /// fresh write after it goes through. Fails if the guard also blocks
+    /// `remove_secret`.
+    #[tokio::test]
+    async fn remove_secret_host_fn_clears_an_undecryptable_blob_and_set_then_works() {
+        let mut f = fixture().await;
+        put(&mut f, b"vault-index", b"real data");
+        let path = blob_path(&f, &SecretsId::new(b"vault-index".to_vec()));
+        corrupt(&path);
+
+        let mem = kv_mem(b"vault-index", b"fresh empty index");
+        let (refused, removed, set, len) = as_guest(&mut f, 0x6323_0002, &mem, || {
+            let refused = host_set(b"vault-index", b"fresh empty index");
+            let removed = delegate_secrets::remove_secret(0, 11);
+            let set = host_set(b"vault-index", b"fresh empty index");
+            let len = delegate_secrets::get_secret_len(0, 11);
+            (refused, removed, set, len)
+        });
+
+        assert_eq!(refused, error_codes::ERR_STORAGE_FAILED);
+        assert_eq!(removed, error_codes::SUCCESS, "remove is the recovery path");
+        assert_eq!(set, error_codes::SUCCESS);
+        assert_eq!(len, b"fresh empty index".len() as i32);
+    }
+
+    /// #6323: the refusal is per key. Another key of the same delegate stays
+    /// writable, whether it exists already or not.
+    #[tokio::test]
+    async fn set_secret_host_fn_other_keys_stay_writable_beside_a_corrupt_blob() {
+        let mut f = fixture().await;
+        put(&mut f, b"bad", b"real data");
+        put(&mut f, b"good", b"old");
+        corrupt(&blob_path(&f, &SecretsId::new(b"bad".to_vec())));
+
+        let mem = kv_mem(b"good", b"new");
+        let (existing, len) = as_guest(&mut f, 0x6323_0003, &mem, || {
+            let set = host_set(b"good", b"new");
+            (set, delegate_secrets::get_secret_len(0, 4))
+        });
+        assert_eq!(existing, error_codes::SUCCESS);
+        assert_eq!(len, 3);
+
+        let mem = kv_mem(b"fresh", b"x");
+        let fresh = as_guest(&mut f, 0x6323_0004, &mem, || host_set(b"fresh", b"x"));
+        assert_eq!(fresh, error_codes::SUCCESS);
+    }
+
+    /// #6323: an undecryptable KEY REGISTRY. Blob file names are hashes and the
+    /// raw key names exist only inside the registry, so it cannot be rebuilt.
+    /// The secret write itself must still go through, the damaged registry
+    /// must be left exactly as found (not replaced by a one-key registry), and
+    /// enumeration keeps reporting an empty list. Fails if a registry failure
+    /// starts refusing, or clobbering, the value write.
+    #[tokio::test]
+    async fn set_secret_host_fn_with_undecryptable_registry_writes_the_secret_only() {
+        let mut f = fixture().await;
+        put(&mut f, b"old-room", b"v");
+        let reg = f
+            .secret_store
+            .key_registry_path(&delegate_key(), &SecretScope::Local);
+        let corrupted = corrupt(&reg);
+
+        let mem = kv_mem(b"new-room", b"data");
+        let (set, listed, read) = as_guest(&mut f, 0x6323_0005, &mem, || {
+            let set = host_set(b"new-room", b"data");
+            let listed = delegate_secrets::list_secrets_len(0, 0);
+            let read = delegate_secrets::get_secret_len(0, 8);
+            (set, listed, read)
+        });
+
+        assert_eq!(set, error_codes::SUCCESS, "the secret write goes through");
+        assert_eq!(read, 4, "and is readable");
+        assert_eq!(
+            listed, 0,
+            "enumeration still reads the damaged registry as empty"
+        );
+        assert_eq!(
+            std::fs::read(&reg).unwrap(),
+            corrupted,
+            "the damaged registry is left as found, not rewritten from empty"
+        );
+    }
+
+    /// #6323: `create_delegate` registers a cipher in memory and stores the
+    /// delegate's code; it writes no secret blob and no registry, so it cannot
+    /// overwrite an undecryptable one. Pinned so that stays true.
+    #[tokio::test]
+    async fn create_delegate_leaves_undecryptable_secret_data_alone() {
+        let mut f = fixture().await;
+        let code = [7u8; 8];
+        let child = Delegate::from((
+            &DelegateCode::from(code.to_vec()),
+            &Parameters::from(vec![]),
+        ))
+        .key()
+        .clone();
+        let scope = f.secret_store.scope_dir(&child, &SecretScope::Local);
+        std::fs::create_dir_all(&scope).unwrap();
+        let blob = scope.join(SecretsId::new(b"k".to_vec()).encode());
+        let registry = f
+            .secret_store
+            .key_registry_path(&child, &SecretScope::Local);
+        let bad_blob = b"\x01not an authentic blob at all, long enough".to_vec();
+        let bad_registry = b"\x01not an authentic registry either, long enough".to_vec();
+        std::fs::write(&blob, &bad_blob).unwrap();
+        std::fs::write(&registry, &bad_registry).unwrap();
+
+        // SAFETY: `env` is dropped at the end of this test, before `f`.
+        let env = unsafe { env_of(&mut f) };
+        let created = env.create_delegate_sync(&code, &[], [0u8; 32], [0u8; 24]);
+        assert!(created.is_ok(), "create_delegate: {created:?}");
+        assert_eq!(std::fs::read(&blob).unwrap(), bad_blob);
+        assert_eq!(std::fs::read(&registry).unwrap(), bad_registry);
     }
 
     /// The memo is keyed on the secret's hash. Without that check a read of a
