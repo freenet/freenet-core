@@ -5265,13 +5265,25 @@ mod test {
             .enumerate()
         {
             let key = SecretsId::new(vec![61, n as u8]);
-            let raw = derived
-                .cipher
-                .encrypt(&derived.legacy_nonce, old)
-                .expect("legacy encrypt");
+            // A raw-AEAD blob starts with a random byte, and 1 in 256 start
+            // with VERSION_V1 (the ambiguity `decrypt_secret_blob` documents).
+            // The KEK is random per run, so pad the plaintext until the
+            // fixture reads as legacy; otherwise the test fails 1 run in 256.
+            let same = old == new;
+            let mut old = old.to_vec();
+            let raw = loop {
+                let raw = derived
+                    .cipher
+                    .encrypt(&derived.legacy_nonce, old.as_slice())
+                    .expect("legacy encrypt");
+                if raw[0] != VERSION_V1 {
+                    break raw;
+                }
+                old.push(b'.');
+            };
+            let new = if same { old.as_slice() } else { new };
             let path = dir.join(key.encode());
             std::fs::write(&path, &raw)?;
-            assert_ne!(raw[0], VERSION_V1, "fixture must read as legacy");
 
             store.store_secret(
                 delegate.key(),
