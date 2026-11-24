@@ -3531,7 +3531,7 @@ mod tests {
 
     #[test]
     fn older_peer_refusal_does_not_make_connected_node_trouble() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
         init(31340, HashSet::new(), "0.2.164".to_string());
         connect_peer(status_addr(1));
         // The real Display text of both errors an older peer's refusal can

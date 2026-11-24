@@ -680,7 +680,6 @@ mod tests {
     /// parse_semver with adversarial/malformed input.
     #[test]
     fn test_parse_semver_malformed() {
-        // Empty string
         assert_eq!(try_parse_semver("0.2.164"), Some((0, 2, 164)));
         assert_eq!(try_parse_semver("1.2.3-rc.1+b5"), Some((1, 2, 3)));
         assert_eq!(try_parse_semver("0.2.65535"), Some((0, 2, 65535)));
@@ -694,6 +693,7 @@ mod tests {
             &local
         ));
         assert!(!old_peer_rejection_means_we_must_update("256.0.0", &local));
+        // Empty string
         assert_eq!(parse_semver(""), (0, 0, 0));
         // Missing patch
         assert_eq!(parse_semver("0.1"), (0, 1, 0));

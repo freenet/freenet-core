@@ -263,9 +263,7 @@ mod tests {
     /// required" banner or an install command for an older version.
     #[test]
     fn older_peer_refusal_never_shows_update_banner() {
-        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
-            .lock()
-            .unwrap();
+        let _lock = crate::node::network_status::lock_global_state_for_test();
         let card = status_card_after_refusal(
             crate::transport::TransportError::PeerVersionOutdated {
                 peer_version: "0.2.117".into(),
@@ -282,9 +280,7 @@ mod tests {
     /// produce the banner either (second guard in the classifier).
     #[test]
     fn mismatch_text_with_older_remote_never_shows_update_banner() {
-        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
-            .lock()
-            .unwrap();
+        let _lock = crate::node::network_status::lock_global_state_for_test();
         let card = status_card_after_refusal(
             crate::transport::TransportError::ProtocolVersionMismatch {
                 expected: "0.2.117".into(),
@@ -301,9 +297,7 @@ mod tests {
     /// no connections, and the version it offers is newer than the running one.
     #[test]
     fn newer_peer_requiring_update_shows_banner_without_connections() {
-        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
-            .lock()
-            .unwrap();
+        let _lock = crate::node::network_status::lock_global_state_for_test();
         let card = status_card_after_refusal(
             crate::transport::TransportError::ProtocolVersionMismatch {
                 expected: "0.2.170".into(),
