@@ -127,6 +127,8 @@ impl QuicUpgrades {
             tracing::debug!(addr = %dial.addr, %error, "A QUIC-native setup gave no connection");
             outcome_of(&error)
         })?;
+        // The Hello exchange completed: this destination is proven reachable.
+        self.punch_budget.mark_proven(dial.addr, clock.now());
         Ok(self.native_connection(native.connection, native.peer.version, dial.addr))
     }
 

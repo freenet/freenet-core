@@ -3149,6 +3149,18 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.connect_native_survivor_udp_dropped),
             );
             m.insert(
+                "connect_native_punch_allowance_used".into(),
+                serde_json::json!(snapshot.connect_native_punch_allowance_used),
+            );
+            m.insert(
+                "connect_native_punch_allowance_exhausted".into(),
+                serde_json::json!(snapshot.connect_native_punch_allowance_exhausted),
+            );
+            m.insert(
+                "connect_native_punch_allowance_refused".into(),
+                serde_json::json!(snapshot.connect_native_punch_allowance_refused),
+            );
+            m.insert(
                 "connect_native_offer_level".into(),
                 serde_json::json!(snapshot.connect_native_offer_level),
             );

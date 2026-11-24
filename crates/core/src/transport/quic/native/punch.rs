@@ -19,6 +19,18 @@
 //! replaces the least recently charged (a refused charge counts as a use)
 //! only once that one's budget has refilled, so forgetting a destination
 //! never gives it back bytes early; otherwise the new one is refused.
+//!
+//! Destinations this node has completed a native setup with (Hello exchanged)
+//! within [`PROVEN_TTL`] are proven. A setup to a proven destination is
+//! charged to a separate allowance first, [`ALLOWANCE_BYTES`] a minute per
+//! destination and [`NODE_ALLOWANCE_BYTES`] for the node, so pressure on the
+//! shared budget does not stop a reconnect to a known-good peer. A spent
+//! allowance falls back to the shared budget, so a proven destination is
+//! never worse off than an unproven one. The proven set holds
+//! [`PROVEN_ENTRIES`] destinations; a new one replaces the least recently
+//! used only once that one's allowance has refilled, so forgetting a
+//! destination never gives it allowance early, and otherwise the new one is
+//! not recorded.
 
 use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroUsize;
@@ -29,7 +41,7 @@ use parking_lot::Mutex;
 use crate::config::GlobalRng;
 use crate::simulation::TimeSource;
 use crate::transport::demux::{PUNCH_FIRST_BYTE, PUNCH_LEN};
-use crate::transport::normalize_mapped_addr;
+use crate::transport::{TRANSPORT_METRICS, normalize_mapped_addr};
 
 /// Time between two punches of one dial.
 pub(crate) const PUNCH_INTERVAL: Duration = Duration::from_millis(250);
@@ -50,6 +62,22 @@ pub(crate) const PUNCH_BUDGET_WINDOW: Duration = Duration::from_secs(60);
 
 /// Destinations the budget remembers.
 pub(crate) const PUNCH_BUDGET_ENTRIES: usize = 4096;
+
+/// How long a completed native setup keeps its destination proven.
+pub(crate) const PROVEN_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Destinations the proven set remembers.
+pub(crate) const PROVEN_ENTRIES: usize = 1024;
+
+/// Bytes one proven destination's allowance holds per [`PUNCH_BUDGET_WINDOW`]:
+/// two client setups of two dials each (a dial and its overlapping second).
+pub(crate) const ALLOWANCE_BYTES: u64 = 4 * CLIENT_BYTES_PER_DIAL;
+
+/// Bytes the node's allowance holds per [`PUNCH_BUDGET_WINDOW`], all proven
+/// destinations together: about 17 client setups a minute. Sized
+/// conservatively from 0.2.164 field counters (see the PR): refusals were
+/// near zero there, so this only has to cover reconnect bursts.
+pub(crate) const NODE_ALLOWANCE_BYTES: u64 = 512 * 1024;
 
 /// Padded datagrams a native client sends at most in its window. From a
 /// 100 ms initial RTT the probe timeout is about 300 ms and doubles, and
@@ -150,6 +178,14 @@ pub(crate) struct PunchBudget {
 struct BudgetState {
     destinations: lru::LruCache<Destination, Bucket>,
     node: Option<Bucket>,
+    proven: lru::LruCache<Destination, Proven>,
+    node_allowance: Option<Bucket>,
+}
+
+/// A proven destination: when it was last proven, and its allowance.
+struct Proven {
+    at: Duration,
+    allowance: Bucket,
 }
 
 impl Default for PunchBudget {
@@ -160,14 +196,87 @@ impl Default for PunchBudget {
 
 impl PunchBudget {
     fn with_entries(entries: usize) -> Self {
+        Self::with_capacities(entries, PROVEN_ENTRIES)
+    }
+
+    fn with_capacities(entries: usize, proven: usize) -> Self {
+        let cap = |n: usize| NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN);
         Self {
             state: Mutex::new(BudgetState {
-                destinations: lru::LruCache::new(
-                    NonZeroUsize::new(entries).unwrap_or(NonZeroUsize::MIN),
-                ),
+                destinations: lru::LruCache::new(cap(entries)),
                 node: None,
+                proven: lru::LruCache::new(cap(proven)),
+                node_allowance: None,
             }),
         }
+    }
+
+    /// Record that a native setup with `to` completed at `now`: it is proven
+    /// until [`PROVEN_TTL`] has passed, and proving it again renews that
+    /// without refilling its allowance. If the set is full and the least
+    /// recently used destination's allowance has not refilled, `to` is not
+    /// recorded.
+    pub(crate) fn mark_proven(&self, to: SocketAddr, now: Duration) {
+        let key = Destination::of(to);
+        let mut state = self.state.lock();
+        if let Some(entry) = state.proven.get_mut(&key) {
+            entry.at = now;
+            return;
+        }
+        if state.proven.len() == state.proven.cap().get() {
+            let refilled = state.proven.peek_lru().is_some_and(|(_, oldest)| {
+                let mut allowance = oldest.allowance;
+                allowance.refill(ALLOWANCE_BYTES, now);
+                allowance.left >= ALLOWANCE_BYTES
+            });
+            if !refilled {
+                return;
+            }
+            state.proven.pop_lru();
+        }
+        state.proven.put(
+            key,
+            Proven {
+                at: now,
+                allowance: Bucket::full(ALLOWANCE_BYTES, now),
+            },
+        );
+    }
+
+    /// Whether `to` is proven at `now`.
+    #[cfg(test)]
+    fn is_proven(&self, to: SocketAddr, now: Duration) -> bool {
+        let state = self.state.lock();
+        state
+            .proven
+            .peek(&Destination::of(to))
+            .is_some_and(|p| now.saturating_sub(p.at) < PROVEN_TTL)
+    }
+
+    /// Take `bytes` from `key`'s allowance and the node's, if `key` is
+    /// proven at `now`. Returns whether it did; takes nothing otherwise.
+    fn charge_allowance(
+        state: &mut BudgetState,
+        key: Destination,
+        bytes: u64,
+        now: Duration,
+    ) -> Option<bool> {
+        let entry = state.proven.peek(&key)?;
+        if now.saturating_sub(entry.at) >= PROVEN_TTL {
+            return None;
+        }
+        let node = state
+            .node_allowance
+            .get_or_insert_with(|| Bucket::full(NODE_ALLOWANCE_BYTES, now));
+        node.refill(NODE_ALLOWANCE_BYTES, now);
+        let entry = state.proven.get_mut(&key)?;
+        entry.allowance.refill(ALLOWANCE_BYTES, now);
+        if bytes > entry.allowance.left || bytes > node.left {
+            return Some(false);
+        }
+        entry.allowance.left -= bytes;
+        node.left -= bytes;
+        Some(true)
     }
 
     /// Take `bytes` for a setup toward `to` at `now`, from `to`'s
@@ -184,13 +293,40 @@ impl PunchBudget {
             return Err(PunchRefusal::Destination);
         }
         let mut state = self.state.lock();
-        let BudgetState { destinations, node } = &mut *state;
+        let key = Destination::of(to);
+        // A proven destination draws on its allowance, not the shared budget.
+        let proven_but_spent = match Self::charge_allowance(&mut state, key, bytes, now) {
+            Some(true) => {
+                TRANSPORT_METRICS.record_connect_native_punch_allowance_used();
+                return Ok(());
+            }
+            Some(false) => {
+                TRANSPORT_METRICS.record_connect_native_punch_allowance_exhausted();
+                true
+            }
+            None => false,
+        };
+        let result = Self::charge_shared(&mut state, key, bytes, now);
+        if proven_but_spent && result.is_err() {
+            TRANSPORT_METRICS.record_connect_native_punch_allowance_refused();
+        }
+        result
+    }
+
+    fn charge_shared(
+        state: &mut BudgetState,
+        key: Destination,
+        bytes: u64,
+        now: Duration,
+    ) -> Result<(), PunchRefusal> {
+        let BudgetState {
+            destinations, node, ..
+        } = state;
         let node = node.get_or_insert_with(|| Bucket::full(NODE_PUNCH_BUDGET_BYTES, now));
         node.refill(NODE_PUNCH_BUDGET_BYTES, now);
         if node.left < bytes {
             return Err(PunchRefusal::Node);
         }
-        let key = Destination::of(to);
         if !destinations.contains(&key) && destinations.len() == destinations.cap().get() {
             let refilled = destinations.peek_lru().is_some_and(|(_, oldest)| {
                 let mut oldest = *oldest;
@@ -273,6 +409,29 @@ mod tests {
         assert_eq!(NODE_PUNCH_BUDGET_BYTES, 1_048_576);
         assert_eq!(PUNCH_BUDGET_WINDOW, Duration::from_secs(60));
         assert_eq!(PUNCH_BUDGET_ENTRIES, 4096);
+        assert_eq!(PROVEN_TTL, Duration::from_secs(21_600));
+        assert_eq!(PROVEN_ENTRIES, 1024);
+        assert_eq!(ALLOWANCE_BYTES, 4 * CLIENT_BYTES_PER_DIAL);
+        assert_eq!(NODE_ALLOWANCE_BYTES, 524_288);
+    }
+
+    /// A completed native setup records its destination as proven; without
+    /// this call the allowance is never available.
+    #[test]
+    fn a_completed_native_setup_proves_its_destination() {
+        let driver = include_str!("../upgrade/driver/native.rs");
+        let setup = driver
+            .split("async fn run_native_setup")
+            .nth(1)
+            .and_then(|rest| rest.split("fn native_connection").next())
+            .expect("run_native_setup");
+        let proven = setup
+            .find("punch_budget.mark_proven(dial.addr")
+            .expect("run_native_setup proves the destination");
+        let failed = setup
+            .find("A QUIC-native setup gave no connection")
+            .unwrap();
+        assert!(proven > failed, "proven only after the setup succeeded");
     }
 
     /// A destination takes PUNCH_BUDGET_BYTES a minute: four client setups
@@ -318,6 +477,166 @@ mod tests {
                 Ok(())
             );
         }
+    }
+
+    /// Spend a destination's whole shared budget, as pressure on it would.
+    fn exhaust_shared(budget: &PunchBudget, ip: &str, now: Duration) {
+        for _ in 0..PUNCH_BUDGET_BYTES / CLIENT_BYTES_PER_DIAL {
+            assert_eq!(budget.charge(to(ip), CLIENT_BYTES_PER_DIAL, now), Ok(()));
+        }
+        assert_eq!(
+            budget.charge(to(ip), CLIENT_BYTES_PER_DIAL, now),
+            Err(PunchRefusal::Destination)
+        );
+    }
+
+    /// A destination whose shared budget is spent is refused unless it is
+    /// proven, and a proven one is served from the allowance, up to the
+    /// allowance and no further. Fails if the allowance is removed.
+    #[test]
+    fn a_proven_destination_is_served_when_the_shared_budget_is_spent() {
+        let budget = PunchBudget::default();
+        let t0 = Duration::from_secs(100);
+        exhaust_shared(&budget, "198.51.100.1", t0);
+        budget.mark_proven(to("198.51.100.1"), t0);
+        for _ in 0..ALLOWANCE_BYTES / CLIENT_BYTES_PER_DIAL {
+            assert_eq!(
+                budget.charge(to("198.51.100.1"), CLIENT_BYTES_PER_DIAL, t0),
+                Ok(())
+            );
+        }
+        // The allowance is bounded: past it the shared budget answers.
+        assert_eq!(
+            budget.charge(to("198.51.100.1"), CLIENT_BYTES_PER_DIAL, t0),
+            Err(PunchRefusal::Destination)
+        );
+        // The allowance refills over the window like the budget.
+        assert_eq!(
+            budget.charge(
+                to("198.51.100.1"),
+                CLIENT_BYTES_PER_DIAL,
+                t0 + PUNCH_BUDGET_WINDOW
+            ),
+            Ok(())
+        );
+    }
+
+    /// Allowance charges leave the shared budgets alone, so proven reconnects
+    /// do not use up what unproven destinations share.
+    #[test]
+    fn the_allowance_does_not_draw_on_the_shared_budget() {
+        let budget = PunchBudget::default();
+        let t0 = Duration::from_secs(100);
+        budget.mark_proven(to("198.51.100.1"), t0);
+        for _ in 0..ALLOWANCE_BYTES / CLIENT_BYTES_PER_DIAL {
+            assert_eq!(
+                budget.charge(to("198.51.100.1"), CLIENT_BYTES_PER_DIAL, t0),
+                Ok(())
+            );
+        }
+        // The destination's own shared budget is still whole.
+        let dials = PUNCH_BUDGET_BYTES / CLIENT_BYTES_PER_DIAL;
+        for _ in 0..dials {
+            assert_eq!(
+                budget.charge(to("198.51.100.1"), CLIENT_BYTES_PER_DIAL, t0),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            budget.charge(to("198.51.100.1"), CLIENT_BYTES_PER_DIAL, t0),
+            Err(PunchRefusal::Destination)
+        );
+    }
+
+    /// An unproven destination gets no allowance.
+    #[test]
+    fn an_unproven_destination_gets_no_allowance() {
+        let budget = PunchBudget::default();
+        let t0 = Duration::from_secs(100);
+        exhaust_shared(&budget, "198.51.100.1", t0);
+        assert!(!budget.is_proven(to("198.51.100.1"), t0));
+        assert_eq!(
+            budget.charge(to("198.51.100.1"), CLIENT_BYTES_PER_DIAL, t0),
+            Err(PunchRefusal::Destination)
+        );
+    }
+
+    /// A destination stays proven for PROVEN_TTL after its last proof, and
+    /// renewing the proof does not refill its allowance.
+    #[test]
+    fn proof_expires_and_renewal_does_not_refill() {
+        let budget = PunchBudget::default();
+        let t0 = Duration::from_secs(100);
+        exhaust_shared(&budget, "198.51.100.1", t0);
+        budget.mark_proven(to("198.51.100.1"), t0);
+        let dials = ALLOWANCE_BYTES / CLIENT_BYTES_PER_DIAL;
+        for _ in 0..dials {
+            assert_eq!(
+                budget.charge(to("198.51.100.1"), CLIENT_BYTES_PER_DIAL, t0),
+                Ok(())
+            );
+        }
+        budget.mark_proven(to("198.51.100.1"), t0);
+        assert_eq!(
+            budget.charge(to("198.51.100.1"), CLIENT_BYTES_PER_DIAL, t0),
+            Err(PunchRefusal::Destination)
+        );
+        // Just before expiry the proof holds; at expiry it does not.
+        let last = t0 + PROVEN_TTL;
+        budget.mark_proven(to("198.51.100.1"), last - Duration::from_secs(1));
+        assert!(budget.is_proven(to("198.51.100.1"), last));
+        assert!(!budget.is_proven(
+            to("198.51.100.1"),
+            last + PROVEN_TTL - Duration::from_secs(1)
+        ));
+        // Expired: refused again once the shared budget is spent.
+        let late = last + PROVEN_TTL;
+        exhaust_shared(&budget, "198.51.100.1", late);
+    }
+
+    /// All proven destinations together are held to the node allowance: what
+    /// a node serves is at most its shared node budget plus its allowance,
+    /// and the allowance does add to it.
+    #[test]
+    fn the_node_allowance_bounds_all_proven_destinations() {
+        let budget = PunchBudget::default();
+        let t0 = Duration::from_secs(100);
+        let mut served = 0u64;
+        for host in 1..=200u8 {
+            let to = to(&format!("198.51.100.{host}"));
+            budget.mark_proven(to, t0);
+            while budget.charge(to, CLIENT_BYTES_PER_DIAL, t0).is_ok() {
+                served += CLIENT_BYTES_PER_DIAL;
+            }
+        }
+        assert!(served > NODE_PUNCH_BUDGET_BYTES);
+        assert!(served <= NODE_PUNCH_BUDGET_BYTES + NODE_ALLOWANCE_BYTES);
+        let probe = to("198.51.100.250");
+        budget.mark_proven(probe, t0);
+        assert_eq!(
+            budget.charge(probe, CLIENT_BYTES_PER_DIAL, t0),
+            Err(PunchRefusal::Node)
+        );
+    }
+
+    /// A full proven set does not forget a destination whose allowance has
+    /// not refilled: the newcomer is not recorded, and is recorded once the
+    /// allowance has refilled.
+    #[test]
+    fn forgetting_a_proven_destination_never_refills_its_allowance() {
+        let budget = PunchBudget::with_capacities(PUNCH_BUDGET_ENTRIES, 2);
+        let t0 = Duration::from_secs(100);
+        for ip in ["198.51.100.1", "198.51.100.2"] {
+            budget.mark_proven(to(ip), t0);
+            assert_eq!(budget.charge(to(ip), CLIENT_BYTES_PER_DIAL, t0), Ok(()));
+        }
+        budget.mark_proven(to("198.51.100.3"), t0);
+        assert!(!budget.is_proven(to("198.51.100.3"), t0));
+        assert!(budget.is_proven(to("198.51.100.1"), t0));
+        // A minute on, every allowance is whole and the newcomer is taken.
+        let later = t0 + PUNCH_BUDGET_WINDOW;
+        budget.mark_proven(to("198.51.100.3"), later);
+        assert!(budget.is_proven(to("198.51.100.3"), later));
     }
 
     /// A refused charge takes nothing, and every port and the IPv4-mapped
