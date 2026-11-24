@@ -4892,12 +4892,15 @@ pub mod mock_transport {
             "expected version 1.2",
             "expected version ",
         ] {
-            match handle_ack_connection_error(bad.to_string().into()) {
-                TransportError::ConnectionEstablishmentFailure { cause } => {
-                    assert!(!cause.contains("example.invalid") && !cause.contains("echo"));
-                }
-                other => panic!("expected generic failure for {bad:?}, got {other:?}"),
-            }
+            let err = handle_ack_connection_error(bad.to_string().into());
+            assert!(
+                matches!(
+                    &err,
+                    TransportError::ConnectionEstablishmentFailure { cause }
+                        if !cause.contains("example.invalid") && !cause.contains("echo")
+                ),
+                "expected generic failure for {bad:?}, got {err:?}"
+            );
         }
 
         let err_msg_no_version = "remote is using a different protocol version".to_string();
