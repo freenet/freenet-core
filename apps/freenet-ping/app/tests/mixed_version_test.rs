@@ -36,7 +36,7 @@ use freenet_stdlib::{
     client_api::{ClientRequest, ContractRequest, HostResponse, NodeQuery, QueryResponse, WebApi},
     prelude::*,
 };
-use freenet_test_network::{Backend, DockerNatConfig, FreenetBinary, NetworkBuilder, TestNetwork};
+use freenet_test_network::{Backend, DockerNatConfig, FreenetBinary, NetworkBuilder};
 use serde_json::json;
 use std::{
     path::{Path, PathBuf},
@@ -415,30 +415,50 @@ async fn check_large(
         .await
 }
 
-/// Per-node facts for the report: which binary, what it connected to. Which
-/// transport each node used is read from the node's own log, as evidence for a
-/// human; nothing asserts on it.
-fn transport_evidence(net: &TestNetwork, nodes: &[Node<'_>]) -> Vec<String> {
-    let mut out = Vec::new();
-    let peers: Vec<_> = (0..nodes.len() - 1).map(|i| net.peer(i)).collect();
-    let logs = std::iter::once(net.gateway(0)).chain(peers);
-    for (node, peer) in nodes.iter().zip(logs) {
-        let text = std::fs::read_to_string(peer.log_path()).unwrap_or_default();
-        let count = |needle: &str| {
-            text.lines()
-                .filter(|l| l.to_ascii_lowercase().contains(needle))
-                .count()
-        };
-        out.push(format!(
-            "{} {}: log lines mentioning quic={}, native={}, udp={}",
-            node.name,
-            node.build.label(),
-            count("quic"),
-            count("native"),
-            count("udp"),
-        ));
+/// First release that can carry native QUIC; earlier builds have no such flags.
+const NATIVE_QUIC_SINCE: Version = Version(0, 2, 163);
+
+/// Whether this run forces native QUIC between builds that support it
+/// (`FREENET_MIXED_QUIC=force`). The node exposes no per-connection transport to
+/// clients and logs nothing about it at the level the release builds keep, so
+/// the transport a pair used cannot be read back. Forcing makes a native pair
+/// certain instead (both ends prefer QUIC data at 100%), and the report records
+/// the mode each node ran in. Without it the node's own hashed choice applies,
+/// as in production, and a small network may form no native pair at all.
+fn force_native() -> bool {
+    std::env::var("FREENET_MIXED_QUIC").is_ok_and(|v| v == "force")
+}
+
+/// Extra node arguments for a build in this run's transport mode.
+fn transport_args(b: &Build) -> Vec<&'static str> {
+    if force_native() && b.version >= NATIVE_QUIC_SINCE {
+        vec!["--transport-quic", "prefer", "--quic-data-percent", "100"]
+    } else {
+        Vec::new()
     }
-    out
+}
+
+fn transport_mode(b: &Build) -> &'static str {
+    if !transport_args(b).is_empty() {
+        "native QUIC forced (prefer, data 100%)"
+    } else if b.version >= NATIVE_QUIC_SINCE {
+        "node default (hashed per pair)"
+    } else {
+        "legacy UDP only (build predates native QUIC)"
+    }
+}
+
+/// The node's own log: files under its data and config directories, plus what it
+/// wrote to the container's output.
+fn node_log(container: &str) -> String {
+    let files = docker(&[
+        "exec",
+        container,
+        "sh",
+        "-c",
+        "find /data /config -type f -name '*.log*' 2>/dev/null | xargs -r cat",
+    ]);
+    format!("{files}\n{}", docker(&["logs", container]))
 }
 
 fn write_artifacts(report: &Report, nodes: &[Node<'_>], outcome: &Result<()>) {
@@ -468,7 +488,7 @@ fn write_artifacts(report: &Report, nodes: &[Node<'_>], outcome: &Result<()>) {
         let tag = format!("{}-{}", n.name, n.build.label().replace('@', "-"));
         let _ = std::fs::write(
             dir.join(format!("{tag}.docker.log")),
-            docker(&["logs", &n.container]),
+            node_log(&n.container),
         );
         let _ = std::fs::write(
             dir.join(format!("{tag}.inspect.json")),
@@ -497,9 +517,10 @@ async fn run_scenario(spec: Spec<'_>, head: &Build) -> Result<()> {
         .collect();
     for (i, (b, ok)) in all.iter().zip(&expect_connected).enumerate() {
         report.note(format!(
-            "node {i} {} floor {} binary {}: expected to {} the gateway",
+            "node {i} {} floor {} transport {} binary {}: expected to {} the gateway",
             b.label(),
             b.floor,
+            transport_mode(b),
             b.binary.display(),
             if *ok { "connect to" } else { "be refused by" }
         ));
@@ -519,8 +540,11 @@ async fn run_scenario(spec: Spec<'_>, head: &Build) -> Result<()> {
         .require_connectivity(ratio - 0.01)
         .connectivity_timeout(CONNECT_TIMEOUT)
         .preserve_temp_dirs_on_failure(true);
+    builder = builder.gateway_extra_args(0, transport_args(spec.gateway));
     for (i, b) in spec.peers.iter().enumerate() {
-        builder = builder.peer_binary(i, FreenetBinary::Path(b.binary.clone()));
+        builder = builder
+            .peer_binary(i, FreenetBinary::Path(b.binary.clone()))
+            .peer_extra_args(i, transport_args(b));
     }
 
     let network = builder
@@ -545,9 +569,6 @@ async fn run_scenario(spec: Spec<'_>, head: &Build) -> Result<()> {
 
     let outcome = run_checks(&mut report, &nodes, &expect_connected, head).await;
 
-    for line in transport_evidence(&network, &nodes) {
-        report.note(line);
-    }
     write_artifacts(&report, &nodes, &outcome);
     outcome
 }
