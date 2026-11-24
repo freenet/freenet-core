@@ -9363,7 +9363,7 @@ mod tests {
             .find("recorder.contract_exists();")
             .expect("InlineFound arm settles pending NotFounds");
         assert!(
-            cache < proof && found_arm[cache..proof].contains("if state_present"),
+            cache < proof && found_arm[cache..proof].contains("if cached.accepted_remote"),
             "existence proof requires state this node stored: \
              contract_exists() must follow the store and be gated on it"
         );
@@ -9386,7 +9386,8 @@ mod tests {
                 .rfind("cache_contract_locally(")
                 .expect("a store precedes each streaming contract_exists()");
             assert!(
-                streaming_arm[store..at].contains("if stored"),
+                streaming_arm[store..at].contains("if stored")
+                    || streaming_arm[store..at].contains("if cached.accepted_remote"),
                 "existence proof requires state this node stored: each streaming \
                  contract_exists() must be gated on its store's result"
             );
