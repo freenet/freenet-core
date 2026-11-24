@@ -96,10 +96,8 @@ const OP_TIMEOUT: Duration = Duration::from_secs(90);
 /// Window in which a refused node must stay unconnected, after the rest of the
 /// network is demonstrably up.
 const REFUSAL_WINDOW: Duration = Duration::from_secs(60);
-/// Upper bound on probe rounds in the refusal step (about 3 s apart, so the
-/// window gives at least 3 rounds and a stuck node ends the step before the
-/// job timeout).
-const MAX_REFUSAL_ROUNDS: u32 = 40;
+/// Extra time past the refusal window for a refused node's final probe to answer.
+const REFUSAL_GRACE: Duration = Duration::from_secs(90);
 /// Bytes of padding in the large state. Above the 64 KiB streaming threshold and
 /// the 512 KiB single-message size.
 const LARGE_PADDING: usize = 600 * 1024;
@@ -434,6 +432,13 @@ const PROBE_OUTER_TIMEOUT: Duration = Duration::from_secs(45);
 /// a reply that does not decode. Finding that kind of break is what this test is
 /// for, so it must not be absorbed as "no data".
 async fn probe(ws_url: &str) -> Result<Option<usize>> {
+    probe_within(ws_url, PROBE_OUTER_TIMEOUT).await
+}
+
+/// `probe` with the outer bound lowered to `limit` when that is shorter, so a
+/// caller with a hard deadline is never held past it by a stalled node.
+async fn probe_within(ws_url: &str, limit: Duration) -> Result<Option<usize>> {
+    let outer = limit.min(PROBE_OUTER_TIMEOUT);
     let attempt = async {
         let mut client = match connect_ws_with_retry(
             &format!("{ws_url}?encodingProtocol=native"),
@@ -467,10 +472,10 @@ async fn probe(ws_url: &str) -> Result<Option<usize>> {
             Ok(Ok(other)) => bail!("client-api: unexpected reply to ConnectedPeers: {other:?}"),
         }
     };
-    match tokio::time::timeout(PROBE_OUTER_TIMEOUT, attempt).await {
+    match tokio::time::timeout(outer, attempt).await {
         Ok(r) => r,
         Err(_) => {
-            eprintln!("  probe of {ws_url} timed out after {PROBE_OUTER_TIMEOUT:?}");
+            eprintln!("  probe of {ws_url} timed out after {outer:?}");
             Ok(None)
         }
     }
@@ -956,16 +961,21 @@ async fn run_checks(
         report
             .timed("refusal", async {
                 let deadline = Instant::now() + REFUSAL_WINDOW;
+                // Hard stop. A refused node whose WebSocket handshake stalls makes
+                // every probe run to its outer bound, so counting rounds could
+                // outlast the test runner's limit and lose the report; past this
+                // instant the step fails normally instead.
+                let grace_deadline = deadline + REFUSAL_GRACE;
                 // Most recent probe per refused node. The LAST probe of the
                 // window must have answered and shown 0 connections: a node that
                 // answered 0 early, connected later and then went quiet must not
                 // pass.
                 let mut last: Vec<Option<usize>> = vec![None; refused.len()];
-                let mut round = 0u32;
                 loop {
                     for (i, n) in refused.iter().enumerate() {
                         // `probe` errs on a protocol break; that fails the step.
-                        last[i] = probe(&n.ws_url).await?;
+                        let left = grace_deadline.saturating_duration_since(Instant::now());
+                        last[i] = probe_within(&n.ws_url, left).await?;
                         if let Some(c) = last[i]
                             && c != 0
                         {
@@ -981,11 +991,11 @@ async fn run_checks(
                             bail!("{} {} exited instead of staying out", n.name, n.build.label());
                         }
                     }
-                    round += 1;
-                    // Past the window, keep probing (a few extra rounds at most)
-                    // until every refused node's latest probe has answered.
+                    // Past the window, keep probing until every refused node's latest
+                    // probe has answered, or the grace deadline passes.
                     let answered = last.iter().all(Option::is_some);
-                    if Instant::now() >= deadline && (answered || round >= MAX_REFUSAL_ROUNDS) {
+                    if (Instant::now() >= deadline && answered) || Instant::now() >= grace_deadline
+                    {
                         break;
                     }
                     tokio::time::sleep(Duration::from_secs(3)).await;
