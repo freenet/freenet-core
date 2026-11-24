@@ -8,6 +8,9 @@
 #       OUT_DIR/versions.json.
 #   fetch-release-binary.sh select [EXCLUDE_TAG]
 #       Read tags on stdin, print "n1=<tag>" and "n2=<tag>" (selection only).
+#   fetch-release-binary.sh tags [--exclude-tag TAG]
+#       List the published releases and print "n1=<tag>" / "n2=<tag>" without
+#       downloading (used to key the CI cache).
 #   fetch-release-binary.sh fetch TAG OUT_DIR
 #       Download, verify and cache one release binary; print its path.
 #   fetch-release-binary.sh floor TAG
@@ -162,6 +165,11 @@ main() {
     shift || true
     case "$cmd" in
         select) select_tags "${1:-}" ;;
+        tags)
+            local exclude=""
+            if [ "${1:-}" = "--exclude-tag" ]; then exclude="${2:?tag}"; fi
+            list_release_tags | select_tags "$exclude"
+            ;;
         floor) release_floor "${1:?tag}" ;;
         floor-from-cargo-toml) floor_from_cargo_toml ;;
         fetch) fetch_release "${1:?tag}" "${2:?out dir}" ;;
@@ -176,7 +184,7 @@ main() {
             done
             resolve "$out" "$exclude"
             ;;
-        *) sed -n '2,20p' "$0"; exit 2 ;;
+        *) sed -n '2,24p' "$0"; exit 2 ;;
     esac
 }
 
