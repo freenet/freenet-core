@@ -128,15 +128,22 @@ fn waits_for_a_stream_and_for_a_permit_are_counted() {
                 (unpermitted, unopened, held)
             })
             .await;
-        for outcome in [&unpermitted, &unopened] {
-            assert!(
-                matches!(
-                    outcome,
-                    BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
-                ),
-                "{outcome:?}"
-            );
-        }
+        // A wait for this side's own permit is `TimedOut`; a wait for the peer's
+        // stream credit is `NoCredit`, the one a native path retries.
+        assert!(
+            matches!(
+                unpermitted,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+            ),
+            "{unpermitted:?}"
+        );
+        assert!(
+            matches!(
+                unopened,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::NoCredit))
+            ),
+            "{unopened:?}"
+        );
         let keys = keys(node);
         assert_eq!(keys["quic_streamed_sends"], 1);
         assert_eq!(keys["quic_stream_permit_waited"], 1);

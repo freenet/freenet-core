@@ -11,6 +11,7 @@
 //! | `Sent` | done | done |
 //! | `MaybeDelivered` | done | done |
 //! | `Failed(NotOpened)` | UDP | UDP, same id |
+//! | `Failed(NotOpened(NoCredit))` on a native path | same path again, `NOT_OPENED_RETRIES` times, then dropped | same |
 //! | `Failed(NotOpened(Paced))` (the pacer refused it) | UDP, charged to the pacer | UDP, same id, charged to the pacer |
 //! | `Failed(TimedOut)` after open | UDP | give up |
 //! | `Failed(Paced)` after open | UDP, charged to the pacer | give up |
