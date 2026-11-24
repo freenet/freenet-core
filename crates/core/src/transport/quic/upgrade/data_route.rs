@@ -159,7 +159,7 @@ impl DataRoute {
 
     /// Take `payload` for a native connection's path, which has no UDP
     /// session to hand it to. Never waits. A message refused because the queue
-    /// is full is counted as a dropped short; one refused because the path has
+    /// is full is counted as `native_short_queue_full`, not as a dropped short; one refused because the path has
     /// ended is not, since the connection is over.
     pub(in crate::transport) fn queue_native_short(
         &self,
@@ -168,7 +168,9 @@ impl DataRoute {
         match self.shorts.try_send(payload) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => {
-                self.path.stats().record_send_dropped(SendKind::Short);
+                self.path
+                    .stats()
+                    .record_send_event(QuicSendEvent::NativeShortQueueFull);
                 Err(ShortRefused::Full)
             }
             Err(mpsc::error::TrySendError::Closed(_)) => Err(ShortRefused::Closed),

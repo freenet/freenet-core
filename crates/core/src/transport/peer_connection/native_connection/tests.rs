@@ -606,7 +606,14 @@ fn a_full_short_queue_refuses_the_send_and_keeps_the_connection() {
                 matches!(observed, Err(TransportError::SendQueueFull(_))),
                 "{observed:?}"
             );
-            assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Dropped), 2);
+            assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Dropped), 0);
+            assert_eq!(
+                rig.conn
+                    .path()
+                    .stats()
+                    .send_event_count(QuicSendEvent::NativeShortQueueFull),
+                2
+            );
             assert_eq!(
                 rig.conn
                     .path()
@@ -939,49 +946,109 @@ fn a_native_connection_counts_in_the_shared_bandwidth_pool() {
     );
 }
 
-/// A native path has no UDP session, so a short whose stream did not open within
-/// its deadline (the peer's stream limit is full, here because the peer's short
-/// channel is full and its readers hold their slots) used to be dropped. It is
-/// sent again on the same path, and arrives once the peer frees a slot.
-#[test]
-fn a_short_that_found_no_stream_credit_is_sent_again_not_dropped() {
+/// The peer's stream limit is held full by shorts its application does not read:
+/// its short channel holds one and each further reader keeps its slot. Runs
+/// `test` on a native connection that has sent `primed` shorts into those limits.
+fn starved<F, Fut>(network: &'static str, primed: usize, test: F)
+where
+    F: FnOnce(Rig) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
     run(
-        "native-conn-not-opened-retry",
+        network,
         QuicPathLimits {
             start_streams: 4,
             short_capacity: 1,
             ..QuicPathLimits::DEFAULT
         },
         None,
-        |mut rig| async move {
-            let sent = 12usize;
-            for i in 0..sent {
+        move |mut rig| async move {
+            for i in 0..primed {
                 rig.conn.send_bytes(vec![i as u8; 8]).await.unwrap();
             }
-            // The peer's application reads nothing for 1.5 s, so the sends past the
-            // first two wait out their 1 s open deadline at least once.
-            let mut got = Vec::new();
-            rig.settle(Duration::from_millis(1500)).await;
-            for _ in 0..60 {
-                rig.settle(Duration::from_millis(400)).await;
-                while let Ok(short) = rig.peer.peer_inbound.shorts.try_recv() {
-                    got.push(short);
-                }
-                if got.len() == sent {
-                    break;
-                }
+            rig.settle(Duration::from_millis(500)).await;
+            test(rig).await;
+        },
+    );
+}
+
+fn event(rig: &Rig, event: QuicSendEvent) -> u64 {
+    rig.conn.path().stats().send_event_count(event)
+}
+
+/// A native path has no UDP session, so a short whose stream did not open within
+/// its deadline (the peer's stream limit is full) used to be dropped. It is sent
+/// again on the same path, and arrives once the peer frees a slot. A short waits
+/// 1 s for credit on each attempt.
+#[test]
+fn a_short_that_found_no_stream_credit_is_sent_again_not_dropped() {
+    starved("native-conn-not-opened-retry", 5, |mut rig| async move {
+        rig.conn.send_bytes(vec![99; 8]).await.unwrap();
+        // The probe waits out its first 1 s deadline, then the peer reads.
+        rig.settle(Duration::from_millis(1200)).await;
+        let mut got = 0;
+        for _ in 0..20 {
+            while rig.peer.peer_inbound.shorts.try_recv().is_ok() {
+                got += 1;
             }
-            let stats = rig.conn.path().stats();
+            rig.settle(Duration::from_millis(250)).await;
+        }
+        assert_eq!(got, 6);
+        assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Dropped), 0);
+        assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Sent), 6);
+        assert_eq!(event(&rig, QuicSendEvent::NotOpenedRetried), 1);
+        assert_eq!(event(&rig, QuicSendEvent::NotOpenedRetrySent), 1);
+    });
+}
+
+/// A peer that never grants credit: the send is attempted once and retried
+/// `NOT_OPENED_RETRIES` times, 1 s each, and then dropped, counted once.
+#[test]
+fn a_short_is_dropped_once_its_retries_run_out() {
+    starved(
+        "native-conn-not-opened-exhausted",
+        5,
+        |mut rig| async move {
+            rig.conn.send_bytes(vec![99; 8]).await.unwrap();
+            rig.settle(Duration::from_millis(2900)).await;
             assert_eq!(
                 rig.sends(SendKind::Short, QuicSendResult::Dropped),
                 0,
-                "retried {}, got {}",
-                stats.send_event_count(QuicSendEvent::NotOpenedRetried),
-                got.len()
+                "still retrying"
             );
-            assert_eq!(got.len(), sent);
-            assert!(stats.send_event_count(QuicSendEvent::NotOpenedRetried) > 0);
-            assert!(stats.send_event_count(QuicSendEvent::NotOpenedRetrySent) > 0);
+            rig.settle(Duration::from_millis(300)).await;
+            assert_eq!(rig.sends(SendKind::Short, QuicSendResult::Dropped), 1);
+            assert_eq!(event(&rig, QuicSendEvent::NotOpenedRetried), 2);
+            assert_eq!(event(&rig, QuicSendEvent::NotOpenedRetrySent), 0);
+            assert_eq!(event(&rig, QuicSendEvent::StreamLimitFull), 3);
         },
     );
+}
+
+/// A large short (past one packet) retries the same way; it waits 2 s per
+/// attempt, so up to 6 s.
+#[test]
+fn a_large_short_is_retried_then_dropped() {
+    starved("native-conn-large-short-retry", 5, |mut rig| async move {
+        rig.conn.send_bytes(vec![7; 5000]).await.unwrap();
+        rig.settle(Duration::from_millis(6500)).await;
+        assert_eq!(rig.sends(SendKind::LargeShort, QuicSendResult::Dropped), 1);
+        assert_eq!(event(&rig, QuicSendEvent::NotOpenedRetried), 2);
+        assert_eq!(event(&rig, QuicSendEvent::StreamLimitFull), 3);
+    });
+}
+
+/// A stream retries the same way; it waits 2 s per attempt, so up to 6 s.
+#[test]
+fn a_stream_is_retried_then_dropped() {
+    starved("native-conn-stream-retry", 5, |mut rig| async move {
+        rig.conn
+            .send_stream_data(StreamId::next(), bytes_of(5000), None, None, None)
+            .await
+            .unwrap();
+        rig.settle(Duration::from_millis(6500)).await;
+        assert_eq!(rig.sends(SendKind::Stream, QuicSendResult::Dropped), 1);
+        assert_eq!(event(&rig, QuicSendEvent::NotOpenedRetried), 2);
+        assert_eq!(event(&rig, QuicSendEvent::StreamLimitFull), 3);
+    });
 }
