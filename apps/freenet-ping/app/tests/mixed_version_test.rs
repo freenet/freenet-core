@@ -10,9 +10,15 @@
 //! - `mixed_version_floor` (C): proves the FLOOR causes a refusal. First a
 //!   control, gateway N with peers [N-1, N-2], which must all connect (so N-2 is
 //!   wire-compatible with this source). Then the same peers against N', a second
-//!   build of the same source whose floor is set to N-1's version
-//!   (`FREENET_MIN_COMPATIBLE_VERSION`): N-1 must be accepted, N-2 refused. The
-//!   only difference between the two gateways is the floor constant.
+//!   build of the same source whose floor is set to min(N-1's version, HEAD's
+//!   version) (`FREENET_MIN_COMPATIBLE_VERSION`): N-1 must be accepted, N-2
+//!   refused. The only difference between the two gateways is the floor
+//!   constant, so the refusal is caused by the floor N' advertises in the
+//!   handshake. Either side may enforce it: an old release also refuses a peer
+//!   whose floor exceeds its own version. The test therefore shows that the
+//!   advertised floor decides the outcome, not that N's own check is the one
+//!   that fires.
+//!   A floor raise past N-2 turns the control red on purpose (see the test).
 //! - `mixed_version_very_old_node`: gateway N, peers [N-1, below-floor], where
 //!   the below-floor node is the newest release under N's floor. It stays out and
 //!   does not disturb the rest of the network. This is NOT a floor test: a node
@@ -49,8 +55,8 @@
 //! receives per-scenario reports and container logs.
 //!
 //! Local recipe (from the repo root): build N with `cargo build`, build N' with
-//! `FREENET_MIN_COMPATIBLE_VERSION=<N-1 version> cargo build` into another
-//! location, run `scripts/fetch-release-binary.sh resolve DIR --core-toml
+//! `FREENET_MIN_COMPATIBLE_VERSION=<the lower of N-1's version and HEAD's> cargo
+//! build` into another location (the build refuses a floor above HEAD's version), run `scripts/fetch-release-binary.sh resolve DIR --core-toml
 //! crates/core/Cargo.toml`, then run the tests with the variables above.
 
 mod common;
@@ -213,7 +219,7 @@ fn quic_mode() -> Result<bool> {
 
 struct Builds {
     head: Build,
-    /// Same source as `head` with its floor set to N-1's version.
+    /// Same source as `head` with its floor set to min(N-1, HEAD) versions.
     nprime: Option<Build>,
     n1: Build,
     n2: Option<Build>,
@@ -302,17 +308,33 @@ fn load_builds() -> Result<Builds> {
         _ => None,
     };
     if let Some(np) = &nprime {
-        // The floor test's claim is "N-1 is accepted, N-2 is refused".
-        if np.floor != n1.version {
+        // The floor test's claim is "N-1 is accepted, N-2 is refused", so N-2 <
+        // floor <= N-1. The floor also cannot exceed HEAD's own version: between
+        // a release being published and its version bump reaching main, N-1 can
+        // be newer than HEAD, and the build refuses such a floor.
+        if np.floor > n1.version {
             bail!(
-                "N' floor {} must equal N-1's version {}",
+                "N' floor {} is above N-1's version {}: N-1 would be refused",
                 np.floor,
                 n1.version
             );
         }
-        if np.floor > np.version {
-            bail!("N' floor {} is above its own version", np.floor);
+        if np.floor > head.version {
+            bail!(
+                "N' floor {} is above HEAD's version {}: the build cannot use it",
+                np.floor,
+                head.version
+            );
         }
+        eprintln!(
+            "N' floor {}: {}",
+            np.floor,
+            if np.floor == n1.version {
+                "equals N-1's version"
+            } else {
+                "capped at HEAD's version, which is below N-1's (a release not yet merged back)"
+            }
+        );
         if let Some(n2) = &n2
             && n2.version >= np.floor
         {
@@ -391,6 +413,22 @@ fn docker(args: &[&str]) -> String {
 
 fn container_running(name: &str) -> bool {
     docker(&["inspect", "-f", "{{.State.Running}}", name]).trim() == "true"
+}
+
+/// `connected_peer_count` with an overall bound, for use inside polling windows:
+/// an error or timeout is logged and reported as "no data yet".
+async fn probe(ws_url: &str) -> Option<usize> {
+    match tokio::time::timeout(Duration::from_secs(25), connected_peer_count(ws_url)).await {
+        Ok(Ok(n)) => Some(n),
+        Ok(Err(e)) => {
+            eprintln!("  probe of {ws_url} failed: {e:#}");
+            None
+        }
+        Err(_) => {
+            eprintln!("  probe of {ws_url} timed out");
+            None
+        }
+    }
 }
 
 async fn connected_peer_count(ws_url: &str) -> Result<usize> {
@@ -819,7 +857,9 @@ fn verify_running_binaries(report: &mut Report, nodes: &[Node<'_>]) -> Result<()
             .unwrap_or_default()
             .trim()
             .to_string();
-        if !version.contains(&n.build.version.to_string()) {
+        let want = n.build.version.to_string();
+        // Exact token, so 0.2.16 cannot match 0.2.164 as a substring.
+        if !version.split_whitespace().any(|t| t == want) {
             bail!(
                 "{} {} reports version '{version}', expected {}",
                 n.name,
@@ -848,15 +888,19 @@ async fn run_checks(
         .timed("connect", async {
             let deadline = Instant::now() + CONNECT_SETTLE;
             loop {
+                // A probe that fails or times out is "no data yet", not a failure:
+                // only the deadline fails this step.
                 let mut counts = Vec::new();
                 for (n, expected) in nodes.iter().zip(expect_connected) {
-                    counts.push((n, *expected, connected_peer_count(&n.ws_url).await?));
+                    counts.push((n, *expected, probe(&n.ws_url).await));
                 }
-                let ready = counts.iter().all(|(_, expected, c)| !*expected || *c > 0);
+                let ready = counts
+                    .iter()
+                    .all(|(_, expected, c)| !*expected || c.is_some_and(|c| c > 0));
                 if ready || Instant::now() >= deadline {
                     for (n, expected, count) in &counts {
                         eprintln!(
-                            "  {} {} connections={count} expected_connected={expected}",
+                            "  {} {} connections={count:?} expected_connected={expected}",
                             n.name,
                             n.build.label()
                         );
@@ -884,17 +928,23 @@ async fn run_checks(
         report
             .timed("refusal", async {
                 let deadline = Instant::now() + REFUSAL_WINDOW;
+                // Successful probes per refused node: a window with no data at
+                // all would prove nothing, so each needs at least one.
+                let mut answered = vec![0u32; refused.len()];
                 while Instant::now() < deadline {
-                    for n in &refused {
-                        let c = connected_peer_count(&n.ws_url).await?;
-                        if c != 0 {
-                            bail!(
-                                "{} {} should be refused by the gateway {} (floor {}) but has {c} connection(s)",
-                                n.name,
-                                n.build.label(),
-                                gateway.label(),
-                                gateway.floor,
-                            );
+                    for (i, n) in refused.iter().enumerate() {
+                        // A failed probe is "no data yet"; a connection is a failure.
+                        if let Some(c) = probe(&n.ws_url).await {
+                            answered[i] += 1;
+                            if c != 0 {
+                                bail!(
+                                    "{} {} should be refused by the gateway {} (floor {}) but has {c} connection(s)",
+                                    n.name,
+                                    n.build.label(),
+                                    gateway.label(),
+                                    gateway.floor,
+                                );
+                            }
                         }
                         if !container_running(&n.container) {
                             bail!("{} {} exited instead of staying out", n.name, n.build.label());
@@ -902,16 +952,30 @@ async fn run_checks(
                     }
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
+                for (n, k) in refused.iter().zip(&answered) {
+                    if *k == 0 {
+                        bail!(
+                            "{} {} never answered a ConnectedPeers probe during the window",
+                            n.name,
+                            n.build.label()
+                        );
+                    }
+                }
                 // The gateway lists peers by NAT address, which cannot be mapped
                 // back to nodes, so check the count from below: every admitted
                 // node must be there. The refused node's own view above (no
-                // connections) is the absence check.
+                // connections) is the absence check. Retried to a bound.
                 let allowed = expect_connected.iter().filter(|c| **c).count() - 1;
-                let gw_count = connected_peer_count(&nodes[0].ws_url).await?;
-                if gw_count < allowed {
-                    bail!("gateway reports {gw_count} connections, fewer than the {allowed} admitted nodes");
+                let gw_deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    match probe(&nodes[0].ws_url).await {
+                        Some(c) if c >= allowed => return Ok(()),
+                        other if Instant::now() >= gw_deadline => bail!(
+                            "gateway reports {other:?} connections, fewer than the {allowed} admitted nodes"
+                        ),
+                        _ => tokio::time::sleep(Duration::from_secs(2)).await,
+                    }
                 }
-                Ok(())
             })
             .await?;
     }
@@ -1049,7 +1113,7 @@ async fn mixed_version_new_gateway() -> Result<()> {
 
 /// C: the floor causes the refusal. Control first: with N's own floor, N-1 and
 /// N-2 both connect, so N-2 is wire-compatible with this source. Then N', the
-/// same source with its floor raised to N-1's version, accepts N-1 and refuses
+/// same source with its floor raised to min(N-1, HEAD), accepts N-1 and refuses
 /// N-2. Only the floor constant differs between the two gateways.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
@@ -1076,21 +1140,28 @@ async fn mixed_version_floor() -> Result<()> {
         );
     };
 
-    if can_connect(&b.head, n2) {
-        run_scenario(Spec {
-            name: "C-control-n-accepts-n2",
-            gateway: &b.head,
-            peers: vec![&b.n1, n2],
-        })
-        .await
-        .context("control scenario (N with its own floor)")?;
-    } else {
-        eprintln!(
-            "NOTE: N's own floor {} already excludes N-2 {}; the control is skipped and \
-             the N' scenario below only repeats that fact",
+    // The control is what shows N-2 is wire-compatible with this source, so the
+    // N' refusal below is caused by the floor and not by drift. If N's own floor
+    // already excludes N-2 the control cannot run, and without it the test proves
+    // nothing, so it fails (a lenient local run skips). This turns the nightly red
+    // on purpose when a floor raise passes N-2: that raise is exactly the
+    // deliberate event this test watches. Read the raise as intended, then either
+    // wait for the next release to move N-2 above the floor, or, if the raise is
+    // permanent policy, change the test to take the control from an older source.
+    if !can_connect(&b.head, n2) {
+        return missing(&format!(
+            "N's own floor {} already excludes N-2 {}, so the control (N accepts N-2) cannot \
+             run and the floor test would prove nothing",
             b.head.floor, n2.version
-        );
+        ));
     }
+    run_scenario(Spec {
+        name: "C-control-n-accepts-n2",
+        gateway: &b.head,
+        peers: vec![&b.n1, n2],
+    })
+    .await
+    .context("control scenario (N with its own floor)")?;
 
     if can_connect(nprime, n2) {
         bail!(

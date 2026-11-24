@@ -2,9 +2,12 @@ name: Mixed Version Interop
 
 # Proves that the current build (N) and the previous published releases (N-1,
 # N-2) interoperate in one Docker NAT network, so the 1.0 transition is not a
-# flag day, and that the handshake floor causes a refusal (a second build of the
-# same source, N', with its floor raised to N-1's version, must refuse N-2 while
-# plain N accepts it). Scenarios and assertions are documented at the top of
+# flag day, and that the advertised handshake floor decides who is refused (a
+# second build of the same source, N', with its floor raised to min(N-1, HEAD),
+# must refuse N-2 while plain N accepts it). The floor is advertised in the
+# handshake and enforced by either side, so this shows the floor decides the
+# outcome, not that N's own check is the one that fires. Scenarios and
+# assertions are documented at the top of
 # apps/freenet-ping/app/tests/mixed_version_test.rs.
 #
 # Runs:
@@ -16,11 +19,13 @@ name: Mixed Version Interop
 # release gate yet: that is a separate decision once the nightly record is in.
 # It reports no required status context, so a skipped run blocks nothing.
 #
-# Paths that do NOT trigger a PR run, by design: everything outside the list in
-# the select job, notably crates/core/src/ring/, contract/, client_events/, the
-# server and dashboard code, docs, and every other app. A change there reaches
-# the wire only through the paths that are listed, and the nightly run covers it
-# within a day.
+# The PR path filter is a heuristic, not a complete map of the wire surface.
+# Anything outside the list in the select job (for example most of
+# crates/core/src/ring/, contract/, client_events/, the server and dashboard
+# code, docs, and other apps) does not start a PR run even if it changes
+# behaviour on the wire. The nightly run on main is the backstop and covers such
+# a change within a day; add the `mixed-version` label to a PR that you suspect
+# of one.
 #
 # Transport: the nodes expose no per-connection transport, so the run records
 # only each node's CONFIGURED mode. Pass 1 leaves the nodes' own choice (hashed
@@ -87,7 +92,7 @@ jobs:
           fi
           # Wire, transport, handshake and version surface, plus this test's own
           # files. `network_bridge` matches the file and the directory.
-          WATCHED='^(crates/core/src/transport/|crates/core/src/node/network_bridge(\.rs$|/)|crates/core/src/message\.rs$|crates/core/src/operations/(get|put|subscribe|update|connect)\.rs$|crates/core/src/operations/connect/wire\.rs$|crates/core/src/config\.rs$|crates/core/build\.rs$|crates/core/Cargo\.toml$|Cargo\.toml$|apps/freenet-ping/app/tests/(mixed_version_test\.rs|common/)|scripts/fetch-release-binary|\.github/workflows/mixed-version\.yml$)'
+          WATCHED='^(crates/core/src/transport/|crates/core/src/node/network_bridge(\.rs$|/)|crates/core/src/message\.rs$|crates/core/src/operations/(get|put|subscribe|update)\.rs$|crates/core/src/operations/connect(\.rs$|/)|crates/core/src/operations/visited_peers\.rs$|crates/core/src/ring/(peer_key_location|location)\.rs$|crates/core/src/config\.rs$|crates/core/build(\.rs$|/)|crates/core/Cargo\.toml$|Cargo\.toml$|apps/freenet-ping/app/Cargo\.toml$|apps/freenet-ping/app/tests/(mixed_version_test\.rs|common/)|\.config/nextest\.toml$|scripts/fetch-release-binary|\.github/workflows/mixed-version\.yml$)'
           files="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename')"
           hits="$(grep -E "$WATCHED" <<<"$files" || true)"
           # A freenet-stdlib bump changes the client wire; it shows up only in
@@ -118,9 +123,6 @@ jobs:
       # `build.rs` reads this at build time; set job-wide so no step rebuilds.
       FREENET_GIT_IS_DIRTY: "1"
       FREENET_MIXED_ARTIFACT_DIR: ${{ github.workspace }}/mixed-version-artifacts
-      # The harness writes node directories here; collecting them is then just
-      # the artifact upload.
-      FREENET_TEST_NETWORK_BASE_DIR: ${{ github.workspace }}/mixed-version-artifacts/harness
     steps:
       - uses: actions/checkout@v7
 
@@ -134,8 +136,10 @@ jobs:
           toolchain: 1.93.0
           targets: wasm32-unknown-unknown
 
-      # Restore-only on PRs; the main-scoped entry is written by
-      # ci-cache-warm.yml (see the note on test_simulation's cache step).
+      # Restore-only on PRs. The main-scoped entry is written only by this
+      # workflow's own runs on main (the nightly): ci-cache-warm.yml does not
+      # build the same targets, so a PR run may start from a cold cache until
+      # the first nightly has saved one.
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -183,9 +187,13 @@ jobs:
             || { echo "::error::versions.json is missing n1, n2 or below"; cat mixed-version-bins/versions.json; exit 1; }
 
       # N is this commit. N' is the same source built with its floor raised to
-      # N-1's version, so the only difference between them is the floor constant.
-      # The binaries are copied out because the second build overwrites the first.
-      - name: Build N and N' (this commit, floor raised to N-1)
+      # min(N-1, HEAD)'s version, so the only difference between them is the
+      # floor constant. The floor is capped at HEAD's own version because a
+      # release can be published before its version bump reaches main, which
+      # leaves N-1 newer than HEAD, and the build refuses a floor above its own
+      # version. The binaries are copied out because the second build overwrites
+      # the first.
+      - name: Build N and N' (this commit, floor raised to min(N-1, HEAD))
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
@@ -195,8 +203,12 @@ jobs:
           cargo build --locked
           cp target/debug/freenet mixed-version-head/freenet-n
           N1_VERSION="$(jq -r .n1.version mixed-version-bins/versions.json)"
-          echo "N' floor: $N1_VERSION"
-          FREENET_MIN_COMPATIBLE_VERSION="$N1_VERSION" cargo build --locked
+          HEAD_VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' crates/core/Cargo.toml | head -n 1)"
+          [ -n "$N1_VERSION" ] && [ -n "$HEAD_VERSION" ]
+          NPRIME_FLOOR="$(printf '%s\n%s\n' "$N1_VERSION" "$HEAD_VERSION" | sort -V | head -n 1)"
+          echo "N' floor: $NPRIME_FLOOR (N-1 $N1_VERSION, HEAD $HEAD_VERSION)"
+          printf '%s\n' "$NPRIME_FLOOR" > mixed-version-head/nprime-floor
+          FREENET_MIN_COMPATIBLE_VERSION="$NPRIME_FLOOR" cargo build --locked
           cp target/debug/freenet mixed-version-head/freenet-nprime
           export PATH="$PWD/target/debug:$PATH"
           make -C apps/freenet-ping -f run-ping.mk build
@@ -214,9 +226,10 @@ jobs:
             echo "ERROR: Docker is not available but is REQUIRED for the mixed-version test"
             exit 1
           fi
-          mkdir -p "$FREENET_MIXED_ARTIFACT_DIR" "$FREENET_TEST_NETWORK_BASE_DIR"
+          mkdir -p "$FREENET_MIXED_ARTIFACT_DIR"
           cp mixed-version-bins/versions.json "$FREENET_MIXED_ARTIFACT_DIR/versions.json"
-          export FREENET_NPRIME_FLOOR="$(jq -r .n1.version mixed-version-bins/versions.json)"
+          FREENET_NPRIME_FLOOR="$(cat mixed-version-head/nprime-floor)"
+          export FREENET_NPRIME_FLOOR
           # One test at a time (each owns a Docker network); retries are off in
           # .config/nextest.toml for these tests. FREENET_MIXED_LENIENT is never
           # set here, so a missing binary fails the run.
@@ -225,6 +238,11 @@ jobs:
           for mode in default force; do
             export FREENET_MIXED_QUIC="$mode"
             export FREENET_MIXED_ARTIFACT_DIR="$base/$mode"
+            # The harness writes node directories here, one tree per pass so the
+            # second pass cannot overwrite the first pass's logs; the artifact
+            # upload then collects them.
+            export FREENET_TEST_NETWORK_BASE_DIR="$base/$mode/harness"
+            mkdir -p "$FREENET_TEST_NETWORK_BASE_DIR"
             cargo nextest run -p freenet-ping-app --features testing \
               --profile ci --test-threads 1 \
               -E 'test(mixed_version)' -- --ignored || rc=1

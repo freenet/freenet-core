@@ -20,8 +20,9 @@
 #
 # Definitions. N-1 is the newest published (not draft, not prerelease) release,
 # N-2 the one before it, both compared by semantic version, never by date. A
-# release is skipped only when it is named with --exclude-tag, which the
-# release gate uses for the tag under test. Version strings of the HEAD build
+# release is skipped only when it is named with --exclude-tag. That option is
+# reserved for a future release gate (the tag under test) and is not used by the
+# nightly or PR workflow. Version strings of the HEAD build
 # are never compared: between releases HEAD usually carries the same version
 # as the newest release, and that release is still a valid, different binary.
 #
