@@ -54,7 +54,10 @@ case "$1 $2" in
             n=$(cat "$STUB_DIR/open_n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$STUB_DIR/open_n"
             json=$(awk -v n="$n" 'BEGIN{k=1} /^---$/{k++; next} {part[k]=part[k] $0 "\n"} END{if (n > k) n = k; printf "%s", part[n]}' "$STUB_DIR/open_prs")
         fi ;;
-    "pr create") echo "https://github.com/freenet/freenet-core/pull/777"; exit 0 ;;
+    "pr create")
+        # Optional hook: something lands on main while the sync runs.
+        if [ -x "$STUB_DIR/on_create" ]; then "$STUB_DIR/on_create" >> "$STUB_DIR/hook.log" 2>&1; fi
+        echo "https://github.com/freenet/freenet-core/pull/777"; exit 0 ;;
     "pr view") json=$(cat "$STUB_DIR/view") ;;
     "pr merge"|"pr close") exit 0 ;;
     *) echo "unexpected gh $*" >&2; exit 99 ;;
@@ -168,6 +171,36 @@ check "a racing higher sync: succeeds" "$(run_sync "$TEST_TMP/w1c" 0.2.101)" "0"
 check "a racing higher sync: our just-opened PR is closed after the fact" \
     "$(grep -c '^gh pr close 777 .*Superseded by the open sync to 0.2.102.' "$STUB_DIR/calls")" "1"
 
+# --- 1d. main reaches the version while the sync runs ---------------------------
+# (another sync or a hand bump merges between the first read and auto-merge).
+# A PR bumping main to a version it already has must be closed, not armed.
+cat > "$TEST_TMP/bump_main.sh" <<HOOK
+#!/usr/bin/env bash
+set -e
+d=\$(mktemp -d)
+git clone -q "$ORIGIN" "\$d/m"
+sed -i 's/^version = ".*"/version = "0.2.101"/' "\$d/m/crates/core/Cargo.toml"
+git -C "\$d/m" -c user.email=t@example.invalid -c user.name=t commit -qam "main reaches 0.2.101"
+git -C "\$d/m" push -q origin main
+HOOK
+chmod +x "$TEST_TMP/bump_main.sh"
+MAIN_BEFORE_1D=$(git -C "$ORIGIN" rev-parse main)
+reset_stub
+cp "$TEST_TMP/bump_main.sh" "$STUB_DIR/on_create"
+fresh_clone "$TEST_TMP/w1d"
+check "main reaching the version mid-sync: succeeds" "$(run_sync "$TEST_TMP/w1d" 0.2.101)" "0"
+check "main reaching the version mid-sync: the hook really moved main" \
+    "$([ "$(git -C "$ORIGIN" rev-parse main)" != "$MAIN_BEFORE_1D" ] && echo moved || echo "not moved: $(cat "$STUB_DIR/hook.log")")" "moved"
+check "main reaching the version mid-sync: the PR is closed" \
+    "$(grep -c '^gh pr close 777 .*main is already at 0.2.101' "$STUB_DIR/calls")" "1"
+check "main reaching the version mid-sync: auto-merge is never armed" "$(grep -c '^gh pr merge' "$STUB_DIR/calls" || true)" "0"
+# Put main back below the release for the cases that follow.
+git -C "$SEED" fetch -q origin main
+git -C "$SEED" reset -q --hard origin/main
+sed -i 's/^version = ".*"/version = "0.2.100"/' "$SEED/crates/core/Cargo.toml"
+G commit -qam "main back at 0.2.100"
+G push -q origin main
+
 # --- 2. re-run after main moved: regenerated and force-pushed, PR reused ------
 G commit -q --allow-empty -m "fix: something landed after the release"
 G push -q origin main
@@ -216,7 +249,76 @@ check "release-sync.yml pushes and opens the PR with RELEASE_PAT (coalesced)" \
     "$(grep -cE '^[[:space:]]*(token|GH_TOKEN): \$\{\{ secrets\.RELEASE_PAT \|\| secrets\.GITHUB_TOKEN \}\}[[:space:]]*$' "$SYNC_YML")" "2"
 # shellcheck disable=SC2016  # matched literally
 check "release-sync.yml's concurrency group is per version (a pending newer sync is never cancelled)" \
-    "$(grep -cE '^  group: release-sync-\$\{\{ github\.event\.release\.tag_name \|\| inputs\.version \}\}$' "$SYNC_YML")" "1"
+    "$(grep -cE '^  group: release-sync-\$\{\{ ' "$SYNC_YML")" "1"
+# The key, evaluated for each way a version arrives, must come out the same
+# for one version (a dispatch and the event share a group) and differ between
+# versions (a newer sync is never queued behind, or cancelled by, an older one).
+CONC_EXPR=$(sed -n 's/^  group: release-sync-\${{ \(.*\) }}$/\1/p' "$SYNC_YML")
+conc_key() {
+    python3 - "$CONC_EXPR" "$1" "$2" <<'PYK'
+import re, sys
+expr, tag, inp = sys.argv[1:]
+ctx = {"github.event.release.tag_name": tag, "inputs.version": inp}
+TOK = re.compile(r"\s*(\|\||&&|\(|\)|,|'[^']*'|[A-Za-z_][\w.]*)")
+toks, pos = [], 0
+while pos < len(expr):
+    m = TOK.match(expr, pos)
+    if not m:
+        sys.exit(f"cannot parse {expr!r}")
+    toks.append(m.group(1))
+    pos = m.end()
+i = 0
+def peek():
+    return toks[i] if i < len(toks) else None
+def take():
+    global i
+    i += 1
+    return toks[i - 1]
+def falsy(v):
+    return v in ("", False, None)
+def or_():
+    v = and_()
+    while peek() == "||":
+        take()
+        r = and_()
+        v = r if falsy(v) else v
+    return v
+def and_():
+    v = atom()
+    while peek() == "&&":
+        take()
+        r = atom()
+        v = v if falsy(v) else r
+    return v
+def atom():
+    t = take()
+    if t == "(":
+        v = or_()
+        take()
+        return v
+    if t.startswith("'"):
+        return t[1:-1]
+    if peek() == "(":
+        take()
+        args = []
+        while peek() != ")":
+            args.append(or_())
+            if peek() == ",":
+                take()
+        take()
+        if t == "startsWith":
+            return str(args[0]).lower().startswith(str(args[1]).lower())
+        if t == "format":
+            return re.sub(r"\{(\d+)\}", lambda m: str(args[1 + int(m.group(1))]), args[0])
+        sys.exit(f"unsupported {t}")
+    return ctx.get(t, "")
+print(or_())
+PYK
+}
+check "concurrency key: release event v0.2.165" "$(conc_key v0.2.165 '')" "v0.2.165"
+check "concurrency key: dispatch 0.2.165 matches the event" "$(conc_key '' 0.2.165)" "v0.2.165"
+check "concurrency key: dispatch v0.2.165 matches the event" "$(conc_key '' v0.2.165)" "v0.2.165"
+check "concurrency key: versions differ" "$(conc_key '' 0.2.166)" "v0.2.166"
 check "release-sync.yml never cancels a sync in progress" "$(grep -cE '^  cancel-in-progress: false$' "$SYNC_YML")" "1"
 # Without RELEASE_PAT the PR starts no CI and can never merge: the first step
 # must refuse. Run it as the workflow does, both ways.

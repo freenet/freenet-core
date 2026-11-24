@@ -34,7 +34,9 @@ rel_version_gt() {
 
 # rel_max_version: the highest X.Y.Z on stdin (one per line), or nothing.
 rel_max_version() {
-    grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1
+    # `|| true`: grep exits 1 on no match, which under a caller's pipefail and
+    # `set -e` would abort a bare `x=$(... | rel_max_version)` silently.
+    { grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V | tail -1
 }
 
 # rel_latest_published ROWS: the highest published, non-prerelease vX.Y.Z tag

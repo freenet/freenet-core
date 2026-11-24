@@ -181,6 +181,10 @@ harmless once the release is published. Two cases need action:
   ```
   Check crates.io first (top of this file): a version already on crates.io
   is spent, and its tag and draft stay.
+- **A stale draft for the version you are re-cutting**: `create_release`
+  refuses to reuse a release created before its own run ("Stale release
+  vX.Y.Z"). Delete the draft (after the crates.io check above) and re-run that
+  job.
 - **Old published releases**: optional housekeeping. Delete
   `release/vX.Y.Z` for any published X.Y.Z if the branch list gets long;
   the tag keeps the commit.

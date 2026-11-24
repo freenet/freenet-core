@@ -180,8 +180,6 @@ run_case "an unpublished tag above the latest release refuses" 1 "title=Another 
     version=0.2.165 addtag=v0.2.164
 run_case "a release/v* branch above the latest release with no tag refuses" 1 "title=Another release is unfinished" \
     version=0.2.165 addbranch=v0.2.164
-run_case "a visible draft above the latest release refuses" 1 "title=Another release is unfinished" version=0.2.165 \
-    releases='[{"tag_name":"v0.2.163","draft":false,"prerelease":false},{"tag_name":"v0.2.164","draft":true,"prerelease":false}]'
 run_case "the SAME version's branch is a re-cut, not a conflict" 0 "" addbranch=v0.2.164
 run_case "branches and tags at or below the latest release are history" 0 "" \
     addbranch=v0.2.160 addtag=v0.2.100

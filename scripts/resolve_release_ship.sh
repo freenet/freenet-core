@@ -144,10 +144,72 @@ SHIP_CI="$TMPDIR_OUT/ship-ci.yml"
 if ! read_file "$SHIP" .github/workflows/release-sync.yml > /dev/null 2>&1; then
     gate "ship_sha predates the exact-SHA release flow" "$SHIP has no .github/workflows/release-sync.yml (or it could not be read). The tag-triggered workflows run from the release commit's tree, so this release would ship without the merge-back. Ship a commit that contains it (docs/RELEASING.md, 'First release under this flow')."
 fi
+# Parsed as YAML (flow or block lists, any quoting, `on:` read by PyYAML as
+# the boolean key True), with GitHub's branch-filter semantics: no filter
+# admits every branch, `branches` patterns are evaluated in order with `!`
+# negation (the last match wins), `branches-ignore` excludes. `*` stops at
+# `/`, `**` does not. Exit 0: a push to release/v0.0.0 runs ci.yml; 1: it
+# does not; 3: the file could not be parsed.
+ci_admits_release_push() {
+    python3 - "$1" <<'PY_CI'
+import re, sys
+try:
+    import yaml
+except ImportError:
+    print("PyYAML is not installed", file=sys.stderr)
+    sys.exit(3)
+try:
+    doc = yaml.safe_load(open(sys.argv[1]))
+except Exception as e:
+    print(f"unparseable: {e}", file=sys.stderr)
+    sys.exit(3)
+if not isinstance(doc, dict):
+    sys.exit(3)
+on = doc.get("on", doc.get(True))
+if isinstance(on, str):
+    on = {on: None}
+elif isinstance(on, list):
+    on = {k: None for k in on}
+if not isinstance(on, dict) or "push" not in on:
+    sys.exit(1)
+push = on["push"] or {}
+if not isinstance(push, dict):
+    sys.exit(3)
+def glob(p):
+    out, i = "", 0
+    while i < len(p):
+        if p.startswith("**", i): out += ".*"; i += 2
+        elif p[i] == "*": out += "[^/]*"; i += 1
+        else: out += re.escape(p[i]); i += 1
+    return re.compile(out + "$")
+def as_list(v):
+    return [v] if isinstance(v, str) else list(v or [])
+branch = "release/v0.0.0"
+if "branches" in push:
+    admitted = False
+    for pat in as_list(push["branches"]):
+        pat = str(pat)
+        neg = pat.startswith("!")
+        if glob(pat[1:] if neg else pat).match(branch):
+            admitted = not neg
+    sys.exit(0 if admitted else 1)
+if "branches-ignore" in push:
+    sys.exit(1 if any(glob(str(p)).match(branch) for p in as_list(push["branches-ignore"])) else 0)
+if "tags" in push or "tags-ignore" in push:
+    sys.exit(1)  # a tags-only push filter runs on no branch push
+sys.exit(0)
+PY_CI
+}
 if ! read_file "$SHIP" .github/workflows/ci.yml > "$SHIP_CI" 2>/dev/null; then
     gate "Could not read ship_sha's ci.yml" "Whether ci.yml at $SHIP runs on pushes to release/v* is unknown."
-elif ! awk '/^on:/ {on = 1; next} on && /^[^ #]/ {exit} on && /^  push:/ {p = 1; next} on && /^  [^ ]/ {p = 0} p && /^    branches:/ {print}' "$SHIP_CI" | grep -qF "'release/v*'"; then
-    gate "ship_sha's CI does not gate release branches" "ci.yml at $SHIP does not run on pushes to 'release/v*', so the release commit would get no CI and wait_for_ci would fail after its no-run timeout. Ship a commit that contains the exact-SHA flow."
+else
+    rc=0
+    ci_admits_release_push "$SHIP_CI" 2> "$TMPDIR_OUT/ci-parse.err" || rc=$?
+    case "$rc" in
+        0) ;;
+        1) gate "ship_sha's CI does not gate release branches" "ci.yml at $SHIP does not run on pushes to release/v*, so the release commit would get no CI and wait_for_ci would fail after its no-run timeout. Ship a commit that contains the exact-SHA flow." ;;
+        *) gate "Could not parse ship_sha's ci.yml" "ci.yml at $SHIP could not be read as a workflow ($(head -c 200 "$TMPDIR_OUT/ci-parse.err")), so whether it gates release branches is unknown." ;;
+    esac
 fi
 
 # --- 5. versions --------------------------------------------------------------
@@ -175,6 +237,12 @@ if ! TAGS=$(rel_remote_tags); then
     exit 1
 fi
 TOP_TAG=$(rel_max_version <<< "$TAGS")
+if [ -z "$TOP_TAG" ] && [ -n "$PREV_TAG" ]; then
+    # A published release exists, so its tag must: an empty listing is a
+    # lookup that went wrong, not a repository without releases.
+    echo "::error title=No release tags found::Origin lists no vX.Y.Z tag, yet $PREV_TAG is published, so the next fdev version cannot be chosen safely."
+    exit 1
+fi
 FDEV_TAG=""
 if [ -n "$TOP_TAG" ]; then
     TOP_TAG="v$TOP_TAG"

@@ -746,12 +746,15 @@ anything is created, and refuses when:
   version lags a release until its merge-back PR lands, so a ship commit can
   still say an older version than what is already out.
   Always pass the version explicitly, as the `freenet:release` skill does;
-- **another release is unfinished**: a `vY` tag, a draft, or a `release/vY`
-  branch with no tag yet, for a Y above the latest published release and other
+- **another release is unfinished**: a `vY` tag, or a `release/vY` branch
+  with no tag yet, for a Y above the latest published release and other
   than X.Y.Z. Finish that release, or abandon it by deleting its tag, draft and
   branch (`scripts/RELEASE_RECOVERY.md`, "Cleaning up release branches").
   X.Y.Z's own branch is exempt on purpose: a same-version re-cut reuses it
-  (`update_versions` replaces it), and its tag must be gone first.
+  (`update_versions` replaces it), and its tag must be gone first. Drafts are
+  not checked here (`validate`'s read-only token is not shown them); every
+  cut pushes its tag before its draft, and `create_release` refuses to reuse
+  a same-version draft older than its own run.
 
 "The latest published release" is always the highest-semver published,
 non-prerelease release (`scripts/release_lib.sh`), never GitHub's

@@ -32,8 +32,11 @@ permissions:
 # never drop a sync; syncs for different versions may then overlap, and
 # release_sync.sh resolves that by superseding (the lower one closes, before
 # and after it opens its PR). A re-run for the same version waits its turn.
+# The key is normalised to `vX.Y.Z` whichever way the version arrives (the
+# release event's tag, or a dispatch input given as `X.Y.Z` or `vX.Y.Z`), so
+# a hand dispatch and the event for one version share a group.
 concurrency:
-  group: release-sync-${{ github.event.release.tag_name || inputs.version }}
+  group: release-sync-${{ github.event.release.tag_name || (startsWith(inputs.version, 'v') && inputs.version) || format('v{0}', inputs.version) }}
   cancel-in-progress: false
 
 jobs:

@@ -155,6 +155,21 @@ if [[ ! "$PR" =~ ^[0-9]+$ ]]; then
     echo "::error::Could not determine the sync PR number (got '$PR')."
     exit 1
 fi
+# main may have reached VERSION while this ran (another sync, or a hand bump
+# merging). Read it again right before arming auto-merge: a PR that bumps main
+# to a version it already has must not merge.
+git fetch --no-tags --depth=1 origin main
+MAIN_NOW=$(git show FETCH_HEAD:crates/core/Cargo.toml | package_version)
+if [[ ! "$MAIN_NOW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "::error::Could not re-read main's version before enabling auto-merge (got '$MAIN_NOW'); #$PR is left open without auto-merge."
+    exit 1
+fi
+if ! version_lt "$MAIN_NOW" "$VERSION"; then
+    echo "Closing #$PR: main reached $MAIN_NOW while this sync ran."
+    gh pr close "$PR" --repo "$REPO" --delete-branch --comment "main is already at $MAIN_NOW, so there is nothing left to sync."
+    echo "✅ main is at $MAIN_NOW, not below $VERSION: nothing to sync."
+    exit 0
+fi
 AUTO=$(gh pr view "$PR" --repo "$REPO" --json autoMergeRequest --jq '.autoMergeRequest != null')
 if [ "$AUTO" != "true" ]; then
     gh pr merge "$PR" --repo "$REPO" --auto

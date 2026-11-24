@@ -21,15 +21,18 @@
 #      movable /releases/latest marker). main's Cargo version lags a release
 #      until its merge-back PR (release-sync.yml) lands, so check 4 alone
 #      would accept a version that is already out.
-#   6. Another release is unfinished: a vY tag, a draft release, or a
-#      `release/vY` branch with no tag yet, for some Y above the latest
+#   6. Another release is unfinished: a vY tag, or a `release/vY` branch
+#      with no tag yet, for some Y above the latest
 #      published release and other than $VERSION. Cutting past it would let
 #      both ship, or leave the first one half-done. The SAME version is
 #      exempt on purpose: a re-cut after a Gate A block deletes the tag and
 #      the draft (check 2 refuses until it has) and then reuses
 #      `release/v$VERSION`, which update_versions force-pushes. An abandoned
 #      cut is cleared by deleting its tag, draft and branch
-#      (scripts/RELEASE_RECOVERY.md).
+#      (scripts/RELEASE_RECOVERY.md). Drafts themselves are not checked:
+#      validate's read-only token is not shown them. Every cut pushes its tag
+#      before it creates its draft, so the tag check covers a cut in flight,
+#      and create_release refuses to reuse a stale same-version draft.
 #
 # Every lookup FAILS CLOSED: an answer this script cannot read refuses the run
 # with a message naming what it could not check. Nothing has been created yet,
@@ -151,16 +154,6 @@ if [ -n "$LATEST" ]; then
             fi
         done <<< "$ALL_TAGS"
     fi
-    # Drafts without a tag. A token without push access is not shown drafts,
-    # which is why the tags above are the authority: every cut pushes its tag
-    # before it creates its draft.
-    while IFS=$'\t' read -r tag draft _; do
-        v="${tag#v}"
-        if [ "$draft" = true ] && [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] && rel_version_gt "$v" "$LATEST" \
-                && [ "$v" != "$VERSION" ] && ! grep -qxF "$v" <<< "${ALL_TAGS:-}"; then
-            INFLIGHT+=("draft $tag")
-        fi
-    done <<< "$ROWS"
     if ! BRANCHES=$(rel_remote_release_branches); then
         refuse "Could not list release branches" "Could not list origin's release/v* branches, so an unfinished cut cannot be ruled out."
     else

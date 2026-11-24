@@ -191,6 +191,8 @@ check "fdev = crates.io's 0.3.400 + 1" "$(out fdev_version)" "0.3.401"
 run_case "an unreadable crates.io fdev answer refuses" 1 crates_fdev=FAIL
 run_case "a crates.io answer with no version refuses" 1 crates_fdev='{"errors":[{"detail":"x"}]}'
 run_case "a failed tag listing refuses" 1 tags=FAIL
+run_case "an EMPTY tag listing with a published release refuses with an error" 1 tags=
+check "empty tags: names the cause instead of dying silently" "$(grep -c '^::error title=No release tags found' "$TEST_TMP/case/log")" "1"
 
 # --- ship_sha must carry the exact-SHA release flow (#6362) ---------------------
 run_case "a ship_sha without release-sync.yml refuses (live)" 1 "tree_$SHIP/.github/workflows/release-sync.yml=FAIL"
@@ -200,6 +202,21 @@ run_case "an unreadable ship ci.yml refuses (live)" 1 "tree_$SHIP/.github/workfl
 run_case "release/v* only in pull_request, not push, refuses" 1 \
     "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main, \x27release/v*\x27]\n')"
 run_case "a dry run only warns about an old-flow ship_sha" 0 live=false "tree_$SHIP/.github/workflows/ci.yml=$CI_OLD"
+# Parsed as YAML with GitHub's filter rules, not matched as one text form.
+run_case "a block-list, double-quoted release/v* push filter is accepted" 0 \
+    "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on:\n  push:\n    branches:\n      - main\n      - "release/v*"\n')"
+run_case "a broader release/** push filter is accepted" 0 \
+    "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on:\n  push:\n    branches: [main, "release/**"]\n')"
+run_case "an unfiltered push trigger is accepted" 0 "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on: [push, pull_request]\n')"
+run_case "a negated !release/** after release/v* refuses (last match wins)" 1 \
+    "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on:\n  push:\n    branches: ["release/v*", "!release/**"]\n')"
+run_case "branches-ignore covering release/v* refuses" 1 \
+    "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on:\n  push:\n    branches-ignore: ["release/*"]\n')"
+run_case "a commented-out release/v* refuses" 1 \
+    "tree_$SHIP/.github/workflows/ci.yml=$(printf "on:\n  push:\n    branches: [main] # 'release/v*'\n")"
+run_case "this repo's own ci.yml is accepted" 0 "tree_$SHIP/.github/workflows/ci.yml=$(cat "$REPO_ROOT/.github/workflows/ci.yml")"
+run_case "an unparseable ci.yml refuses (live)" 1 "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on: [push\n  : :\n')"
+check "unparseable ci.yml: says it could not parse" "$(grep -c 'Could not parse ship_sha' "$TEST_TMP/case/log")" "1"
 run_case "an unreadable tag commit refuses" 1 commit_v0.2.163=FAIL
 run_case "an unreadable first parent refuses" 1 "commit_$TAGC=FAIL"
 run_case "a failed tag-on-main compare refuses" 1 "cmp_${TAGC}_main=FAIL"

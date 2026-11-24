@@ -803,11 +803,23 @@ jobs:
           [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not creating the GitHub release: this run is not live (#5936)."; exit 1; }
           VERSION="${{ needs.validate.outputs.version }}"
           # Idempotent for a re-run of this job after the tag pushed but the
-          # create failed. Validate refused an existing tag, and this job's tag
-          # step accepted only one on RELEASE_SHA, so a release for it is this
-          # cut's (normally still a draft).
-          if gh release view "v$VERSION" --json isDraft >/dev/null 2>&1; then
-            echo "✅ Release v$VERSION already exists (re-run); not re-creating"
+          # create failed: a release THIS RUN created (after the run started;
+          # a re-run attempt keeps the run's start time) is accepted. Any older
+          # release for this version is a stale draft from an earlier cut,
+          # which a re-cut must delete first: its notes and assets describe
+          # another commit, and cross-compile.yml would attach to it. The
+          # pre-flight cannot see drafts with validate's read-only token, so
+          # this is the guard against them.
+          if REL_CREATED=$(gh release view "v$VERSION" --json createdAt --jq .createdAt 2>/dev/null) && [ -n "$REL_CREATED" ]; then
+            if ! RUN_CREATED=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at) || [ -z "$RUN_CREATED" ]; then
+              echo "::error::Release v$VERSION already exists, and this run's start time could not be read to tell whether this run created it. Re-run this job."
+              exit 1
+            fi
+            if [[ "$REL_CREATED" < "$RUN_CREATED" ]]; then
+              echo "::error title=Stale release v$VERSION::A release v$VERSION created at $REL_CREATED, before this run started ($RUN_CREATED), already exists: a draft left by an earlier cut. Delete it (gh release delete v$VERSION --yes, after checking crates.io as scripts/RELEASE_RECOVERY.md says), then re-run this job."
+              exit 1
+            fi
+            echo "✅ Release v$VERSION was created by this run ($REL_CREATED); not re-creating"
             exit 0
           fi
           gh release create "v$VERSION" \

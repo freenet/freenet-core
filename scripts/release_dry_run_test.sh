@@ -464,22 +464,41 @@ check "re-run: tag on another commit refuses without pushing" \
 check "no tag yet: tags and pushes" "$(rerun_tag "")" "rc=0 pushes=1"
 REL_SCRIPT=$(grep -lxF "create_release / Create GitHub release" "$RUNS"/*.name)
 REL_SCRIPT="${REL_SCRIPT%.name}.sh"
+# The stub answers `release view` with $REL_CREATED (empty: no release) and
+# the run lookup with $RUN_CREATED (FAIL: the API call fails).
 cat > "$RERUN_STUBS/gh" <<'SH'
 #!/usr/bin/env bash
 echo "gh $*" >> "$STUB_CALLS"
+case "$1 $2" in
+    "release view") [ -n "${REL_CREATED:-}" ] || exit 1; echo "$REL_CREATED" ;;
+    "api repos/"*) [[ "$2" == "repos/example/repo/actions/runs/4242" ]] || exit 3
+                   [ "${RUN_CREATED:-}" = FAIL ] && exit 1; echo "$RUN_CREATED" ;;
+esac
 exit 0
 SH
 REL_CALLS="$TEST_TMP/rel.calls"
-: > "$REL_CALLS"
 mapfile -t REL_ENVS < "${REL_SCRIPT%.sh}.env"
-REL_RC=0
-( builtin cd -- "$SCRATCH" && env "${REL_ENVS[@]}" PATH="$RERUN_STUBS:$PATH" STUB_CALLS="$REL_CALLS" \
-    RELEASE_LIVE=true bash -e "$REL_SCRIPT" ) > /dev/null 2>&1 || REL_RC=$?
-# All three: it reached its existence check, found the release, exited cleanly,
-# so a step that died before the check cannot pass as "did not re-create".
-check "re-run: an existing release is not re-created" \
-    "rc=$REL_RC views=$(grep -c '^gh release view' "$REL_CALLS") creates=$(grep -c '^gh release create' "$REL_CALLS")" \
-    "rc=0 views=1 creates=0"
+rel_case() {
+    # rel_case <release createdAt> <run created_at> -> "rc=N views=N creates=N"
+    local rc=0
+    : > "$REL_CALLS"
+    ( builtin cd -- "$SCRATCH" && env "${REL_ENVS[@]}" PATH="$RERUN_STUBS:$PATH" STUB_CALLS="$REL_CALLS" \
+        GITHUB_REPOSITORY=example/repo GITHUB_RUN_ID=4242 REL_CREATED="$1" RUN_CREATED="$2" \
+        RELEASE_LIVE=true bash -e "$REL_SCRIPT" ) > "$TEST_TMP/rel.out" 2>&1 || rc=$?
+    echo "rc=$rc views=$(grep -c '^gh release view' "$REL_CALLS") creates=$(grep -c '^gh release create' "$REL_CALLS")"
+}
+# A re-run of create_release after the create succeeded: the release is this
+# run's, so it is accepted (the view proves the check ran).
+check "re-run: a release this run created is accepted, not re-created" \
+    "$(rel_case 2026-11-23T10:05:00Z 2026-11-23T10:00:00Z)" "rc=0 views=1 creates=0"
+# A draft left by an earlier cut of the same version must not be reused: its
+# notes and assets describe another commit.
+check "a stale release from before this run refuses, and is not reused" \
+    "$(rel_case 2026-11-20T09:00:00Z 2026-11-23T10:00:00Z)" "rc=1 views=1 creates=0"
+check "the stale-release refusal says to delete it" "$(grep -c '^::error title=Stale release' "$TEST_TMP/rel.out")" "1"
+check "an unreadable run start refuses rather than reusing a release" \
+    "$(rel_case 2026-11-23T10:05:00Z FAIL)" "rc=1 views=1 creates=0"
+check "no release yet: creates the draft" "$(rel_case '' 2026-11-23T10:00:00Z)" "rc=0 views=1 creates=1"
 
 # The packaging dry run checks freenet, the crate that is publishable before
 # the release exists (fdev resolves freenet from the registry).
