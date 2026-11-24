@@ -222,7 +222,8 @@ run_case "a filter excluding another version's branches is accepted" 0 \
 run_case "a filter excluding this version's branch refuses" 1 \
     "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on:\n  push:\n    branches: ["release/v*", "!release/v0.2.*"]\n')"
 check "excluded branch: names the release branch" "$(grep -c 'pushes to release/v0.2.164' "$TEST_TMP/case/log")" "1"
-run_case "live without a release version refuses" 1 version=
+run_case "without a release version refuses" 1 version=
+check "no release version: says so" "$(grep -c 'RELEASE_VERSION must be X.Y.Z' "$TEST_TMP/case/log")" "1"
 run_case "a ci.yml with no push trigger refuses" 1 \
     "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on:\n  pull_request:\n    branches: [main]\n')"
 run_case "a tags-only push filter refuses" 1 \

@@ -345,6 +345,7 @@ fi
 # No release exists yet: create_release's re-run check must fall through to
 # the create. (git ls-remote prints nothing, so the tag is absent too.)
 if [[ "$(basename "$0")" == gh && "$1 $2" == "release view" ]]; then
+    echo "release not found" >&2
     exit 1
 fi
 exit 0
@@ -464,14 +465,19 @@ check "re-run: tag on another commit refuses without pushing" \
 check "no tag yet: tags and pushes" "$(rerun_tag "")" "rc=0 pushes=1"
 REL_SCRIPT=$(grep -lxF "create_release / Create GitHub release" "$RUNS"/*.name)
 REL_SCRIPT="${REL_SCRIPT%.name}.sh"
-# The stub answers `release view` with $REL_CREATED (empty: no release) and
-# the run lookup with $RUN_CREATED (FAIL: the API call fails).
+# The stub answers `release view` with $REL_CREATED (empty: no release;
+# ERROR: a failure other than "not found") and the run lookup with
+# $RUN_CREATED (FAIL: the API call fails). The run lookup must use the job
+# token ($RUN_LOOKUP_TOKEN), not the PAT.
 cat > "$RERUN_STUBS/gh" <<'SH'
 #!/usr/bin/env bash
 echo "gh $*" >> "$STUB_CALLS"
 case "$1 $2" in
-    "release view") [ -n "${REL_CREATED:-}" ] || exit 1; echo "$REL_CREATED" ;;
+    "release view") [ -n "${REL_CREATED:-}" ] || { echo "release not found" >&2; exit 1; }
+                    [ "$REL_CREATED" = ERROR ] && { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
+                    echo "$REL_CREATED" ;;
     "api repos/"*) [[ "$2" == "repos/example/repo/actions/runs/4242" ]] || exit 3
+                   [ -n "${RUN_LOOKUP_TOKEN:-}" ] && [ "${GH_TOKEN:-}" = "$RUN_LOOKUP_TOKEN" ] || exit 4
                    [ "${RUN_CREATED:-}" = FAIL ] && exit 1; echo "$RUN_CREATED" ;;
 esac
 exit 0
@@ -523,6 +529,10 @@ check "tag step: a release this run created does not block (re-run, tag in place
     "$(tag_stale_case 2026-11-23T10:05:00Z 2026-11-23T10:00:00Z "$REL_SHA\t$TAG_REF\n")" "rc=0 pushes=0"
 check "tag step: no release yet tags and pushes" \
     "$(tag_stale_case '' 2026-11-23T10:00:00Z '')" "rc=0 pushes=1"
+check "tag step: a release lookup error other than not-found refuses before the push" \
+    "$(tag_stale_case ERROR 2026-11-23T10:00:00Z '')" "rc=1 pushes=0"
+check "a release lookup error other than not-found refuses rather than creating" \
+    "$(rel_case ERROR 2026-11-23T10:00:00Z)" "rc=1 views=1 creates=0"
 check "an empty run start refuses rather than reusing a release" \
     "$(rel_case 2026-11-20T09:00:00Z '')" "rc=1 views=1 creates=0"
 

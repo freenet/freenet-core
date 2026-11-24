@@ -748,13 +748,16 @@ anything is created, and refuses when:
   Always pass the version explicitly, as the `freenet:release` skill does;
 - **another release is unfinished**: a `vY` tag, or a `release/vY` branch
   with no tag yet, for a Y above the latest published release and other
-  than X.Y.Z. Finish that release, or abandon it by deleting its tag, draft and
-  branch (`scripts/RELEASE_RECOVERY.md`, "Cleaning up release branches").
+  than X.Y.Z. Finish that release, or abandon it by deleting its tag and
+  branch, and its draft too so a later re-cut does not meet it
+  (`scripts/RELEASE_RECOVERY.md`, "Cleaning up release branches").
   X.Y.Z's own branch is exempt on purpose: a same-version re-cut reuses it
   (`update_versions` replaces it), and its tag must be gone first. Drafts are
   not checked here (`validate`'s read-only token is not shown them); every
-  cut pushes its tag before its draft, and `create_release` refuses to reuse
-  a same-version draft older than its own run.
+  cut pushes its tag before its draft, and `create_release`'s tag step
+  refuses, before pushing the tag, a same-version draft older than its own
+  run. That refusal comes after the release branch's CI wait, so delete a
+  stale draft before dispatching.
 
 "The latest published release" is always the highest-semver published,
 non-prerelease release (`scripts/release_lib.sh`), never GitHub's
@@ -799,6 +802,7 @@ gh workflow run release.yml
             └─→ cargo publish -p freenet --dry-run   (packaging check only —
                 nothing is uploaded here; see the section below)
     └─→ release.yml: create_release
+            └─→ refuses a same-version draft older than this run
             └─→ git tag -a vX.Y.Z; git push
                     └─→ tag push triggers cross-compile.yml
             └─→ gh release create --draft (release exists but draft)
@@ -1059,7 +1063,9 @@ invisible to every test in the repo.
 
 **"Stale release vX.Y.Z"**: a release for this version, created before this
 run started, already exists: a draft left by an earlier cut. The tag step
-refuses before pushing, so cross-compile.yml has not started. Check crates.io
+refuses before pushing, so cross-compile.yml has not started (the release
+branch's CI wait has already been spent; delete stale drafts before
+dispatching next time). Check crates.io
 (`scripts/RELEASE_RECOVERY.md`), delete the draft
 (`gh release delete vX.Y.Z --yes`), and re-run the job.
 

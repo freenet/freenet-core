@@ -41,8 +41,8 @@
 # history and the tests can stub `gh`.
 #
 # Inputs (env): SHIP_SHA_INPUT (may be empty), RELEASE_LIVE, LAUNCH_SHA,
-# RELEASE_VERSION (X.Y.Z, required in a live run: check 4 tests the real
-# release/vX.Y.Z branch name), GITHUB_REPOSITORY, GH_TOKEN, GITHUB_OUTPUT,
+# RELEASE_VERSION (X.Y.Z, required: check 4 tests the real release/vX.Y.Z
+# branch name), GITHUB_REPOSITORY, GH_TOKEN, GITHUB_OUTPUT,
 # RUNNER_TEMP.
 # Outputs: ship_sha, fdev_version, prev_tag, prev_ship_sha, ship_cargo_toml
 # (a copy of ship_sha's crates/core/Cargo.toml, for check_release_preflight.sh).
@@ -146,17 +146,13 @@ SHIP_CI="$TMPDIR_OUT/ship-ci.yml"
 if ! read_file "$SHIP" .github/workflows/release-sync.yml > /dev/null 2>&1; then
     gate "ship_sha predates the exact-SHA release flow" "$SHIP has no .github/workflows/release-sync.yml (or it could not be read). The tag-triggered workflows run from the release commit's tree, so this release would ship without the merge-back. Ship a commit that contains it (docs/RELEASING.md, 'First release under this flow')."
 fi
-# The branch this release's commit is pushed to. A dry run may not have a
-# version yet (blank input resolves later); it checks a placeholder and only
-# warns anyway.
-if [[ "${RELEASE_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    RELEASE_BRANCH="release/v$RELEASE_VERSION"
-elif [ "$LIVE" = true ]; then
-    echo "::error::RELEASE_VERSION must be X.Y.Z in a live run (got '${RELEASE_VERSION:-}')."
+# The branch this release's commit is pushed to. validate resolves the
+# version (auto-bumping a blank input) before this script runs, in both modes.
+if [[ ! "${RELEASE_VERSION:-}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "::error::RELEASE_VERSION must be X.Y.Z (got '${RELEASE_VERSION:-}')."
     exit 1
-else
-    RELEASE_BRANCH="release/v0.0.0"
 fi
+RELEASE_BRANCH="release/v$RELEASE_VERSION"
 # Parsed as YAML (flow or block lists, any quoting, `on:` read by PyYAML as
 # the boolean key True), with GitHub's branch-filter semantics for `*` and
 # `**`: no filter admits every branch, `branches` patterns are evaluated in

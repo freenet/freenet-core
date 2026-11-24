@@ -86,10 +86,11 @@ after deleting the tag and the draft as above:
    `release/vX.Y.Z` with the new release commit, and the full suite runs on it
    as for any cut.
 
-If the old draft is still there, the run refuses at `create_release`'s tag
-step with "Stale release vX.Y.Z", before the tag is pushed, so nothing has
-started. Delete the draft (after the crates.io check above) and re-run that
-job.
+Delete the old draft before step 3. If it is still there, the run refuses at
+`create_release`'s tag step with "Stale release vX.Y.Z", before the tag is
+pushed, so cross-compile.yml has not started; but by then the release
+branch's whole CI wait has been spent. Delete the draft (after the crates.io
+check above) and re-run that job.
 
 A release cut with the older PR flow (a `build: release X.Y.Z` PR merged into
 `main`) left `main` at X.Y.Z, so a ship commit after it says X.Y.Z too and the
