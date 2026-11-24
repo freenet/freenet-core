@@ -9477,7 +9477,19 @@ mod route_attempt_driver_tests {
         })
     }
 
+    /// The instance id of the contract code the fixtures carry. A reply that
+    /// carries code is stored only when the key it names is the key that code
+    /// derives, so fixtures that send code request this id.
+    fn coded_id() -> ContractInstanceId {
+        *crate::operations::test_utils::make_test_contract(&[9u8; 8])
+            .key()
+            .id()
+    }
+
     fn key_for(instance_id: ContractInstanceId) -> ContractKey {
+        if instance_id == coded_id() {
+            return crate::operations::test_utils::make_test_contract(&[9u8; 8]).key();
+        }
         ContractKey::from_id_and_code(instance_id, CodeHash::new([9u8; 32]))
     }
 
@@ -9643,7 +9655,7 @@ mod route_attempt_driver_tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn not_found_then_found_blames_the_forwarded_not_found_hop() {
         let (op_manager, rx, peers, _guards) = op_manager_with_peers("get-nf-then-found", 3).await;
-        let instance_id = ContractInstanceId::new([41u8; 32]);
+        let instance_id = coded_id();
         let (hop_nf, hop_found) = (peers[2].clone(), peers[1].clone());
         serve_attempts(
             op_manager.clone(),
@@ -10135,7 +10147,7 @@ mod route_attempt_driver_tests {
     async fn relay_not_found_then_consulted_found_labels_both_peers_once() {
         let (op_manager, rx, peers, _guards, _store) =
             op_manager_with_peers_and_store("get-relay", 4).await;
-        let instance_id = ContractInstanceId::new([53u8; 32]);
+        let instance_id = coded_id();
         let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
         let upstream = peers[0].clone();
         let greedy = op_manager
@@ -10485,7 +10497,7 @@ mod route_attempt_driver_tests {
     async fn not_found_is_trained_only_with_existence_proof() {
         for (label, proof) in [("get-proof", true), ("get-no-proof", false)] {
             let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
-            let instance_id = ContractInstanceId::new([63u8; 32]);
+            let instance_id = coded_id();
             let non_proof = ContractInstanceId::new([64u8; 32]);
             let (nf_hop, found_hop) = (peers[2].clone(), peers[1].clone());
             serve_attempts(
@@ -10527,7 +10539,7 @@ mod route_attempt_driver_tests {
         for (label, proof) in [("get-relay-proof", true), ("get-relay-no-proof", false)] {
             let (op_manager, rx, _store, upstream, greedy, host, _guards) =
                 relay_fixture(label, true).await;
-            let instance_id = ContractInstanceId::new([53u8; 32]);
+            let instance_id = coded_id();
             let non_proof = ContractInstanceId::new([54u8; 32]);
             let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
             serve_attempts(
@@ -10569,7 +10581,7 @@ mod route_attempt_driver_tests {
             if rejected {
                 reject_stores(label);
             }
-            let instance_id = ContractInstanceId::new([65u8; 32]);
+            let instance_id = coded_id();
             let (nf_hop, found_hop) = (peers[2].clone(), peers[1].clone());
             serve_attempts(
                 op_manager.clone(),
@@ -10626,7 +10638,7 @@ mod route_attempt_driver_tests {
             if rejected {
                 reject_stores(label);
             }
-            let instance_id = ContractInstanceId::new([53u8; 32]);
+            let instance_id = coded_id();
             let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
             serve_attempts(
                 op_manager.clone(),
@@ -10851,15 +10863,15 @@ mod route_attempt_driver_tests {
     /// state is stored.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn not_found_is_trained_only_after_a_streamed_store() {
-        for (label, seed, refused) in [
-            ("get-stream-stored", 76u8, false),
-            ("get-stream-store-refused", 77u8, true),
+        for (label, refused) in [
+            ("get-stream-stored", false),
+            ("get-stream-store-refused", true),
         ] {
             let (op_manager, rx, peers, _guards) = op_manager_with_peers(label, 3).await;
             if refused {
                 reject_stores(label);
             }
-            let instance_id = ContractInstanceId::new([seed; 32]);
+            let instance_id = coded_id();
             let stream_id = StreamId::next();
             // The stream is claimed from the driver's `current_target` after
             // its advance; offer it from every peer so the pick does not matter.
@@ -10927,7 +10939,7 @@ mod route_attempt_driver_tests {
             if refused {
                 reject_stores(label);
             }
-            let instance_id = ContractInstanceId::new([53u8; 32]);
+            let instance_id = coded_id();
             let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
             let stream_id = StreamId::next();
             register_stream(&op_manager, host_addr, stream_id, instance_id);
@@ -11156,7 +11168,7 @@ mod route_attempt_driver_tests {
         ] {
             let (op_manager, rx, _store, upstream, greedy, host, _guards) =
                 relay_fixture(label, true).await;
-            let instance_id = ContractInstanceId::new([53u8; 32]);
+            let instance_id = coded_id();
             let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
             let stream_id = StreamId::next();
             serve_attempts(
@@ -11212,7 +11224,7 @@ mod route_attempt_driver_tests {
             op_manager_with_peers_and_store(label, 4).await;
         let own = op_manager.ring.connection_manager.get_own_addr().unwrap();
         let upstream = peers[0].clone();
-        let instance_id = ContractInstanceId::new([53u8; 32]);
+        let instance_id = coded_id();
         let greedy = op_manager
             .ring
             .k_closest_potentially_hosting(
@@ -11347,7 +11359,7 @@ mod route_attempt_driver_tests {
             op_manager,
             &conn_manager,
             incoming_tx,
-            ContractInstanceId::new([53u8; 32]),
+            coded_id(),
             3,
             addr(upstream),
             VisitedPeers::new(&incoming_tx),
@@ -11364,7 +11376,7 @@ mod route_attempt_driver_tests {
     async fn relay_stale_local_copy_after_not_found_is_not_proof() {
         let (op_manager, rx, store, upstream, greedy, _host, _guards) =
             relay_fixture("get-relay-stale", false).await;
-        let instance_id = ContractInstanceId::new([53u8; 32]);
+        let instance_id = coded_id();
         // A local copy with no local interest: the relay forwards first and
         // falls back to it only after the downstream NotFound.
         *store.lock() = Some((key_for(instance_id), WrappedState::new(vec![9, 9])));
@@ -11458,7 +11470,7 @@ mod route_attempt_driver_tests {
             let _mode = force_label_mode(mode);
             let (op_manager, rx, _store, upstream, greedy, host, _guards) =
                 relay_fixture(&format!("get-relay-mode-{mode:?}"), true).await;
-            let instance_id = ContractInstanceId::new([53u8; 32]);
+            let instance_id = coded_id();
             let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
             serve_attempts(
                 op_manager.clone(),
@@ -13970,6 +13982,11 @@ mod reply_hosting_gate_tests {
         .err()
         .expect("a header for another contract must be refused");
         assert!(failure.peer_caused);
+        assert!(
+            failure.message.contains("not the requested contract"),
+            "refused for the header mismatch, not for a claim timeout: {}",
+            failure.message
+        );
         assert!(!op_manager.ring.is_hosting_contract(&header_key));
     }
 }
