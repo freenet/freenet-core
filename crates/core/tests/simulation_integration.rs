@@ -26358,6 +26358,10 @@ fn test_heal_of_a_streamed_state_does_not_block_the_event_loop() {
         "the crashed subscriber was healed (longest event-loop event {longest:?})"
     );
     assert!(
+        longest > Duration::ZERO,
+        "premise: the event-loop timer recorded nothing (is the `testing` feature on?)"
+    );
+    assert!(
         longest < Duration::from_secs(10),
         "a node's event loop was held for {longest:?} by one event"
     );

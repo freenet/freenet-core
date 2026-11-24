@@ -332,16 +332,27 @@ mod tests {
             "the simulation heal path must apply the spacing"
         );
         // The send runs in a spawned task, not on the event loop: it waits for
-        // its stream's completion, which only the event loop dispatches. The
-        // claim moves into that task and is bound there before the send, so it
-        // stays held until the send ends.
-        let task = spawned_block(&heal, "GlobalExecutor::spawn(async move {")
-            .expect("the simulation heal sends from a spawned task, not the event loop");
+        // its stream's completion, which only the event loop dispatches. So the
+        // heal hands its claim to `spawn_leg` and never calls the send itself
+        // (the production arm enqueues instead)...
+        assert!(
+            heal.contains("Self::spawn_leg("),
+            "the simulation heal must send through `spawn_leg`"
+        );
+        assert!(
+            !heal.contains("broadcast_to_single_peer("),
+            "the simulation heal must not await the send on the event loop"
+        );
+        // ...and the claim moves into that task and is bound there before the
+        // send, so it stays held until the send ends.
+        let leg = region(SIM_SRC, "    fn spawn_leg(", "\n    }\n");
+        let task = spawned_block(&leg, "GlobalExecutor::spawn(async move {")
+            .expect("`spawn_leg` sends from a spawned task");
         let held = task.find("let _claim = claim;");
         let sent = task.find("broadcast_to_single_peer(");
         assert!(
             matches!((held, sent), (Some(held), Some(sent)) if held < sent),
-            "the spawned heal must hold the claim across its send, both inside the task"
+            "the spawned leg must hold the claim across its send, both inside the task"
         );
     }
 

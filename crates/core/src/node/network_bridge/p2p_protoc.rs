@@ -4490,6 +4490,8 @@ fn extract_sender_from_message_mut(msg: &mut NetMessage) -> Option<&mut PeerKeyL
 
 /// Records, when dropped, how long the event loop spent on one event
 /// (`GlobalTestMetrics::longest_event_loop_event`).
+/// Reads `tokio::time::Instant` on purpose, not `TimeSource`: the simulation
+/// runs on tokio's virtual clock, and that is the time a held loop is measured in.
 #[cfg(any(test, feature = "testing"))]
 struct EventLoopTimer(tokio::time::Instant);
 
