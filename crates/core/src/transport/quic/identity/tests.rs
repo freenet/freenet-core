@@ -733,22 +733,22 @@ proptest::proptest! {
 /// One node's key material, made once: key generation draws from `GlobalRng`,
 /// which the property cases below must not reseed.
 struct Fixture {
-    keys: TransportKeypair,
     peer: PeerKey,
 }
 
 fn fixture() -> &'static Fixture {
     static FIXTURE: std::sync::OnceLock<Fixture> = std::sync::OnceLock::new();
     FIXTURE.get_or_init(|| {
-        let _seed = GlobalRng::seed_guard(SEED);
-        let keys = TransportKeypair::new();
+        let keys = GlobalRng::scoped_seed(SEED, TransportKeypair::new);
         let peer = PeerKey::of(keys.public()).unwrap();
-        Fixture { keys, peer }
+        Fixture { peer }
     })
 }
 
 /// Case counts for the properties below. The default keeps PR CI cheap; the
-/// scheduled `spki-proptest` workflow raises it through `PROPTEST_CASES`.
+/// scheduled `spki-proptest` workflow raises it through `PROPTEST_CASES`
+/// (and fails the job when the value does not parse, rather than falling
+/// back to this default).
 fn cases() -> proptest::test_runner::Config {
     proptest::test_runner::Config::with_cases(
         std::env::var("PROPTEST_CASES")
@@ -758,22 +758,142 @@ fn cases() -> proptest::test_runner::Config {
     )
 }
 
-/// A raw public key as an attacker may send it: arbitrary bytes, the SPKI
-/// prefix with an arbitrary key, or the exact key with some bytes replaced
-/// and then cut short or extended.
+/// p = 2^255 - 19 and the Ed25519 group order L = 2^252 +
+/// 27742317777372353535851937790883648493, little-endian, written out here
+/// rather than taken from the code under test.
+const P_LE: [u8; 32] = {
+    let mut p = [0xffu8; 32];
+    p[0] = 0xed;
+    p[31] = 0x7f;
+    p
+};
+const L_LE: [u8; 32] = [
+    0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
+];
+
+/// `a < b` for little-endian 256-bit numbers.
+fn below(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let halves = |x: &[u8; 32]| {
+        (
+            u128::from_le_bytes(x[16..].try_into().unwrap()),
+            u128::from_le_bytes(x[..16].try_into().unwrap()),
+        )
+    };
+    halves(a) < halves(b)
+}
+
+/// Whether a node can hold the transport key `u`, decided with
+/// curve25519-dalek 5 alone: canonical (u < p), an Edwards form exists, and
+/// the point has neither small order nor a torsion component.
+fn oracle_accepts_transport_key(u: [u8; 32]) -> bool {
+    below(&u, &P_LE)
+        && curve25519_dalek::montgomery::MontgomeryPoint(u)
+            .to_edwards(0)
+            .is_some_and(|point| !point.is_small_order() && point.is_torsion_free())
+}
+
+/// Whether `bytes` is the presented form of a key a node can hold, decided
+/// with curve25519-dalek 5 alone: the Ed25519 SPKI prefix and 32 bytes that
+/// are the canonical sign-bit-0 encoding of a point with neither small
+/// order nor a torsion component.
+fn oracle_accepts_presented(bytes: &[u8]) -> bool {
+    let Some(rest) = bytes.strip_prefix(&ED25519_SPKI_PREFIX[..]) else {
+        return false;
+    };
+    let Ok(y) = <[u8; 32]>::try_from(rest) else {
+        return false;
+    };
+    y[31] >> 7 == 0
+        && curve25519_dalek::edwards::CompressedEdwardsY(y)
+            .decompress()
+            .is_some_and(|point| {
+                point.compress().to_bytes() == y
+                    && !point.is_small_order()
+                    && point.is_torsion_free()
+            })
+}
+
+/// The expected key's point plus each of the eight torsion points, and the
+/// torsion points alone, as Edwards points.
+fn torsion_mixed() -> Vec<curve25519_dalek::edwards::EdwardsPoint> {
+    use curve25519_dalek::constants::EIGHT_TORSION;
+    let honest = curve25519_dalek::edwards::CompressedEdwardsY(*fixture().peer.ed25519())
+        .decompress()
+        .unwrap();
+    EIGHT_TORSION
+        .iter()
+        .flat_map(|t| [honest + t, *t])
+        .collect()
+}
+
+fn spki_with(key: &[u8; 32]) -> Vec<u8> {
+    [&ED25519_SPKI_PREFIX[..], &key[..]].concat()
+}
+
+/// A transport key as an attacker may send it: arbitrary, or chosen at the
+/// edges of the checks (u in [p, 2^255), just below p, bit 255 set, the
+/// honest key plus a torsion point, a torsion point).
+fn arb_transport_key() -> impl proptest::strategy::Strategy<Value = [u8; 32]> {
+    use proptest::prelude::*;
+    let mixed: Vec<[u8; 32]> = torsion_mixed()
+        .iter()
+        .map(|point| point.to_montgomery().to_bytes())
+        .collect();
+    let honest = *fixture().peer.transport_key().as_bytes();
+    prop_oneof![
+        4 => any::<[u8; 32]>(),
+        2 => (0u8..19).prop_map(|k| add_le(&P_LE, &{
+            let mut add = [0u8; 32];
+            add[0] = k;
+            add
+        }).unwrap()),
+        1 => (1u8..4).prop_map(|k| {
+            let mut u = P_LE;
+            u[0] -= k;
+            u
+        }),
+        1 => any::<[u8; 32]>().prop_map(|mut u| {
+            u[31] |= 0x80;
+            u
+        }),
+        2 => proptest::sample::select(mixed),
+        1 => Just(honest),
+    ]
+}
+
+/// A raw public key as an attacker may send it: the exact key (a fifth of
+/// the cases, so the accept path is exercised), arbitrary bytes, the prefix
+/// with an arbitrary key, the exact key with bytes replaced and then cut
+/// short or extended, the honest key plus a torsion point (either sign bit),
+/// non-canonical encodings of small y, other algorithm OIDs, and the exact
+/// key with the sign bit set.
 fn arb_presented() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
     use proptest::prelude::*;
     let exact = fixture().peer.spki().to_vec();
+    let mutated = exact.clone();
+    let signed = exact.clone();
+    let oid = exact.clone();
+    let torsion: Vec<Vec<u8>> = torsion_mixed()
+        .iter()
+        .flat_map(|point| {
+            let y = point.compress().to_bytes();
+            let mut flipped = y;
+            flipped[31] ^= 0x80;
+            [spki_with(&y), spki_with(&flipped)]
+        })
+        .collect();
     prop_oneof![
-        proptest::collection::vec(any::<u8>(), 0..96),
-        any::<[u8; 32]>().prop_map(|key| [&ED25519_SPKI_PREFIX[..], &key[..]].concat()),
-        (
+        5 => Just(exact),
+        1 => proptest::collection::vec(any::<u8>(), 0..96),
+        2 => any::<[u8; 32]>().prop_map(|key| spki_with(&key)),
+        3 => (
             proptest::collection::vec((0..ED25519_SPKI_LEN, any::<u8>()), 0..4),
             0..ED25519_SPKI_LEN + 8,
             proptest::collection::vec(any::<u8>(), 0..8),
         )
             .prop_map(move |(edits, len, filler)| {
-                let mut bytes = exact.clone();
+                let mut bytes = mutated.clone();
                 for (at, value) in edits {
                     bytes[at] = value;
                 }
@@ -781,6 +901,23 @@ fn arb_presented() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
                 bytes.truncate(len);
                 bytes
             }),
+        3 => proptest::sample::select(torsion),
+        1 => (0u8..19).prop_map(|k| {
+            let mut y = [0u8; 32];
+            y[0] = k;
+            spki_with(&add_le(&y, &P_LE).unwrap())
+        }),
+        1 => proptest::sample::select(vec![[0x2b, 0x65, 0x71], [0x2b, 0x65, 0x6e]])
+            .prop_map(move |id| {
+                let mut bytes = oid.clone();
+                bytes[6..9].copy_from_slice(&id);
+                bytes
+            }),
+        1 => Just(()).prop_map(move |()| {
+            let mut bytes = signed.clone();
+            bytes[ED25519_SPKI_LEN - 1] |= 0x80;
+            bytes
+        }),
     ]
 }
 
@@ -792,19 +929,39 @@ fn arb_scheme() -> impl proptest::strategy::Strategy<Value = SignatureScheme> {
     ]
 }
 
+/// A node key whose natural Edwards key has sign bit `negated` (XEdDSA
+/// negates the key when it is 1), so a signature round trip covers both
+/// branches rather than whichever one a fixed key happens to take.
+fn keypair_with_natural_sign(seed: u64, negated: bool) -> TransportKeypair {
+    for offset in 0..64 {
+        let keys = GlobalRng::scoped_seed(seed.wrapping_add(offset), TransportKeypair::new);
+        let natural =
+            curve25519_dalek::edwards::EdwardsPoint::mul_base_clamped(keys.auth_token_signer().0)
+                .compress()
+                .to_bytes();
+        if (natural[31] >> 7 == 1) == negated {
+            return keys;
+        }
+    }
+    unreachable!("64 keys with the same natural sign bit has probability 2^-64")
+}
+
 proptest::proptest! {
     #![proptest_config(cases())]
 
-    /// The conversion and `PeerKey::of` take any 32 bytes without panicking.
-    /// What `PeerKey::of` accepts is in canonical form, converts to the key
-    /// the independent conversion gives, and is accepted back from its own
-    /// presented form as the same key.
+    /// The conversion takes any 32 bytes; `PeerKey::of` accepts exactly the
+    /// keys a node can hold, as decided by curve25519-dalek 5 (so deleting
+    /// the small-order, torsion or canonical-range check turns this red),
+    /// converts to the independent conversion's key, and is accepted back
+    /// from its own presented form.
     #[test]
-    fn peer_key_of_takes_any_transport_key(u in proptest::prelude::any::<[u8; 32]>()) {
+    fn peer_key_of_matches_the_independent_oracle(u in arb_transport_key()) {
         let transport = TransportPublicKey::from_bytes(u);
-        proptest::prop_assert_eq!(ed25519_public_key(&transport).ok(), independent_edwards(u));
-        if let Ok(peer) = PeerKey::of(&transport) {
-            proptest::prop_assert!(is_canonical(&u));
+        proptest::prop_assert_eq!(ed25519_public_key(&transport).ok().is_some(),
+            curve25519_dalek::montgomery::MontgomeryPoint(u).to_edwards(0).is_some());
+        let accepted = PeerKey::of(&transport);
+        proptest::prop_assert_eq!(accepted.is_ok(), oracle_accepts_transport_key(u));
+        if let Ok(peer) = accepted {
             proptest::prop_assert_eq!(Some(*peer.ed25519()), independent_edwards(u));
             let again = peer_key_presented(peer.spki()).unwrap();
             proptest::prop_assert_eq!(&again, &peer);
@@ -812,10 +969,20 @@ proptest::proptest! {
         }
     }
 
+    /// `peer_key_presented` accepts exactly what the oracle accepts, over
+    /// arbitrary, mutated and targeted encodings.
+    #[test]
+    fn peer_key_presented_matches_the_independent_oracle(presented in arb_presented()) {
+        proptest::prop_assert_eq!(
+            peer_key_presented(&presented).is_ok(),
+            oracle_accepts_presented(&presented)
+        );
+    }
+
     /// Nothing that is not exactly the expected key's encoding passes the
     /// pinned check, on either side, with or without a chain. The proven
-    /// verifier accepts exactly what `peer_key_presented` accepts, and never
-    /// with a chain.
+    /// verifier accepts exactly what the oracle accepts, and never with a
+    /// chain.
     #[test]
     fn certificate_verifiers_take_any_presented_key(
         presented in arb_presented(),
@@ -844,7 +1011,7 @@ proptest::proptest! {
         proptest::prop_assert_eq!(client, exact && intermediates.is_empty());
         proptest::prop_assert_eq!(
             proven,
-            peer_key_presented(&presented).is_ok() && intermediates.is_empty()
+            oracle_accepts_presented(&presented) && intermediates.is_empty()
         );
         proptest::prop_assert!(
             RefuseEveryClient
@@ -854,9 +1021,10 @@ proptest::proptest! {
     }
 
     /// A handshake signature from arbitrary bytes, message and scheme is
-    /// refused by the pinned and proven checks, for the expected key and for any other
-    /// presented key, and never panics. (Forging an Ed25519 signature
-    /// succeeds with negligible probability, so "refused" is the property.)
+    /// refused by the pinned and proven checks, for the expected key and for
+    /// any other presented key, and never panics. (Forging an Ed25519
+    /// signature succeeds with negligible probability, so "refused" is the
+    /// property.)
     #[test]
     fn signature_verifiers_refuse_arbitrary_signatures(
         presented in arb_presented(),
@@ -874,53 +1042,97 @@ proptest::proptest! {
         );
     }
 
-    /// Our own signature over any message round-trips through the pinned
-    /// and proven checks, and is refused when a bit of it or of the message changes,
-    /// when its length changes, or when a different scheme is declared.
+    /// A fresh node key per case, with both XEdDSA sign branches covered.
+    /// Its signature over any message verifies under the pinned and proven
+    /// checks. It is refused when a bit of it or of the message changes,
+    /// when its length changes, when a different scheme is declared, when S
+    /// is replaced by S + kL (the same signature mod L), when R is a
+    /// non-canonical encoding or has its sign bit flipped, and when it is
+    /// presented under another node's key. Another node's valid signature
+    /// under its own key is accepted by the proven check only for that key.
     #[test]
     fn our_signatures_round_trip_and_nothing_else_verifies(
+        seed in proptest::prelude::any::<u64>(),
+        negated in proptest::prelude::any::<bool>(),
         message in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
         flip_at in 0usize..64,
         flip_bit in 0u8..8,
+        multiple in 1usize..8,
+        small_y in 0u8..19,
         scheme in arb_scheme(),
     ) {
-        let fixture = fixture();
-        let expected = &fixture.peer;
+        let keys = keypair_with_natural_sign(seed, negated);
+        let other_keys = keypair_with_natural_sign(!seed, !negated);
+        let expected = PeerKey::of(keys.public()).unwrap();
+        let other = PeerKey::of(other_keys.public()).unwrap();
         let end_entity = cert(expected.spki());
-        let good = handshake_sign(&fixture.keys, &message);
+        let other_entity = cert(other.spki());
+        let good = handshake_sign(&keys, &message);
+        let other_good = handshake_sign(&other_keys, &message);
         let ed25519 = SignatureScheme::ED25519;
-        // The pinned verifiers (`PinnedServerKey`, `PinnedClientKey`) call
-        // `PeerKey::verify_signature` unchanged; `DigitallySignedStruct`
-        // cannot be built outside rustls, so the shared function is the
-        // reachable entry point.
-        let verifies = |message: &[u8], scheme, signature: &[u8]| {
-            let pinned = expected
-                .verify_signature(message, &end_entity, scheme, signature)
-                .is_ok();
-            let proven = ProvenClientKey::verify_signature(message, &end_entity, scheme, signature)
-                .is_ok();
-            assert_eq!(pinned, proven, "verifiers disagree");
-            pinned
+        // The pinned verifiers call `PeerKey::verify_signature` unchanged;
+        // `DigitallySignedStruct` cannot be built outside rustls, so the
+        // shared function is the reachable entry point. The pinned check is
+        // always against `expected`; the proven one takes the key from the
+        // certificate.
+        let pinned = |presented: &CertificateDer<'_>, message: &[u8], scheme, signature: &[u8]| {
+            expected.verify_signature(message, presented, scheme, signature).is_ok()
         };
-        proptest::prop_assert!(verifies(&message, ed25519, &good));
+        let proven = |presented: &CertificateDer<'_>, message: &[u8], scheme, signature: &[u8]| {
+            ProvenClientKey::verify_signature(message, presented, scheme, signature).is_ok()
+        };
+        let both = |message: &[u8], scheme, signature: &[u8]| {
+            let a = pinned(&end_entity, message, scheme, signature);
+            let b = proven(&end_entity, message, scheme, signature);
+            assert_eq!(a, b, "verifiers disagree");
+            a
+        };
+        proptest::prop_assert!(both(&message, ed25519, &good));
 
         let mut altered = good.clone();
         altered[flip_at] ^= 1 << flip_bit;
-        proptest::prop_assert!(!verifies(&message, ed25519, &altered));
+        proptest::prop_assert!(!both(&message, ed25519, &altered));
 
         let mut longer = message.clone();
         longer.push(0);
-        proptest::prop_assert!(!verifies(&longer, ed25519, &good));
+        proptest::prop_assert!(!both(&longer, ed25519, &good));
         if let Some(first) = message.first() {
             let mut changed = message.clone();
             changed[0] = first ^ 1;
-            proptest::prop_assert!(!verifies(&changed, ed25519, &good));
+            proptest::prop_assert!(!both(&changed, ed25519, &good));
         }
-        proptest::prop_assert!(!verifies(&message, ed25519, &good[..63]));
-        proptest::prop_assert!(!verifies(&message, ed25519, &[&good[..], &[0][..]].concat()));
+        proptest::prop_assert!(!both(&message, ed25519, &good[..63]));
+        proptest::prop_assert!(!both(&message, ed25519, &[&good[..], &[0][..]].concat()));
         if scheme != ed25519 {
-            proptest::prop_assert!(!verifies(&message, scheme, &good));
+            proptest::prop_assert!(!both(&message, scheme, &good));
         }
+
+        // S + kL is the same scalar mod L and must still be refused (S < L,
+        // so kL + S fits in 256 bits for k <= 7).
+        let s: [u8; 32] = good[32..].try_into().unwrap();
+        proptest::prop_assert!(below(&s, &L_LE));
+        let mut malleated = s;
+        for _ in 0..multiple {
+            malleated = add_le(&malleated, &L_LE).unwrap();
+        }
+        proptest::prop_assert!(!both(&message, ed25519, &[&good[..32], &malleated[..]].concat()));
+
+        // R as a non-canonical encoding of a small y (y + p), and R with its
+        // sign bit flipped.
+        let mut small = [0u8; 32];
+        small[0] = small_y;
+        let non_canonical = add_le(&small, &P_LE).unwrap();
+        proptest::prop_assert!(!both(&message, ed25519, &[&non_canonical[..], &good[32..]].concat()));
+        let mut flipped_r = good.clone();
+        flipped_r[31] ^= 0x80;
+        proptest::prop_assert!(!both(&message, ed25519, &flipped_r));
+
+        // Under another node's key, whoever signed.
+        proptest::prop_assert!(!pinned(&other_entity, &message, ed25519, &good));
+        proptest::prop_assert!(!proven(&other_entity, &message, ed25519, &good));
+        proptest::prop_assert!(!pinned(&other_entity, &message, ed25519, &other_good));
+        proptest::prop_assert!(!proven(&end_entity, &message, ed25519, &other_good));
+        proptest::prop_assert!(proven(&other_entity, &message, ed25519, &other_good));
     }
 }
 
