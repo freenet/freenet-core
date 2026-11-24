@@ -3840,7 +3840,11 @@ fn note_read_failure(delegate: &DelegateKey, blob_hash: &str, e: &SecretStoreErr
         SecretStoreError::IO(io) if io.kind() != std::io::ErrorKind::NotFound => {
             read_failures::FailureKind::Io
         }
-        _ => return,
+        SecretStoreError::IO(_)
+        | SecretStoreError::MissingCipher
+        | SecretStoreError::MissingSecret(_)
+        | SecretStoreError::SnapshotNotFound { .. }
+        | SecretStoreError::QuotaExceeded { .. } => return,
     };
     read_failures::record_failure(&delegate.to_string(), blob_hash, kind);
 }
