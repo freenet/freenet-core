@@ -27,7 +27,7 @@
 # fdev actually get published" and "does publishing happen after the tag", and
 # the only way to assert a property is to run the thing.
 #
-# Both functions are extracted verbatim from release.sh (`eval "$(awk ...)"`),
+# Functions are extracted verbatim from release.sh (`eval "$(awk ...)"`),
 # matching release_state_restore_test.sh's idiom, so these tests cannot drift
 # from the implementation.
 #
@@ -554,6 +554,148 @@ else
             "before the PR, the tag and Gate A." \
             "publish_crates belongs in the main flow only."
     fi
+fi
+
+# ---------------------------------------------------------------------------
+# N. The handshake floor ships as committed (#5833)
+# ---------------------------------------------------------------------------
+# release.sh used to default --min-compatible to the version before the bump
+# and write it into the bump, which would make every updated peer refuse every
+# peer that had not updated yet: a network split on an ordinary release. Now it
+# never changes the floor, refuses --min-compatible, refuses a committed floor
+# it cannot read (build.rs would fall back to the package version), and clears
+# FREENET_MIN_COMPATIBLE_VERSION so a value in the caller's shell cannot reach
+# the builds.
+FLOOR_FN="$(awk '/^current_min_compatible\(\) \{/,/^\}/' "$RELEASE_SH")"
+if [[ "$FLOOR_FN" != *"min-compatible-version"* ]]; then
+    fail "could not extract current_min_compatible() from release.sh" \
+        "Every floor case below runs it, so an empty extraction would make them" \
+        "all pass vacuously."
+else
+    eval "$FLOOR_FN"
+    # floor_case <desc> <Cargo.toml body> <expected output or FAIL>
+    floor_case() {
+        local desc="$1" body="$2" want="$3" work got
+        work="$(mktemp -d)"
+        printf '%s\n' "$body" > "$work/Cargo.toml"
+        if got="$(current_min_compatible "$work/Cargo.toml")"; then :; else got="FAIL"; fi
+        rm -rf "$work"
+        if [[ "$got" == "$want" ]]; then
+            pass "$desc"
+        else
+            fail "$desc" "got '$got', expected '$want'"
+        fi
+    }
+    floor_case "the floor read is min-compatible-version, not the package version" \
+        $'[package]\nname = "freenet"\nversion = "0.2.200"\n\n[package.metadata.freenet]\nmin-compatible-version = "0.2.122"' \
+        "0.2.122"
+    floor_case "a floor written without spaces around '=' is read" \
+        $'[package]\nversion = "0.2.200"\n[package.metadata.freenet]\nmin-compatible-version="0.2.150"' "0.2.150"
+    floor_case "a missing min-compatible-version is refused" \
+        $'[package]\nname = "freenet"\nversion = "0.2.200"' "FAIL"
+    floor_case "a malformed min-compatible-version is refused" \
+        $'[package]\nversion = "0.2.200"\n[package.metadata.freenet]\nmin-compatible-version = "next"' "FAIL"
+
+    REAL_TOML="$SCRIPT_DIR/../crates/core/Cargo.toml"
+    if got="$(current_min_compatible "$REAL_TOML")"; then
+        pass "the real crates/core/Cargo.toml has a readable floor ($got)"
+    else
+        fail "the real crates/core/Cargo.toml has no readable min-compatible-version" \
+            "Every release.sh run would refuse."
+    fi
+fi
+
+# The call site, run for real: release.sh is copied into a throwaway repo with
+# a stub `cargo`. The first thing the driver does after the floor check is
+# `cargo search`, with stderr discarded, so the stub records that it was
+# reached, and what FREENET_MIN_COMPATIBLE_VERSION it saw, in a file.
+# floor_run_case <desc> <expect: refuse|proceed> <error text or ""> <Cargo.toml body> <args...>
+floor_run_case() {
+    local desc="$1" expect="$2" want_err="$3" toml_body="$4" out rc work reached seen
+    shift 4
+    work="$(mktemp -d)"
+    mkdir -p "$work/scripts" "$work/crates/core" "$work/bin"
+    cp "$RELEASE_SH" "$work/scripts/release.sh"
+    printf '%s\n' "$toml_body" > "$work/crates/core/Cargo.toml"
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "${FREENET_MIN_COMPATIBLE_VERSION-<unset>}" > "%s/reached_cargo"\nexit 1\n' \
+        "$work" > "$work/bin/cargo"
+    chmod +x "$work/bin/cargo"
+    (cd "$work" && GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git init -q .)
+    rc=0
+    out="$(cd "$work" && PATH="$work/bin:$PATH" GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        FREENET_MIN_COMPATIBLE_VERSION=0.0.1 bash scripts/release.sh "$@" 2>&1)" || rc=$?
+    reached=no
+    seen=""
+    if [[ -e "$work/reached_cargo" ]]; then
+        reached=yes
+        seen="$(cat "$work/reached_cargo")"
+    fi
+    rm -rf "$work"
+    case "$expect" in
+        refuse)
+            if [[ "$rc" -ne 0 ]] && [[ "$reached" == no ]] && [[ "$out" == *"$want_err"* ]]; then
+                pass "$desc"
+            else
+                fail "$desc" "exit=$rc, reached cargo=$reached, wanted '$want_err'" "$out"
+            fi
+            ;;
+        proceed)
+            # A shell value of the override must not reach the build steps.
+            if [[ "$reached" == yes ]] && [[ "$seen" == "<unset>" ]]; then
+                pass "$desc"
+            else
+                fail "$desc" "reached cargo=$reached, FREENET_MIN_COMPATIBLE_VERSION seen='$seen'" "$out"
+            fi
+            ;;
+    esac
+}
+TOML_FLOOR=$'[package]\nname = "freenet"\nversion = "0.2.200"\n[package.metadata.freenet]\nmin-compatible-version = "0.2.122"'
+floor_run_case "release.sh proceeds past the floor check with a committed floor, override cleared" \
+    proceed "" "$TOML_FLOOR" --version 0.2.201 --dry-run
+floor_run_case "release.sh refuses before any work when Cargo.toml has no floor" \
+    refuse "Error: could not read an X.Y.Z min-compatible-version" \
+    $'[package]\nname = "freenet"\nversion = "0.2.200"' --version 0.2.201 --dry-run
+floor_run_case "release.sh refuses --min-compatible before any work" \
+    refuse "Error: --min-compatible is no longer supported" \
+    "$TOML_FLOOR" --version 0.2.201 --min-compatible 0.2.165 --dry-run
+floor_run_case "release.sh refuses an empty --min-compatible too" \
+    refuse "Error: --min-compatible is no longer supported" \
+    "$TOML_FLOOR" --version 0.2.201 --dry-run --min-compatible ""
+floor_run_case "release.sh refuses --min-compatible given without a value" \
+    refuse "Error: --min-compatible is no longer supported" \
+    "$TOML_FLOOR" --version 0.2.201 --dry-run --min-compatible
+floor_run_case "release.sh refuses --min-compatible=X.Y.Z with the same message" \
+    refuse "Error: --min-compatible is no longer supported" \
+    "$TOML_FLOOR" --version 0.2.201 --dry-run --min-compatible=0.2.165
+
+# The runs above stop at the first cargo call, and update_versions cannot run
+# on its own (it defines its helpers inline and edits the tree), so these two
+# read the code, by allow-list rather than by the tool a writer would use:
+#   - min-compatible-version may appear only in the reader's grep and in
+#     echo lines whose whole argument is one quoted string, so a sed,
+#     perl, awk, toml-tool or `echo > file` rewrite anywhere fails. These are
+#     tripwires for mistakes, not proof against deliberate evasion;
+#   - FREENET_MIN_COMPATIBLE_VERSION may appear only in the one `unset`, so
+#     an export or assignment added anywhere later fails.
+FLOOR_LINES="$(code_lines "$RELEASE_SH" \
+    | grep -F 'min-compatible-version' \
+    | grep -vE '^[0-9]+:[[:space:]]*echo "[^"]*"$' \
+    | grep -vF "value=\$(grep -E '^min-compatible-version[[:space:]]*=' \"\$1\"" || true)"
+if [[ -z "$FLOOR_LINES" ]]; then
+    pass "release.sh never rewrites min-compatible-version (only the reader and messages name it)"
+else
+    fail "release.sh names min-compatible-version outside the reader and messages" "$FLOOR_LINES" \
+        "Raising the floor is its own reviewed PR (docs/RELEASING.md, #5833)."
+fi
+ENV_LINES="$(code_lines "$RELEASE_SH" \
+    | grep -F 'FREENET_MIN_COMPATIBLE_VERSION' \
+    | grep -vE '^[0-9]+:unset FREENET_MIN_COMPATIBLE_VERSION$' || true)"
+ENV_UNSETS="$(code_lines "$RELEASE_SH" | grep -cE '^[0-9]+:unset FREENET_MIN_COMPATIBLE_VERSION$' || true)"
+if [[ -z "$ENV_LINES" ]] && [[ "$ENV_UNSETS" -eq 1 ]]; then
+    pass "FREENET_MIN_COMPATIBLE_VERSION is only ever unset by release.sh"
+else
+    fail "release.sh sets FREENET_MIN_COMPATIBLE_VERSION, or does not unset it exactly once" \
+        "unset lines: $ENV_UNSETS" "${ENV_LINES:-}"
 fi
 
 echo

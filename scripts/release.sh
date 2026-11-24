@@ -68,8 +68,9 @@ show_help() {
     echo
     echo "Options:"
     echo "  --version X.Y.Z           Target version (required)"
-    echo "  --min-compatible X.Y.Z    Minimum compatible version for range-based"
-    echo "                            version checking (default: previous release)"
+    echo "  --min-compatible X.Y.Z    Refused. This script never changes the"
+    echo "                            handshake floor; raise it in its own reviewed"
+    echo "                            PR (docs/RELEASING.md)"
     echo "  --skip-tests              Skip pre-release tests"
     echo "  --dry-run                 Show what would be done without executing"
     echo "  --help                    Show this help"
@@ -99,9 +100,12 @@ while [[ $# -gt 0 ]]; do
             echo "      Gateways are now updated automatically after binaries are available."
             shift
             ;;
-        --min-compatible)
-            MIN_COMPATIBLE="$2"
-            shift 2
+        --min-compatible|--min-compatible=*)
+            # Refused on sight, in any spelling, with or without a value (#5833).
+            echo "Error: --min-compatible is no longer supported. This script never changes"
+            echo "       the handshake floor; raise min-compatible-version in"
+            echo "       crates/core/Cargo.toml in its own reviewed PR (docs/RELEASING.md)."
+            exit 1
             ;;
         --skip-tests)
             SKIP_TESTS=true
@@ -135,15 +139,34 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     exit 1
 fi
 
-# Default min-compatible to the current version in Cargo.toml (the version before the bump).
-# This means gateways running the new version will still accept peers on the previous version.
-if [[ -z "$MIN_COMPATIBLE" ]]; then
-    MIN_COMPATIBLE=$(grep "^version" "$PROJECT_ROOT/crates/core/Cargo.toml" 2>/dev/null | head -1 | cut -d'"' -f2)
-    echo "Min-compatible version: $MIN_COMPATIBLE (defaulting to current version before bump)"
-else
-    echo "Min-compatible version: $MIN_COMPATIBLE (explicitly set)"
+# current_min_compatible <Cargo.toml> -- print the handshake floor committed in
+# `package.metadata.freenet.min-compatible-version`, or return 1 if it is
+# missing or not X.Y.Z.
+current_min_compatible() {
+    local value
+    value=$(grep -E '^min-compatible-version[[:space:]]*=' "$1" 2>/dev/null | head -1 | cut -d'"' -f2)
+    if [[ ! "$value" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+# The handshake floor ships exactly as committed, as it does from release.yml
+# (#5833). This script used to default it to the previous release and write
+# that into the bump, which would make every updated peer refuse every peer
+# that had not updated yet: a network split on an ordinary release. Raising the
+# floor is its own reviewed PR (docs/RELEASING.md), so --min-compatible is
+# refused during argument parsing rather than written into a release bump.
+#
+# A committed floor that cannot be read is refused too: build.rs would then
+# fall back to the package version, the same split. The env override is
+# cleared so a value left in the caller's shell cannot reach the builds.
+if ! MIN_COMPATIBLE=$(current_min_compatible "$PROJECT_ROOT/crates/core/Cargo.toml"); then
+    echo "Error: could not read an X.Y.Z min-compatible-version from crates/core/Cargo.toml."
+    exit 1
 fi
-export FREENET_MIN_COMPATIBLE_VERSION="$MIN_COMPATIBLE"
+echo "Handshake floor (min-compatible-version): $MIN_COMPATIBLE (unchanged, shipped as committed)"
+unset FREENET_MIN_COMPATIBLE_VERSION
 
 # Get the most recently published version from crates.io (most authoritative source).
 #
@@ -803,11 +826,8 @@ update_versions() {
     sed_inplace "s/^version = \".*\"/version = \"$VERSION\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
     echo "✓"
 
-    # Update min-compatible-version in Cargo.toml metadata so cross-compile CI
-    # builds (which don't have the env var) get the correct min-compatible version.
-    echo -n "  Setting min-compatible-version to $MIN_COMPATIBLE... "
-    sed_inplace "s/^min-compatible-version = \".*\"/min-compatible-version = \"$MIN_COMPATIBLE\"/" "$PROJECT_ROOT/crates/core/Cargo.toml"
-    echo "✓"
+    # min-compatible-version is deliberately left alone (#5833): the
+    # committed floor ships unchanged.
 
     # Update fdev version and its freenet dependency
     echo -n "  Updating fdev to $FDEV_VERSION... "
