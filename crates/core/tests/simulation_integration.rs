@@ -23996,6 +23996,13 @@ fn test_quic_native_gateway_join_dead_before_a_frame_goes_legacy_next() {
     use freenet::dev_tool::NodeLabel;
     const SEED: u64 = 0x0059_40B0_0003;
     let run = run_native_connect_sim("native-gateway-join-closed", SEED, 300, |sim| {
+        // Peer-to-peer native connects at 0%, so every native link in the
+        // run is a gateway join and the assertion below reads only the
+        // closed joins. Since A+ step 1 (#6330) production decides 25% of
+        // ordinary CONNECTs native, and the two gateways' own CONNECT to
+        // each other drew native at this seed: a link the gateway does not
+        // close, since only its join hand-off is missing, not its connect op.
+        sim.with_native_connect(0);
         sim.with_native_gateway_join(100);
         let gateways: Vec<NodeLabel> = sim
             .all_node_addresses()
