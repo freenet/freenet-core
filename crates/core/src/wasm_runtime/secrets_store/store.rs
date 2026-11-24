@@ -3654,9 +3654,10 @@ const REFUSAL_LIMITER_CAPACITY: usize = 256;
 
 /// Per (delegate, key): when it was last logged, and how many refusals were
 /// swallowed since. One noisy key therefore cannot hide another.
-static REFUSAL_LIMITER: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<(DelegateKey, [u8; 32]), (std::time::Instant, u64)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+static REFUSAL_LIMITER: std::sync::LazyLock<std::sync::Mutex<RefusalLimiterMap>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+type RefusalLimiterMap = HashMap<(DelegateKey, [u8; 32]), (std::time::Instant, u64)>;
 
 /// Log a refused overwrite at `warn!` (kept in release builds), at most once
 /// per [`REFUSAL_REPORT_INTERVAL`] per (delegate, key), saying how many
@@ -5169,16 +5170,15 @@ mod test {
 
     /// Assert `res` is the #6323 refusal and return its cause text.
     fn refusal_cause<T: std::fmt::Debug>(res: RuntimeResult<T>) -> String {
-        match res {
-            Err(e) => match e.deref() {
-                RuntimeInnerError::SecretStoreError(SecretStoreError::ExistingBlobUnusable {
-                    cause,
-                    ..
-                }) => cause.clone(),
-                other => panic!("expected the #6323 refusal, got {other:?}"),
-            },
-            Ok(v) => panic!("expected the #6323 refusal, but the write succeeded: {v:?}"),
-        }
+        let err = res.expect_err("expected the #6323 refusal, but the write succeeded");
+        let RuntimeInnerError::SecretStoreError(SecretStoreError::ExistingBlobUnusable {
+            cause,
+            ..
+        }) = err.deref()
+        else {
+            panic!("expected the #6323 refusal, got {:?}", err.deref());
+        };
+        cause.clone()
     }
 
     /// #6323, User scope: a blob written under another `dek_secret` (a key
