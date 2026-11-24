@@ -4096,6 +4096,33 @@ mod tests {
         assert_eq!(s.open_connections, 0);
     }
 
+    /// #6365: a test inside a `ScopedStatus` must not see writes that other
+    /// threads make to the process-global tracker without holding the test
+    /// lock (as ring, connection-lifecycle and node-start tests do).
+    #[test]
+    fn scoped_status_ignores_unlocked_writers_on_other_threads() {
+        // The lock keeps this test's own global writes away from the locked
+        // tests that read the global.
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
+        init(31350, HashSet::new(), "scoped".to_string());
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 7, 7)), 7777);
+        // Another thread has no scope, so these go to the global tracker (a
+        // no-op if nothing has initialised it yet).
+        std::thread::spawn(move || {
+            init(31351, HashSet::new(), "global-intruder".to_string());
+            record_peer_connected(peer, None, None);
+            record_peer_disconnected(peer);
+            record_peer_connected(peer, None, None);
+        })
+        .join()
+        .unwrap();
+        let snap = get_snapshot().unwrap();
+        assert_eq!(snap.version, "scoped");
+        assert_eq!(snap.listening_port, 31350);
+        assert!(snap.peers.is_empty());
+    }
+
     /// Regression: a second `init()` must overwrite the global tracker in
     /// place rather than no-op.
     ///
