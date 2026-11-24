@@ -162,9 +162,21 @@ jobs:
           mkdir -p "$FREENET_MIXED_ARTIFACT_DIR"
           cp mixed-version-bins/versions.json "$FREENET_MIXED_ARTIFACT_DIR/versions.json"
           # One test at a time (each owns a Docker network), no retries.
-          cargo nextest run -p freenet-ping-app --features testing \
-            --profile ci --test-threads 1 --retries 0 \
-            -E 'test(mixed_version)' -- --ignored
+          # Pass 1: the nodes' own transport choice, as in production (a small
+          # network may form no native QUIC pair). Pass 2: native QUIC forced
+          # between builds that support it, so native pairs are certain. The
+          # node exposes no per-connection transport, so forcing is how the run
+          # knows native QUIC was exercised.
+          export FREENET_MIXED_ARTIFACT_DIR_BASE="$FREENET_MIXED_ARTIFACT_DIR"
+          rc=0
+          for mode in default force; do
+            export FREENET_MIXED_QUIC="$mode"
+            export FREENET_MIXED_ARTIFACT_DIR="$FREENET_MIXED_ARTIFACT_DIR_BASE/$mode"
+            cargo nextest run -p freenet-ping-app --features testing \
+              --profile ci --test-threads 1 --retries 0 \
+              -E 'test(mixed_version)' -- --ignored || rc=1
+          done
+          exit $rc
 
       - name: Collect node logs
         if: always()
