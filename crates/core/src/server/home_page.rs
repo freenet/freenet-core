@@ -242,6 +242,80 @@ fn homepage_html_for(snap: Option<network_status::NetworkStatusSnapshot>, hosted
 mod tests {
     use super::*;
 
+    /// Drive the real failure path (transport error text -> classifier ->
+    /// recorded failure -> snapshot -> status card) and return the card.
+    fn status_card_after_refusal(
+        error: crate::transport::TransportError,
+        version: &str,
+        port: u16,
+    ) -> String {
+        use crate::node::network_status as ns;
+        let message = error.to_string();
+        ns::init(port, Default::default(), version.to_string());
+        ns::record_gateway_failure(
+            "10.9.8.7:31337".parse().unwrap(),
+            ns::classify_transport_error(&message),
+        );
+        cards::build_status_card(&ns::get_snapshot())
+    }
+
+    /// Regression: an older peer refusing us must never produce the "update
+    /// required" banner or an install command for an older version.
+    #[test]
+    fn older_peer_refusal_never_shows_update_banner() {
+        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap();
+        let card = status_card_after_refusal(
+            crate::transport::TransportError::PeerVersionOutdated {
+                peer_version: "0.2.117".into(),
+            },
+            "0.2.164",
+            31350,
+        );
+        assert!(!card.contains("update required"), "{card}");
+        assert!(!card.contains("Version mismatch"), "{card}");
+        assert!(!card.contains("--version 0.2.117"), "{card}");
+    }
+
+    /// The real mismatch Display text with the remote OLDER than us must not
+    /// produce the banner either (second guard in the classifier).
+    #[test]
+    fn mismatch_text_with_older_remote_never_shows_update_banner() {
+        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap();
+        let card = status_card_after_refusal(
+            crate::transport::TransportError::ProtocolVersionMismatch {
+                expected: "0.2.117".into(),
+                actual: "0.2.164".into(),
+            },
+            "0.2.164",
+            31352,
+        );
+        assert!(!card.contains("update required"), "{card}");
+        assert!(!card.contains("--version 0.2.117"), "{card}");
+    }
+
+    /// A newer peer requiring an update keeps the banner for a node that has
+    /// no connections, and the version it offers is newer than the running one.
+    #[test]
+    fn newer_peer_requiring_update_shows_banner_without_connections() {
+        let _lock = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap();
+        let card = status_card_after_refusal(
+            crate::transport::TransportError::ProtocolVersionMismatch {
+                expected: "0.2.170".into(),
+                actual: "0.2.164".into(),
+            },
+            "0.2.164",
+            31351,
+        );
+        assert!(card.contains("update required"), "{card}");
+        assert!(card.contains("--version 0.2.170"), "{card}");
+    }
+
     /// A hosted node does not serve `/permission/apps`, so its home page does
     /// not link to it; a node that is not hosted keeps the link.
     ///

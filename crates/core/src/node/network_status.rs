@@ -2720,7 +2720,10 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
         recent_successes: s.nat_stats.recent_successes(),
     };
 
-    let health = if has_version_mismatch || (open_connections == 0 && elapsed_secs > 60) {
+    // A recorded version mismatch means "update required" only while the node
+    // is cut off. With open connections the node works, and one peer's
+    // refusal must not turn the dashboard red.
+    let health = if open_connections == 0 && (has_version_mismatch || elapsed_secs > 60) {
         HealthLevel::Trouble
     } else if open_connections == 0 {
         HealthLevel::Connecting
@@ -2823,7 +2826,24 @@ pub fn classify_transport_error(error_msg: &str) -> FailureReason {
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         if is_well_formed_version(&local) && is_well_formed_version(&gateway) {
-            FailureReason::VersionMismatch { local, gateway }
+            // "Update required" is only true when the remote is NEWER. The
+            // transport layer already sends an older peer's refusal as a
+            // different error, so this is a second guard: the banner must
+            // never tell the user to install a version older than their own.
+            let remote_is_newer = match (
+                semver::Version::parse(&local),
+                semver::Version::parse(&gateway),
+            ) {
+                (Ok(l), Ok(g)) => g > l,
+                _ => false,
+            };
+            if remote_is_newer {
+                FailureReason::VersionMismatch { local, gateway }
+            } else {
+                FailureReason::Other(format!(
+                    "peer runs an outdated version {gateway} (this node runs {local})"
+                ))
+            }
         } else {
             FailureReason::Other("version mismatch (version text not recognised)".to_string())
         }
@@ -3384,6 +3404,89 @@ mod tests {
         assert_eq!(snap.failures.len(), 1);
         assert!(snap.failures[0].reason_html.contains("Version mismatch"));
         assert!(snap.failures[0].reason_html.contains("0.1.1"));
+    }
+
+    const OLDER_PEER_REFUSAL: &str = "failed while establishing connection, reason: peer runs an outdated version 0.2.117 and refused this connection";
+
+    fn status_addr(last: u8) -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 9, 8, last)), 31337)
+    }
+
+    fn connect_peer(addr: SocketAddr) {
+        record_peer_connected(addr, None, None);
+    }
+
+    /// Regression: an older peer refusing a node on the latest release was
+    /// recorded as a version mismatch, so the dashboard said "update
+    /// required" and offered a downgrade command.
+    #[test]
+    fn older_peer_refusal_is_not_a_version_mismatch() {
+        let error = crate::transport::TransportError::PeerVersionOutdated {
+            peer_version: "0.2.117".into(),
+        };
+        let message = crate::node::network_bridge::ConnectionError::from(error).to_string();
+        assert!(!matches!(
+            classify_transport_error(&message),
+            FailureReason::VersionMismatch { .. }
+        ));
+        // Second guard: even the legacy mismatch text is not a mismatch when
+        // the remote is older than us.
+        let legacy = "Version incompatibility with gateway\n  Your client version: 0.2.164\n  Gateway version: 0.2.117\n  \n";
+        match classify_transport_error(legacy) {
+            FailureReason::Other(m) => assert!(m.contains("0.2.117")),
+            FailureReason::VersionMismatch { .. }
+            | FailureReason::NatTraversalFailed
+            | FailureReason::Timeout => panic!("older peer must not be a VersionMismatch"),
+        }
+    }
+
+    #[test]
+    fn newer_peer_requiring_update_is_still_a_version_mismatch() {
+        let error = crate::transport::TransportError::ProtocolVersionMismatch {
+            expected: "0.2.170".into(),
+            actual: "0.2.164".into(),
+        };
+        let message = crate::node::network_bridge::ConnectionError::from(error).to_string();
+        match classify_transport_error(&message) {
+            FailureReason::VersionMismatch { local, gateway } => {
+                assert_eq!(local, "0.2.164");
+                assert_eq!(gateway, "0.2.170");
+            }
+            FailureReason::NatTraversalFailed
+            | FailureReason::Timeout
+            | FailureReason::Other(_) => panic!("expected VersionMismatch from {message:?}"),
+        }
+    }
+
+    #[test]
+    fn older_peer_refusal_does_not_make_connected_node_trouble() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        init(31340, HashSet::new(), "0.2.164".to_string());
+        connect_peer(status_addr(1));
+        record_gateway_failure(status_addr(2), classify_transport_error(OLDER_PEER_REFUSAL));
+        let snap = get_snapshot().unwrap();
+        assert_ne!(snap.health, HealthLevel::Trouble);
+        assert!(!snap.failures[0].reason_html.contains("Version mismatch"));
+        assert!(!snap.failures[0].reason_html.contains("cargo install"));
+    }
+
+    /// A genuine must-update failure must not paint a WORKING node red, but
+    /// must still show when the node is cut off.
+    #[test]
+    fn version_mismatch_is_trouble_only_without_connections() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let mismatch = || FailureReason::VersionMismatch {
+            local: "0.2.164".to_string(),
+            gateway: "0.2.170".to_string(),
+        };
+        init(31341, HashSet::new(), "0.2.164".to_string());
+        record_gateway_failure(status_addr(3), mismatch());
+        assert_eq!(get_snapshot().unwrap().health, HealthLevel::Trouble);
+
+        init(31342, HashSet::new(), "0.2.164".to_string());
+        connect_peer(status_addr(4));
+        record_gateway_failure(status_addr(3), mismatch());
+        assert_ne!(get_snapshot().unwrap().health, HealthLevel::Trouble);
     }
 
     #[test]

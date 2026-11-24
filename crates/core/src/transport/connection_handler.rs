@@ -3060,7 +3060,11 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                         // Failed gateway connection
                         Err((error, remote_addr)) => {
                             tracing::info!(error = %error, peer_addr = %remote_addr, "Failed to establish gateway connection");
-                            if matches!(error, TransportError::ProtocolVersionMismatch { .. }) {
+                            if matches!(
+                                error,
+                                TransportError::ProtocolVersionMismatch { .. }
+                                    | TransportError::PeerVersionOutdated { .. }
+                            ) {
                                 outdated_peer.insert(remote_addr, self.time_source.now_nanos());
                             }
                             self.connections.fail_gateway_handshake(&remote_addr);
@@ -3137,7 +3141,8 @@ impl<S: Socket, T: TimeSource> UdpPacketsListener<S, T> {
                                 &crate::transport::TRANSPORT_METRICS,
                             );
                             match &error {
-                                TransportError::ProtocolVersionMismatch { .. } => {
+                                TransportError::ProtocolVersionMismatch { .. }
+                                | TransportError::PeerVersionOutdated { .. } => {
                                     tracing::warn!(%error);
                                     crate::transport::TRANSPORT_METRICS
                                         .record_nat_traversal_failed_version();
@@ -4348,7 +4353,8 @@ fn classify_nat_failure(
         return NatFailureKind::VersionIncompatible;
     }
     match error {
-        TransportError::ProtocolVersionMismatch { .. } => NatFailureKind::VersionIncompatible,
+        TransportError::ProtocolVersionMismatch { .. }
+        | TransportError::PeerVersionOutdated { .. } => NatFailureKind::VersionIncompatible,
         TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => NatFailureKind::SendError,
         TransportError::ChannelClosed
         | TransportError::ConnectionClosed(_)
@@ -4640,11 +4646,12 @@ fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
         ) {
             tracing::info!(
                 remote_version = remote_version_str,
-                "Old peer rejected us (strict match) but is within our compatible range — not triggering self-update"
+                "Old peer rejected us (strict match) but is not newer than us — not triggering self-update"
             );
-            return TransportError::ProtocolVersionMismatch {
-                expected: remote_version_str.to_string(),
-                actual: PCK_VERSION.to_string(),
+            // The remote is the one that is out of date: record it as such so
+            // the dashboard never tells the user to install the remote's version.
+            return TransportError::PeerVersionOutdated {
+                peer_version: remote_version_str.to_string(),
             };
         }
         // Remote is genuinely newer — signal version mismatch
@@ -4930,15 +4937,16 @@ pub mod mock_transport {
     #[test]
     fn test_handle_ack_connection_error() {
         let err_msg =
-            "remote is using a different protocol version, expected version 1.2.3".to_string();
+            "remote is using a different protocol version, expected version 999.2.3".to_string();
         match handle_ack_connection_error(err_msg.into()) {
             TransportError::ProtocolVersionMismatch { expected, actual } => {
-                assert_eq!(expected, "1.2.3");
+                assert_eq!(expected, "999.2.3");
                 assert_eq!(actual, PCK_VERSION);
             }
             TransportError::ChannelClosed
             | TransportError::ConnectionClosed(_)
             | TransportError::ConnectionEstablishmentFailure { .. }
+            | TransportError::PeerVersionOutdated { .. }
             | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..)))
             | TransportError::OutboundStreamFailed(_)
             | TransportError::OutboundStreamInvalidLength(..)
@@ -4973,11 +4981,23 @@ pub mod mock_transport {
             );
         }
 
-        let ok = handle_ack_connection_error("expected version 1.2.3-rc.1+b5".to_string().into());
+        let ok = handle_ack_connection_error("expected version 999.2.3-rc.1+b5".to_string().into());
         assert!(matches!(
             &ok,
-            TransportError::ProtocolVersionMismatch { expected, .. } if expected == "1.2.3-rc.1+b5"
+            TransportError::ProtocolVersionMismatch { expected, .. } if expected == "999.2.3-rc.1+b5"
         ));
+        // An OLDER peer refusing us is not a request for us to update: it must
+        // not be reported as a version mismatch (which drives the "update
+        // required" banner) and must not carry a downgrade install command.
+        let older = handle_ack_connection_error("expected version 0.2.117".to_string().into());
+        assert!(
+            matches!(
+                &older,
+                TransportError::PeerVersionOutdated { peer_version } if peer_version == "0.2.117"
+            ),
+            "older peer must not be a ProtocolVersionMismatch, got {older:?}"
+        );
+        assert!(!older.to_string().contains("cargo install"));
         let long_other = "x".repeat(500);
         let err = handle_ack_connection_error(long_other.into());
         assert!(matches!(
@@ -4993,6 +5013,7 @@ pub mod mock_transport {
             TransportError::ChannelClosed
             | TransportError::ConnectionClosed(_)
             | TransportError::ProtocolVersionMismatch { .. }
+            | TransportError::PeerVersionOutdated { .. }
             | TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..)))
             | TransportError::OutboundStreamFailed(_)
             | TransportError::OutboundStreamInvalidLength(..)
