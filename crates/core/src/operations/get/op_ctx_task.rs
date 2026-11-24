@@ -6622,6 +6622,38 @@ mod tests {
         );
     }
 
+    /// Existence proofs may only come from reply state this node accepted
+    /// (`accepted_remote`), never from `local_copy`, which an older local copy
+    /// also satisfies (operations.md, existence proofs). The client path is
+    /// driven by `a_rejected_reply_for_a_held_contract_is_no_existence_proof`;
+    /// the relay arms cannot be reached with a held copy in the fixture (a
+    /// held copy ends the relay's consult at the local fallback), so they are
+    /// pinned here by source.
+    #[test]
+    fn existence_proofs_read_accepted_remote_state_only() {
+        let code = code_only(production_source());
+        assert_eq!(
+            code.matches("cached.accepted_remote&&is_existence_proof(")
+                .count(),
+            2,
+            "both relay arms must gate the existence proof on accepted_remote"
+        );
+        assert!(code.contains(".await.accepted_remote;"), "loopback arm");
+        assert!(
+            code.contains("state_stored:state_stored.accepted_remote"),
+            "originator stream path"
+        );
+        assert!(
+            code.contains("driver.note_stored_state(key,state_stored.accepted_remote)"),
+            "originator inline path"
+        );
+        assert!(
+            !code.contains("local_copy&&is_existence_proof")
+                && !code.contains("state_present&&is_existence_proof"),
+            "a local copy is not an existence proof"
+        );
+    }
+
     /// Every originator and relay call must pass the request's OWN instance id
     /// as `requested`; an id read from the reply makes the check compare the
     /// reply with itself. The streamed originator path takes the driver's id.
@@ -10754,45 +10786,6 @@ mod route_attempt_driver_tests {
             false,
         )
         .await;
-        assert_eq!(failed_addrs(&op_manager), Vec::<SocketAddr>::new());
-    }
-
-    /// The same through the relay driver: the NotFound hop is not settled as a
-    /// failure by a rejected reply that a held older copy would otherwise back.
-    #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn relay_a_rejected_reply_for_a_held_contract_is_no_existence_proof() {
-        let label = "get-relay-held-rejected";
-        let (op_manager, rx, store, upstream, greedy, host, _guards) =
-            relay_fixture(label, true).await;
-        let instance_id = coded_id();
-        let held_key = key_for(instance_id);
-        *store.lock() = Some((held_key, WrappedState::new(vec![8; 4])));
-        op_manager.ring.host_contract(
-            held_key,
-            4,
-            crate::ring::AccessType::Get,
-            crate::ring::HostingCause::Other,
-        );
-        reject_stores(label);
-        let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
-        serve_attempts(
-            op_manager.clone(),
-            rx,
-            crate::message::TransactionType::Get,
-            move |_, msg, target| {
-                let answer = if !is_request(msg) {
-                    Answer::DropWaiter
-                } else if target == Some(greedy_addr) {
-                    Answer::Reply(not_found(msg, instance_id))
-                } else if target == Some(host_addr) {
-                    Answer::Reply(found_with_code(msg, instance_id))
-                } else {
-                    Answer::Never
-                };
-                Step { hop: None, answer }
-            },
-        );
-        run_relay(&op_manager, &upstream).await;
         assert_eq!(failed_addrs(&op_manager), Vec::<SocketAddr>::new());
     }
 
