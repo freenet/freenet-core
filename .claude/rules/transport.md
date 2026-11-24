@@ -1600,7 +1600,8 @@ a test passes its own; tests read their own, never the global).
   quic_data_send_<short|large_short|stream|pipe>_<sent|maybe_delivered|
   not_opened_udp|failed_udp|dropped>; quic_data_event_<short_overflow_udp|
   data_refused|stalled_closed|udp_send_failed|suspect_entered|suspect_left|
-  pacer_refused|ack_wait_released|stream_limit_full|native_worker_panicked>; quic_data_stop_<code> (stops a
+  pacer_refused|ack_wait_released|stream_limit_full|not_opened_retried|
+  not_opened_retry_sent|native_short_queue_full|native_worker_panicked>; quic_data_stop_<code> (stops a
   peer sent to data sends); quic_inbound_<QuicInboundOutcome> (every receive
   outcome, refusals by frame kind as short_refused_budget and
   stream_refused_budget); quic_enabled_data_paths; quic_live_data_paths (a gauge of
@@ -2341,8 +2342,8 @@ Path: QuicPathLimits::NATIVE (DEFAULT with udp_fallback off) and data
   Upgrade paths keep udp_fallback on and are unchanged.
 Shorts: DataRoute::native, no UDP sender. queue_native_short refuses a full
   queue with TransportError::SendQueueFull (Transient: the connection
-  survives, the message is counted Dropped, no ShortOverflowUdp), and an
-  ended path with ConnectionClosed. The worker drops and counts a short it
+  survives, the message is counted quic_data_event_native_short_queue_full,
+  not Dropped, and no ShortOverflowUdp), and an ended path with ConnectionClosed. The worker drops and counts a short it
   cannot put on the path (ended, or refusing data while it closes).
 Receive: recv reads the path's inbox through InboundDispatch, the same record
   a UDP connection keeps (metadata dispatched once, stream ids not reused).
@@ -2731,21 +2732,31 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
     peer's limit would stop the raise. Until the peer has raised, the reserve
     does not hold: a send past the peer's limit, streamed, one-packet or
     control, waits in open_uni until its open deadline (2 s streamed, 1 s a
-    one-packet Short) and ends NotOpened, which goes on UDP; it never ends
-    MaybeDelivered, since nothing was written. Each is counted
+    one-packet Short) and ends NotOpened(NoCredit); on an upgraded path it goes
+    on UDP, on a native path (no UDP session) it is sent again on the same path
+    up to NOT_OPENED_RETRIES (2) times and dropped after that
+    (QuicPath::retry_not_opened, only while the path still takes data; the
+    short worker, send_large_short_with and send_stream_with retry, a pipe does
+    not), so a short waits up to 3 s and a stream or large short up to 6 s. It
+    never ends MaybeDelivered, since nothing was written. Each attempt is counted
     quic_data_event_stream_limit_full when its open deadline ends the wait
     (a send cancelled earlier, by a teardown or shutdown, is not counted;
-    pinned by sends_past_a_fresh_peers_stream_limit_end_not_opened). Control
+    pinned by sends_past_a_fresh_peers_stream_limit_end_not_opened), so a send
+    retried twice and dropped counts 3; each retry counts not_opened_retried
+    and a retried send that goes through counts not_opened_retry_sent. A wait
+    on this side's own resources (stream permit, control-frame turn, pipe first
+    chunk) ends NotOpened(TimedOut) and is not retried. Control
     frames are sent only during setup, but a client's ReadyAck goes out in
     the step that enables its data, so it would race its own data for the
     peer's slots: the driver reserves the frame's stream before the send
     runs (QuicPath::control_first), and no data send opens a stream until
     the control frame has one or its send ended (pinned by
     a_reserved_control_frame_opens_ahead_of_data_at_a_full_limit).
-  → Once the UDP transport is removed there is no UDP to go to: a send that
-    finds the peer's limit full then waits for a slot, bounded by its send
-    deadline, and fails NotOpened at the deadline. Not built; the
-    stream_limit_full count is what sizes that wait.
+  → A native path already has no UDP to go to, so it retries (above) instead.
+    Once the UDP transport is removed, an upgraded path would too, or wait
+    longer for a slot, bounded by its send deadline. Not built for upgraded
+    paths; the stream_limit_full and not_opened_retry_sent counts are what size
+    that wait.
   → Each bounded send arms TimeSource::sleep_cancelable, which VirtualTime
     removes (wakeup and waker) when the future is dropped; plain sleep
     keeps its wakeup until the deadline (VirtualSleep has no drop
@@ -2868,7 +2879,7 @@ Sending (QuicPath::send_short_bounded / send_stream_bounded /
   whole message was written and FIN queued, SendProgress set in
   Outgoing::finish, then the deadline passed or the connection was lost
   during the ack wait: the peer may have it, do not treat it as Failed),
-  Failed(NotOpened(TimedOut | ConnectionLost)) (no stream ever existed, so the
+  Failed(NotOpened(TimedOut | NoCredit | ConnectionLost)) (no stream ever existed, so the
   message can go another way), or Failed(TimedOut | Error) (the stream did not
   finish, or a stop from the peer, or a source that ended or failed before its
   first chunk). After MaybeDelivered or any Failed but NotOpened the receiver
@@ -3519,7 +3530,7 @@ QUIC send route (#5940 e5b-6, quic/upgrade/data_route.rs,
   verdict holds past the limit, so it is made at the next counted timeout
   once the flag clears; counted once. Any acknowledgement or any Sent starts the count again. All
   kinds count: Failed(TimedOut) and MaybeDelivered(TimedOut).
-  Failed(NotOpened(TimedOut)) does not (route::timed_out): a wait to open is
+  Failed(NotOpened(TimedOut | NoCredit)) does not (route::timed_out): a wait to open is
   back-pressure. What recycles the cases it used to: a path whose sends
   nobody acknowledges is closed by the dark rule if it is native, and ended
   by quinn's idle timeout if it has a UDP session; a peer that never
