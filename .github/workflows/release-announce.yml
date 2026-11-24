@@ -43,6 +43,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       release_url: ${{ steps.v.outputs.release_url }}
+      skip: ${{ steps.v.outputs.skip }}
       message: ${{ steps.v.outputs.message }}
     steps:
       - name: Resolve version
@@ -56,8 +57,11 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           TAG_NAME: ${{ github.event.release.tag_name }}
           DISPATCH_VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
           REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           if [[ "$EVENT_NAME" == "release" ]]; then
             RAW="$TAG_NAME"
           else
@@ -68,6 +72,26 @@ jobs:
             echo "::error::Version must be X.Y.Z. Got: $VERSION (raw: $RAW)"
             exit 1
           fi
+          # On a release event, announce only GitHub's latest release, as
+          # gateway-update.yml rolls out only that one. A recovery un-draft of
+          # an older stuck release is published but must not be announced as
+          # "released". cross-compile.yml sets the latest marker in the same
+          # call as the un-draft, so the newest release is already latest by
+          # the time this event fires. A manual dispatch is taken as meant.
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            if [[ "$PRERELEASE" == "true" ]]; then
+              echo "::notice::v$VERSION is a prerelease; not announcing."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            LATEST=$(gh api "repos/${REPO}/releases/latest" --jq .tag_name)
+            if [[ "${LATEST#v}" != "$VERSION" ]]; then
+              echo "::notice::v$VERSION is not GitHub's latest release ($LATEST); not announcing."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
           RELEASE_URL="https://github.com/${REPO}/releases/tag/v${VERSION}"
           MESSAGE="Freenet v${VERSION} released: ${RELEASE_URL}"
           {
@@ -82,6 +106,8 @@ jobs:
   matrix:
     name: Post to Matrix
     needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - name: Send Matrix message
@@ -118,7 +144,7 @@ jobs:
           # URL-encode the room ID. ! and : are reserved chars.
           ROOM_ENC=$(printf '%s' "$ROOM_ID" | jq -sRr @uri)
           URL="${HOMESERVER%/}/_matrix/client/v3/rooms/${ROOM_ENC}/send/m.room.message/${TXN_ID}"
-          HTTP_STATUS=$(curl -sS -o /tmp/matrix-response.json -w '%{http_code}' \
+          HTTP_STATUS=$(curl -sS --max-time 30 -o /tmp/matrix-response.json -w '%{http_code}' \
             -X PUT "$URL" \
             -H "Authorization: Bearer $TOKEN" \
             -H 'Content-Type: application/json' \
@@ -135,6 +161,8 @@ jobs:
   river:
     name: Post to River (via nova webhook)
     needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - name: Sign and POST /announce/river

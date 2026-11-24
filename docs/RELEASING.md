@@ -4,8 +4,8 @@
 > remain are historical incident records (notably the v0.2.71 half-applied
 > rollout that motivated the post-deploy verify) and are kept deliberately —
 > they explain why a check exists. It is no longer a rollout target: the release
-> matrix, the manual SSH driver in `release.sh`, and `RELEASE_AGENT_HMAC_VEGA`
-> have all been removed. nova now runs two gateway processes; the second,
+> matrix, the AWS entry in `release.sh`'s legacy SSH driver (which now targets
+> nova only), and `RELEASE_AGENT_HMAC_VEGA` have all been removed. nova now runs two gateway processes; the second,
 > `freenet-gateway-2`, has no release-agent of its own. It is deliberately not
 > tied to the primary's stop/start (#6336: restarting both together doubled the
 > share of subscribes needing extra hops for 10+ hours). After the primary is
@@ -79,13 +79,13 @@ a `::warning::` annotation telling you what to fix.
 
 | Secret | Used by | Failure mode if missing |
 |---|---|---|
-| `RELEASE_PAT` | release.yml, cross-compile.yml | Bump PR has no CI; `release.published` doesn't auto-fire downstream workflows. The workflows emit a `::warning::` on every run. |
+| `RELEASE_PAT` | release.yml, cross-compile.yml | A LIVE `release.yml` run fails in `validate`, before anything is created: without it the bump PR gets no CI, the tag push does not start cross-compile.yml and `release.published` does not fire the downstream workflows, so the release would stall half-done. A dry run only warns. |
 | `CARGO_REGISTRY_TOKEN` | release.yml `validate` (checks it), cross-compile.yml `attach-to-release` (uses it) | **`validate` fails first**, before the bump PR exists — that is the intended place to find out, and where to look when a release dies immediately. If `validate` is bypassed (a bare tag push, or a manual `cross-compile.yml` dispatch), `attach-to-release` fails after the binaries are uploaded and the release stays a draft. The actual publish lives in cross-compile.yml, not release.yml, because it is deliberately downstream of Gate A — see "The crates.io publish is downstream of Gate A" below. |
 | `MATRIX_HOMESERVER_URL` | release-announce.yml | Matrix job warns + skips (success, no post). |
 | `MATRIX_ACCESS_TOKEN` | release-announce.yml | Matrix job warns + skips. |
 | `RELEASE_AGENT_HMAC_NOVA` | gateway-update.yml, release-announce.yml | nova update + River announce fail (HTTP 401). |
 | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | cross-compile.yml `build-x86_64-windows` (Authenticode signing) | **Does NOT degrade gracefully — this one fails the release.** See "Windows code signing" below. |
-| `FREENET_RELEASE_SIGNING_KEY` | cross-compile.yml (`Sign SHA256SUMS.txt`) | Releases are UNSIGNED (no `SHA256SUMS.txt.sig` attached). Clients accept unsigned releases during the transition window (`REQUIRE_RELEASE_SIGNATURE = false`), but once that flag is flipped to `true` in a future release, unsigned releases are REFUSED by the auto-updater. PEM-encoded ed25519 private key whose public half is baked into the updater (`update.rs` `FREENET_RELEASE_PUBKEY`). |
+| `FREENET_RELEASE_SIGNING_KEY` | cross-compile.yml (`Sign SHA256SUMS.txt`) | **Fails the release** in `attach-to-release`, while it is still a draft. It used to publish an UNSIGNED release with only a warning; clients accept one (`REQUIRE_RELEASE_SIGNATURE = false`) but verify nothing, and docker-publish.yml then fails after publication because it requires a verified signature. PEM-encoded ed25519 private key whose public half is baked into the updater (`update.rs` `FREENET_RELEASE_PUBKEY`). |
 
 To validate `FREENET_RELEASE_SIGNING_KEY` without cutting a release, run the
 `Build and Cross-Compile` workflow via `workflow_dispatch`: its

@@ -123,7 +123,7 @@ EOF
         # so shellcheck cannot see the uses: the variables look unset-and-unused
         # (SC2034) and the stubs look unreachable (SC2317). Both are the point --
         # the function under test is injected at runtime.
-        # shellcheck disable=SC2034,SC2317
+        # shellcheck disable=SC2030,SC2034,SC2317
         (
             PATH="$work/bin:$PATH"
             VERSION=9.9.9
@@ -696,6 +696,85 @@ if [[ -z "$ENV_LINES" ]] && [[ "$ENV_UNSETS" -eq 1 ]]; then
 else
     fail "release.sh sets FREENET_MIN_COMPATIBLE_VERSION, or does not unset it exactly once" \
         "unset lines: $ENV_UNSETS" "${ENV_LINES:-}"
+fi
+
+# --- create_github_release tags the bump PR's MERGE COMMIT --------------------
+#
+# It used to tag local HEAD: after `git pull` that includes anything merged
+# since the bump (#5233), and after a PR-wait timeout it was the UNMERGED
+# release branch. Run the real function against a stub gh/git and check which
+# commit `git tag -a` names, and that a stale tag elsewhere refuses.
+TAG_FN="$(awk '/^create_github_release\(\) \{/,/^\}/' "$RELEASE_SH")"
+if [[ -z "$TAG_FN" ]] || [[ "$TAG_FN" != *"git tag -a"* ]]; then
+    fail "could not extract create_github_release() from release.sh"
+else
+    MERGE_SHA=1111111111111111111111111111111111111111
+    # tag_case <desc> <local tag sha or ""> <remote tag sha or ""> <Cargo version> <expected>
+    #   expected: "tag+push" | "push" | "skip" | "refuse"
+    tag_case() {
+        local desc="$1" local_sha="$2" remote_sha="$3" cargo_ver="$4" want="$5"
+        local work got rc=0
+        work="$(mktemp -d)"
+        mkdir -p "$work/bin"
+        cat > "$work/bin/gh" <<EOF
+#!/usr/bin/env bash
+case "\$1 \$2" in
+    "pr list") echo "$MERGE_SHA" ;;
+    "release view") exit 1 ;;
+    "release create") echo "https://example/release" ;;
+esac
+EOF
+        cat > "$work/bin/git" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$work/git.log"
+case "\$1" in
+    tag) [ "\$2" = -l ] && { [ -n "$local_sha" ] && echo "v9.9.9"; exit 0; } ;;
+    rev-parse) echo "$local_sha" ;;
+    show) printf '[package]\nname = "freenet"\nversion = "$cargo_ver"\n' ;;
+    ls-remote) [ -n "$remote_sha" ] && printf '%s\trefs/tags/v9.9.9\n' "$remote_sha" ;;
+esac
+exit 0
+EOF
+        chmod +x "$work/bin/gh" "$work/bin/git"
+        : > "$work/git.log"
+        # shellcheck disable=SC2030,SC2031,SC2034,SC2317
+        (
+            PATH="$work/bin:$PATH"
+            VERSION=9.9.9
+            FDEV_VERSION=0.9.9
+            DRY_RUN=false
+            is_step_completed() { return 1; }
+            mark_completed() { :; }
+            run_cmd() { shift; "$@"; }
+            generate_release_notes() { echo notes; }
+            eval "$TAG_FN"
+            create_github_release
+        ) > "$work/out" 2>&1 || rc=$?
+        if [[ "$rc" -ne 0 ]]; then
+            got=refuse
+        elif grep -qxF "tag -a v9.9.9 -m Release v9.9.9 $MERGE_SHA" "$work/git.log" \
+            && grep -qxF "push origin v9.9.9" "$work/git.log"; then
+            got=tag+push
+        elif grep -q '^tag -a' "$work/git.log"; then
+            got="tag-on-wrong-commit"
+        elif grep -qxF "push origin v9.9.9" "$work/git.log"; then
+            got=push
+        else
+            got=skip
+        fi
+        if [[ "$got" == "$want" ]]; then
+            pass "create_github_release: $desc"
+        else
+            fail "create_github_release: $desc (got '$got', expected '$want')" "$(cat "$work/out")"
+        fi
+        rm -rf "$work"
+    }
+    tag_case "fresh: tags the merge commit and pushes" "" "" 9.9.9 tag+push
+    tag_case "local tag already on the merge commit: pushes it" "$MERGE_SHA" "" 9.9.9 push
+    tag_case "remote tag already on the merge commit: nothing to do" "$MERGE_SHA" "$MERGE_SHA" 9.9.9 skip
+    tag_case "local tag on another commit: refuses" 2222222222222222222222222222222222222222 "" 9.9.9 refuse
+    tag_case "remote tag on another commit: refuses" "" 2222222222222222222222222222222222222222 9.9.9 refuse
+    tag_case "merge commit carries another version: refuses" "" "" 9.9.8 refuse
 fi
 
 echo

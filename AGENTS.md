@@ -241,12 +241,11 @@ env:
   GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 ```
 
-When the secret is missing the workflows degrade gracefully: they
-still complete, but the bump-PR CI, the tag-push → cross-compile
-trigger, and the release-published cascade won't auto-fire and a
-human has to intervene. `release.yml` emits a GitHub `::warning::`
-on every run that's missing the secret, so the gap is visible
-early.
+When the secret is missing, the bump-PR CI, the tag-push →
+cross-compile trigger, and the release-published cascade won't
+auto-fire, so a live release would stall half-done after its bump
+merged. A live `release.yml` run therefore refuses in `validate`,
+before anything is created; a dry run only warns.
 
 `.github/workflows/check-token-coalesce.yml` runs on every PR that
 touches a workflow file — it is path-filtered to
@@ -260,9 +259,9 @@ class this guard prevents.
 
 The PAT belongs to a maintainer's account (currently @sanity). Rotate
 it on the GitHub PAT expiry schedule, and update the `RELEASE_PAT`
-secret in the freenet-core repo when you do. If `release.yml` prints
-the "RELEASE_PAT not set" warning unexpectedly, the secret has
-expired and the same rotation procedure applies.
+secret in the freenet-core repo when you do. If `release.yml` reports
+"RELEASE_PAT not set" unexpectedly, the secret has expired and the
+same rotation procedure applies.
 
 ### Cutting a release
 

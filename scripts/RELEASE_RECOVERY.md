@@ -1,6 +1,7 @@
 # Freenet Release Recovery Guide
 
-When the release script fails mid-process, use this guide to complete the release manually.
+When a release fails mid-process (normally a `release.yml` run, or the legacy
+`scripts/release.sh` driver), use this guide to complete it.
 
 ## Read this before running anything
 
@@ -104,9 +105,12 @@ gh run list --workflow=cross-compile.yml --branch vX.Y.Z --limit 3
 
 **Recovery:**
 1. Fix any CI failures
-2. If conventional commits check failed:
+2. If the conventional commits check failed, restore the title. It MUST start
+   with `build: release `: `ci.yml` keys the full-suite release gate in the
+   merge queue on that prefix, so any other title (`chore: release` included)
+   passes the title check while silently switching the release gate off.
    ```bash
-   gh pr edit <PR_NUMBER> --title "chore: release X.Y.Z"
+   gh pr edit <PR_NUMBER> --title "build: release X.Y.Z"
    ```
 3. If other CI failures, fix code and push to release branch
 4. Wait for PR to auto-merge or merge manually
@@ -413,41 +417,31 @@ no verdict inside its window), that is infrastructure, not a bug in the binary.
 Re-run the job. An unverified gate is still not a passed gate — do not
 un-draft to work around it.
 
-### Step 5: Crates Published but Local Not Deployed
+### Step 5: Published but Gateways Not Updated
 
 **Symptoms:**
-- Everything published
-- Local gateway not updated
+- Release published (not a draft)
+- The gateways are still on the previous version
 
-**Recovery:**
+**Recovery:** the `release.published` event normally starts
+`gateway-update.yml`. If it did not (RELEASE_PAT missing or expired), dispatch
+it. Do not build from source and copy a binary onto a gateway: the gateways run
+the exact released binary, installed by their release-agent.
 ```bash
-cd ~/code/freenet/freenet-core/main
-cargo build --release --bin freenet
-
-# Deploy to gateway only
-./scripts/deploy-local-gateway.sh
-
-# Deploy to all instances (gateway + 10 peers)
-./scripts/deploy-local-gateway.sh --all-instances
+gh workflow run gateway-update.yml --repo freenet/freenet-core \
+  --field version=X.Y.Z --field gateways=all
 ```
 
-### Step 6: Deployed but Matrix Not Announced
+### Step 6: Published but Not Announced
 
 **Symptoms:**
 - Release complete
-- No Matrix announcement
+- No Matrix or River announcement
 
-**Recovery:**
+**Recovery:** `release-announce.yml` normally runs on `release.published`.
+Dispatch it by hand; re-running it is idempotent for Matrix.
 ```bash
-matrix-commander -r '#freenet-locutus:matrix.org' -m "🎉 **Freenet v0.1.X Released!**
-
-📦 Published to crates.io:
-  • freenet v0.1.X
-  • fdev v0.Y.Z
-
-🔗 Release: https://github.com/freenet/freenet-core/releases/tag/v0.1.X
-
-[AI-assisted release announcement]"
+gh workflow run release-announce.yml --repo freenet/freenet-core --field version=X.Y.Z
 ```
 
 ## Common Issues
@@ -478,9 +472,10 @@ sudo systemctl start freenet-gateway freenet-peer-{01..10}
 
 **Cause:** PR title doesn't follow conventional commit format
 
-**Solution:**
+**Solution:** restore the generated title. It must start with `build: release `,
+which is what `ci.yml` keys the full-suite merge-queue release gate on.
 ```bash
-gh pr edit <PR_NUMBER> --title "chore: release X.Y.Z"
+gh pr edit <PR_NUMBER> --title "build: release X.Y.Z"
 
 # Trigger CI rerun
 git checkout release/vX.Y.Z
@@ -528,9 +523,11 @@ cd ~/code/freenet/freenet-core/main
 # Edit Cargo.toml versions manually
 git checkout -b release/v0.1.X
 git add -A
-git commit -m "chore: release 0.1.X"
+git commit -m "build: release 0.1.X"
 git push origin release/v0.1.X
-gh pr create --title "chore: release 0.1.X" --body "Release v0.1.X" --base main
+# The title MUST start with "build: release ": ci.yml keys the full-suite
+# merge-queue release gate on it.
+gh pr create --title "build: release 0.1.X" --body "Release v0.1.X" --base main
 
 # 2. Wait for CI and merge (or use gh pr merge --auto)
 

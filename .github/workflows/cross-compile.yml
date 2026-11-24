@@ -9,9 +9,14 @@ on:
 
 # Cancel in-progress runs when a new commit is pushed to the same ref.
 # On main, never cancel — each merge must complete its build (#3311).
+# On a release tag, never cancel either: a second run for the tag (the
+# documented `gh workflow run cross-compile.yml --ref vX.Y.Z` recovery) would
+# otherwise kill the first wherever it is, including between the two crates.io
+# publishes or between the publish and the un-draft. The publish and un-draft
+# are idempotent, so the second run queues and finishes the job.
 concurrency:
   group: cross-compile-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 jobs:
   build-x86_64-linux:
@@ -254,11 +259,15 @@ jobs:
         # `cargo build --release`, which builds the whole workspace incl. fdev and
         # so unifies fdev's `freenet/testing` onto the shipped freenet binary —
         # the 0.2.81 telemetry blackout; see x86_64-linux step for full rationale).
+        # bash, not the runner's default pwsh: pwsh fails a step only on its
+        # LAST native command's exit code, so a failed first build was hidden.
+        shell: bash
         run: |
           cargo build --release -p freenet
           cargo build --release -p fdev
 
       - name: Smoke test
+        shell: bash
         run: |
           target/release/freenet.exe --version
           target/release/freenet.exe service --help
@@ -660,26 +669,31 @@ jobs:
 
       - name: Prepare release assets
         run: |
+          # Each archive is ONE command (`tar -C`, or zip in a subshell) so
+          # that `set -e` sees its status. The old `cd X && tar ... && cd ../..`
+          # form hid a failed tar from errexit (only the last command of an &&
+          # list counts) and left the shell in the wrong directory.
+          set -euo pipefail
           # Create tar.gz files for each binary with binstall-compatible naming
           # Linux x86_64 (musl for maximum compatibility)
-          cd artifacts/x86_64-linux-freenet && tar -czvf ../../freenet-x86_64-unknown-linux-musl.tar.gz freenet && cd ../..
-          cd artifacts/x86_64-linux-fdev && tar -czvf ../../fdev-x86_64-unknown-linux-musl.tar.gz fdev && cd ../..
+          tar -czvf freenet-x86_64-unknown-linux-musl.tar.gz -C artifacts/x86_64-linux-freenet freenet
+          tar -czvf fdev-x86_64-unknown-linux-musl.tar.gz -C artifacts/x86_64-linux-fdev fdev
 
           # Linux ARM64 (musl for maximum compatibility)
-          cd artifacts/arm64-linux-freenet && tar -czvf ../../freenet-aarch64-unknown-linux-musl.tar.gz freenet && cd ../..
-          cd artifacts/arm64-linux-fdev && tar -czvf ../../fdev-aarch64-unknown-linux-musl.tar.gz fdev && cd ../..
+          tar -czvf freenet-aarch64-unknown-linux-musl.tar.gz -C artifacts/arm64-linux-freenet freenet
+          tar -czvf fdev-aarch64-unknown-linux-musl.tar.gz -C artifacts/arm64-linux-fdev fdev
 
           # macOS ARM64
-          cd artifacts/arm64-macos-freenet && tar -czvf ../../freenet-aarch64-apple-darwin.tar.gz freenet && cd ../..
-          cd artifacts/arm64-macos-fdev && tar -czvf ../../fdev-aarch64-apple-darwin.tar.gz fdev && cd ../..
+          tar -czvf freenet-aarch64-apple-darwin.tar.gz -C artifacts/arm64-macos-freenet freenet
+          tar -czvf fdev-aarch64-apple-darwin.tar.gz -C artifacts/arm64-macos-fdev fdev
 
           # macOS x86_64
-          cd artifacts/x86_64-macos-freenet && tar -czvf ../../freenet-x86_64-apple-darwin.tar.gz freenet && cd ../..
-          cd artifacts/x86_64-macos-fdev && tar -czvf ../../fdev-x86_64-apple-darwin.tar.gz fdev && cd ../..
+          tar -czvf freenet-x86_64-apple-darwin.tar.gz -C artifacts/x86_64-macos-freenet freenet
+          tar -czvf fdev-x86_64-apple-darwin.tar.gz -C artifacts/x86_64-macos-fdev fdev
 
           # Windows x86_64 (zip for backwards compat + bare exe for direct download)
-          cd artifacts/x86_64-windows-freenet && zip ../../freenet-x86_64-pc-windows-msvc.zip freenet.exe && cd ../..
-          cd artifacts/x86_64-windows-fdev && zip ../../fdev-x86_64-pc-windows-msvc.zip fdev.exe && cd ../..
+          (cd artifacts/x86_64-windows-freenet && zip ../../freenet-x86_64-pc-windows-msvc.zip freenet.exe)
+          (cd artifacts/x86_64-windows-fdev && zip ../../fdev-x86_64-pc-windows-msvc.zip fdev.exe)
           cp artifacts/x86_64-windows-freenet/freenet.exe freenet.exe
 
           # macOS universal installer (signed + notarized)
@@ -696,7 +710,10 @@ jobs:
       - name: Generate SHA256 checksums
         run: |
           # Generate checksums for all available release assets
-          sha256sum *.tar.gz *.zip *.exe *.dmg 2>/dev/null > SHA256SUMS.txt || true
+          # No `|| true`: every one of these globs is produced by the step
+          # above, so a missing class is a broken release, not a skip.
+          set -euo pipefail
+          sha256sum *.tar.gz *.zip *.exe *.dmg > SHA256SUMS.txt
 
           # Display checksums
           echo "=== SHA256 Checksums ==="
@@ -724,12 +741,14 @@ jobs:
             exit 1
           fi
           if [ -z "${FREENET_RELEASE_SIGNING_KEY:-}" ]; then
-            # Degrade gracefully: clients tolerate an absent signature during
-            # the two-release transition (REQUIRE_RELEASE_SIGNATURE=false), so
-            # a missing secret must not fail the whole release. The upload step
-            # deletes any stale .sig so the release stays consistently unsigned.
-            echo "::warning::FREENET_RELEASE_SIGNING_KEY not set; release will be UNSIGNED."
-            exit 0
+            # Refuse. Every release since #4587 is signed, so an unsigned one is
+            # a regression, not a transition state: clients still accept it
+            # (REQUIRE_RELEASE_SIGNATURE=false) but verify nothing, and
+            # docker-publish.yml requires a verified signature, so it would fail
+            # only after the release is public. The release is still a draft
+            # here; restore the secret and re-run the job.
+            echo "::error::FREENET_RELEASE_SIGNING_KEY is not set; refusing to publish an UNSIGNED release. Restore the secret and re-run this job."
+            exit 1
           fi
 
           # Write the key to a 0600 temp PEM and remove it on every exit path.
@@ -1039,26 +1058,42 @@ jobs:
           # binary's updater has been verified. The release is created as a
           # draft by release.sh/release.yml to prevent the installer from
           # seeing a version before binaries exist.
-          gh release edit "$TAG_NAME" \
-            --repo ${{ github.repository }} \
-            --draft=false
-          # An older release can have been marked latest by hand to stop a bad
-          # build spreading (0.2.151 for 0.2.152). Nodes only see the release
-          # that /releases/latest points at, so the new one must take that over.
-          # This is a separate call and cannot fail the step: the release is
-          # already published here, and GitHub does not allow a draft to be
-          # latest. A recovery run on an older tag must not move the marker
-          # backwards, so it applies only to the highest version.
-          HIGHEST=$(gh release list --repo ${{ github.repository }} --limit 30 --exclude-drafts \
+          set -euo pipefail
+          # Decide BEFORE un-drafting whether this release becomes latest, and
+          # do both in ONE call. Nodes only see the release /releases/latest
+          # points at, so the newest release must take that marker over, even
+          # from an older one marked latest by hand to stop a bad build
+          # spreading (0.2.151 for 0.2.152). A recovery run on an OLDER tag
+          # must not take it: an un-draft that does not say otherwise is made
+          # latest by GitHub, which would move the marker backwards for good,
+          # and release-announce.yml / gateway-update.yml, which fire on this
+          # un-draft, read the marker. A failed listing fails here, while the
+          # release is still a draft, so a re-run is safe.
+          PUBLISHED=$(gh release list --repo ${{ github.repository }} --limit 30 --exclude-drafts \
             --json tagName,isPrerelease \
-            --jq '.[] | select(.isPrerelease | not) | .tagName' | sort -V | tail -1 || true)
-          if [ -z "$HIGHEST" ]; then
-            echo "::warning::could not list releases; if $TAG_NAME is the newest, run: gh release edit $TAG_NAME --latest"
-          elif [ "$HIGHEST" = "$TAG_NAME" ]; then
-            gh release edit "$TAG_NAME" --repo ${{ github.repository }} --latest \
-              || echo "::warning::could not mark $TAG_NAME as latest; run: gh release edit $TAG_NAME --latest"
+            --jq '.[] | select(.isPrerelease | not) | .tagName')
+          HIGHEST=$(printf '%s\n%s\n' "$PUBLISHED" "$TAG_NAME" | sed '/^$/d' | sort -V | tail -1)
+          if [ "$HIGHEST" = "$TAG_NAME" ]; then
+            MAKE_LATEST=true
+          else
+            MAKE_LATEST=false
+            echo "::notice::$TAG_NAME is older than $HIGHEST; publishing it without taking the latest marker."
           fi
-          echo "✅ Release $TAG_NAME published with all binaries attached"
+          # GitHub applies an edit atomically, so a refused combined call has
+          # changed nothing. Should it ever refuse the pair, fall back to the
+          # two-call form this step used before (un-draft, then mark latest).
+          if ! gh release edit "$TAG_NAME" \
+              --repo ${{ github.repository }} \
+              --draft=false \
+              --latest="$MAKE_LATEST"; then
+            echo "::warning::un-draft with --latest=$MAKE_LATEST was refused; retrying as un-draft, then latest"
+            gh release edit "$TAG_NAME" --repo ${{ github.repository }} --draft=false
+            if [ "$MAKE_LATEST" = true ]; then
+              gh release edit "$TAG_NAME" --repo ${{ github.repository }} --latest \
+                || echo "::warning::could not mark $TAG_NAME as latest; run: gh release edit $TAG_NAME --latest"
+            fi
+          fi
+          echo "✅ Release $TAG_NAME published with all binaries attached (latest=$MAKE_LATEST)"
 
   # -----------------------------------------------------------------------
   # Gate B of the auto-update canary (#5222) — end-to-end, after publication.

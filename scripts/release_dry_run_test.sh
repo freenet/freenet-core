@@ -267,7 +267,7 @@ done
 # behaviour must change this list deliberately.
 step_seq() { grep "^$2 / " <<< "$1" | sed "s|^$2 / ||" | paste -sd'|' -; }
 check "live: validate step order" "$(step_seq "$LIVE_RUN" validate)" \
-    "Checkout code|Resolve run mode (live or dry run)|Warn if RELEASE_PAT is not configured|Verify the crates.io token before anything is created|Resolve + validate version|Check the QUIC data ramp start is near now"
+    "Checkout code|Resolve run mode (live or dry run)|Check RELEASE_PAT is configured|Verify the crates.io token before anything is created|Resolve + validate version|Refuse a version that is spent or already being cut|Check the QUIC data ramp start is near now"
 check "live: update_versions step order" "$(step_seq "$LIVE_RUN" update_versions)" \
     "Checkout code|Configure git|Update freenet version|Update fdev version|Install Rust|Update Cargo.lock|Commit the version bump locally|Compose the release PR|Push the release branch|Create Pull Request|Enable auto-merge"
 check "live: wait_for_pr step order" "$(step_seq "$LIVE_RUN" wait_for_pr)" \
@@ -295,7 +295,8 @@ for j in jobs:
     print(f"effective:{j.name}={sorted((j.permissions or workflow).items())}")
 PY
 )
-check "validate is read-only" "$(grep '^validate=' <<< "$PERMS")" "validate=[('contents', 'read')]"
+# Reads only: actions and pull-requests are read by check_release_preflight.sh.
+check "validate is read-only" "$(grep '^validate=' <<< "$PERMS")" "validate=[('actions', 'read'), ('contents', 'read'), ('pull-requests', 'read')]"
 check "summary holds no permissions" "$(grep '^summary=' <<< "$PERMS")" "summary=[('*', '{}')]"
 check "dry_run_rehearsal is read-only" "$(grep '^dry_run_rehearsal=' <<< "$PERMS")" "dry_run_rehearsal=[('contents', 'read')]"
 # ...and the live jobs keep what they need: push and PR in update_versions,
@@ -337,6 +338,11 @@ for a in "$@"; do [ -n "$a" ] || echo "EMPTYARG" >> "$STUB_CALLS"; done
 if [[ "$(basename "$0")" == gh && -z "${GH_TOKEN:-}" ]]; then echo "NOTOKEN" >> "$STUB_CALLS"; fi
 if [[ "$(basename "$0")" == gh && "$1 $2" == "pr create" ]]; then
     echo "https://github.com/example/repo/pull/123"
+fi
+# No release exists yet: create_release's re-run check must fall through to
+# the create. (git ls-remote prints nothing, so the tag is absent too.)
+if [[ "$(basename "$0")" == gh && "$1 $2" == "release view" ]]; then
+    exit 1
 fi
 exit 0
 SH
@@ -420,6 +426,54 @@ TAG_MAKE=$(tag_line "git tag -a v@@needs.validate.outputs.version@@ -m Release v
 TAG_PUSH=$(tag_line "git push origin v@@needs.validate.outputs.version@@")
 check "live tags in order: identity, annotated tag, push" \
     "$([ -n "$TAG_NAME" ] && [ -n "$TAG_IDENT" ] && [ -n "$TAG_MAKE" ] && [ -n "$TAG_PUSH" ] && [ "$TAG_NAME" -lt "$TAG_MAKE" ] && [ "$TAG_IDENT" -lt "$TAG_MAKE" ] && [ "$TAG_MAKE" -lt "$TAG_PUSH" ] && echo ordered || echo "name=$TAG_NAME email=$TAG_IDENT tag=$TAG_MAKE push=$TAG_PUSH")" "ordered"
+# Re-running create_release after the tag pushed but the release create failed
+# must not die at `git tag`: an existing tag on RELEASE_SHA is accepted and not
+# re-pushed, a tag anywhere else refuses, and an existing release is not
+# re-created. A stub git answers ls-remote from $LSREMOTE.
+REL_SHA='@@needs.wait_for_pr.outputs.release_sha || github.sha@@'
+TAG_REF='refs/tags/v@@needs.validate.outputs.version@@'
+RERUN_STUBS="$TEST_TMP/rerun-stubs"
+mkdir -p "$RERUN_STUBS"
+cp "$STUBS/gh" "$RERUN_STUBS/gh"
+cat > "$RERUN_STUBS/git" <<'SH'
+#!/usr/bin/env bash
+echo "git $*" >> "$STUB_CALLS"
+[ "$1" = ls-remote ] && printf '%b' "${LSREMOTE:-}"
+exit 0
+SH
+chmod +x "$RERUN_STUBS/git"
+TAG_SCRIPT=$(grep -lxF "create_release / Create and push tag" "$RUNS"/*.name)
+TAG_SCRIPT="${TAG_SCRIPT%.name}.sh"
+rerun_tag() {
+    local calls="$TEST_TMP/rerun.calls" rc=0 line
+    local -a envs=()
+    : > "$calls"
+    while IFS= read -r line; do envs+=("$line"); done < "${TAG_SCRIPT%.sh}.env"
+    ( builtin cd -- "$SCRATCH" && env "${envs[@]}" PATH="$RERUN_STUBS:$PATH" STUB_CALLS="$calls" \
+        LSREMOTE="$1" RELEASE_LIVE=true bash -e "$TAG_SCRIPT" ) > "$TEST_TMP/rerun.out" 2>&1 || rc=$?
+    echo "rc=$rc pushes=$(grep -c '^git push' "$calls")"
+}
+check "re-run: annotated tag already on RELEASE_SHA is accepted, not re-pushed" \
+    "$(rerun_tag "deadbeef\t$TAG_REF\n$REL_SHA\t$TAG_REF^{}\n")" "rc=0 pushes=0"
+check "re-run: lightweight tag already on RELEASE_SHA is accepted, not re-pushed" \
+    "$(rerun_tag "$REL_SHA\t$TAG_REF\n")" "rc=0 pushes=0"
+check "re-run: tag on another commit refuses without pushing" \
+    "$(rerun_tag "deadbeef\t$TAG_REF\nfeedface\t$TAG_REF^{}\n")" "rc=1 pushes=0"
+check "no tag yet: tags and pushes" "$(rerun_tag "")" "rc=0 pushes=1"
+REL_SCRIPT=$(grep -lxF "create_release / Create GitHub release" "$RUNS"/*.name)
+REL_SCRIPT="${REL_SCRIPT%.name}.sh"
+cat > "$RERUN_STUBS/gh" <<'SH'
+#!/usr/bin/env bash
+echo "gh $*" >> "$STUB_CALLS"
+exit 0
+SH
+REL_CALLS="$TEST_TMP/rel.calls"
+: > "$REL_CALLS"
+mapfile -t REL_ENVS < "${REL_SCRIPT%.sh}.env"
+( builtin cd -- "$SCRATCH" && env "${REL_ENVS[@]}" PATH="$RERUN_STUBS:$PATH" STUB_CALLS="$REL_CALLS" \
+    RELEASE_LIVE=true bash -e "$REL_SCRIPT" ) > /dev/null 2>&1 || true
+check "re-run: an existing release is not re-created" "$(grep -c '^gh release create' "$REL_CALLS")" "0"
+
 # The PR number a live run hands to auto-merge and wait_for_pr is the one in
 # the URL `gh pr create` printed (the stub prints .../pull/123).
 check "Create Pull Request writes the PR number from gh's URL" \
