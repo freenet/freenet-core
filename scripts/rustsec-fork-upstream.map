@@ -1,0 +1,20 @@
+# Upstream crates that the vendored quinn fork (freenet-quinn*, see
+# crates/core/Cargo.toml) is built from. `cargo audit` matches advisories by
+# crate name, so it never sees advisories filed against `quinn` / `quinn-proto`
+# for the renamed fork crates. scripts/rustsec-watch.sh audits these upstream
+# name/version pairs as well.
+#
+# Format: <fork crate> <upstream crate> <upstream version>
+#
+# The version is the newest RELEASED upstream version that is an ancestor of
+# the fork's commit (the fork is upstream's 0.11.x branch plus unreleased
+# commits). It is a lower bound on what the fork contains, so a report here may
+# be a false positive when the fork head already carries an unreleased fix: check
+# the fork head before dismissing it, and never raise the version without
+# checking ancestry. Update this file in the same PR as every fork bump
+# (docs/quinn-rustls-bump.md).
+#
+# freenet/quinn @ 9072e7f1 (freenet-quinn 0.11.13): quinn-proto-0.11.19 is an
+# ancestor (compare quinn-proto-0.11.19...9072e7f1: ahead 40, behind 0).
+freenet-quinn quinn 0.11.12
+freenet-quinn-proto quinn-proto 0.11.19
