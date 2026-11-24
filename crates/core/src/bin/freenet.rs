@@ -365,7 +365,7 @@ async fn run_network_node_with_signals(
         claim_update_attempt_after_staging, clear_version_mismatch, get_open_connection_count,
         has_reached_max_backoff, has_version_mismatch, jittered_repoll_interval,
         repoll_deadline_while_cooling, reset_backoff, should_attempt_update, startup_update_check,
-        update_attempt_claimable, version_mismatch_generation,
+        update_attempt_claimable, update_attempt_would_spend_retry, version_mismatch_generation,
     };
     use commands::update::stage_latest_release;
     use freenet::transport::{
@@ -1081,21 +1081,25 @@ async fn run_network_node_with_signals(
             // may have moved past this version. Same claim, blocked-version
             // gate and staging as the re-poll; at most one check an hour. Not
             // run while a release cools down, and then it does not use up the
-            // hour.
+            // hour. It also stays out when the claim would spend a locked-out
+            // node's daily retry (#3934): this fires when the node is likely
+            // offline, so the retry would go on a fetch that cannot succeed.
+            // The hour starts only once the claim is granted.
             if !cooling()
-                && handshake_trigger.should_check(
+                && handshake_trigger.due(
                     Instant::now(),
                     get_open_connection_count(),
                     get_bootstrap_rounds_without_connection(),
                 )
+                && !update_attempt_would_spend_retry()
             {
-                tracing::info!(
-                    rounds = get_bootstrap_rounds_without_connection(),
-                    checks_started = commands::auto_update::handshake_failure_checks_started(),
-                    "No connection after repeated gateway handshake failures: \
-                     checking GitHub for a newer release"
-                );
                 if let Ok(attempt) = claim_update_attempt() {
+                    handshake_trigger.record_started(Instant::now());
+                    tracing::info!(
+                        rounds = get_bootstrap_rounds_without_connection(),
+                        checks_started = commands::auto_update::handshake_failure_checks_started(),
+                        "No connection after repeated gateway handshake failures: checking GitHub"
+                    );
                     if let Some(new_version) =
                         startup_update_check(attempt, build_info::VERSION).await
                     {
@@ -1104,15 +1108,12 @@ async fn run_network_node_with_signals(
                         {
                             tracing::warn!(
                                 new_version = %new_version,
-                                "Handshake-failure check: newer version is locally blocked \
-                                 (crash-loop known-bad pin or repeated install failures); not \
-                                 triggering auto-update"
+                                "Handshake-failure check: newer version is locally blocked; not triggering auto-update"
                             );
                         } else {
                             tracing::info!(
                                 new_version = %new_version,
-                                "Handshake-failure check: newer version on GitHub, triggering \
-                                 auto-update"
+                                "Handshake-failure check: newer version on GitHub, triggering auto-update"
                             );
                             if stage_latest_release(build_info::VERSION, Some(&new_version))
                                 .await
@@ -3487,6 +3488,42 @@ mod tests {
             .map(|line| line.split_once("//").map(|(code, _)| code).unwrap_or(line))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// The handshake-failure update check (#5940 prerequisite) stays plugged
+    /// in: the update task consults the rule behind the cooling gate, skips a
+    /// node whose claim would spend its locked-out retry, claims, and only then
+    /// records the start; and the maintenance loop publishes the pacer's real
+    /// round count (a constant fails).
+    #[test]
+    fn the_handshake_failure_check_is_wired_in_order() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let body = fn_body(&src, "async fn run_network_node_with_signals(");
+        let flat: String = body.split_whitespace().collect();
+        let gate = flat
+            .find("if!cooling()&&handshake_trigger.due(")
+            .expect("the update task must consult the trigger behind the cooling gate");
+        let after = &flat[gate..];
+        let spend = after
+            .find("!update_attempt_would_spend_retry()")
+            .expect("the trigger must skip a node whose claim would spend its retry");
+        let claim = after
+            .find("claim_update_attempt()")
+            .expect("the trigger claims");
+        let record = after
+            .find("handshake_trigger.record_started(")
+            .expect("the trigger records a started check");
+        assert!(spend < claim && claim < record, "spend gate, claim, record");
+        assert!(after.contains("get_bootstrap_rounds_without_connection()"));
+
+        let ring = strip_line_comments(include_str!("../ring.rs"));
+        let ring_flat: String = ring.split_whitespace().collect();
+        assert!(
+            ring_flat.contains(
+                "set_bootstrap_rounds_without_connection(op_manager.bootstrap_pacer.lock().rounds_without_connection(),)"
+            ),
+            "connection_maintenance must publish BootstrapPacer::rounds_without_connection"
+        );
     }
 
     /// #5975: `run_network` records the updater's state BEFORE the node is
