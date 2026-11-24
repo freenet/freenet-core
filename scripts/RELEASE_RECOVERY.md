@@ -1,6 +1,7 @@
 # Freenet Release Recovery Guide
 
-When the release script fails mid-process, use this guide to complete the release manually.
+When a release fails mid-process (normally a `release.yml` run, or the legacy
+`scripts/release.sh` driver), use this guide to complete it.
 
 ## Read this before running anything
 
@@ -13,7 +14,7 @@ bump PR merges
   -> cross-compile.yml:  build -> attach binaries
                          -> Gate A: auto-update pre-flight   BLOCKING
                          -> cargo publish (crates.io)        IRREVERSIBLE
-                         -> gh release edit --draft=false
+                         -> gh release edit --draft=false --latest=<newest?>
 ```
 
 Two consequences for anyone recovering by hand. Both are about ORDER, not about
@@ -66,6 +67,22 @@ git push --delete origin vX.Y.Z
 git tag -d vX.Y.Z
 ```
 
+### Re-cutting the same version
+
+`release.yml` cannot do this. Its bump PR for X.Y.Z already merged, so `main`
+already says X.Y.Z, the bump would be an empty commit, and the pre-flight in
+`validate` refuses the dispatch ("main is already at X.Y.Z"). Two ways on:
+
+- **Cut the next patch** with `release.yml` as normal. Simplest; it costs a
+  version number but nothing else.
+- **Keep X.Y.Z** by tagging the corrected commit by hand. Land the fix on
+  `main` through a normal PR, soak that `main` HEAD (the `freenet:release`
+  skill's gates apply as for any cut), then follow Steps 2 and 3 below with
+  `RELEASE_SHA` set to that soaked commit, after checking that its
+  `crates/core/Cargo.toml` says X.Y.Z. This skips the merge queue's
+  full-suite release gate, so confirm the fix PR's own CI (which runs the
+  full suite) was green.
+
 ## Quick Reference
 
 ```bash
@@ -103,10 +120,18 @@ gh run list --workflow=cross-compile.yml --branch vX.Y.Z --limit 3
 - CI may be failing
 
 **Recovery:**
+
+An open bump PR also blocks every later live `release.yml` dispatch (the
+pre-flight refuses while one is open), so drive it to merged, or close it, before
+starting anything else.
+
 1. Fix any CI failures
-2. If conventional commits check failed:
+2. If the conventional commits check failed, restore the title. It MUST start
+   with `build: release `: `ci.yml` keys the full-suite release gate in the
+   merge queue on that prefix, so any other title (`chore: release` included)
+   passes the title check while silently switching the release gate off.
    ```bash
-   gh pr edit <PR_NUMBER> --title "chore: release X.Y.Z"
+   gh pr edit <PR_NUMBER> --title "build: release X.Y.Z"
    ```
 3. If other CI failures, fix code and push to release branch
 4. Wait for PR to auto-merge or merge manually
@@ -169,13 +194,11 @@ against the tag; `attach-to-release` requires a `refs/tags/v*` ref, so the
 `--ref` must be the tag, not a branch:
 
 **Check nothing is already running for this tag first.** `cross-compile.yml`
-sets `cancel-in-progress` for any ref that is not `main`, so dispatching against
-a tag **cancels the in-flight run for that same tag**. The moment you reach for
-this command — "did it start? is it stuck?" — is exactly when a run may be in
-flight, and a cancellation can now land between the two crate publishes, or
-between the publish and the un-draft. Both states are recoverable (Step 4
-re-runs safely, skipping whatever already published), but do not create them for
-no reason.
+never cancels a tag run (it used to, which could land a cancellation between
+the two crate publishes, or between the publish and the un-draft), so a second
+dispatch now QUEUES behind the in-flight one and repeats its work once it
+finishes. That is safe, since the publish and the un-draft skip what is already
+done, but it is an hour of runners for nothing.
 
 ```bash
 # Is one already running? If so, watch it instead of dispatching.
@@ -373,8 +396,16 @@ for c in "freenet 0.1.X" "fdev 0.Y.Z"; do
   esac
 done
 
-# ONLY now, and only if Gate A reported success above, un-draft:
-gh release edit "$TAG" --repo "$REPO" --draft=false
+# ONLY now, and only if Gate A reported success above, un-draft. Decide
+# `--latest` in the same call, as cross-compile.yml's "Publish release" does:
+# a bare un-draft is made latest by GitHub, which for a tag older than a
+# published release moves the marker backwards, and nodes update from it.
+PUBLISHED=$(gh release list --repo "$REPO" --limit 30 --exclude-drafts \
+  --json tagName,isPrerelease --jq '.[] | select(.isPrerelease | not) | .tagName') \
+  || { echo "STOP: could not list releases"; exit 1; }
+HIGHEST=$(printf '%s\n%s\n' "$PUBLISHED" "$TAG" | sed '/^$/d' | sort -V | tail -1)
+if [ "$HIGHEST" = "$TAG" ]; then MAKE_LATEST=true; else MAKE_LATEST=false; fi
+gh release edit "$TAG" --repo "$REPO" --draft=false --latest="$MAKE_LATEST"
 ```
 
 ### Step 4b: Gate A blocked the release
@@ -413,41 +444,34 @@ no verdict inside its window), that is infrastructure, not a bug in the binary.
 Re-run the job. An unverified gate is still not a passed gate — do not
 un-draft to work around it.
 
-### Step 5: Crates Published but Local Not Deployed
+### Step 5: Published but Gateways Not Updated
 
 **Symptoms:**
-- Everything published
-- Local gateway not updated
+- Release published (not a draft)
+- The gateways are still on the previous version
 
-**Recovery:**
+**Recovery:** the `release.published` event normally starts
+`gateway-update.yml`. If it did not (RELEASE_PAT missing or expired), dispatch
+it. Do not build from source and copy a binary onto a gateway: the gateways run
+the exact released binary, installed by their release-agent.
 ```bash
-cd ~/code/freenet/freenet-core/main
-cargo build --release --bin freenet
-
-# Deploy to gateway only
-./scripts/deploy-local-gateway.sh
-
-# Deploy to all instances (gateway + 10 peers)
-./scripts/deploy-local-gateway.sh --all-instances
+gh workflow run gateway-update.yml --repo freenet/freenet-core \
+  --field version=X.Y.Z --field gateways=all
 ```
 
-### Step 6: Deployed but Matrix Not Announced
+### Step 6: Published but Not Announced
 
 **Symptoms:**
 - Release complete
-- No Matrix announcement
+- No Matrix or River announcement
 
-**Recovery:**
+**Recovery:** `release-announce.yml` normally runs on `release.published`.
+It deliberately posts nothing for a prerelease or for a release older than one
+already published (a recovery un-draft of an old tag), so silence there is
+expected. Otherwise dispatch it by hand; a dispatch always posts, and re-running
+it is idempotent for Matrix.
 ```bash
-matrix-commander -r '#freenet-locutus:matrix.org' -m "🎉 **Freenet v0.1.X Released!**
-
-📦 Published to crates.io:
-  • freenet v0.1.X
-  • fdev v0.Y.Z
-
-🔗 Release: https://github.com/freenet/freenet-core/releases/tag/v0.1.X
-
-[AI-assisted release announcement]"
+gh workflow run release-announce.yml --repo freenet/freenet-core --field version=X.Y.Z
 ```
 
 ## Common Issues
@@ -478,9 +502,10 @@ sudo systemctl start freenet-gateway freenet-peer-{01..10}
 
 **Cause:** PR title doesn't follow conventional commit format
 
-**Solution:**
+**Solution:** restore the generated title. It must start with `build: release `,
+which is what `ci.yml` keys the full-suite merge-queue release gate on.
 ```bash
-gh pr edit <PR_NUMBER> --title "chore: release X.Y.Z"
+gh pr edit <PR_NUMBER> --title "build: release X.Y.Z"
 
 # Trigger CI rerun
 git checkout release/vX.Y.Z
@@ -528,9 +553,11 @@ cd ~/code/freenet/freenet-core/main
 # Edit Cargo.toml versions manually
 git checkout -b release/v0.1.X
 git add -A
-git commit -m "chore: release 0.1.X"
+git commit -m "build: release 0.1.X"
 git push origin release/v0.1.X
-gh pr create --title "chore: release 0.1.X" --body "Release v0.1.X" --base main
+# The title MUST start with "build: release ": ci.yml keys the full-suite
+# merge-queue release gate on it.
+gh pr create --title "build: release 0.1.X" --body "Release v0.1.X" --base main
 
 # 2. Wait for CI and merge (or use gh pr merge --auto)
 
@@ -558,12 +585,10 @@ gh release view v0.1.X --json isDraft --jq '.isDraft'   # must be false
 # published?" (see Step 4b and the Quick Reference).
 cargo search freenet --limit 1
 
-# 7. Deploy locally
-cargo build --release --bin freenet
-./scripts/deploy-local-gateway.sh --all-instances
-
-# 8. Announce to Matrix
-matrix-commander -r '#freenet-locutus:matrix.org' -m "..."
+# 7. Gateways and announcements fire on the un-draft (release.published). If
+#    they did not, dispatch them (Steps 5 and 6 above):
+gh workflow run gateway-update.yml --repo freenet/freenet-core --field version=0.1.X --field gateways=all
+gh workflow run release-announce.yml --repo freenet/freenet-core --field version=0.1.X
 ```
 
 ## Rollback

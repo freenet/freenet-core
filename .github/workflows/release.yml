@@ -27,11 +27,16 @@ jobs:
   validate:
     name: Validate release inputs
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 10: the live pre-flight adds a few API calls and a retried crates.io probe.
+    timeout-minutes: 10
     # Reads only. Without this the job would hold the workflow's write token,
     # in a dry run as much as a live one.
     permissions:
       contents: read
+      # check_release_preflight.sh lists release.yml runs and open
+      # `release/v*` PRs to refuse a concurrent cut.
+      actions: read
+      pull-requests: read
     outputs:
       version: ${{ steps.validate.outputs.version }}
       fdev_version: ${{ steps.validate.outputs.fdev_version }}
@@ -56,17 +61,26 @@ jobs:
           DRY_RUN_INPUT: ${{ inputs.dry_run }}
         run: bash scripts/resolve_release_mode.sh
 
-      - name: Warn if RELEASE_PAT is not configured
+      # A LIVE run refuses without RELEASE_PAT; a dry run only warns. Without
+      # it every push, tag and un-draft is made with GITHUB_TOKEN, whose events
+      # GitHub suppresses: the bump PR gets no CI, the tag push never starts
+      # cross-compile.yml, and nothing ever un-drafts or announces. A live run
+      # without it stalls half-done after the bump has merged (#4118, v0.2.57).
+      - name: Check RELEASE_PAT is configured
         env:
           # Workflow secrets are not directly visible in `if:` expressions,
           # so we expose RELEASE_PAT via env and check for emptiness inside
           # the step. The value is never echoed.
           RELEASE_PAT_PRESENT: ${{ secrets.RELEASE_PAT != '' }}
+          RELEASE_LIVE: ${{ steps.mode.outputs.live }}
         run: |
-          if [ "$RELEASE_PAT_PRESENT" != "true" ]; then
-            echo "::warning title=RELEASE_PAT not set::The release workflow can complete without RELEASE_PAT, but downstream workflows (CI on the bump PR, gateway-update.yml, release-announce.yml) will NOT fire automatically. GITHUB_TOKEN suppresses workflow-triggering events as an anti-recursion safeguard. Configure a RELEASE_PAT repo secret with 'repo' + 'workflow' scopes to make releases zero-touch. See issue #4118 and AGENTS.md → 'Release Workflow & RELEASE_PAT'."
-          else
+          if [ "$RELEASE_PAT_PRESENT" = "true" ]; then
             echo "✅ RELEASE_PAT is configured. Downstream workflows will be triggered automatically."
+          elif [ "$RELEASE_LIVE" = "true" ]; then
+            echo "::error title=RELEASE_PAT not set::A live release needs RELEASE_PAT. With GITHUB_TOKEN the tag push does not start cross-compile.yml and the un-draft fires no gateway-update or announcement, so the release would stop half-done after the bump PR merged. Configure a RELEASE_PAT repo secret with 'repo' + 'workflow' scopes. See issue #4118 and AGENTS.md → 'Release Workflow & RELEASE_PAT'."
+            exit 1
+          else
+            echo "::warning title=RELEASE_PAT not set::Dry run only. A live run refuses without RELEASE_PAT (#4118)."
           fi
 
       # The crates.io credential is checked HERE, in the first job, because the
@@ -140,28 +154,68 @@ jobs:
           fi
           echo "✅ CARGO_REGISTRY_TOKEN is present. Its live validity is NOT checked here; see the comment above this step for why crates.io offers no endpoint that could."
 
+      # Presence only, like the crates.io token above. cross-compile.yml's
+      # "Sign SHA256SUMS.txt" refuses to publish an unsigned release, and that
+      # runs after the tag and ~25 minutes of builds; finding a missing key
+      # here costs nothing.
+      - name: Verify the release signing key before anything is created
+        if: steps.mode.outputs.live == 'true'
+        env:
+          FREENET_RELEASE_SIGNING_KEY_PRESENT: ${{ secrets.FREENET_RELEASE_SIGNING_KEY != '' }}
+        run: |
+          if [ "$FREENET_RELEASE_SIGNING_KEY_PRESENT" != "true" ]; then
+            echo "::error title=FREENET_RELEASE_SIGNING_KEY not set::cross-compile.yml refuses to publish an unsigned release, so without this secret the release would stop as a draft after the tag and the builds. Restore the secret and re-run."
+            exit 1
+          fi
+          echo "✅ FREENET_RELEASE_SIGNING_KEY is present."
+
       - name: Resolve + validate version
         id: validate
+        env:
+          # Via env, not `${{ }}` in the script: the raw input is templated in
+          # before the format check below could reject it.
+          VERSION_INPUT: ${{ inputs.version }}
         run: |
-          VERSION="${{ inputs.version }}"
-          VERSION="${VERSION#v}"
+          set -euo pipefail
+          VERSION="${VERSION_INPUT#v}"
 
           if [[ -z "$VERSION" ]]; then
             # Auto-bump: take the highest released version on crates.io for
             # the `freenet` crate and increment the patch. Minor/major bumps
             # still require explicit input.
+            # `|| true`: under pipefail a curl failure would abort before the
+            # error below names the cause; the regex check still fails closed.
             LATEST=$(curl -sS -A 'github-actions' https://crates.io/api/v1/crates/freenet \
-              | jq -r '.crate.max_version')
+              | jq -r '.crate.max_version' || true)
             if [[ ! "$LATEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "::error::Could not resolve latest version from crates.io (got: '$LATEST')"
               exit 1
             fi
-            MAJOR=$(echo "$LATEST" | cut -d. -f1)
-            MINOR=$(echo "$LATEST" | cut -d. -f2)
-            PATCH=$(echo "$LATEST" | cut -d. -f3)
+            # Bump from the higher of crates.io and this tree's version. After a
+            # Gate A block the bump has merged but nothing was published, so
+            # crates.io alone would pick the version main already carries, which
+            # the pre-flight refuses on every dispatch.
+            CURRENT=$(awk '/^\[package\]/ {p = 1; next} /^\[/ {p = 0}
+                           p && /^version *=/ {gsub(/.*= *"|".*/, ""); print; exit}' crates/core/Cargo.toml)
+            # Only those two shapes are guessed: the tree equal to crates.io (the
+            # normal case) or one patch ahead of it (a merged, unpublished bump).
+            # Anything else (a tree far ahead, an unreadable version, a dispatch
+            # from a branch carrying some other version) needs an explicit input.
+            NEXT_OF_LATEST="$(echo "$LATEST" | cut -d. -f1-2).$(( $(echo "$LATEST" | cut -d. -f3) + 1 ))"
+            if [[ "$CURRENT" == "$LATEST" ]]; then
+              BASE="$LATEST"
+            elif [[ "$CURRENT" == "$NEXT_OF_LATEST" ]]; then
+              BASE="$CURRENT"
+            else
+              echo "::error::No version input, and the tree's version '$CURRENT' is neither crates.io's $LATEST nor one patch above it. Dispatch with an explicit version."
+              exit 1
+            fi
+            MAJOR=$(echo "$BASE" | cut -d. -f1)
+            MINOR=$(echo "$BASE" | cut -d. -f2)
+            PATCH=$(echo "$BASE" | cut -d. -f3)
             NEW_PATCH=$((PATCH + 1))
             VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
-            echo "::notice::No version input; auto-bumping patch from crates.io latest $LATEST → $VERSION"
+            echo "::notice::No version input; auto-bumping patch from $BASE (crates.io latest $LATEST, tree $CURRENT) → $VERSION"
           else
             if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "::error::Version must be in format X.Y.Z (e.g., 0.1.31). Got: $VERSION"
@@ -184,6 +238,18 @@ jobs:
           echo "✅ Release versions:"
           echo "  freenet: $VERSION"
           echo "  fdev: $FDEV_VERSION"
+
+      # Refuse, before anything is created, the cuts that would otherwise fail
+      # half-done: after the bump PR has merged (a tag that already exists, a
+      # version already on crates.io) or after a second bump PR has raced the
+      # first one into the queue (a concurrent cut). Live only; a dry run
+      # creates nothing, so it has nothing to collide with.
+      - name: Refuse a version that is spent or already being cut
+        if: steps.mode.outputs.live == 'true'
+        env:
+          RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/check_release_preflight.sh
 
       # The QUIC data ramp release must be published within 3 h of its ramp
       # start (QUIC_DATA_RAMP_START), which is fixed in the binary: a late
@@ -673,10 +739,15 @@ jobs:
           # regress to GITHUB_TOKEN.
           GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           VERSION="${{ needs.validate.outputs.version }}"
 
-          # Get previous release
-          PREV_VERSION=$(gh release list --limit 50 --json tagName --jq '.[].tagName' | head -1 || echo "")
+          # The previous PUBLISHED release. Drafts are excluded: a spent version
+          # is left as a draft on purpose (RELEASE_RECOVERY.md), and measuring
+          # from it would drop its commits from these notes. A `gh` failure
+          # fails the step rather than shipping bare "Release X" notes; nothing
+          # irreversible has happened yet, so a re-run is safe.
+          PREV_VERSION=$(gh release list --limit 50 --exclude-drafts --json tagName --jq '.[0].tagName // empty')
 
           if [ -z "$PREV_VERSION" ]; then
             NOTES="Release $VERSION"
@@ -711,6 +782,27 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           VERSION="${{ needs.validate.outputs.version }}"
+          # Idempotent, so "Re-run failed jobs" works after the tag pushed but
+          # the release create below failed. An existing tag is accepted ONLY
+          # if it already points at RELEASE_SHA; anywhere else is a conflict a
+          # human must resolve (scripts/RELEASE_RECOVERY.md).
+          if ! REFS=$(git ls-remote --tags origin "refs/tags/v$VERSION" "refs/tags/v$VERSION^{}"); then
+            echo "::error::Could not query origin for tag v$VERSION."
+            exit 1
+          fi
+          # The peeled (^{}) line is the commit of an annotated tag; a
+          # lightweight tag has only the plain line.
+          PEELED=$(awk -F'\t' -v r="refs/tags/v$VERSION^{}" '$2 == r {print $1}' <<<"$REFS")
+          PLAIN=$(awk -F'\t' -v r="refs/tags/v$VERSION" '$2 == r {print $1}' <<<"$REFS")
+          REMOTE_SHA="${PEELED:-$PLAIN}"
+          if [ -n "$REMOTE_SHA" ]; then
+            if [ "$REMOTE_SHA" != "$RELEASE_SHA" ]; then
+              echo "::error::Tag v$VERSION already exists at $REMOTE_SHA, not at the release commit $RELEASE_SHA. See scripts/RELEASE_RECOVERY.md."
+              exit 1
+            fi
+            echo "✅ Tag v$VERSION already points at $RELEASE_SHA (re-run); not re-pushing"
+            exit 0
+          fi
           git tag -a "v$VERSION" -m "Release v$VERSION"
           git push origin "v$VERSION"
           echo "✅ Created and pushed tag v$VERSION"
@@ -726,6 +818,14 @@ jobs:
         run: |
           [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not creating the GitHub release: this run is not live (#5936)."; exit 1; }
           VERSION="${{ needs.validate.outputs.version }}"
+          # Idempotent for a re-run of this job after the tag pushed but the
+          # create failed. Validate refused an existing tag, and this job's tag
+          # step accepted only one on RELEASE_SHA, so a release for it is this
+          # cut's (normally still a draft).
+          if gh release view "v$VERSION" --json isDraft >/dev/null 2>&1; then
+            echo "✅ Release v$VERSION already exists (re-run); not re-creating"
+            exit 0
+          fi
           gh release create "v$VERSION" \
             --title "v$VERSION" \
             --notes-file "${{ steps.release_notes.outputs.notes_file }}" \

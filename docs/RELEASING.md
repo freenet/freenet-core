@@ -4,8 +4,8 @@
 > remain are historical incident records (notably the v0.2.71 half-applied
 > rollout that motivated the post-deploy verify) and are kept deliberately —
 > they explain why a check exists. It is no longer a rollout target: the release
-> matrix, the manual SSH driver in `release.sh`, and `RELEASE_AGENT_HMAC_VEGA`
-> have all been removed. nova now runs two gateway processes; the second,
+> matrix, the AWS entry in `release.sh`'s legacy SSH driver (which now targets
+> nova only), and `RELEASE_AGENT_HMAC_VEGA` have all been removed. nova now runs two gateway processes; the second,
 > `freenet-gateway-2`, has no release-agent of its own. It is deliberately not
 > tied to the primary's stop/start (#6336: restarting both together doubled the
 > share of subscribes needing extra hops for 10+ hours). After the primary is
@@ -73,19 +73,20 @@ Within ~30–60 minutes you should see:
 ## Prerequisites
 
 These repo secrets must be configured under
-**Settings → Secrets and variables → Actions**. The workflow degrades
-gracefully when any are missing — it just won't auto-cascade and you'll get
-a `::warning::` annotation telling you what to fix.
+**Settings → Secrets and variables → Actions**. What a missing one costs
+differs per secret (table below): some only skip a notification, and the ones
+whose absence would leave a release half-done fail the run before anything is
+published.
 
 | Secret | Used by | Failure mode if missing |
 |---|---|---|
-| `RELEASE_PAT` | release.yml, cross-compile.yml | Bump PR has no CI; `release.published` doesn't auto-fire downstream workflows. The workflows emit a `::warning::` on every run. |
+| `RELEASE_PAT` | release.yml, cross-compile.yml | A LIVE `release.yml` run fails in `validate`, before anything is created: without it the bump PR gets no CI, the tag push does not start cross-compile.yml and `release.published` does not fire the downstream workflows, so the release would stall half-done. A dry run only warns. |
 | `CARGO_REGISTRY_TOKEN` | release.yml `validate` (checks it), cross-compile.yml `attach-to-release` (uses it) | **`validate` fails first**, before the bump PR exists — that is the intended place to find out, and where to look when a release dies immediately. If `validate` is bypassed (a bare tag push, or a manual `cross-compile.yml` dispatch), `attach-to-release` fails after the binaries are uploaded and the release stays a draft. The actual publish lives in cross-compile.yml, not release.yml, because it is deliberately downstream of Gate A — see "The crates.io publish is downstream of Gate A" below. |
 | `MATRIX_HOMESERVER_URL` | release-announce.yml | Matrix job warns + skips (success, no post). |
 | `MATRIX_ACCESS_TOKEN` | release-announce.yml | Matrix job warns + skips. |
 | `RELEASE_AGENT_HMAC_NOVA` | gateway-update.yml, release-announce.yml | nova update + River announce fail (HTTP 401). |
 | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | cross-compile.yml `build-x86_64-windows` (Authenticode signing) | **Does NOT degrade gracefully — this one fails the release.** See "Windows code signing" below. |
-| `FREENET_RELEASE_SIGNING_KEY` | cross-compile.yml (`Sign SHA256SUMS.txt`) | Releases are UNSIGNED (no `SHA256SUMS.txt.sig` attached). Clients accept unsigned releases during the transition window (`REQUIRE_RELEASE_SIGNATURE = false`), but once that flag is flipped to `true` in a future release, unsigned releases are REFUSED by the auto-updater. PEM-encoded ed25519 private key whose public half is baked into the updater (`update.rs` `FREENET_RELEASE_PUBKEY`). |
+| `FREENET_RELEASE_SIGNING_KEY` | cross-compile.yml (`Sign SHA256SUMS.txt`) | **Fails the release** in `attach-to-release`, while it is still a draft. It used to publish an UNSIGNED release with only a warning; clients accept one (`REQUIRE_RELEASE_SIGNATURE = false`) but verify nothing, and docker-publish.yml then fails after publication because it requires a verified signature. PEM-encoded ed25519 private key whose public half is baked into the updater (`update.rs` `FREENET_RELEASE_PUBKEY`). |
 
 To validate `FREENET_RELEASE_SIGNING_KEY` without cutting a release, run the
 `Build and Cross-Compile` workflow via `workflow_dispatch`: its
@@ -677,7 +678,8 @@ value and refuses in its own script when that is not `true`. No step that
 runs in a dry run is passed `RELEASE_PAT`. The only job that runs in a dry run
 holding a write-capable token is the bump job (`update_versions`), and the
 only step given that token is its checkout, which uses it to fetch and
-persists nothing. `validate` is read-only, `summary` has no permissions, and
+persists nothing. `validate` is read-only (it reads Actions runs and PRs for
+the live pre-flight below), `summary` has no permissions, and
 the rehearsal job is read-only. A presence test such as
 `secrets.RELEASE_PAT != ''` passes no credential and is allowed. Rule Lint's
 `.github/scripts/check_release_dry_run.py` and the CI self-test
@@ -690,13 +692,36 @@ Caveats:
   the branch and auto-merged the bump PR, so `--ref` pointing at an older tag
   or branch still does.
 - **It does not exercise the live-only half:** the `CARGO_REGISTRY_TOKEN`
-  presence check, waiting for the bump PR's merge queue (`wait_for_pr`,
+  presence check, the pre-flight below, waiting for the bump PR's merge queue (`wait_for_pr`,
   `resolve_release_sha.sh`), GitHub's generated release notes, the tag push
   and the release creation, and everything the tag triggers in
   `cross-compile.yml` (binaries, Gate A, the crates.io publish). A green dry
   run says the bump and the packaging are sound, not that a cut will ship.
 - Whether a dry run needs the pre-cut preconditions is decided by the
   `freenet:release` skill, not here.
+
+## Live pre-flight
+
+A live run's `validate` job runs `scripts/check_release_preflight.sh` before
+anything is created, and refuses when:
+
+- **another `release.yml` run is queued or in progress** (a dry run counts; a
+  run stuck waiting counts too, so cancel it), or **a version-bump PR is open**
+  (head `release/v*` or title `build: release`; a failed cut can leave one
+  behind, see `scripts/RELEASE_RECOVERY.md` Step 1). It does not check for a
+  previous tag's still-running `cross-compile.yml` run; the `freenet:release`
+  skill's P0 still does;
+- **tag `vX.Y.Z` already exists**, or **freenet X.Y.Z is already on crates.io**
+  (an unreadable answer refuses too);
+- **X.Y.Z is not above `crates/core/Cargo.toml`** on the dispatched ref.
+  (A blank version auto-bumps from crates.io, or from the tree when it is one
+  patch ahead after a blocked cut. Dispatched while the previous release is
+  still building, before its crates.io upload, that skips a number, so always
+  pass the version explicitly, as the `freenet:release` skill does.) Equal
+  means the bump already merged without a published release: see
+  "Re-cutting the same version" in `scripts/RELEASE_RECOVERY.md`.
+
+Each of these used to fail later, after the bump PR had merged.
 
 ## What fires when
 
@@ -735,6 +760,14 @@ gh workflow run release.yml
                                     └─→ POST /announce/river to nova
                                             └─→ nova runs riverctl locally
 ```
+
+The un-draft makes the release latest only when it is the highest published
+non-prerelease version; an older tag un-drafted during a recovery stays
+non-latest, so nodes are not pointed back at it. On a release event,
+release-announce.yml likewise skips a prerelease or a release older than one
+already published, while a manual `workflow_dispatch` always posts. Gate B
+(the self-update canary) is skipped for such a non-latest un-draft: nodes follow
+`/releases/latest`, so there is no transition to check.
 
 ## How to monitor
 
@@ -1294,7 +1327,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
 
 - **404 — the normal case after a Gate A block.** Nothing irreversible has
   happened. Delete the tag and the draft, fix, and re-cut the SAME version on
-  the corrected commit.
+  the corrected commit. `release.yml` cannot do that re-cut (its bump already
+  merged, so its pre-flight refuses); `scripts/RELEASE_RECOVERY.md`, "Re-cutting
+  the same version", has the manual path, or cut the next patch.
 - **200 — the version really is spent.** Only reachable if the publish step ran
   and something later failed. Do not re-tag it; cut the next patch instead, and
   note that `cargo binstall freenet` will 404 and the nightly

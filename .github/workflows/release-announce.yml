@@ -43,6 +43,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       release_url: ${{ steps.v.outputs.release_url }}
+      skip: ${{ steps.v.outputs.skip }}
       message: ${{ steps.v.outputs.message }}
     steps:
       - name: Resolve version
@@ -56,8 +57,11 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           TAG_NAME: ${{ github.event.release.tag_name }}
           DISPATCH_VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
           REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           if [[ "$EVENT_NAME" == "release" ]]; then
             RAW="$TAG_NAME"
           else
@@ -68,6 +72,31 @@ jobs:
             echo "::error::Version must be X.Y.Z. Got: $VERSION (raw: $RAW)"
             exit 1
           fi
+          # On a release event, do not announce a release older than one
+          # already published: a recovery un-draft of an old stuck release is
+          # published but must not be announced as "released". This compares
+          # versions over the published list instead of reading
+          # /releases/latest, which lags a fresh publication by up to a minute
+          # (cross-compile.yml's Gate B waits on that) and would skip the
+          # announcement of the release that just shipped. A lagging list can
+          # only omit the new release itself, which does not change the answer.
+          # A manual dispatch is taken as meant.
+          if [[ "$EVENT_NAME" == "release" ]]; then
+            if [[ "$PRERELEASE" == "true" ]]; then
+              echo "::notice::v$VERSION is a prerelease; not announcing."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            PUBLISHED=$(gh release list --repo "$REPO" --limit 30 --exclude-drafts \
+              --json tagName,isPrerelease --jq '.[] | select(.isPrerelease | not) | .tagName')
+            HIGHEST=$(printf '%s\nv%s\n' "$PUBLISHED" "$VERSION" | sed '/^$/d' | sort -V | tail -1)
+            if [[ "${HIGHEST#v}" != "$VERSION" ]]; then
+              echo "::notice::v$VERSION is older than the published $HIGHEST; not announcing."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
           RELEASE_URL="https://github.com/${REPO}/releases/tag/v${VERSION}"
           MESSAGE="Freenet v${VERSION} released: ${RELEASE_URL}"
           {
@@ -82,6 +111,8 @@ jobs:
   matrix:
     name: Post to Matrix
     needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - name: Send Matrix message
@@ -118,7 +149,7 @@ jobs:
           # URL-encode the room ID. ! and : are reserved chars.
           ROOM_ENC=$(printf '%s' "$ROOM_ID" | jq -sRr @uri)
           URL="${HOMESERVER%/}/_matrix/client/v3/rooms/${ROOM_ENC}/send/m.room.message/${TXN_ID}"
-          HTTP_STATUS=$(curl -sS -o /tmp/matrix-response.json -w '%{http_code}' \
+          HTTP_STATUS=$(curl -sS --max-time 30 -o /tmp/matrix-response.json -w '%{http_code}' \
             -X PUT "$URL" \
             -H "Authorization: Bearer $TOKEN" \
             -H 'Content-Type: application/json' \
@@ -135,6 +166,8 @@ jobs:
   river:
     name: Post to River (via nova webhook)
     needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - name: Sign and POST /announce/river

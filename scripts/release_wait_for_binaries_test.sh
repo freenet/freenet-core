@@ -410,6 +410,18 @@ respond jobs    1 0 "completed:failure"
 check "publish gate: still a draft and attach job failed -> refuses to publish" \
     no 1 "NOT publishing v0.0.0-test"
 
+# The attach job waits for every build, macOS notarization and Gate A, about
+# 25 minutes after the tag on a good day, so the driver must wait an hour. The
+# old 20-minute cap failed the driver on an ordinary release.
+MAX_WAIT="$(awk '/^wait_for_binaries\(\) \{/,/^}/' "$RELEASE_SH" \
+    | sed -n 's/^[[:space:]]*local max_wait=\([0-9][0-9]*\)[[:space:]]*\(#.*\)\{0,1\}$/\1/p' | head -1)"
+if [[ -n "$MAX_WAIT" && "$MAX_WAIT" -ge 3600 ]]; then
+    echo "ok   - wait_for_binaries waits at least an hour for cross-compile (max_wait=$MAX_WAIT)"
+else
+    echo "FAIL - wait_for_binaries max_wait is '${MAX_WAIT:-<not found>}', expected a literal >= 3600" >&2
+    FAILURES=$((FAILURES + 1))
+fi
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
     echo "All release wait_for_binaries assertions passed."

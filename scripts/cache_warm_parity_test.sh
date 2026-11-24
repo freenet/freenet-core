@@ -145,7 +145,7 @@ PY
 )
 check "refusal message uses the same filter as the failure count" "$SELECTS" "1"
 check "pre-flight asks for 100 check runs per page" \
-    "$(grep -cE '^[[:space:]]*check_runs_json=\$\(gh api "repos/freenet/freenet-core/commits/main/check-runs\?per_page=100"' "$RELEASE_SH" || true)" "1"
+    "$(grep -cE '^[[:space:]]*(if ! )?check_runs_json=\$\(gh api "repos/freenet/freenet-core/commits/main/check-runs\?per_page=100"' "$RELEASE_SH" || true)" "1"
 
 if [[ $FAILURES -gt 0 ]]; then
     echo "$FAILURES check(s) failed" >&2
