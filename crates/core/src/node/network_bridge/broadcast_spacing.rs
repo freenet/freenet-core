@@ -263,9 +263,6 @@ mod tests {
     const SIM_SRC: &str = include_str!("p2p_protoc/broadcast.rs");
     const HANDLER_SRC: &str = include_str!("../../contract.rs");
 
-    /// #5842: BOTH fan-out paths apply the per-pair spacing. The simulation
-    /// runs only its inline copy and the production binary only the queue, so
-    /// a behavioural test of one says nothing about the other.
     /// The body of the block that `opener` (ending in its `{`) starts in `src`,
     /// by brace matching, so a line moved out of the block is not in it.
     fn spawned_block<'a>(src: &'a str, opener: &str) -> Option<&'a str> {
@@ -286,6 +283,9 @@ mod tests {
         None
     }
 
+    /// #5842: BOTH fan-out paths apply the per-pair spacing. The simulation
+    /// runs only its inline copy and the production binary only the queue, so
+    /// a behavioural test of one says nothing about the other.
     #[test]
     fn both_fan_out_paths_apply_the_spacing() {
         let drain = region(QUEUE_SRC, "    async fn drain_lane<D, F>(", "\n    }\n");
