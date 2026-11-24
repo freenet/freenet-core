@@ -742,7 +742,7 @@ impl P2pConnManager {
                 Ok(claim) => {
                     // Detached, as production's queue worker is: the send waits
                     // for its stream's completion (up to
-                    // STREAM_COMPLETION_TIMEOUT), and that stream is handed to
+                    // `stream_completion_timeout`), and that stream is handed to
                     // the event loop through the bridge, so awaiting it here, on
                     // the event loop, would hold both until the timeout. Unlike
                     // production's queue lanes, nothing limits how many heals run
@@ -787,7 +787,7 @@ impl P2pConnManager {
     /// Simulation only. Production sends every leg from the broadcast queue's
     /// tasks; a stream leg awaits its completion signal, which the node's event
     /// loop has to drive, so awaiting the send on the event loop would stall the
-    /// node until `STREAM_COMPLETION_TIMEOUT`. The task holds the pair's
+    /// node until `stream_completion_timeout`. The task holds the pair's
     /// spacing `claim` until the send ends, as an inline send would.
     #[cfg(feature = "simulation_tests")]
     fn spawn_leg(

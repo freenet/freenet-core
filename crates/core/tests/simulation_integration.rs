@@ -26266,11 +26266,14 @@ fn run_get_at_htl_zero_sim(ring_max_htl: usize, demandless: bool) -> GetAtHtlZer
 /// broadcast) is healed by anti-entropy, and the heal never holds a node's event
 /// loop. Before the fix, the simulation build awaited the heal's send inside the
 /// event loop, and that send waits for its stream's completion, which the blocked
-/// loop could not dispatch: each heal held the loop for STREAM_COMPLETION_TIMEOUT
-/// (120 s), and every message the node received waited behind it.
+/// loop could not dispatch: each heal held the loop for `stream_completion_timeout`
+/// (270 s for this state), and every message the node received waited behind it.
 #[test_log::test]
 fn test_heal_of_a_streamed_state_does_not_block_the_event_loop() {
-    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract};
+    use freenet::dev_tool::{
+        NodeLabel, ScheduledOperation, SimOperation, register_crdt_contract,
+        stale_peer_heal_observations,
+    };
     const NETWORK: &str = "heal-event-loop";
     const SEED: u64 = 0x5842_E5B9_0001;
     const STATE_LEN: usize = 1024 * 1024;
@@ -26278,6 +26281,7 @@ fn test_heal_of_a_streamed_state_does_not_block_the_event_loop() {
     let contract = SimOperation::create_test_contract(0x91);
     let key = contract.key();
     register_crdt_contract(*key.id());
+    stale_peer_heal_observations::clear(&key);
     let state = |version: u64| {
         let mut bytes = version.to_le_bytes().to_vec();
         bytes.extend((0..STATE_LEN).map(|i| (i % 251) as u8 ^ version as u8));
@@ -26342,6 +26346,8 @@ fn test_heal_of_a_streamed_state_does_not_block_the_event_loop() {
         result.turmoil_result.err()
     );
     let longest = GlobalTestMetrics::longest_event_loop_event();
+    let heals = stale_peer_heal_observations::get(&key).heals_emitted;
+    stale_peer_heal_observations::clear(&key);
     let stored = |label: &NodeLabel| {
         result
             .node_storages
@@ -26354,13 +26360,16 @@ fn test_heal_of_a_streamed_state_does_not_block_the_event_loop() {
         "premise: the subscriber that stayed up got the update"
     );
     assert!(
+        heals >= 1,
+        "premise: anti-entropy emitted a heal, so the path under test ran"
+    );
+    assert!(
         stored(&stale).as_deref() == Some(updated.as_slice()),
         "the crashed subscriber was healed (longest event-loop event {longest:?})"
     );
     // Virtual time only moves when something awaits a timer, so an event that
-    // does not wait reads as zero: zero is the healthy value, and a `> ZERO`
-    // premise fails the healthy run (it did, in CI). The bound has teeth
-    // because the inline await it guards against reads 120 s or more.
+    // does not wait reads as zero: zero is the healthy value. The bound has
+    // teeth because the inline await it guards against reads 120 s or more.
     assert!(
         longest < Duration::from_secs(10),
         "a node's event loop was held for {longest:?} by one event"
