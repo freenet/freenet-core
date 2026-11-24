@@ -6631,26 +6631,44 @@ mod tests {
     /// pinned here by source.
     #[test]
     fn existence_proofs_read_accepted_remote_state_only() {
-        let code = code_only(production_source());
+        let src = production_source();
+        let relay = code_only(extract_fn_body(src, "async fn drive_relay_get_inner<CB>("));
+        // Relay inline arm and relay stream-forward arm.
         assert_eq!(
-            code.matches("cached.accepted_remote&&is_existence_proof(")
+            relay
+                .matches("cached.accepted_remote&&is_existence_proof(")
                 .count(),
             2,
-            "both relay arms must gate the existence proof on accepted_remote"
+            "both relay cache arms must gate the existence proof on accepted_remote"
         );
-        assert!(code.contains(".await.accepted_remote;"), "loopback arm");
-        assert!(
-            code.contains("state_stored:state_stored.accepted_remote"),
-            "originator stream path"
+        // Relay loopback arm: the stored flag IS accepted_remote, and the proof
+        // is gated on it.
+        assert_eq!(
+            relay
+                .matches(".await.accepted_remote;ifstored&&is_existence_proof(")
+                .count(),
+            1,
+            "the loopback arm must bind `stored` from accepted_remote and gate on it"
+        );
+        assert_eq!(
+            relay.matches("ifstored&&").count(),
+            1,
+            "no other relay proof may be gated on a bare `stored`"
         );
         assert!(
-            code.contains("driver.note_stored_state(key,state_stored.accepted_remote)"),
+            !relay.contains("local_copy&&is_existence_proof")
+                && !relay.contains("state_present&&is_existence_proof"),
+            "a local copy is not an existence proof"
+        );
+        let client = code_only(extract_fn_body(src, "async fn drive_client_get_inner("));
+        assert!(
+            client.contains("driver.note_stored_state(key,state_stored.accepted_remote)"),
             "originator inline path"
         );
+        let stream = code_only(extract_fn_body(src, "async fn assemble_and_cache_stream("));
         assert!(
-            !code.contains("local_copy&&is_existence_proof")
-                && !code.contains("state_present&&is_existence_proof"),
-            "a local copy is not an existence proof"
+            stream.contains("state_stored:state_stored.accepted_remote"),
+            "originator stream path"
         );
     }
 
@@ -14138,6 +14156,25 @@ mod reply_hosting_gate_tests {
             crate::ring::HostingCause::Other,
         );
         assert_eq!(op_manager.ring.hosting_contract_size(&key), 2);
+        // A second hosted contract, touched after `key`: `key` is the older one.
+        let newer = make_contract_key(91);
+        op_manager.ring.host_contract(
+            newer,
+            4,
+            crate::ring::AccessType::Get,
+            crate::ring::HostingCause::Other,
+        );
+        let recency = |wanted: &ContractKey| {
+            op_manager
+                .ring
+                .dashboard_hosting_snapshot()
+                .contracts
+                .iter()
+                .find(|row| row.key_full == wanted.to_string())
+                .map(|row| row.recency_seq)
+                .expect("the contract is hosted")
+        };
+        assert!(recency(&key) < recency(&newer));
         reject_stores("gate-held-size");
         let held = cache_contract_locally(
             &op_manager,
@@ -14151,6 +14188,10 @@ mod reply_hosting_gate_tests {
         .await;
         assert!(held.local_copy && !held.accepted_remote);
         assert_eq!(op_manager.ring.hosting_contract_size(&key), 4);
+        assert!(
+            recency(&key) > recency(&newer),
+            "the read must reset the held entry's recency, not only its size"
+        );
     }
 
     /// The streamed originator path compares the stream header with the id the
