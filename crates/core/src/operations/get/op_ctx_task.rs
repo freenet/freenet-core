@@ -1606,6 +1606,7 @@ async fn drive_get_with_assembly_retry(
             peer_addr,
             stream_id,
             key,
+            &driver.instance_id,
             includes_contract,
             cause,
         )
@@ -1889,12 +1890,27 @@ fn stored_state_and_code_match(
     )
 }
 
+/// Count a GET reply that names a different contract than the one requested.
+/// The peer sets the rate, so log the 1st, 2nd, 4th, 8th, ... occurrence only.
+fn note_reply_not_for_request() {
+    static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seen = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if seen.is_power_of_two() {
+        tracing::warn!(
+            seen,
+            "get: reply does not match the requested contract; not hosting it \
+             (logged at doubling counts)"
+        );
+    }
+}
+
 /// Store the fetched contract state in the local executor and run
 /// the originator-side hosting side effects. Mirrors the legacy
 /// `process_message` Response{Found} branch at `get.rs:2218-2450`.
 ///
 /// Returns `true` when this node holds the contract's current state after the
-/// call (`state_matches || put_persisted`) — D-CACHE-RET (step 10 §1a). Relay
+/// call (`state_matches || put_persisted`, or an already hosted copy answered
+/// the read), and `false` for a reply that names another contract — D-CACHE-RET (step 10 §1a). Relay
 /// callers gate downstream-subscriber registration on this so a peer registers
 /// demand only after it actually holds state; registering after state makes the
 /// phantom (`contract_in_use && !contract_state_present`) unrepresentable.
@@ -1904,12 +1920,14 @@ fn stored_state_and_code_match(
 ///    state, skip `PutQuery` entirely so contracts that enforce
 ///    identical-state rejection in `update_state()` aren't invoked
 ///    redundantly.
-/// 2. **Unconditional hosting refresh** — `record_get_access` and
-///    interest-manager eviction cleanup run for BOTH the
-///    state-matches short-circuit AND the PutQuery-failed error paths.
-///    Legacy behaviour at `get.rs:2420-2435` continues these side
-///    effects on error so re-GETs keep refreshing the hosting LRU/TTL
-///    even when the executor rejected the write.
+/// 2. **Hosting refresh** — `record_get_access` and interest-manager
+///    eviction cleanup run when the state is held after this call
+///    (state-matches short-circuit or an accepted write), and also for a
+///    contract this node ALREADY hosts when the executor rejected the
+///    incoming state: the read is real demand, charged at the held copy's
+///    size. A contract not already hosted is not hosted off a rejected reply.
+///    A reply naming another contract, or code that does not match its
+///    key, is dropped before anything else.
 /// 3. **`mark_local_client_access` gated on `is_client_requester`** —
 ///    the sticky flag that moves the contract into the
 ///    `contracts_needing_renewal()` set (see `ring/hosting.rs:889`) must
@@ -1959,17 +1977,20 @@ async fn cache_contract_locally(
         // return value does not register a downstream against uncached state.
         return false;
     }
-    // A reply for some other contract is not this GET's answer: nothing about it
-    // may reach the hosting cache.
-    if key.id() != requested {
-        tracing::warn!(
-            requested = %requested,
-            replied = %key,
-            "get: reply is for a different contract; not hosting it"
-        );
+    // A reply for some other contract, or one whose code does not belong to
+    // the key it names, is not this GET's answer: nothing about it reaches the
+    // hosting cache. The code hash is compared as well as the instance id,
+    // because key equality ignores the hash.
+    if key.id() != requested
+        || contract.as_ref().is_some_and(|code| {
+            let derived = code.key();
+            derived.id() != key.id() || derived.code_hash() != key.code_hash()
+        })
+    {
+        note_reply_not_for_request();
         return false;
     }
-    let state_size = state.size() as u64;
+    let reply_state_size = state.size() as u64;
 
     // (1) Idempotency short-circuit: re-query the local store FIRST.
     // Comparing bytes against the incoming state avoids re-invoking
@@ -1994,8 +2015,7 @@ async fn cache_contract_locally(
 
     // (2) Decide whether PutQuery must run. If local state already
     // matches or we lack the contract code (issue #2306), skip the
-    // PutQuery but STILL run hosting side effects below so LRU/TTL
-    // refresh does not depend on the write path.
+    // PutQuery; step (3) decides what hosting side effects still run.
     let put_persisted = if state_matches {
         tracing::debug!(
             %key,
@@ -2053,14 +2073,32 @@ async fn cache_contract_locally(
         false
     };
 
-    // (3) Hosting side effects run only for state this node actually holds
-    // (it already matched, or the executor accepted it). A reply the executor
-    // rejected, or one we cannot store for lack of contract code, is not a
-    // genuine read of a held contract and must not enter the hosting cache,
-    // where it would compete with (and evict) contracts that are hosted.
-    if !(state_matches || put_persisted) {
+    // (3) A contract this node does not hold only starts hosting if the reply
+    // was accepted (it already matched, or the executor took it). A reply the
+    // executor rejected, or one we cannot store for lack of contract code, does
+    // not make a new hosted contract. A contract this node already hosts keeps
+    // its read-recency refresh either way: the read is real demand, and the
+    // size charged is that of the copy held, not of the rejected reply.
+    let accepted = state_matches || put_persisted;
+    let held = match &local_state {
+        Ok(ContractHandlerEvent::GetResponse {
+            key: Some(stored_key),
+            response: Ok(StoreResponse {
+                state: Some(local), ..
+            }),
+            ..
+        }) if !accepted && op_manager.ring.is_hosting_contract(stored_key) => {
+            Some((*stored_key, local.size() as u64))
+        }
+        _ => None,
+    };
+    if !accepted && held.is_none() {
         return false;
     }
+    let (key, state_size) = match held {
+        Some((stored_key, stored_size)) => (stored_key, stored_size),
+        None => (key, reply_state_size),
+    };
     let access_result = op_manager.ring.record_get_access(key, state_size, cause);
     // Sticky flag gating subscription renewal; only the client-originating
     // node sets it. Relays that pass through a Found MUST NOT taint their
@@ -2160,10 +2198,11 @@ async fn cache_contract_locally(
         crate::operations::broadcast_change_interests(op_manager, vec![], removed_contracts).await;
     }
 
-    // D-CACHE-RET: current state is held locally iff it already matched or we
-    // just persisted it. Relay callers gate register_downstream_subscriber on
-    // this (register-after-state, step 10 §1a).
-    state_matches || put_persisted
+    // D-CACHE-RET: current state is held locally iff it already matched, we
+    // just persisted it, or an already hosted copy answered the read. Relay
+    // callers gate register_downstream_subscriber on this (register-after-state,
+    // step 10 §1a).
+    accepted || held.is_some()
 }
 
 /// Await `phase`, calling `on_tick` at once and then once a second while
@@ -2259,10 +2298,27 @@ async fn assemble_and_cache_stream(
     peer_addr: std::net::SocketAddr,
     stream_id: StreamId,
     expected_key: ContractKey,
+    // The instance id this GET asked for. `expected_key` comes from the
+    // replying peer's header, so it cannot be the reference for what was
+    // requested.
+    requested: &ContractInstanceId,
     includes_contract: bool,
     // Hosting attribution for the store below; see `cache_contract_locally`.
     cause: crate::ring::HostingCause,
 ) -> Result<StreamProgress, AssemblyFailure> {
+    if expected_key.id() != requested {
+        note_reply_not_for_request();
+        return Err(AssemblyFailure {
+            message: format!(
+                "stream header is for {expected_key}, which is not the requested contract {requested}"
+            ),
+            cause: StreamAbortCause::PayloadInvalid,
+            peer_caused: true,
+            fragments_received: None,
+            total_fragments: None,
+        });
+    }
+
     // Test-only deterministic fault injection (#4345). Returning before
     // the claim mirrors the production claim-timeout failure (the inbound
     // stream is left orphaned for GC), so the retry path is exercised
@@ -2405,7 +2461,7 @@ async fn assemble_and_cache_stream(
     let is_client_requester = matches!(cause, crate::ring::HostingCause::ClientGet);
     let state_stored = cache_contract_locally(
         op_manager,
-        expected_key.id(),
+        requested,
         payload.key,
         state,
         contract,
@@ -4351,9 +4407,8 @@ where
         // O(channel_send).
         //
         // Caching ALWAYS runs after forwarding, even when forwarding
-        // returns Err — this preserves the legacy invariant that LRU/TTL
-        // bookkeeping and `announce_contract_hosted` fire on any successful
-        // wire-level GET. The send error is deferred via `let send_result`
+        // returns Err, so the hosting bookkeeping for state this node holds
+        // does not depend on the send. The send error is deferred via `let send_result`
         // and propagated after the cache call.
         //
         // R4 (this site) and R10 read from the local store, so the
@@ -6504,38 +6559,48 @@ mod tests {
         );
     }
 
-    /// Bug #4 reproduction: the legacy branch at `get.rs:2420-2435`
-    /// logs on PutQuery error but **continues** to run the hosting /
-    /// interest / access-tracking side effects. Hosting LRU / TTL
-    /// must refresh for ANY successful wire-level GET, not only when
-    /// the local store write succeeded.
-    ///
-    /// After the fix the side effects live OUTSIDE the PutQuery match:
-    /// the match result feeds a `put_persisted: bool` and
-    /// `record_get_access` / `announce_contract_hosted` run after the
-    /// match closes — reachable from state-matches, PutQuery-Ok, and
-    /// PutQuery-Err paths alike. We pin that structure here by
-    /// requiring the `record_get_access` call to appear AFTER the
-    /// PutResponse match arms (identified by the `Err(err)` arm) in
-    /// the source order.
+    /// The hosting side effects (`record_get_access` and what follows) sit
+    /// AFTER the PutResponse match and AFTER the held-or-accepted gate, so a
+    /// rejected reply for a contract this node does not host never reaches
+    /// them. The behavioural tests in `reply_hosting_gate_tests` are the real
+    /// pin; this one fails if the call is moved above the gate.
     #[test]
-    fn cache_contract_locally_runs_side_effects_on_put_error() {
+    fn cache_contract_locally_gates_hosting_side_effects_on_held_or_accepted() {
         let src = production_source();
         let body = extract_fn_body(src, "async fn cache_contract_locally(");
         let err_arm = body
             .find("new_value: Err(")
             .expect("PutResponse Err arm must exist");
+        let gate = body
+            .find("if !accepted && held.is_none()")
+            .expect("the held-or-accepted gate must exist");
         let side_effect = body
             .find("record_get_access")
             .expect("record_get_access must be called");
         assert!(
-            side_effect > err_arm,
-            "record_get_access must run AFTER the PutResponse match \
-             (outside both Ok and Err arms) so hosting LRU/TTL refresh on \
-             any successful wire-level GET — including when the local \
-             executor rejects the PutQuery. The legacy branch at \
-             get.rs:2420-2435 continues these side effects on error; \
-             the driver must match."
+            err_arm < gate && gate < side_effect,
+            "record_get_access must run after the PutResponse match and after \
+             the held-or-accepted gate"
+        );
+    }
+
+    /// Every originator and relay call must pass the request's OWN instance id
+    /// as `requested`; an id read from the reply makes the check compare the
+    /// reply with itself. The streamed originator path takes the driver's id.
+    #[test]
+    fn cache_contract_locally_callers_pass_the_requests_own_instance_id() {
+        let code = code_only(production_source());
+        assert!(
+            code.contains(
+                "assemble_and_cache_stream(op_manager,peer_addr,stream_id,key,&driver.instance_id,"
+            ),
+            "the streamed originator path must pass driver.instance_id"
+        );
+        assert!(
+            !code.contains("cache_contract_locally(op_manager,key.id(),")
+                && !code.contains("cache_contract_locally(op_manager,payload.key.id(),")
+                && !code.contains("cache_contract_locally(op_manager,expected_key.id(),"),
+            "a reply-derived id must not stand in for the requested one"
         );
     }
 
@@ -8792,6 +8857,11 @@ mod tests {
                 "relay callsite #{idx} should pass seven arguments (op_manager, \
                  requested, key, state, contract, is_client_requester, cause). \
                  Call text: {call}"
+            );
+            assert_eq!(
+                args[1], "&instance_id",
+                "Relay callsite #{idx} must pass the request's own instance id \
+                 as `requested`. Call text: {call}"
             );
             assert_eq!(
                 args[5], "false",
@@ -13675,8 +13745,8 @@ mod outbound_budget_relay_tests {
     }
 }
 
-/// A GET reply reaches the hosting cache only if this node ends up holding its
-/// state and it is the contract that was asked for.
+/// A GET reply reaches the hosting cache only if it is the contract that was
+/// asked for and this node ends up holding its state (or already hosted it).
 #[cfg(test)]
 mod reply_hosting_gate_tests {
     use super::*;
@@ -13684,26 +13754,38 @@ mod reply_hosting_gate_tests {
         op_manager_with_peers_and_store, reject_stores,
     };
     use crate::operations::test_utils::make_contract_key;
+    use freenet_stdlib::prelude::CodeHash;
 
-    fn code() -> Option<ContractContainer> {
-        Some(ContractContainer::Wasm(ContractWasmAPIVersion::V1(
-            WrappedContract::new(
-                std::sync::Arc::new(ContractCode::from(vec![1u8, 2, 3])),
-                Parameters::from(vec![]),
-            ),
-        )))
+    /// A container and the key derived from it (code hash included).
+    fn contract(seed: u8) -> (ContractContainer, ContractKey) {
+        let container = ContractContainer::Wasm(ContractWasmAPIVersion::V1(WrappedContract::new(
+            std::sync::Arc::new(ContractCode::from(vec![1u8, 2, 3])),
+            Parameters::from(vec![seed]),
+        )));
+        let key = container.key();
+        (container, key)
     }
 
-    /// Host an incumbent contract, then deliver a reply for `reply_seed` while
-    /// answering a GET for `requested_seed`. Returns (stored, reply hosted,
-    /// incumbent hosted, hosted count).
+    struct Delivery {
+        stored: bool,
+        reply_hosted: bool,
+        incumbent_hosted: bool,
+        hosted_count: usize,
+        client_access: bool,
+    }
+
+    /// Host one unrelated incumbent, then deliver `state` for `reply_key` while
+    /// answering a GET for `requested`.
     async fn deliver(
         label: &str,
         reject: bool,
-        requested_seed: u8,
-        reply_seed: u8,
-    ) -> (bool, bool, bool, usize) {
-        let (op_manager, _rx, _peers, _guards, _store) =
+        requested: ContractInstanceId,
+        reply_key: ContractKey,
+        container: Option<ContractContainer>,
+        client: bool,
+        preload_held: bool,
+    ) -> Delivery {
+        let (op_manager, _rx, _peers, _guards, store) =
             op_manager_with_peers_and_store(label, 1).await;
         let incumbent = make_contract_key(90);
         op_manager.ring.host_contract(
@@ -13712,52 +13794,182 @@ mod reply_hosting_gate_tests {
             crate::ring::AccessType::Get,
             crate::ring::HostingCause::Other,
         );
-        assert_eq!(op_manager.ring.hosting_contracts_count(), 1);
+        if preload_held {
+            *store.lock() = Some((reply_key, WrappedState::new(vec![1; 4])));
+            op_manager.ring.host_contract(
+                reply_key,
+                4,
+                crate::ring::AccessType::Get,
+                crate::ring::HostingCause::Other,
+            );
+        }
+        let before = op_manager.ring.hosting_contracts_count();
         if reject {
             reject_stores(label);
         }
-        let requested = *make_contract_key(requested_seed).id();
-        let reply_key = make_contract_key(reply_seed);
         let stored = cache_contract_locally(
             &op_manager,
             &requested,
             reply_key,
             WrappedState::new(vec![9; 16]),
-            code(),
-            false,
+            container,
+            client,
             crate::ring::HostingCause::Other,
         )
         .await;
-        (
+        let hosted_count = op_manager.ring.hosting_contracts_count();
+        assert!(hosted_count >= before.min(2));
+        Delivery {
             stored,
-            op_manager.ring.is_hosting_contract(&reply_key),
-            op_manager.ring.is_hosting_contract(&incumbent),
-            op_manager.ring.hosting_contracts_count(),
-        )
+            reply_hosted: op_manager.ring.is_hosting_contract(&reply_key),
+            incumbent_hosted: op_manager.ring.is_hosting_contract(&incumbent),
+            hosted_count,
+            client_access: op_manager.ring.has_recent_local_client_access(&reply_key),
+        }
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn an_accepted_reply_is_hosted() {
-        let (stored, hosted, incumbent, count) = deliver("gate-accept", false, 11, 11).await;
-        assert!(stored && hosted && incumbent);
-        assert_eq!(count, 2);
+        let (code, key) = contract(11);
+        let d = deliver(
+            "gate-accept",
+            false,
+            *key.id(),
+            key,
+            Some(code),
+            false,
+            false,
+        )
+        .await;
+        assert!(d.stored && d.reply_hosted && d.incumbent_hosted);
+        assert_eq!(d.hosted_count, 2);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_reply_the_executor_rejects_is_not_hosted() {
-        let (stored, hosted, incumbent, count) = deliver("gate-reject", true, 12, 12).await;
-        assert!(!stored);
-        assert!(!hosted, "a rejected reply must not enter the hosting cache");
-        assert!(incumbent, "the hosted contract is untouched");
-        assert_eq!(count, 1);
+        let (code, key) = contract(12);
+        let d = deliver(
+            "gate-reject",
+            true,
+            *key.id(),
+            key,
+            Some(code),
+            false,
+            false,
+        )
+        .await;
+        assert!(!d.stored);
+        assert!(
+            !d.reply_hosted,
+            "a rejected reply must not enter the hosting cache"
+        );
+        assert!(d.incumbent_hosted, "the hosted contract is untouched");
+        assert_eq!(d.hosted_count, 1);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn a_reply_for_a_different_contract_is_not_hosted() {
-        let (stored, hosted, incumbent, count) = deliver("gate-mismatch", false, 13, 14).await;
-        assert!(!stored);
-        assert!(!hosted, "a reply for another contract must not be hosted");
-        assert!(incumbent);
-        assert_eq!(count, 1);
+        let (code, key) = contract(14);
+        let (_, asked) = contract(13);
+        let d = deliver(
+            "gate-mismatch",
+            false,
+            *asked.id(),
+            key,
+            Some(code),
+            false,
+            false,
+        )
+        .await;
+        assert!(!d.stored);
+        assert!(
+            !d.reply_hosted,
+            "a reply for another contract must not be hosted"
+        );
+        assert!(d.incumbent_hosted);
+        assert_eq!(d.hosted_count, 1);
+    }
+
+    /// The reply names the requested instance but its code derives another key.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_reply_whose_code_does_not_match_its_key_is_not_hosted() {
+        let (code, real) = contract(15);
+        let named = ContractKey::from_id_and_code(*real.id(), CodeHash::new([0x77; 32]));
+        let d = deliver(
+            "gate-codehash",
+            false,
+            *real.id(),
+            named,
+            Some(code),
+            false,
+            false,
+        )
+        .await;
+        assert!(!d.stored);
+        assert!(!d.reply_hosted);
+        assert_eq!(d.hosted_count, 1);
+    }
+
+    /// A contract this node already hosts keeps its read refresh, and reports
+    /// that it holds state, when the executor rejects the incoming state.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_held_contract_stays_hosted_when_the_reply_is_rejected() {
+        let (code, key) = contract(16);
+        let d = deliver("gate-held", true, *key.id(), key, Some(code), true, true).await;
+        assert!(d.stored, "a held copy answers the read");
+        assert!(d.reply_hosted && d.incumbent_hosted);
+        assert_eq!(d.hosted_count, 2);
+        assert!(d.client_access, "the client read of a held contract counts");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn client_access_is_marked_only_for_state_this_node_holds() {
+        let (code, key) = contract(17);
+        let rejected = deliver(
+            "gate-client-rej",
+            true,
+            *key.id(),
+            key,
+            Some(code.clone()),
+            true,
+            false,
+        )
+        .await;
+        assert!(!rejected.client_access);
+        let accepted = deliver(
+            "gate-client-ok",
+            false,
+            *key.id(),
+            key,
+            Some(code),
+            true,
+            false,
+        )
+        .await;
+        assert!(accepted.client_access);
+    }
+
+    /// The streamed originator path compares the stream header with the id the
+    /// GET asked for, before claiming anything.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_stream_header_for_another_contract_is_refused_before_the_claim() {
+        let (op_manager, _rx, _peers, _guards, _store) =
+            op_manager_with_peers_and_store("gate-stream", 1).await;
+        let (_, header_key) = contract(19);
+        let (_, asked) = contract(18);
+        let failure = assemble_and_cache_stream(
+            &op_manager,
+            SocketAddr::from(([10, 8, 0, 1], 4000)),
+            StreamId::next(),
+            header_key,
+            asked.id(),
+            false,
+            crate::ring::HostingCause::ClientGet,
+        )
+        .await
+        .err()
+        .expect("a header for another contract must be refused");
+        assert!(failure.peer_caused);
+        assert!(!op_manager.ring.is_hosting_contract(&header_key));
     }
 }
