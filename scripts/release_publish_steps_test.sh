@@ -160,6 +160,17 @@ if load_step "$CROSS_YML" attach-to-release "Publish release" "$PUB"; then
         "rc=0 edits=release edit v0.2.99 --draft=false --latest=true"
 fi
 
+# shellcheck disable=SC2016  # a literal $MAKE_LATEST is the text being matched
+check "Publish release: reports made_latest for Gate B" \
+    "$(grep -c 'made_latest=\$MAKE_LATEST' "$PUB/step.sh" 2>/dev/null)" "1"
+check "Gate B skips a non-latest recovery publish" \
+    "$(python3 -c '
+import sys, yaml
+jobs = yaml.safe_load(open(sys.argv[1]))["jobs"]
+print(jobs["attach-to-release"]["outputs"]["made_latest"], jobs["auto-update-selfupdate-canary"]["if"], sep="|")
+' "$CROSS_YML")" \
+    "\${{ steps.publish.outputs.made_latest }}|startsWith(github.ref, 'refs/tags/v') && needs.attach-to-release.outputs.made_latest != 'false'"
+
 # --- 2. cross-compile.yml: signing, checksums, assets -------------------------
 SIGN="$TEST_TMP/sign"
 if load_step "$CROSS_YML" attach-to-release "Sign SHA256SUMS.txt (ed25519)" "$SIGN"; then
@@ -374,6 +385,8 @@ if load_step "$RELEASE_YML" validate "Resolve + validate version" "$VALIDATE"; t
     autobump_case "normal: tree equals crates.io" 0.2.163 0.2.163 "rc=0 0.2.164"
     autobump_case "after a Gate A block: tree is ahead of crates.io" 0.2.163 0.2.164 "rc=0 0.2.165"
     autobump_case "unreadable crates.io answer refuses" garbage 0.2.163 "rc=1 "
+    autobump_case "a tree far ahead of crates.io refuses (needs an explicit version)" 0.2.163 0.3.0 "rc=1 "
+    autobump_case "a tree behind crates.io refuses" 0.2.163 0.2.160 "rc=1 "
     rm -f "$STUBS/curl"
 fi
 

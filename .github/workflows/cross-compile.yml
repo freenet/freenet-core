@@ -544,6 +544,13 @@ jobs:
     permissions:
       contents: write
 
+    outputs:
+      # 'true' when "Publish release" made this release GitHub's latest,
+      # 'false' for a recovery un-draft of an older tag. Gate B skips on
+      # 'false': it waits for this release to become latest, which it never
+      # will by design.
+      made_latest: ${{ steps.publish.outputs.made_latest }}
+
     steps:
       # The release source and its toolchain are staged FIRST, before the
       # artifacts, so that everything `cargo publish` needs is already on disk
@@ -1044,6 +1051,7 @@ jobs:
           fi
 
       - name: Publish release
+        id: publish
         env:
           # Coalesce on RELEASE_PAT so `--draft=false` fires a
           # `release.published` event that downstream workflows
@@ -1099,6 +1107,7 @@ jobs:
             gh release edit "$TAG_NAME" --repo ${{ github.repository }} --latest \
               || echo "::warning::could not mark $TAG_NAME as latest; run: gh release edit $TAG_NAME --latest"
           fi
+          echo "made_latest=$MAKE_LATEST" >> "$GITHUB_OUTPUT"
           echo "✅ Release $TAG_NAME published with all binaries attached (latest=$MAKE_LATEST)"
 
   # -----------------------------------------------------------------------
@@ -1138,7 +1147,10 @@ jobs:
     # but says nothing useful.
     timeout-minutes: 35
     needs: attach-to-release
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Not for a recovery un-draft of an OLDER tag (made_latest == 'false'):
+    # nodes follow /releases/latest, which stays on the newer release, so there
+    # is no transition to check and the latest-release wait would fail.
+    if: startsWith(github.ref, 'refs/tags/v') && needs.attach-to-release.outputs.made_latest != 'false'
     permissions:
       contents: read
     outputs:

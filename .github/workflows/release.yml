@@ -197,9 +197,18 @@ jobs:
             # the pre-flight refuses on every dispatch.
             CURRENT=$(awk '/^\[package\]/ {p = 1; next} /^\[/ {p = 0}
                            p && /^version *=/ {gsub(/.*= *"|".*/, ""); print; exit}' crates/core/Cargo.toml)
-            BASE="$LATEST"
-            if [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-              BASE=$(printf '%s\n%s\n' "$LATEST" "$CURRENT" | sort -V | tail -1)
+            # Only those two shapes are guessed: the tree equal to crates.io (the
+            # normal case) or one patch ahead of it (a merged, unpublished bump).
+            # Anything else (a tree far ahead, an unreadable version, a dispatch
+            # from a branch carrying some other version) needs an explicit input.
+            NEXT_OF_LATEST="$(echo "$LATEST" | cut -d. -f1-2).$(( $(echo "$LATEST" | cut -d. -f3) + 1 ))"
+            if [[ "$CURRENT" == "$LATEST" ]]; then
+              BASE="$LATEST"
+            elif [[ "$CURRENT" == "$NEXT_OF_LATEST" ]]; then
+              BASE="$CURRENT"
+            else
+              echo "::error::No version input, and the tree's version '$CURRENT' is neither crates.io's $LATEST nor one patch above it. Dispatch with an explicit version."
+              exit 1
             fi
             MAJOR=$(echo "$BASE" | cut -d. -f1)
             MINOR=$(echo "$BASE" | cut -d. -f2)

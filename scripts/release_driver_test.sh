@@ -825,9 +825,14 @@ else
 printf '%s\n' "\$*" >> "$work/gh.log"
 case "\$1 \$2" in
     "pr list") echo "77|OPEN|build: release 9.9.9" ;;
+    "api graphql")
+        case "\$*" in
+            *isInMergeQueue*) echo "$mstate" ;;
+        esac ;;
     "pr view")
         case "\$*" in
-            *autoMergeRequest*) echo "$mstate" ;;
+            # gh has no such --json field and rejects the whole query.
+            *isInMergeQueue*) echo 'Unknown JSON field: "isInMergeQueue"' >&2; exit 1 ;;
             *statusCheckRollup*) echo "[]" ;;
             *) echo "$wstate" ;;
         esac ;;
@@ -881,9 +886,9 @@ EOF
 printf '%s\n' "\$*" >> "$work/gh.log"
 case "\$1 \$2" in
     "pr create") cat "$work/create_out"; exit $create_rc ;;
+    "api graphql") echo "OPEN|false" ;;
     "pr view")
         case "\$*" in
-            *autoMergeRequest*) echo "OPEN|false" ;;
             *) echo MERGED ;;
         esac ;;
 esac

@@ -761,7 +761,9 @@ The un-draft makes the release latest only when it is the highest published
 non-prerelease version; an older tag un-drafted during a recovery stays
 non-latest, so nodes are not pointed back at it. On a release event,
 release-announce.yml likewise skips a prerelease or a release older than one
-already published, while a manual `workflow_dispatch` always posts.
+already published, while a manual `workflow_dispatch` always posts. Gate B
+(the self-update canary) is skipped for such a non-latest un-draft: nodes follow
+`/releases/latest`, so there is no transition to check.
 
 ## How to monitor
 
