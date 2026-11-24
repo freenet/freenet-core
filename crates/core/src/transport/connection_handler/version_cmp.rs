@@ -151,6 +151,31 @@ const fn parse_semver(version: &str) -> (u8, u8, u16) {
     (major, minor, patch)
 }
 
+/// [`parse_semver`] for text a remote peer sent: `None` when a component does
+/// not fit the wire width (`u8.u8.u16`) instead of overflowing (a debug
+/// panic, or a silent wrap in release) or truncating ("256.0.0" reading as
+/// 0.0.0). Callers must treat `None` as "not newer than us".
+fn try_parse_semver(version: &str) -> Option<(u8, u8, u16)> {
+    let mut parts = [0u32; 3];
+    let mut state = 0usize;
+    for c in version.bytes() {
+        if c == b'.' {
+            state += 1;
+        } else if c.is_ascii_digit() {
+            if let Some(part) = parts.get_mut(state) {
+                *part = part.checked_mul(10)?.checked_add(u32::from(c - b'0'))?;
+            }
+        } else {
+            break; // Pre-release suffix.
+        }
+    }
+    Some((
+        u8::try_from(parts[0]).ok()?,
+        u8::try_from(parts[1]).ok()?,
+        u16::try_from(parts[2]).ok()?,
+    ))
+}
+
 /// Parse 8 version bytes. Detects old (byte[7]==0) vs new (byte[0]==0xFF, byte[7]!=0).
 pub(super) fn parse_version_bytes(bytes: &[u8; 8]) -> VersionInfo {
     if bytes[0] == NEW_FORMAT_MARKER && bytes[7] != 0 {
@@ -305,7 +330,10 @@ pub(super) fn old_peer_rejection_means_we_must_update(
     local: &[u8; 8],
 ) -> bool {
     let local_info = parse_version_bytes(local);
-    let (rmaj, rmin, rpatch) = parse_semver(remote_version_str);
+    // An unrepresentable remote version cannot be shown to be newer than us.
+    let Some((rmaj, rmin, rpatch)) = try_parse_semver(remote_version_str) else {
+        return false;
+    };
 
     if let Some(local_min) = local_info.min_compatible {
         // If remote < our min, we don't care about their rejection
@@ -652,6 +680,19 @@ mod tests {
     /// parse_semver with adversarial/malformed input.
     #[test]
     fn test_parse_semver_malformed() {
+        assert_eq!(try_parse_semver("0.2.164"), Some((0, 2, 164)));
+        assert_eq!(try_parse_semver("1.2.3-rc.1+b5"), Some((1, 2, 3)));
+        assert_eq!(try_parse_semver("0.2.65535"), Some((0, 2, 65535)));
+        for unrepresentable in ["0.2.70000", "256.0.0", "0.256.0", "99999999999.0.0"] {
+            assert_eq!(try_parse_semver(unrepresentable), None, "{unrepresentable}");
+        }
+        // Peer-supplied text that overflows must fail safe: not "newer".
+        let local = encode_new_format("0.1.153", "0.1.150");
+        assert!(!old_peer_rejection_means_we_must_update(
+            "0.2.70000",
+            &local
+        ));
+        assert!(!old_peer_rejection_means_we_must_update("256.0.0", &local));
         // Empty string
         assert_eq!(parse_semver(""), (0, 0, 0));
         // Missing patch

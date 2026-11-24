@@ -406,6 +406,11 @@ pub enum TransportError {
         "Version incompatibility with gateway\n  Your client version: {actual}\n  Gateway version: {expected}\n  \n  To fix this, update your Freenet client:\n    cargo install --force freenet --version {expected}\n  \n  Or if building from source:\n    git pull && cargo install --path crates/core"
     )]
     ProtocolVersionMismatch { expected: String, actual: String },
+    /// The remote peer runs an OLDER release that refused us. We do not need
+    /// to update, so this must never be shown as "update required". Local
+    /// classification only: never serialized onto the wire.
+    #[error("peer runs an outdated version {peer_version} and refused this connection")]
+    PeerVersionOutdated { peer_version: String },
     #[error("outbound stream to {0} failed (stream-scoped, connection survives)")]
     OutboundStreamFailed(SocketAddr),
     /// An outbound stream was not started because its length is outside
@@ -694,6 +699,7 @@ impl TransportError {
             | TransportError::ConnectionClosed(_)
             | TransportError::ConnectionEstablishmentFailure { .. }
             | TransportError::ProtocolVersionMismatch { .. }
+            | TransportError::PeerVersionOutdated { .. }
             | TransportError::Other(_)
             | TransportError::Udp(UdpError(
                 UdpErrorKind::IO(_)
@@ -1227,6 +1233,7 @@ mod tests {
                 TransportError::ProtocolVersionMismatch { .. } => {
                     (ErrorScope::Connection, false, true)
                 }
+                TransportError::PeerVersionOutdated { .. } => (ErrorScope::Connection, false, true),
                 TransportError::Udp(UdpError(UdpErrorKind::SendFailed(..))) => {
                     (ErrorScope::Transient, true, false)
                 }
@@ -1279,6 +1286,9 @@ mod tests {
             TransportError::ProtocolVersionMismatch {
                 expected: "1".into(),
                 actual: "2".into(),
+            },
+            TransportError::PeerVersionOutdated {
+                peer_version: "1".into(),
             },
             TransportError::send_failed(addr, io::ErrorKind::NetworkUnreachable),
             TransportError::OutboundStreamFailed(addr),
