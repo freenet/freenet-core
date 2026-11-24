@@ -779,6 +779,10 @@ async fn run_network_node_with_signals(
         // Update check when the node cannot join (#5940 prerequisite). It only
         // adds a check; the boot check and the re-poll above are untouched.
         let mut handshake_trigger = HandshakeFailureTrigger::default();
+        // A boot check that ran counts as this rule's last check, so a node
+        // that cannot connect at boot does not ask GitHub again a minute or
+        // two later.
+        handshake_trigger.seed_from_boot_check(Instant::now(), startup_check_ran);
         let our_version = parse_our_version();
         // #5799: while a newer release cools down after failed attempts,
         // nothing asks GitHub or claims a retry; the signals are kept and act
@@ -1079,7 +1083,8 @@ async fn run_network_node_with_signals(
             // sent to every known gateway, all failed asks GitHub now instead
             // of waiting for the next re-poll (up to 7.5 h away): the network
             // may have moved past this version. Same claim, blocked-version
-            // gate and staging as the re-poll; at most one check an hour. Not
+            // gate and staging as the re-poll; at most one check an hour per process
+            // (the cap is in memory and restarts with the process). Not
             // run while a release cools down, and then it does not use up the
             // hour. It also stays out when the claim would spend a locked-out
             // node's daily retry (#3934): this fires when the node is likely
@@ -3500,6 +3505,12 @@ mod tests {
         let src = strip_line_comments(include_str!("freenet.rs"));
         let body = fn_body(&src, "async fn run_network_node_with_signals(");
         let flat: String = body.split_whitespace().collect();
+        assert!(
+            flat.contains(
+                "handshake_trigger.seed_from_boot_check(Instant::now(),startup_check_ran);"
+            ),
+            "a boot check that ran must seed the trigger's interval"
+        );
         let gate = flat
             .find("if!cooling()&&handshake_trigger.due(")
             .expect("the update task must consult the trigger behind the cooling gate");

@@ -2328,8 +2328,11 @@ pub const HANDSHAKE_FAILURE_ROUNDS: u32 = 3;
 /// The shortest time between two checks the handshake-failure rule starts.
 /// A node that cannot reach the network at all (offline, or behind a block)
 /// meets the rule every round, so this is what keeps it to one GitHub request
-/// an hour, well under the 60/hour/IP unauthenticated limit that the 6 h
-/// re-poll and the peer-signal checks share. Against the 7.5 h worst case of
+/// an hour per process. The cap is in memory and a restart clears it; across
+/// restarts the on-disk node token bucket and the #5799 release cooldown and
+/// install gate bound the requests. Within a process that is well under the
+/// 60/hour/IP unauthenticated limit that the 6 h re-poll and the peer-signal
+/// checks share. Against the 7.5 h worst case of
 /// the re-poll alone, an hour still finds a release within about an hour of
 /// it being published for a node the network has left behind.
 pub const HANDSHAKE_FAILURE_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
@@ -2379,6 +2382,14 @@ impl HandshakeFailureTrigger {
             .is_none_or(|t| now.saturating_duration_since(t) >= HANDSHAKE_FAILURE_CHECK_INTERVAL)
     }
 
+    /// A boot check that ran (`ran`) at `now` starts the interval, without
+    /// counting as a trigger of this rule. A skipped boot check starts nothing.
+    pub fn seed_from_boot_check(&mut self, now: std::time::Instant, ran: bool) {
+        if ran {
+            self.last_started = Some(now);
+        }
+    }
+
     /// A check is going ahead: start the interval and count it. An empty
     /// node token bucket still lands here, since only the fetch can tell; the
     /// hour then goes unused by the request but also keeps a node with an
@@ -2423,6 +2434,17 @@ mod handshake_failure_trigger_tests {
         for _ in 0..5 {
             assert!(t.due(now, 0, HANDSHAKE_FAILURE_ROUNDS));
         }
+    }
+
+    #[test]
+    fn a_boot_check_starts_the_interval_without_counting() {
+        let now = Instant::now();
+        let mut t = HandshakeFailureTrigger::default();
+        t.seed_from_boot_check(now, false);
+        assert!(t.due(now, 0, 10), "a skipped boot check starts nothing");
+        t.seed_from_boot_check(now, true);
+        assert!(!t.due(now + Duration::from_secs(120), 0, 10));
+        assert!(t.due(now + HANDSHAKE_FAILURE_CHECK_INTERVAL, 0, 10));
     }
 
     #[test]
