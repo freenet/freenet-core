@@ -2778,16 +2778,20 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
     })
 }
 
-/// True when `s` is a well-formed version string, the only kind that may be
-/// placed into a suggested install command.
-fn is_plain_version(s: &str) -> bool {
-    semver::Version::parse(s).is_ok()
+/// Longest peer-supplied version text that is logged or displayed.
+const MAX_PEER_VERSION_TEXT_LEN: usize = 64;
+
+/// True when `s` is a well-formed version string (pre-release and build
+/// suffixes allowed) of bounded length, the only kind that may be placed into
+/// a suggested install command.
+fn is_well_formed_version(s: &str) -> bool {
+    s.len() <= MAX_PEER_VERSION_TEXT_LEN && semver::Version::parse(s).is_ok()
 }
 
 /// Dashboard text for a version mismatch. The install command is only offered
 /// when both versions are well-formed.
 fn version_mismatch_html(local: &str, gateway: &str) -> String {
-    if !(is_plain_version(local) && is_plain_version(gateway)) {
+    if !(is_well_formed_version(local) && is_well_formed_version(gateway)) {
         return "<strong>Version mismatch</strong>: the gateway reported a version \
                 this node could not read. Update Freenet to the latest release."
             .to_string();
@@ -2818,7 +2822,7 @@ pub fn classify_transport_error(error_msg: &str) -> FailureReason {
             .and_then(|s| s.split('\n').next())
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
-        if is_plain_version(&local) && is_plain_version(&gateway) {
+        if is_well_formed_version(&local) && is_well_formed_version(&gateway) {
             FailureReason::VersionMismatch { local, gateway }
         } else {
             FailureReason::Other("version mismatch (version text not recognised)".to_string())
@@ -2939,6 +2943,29 @@ mod tests {
         let html = version_mismatch_html("0.1.133", "1.0.0 --git https://example.invalid/x");
         assert!(!html.contains("cargo install"));
         assert!(!html.contains("example.invalid"));
+    }
+
+    #[test]
+    fn test_classify_version_mismatch_accepts_prerelease_and_rejects_overlong() {
+        let msg = "Version incompatibility with gateway\n  Your client version: 0.1.133\n  Gateway version: 1.2.3-rc.1+b5\n  \n";
+        match classify_transport_error(msg) {
+            FailureReason::VersionMismatch { gateway, .. } => assert_eq!(gateway, "1.2.3-rc.1+b5"),
+            FailureReason::NatTraversalFailed
+            | FailureReason::Timeout
+            | FailureReason::Other(_) => panic!("expected VersionMismatch"),
+        }
+        let html = version_mismatch_html("0.1.133", "1.2.3-rc.1+b5");
+        assert!(html.contains("cargo install --force freenet --version 1.2.3-rc.1+b5"));
+
+        let long = format!("1.2.3-{}", "a".repeat(100));
+        let msg = format!(
+            "Version incompatibility with gateway\n  Your client version: 0.1.133\n  Gateway version: {long}\n  \n"
+        );
+        assert!(matches!(
+            classify_transport_error(&msg),
+            FailureReason::Other(_)
+        ));
+        assert!(!version_mismatch_html("0.1.133", &long).contains("cargo install"));
     }
 
     #[test]

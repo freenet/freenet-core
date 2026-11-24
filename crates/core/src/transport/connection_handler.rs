@@ -4563,7 +4563,7 @@ fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
         let remote_version_str = expected.trim();
         // The version is echoed in logs and in a suggested install command,
         // so only a well-formed version is ever carried forward.
-        if semver::Version::parse(remote_version_str).is_err() {
+        if remote_version_str.len() > 64 || semver::Version::parse(remote_version_str).is_err() {
             return TransportError::ConnectionEstablishmentFailure {
                 cause: Cow::Borrowed("remote reported an unrecognised protocol version"),
             };
@@ -4591,7 +4591,13 @@ fn handle_ack_connection_error(err: Cow<'static, str>) -> TransportError {
             actual: PCK_VERSION.to_string(),
         }
     } else {
-        TransportError::ConnectionEstablishmentFailure { cause: err }
+        // Peer text is logged and displayed, so keep only a bounded prefix.
+        let cause = if err.chars().count() > 64 {
+            Cow::Owned(err.chars().take(64).collect::<String>())
+        } else {
+            err
+        };
+        TransportError::ConnectionEstablishmentFailure { cause }
     }
 }
 
@@ -4891,6 +4897,7 @@ pub mod mock_transport {
             "expected version <b>1.2.3</b>",
             "expected version 1.2",
             "expected version ",
+            "expected version 1.2.3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
             let err = handle_ack_connection_error(bad.to_string().into());
             assert!(
@@ -4902,6 +4909,18 @@ pub mod mock_transport {
                 "expected generic failure for {bad:?}, got {err:?}"
             );
         }
+
+        let ok = handle_ack_connection_error("expected version 1.2.3-rc.1+b5".to_string().into());
+        assert!(matches!(
+            &ok,
+            TransportError::ProtocolVersionMismatch { expected, .. } if expected == "1.2.3-rc.1+b5"
+        ));
+        let long_other = "x".repeat(500);
+        let err = handle_ack_connection_error(long_other.into());
+        assert!(matches!(
+            &err,
+            TransportError::ConnectionEstablishmentFailure { cause } if cause.chars().count() == 64
+        ));
 
         let err_msg_no_version = "remote is using a different protocol version".to_string();
         match handle_ack_connection_error(err_msg_no_version.clone().into()) {
