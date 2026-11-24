@@ -14,7 +14,7 @@ bump PR merges
   -> cross-compile.yml:  build -> attach binaries
                          -> Gate A: auto-update pre-flight   BLOCKING
                          -> cargo publish (crates.io)        IRREVERSIBLE
-                         -> gh release edit --draft=false
+                         -> gh release edit --draft=false --latest=<newest?>
 ```
 
 Two consequences for anyone recovering by hand. Both are about ORDER, not about
@@ -396,8 +396,16 @@ for c in "freenet 0.1.X" "fdev 0.Y.Z"; do
   esac
 done
 
-# ONLY now, and only if Gate A reported success above, un-draft:
-gh release edit "$TAG" --repo "$REPO" --draft=false
+# ONLY now, and only if Gate A reported success above, un-draft. Decide
+# `--latest` in the same call, as cross-compile.yml's "Publish release" does:
+# a bare un-draft is made latest by GitHub, which for a tag older than a
+# published release moves the marker backwards, and nodes update from it.
+PUBLISHED=$(gh release list --repo "$REPO" --limit 30 --exclude-drafts \
+  --json tagName,isPrerelease --jq '.[] | select(.isPrerelease | not) | .tagName') \
+  || { echo "STOP: could not list releases"; exit 1; }
+HIGHEST=$(printf '%s\n%s\n' "$PUBLISHED" "$TAG" | sed '/^$/d' | sort -V | tail -1)
+if [ "$HIGHEST" = "$TAG" ]; then MAKE_LATEST=true; else MAKE_LATEST=false; fi
+gh release edit "$TAG" --repo "$REPO" --draft=false --latest="$MAKE_LATEST"
 ```
 
 ### Step 4b: Gate A blocked the release

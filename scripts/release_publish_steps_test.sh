@@ -44,6 +44,7 @@ check() {
 #              step's own --jq filter is applied to it with real jq, so the
 #              filter itself (e.g. dropping prereleases) is under test
 #   COMBINED_RC: exit code of a `release edit` that both un-drafts and sets --latest=
+#   LATEST_RC: exit code of a bare `release edit ... --latest`
 #   API_OUT: `gh api` output
 STUBS="$TEST_TMP/bin"
 mkdir -p "$STUBS"
@@ -66,6 +67,7 @@ case "$1 $2" in
     "release edit")
         case " $* " in
             *" --draft=false --latest="*) exit "${COMBINED_RC:-0}" ;;
+            *" --latest ") exit "${LATEST_RC:-0}" ;;
         esac ;;
     "api *"|api*) printf '%s\n' "${API_OUT:-notes}" ;;
 esac
@@ -142,6 +144,14 @@ if load_step "$CROSS_YML" attach-to-release "Publish release" "$PUB"; then
         "rc=0 edits=release edit v0.2.99 --draft=false --latest=true|release edit v0.2.99 --draft=false|release edit v0.2.99 --latest"
     publish_case "combined edit refused for an older tag: fails, no bare un-draft" v0.2.99 'v0.2.100\n' 0 1 \
         "rc=1 edits=release edit v0.2.99 --draft=false --latest=false"
+    # The release is already public by the fallback's last call, so a refused
+    # --latest there warns rather than failing a published release.
+    rc=$(run_step "$PUB" GITHUB_REF=refs/tags/v0.2.99 LIST_OUT='v0.2.98\n' COMBINED_RC=1 LATEST_RC=1)
+    check "Publish release: a refused --latest in the fallback warns, exit 0" \
+        "rc=$rc $(grep -c '^::warning::could not mark v0.2.99 as latest' "$PUB/out")" "rc=0 1"
+    # Drafts must not count: a spent version left as a draft is not published.
+    check "Publish release: the listing excludes drafts" \
+        "$(grep -c '^release list .*--exclude-drafts' "$PUB/calls")" "1"
     # The step's own --jq runs here, so deleting its prerelease filter fails this.
     rc=$(run_step "$PUB" GITHUB_REF="refs/tags/v0.2.99" \
         LIST_JSON='[{"tagName":"v0.3.0-rc1","isPrerelease":true},{"tagName":"v0.2.98","isPrerelease":false}]')
@@ -204,6 +214,11 @@ if load_step "$CROSS_YML" attach-to-release "Prepare release assets" "$ASSETS"; 
     rm -rf "$ASSETS/work/artifacts/x86_64-linux-fdev"
     rc=$(run_step "$ASSETS")
     check "Prepare release assets: a missing artifact fails the step" "$([ "$rc" -ne 0 ] && echo failed || echo "passed rc=$rc")" "failed"
+    # The Windows archives are zipped in a subshell; its failure must count too.
+    make_artifacts
+    rm -rf "$ASSETS/work/artifacts/x86_64-windows-fdev"
+    rc=$(run_step "$ASSETS")
+    check "Prepare release assets: a missing Windows artifact fails the step" "$([ "$rc" -ne 0 ] && echo failed || echo "passed rc=$rc")" "failed"
     check "Prepare release assets: runs under set -euo pipefail" \
         "$(grep -cxF 'set -euo pipefail' "$ASSETS/step.sh")" "1"
     check "Prepare release assets: no 'cd artifacts/... && tar' form" \
@@ -253,6 +268,8 @@ if load_step "$ANNOUNCE_YML" resolve "Resolve version" "$ANN"; then
     announce_case "a release older than a published one is not announced" release v0.2.99 false 'v0.2.100\n' 0 "rc=0 skip=true"
     announce_case "a workflow_dispatch is announced as asked" workflow_dispatch 0.2.99 "" 'v0.2.100\n' 0 "rc=0 skip=false"
     announce_case "a failed listing on a release event fails the step" release v0.2.99 false '' 1 "rc=1 skip="
+    check "Resolve version: the listing excludes drafts" \
+        "$(grep -c '^release list .*--exclude-drafts' "$ANN/calls")" "1"
     # The step's own --jq runs here, so deleting its prerelease filter fails this.
     rc=$(run_step "$ANN" EVENT_NAME=release TAG_NAME=v0.2.99 DISPATCH_VERSION= PRERELEASE=false REPO=example/repo \
         LIST_JSON='[{"tagName":"v0.3.0-rc1","isPrerelease":true},{"tagName":"v0.2.98","isPrerelease":false}]')
@@ -281,6 +298,49 @@ if load_step "$RELEASE_YML" validate "Check RELEASE_PAT is configured" "$PAT"; t
     pat_case "missing on a live run: refuses" false true "rc=1 ::error"
     pat_case "missing on a dry run: warns only" false false "rc=0 ::warning"
 fi
+
+# step_if <workflow> <job> <step>: the step's `if:` expression, or None.
+step_if() {
+    python3 -c '
+import sys, yaml
+steps = yaml.safe_load(open(sys.argv[1]))["jobs"][sys.argv[2]]["steps"]
+print(next(s for s in steps if s.get("name") == sys.argv[3]).get("if"))
+' "$@"
+}
+LIVE_GATE="steps.mode.outputs.live == 'true'"
+
+# The live pre-flight runs scripts/check_release_preflight.sh (tested on its
+# own). Here a stand-in in the work dir records what the step hands it, so
+# `run: true` or a dropped env entry fails, and its exit code must propagate.
+PRE="$TEST_TMP/preflight"
+if load_step "$RELEASE_YML" validate "Refuse a version that is spent or already being cut" "$PRE"; then
+    mkdir -p "$PRE/work/scripts"
+    # shellcheck disable=SC2016  # expanded by the stand-in, not here
+    printf '#!/usr/bin/env bash
+printf "RELEASE_VERSION=%%s GH_TOKEN=%%s\n" "${RELEASE_VERSION-unset}" "${GH_TOKEN-unset}" > "$PWD/ran"
+exit "${FAKE_RC:-0}"
+' \
+        > "$PRE/work/scripts/check_release_preflight.sh"
+    rm -f "$PRE/work/ran"
+    rc=$(run_step "$PRE")
+    check "pre-flight step: runs check_release_preflight.sh with the version and a token" \
+        "rc=$rc $(cat "$PRE/work/ran" 2>/dev/null || echo not-run)" \
+        "rc=0 RELEASE_VERSION=@@steps.validate.outputs.version@@ GH_TOKEN=@@github.token@@"
+    check "pre-flight step: a refusal fails the step" "rc=$(run_step "$PRE" FAKE_RC=1)" "rc=1"
+fi
+check "pre-flight step: gated on a live run" \
+    "$(step_if "$RELEASE_YML" validate "Refuse a version that is spent or already being cut")" "$LIVE_GATE"
+
+SIGNKEY="$TEST_TMP/signkey"
+if load_step "$RELEASE_YML" validate "Verify the release signing key before anything is created" "$SIGNKEY"; then
+    check "signing-key check: present passes" \
+        "rc=$(run_step "$SIGNKEY" FREENET_RELEASE_SIGNING_KEY_PRESENT=true)" "rc=0"
+    rc=$(run_step "$SIGNKEY" FREENET_RELEASE_SIGNING_KEY_PRESENT=false)
+    check "signing-key check: missing refuses with an error" \
+        "rc=$rc $(grep -c '^::error' "$SIGNKEY/out")" "rc=1 1"
+fi
+check "signing-key check: gated on a live run" \
+    "$(step_if "$RELEASE_YML" validate "Verify the release signing key before anything is created")" "$LIVE_GATE"
 
 NOTES="$TEST_TMP/notes"
 if load_step "$RELEASE_YML" create_release "Generate release notes" "$NOTES"; then

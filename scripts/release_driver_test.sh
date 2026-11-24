@@ -864,6 +864,68 @@ EOF
     pr_case "auto-merge already on: no merge call" "OPEN|true" 0 MERGED "rc=0 merges=0 squash=0"
     pr_case "already merged: no merge call" "MERGED|false" 0 MERGED "rc=0 merges=0 squash=0"
     pr_case "a PR that never merges times out NON-ZERO" "OPEN|false" 0 OPEN "rc=1 merges=1 squash=0"
+
+    # The PR number comes from the URL `gh pr create` prints. It used to be
+    # grepped from stdout with stderr discarded, so a failed create produced
+    # an empty number. Run the create path (no existing PR, a version change
+    # to commit) and check which PR the driver goes on to merge.
+    # create_case <desc> <gh pr create output> <gh pr create rc> <expected "rc=N merge=<argv or none>">
+    create_case() {
+        local desc="$1" create_out="$2" create_rc="$3" want="$4"
+        local work got rc=0
+        work="$(mktemp -d)"
+        mkdir -p "$work/bin"
+        printf '%s\n' "$create_out" > "$work/create_out"
+        cat > "$work/bin/gh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$work/gh.log"
+case "\$1 \$2" in
+    "pr create") cat "$work/create_out"; exit $create_rc ;;
+    "pr view")
+        case "\$*" in
+            *autoMergeRequest*) echo "OPEN|false" ;;
+            *) echo MERGED ;;
+        esac ;;
+esac
+exit 0
+EOF
+        # diff reports changes and show-ref finds no branch, so the driver
+        # commits, pushes and creates the PR.
+        cat > "$work/bin/git" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    diff|show-ref) exit 1 ;;
+esac
+exit 0
+EOF
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/sleep"
+        chmod +x "$work/bin"/*
+        : > "$work/gh.log"
+        # shellcheck disable=SC2030,SC2031,SC2034,SC2317
+        (
+            PATH="$work/bin:$PATH"
+            VERSION=9.9.9
+            FDEV_VERSION=0.9.9
+            DRY_RUN=false
+            is_step_completed() { return 1; }
+            mark_completed() { :; }
+            run_cmd() { shift; "$@"; }
+            eval "$CRPR_FN"
+            create_release_pr
+        ) > "$work/out" 2>&1 || rc=$?
+        got="rc=$rc merge=$(grep '^pr merge' "$work/gh.log" | paste -sd'|' -)"
+        [[ "$got" == *"merge=" ]] && got="${got}none"
+        if [[ "$got" == "$want" ]]; then
+            pass "create_release_pr: $desc"
+        else
+            fail "create_release_pr: $desc (got '$got', expected '$want')" "$(tail -5 "$work/out")"
+        fi
+        rm -rf "$work"
+    }
+    create_case "the PR number is read from gh's URL" \
+        "https://github.com/freenet/freenet-core/pull/123" 0 "rc=0 merge=pr merge 123 --auto"
+    create_case "output with no PR number refuses" "something went sideways" 0 "rc=1 merge=none"
+    create_case "a failed gh pr create refuses" "HTTP 422: Validation Failed" 1 "rc=1 merge=none"
 fi
 
 # --- min-compatible-version moves only when asked ------------------------------

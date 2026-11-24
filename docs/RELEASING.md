@@ -757,6 +757,12 @@ gh workflow run release.yml
                                             └─→ nova runs riverctl locally
 ```
 
+The un-draft makes the release latest only when it is the highest published
+non-prerelease version; an older tag un-drafted during a recovery stays
+non-latest, so nodes are not pointed back at it. On a release event,
+release-announce.yml likewise skips a prerelease or a release older than one
+already published, while a manual `workflow_dispatch` always posts.
+
 ## How to monitor
 
 - **All in one place**:
