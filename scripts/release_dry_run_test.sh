@@ -531,8 +531,12 @@ check "tag step: no release yet tags and pushes" \
     "$(tag_stale_case '' 2026-11-23T10:00:00Z '')" "rc=0 pushes=1"
 check "tag step: a release lookup error other than not-found refuses before the push" \
     "$(tag_stale_case ERROR 2026-11-23T10:00:00Z '')" "rc=1 pushes=0"
+check "tag step: the lookup-error refusal names it" \
+    "$(grep -c '^::error::Could not ask GitHub whether release' "$TEST_TMP/tagstale.out")" "1"
 check "a release lookup error other than not-found refuses rather than creating" \
     "$(rel_case ERROR 2026-11-23T10:00:00Z)" "rc=1 views=1 creates=0"
+check "the release step's lookup-error refusal names it" \
+    "$(grep -c '^::error::Could not ask GitHub whether release' "$TEST_TMP/rel.out")" "1"
 check "an empty run start refuses rather than reusing a release" \
     "$(rel_case 2026-11-20T09:00:00Z '')" "rc=1 views=1 creates=0"
 

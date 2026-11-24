@@ -786,10 +786,15 @@ jobs:
           # pre-flight cannot do this: validate's read-only token is not
           # shown drafts. Fails closed: only gh's "release not found" counts
           # as no release; any other error refuses.
-          # `gh release view` resolves drafts by listing releases when the
-          # by-tag endpoint 404s, and createdAt is the creation time, not the
-          # commit date (v0.2.164: created 03:08:40Z, tag commit 02:46:24Z).
-          VIEW_ERR=$(mktemp)
+          # `gh release view` resolves a draft by its pending tag (GraphQL) in
+          # parallel with the REST by-tag lookup, and prints exactly "release
+          # not found" only when neither finds one (gh 2.86 fetch.go). A draft
+          # is visible only to a token with push access, which GH_TOKEN has
+          # (the next step creates the release with it). createdAt is the
+          # creation time, not the commit date (v0.2.164: created 03:08:40Z,
+          # tag commit 02:46:24Z). If gh ever rewords the not-found error,
+          # this refuses every cut: safe, and visible in the annotation.
+          VIEW_ERR=$(mktemp -p "${RUNNER_TEMP:-/tmp}")
           if REL_CREATED=$(gh release view "v$VERSION" --json createdAt --jq .createdAt 2>"$VIEW_ERR"); then
             if [ -z "$REL_CREATED" ]; then
               echo "::error::gh release view v$VERSION succeeded but returned no createdAt. Nothing was pushed; re-run this job."
@@ -804,7 +809,7 @@ jobs:
               exit 1
             fi
           elif ! grep -qi 'release not found' "$VIEW_ERR"; then
-            echo "::error::Could not ask GitHub whether release v$VERSION already exists ($(head -c 200 "$VIEW_ERR")). Nothing was pushed; re-run this job."
+            echo "::error::Could not ask GitHub whether release v$VERSION already exists ($(head -c 200 "$VIEW_ERR" | tr '\n' ' ')). Nothing was pushed; re-run this job."
             exit 1
           fi
           # `git tag -a` needs user.name/email. The `update_versions` job
@@ -857,7 +862,7 @@ jobs:
           # refused that before pushing; the check is repeated so this step
           # never reuses a stale draft on its own (e.g. if the steps are
           # reordered).
-          VIEW_ERR=$(mktemp)
+          VIEW_ERR=$(mktemp -p "${RUNNER_TEMP:-/tmp}")
           if REL_CREATED=$(gh release view "v$VERSION" --json createdAt --jq .createdAt 2>"$VIEW_ERR"); then
             if [ -z "$REL_CREATED" ]; then
               echo "::error::gh release view v$VERSION succeeded but returned no createdAt. Re-run this job."
@@ -875,7 +880,7 @@ jobs:
             exit 0
           elif ! grep -qi 'release not found' "$VIEW_ERR"; then
             # Creating anyway could make a second draft with the same tag.
-            echo "::error::Could not ask GitHub whether release v$VERSION already exists ($(head -c 200 "$VIEW_ERR")). Re-run this job."
+            echo "::error::Could not ask GitHub whether release v$VERSION already exists ($(head -c 200 "$VIEW_ERR" | tr '\n' ' ')). Re-run this job."
             exit 1
           fi
           gh release create "v$VERSION" \
