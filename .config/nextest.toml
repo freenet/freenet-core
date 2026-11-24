@@ -52,6 +52,20 @@ retries = 0
 filter = "test(lattice_probe_does_not_grow_degree_with_uptime)"
 slow-timeout = { period = "300s", terminate-after = 2 }
 
+# Mixed-version interop (freenet-ping-app, mixed_version_test.rs). Each test
+# builds one or two Docker NAT networks of old and new binaries and runs PUT,
+# GET, SUBSCRIBE, UPDATE and a large-state transfer across versions; the floor
+# test runs two networks. No retries: an interop failure that passes on a second
+# attempt is a real intermittent break and must stay visible.
+#
+# This must stay ABOVE the package(freenet-ping-app) override below: nextest
+# applies the first matching override for each setting, so placed after it the
+# slow-timeout here would never take effect.
+[[profile.ci.overrides]]
+filter = "test(mixed_version)"
+slow-timeout = { period = "300s", terminate-after = 4 }
+retries = 0
+
 # Ping integration tests have internal timeouts of 360-600s with sequential
 # phases (WS connect retries, ring connection waits, contract operations).
 # Default 240s nextest cap kills them before they can finish on slow runners.

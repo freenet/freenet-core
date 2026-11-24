@@ -330,6 +330,8 @@ SimulationSocket::bind(addr).await
 ```
 See: `crates/core/src/transport/in_memory_socket.rs`
 
+**Mixed-version network (N, N-1, N-2 in Docker NAT):** `apps/freenet-ping/app/tests/mixed_version_test.rs`, run by `.github/workflows/mixed-version.yml`. To run it locally follow the recipe in the header of that file; it needs a second HEAD build (N') with `FREENET_MIN_COMPATIBLE_VERSION` set to the lower of N-1's version and HEAD's (the floor test shows the advertised floor decides who is refused, enforced by either side) and the release binaries from `scripts/fetch-release-binary.sh resolve`.
+
 ## Choosing a Simulation Runner
 
 ```

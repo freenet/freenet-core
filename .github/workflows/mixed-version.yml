@@ -1,0 +1,282 @@
+name: Mixed Version Interop
+
+# Proves that the current build (N) and the previous published releases (N-1,
+# N-2) interoperate in one Docker NAT network, so the 1.0 transition is not a
+# flag day, and that the advertised handshake floor decides who is refused (a
+# second build of the same source, N', with its floor raised to min(N-1, HEAD),
+# must refuse N-2 while plain N accepts it). The floor is advertised in the
+# handshake and enforced by either side, so this shows the floor decides the
+# outcome, not that N's own check is the one that fires. Scenarios and
+# assertions are documented at the top of
+# apps/freenet-ping/app/tests/mixed_version_test.rs.
+#
+# Runs:
+#   - nightly on main, to catch wire drift while the culprit is identifiable;
+#   - on pull requests that touch the wire, transport, handshake or version
+#     surface (listed in the select job), or that carry the `mixed-version` label;
+#   - on demand.
+# Deliberately NOT on every PR (about $0.40 per run on Ubicloud), and not a
+# release gate yet: that is a separate decision once the nightly record is in.
+# It reports no required status context, so a skipped run blocks nothing.
+#
+# The PR path filter is a heuristic, not a complete map of the wire surface.
+# Anything outside the list in the select job (for example most of
+# crates/core/src/ring/, contract/, client_events/, the server and dashboard
+# code, docs, and other apps) does not start a PR run even if it changes
+# behaviour on the wire. The nightly run on main is the backstop and covers such
+# a change within a day; add the `mixed-version` label to a PR that you suspect
+# of one.
+#
+# Transport: the nodes expose no per-connection transport, so the run records
+# only each node's CONFIGURED mode. Pass 1 leaves the nodes' own choice (hashed
+# per pair, as in production; a small network may form no native pair). Pass 2
+# configures builds that support it to prefer native QUIC at 100%. Neither pass
+# proves a native pair formed.
+
+on:
+  schedule:
+    # 04:30 UTC, between simulation-nightly (02:00-03:00) and binstall (05:00).
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+  pull-requests: read # list a PR's files in the select job
+
+concurrency:
+  # A `labeled` event for any other label gets its own group, so adding an
+  # unrelated label cannot cancel and restart a run that is already going.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}-${{ (github.event.action == 'labeled' && github.event.label.name != 'mixed-version') && github.run_id || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Cheap decision job: the PR trigger cannot combine a path filter with a
+  # label, so every PR starts this and only wire-surface PRs go on to the
+  # expensive job below.
+  select:
+    name: Decide whether to run
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
+          LABEL_NAME: ${{ github.event.label.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'mixed-version') }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only list of a PR's files, emits no event
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Not a pull request ($EVENT_NAME): running."
+            exit 0
+          fi
+          # Only the mixed-version label may start a run from a label event.
+          if [ "$EVENT_ACTION" = "labeled" ] && [ "$LABEL_NAME" != "mixed-version" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Unrelated label '$LABEL_NAME' added: nothing to do."
+            exit 0
+          fi
+          if [ "$HAS_LABEL" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "The mixed-version label is set: running."
+            exit 0
+          fi
+          # Wire, transport, handshake and version surface, plus this test's own
+          # files. `network_bridge` matches the file and the directory.
+          WATCHED='^(crates/core/src/transport/|crates/core/src/node/network_bridge(\.rs$|/)|crates/core/src/message\.rs$|crates/core/src/operations/(get|put|subscribe|update)\.rs$|crates/core/src/operations/connect(\.rs$|/)|crates/core/src/operations/visited_peers\.rs$|crates/core/src/ring/(peer_key_location|location)\.rs$|crates/core/src/config\.rs$|crates/core/build(\.rs$|/)|crates/core/Cargo\.toml$|Cargo\.toml$|apps/freenet-ping/app/Cargo\.toml$|apps/freenet-ping/app/tests/(mixed_version_test\.rs|common/)|\.config/nextest\.toml$|scripts/fetch-release-binary|\.github/workflows/mixed-version\.yml$)'
+          files="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename')"
+          hits="$(grep -E "$WATCHED" <<<"$files" || true)"
+          # A freenet-stdlib bump changes the client wire; it shows up only in
+          # Cargo.lock, so look at that file's diff for a stdlib line.
+          if gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" \
+            --jq '.[] | select(.filename == "Cargo.lock") | .patch // ""' | grep -q 'freenet-stdlib'; then
+            hits="$hits"$'\n'"Cargo.lock (freenet-stdlib)"
+          fi
+          if [ -n "$(tr -d '[:space:]' <<<"$hits")" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "The PR touches the wire/version surface:"
+            echo "$hits"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No wire/version paths touched and no mixed-version label: skipping."
+          fi
+
+  mixed_version:
+    name: Mixed Version Interop
+    needs: select
+    if: needs.select.outputs.run == 'true' && !startsWith(github.head_ref, 'dependabot/')
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 75
+    env:
+      RUST_LOG: error
+      RUST_MIN_STACK: 268435456
+      # Auto-update off in the Docker test nodes, as in NAT Validation (#6341).
+      # `build.rs` reads this at build time; set job-wide so no step rebuilds.
+      FREENET_GIT_IS_DIRTY: "1"
+      FREENET_MIXED_ARTIFACT_DIR: ${{ github.workspace }}/mixed-version-artifacts
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold liblzma-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          targets: wasm32-unknown-unknown
+
+      # Restore-only on PRs. The main-scoped entry is written only by this
+      # workflow's own runs on main (the nightly): ci-cache-warm.yml does not
+      # build the same targets, so a PR run may start from a cold cache until
+      # the first nightly has saved one.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
+
+      - name: Pull Docker images for NAT simulation
+        run: docker pull alpine:latest
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
+
+      # N-1 and N-2: the two newest published (non-draft, non-prerelease)
+      # releases by semver. A tag's assets never change, so the download is
+      # cached by tag; every run still compares the cached archive's recorded
+      # checksum with the release's current SHA256SUMS.txt and re-hashes the
+      # cached binary before using it.
+      - name: Select N-1 and N-2
+        id: select
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only release lookup, emits no event
+        run: |
+          set -euo pipefail
+          bash scripts/fetch-release-binary.sh tags | tee -a "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        with:
+          path: mixed-version-bins
+          key: mixed-version-bins-${{ steps.select.outputs.n1 }}-${{ steps.select.outputs.n2 }}
+
+      # Also fetches the newest release below N's min-compatible-version, used by
+      # the very-old-node test. The cache key does not name it: it changes only
+      # when the floor does, and a miss just downloads it again.
+      - name: Download and verify N-1, N-2 and the below-floor release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only release download, emits no event
+        run: |
+          set -euo pipefail
+          bash scripts/fetch-release-binary.sh resolve mixed-version-bins --core-toml crates/core/Cargo.toml
+          # No silent green: every role the tests need must be in the manifest.
+          jq -e 'has("n1") and has("n2") and has("below")' mixed-version-bins/versions.json \
+            || { echo "::error::versions.json is missing n1, n2 or below"; cat mixed-version-bins/versions.json; exit 1; }
+
+      # N is this commit. N' is the same source built with its floor raised to
+      # min(N-1, HEAD)'s version, so the only difference between them is the
+      # floor constant. The floor is capped at HEAD's own version because a
+      # release can be published before its version bump reaches main, which
+      # leaves N-1 newer than HEAD, and the build refuses a floor above its own
+      # version. The binaries are copied out because the second build overwrites
+      # the first.
+      - name: Build N and N' (this commit, floor raised to min(N-1, HEAD))
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          set -euo pipefail
+          mkdir -p mixed-version-head
+          cargo build --locked
+          cp target/debug/freenet mixed-version-head/freenet-n
+          N1_VERSION="$(jq -r .n1.version mixed-version-bins/versions.json)"
+          HEAD_VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' crates/core/Cargo.toml | head -n 1)"
+          # `jq -r` prints "null" for a missing field, so treat that as empty too.
+          if [ -z "$N1_VERSION" ] || [ "$N1_VERSION" = "null" ]; then
+            echo "::error::no N-1 version in versions.json"; exit 1
+          fi
+          if [ -z "$HEAD_VERSION" ]; then
+            echo "::error::cannot read HEAD's version from crates/core/Cargo.toml"; exit 1
+          fi
+          NPRIME_FLOOR="$(printf '%s\n%s\n' "$N1_VERSION" "$HEAD_VERSION" | sort -V | head -n 1)"
+          echo "N' floor: $NPRIME_FLOOR (N-1 $N1_VERSION, HEAD $HEAD_VERSION)"
+          printf '%s\n' "$NPRIME_FLOOR" > mixed-version-head/nprime-floor
+          FREENET_MIN_COMPATIBLE_VERSION="$NPRIME_FLOOR" cargo build --locked
+          cp target/debug/freenet mixed-version-head/freenet-nprime
+          export PATH="$PWD/target/debug:$PATH"
+          make -C apps/freenet-ping -f run-ping.mk build
+
+      - name: Run mixed-version scenarios
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+          FREENET_TEST_DOCKER_NAT: "1"
+          FREENET_BINARY_PATH: ${{ github.workspace }}/mixed-version-head/freenet-n
+          FREENET_NPRIME_BINARY_PATH: ${{ github.workspace }}/mixed-version-head/freenet-nprime
+          FREENET_MIXED_VERSIONS: ${{ github.workspace }}/mixed-version-bins/versions.json
+        run: |
+          if ! docker info >/dev/null 2>&1; then
+            echo "ERROR: Docker is not available but is REQUIRED for the mixed-version test"
+            exit 1
+          fi
+          mkdir -p "$FREENET_MIXED_ARTIFACT_DIR"
+          cp mixed-version-bins/versions.json "$FREENET_MIXED_ARTIFACT_DIR/versions.json"
+          FREENET_NPRIME_FLOOR="$(cat mixed-version-head/nprime-floor)"
+          export FREENET_NPRIME_FLOOR
+          # One test at a time (each owns a Docker network); retries are off in
+          # .config/nextest.toml for these tests. FREENET_MIXED_LENIENT is never
+          # set here, so a missing binary fails the run.
+          base="$FREENET_MIXED_ARTIFACT_DIR"
+          rc=0
+          for mode in default force; do
+            export FREENET_MIXED_QUIC="$mode"
+            export FREENET_MIXED_ARTIFACT_DIR="$base/$mode"
+            # The harness writes node directories here, one tree per pass so the
+            # second pass cannot overwrite the first pass's logs; the artifact
+            # upload then collects them.
+            export FREENET_TEST_NETWORK_BASE_DIR="$base/$mode/harness"
+            mkdir -p "$FREENET_TEST_NETWORK_BASE_DIR"
+            cargo nextest run -p freenet-ping-app --features testing \
+              --profile ci --test-threads 1 \
+              -E 'test(mixed_version)' -- --ignored || rc=1
+          done
+          exit $rc
+
+      - name: Upload reports and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mixed-version
+          path: mixed-version-artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Nightly failures go to the private dev room only: the check is new and not
+  # a release gate, so it must not page the public room yet.
+  notify-dev-room-failure:
+    name: Notify dev room on Failure
+    runs-on: ubuntu-latest
+    needs: mixed_version
+    if: failure() && github.event_name == 'schedule' && needs.mixed_version.result == 'failure'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/river-dev-notify
+        with:
+          message: "Nightly mixed-version interop test failed: ${{ github.repository }} ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

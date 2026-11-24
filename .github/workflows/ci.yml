@@ -280,6 +280,12 @@ jobs:
       - name: Self-test cache-warm parity guard
         run: bash scripts/cache_warm_parity_test.sh
 
+      # Release selection and the checksum gate of the mixed-version test's
+      # binary resolver (semver ordering, junk tags, tampered and unlisted
+      # archives, cache reuse), against local fixtures with no network.
+      - name: Self-test release binary resolver
+        run: bash scripts/fetch-release-binary_test.sh
+
       # Each simulation-nightly job selects its cron with a literal copy of the
       # string under `on.schedule`. If they drift, the job is skipped on every
       # run, which the notifiers and the release pre-flight read as healthy.
