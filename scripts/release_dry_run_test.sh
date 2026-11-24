@@ -267,7 +267,7 @@ done
 # behaviour must change this list deliberately.
 step_seq() { grep "^$2 / " <<< "$1" | sed "s|^$2 / ||" | paste -sd'|' -; }
 check "live: validate step order" "$(step_seq "$LIVE_RUN" validate)" \
-    "Checkout code|Resolve run mode (live or dry run)|Check RELEASE_PAT is configured|Verify the crates.io token before anything is created|Resolve + validate version|Refuse a version that is spent or already being cut|Check the QUIC data ramp start is near now"
+    "Checkout code|Resolve run mode (live or dry run)|Check RELEASE_PAT is configured|Verify the crates.io token before anything is created|Verify the release signing key before anything is created|Resolve + validate version|Refuse a version that is spent or already being cut|Check the QUIC data ramp start is near now"
 check "live: update_versions step order" "$(step_seq "$LIVE_RUN" update_versions)" \
     "Checkout code|Configure git|Update freenet version|Update fdev version|Install Rust|Update Cargo.lock|Commit the version bump locally|Compose the release PR|Push the release branch|Create Pull Request|Enable auto-merge"
 check "live: wait_for_pr step order" "$(step_seq "$LIVE_RUN" wait_for_pr)" \

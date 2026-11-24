@@ -153,6 +153,21 @@ jobs:
           fi
           echo "✅ CARGO_REGISTRY_TOKEN is present. Its live validity is NOT checked here; see the comment above this step for why crates.io offers no endpoint that could."
 
+      # Presence only, like the crates.io token above. cross-compile.yml's
+      # "Sign SHA256SUMS.txt" refuses to publish an unsigned release, and that
+      # runs after the tag and ~25 minutes of builds; finding a missing key
+      # here costs nothing.
+      - name: Verify the release signing key before anything is created
+        if: steps.mode.outputs.live == 'true'
+        env:
+          FREENET_RELEASE_SIGNING_KEY_PRESENT: ${{ secrets.FREENET_RELEASE_SIGNING_KEY != '' }}
+        run: |
+          if [ "$FREENET_RELEASE_SIGNING_KEY_PRESENT" != "true" ]; then
+            echo "::error title=FREENET_RELEASE_SIGNING_KEY not set::cross-compile.yml refuses to publish an unsigned release, so without this secret the release would stop as a draft after the tag and the builds. Restore the secret and re-run."
+            exit 1
+          fi
+          echo "✅ FREENET_RELEASE_SIGNING_KEY is present."
+
       - name: Resolve + validate version
         id: validate
         env:
@@ -781,8 +796,10 @@ jobs:
         run: |
           [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not creating the GitHub release: this run is not live (#5936)."; exit 1; }
           VERSION="${{ needs.validate.outputs.version }}"
-          # Idempotent for a re-run: the release is a draft until
-          # cross-compile.yml un-drafts it, so an existing one is this run's.
+          # Idempotent for a re-run of this job after the tag pushed but the
+          # create failed. Validate refused an existing tag, and this job's tag
+          # step accepted only one on RELEASE_SHA, so a release for it is this
+          # cut's (normally still a draft).
           if gh release view "v$VERSION" --json isDraft >/dev/null 2>&1; then
             echo "✅ Release v$VERSION already exists (re-run); not re-creating"
             exit 0

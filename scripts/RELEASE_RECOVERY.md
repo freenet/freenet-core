@@ -67,6 +67,22 @@ git push --delete origin vX.Y.Z
 git tag -d vX.Y.Z
 ```
 
+### Re-cutting the same version
+
+`release.yml` cannot do this. Its bump PR for X.Y.Z already merged, so `main`
+already says X.Y.Z, the bump would be an empty commit, and the pre-flight in
+`validate` refuses the dispatch ("main is already at X.Y.Z"). Two ways on:
+
+- **Cut the next patch** with `release.yml` as normal. Simplest; it costs a
+  version number but nothing else.
+- **Keep X.Y.Z** by tagging the corrected commit by hand. Land the fix on
+  `main` through a normal PR, soak that `main` HEAD (the `freenet:release`
+  skill's gates apply as for any cut), then follow Steps 2 and 3 below with
+  `RELEASE_SHA` set to that soaked commit, after checking that its
+  `crates/core/Cargo.toml` says X.Y.Z. This skips the merge queue's
+  full-suite release gate, so confirm the fix PR's own CI (which runs the
+  full suite) was green.
+
 ## Quick Reference
 
 ```bash
@@ -104,6 +120,11 @@ gh run list --workflow=cross-compile.yml --branch vX.Y.Z --limit 3
 - CI may be failing
 
 **Recovery:**
+
+An open bump PR also blocks every later live `release.yml` dispatch (the
+pre-flight refuses while one is open), so drive it to merged, or close it, before
+starting anything else.
+
 1. Fix any CI failures
 2. If the conventional commits check failed, restore the title. It MUST start
    with `build: release `: `ci.yml` keys the full-suite release gate in the
@@ -173,13 +194,11 @@ against the tag; `attach-to-release` requires a `refs/tags/v*` ref, so the
 `--ref` must be the tag, not a branch:
 
 **Check nothing is already running for this tag first.** `cross-compile.yml`
-sets `cancel-in-progress` for any ref that is not `main`, so dispatching against
-a tag **cancels the in-flight run for that same tag**. The moment you reach for
-this command — "did it start? is it stuck?" — is exactly when a run may be in
-flight, and a cancellation can now land between the two crate publishes, or
-between the publish and the un-draft. Both states are recoverable (Step 4
-re-runs safely, skipping whatever already published), but do not create them for
-no reason.
+never cancels a tag run (it used to, which could land a cancellation between
+the two crate publishes, or between the publish and the un-draft), so a second
+dispatch now QUEUES behind the in-flight one and repeats its work once it
+finishes. That is safe, since the publish and the un-draft skip what is already
+done, but it is an hour of runners for nothing.
 
 ```bash
 # Is one already running? If so, watch it instead of dispatching.
@@ -555,12 +574,10 @@ gh release view v0.1.X --json isDraft --jq '.isDraft'   # must be false
 # published?" (see Step 4b and the Quick Reference).
 cargo search freenet --limit 1
 
-# 7. Deploy locally
-cargo build --release --bin freenet
-./scripts/deploy-local-gateway.sh --all-instances
-
-# 8. Announce to Matrix
-matrix-commander -r '#freenet-locutus:matrix.org' -m "..."
+# 7. Gateways and announcements fire on the un-draft (release.published). If
+#    they did not, dispatch them (Steps 5 and 6 above):
+gh workflow run gateway-update.yml --repo freenet/freenet-core --field version=0.1.X --field gateways=all
+gh workflow run release-announce.yml --repo freenet/freenet-core --field version=0.1.X
 ```
 
 ## Rollback

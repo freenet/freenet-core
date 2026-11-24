@@ -259,17 +259,17 @@ jobs:
         # `cargo build --release`, which builds the whole workspace incl. fdev and
         # so unifies fdev's `freenet/testing` onto the shipped freenet binary —
         # the 0.2.81 telemetry blackout; see x86_64-linux step for full rationale).
-        # bash, not the runner's default pwsh: pwsh fails a step only on its
-        # LAST native command's exit code, so a failed first build was hidden.
-        shell: bash
+        # This runs in pwsh, which fails a step only on its LAST native
+        # command's exit code, so each earlier command checks its own.
         run: |
           cargo build --release -p freenet
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --release -p fdev
 
       - name: Smoke test
-        shell: bash
         run: |
           target/release/freenet.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           target/release/freenet.exe service --help
 
       # --- Authenticode signing (Azure Artifact Signing) -------------------
@@ -796,8 +796,9 @@ jobs:
             [ -f "$f" ] && ASSETS="$ASSETS $f"
           done
           ASSETS="$ASSETS SHA256SUMS.txt"
-          # Attach the detached signature when the signing step produced one
-          # (absent only if FREENET_RELEASE_SIGNING_KEY was unset).
+          # Attach the detached signature. The signing step now refuses without
+          # a key, so the unsigned branch below is a backstop for a run that
+          # somehow skipped it.
           if [ -f SHA256SUMS.txt.sig ]; then
             ASSETS="$ASSETS SHA256SUMS.txt.sig"
           else
@@ -1086,12 +1087,17 @@ jobs:
               --repo ${{ github.repository }} \
               --draft=false \
               --latest="$MAKE_LATEST"; then
-            echo "::warning::un-draft with --latest=$MAKE_LATEST was refused; retrying as un-draft, then latest"
-            gh release edit "$TAG_NAME" --repo ${{ github.repository }} --draft=false
-            if [ "$MAKE_LATEST" = true ]; then
-              gh release edit "$TAG_NAME" --repo ${{ github.repository }} --latest \
-                || echo "::warning::could not mark $TAG_NAME as latest; run: gh release edit $TAG_NAME --latest"
+            # Only the newest release may fall back: a bare un-draft is made
+            # latest by GitHub, which for an OLDER tag is the backwards move
+            # this step exists to prevent. That case stays a draft and fails.
+            if [ "$MAKE_LATEST" != true ]; then
+              echo "::error::un-draft of the older $TAG_NAME with --latest=false was refused; left as a draft. Un-draft it by hand with --latest=false."
+              exit 1
             fi
+            echo "::warning::un-draft with --latest=true was refused; retrying as un-draft, then latest"
+            gh release edit "$TAG_NAME" --repo ${{ github.repository }} --draft=false
+            gh release edit "$TAG_NAME" --repo ${{ github.repository }} --latest \
+              || echo "::warning::could not mark $TAG_NAME as latest; run: gh release edit $TAG_NAME --latest"
           fi
           echo "✅ Release $TAG_NAME published with all binaries attached (latest=$MAKE_LATEST)"
 

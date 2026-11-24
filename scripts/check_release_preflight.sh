@@ -57,12 +57,17 @@ else
     fi
 fi
 
-if ! PRS=$(gh pr list --repo "$REPO" --state open --limit 200 \
+PR_LIMIT=1000
+if ! PRS=$(gh pr list --repo "$REPO" --state open --limit "$PR_LIMIT" \
         --json number,headRefName,title); then
     refuse "Could not list open PRs" "Could not ask GitHub for open version-bump PRs, so a concurrent cut cannot be ruled out."
+elif [ "$(jq length <<<"$PRS")" -ge "$PR_LIMIT" ]; then
+    refuse "Too many open PRs to check" "$PR_LIMIT or more PRs are open, so a bump PR beyond the listing cannot be ruled out."
 else
+    # The title form is anchored on a version so an unrelated "build: release-…"
+    # PR does not block every cut.
     OPEN_BUMPS=$(jq -r '[.[] | select((.headRefName | startswith("release/v"))
-                                      or (.title | startswith("build: release")))
+                                      or (.title | test("^build: release [0-9]")))
                              | "#\(.number) (\(.headRefName))"] | join(", ")' <<<"$PRS")
     if [ -n "$OPEN_BUMPS" ]; then
         refuse "A version-bump PR is already open" "Open: $OPEN_BUMPS. Another cut is in flight, or a failed one left its PR behind; resolve that first (scripts/RELEASE_RECOVERY.md)."
@@ -73,7 +78,7 @@ fi
 if ! TAGS=$(git ls-remote --tags "https://github.com/$REPO.git" "refs/tags/v$VERSION"); then
     refuse "Could not list tags" "Could not ask origin whether tag v$VERSION exists."
 elif [ -n "$TAGS" ]; then
-    refuse "Tag v$VERSION already exists" "Tag v$VERSION is already on origin. If it is a blocked cut being redone, follow scripts/RELEASE_RECOVERY.md; otherwise pick the next version."
+    refuse "Tag v$VERSION already exists" "Tag v$VERSION is already on origin. Resuming a failed run? Use 'Re-run failed jobs', not 'Re-run all jobs' (which re-runs this check). A blocked cut being redone: scripts/RELEASE_RECOVERY.md. Otherwise pick the next version."
 fi
 
 # --- 3. already on crates.io -------------------------------------------------
@@ -96,7 +101,7 @@ CURRENT=$(awk '/^\[package\]/ {p = 1; next} /^\[/ {p = 0}
 if [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     refuse "Could not read the current version" "No [package] version found in $CARGO_TOML (got '$CURRENT')."
 elif [ "$CURRENT" = "$VERSION" ]; then
-    refuse "main is already at $VERSION" "crates/core/Cargo.toml already says $VERSION, so the bump commit would be empty and update_versions would fail. Cut the next patch."
+    refuse "main is already at $VERSION" "crates/core/Cargo.toml already says $VERSION: its bump merged without a published release, so this bump would be an empty commit. Cut the next patch, or re-cut $VERSION by hand per scripts/RELEASE_RECOVERY.md, 'Re-cutting the same version'."
 elif [ "$(printf '%s\n%s\n' "$CURRENT" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
     refuse "$VERSION is a downgrade" "crates/core/Cargo.toml is at $CURRENT, above the requested $VERSION."
 fi

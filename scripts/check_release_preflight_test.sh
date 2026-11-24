@@ -87,6 +87,10 @@ run_case "an open release/v* PR refuses" 1 \
 run_case "an open build: release PR refuses" 1 \
     prs='[{"number":5,"headRefName":"other","title":"build: release 0.2.164"}]'
 run_case "a failed PR listing refuses" 1 prs=FAIL
+run_case "an unrelated 'build: release-…' title does not block" 0 \
+    prs='[{"number":6,"headRefName":"ci/rp","title":"build: release-please config"}]'
+run_case "a listing that hits the PR limit refuses (cannot rule out a bump PR)" 1 \
+    prs="$(jq -nc '[range(1000) | {number: ., headRefName: "x", title: "fix: x"}]')"
 run_case "an existing tag refuses" 1 tags='abc123	refs/tags/v0.2.164'
 run_case "a failed tag lookup refuses" 1 tags=FAIL
 run_case "a version already on crates.io refuses" 1 crates=200

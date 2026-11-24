@@ -73,9 +73,10 @@ Within ~30–60 minutes you should see:
 ## Prerequisites
 
 These repo secrets must be configured under
-**Settings → Secrets and variables → Actions**. The workflow degrades
-gracefully when any are missing — it just won't auto-cascade and you'll get
-a `::warning::` annotation telling you what to fix.
+**Settings → Secrets and variables → Actions**. What a missing one costs
+differs per secret (table below): some only skip a notification, and the ones
+whose absence would leave a release half-done fail the run before anything is
+published.
 
 | Secret | Used by | Failure mode if missing |
 |---|---|---|
@@ -677,7 +678,8 @@ value and refuses in its own script when that is not `true`. No step that
 runs in a dry run is passed `RELEASE_PAT`. The only job that runs in a dry run
 holding a write-capable token is the bump job (`update_versions`), and the
 only step given that token is its checkout, which uses it to fetch and
-persists nothing. `validate` is read-only, `summary` has no permissions, and
+persists nothing. `validate` is read-only (it reads Actions runs and PRs for
+the live pre-flight below), `summary` has no permissions, and
 the rehearsal job is read-only. A presence test such as
 `secrets.RELEASE_PAT != ''` passes no credential and is allowed. Rule Lint's
 `.github/scripts/check_release_dry_run.py` and the CI self-test
@@ -690,13 +692,32 @@ Caveats:
   the branch and auto-merged the bump PR, so `--ref` pointing at an older tag
   or branch still does.
 - **It does not exercise the live-only half:** the `CARGO_REGISTRY_TOKEN`
-  presence check, waiting for the bump PR's merge queue (`wait_for_pr`,
+  presence check, the pre-flight below, waiting for the bump PR's merge queue (`wait_for_pr`,
   `resolve_release_sha.sh`), GitHub's generated release notes, the tag push
   and the release creation, and everything the tag triggers in
   `cross-compile.yml` (binaries, Gate A, the crates.io publish). A green dry
   run says the bump and the packaging are sound, not that a cut will ship.
 - Whether a dry run needs the pre-cut preconditions is decided by the
   `freenet:release` skill, not here.
+
+## Live pre-flight
+
+A live run's `validate` job runs `scripts/check_release_preflight.sh` before
+anything is created, and refuses when:
+
+- **another `release.yml` run is queued or in progress** (a dry run counts; a
+  run stuck waiting counts too, so cancel it), or **a version-bump PR is open**
+  (head `release/v*` or title `build: release`; a failed cut can leave one
+  behind, see `scripts/RELEASE_RECOVERY.md` Step 1). It does not check for a
+  previous tag's still-running `cross-compile.yml` run; the `freenet:release`
+  skill's P0 still does;
+- **tag `vX.Y.Z` already exists**, or **freenet X.Y.Z is already on crates.io**
+  (an unreadable answer refuses too);
+- **X.Y.Z is not above `crates/core/Cargo.toml`** on the dispatched ref. Equal
+  means the bump already merged without a published release: see
+  "Re-cutting the same version" in `scripts/RELEASE_RECOVERY.md`.
+
+Each of these used to fail later, after the bump PR had merged.
 
 ## What fires when
 
@@ -1294,7 +1315,9 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
 
 - **404 — the normal case after a Gate A block.** Nothing irreversible has
   happened. Delete the tag and the draft, fix, and re-cut the SAME version on
-  the corrected commit.
+  the corrected commit. `release.yml` cannot do that re-cut (its bump already
+  merged, so its pre-flight refuses); `scripts/RELEASE_RECOVERY.md`, "Re-cutting
+  the same version", has the manual path, or cut the next patch.
 - **200 — the version really is spent.** Only reachable if the publish step ran
   and something later failed. Do not re-tag it; cut the next patch instead, and
   note that `cargo binstall freenet` will 404 and the nightly
