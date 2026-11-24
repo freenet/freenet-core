@@ -752,6 +752,41 @@ function check(name, cond) {
   }
 }
 
+// 8. contractConsentKey canonicalises percent-encoded spellings of one key.
+{
+  const kb = src.indexOf('function contractConsentKey(');
+  const ke = src.indexOf('function contractSnoozeKey(');
+  const keyFn = src.slice(kb, ke);
+  const keyFor = (pathname) =>
+    new Function('location', `${keyFn}\nreturn contractConsentKey();`)({
+      pathname,
+    });
+  const plain = keyFor('/v1/contract/web/AbC123/');
+  check('plain key derived', plain === 'freenet_notify:AbC123');
+  check(
+    'percent-encoded spelling shares the plain key',
+    keyFor('/v1/contract/web/%41bC123/') === plain,
+  );
+  check(
+    'mixed-case hex escape shares the plain key',
+    keyFor('/v2/contract/web/Ab%43123/') === plain,
+  );
+  check(
+    'invalid escape does not throw and is kept raw',
+    keyFor('/v1/contract/web/Ab%ZZ/') === 'freenet_notify:Ab%ZZ',
+  );
+  check(
+    'double-encoded spelling decodes once and stays distinct',
+    keyFor('/v1/contract/web/%2541bC123/') === 'freenet_notify:%41bC123' &&
+      keyFor('/v1/contract/web/%2541bC123/') !== plain,
+  );
+  check(
+    'invalid UTF-8 escape does not throw and is kept raw',
+    keyFor('/v1/contract/web/Ab%C3/') === 'freenet_notify:Ab%C3',
+  );
+  check('non-contract path -> null', keyFor('/other/') === null);
+}
+
 if (failures > 0) {
   console.error(`\nnotify-rate-limiter: ${failures} check(s) FAILED`);
   process.exit(1);
