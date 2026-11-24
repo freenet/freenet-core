@@ -31,5 +31,4 @@ hours, not days.
    `cargo nextest run -p freenet quic` (plus the transport tests the change
    touches).
 5. **Review and release.** Transport/TLS changes are Full-tier review. Whether to
-   cut a release is a separate decision; a security-relevant bump that fixes a
-   user-impacting problem may use the fix-release path in `docs/RELEASING.md`.
+   cut a release is a separate decision (see `docs/RELEASING.md`).
