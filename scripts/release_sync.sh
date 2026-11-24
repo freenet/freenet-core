@@ -156,10 +156,15 @@ if [[ ! "$PR" =~ ^[0-9]+$ ]]; then
     exit 1
 fi
 # main may have reached VERSION while this ran (another sync, or a hand bump
-# merging). Read it again right before arming auto-merge: a PR that bumps main
-# to a version it already has must not merge.
-git fetch --no-tags --depth=1 origin main
-MAIN_NOW=$(git show FETCH_HEAD:crates/core/Cargo.toml | package_version)
+# merging). Read it again right before arming auto-merge, so a PR that would
+# bump main to a version it already has is closed instead. This narrows the
+# race rather than closing it: main can still reach VERSION between this read
+# and `gh pr merge --auto`; the merge queue and the next sync's supersede pass
+# cover what is left.
+MAIN_NOW=""
+if git fetch --no-tags --depth=1 origin main; then
+    MAIN_NOW=$(git show FETCH_HEAD:crates/core/Cargo.toml | package_version) || MAIN_NOW=""
+fi
 if [[ ! "$MAIN_NOW" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "::error::Could not re-read main's version before enabling auto-merge (got '$MAIN_NOW'); #$PR is left open without auto-merge."
     exit 1

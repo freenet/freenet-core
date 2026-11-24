@@ -86,6 +86,11 @@ after deleting the tag and the draft as above:
    `release/vX.Y.Z` with the new release commit, and the full suite runs on it
    as for any cut.
 
+If the old draft is still there, the run refuses at `create_release`'s tag
+step with "Stale release vX.Y.Z", before the tag is pushed, so nothing has
+started. Delete the draft (after the crates.io check above) and re-run that
+job.
+
 A release cut with the older PR flow (a `build: release X.Y.Z` PR merged into
 `main`) left `main` at X.Y.Z, so a ship commit after it says X.Y.Z too and the
 pre-flight refuses that version ("The ship commit is already at X.Y.Z"). Cut
@@ -169,11 +174,13 @@ minutes saying so; delete the branch and re-dispatch.
 
 `release/vX.Y.Z` branches are not deleted automatically: the branch is the
 only ref besides the tag that points at the release commit, and it is
-harmless once the release is published. Two cases need action:
+harmless once the release is published. One case needs action:
 
 - **An abandoned cut** (you decided to cut the next version instead): its
-  branch, and its tag and draft if they exist, block every later live
-  dispatch (the pre-flight's "Another release is unfinished"). Delete them:
+  branch and its tag, if they exist, block every later live dispatch (the
+  pre-flight's "Another release is unfinished"). Its draft does not block a
+  dispatch for another version, but delete it too, so a later re-cut of that
+  version does not meet it. Delete them:
   ```bash
   gh release delete vX.Y.Z --repo freenet/freenet-core --yes   # only if a draft exists
   git push --delete origin vX.Y.Z                              # only if the tag exists
@@ -181,10 +188,6 @@ harmless once the release is published. Two cases need action:
   ```
   Check crates.io first (top of this file): a version already on crates.io
   is spent, and its tag and draft stay.
-- **A stale draft for the version you are re-cutting**: `create_release`
-  refuses to reuse a release created before its own run ("Stale release
-  vX.Y.Z"). Delete the draft (after the crates.io check above) and re-run that
-  job.
 - **Old published releases**: optional housekeeping. Delete
   `release/vX.Y.Z` for any published X.Y.Z if the branch list gets long;
   the tag keeps the commit.

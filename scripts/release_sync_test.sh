@@ -192,13 +192,49 @@ check "main reaching the version mid-sync: succeeds" "$(run_sync "$TEST_TMP/w1d"
 check "main reaching the version mid-sync: the hook really moved main" \
     "$([ "$(git -C "$ORIGIN" rev-parse main)" != "$MAIN_BEFORE_1D" ] && echo moved || echo "not moved: $(cat "$STUB_DIR/hook.log")")" "moved"
 check "main reaching the version mid-sync: the PR is closed" \
-    "$(grep -c '^gh pr close 777 .*main is already at 0.2.101' "$STUB_DIR/calls")" "1"
+    "$(grep -c '^gh pr close 777 --repo [^ ]* --delete-branch .*main is already at 0.2.101' "$STUB_DIR/calls")" "1"
 check "main reaching the version mid-sync: auto-merge is never armed" "$(grep -c '^gh pr merge' "$STUB_DIR/calls" || true)" "0"
+# main ABOVE the release by the time of the re-read: closed the same way.
+sed 's/0\.2\.101/0.2.102/g' "$TEST_TMP/bump_main.sh" > "$TEST_TMP/bump_main_above.sh"
+chmod +x "$TEST_TMP/bump_main_above.sh"
+git -C "$SEED" fetch -q origin main
+git -C "$SEED" reset -q --hard origin/main
+git -C "$SEED" checkout -q "$MAIN_BEFORE_1D" -- crates/core/Cargo.toml
+G commit -q --allow-empty -am "main back at 0.2.100 (1d above)"
+G push -q origin main
+reset_stub
+cp "$TEST_TMP/bump_main_above.sh" "$STUB_DIR/on_create"
+fresh_clone "$TEST_TMP/w1d2"
+check "main passing the version mid-sync: succeeds" "$(run_sync "$TEST_TMP/w1d2" 0.2.101)" "0"
+check "main passing the version mid-sync: the PR is closed" \
+    "$(grep -c '^gh pr close 777 --repo [^ ]* --delete-branch .*main is already at 0.2.102' "$STUB_DIR/calls")" "1"
+check "main passing the version mid-sync: auto-merge is never armed" "$(grep -c '^gh pr merge' "$STUB_DIR/calls" || true)" "0"
+# main's manifest unreadable at the re-read: refuse, leave the PR unarmed.
+cat > "$TEST_TMP/break_main.sh" <<HOOK
+#!/usr/bin/env bash
+set -e
+d=\$(mktemp -d)
+git clone -q "$ORIGIN" "\$d/m"
+printf 'not a manifest\\n' > "\$d/m/crates/core/Cargo.toml"
+git -C "\$d/m" -c user.email=t@example.invalid -c user.name=t commit -qam "garbage manifest"
+git -C "\$d/m" push -q origin main
+HOOK
+chmod +x "$TEST_TMP/break_main.sh"
+git -C "$SEED" fetch -q origin main
+git -C "$SEED" reset -q --hard origin/main
+git -C "$SEED" checkout -q "$MAIN_BEFORE_1D" -- crates/core/Cargo.toml
+G commit -q --allow-empty -am "main back at 0.2.100 (1d unreadable)"
+G push -q origin main
+reset_stub
+cp "$TEST_TMP/break_main.sh" "$STUB_DIR/on_create"
+fresh_clone "$TEST_TMP/w1d3"
+check "main unreadable at the re-read: fails" "$(run_sync "$TEST_TMP/w1d3" 0.2.101)" "1"
+check "main unreadable at the re-read: auto-merge is never armed" "$(grep -c '^gh pr merge' "$STUB_DIR/calls" || true)" "0"
 # Put main back below the release for the cases that follow.
 git -C "$SEED" fetch -q origin main
 git -C "$SEED" reset -q --hard origin/main
-sed -i 's/^version = ".*"/version = "0.2.100"/' "$SEED/crates/core/Cargo.toml"
-G commit -qam "main back at 0.2.100"
+git -C "$SEED" checkout -q "$MAIN_BEFORE_1D" -- crates/core/Cargo.toml
+G commit -q --allow-empty -am "main back at 0.2.100"
 G push -q origin main
 
 # --- 2. re-run after main moved: regenerated and force-pushed, PR reused ------

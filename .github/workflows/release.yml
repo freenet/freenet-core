@@ -235,6 +235,8 @@ jobs:
           SHIP_SHA_INPUT: ${{ inputs.ship_sha }}
           RELEASE_LIVE: ${{ steps.mode.outputs.live }}
           LAUNCH_SHA: ${{ github.sha }}
+          # The ci.yml gate tests the real release/vX.Y.Z branch name.
+          RELEASE_VERSION: ${{ steps.validate.outputs.version }}
           # Read-only API lookups; this job's token can only read.
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/resolve_release_ship.sh
@@ -672,6 +674,11 @@ jobs:
     needs: [validate, wait_for_ci, verify_publishable]
     # Live only, at job level AND on each mutating step below (#5936).
     if: always() && needs.verify_publishable.result == 'success' && needs.validate.outputs.live == 'true'
+    permissions:
+      contents: write
+      # The stale-release check reads this run's start time
+      # (actions/runs/<id>), which a GITHUB_TOKEN fallback cannot without it.
+      actions: read
     env:
       RELEASE_LIVE: ${{ needs.validate.outputs.live }}
       # The tag MUST land on the same commit that was published to crates.io.
@@ -757,15 +764,40 @@ jobs:
 
       - name: Create and push tag
         if: needs.validate.outputs.live == 'true'
+        env:
+          # Sees drafts (validate's read-only token does not), for the
+          # stale-release check below. Reads only; the push uses git's own
+          # credentials.
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
         run: |
           [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not pushing the release tag: this run is not live (#5936)."; exit 1; }
+          VERSION="${{ needs.validate.outputs.version }}"
+          # A release vX.Y.Z created BEFORE this run started is a draft left by
+          # an earlier cut of the same version. Refuse before the tag push:
+          # the push starts cross-compile.yml, which uploads to whatever
+          # release has this tag name, then publishes to crates.io and
+          # un-drafts it, with the earlier cut's notes. A release created
+          # after the run started is this run's own (a re-run attempt keeps
+          # the run's created_at), so a re-run passes. GitHub reports a
+          # release's createdAt as its creation time, not the commit date
+          # (checked on v0.2.124 and v0.2.164). The pre-flight cannot do this:
+          # validate's read-only token is not shown drafts.
+          if REL_CREATED=$(gh release view "v$VERSION" --json createdAt --jq .createdAt 2>/dev/null) && [ -n "$REL_CREATED" ]; then
+            if ! RUN_CREATED=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at) || [ -z "$RUN_CREATED" ]; then
+              echo "::error::Release v$VERSION already exists, and this run's start time could not be read to tell whether this run created it. Nothing was pushed; re-run this job."
+              exit 1
+            fi
+            if [[ "$REL_CREATED" < "$RUN_CREATED" ]]; then
+              echo "::error title=Stale release v$VERSION::A release v$VERSION created at $REL_CREATED, before this run started ($RUN_CREATED), already exists: a draft left by an earlier cut. Nothing was pushed. Delete it (gh release delete v$VERSION --yes, after checking crates.io as scripts/RELEASE_RECOVERY.md says), then re-run this job."
+              exit 1
+            fi
+          fi
           # `git tag -a` needs user.name/email. The `update_versions` job
           # set these in its runner, but this job runs on a fresh runner
           # where git config is empty — without these two lines the tag
           # step fails with `fatal: empty ident name not allowed`.
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          VERSION="${{ needs.validate.outputs.version }}"
           # Idempotent, so "Re-run failed jobs" works after the tag pushed but
           # the release create below failed. An existing tag is accepted ONLY
           # if it already points at RELEASE_SHA; anywhere else is a conflict a
@@ -804,12 +836,11 @@ jobs:
           VERSION="${{ needs.validate.outputs.version }}"
           # Idempotent for a re-run of this job after the tag pushed but the
           # create failed: a release THIS RUN created (after the run started;
-          # a re-run attempt keeps the run's start time) is accepted. Any older
-          # release for this version is a stale draft from an earlier cut,
-          # which a re-cut must delete first: its notes and assets describe
-          # another commit, and cross-compile.yml would attach to it. The
-          # pre-flight cannot see drafts with validate's read-only token, so
-          # this is the guard against them.
+          # a re-run attempt keeps the run's start time) is accepted. An older
+          # one is a stale draft from an earlier cut. The tag step already
+          # refused that before pushing; the check is repeated so this step
+          # never reuses a stale draft on its own (e.g. if the steps are
+          # reordered).
           if REL_CREATED=$(gh release view "v$VERSION" --json createdAt --jq .createdAt 2>/dev/null) && [ -n "$REL_CREATED" ]; then
             if ! RUN_CREATED=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at) || [ -z "$RUN_CREATED" ]; then
               echo "::error::Release v$VERSION already exists, and this run's start time could not be read to tell whether this run created it. Re-run this job."

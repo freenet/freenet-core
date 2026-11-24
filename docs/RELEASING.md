@@ -1057,7 +1057,13 @@ invisible to every test in the repo.
 
 ### `create_release` failed
 
-Most likely cause: tag push failed because git identity wasn't configured on
+**"Stale release vX.Y.Z"**: a release for this version, created before this
+run started, already exists: a draft left by an earlier cut. The tag step
+refuses before pushing, so cross-compile.yml has not started. Check crates.io
+(`scripts/RELEASE_RECOVERY.md`), delete the draft
+(`gh release delete vX.Y.Z --yes`), and re-run the job.
+
+Otherwise, the most likely cause: tag push failed because git identity wasn't configured on
 the runner. Fixed by [PR #4135] — if it recurs, check that the
 `Create and push tag` step still has `git config user.name` /
 `git config user.email`.

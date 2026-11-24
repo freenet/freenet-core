@@ -212,7 +212,7 @@ mutate_case "the push step's guard is ORed away" "step \`Push the release branch
 mutate_case "the push step loses its in-script refusal" "does not refuse in its own script" \
     "s.replace('          [ \"\${RELEASE_LIVE:-}\" = \"true\" ] || { echo \"::error title=Refusing in a dry run::Not pushing the release branch: this run is not live (#5936).\"; exit 1; }\n', '', 1)"
 mutate_case "create_release loses its job-level live guard and the tag step its own" "step \`Create and push tag\` mutates" \
-    "s.replace(\" && needs.validate.outputs.live == 'true'\n    env:\n      RELEASE_LIVE\", \"\n    env:\n      RELEASE_LIVE\", 1).replace(\"      - name: Create and push tag\n        if: needs.validate.outputs.live == 'true'\n\", \"      - name: Create and push tag\n\", 1)"
+    "s.replace(\" && needs.validate.outputs.live == 'true'\n    permissions:\n      contents: write\", \"\n    permissions:\n      contents: write\", 1).replace(\"      - name: Create and push tag\n        if: needs.validate.outputs.live == 'true'\n\", \"      - name: Create and push tag\n\", 1)"
 mutate_case "a step goes back to reading inputs.dry_run" "read outside the mode step" \
     "s.replace(\"      - name: Create GitHub release\n        if: needs.validate.outputs.live == 'true'\", \"      - name: Create GitHub release\n        if: \${{ !inputs.dry_run }}\", 1)"
 mutate_case "a new unguarded step edits a release in a dry-run job" "step \`Sneaky\` mutates" \
@@ -307,7 +307,7 @@ check "dry_run_rehearsal is read-only" "$(grep '^dry_run_rehearsal=' <<< "$PERMS
 check "update_versions can push" "$(grep '^effective:update_versions=' <<< "$PERMS")" \
     "effective:update_versions=[('contents', 'write')]"
 check "create_release can push the tag and create the release" "$(grep '^effective:create_release=' <<< "$PERMS")" \
-    "effective:create_release=[('contents', 'write')]"
+    "effective:create_release=[('actions', 'read'), ('contents', 'write')]"
 check "wait_for_ci can read runs and the repo" "$(grep '^effective:wait_for_ci=' <<< "$PERMS")" \
     "effective:wait_for_ci=[('actions', 'read'), ('contents', 'read')]"
 # Failure paths: nothing irreversible may follow a failed gate.
@@ -499,6 +499,32 @@ check "the stale-release refusal says to delete it" "$(grep -c '^::error title=S
 check "an unreadable run start refuses rather than reusing a release" \
     "$(rel_case 2026-11-23T10:05:00Z FAIL)" "rc=1 views=1 creates=0"
 check "no release yet: creates the draft" "$(rel_case '' 2026-11-23T10:00:00Z)" "rc=0 views=1 creates=1"
+# The tag step refuses a stale release BEFORE its push: the tag push starts
+# cross-compile.yml, which would attach to that draft, publish and un-draft it.
+mapfile -t TAG_ENVS < "${TAG_SCRIPT%.sh}.env"
+tag_stale_case() {
+    # tag_stale_case <release createdAt> <run created_at> <ls-remote output> -> "rc=N pushes=N"
+    local rc=0
+    : > "$REL_CALLS"
+    ( builtin cd -- "$SCRATCH" && env "${TAG_ENVS[@]}" PATH="$RERUN_STUBS:$PATH" STUB_CALLS="$REL_CALLS" \
+        GITHUB_REPOSITORY=example/repo GITHUB_RUN_ID=4242 REL_CREATED="$1" RUN_CREATED="$2" \
+        LSREMOTE="$3" RELEASE_LIVE=true bash -e "$TAG_SCRIPT" ) > "$TEST_TMP/tagstale.out" 2>&1 || rc=$?
+    echo "rc=$rc pushes=$(grep -c '^git push' "$REL_CALLS")"
+}
+check "tag step: a stale release refuses before the tag push" \
+    "$(tag_stale_case 2026-11-20T09:00:00Z 2026-11-23T10:00:00Z '')" "rc=1 pushes=0"
+check "tag step: the stale refusal says nothing was pushed" \
+    "$(grep -c '^::error title=Stale release.*Nothing was pushed' "$TEST_TMP/tagstale.out")" "1"
+check "tag step: an unreadable run start refuses before the push" \
+    "$(tag_stale_case 2026-11-20T09:00:00Z FAIL '')" "rc=1 pushes=0"
+check "tag step: an empty run start refuses before the push" \
+    "$(tag_stale_case 2026-11-20T09:00:00Z '' '')" "rc=1 pushes=0"
+check "tag step: a release this run created does not block (re-run, tag in place)" \
+    "$(tag_stale_case 2026-11-23T10:05:00Z 2026-11-23T10:00:00Z "$REL_SHA\t$TAG_REF\n")" "rc=0 pushes=0"
+check "tag step: no release yet tags and pushes" \
+    "$(tag_stale_case '' 2026-11-23T10:00:00Z '')" "rc=0 pushes=1"
+check "an empty run start refuses rather than reusing a release" \
+    "$(rel_case 2026-11-20T09:00:00Z '')" "rc=1 views=1 creates=0"
 
 # The packaging dry run checks freenet, the crate that is publishable before
 # the release exists (fdev resolves freenet from the registry).

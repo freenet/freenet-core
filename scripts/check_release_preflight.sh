@@ -25,14 +25,15 @@
 #      with no tag yet, for some Y above the latest
 #      published release and other than $VERSION. Cutting past it would let
 #      both ship, or leave the first one half-done. The SAME version is
-#      exempt on purpose: a re-cut after a Gate A block deletes the tag and
-#      the draft (check 2 refuses until it has) and then reuses
+#      exempt on purpose: a re-cut after a Gate A block deletes the tag
+#      (check 2 refuses until it has) and the draft, then reuses
 #      `release/v$VERSION`, which update_versions force-pushes. An abandoned
 #      cut is cleared by deleting its tag, draft and branch
-#      (scripts/RELEASE_RECOVERY.md). Drafts themselves are not checked:
+#      (scripts/RELEASE_RECOVERY.md). Drafts alone are ignored here:
 #      validate's read-only token is not shown them. Every cut pushes its tag
 #      before it creates its draft, so the tag check covers a cut in flight,
-#      and create_release refuses to reuse a stale same-version draft.
+#      and create_release's tag step refuses, before pushing, a same-version
+#      draft older than its run.
 #
 # Every lookup FAILS CLOSED: an answer this script cannot read refuses the run
 # with a message naming what it could not check. Nothing has been created yet,

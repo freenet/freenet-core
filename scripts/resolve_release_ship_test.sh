@@ -94,7 +94,7 @@ run_case() {
     # run_case <desc> <expected rc> [live=..] [input=..] [file=content ...]
     local desc="$1" want="$2"
     shift 2
-    local dir="$TEST_TMP/case" live=true input="$SHIP"
+    local dir="$TEST_TMP/case" live=true input="$SHIP" version=0.2.164
     rm -rf "$dir" && mkdir -p "$dir/stub" "$dir/tmp"
     local S="$dir/stub"
     echo identical > "$S/cmp_${SHIP}_main"
@@ -119,12 +119,13 @@ run_case() {
         case "$kv" in
             live=*) live="${kv#live=}" ;;
             input=*) input="${kv#input=}" ;;
+            version=*) version="${kv#version=}" ;;
             *) mkdir -p "$(dirname "$S/${kv%%=*}")"; printf '%s\n' "${kv#*=}" > "$S/${kv%%=*}" ;;
         esac
     done
     : > "$dir/out"
     local rc=0
-    STUB_DIR="$S" PATH="$STUBS:$PATH" SHIP_SHA_INPUT="$input" RELEASE_LIVE="$live" \
+    STUB_DIR="$S" PATH="$STUBS:$PATH" SHIP_SHA_INPUT="$input" RELEASE_LIVE="$live" RELEASE_VERSION="$version" \
         LAUNCH_SHA="$LAUNCH" GITHUB_REPOSITORY=freenet/freenet-core GITHUB_OUTPUT="$dir/out" \
         RUNNER_TEMP="$dir/tmp" bash "$RESOLVE" > "$dir/log" 2>&1 || rc=$?
     check "$desc" "$rc" "$want"
@@ -215,6 +216,23 @@ run_case "branches-ignore covering release/v* refuses" 1 \
 run_case "a commented-out release/v* refuses" 1 \
     "tree_$SHIP/.github/workflows/ci.yml=$(printf "on:\n  push:\n    branches: [main] # 'release/v*'\n")"
 run_case "this repo's own ci.yml is accepted" 0 "tree_$SHIP/.github/workflows/ci.yml=$(cat "$REPO_ROOT/.github/workflows/ci.yml")"
+# The filters are evaluated against THIS release's branch, release/v0.2.164.
+run_case "a filter excluding another version's branches is accepted" 0 \
+    "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on:\n  push:\n    branches: ["release/v*", "!release/v0.0.*"]\n')"
+run_case "a filter excluding this version's branch refuses" 1 \
+    "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on:\n  push:\n    branches: ["release/v*", "!release/v0.2.*"]\n')"
+check "excluded branch: names the release branch" "$(grep -c 'pushes to release/v0.2.164' "$TEST_TMP/case/log")" "1"
+run_case "live without a release version refuses" 1 version=
+run_case "a ci.yml with no push trigger refuses" 1 \
+    "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on:\n  pull_request:\n    branches: [main]\n')"
+run_case "a tags-only push filter refuses" 1 \
+    "tree_$SHIP/.github/workflows/ci.yml=$(printf "on:\n  push:\n    tags: ['v*']\n")"
+run_case "a bare 'on: push' is accepted" 0 "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on: push\n')"
+run_case "a lone '*' does not match release/v0.2.164 (it stops at /)" 1 \
+    "tree_$SHIP/.github/workflows/ci.yml=$(printf "on:\n  push:\n    branches: [main, '*']\n")"
+run_case "a malformed branches value refuses as unparseable" 1 \
+    "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on:\n  push:\n    branches: 5\n')"
+check "malformed branches: says it could not parse" "$(grep -c 'Could not parse ship_sha' "$TEST_TMP/case/log")" "1"
 run_case "an unparseable ci.yml refuses (live)" 1 "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on: [push\n  : :\n')"
 check "unparseable ci.yml: says it could not parse" "$(grep -c 'Could not parse ship_sha' "$TEST_TMP/case/log")" "1"
 run_case "an unreadable tag commit refuses" 1 commit_v0.2.163=FAIL
