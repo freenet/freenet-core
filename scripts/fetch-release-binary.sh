@@ -2,10 +2,12 @@
 # Resolve and download the released freenet binaries the mixed-version test
 # runs against, and write a manifest the test reads.
 #
-#   fetch-release-binary.sh resolve OUT_DIR [--exclude-tag TAG]
+#   fetch-release-binary.sh resolve OUT_DIR [--exclude-tag TAG] [--core-toml PATH]
 #       Pick N-1 and N-2 from the published GitHub releases, download and
 #       verify their linux x86_64 musl binaries into OUT_DIR, and write
-#       OUT_DIR/versions.json.
+#       OUT_DIR/versions.json. With --core-toml (crates/core/Cargo.toml of the
+#       build under test) it also fetches "below": the newest release strictly
+#       below that build's min-compatible-version, which N must refuse.
 #   fetch-release-binary.sh select [EXCLUDE_TAG]
 #       Read tags on stdin, print "n1=<tag>" and "n2=<tag>" (selection only).
 #   fetch-release-binary.sh tags [--exclude-tag TAG]
@@ -135,8 +137,19 @@ fetch_release() (
     printf '%s\n' "$bin"
 )
 
+# Tags strictly below version FLOOR (X.Y.Z), newest first, at most five. Tags on
+# stdin. The first one with a verifiable musl asset is the "below the floor" build.
+below_candidates() {
+    local floor="$1"
+    grep -E "$TAG_RE" | sort -u | while read -r t; do
+        [ "${t#v}" = "$floor" ] && continue
+        # Strictly below: it sorts first of the pair.
+        [ "$(printf '%s\n%s\n' "${t#v}" "$floor" | sort -V | head -n 1)" = "${t#v}" ] && echo "$t"
+    done | sort -V -r | head -n 5
+}
+
 resolve() {
-    local out="$1" exclude="${2:-}" sel n1 n2 role tag bin floor
+    local out="$1" exclude="${2:-}" core_toml="${3:-}" sel n1 n2 role tag bin floor
     mkdir -p "$out"
     sel="$(list_release_tags | select_tags "$exclude")"
     n1="$(sed -n 's/^n1=//p' <<<"$sel")"
@@ -155,6 +168,26 @@ resolve() {
             --arg sha "$(sha256_of "$bin")" --arg floor "$floor" \
             '.[$r] = {tag: $tag, version: $ver, path: $path, binary_sha256: $sha, floor: $floor}' <<<"$json")"
     done
+
+    # The newest release strictly below the floor of the build under test, so a
+    # refusal is exercised today and not only after the next floor raise.
+    if [ -n "$core_toml" ]; then
+        local head_floor cand
+        head_floor="$(floor_from_cargo_toml <"$core_toml")" || die "cannot read the floor from $core_toml"
+        for cand in $(list_release_tags | below_candidates "$head_floor"); do
+            if bin="$(fetch_release "$cand" "$out" 2>/dev/null)"; then
+                floor="$(release_floor "$cand")" || continue
+                json="$(jq --arg tag "$cand" --arg ver "${cand#v}" --arg path "$(readlink -f "$bin")" \
+                    --arg sha "$(sha256_of "$bin")" --arg floor "$floor" \
+                    '.below = {tag: $tag, version: $ver, path: $path, binary_sha256: $sha, floor: $floor}' <<<"$json")"
+                break
+            fi
+            echo "$cand has no verifiable musl asset, trying an older release" >&2
+        done
+        if [ "$(jq 'has("below")' <<<"$json")" != true ]; then
+            echo "no release below floor $head_floor could be fetched; the test reports this" >&2
+        fi
+    fi
     printf '%s\n' "$json" >"$out/versions.json"
     echo "wrote $out/versions.json" >&2
     cat "$out/versions.json"
@@ -174,15 +207,16 @@ main() {
         floor-from-cargo-toml) floor_from_cargo_toml ;;
         fetch) fetch_release "${1:?tag}" "${2:?out dir}" ;;
         resolve)
-            local out="${1:?out dir}" exclude=""
+            local out="${1:?out dir}" exclude="" core_toml=""
             shift
             while [ $# -gt 0 ]; do
                 case "$1" in
                     --exclude-tag) exclude="${2:?tag}"; shift 2 ;;
+                    --core-toml) core_toml="${2:?path}"; shift 2 ;;
                     *) die "unknown argument $1" ;;
                 esac
             done
-            resolve "$out" "$exclude"
+            resolve "$out" "$exclude" "$core_toml"
             ;;
         *) sed -n '2,24p' "$0"; exit 2 ;;
     esac

@@ -77,6 +77,10 @@ mk_release v0.2.20
 mk_release v0.2.21
 mk_release v0.2.22 tamper
 mk_release v0.2.23 noentry
+mk_release v0.2.14
+mk_release v0.2.15 tamper
+mk_release v0.2.30
+mk_release v0.2.31
 export FREENET_RELEASE_BASE_URL="file://$work/dl"
 
 out="$work/out"
@@ -125,6 +129,22 @@ check "manifest floor" "$(jq -r .n1.floor "$work/res/versions.json")" "0.2.10"
 check "manifest path runs" "$("$(jq -r .n2.path "$work/res/versions.json")")" "v0.2.20"
 bash "$script" resolve "$work/res2" --exclude-tag v0.2.21 >/dev/null 2>&1
 check "resolve honours --exclude-tag" "$(jq -r .n1.tag "$work/res2/versions.json")" "v0.2.20"
+
+# Below-floor selection: strictly below, newest first, floor itself excluded.
+below() { (source "$script"; printf '%s\n' "$1" | below_candidates "$2" | tr '\n' ' '); }
+check "below-floor candidates are strictly below, newest first" \
+    "$(below $'v0.2.122\nv0.2.121\nv0.2.99\nv0.2.123\nv0.2.100' 0.2.122)" "v0.2.121 v0.2.100 v0.2.99 "
+check "below-floor with nothing below" "$(below $'v0.2.5\nv0.2.6' 0.2.5)" ""
+
+printf '[package]\nversion = "0.2.21"\n[package.metadata.freenet]\nmin-compatible-version = "0.2.20"\n' >"$work/head-Cargo.toml"
+bash "$script" resolve "$work/res3" --core-toml "$work/head-Cargo.toml" >/dev/null 2>&1
+check "manifest below tag is the newest under the floor" "$(jq -r .below.tag "$work/res3/versions.json")" "v0.2.19"
+check "manifest below binary runs" "$("$(jq -r .below.path "$work/res3/versions.json")")" "v0.2.19"
+# A below-floor candidate without a verifiable asset is skipped for an older one.
+printf 'v0.2.31\nv0.2.30\nv0.2.15\nv0.2.14\n' >"$work/tags"
+printf '[package]\nversion = "0.2.23"\n[package.metadata.freenet]\nmin-compatible-version = "0.2.20"\n' >"$work/head-Cargo.toml"
+bash "$script" resolve "$work/res4" --core-toml "$work/head-Cargo.toml" >/dev/null 2>&1
+check "tampered below-floor candidate skipped for an older one" "$(jq -r .below.tag "$work/res4/versions.json")" "v0.2.14"
 
 if [ "$fails" -ne 0 ]; then
     echo "$fails check(s) failed"

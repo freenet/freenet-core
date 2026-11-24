@@ -132,8 +132,11 @@ jobs:
           path: mixed-version-bins
           key: mixed-version-bins-${{ steps.select.outputs.n1 }}-${{ steps.select.outputs.n2 }}
 
-      - name: Download and verify N-1 and N-2
-        run: bash scripts/fetch-release-binary.sh resolve mixed-version-bins
+      # Also fetches the newest release below N's min-compatible-version, which
+      # scenario C expects to be refused. The cache key does not name it: it
+      # changes only when the floor does, and a miss just downloads it again.
+      - name: Download and verify N-1, N-2 and the below-floor release
+        run: bash scripts/fetch-release-binary.sh resolve mixed-version-bins --core-toml crates/core/Cargo.toml
 
       - name: Build N (this commit)
         env:
