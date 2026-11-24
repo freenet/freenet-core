@@ -1169,9 +1169,10 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
 
 /// Check if an address is a known gateway.
 pub fn is_known_gateway(addr: &SocketAddr) -> bool {
-    status_cell()
-        .and_then(|s| s.read().ok())
-        .is_some_and(|s| s.gateway_addresses.contains(addr))
+    status_cell().is_some_and(|s| {
+        s.read()
+            .is_ok_and(|status| status.gateway_addresses.contains(addr))
+    })
 }
 
 /// Record a gateway connection failure with a classified reason.
@@ -3667,7 +3668,8 @@ mod tests {
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)), 12345);
         init(31346, HashSet::new(), "0.1.148".to_string());
         {
-            let mut s = status_cell().unwrap().write().unwrap();
+            let cell = status_cell().unwrap();
+            let mut s = cell.write().unwrap();
             s.gateway_addresses.insert(gw_addr);
             s.connected_peers.clear();
             s.gateway_only_since = None;
@@ -4107,7 +4109,41 @@ mod tests {
     /// asserts the second call's values fully replace the first's.
     #[test]
     fn init_overwrites_existing_global() {
-        let _lock = lock_global_state_for_test();
+        const CHILD_ENV: &str = "FREENET_INIT_OVERWRITE_CHILD";
+        const CHILD_TEST: &str = "node::network_status::tests::init_overwrites_existing_global";
+
+        // The subject is the process-global tracker itself, so a scoped
+        // tracker would test the wrong thing, and the lock does not exclude
+        // the node-start tests that call `init` without it (#6365). Run the
+        // body in a child process of its own, where nothing else runs.
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Re-exec the running image: after a concurrent rebuild replaces
+            // the test binary, Linux current_exe() reports "<path> (deleted)".
+            let exe = if cfg!(target_os = "linux") {
+                std::path::PathBuf::from("/proc/self/exe")
+            } else {
+                std::env::current_exe().expect("test binary path")
+            };
+            let output = std::process::Command::new(exe)
+                .args(["--exact", "--test-threads=1", "--nocapture", CHILD_TEST])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("re-exec the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child run of {CHILD_TEST} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            );
+            // libtest exits 0 when its filter matches nothing; fail closed on
+            // a rename.
+            assert!(
+                stdout.contains("1 passed"),
+                "the child must actually have run {CHILD_TEST}; if this test was \
+                 renamed, update CHILD_TEST.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            );
+            return;
+        }
 
         // First initialization, then dirty the state so we can prove the
         // second init() resets it (not just changes scalar fields).
