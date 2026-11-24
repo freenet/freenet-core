@@ -710,16 +710,31 @@ if [[ -z "$TAG_FN" ]] || [[ "$TAG_FN" != *"git tag -a"* ]]; then
 else
     MERGE_SHA=1111111111111111111111111111111111111111
     # tag_case <desc> <local tag sha or ""> <remote tag sha or ""> <Cargo version> <expected>
+    #          [ls-remote output] [gh pr list output]
     #   expected: "tag+push" | "push" | "skip" | "refuse"
+    # The two optional arguments replace the stubs' default answers: the
+    # ls-remote lines built from <remote tag sha>, and the merge SHA.
     tag_case() {
         local desc="$1" local_sha="$2" remote_sha="$3" cargo_ver="$4" want="$5"
         local work got rc=0
         work="$(mktemp -d)"
         mkdir -p "$work/bin"
+        if [[ $# -ge 6 ]]; then
+            printf '%b' "$6" > "$work/lsremote"
+        elif [[ -n "$remote_sha" ]]; then
+            printf '%s\trefs/tags/v9.9.9\n' "$remote_sha" > "$work/lsremote"
+        else
+            : > "$work/lsremote"
+        fi
+        if [[ $# -ge 7 ]]; then
+            printf '%s' "$7" > "$work/prlist"
+        else
+            printf '%s\n' "$MERGE_SHA" > "$work/prlist"
+        fi
         cat > "$work/bin/gh" <<EOF
 #!/usr/bin/env bash
 case "\$1 \$2" in
-    "pr list") echo "$MERGE_SHA" ;;
+    "pr list") cat "$work/prlist" ;;
     "release view") exit 1 ;;
     "release create") echo "https://example/release" ;;
 esac
@@ -731,7 +746,7 @@ case "\$1" in
     tag) [ "\$2" = -l ] && { [ -n "$local_sha" ] && echo "v9.9.9"; exit 0; } ;;
     rev-parse) echo "$local_sha" ;;
     show) printf '[package]\nname = "freenet"\nversion = "$cargo_ver"\n' ;;
-    ls-remote) [ -n "$remote_sha" ] && printf '%s\trefs/tags/v9.9.9\n' "$remote_sha" ;;
+    ls-remote) cat "$work/lsremote" ;;
 esac
 exit 0
 EOF
@@ -775,6 +790,218 @@ EOF
     tag_case "local tag on another commit: refuses" 2222222222222222222222222222222222222222 "" 9.9.9 refuse
     tag_case "remote tag on another commit: refuses" "" 2222222222222222222222222222222222222222 9.9.9 refuse
     tag_case "merge commit carries another version: refuses" "" "" 9.9.8 refuse
+    # An annotated tag lists twice: the tag object's own SHA on the plain ref,
+    # the commit on the peeled `^{}` ref. Only the peeled line names the commit.
+    TAGOBJ=3333333333333333333333333333333333333333
+    tag_case "annotated remote tag on the merge commit (peeled line): nothing to do" "$MERGE_SHA" "" 9.9.9 skip \
+        "$TAGOBJ\trefs/tags/v9.9.9\n$MERGE_SHA\trefs/tags/v9.9.9^{}\n"
+    tag_case "annotated remote tag on another commit: refuses" "$MERGE_SHA" "" 9.9.9 refuse \
+        "$TAGOBJ\trefs/tags/v9.9.9\n2222222222222222222222222222222222222222\trefs/tags/v9.9.9^{}\n"
+    # No merged bump PR means no validated commit; tagging must not fall back
+    # to HEAD or to an empty SHA.
+    tag_case "no merged release PR: refuses" "" "" 9.9.9 refuse "" ""
+fi
+
+# --- create_release_pr: auto-merge and the PR wait -----------------------------
+#
+# Auto-merge used to be `gh pr merge --squash --auto ... || true`: the merge
+# queue rejects an explicit strategy, the rejection was swallowed, and the wait
+# below then timed out. The timeout itself returned 0, so the driver went on to
+# tag HEAD, which was the unmerged release branch. Run the real function on an
+# already-open bump PR with a stub gh, a no-op git and an instant sleep.
+CRPR_FN="$(awk '/^create_release_pr\(\) \{/,/^\}/' "$RELEASE_SH")"
+if [[ -z "$CRPR_FN" ]] || [[ "$CRPR_FN" != *"gh pr merge"* ]]; then
+    fail "could not extract create_release_pr() from release.sh"
+else
+    # pr_case <desc> <"STATE|auto-merge-on" from gh pr view> <gh pr merge rc>
+    #         <PR state while waiting> <expected "rc=N merges=M squash=S">
+    pr_case() {
+        local desc="$1" mstate="$2" mrc="$3" wstate="$4" want="$5"
+        local work got rc=0
+        work="$(mktemp -d)"
+        mkdir -p "$work/bin"
+        cat > "$work/bin/gh" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$work/gh.log"
+case "\$1 \$2" in
+    "pr list") echo "77|OPEN|build: release 9.9.9" ;;
+    "pr view")
+        case "\$*" in
+            *autoMergeRequest*) echo "$mstate" ;;
+            *statusCheckRollup*) echo "[]" ;;
+            *) echo "$wstate" ;;
+        esac ;;
+    "pr merge") [ "$mrc" = 0 ] || { echo "merge refused" >&2; exit "$mrc"; } ;;
+esac
+exit 0
+EOF
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/git"
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/sleep"
+        chmod +x "$work/bin/gh" "$work/bin/git" "$work/bin/sleep"
+        : > "$work/gh.log"
+        # shellcheck disable=SC2030,SC2031,SC2034,SC2317
+        (
+            PATH="$work/bin:$PATH"
+            VERSION=9.9.9
+            FDEV_VERSION=0.9.9
+            DRY_RUN=false
+            is_step_completed() { return 1; }
+            mark_completed() { :; }
+            run_cmd() { shift; "$@"; }
+            eval "$CRPR_FN"
+            create_release_pr
+        ) > "$work/out" 2>&1 || rc=$?
+        got="rc=$rc merges=$(grep -c '^pr merge' "$work/gh.log") squash=$(grep -c -- '--squash' "$work/gh.log")"
+        if [[ "$got" == "$want" ]]; then
+            pass "create_release_pr: $desc"
+        else
+            fail "create_release_pr: $desc (got '$got', expected '$want')" "$(tail -5 "$work/out")"
+        fi
+        rm -rf "$work"
+    }
+    pr_case "enables auto-merge without --squash, then sees the merge" "OPEN|false" 0 MERGED "rc=0 merges=1 squash=0"
+    pr_case "a refused auto-merge fails the driver" "OPEN|false" 1 MERGED "rc=1 merges=1 squash=0"
+    pr_case "auto-merge already on: no merge call" "OPEN|true" 0 MERGED "rc=0 merges=0 squash=0"
+    pr_case "already merged: no merge call" "MERGED|false" 0 MERGED "rc=0 merges=0 squash=0"
+    pr_case "a PR that never merges times out NON-ZERO" "OPEN|false" 0 OPEN "rc=1 merges=1 squash=0"
+fi
+
+# --- min-compatible-version moves only when asked ------------------------------
+#
+# It used to default to the version before the bump, so every cut raised the
+# network's handshake floor (#5833). Two parts: the top-level parse, run as the
+# whole region between the --version check and the crates.io lookup (so code
+# inserted anywhere there runs too), and update_versions against a temp tree.
+MC_BLOCK="$(awk '
+    /^if \[\[ ! "\$VERSION" =~/ { seen = 1 }
+    seen == 1 && /^fi$/ { seen = 2; next }
+    /^echo -n "Checking latest published version/ { exit }
+    seen == 2 { print }
+' "$RELEASE_SH")"
+if [[ -z "$MC_BLOCK" ]] || [[ "$MC_BLOCK" != *'MIN_COMPATIBLE'* ]]; then
+    fail "could not extract the --min-compatible handling from release.sh"
+else
+    # mc_parse_case <desc> <MIN_COMPATIBLE> <expected "rc=N env=X">
+    mc_parse_case() {
+        local desc="$1" mc="$2" want="$3" work got
+        work="$(mktemp -d)"
+        mkdir -p "$work/crates/core"
+        printf '[package]\nname = "freenet"\nversion = "0.2.1"\n' > "$work/crates/core/Cargo.toml"
+        # shellcheck disable=SC2030,SC2031,SC2034
+        got="$(
+            unset FREENET_MIN_COMPATIBLE_VERSION
+            PROJECT_ROOT="$work"
+            VERSION=0.2.2
+            MIN_COMPATIBLE="$mc"
+            eval "$MC_BLOCK" > /dev/null 2>&1
+            echo "rc=0 env=${FREENET_MIN_COMPATIBLE_VERSION-unset}"
+        )"
+        [[ -n "$got" ]] || got="rc=1"
+        if [[ "$got" == "$want" ]]; then
+            pass "--min-compatible parse: $desc"
+        else
+            fail "--min-compatible parse: $desc (got '$got', expected '$want')"
+        fi
+        rm -rf "$work"
+    }
+    mc_parse_case "absent: nothing is exported, no default is derived" "" "rc=0 env=unset"
+    mc_parse_case "X.Y.Z: exported for the build" 0.2.5 "rc=0 env=0.2.5"
+    mc_parse_case "malformed X.Y: rejected" 0.2 "rc=1"
+    mc_parse_case "trailing junk: rejected" "0.2.5x" "rc=1"
+fi
+
+UV_FN="$(awk '/^update_versions\(\) \{/,/^\}/' "$RELEASE_SH")"
+if [[ -z "$UV_FN" ]] || [[ "$UV_FN" != *"min-compatible-version"* ]]; then
+    fail "could not extract update_versions() from release.sh"
+else
+    # uv_case <desc> <MIN_COMPATIBLE> <expected min-compatible-version line>
+    uv_case() {
+        local desc="$1" mc="$2" want="$3" work got rc=0
+        work="$(mktemp -d)"
+        mkdir -p "$work/bin" "$work/crates/core" "$work/crates/fdev"
+        printf '[package]\nname = "freenet"\nversion = "0.2.1"\n\n[package.metadata.freenet]\nmin-compatible-version = "0.2.0"\n' \
+            > "$work/crates/core/Cargo.toml"
+        printf '[package]\nname = "fdev"\nversion = "0.3.1"\n\n[dependencies]\nfreenet = { path = "../core", version = "0.2.1" }\n' \
+            > "$work/crates/fdev/Cargo.toml"
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/cargo"
+        chmod +x "$work/bin/cargo"
+        # shellcheck disable=SC2030,SC2031,SC2034,SC2317
+        (
+            PATH="$work/bin:$PATH"
+            PROJECT_ROOT="$work"
+            VERSION=0.2.2
+            FDEV_VERSION=0.3.2
+            MIN_COMPATIBLE="$mc"
+            DRY_RUN=false
+            is_step_completed() { return 1; }
+            sync_lockfiles() { :; }
+            eval "$UV_FN"
+            update_versions
+        ) > "$work/out" 2>&1 || rc=$?
+        got="rc=$rc $(grep '^min-compatible-version' "$work/crates/core/Cargo.toml")"
+        if [[ "$got" == "rc=0 $want" ]]; then
+            pass "update_versions: $desc"
+        else
+            fail "update_versions: $desc (got '$got', expected 'rc=0 $want')" "$(tail -5 "$work/out")"
+        fi
+        rm -rf "$work"
+    }
+    uv_case "no --min-compatible leaves the floor alone" "" 'min-compatible-version = "0.2.0"'
+    uv_case "--min-compatible moves the floor" 0.2.1 'min-compatible-version = "0.2.1"'
+fi
+
+# --- check_prerequisites refuses an unreadable or empty CI status ---------------
+#
+# A failed `gh api` used to become `{}`, and zero checks used to print a
+# warning and proceed, so a release could start on a main nobody had checked.
+CP_FN="$(awk '/^check_prerequisites\(\) \{/,/^\}/' "$RELEASE_SH")"
+if [[ -z "$CP_FN" ]] || [[ "$CP_FN" != *"check-runs"* ]]; then
+    fail "could not extract check_prerequisites() from release.sh"
+else
+    # ci_case <desc> <check-runs JSON, or FAIL> <expected "rc=N"> [message substring]
+    ci_case() {
+        local desc="$1" answer="$2" want="$3" msg="${4:-}" work got rc=0
+        work="$(mktemp -d)"
+        mkdir -p "$work/bin"
+        printf '%s\n' "$answer" > "$work/checks"
+        cat > "$work/bin/gh" <<EOF
+#!/usr/bin/env bash
+[ "\$1" = api ] || exit 0
+[ "\$(cat "$work/checks")" = FAIL ] && exit 1
+cat "$work/checks"
+EOF
+        cat > "$work/bin/git" <<'EOF'
+#!/usr/bin/env bash
+case "$1" in
+    branch) echo main ;;
+    rev-parse) echo 4444444444444444444444444444444444444444 ;;
+esac
+exit 0
+EOF
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/sleep"
+        printf '#!/usr/bin/env bash\nexit 0\n' > "$work/bin/cargo"
+        chmod +x "$work/bin"/*
+        # shellcheck disable=SC2030,SC2031,SC2034,SC2317
+        (
+            PATH="$work/bin:$PATH"
+            PROJECT_ROOT="$work"
+            DRY_RUN=false
+            SKIP_TESTS=false
+            eval "$CP_FN"
+            check_prerequisites
+        ) > "$work/out" 2>&1 || rc=$?
+        got="rc=$rc"
+        if [[ "$got" == "$want" ]] && { [[ -z "$msg" ]] || grep -qF "$msg" "$work/out"; }; then
+            pass "check_prerequisites: $desc"
+        else
+            fail "check_prerequisites: $desc (got '$got', expected '$want' with '$msg')" "$(tail -5 "$work/out")"
+        fi
+        rm -rf "$work"
+    }
+    ci_case "green main passes" \
+        '{"total_count":1,"check_runs":[{"name":"Test","status":"completed","conclusion":"success"}]}' "rc=0"
+    ci_case "a failed gh api refuses, naming the unreadable status" FAIL "rc=1" "Could not read main's CI status"
+    ci_case "zero checks on main's HEAD refuses" '{"total_count":0,"check_runs":[]}' "rc=1" "no CI checks"
 fi
 
 echo
