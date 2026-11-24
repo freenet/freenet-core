@@ -133,7 +133,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           targets: wasm32-unknown-unknown
 
       # Restore-only on PRs. The main-scoped entry is written only by this
