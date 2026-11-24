@@ -27,7 +27,8 @@ jobs:
   validate:
     name: Validate release inputs
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # 10: the live pre-flight adds a few API calls and a retried crates.io probe.
+    timeout-minutes: 10
     # Reads only. Without this the job would hold the workflow's write token,
     # in a dry run as much as a live one.
     permissions:
@@ -182,18 +183,30 @@ jobs:
             # Auto-bump: take the highest released version on crates.io for
             # the `freenet` crate and increment the patch. Minor/major bumps
             # still require explicit input.
+            # `|| true`: under pipefail a curl failure would abort before the
+            # error below names the cause; the regex check still fails closed.
             LATEST=$(curl -sS -A 'github-actions' https://crates.io/api/v1/crates/freenet \
-              | jq -r '.crate.max_version')
+              | jq -r '.crate.max_version' || true)
             if [[ ! "$LATEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "::error::Could not resolve latest version from crates.io (got: '$LATEST')"
               exit 1
             fi
-            MAJOR=$(echo "$LATEST" | cut -d. -f1)
-            MINOR=$(echo "$LATEST" | cut -d. -f2)
-            PATCH=$(echo "$LATEST" | cut -d. -f3)
+            # Bump from the higher of crates.io and this tree's version. After a
+            # Gate A block the bump has merged but nothing was published, so
+            # crates.io alone would pick the version main already carries, which
+            # the pre-flight refuses on every dispatch.
+            CURRENT=$(awk '/^\[package\]/ {p = 1; next} /^\[/ {p = 0}
+                           p && /^version *=/ {gsub(/.*= *"|".*/, ""); print; exit}' crates/core/Cargo.toml)
+            BASE="$LATEST"
+            if [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              BASE=$(printf '%s\n%s\n' "$LATEST" "$CURRENT" | sort -V | tail -1)
+            fi
+            MAJOR=$(echo "$BASE" | cut -d. -f1)
+            MINOR=$(echo "$BASE" | cut -d. -f2)
+            PATCH=$(echo "$BASE" | cut -d. -f3)
             NEW_PATCH=$((PATCH + 1))
             VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
-            echo "::notice::No version input; auto-bumping patch from crates.io latest $LATEST → $VERSION"
+            echo "::notice::No version input; auto-bumping patch from $BASE (crates.io latest $LATEST, tree $CURRENT) → $VERSION"
           else
             if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "::error::Version must be in format X.Y.Z (e.g., 0.1.31). Got: $VERSION"

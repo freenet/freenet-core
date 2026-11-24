@@ -458,7 +458,10 @@ gh workflow run gateway-update.yml --repo freenet/freenet-core \
 - No Matrix or River announcement
 
 **Recovery:** `release-announce.yml` normally runs on `release.published`.
-Dispatch it by hand; re-running it is idempotent for Matrix.
+It deliberately posts nothing for a prerelease or for a release older than one
+already published (a recovery un-draft of an old tag), so silence there is
+expected. Otherwise dispatch it by hand; a dispatch always posts, and re-running
+it is idempotent for Matrix.
 ```bash
 gh workflow run release-announce.yml --repo freenet/freenet-core --field version=X.Y.Z
 ```

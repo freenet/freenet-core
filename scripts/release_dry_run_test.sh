@@ -470,9 +470,14 @@ SH
 REL_CALLS="$TEST_TMP/rel.calls"
 : > "$REL_CALLS"
 mapfile -t REL_ENVS < "${REL_SCRIPT%.sh}.env"
+REL_RC=0
 ( builtin cd -- "$SCRATCH" && env "${REL_ENVS[@]}" PATH="$RERUN_STUBS:$PATH" STUB_CALLS="$REL_CALLS" \
-    RELEASE_LIVE=true bash -e "$REL_SCRIPT" ) > /dev/null 2>&1 || true
-check "re-run: an existing release is not re-created" "$(grep -c '^gh release create' "$REL_CALLS")" "0"
+    RELEASE_LIVE=true bash -e "$REL_SCRIPT" ) > /dev/null 2>&1 || REL_RC=$?
+# All three: it reached its existence check, found the release, exited cleanly,
+# so a step that died before the check cannot pass as "did not re-create".
+check "re-run: an existing release is not re-created" \
+    "rc=$REL_RC views=$(grep -c '^gh release view' "$REL_CALLS") creates=$(grep -c '^gh release create' "$REL_CALLS")" \
+    "rc=0 views=1 creates=0"
 
 # The PR number a live run hands to auto-merge and wait_for_pr is the one in
 # the URL `gh pr create` printed (the stub prints .../pull/123).

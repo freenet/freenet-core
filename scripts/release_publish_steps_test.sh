@@ -40,6 +40,9 @@ check() {
 # One gh stub for every step: it logs its argv to $STUB_CALLS and answers from
 # env, so each case states its inputs inline.
 #   LIST_OUT / LIST_RC: `gh release list` output (after --jq) and exit code
+#   LIST_JSON: when set, the raw `gh release list --json` answer instead; the
+#              step's own --jq filter is applied to it with real jq, so the
+#              filter itself (e.g. dropping prereleases) is under test
 #   COMBINED_RC: exit code of a `release edit` that both un-drafts and sets --latest=
 #   API_OUT: `gh api` output
 STUBS="$TEST_TMP/bin"
@@ -50,7 +53,16 @@ printf '%s\n' "$*" >> "$STUB_CALLS"
 case "$1 $2" in
     "release list")
         [ "${LIST_RC:-0}" = 0 ] || exit "$LIST_RC"
-        printf '%b' "${LIST_OUT:-}" ;;
+        if [ -n "${LIST_JSON:-}" ]; then
+            filter=""
+            while [ $# -gt 0 ]; do
+                [ "$1" = --jq ] && { filter="$2"; break; }
+                shift
+            done
+            jq -r "${filter:-.}" <<<"$LIST_JSON"
+        else
+            printf '%b' "${LIST_OUT:-}"
+        fi ;;
     "release edit")
         case " $* " in
             *" --draft=false --latest="*) exit "${COMBINED_RC:-0}" ;;
@@ -130,6 +142,12 @@ if load_step "$CROSS_YML" attach-to-release "Publish release" "$PUB"; then
         "rc=0 edits=release edit v0.2.99 --draft=false --latest=true|release edit v0.2.99 --draft=false|release edit v0.2.99 --latest"
     publish_case "combined edit refused for an older tag: fails, no bare un-draft" v0.2.99 'v0.2.100\n' 0 1 \
         "rc=1 edits=release edit v0.2.99 --draft=false --latest=false"
+    # The step's own --jq runs here, so deleting its prerelease filter fails this.
+    rc=$(run_step "$PUB" GITHUB_REF="refs/tags/v0.2.99" \
+        LIST_JSON='[{"tagName":"v0.3.0-rc1","isPrerelease":true},{"tagName":"v0.2.98","isPrerelease":false}]')
+    check "Publish release: a newer PRERELEASE does not stop the release taking latest" \
+        "rc=$rc edits=$(grep '^release edit' "$PUB/calls" | sed 's/ --repo [^ ]*//' | paste -sd'|' -)" \
+        "rc=0 edits=release edit v0.2.99 --draft=false --latest=true"
 fi
 
 # --- 2. cross-compile.yml: signing, checksums, assets -------------------------
@@ -235,6 +253,11 @@ if load_step "$ANNOUNCE_YML" resolve "Resolve version" "$ANN"; then
     announce_case "a release older than a published one is not announced" release v0.2.99 false 'v0.2.100\n' 0 "rc=0 skip=true"
     announce_case "a workflow_dispatch is announced as asked" workflow_dispatch 0.2.99 "" 'v0.2.100\n' 0 "rc=0 skip=false"
     announce_case "a failed listing on a release event fails the step" release v0.2.99 false '' 1 "rc=1 skip="
+    # The step's own --jq runs here, so deleting its prerelease filter fails this.
+    rc=$(run_step "$ANN" EVENT_NAME=release TAG_NAME=v0.2.99 DISPATCH_VERSION= PRERELEASE=false REPO=example/repo \
+        LIST_JSON='[{"tagName":"v0.3.0-rc1","isPrerelease":true},{"tagName":"v0.2.98","isPrerelease":false}]')
+    check "Resolve version: a newer PRERELEASE does not suppress the announcement" \
+        "rc=$rc skip=$(sed -n 's/^skip=//p' "$ANN/github_output" | paste -sd, -)" "rc=0 skip=false"
 fi
 check "release-announce: both posting jobs are gated on resolve's skip output" \
     "$(python3 -c '
@@ -274,6 +297,24 @@ if load_step "$RELEASE_YML" validate "Resolve + validate version" "$VALIDATE"; t
     # The raw input reaches the script through env, never templated into it.
     check "Resolve + validate version: no \${{ inputs.* }} in the script" \
         "$(grep -c '@@inputs\.' "$VALIDATE/step.sh")" "0"
+    # Auto-bump (blank input) bumps from the higher of crates.io and the tree:
+    # after a Gate A block main already carries the unpublished version, and
+    # bumping from crates.io alone would pick it again.
+    mkdir -p "$VALIDATE/work/crates/core" "$VALIDATE/work/crates/fdev"
+    # shellcheck disable=SC2016  # $CURL_OUT is expanded by the stub, not here
+    printf '#!/usr/bin/env bash\nprintf %%s "$CURL_OUT"\n' > "$STUBS/curl"
+    chmod +x "$STUBS/curl"
+    autobump_case() {
+        local desc="$1" crates="$2" tree="$3" want="$4" rc
+        printf '[package]\nname = "freenet"\nversion = "%s"\n' "$tree" > "$VALIDATE/work/crates/core/Cargo.toml"
+        printf '[package]\nname = "fdev"\nversion = "0.3.10"\n' > "$VALIDATE/work/crates/fdev/Cargo.toml"
+        rc=$(run_step "$VALIDATE" VERSION_INPUT= CURL_OUT="{\"crate\":{\"max_version\":\"$crates\"}}")
+        check "auto-bump: $desc" "rc=$rc $(sed -n 's/^version=//p' "$VALIDATE/github_output")" "$want"
+    }
+    autobump_case "normal: tree equals crates.io" 0.2.163 0.2.163 "rc=0 0.2.164"
+    autobump_case "after a Gate A block: tree is ahead of crates.io" 0.2.163 0.2.164 "rc=0 0.2.165"
+    autobump_case "unreadable crates.io answer refuses" garbage 0.2.163 "rc=1 "
+    rm -f "$STUBS/curl"
 fi
 
 echo
