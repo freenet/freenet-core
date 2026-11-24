@@ -730,6 +730,200 @@ proptest::proptest! {
     }
 }
 
+/// One node's key material, made once: key generation draws from `GlobalRng`,
+/// which the property cases below must not reseed.
+struct Fixture {
+    keys: TransportKeypair,
+    peer: PeerKey,
+}
+
+fn fixture() -> &'static Fixture {
+    static FIXTURE: std::sync::OnceLock<Fixture> = std::sync::OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let keys = TransportKeypair::new();
+        let peer = PeerKey::of(keys.public()).unwrap();
+        Fixture { keys, peer }
+    })
+}
+
+/// Case counts for the properties below. The default keeps PR CI cheap; the
+/// scheduled `spki-proptest` workflow raises it through `PROPTEST_CASES`.
+fn cases() -> proptest::test_runner::Config {
+    proptest::test_runner::Config::with_cases(
+        std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(256),
+    )
+}
+
+/// A raw public key as an attacker may send it: arbitrary bytes, the SPKI
+/// prefix with an arbitrary key, or the exact key with some bytes replaced
+/// and then cut short or extended.
+fn arb_presented() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+    use proptest::prelude::*;
+    let exact = fixture().peer.spki().to_vec();
+    prop_oneof![
+        proptest::collection::vec(any::<u8>(), 0..96),
+        any::<[u8; 32]>().prop_map(|key| [&ED25519_SPKI_PREFIX[..], &key[..]].concat()),
+        (
+            proptest::collection::vec((0..ED25519_SPKI_LEN, any::<u8>()), 0..4),
+            0..ED25519_SPKI_LEN + 8,
+            proptest::collection::vec(any::<u8>(), 0..8),
+        )
+            .prop_map(move |(edits, len, filler)| {
+                let mut bytes = exact.clone();
+                for (at, value) in edits {
+                    bytes[at] = value;
+                }
+                bytes.extend_from_slice(&filler);
+                bytes.truncate(len);
+                bytes
+            }),
+    ]
+}
+
+fn arb_scheme() -> impl proptest::strategy::Strategy<Value = SignatureScheme> {
+    use proptest::prelude::*;
+    prop_oneof![
+        Just(SignatureScheme::ED25519),
+        any::<u16>().prop_map(SignatureScheme::from),
+    ]
+}
+
+proptest::proptest! {
+    #![proptest_config(cases())]
+
+    /// The conversion and `PeerKey::of` take any 32 bytes without panicking.
+    /// What `PeerKey::of` accepts is in canonical form, converts to the key
+    /// the independent conversion gives, and is accepted back from its own
+    /// presented form as the same key.
+    #[test]
+    fn peer_key_of_takes_any_transport_key(u in proptest::prelude::any::<[u8; 32]>()) {
+        let transport = TransportPublicKey::from_bytes(u);
+        proptest::prop_assert_eq!(ed25519_public_key(&transport).ok(), independent_edwards(u));
+        if let Ok(peer) = PeerKey::of(&transport) {
+            proptest::prop_assert!(is_canonical(&u));
+            proptest::prop_assert_eq!(Some(*peer.ed25519()), independent_edwards(u));
+            let again = peer_key_presented(peer.spki()).unwrap();
+            proptest::prop_assert_eq!(&again, &peer);
+            proptest::prop_assert_eq!(again.transport_key().as_bytes(), &u);
+        }
+    }
+
+    /// Nothing that is not exactly the expected key's encoding passes the
+    /// pinned check, on either side, with or without a chain. The proven
+    /// verifier accepts exactly what `peer_key_presented` accepts, and never
+    /// with a chain.
+    #[test]
+    fn certificate_verifiers_take_any_presented_key(
+        presented in arb_presented(),
+        chain in proptest::collection::vec(
+            proptest::collection::vec(proptest::prelude::any::<u8>(), 0..64),
+            0..3,
+        ),
+    ) {
+        let expected = &fixture().peer;
+        let end_entity = cert(&presented);
+        let intermediates: Vec<_> = chain.iter().map(|der| cert(der)).collect();
+        let name = rustls::pki_types::ServerName::try_from("freenet").unwrap();
+        let now = rustls::pki_types::UnixTime::now();
+        let exact = presented.as_slice() == &expected.spki()[..];
+
+        let server = PinnedServerKey::new(expected)
+            .verify_server_cert(&end_entity, &intermediates, &name, &[], now)
+            .is_ok();
+        let client = PinnedClientKey::new(expected)
+            .verify_client_cert(&end_entity, &intermediates, now)
+            .is_ok();
+        let proven = ProvenClientKey
+            .verify_client_cert(&end_entity, &intermediates, now)
+            .is_ok();
+        proptest::prop_assert_eq!(server, exact && intermediates.is_empty());
+        proptest::prop_assert_eq!(client, exact && intermediates.is_empty());
+        proptest::prop_assert_eq!(
+            proven,
+            peer_key_presented(&presented).is_ok() && intermediates.is_empty()
+        );
+        proptest::prop_assert!(
+            RefuseEveryClient
+                .verify_client_cert(&end_entity, &intermediates, now)
+                .is_err()
+        );
+    }
+
+    /// A handshake signature from arbitrary bytes, message and scheme is
+    /// refused by the pinned and proven checks, for the expected key and for any other
+    /// presented key, and never panics. (Forging an Ed25519 signature
+    /// succeeds with negligible probability, so "refused" is the property.)
+    #[test]
+    fn signature_verifiers_refuse_arbitrary_signatures(
+        presented in arb_presented(),
+        message in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+        signature in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..100),
+        scheme in arb_scheme(),
+    ) {
+        let expected = &fixture().peer;
+        let end_entity = cert(&presented);
+        proptest::prop_assert!(
+            expected.verify_signature(&message, &end_entity, scheme, &signature).is_err()
+        );
+        proptest::prop_assert!(
+            ProvenClientKey::verify_signature(&message, &end_entity, scheme, &signature).is_err()
+        );
+    }
+
+    /// Our own signature over any message round-trips through the pinned
+    /// and proven checks, and is refused when a bit of it or of the message changes,
+    /// when its length changes, or when a different scheme is declared.
+    #[test]
+    fn our_signatures_round_trip_and_nothing_else_verifies(
+        message in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
+        flip_at in 0usize..64,
+        flip_bit in 0u8..8,
+        scheme in arb_scheme(),
+    ) {
+        let fixture = fixture();
+        let expected = &fixture.peer;
+        let end_entity = cert(expected.spki());
+        let good = handshake_sign(&fixture.keys, &message);
+        let ed25519 = SignatureScheme::ED25519;
+        // The pinned verifiers (`PinnedServerKey`, `PinnedClientKey`) call
+        // `PeerKey::verify_signature` unchanged; `DigitallySignedStruct`
+        // cannot be built outside rustls, so the shared function is the
+        // reachable entry point.
+        let verifies = |message: &[u8], scheme, signature: &[u8]| {
+            let pinned = expected
+                .verify_signature(message, &end_entity, scheme, signature)
+                .is_ok();
+            let proven = ProvenClientKey::verify_signature(message, &end_entity, scheme, signature)
+                .is_ok();
+            assert_eq!(pinned, proven, "verifiers disagree");
+            pinned
+        };
+        proptest::prop_assert!(verifies(&message, ed25519, &good));
+
+        let mut altered = good.clone();
+        altered[flip_at] ^= 1 << flip_bit;
+        proptest::prop_assert!(!verifies(&message, ed25519, &altered));
+
+        let mut longer = message.clone();
+        longer.push(0);
+        proptest::prop_assert!(!verifies(&longer, ed25519, &good));
+        if let Some(first) = message.first() {
+            let mut changed = message.clone();
+            changed[0] = first ^ 1;
+            proptest::prop_assert!(!verifies(&changed, ed25519, &good));
+        }
+        proptest::prop_assert!(!verifies(&message, ed25519, &good[..63]));
+        proptest::prop_assert!(!verifies(&message, ed25519, &[&good[..], &[0][..]].concat()));
+        if scheme != ed25519 {
+            proptest::prop_assert!(!verifies(&message, scheme, &good));
+        }
+    }
+}
+
 /// Drive a TLS 1.3 handshake between `client` and `server` in memory,
 /// to the end or the first error (either side's). On success, the key the
 /// server's connection holds for the client, parsed as `proven_client_key`
