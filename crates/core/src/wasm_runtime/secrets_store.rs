@@ -56,10 +56,8 @@ pub use sweep::{
     spawn_inactive_user_sweep, stamp_user_last_seen, wall_clock_unix_secs,
 };
 
-#[allow(unused_imports)]
 pub use store::{
     ExportScopeError, ExportSecretEntry, MigrationReport, SecretStoreError, SecretsStore,
-    refused_unauthenticated_overwrites,
 };
 
 // ── pub(super) re-exports ─────────────────────────────────────────────────────

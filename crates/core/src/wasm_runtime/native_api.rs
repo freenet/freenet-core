@@ -1077,7 +1077,8 @@ pub(super) struct DelegateCallEnv {
     secret_read_memo: std::cell::RefCell<SecretReadMemo>,
     /// Set the first time a secret READ fails with an I/O error rather than the
     /// secret being absent. #5857. (A blob that reads but fails to
-    /// authenticate keeps its old answer, see #6323.)
+    /// authenticate keeps its old answer, "absent", and does not poison the
+    /// call; instead `store_secret` refuses to write over it, #6323.)
     ///
     /// A delegate cannot be trusted to tell that apart from "no such secret":
     /// every stdlib guest to date maps ANY negative return of `get_secret` /
@@ -1416,12 +1417,15 @@ impl DelegateCallEnv {
     /// hand the guest: `ERR_STORAGE_FAILED` for an I/O failure, in which case
     /// the call is poisoned (see the `secret_read_failure` field docs), and
     /// `ERR_SECRET_NOT_FOUND` for everything else, including a blob that fails
-    /// to authenticate (#6323).
+    /// to authenticate. That keeps reads working; the data is protected on the
+    /// write side, where `SecretsStore::store_secret` refuses to replace such
+    /// a blob (#6323).
     fn classify_secret_read_error(&self, secret_id: &SecretsId, e: &SecretStoreError) -> i32 {
         // Scope: I/O failures, which are transient and retryable. A blob that
         // reads but does not authenticate is deterministic corruption or a key
         // mismatch; retrying cannot help and failing the call would leave the
-        // delegate unable to run at all, so it keeps its historical answer.
+        // delegate unable to run at all, so it keeps its historical answer
+        // ("absent") and is protected by the write-side refusal instead.
         if !matches!(e, SecretStoreError::IO(_)) {
             return error_codes::ERR_SECRET_NOT_FOUND;
         }
@@ -2431,8 +2435,11 @@ pub(super) mod delegate_secrets {
     /// ## Returns
     /// - `SUCCESS` (0): store succeeded
     /// - `ERR_NOT_IN_PROCESS`: called outside process()
-    /// - `ERR_STORAGE_FAILED`: storage operation failed, or an earlier secret
-    ///   read in this call failed (the call is poisoned, #5857)
+    /// - `ERR_STORAGE_FAILED`: storage operation failed, an earlier secret
+    ///   read in this call failed (the call is poisoned, #5857), or a blob
+    ///   already exists at this key and could not be read and authenticated
+    ///   (corrupt, a different key, or unreadable; #6323). `remove_secret` on
+    ///   that key clears it.
     /// - `ERR_INVALID_PARAM`: invalid parameter (negative length)
     pub(crate) fn set_secret(key_ptr: i64, key_len: i32, val_ptr: i64, val_len: i32) -> i32 {
         let id = current_instance_id();
@@ -2501,13 +2508,14 @@ pub(super) mod delegate_secrets {
         {
             Ok(()) => error_codes::SUCCESS,
             Err(e) => {
-                // A refusal to replace a blob that does not authenticate
-                // (#6323) is already counted and logged, rate-limited, by the
-                // store; the guest sees the ordinary storage-failure code.
+                // A refusal to replace a blob that could not be read and
+                // authenticated (#6323) is already logged, rate-limited per
+                // key, by the store; the guest sees the ordinary
+                // storage-failure code.
                 if !matches!(
                     e.deref(),
                     crate::wasm_runtime::RuntimeInnerError::SecretStoreError(
-                        SecretStoreError::ExistingBlobUnauthenticated(_)
+                        SecretStoreError::ExistingBlobUnusable { .. }
                     )
                 ) {
                     tracing::error!("delegate set_secret failed: {e}");
@@ -3832,7 +3840,6 @@ mod secret_read_memo_tests {
         let path = blob_path(&f, &SecretsId::new(b"vault-index".to_vec()));
         let corrupted = corrupt(&path);
 
-        let before = crate::wasm_runtime::secrets_store::refused_unauthenticated_overwrites();
         let mem = kv_mem(b"vault-index", b"fresh empty index");
         let (set, len, poisoned) = as_guest(&mut f, 0x6323_0001, &mem, || {
             let set = host_set(b"vault-index", b"fresh empty index");
@@ -3852,10 +3859,6 @@ mod secret_read_memo_tests {
             "reads of an undecryptable blob still report absent"
         );
         assert!(!poisoned, "a corrupt blob must not fail the whole call");
-        assert!(
-            crate::wasm_runtime::secrets_store::refused_unauthenticated_overwrites() > before,
-            "the refusal must be counted"
-        );
     }
 
     /// #6323: explicit delete stays allowed on an undecryptable blob, and the

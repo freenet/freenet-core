@@ -4,7 +4,7 @@
 //! `store_secret` overwrites an existing value with DIFFERENT content, the
 //! previous ciphertext is moved into a `.snapshots/{secret_id}/{epoch_ms}`
 //! file. (A write that leaves the plaintext unchanged is skipped — see
-//! `SecretsStore::active_plaintext_matches` — since a second, differently-
+//! the unchanged-plaintext check in `SecretsStore::store_secret` — since a second, differently-
 //! nonced copy of a value we already hold buys no recovery.) Retention is
 //! then thinned per the policy below: recent history stays dense, older
 //! history is sampled at progressively coarser intervals (minute / hour /

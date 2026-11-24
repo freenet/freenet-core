@@ -180,9 +180,11 @@ A snapshot is taken only when a write actually **changes** the secret's
 plaintext. Re-writing a byte-identical value is a no-op for history: the
 snapshot would be a second copy of a value already on disk, and since
 every write draws a fresh AEAD nonce, that copy is a distinct ciphertext
-no deduplication can reclaim later. Any uncertainty about the current
-on-disk value (unreadable file, unexpected size, a blob that does not
-decrypt) falls back to taking the snapshot.
+no deduplication can reclaim later. A blob that cannot be read
+and authenticated is not snapshotted and overwritten: the write is
+refused (see "A write over an unreadable or unauthenticated blob is
+refused" below). A pre-#4143 raw-AEAD blob is authentic, so it is
+snapshotted and rewritten in the current format.
 
 Retained history per secret is bounded on three axes:
 
@@ -323,6 +325,42 @@ write, an import does not skip it when the content happens to match,
 because an import is where foreign data lands on top of local data.
 `--out` on export refuses to overwrite an existing file.
 
+### A write over an unreadable or unauthenticated blob is refused (#6323)
+
+A delegate reads a blob that fails to authenticate (corruption, or a
+different key) as "absent", and a delegate that initialises its state on
+"absent" would then replace data that may still be recoverable. So
+`set_secret` is refused, per key, whenever a blob already exists at the key
+and cannot be read and authenticated: the guest gets the ordinary
+storage-failure code, the blob is left byte-for-byte as it was, and the node
+logs a `warn!` (at most once per 30 s per delegate and key, with the number
+of refusals suppressed since the last line). The same applies when the
+existing file cannot be read at all (for example EACCES), because its
+contents are unknown. The check does not depend on the key having been read
+in the same call. Not refused: `remove_secret` (the recovery path), reads
+(still "absent"), other keys of the same delegate, and a key with no blob
+yet. `create_delegate` writes no secrets and is unaffected.
+
+**Operator recovery.** If the node's key material changed (a different KEK
+or keychain backend, or a different user `dek_secret`), EVERY existing blob
+fails to authenticate and every write over one is refused until you act.
+The refused blobs are the only copy of that data, so first try to put the
+right key back: restore the original `node_kek`, or switch back to the
+original backend (`freenet secrets kek-status` shows which is configured).
+Once the right key is present the blobs authenticate and writes work again.
+If the data is not wanted, remove the blobs instead, either by having the
+delegate call `remove_secret` for the key, or with the node stopped by
+deleting the files: `<secrets_dir>/<delegate>/<secret-id>` for the local
+scope, `<secrets_dir>/<delegate>/users/<user_id>/<secret-id>` for a user
+scope (the refusal's log line names the `secret` id; `freenet secrets
+snapshot-list` prints ids too), and, for the key-enumeration registry,
+`.keys` in the same directory. `.snapshots/` can stay. Deleting a file
+directly leaves the node's index row for it until the next write of that key.
+
+`freenet secrets import --overwrite` is deliberately NOT subject to the
+refusal: it replaces whatever is there after taking a snapshot, because an
+operator asked for it.
+
 ## File permissions (PR #4195 / issue #4141)
 
 The secrets tree is owner-only on Unix:
@@ -375,8 +413,11 @@ describes:
 The registry is **independent of the value path**: it is written
 strictly AFTER the durable value+index commit, and a failed or unreadable
 registry never blocks or loses a secret VALUE. A corrupt or undecryptable
-`.keys` blob is best-effort: it enumerates as empty (policy tracked in
-#6323). A transient I/O error reading the registry (EIO, EACCES, EMFILE)
+`.keys` blob is best-effort: it enumerates as empty, it is left on disk as
+found, and only the registry update is skipped, so secret writes still go
+through (key names exist only inside the registry, since blob file names are
+hashes, so it cannot be rebuilt; new keys stay un-enumerable until the
+`.keys` file is removed). A transient I/O error reading the registry (EIO, EACCES, EMFILE)
 is NOT reported as an empty list: `list_secrets` returns
 `ERR_STORAGE_FAILED` and fails that delegate call, so a delegate cannot
 mistake an unreadable registry for "no secrets" (#5857). Either way the

@@ -111,14 +111,18 @@ pub enum SecretStoreError {
     MissingCipher,
     #[error("missing secret: {0}")]
     MissingSecret(SecretsId),
-    /// A write was REFUSED because a blob already exists at the key and does
-    /// not authenticate (corruption, or a KEK or key mismatch), or could not
-    /// be read to find out (#6323). Reads of such a blob report the secret as
-    /// absent, so a delegate that initialises state on "absent" would
-    /// otherwise replace data that may still be recoverable. `remove_secret`
-    /// is the recovery path and is never refused for this reason.
-    #[error("refusing to overwrite an existing secret that does not authenticate: {0}")]
-    ExistingBlobUnauthenticated(SecretsId),
+    /// A write was REFUSED because a blob already exists at the key and could
+    /// not be read and authenticated: it is corrupt, was written under a
+    /// different key (KEK or `dek_secret` mismatch), or could not be read at
+    /// all (an I/O error such as EACCES). `cause` says which (#6323). Reads of
+    /// such a blob report the secret as absent, so a delegate that initialises
+    /// state on "absent" would otherwise replace data that may still be
+    /// recoverable. `remove_secret` is the recovery path and is never refused
+    /// for this reason.
+    #[error(
+        "refusing to overwrite an existing secret blob that could not be read and authenticated ({key}): {cause}"
+    )]
+    ExistingBlobUnusable { key: SecretsId, cause: String },
     /// No snapshot file matched the requested `timestamp_ms` in the
     /// secret's `.snapshots/{secret_id}/` directory. Distinct from
     /// `IO`/`MissingSecret` so the CLI (issue #4036) can surface a
@@ -664,13 +668,18 @@ impl SecretsStore {
         // written, snapshotted or counted. Only a file that does not exist is
         // free to create; an unreadable one is refused too, since its contents
         // are unknown. `remove_secret` is the way out.
-        match self.get_secret_in(delegate, key, &scope) {
-            Ok(_) | Err(SecretStoreError::MissingSecret(_)) => {}
+        let existing = match self.get_secret_in(delegate, key, &scope) {
+            Ok(plaintext) => Some(plaintext),
+            Err(SecretStoreError::MissingSecret(_)) => None,
             Err(e) => {
-                note_refused_unauthenticated_overwrite(delegate, key, &e);
-                return Err(SecretStoreError::ExistingBlobUnauthenticated(key.clone()).into());
+                note_refused_unusable_overwrite(delegate, key, &e);
+                return Err(SecretStoreError::ExistingBlobUnusable {
+                    key: key.clone(),
+                    cause: e.to_string(),
+                }
+                .into());
             }
-        }
+        };
 
         // DEK selection. Local: `cipher_for` derives via HKDF from the node
         // KEK and caches on first call (a prior `register_delegate` has already
@@ -825,14 +834,21 @@ impl SecretsStore {
         //   - update index AFTER the active rename so a crash between rename
         //     and index-update still gives `get_secret` the new value.
         //
-        // A write that does not CHANGE the plaintext is skipped entirely
-        // (`active_plaintext_matches`): the snapshot would be a second,
-        // differently-nonced ciphertext for a value we already hold, so it
-        // buys no recovery and cannot be deduped away later. The check is
-        // fail-safe — any doubt about what is on disk means we snapshot.
+        // A write that does not CHANGE the plaintext skips the snapshot: it
+        // would be a second, differently-nonced ciphertext for a value we
+        // already hold, so it buys no recovery and cannot be deduped away
+        // later. The comparison uses the plaintext the guard above already
+        // read and authenticated, so the old blob is read and decrypted once.
+        // A pre-#4143 raw-AEAD blob (no header, so a different length) is
+        // snapshotted even when the plaintext matches, as before: the write
+        // rewrites it in the current format.
         let needs_snapshot = take_snapshots
-            && secret_file_path.exists()
-            && !self.active_plaintext_matches(&encryption, &secret_file_path, plaintext.as_slice());
+            && existing.as_ref().is_some_and(|old| {
+                let current_format_len = (HEADER_LEN + old.len() + TAG_LEN) as u64;
+                let on_disk_len = fs::metadata(&secret_file_path).map(|m| m.len()).ok();
+                !same_plaintext(old.as_slice(), plaintext.as_slice())
+                    || on_disk_len != Some(current_format_len)
+            });
         if needs_snapshot
             && let Err(e) = self.snapshot_prior_value(&scope_path, key, &secret_file_path)
         {
@@ -1019,90 +1035,6 @@ impl SecretsStore {
         secret_file_path: &Path,
     ) -> std::io::Result<()> {
         snapshot_active_value(delegate_path, &key.encode(), secret_file_path)
-    }
-
-    /// Does the active secret file already hold exactly `plaintext`?
-    ///
-    /// `store_secret` uses this to skip the pre-overwrite snapshot when a
-    /// write does not change the content. Snapshotting a byte-identical
-    /// value has zero recovery value, and because every write draws a FRESH
-    /// AEAD nonce, the redundant copy is a distinct ciphertext that no
-    /// byte-level dedup can ever reclaim afterwards — on a measured
-    /// production peer, hashing all 1001 snapshot files found zero duplicate
-    /// blobs despite obvious value-level repetition.
-    ///
-    /// FAIL-SAFE BY CONSTRUCTION. Every path except "decrypted the active
-    /// blob and its plaintext hashes equal" returns `false`, i.e. "assume it
-    /// changed, take the snapshot":
-    /// - the file can't be stat'd or read,
-    /// - its length differs from the length this plaintext would produce,
-    /// - it isn't in the current on-disk format,
-    /// - it doesn't decrypt under the scope DEK.
-    ///
-    /// So a corrupt, legacy, or foreign-key blob costs a redundant snapshot,
-    /// never a lost one. That asymmetry is deliberate: the failure mode we
-    /// refuse is "silently declined to preserve a value that was about to be
-    /// overwritten".
-    ///
-    /// The length check runs first and settles the common case for free: an
-    /// on-disk blob is exactly `HEADER_LEN + plaintext + TAG_LEN` bytes, so a
-    /// different plaintext length is proof of a change without reading or
-    /// decrypting anything. Only same-length candidates pay the decrypt,
-    /// which is bounded by the size of the very value this write is already
-    /// encrypting and fsync'ing.
-    ///
-    /// Unlike [`decrypt_secret_blob`], the legacy cipher/format fallback
-    /// chain is deliberately NOT consulted. A blob this node's current writer
-    /// did not produce is exactly the blob most worth preserving before it is
-    /// rewritten, and skipping the chain also keeps this off the write path's
-    /// "migrating a legacy blob" log lines.
-    fn active_plaintext_matches(
-        &self,
-        encryption: &Encryption,
-        secret_file_path: &Path,
-        plaintext: &[u8],
-    ) -> bool {
-        let expected_len = (HEADER_LEN + plaintext.len() + TAG_LEN) as u64;
-        match fs::metadata(secret_file_path) {
-            Ok(md) if md.len() == expected_len => {}
-            // Different size => different plaintext. No read, no decrypt.
-            Ok(_) => return false,
-            Err(e) => {
-                tracing::debug!(
-                    path = %secret_file_path.display(),
-                    error = %e,
-                    "could not stat active secret; snapshotting rather than assuming it is unchanged"
-                );
-                return false;
-            }
-        }
-
-        let blob = match fs::read(secret_file_path) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!(
-                    path = %secret_file_path.display(),
-                    error = %e,
-                    "could not read active secret; snapshotting rather than assuming it is unchanged"
-                );
-                return false;
-            }
-        };
-        // `expected_len` already guarantees `blob.len() >= HEADER_LEN`, but
-        // re-check so this stays correct if the length gate ever moves.
-        if blob.len() < HEADER_LEN || blob.first().copied() != Some(VERSION_V1) {
-            return false;
-        }
-        let nonce = XNonce::from_slice(&blob[1..HEADER_LEN]);
-        let Ok(existing) = encryption.cipher.decrypt(nonce, &blob[HEADER_LEN..]) else {
-            return false;
-        };
-        let existing = Zeroizing::new(existing);
-        // Compare 32-byte BLAKE3 digests rather than the plaintexts: the
-        // comparison then never short-circuits on secret bytes, and a
-        // 256-bit digest makes a false "unchanged" verdict computationally
-        // unreachable.
-        blake3::hash(existing.as_slice()) == blake3::hash(plaintext)
     }
 
     /// Remove a secret under the given `scope`. Local and User scopes are
@@ -3707,49 +3639,67 @@ pub enum ExportScopeError {
     CountTooLarge { actual: usize, limit: usize },
 }
 
-/// Writes refused because an existing blob did not authenticate (#6323),
-/// since process start. Read via [`refused_unauthenticated_overwrites`].
-static REFUSED_UNAUTHENTICATED_OVERWRITES: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-
-/// When a refusal was last logged, so a delegate retrying a refused write in a
-/// loop cannot flood the log. The counter above still counts every refusal.
-static LAST_REFUSAL_REPORT: std::sync::Mutex<Option<std::time::Instant>> =
-    std::sync::Mutex::new(None);
-
-const REFUSAL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Number of `store_secret` calls refused since process start because the
-/// existing blob did not authenticate (#6323).
-#[allow(dead_code)] // read by tests; available to diagnostics
-pub fn refused_unauthenticated_overwrites() -> u64 {
-    REFUSED_UNAUTHENTICATED_OVERWRITES.load(std::sync::atomic::Ordering::Relaxed)
+/// Compare two plaintexts by 32-byte BLAKE3 digest rather than directly: the
+/// comparison then never short-circuits on secret bytes, and a 256-bit digest
+/// makes a false "unchanged" verdict computationally unreachable.
+fn same_plaintext(a: &[u8], b: &[u8]) -> bool {
+    blake3::hash(a) == blake3::hash(b)
 }
 
-/// Count a refused overwrite and log it at `warn!` (kept in release builds),
-/// at most once per [`REFUSAL_REPORT_INTERVAL`].
-fn note_refused_unauthenticated_overwrite(
+/// How long a refused (delegate, key) stays quiet in the log.
+const REFUSAL_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+/// Bound on the limiter's map. A delegate can name unbounded keys, so the map
+/// must not grow with them.
+const REFUSAL_LIMITER_CAPACITY: usize = 256;
+
+/// Per (delegate, key): when it was last logged, and how many refusals were
+/// swallowed since. One noisy key therefore cannot hide another.
+static REFUSAL_LIMITER: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<(DelegateKey, [u8; 32]), (std::time::Instant, u64)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Log a refused overwrite at `warn!` (kept in release builds), at most once
+/// per [`REFUSAL_REPORT_INTERVAL`] per (delegate, key), saying how many
+/// refusals were suppressed since the last line.
+fn note_refused_unusable_overwrite(
     delegate: &DelegateKey,
     key: &SecretsId,
     cause: &SecretStoreError,
 ) {
-    let total =
-        REFUSED_UNAUTHENTICATED_OVERWRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let now = std::time::Instant::now();
-    let mut last = LAST_REFUSAL_REPORT
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
-    if last.is_some_and(|at| now.duration_since(at) < REFUSAL_REPORT_INTERVAL) {
-        return;
-    }
-    *last = Some(now);
+    let mut map = REFUSAL_LIMITER.lock().unwrap_or_else(|p| p.into_inner());
+    let id = (delegate.clone(), *key.hash());
+    let suppressed = match map.get_mut(&id) {
+        Some((at, swallowed)) => {
+            if now.duration_since(*at) < REFUSAL_REPORT_INTERVAL {
+                *swallowed += 1;
+                return;
+            }
+            let n = *swallowed;
+            *at = now;
+            *swallowed = 0;
+            n
+        }
+        None => {
+            if map.len() >= REFUSAL_LIMITER_CAPACITY {
+                map.retain(|_, (at, _)| now.duration_since(*at) < REFUSAL_REPORT_INTERVAL);
+                if map.len() >= REFUSAL_LIMITER_CAPACITY {
+                    map.clear();
+                }
+            }
+            map.insert(id, (now, 0));
+            0
+        }
+    };
+    drop(map);
     tracing::warn!(
         delegate = %delegate.encode(),
         secret = %key.encode(),
         cause = %cause,
-        refused_total = total,
-        "refused to overwrite an existing secret that does not authenticate; the data \
-         is left on disk and reads report it absent. remove_secret clears it"
+        suppressed_since_last_log = suppressed,
+        "refused to overwrite an existing secret blob that could not be read and \
+         authenticated; the data is left on disk and reads report it absent. \
+         remove_secret clears it"
     );
 }
 
@@ -5187,7 +5137,7 @@ mod test {
             matches!(
                 res.as_ref().map_err(|e| e.deref()),
                 Err(RuntimeInnerError::SecretStoreError(
-                    SecretStoreError::ExistingBlobUnauthenticated(_)
+                    SecretStoreError::ExistingBlobUnusable { .. }
                 ))
             ),
             "overwriting an undecryptable blob must be refused, got {res:?}"
@@ -5214,6 +5164,298 @@ mod test {
                 .to_vec(),
             body
         );
+        Ok(())
+    }
+
+    /// Assert `res` is the #6323 refusal and return its cause text.
+    fn refusal_cause<T: std::fmt::Debug>(res: RuntimeResult<T>) -> String {
+        match res {
+            Err(e) => match e.deref() {
+                RuntimeInnerError::SecretStoreError(SecretStoreError::ExistingBlobUnusable {
+                    cause,
+                    ..
+                }) => cause.clone(),
+                other => panic!("expected the #6323 refusal, got {other:?}"),
+            },
+            Ok(v) => panic!("expected the #6323 refusal, but the write succeeded: {v:?}"),
+        }
+    }
+
+    /// #6323, User scope: a blob written under another `dek_secret` (a key
+    /// change) is refused, a corrupt one is refused, and a healthy blob under
+    /// the right `dek_secret` still overwrites.
+    #[tokio::test]
+    async fn user_scope_refuses_unauthenticated_blob_and_overwrites_healthy_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![60].into(), &vec![].into()));
+        let (id, dek) = fresh_user(&secrets_dir, 0x60);
+        let other_dek = Zeroizing::new([0xCDu8; 32]);
+        let mine = SecretScope::User {
+            id: &id,
+            dek_secret: &dek,
+        };
+        let theirs = SecretScope::User {
+            id: &id,
+            dek_secret: &other_dek,
+        };
+        let key = SecretsId::new(b"k".to_vec());
+
+        // Healthy: overwrite under the same dek_secret works.
+        store.store_secret(delegate.key(), &key, mine, Zeroizing::new(b"v1".to_vec()))?;
+        let mine = SecretScope::User {
+            id: &id,
+            dek_secret: &dek,
+        };
+        store.store_secret(delegate.key(), &key, mine, Zeroizing::new(b"v2".to_vec()))?;
+
+        // Key change: the same user presents a different dek_secret.
+        let blob = store.scope_dir(delegate.key(), &theirs).join(key.encode());
+        let before = std::fs::read(&blob)?;
+        refusal_cause(store.store_secret(
+            delegate.key(),
+            &key,
+            theirs,
+            Zeroizing::new(b"x".to_vec()),
+        ));
+        assert_eq!(std::fs::read(&blob)?, before, "blob untouched");
+
+        // Corruption under the right dek_secret.
+        let mut bad = before.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 0xff;
+        std::fs::write(&blob, &bad)?;
+        let mine = SecretScope::User {
+            id: &id,
+            dek_secret: &dek,
+        };
+        refusal_cause(store.store_secret(
+            delegate.key(),
+            &key,
+            mine,
+            Zeroizing::new(b"x".to_vec()),
+        ));
+        assert_eq!(std::fs::read(&blob)?, bad, "corrupt blob untouched");
+        Ok(())
+    }
+
+    /// #6323: an AUTHENTIC pre-#4143 raw-AEAD blob is not "unauthenticated":
+    /// it still overwrites, the old bytes are snapshotted, and the active file
+    /// is rewritten in the current format (the migration). Re-writing the SAME
+    /// plaintext also migrates, and still snapshots the legacy bytes.
+    #[tokio::test]
+    async fn authentic_legacy_blob_is_overwritable_and_migrates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![61].into(), &vec![].into()));
+        let derived = store.derive_delegate_dek(delegate.key());
+        let dir = secrets_dir.join(delegate.key().encode());
+        std::fs::create_dir_all(&dir)?;
+
+        for (n, (old, new)) in [(&b"legacy-1"[..], &b"fresh-1"[..]), (b"same", b"same")]
+            .into_iter()
+            .enumerate()
+        {
+            let key = SecretsId::new(vec![61, n as u8]);
+            let raw = derived
+                .cipher
+                .encrypt(&derived.legacy_nonce, old)
+                .expect("legacy encrypt");
+            let path = dir.join(key.encode());
+            std::fs::write(&path, &raw)?;
+            assert_ne!(raw[0], VERSION_V1, "fixture must read as legacy");
+
+            store.store_secret(
+                delegate.key(),
+                &key,
+                SecretScope::Local,
+                Zeroizing::new(new.to_vec()),
+            )?;
+            assert_eq!(std::fs::read(&path)?[0], VERSION_V1, "migrated");
+            assert_eq!(
+                store
+                    .get_secret(delegate.key(), &key, SecretScope::Local)?
+                    .to_vec(),
+                new
+            );
+            assert_eq!(
+                snapshot_count(&secrets_dir, delegate.key(), &key),
+                1,
+                "the legacy bytes are preserved before the rewrite"
+            );
+        }
+        Ok(())
+    }
+
+    /// #6323: a refused write has no side effects. No tmp file, no `.keys`
+    /// registry entry, no index entry, no snapshot, and for a User scope the
+    /// quota tracker does not move even for a value far over the limit (the
+    /// refusal, not `QuotaExceeded`, must be what the caller sees, so the guard
+    /// runs before the quota check).
+    #[tokio::test]
+    async fn refused_write_leaves_no_trace() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store =
+            SecretsStore::new(secrets_dir.clone(), Default::default(), db)?.with_user_quota(4096);
+        let delegate = Delegate::from((&vec![62].into(), &vec![].into()));
+
+        // Local: a corrupt blob for a key that was never indexed or registered.
+        let key = SecretsId::new(b"never-indexed".to_vec());
+        let dir = store.scope_dir(delegate.key(), &SecretScope::Local);
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(key.encode()), vec![0x01u8; 80])?;
+        refusal_cause(store.store_secret(
+            delegate.key(),
+            &key,
+            SecretScope::Local,
+            Zeroizing::new(b"x".to_vec()),
+        ));
+        let names: Vec<String> = std::fs::read_dir(&dir)?
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![key.encode()],
+            "no tmp, registry or snapshot dir"
+        );
+        assert!(
+            store
+                .key_to_secret_part
+                .get(delegate.key())
+                .is_none_or(|s| s.value().is_empty()),
+            "no index entry"
+        );
+        assert_eq!(snapshot_count(&secrets_dir, delegate.key(), &key), 0);
+
+        // User: healthy small write, corrupt it, then refuse a huge write.
+        let (id, dek) = fresh_user(&secrets_dir, 0x62);
+        let scope = || SecretScope::User {
+            id: &id,
+            dek_secret: &dek,
+        };
+        let ukey = SecretsId::new(b"u".to_vec());
+        store.store_secret(
+            delegate.key(),
+            &ukey,
+            scope(),
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+        let tracked = quota_tracked_total_for_test(&secrets_dir, &id);
+        let blob = store
+            .scope_dir(delegate.key(), &scope())
+            .join(ukey.encode());
+        let mut bytes = std::fs::read(&blob)?;
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&blob, &bytes)?;
+        let cause = refusal_cause(store.store_secret(
+            delegate.key(),
+            &ukey,
+            scope(),
+            Zeroizing::new(vec![9u8; 64 * 1024]),
+        ));
+        assert!(cause.contains("encryption error"), "cause: {cause}");
+        assert_eq!(quota_tracked_total_for_test(&secrets_dir, &id), tracked);
+        assert_eq!(std::fs::read(&blob)?, bytes);
+        Ok(())
+    }
+
+    /// #6323: the I/O arm. A blob path that cannot be read (here a directory)
+    /// is refused too, and the cause names the I/O error, not authentication.
+    #[tokio::test]
+    async fn unreadable_blob_path_is_refused_with_an_io_cause()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let delegate = Delegate::from((&vec![63].into(), &vec![].into()));
+        let key = SecretsId::new(b"k".to_vec());
+        let path = store
+            .scope_dir(delegate.key(), &SecretScope::Local)
+            .join(key.encode());
+        std::fs::create_dir_all(&path)?;
+
+        let cause = refusal_cause(store.store_secret(
+            delegate.key(),
+            &key,
+            SecretScope::Local,
+            Zeroizing::new(b"x".to_vec()),
+        ));
+        assert!(path.is_dir(), "still a directory");
+        assert!(
+            cause.contains("directory"),
+            "an I/O failure must read as one, got: {cause}"
+        );
+        assert!(!cause.contains("encryption"), "cause: {cause}");
+        Ok(())
+    }
+
+    /// #6323, copy-forward: the successor's crate-format `pred-done:` marker is
+    /// read BEFORE any write, so a corrupt marker blob fails closed there and
+    /// `store_secret` is never asked to overwrite it. Pins the behaviour: the
+    /// pair is reported already-migrated with a "marker read failed" error,
+    /// nothing is copied, the marker blob is untouched, no redb row is sealed,
+    /// and the next registration repeats the same outcome (it retries, never
+    /// seals, until an operator removes the damaged marker).
+    #[tokio::test]
+    async fn migrate_over_a_corrupt_marker_stays_unsealed_and_retries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("s");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db.clone())?;
+        let pred = Delegate::from((&vec![0].into(), &vec![1].into()));
+        let succ = Delegate::from((&vec![0].into(), &vec![2].into()));
+        let secret_id = SecretsId::new(b"room:bob".to_vec());
+        store.store_secret(
+            pred.key(),
+            &secret_id,
+            SecretScope::Local,
+            Zeroizing::new(b"v1".to_vec()),
+        )?;
+        store
+            .record_delegate_registration_origin(pred.key(), Some(TEST_ORIGIN))
+            .unwrap();
+
+        let marker = pred_done_marker_secret_id(pred.key());
+        let dir = store.scope_dir(succ.key(), &SecretScope::Local);
+        std::fs::create_dir_all(&dir)?;
+        let marker_path = dir.join(marker.encode());
+        let mut bad = vec![VERSION_V1];
+        bad.extend_from_slice(&[7u8; 24 + 17]);
+        std::fs::write(&marker_path, &bad)?;
+
+        for _ in 0..2 {
+            let report = store.migrate_secrets(
+                std::slice::from_ref(pred.key()),
+                succ.key(),
+                Some(TEST_ORIGIN),
+            );
+            let pm = &report.per_predecessor[0];
+            assert!(pm.already_migrated);
+            assert!(pm.errors.iter().any(|e| e.contains("marker read failed")));
+            assert_eq!(report.total_copied(), 0);
+            assert_eq!(std::fs::read(&marker_path)?, bad, "marker untouched");
+            assert!(
+                db.get_migration_marker(pred.key(), succ.key())?.is_none(),
+                "the pair must not be sealed"
+            );
+        }
         Ok(())
     }
 
@@ -5548,7 +5790,7 @@ mod test {
             | SecretStoreError::IO(_)
             | SecretStoreError::MissingCipher
             | SecretStoreError::MissingSecret(_)
-            | SecretStoreError::ExistingBlobUnauthenticated(_)
+            | SecretStoreError::ExistingBlobUnusable { .. }
             | SecretStoreError::QuotaExceeded { .. } => {
                 panic!("expected SnapshotNotFound, got {err:?}");
             }
