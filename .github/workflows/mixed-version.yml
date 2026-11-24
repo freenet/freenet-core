@@ -1,0 +1,198 @@
+name: Mixed Version Interop
+
+# Proves that the current build (N) and the previous published releases (N-1,
+# N-2) interoperate in one Docker NAT network, so the 1.0 transition is not a
+# flag day. Scenarios and what they assert are documented at the top of
+# apps/freenet-ping/app/tests/mixed_version_test.rs.
+#
+# Runs:
+#   - nightly on main, to catch wire drift while the culprit is identifiable;
+#   - on pull requests that touch the wire, transport or version surface, or
+#     that carry the `mixed-version` label;
+#   - on demand.
+# Deliberately NOT on every PR (about $0.40 per run on Ubicloud), and not a
+# release gate yet: that is a separate decision once the nightly record is in.
+# It reports no required status context, so a skipped run blocks nothing.
+
+on:
+  schedule:
+    # 04:30 UTC, between simulation-nightly (02:00-03:00) and binstall (05:00).
+    - cron: "30 4 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # Cheap decision job: the PR trigger cannot combine a path filter with a
+  # label, so every PR starts this and only wire-surface PRs go on to the
+  # expensive job below.
+  select:
+    name: Decide whether to run
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'mixed-version') }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only list of a PR's files, emits no event
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" != "pull_request" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Not a pull request ($EVENT_NAME): running."
+            exit 0
+          fi
+          if [ "$HAS_LABEL" = "true" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "The mixed-version label is set: running."
+            exit 0
+          fi
+          # Wire, transport, handshake and version surface, plus this test's own files.
+          WATCHED='^(crates/core/src/transport/|crates/core/src/node/network_bridge/|crates/core/src/message\.rs$|crates/core/src/operations/connect|crates/core/build\.rs$|crates/core/Cargo\.toml$|Cargo\.toml$|apps/freenet-ping/app/tests/(mixed_version_test\.rs|common/)|scripts/fetch-release-binary|\.github/workflows/mixed-version\.yml$)'
+          files="$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/files" --jq '.[].filename')"
+          hits="$(grep -E "$WATCHED" <<<"$files" || true)"
+          if [ -n "$hits" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "The PR touches the wire/version surface:"
+            echo "$hits"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No wire/version paths touched and no mixed-version label: skipping."
+          fi
+
+  mixed_version:
+    name: Mixed Version Interop
+    needs: select
+    if: needs.select.outputs.run == 'true' && !startsWith(github.head_ref, 'dependabot/')
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 60
+    env:
+      RUST_LOG: error
+      RUST_MIN_STACK: 268435456
+      # Auto-update off in the Docker test nodes, as in NAT Validation (#6341).
+      # `build.rs` reads this at build time; set job-wide so no step rebuilds.
+      FREENET_GIT_IS_DIRTY: "1"
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only release lookup and download, emits no event
+      FREENET_MIXED_ARTIFACT_DIR: ${{ github.workspace }}/mixed-version-artifacts
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold liblzma-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+          targets: wasm32-unknown-unknown
+
+      # Restore-only on PRs; the main-scoped entry is written by
+      # ci-cache-warm.yml (see the note on test_simulation's cache step).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          key: ci-${{ hashFiles('.github/workflows/ci-cache-warm.yml') }}
+
+      - name: Pull Docker images for NAT simulation
+        run: docker pull alpine:latest
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        timeout-minutes: 5
+        with:
+          tool: cargo-nextest
+          fallback: none
+
+      # N-1 and N-2: the two newest published (non-draft, non-prerelease)
+      # releases by semver. A tag's assets never change, so the download is
+      # cached by tag; every run still re-verifies the archive against the
+      # release's SHA256SUMS.txt.
+      - name: Select N-1 and N-2
+        id: select
+        run: |
+          set -euo pipefail
+          bash scripts/fetch-release-binary.sh tags | tee -a "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v6
+        with:
+          path: mixed-version-bins
+          key: mixed-version-bins-${{ steps.select.outputs.n1 }}-${{ steps.select.outputs.n2 }}
+
+      - name: Download and verify N-1 and N-2
+        run: bash scripts/fetch-release-binary.sh resolve mixed-version-bins
+
+      - name: Build N (this commit)
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+        run: |
+          cargo build --locked
+          export PATH="$PWD/target/debug:$PATH"
+          make -C apps/freenet-ping -f run-ping.mk build
+
+      - name: Run mixed-version scenarios
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+          FREENET_TEST_DOCKER_NAT: "1"
+          FREENET_BINARY_PATH: ${{ github.workspace }}/target/debug/freenet
+          FREENET_MIXED_VERSIONS: ${{ github.workspace }}/mixed-version-bins/versions.json
+        run: |
+          if ! docker info >/dev/null 2>&1; then
+            echo "ERROR: Docker is not available but is REQUIRED for the mixed-version test"
+            exit 1
+          fi
+          mkdir -p "$FREENET_MIXED_ARTIFACT_DIR"
+          cp mixed-version-bins/versions.json "$FREENET_MIXED_ARTIFACT_DIR/versions.json"
+          # One test at a time (each owns a Docker network), no retries.
+          cargo nextest run -p freenet-ping-app --features testing \
+            --profile ci --test-threads 1 --retries 0 \
+            -E 'test(mixed_version)' -- --ignored
+
+      - name: Collect node logs
+        if: always()
+        run: |
+          mkdir -p "$FREENET_MIXED_ARTIFACT_DIR/node-logs"
+          for d in /tmp/freenet-test-network-*; do
+            [ -d "$d" ] && cp -r "$d" "$FREENET_MIXED_ARTIFACT_DIR/node-logs/" || true
+          done
+
+      - name: Upload reports and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: mixed-version
+          path: mixed-version-artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # Nightly failures go to the private dev room only: the check is new and not
+  # a release gate, so it must not page the public room yet.
+  notify-dev-room-failure:
+    name: Notify dev room on Failure
+    runs-on: ubuntu-latest
+    needs: mixed_version
+    if: failure() && github.event_name == 'schedule' && needs.mixed_version.result == 'failure'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/river-dev-notify
+        with:
+          message: "Nightly mixed-version interop test failed: ${{ github.repository }} ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

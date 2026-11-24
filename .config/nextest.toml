@@ -188,6 +188,16 @@ filter = "test(test_quic_data_ramp_stops_against_a_node_on_the_default_off_relea
 slow-timeout = { period = "180s", terminate-after = 2 }
 retries = 0
 
+# Mixed-version interop (freenet-ping-app, mixed_version_test.rs). Each test
+# builds a Docker NAT network of old and new binaries and then runs PUT, GET,
+# SUBSCRIBE, UPDATE and a large-state transfer across versions, so one test can
+# take several minutes. No retries: an interop failure that passes on a second
+# attempt is a real intermittent break and must stay visible.
+[[profile.ci.overrides]]
+filter = "test(mixed_version)"
+slow-timeout = { period = "300s", terminate-after = 4 }
+retries = 0
+
 [profile.nightly]
 # Nightly tests run longer by design; no retries since failures need investigation.
 retries = 0
