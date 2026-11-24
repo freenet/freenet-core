@@ -4,6 +4,9 @@ Use this when the RustSec watch (`.github/workflows/rustsec-watch.yml`) fails,
 or when a release fixes a transport/TLS advisory. Goal: a reviewed bump PR in
 hours, not days.
 
+0. **Known advisory being fixed?** Add it to `scripts/rustsec-baseline.tsv`
+   (id, crate, version, tracking link, expiry about 14 days out) so the daily
+   run is not red while the fix is in review; delete the entry in the fix PR.
 1. **Read the failing advisory.** The job log lists id, crate, version and
    patched range. Entries labelled `fork-upstream` are advisories against the
    upstream crates behind `freenet-quinn*`; they come from
