@@ -103,11 +103,37 @@ release_floor() {
 
 sha256_of() { sha256sum "$1" | awk '{print $1}'; }
 
-# Download, verify, extract. Prints the binary path. Cached by tag: a tag's
-# assets do not change, and the cached binary is re-verified against the
-# recorded checksum before reuse.
+# Fetch URL into FILE. Returns 0 on success, 3 when the file does not exist
+# (HTTP 404, or a missing file:// fixture), and dies on anything else, so a
+# network or server failure is never mistaken for "this release has no asset".
+download() {
+    local url="$1" file="$2" code rc=0
+    local args=(-sSL --retry 3 --retry-delay 2 -o "$file" -w '%{http_code}')
+    local token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+    if [ -n "$token" ]; then args+=(-H "Authorization: Bearer $token"); fi
+    code="$(curl "${args[@]}" "$url")" || rc=$?
+    if [ "$rc" -eq 37 ]; then return 3; fi # file:// source not readable
+    [ "$rc" -eq 0 ] || die "download of $url failed (curl exit $rc)"
+    case "$code" in
+        200 | 000) return 0 ;;
+        404) return 3 ;;
+        *) die "download of $url returned HTTP $code" ;;
+    esac
+}
+
+# Download, verify, extract. Prints the binary path.
+#
+# Exit codes: 0 ok; 3 the release has no musl asset or no checksum entry for it
+# (the only condition callers may skip past); anything else is a failure. A
+# checksum mismatch always dies.
+#
+# Cached by tag: a tag's assets do not change. A cache hit requires that the
+# release's current SHA256SUMS.txt entry equals the recorded one AND that the
+# cached binary hashes to the value recorded when it was installed. Install is
+# atomic (temp file in the same directory, then mv), so a killed run cannot
+# leave a half-written binary that a later run trusts.
 fetch_release() (
-    local tag="$1" out="$2" base work want got bin
+    local tag="$1" out="$2" base work want got bin rc=0
     [[ "$tag" =~ $TAG_RE ]] || die "refusing odd tag '$tag'"
     base="${FREENET_RELEASE_BASE_URL:-https://github.com/$REPO/releases/download}/$tag"
     mkdir -p "$out"
@@ -115,25 +141,32 @@ fetch_release() (
 
     work="$(mktemp -d)"
     trap 'rm -rf "$work"' EXIT
-    curl_auth -o "$work/SHA256SUMS.txt" "$base/SHA256SUMS.txt" || die "no SHA256SUMS.txt for $tag"
+    download "$base/SHA256SUMS.txt" "$work/SHA256SUMS.txt" || rc=$?
+    if [ "$rc" -eq 3 ]; then echo "$tag has no SHA256SUMS.txt" >&2; return 3; fi
     want="$(awk -v a="$ASSET" '$2 == a || $2 == "*" a {print $1}' "$work/SHA256SUMS.txt" | head -n 1)"
-    [ -n "$want" ] || die "SHA256SUMS.txt for $tag has no entry for $ASSET"
+    if [ -z "$want" ]; then echo "SHA256SUMS.txt for $tag has no entry for $ASSET" >&2; return 3; fi
 
-    if [ -f "$bin" ] && [ -f "$bin.asset-sha256" ] && [ "$(cat "$bin.asset-sha256")" = "$want" ]; then
+    if [ -f "$bin" ] && [ -f "$bin.sha256" ] &&
+        [ "$(sed -n 1p "$bin.sha256")" = "$want" ] &&
+        [ "$(sed -n 2p "$bin.sha256")" = "$(sha256_of "$bin")" ]; then
         echo "cache hit for $tag" >&2
         printf '%s\n' "$bin"
         return
     fi
 
-    curl_auth -o "$work/$ASSET" "$base/$ASSET" || die "download of $ASSET for $tag failed"
+    rc=0
+    download "$base/$ASSET" "$work/$ASSET" || rc=$?
+    if [ "$rc" -eq 3 ]; then echo "$tag has no $ASSET" >&2; return 3; fi
     got="$(sha256_of "$work/$ASSET")"
     [ "$got" = "$want" ] || die "checksum mismatch for $tag $ASSET: got $got, SHA256SUMS.txt says $want"
 
     mkdir "$work/x"
     tar -xzf "$work/$ASSET" -C "$work/x" || die "cannot extract $ASSET for $tag"
     [ -f "$work/x/freenet" ] || die "$ASSET for $tag has no top-level 'freenet' file"
-    install -m 0755 "$work/x/freenet" "$bin"
-    printf '%s\n' "$want" >"$bin.asset-sha256"
+    rm -f "$bin.sha256"
+    install -m 0755 "$work/x/freenet" "$bin.tmp.$$"
+    mv -f "$bin.tmp.$$" "$bin"
+    printf '%s\n%s\n' "$want" "$(sha256_of "$bin")" >"$bin.sha256"
     printf '%s\n' "$bin"
 )
 
@@ -175,17 +208,21 @@ resolve() {
         local head_floor cand
         head_floor="$(floor_from_cargo_toml <"$core_toml")" || die "cannot read the floor from $core_toml"
         for cand in $(list_release_tags | below_candidates "$head_floor"); do
-            if bin="$(fetch_release "$cand" "$out" 2>/dev/null)"; then
-                floor="$(release_floor "$cand")" || continue
-                json="$(jq --arg tag "$cand" --arg ver "${cand#v}" --arg path "$(readlink -f "$bin")" \
-                    --arg sha "$(sha256_of "$bin")" --arg floor "$floor" \
-                    '.below = {tag: $tag, version: $ver, path: $path, binary_sha256: $sha, floor: $floor}' <<<"$json")"
-                break
+            local rc=0
+            bin="$(fetch_release "$cand" "$out")" || rc=$?
+            if [ "$rc" -eq 3 ]; then
+                echo "$cand has no musl asset or checksum entry, trying an older release" >&2
+                continue
             fi
-            echo "$cand has no verifiable musl asset, trying an older release" >&2
+            [ "$rc" -eq 0 ] || die "fetching $cand failed (exit $rc)"
+            floor="$(release_floor "$cand")"
+            json="$(jq --arg tag "$cand" --arg ver "${cand#v}" --arg path "$(readlink -f "$bin")" \
+                --arg sha "$(sha256_of "$bin")" --arg floor "$floor" \
+                '.below = {tag: $tag, version: $ver, path: $path, binary_sha256: $sha, floor: $floor}' <<<"$json")"
+            break
         done
         if [ "$(jq 'has("below")' <<<"$json")" != true ]; then
-            echo "no release below floor $head_floor could be fetched; the test reports this" >&2
+            echo "no release below floor $head_floor has a musl asset with a checksum entry" >&2
         fi
     fi
     printf '%s\n' "$json" >"$out/versions.json"

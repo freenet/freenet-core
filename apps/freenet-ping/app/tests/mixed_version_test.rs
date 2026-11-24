@@ -2,38 +2,71 @@
 //! published releases (N-1, N-2) run in one Docker NAT network and must
 //! interoperate. The 1.0 transition is not a flag day, so a rolling upgrade has
 //! to work in both orders (old gateway with new peers, new gateway with old
-//! peers) and a deliberate floor raise has to refuse old nodes cleanly.
+//! peers), and the handshake floor has to keep a below-floor node out.
 //!
-//! Scenarios (each is its own network):
-//! - A: gateway N-1, peers [N, N, N-1].
-//! - B: gateway N, peers [N-1, N-1, N].
-//! - C: gateway N, peers [N-1, N-2]. N-2 must be refused if and only if N's
-//!   handshake floor is above N-2's version (or N-2's floor above N).
+//! Tests (each scenario is its own network):
+//! - `mixed_version_old_gateway` (A): gateway N-1, peers [N, N, N-1].
+//! - `mixed_version_new_gateway` (B): gateway N, peers [N-1, N-1, N].
+//! - `mixed_version_floor` (C): proves the FLOOR causes a refusal. First a
+//!   control, gateway N with peers [N-1, N-2], which must all connect (so N-2 is
+//!   wire-compatible with this source). Then the same peers against N', a second
+//!   build of the same source whose floor is set to N-1's version
+//!   (`FREENET_MIN_COMPATIBLE_VERSION`): N-1 must be accepted, N-2 refused. The
+//!   only difference between the two gateways is the floor constant.
+//! - `mixed_version_very_old_node`: gateway N, peers [N-1, below-floor], where
+//!   the below-floor node is the newest release under N's floor. It stays out and
+//!   does not disturb the rest of the network. This is NOT a floor test: a node
+//!   that old could also fail for wire drift unrelated to the floor.
 //!
-//! Assertions are on what the network delivers (connections, PUT/GET,
-//! SUBSCRIBE+UPDATE in both directions, large-state streaming), never on log
-//! lines. Which transport each pair used is recorded in the output, not
-//! asserted, so a run that never exercised native QUIC is visible.
+//! What is asserted (never log lines):
+//! - connectivity from each node's own `ConnectedPeers`, polled to a bound;
+//! - each container runs the binary the manifest names (sha256 of PID 1's exe);
+//! - cross-version PUT then GET, SUBSCRIBE + one UPDATE delivered as an
+//!   `UpdateNotification` on the subscribing client's WebSocket, both directions;
+//! - a 600 KiB streaming PUT/GET round trip with a non-uniform payload, both
+//!   directions;
+//! - a refused node reports no connections for a window and its container keeps
+//!   running. There is no positive signal that the refusal was orderly (the node
+//!   gives no refusal reason to clients), so "refused" is all this claims.
 //!
-//! Versions and floors are never hard-coded: N comes from `crates/core/Cargo.toml`,
-//! N-1 and N-2 from the manifest written by `scripts/fetch-release-binary.sh`.
+//! Transport: the node exposes no per-connection transport and logs nothing about
+//! it, so the transport a pair actually used cannot be read back. The report
+//! records only the CONFIGURED mode of each node. `FREENET_MIXED_QUIC=force`
+//! configures builds that support it to prefer native QUIC data at 100%.
 //!
-//! Requires: FREENET_TEST_DOCKER_NAT=1, FREENET_BINARY_PATH (the N binary),
-//! FREENET_MIXED_VERSIONS (the manifest), a Docker daemon. Run the three tests
-//! one at a time (`--test-threads 1`): each owns a Docker network. Optional:
-//! FREENET_MIXED_ARTIFACT_DIR receives per-scenario reports and container logs.
+//! Versions and floors are never hard-coded, with one exception: `NATIVE_QUIC_SINCE`
+//! (below). N and N' floors come from `crates/core/Cargo.toml` and the N' env;
+//! N-1, N-2 and the below-floor build from the manifest written by
+//! `scripts/fetch-release-binary.sh`.
+//!
+//! Requires: FREENET_TEST_DOCKER_NAT=1, FREENET_BINARY_PATH (N),
+//! FREENET_NPRIME_BINARY_PATH and FREENET_NPRIME_FLOOR (N'), FREENET_MIXED_VERSIONS
+//! (the manifest), a Docker daemon. A missing N-2, below-floor or N' input FAILS
+//! the test; `FREENET_MIXED_LENIENT=1` (local use only, never CI) turns that into a
+//! skip. Run one test at a time (`--test-threads 1`): each owns a Docker network.
+//! Do not run it while anything else on the host uses `freenet-nat-*` containers:
+//! the harness removes stale ones at startup. `FREENET_MIXED_ARTIFACT_DIR`
+//! receives per-scenario reports and container logs.
+//!
+//! Local recipe (from the repo root): build N with `cargo build`, build N' with
+//! `FREENET_MIN_COMPATIBLE_VERSION=<N-1 version> cargo build` into another
+//! location, run `scripts/fetch-release-binary.sh resolve DIR --core-toml
+//! crates/core/Cargo.toml`, then run the tests with the variables above.
 
 mod common;
 
 use anyhow::{Context, Result, anyhow, bail};
 use common::{
     APP_TAG, PACKAGE_DIR, PATH_TO_CONTRACT, connect_ws_with_retry, get_contract_state,
-    load_contract, subscribe_to_contract, update_contract_state, wait_for_ping_entry,
+    load_contract, subscribe_to_contract, update_contract_state,
 };
 use freenet_ping_app::ping_client::wait_for_put_response;
 use freenet_ping_types::{Ping, PingContractOptions};
 use freenet_stdlib::{
-    client_api::{ClientRequest, ContractRequest, HostResponse, NodeQuery, QueryResponse, WebApi},
+    client_api::{
+        ClientRequest, ContractRequest, ContractResponse, HostResponse, NodeQuery, QueryResponse,
+        WebApi,
+    },
     prelude::*,
 };
 use freenet_test_network::{Backend, DockerNatConfig, FreenetBinary, NetworkBuilder};
@@ -46,17 +79,26 @@ use std::{
 
 /// Wait for the whole network to form. Doubled from the single-version NAT test.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
-/// How long a subscriber may take to observe an UPDATE. The update is sent once,
-/// so a repair path cannot hide a broken live delivery behind a long window.
+/// After the harness reports readiness, how long every expected node may take to
+/// show a connection in its own `ConnectedPeers`.
+const CONNECT_SETTLE: Duration = Duration::from_secs(60);
+/// How long the subscriber's client may wait for the UPDATE notification. The
+/// update is sent once, so a repair path cannot hide a broken live delivery.
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(40);
 /// Bound on one PUT or GET round trip.
 const OP_TIMEOUT: Duration = Duration::from_secs(90);
 /// Window in which a refused node must stay unconnected, after the rest of the
 /// network is demonstrably up.
 const REFUSAL_WINDOW: Duration = Duration::from_secs(60);
-/// Entries added to the ping state, in bytes of padding. Above the 64 KiB
-/// streaming threshold and above the 512 KiB single-message size.
+/// Bytes of padding in the large state. Above the 64 KiB streaming threshold and
+/// the 512 KiB single-message size.
 const LARGE_PADDING: usize = 600 * 1024;
+
+/// The one hard-coded version: the first release that can carry native QUIC, so
+/// the first with the `--transport-quic` and `--quic-data-percent` flags (checked
+/// with `freenet network --help` on the 0.2.163 binary; 0.2.162 has neither flag
+/// set). Native QUIC pairs form only between builds at or above it.
+const NATIVE_QUIC_SINCE: Version = Version(0, 2, 163);
 
 // ---------------------------------------------------------------- versions
 
@@ -88,12 +130,15 @@ impl std::fmt::Display for Version {
 
 #[derive(Clone, Debug)]
 struct Build {
-    /// "N", "N-1" or "N-2".
+    /// "N", "N'", "N-1", "N-2" or "below-floor".
     role: &'static str,
+    /// Built from this checkout's source (N and N'), as opposed to a release.
+    from_head: bool,
     version: Version,
     /// Lowest version this build accepts in the handshake.
     floor: Version,
     binary: PathBuf,
+    sha256: String,
 }
 
 impl Build {
@@ -125,27 +170,74 @@ fn version_and_floor(cargo_toml: &str) -> Result<(Version, Version)> {
     Ok((version, floor))
 }
 
+fn sha256_file(path: &Path) -> Result<String> {
+    let out = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .context("running sha256sum")?;
+    if !out.status.success() {
+        bail!("sha256sum {} failed", path.display());
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("empty sha256sum output for {}", path.display()))
+}
+
+/// `FREENET_MIXED_LENIENT=1` lets a missing optional input skip instead of fail.
+/// Local use only: CI never sets it, so a missing binary cannot pass silently.
+fn lenient() -> bool {
+    std::env::var("FREENET_MIXED_LENIENT").is_ok_and(|v| v == "1")
+}
+
+/// A required input is missing: an error, or a loud skip in lenient mode.
+fn missing(what: &str) -> Result<()> {
+    if lenient() {
+        eprintln!("SKIPPED (FREENET_MIXED_LENIENT=1): {what}");
+        Ok(())
+    } else {
+        bail!("{what} (set FREENET_MIXED_LENIENT=1 to skip locally; CI must not)")
+    }
+}
+
+/// `FREENET_MIXED_QUIC`: unset or `default`, or `force`. Anything else is an
+/// error, so a typo cannot silently run the wrong mode.
+fn quic_mode() -> Result<bool> {
+    match std::env::var("FREENET_MIXED_QUIC").as_deref() {
+        Err(_) | Ok("default") => Ok(false),
+        Ok("force") => Ok(true),
+        Ok(other) => bail!("FREENET_MIXED_QUIC must be 'default' or 'force', got '{other}'"),
+    }
+}
+
 struct Builds {
     head: Build,
+    /// Same source as `head` with its floor set to N-1's version.
+    nprime: Option<Build>,
     n1: Build,
     n2: Option<Build>,
-    /// Newest published release strictly below N's floor, if one can be fetched.
+    /// Newest release strictly below N's floor, if one can be fetched.
     below: Option<Build>,
 }
 
 fn load_builds() -> Result<Builds> {
+    quic_mode()?;
     let core_toml = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../crates/core/Cargo.toml");
     let (version, floor) = version_and_floor(
         &std::fs::read_to_string(&core_toml)
             .with_context(|| format!("reading {}", core_toml.display()))?,
     )?;
+    let head_binary: PathBuf = std::env::var("FREENET_BINARY_PATH")
+        .context("FREENET_BINARY_PATH must point to the N binary")?
+        .into();
     let head = Build {
         role: "N",
+        from_head: true,
         version,
         floor,
-        binary: std::env::var("FREENET_BINARY_PATH")
-            .context("FREENET_BINARY_PATH must point to the N binary")?
-            .into(),
+        sha256: sha256_file(&head_binary)?,
+        binary: head_binary,
     };
 
     let manifest_path = std::env::var("FREENET_MIXED_VERSIONS").context(
@@ -162,23 +254,72 @@ fn load_builds() -> Result<Builds> {
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow!("{key}.{f} missing in {manifest_path}"))
         };
+        let binary: PathBuf = get("path")?.into();
+        let sha256 = sha256_file(&binary)?;
+        if sha256 != get("binary_sha256")? {
+            bail!(
+                "{role}: {} does not hash to the manifest's binary_sha256",
+                binary.display()
+            );
+        }
         Ok(Some(Build {
             role,
+            from_head: false,
             version: Version::parse(get("version")?)?,
             floor: Version::parse(get("floor")?)?,
-            binary: get("path")?.into(),
+            binary,
+            sha256,
         }))
     };
     let n1 = from_manifest("n1", "N-1")?.ok_or_else(|| anyhow!("manifest has no n1"))?;
     let n2 = from_manifest("n2", "N-2")?;
     let below = from_manifest("below", "below-floor")?;
-    if let Some(b) = &below {
-        // The manifest picks it by N's floor; a mismatch means a stale manifest.
-        if b.version >= head.floor {
+    if let Some(b) = &below
+        && b.version >= head.floor
+    {
+        bail!(
+            "below-floor build {} is not below N's floor {}: stale manifest",
+            b.version,
+            head.floor
+        );
+    }
+
+    let nprime = match (
+        std::env::var("FREENET_NPRIME_BINARY_PATH"),
+        std::env::var("FREENET_NPRIME_FLOOR"),
+    ) {
+        (Ok(path), Ok(floor)) => {
+            let binary: PathBuf = path.into();
+            Some(Build {
+                role: "N'",
+                from_head: true,
+                version: head.version,
+                floor: Version::parse(&floor)?,
+                sha256: sha256_file(&binary)?,
+                binary,
+            })
+        }
+        _ => None,
+    };
+    if let Some(np) = &nprime {
+        // The floor test's claim is "N-1 is accepted, N-2 is refused".
+        if np.floor != n1.version {
             bail!(
-                "below-floor build {} is not below N's floor {}: stale manifest",
-                b.version,
-                head.floor
+                "N' floor {} must equal N-1's version {}",
+                np.floor,
+                n1.version
+            );
+        }
+        if np.floor > np.version {
+            bail!("N' floor {} is above its own version", np.floor);
+        }
+        if let Some(n2) = &n2
+            && n2.version >= np.floor
+        {
+            bail!(
+                "N-2 {} is not below N' floor {}: the floor test cannot refuse it",
+                n2.version,
+                np.floor
             );
         }
     }
@@ -191,16 +332,28 @@ fn load_builds() -> Result<Builds> {
         if b.floor > b.version {
             bail!("{}: floor {} is above its own version", b.label(), b.floor);
         }
-        if !b.binary.is_file() {
-            bail!(
-                "{}: binary {} does not exist",
-                b.label(),
-                b.binary.display()
-            );
+    }
+    // Different roles must be different files, or a mis-wired path would test nothing.
+    let all: Vec<&Build> = [
+        Some(&head),
+        nprime.as_ref(),
+        Some(&n1),
+        n2.as_ref(),
+        below.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            if a.sha256 == b.sha256 {
+                bail!("{} and {} are the same binary", a.label(), b.label());
+            }
         }
     }
     Ok(Builds {
         head,
+        nprime,
         n1,
         n2,
         below,
@@ -219,6 +372,7 @@ struct Node<'a> {
     name: String,
     build: &'a Build,
     container: String,
+    /// Empty until the network is built.
     ws_url: String,
 }
 
@@ -300,6 +454,57 @@ async fn get_state(client: &mut WebApi, key: ContractKey) -> Result<Ping> {
         .context("GET timed out")?
 }
 
+/// Wait on the subscribing client's own WebSocket for the `UpdateNotification`
+/// that carries `entry`. This is live delivery to the subscriber: unlike a GET,
+/// it cannot be satisfied by a request forwarded to the writer's node.
+async fn wait_for_update_notification(
+    client: &mut WebApi,
+    key: ContractKey,
+    entry: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut other_messages = 0u32;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!(
+                "no UpdateNotification carrying '{entry}' within {timeout:?} \
+                 ({other_messages} unrelated message(s) seen)"
+            );
+        }
+        match tokio::time::timeout(remaining, client.recv()).await {
+            Err(_) => continue,
+            Ok(Err(e)) => bail!("client closed while waiting for the update: {e}"),
+            Ok(Ok(HostResponse::ContractResponse(ContractResponse::UpdateNotification {
+                key: k,
+                update,
+            }))) if k == key => {
+                let carries =
+                    |bytes: &[u8]| bytes.windows(entry.len()).any(|w| w == entry.as_bytes());
+                let hit = match &update {
+                    UpdateData::Delta(d) => carries(d.as_ref()),
+                    UpdateData::State(s) => carries(s.as_ref()),
+                    UpdateData::StateAndDelta { state, delta } => {
+                        carries(state.as_ref()) || carries(delta.as_ref())
+                    }
+                    _ => false,
+                };
+                if hit {
+                    eprintln!(
+                        "update notification carrying '{entry}' after {:?}",
+                        start.elapsed()
+                    );
+                    return Ok(());
+                }
+                other_messages += 1;
+            }
+            Ok(Ok(_)) => other_messages += 1,
+        }
+    }
+}
+
 struct Report {
     scenario: &'static str,
     steps: Vec<(String, Duration)>,
@@ -327,7 +532,8 @@ impl Report {
 }
 
 /// One direction of the interop checks: `src` writes, `dst` reads.
-/// Cross-version PUT then GET, then SUBSCRIBE at `dst` and an UPDATE from `src`.
+/// Cross-version PUT then GET, then SUBSCRIBE at `dst` and an UPDATE from `src`
+/// that must arrive as a notification on `dst`'s client.
 async fn check_direction(
     report: &mut Report,
     src: (&Node<'_>, &mut WebApi),
@@ -362,18 +568,26 @@ async fn check_direction(
             tokio::time::timeout(OP_TIMEOUT, subscribe_to_contract(dst_client, key))
                 .await
                 .context("SUBSCRIBE timed out")??;
-            // The subscription reply confirms registration at the subscriber's
-            // upstream; give it time to reach the writer's node before the single
-            // UPDATE. Bounded, and measured: see the run timings.
+            // The subscribe response is the only readiness signal the node gives,
+            // and it confirms registration upstream, not that the writer's node
+            // already lists this subscriber. A fixed settle covers the rest; the
+            // UPDATE is then sent once and must arrive live.
             tokio::time::sleep(Duration::from_secs(5)).await;
             let mut delta = Ping::default();
             delta.insert(format!("upd-{dir_tag}"));
             update_contract_state(src_client, key, delta).await?;
-            wait_for_ping_entry(dst_client, key, &format!("upd-{dir_tag}"), UPDATE_TIMEOUT)
+            wait_for_update_notification(dst_client, key, &format!("upd-{dir_tag}"), UPDATE_TIMEOUT)
                 .await
-                .map(|_| ())
         })
         .await
+}
+
+/// Payload with no repeating byte, so truncation, reordering or fragment
+/// duplication changes the content, not just the length.
+fn large_pattern() -> Vec<u8> {
+    (0..LARGE_PADDING)
+        .map(|i| ((i.wrapping_mul(131) ^ (i >> 7)) % 251) as u8)
+        .collect()
 }
 
 /// Large-state streaming round trip, `src` PUT and `dst` GET.
@@ -402,49 +616,43 @@ async fn check_large(
             .context("client-api: streaming WebSocket")?;
             let container = contract_for(dir_tag)?;
             let key = container.key();
-            let mut state = Ping::with_padding(LARGE_PADDING);
+            let pattern = large_pattern();
+            let mut state = Ping::default();
+            state.padding = Some(pattern.clone());
             state.insert(format!("large-{dir_tag}"));
             put_state(&mut src, container, &state).await?;
             let got = get_state(&mut dst, key).await?;
-            let len = got.padding.as_ref().map_or(0, Vec::len);
-            if len != LARGE_PADDING || !got.contains_key(&format!("large-{dir_tag}")) {
-                bail!("large state came back damaged: padding {len} of {LARGE_PADDING} bytes");
+            let body = got.padding.as_deref().unwrap_or_default();
+            if body != pattern.as_slice() || !got.contains_key(&format!("large-{dir_tag}")) {
+                bail!(
+                    "large state came back different: {} of {LARGE_PADDING} bytes, content equal: {}",
+                    body.len(),
+                    body == pattern.as_slice()
+                );
             }
             Ok(())
         })
         .await
 }
 
-/// First release that can carry native QUIC; earlier builds have no such flags.
-const NATIVE_QUIC_SINCE: Version = Version(0, 2, 163);
-
-/// Whether this run forces native QUIC between builds that support it
-/// (`FREENET_MIXED_QUIC=force`). The node exposes no per-connection transport to
-/// clients and logs nothing about it at the level the release builds keep, so
-/// the transport a pair used cannot be read back. Forcing makes a native pair
-/// certain instead (both ends prefer QUIC data at 100%), and the report records
-/// the mode each node ran in. Without it the node's own hashed choice applies,
-/// as in production, and a small network may form no native pair at all.
-fn force_native() -> bool {
-    std::env::var("FREENET_MIXED_QUIC").is_ok_and(|v| v == "force")
-}
-
 /// Extra node arguments for a build in this run's transport mode.
 fn transport_args(b: &Build) -> Vec<&'static str> {
-    if force_native() && b.version >= NATIVE_QUIC_SINCE {
+    if quic_mode().unwrap_or(false) && b.version >= NATIVE_QUIC_SINCE {
         vec!["--transport-quic", "prefer", "--quic-data-percent", "100"]
     } else {
         Vec::new()
     }
 }
 
+/// The configured transport mode of a node. This is configuration, not
+/// observation: nothing in the node reports which transport a pair used.
 fn transport_mode(b: &Build) -> &'static str {
     if !transport_args(b).is_empty() {
-        "native QUIC forced (prefer, data 100%)"
+        "configured: native QUIC preferred, data share 100%"
     } else if b.version >= NATIVE_QUIC_SINCE {
-        "node default (hashed per pair)"
+        "configured: node default (hashed per pair)"
     } else {
-        "legacy UDP only (build predates native QUIC)"
+        "build predates native QUIC (legacy UDP only)"
     }
 }
 
@@ -475,6 +683,8 @@ fn write_artifacts(report: &Report, nodes: &[Node<'_>], outcome: &Result<()>) {
             "role": n.build.role,
             "version": n.build.version.to_string(),
             "floor": n.build.floor.to_string(),
+            "binary_sha256": n.build.sha256,
+            "transport": transport_mode(n.build),
             "container": n.container,
         })).collect::<Vec<_>>(),
         "steps": report.steps.iter().map(|(l, d)| json!({"step": l, "seconds": d.as_secs_f64()})).collect::<Vec<_>>(),
@@ -484,8 +694,10 @@ fn write_artifacts(report: &Report, nodes: &[Node<'_>], outcome: &Result<()>) {
         dir.join("report.json"),
         serde_json::to_string_pretty(&summary).unwrap_or_default(),
     );
+    // Best effort: when the network failed to build the containers may be gone,
+    // and the harness's preserved node directories carry the logs instead.
     for n in nodes {
-        let tag = format!("{}-{}", n.name, n.build.label().replace('@', "-"));
+        let tag = format!("{}-{}", n.name, n.build.label().replace(['@', '\''], "-"));
         let _ = std::fs::write(
             dir.join(format!("{tag}.docker.log")),
             node_log(&n.container),
@@ -497,7 +709,7 @@ fn write_artifacts(report: &Report, nodes: &[Node<'_>], outcome: &Result<()>) {
     }
 }
 
-async fn run_scenario(spec: Spec<'_>, head: &Build) -> Result<()> {
+async fn run_scenario(spec: Spec<'_>) -> Result<()> {
     let mut report = Report {
         scenario: spec.name,
         steps: Vec::new(),
@@ -517,21 +729,39 @@ async fn run_scenario(spec: Spec<'_>, head: &Build) -> Result<()> {
         .collect();
     for (i, (b, ok)) in all.iter().zip(&expect_connected).enumerate() {
         report.note(format!(
-            "node {i} {} floor {} transport {} binary {}: expected to {} the gateway",
+            "node {i} {} floor {} {} binary {} sha256 {}: expected to {} the gateway",
             b.label(),
             b.floor,
             transport_mode(b),
             b.binary.display(),
+            b.sha256,
             if *ok { "connect to" } else { "be refused by" }
         ));
     }
 
+    let mut nodes: Vec<Node<'_>> = vec![Node {
+        name: "gw".into(),
+        build: spec.gateway,
+        container: format!("{prefix}-gw-0"),
+        ws_url: String::new(),
+    }];
+    for (i, b) in spec.peers.iter().enumerate() {
+        nodes.push(Node {
+            name: format!("peer{i}"),
+            build: b,
+            container: format!("{prefix}-peer-{}", i + 1),
+            ws_url: String::new(),
+        });
+    }
+
     let ratio = expect_connected.iter().filter(|c| **c).count() as f64 / all.len() as f64;
+    // The default binary is unused when every node is overridden, and the
+    // gateway is overridden below, so the first peer's binary is a harmless default.
     let mut builder = NetworkBuilder::new()
         .backend(Backend::DockerNat(config))
         .gateways(1)
         .peers(spec.peers.len())
-        .binary(FreenetBinary::Path(head.binary.clone()))
+        .binary(FreenetBinary::Path(spec.gateway.binary.clone()))
         .gateway_binary(0, FreenetBinary::Path(spec.gateway.binary.clone()))
         // A node that sees a newer release, or a remote floor above its own
         // version, would stage the real release and replace the binary under
@@ -539,71 +769,105 @@ async fn run_scenario(spec: Spec<'_>, head: &Build) -> Result<()> {
         .extra_hosts_all(["github.com:127.0.0.1", "api.github.com:127.0.0.1"])
         .require_connectivity(ratio - 0.01)
         .connectivity_timeout(CONNECT_TIMEOUT)
-        .preserve_temp_dirs_on_failure(true);
-    builder = builder.gateway_extra_args(0, transport_args(spec.gateway));
+        .preserve_temp_dirs_on_failure(true)
+        .gateway_extra_args(0, transport_args(spec.gateway));
     for (i, b) in spec.peers.iter().enumerate() {
         builder = builder
             .peer_binary(i, FreenetBinary::Path(b.binary.clone()))
             .peer_extra_args(i, transport_args(b));
     }
 
-    let network = builder
-        .build()
-        .await
-        .map_err(|e| anyhow!("step=connect: the network did not form: {e}"))?;
-
-    let mut nodes: Vec<Node<'_>> = vec![Node {
-        name: "gw".into(),
-        build: spec.gateway,
-        container: format!("{prefix}-gw-0"),
-        ws_url: network.gateway(0).ws_url(),
-    }];
-    for (i, b) in spec.peers.iter().enumerate() {
-        nodes.push(Node {
-            name: format!("peer{i}"),
-            build: b,
-            container: format!("{prefix}-peer-{}", i + 1),
-            ws_url: network.peer(i).ws_url(),
-        });
+    let network = match builder.build().await {
+        Ok(n) => n,
+        Err(e) => {
+            let err = anyhow!("step=connect: the network did not form: {e}");
+            let outcome = Err(anyhow!("{err:#}"));
+            write_artifacts(&report, &nodes, &outcome);
+            return Err(err);
+        }
+    };
+    nodes[0].ws_url = network.gateway(0).ws_url();
+    for i in 0..spec.peers.len() {
+        nodes[i + 1].ws_url = network.peer(i).ws_url();
     }
 
-    let outcome = run_checks(&mut report, &nodes, &expect_connected, head).await;
+    let outcome = run_checks(&mut report, &nodes, &expect_connected).await;
 
     write_artifacts(&report, &nodes, &outcome);
     outcome
+}
+
+/// Each container must run the binary the test believes it does: PID 1's exe
+/// hashes to the build's file, and `--version` names the build's version.
+fn verify_running_binaries(report: &mut Report, nodes: &[Node<'_>]) -> Result<()> {
+    for n in nodes {
+        let got = docker(&["exec", &n.container, "sha256sum", "/proc/1/exe"]);
+        let got = got.split_whitespace().next().unwrap_or_default();
+        if got != n.build.sha256 {
+            bail!(
+                "{} {} runs sha256 '{got}', expected {} ({})",
+                n.name,
+                n.build.label(),
+                n.build.sha256,
+                n.build.binary.display()
+            );
+        }
+        let version = docker(&["exec", &n.container, "/proc/1/exe", "--version"]);
+        let version = version
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if !version.contains(&n.build.version.to_string()) {
+            bail!(
+                "{} {} reports version '{version}', expected {}",
+                n.name,
+                n.build.label(),
+                n.build.version
+            );
+        }
+        report.note(format!(
+            "{} runs {} ({version}), sha256 verified",
+            n.name,
+            n.build.label()
+        ));
+    }
+    Ok(())
 }
 
 async fn run_checks(
     report: &mut Report,
     nodes: &[Node<'_>],
     expect_connected: &[bool],
-    head: &Build,
 ) -> Result<()> {
-    // Connectivity, from each node's own connected-peer data.
+    step("binary-identity", verify_running_binaries(report, nodes))?;
+
+    // Connectivity, from each node's own connected-peer data, polled to a bound.
     report
         .timed("connect", async {
-            let mut counts = Vec::new();
-            for (n, expected) in nodes.iter().zip(expect_connected) {
-                let count = connected_peer_count(&n.ws_url).await?;
-                counts.push((n, *expected, count));
-            }
-            for (n, expected, count) in &counts {
-                eprintln!(
-                    "  {} {} connections={count} expected_connected={expected}",
-                    n.name,
-                    n.build.label()
-                );
-            }
-            for (n, expected, count) in &counts {
-                if *expected && *count == 0 {
-                    bail!(
-                        "{} {} has no connections but is allowed to connect",
-                        n.name,
-                        n.build.label()
-                    );
+            let deadline = Instant::now() + CONNECT_SETTLE;
+            loop {
+                let mut counts = Vec::new();
+                for (n, expected) in nodes.iter().zip(expect_connected) {
+                    counts.push((n, *expected, connected_peer_count(&n.ws_url).await?));
                 }
+                let ready = counts.iter().all(|(_, expected, c)| !*expected || *c > 0);
+                if ready || Instant::now() >= deadline {
+                    for (n, expected, count) in &counts {
+                        eprintln!(
+                            "  {} {} connections={count} expected_connected={expected}",
+                            n.name,
+                            n.build.label()
+                        );
+                    }
+                    if !ready {
+                        bail!("not every node allowed to connect has a connection after {CONNECT_SETTLE:?}");
+                    }
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
             }
-            Ok(())
         })
         .await?;
 
@@ -616,36 +880,36 @@ async fn run_checks(
         .map(|(n, _)| n)
         .collect();
     if !refused.is_empty() {
+        let gateway = nodes[0].build;
         report
-            .timed("floor-refusal", async {
+            .timed("refusal", async {
                 let deadline = Instant::now() + REFUSAL_WINDOW;
                 while Instant::now() < deadline {
                     for n in &refused {
                         let c = connected_peer_count(&n.ws_url).await?;
                         if c != 0 {
                             bail!(
-                                "{} {} should be refused (floor {} / version {}) but has {c} connection(s)",
+                                "{} {} should be refused by the gateway {} (floor {}) but has {c} connection(s)",
                                 n.name,
                                 n.build.label(),
-                                head.floor,
-                                n.build.version
+                                gateway.label(),
+                                gateway.floor,
                             );
                         }
                         if !container_running(&n.container) {
-                            bail!(
-                                "{} {} exited instead of being refused cleanly",
-                                n.name,
-                                n.build.label()
-                            );
+                            bail!("{} {} exited instead of staying out", n.name, n.build.label());
                         }
                     }
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
-                // The gateway must have admitted the control peers only.
+                // The gateway lists peers by NAT address, which cannot be mapped
+                // back to nodes, so check the count from below: every admitted
+                // node must be there. The refused node's own view above (no
+                // connections) is the absence check.
                 let allowed = expect_connected.iter().filter(|c| **c).count() - 1;
                 let gw_count = connected_peer_count(&nodes[0].ws_url).await?;
-                if gw_count != allowed {
-                    bail!("gateway reports {gw_count} connections, expected {allowed}");
+                if gw_count < allowed {
+                    bail!("gateway reports {gw_count} connections, fewer than the {allowed} admitted nodes");
                 }
                 Ok(())
             })
@@ -661,7 +925,7 @@ async fn run_checks(
         .collect();
     let pairs = cross_pairs(&live);
     if pairs.is_empty() {
-        bail!("step=setup: no connected pair of N and an older build in this scenario");
+        bail!("step=setup: no connected pair of a HEAD build and a different build");
     }
     for (i, (a, b)) in pairs.into_iter().enumerate() {
         report.note(format!(
@@ -687,7 +951,8 @@ async fn run_checks(
     Ok(())
 }
 
-/// Interop operations between `a` (an older build) and `b` (N), both directions.
+/// Interop operations between `a` (a different build) and `b` (a HEAD build),
+/// both directions.
 async fn run_pair_ops(report: &mut Report, a: &Node<'_>, b: &Node<'_>, idx: usize) -> Result<()> {
     let mut ca = connect_ws_with_retry(
         &format!("{}?encodingProtocol=native", a.ws_url),
@@ -724,18 +989,18 @@ async fn run_pair_ops(report: &mut Report, a: &Node<'_>, b: &Node<'_>, idx: usiz
     Ok(())
 }
 
-/// For each distinct older build among the connected nodes, a pair (older node, N
-/// node). N nodes that are peers are preferred over the gateway so peer-to-peer
-/// links between versions are exercised where the topology has them.
+/// For each distinct non-HEAD build among the connected nodes, a pair (that
+/// node, a HEAD node). HEAD nodes that are peers are preferred over the gateway
+/// so peer-to-peer links between versions are exercised where the topology has
+/// them (whether such a direct link exists is not asserted).
 fn cross_pairs<'a>(live: &[&'a Node<'a>]) -> Vec<(&'a Node<'a>, &'a Node<'a>)> {
-    let is_head = |n: &Node<'_>| n.build.role == "N";
-    let head_node = live.iter().rev().find(|n| is_head(n)).copied();
+    let head_node = live.iter().rev().find(|n| n.build.from_head).copied();
     let Some(head_node) = head_node else {
         return Vec::new();
     };
     let mut seen: Vec<&PathBuf> = Vec::new();
     let mut out = Vec::new();
-    for n in live.iter().rev().filter(|n| !is_head(n)) {
+    for n in live.iter().rev().filter(|n| !n.build.from_head) {
         if !seen.contains(&&n.build.binary) {
             seen.push(&n.build.binary);
             out.push((*n, head_node));
@@ -760,14 +1025,11 @@ fn require_env() -> Result<()> {
 async fn mixed_version_old_gateway() -> Result<()> {
     require_env()?;
     let b = load_builds()?;
-    run_scenario(
-        Spec {
-            name: "A-old-gateway",
-            gateway: &b.n1,
-            peers: vec![&b.head, &b.head, &b.n1],
-        },
-        &b.head,
-    )
+    run_scenario(Spec {
+        name: "A-old-gateway",
+        gateway: &b.n1,
+        peers: vec![&b.head, &b.head, &b.n1],
+    })
     .await
 }
 
@@ -777,19 +1039,18 @@ async fn mixed_version_old_gateway() -> Result<()> {
 async fn mixed_version_new_gateway() -> Result<()> {
     require_env()?;
     let b = load_builds()?;
-    run_scenario(
-        Spec {
-            name: "B-new-gateway",
-            gateway: &b.head,
-            peers: vec![&b.n1, &b.n1, &b.head],
-        },
-        &b.head,
-    )
+    run_scenario(Spec {
+        name: "B-new-gateway",
+        gateway: &b.head,
+        peers: vec![&b.n1, &b.n1, &b.head],
+    })
     .await
 }
 
-/// C: the floor. N-1 must always be accepted by N. N-2 is refused if and only
-/// if the floors say so, and the refusal must be clean.
+/// C: the floor causes the refusal. Control first: with N's own floor, N-1 and
+/// N-2 both connect, so N-2 is wire-compatible with this source. Then N', the
+/// same source with its floor raised to N-1's version, accepts N-1 and refuses
+/// N-2. Only the floor constant differs between the two gateways.
 #[ignore]
 #[tokio::test(flavor = "multi_thread")]
 async fn mixed_version_floor() -> Result<()> {
@@ -805,31 +1066,66 @@ async fn mixed_version_floor() -> Result<()> {
             b.n1.floor
         );
     }
-    // The control peer N-1 first, then N-2 (accepted when at or above the floor),
-    // then the newest release below the floor (refused). The below-floor build
-    // is what exercises the refusal path while the floor is still low.
-    let mut peers = vec![&b.n1];
-    peers.extend(b.n2.as_ref());
-    match b.below.as_ref() {
-        Some(below) => peers.push(below),
-        None => eprintln!(
-            "NOTE scenario C: no published release below N's floor {} has a verified \
-             musl asset, so the refusal path is exercised only if N-2 is itself below the floor",
-            b.head.floor
-        ),
-    }
-    if peers.len() == 1 {
-        eprintln!("SKIPPED scenario C: there is no N-2 or below-floor release to test");
-        return Ok(());
-    }
-    run_scenario(
-        Spec {
-            name: "C-floor",
+    let Some(n2) = b.n2.as_ref() else {
+        return missing("no N-2 release is available for the floor test");
+    };
+    let Some(nprime) = b.nprime.as_ref() else {
+        return missing(
+            "FREENET_NPRIME_BINARY_PATH and FREENET_NPRIME_FLOOR are not set, \
+             so the floor cannot be shown to cause the refusal",
+        );
+    };
+
+    if can_connect(&b.head, n2) {
+        run_scenario(Spec {
+            name: "C-control-n-accepts-n2",
             gateway: &b.head,
-            peers,
-        },
-        &b.head,
-    )
+            peers: vec![&b.n1, n2],
+        })
+        .await
+        .context("control scenario (N with its own floor)")?;
+    } else {
+        eprintln!(
+            "NOTE: N's own floor {} already excludes N-2 {}; the control is skipped and \
+             the N' scenario below only repeats that fact",
+            b.head.floor, n2.version
+        );
+    }
+
+    if can_connect(nprime, n2) {
+        bail!(
+            "N' (floor {}) would accept N-2 {}: bad setup",
+            nprime.floor,
+            n2.version
+        );
+    }
+    run_scenario(Spec {
+        name: "C-floor-nprime-refuses-n2",
+        gateway: nprime,
+        peers: vec![&b.n1, n2],
+    })
+    .await
+    .context("floor scenario (N' with floor raised to N-1)")
+}
+
+/// A node far below the floor stays out and does not disturb the rest of the
+/// network. Not a floor test: that old a node could also fail for wire drift.
+#[ignore]
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_version_very_old_node() -> Result<()> {
+    require_env()?;
+    let b = load_builds()?;
+    let Some(below) = b.below.as_ref() else {
+        return missing(&format!(
+            "no published release below N's floor {} has a musl asset with a checksum entry",
+            b.head.floor
+        ));
+    };
+    run_scenario(Spec {
+        name: "D-very-old-node",
+        gateway: &b.head,
+        peers: vec![&b.n1, below],
+    })
     .await
 }
 
@@ -842,9 +1138,11 @@ mod tests {
     fn build(v: &str, f: &str) -> Build {
         Build {
             role: "N",
+            from_head: true,
             version: Version::parse(v).unwrap(),
             floor: Version::parse(f).unwrap(),
             binary: PathBuf::new(),
+            sha256: String::new(),
         }
     }
 
@@ -888,5 +1186,14 @@ mod tests {
         let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../crates/core/Cargo.toml");
         let (v, f) = version_and_floor(&std::fs::read_to_string(core).unwrap()).unwrap();
         assert!(f <= v, "floor {f} above version {v}");
+    }
+
+    #[test]
+    fn large_pattern_has_no_short_period() {
+        let p = large_pattern();
+        assert_eq!(p.len(), LARGE_PADDING);
+        // Not uniform, and not a short repeating block either.
+        assert!(p.iter().any(|b| *b != p[0]));
+        assert_ne!(p[..4096], p[4096..8192]);
     }
 }

@@ -79,6 +79,7 @@ mk_release v0.2.22 tamper
 mk_release v0.2.23 noentry
 mk_release v0.2.14
 mk_release v0.2.15 tamper
+mk_release v0.2.16 noentry
 mk_release v0.2.30
 mk_release v0.2.31
 export FREENET_RELEASE_BASE_URL="file://$work/dl"
@@ -100,16 +101,24 @@ if [ -e "$out/freenet-0.2.22" ]; then
 else
     echo "ok   - no binary left after a rejected download"
 fi
-if bash "$script" fetch v0.2.23 "$out" >/dev/null 2>"$work/err"; then
-    echo "FAIL - missing checksum entry was accepted"
-    fails=$((fails + 1))
-else
-    check "missing checksum entry rejected" "$(grep -c 'no entry' "$work/err")" "1"
-fi
+bash "$script" fetch v0.2.23 "$out" >/dev/null 2>"$work/err"
+check "missing checksum entry exits 3 (skippable: no asset)" "$?" "3"
+check "missing checksum entry says why" "$(grep -c 'no entry' "$work/err")" "1"
+bash "$script" fetch v0.2.22 "$out" >/dev/null 2>"$work/err"
+check "checksum mismatch exits 1 (never skippable)" "$?" "1"
+bash "$script" fetch v0.2.99 "$out" >/dev/null 2>"$work/err"
+check "release with no files exits 3" "$?" "3"
 # A cached binary whose archive checksum changed upstream is not reused.
-echo "stale" >"$out/freenet-0.2.21.asset-sha256"
+sed -i '1s/.*/stale/' "$out/freenet-0.2.21.sha256"
 check "stale cache record forces a re-download" \
     "$(bash "$script" fetch v0.2.21 "$out" 2>&1 >/dev/null | grep -c 'cache hit')" "0"
+check "cache is valid again after the re-download" \
+    "$(bash "$script" fetch v0.2.21 "$out" 2>&1 >/dev/null | grep -c 'cache hit')" "1"
+# A cached binary that no longer hashes to the recorded value is not reused.
+printf 'tampered' >>"$out/freenet-0.2.21"
+check "modified cached binary forces a re-download" \
+    "$(bash "$script" fetch v0.2.21 "$out" 2>&1 >/dev/null | grep -c 'cache hit')" "0"
+check "re-download restored the binary" "$("$out/freenet-0.2.21")" "v0.2.21"
 if bash "$script" fetch 'v0.2.21;rm' "$out" >/dev/null 2>&1; then
     echo "FAIL - odd tag accepted"
     fails=$((fails + 1))
@@ -140,11 +149,25 @@ printf '[package]\nversion = "0.2.21"\n[package.metadata.freenet]\nmin-compatibl
 bash "$script" resolve "$work/res3" --core-toml "$work/head-Cargo.toml" >/dev/null 2>&1
 check "manifest below tag is the newest under the floor" "$(jq -r .below.tag "$work/res3/versions.json")" "v0.2.19"
 check "manifest below binary runs" "$("$(jq -r .below.path "$work/res3/versions.json")")" "v0.2.19"
-# A below-floor candidate without a verifiable asset is skipped for an older one.
-printf 'v0.2.31\nv0.2.30\nv0.2.15\nv0.2.14\n' >"$work/tags"
+# A below-floor candidate that has no asset (no checksum entry, or no files at
+# all) is skipped for an older one. A checksum mismatch is a failure, not a skip.
 printf '[package]\nversion = "0.2.23"\n[package.metadata.freenet]\nmin-compatible-version = "0.2.20"\n' >"$work/head-Cargo.toml"
+printf 'v0.2.31\nv0.2.30\nv0.2.17\nv0.2.16\nv0.2.14\n' >"$work/tags"
 bash "$script" resolve "$work/res4" --core-toml "$work/head-Cargo.toml" >/dev/null 2>&1
-check "tampered below-floor candidate skipped for an older one" "$(jq -r .below.tag "$work/res4/versions.json")" "v0.2.14"
+check "below-floor candidates without assets are skipped" "$(jq -r .below.tag "$work/res4/versions.json")" "v0.2.14"
+printf 'v0.2.31\nv0.2.30\nv0.2.15\nv0.2.14\n' >"$work/tags"
+if bash "$script" resolve "$work/res5" --core-toml "$work/head-Cargo.toml" >/dev/null 2>"$work/err"; then
+    echo "FAIL - a tampered below-floor candidate was skipped"
+    fails=$((fails + 1))
+else
+    check "tampered below-floor candidate fails the resolve" "$(grep -c 'checksum mismatch' "$work/err")" "1"
+fi
+if [ -e "$work/res5/versions.json" ]; then
+    echo "FAIL - versions.json written after a failed resolve"
+    fails=$((fails + 1))
+else
+    echo "ok   - no manifest after a failed resolve"
+fi
 
 if [ "$fails" -ne 0 ]; then
     echo "$fails check(s) failed"
