@@ -25968,3 +25968,172 @@ fn simulation_data_dirs_are_private_to_this_process() {
         "the gateway's data dir is not under this process's root {own_root}"
     );
 }
+
+// =============================================================================
+// Retrievability investigation: fresh contract PUT at a gateway, GET later from
+// a non-adjacent node (inv/new-contract-retrievability).
+// =============================================================================
+
+/// One run: PUT a fresh contract at the gateway (or at a regular node when
+/// `put_at_gateway` is false), then GET it from the node ranked
+/// `requester_rank` by ring distance to the key after `delay`.
+/// Returns (client_got_state, #hosting nodes, nearest-holder ring distance to key,
+/// rank of the PUT origin's ring distance, GET outcome summary string).
+fn run_retrievability_once(
+    seed: u64,
+    num_nodes: usize,
+    max_conn: usize,
+    delay: Duration,
+    requester_rank: usize,
+    put_at_gateway: bool,
+) -> (bool, usize, f64, String) {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    setup_deterministic_state(seed);
+    let network = format!("retr-{seed:x}-{}-{requester_rank}", delay.as_secs());
+    let contract = SimOperation::create_test_contract(0xC3);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let state_v1 = SimOperation::create_test_state(1);
+
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    let node_locations: Vec<f64> = (0..num_nodes)
+        .map(|i| wrap(key_loc + (i as f64 + 0.5) / num_nodes as f64))
+        .collect();
+
+    let rt = create_runtime();
+    let mut sim = rt.block_on(async {
+        SimNetwork::new_with_node_locations(
+            &network,
+            1,
+            num_nodes,
+            10,
+            7,
+            max_conn,
+            3,
+            seed,
+            &node_locations,
+        )
+        .await
+    });
+    sim.with_controlled_op_interval(delay);
+
+    let locs = sim.get_peer_locations();
+    let ranked = nodes_by_distance_to_key(&locs, num_nodes, key_loc);
+    let requester_no = ranked[requester_rank.min(num_nodes - 1)];
+    let origin = if put_at_gateway {
+        NodeLabel::gateway(&network, 0)
+    } else {
+        NodeLabel::node(&network, ranked[num_nodes - 1])
+    };
+    let requester = NodeLabel::node(&network, requester_no);
+
+    let operations = vec![
+        ScheduledOperation::new(
+            origin.clone(),
+            SimOperation::Put {
+                contract: contract.clone(),
+                state: state_v1.clone(),
+                subscribe: true,
+            },
+        ),
+        ScheduledOperation::new(
+            requester.clone(),
+            SimOperation::Get {
+                contract_id,
+                return_contract_code: true,
+                subscribe: false,
+            },
+        ),
+    ];
+    let logs_handle = sim.event_logs_handle();
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(900),
+        Duration::from_secs(5),
+    );
+    assert!(result.turmoil_result.is_ok(), "sim failed");
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let summary = freenet::tracing::summarize_get_outcomes_per_tx(&logs);
+    let got = result
+        .node_storages
+        .get(&requester)
+        .and_then(|s| s.get_stored_state(&contract_key))
+        .is_some();
+    let ring_dist = |a: f64| {
+        let d = (a - key_loc).abs();
+        d.min(1.0 - d)
+    };
+    let mut holders = Vec::new();
+    for l in result.captured_node_labels() {
+        if l != requester && result.is_node_hosting(&l, &contract_key) {
+            holders.push(l);
+        }
+    }
+    let nearest = holders
+        .iter()
+        .filter_map(|l| {
+            let idx = std::iter::once(NodeLabel::gateway(&network, 0))
+                .chain((1..=num_nodes).map(|n| NodeLabel::node(&network, n)))
+                .position(|x| &x == l)?;
+            Some(ring_dist(locs[idx]))
+        })
+        .fold(f64::INFINITY, f64::min);
+    let requester_dist = ring_dist(locs[requester_no]);
+    let info = format!(
+        "key_loc={key_loc:.3} gw_loc={:.3} requester_dist={requester_dist:.3} \
+         gets_ok={}/{} holders_excl_req={} nearest_holder_dist={nearest:.3}",
+        locs[0],
+        summary.successes,
+        summary.total(),
+        holders.len()
+    );
+    (got, holders.len(), nearest, info)
+}
+
+#[test_log::test]
+#[ignore = "investigation harness; run explicitly with --ignored"]
+fn investigate_new_contract_retrievability() {
+    let num_nodes: usize = std::env::var("RV_NODES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40);
+    let max_conn: usize = std::env::var("RV_MAXCONN")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8);
+    let seeds: Vec<u64> = (0..std::env::var("RV_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4u64))
+        .map(|i| 0x7261_7600 + i)
+        .collect();
+    let delays: Vec<u64> = std::env::var("RV_DELAYS")
+        .unwrap_or_else(|_| "3,60,300".into())
+        .split(',')
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    let at_gw = std::env::var("RV_PUT_AT_NODE").is_err();
+    for &d in &delays {
+        for rank in [num_nodes / 3, num_nodes / 2, 2 * num_nodes / 3] {
+            let mut ok = 0;
+            let mut n = 0;
+            for &seed in &seeds {
+                let (got, _h, _near, info) = run_retrievability_once(
+                    seed,
+                    num_nodes,
+                    max_conn,
+                    Duration::from_secs(d),
+                    rank,
+                    at_gw,
+                );
+                n += 1;
+                ok += got as usize;
+                eprintln!("RV delay={d}s rank={rank} seed={seed:x} got={got} {info}");
+            }
+            eprintln!("RV-SUMMARY delay={d}s rank={rank} put_at_gateway={at_gw}: {ok}/{n}");
+        }
+    }
+}
