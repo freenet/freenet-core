@@ -6991,17 +6991,16 @@ mod tests {
         }
     }
 
-    /// Serializes the #4827 `transfers_failed` tests. `TRANSPORT_METRICS` is a
-    /// process-wide global and these tests assert an EXACT +1 delta, so they
-    /// must not observe each other's increment. An exact delta (rather than a
-    /// weaker `>=`) is what makes them fail on a double-count as well as on the
+    /// The #4827 `transfers_failed` tests assert an EXACT +1 delta, so they
+    /// read the per-thread counter (`thread_transfers_failed`), not the
+    /// process-wide `TRANSPORT_METRICS` one: any other test whose connection
+    /// fails a stream bumps the global, and a lock shared by only these two
+    /// tests cannot stop that (#6365). An exact delta (rather than a weaker
+    /// `>=`) is what makes them fail on a double-count as well as on the
     /// original never-counts bug.
-    ///
-    /// `tokio::sync::Mutex` (not `parking_lot`/`std`): the guard is held across
-    /// an `.await`, which `clippy::await_holding_lock` rightly rejects for a
-    /// sync guard.
-    static TRANSFERS_FAILED_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    fn failed_transfers_on_this_thread() -> u64 {
+        crate::transport::metrics::thread_transfers_failed()
+    }
 
     /// Regression test for #4827: a failed outbound stream must increment
     /// `transfers_failed`.
@@ -7023,15 +7022,12 @@ mod tests {
     /// classifies connection liveness, not the transfer's fate.
     #[tokio::test]
     async fn recv_records_transfer_failed_on_transient_stream_failure() {
-        let _guard = TRANSFERS_FAILED_TEST_LOCK.lock().await;
         let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 4).into(), 50004);
         // `_inbound_tx` must stay alive: dropping it closes the inbound channel
         // and recv() returns before the outbound-stream arm is polled.
         let (mut conn, _inbound_tx) = test_conn_for_outbound_stream_arm(remote_addr);
 
-        let before = crate::transport::TRANSPORT_METRICS
-            .read_snapshot()
-            .transfers_failed;
+        let before = failed_transfers_on_this_thread();
 
         // `OutboundStreamFailed` is what send_stream/pipe_stream's stream-scoped
         // error sites return (cwnd-wait timeout, pipe inactivity stall,
@@ -7057,9 +7053,7 @@ mod tests {
              survives and only the stream fails (#4345)"
         );
 
-        let after = crate::transport::TRANSPORT_METRICS
-            .read_snapshot()
-            .transfers_failed;
+        let after = failed_transfers_on_this_thread();
         assert_eq!(
             after,
             before + 1,
@@ -7092,14 +7086,11 @@ mod tests {
     /// the test asserts directly.
     #[tokio::test]
     async fn recv_records_transfer_failed_on_terminal_stream_failure() {
-        let _guard = TRANSFERS_FAILED_TEST_LOCK.lock().await;
         let remote_addr = SocketAddr::new(Ipv4Addr::new(10, 99, 99, 5).into(), 50005);
         // `_inbound_tx` must stay alive — see the transient test above.
         let (mut conn, _inbound_tx) = test_conn_for_outbound_stream_arm(remote_addr);
 
-        let before = crate::transport::TRANSPORT_METRICS
-            .read_snapshot()
-            .transfers_failed;
+        let before = failed_transfers_on_this_thread();
 
         const SENTINEL: &str = "4827-terminal-stream-failure-sentinel";
         let err = TransportError::ConnectionEstablishmentFailure {
@@ -7129,9 +7120,7 @@ mod tests {
             ),
         }
 
-        let after = crate::transport::TRANSPORT_METRICS
-            .read_snapshot()
-            .transfers_failed;
+        let after = failed_transfers_on_this_thread();
         assert_eq!(
             after,
             before + 1,

@@ -27,13 +27,12 @@ clock_skew_tolerance_seconds = 300
 # and reports the result as `service_active`, so the release workflow can tell a
 # successful binary swap apart from a gateway whose service failed to restart
 # (the vega v0.2.71 incident). `systemctl is-active` is read-only and needs no
-# sudo. Defaults to `freenet-gateway`; vega's secondary instance uses
-# `freenet-gateway-hector`.
+# sudo. Defaults to `freenet-gateway`; set it for a non-default instance.
 managed_service = "freenet-gateway"
 
 # River announcement endpoint. Set both to enable `POST /announce/river`.
 # Leave blank (default) on gateways that don't have a Freenet node + room
-# signing key (e.g. vega) — the endpoint will return 503 there.
+# signing key — the endpoint will return 503 there.
 #
 # `river_announce_user` is the local user under which `riverctl` runs;
 # they own the signing key and rooms.json. The sudoers entry must

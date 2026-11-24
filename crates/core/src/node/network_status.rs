@@ -16,6 +16,72 @@ use crate::router::Router;
 use crate::transport::metrics::{TRANSPORT_METRICS, TransportSnapshot};
 
 static NETWORK_STATUS: OnceLock<Arc<RwLock<NetworkStatus>>> = OnceLock::new();
+
+/// The tracker this thread should use: the process-global one, or, in a test
+/// that opened a [`ScopedStatus`], that test's own.
+#[cfg(not(test))]
+fn status_cell() -> Option<Arc<RwLock<NetworkStatus>>> {
+    NETWORK_STATUS.get().cloned()
+}
+
+#[cfg(test)]
+fn status_cell() -> Option<Arc<RwLock<NetworkStatus>>> {
+    match TEST_SCOPE.with(|c| c.borrow().clone()) {
+        Some(scoped) => scoped,
+        None => NETWORK_STATUS.get().cloned(),
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `None`: no scope, use the global. `Some(None)`: a scope with no `init()`
+    /// yet. `Some(Some(_))`: the scope's own tracker.
+    static TEST_SCOPE: std::cell::RefCell<Option<Option<Arc<RwLock<NetworkStatus>>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Gives the calling test thread a private `NetworkStatus`: every function in
+/// this module called on this thread reads and writes it instead of the
+/// process-global tracker, until the guard drops (#6365).
+///
+/// The global is written by any test that drives code reaching
+/// `record_peer_connected`, `init` and the like (ring, connection lifecycle,
+/// node start), and most of those do not hold [`TEST_GLOBAL_STATE_LOCK`], so a
+/// test that needs exact state cannot get it from the lock alone. Only for
+/// tests that stay on one thread: work done on another thread still reaches
+/// the global.
+#[cfg(test)]
+pub(crate) struct ScopedStatus {
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(test)]
+impl ScopedStatus {
+    pub(crate) fn new() -> Self {
+        TEST_SCOPE.with(|c| *c.borrow_mut() = Some(None));
+        Self {
+            _not_send: std::marker::PhantomData,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedStatus {
+    fn drop(&mut self) {
+        TEST_SCOPE.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// Takes [`TEST_GLOBAL_STATE_LOCK`], recovering from poison. A test that
+/// panics while holding it must fail alone: with `.unwrap()` every later test
+/// failed on the `PoisonError` and one failure read as 25 (#6365).
+#[cfg(test)]
+pub(crate) fn lock_global_state_for_test() -> std::sync::MutexGuard<'static, ()> {
+    TEST_GLOBAL_STATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 static ROUTER: OnceLock<Arc<parking_lot::RwLock<Router>>> = OnceLock::new();
 
 /// Provider returning the current dashboard view of subscribed contracts.
@@ -187,7 +253,7 @@ pub(crate) struct OtelStatusScalars {
 /// into one snapshot, so an unregistered ring provider silently zeroed the
 /// queue metrics too, which do not depend on it at all.
 pub(crate) fn otel_status_scalars() -> Option<OtelStatusScalars> {
-    let status = NETWORK_STATUS.get()?;
+    let status = status_cell()?;
     // Poison tolerance matches the writers in this module, which already keep
     // going field-by-field. Propagating it instead would make every metric
     // sourced here vanish permanently, silently, for the process's life.
@@ -1072,6 +1138,11 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
         reconcile_shadow_host_formation: ReconcileShadowStats::default(),
         bootstrap_churn_stats: BootstrapChurnStats::default(),
     };
+    #[cfg(test)]
+    if TEST_SCOPE.with(|c| c.borrow().is_some()) {
+        TEST_SCOPE.with(|c| *c.borrow_mut() = Some(Some(Arc::new(RwLock::new(status)))));
+        return;
+    }
     match NETWORK_STATUS.get() {
         // Already initialized: overwrite the existing tracker in place so
         // repeated `init()` calls are idempotent-overwrite rather than no-ops.
@@ -1098,15 +1169,15 @@ pub fn init(listening_port: u16, gateway_addrs: HashSet<SocketAddr>, version: St
 
 /// Check if an address is a known gateway.
 pub fn is_known_gateway(addr: &SocketAddr) -> bool {
-    NETWORK_STATUS
-        .get()
-        .and_then(|s| s.read().ok())
-        .is_some_and(|s| s.gateway_addresses.contains(addr))
+    status_cell().is_some_and(|s| {
+        s.read()
+            .is_ok_and(|status| status.gateway_addresses.contains(addr))
+    })
 }
 
 /// Record a gateway connection failure with a classified reason.
 pub fn record_gateway_failure(address: SocketAddr, reason: FailureReason) {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.connection_attempts = s.connection_attempts.saturating_add(1);
             // Track NAT failures
@@ -1155,7 +1226,7 @@ pub fn record_peer_connected(
     location: Option<f64>,
     peer_key_location: Option<PeerKeyLocation>,
 ) {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             // Remove any existing entry for this address
             s.connected_peers.retain(|p| p.address != addr);
@@ -1175,7 +1246,7 @@ pub fn record_peer_connected(
 
 /// Record a peer disconnection.
 pub fn record_peer_disconnected(addr: SocketAddr) {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.connected_peers.retain(|p| p.address != addr);
             s.refresh_gateway_only_since(Instant::now());
@@ -1250,7 +1321,7 @@ pub fn record_peer_disconnected(addr: SocketAddr) {
 /// Audit: `grep -rn "record_op_result" crates/core/src/operations/`
 /// must show coverage for every op type with a driver.
 pub fn record_op_result(op_type: OpType, success: bool) {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             let counter = match op_type {
                 OpType::Get => &mut s.op_stats.gets,
@@ -1292,7 +1363,7 @@ pub fn record_op_result(op_type: OpType, success: bool) {
 /// *requests* toward the key (`relayed_op_stats`) and deliberately does
 /// NOT count broadcast fan-out.
 pub fn record_update_received() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.op_stats.updates_received = s.op_stats.updates_received.saturating_add(1);
         }
@@ -1308,7 +1379,7 @@ pub fn record_update_received() {
 /// call so the two can never drift relative to each other (see
 /// `.claude/rules/bug-prevention-patterns.md`: manually-mirrored counters).
 pub fn record_put_bytes(case: PutProbeCase, bytes: u64) {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             let counter = match case {
                 PutProbeCase::NewContract => &mut s.op_stats.put_probe_new_contract,
@@ -1324,7 +1395,7 @@ pub fn record_put_bytes(case: PutProbeCase, bytes: u64) {
 /// (hosting redesign piece C). One increment per terminus, regardless of
 /// how many advertised hosts it then tries.
 pub fn record_terminal_consult_attempt() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.terminal_consult_stats.attempts = s.terminal_consult_stats.attempts.saturating_add(1);
         }
@@ -1333,7 +1404,7 @@ pub fn record_terminal_consult_attempt() {
 
 /// Record that a consult found at least one advertised host to forward to.
 pub fn record_terminal_consult_hit() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.terminal_consult_stats.hits = s.terminal_consult_stats.hits.saturating_add(1);
         }
@@ -1342,7 +1413,7 @@ pub fn record_terminal_consult_hit() {
 
 /// Record that a consult forward resolved the request to Found/Subscribed.
 pub fn record_terminal_consult_resolved_found() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.terminal_consult_stats.resolved_found =
                 s.terminal_consult_stats.resolved_found.saturating_add(1);
@@ -1352,7 +1423,7 @@ pub fn record_terminal_consult_resolved_found() {
 
 /// Record that a consult ran but the request still ended NotFound.
 pub fn record_terminal_consult_still_not_found() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.terminal_consult_stats.still_not_found =
                 s.terminal_consult_stats.still_not_found.saturating_add(1);
@@ -1370,7 +1441,7 @@ pub fn record_terminal_consult_still_not_found() {
 /// production findability baseline (dead-end decomposition) is legible in
 /// central telemetry, not just the internal singleton / sim-only metrics.
 pub fn terminal_consult_counts() -> Option<(u64, u64, u64, u64)> {
-    let status = NETWORK_STATUS.get()?;
+    let status = status_cell()?;
     let s = status.read().ok()?;
     let c = &s.terminal_consult_stats;
     Some((c.attempts, c.hits, c.resolved_found, c.still_not_found))
@@ -1378,7 +1449,7 @@ pub fn terminal_consult_counts() -> Option<(u64, u64, u64, u64)> {
 
 /// Record one eviction retraction accepted by the node-event channel (#5059).
 pub fn record_hosting_retraction_emitted() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.hosting_retraction_stats.emitted =
                 s.hosting_retraction_stats.emitted.saturating_add(1);
@@ -1390,7 +1461,7 @@ pub fn record_hosting_retraction_emitted() {
 /// interest-heartbeat full-set re-request heals it within one interval; a
 /// sustained rate here means evicted contracts stay advertised that long.
 pub fn record_hosting_retraction_dropped() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.hosting_retraction_stats.dropped =
                 s.hosting_retraction_stats.dropped.saturating_add(1);
@@ -1430,7 +1501,7 @@ pub fn record_inter_delegate_dropped() {
 /// for the snapshot cadence; `None` before the singleton is initialized,
 /// like its siblings.
 pub fn delegate_lane_counts() -> Option<(u64, u64, u64, u64)> {
-    NETWORK_STATUS.get()?;
+    status_cell()?;
     let load = |c: &AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
     Some((
         load(&DELEGATE_LANE_REFUSED),
@@ -1442,7 +1513,7 @@ pub fn delegate_lane_counts() -> Option<(u64, u64, u64, u64)> {
 
 /// `(emitted, dropped)` eviction-retraction totals for the snapshot cadence.
 pub fn hosting_retraction_counts() -> Option<(u64, u64)> {
-    let status = NETWORK_STATUS.get()?;
+    let status = status_cell()?;
     let s = status.read().ok()?;
     let c = &s.hosting_retraction_stats;
     Some((c.emitted, c.dropped))
@@ -1480,7 +1551,7 @@ fn bump_stream_frac(stats: &mut StreamAbortStats, received: Option<u32>, total: 
 /// inactivity window. Called from the transport `StreamHandle::assemble` site
 /// (covers both the GET originator and relay receive paths).
 pub fn record_stream_recv_abort_inactivity(received: Option<u32>, total: Option<u32>) {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.stream_abort_stats.recv_inactivity =
                 s.stream_abort_stats.recv_inactivity.saturating_add(1);
@@ -1492,7 +1563,7 @@ pub fn record_stream_recv_abort_inactivity(received: Option<u32>, total: Option<
 /// Record a receiver stream-assembly abort: the stream was cancelled or the
 /// connection closed mid-transfer.
 pub fn record_stream_recv_abort_cancelled(received: Option<u32>, total: Option<u32>) {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.stream_abort_stats.recv_cancelled =
                 s.stream_abort_stats.recv_cancelled.saturating_add(1);
@@ -1504,7 +1575,7 @@ pub fn record_stream_recv_abort_cancelled(received: Option<u32>, total: Option<u
 /// Record a receiver stream abort: no inbound stream was ever claimed (the
 /// claim timed out); zero fragments observed.
 pub fn record_stream_recv_abort_claim_timeout() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.stream_abort_stats.recv_claim_timeout =
                 s.stream_abort_stats.recv_claim_timeout.saturating_add(1);
@@ -1516,7 +1587,7 @@ pub fn record_stream_recv_abort_claim_timeout() {
 /// Record a receiver stream abort: all bytes arrived but the payload failed to
 /// deserialize or was structurally invalid (key mismatch / missing state).
 pub fn record_stream_recv_abort_deserialize(received: Option<u32>, total: Option<u32>) {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.stream_abort_stats.recv_deserialize =
                 s.stream_abort_stats.recv_deserialize.saturating_add(1);
@@ -1528,7 +1599,7 @@ pub fn record_stream_recv_abort_deserialize(received: Option<u32>, total: Option
 /// Record a sender stream abort: cwnd-wait timed out (ACKs stopped arriving) and
 /// the stream was failed rather than blocking the connection.
 pub fn record_stream_send_abort_cwnd() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.stream_abort_stats.send_cwnd = s.stream_abort_stats.send_cwnd.saturating_add(1);
         }
@@ -1539,7 +1610,7 @@ pub fn record_stream_send_abort_cwnd() {
 /// `router_snapshot` telemetry event. `None` before the singleton is
 /// initialized (i.e. always populated in production snapshots).
 pub fn stream_abort_counts() -> Option<StreamAbortSnapshot> {
-    let status = NETWORK_STATUS.get()?;
+    let status = status_cell()?;
     let s = status.read().ok()?;
     let a = &s.stream_abort_stats;
     Some(StreamAbortSnapshot {
@@ -1558,7 +1629,7 @@ pub fn stream_abort_counts() -> Option<StreamAbortSnapshot> {
 
 /// Record that this node relayed (forwarded one hop) a GET request.
 pub fn record_relayed_get() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.relayed_op_stats.gets = s.relayed_op_stats.gets.saturating_add(1);
         }
@@ -1567,7 +1638,7 @@ pub fn record_relayed_get() {
 
 /// Record that this node relayed (forwarded one hop) a PUT request.
 pub fn record_relayed_put() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.relayed_op_stats.puts = s.relayed_op_stats.puts.saturating_add(1);
         }
@@ -1576,7 +1647,7 @@ pub fn record_relayed_put() {
 
 /// Record that this node relayed (forwarded one hop) a SUBSCRIBE request.
 pub fn record_relayed_subscribe() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.relayed_op_stats.subscribes = s.relayed_op_stats.subscribes.saturating_add(1);
         }
@@ -1591,7 +1662,7 @@ pub fn record_relayed_subscribe() {
 /// toward the key, and counting them would conflate relay volume with fan-out
 /// volume (one update -> N broadcasts).
 pub fn record_relayed_update() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.relayed_op_stats.updates = s.relayed_op_stats.updates.saturating_add(1);
         }
@@ -1602,7 +1673,7 @@ pub fn record_relayed_update() {
 /// Returns `(gets, puts, subscribes, updates)` or `None` before the singleton
 /// is initialized.
 pub fn relayed_op_counts() -> Option<(u64, u64, u64, u64)> {
-    let status = NETWORK_STATUS.get()?;
+    let status = status_cell()?;
     let s = status.read().ok()?;
     let r = &s.relayed_op_stats;
     Some((r.gets, r.puts, r.subscribes, r.updates))
@@ -1611,7 +1682,7 @@ pub fn relayed_op_counts() -> Option<(u64, u64, u64, u64)> {
 /// Record that a `connect_connected` telemetry event was emitted to the
 /// collector (aggregate precursor to retiring the per-event firehose).
 pub fn record_connect_accept_emitted() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.connect_emit_stats.accepts_emitted =
                 s.connect_emit_stats.accepts_emitted.saturating_add(1);
@@ -1622,7 +1693,7 @@ pub fn record_connect_accept_emitted() {
 /// Record that a `connect_rejected` telemetry event was emitted to the
 /// collector (aggregate precursor to retiring the per-event firehose).
 pub fn record_connect_reject_emitted() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.connect_emit_stats.rejects_emitted =
                 s.connect_emit_stats.rejects_emitted.saturating_add(1);
@@ -1634,7 +1705,7 @@ pub fn record_connect_reject_emitted() {
 /// `router_snapshot`. Returns `(accepts_emitted, rejects_emitted)` or `None`
 /// before the singleton is initialized.
 pub fn connect_emit_counts() -> Option<(u64, u64)> {
-    let status = NETWORK_STATUS.get()?;
+    let status = status_cell()?;
     let s = status.read().ok()?;
     let c = &s.connect_emit_stats;
     Some((c.accepts_emitted, c.rejects_emitted))
@@ -1645,7 +1716,7 @@ pub fn connect_emit_counts() -> Option<(u64, u64)> {
 /// the "Registered transient connection" site in
 /// `p2p_protoc/connection_lifecycle.rs`.
 pub fn record_bootstrap_transient_registered() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.bootstrap_churn_stats.transient_registered = s
                 .bootstrap_churn_stats
@@ -1662,7 +1733,7 @@ pub fn record_bootstrap_transient_registered() {
 /// "Transient connection past its TTL" site in
 /// `p2p_protoc/connection_lifecycle.rs`.
 pub fn record_bootstrap_transient_expired() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.bootstrap_churn_stats.transient_expired =
                 s.bootstrap_churn_stats.transient_expired.saturating_add(1);
@@ -1673,7 +1744,7 @@ pub fn record_bootstrap_transient_expired() {
 /// Record that a transient registration was refused for its source's share
 /// of the budget. Called from `ConnectionManager::register_transient`.
 pub fn record_transient_source_refused() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.bootstrap_churn_stats.transient_source_refusals = s
                 .bootstrap_churn_stats
@@ -1686,7 +1757,7 @@ pub fn record_transient_source_refused() {
 /// Record that an unpromoted connection was closed to admit a newcomer at the
 /// transient budget. Called from `ConnectionManager::record_transient_eviction`.
 pub fn record_transient_evicted() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.bootstrap_churn_stats.transient_evictions = s
                 .bootstrap_churn_stats
@@ -1700,7 +1771,7 @@ pub fn record_transient_evicted() {
 /// issue #4787 instrumentation. Called from the "connect_peer: promoted to
 /// ring" site in `p2p_protoc/connection_lifecycle.rs`.
 pub fn record_bootstrap_promoted_to_ring() {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.bootstrap_churn_stats.promoted_to_ring =
                 s.bootstrap_churn_stats.promoted_to_ring.saturating_add(1);
@@ -1747,7 +1818,7 @@ pub fn record_bootstrap_min_connections_reached() {
         return;
     }
     let elapsed = since_process_start();
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             if s.bootstrap_churn_stats.time_to_min_connections.is_none() {
                 s.bootstrap_churn_stats.time_to_min_connections = Some(elapsed);
@@ -1771,7 +1842,7 @@ pub fn record_bootstrap_first_ring_connection() {
     if simulated_node() {
         return;
     }
-    let Some(status) = NETWORK_STATUS.get() else {
+    let Some(status) = status_cell() else {
         return;
     };
     if status.read().is_ok_and(|s| {
@@ -1801,7 +1872,7 @@ pub fn record_bootstrap_connect_attempt() {
     if simulated_node() {
         return;
     }
-    let Some(status) = NETWORK_STATUS.get() else {
+    let Some(status) = status_cell() else {
         return;
     };
     if status.read().is_ok_and(|s| {
@@ -1841,7 +1912,7 @@ pub fn record_bootstrap_startup_round(outcome: StartupRoundOutcome) {
     if simulated_node() {
         return;
     }
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             let b = &mut s.bootstrap_churn_stats;
             let slot = match outcome {
@@ -1864,7 +1935,7 @@ pub fn record_bootstrap_startup_round(outcome: StartupRoundOutcome) {
 /// distinguishes "no data" from a node that has simply never bootstrapped
 /// (present, with `time_to_min_connections: None`).
 pub fn bootstrap_churn_counts() -> Option<BootstrapChurnStats> {
-    let status = NETWORK_STATUS.get()?;
+    let status = status_cell()?;
     let s = status.read().ok()?;
     Some(s.bootstrap_churn_stats)
 }
@@ -1874,7 +1945,7 @@ pub fn bootstrap_churn_counts() -> Option<BootstrapChurnStats> {
 /// authoritative tracked `connected_peers` list. `None` before the singleton is
 /// initialized.
 pub fn connections_to_gateways() -> Option<u64> {
-    let status = NETWORK_STATUS.get()?;
+    let status = status_cell()?;
     let s = status.read().ok()?;
     Some(s.connected_peers.iter().filter(|p| p.is_gateway).count() as u64)
 }
@@ -1890,7 +1961,7 @@ pub fn connections_to_gateways() -> Option<u64> {
 /// measures the flag's drift so it is legible in production telemetry before the
 /// reconcile-core keystone deletes the flag.
 pub fn record_upstream_divergence_comparison(diverged: bool) {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.upstream_divergence_stats.comparisons =
                 s.upstream_divergence_stats.comparisons.saturating_add(1);
@@ -1911,7 +1982,7 @@ pub fn record_upstream_divergence_comparison(diverged: bool) {
 /// stored-flag drift rate is visible in central telemetry, not just the internal
 /// singleton, giving field evidence for the flag's removal.
 pub fn upstream_divergence_counts() -> Option<(u64, u64)> {
-    let status = NETWORK_STATUS.get()?;
+    let status = status_cell()?;
     let s = status.read().ok()?;
     let d = &s.upstream_divergence_stats;
     Some((d.comparisons, d.divergences))
@@ -1930,7 +2001,7 @@ pub fn record_reconcile_shadow_comparison(
     site: ReconcileShadowSite,
     divergence: ReconcileActionDivergence,
 ) {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             let r = match site {
                 ReconcileShadowSite::Collapse => &mut s.reconcile_shadow_collapse,
@@ -1987,7 +2058,7 @@ pub struct ReconcileShadowSnapshot {
 /// `NETWORK_STATUS` singleton is initialized. `Ring` polls this on the snapshot
 /// cadence and copies the values onto `RouterSnapshotInfo`.
 pub fn reconcile_shadow_counts() -> Option<ReconcileShadowSnapshot> {
-    let status = NETWORK_STATUS.get()?;
+    let status = status_cell()?;
     let s = status.read().ok()?;
     Some(ReconcileShadowSnapshot {
         collapse: s.reconcile_shadow_collapse,
@@ -2000,7 +2071,7 @@ pub fn reconcile_shadow_counts() -> Option<ReconcileShadowSnapshot> {
 
 /// Record a NAT traversal attempt.
 pub fn record_nat_attempt(success: bool) {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.nat_stats.record(success);
         }
@@ -2009,7 +2080,7 @@ pub fn record_nat_attempt(success: bool) {
 
 /// Set this node's ring location.
 pub fn set_own_location(location: f64) {
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.own_location = Some(location);
         }
@@ -2024,7 +2095,7 @@ pub fn set_external_address(addr: SocketAddr) {
     if simulated_node() {
         return;
     }
-    if let Some(status) = NETWORK_STATUS.get() {
+    if let Some(status) = status_cell() {
         if let Ok(mut s) = status.write() {
             s.external_address = Some(addr);
         }
@@ -2039,9 +2110,7 @@ pub fn set_external_address(addr: SocketAddr) {
 /// consistent under concurrent writers (issue #4172).
 #[cfg(test)]
 pub(crate) fn external_address() -> Option<SocketAddr> {
-    NETWORK_STATUS
-        .get()
-        .and_then(|status| status.read().ok().and_then(|s| s.external_address))
+    status_cell().and_then(|status| status.read().ok().and_then(|s| s.external_address))
 }
 
 /// Process-wide serialization lock for tests that read or write the shared
@@ -2569,7 +2638,7 @@ pub fn get_snapshot() -> Option<NetworkStatusSnapshot> {
 /// dashboard shows some time from now without sleeping or constructing an
 /// `Instant` in the past (which can underflow on a freshly booted machine).
 fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
-    let status = NETWORK_STATUS.get()?;
+    let status = status_cell()?;
     // Call every registered provider BEFORE taking the NETWORK_STATUS read
     // guard. Providers lock ring/connection state (e.g. the ring-stats provider
     // takes `ConnectionManager::own_addr`), while `set_own_addr` holds that
@@ -2896,15 +2965,12 @@ mod tests {
     use super::*;
     use std::net::{IpAddr, Ipv4Addr};
 
-    /// Tests that touch the shared NETWORK_STATUS global must hold this lock
-    /// to prevent interleaving with other tests running in parallel.
-    ///
-    /// This is the crate-wide [`TEST_GLOBAL_STATE_LOCK`] — shared with the
-    /// `set_own_addr` TOCTOU regression test in `connection_manager.rs`, which
-    /// also mutates this global. A poisoned lock here would mean some test
-    /// panicked while holding it; `.lock()` would then return `Err`, which is
-    /// itself a useful signal, so the `.unwrap()` is intentional.
-    use super::TEST_GLOBAL_STATE_LOCK as TEST_MUTEX;
+    // Tests that touch the shared NETWORK_STATUS global must hold the
+    // crate-wide [`TEST_GLOBAL_STATE_LOCK`] (via `lock_global_state_for_test`,
+    // which survives poison) to prevent interleaving with other tests running
+    // in parallel. Tests that need exact state and stay on one thread also
+    // open a `ScopedStatus`, because plenty of tests write the global without
+    // holding the lock (#6365).
 
     #[test]
     fn test_classify_version_mismatch() {
@@ -3021,7 +3087,8 @@ mod tests {
     /// here rather than silently emitting zeros in production.
     #[test]
     fn terminal_consult_counts_reflect_recorded_events() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         // Fresh singleton state for a deterministic baseline (init overwrites
         // the process-global tracker in place, zeroing the consult counters).
         init(31337, HashSet::new(), "test".to_string());
@@ -3059,7 +3126,8 @@ mod tests {
     /// tuple fails here rather than silently emitting zeros in production.
     #[test]
     fn upstream_divergence_counts_reflect_recorded_events() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         // Fresh singleton state for a deterministic baseline (init overwrites
         // the process-global tracker in place, zeroing the counters).
         init(31337, HashSet::new(), "test".to_string());
@@ -3089,7 +3157,8 @@ mod tests {
     /// which describes this process's one real node.
     #[test]
     fn simulated_node_external_address_is_not_recorded() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         init(31339, HashSet::new(), "test".to_string());
         let real: SocketAddr = "127.0.0.1:31339".parse().unwrap();
         set_external_address(real);
@@ -3103,7 +3172,8 @@ mod tests {
     /// min_connections stay out of the process singleton too.
     #[test]
     fn simulated_node_join_latency_is_not_recorded() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         init(31341, HashSet::new(), "test".to_string());
         crate::ring::topology_registry::set_current_network_name("status-isolation-join");
         record_bootstrap_connect_attempt();
@@ -3121,7 +3191,8 @@ mod tests {
     /// `startup_rounds_*` tests' counts.
     #[test]
     fn simulated_node_startup_rounds_are_not_recorded() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         init(31338, HashSet::new(), "test".to_string());
         crate::ring::topology_registry::set_current_network_name("status-isolation");
         record_bootstrap_startup_round(StartupRoundOutcome::ConnectIssuedRouted);
@@ -3140,7 +3211,8 @@ mod tests {
     /// asserted idempotent (only the FIRST call has effect).
     #[test]
     fn bootstrap_churn_counts_reflect_recorded_events() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         // Fresh singleton state for a deterministic baseline (init overwrites
         // the process-global tracker in place, zeroing the counters).
         init(31337, HashSet::new(), "test".to_string());
@@ -3218,7 +3290,8 @@ mod tests {
     /// [`since_process_start`] rather than starting a fresh clock.
     #[test]
     fn bootstrap_latency_measures_from_process_start_anchor() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         init(31338, HashSet::new(), "test".to_string());
         // The anchor is process-global and was forced no later than the first
         // `init()` in this test binary, so real elapsed time has accrued.
@@ -3243,7 +3316,8 @@ mod tests {
     /// reach the OTEL scalar source that feeds the gauges.
     #[test]
     fn first_ring_connection_is_recorded_once_from_process_start() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         init(31339, HashSet::new(), "test".to_string());
 
         let b = bootstrap_churn_counts().expect("singleton is initialized");
@@ -3313,7 +3387,8 @@ mod tests {
     #[test]
     fn reconcile_shadow_counts_reflect_recorded_events() {
         use ReconcileShadowSite::*;
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         init(31337, HashSet::new(), "test".to_string());
 
         let z = reconcile_shadow_counts().expect("counters present after init");
@@ -3387,7 +3462,8 @@ mod tests {
 
     #[test]
     fn test_failure_snapshot_rendering() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 31337);
 
         // Test version mismatch rendering
@@ -3502,12 +3578,13 @@ mod tests {
 
     #[test]
     fn test_gateway_only_detection() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         let gw_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 9, 111, 215)), 31337);
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 12345);
         init(31339, HashSet::new(), "0.1.148".to_string());
 
-        let status = NETWORK_STATUS.get().unwrap();
+        let status = status_cell().unwrap();
 
         // Gateway-only: one gateway peer connected
         {
@@ -3567,11 +3644,12 @@ mod tests {
 
     #[test]
     fn test_op_stats_recording() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         init(31340, HashSet::new(), "0.1.148".to_string());
 
         // Reset op stats to avoid interference from other tests
-        if let Some(status) = NETWORK_STATUS.get() {
+        if let Some(status) = status_cell() {
             let mut s = status.write().unwrap();
             s.op_stats = OperationStats::default();
         }
@@ -3604,7 +3682,8 @@ mod tests {
     fn test_subscription_tracking_no_provider_wired() {
         // With no provider registered, `get_snapshot()` reports zero
         // subscribed contracts (rather than panicking).
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         init(31341, HashSet::new(), "0.1.148".to_string());
         clear_subscription_provider();
         let snap = get_snapshot().unwrap();
@@ -3626,7 +3705,8 @@ mod tests {
     fn test_subscription_provider_wired_renders_contracts() {
         use freenet_stdlib::prelude::{ContractCode, ContractInstanceId, ContractKey};
 
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         init(31350, HashSet::new(), "0.1.148".to_string());
 
         // Two contracts with deterministic keys; the base58 encoding is
@@ -3678,12 +3758,14 @@ mod tests {
     /// reachability problem.
     #[test]
     fn gateway_only_is_degraded_only_after_the_joining_grace() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         let gw_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 9, 111, 215)), 31337);
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9)), 12345);
         init(31346, HashSet::new(), "0.1.148".to_string());
         {
-            let mut s = NETWORK_STATUS.get().unwrap().write().unwrap();
+            let cell = status_cell().unwrap();
+            let mut s = cell.write().unwrap();
             s.gateway_addresses.insert(gw_addr);
             s.connected_peers.clear();
             s.gateway_only_since = None;
@@ -3761,10 +3843,11 @@ mod tests {
     /// at once.
     #[test]
     fn gateway_only_grace_survives_a_reconnect_but_not_a_long_outage() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         let gw_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 9, 111, 215)), 31337);
         init(31348, HashSet::new(), "0.1.148".to_string());
-        let status = NETWORK_STATUS.get().unwrap();
+        let status = status_cell().unwrap();
         let secs = Duration::from_secs;
         let t0 = Instant::now();
         // Drive the state machine at chosen instants. `record_peer_*` stamp
@@ -3897,10 +3980,11 @@ mod tests {
         assert!(blocked(NAT_MIN_ATTEMPTS_FOR_VERDICT, 0));
         assert!(!blocked(NAT_MIN_ATTEMPTS_FOR_VERDICT * 10, 1));
 
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 7)), 12345);
         init(31347, HashSet::new(), "0.1.148".to_string());
-        let status = NETWORK_STATUS.get().unwrap();
+        let status = status_cell().unwrap();
         {
             let mut s = status.write().unwrap();
             s.connected_peers.clear();
@@ -3930,11 +4014,12 @@ mod tests {
 
     #[test]
     fn test_nat_stats() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         init(31342, HashSet::new(), "0.1.148".to_string());
 
         // Reset NAT stats to avoid interference from other tests
-        if let Some(status) = NETWORK_STATUS.get() {
+        if let Some(status) = status_cell() {
             let mut s = status.write().unwrap();
             s.nat_stats = NatStats::default();
         }
@@ -3950,12 +4035,13 @@ mod tests {
 
     #[test]
     fn test_nat_failure_no_peers_shows_firewall_message() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 31337);
         init(31343, HashSet::new(), "0.1.148".to_string());
 
         // Ensure clean state: no peers, no failures
-        if let Some(status) = NETWORK_STATUS.get() {
+        if let Some(status) = status_cell() {
             let mut s = status.write().unwrap();
             s.connected_peers.clear();
             s.gateway_failures.clear();
@@ -3972,13 +4058,14 @@ mod tests {
 
     #[test]
     fn test_nat_failure_with_peer_connections_shows_benign_message() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 12345);
         let fail_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 31337);
         init(31344, HashSet::new(), "0.1.148".to_string());
 
         // Ensure clean state
-        if let Some(status) = NETWORK_STATUS.get() {
+        if let Some(status) = status_cell() {
             let mut s = status.write().unwrap();
             s.connected_peers.clear();
             s.gateway_failures.clear();
@@ -4000,13 +4087,14 @@ mod tests {
 
     #[test]
     fn test_nat_failure_with_only_gateway_connections_shows_firewall_message() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         let gw_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 9, 111, 215)), 31337);
         let fail_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 31337);
         init(31345, HashSet::new(), "0.1.148".to_string());
 
         // Register gateway and ensure clean state
-        if let Some(status) = NETWORK_STATUS.get() {
+        if let Some(status) = status_cell() {
             let mut s = status.write().unwrap();
             s.gateway_addresses.insert(gw_addr);
             s.connected_peers.clear();
@@ -4057,7 +4145,8 @@ mod tests {
 
     #[test]
     fn test_record_peer_connected_updates_location() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         let peer_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 9999);
         init(31339, HashSet::new(), "0.1.148".to_string());
 
@@ -4092,7 +4181,8 @@ mod tests {
     /// shows "Starting up…" forever in local mode (#3507 / PR #4297).
     #[test]
     fn init_populates_snapshot() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         init(31337, HashSet::new(), "0.1.0-test".to_string());
         let snap = get_snapshot();
         assert!(snap.is_some(), "snapshot should be Some after init");
@@ -4100,6 +4190,33 @@ mod tests {
         assert_eq!(s.version, "0.1.0-test");
         assert_eq!(s.listening_port, 31337);
         assert_eq!(s.open_connections, 0);
+    }
+
+    /// #6365: a test inside a `ScopedStatus` must not see writes that other
+    /// threads make to the process-global tracker without holding the test
+    /// lock (as ring, connection-lifecycle and node-start tests do).
+    #[test]
+    fn scoped_status_ignores_unlocked_writers_on_other_threads() {
+        // The lock keeps this test's own global writes away from the locked
+        // tests that read the global.
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
+        init(31350, HashSet::new(), "scoped".to_string());
+        let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 7, 7)), 7777);
+        // Another thread has no scope, so these go to the global tracker (a
+        // no-op if nothing has initialised it yet).
+        std::thread::spawn(move || {
+            init(31351, HashSet::new(), "global-intruder".to_string());
+            record_peer_connected(peer, None, None);
+            record_peer_disconnected(peer);
+            record_peer_connected(peer, None, None);
+        })
+        .join()
+        .unwrap();
+        let snap = get_snapshot().unwrap();
+        assert_eq!(snap.version, "scoped");
+        assert_eq!(snap.listening_port, 31350);
+        assert!(snap.peers.is_empty());
     }
 
     /// Regression: a second `init()` must overwrite the global tracker in
@@ -4115,7 +4232,41 @@ mod tests {
     /// asserts the second call's values fully replace the first's.
     #[test]
     fn init_overwrites_existing_global() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        const CHILD_ENV: &str = "FREENET_INIT_OVERWRITE_CHILD";
+        const CHILD_TEST: &str = "node::network_status::tests::init_overwrites_existing_global";
+
+        // The subject is the process-global tracker itself, so a scoped
+        // tracker would test the wrong thing, and the lock does not exclude
+        // the node-start tests that call `init` without it (#6365). Run the
+        // body in a child process of its own, where nothing else runs.
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Re-exec the running image: after a concurrent rebuild replaces
+            // the test binary, Linux current_exe() reports "<path> (deleted)".
+            let exe = if cfg!(target_os = "linux") {
+                std::path::PathBuf::from("/proc/self/exe")
+            } else {
+                std::env::current_exe().expect("test binary path")
+            };
+            let output = std::process::Command::new(exe)
+                .args(["--exact", "--test-threads=1", "--nocapture", CHILD_TEST])
+                .env(CHILD_ENV, "1")
+                .output()
+                .expect("re-exec the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "child run of {CHILD_TEST} failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            );
+            // libtest exits 0 when its filter matches nothing; fail closed on
+            // a rename.
+            assert!(
+                stdout.contains("1 passed"),
+                "the child must actually have run {CHILD_TEST}; if this test was \
+                 renamed, update CHILD_TEST.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            );
+            return;
+        }
 
         // First initialization, then dirty the state so we can prove the
         // second init() resets it (not just changes scalar fields).
@@ -4153,7 +4304,8 @@ mod tests {
     /// no-provider default is all-zeros.
     #[test]
     fn ring_stats_provider_round_trip() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
+        let _scope = ScopedStatus::new();
         // Use the same init as other tests in this module.
         init(31337, HashSet::new(), "0.1.0-test".to_string());
 
@@ -4205,7 +4357,7 @@ mod tests {
     /// `own_addr`; under the old ordering this test hangs.
     #[test]
     fn snapshot_does_not_call_providers_under_status_lock() {
-        let _lock = TEST_MUTEX.lock().unwrap();
+        let _lock = lock_global_state_for_test();
         init(31340, HashSet::new(), "test".to_string());
 
         let own = Arc::new(parking_lot::Mutex::new(()));

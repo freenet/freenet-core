@@ -290,11 +290,16 @@ cascade to fire automatically.
 (`FREENET_RELEASE_SIGNING_KEY` repo secret) and uploads `SHA256SUMS.txt.sig`.
 The auto-updater (`crates/core/src/bin/commands/update.rs`) verifies that
 signature against the public key baked into the binary (`FREENET_RELEASE_PUBKEY`)
-before trusting the checksum manifest. Rotating the key means updating BOTH the
-secret AND the baked-in `FREENET_RELEASE_PUBKEY` (a mismatch would make every
-client refuse the release). To verify the secret matches the baked-in key
-without cutting a release, run `cross-compile.yml` via `workflow_dispatch` and
-check the `verify-signing-key` job. The full prerequisites table (including the
+before trusting the checksum manifest. Rotating the key means updating the
+secret AND every copy of the public key: the baked-in `FREENET_RELEASE_PUBKEY`,
+`docker/freenet-node/release-signing-key.der`, and `RELEASE_PUBKEY_HEX` in
+`scripts/gateway-auto-update.sh` (which refuses to install a gateway update
+whose manifest does not verify). A mismatch makes every client, image build or
+gateway update refuse the release; tests in `update.rs` and
+`scripts/release-agent/gateway-auto-update_test.sh` fail if the copies drift.
+To verify the secret matches the baked-in key without cutting a release, run
+`cross-compile.yml` via `workflow_dispatch` and check the `verify-signing-key`
+job. The full prerequisites table (including the
 two-release `REQUIRE_RELEASE_SIGNATURE` transition) is in `docs/RELEASING.md`.
 
 ### Reserved offline revocation key (`FREENET_REVOCATION_PUBKEY`)

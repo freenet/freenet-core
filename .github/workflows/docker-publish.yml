@@ -323,19 +323,28 @@ jobs:
         id: version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
         run: |
           set -euo pipefail
+          # Release tags are always v-prefixed semver. Refuse anything else
+          # rather than guess: a dispatched `0.2.150` would otherwise compare
+          # unequal to every listed tag and skip the floating tags silently.
+          if ! printf '%s' "$RELEASE_TAG" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Release tag '${RELEASE_TAG}' is not of the form vX.Y.Z[-pre]."
+            exit 1
+          fi
           version="${RELEASE_TAG#v}"
           minor="${version%.*}"
           echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "minor=${minor}" >> "$GITHUB_OUTPUT"
 
-          # `latest` and the minor tag must move only for a stable release.
-          # `!github.event.release.prerelease` is TRUE on a workflow_dispatch,
-          # where that field is empty, so a dispatched prerelease tag would
-          # otherwise take over `latest`. Decide from the version string too.
-          if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+          # The floating tags (`latest`, the minor tag) may move only for a
+          # stable release. `!github.event.release.prerelease` is TRUE on a
+          # workflow_dispatch, where that field is empty, so a dispatched
+          # prerelease tag would otherwise take over `latest`. Decide from the
+          # version string too.
+          if [ "${RELEASE_PRERELEASE:-}" = "true" ]; then
             is_stable=false
           elif printf '%s' "$version" | grep -q -- '-'; then
             is_stable=false
@@ -345,6 +354,9 @@ jobs:
           echo "is_stable=${is_stable}" >> "$GITHUB_OUTPUT"
           echo "stable release: ${is_stable}"
 
+      # Only the immutable per-release tags are pushed here. The floating tags
+      # (`latest`, `X.Y`) are moved by "Move the floating tags" below, AFTER the
+      # push, from a fresh look at the published releases.
       - uses: docker/metadata-action@v6
         id: metadata
         with:
@@ -352,8 +364,6 @@ jobs:
           tags: |
             type=raw,value=${{ steps.version.outputs.tag }}
             type=raw,value=${{ steps.version.outputs.version }}
-            type=raw,value=${{ steps.version.outputs.minor }},enable=${{ steps.version.outputs.is_stable == 'true' }}
-            type=raw,value=latest,enable=${{ steps.version.outputs.is_stable == 'true' }}
           labels: |
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
 
@@ -375,6 +385,79 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           build-args: |
             FREENET_VERSION=${{ steps.version.outputs.tag }}
+
+      # `latest` must name the highest published non-prerelease release, and
+      # `X.Y` the highest within that minor (the same definition as
+      # cross-compile.yml's "Publish release" un-draft). Re-publishing an older
+      # tag must not move either backwards.
+      #
+      # Decided HERE, after the slow build and push, from a fresh release list,
+      # and applied by re-tagging the image just pushed: deciding before the
+      # build would let a slow re-publish of an old tag overwrite `latest`
+      # after a newer release's job had already set it. The window that
+      # remains is the few seconds between this listing and the retag.
+      #
+      # On a `release` event the tag counts as published even if the listing
+      # lags behind the publish. Only plain vX.Y.Z tags count, so a release
+      # someone forgot to flag as a prerelease (v0.3.0-beta) cannot pin
+      # `latest`. Fails closed: if the list cannot be read or is empty, neither
+      # floating tag moves, and the step FAILS so notify-publish-failure says
+      # `latest` is stale (the versioned tags are already pushed). A tag that
+      # is simply not the highest is a warning, not a failure.
+      - name: Move the floating tags
+        id: floating
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          MINOR: ${{ steps.version.outputs.minor }}
+          IS_STABLE: ${{ steps.version.outputs.is_stable }}
+          EVENT_NAME: ${{ github.event_name }}
+          IMAGE: ghcr.io/${{ github.repository }}
+          # Read-only: lists releases.
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          moved_latest=false
+          moved_minor=false
+          finish() {
+            echo "moved_latest=${moved_latest}" >> "$GITHUB_OUTPUT"
+            echo "moved_minor=${moved_minor}" >> "$GITHUB_OUTPUT"
+            echo "moved latest: ${moved_latest}; moved ${MINOR}: ${moved_minor}"
+          }
+          if [ "$IS_STABLE" != true ]; then
+            echo "${RELEASE_TAG} is a prerelease; floating tags unchanged."
+            finish; exit 0
+          fi
+          if ! published=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --exclude-drafts \
+              --json tagName,isPrerelease \
+              --jq '.[] | select(.isPrerelease | not) | .tagName'); then
+            echo "::error::Could not list published releases; \`latest\` and \`${MINOR}\` were NOT moved to ${RELEASE_TAG}. Re-run this workflow once the GitHub API answers."
+            finish; exit 1
+          fi
+          published=$(printf '%s\n' "$published" | awk '/^v[0-9]+\.[0-9]+\.[0-9]+$/')
+          if [ -z "$published" ]; then
+            echo "::error::The published release list has no vX.Y.Z release; \`latest\` and \`${MINOR}\` were NOT moved to ${RELEASE_TAG}."
+            finish; exit 1
+          fi
+          candidates="$published"
+          if [ "$EVENT_NAME" = release ]; then
+            candidates=$(printf '%s\n%s\n' "$published" "$RELEASE_TAG")
+          fi
+          highest=$(printf '%s\n' "$candidates" | sort -V | tail -1)
+          highest_minor=$(printf '%s\n' "$candidates" | awk -v p="v${MINOR}." 'index($0, p) == 1' | sort -V | tail -1)
+
+          if [ "$highest_minor" = "$RELEASE_TAG" ]; then
+            docker buildx imagetools create -t "${IMAGE}:${MINOR}" "${IMAGE}:${RELEASE_TAG}"
+            moved_minor=true
+          else
+            echo "::warning::${RELEASE_TAG} is not the highest published ${MINOR}.x release (${highest_minor:-none}); \`${MINOR}\` NOT moved."
+          fi
+          if [ "$highest" = "$RELEASE_TAG" ]; then
+            docker buildx imagetools create -t "${IMAGE}:latest" "${IMAGE}:${RELEASE_TAG}"
+            moved_latest=true
+          else
+            echo "::warning::${RELEASE_TAG} is not the highest published release (${highest}); \`latest\` NOT moved."
+          fi
+          finish
 
   smoke:
     name: Smoke-test the published image

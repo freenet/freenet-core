@@ -45,6 +45,25 @@ pub(crate) use quic_data::{
 /// metrics for periodic telemetry snapshots.
 pub static TRANSPORT_METRICS: LazyLock<TransportMetrics> = LazyLock::new(TransportMetrics::new);
 
+#[cfg(test)]
+thread_local! {
+    /// Failed transfers recorded on THIS thread, for tests only (#6365).
+    ///
+    /// `TRANSPORT_METRICS.transfers_failed` is shared by every test in the
+    /// process, and any test that drives a real connection's stream task can
+    /// bump it, so an exact before/after delta on it is racy under plain
+    /// `cargo test`. A current-thread test runtime runs `recv()` on the test's
+    /// own thread, so this counter sees that test's increments and no one
+    /// else's.
+    static THREAD_TRANSFERS_FAILED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook: failed transfers recorded on the calling thread so far.
+#[cfg(test)]
+pub(crate) fn thread_transfers_failed() -> u64 {
+    THREAD_TRANSFERS_FAILED.with(|c| c.get())
+}
+
 /// Test hook: connection identity decisions since the process started, by
 /// [`ConnIdentity`]. Unlike the period counters, never reset by
 /// `take_snapshot`, so a simulation can read its totals at the end.
@@ -2933,6 +2952,8 @@ impl TransportMetrics {
     /// and the bytes it did put on the wire are already counted at the socket
     /// layer by `record_packet_sent`.
     pub fn record_transfer_failed(&self) {
+        #[cfg(test)]
+        THREAD_TRANSFERS_FAILED.with(|c| c.set(c.get() + 1));
         self.cumulative_transfers_failed
             .fetch_add(1, Ordering::Relaxed);
         // Saturating, matching `record_transfer_completed` — a pinned u32::MAX
