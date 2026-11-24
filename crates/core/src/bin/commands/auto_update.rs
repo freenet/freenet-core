@@ -2296,6 +2296,133 @@ pub fn repoll_deadline_while_cooling(
     cooldown_end + REPOLL_AFTER_COOLDOWN_JITTER.mul_f64(rand_unit.clamp(0.0, 1.0))
 }
 
+/// Consecutive bootstrap rounds, each sent to every known gateway with no ring
+/// connection since the last, after which a node with zero connections checks
+/// for an update at once (#5940, the update check on handshake failure).
+///
+/// A round is one CONNECT to each eligible gateway, and the pacer's backoff
+/// spaces them, so three rounds is about half a minute to a few minutes of
+/// failing to join. Fewer would fire on an ordinary slow start.
+pub const HANDSHAKE_FAILURE_ROUNDS: u32 = 3;
+
+/// The shortest time between two checks the handshake-failure rule starts.
+/// A node that cannot reach the network at all (offline, or behind a block)
+/// meets the rule every round, so this is what keeps it to one GitHub request
+/// an hour, well under the 60/hour/IP unauthenticated limit that the 6 h
+/// re-poll and the peer-signal checks share. Against the 7.5 h worst case of
+/// the re-poll alone, an hour still finds a release within about an hour of
+/// it being published for a node the network has left behind.
+pub const HANDSHAKE_FAILURE_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Number of update checks the handshake-failure rule has started in this
+/// process (the trigger counter; also logged at INFO when it fires).
+static HANDSHAKE_FAILURE_CHECKS: AtomicU32 = AtomicU32::new(0);
+
+/// How many update checks the handshake-failure rule has started.
+pub fn handshake_failure_checks_started() -> u32 {
+    HANDSHAKE_FAILURE_CHECKS.load(Ordering::Relaxed)
+}
+
+/// The rule that starts an update check when a node cannot join the network.
+///
+/// It only adds a check; the boot check and the 6 h re-poll are separate and
+/// unaffected. Whether a gateway refused on version needs no separate case:
+/// a version refusal already raises the version-mismatch signal that the
+/// peer-signal checks act on, and this rule covers every other reason the
+/// handshakes fail (a gateway that no longer speaks our protocol answers
+/// nothing we can read).
+#[derive(Debug, Default)]
+pub struct HandshakeFailureTrigger {
+    last_started: Option<std::time::Instant>,
+}
+
+impl HandshakeFailureTrigger {
+    /// Whether to start an update check now: the node has no ring connection,
+    /// at least [`HANDSHAKE_FAILURE_ROUNDS`] bootstrap rounds in a row have
+    /// brought none, and no check from this rule started within
+    /// [`HANDSHAKE_FAILURE_CHECK_INTERVAL`]. Returning true records the start.
+    ///
+    /// `rounds_without_connection` restarts at zero with the first connection,
+    /// so a node that joined, however briefly, needs a fresh run of rounds.
+    pub fn should_check(
+        &mut self,
+        now: std::time::Instant,
+        open_connections: usize,
+        rounds_without_connection: u32,
+    ) -> bool {
+        if open_connections > 0 || rounds_without_connection < HANDSHAKE_FAILURE_ROUNDS {
+            return false;
+        }
+        if self
+            .last_started
+            .is_some_and(|t| now.saturating_duration_since(t) < HANDSHAKE_FAILURE_CHECK_INTERVAL)
+        {
+            return false;
+        }
+        self.last_started = Some(now);
+        HANDSHAKE_FAILURE_CHECKS.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
+#[cfg(test)]
+mod handshake_failure_trigger_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn fires_only_at_zero_connections_after_k_rounds() {
+        let now = Instant::now();
+        let mut t = HandshakeFailureTrigger::default();
+        assert!(!t.should_check(now, 0, HANDSHAKE_FAILURE_ROUNDS - 1));
+        assert!(!t.should_check(now, 1, HANDSHAKE_FAILURE_ROUNDS));
+        assert!(!t.should_check(now, 5, 100));
+        assert!(t.should_check(now, 0, HANDSHAKE_FAILURE_ROUNDS));
+    }
+
+    #[test]
+    fn is_rate_limited_and_rearms_after_the_interval() {
+        let now = Instant::now();
+        let mut t = HandshakeFailureTrigger::default();
+        assert!(t.should_check(now, 0, 10));
+        let just_before = now + HANDSHAKE_FAILURE_CHECK_INTERVAL - Duration::from_secs(1);
+        assert!(!t.should_check(just_before, 0, 10), "within the interval");
+        assert!(t.should_check(now + HANDSHAKE_FAILURE_CHECK_INTERVAL, 0, 10));
+    }
+
+    #[test]
+    fn a_refused_call_does_not_use_up_the_interval() {
+        let now = Instant::now();
+        let mut t = HandshakeFailureTrigger::default();
+        assert!(!t.should_check(now, 0, 1));
+        assert!(!t.should_check(now, 3, 9));
+        assert!(
+            t.should_check(now, 0, HANDSHAKE_FAILURE_ROUNDS),
+            "only a started check starts the interval"
+        );
+    }
+
+    #[test]
+    fn counts_the_checks_it_starts() {
+        let before = handshake_failure_checks_started();
+        let mut t = HandshakeFailureTrigger::default();
+        assert!(t.should_check(Instant::now(), 0, HANDSHAKE_FAILURE_ROUNDS));
+        assert!(handshake_failure_checks_started() > before);
+    }
+
+    /// Fails if the trigger is unplugged: the update task must consult the
+    /// rule, and the maintenance loop must publish the round count it reads.
+    #[test]
+    fn the_trigger_is_wired_into_the_update_task_and_the_maintenance_loop() {
+        let bin = include_str!("../freenet.rs");
+        assert!(bin.contains("HandshakeFailureTrigger"));
+        assert!(bin.contains("get_bootstrap_rounds_without_connection()"));
+        assert!(bin.contains("handshake_trigger.should_check("));
+        let ring = include_str!("../../ring.rs");
+        assert!(ring.contains("set_bootstrap_rounds_without_connection("));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// A transient read error must not be persisted as a permanent lockout.

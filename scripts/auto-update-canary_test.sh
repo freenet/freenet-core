@@ -2623,8 +2623,8 @@ done
 # for auto-update", not "this release detected". `node_decided_to_update` does
 # not see them, which is correct for the gates: neither is reachable in a
 # canary run (both need hours of isolation with a version mismatch).
-EXPECTED_SEND_SITES=7
-EXPECTED_TRIGGER_SITES=5
+EXPECTED_SEND_SITES=8
+EXPECTED_TRIGGER_SITES=6
 # shellcheck disable=SC2016  # literal source text, must not expand
 total_sends="$(grep -cF 'update_tx.send(' "$SRC" 2>/dev/null || echo 0)"
 # shellcheck disable=SC2016

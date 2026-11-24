@@ -7,7 +7,7 @@
 //! See `architecture.md`.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::{borrow::Cow, io, net::SocketAddr};
 
@@ -184,6 +184,22 @@ pub fn set_open_connection_count(count: usize) {
 /// Get the current open connection count.
 pub fn get_open_connection_count() -> usize {
     OPEN_CONNECTION_COUNT.load(Ordering::SeqCst)
+}
+
+/// Bootstrap rounds issued in a row with no ring connection in between,
+/// published by `connection_maintenance` for the update check on handshake
+/// failure (#5940 phase D prerequisite). Like [`OPEN_CONNECTION_COUNT`] it is
+/// process-wide.
+static BOOTSTRAP_ROUNDS_WITHOUT_CONNECTION: AtomicU32 = AtomicU32::new(0);
+
+/// Publish the number of consecutive bootstrap rounds with no connection.
+pub fn set_bootstrap_rounds_without_connection(rounds: u32) {
+    BOOTSTRAP_ROUNDS_WITHOUT_CONNECTION.store(rounds, Ordering::SeqCst);
+}
+
+/// Bootstrap rounds issued in a row with no ring connection in between.
+pub fn get_bootstrap_rounds_without_connection() -> u32 {
+    BOOTSTRAP_ROUNDS_WITHOUT_CONNECTION.load(Ordering::SeqCst)
 }
 
 mod boundary;

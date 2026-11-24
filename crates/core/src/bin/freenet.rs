@@ -360,15 +360,18 @@ async fn run_network_node_with_signals(
     disable_auto_update: bool,
 ) -> anyhow::Result<()> {
     use commands::auto_update::{
-        UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION, UpdateCheckResult,
-        UpdateNeededError, check_if_update_available, claim_update_attempt,
+        HandshakeFailureTrigger, UPDATE_REPOLL_INTERVAL, UPDATE_REPOLL_JITTER_FRACTION,
+        UpdateCheckResult, UpdateNeededError, check_if_update_available, claim_update_attempt,
         claim_update_attempt_after_staging, clear_version_mismatch, get_open_connection_count,
         has_reached_max_backoff, has_version_mismatch, jittered_repoll_interval,
         repoll_deadline_while_cooling, reset_backoff, should_attempt_update, startup_update_check,
         update_attempt_claimable, version_mismatch_generation,
     };
     use commands::update::stage_latest_release;
-    use freenet::transport::{clear_urgent_update, get_highest_seen_version, is_urgent_update};
+    use freenet::transport::{
+        clear_urgent_update, get_bootstrap_rounds_without_connection, get_highest_seen_version,
+        is_urgent_update,
+    };
     use tokio::signal;
 
     // #4549: this is the real node process (not a test / embedded use), so enable the
@@ -773,6 +776,9 @@ async fn run_network_node_with_signals(
         // First periodic re-poll is one (jittered) interval out; the boot-time
         // startup_update_check above already covered "right now".
         let mut next_repoll = Instant::now() + repoll_delay();
+        // Update check when the node cannot join (#5940 prerequisite). It only
+        // adds a check; the boot check and the re-poll above are untouched.
+        let mut handshake_trigger = HandshakeFailureTrigger::default();
         let our_version = parse_our_version();
         // #5799: while a newer release cools down after failed attempts,
         // nothing asks GitHub or claims a retry; the signals are kept and act
@@ -1065,6 +1071,60 @@ async fn run_network_node_with_signals(
                 }
             } else {
                 isolated_mismatch_since = None;
+            }
+
+            // --- Priority 3b: Check on handshake failure ---
+            //
+            // A node with no connection whose last few bootstrap rounds, each
+            // sent to every known gateway, all failed asks GitHub now instead
+            // of waiting for the next re-poll (up to 7.5 h away): the network
+            // may have moved past this version. Same claim, blocked-version
+            // gate and staging as the re-poll; at most one check an hour. Not
+            // run while a release cools down, and then it does not use up the
+            // hour.
+            if !cooling()
+                && handshake_trigger.should_check(
+                    Instant::now(),
+                    get_open_connection_count(),
+                    get_bootstrap_rounds_without_connection(),
+                )
+            {
+                tracing::info!(
+                    rounds = get_bootstrap_rounds_without_connection(),
+                    checks_started = commands::auto_update::handshake_failure_checks_started(),
+                    "No connection after repeated gateway handshake failures: \
+                     checking GitHub for a newer release"
+                );
+                if let Ok(attempt) = claim_update_attempt() {
+                    if let Some(new_version) =
+                        startup_update_check(attempt, build_info::VERSION).await
+                    {
+                        if commands::rollback::is_version_pinned_bad(&new_version)
+                            || commands::rollback::is_version_install_gated(&new_version)
+                        {
+                            tracing::warn!(
+                                new_version = %new_version,
+                                "Handshake-failure check: newer version is locally blocked \
+                                 (crash-loop known-bad pin or repeated install failures); not \
+                                 triggering auto-update"
+                            );
+                        } else {
+                            tracing::info!(
+                                new_version = %new_version,
+                                "Handshake-failure check: newer version on GitHub, triggering \
+                                 auto-update"
+                            );
+                            if stage_latest_release(build_info::VERSION, Some(&new_version))
+                                .await
+                                .should_exit()
+                            {
+                                #[allow(clippy::let_underscore_must_use)]
+                                let _ = update_tx.send(new_version);
+                                return;
+                            }
+                        }
+                    }
+                }
             }
 
             // --- Priority 4: Periodic direct GitHub re-poll (#4073) ---
@@ -3662,8 +3722,8 @@ mod tests {
             );
         }
         assert_eq!(
-            sends, 7,
-            "expected the 7 update trigger sites in freenet.rs"
+            sends, 8,
+            "expected the 8 update trigger sites in freenet.rs"
         );
         // Stale staged releases are cleared once auto-update is known to be on,
         // before the startup check can stage a new one. Bounded to the

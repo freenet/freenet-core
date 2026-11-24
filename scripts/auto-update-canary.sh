@@ -138,7 +138,7 @@ MARKER_STAGE_FAILED='Could not download the update in advance'
 # auto_update.rs -- GithubRateLimitedError's Display, inside a staging failure.
 MARKER_RATE_LIMITED='GitHub rate-limited this IP'
 # freenet.rs -- detection succeeded and an update was requested. There are
-# FIVE such sites and one REFUSAL that shares the phrase:
+# SIX such sites and one REFUSAL that shares the phrase:
 # Cited by PHRASE, never by line number. The six that were here were all low
 # by 12 within one release, and this file's own rules already say a line number
 # in a note about stale pins rots faster than the thing it describes. The
@@ -148,6 +148,7 @@ MARKER_RATE_LIMITED='GitHub rate-limited this IP'
 #   "Update confirmed on GitHub after stagger, triggering auto-update"
 #   "Newer version confirmed on GitHub, triggering auto-update"
 #   "Periodic re-poll: newer version on GitHub, triggering auto-update"
+#   "Handshake-failure check: newer version on GitHub, triggering auto-update"
 #   "...repeated install failures); not triggering auto-update (#4073)"  <- the refusal
 # Matching the bare substring counts the refusal as a trigger; anchoring on any
 # ONE site's full phrase misses the others, reporting "did not decide to
