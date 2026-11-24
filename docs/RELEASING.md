@@ -106,7 +106,7 @@ published.
 | `MATRIX_ACCESS_TOKEN` | release-announce.yml | Matrix job warns + skips. |
 | `RELEASE_AGENT_HMAC_NOVA` | gateway-update.yml, release-announce.yml | nova update + River announce fail (HTTP 401). |
 | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | cross-compile.yml `build-x86_64-windows` (Authenticode signing) | **Does NOT degrade gracefully — this one fails the release.** See "Windows code signing" below. |
-| `FREENET_RELEASE_SIGNING_KEY` | cross-compile.yml (`Sign SHA256SUMS.txt`) | **Fails the release** in `attach-to-release`, while it is still a draft. It used to publish an UNSIGNED release with only a warning; clients accept one (`REQUIRE_RELEASE_SIGNATURE = false`) but verify nothing, and docker-publish.yml then fails after publication because it requires a verified signature. PEM-encoded ed25519 private key whose public half is baked into the updater (`update.rs` `FREENET_RELEASE_PUBKEY`). |
+| `FREENET_RELEASE_SIGNING_KEY` | cross-compile.yml (`Sign SHA256SUMS.txt`) | **Fails the release** in `attach-to-release`, while it is still a draft. It used to publish an UNSIGNED release with only a warning; clients accept one (`REQUIRE_RELEASE_SIGNATURE = false`) but verify nothing, and docker-publish.yml then fails after publication because it requires a verified signature. PEM-encoded ed25519 private key. Its public half has three copies that must all change on rotation: `update.rs` `FREENET_RELEASE_PUBKEY` (the node's updater), `docker/freenet-node/release-signing-key.der` (image builds), and `RELEASE_PUBKEY_HEX` in `scripts/gateway-auto-update.sh` (gateway rollouts, which refuse an unsigned or mis-signed release outright). Tests fail if they drift. |
 
 To validate `FREENET_RELEASE_SIGNING_KEY` without cutting a release, run the
 `Build and Cross-Compile` workflow via `workflow_dispatch`: its
@@ -1143,9 +1143,14 @@ Recovery:
    --since "10 min ago"'`
 2. If the agent is fine but the service is down, restart it directly:
    `ssh ian@<host> 'sudo systemctl restart freenet-gateway'` (then confirm
-   `systemctl is-active freenet-gateway`). If the script itself failed, the
-   manual fix is `ssh ian@<host> 'sudo /usr/local/bin/gateway-auto-update.sh
-   --force'`.
+   `systemctl is-active freenet-gateway`). If the script itself failed, check
+   `sudo grep -E 'Release verification|Refusing to downgrade' /var/log/freenet-auto-update.log`
+   first: a "Release verification FAILED" line means the download did not
+   match the release's signed `SHA256SUMS.txt` (or the signature or manifest
+   was missing), and the gateway deliberately stayed on its old binary. Gateway
+   rollouts require a signed release; do not work around this, find out why
+   the release's signature or checksums are wrong. Otherwise the manual fix is
+   `ssh ian@<host> 'sudo /usr/local/bin/gateway-auto-update.sh --force'`.
 3. Re-run the gateway-update workflow against just the failed gateway:
    `gh workflow run gateway-update.yml --field version=X.Y.Z --field
    gateways=nova`.
@@ -1228,8 +1233,11 @@ fix-forward release.
 
 For a serious regression that needs immediate rollback, the operator path
 is `ssh ian@<host> 'sudo gateway-auto-update.sh --force --target-version
-vX.Y.Z'` against the previous good version — the script accepts a downgrade
-when invoked directly, the agent doesn't.
+vX.Y.Z --allow-downgrade'` against the previous good version. The script
+refuses any downgrade without `--allow-downgrade` (even with `--force`, which
+only permits reinstalling the same version), and refuses that flag when sudo
+reports the caller as the release-agent account; the agent itself answers 403
+to a downgrade. The rolled-back release is still signature-checked.
 
 ## Skip mechanisms
 

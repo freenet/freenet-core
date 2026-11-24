@@ -17,6 +17,8 @@
 #   ./gateway-auto-update.sh --force      # Force update even if same version
 #   ./gateway-auto-update.sh --check      # Just check, don't update
 #   ./gateway-auto-update.sh --dry-run    # Show what would be done
+#   sudo ./gateway-auto-update.sh --force --target-version vX.Y.Z --allow-downgrade
+#                                         # Roll back to an older release (operator only)
 
 set -euo pipefail
 
@@ -29,7 +31,9 @@ GITHUB_REPO="${GITHUB_REPO:-freenet/freenet-core}"
 # fixed path under /tmp would let any local user pre-create it and swap the
 # archive between verification and extraction, which would make the
 # signature check below worthless. sudo strips the environment, so the
-# release-agent's invocation always gets the private directory.
+# release-agent's invocation always gets the private directory. An override
+# is honoured only if it is an existing directory, not a symlink, owned by the
+# user running this script and mode 0700 (see prepare_download_dir).
 DOWNLOAD_DIR="${DOWNLOAD_DIR:-}"
 LOG_FILE="${LOG_FILE:-/var/log/freenet-auto-update.log}"
 # Ed25519 public key that signs every release's SHA256SUMS.txt, as 64 hex
@@ -81,6 +85,15 @@ ALL_INSTANCES=false
 # actually installed, even if a newer release is published between the
 # agent's GitHub check and this script's own fetch.
 TARGET_VERSION=""
+# Installing a release OLDER than the one installed is refused unless the
+# operator passes --allow-downgrade. Argv only, never the environment. The
+# release-agent's sudoers entry ends in a `*` wildcard that can match extra
+# arguments, so the flag is also refused when sudo reports the caller as the
+# agent's account (SUDO_USER is set by sudo itself from the invoking user and
+# cannot be supplied by the caller). The agent never downgrades: it answers
+# 403 to a version below the installed one.
+ALLOW_DOWNGRADE=false
+RELEASE_AGENT_USER="freenet-update"
 
 # Colors (disabled if not a terminal)
 if [[ -t 1 ]]; then
@@ -137,6 +150,9 @@ Options:
                           a newer release lands between sign and install.
                           Must be strict semver; whitespace and shell metachars
                           rejected (paired with sudoers wildcard for the agent).
+  --allow-downgrade       Permit installing a release older than the installed
+                          one (a rollback). Operator use only: refused when
+                          invoked through sudo by the release-agent account.
   --verbose, -v           Show verbose output
   --help, -h              Show this help message
 
@@ -221,6 +237,10 @@ while [[ $# -gt 0 ]]; do
             fi
             shift 2
             ;;
+        --allow-downgrade)
+            ALLOW_DOWNGRADE=true
+            shift
+            ;;
         --verbose|-v)
             VERBOSE=true
             shift
@@ -258,6 +278,31 @@ check_dependencies() {
         log ERROR "Install with: sudo apt install ${missing[*]}"
         exit 1
     fi
+
+    # Release verification needs these; fail before any download rather than
+    # after. verify_release_download checks again, since it is also callable
+    # on its own.
+    if ! check_verification_tools; then
+        exit 1
+    fi
+}
+
+# OpenSSL >= 3.0 (raw ed25519 `pkeyutl -rawin`) and sha256sum.
+check_verification_tools() {
+    if ! command -v openssl &> /dev/null; then
+        log ERROR "Release verification: openssl not found (need OpenSSL >= 3.0); install it with: sudo apt install openssl"
+        return 1
+    fi
+    local ossl_name ossl_ver
+    read -r ossl_name ossl_ver _ <<< "$(openssl version 2>/dev/null)"
+    if [[ "$ossl_name" != "OpenSSL" ]] || [[ ! "$ossl_ver" =~ ^([0-9]+)\. ]] || (( BASH_REMATCH[1] < 3 )); then
+        log ERROR "Release verification: need OpenSSL >= 3.0 for raw ed25519 verification, found '${ossl_name:-?} ${ossl_ver:-?}'"
+        return 1
+    fi
+    if ! command -v sha256sum &> /dev/null; then
+        log ERROR "Release verification: sha256sum not found"
+        return 1
+    fi
 }
 
 # Get current installed version
@@ -292,7 +337,7 @@ get_latest_version() {
             auth_header=(-H "Authorization: token $GITHUB_TOKEN")
         fi
 
-        version=$(curl -s "${auth_header[@]}" "$api_url" | jq -r '.tag_name // empty' 2>/dev/null || echo "")
+        version=$(curl -s ${auth_header[@]+"${auth_header[@]}"} "$api_url" | jq -r '.tag_name // empty' 2>/dev/null || echo "")
     fi
 
     # Strip 'v' prefix if present
@@ -359,7 +404,12 @@ download_release() {
 
     # Download with progress. --fail: a 404 must be an error, not an HTML body
     # saved under the archive's name.
-    if ! curl --fail -L --progress-bar -o "$archive_path" "$download_url"; then
+    # HTTPS only, including across GitHub's redirect to its asset host, and
+    # bounded in size and time so a hostile or broken server cannot fill the
+    # disk or hang the update.
+    if ! curl --fail -L --proto =https --proto-redir =https \
+            --max-filesize 209715200 --max-time 900 \
+            --progress-bar -o "$archive_path" "$download_url"; then
         log ERROR "Failed to download release"
         return 1
     fi
@@ -374,7 +424,9 @@ download_release() {
     local release_base="https://github.com/$GITHUB_REPO/releases/download/v${version}"
     local f
     for f in SHA256SUMS.txt SHA256SUMS.txt.sig; do
-        if ! curl --fail -sSL -o "$DOWNLOAD_DIR/$f" "$release_base/$f"; then
+        if ! curl --fail -sSL --proto =https --proto-redir =https \
+                --max-filesize 1048576 --max-time 120 \
+                -o "$DOWNLOAD_DIR/$f" "$release_base/$f"; then
             log ERROR "Release verification FAILED: could not download $f from release v$version; refusing to install"
             return 1
         fi
@@ -402,12 +454,18 @@ download_release() {
 
     chmod +x "$binary_path"
 
-    # Verify extracted binary
+    # The archive must contain the release it was requested as. Asset names in
+    # SHA256SUMS.txt carry no version, so an older release's archive, manifest
+    # and signature all verify if re-uploaded under a newer tag. This is what
+    # stops that replay, so a mismatch is fatal, before anything is installed.
+    # (Running --version executes the binary, but only one whose hash the
+    # signed manifest vouched for.)
     local extracted_version
-    extracted_version=$("$binary_path" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+    extracted_version=$("$binary_path" --version 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?' | head -1 || echo "")
 
-    if [[ "$extracted_version" != "$version" ]]; then
-        log WARN "Version mismatch: expected $version, got $extracted_version"
+    if [[ "$extracted_version" != "${version%%+*}" ]]; then
+        log ERROR "Release verification FAILED: release v$version contains a binary reporting version '${extracted_version:-unknown}'; refusing to install. The running gateway is unchanged."
+        return 1
     fi
 
     log INFO "Downloaded and verified v$version"
@@ -444,20 +502,7 @@ verify_release_download() {
     local dir="$1" asset="$2"
     local sums="$dir/SHA256SUMS.txt" sig="$dir/SHA256SUMS.txt.sig" archive="$dir/$asset"
 
-    if ! command -v openssl &> /dev/null; then
-        log ERROR "Release verification: openssl not found (need OpenSSL >= 3.0); install it with: sudo apt install openssl"
-        return 1
-    fi
-    local ossl_name ossl_ver
-    read -r ossl_name ossl_ver _ <<< "$(openssl version 2>/dev/null)"
-    if [[ "$ossl_name" != "OpenSSL" ]] || [[ ! "$ossl_ver" =~ ^([0-9]+)\. ]] || (( BASH_REMATCH[1] < 3 )); then
-        log ERROR "Release verification: need OpenSSL >= 3.0 for raw ed25519 verification, found '${ossl_name:-?} ${ossl_ver:-?}'"
-        return 1
-    fi
-    if ! command -v sha256sum &> /dev/null; then
-        log ERROR "Release verification: sha256sum not found"
-        return 1
-    fi
+    check_verification_tools || return 1
 
     if [[ ! -s "$sums" ]]; then
         log ERROR "Release verification: SHA256SUMS.txt is missing or empty"
@@ -474,10 +519,20 @@ verify_release_download() {
         return 1
     fi
 
-    local pub="$dir/.release-pubkey.der"
-    write_release_pubkey_der "$pub" || return 1
-    if ! openssl pkeyutl -verify -pubin -keyform DER -inkey "$pub" -rawin \
+    # The trusted key goes in its own private directory, never next to the
+    # downloaded files.
+    local keydir sig_ok=false
+    if ! keydir=$(mktemp -d); then
+        log ERROR "Release verification: could not create a directory for the release key"
+        return 1
+    fi
+    if write_release_pubkey_der "$keydir/release-pubkey.der" \
+        && openssl pkeyutl -verify -pubin -keyform DER -inkey "$keydir/release-pubkey.der" -rawin \
             -in "$sums" -sigfile "$sig" > /dev/null 2>&1; then
+        sig_ok=true
+    fi
+    rm -rf "$keydir"
+    if [[ "$sig_ok" != true ]]; then
         log ERROR "Release verification: SHA256SUMS.txt signature is INVALID for release key $RELEASE_PUBKEY_HEX"
         return 1
     fi
@@ -649,6 +704,23 @@ verify_service_active() {
     return 1
 }
 
+# Use DOWNLOAD_DIR if the caller set a safe one, else create a private one.
+# Sets DOWNLOAD_DIR. Returns non-zero (with a log line) on an unsafe override.
+prepare_download_dir() {
+    if [[ -z "$DOWNLOAD_DIR" ]]; then
+        if ! DOWNLOAD_DIR=$(mktemp -d /tmp/freenet-update.XXXXXX); then
+            log ERROR "Could not create a private download directory"
+            return 1
+        fi
+        return 0
+    fi
+    if [[ -L "$DOWNLOAD_DIR" || ! -d "$DOWNLOAD_DIR" ]] \
+        || [[ "$(stat -c '%u %a' "$DOWNLOAD_DIR" 2>/dev/null)" != "$EUID 700" ]]; then
+        log ERROR "DOWNLOAD_DIR=$DOWNLOAD_DIR must be an existing directory (not a symlink) owned by uid $EUID with mode 0700; refusing to download into it"
+        return 1
+    fi
+}
+
 # Cleanup temporary files
 cleanup() {
     if [[ -d "$DOWNLOAD_DIR" ]]; then
@@ -686,6 +758,11 @@ schedule_companion_restart() {
 main() {
     log INFO "Freenet Gateway Auto-Update starting..."
 
+    if [[ "$ALLOW_DOWNGRADE" == "true" && "${SUDO_USER:-}" == "$RELEASE_AGENT_USER" ]]; then
+        log ERROR "--allow-downgrade is for operators; refusing it from the release-agent account ($RELEASE_AGENT_USER)"
+        exit 1
+    fi
+
     check_dependencies
 
     # Get versions
@@ -720,6 +797,18 @@ main() {
         log WARN "Current version ($current_version) is newer than latest release ($latest_version)"
     fi
 
+    # Never move the gateway BACKWARDS without an operator saying so: --force
+    # means "reinstall even if the version matches", not "accept an older
+    # release". A signed older release is still a valid signature, so this is
+    # the check that stops a replayed old release from being installed.
+    if [[ "$needs_update" == "true" ]] && version_gt "$current_version" "$latest_version"; then
+        if [[ "$ALLOW_DOWNGRADE" != "true" ]]; then
+            log ERROR "Refusing to downgrade from v$current_version to v$latest_version; an operator can roll back with --allow-downgrade. The running gateway is unchanged."
+            exit 1
+        fi
+        log WARN "Downgrading from v$current_version to v$latest_version (--allow-downgrade)"
+    fi
+
     # Check-only mode
     if [[ "$CHECK_ONLY" == "true" ]]; then
         if [[ "$needs_update" == "true" ]]; then
@@ -733,12 +822,7 @@ main() {
 
     # Perform update if needed
     if [[ "$needs_update" == "true" ]]; then
-        if [[ -z "$DOWNLOAD_DIR" ]]; then
-            if ! DOWNLOAD_DIR=$(mktemp -d /tmp/freenet-update.XXXXXX); then
-                log ERROR "Could not create a private download directory"
-                exit 1
-            fi
-        fi
+        prepare_download_dir || exit 1
         trap cleanup EXIT
 
         local binary_path

@@ -64,8 +64,21 @@ if [[ ! -f /etc/freenet-release-agent/hmac.key ]]; then
     echo
 fi
 
-echo "==> Verifying gateway-auto-update.sh privilege boundary"
+echo "==> Installing gateway-auto-update.sh"
+# Always from this checkout, so re-running install.sh after a merge is how the
+# gateway picks up the current script (it verifies each release's signed
+# checksums before installing; an older copy does not). It resolves
+# deploy-local-gateway.sh next to itself: install or refresh that one with
+# scripts/install-auto-update.sh.
 GATEWAY_UPDATE_SCRIPT=/usr/local/bin/gateway-auto-update.sh
+install -m 0755 -o root -g root \
+    "$SCRIPT_DIR/../gateway-auto-update.sh" \
+    "$GATEWAY_UPDATE_SCRIPT"
+if ! openssl version 2>/dev/null | grep -qE '^OpenSSL ([3-9]|[1-9][0-9])\.'; then
+    echo "WARNING: OpenSSL >= 3.0 not found; gateway-auto-update.sh will refuse every update until it is installed." >&2
+fi
+
+echo "==> Verifying gateway-auto-update.sh privilege boundary"
 if [[ -e "$GATEWAY_UPDATE_SCRIPT" ]]; then
     script_owner=$(stat -c '%U' "$GATEWAY_UPDATE_SCRIPT")
     script_perms=$(stat -c '%a' "$GATEWAY_UPDATE_SCRIPT")

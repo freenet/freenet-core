@@ -98,16 +98,24 @@ the Matrix secrets are absent — useful while bootstrapping.
 
 ## Prerequisites per gateway
 
-1. **`gateway-auto-update.sh` installed at `/usr/local/bin/`** (or wherever
-   the existing release flow puts it), owned by root, perms ≤ 755.
-   `install.sh` aborts otherwise.
-2. **Caddy** (or another TLS terminator) already running and serving
+1. **`gateway-auto-update.sh` installed at `/usr/local/bin/`**, owned by
+   root, perms ≤ 755. `install.sh` installs it from the checkout it runs
+   from, and aborts if the result is not root-owned. **Nothing updates it
+   automatically**: after a change to `scripts/gateway-auto-update.sh` merges,
+   re-install it by hand from an up-to-date `main` checkout, on each gateway:
+   `sudo install -m 0755 -o root -g root scripts/gateway-auto-update.sh
+   /usr/local/bin/` (or re-run `install.sh`). The same applies to
+   `deploy-local-gateway.sh`, which it calls from the same directory.
+2. **OpenSSL >= 3.0** (`openssl version`). `gateway-auto-update.sh` verifies
+   each release's signed `SHA256SUMS.txt` with `openssl pkeyutl -rawin`, and
+   refuses every update, before downloading, if OpenSSL is missing or older.
+3. **Caddy** (or another TLS terminator) already running and serving
    `*.locut.us`. Caddyfile snippet in
    [`scripts/release-agent/Caddyfile.snippet`](../scripts/release-agent/Caddyfile.snippet).
-3. **DNS A record** for `update.<host>.locut.us` pointing at the
+4. **DNS A record** for `update.<host>.locut.us` pointing at the
    gateway's public IP. Create this before `install.sh` runs so Caddy can
    acquire the cert.
-4. **Inbound TCP/443 reachable** from GitHub Actions runners. See [Firewall
+5. **Inbound TCP/443 reachable** from GitHub Actions runners. See [Firewall
    notes per host](#firewall-notes-per-host) below.
 
 ## Install procedure
