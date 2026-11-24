@@ -23,6 +23,7 @@
 //!   `#[cfg(test)]` test module
 
 mod quota;
+pub(crate) mod read_failures;
 mod store;
 // `pub(crate)` for `sweep::create_owner_only`, which is the project's one correct way
 // to create a secret file (owner-only at creation, not chmod-ed afterwards). The
