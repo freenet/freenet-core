@@ -8,11 +8,6 @@ on:
         required: false
         type: string
         default: ''
-      skip_tests:
-        description: 'Skip running tests before release'
-        required: false
-        type: boolean
-        default: false
       ship_sha:
         description: 'Full 40-character SHA of the commit on main to release (the soaked commit). Required for a live run; a dry run defaults to the dispatch commit.'
         required: false
@@ -376,18 +371,32 @@ jobs:
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "bump_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # Forced: the branch carries only this release's bump commit and nothing
-      # else depends on it. A previous attempt at the same version (a re-cut
-      # after deleting its tag, or a re-run of this job) leaves the branch at
-      # an older B, which must be replaced. The validate pre-flight has already
-      # refused a version whose tag exists, and a concurrent release run.
+      # A previous attempt at the same version (a re-cut after deleting its
+      # tag, or a re-run of this job) leaves release/vX at an older B, which
+      # must be replaced. The branch is DELETED and pushed fresh rather than
+      # force-pushed: a re-cut on the same ship commit makes a B with the same
+      # TREE as the old tip, a force-push of it changes no file, and ci.yml's
+      # push `paths-ignore` filter would have nothing to match, so whether its
+      # gate runs at all would rest on undocumented empty-diff behaviour. A new
+      # branch is diffed against its parent (ship_sha), which always changes a
+      # Cargo manifest. The branch carries only this release's bump commit;
+      # validate's pre-flight has already refused a version whose tag exists,
+      # an unfinished other release, and a concurrent release run.
       - name: Push the release branch
         if: needs.validate.outputs.live == 'true'
         env:
           RELEASE_BRANCH: ${{ steps.bump.outputs.branch }}
         run: |
           [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not pushing the release branch: this run is not live (#5936)."; exit 1; }
-          git push --force origin "$RELEASE_BRANCH"
+          rc=0
+          git ls-remote --exit-code --heads origin "refs/heads/$RELEASE_BRANCH" > /dev/null || rc=$?
+          case "$rc" in
+            0) echo "Replacing the existing $RELEASE_BRANCH (a re-cut or a re-run)."
+               git push origin --delete "$RELEASE_BRANCH" ;;
+            2) ;;
+            *) echo "::error::Could not ask origin whether $RELEASE_BRANCH exists (git ls-remote exit $rc)."; exit 1 ;;
+          esac
+          git push origin "$RELEASE_BRANCH"
 
       # The dry-run counterpart of the push: say what a live run would do, then
       # hand the unpushed commit to `dry_run_rehearsal`.
@@ -531,10 +540,13 @@ jobs:
   wait_for_ci:
     name: Wait for CI on the release commit
     runs-on: ubuntu-latest
-    # The waiter's own budget is 75 min (MAX_WAIT): the full suite in parallel
-    # (Unit & Integration, Simulation, NAT Validation, Windows/macOS units,
-    # ~15-40 min on busy runners) plus scheduling.
-    timeout-minutes: 80
+    # The waiter's own wall-clock budget is 75 min (MAX_WAIT): the full suite
+    # in parallel (Unit & Integration, Simulation, NAT Validation,
+    # Windows/macOS units, ~15-40 min on busy runners) plus scheduling. The job
+    # limit is 15 min above it, so the waiter's own diagnosis (which run, which
+    # jobs) is what fails the job, not a bare cancellation. Pinned by
+    # scripts/wait_for_release_ci_test.sh.
+    timeout-minutes: 90
     needs: [validate, update_versions]
     # Live only: a dry run pushes nothing, so there is no CI to wait for. The
     # dry-run counterpart of this job and the two after it is

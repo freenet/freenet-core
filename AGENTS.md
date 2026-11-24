@@ -277,9 +277,9 @@ soak of the exact SHA, and a telemetry baseline. Do not dispatch
 afterwards from `release-sync.yml`'s `build: sync main to X after release`
 PR, when the release is published. A blocked cut (tag and draft deleted) is
 re-cut by dispatching again with the same version and the corrected
-`ship_sha`. A `dry_run=true` dispatch is safe only from a ref that
-contains #5939; from an older ref it still pushes, opens and auto-merges
-the version-bump PR (#5936).
+`ship_sha`. A `dry_run=true` dispatch pushes nothing from any ref carrying
+this flow; never point `--ref` at a ref from before #5939, where a "dry run"
+still pushes, opens and auto-merges a version-bump PR (#5936).
 [`docs/RELEASING.md`](docs/RELEASING.md) describes how the pipeline works
 once triggered. The `RELEASE_PAT` section above is the prerequisite for the
 cascade to fire automatically.

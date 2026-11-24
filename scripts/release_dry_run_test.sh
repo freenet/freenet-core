@@ -413,7 +413,8 @@ done
 # The commands a live release actually issues, and WHICH value feeds each:
 # every `${{ expr }}` is extracted as `@@expr@@`, so tagging the fdev version
 # or pushing a branch built from the wrong output fails here.
-for call in "git push --force origin @@steps.bump.outputs.branch@@" \
+for call in "git push origin --delete @@steps.bump.outputs.branch@@" \
+            "git push origin @@steps.bump.outputs.branch@@" \
             "git push origin v@@needs.validate.outputs.version@@" \
             "gh release create v@@needs.validate.outputs.version@@ --title v@@needs.validate.outputs.version@@ --notes-file @@steps.release_notes.outputs.notes_file@@ --draft"; do
     check "live issues '$call'" "$(grep -cxF "$call" <<< "$LIVE_CALLS")" "1"

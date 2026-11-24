@@ -82,7 +82,7 @@ after deleting the tag and the draft as above:
    cut).
 3. Dispatch `release.yml` with the SAME `version` and the fixed commit as
    `ship_sha`. The pre-flight accepts it (no tag, not on crates.io, above the
-   latest published release), `update_versions` force-pushes
+   latest published release), `update_versions` replaces
    `release/vX.Y.Z` with the new release commit, and the full suite runs on it
    as for any cut.
 
@@ -137,12 +137,53 @@ Nothing has been tagged and `main` is untouched, so this is cheap.
    failed", lists the cases).
 2. A real test failure means the ship commit is not releasable. Fix it on
    `main` through a normal PR, soak the new commit, and dispatch again with
-   the new `ship_sha` (same version is fine; the branch is force-pushed).
-3. A failure that is not the commit's (a runner outage): re-run the failed
-   jobs of the ci.yml run on `release/vX.Y.Z`, then
-   `gh run rerun --failed <RELEASE_RUN_ID>` to re-run `wait_for_ci`.
+   the new `ship_sha` (same version is fine; the branch is replaced).
+3. A red job that is not the commit's fault (a runner outage, a flake you
+   have diagnosed and filed): `wait_for_ci` has already failed, because it
+   stops at the first non-success conclusion. Re-run the failed jobs of the
+   ci.yml run on `release/vX.Y.Z`, wait for that run to conclude success,
+   then re-run `wait_for_ci`, which reads the newest run on B and its jobs
+   again:
+   ```bash
+   gh run list --repo freenet/freenet-core --workflow ci.yml --branch release/vX.Y.Z --limit 1
+   gh run rerun --failed <CI_RUN_ID> --repo freenet/freenet-core
+   gh run watch <CI_RUN_ID> --repo freenet/freenet-core
+   gh run rerun --failed <RELEASE_RUN_ID> --repo freenet/freenet-core
+   ```
+   Flaky tests are broken tests: do not use this to wave a real failure
+   through.
 4. Do not push anything else to `release/vX.Y.Z` by hand. `wait_for_ci`
    refuses a branch tip that is not exactly ship_sha plus version files.
+
+A same-version re-cut on the SAME `ship_sha` (say, after an infrastructure
+failure past the tag) makes a release commit with the same tree as the old
+branch tip. `update_versions` deletes the old `release/vX.Y.Z` and pushes it
+fresh, so the push is a new branch diffed against `ship_sha` and ci.yml's
+`paths-ignore` filter always sees a changed Cargo manifest. Do not replace
+the branch by force-pushing it by hand: a force-push with an identical tree
+changes no file, and whether GitHub then runs ci.yml at all is not something
+this flow relies on. If no CI run appears, `wait_for_ci` fails after 15
+minutes saying so; delete the branch and re-dispatch.
+
+### Cleaning up release branches
+
+`release/vX.Y.Z` branches are not deleted automatically: the branch is the
+only ref besides the tag that points at the release commit, and it is
+harmless once the release is published. Two cases need action:
+
+- **An abandoned cut** (you decided to cut the next version instead): its
+  branch, and its tag and draft if they exist, block every later live
+  dispatch (the pre-flight's "Another release is unfinished"). Delete them:
+  ```bash
+  gh release delete vX.Y.Z --repo freenet/freenet-core --yes   # only if a draft exists
+  git push --delete origin vX.Y.Z                              # only if the tag exists
+  git push --delete origin release/vX.Y.Z
+  ```
+  Check crates.io first (top of this file): a version already on crates.io
+  is spent, and its tag and draft stay.
+- **Old published releases**: optional housekeeping. Delete
+  `release/vX.Y.Z` for any published X.Y.Z if the branch list gets long;
+  the tag keeps the commit.
 
 A legacy `build: release X.Y.Z` PR (from `scripts/release.sh`) left open
 blocks every later live `release.yml` dispatch; merge or close it first.

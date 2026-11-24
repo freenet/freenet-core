@@ -26,7 +26,7 @@ DRY_RUN_INPUT="${DRY_RUN_INPUT-}"
 
 if [ "$DRY_RUN_INPUT" = "false" ]; then
     echo "live=true" >> "$OUTPUT_FILE"
-    echo "🚀 LIVE release: this run pushes the bump branch, merges the bump PR, tags and creates the draft release."
+    echo "🚀 LIVE release: this run pushes the release branch (ship_sha plus the version bump), waits for its CI, tags it and creates the draft release."
     exit 0
 fi
 

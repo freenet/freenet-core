@@ -16,16 +16,26 @@
 #      first parent otherwise (the tag sits on a `release/v*` bump commit whose
 #      parent is the previous ship_sha). Without this, a release could silently
 #      drop a fix the previous one shipped.
-#   4. The fdev version: max(fdev in ship_sha, fdev in the latest published
-#      tag) + 1 patch. main's fdev version lags a release until the merge-back
-#      PR (release-sync.yml) lands, so ship_sha alone could reuse a published
-#      fdev version.
+#   4. ship_sha's tree carries the exact-SHA release flow: release-sync.yml
+#      exists and ci.yml's push trigger admits `release/v*`. The tag- and
+#      release-triggered workflows (cross-compile, release-announce,
+#      gateway-update, release-sync) run from the TAG's tree, which is
+#      ship_sha plus the bump, and without a ci.yml push trigger B gets no CI
+#      at all. An older ship_sha would release with the old cascade.
+#   5. The fdev version: one patch above the highest of fdev in ship_sha, fdev
+#      in the highest-version release TAG (drafts and unfinished cuts
+#      included, since their fdev may already be built), and fdev's newest
+#      version on crates.io. main's fdev lags a release until the merge-back
+#      (release-sync.yml), so ship_sha alone could reuse a published one.
 #
-# Checks 2 and 3 FAIL CLOSED in a live run: any lookup this script cannot read
-# refuses the run. In a dry run they only warn, so a dry run dispatched from a
-# feature branch (to rehearse a release.yml change) still runs to the end.
-# Check 1 and the reads behind check 4 fail in both modes: nothing after this
-# step can run without them.
+# "The latest release" is the highest-semver published, non-prerelease release
+# (scripts/release_lib.sh), never GitHub's movable /releases/latest marker.
+#
+# Checks 2, 3 and 4 FAIL CLOSED in a live run: any lookup this script cannot
+# read refuses the run. In a dry run they only warn, so a dry run dispatched
+# from a feature branch (to rehearse a release.yml change) still runs to the
+# end. Check 1 and the reads behind check 5 fail in both modes: nothing after
+# this step can run without them.
 #
 # Every lookup goes through the GitHub API (no fetch), so the job needs no
 # history and the tests can stub `gh`.
@@ -39,6 +49,8 @@
 set -euo pipefail
 
 REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
+# shellcheck source=scripts/release_lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/release_lib.sh"
 LAUNCH_SHA="${LAUNCH_SHA:?LAUNCH_SHA is required}"
 OUT="${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
 TMPDIR_OUT="${RUNNER_TEMP:?RUNNER_TEMP is required}"
@@ -87,10 +99,13 @@ case "$STATUS" in
 esac
 
 # --- 3. contains the previous release's ship commit --------------------------
-PREV_TAG=$(gh api "repos/$REPO/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+PREV_TAG=""
+if ROWS=$(rel_release_rows 2>/dev/null); then
+    PREV_TAG=$(rel_latest_published "$ROWS" || true)
+fi
 PREV_SHIP=""
-if [[ ! "$PREV_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    gate "Could not find the previous release" "The latest published release's tag is '$PREV_TAG', not vX.Y.Z, so the previous ship commit cannot be checked."
+if ! rel_is_semver_tag "$PREV_TAG"; then
+    gate "Could not find the previous release" "No published vX.Y.Z release could be read (got '$PREV_TAG'), so the previous ship commit cannot be checked."
     PREV_TAG=""
 else
     PREV_COMMIT=$(gh api "repos/$REPO/commits/$PREV_TAG" --jq '.sha' 2>/dev/null || true)
@@ -119,11 +134,23 @@ else
     fi
 fi
 
-# --- 4. versions read from ship_sha's tree ------------------------------------
 # read_file REF PATH: the raw file at REF, or exit 1.
 read_file() {
     gh api -H 'Accept: application/vnd.github.raw+json' "repos/$REPO/contents/$2?ref=$1"
 }
+
+# --- 4. ship_sha carries the exact-SHA release flow -----------------------------
+SHIP_CI="$TMPDIR_OUT/ship-ci.yml"
+if ! read_file "$SHIP" .github/workflows/release-sync.yml > /dev/null 2>&1; then
+    gate "ship_sha predates the exact-SHA release flow" "$SHIP has no .github/workflows/release-sync.yml (or it could not be read). The tag-triggered workflows run from the release commit's tree, so this release would ship without the merge-back. Ship a commit that contains it (docs/RELEASING.md, 'First release under this flow')."
+fi
+if ! read_file "$SHIP" .github/workflows/ci.yml > "$SHIP_CI" 2>/dev/null; then
+    gate "Could not read ship_sha's ci.yml" "Whether ci.yml at $SHIP runs on pushes to release/v* is unknown."
+elif ! awk '/^on:/ {on = 1; next} on && /^[^ #]/ {exit} on && /^  push:/ {p = 1; next} on && /^  [^ ]/ {p = 0} p && /^    branches:/ {print}' "$SHIP_CI" | grep -qF "'release/v*'"; then
+    gate "ship_sha's CI does not gate release branches" "ci.yml at $SHIP does not run on pushes to 'release/v*', so the release commit would get no CI and wait_for_ci would fail after its no-run timeout. Ship a commit that contains the exact-SHA flow."
+fi
+
+# --- 5. versions --------------------------------------------------------------
 package_version() {
     awk '/^\[package\]/ {p = 1; next} /^\[/ {p = 0}
          p && /^version *=/ {gsub(/.*= *"|".*/, ""); print; exit}' "$1"
@@ -141,21 +168,36 @@ if [[ ! "$FDEV_SHIP" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     echo "::error title=Could not read fdev's version::No [package] version in crates/fdev/Cargo.toml at $SHIP (got '$FDEV_SHIP')."
     exit 1
 fi
-FDEV_BASE="$FDEV_SHIP"
-if [ -n "$PREV_TAG" ]; then
+# fdev in the highest-version tag on origin: a draft or an unfinished cut has
+# already chosen its fdev version, which must not be chosen again.
+if ! TAGS=$(rel_remote_tags); then
+    echo "::error title=Could not list tags::The release tags on origin could not be listed, so the next fdev version cannot be chosen safely."
+    exit 1
+fi
+TOP_TAG=$(rel_max_version <<< "$TAGS")
+FDEV_TAG=""
+if [ -n "$TOP_TAG" ]; then
+    TOP_TAG="v$TOP_TAG"
     TAG_FDEV="$TMPDIR_OUT/tag-fdev-Cargo.toml"
-    FDEV_TAG=""
-    if read_file "$PREV_TAG" crates/fdev/Cargo.toml > "$TAG_FDEV"; then
+    if read_file "$TOP_TAG" crates/fdev/Cargo.toml > "$TAG_FDEV" 2>/dev/null; then
         FDEV_TAG=$(package_version "$TAG_FDEV")
     fi
     if [[ ! "$FDEV_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         # Not an ancestry check: an fdev version this cannot read could be one
         # already on crates.io, so refuse in both modes.
-        echo "::error title=Could not read $PREV_TAG's fdev version::crates/fdev/Cargo.toml at $PREV_TAG gave '$FDEV_TAG', so the next fdev version cannot be chosen safely."
+        echo "::error title=Could not read $TOP_TAG's fdev version::crates/fdev/Cargo.toml at $TOP_TAG gave '$FDEV_TAG', so the next fdev version cannot be chosen safely."
         exit 1
     fi
-    FDEV_BASE=$(printf '%s\n%s\n' "$FDEV_SHIP" "$FDEV_TAG" | sort -V | tail -1)
 fi
+# ...and fdev's newest version on crates.io. Three-state like the freenet
+# check in check_release_preflight.sh: an answer this cannot read refuses.
+FDEV_CRATES=$(curl -sS -A 'freenet-release-driver' --max-time 30 --retry 3 --retry-all-errors \
+    https://crates.io/api/v1/crates/fdev 2>/dev/null | jq -r '.crate.max_version // empty' 2>/dev/null || true)
+if [[ ! "$FDEV_CRATES" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "::error title=Could not read fdev's version on crates.io::crates.io gave '$FDEV_CRATES' for fdev's newest version, so the next fdev version cannot be chosen safely."
+    exit 1
+fi
+FDEV_BASE=$(printf '%s\n' "$FDEV_SHIP" "$FDEV_TAG" "$FDEV_CRATES" | rel_max_version)
 IFS=. read -r FM FN FP <<< "$FDEV_BASE"
 FDEV_VERSION="$FM.$FN.$((FP + 1))"
 
@@ -171,4 +213,4 @@ fi
     echo "prev_ship_sha=$PREV_SHIP"
     echo "ship_cargo_toml=$SHIP_CORE"
 } >> "$OUT"
-echo "✅ Ship commit $SHIP; fdev $FDEV_SHIP (ship) / ${FDEV_TAG:-none} (${PREV_TAG:-no tag}) -> $FDEV_VERSION"
+echo "✅ Ship commit $SHIP; fdev $FDEV_SHIP (ship) / ${FDEV_TAG:-none} (${TOP_TAG:-no tag}) / $FDEV_CRATES (crates.io) -> $FDEV_VERSION"

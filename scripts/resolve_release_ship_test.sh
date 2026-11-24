@@ -57,7 +57,9 @@ case "$path" in
         f="$STUB_DIR/cmp_${spec%%...*}_${spec#*...}"
         answer "$f"
         json="{\"status\":\"$(cat "$f")\"}" ;;
-    repos/freenet/freenet-core/releases/latest) answer "$STUB_DIR/latest"; json=$(cat "$STUB_DIR/latest") ;;
+    "repos/freenet/freenet-core/releases?per_page=100")
+        [[ " $* " == *" --paginate "* ]] || { echo "releases must be paginated" >&2; exit 98; }
+        answer "$STUB_DIR/releases"; json=$(cat "$STUB_DIR/releases") ;;
     repos/freenet/freenet-core/commits/*)
         f="$STUB_DIR/commit_${path##*/}"; answer "$f"; json=$(cat "$f") ;;
     repos/freenet/freenet-core/contents/*)
@@ -68,7 +70,23 @@ case "$path" in
 esac
 jq -rc "$jqarg" <<< "$json"
 EOF
-chmod +x "$STUBS/gh"
+cat > "$STUBS/git" <<'EOF'
+#!/usr/bin/env bash
+[ "$1 $2" = "ls-remote --tags" ] || { echo "unexpected git $*" >&2; exit 99; }
+[ "$(cat "$STUB_DIR/tags")" = FAIL ] && exit 128
+cat "$STUB_DIR/tags"
+EOF
+cat > "$STUBS/curl" <<'EOF'
+#!/usr/bin/env bash
+[ "$(cat "$STUB_DIR/crates_fdev")" = FAIL ] && exit 6
+[[ "$*" == *"https://crates.io/api/v1/crates/fdev"* && "$*" == *"-A "* ]] || { echo "unexpected curl $*" >&2; exit 99; }
+cat "$STUB_DIR/crates_fdev"
+EOF
+chmod +x "$STUBS/gh" "$STUBS/git" "$STUBS/curl"
+rel() { printf '{"tag_name":"%s","draft":%s,"prerelease":%s}' "$1" "$2" "$3"; }
+tagline() { printf '%s\trefs/tags/%s\n' "$TAGC" "$1"; }
+CI_PUSH=$'on:\n  push:\n    branches: [main, \'release/v*\']\n  pull_request:\n'
+CI_OLD=$'on:\n  push:\n    branches: [main]\n  pull_request:\n'
 
 manifest() { printf '[package]\nname = "%s"\nversion = "%s"\n\n[dependencies]\nversion = "9.9.9"\n' "$1" "$2"; }
 
@@ -80,7 +98,11 @@ run_case() {
     rm -rf "$dir" && mkdir -p "$dir/stub" "$dir/tmp"
     local S="$dir/stub"
     echo identical > "$S/cmp_${SHIP}_main"
-    echo '{"tag_name":"v0.2.163"}' > "$S/latest"
+    # v0.2.163 is the highest PUBLISHED release; GitHub's movable
+    # /releases/latest marker is never read.
+    echo "[$(rel v0.2.163 false false),$(rel v0.2.162 false false),$(rel v0.2.170 false true)]" > "$S/releases"
+    { tagline v0.2.162; tagline v0.2.163; } > "$S/tags"
+    echo '{"crate":{"max_version":"0.3.305"}}' > "$S/crates_fdev"
     echo "{\"sha\":\"$TAGC\",\"parents\":[{\"sha\":\"$PARENT\"}]}" > "$S/commit_v0.2.163"
     echo "{\"sha\":\"$TAGC\",\"parents\":[{\"sha\":\"$PARENT\"}]}" > "$S/commit_$TAGC"
     echo diverged > "$S/cmp_${TAGC}_main"     # the tag sits on a release/v* bump commit
@@ -89,6 +111,9 @@ run_case() {
     manifest freenet 0.2.163 > "$S/tree_$SHIP/crates/core/Cargo.toml"
     manifest fdev 0.3.300 > "$S/tree_$SHIP/crates/fdev/Cargo.toml"
     manifest fdev 0.3.305 > "$S/tree_v0.2.163/crates/fdev/Cargo.toml"
+    mkdir -p "$S/tree_$SHIP/.github/workflows"
+    echo "name: Release sync" > "$S/tree_$SHIP/.github/workflows/release-sync.yml"
+    printf '%s' "$CI_PUSH" > "$S/tree_$SHIP/.github/workflows/ci.yml"
     local kv
     for kv in "$@"; do
         case "$kv" in
@@ -117,7 +142,8 @@ run_case "fdev from the ship tree when it is the higher one" 0 \
 check "fdev = 0.3.310 + 1" "$(out fdev_version)" "0.3.311"
 run_case "fdev comparison is numeric (0.3.99 vs 0.3.100)" 0 \
     "tree_$SHIP/crates/fdev/Cargo.toml=$(manifest fdev 0.3.99)" \
-    "tree_v0.2.163/crates/fdev/Cargo.toml=$(manifest fdev 0.3.100)"
+    "tree_v0.2.163/crates/fdev/Cargo.toml=$(manifest fdev 0.3.100)" \
+    crates_fdev='{"crate":{"max_version":"0.3.98"}}'
 check "fdev = 0.3.100 + 1" "$(out fdev_version)" "0.3.101"
 run_case "a tag ON main (older PR flow) is itself the previous ship commit" 0 \
     "cmp_${TAGC}_main=ahead" "cmp_${TAGC}_${SHIP}=ahead"
@@ -128,7 +154,8 @@ check "no ship_sha: says it is required" "$(grep -c 'ship_sha is required' "$TES
 run_case "dry run without ship_sha defaults to the dispatch commit" 0 live=false input= \
     "cmp_${LAUNCH}_main=identical" "cmp_${PARENT}_${LAUNCH}=ahead" \
     "tree_$LAUNCH/crates/core/Cargo.toml=$(manifest freenet 0.2.163)" \
-    "tree_$LAUNCH/crates/fdev/Cargo.toml=$(manifest fdev 0.3.300)"
+    "tree_$LAUNCH/crates/fdev/Cargo.toml=$(manifest fdev 0.3.300)" \
+    "tree_$LAUNCH/.github/workflows/release-sync.yml=x" "tree_$LAUNCH/.github/workflows/ci.yml=$CI_PUSH"
 check "dry run default: ship_sha is the dispatch commit" "$(out ship_sha)" "$LAUNCH"
 run_case "a short SHA refuses" 1 input=aaaaaaa
 run_case "a branch name refuses" 1 input=main
@@ -145,8 +172,34 @@ run_case "ship_sha that drops the previous ship commit refuses" 1 "cmp_${PARENT}
 run_case "ship_sha BEHIND the previous ship commit refuses" 1 "cmp_${PARENT}_${SHIP}=behind"
 run_case "ship_sha identical to the previous ship commit passes" 0 "cmp_${PARENT}_${SHIP}=identical"
 run_case "a failed containment compare refuses" 1 "cmp_${PARENT}_${SHIP}=FAIL"
-run_case "a failed latest-release lookup refuses" 1 latest=FAIL
-run_case "a non-version latest tag refuses" 1 latest='{"tag_name":"nightly"}'
+run_case "a failed release listing refuses" 1 releases=FAIL
+run_case "no published vX.Y.Z release refuses" 1 "releases=[$(rel nightly false false),$(rel v0.2.164 true false)]"
+# The previous release is the highest PUBLISHED non-prerelease by version, not
+# GitHub's latest marker (which can be moved by hand) and not a draft.
+run_case "the previous release is the highest-semver published one" 0 \
+    "releases=[$(rel v0.2.99 false false),$(rel v0.2.163 false false),$(rel v0.2.164 true false)]"
+check "previous release = v0.2.163 (not the draft v0.2.164, not v0.2.99)" "$(out prev_tag)" "v0.2.163"
+
+# --- fdev never collides with an unfinished or published release (#6362) ------
+run_case "fdev accounts for a DRAFT or unfinished tag above the latest release" 0 \
+    "tags=$(tagline v0.2.163; tagline v0.2.164)" \
+    "tree_v0.2.164/crates/fdev/Cargo.toml=$(manifest fdev 0.3.306)"
+check "fdev = unfinished v0.2.164's 0.3.306 + 1" "$(out fdev_version)" "0.3.307"
+run_case "fdev accounts for crates.io being ahead of every tree" 0 \
+    crates_fdev='{"crate":{"max_version":"0.3.400"}}'
+check "fdev = crates.io's 0.3.400 + 1" "$(out fdev_version)" "0.3.401"
+run_case "an unreadable crates.io fdev answer refuses" 1 crates_fdev=FAIL
+run_case "a crates.io answer with no version refuses" 1 crates_fdev='{"errors":[{"detail":"x"}]}'
+run_case "a failed tag listing refuses" 1 tags=FAIL
+
+# --- ship_sha must carry the exact-SHA release flow (#6362) ---------------------
+run_case "a ship_sha without release-sync.yml refuses (live)" 1 "tree_$SHIP/.github/workflows/release-sync.yml=FAIL"
+check "missing release-sync.yml: names the flow" "$(grep -c 'predates the exact-SHA release flow' "$TEST_TMP/case/log")" "1"
+run_case "a ship_sha whose ci.yml does not run on release/v* refuses (live)" 1 "tree_$SHIP/.github/workflows/ci.yml=$CI_OLD"
+run_case "an unreadable ship ci.yml refuses (live)" 1 "tree_$SHIP/.github/workflows/ci.yml=FAIL"
+run_case "release/v* only in pull_request, not push, refuses" 1 \
+    "tree_$SHIP/.github/workflows/ci.yml=$(printf 'on:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main, \x27release/v*\x27]\n')"
+run_case "a dry run only warns about an old-flow ship_sha" 0 live=false "tree_$SHIP/.github/workflows/ci.yml=$CI_OLD"
 run_case "an unreadable tag commit refuses" 1 commit_v0.2.163=FAIL
 run_case "an unreadable first parent refuses" 1 "commit_$TAGC=FAIL"
 run_case "a failed tag-on-main compare refuses" 1 "cmp_${TAGC}_main=FAIL"

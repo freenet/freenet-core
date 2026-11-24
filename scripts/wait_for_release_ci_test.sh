@@ -223,6 +223,16 @@ PY2
 check "wait_for_ci runs the tested waiter" \
     "$(python3 "$LINTER" --dump-step "$RELEASE_YML" wait_for_ci "Wait for the full CI suite on the release commit" | grep -cxF 'bash scripts/wait_for_release_ci.sh')" "1"
 
+# The job must outlive the waiter's own budget with margin, or a slow suite is
+# reported as a bare cancellation instead of the waiter's diagnosis.
+JOB_TIMEOUT=$(awk '/^  wait_for_ci:/ {j = 1; next} j && /^  [a-z_]+:/ {exit} j && /^    timeout-minutes:/ {print $2}' "$RELEASE_YML")
+# shellcheck disable=SC2016  # a sed pattern, not an expansion
+WAITER_BUDGET=$(sed -n 's/^MAX_WAIT="\${MAX_WAIT:-\([0-9]*\)}"$/\1/p' "$WAITER")
+check "wait_for_ci's job timeout exceeds the waiter's budget by at least 10 min" \
+    "$([ -n "$JOB_TIMEOUT" ] && [ -n "$WAITER_BUDGET" ] && [ $((JOB_TIMEOUT * 60)) -ge $((WAITER_BUDGET + 600)) ] && echo ok || echo "job=${JOB_TIMEOUT}min waiter=${WAITER_BUDGET}s")" "ok"
+# shellcheck disable=SC2016  # matched literally
+check "the waiter measures wall time, not summed sleeps" "$(grep -cE '^[[:space:]]*ELAPSED=\$\(\(SECONDS - START\)\)' "$WAITER")" "1"
+
 # --- 2. the waiter against a stubbed gh --------------------------------------
 
 B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb

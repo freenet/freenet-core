@@ -26,10 +26,14 @@ permissions:
   contents: write
   pull-requests: write
 
-# One sync at a time, never cancelled: a later release's sync waits for the
-# earlier one, then supersedes its PR.
+# One group PER VERSION, never cancelled. A single shared group would hold only
+# one pending run, so a third release published while one sync runs would
+# cancel the pending second one, whichever version it was. Per-version groups
+# never drop a sync; syncs for different versions may then overlap, and
+# release_sync.sh resolves that by superseding (the lower one closes, before
+# and after it opens its PR). A re-run for the same version waits its turn.
 concurrency:
-  group: release-sync
+  group: release-sync-${{ github.event.release.tag_name || inputs.version }}
   cancel-in-progress: false
 
 jobs:
@@ -39,6 +43,19 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      # Without RELEASE_PAT the branch push and the PR are made with
+      # GITHUB_TOKEN, whose events start no workflow: the PR would get no
+      # checks and could never merge (#4118). Fail loudly instead.
+      - name: Check RELEASE_PAT is configured
+        env:
+          RELEASE_PAT_PRESENT: ${{ secrets.RELEASE_PAT != '' }}
+        run: |
+          if [ "$RELEASE_PAT_PRESENT" != "true" ]; then
+            echo "::error title=RELEASE_PAT not set::release-sync needs RELEASE_PAT: with GITHUB_TOKEN its PR would start no CI and never merge, leaving main's version behind the release. Configure the RELEASE_PAT secret (AGENTS.md, 'Release Workflow & RELEASE_PAT') and re-run, or dispatch release-sync.yml by hand once it is set."
+            exit 1
+          fi
+          echo "✅ RELEASE_PAT is configured."
+
       - name: Resolve the released version
         id: version
         env:
@@ -70,8 +87,9 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: main
-          # RELEASE_PAT so the branch push and the PR fire ci.yml; with
-          # GITHUB_TOKEN the PR would get no checks and never merge (#4118).
+          # RELEASE_PAT so the branch push and the PR fire ci.yml (the step
+          # above refuses without it; the coalesce keeps the token-coalesce
+          # lint's form).
           token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Configure git

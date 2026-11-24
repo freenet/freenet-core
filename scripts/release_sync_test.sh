@@ -48,7 +48,12 @@ for ((i = 0; i < ${#args[@]}; i++)); do
 done
 case "$1 $2" in
     "pr list")
-        if [[ "$*" == *"--head "* ]]; then json=$(cat "$STUB_DIR/head_prs"); else json=$(cat "$STUB_DIR/open_prs"); fi ;;
+        if [[ "$*" == *"--head "* ]]; then json=$(cat "$STUB_DIR/head_prs"); else
+            # open_prs may hold one answer per call, separated by lines of ---;
+            # the last answer repeats.
+            n=$(cat "$STUB_DIR/open_n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$STUB_DIR/open_n"
+            json=$(awk -v n="$n" 'BEGIN{k=1} /^---$/{k++; next} {part[k]=part[k] $0 "\n"} END{if (n > k) n = k; printf "%s", part[n]}' "$STUB_DIR/open_prs")
+        fi ;;
     "pr create") echo "https://github.com/freenet/freenet-core/pull/777"; exit 0 ;;
     "pr view") json=$(cat "$STUB_DIR/view") ;;
     "pr merge"|"pr close") exit 0 ;;
@@ -116,7 +121,8 @@ reset_stub() {
 }
 
 # --- 1. main below the release ------------------------------------------------
-reset_stub '[{"number":11,"headRefName":"release-sync/v0.2.99"},{"number":12,"headRefName":"release-sync/v0.2.102"},{"number":13,"headRefName":"fix/x"}]'
+# The second listing (after our PR opens) no longer shows the closed #11.
+reset_stub $'[{"number":11,"headRefName":"release-sync/v0.2.99"},{"number":13,"headRefName":"fix/x"}]\n---\n[{"number":777,"headRefName":"release-sync/v0.2.101"},{"number":13,"headRefName":"fix/x"}]'
 fresh_clone "$TEST_TMP/w1"
 check "main below the release: the sync succeeds" "$(run_sync "$TEST_TMP/w1" 0.2.101)" "0"
 [ -s "$STUB_DIR/log" ] && grep -q '::error' "$STUB_DIR/log" && cat "$STUB_DIR/log" >&2
@@ -139,9 +145,28 @@ check "auto-merge never passes --squash (the queue owns the strategy, v0.2.93)" 
     "$(grep '^gh pr merge' "$STUB_DIR/calls" | grep -c -- '--squash' || true)" "0"
 check "the lower-version sync PR is closed as superseded" \
     "$(grep -c '^gh pr close 11 --repo freenet/freenet-core --delete-branch --comment Superseded by the sync to 0.2.101.' "$STUB_DIR/calls")" "1"
-check "a higher-version sync PR and unrelated PRs are left alone" \
-    "$(grep -cE '^gh pr close (12|13) ' "$STUB_DIR/calls" || true)" "0"
+check "unrelated PRs are left alone" \
+    "$(grep -cE '^gh pr close 13 ' "$STUB_DIR/calls" || true)" "0"
 check "lockfiles are refreshed" "$(grep -cE '^cargo (update --workspace|metadata .*apps/freenet-ping/Cargo.toml)' "$STUB_DIR/calls")" "2"
+
+# --- 1b. a higher sync is already open: this one is superseded -----------------
+BEFORE_1B=$(git -C "$ORIGIN" rev-parse release-sync/v0.2.101)
+reset_stub '[{"number":777,"headRefName":"release-sync/v0.2.101"},{"number":12,"headRefName":"release-sync/v0.2.102"}]'
+fresh_clone "$TEST_TMP/w1b"
+check "a higher open sync: the lower sync succeeds as a no-op" "$(run_sync "$TEST_TMP/w1b" 0.2.101)" "0"
+check "a higher open sync: nothing is pushed" "$(git -C "$ORIGIN" rev-parse release-sync/v0.2.101)" "$BEFORE_1B"
+check "a higher open sync: no PR is opened, no cargo" "$(grep -cE '^(cargo|gh pr create)' "$STUB_DIR/calls" || true)" "0"
+check "a higher open sync: our own open PR is closed as superseded" \
+    "$(grep -c '^gh pr close 777 --repo freenet/freenet-core --delete-branch --comment Superseded by the open sync to 0.2.102.' "$STUB_DIR/calls")" "1"
+check "a higher open sync: the higher PR is left alone" "$(grep -c '^gh pr close 12 ' "$STUB_DIR/calls" || true)" "0"
+
+# A higher sync that opens its PR WHILE this one runs (overlapping per-version
+# runs): the second superseding pass, after our PR is opened, closes ours.
+reset_stub $'[]\n---\n[{"number":777,"headRefName":"release-sync/v0.2.101"},{"number":12,"headRefName":"release-sync/v0.2.102"}]'
+fresh_clone "$TEST_TMP/w1c"
+check "a racing higher sync: succeeds" "$(run_sync "$TEST_TMP/w1c" 0.2.101)" "0"
+check "a racing higher sync: our just-opened PR is closed after the fact" \
+    "$(grep -c '^gh pr close 777 .*Superseded by the open sync to 0.2.102.' "$STUB_DIR/calls")" "1"
 
 # --- 2. re-run after main moved: regenerated and force-pushed, PR reused ------
 G commit -q --allow-empty -m "fix: something landed after the release"
@@ -189,6 +214,29 @@ check "release-sync.yml runs the tested script" "$(grep -cE '^[[:space:]]*run: b
 # shellcheck disable=SC2016  # the expressions are matched literally
 check "release-sync.yml pushes and opens the PR with RELEASE_PAT (coalesced)" \
     "$(grep -cE '^[[:space:]]*(token|GH_TOKEN): \$\{\{ secrets\.RELEASE_PAT \|\| secrets\.GITHUB_TOKEN \}\}[[:space:]]*$' "$SYNC_YML")" "2"
+# shellcheck disable=SC2016  # matched literally
+check "release-sync.yml's concurrency group is per version (a pending newer sync is never cancelled)" \
+    "$(grep -cE '^  group: release-sync-\$\{\{ github\.event\.release\.tag_name \|\| inputs\.version \}\}$' "$SYNC_YML")" "1"
+check "release-sync.yml never cancels a sync in progress" "$(grep -cE '^  cancel-in-progress: false$' "$SYNC_YML")" "1"
+# Without RELEASE_PAT the PR starts no CI and can never merge: the first step
+# must refuse. Run it as the workflow does, both ways.
+LINTER="$REPO_ROOT/.github/scripts/check_release_dry_run.py"
+PAT_STEP=$(python3 "$LINTER" --dump-step "$SYNC_YML" sync "Check RELEASE_PAT is configured" | sed '/^@@ENV@@$/,$d')
+pat_rc() { local rc=0; RELEASE_PAT_PRESENT="$1" bash -c "$PAT_STEP" > "$TEST_TMP/pat.out" 2>&1 || rc=$?; echo "rc=$rc"; }
+check "release-sync refuses loudly without RELEASE_PAT" "$(pat_rc false) $(grep -c '^::error title=RELEASE_PAT not set' "$TEST_TMP/pat.out")" "rc=1 1"
+check "release-sync proceeds with RELEASE_PAT" "$(pat_rc true)" "rc=0"
+check "the RELEASE_PAT check is the sync job's first step" \
+    "$(python3 - "$LINTER" "$SYNC_YML" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("lint", sys.argv[1]); m = importlib.util.module_from_spec(spec)
+sys.modules["lint"] = m
+spec.loader.exec_module(m)
+jobs, _ = m.parse_workflow(open(sys.argv[2]).read())
+job = next(j for j in jobs if j.name == "sync")
+first = job.steps[0]
+print(first.label, "|", "if" in first.keys, "|", first.env.get("RELEASE_PAT_PRESENT", ""))
+PY
+)" "Check RELEASE_PAT is configured | False | \${{ secrets.RELEASE_PAT != '' }}"
 # shellcheck disable=SC2016  # matched literally
 check "release-sync.yml skips pre-releases" "$(grep -c 'PRERELEASE: \${{ github.event.release.prerelease }}' "$SYNC_YML")" "1"
 check "CI runs this test" \

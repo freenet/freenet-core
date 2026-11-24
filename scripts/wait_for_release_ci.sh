@@ -26,7 +26,8 @@
 #
 # Inputs (env): RELEASE_SHA (B), SHIP_SHA, GITHUB_REPOSITORY, GH_TOKEN,
 # GITHUB_OUTPUT. Optional: RELEASE_BRANCH (only runs on this branch count),
-# MAX_WAIT (s, default 4500), NO_RUN_TIMEOUT (s, default 900),
+# MAX_WAIT (s of wall time, default 4500; release.yml's job timeout must exceed
+# it with margin, pinned by the test), NO_RUN_TIMEOUT (s, default 900),
 # WAIT_INTERVAL (s, default 30).
 # `--print-required-jobs` prints REQUIRED_JOBS, one per line, and exits; the
 # test compares it with the jobs ci.yml actually runs on a release push.
@@ -70,6 +71,9 @@ MAX_WAIT="${MAX_WAIT:-4500}"
 NO_RUN_TIMEOUT="${NO_RUN_TIMEOUT:-900}"
 WAIT_INTERVAL="${WAIT_INTERVAL:-30}"
 RELEASE_BRANCH="${RELEASE_BRANCH:-}"
+# Wall-clock time since start (bash's SECONDS), so time spent inside slow or
+# hanging `gh` calls counts against the budget too, not only the sleeps.
+START=$SECONDS
 ELAPSED=0
 
 for v in "$B" "$SHIP"; do
@@ -81,7 +85,7 @@ done
 
 pause() {
     sleep "$WAIT_INTERVAL"
-    ELAPSED=$((ELAPSED + WAIT_INTERVAL))
+    ELAPSED=$((SECONDS - START))
 }
 
 # --- 1 and 2: B is the ship commit plus the bump, nothing else ---------------

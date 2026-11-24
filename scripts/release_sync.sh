@@ -20,7 +20,14 @@
 #     must NOT start with `build: release`: ci.yml treats that prefix as the
 #     legacy release merge-group gate and would run the full suite again;
 #   - closes open `release-sync/v*` PRs for lower versions (superseded), and
-#     the one for VERSION itself when main already has it.
+#     the one for VERSION itself when main already has it;
+#   - does nothing (beyond closing its own PR) when an open `release-sync/v*`
+#     PR for a HIGHER version exists: that one supersedes this sync, and a
+#     lower sync merging after it would conflict with it on the lockfiles.
+#     Syncs for different versions can run concurrently (release-sync.yml's
+#     concurrency group is per version), so the superseding pass runs again
+#     after this PR is opened: whichever of two racing syncs finishes second
+#     closes the lower PR.
 #
 # fdev's version comes from the release tag's tree (what was published), or
 # main's if main is somehow ahead, so the sync never moves fdev backwards.
@@ -62,22 +69,44 @@ if ! version_lt "$MAIN_VERSION" "$VERSION"; then
 fi
 
 # --- close superseded sync PRs ----------------------------------------------
-OPEN=$(gh pr list --repo "$REPO" --state open --limit 200 --json number,headRefName \
-    --jq '.[] | select(.headRefName | startswith("release-sync/v")) | "\(.number) \(.headRefName)"')
-while read -r number head; do
-    [ -n "${number:-}" ] || continue
-    other="${head#release-sync/v}"
-    if version_lt "$other" "$VERSION"; then
-        reason="Superseded by the sync to $VERSION."
-    elif [ "$other" = "$VERSION" ] && [ "$NOOP" = true ]; then
-        reason="main is already at $MAIN_VERSION, so there is nothing left to sync."
-    else
-        continue
-    fi
-    echo "Closing #$number ($head): $reason"
-    gh pr close "$number" --repo "$REPO" --delete-branch --comment "$reason"
-done <<< "$OPEN"
+# supersede_pass: close lower-version sync PRs (and our own when main already
+# has VERSION or a higher sync is open). Sets HIGHER to a higher open sync's
+# version, if any.
+HIGHER=""
+supersede_pass() {
+    local open number head other reason
+    open=$(gh pr list --repo "$REPO" --state open --limit 200 --json number,headRefName \
+        --jq '.[] | select(.headRefName | startswith("release-sync/v")) | "\(.number) \(.headRefName)"')
+    HIGHER=""
+    while read -r number head; do
+        [ -n "${number:-}" ] || continue
+        other="${head#release-sync/v}"
+        if version_lt "$VERSION" "$other"; then
+            HIGHER="$other"
+        fi
+    done <<< "$open"
+    while read -r number head; do
+        [ -n "${number:-}" ] || continue
+        other="${head#release-sync/v}"
+        if version_lt "$other" "$VERSION"; then
+            reason="Superseded by the sync to $VERSION."
+        elif [ "$other" = "$VERSION" ] && [ "$NOOP" = true ]; then
+            reason="main is already at $MAIN_VERSION, so there is nothing left to sync."
+        elif [ "$other" = "$VERSION" ] && [ -n "$HIGHER" ]; then
+            reason="Superseded by the open sync to $HIGHER."
+        else
+            continue
+        fi
+        echo "Closing #$number ($head): $reason"
+        gh pr close "$number" --repo "$REPO" --delete-branch --comment "$reason"
+    done <<< "$open"
+}
+supersede_pass
 
+if [ -n "$HIGHER" ]; then
+    echo "✅ An open sync to $HIGHER supersedes this one: nothing to sync."
+    exit 0
+fi
 if [ "$NOOP" = true ]; then
     echo "✅ main is at $MAIN_VERSION, not below $VERSION: nothing to sync."
     exit 0
@@ -129,5 +158,11 @@ fi
 AUTO=$(gh pr view "$PR" --repo "$REPO" --json autoMergeRequest --jq '.autoMergeRequest != null')
 if [ "$AUTO" != "true" ]; then
     gh pr merge "$PR" --repo "$REPO" --auto
+fi
+# A sync for another version may have opened its PR while this one ran.
+supersede_pass
+if [ -n "$HIGHER" ]; then
+    echo "✅ A sync to $HIGHER opened meanwhile and supersedes #$PR (closed above)."
+    exit 0
 fi
 echo "✅ #$PR syncs main to $VERSION and will merge through the queue."

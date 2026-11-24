@@ -32,7 +32,9 @@ cat > "$STUBS/gh" <<'EOF'
 case "$1 $2" in
     "run list") f="$STUB_DIR/runs"; min=20 ;;
     "pr list") f="$STUB_DIR/prs"; min=1000 ;;
-    "api repos/freenet/freenet-core/releases/latest") f="$STUB_DIR/latest"; min=none ;;
+    "api --paginate")
+        [ "$3" = "repos/freenet/freenet-core/releases?per_page=100" ] || { echo "unexpected gh $*" >&2; exit 99; }
+        f="$STUB_DIR/releases"; min=none ;;
     *) echo "unexpected gh $*" >&2; exit 99 ;;
 esac
 # A listing shorter than these could miss the run or PR that should refuse the
@@ -46,16 +48,30 @@ fi
 [ "$(cat "$f")" = FAIL ] && exit 1
 if [ "$1" = api ]; then
     # Apply the script's own --jq filter, so a wrong field name fails here.
-    jq -r "$4" "$f"
+    jq -r "$5" "$f"
 else
     cat "$f"
 fi
 EOF
+# ls-remote answers like git: --tags from $STUB_DIR/tags, --heads from
+# $STUB_DIR/branches, filtered by the pattern (an exact ref, or a `prefix*`).
 cat > "$STUBS/git" <<'EOF'
 #!/usr/bin/env bash
 [ "$1" = ls-remote ] || { echo "unexpected git $*" >&2; exit 99; }
-[ "$(cat "$STUB_DIR/tags")" = FAIL ] && exit 128
-cat "$STUB_DIR/tags"
+case "$2" in
+    --tags) f="$STUB_DIR/tags"; ns=refs/tags/ ;;
+    --heads) f="$STUB_DIR/branches"; ns=refs/heads/ ;;
+    *) echo "unexpected git $*" >&2; exit 99 ;;
+esac
+[ "$(cat "$f")" = FAIL ] && exit 128
+pat="${4:-}"
+[[ "$pat" == refs/* ]] || pat="$ns$pat"
+while IFS=$'\t' read -r sha ref; do
+    [ -n "$ref" ] || continue
+    if [[ "$pat" == *'*' && "$ref" == "${pat%\*}"* ]] || [ "$ref" = "$pat" ]; then
+        printf '%s\t%s\n' "$sha" "$ref"
+    fi
+done < "$f"
 EOF
 cat > "$STUBS/curl" <<'EOF'
 #!/usr/bin/env bash
@@ -77,9 +93,12 @@ run_case() {
     mkdir -p "$dir"
     echo '[{"databaseId":100,"status":"in_progress"},{"databaseId":7,"status":"completed"}]' > "$dir/runs"
     echo '[{"number":1,"headRefName":"fix/x","title":"fix: x"}]' > "$dir/prs"
-    : > "$dir/tags"
+    printf 'aaa\trefs/tags/v0.2.162\naaa\trefs/tags/v0.2.163\n' > "$dir/tags"
+    printf 'aaa\trefs/heads/release/v0.2.163\n' > "$dir/branches"
     echo 404 > "$dir/crates"
-    echo '{"tag_name":"v0.2.163","name":"v0.2.163"}' > "$dir/latest"
+    # v0.2.163 is the highest PUBLISHED non-prerelease. v0.2.170 is a published
+    # prerelease, which neither counts as the latest nor as in flight.
+    echo '[{"tag_name":"v0.2.163","draft":false,"prerelease":false},{"tag_name":"v0.2.162","draft":false,"prerelease":false},{"tag_name":"v0.2.170","draft":false,"prerelease":true}]' > "$dir/releases"
     printf '[package]\nname = "freenet"\nversion = "0.2.163"\n\n[dependencies]\nversion = "9.9.9"\n' > "$dir/Cargo.toml"
     local version=0.2.164
     for kv in "$@"; do
@@ -87,6 +106,12 @@ run_case() {
             version=*) version="${kv#version=}" ;;
             cargo=*) printf '[package]\nversion = "%s"\n' "${kv#cargo=}" > "$dir/Cargo.toml" ;;
             cargoraw=*) printf '%b' "${kv#cargoraw=}" > "$dir/Cargo.toml" ;;
+            # A history whose only release (and tag) is the one given.
+            latest=*) printf '[{"tag_name":"%s","draft":false,"prerelease":false}]\n' "${kv#latest=}" > "$dir/releases"
+                      printf 'aaa\trefs/tags/%s\n' "${kv#latest=}" > "$dir/tags"
+                      : > "$dir/branches" ;;
+            addtag=*) printf 'bbb\trefs/tags/%s\n' "${kv#addtag=}" >> "$dir/tags" ;;
+            addbranch=*) printf 'bbb\trefs/heads/release/%s\n' "${kv#addbranch=}" >> "$dir/branches" ;;
             *) printf '%s\n' "${kv#*=}" > "$dir/${kv%%=*}" ;;
         esac
     done
@@ -127,21 +152,44 @@ run_case "an unknown crates.io answer (403) refuses" 1 "title=Could not check cr
 run_case "a curl failure refuses" 1 "title=Could not check crates.io" crates=FAIL
 run_case "a version equal to Cargo.toml refuses" 1 "title=The ship commit is already at 0.2.164" cargo=0.2.164
 run_case "a downgrade refuses" 1 "title=0.2.164 is a downgrade" cargo=0.2.170
-run_case "a numeric-not-lexical comparison passes (0.2.99 -> 0.2.100)" 0 "" cargo=0.2.99 version=0.2.100 latest='{"tag_name":"v0.2.98"}'
+run_case "a numeric-not-lexical comparison passes (0.2.99 -> 0.2.100)" 0 "" cargo=0.2.99 version=0.2.100 latest=v0.2.98
 run_case "an unreadable Cargo.toml version refuses" 1 "title=Could not read the current version" cargo=garbage
 run_case "a malformed version refuses" 1 "RELEASE_VERSION must be X.Y.Z" version=0.2
 # Check 5: main's Cargo version lags a release until its merge-back lands, so
 # the ship commit alone cannot say whether a version is already out.
 run_case "a version equal to the latest published release refuses (ship commit lagging)" 1 \
-    "title=0.2.164 is not above the latest release" cargo=0.2.163 latest='{"tag_name":"v0.2.164"}'
+    "title=0.2.164 is not above the latest release" cargo=0.2.163 latest=v0.2.164
 run_case "a version below the latest published release refuses" 1 \
-    "title=0.2.161 is not above the latest release" cargo=0.2.160 version=0.2.161 latest='{"tag_name":"v0.2.163"}'
+    "title=0.2.161 is not above the latest release" cargo=0.2.160 version=0.2.161 latest=v0.2.163
 run_case "a version above both the ship commit and the latest release passes" 0 "" \
-    cargo=0.2.162 latest='{"tag_name":"v0.2.163"}'
+    cargo=0.2.162 latest=v0.2.163
 run_case "numeric comparison against the latest release (0.2.99 -> 0.2.100)" 0 "" \
-    cargo=0.2.99 version=0.2.100 latest='{"tag_name":"v0.2.99"}'
-run_case "a failed latest-release lookup refuses" 1 "title=Could not read the latest release" latest=FAIL
-run_case "a non-version latest tag refuses" 1 "title=Could not read the latest release" latest='{"tag_name":"nightly"}'
+    cargo=0.2.99 version=0.2.100 latest=v0.2.99
+run_case "a failed release listing refuses" 1 "title=Could not read the latest release" releases=FAIL
+run_case "no published vX.Y.Z release refuses" 1 "title=Could not read the latest release" \
+    releases='[{"tag_name":"nightly","draft":false,"prerelease":false}]'
+# The latest release is the highest-semver PUBLISHED non-prerelease, never
+# GitHub's movable /releases/latest marker: listing order does not matter, and
+# a draft above it does not count as published.
+run_case "the latest release is the highest version, in any listing order" 1 \
+    "title=0.2.164 is not above the latest release" \
+    releases='[{"tag_name":"v0.2.99","draft":false,"prerelease":false},{"tag_name":"v0.2.164","draft":false,"prerelease":false}]'
+
+# Check 6: another release in flight above the latest published release.
+run_case "an unpublished tag above the latest release refuses" 1 "title=Another release is unfinished" \
+    version=0.2.165 addtag=v0.2.164
+run_case "a release/v* branch above the latest release with no tag refuses" 1 "title=Another release is unfinished" \
+    version=0.2.165 addbranch=v0.2.164
+run_case "a visible draft above the latest release refuses" 1 "title=Another release is unfinished" version=0.2.165 \
+    releases='[{"tag_name":"v0.2.163","draft":false,"prerelease":false},{"tag_name":"v0.2.164","draft":true,"prerelease":false}]'
+run_case "the SAME version's branch is a re-cut, not a conflict" 0 "" addbranch=v0.2.164
+run_case "branches and tags at or below the latest release are history" 0 "" \
+    addbranch=v0.2.160 addtag=v0.2.100
+run_case "a published prerelease's tag above the latest is not in flight" 0 "" version=0.2.171 addtag=v0.2.170
+run_case "a published release branch (its tag exists) is not in flight" 0 "" version=0.2.165 \
+    addbranch=v0.2.164 addtag=v0.2.164 \
+    releases='[{"tag_name":"v0.2.164","draft":false,"prerelease":false},{"tag_name":"v0.2.163","draft":false,"prerelease":false}]'
+run_case "a failed branch listing refuses" 1 "title=Could not list release branches" branches=FAIL
 run_case "a [package] with no version refuses, even when [dependencies] has one" 1 \
     "title=Could not read the current version" \
     cargoraw='[package]\nname = "freenet"\n\n[dependencies]\nversion = "0.2.1"\n'

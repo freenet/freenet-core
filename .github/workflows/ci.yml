@@ -152,10 +152,10 @@ jobs:
       - name: Check code formatting
         run: cargo fmt -- --check
 
-      # Locks the bash predicate that the merge_group release-gate keys off
-      # (#3973). The actual release path is only exercised on a real release
-      # merge_group entry, so a regression in the matching logic would
-      # silently skip the pre-publish gate. This self-test catches predicate
+      # Locks the bash predicate the legacy merge_group release tier keys off
+      # (#3973; only release.sh's bump PR still produces such an entry). The
+      # pre-publish gate is now the push run on release/v*, pinned by
+      # scripts/wait_for_release_ci_test.sh. This self-test catches predicate
       # quoting, anchoring, and case-sensitivity bugs on every CI run.
       - name: Self-test merge_group release detector
         run: |
@@ -438,7 +438,7 @@ jobs:
       # clean when they landed but were not actually in this list, so nothing
       # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/check-x86-64-baseline.sh scripts/check-x86-64-baseline_test.sh scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/macos-url-scheme-e2e.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh scripts/resolve_release_mode.sh scripts/release_dry_run_test.sh nix/freenet-node.sh scripts/nix-node-wrapper_test.sh scripts/wan-bench-classify.sh scripts/wan-bench-classify_test.sh scripts/cache_warm_parity_test.sh scripts/simulation_schedule_test.sh scripts/check_quic_data_ramp_t0.sh scripts/check_quic_data_ramp_t0_test.sh scripts/check_release_preflight.sh scripts/check_release_preflight_test.sh scripts/apply_version_bump.sh scripts/resolve_release_ship.sh scripts/resolve_release_ship_test.sh scripts/wait_for_release_ci.sh scripts/wait_for_release_ci_test.sh scripts/release_sync.sh scripts/release_sync_test.sh scripts/verify_release_checkout.sh scripts/release_mergequeue_test.sh scripts/release_publish_steps_test.sh
+        run: shellcheck -x scripts/check-x86-64-baseline.sh scripts/check-x86-64-baseline_test.sh scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/macos-url-scheme-e2e.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh scripts/resolve_release_mode.sh scripts/release_dry_run_test.sh nix/freenet-node.sh scripts/nix-node-wrapper_test.sh scripts/wan-bench-classify.sh scripts/wan-bench-classify_test.sh scripts/cache_warm_parity_test.sh scripts/simulation_schedule_test.sh scripts/check_quic_data_ramp_t0.sh scripts/check_quic_data_ramp_t0_test.sh scripts/check_release_preflight.sh scripts/check_release_preflight_test.sh scripts/apply_version_bump.sh scripts/release_lib.sh scripts/resolve_release_ship.sh scripts/resolve_release_ship_test.sh scripts/wait_for_release_ci.sh scripts/wait_for_release_ci_test.sh scripts/release_sync.sh scripts/release_sync_test.sh scripts/verify_release_checkout.sh scripts/release_mergequeue_test.sh scripts/release_publish_steps_test.sh
       # The PR-backlog sweep reports stalled PRs (see
       # .github/workflows/pr-backlog-sweep.yml). Its self-test drives the ABORT
       # paths -- failed query, empty listing the REST probe contradicts,
@@ -1456,11 +1456,12 @@ jobs:
       # Skip every real step on non-release merge_group entries. PR-level CI
       # already exercised the same code; running heavy ubicloud-standard-16
       # simulations on every merge-queue entry contends for runner slots
-      # (issue #3973) without catching merge-time-specific regressions. The
-      # release merge_group entry (commit message starts with "build: release")
-      # still runs the full suite as the final pre-publish gate. The job
-      # remains present in the skipped case so branch-protection's required-
-      # check gate stays satisfied.
+      # (issue #3973) without catching merge-time-specific regressions. A
+      # legacy release merge_group entry (commit message starts with
+      # "build: release") still runs the full suite. The pre-publish gate is
+      # the push run on release/v*, where this step resolves to skip=false.
+      # The job remains present in the skipped case so branch-protection's
+      # required-check gate stays satisfied.
       - name: Detect skip
         id: skip_check
         env:
@@ -1741,10 +1742,11 @@ jobs:
       # already exercised the same code; running Ubicloud Docker NAT
       # validation on every merge-queue entry contends for runner
       # slots (issue #3973) without catching merge-time-specific regressions.
-      # The release merge_group entry (commit message starts with
-      # "build: release") still runs the full suite as the final pre-publish
-      # gate. The job remains present in the skipped case so branch-
-      # protection's required-check gate stays satisfied.
+      # A legacy release merge_group entry (commit message starts with
+      # "build: release") still runs the full suite. The pre-publish gate is
+      # the push run on release/v*, where this step resolves to skip=false.
+      # The job remains present in the skipped case so branch-protection's
+      # required-check gate stays satisfied.
       - name: Detect skip
         id: skip_check
         env:
