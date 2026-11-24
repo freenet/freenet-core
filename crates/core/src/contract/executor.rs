@@ -2674,6 +2674,10 @@ mod tests {
                 "rate limit on punch bytes sent per minute, not memory",
             ),
             (
+                "IP_ALLOWANCE_BYTES",
+                "rate limit on punch bytes sent per minute, not memory",
+            ),
+            (
                 "NODE_ALLOWANCE_BYTES",
                 "rate limit on punch bytes sent per minute, not memory",
             ),

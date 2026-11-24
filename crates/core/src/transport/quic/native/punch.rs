@@ -21,12 +21,13 @@
 //! never gives it back bytes early; otherwise the new one is refused.
 //!
 //! A peer this node has completed a native setup with (Hello exchanged),
-//! identified by its exact address, port included, and its key, is proven
-//! for [`PROVEN_TTL`]. A setup to that same address and key is charged to a
+//! identified by its address (an IPv4 address or an IPv6 /64, whatever the
+//! port) and its key, is proven for [`PROVEN_TTL`]. A setup to that same address and key is charged to a
 //! separate allowance first, [`ALLOWANCE_BYTES`] a minute per proven peer
 //! and [`NODE_ALLOWANCE_BYTES`] for the node, so pressure on the shared
-//! budget does not stop a reconnect to a known-good peer. A setup to any
-//! other port or key at that address gets the shared budget only. A spent
+//! budget does not stop a reconnect to a known-good peer. All proven peers at
+//! one address together draw at most [`IP_ALLOWANCE_BYTES`] a minute. A
+//! setup to another key at that address gets the shared budget only. A spent
 //! allowance falls back to the shared budget, so a proven peer is never
 //! worse off than an unproven one. The proven set holds [`PROVEN_ENTRIES`]
 //! peers; an entry that has expired, or else the least recently used, is
@@ -80,6 +81,16 @@ pub(crate) const PROVEN_ENTRIES: usize = 1024;
 /// limit on bytes sent, not a memory budget. Provisional, until the refusal
 /// counters split by proven and unproven peers have field data.
 pub(crate) const ALLOWANCE_BYTES: u64 = 2 * CLIENT_BYTES_PER_DIAL;
+
+/// Bytes all proven peers at one address (an IPv4 address or an IPv6 /64)
+/// may draw together per [`PUNCH_BUDGET_WINDOW`]: four client dials, the
+/// shared per-destination figure. A rate limit on bytes sent, not a memory
+/// budget. Provisional.
+pub(crate) const IP_ALLOWANCE_BYTES: u64 = 4 * CLIENT_BYTES_PER_DIAL;
+
+/// Peers admitted as gateway joiners that the proven set remembers, apart
+/// from the peers this node dialed. Provisional.
+pub(crate) const JOIN_PROVEN_ENTRIES: usize = 256;
 
 /// Bytes the node's allowance holds per [`PUNCH_BUDGET_WINDOW`], all proven
 /// peers together: 71 client dials a minute, so 36 proven peers each using
@@ -187,20 +198,27 @@ struct BudgetState {
     destinations: lru::LruCache<Destination, Bucket>,
     node: Option<Bucket>,
     proven: lru::LruCache<ProvenPeer, Proven>,
+    /// Peers a gateway admitted as joiners: a partition of their own, so the
+    /// volume of joins cannot forget a peer this node dialed.
+    joined: lru::LruCache<ProvenPeer, Proven>,
+    /// What all proven peers at one address (an IPv4 address or an IPv6
+    /// /64) may draw together.
+    addresses: lru::LruCache<Destination, Bucket>,
     node_allowance: Option<Bucket>,
 }
 
-/// A proven peer: its exact address (normalized, port included) and key.
+/// A proven peer: its address (an IPv4 address or an IPv6 /64, so a peer
+/// whose NAT rebinds its port keeps its proof) and its key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ProvenPeer {
-    addr: SocketAddr,
+    at: Destination,
     key: TransportPublicKey,
 }
 
 impl ProvenPeer {
     fn of(addr: SocketAddr, key: &TransportPublicKey) -> Self {
         Self {
-            addr: normalize_mapped_addr(addr),
+            at: Destination::of(addr),
             key: key.clone(),
         }
     }
@@ -269,7 +287,8 @@ enum AllowanceOutcome {
     Unproven,
     /// The charge was taken from the allowance.
     Used,
-    /// The peer's own allowance is spent.
+    /// The peer's own allowance, or that of all proven peers at its address,
+    /// is spent.
     PeerSpent,
     /// The node's allowance is spent.
     NodeSpent,
@@ -283,57 +302,79 @@ impl Default for PunchBudget {
 
 impl PunchBudget {
     fn with_entries(entries: usize) -> Self {
-        Self::with_capacities(entries, PROVEN_ENTRIES)
+        Self::with_capacities(entries, PROVEN_ENTRIES, JOIN_PROVEN_ENTRIES)
     }
 
-    fn with_capacities(entries: usize, proven: usize) -> Self {
+    fn with_capacities(entries: usize, proven: usize, joined: usize) -> Self {
         let cap = |n: usize| NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN);
         Self {
             state: Mutex::new(BudgetState {
                 destinations: lru::LruCache::new(cap(entries)),
                 node: None,
                 proven: lru::LruCache::new(cap(proven)),
+                joined: lru::LruCache::new(cap(joined)),
+                addresses: lru::LruCache::new(cap(proven + joined)),
                 node_allowance: None,
             }),
         }
     }
 
     /// Record that a native setup with the peer at `to` holding `key`
-    /// completed at `now`: that pair is proven until [`PROVEN_TTL`] has
+    /// completed at `now`: that peer is proven until [`PROVEN_TTL`] has
     /// passed, and proving it again renews that without refilling its
     /// allowance. If the set is full and no entry can be forgotten without
     /// giving it allowance early, the peer is not recorded.
     pub(crate) fn mark_proven(&self, to: SocketAddr, key: &TransportPublicKey, now: Duration) {
         let peer = ProvenPeer::of(to, key);
         let mut state = self.state.lock();
+        Self::insert_proof(&mut state.proven, peer, now);
+    }
+
+    /// [`Self::mark_proven`] for a peer a gateway admitted as a joiner, kept
+    /// apart from the peers this node dialed. A peer already proven by a
+    /// setup this node dialed is renewed there instead.
+    pub(crate) fn mark_proven_joined(
+        &self,
+        to: SocketAddr,
+        key: &TransportPublicKey,
+        now: Duration,
+    ) {
+        let peer = ProvenPeer::of(to, key);
+        let mut state = self.state.lock();
         if let Some(entry) = state.proven.get_mut(&peer) {
             entry.at = now;
             return;
         }
-        if state.proven.len() == state.proven.cap().get() {
+        Self::insert_proof(&mut state.joined, peer, now);
+    }
+
+    fn insert_proof(set: &mut lru::LruCache<ProvenPeer, Proven>, peer: ProvenPeer, now: Duration) {
+        if let Some(entry) = set.get_mut(&peer) {
+            entry.at = now;
+            return;
+        }
+        if set.len() == set.cap().get() {
             // An expired proof goes before a live one.
-            let expired = state
-                .proven
+            let expired = set
                 .iter()
                 .find(|(_, entry)| entry.expired(now) && entry.refilled(now))
                 .map(|(peer, _)| peer.clone());
             match expired {
                 Some(old) => {
-                    state.proven.pop(&old);
+                    set.pop(&old);
                 }
                 None => {
-                    if !state
-                        .proven
+                    if !set
                         .peek_lru()
                         .is_some_and(|(_, oldest)| oldest.refilled(now))
                     {
                         return;
                     }
-                    state.proven.pop_lru();
+                    set.pop_lru();
                 }
             }
         }
-        state.proven.put(
+        set.put(
             peer,
             Proven {
                 at: now,
@@ -346,38 +387,68 @@ impl PunchBudget {
     #[cfg(test)]
     fn is_proven(&self, to: SocketAddr, key: &TransportPublicKey, now: Duration) -> bool {
         let state = self.state.lock();
-        state
-            .proven
-            .peek(&ProvenPeer::of(to, key))
-            .is_some_and(|p| !p.expired(now))
+        let peer = ProvenPeer::of(to, key);
+        [&state.proven, &state.joined]
+            .iter()
+            .any(|set| set.peek(&peer).is_some_and(|p| !p.expired(now)))
     }
 
-    /// Take `bytes` from `peer`'s allowance and the node's, if `peer` is
-    /// proven at `now` and both hold them; takes nothing otherwise.
+    /// Take `bytes` from `peer`'s allowance, its address's and the node's,
+    /// if `peer` is proven at `now` and all three hold them; takes nothing
+    /// otherwise.
     fn charge_allowance(
         state: &mut BudgetState,
         peer: &ProvenPeer,
         bytes: u64,
         now: Duration,
     ) -> AllowanceOutcome {
-        if state.proven.peek(peer).is_none_or(|p| p.expired(now)) {
+        let live = |set: &lru::LruCache<ProvenPeer, Proven>| {
+            set.peek(peer).is_some_and(|p| !p.expired(now))
+        };
+        let BudgetState {
+            proven,
+            joined,
+            addresses,
+            node_allowance,
+            ..
+        } = state;
+        let set = if live(proven) {
+            proven
+        } else if live(joined) {
+            joined
+        } else {
             return AllowanceOutcome::Unproven;
-        }
-        let node = state
-            .node_allowance
-            .get_or_insert_with(|| Bucket::full(NODE_ALLOWANCE_BYTES, now));
+        };
+        let node = node_allowance.get_or_insert_with(|| Bucket::full(NODE_ALLOWANCE_BYTES, now));
         node.refill(NODE_ALLOWANCE_BYTES, now);
-        let Some(entry) = state.proven.get_mut(peer) else {
+        // An address's bucket is whole once refilled, so one forgotten after
+        // that is recreated whole; one still spent is never forgotten.
+        if !addresses.contains(&peer.at) && addresses.len() == addresses.cap().get() {
+            let refilled = addresses.peek_lru().is_some_and(|(_, oldest)| {
+                let mut oldest = *oldest;
+                oldest.refill(IP_ALLOWANCE_BYTES, now);
+                oldest.left >= IP_ALLOWANCE_BYTES
+            });
+            if !refilled {
+                return AllowanceOutcome::PeerSpent;
+            }
+            addresses.pop_lru();
+        }
+        let address =
+            addresses.get_or_insert_mut(peer.at, || Bucket::full(IP_ALLOWANCE_BYTES, now));
+        address.refill(IP_ALLOWANCE_BYTES, now);
+        let Some(entry) = set.get_mut(peer) else {
             return AllowanceOutcome::Unproven;
         };
         entry.allowance.refill(ALLOWANCE_BYTES, now);
-        if bytes > entry.allowance.left {
+        if bytes > entry.allowance.left || bytes > address.left {
             return AllowanceOutcome::PeerSpent;
         }
         if bytes > node.left {
             return AllowanceOutcome::NodeSpent;
         }
         entry.allowance.left -= bytes;
+        address.left -= bytes;
         node.left -= bytes;
         AllowanceOutcome::Used
     }
@@ -551,6 +622,8 @@ mod tests {
         assert_eq!(PROVEN_ENTRIES, 1024);
         assert_eq!(ALLOWANCE_BYTES, 2 * CLIENT_BYTES_PER_DIAL);
         assert_eq!(NODE_ALLOWANCE_BYTES, 1_048_576);
+        assert_eq!(IP_ALLOWANCE_BYTES, 4 * CLIENT_BYTES_PER_DIAL);
+        assert_eq!(JOIN_PROVEN_ENTRIES, 256);
     }
 
     /// A destination takes PUNCH_BUDGET_BYTES a minute: four client setups
@@ -664,11 +737,11 @@ mod tests {
         );
     }
 
-    /// Only the exact address and key that proved themselves draw on the
-    /// allowance: another port, or another key, at the same address gets the
-    /// shared budget only.
+    /// The proof is the address and the key, not the port: a peer whose NAT
+    /// rebinds keeps its allowance, and another key at the same address
+    /// gets the shared budget only.
     #[test]
-    fn a_different_port_or_key_gets_no_allowance() {
+    fn the_key_decides_and_the_port_does_not() {
         let budget = PunchBudget::default();
         let (k, other) = (key(), key());
         let t0 = Duration::from_secs(100);
@@ -682,18 +755,84 @@ mod tests {
             },
         );
         assert_eq!(dial(&budget, PEER, &other, t0), unproven_refused);
-        let other_port = SocketAddr::new(PEER.parse().unwrap(), 31338);
+        // Another port, with the same key, is the same peer.
+        let rebound = SocketAddr::new(PEER.parse().unwrap(), 31338);
         assert_eq!(
-            budget.charge_inner(other_port, Some(&k), CLIENT_BYTES_PER_DIAL, t0, true),
-            unproven_refused
+            budget.charge_inner(rebound, Some(&k), CLIENT_BYTES_PER_DIAL, t0, true),
+            (Ok(()), used())
         );
-        // The proven pair is still served, and an IPv4-mapped form of the
-        // address is the same pair.
+        // So is the IPv4-mapped form of the address.
         let mapped = SocketAddr::new("::ffff:198.51.100.1".parse().unwrap(), 31337);
         assert_eq!(
             budget.charge_inner(mapped, Some(&k), CLIENT_BYTES_PER_DIAL, t0, true),
             (Ok(()), used())
         );
+    }
+
+    /// All proven peers at one address draw at most IP_ALLOWANCE_BYTES
+    /// together, however many keys there are: a shared address cannot take
+    /// the node's allowance.
+    #[test]
+    fn one_address_gets_a_bounded_allowance() {
+        let budget = PunchBudget::default();
+        let t0 = Duration::from_secs(100);
+        let keys: Vec<_> = (0..10).map(|_| key()).collect();
+        for k in &keys {
+            budget.mark_proven(to(PEER), k, t0);
+        }
+        exhaust_shared(&budget, PEER, t0);
+        let mut served = 0;
+        for k in &keys {
+            for _ in 0..ALLOWANCE_BYTES / CLIENT_BYTES_PER_DIAL {
+                let (result, counts) = dial(&budget, PEER, k, t0);
+                if result.is_ok() {
+                    served += CLIENT_BYTES_PER_DIAL;
+                } else {
+                    assert!(counts.exhausted_peer && counts.refused_proven);
+                }
+            }
+        }
+        assert_eq!(served, IP_ALLOWANCE_BYTES);
+        // After a window it refills like the others.
+        assert_eq!(
+            dial(&budget, PEER, &keys[9], t0 + PUNCH_BUDGET_WINDOW),
+            (Ok(()), used())
+        );
+    }
+
+    /// Joins have a partition of their own: however many peers join, none
+    /// of the peers this node dialed is forgotten, and the joined ones stay
+    /// within their own bound.
+    #[test]
+    fn joins_cannot_forget_a_dialed_peer() {
+        let budget = PunchBudget::with_capacities(PUNCH_BUDGET_ENTRIES, 2, 3);
+        let dialed = [key(), key()];
+        let t0 = Duration::from_secs(100);
+        for (i, k) in dialed.iter().enumerate() {
+            budget.mark_proven(to(&format!("198.51.100.{}", i + 1)), k, t0);
+        }
+        let mut now = t0;
+        let joiners: Vec<_> = (0..20).map(|_| key()).collect();
+        for (i, k) in joiners.iter().enumerate() {
+            // A minute apart, so every allowance has refilled and the
+            // partition can forget freely.
+            now += PUNCH_BUDGET_WINDOW;
+            budget.mark_proven_joined(to(&format!("203.0.113.{}", i + 1)), k, now);
+        }
+        for (i, k) in dialed.iter().enumerate() {
+            assert!(budget.is_proven(to(&format!("198.51.100.{}", i + 1)), k, now));
+        }
+        let kept = joiners
+            .iter()
+            .enumerate()
+            .filter(|(i, k)| budget.is_proven(to(&format!("203.0.113.{}", i + 1)), k, now))
+            .count();
+        assert_eq!(kept, 3);
+        // A joined peer's setup draws on its allowance.
+        let last = joiners.len() - 1;
+        let ip = format!("203.0.113.{}", last + 1);
+        exhaust_shared(&budget, &ip, now);
+        assert_eq!(dial(&budget, &ip, &joiners[last], now), (Ok(()), used()));
     }
 
     /// Allowance charges leave the shared budgets alone.
@@ -824,7 +963,7 @@ mod tests {
     /// recorded then, and is once the allowance has refilled.
     #[test]
     fn forgetting_a_proven_peer_never_refills_its_allowance() {
-        let budget = PunchBudget::with_capacities(PUNCH_BUDGET_ENTRIES, 2);
+        let budget = PunchBudget::with_capacities(PUNCH_BUDGET_ENTRIES, 2, 2);
         let (k1, k2, k3) = (key(), key(), key());
         let t0 = Duration::from_secs(100);
         for (ip, k) in [("198.51.100.1", &k1), ("198.51.100.2", &k2)] {
@@ -848,7 +987,7 @@ mod tests {
     /// when the live one is the less recently used.
     #[test]
     fn an_expired_proof_is_forgotten_before_a_live_one() {
-        let budget = PunchBudget::with_capacities(PUNCH_BUDGET_ENTRIES, 2);
+        let budget = PunchBudget::with_capacities(PUNCH_BUDGET_ENTRIES, 2, 2);
         let (a, b, c) = (key(), key(), key());
         let t0 = Duration::from_secs(100);
         let hour = Duration::from_secs(3600);
@@ -903,12 +1042,16 @@ mod tests {
 
         let driver = code_only(include_str!("../upgrade/driver.rs"));
         let join = body_of(&driver, "fn hand_off_join", "    fn route(");
-        assert_eq!(join.matches(".mark_proven(").count(), 1);
-        let marked = join.find(".mark_proven(").unwrap();
+        assert_eq!(join.matches(".mark_proven_joined(").count(), 1);
+        let marked = join.find(".mark_proven_joined(").unwrap();
         let sent = join.find("to_node.try_send").unwrap();
-        assert!(marked < sent);
+        let failed = join.find("Err(_) =>").unwrap();
+        assert!(
+            sent < marked && marked < failed,
+            "a join proves its peer only when handed over"
+        );
 
-        let total: usize = [
+        let sources = [
             include_str!("../../quic.rs"),
             include_str!("../upgrade/driver.rs"),
             include_str!("../upgrade/driver/native.rs"),
@@ -916,14 +1059,19 @@ mod tests {
             include_str!("setup.rs"),
             include_str!("exchange.rs"),
             include_str!("../path.rs"),
-        ]
-        .iter()
-        .map(|source| code_only(source).matches(".mark_proven(").count())
-        .sum();
+        ];
+        let count = |needle: &str| -> usize {
+            sources
+                .iter()
+                .map(|source| code_only(source).matches(needle).count())
+                .sum()
+        };
         assert_eq!(
-            total, 2,
+            count(".mark_proven("),
+            1,
             "UDP-established connections must not prove a peer"
         );
+        assert_eq!(count(".mark_proven_joined("), 1);
     }
 
     /// A refused charge takes nothing, and every port and the IPv4-mapped
