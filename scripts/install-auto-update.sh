@@ -28,7 +28,7 @@ fi
 # Check dependencies
 echo "Checking dependencies..."
 MISSING=()
-for cmd in curl jq unzip; do
+for cmd in curl jq tar unzip openssl; do
     if ! command -v "$cmd" &> /dev/null; then
         MISSING+=("$cmd")
     fi
@@ -37,6 +37,16 @@ done
 if [[ ${#MISSING[@]} -gt 0 ]]; then
     echo -e "${YELLOW}Installing missing dependencies: ${MISSING[*]}${NC}"
     apt-get update && apt-get install -y "${MISSING[@]}"
+fi
+# gateway-auto-update.sh verifies each release's signed SHA256SUMS.txt with
+# `openssl pkeyutl -rawin` (OpenSSL >= 3.0) and refuses every update without it.
+if ! openssl version 2>/dev/null | grep -qE '^OpenSSL ([3-9]|[1-9][0-9])\.'; then
+    echo -e "${RED}Error: OpenSSL >= 3.0 is required (found: $(openssl version 2>/dev/null || echo none))${NC}"
+    exit 1
+fi
+if ! command -v sha256sum &> /dev/null; then
+    echo -e "${RED}Error: sha256sum (coreutils) is required${NC}"
+    exit 1
 fi
 echo -e "${GREEN}Dependencies OK${NC}"
 echo
@@ -47,13 +57,16 @@ cp "$SCRIPT_DIR/gateway-auto-update.sh" /usr/local/bin/gateway-auto-update.sh
 chmod 755 /usr/local/bin/gateway-auto-update.sh
 echo -e "${GREEN}Installed: /usr/local/bin/gateway-auto-update.sh${NC}"
 
-# Install the deploy script (if not already present)
-if [[ ! -f /usr/local/bin/deploy-local-gateway.sh ]]; then
-    echo "Installing deployment script..."
-    cp "$SCRIPT_DIR/deploy-local-gateway.sh" /usr/local/bin/deploy-local-gateway.sh
-    chmod 755 /usr/local/bin/deploy-local-gateway.sh
-    echo -e "${GREEN}Installed: /usr/local/bin/deploy-local-gateway.sh${NC}"
+# Install or refresh the deploy script. Always refreshed: gateway-auto-update.sh
+# runs it as root, and a stale copy that swallowed its own failure reported a
+# dead gateway as updated (#4492). A changed previous copy is kept as .prev.
+DEPLOY_SCRIPT=/usr/local/bin/deploy-local-gateway.sh
+if [[ -f "$DEPLOY_SCRIPT" ]] && ! cmp -s "$SCRIPT_DIR/deploy-local-gateway.sh" "$DEPLOY_SCRIPT"; then
+    cp -p "$DEPLOY_SCRIPT" "$DEPLOY_SCRIPT.prev"
+    echo -e "${YELLOW}Replacing a different deploy-local-gateway.sh (previous copy: $DEPLOY_SCRIPT.prev)${NC}"
 fi
+install -m 0755 -o root -g root "$SCRIPT_DIR/deploy-local-gateway.sh" "$DEPLOY_SCRIPT"
+echo -e "${GREEN}Installed: $DEPLOY_SCRIPT${NC}"
 
 # Install systemd units
 echo "Installing systemd units..."

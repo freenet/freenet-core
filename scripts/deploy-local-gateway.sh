@@ -538,7 +538,7 @@ verify_service() {
             # confirm the service is running the new binary. Return success to
             # preserve the existing manual-deploy behaviour on macOS, but make
             # the lack of verification explicit. The automated release-agent
-            # path is systemd-only (nova/vega), and gateway-auto-update.sh adds
+            # path is systemd-only (nova), and gateway-auto-update.sh adds
             # an independent is-active gate on top of this (#4492), so the
             # unverified launchd path is not on the automated update chain.
             echo "  ℹ️  Manual verification required for launchd"

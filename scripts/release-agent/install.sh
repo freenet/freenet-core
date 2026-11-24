@@ -64,22 +64,45 @@ if [[ ! -f /etc/freenet-release-agent/hmac.key ]]; then
     echo
 fi
 
-echo "==> Verifying gateway-auto-update.sh privilege boundary"
-GATEWAY_UPDATE_SCRIPT=/usr/local/bin/gateway-auto-update.sh
-if [[ -e "$GATEWAY_UPDATE_SCRIPT" ]]; then
-    script_owner=$(stat -c '%U' "$GATEWAY_UPDATE_SCRIPT")
-    script_perms=$(stat -c '%a' "$GATEWAY_UPDATE_SCRIPT")
-    if [[ "$script_owner" != "root" ]]; then
-        echo "ERROR: $GATEWAY_UPDATE_SCRIPT is owned by $script_owner, must be root" >&2
-        echo "  If freenet-update can write this script, the sudoers entry is meaningless." >&2
-        exit 1
-    fi
-    if [[ "$script_perms" -gt 755 ]]; then
-        echo "ERROR: $GATEWAY_UPDATE_SCRIPT has perms $script_perms; max safe is 755" >&2
-        exit 1
-    fi
-else
-    echo "WARNING: $GATEWAY_UPDATE_SCRIPT not found yet. Install it with the existing gateway-auto-update bootstrap before flipping dry_run=false." >&2
+echo "==> Installing gateway-auto-update.sh and deploy-local-gateway.sh"
+# Always from this checkout, so re-running install.sh after a merge is how the
+# gateway picks up the current scripts. gateway-auto-update.sh verifies each
+# release's signed checksums before installing (an older copy does not), and
+# runs deploy-local-gateway.sh from its own directory as root, so a stale
+# deploy script is as dangerous as a stale updater (#4492). Both are
+# refreshed; a changed previous deploy script is kept as .prev.
+GATEWAY_BIN_DIR=/usr/local/bin
+GATEWAY_UPDATE_SCRIPT=$GATEWAY_BIN_DIR/gateway-auto-update.sh
+DEPLOY_SCRIPT=$GATEWAY_BIN_DIR/deploy-local-gateway.sh
+install -m 0755 -o root -g root \
+    "$SCRIPT_DIR/../gateway-auto-update.sh" \
+    "$GATEWAY_UPDATE_SCRIPT"
+if [[ -f "$DEPLOY_SCRIPT" ]] && ! cmp -s "$SCRIPT_DIR/../deploy-local-gateway.sh" "$DEPLOY_SCRIPT"; then
+    cp -p "$DEPLOY_SCRIPT" "$DEPLOY_SCRIPT.prev"
+    echo "  Replacing a different $DEPLOY_SCRIPT (previous copy: $DEPLOY_SCRIPT.prev)"
+fi
+install -m 0755 -o root -g root \
+    "$SCRIPT_DIR/../deploy-local-gateway.sh" \
+    "$DEPLOY_SCRIPT"
+if ! openssl version 2>/dev/null | grep -qE '^OpenSSL ([3-9]|[1-9][0-9])\.'; then
+    echo "WARNING: OpenSSL >= 3.0 not found; gateway-auto-update.sh will refuse every update until it is installed." >&2
+fi
+
+echo "==> Verifying the privilege boundary around the update scripts"
+# The files were just installed root:root 0755, so checking them proves
+# nothing. What can still undo the sudoers boundary is the DIRECTORY: if
+# freenet-update (or any non-root user) can write $GATEWAY_BIN_DIR, it can
+# replace either script, including the deploy script that
+# gateway-auto-update.sh runs as root from that directory.
+dir_owner=$(stat -c '%U' "$GATEWAY_BIN_DIR")
+dir_perms=$(stat -c '%a' "$GATEWAY_BIN_DIR")
+if [[ "$dir_owner" != "root" ]]; then
+    echo "ERROR: $GATEWAY_BIN_DIR is owned by $dir_owner, must be root" >&2
+    exit 1
+fi
+if (( 8#$dir_perms & 8#022 )); then
+    echo "ERROR: $GATEWAY_BIN_DIR has perms $dir_perms; group/other must not be able to write it" >&2
+    exit 1
 fi
 
 echo "==> Installing announce-to-river.sh"

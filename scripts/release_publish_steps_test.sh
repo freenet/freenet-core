@@ -20,6 +20,7 @@ LINTER="$REPO_ROOT/.github/scripts/check_release_dry_run.py"
 CROSS_YML="$REPO_ROOT/.github/workflows/cross-compile.yml"
 ANNOUNCE_YML="$REPO_ROOT/.github/workflows/release-announce.yml"
 RELEASE_YML="$REPO_ROOT/.github/workflows/release.yml"
+DOCKER_YML="$REPO_ROOT/.github/workflows/docker-publish.yml"
 # An ambient token or ref must not leak into a step under test.
 unset GH_TOKEN GITHUB_TOKEN GITHUB_REF
 TEST_TMP=$(mktemp -d)
@@ -389,6 +390,109 @@ if load_step "$RELEASE_YML" validate "Resolve + validate version" "$VALIDATE"; t
     autobump_case "unreadable crates.io answer refuses" garbage 0.2.163 "rc=1 "
     rm -f "$STUBS/curl"
 fi
+
+# --- 6. docker-publish.yml: version tags and the floating tags -----------------
+#
+# The build pushes only the per-release tags. "Move the floating tags" then
+# re-lists the published releases AFTER the push and retags the image as
+# `latest` only for the highest published non-prerelease release, and as `X.Y`
+# only for the highest within that minor (the same definition as
+# cross-compile.yml's Publish release above), so re-publishing an older tag
+# cannot move either backwards. A failed or empty listing moves nothing
+# without failing the step; on a `release` event the tag counts as published
+# even if the listing lags.
+DOCK="$TEST_TMP/docker-version"
+if load_step "$DOCKER_YML" publish "Derive version tags" "$DOCK"; then
+    derive_case() {
+        local desc="$1" tag="$2" pre="$3" want="$4" rc
+        rc=$(run_step "$DOCK" RELEASE_TAG="$tag" RELEASE_PRERELEASE="$pre")
+        check "Docker version tags: $desc" \
+            "rc=$rc stable=$(sed -n 's/^is_stable=//p' "$DOCK/github_output") minor=$(sed -n 's/^minor=//p' "$DOCK/github_output")" \
+            "$want"
+    }
+    derive_case "a stable tag" v0.2.150 false "rc=0 stable=true minor=0.2"
+    derive_case "the prerelease flag on a tag without '-' is not stable" v0.2.150 true "rc=0 stable=false minor=0.2"
+    derive_case "a dispatched prerelease (no event flag) is not stable" v0.3.0-rc1 "" "rc=0 stable=false minor=0.3"
+    derive_case "a tag without the leading v is refused" 0.2.150 "" "rc=1 stable= minor="
+fi
+
+# docker stub: logs its argv, fails when DOCKER_RC is set.
+cat > "$STUBS/docker" <<'EOF'
+#!/usr/bin/env bash
+printf 'docker %s\n' "$*" >> "$STUB_CALLS"
+exit "${DOCKER_RC:-0}"
+EOF
+chmod +x "$STUBS/docker"
+
+FLOAT="$TEST_TMP/docker-floating"
+if load_step "$DOCKER_YML" publish "Move the floating tags" "$FLOAT"; then
+    # float_case <desc> <tag> <event> <stable> <want "rc= latest= minor= retags=">  [env...]
+    float_case() {
+        local desc="$1" tag="$2" event="$3" stable="$4" want="$5" rc minor retags
+        shift 5
+        minor="${tag#v}"; minor="${minor%.*}"
+        rc=$(run_step "$FLOAT" RELEASE_TAG="$tag" MINOR="$minor" IS_STABLE="$stable" EVENT_NAME="$event" \
+            IMAGE=ghcr.io/freenet/freenet-core GITHUB_REPOSITORY=freenet/freenet-core "$@")
+        retags=$(grep '^docker ' "$FLOAT/calls" | sed 's/^docker buildx imagetools create -t ghcr.io\/freenet\/freenet-core://; s/ ghcr.io\/freenet\/freenet-core:/<-/' | paste -sd',' -)
+        check "Floating tags: $desc" \
+            "rc=$rc latest=$(sed -n 's/^moved_latest=//p' "$FLOAT/github_output") minor=$(sed -n 's/^moved_minor=//p' "$FLOAT/github_output") retags=$retags" \
+            "$want"
+    }
+    float_case "the highest published release moves latest and its minor" v0.2.150 release true \
+        "rc=0 latest=true minor=true retags=0.2<-v0.2.150,latest<-v0.2.150" LIST_OUT='v0.2.150\nv0.2.149\n'
+    float_case "re-publishing an older release moves neither" v0.2.140 workflow_dispatch true \
+        "rc=0 latest=false minor=false retags=" LIST_OUT='v0.2.150\nv0.2.140\n'
+    float_case "an older MINOR's highest patch moves its minor tag only" v0.1.99 workflow_dispatch true \
+        "rc=0 latest=false minor=true retags=0.1<-v0.1.99" LIST_OUT='v0.2.150\nv0.1.99\nv0.1.98\n'
+    float_case "an older patch in an older minor moves nothing" v0.1.98 workflow_dispatch true \
+        "rc=0 latest=false minor=false retags=" LIST_OUT='v0.2.150\nv0.1.99\nv0.1.98\n'
+    float_case "minor match is by prefix, not substring (v0.2. vs v0.20.)" v0.2.5 workflow_dispatch true \
+        "rc=0 latest=false minor=true retags=0.2<-v0.2.5" LIST_OUT='v0.20.1\nv0.2.5\n'
+    float_case "versions compare numerically (v0.2.100 over v0.2.99)" v0.2.100 release true \
+        "rc=0 latest=true minor=true retags=0.2<-v0.2.100,latest<-v0.2.100" LIST_OUT='v0.2.99\nv0.2.100\n'
+    float_case "a release event counts its own tag when the listing lags" v0.2.151 release true \
+        "rc=0 latest=true minor=true retags=0.2<-v0.2.151,latest<-v0.2.151" LIST_OUT='v0.2.150\n'
+    float_case "a dispatched tag absent from the list (e.g. a draft) moves nothing" v0.2.151 workflow_dispatch true \
+        "rc=0 latest=false minor=false retags=" LIST_OUT='v0.2.150\n'
+    float_case "a failed listing moves nothing and FAILS the step (stale latest is noticed)" v0.2.150 release true \
+        "rc=1 latest=false minor=false retags=" LIST_RC=1
+    check "Floating tags: a failed listing is an ::error::" "$(grep -c '^::error::Could not list published releases' "$FLOAT/out")" "1"
+    float_case "an empty listing moves nothing and fails the step" v0.2.150 release true \
+        "rc=1 latest=false minor=false retags=" LIST_OUT=''
+    # A release not flagged as a prerelease but named like one must not count.
+    float_case "an unflagged v0.3.0-beta does not pin latest" v0.2.150 workflow_dispatch true \
+        "rc=0 latest=true minor=true retags=0.2<-v0.2.150,latest<-v0.2.150" \
+        LIST_JSON='[{"tagName":"v0.3.0-beta","isPrerelease":false},{"tagName":"v0.2.150","isPrerelease":false}]'
+    float_case "a listing with only non-vX.Y.Z tags fails the step" v0.2.150 workflow_dispatch true \
+        "rc=1 latest=false minor=false retags=" LIST_OUT='v0.3.0-beta\nnightly\n'
+    float_case "a prerelease moves nothing and lists nothing" v0.3.0-rc1 release false \
+        "rc=0 latest=false minor=false retags=" LIST_OUT='v0.3.0-rc1\n'
+    check "Floating tags: a prerelease makes no gh call" "$(grep -c '^release list' "$FLOAT/calls")" "0"
+    float_case "a not-highest skip is a warning" v0.2.140 workflow_dispatch true \
+        "rc=0 latest=false minor=false retags=" LIST_OUT='v0.2.150\nv0.2.140\n'
+    check "Floating tags: the latest skip is a ::warning::" \
+        "$(grep -c '^::warning::v0.2.140 is not the highest published release' "$FLOAT/out")" "1"
+    # The step's own --jq runs here, so deleting its prerelease filter fails this.
+    float_case "a newer PRERELEASE does not stop the highest stable moving latest" v0.2.150 workflow_dispatch true \
+        "rc=0 latest=true minor=true retags=0.2<-v0.2.150,latest<-v0.2.150" \
+        LIST_JSON='[{"tagName":"v0.3.0-rc1","isPrerelease":true},{"tagName":"v0.2.150","isPrerelease":false}]'
+    check "Floating tags: the listing excludes drafts" \
+        "$(grep -c '^release list .*--exclude-drafts' "$FLOAT/calls")" "1"
+    float_case "a failed retag fails the step" v0.2.150 release true \
+        "rc=1 latest= minor= retags=0.2<-v0.2.150" LIST_OUT='v0.2.150\n' DOCKER_RC=1
+fi
+rm -f "$STUBS/docker"
+
+# The build must push only the per-release tags; the floating ones are the
+# step above's job, decided after the push.
+check "Docker metadata: the build pushes no floating tag" \
+    "$(python3 -c '
+import sys, yaml
+steps = yaml.safe_load(open(sys.argv[1]))["jobs"]["publish"]["steps"]
+meta = [s for s in steps if s.get("id") == "metadata"][0]["with"]["tags"]
+names = [s.get("name", s.get("uses", "")) for s in steps]
+print("latest" in meta, "minor" in meta, names.index("Move the floating tags") > max(i for i, n in enumerate(names) if n.startswith("docker/build-push-action")))
+' "$DOCKER_YML")" "False False True"
 
 echo
 if [[ "$FAILURES" -ne 0 ]]; then

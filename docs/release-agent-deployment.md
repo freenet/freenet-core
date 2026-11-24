@@ -79,7 +79,7 @@ cargo run -p riverctl message send <ROOM_VK> "<message>"
 
 This endpoint is **opt-in via config** (`river_announce_command` and
 `river_announce_user` in `config.toml`). Gateways without a local
-Freenet node + room signing key (e.g. vega) leave both fields blank;
+Freenet node + room signing key leave both fields blank;
 `POST /announce/river` returns 503 there.
 
 ## GitHub Actions secrets
@@ -98,16 +98,26 @@ the Matrix secrets are absent — useful while bootstrapping.
 
 ## Prerequisites per gateway
 
-1. **`gateway-auto-update.sh` installed at `/usr/local/bin/`** (or wherever
-   the existing release flow puts it), owned by root, perms ≤ 755.
-   `install.sh` aborts otherwise.
-2. **Caddy** (or another TLS terminator) already running and serving
+1. **`gateway-auto-update.sh` and `deploy-local-gateway.sh` installed at
+   `/usr/local/bin/`**, root:root 0755, in a directory only root can write
+   (the updater runs the deploy script from its own directory, as root).
+   `install.sh` installs both from the checkout it runs from and aborts if
+   `/usr/local/bin` is writable by anyone but root. **Nothing updates them
+   automatically**: after a change to either script merges, refresh both on
+   each gateway from an up-to-date `main` checkout, by re-running `install.sh`
+   (or `scripts/install-auto-update.sh`), or by hand:
+   `sudo install -m 0755 -o root -g root scripts/gateway-auto-update.sh
+   scripts/deploy-local-gateway.sh /usr/local/bin/`.
+2. **OpenSSL >= 3.0** (`openssl version`). `gateway-auto-update.sh` verifies
+   each release's signed `SHA256SUMS.txt` with `openssl pkeyutl -rawin`, and
+   refuses every update, before downloading, if OpenSSL is missing or older.
+3. **Caddy** (or another TLS terminator) already running and serving
    `*.locut.us`. Caddyfile snippet in
    [`scripts/release-agent/Caddyfile.snippet`](../scripts/release-agent/Caddyfile.snippet).
-3. **DNS A record** for `update.<host>.locut.us` pointing at the
+4. **DNS A record** for `update.<host>.locut.us` pointing at the
    gateway's public IP. Create this before `install.sh` runs so Caddy can
    acquire the cert.
-4. **Inbound TCP/443 reachable** from GitHub Actions runners. See [Firewall
+5. **Inbound TCP/443 reachable** from GitHub Actions runners. See [Firewall
    notes per host](#firewall-notes-per-host) below.
 
 ## Install procedure
@@ -194,42 +204,17 @@ narrowing the SG creates more breakage than it prevents.
 
 ### vega (AWS EC2) — RETIRED September 2026
 
-> Retired. Kept because it documents the only deployment where ghostkey-api
-> owned :80/:443 and forced the agent onto :8443 — useful precedent if another
-> host ever needs that shape. No longer a rollout target: out of the release
-> matrix, out of `release.sh`, and `RELEASE_AGENT_HMAC_VEGA` is unused.
+Retired in #5540 and no longer a rollout target: out of the release matrix,
+out of `release.sh`, and `RELEASE_AGENT_HMAC_VEGA` is unused. Its
+deployment-specific files (a Caddyfile that served the agent on `:8443`
+because ghostkey-api owned `:80`/`:443`, and a certbot deploy hook that
+re-applied cert group ownership) were deleted with it. If another host ever
+needs that shape, recover them from git history (`git log --diff-filter=D --
+scripts/release-agent/Caddyfile.vega.snippet`).
 
-
-Vega differs from nova: `ghostkey-api` (gkapi.freenet.org) already owns
-:80 and :443 on this host, so the release-agent uses a **non-standard
-port and a per-host vhost**.
-
-- AWS Security Group `sg-0f4b9b9b5bf2a8cbb`: open inbound **TCP/8443**
-  from `0.0.0.0/0`. (No need to open :443; Caddy doesn't listen there
-  on vega.) Rely on HMAC for authentication; the agent's defense-in-
-  depth layers (clock-skew window, rate-limit, version-pin, GitHub-
-  latest cross-check) make a public endpoint safe.
-- Caddy config: install
-  [`scripts/release-agent/Caddyfile.vega.snippet`](../scripts/release-agent/Caddyfile.vega.snippet)
-  as `/etc/caddy/Caddyfile`. It uses `auto_https off` so Caddy doesn't
-  try to bind :80/:443, and an explicit `tls` directive pointing at
-  the dedicated `vega.locut.us` Let's Encrypt cert at
-  `/etc/letsencrypt/live/vega.locut.us/{fullchain,privkey}.pem`.
-- Cert permissions: the `caddy` system user must be in the `ssl-cert`
-  group; the cert files in `/etc/letsencrypt/archive/vega.locut.us/`
-  must be chgrp'd to `ssl-cert` with mode `0640` (privkey) / `0644`
-  (the rest). Install
-  [`scripts/release-agent/reload-caddy.sh`](../scripts/release-agent/reload-caddy.sh)
-  as `/etc/letsencrypt/renewal-hooks/deploy/reload-caddy.sh` (mode
-  0755) so certbot re-applies the group ownership and reloads Caddy
-  after each renewal.
-- Smoke test URL: `https://vega.locut.us:8443/release-agent/healthz`
-  (not `update.vega.locut.us`). The workflow's vega matrix entry
-  matches this.
-
-If you want a tighter SG, the alternative is a fronting Caddy on a
-known-IP host that the SG allows in, with the agent's port only
-reachable through it. Adds operational complexity; not recommended for
+For a cloud host, if you want a tighter security group, the alternative
+is a fronting Caddy on a known-IP host that the SG allows in, with the
+agent's port only reachable through it. Adds operational complexity; not recommended for
 Phase 1.
 
 ## Dry-run validation checklist
@@ -271,7 +256,7 @@ Verify with a signed request: the response should now return
 `journalctl -u freenet-release-agent -f` should show the sudo
 invocation.
 
-**Do nova first, leave vega in dry-run** until nova has driven a
+**Do nova first, leave any other gateway in dry-run** until nova has driven a
 successful production update via the workflow at least once.
 
 ## Uninstalling
