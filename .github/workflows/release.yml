@@ -13,15 +13,24 @@ on:
         required: false
         type: boolean
         default: false
+      ship_sha:
+        description: 'Full 40-character SHA of the commit on main to release (the soaked commit). Required for a live run; a dry run defaults to the dispatch commit.'
+        required: false
+        type: string
+        default: ''
       dry_run:
-        description: 'Dry run - compute and package the release, print what would be created, push/merge/tag/publish nothing'
+        description: 'Dry run - compute and package the release, print what would be created, push/tag/publish nothing'
         required: false
         type: boolean
         default: false
 
+# A release ships EXACTLY `ship_sha` plus a version bump (commit B, parent
+# ship_sha), never whatever main is when the run starts, so main need not be
+# frozen during a cut. B is pushed as `release/vX.Y.Z`, ci.yml's push run on it
+# is the full-suite gate, and B is tagged. main gets the same bump afterwards
+# from release-sync.yml, when the release is published. docs/RELEASING.md.
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
   validate:
@@ -39,9 +48,11 @@ jobs:
       pull-requests: read
     outputs:
       version: ${{ steps.validate.outputs.version }}
-      fdev_version: ${{ steps.validate.outputs.fdev_version }}
-      # 'true' ONLY for a live release. Every step that pushes, opens or merges
-      # a PR, tags or creates a release is gated on
+      fdev_version: ${{ steps.ship.outputs.fdev_version }}
+      # The commit this release ships, checked by scripts/resolve_release_ship.sh.
+      ship_sha: ${{ steps.ship.outputs.ship_sha }}
+      # 'true' ONLY for a live release. Every step that pushes, tags or creates
+      # a release is gated on
       # `needs.validate.outputs.live == 'true'`, so an empty or missing value
       # skips it (fail closed). See scripts/resolve_release_mode.sh (#5936).
       live: ${{ steps.mode.outputs.live }}
@@ -63,9 +74,9 @@ jobs:
 
       # A LIVE run refuses without RELEASE_PAT; a dry run only warns. Without
       # it every push, tag and un-draft is made with GITHUB_TOKEN, whose events
-      # GitHub suppresses: the bump PR gets no CI, the tag push never starts
-      # cross-compile.yml, and nothing ever un-drafts or announces. A live run
-      # without it stalls half-done after the bump has merged (#4118, v0.2.57).
+      # GitHub suppresses: the release branch gets no CI, the tag push never
+      # starts cross-compile.yml, and nothing ever un-drafts, announces or
+      # syncs main. A live run without it stalls half-done (#4118, v0.2.57).
       - name: Check RELEASE_PAT is configured
         env:
           # Workflow secrets are not directly visible in `if:` expressions,
@@ -77,7 +88,7 @@ jobs:
           if [ "$RELEASE_PAT_PRESENT" = "true" ]; then
             echo "✅ RELEASE_PAT is configured. Downstream workflows will be triggered automatically."
           elif [ "$RELEASE_LIVE" = "true" ]; then
-            echo "::error title=RELEASE_PAT not set::A live release needs RELEASE_PAT. With GITHUB_TOKEN the tag push does not start cross-compile.yml and the un-draft fires no gateway-update or announcement, so the release would stop half-done after the bump PR merged. Configure a RELEASE_PAT repo secret with 'repo' + 'workflow' scopes. See issue #4118 and AGENTS.md → 'Release Workflow & RELEASE_PAT'."
+            echo "::error title=RELEASE_PAT not set::A live release needs RELEASE_PAT. With GITHUB_TOKEN the release-branch push starts no CI, the tag push does not start cross-compile.yml and the un-draft fires no gateway-update or announcement, so the release would stop half-done. Configure a RELEASE_PAT repo secret with 'repo' + 'workflow' scopes. See issue #4118 and AGENTS.md → 'Release Workflow & RELEASE_PAT'."
             exit 1
           else
             echo "::warning title=RELEASE_PAT not set::Dry run only. A live run refuses without RELEASE_PAT (#4118)."
@@ -85,7 +96,7 @@ jobs:
 
       # The crates.io credential is checked HERE, in the first job, because the
       # publish that needs it now runs at the very END of the pipeline -- after
-      # the bump PR, the tag, ~30 minutes of cross-compilation and macOS
+      # the release-branch CI, the tag, ~30 minutes of cross-compilation and macOS
       # notarization, and Gate A. Discovering a missing token at that point
       # costs the whole run and a tag, which is F3's shape reappearing one step
       # further down. Fail before anything has been created.
@@ -191,31 +202,21 @@ jobs:
               echo "::error::Could not resolve latest version from crates.io (got: '$LATEST')"
               exit 1
             fi
-            # Bump from the higher of crates.io and this tree's version. After a
-            # Gate A block the bump has merged but nothing was published, so
-            # crates.io alone would pick the version main already carries, which
-            # the pre-flight refuses on every dispatch.
-            CURRENT=$(awk '/^\[package\]/ {p = 1; next} /^\[/ {p = 0}
-                           p && /^version *=/ {gsub(/.*= *"|".*/, ""); print; exit}' crates/core/Cargo.toml)
-            # Only those two shapes are guessed: the tree equal to crates.io (the
-            # normal case) or one patch ahead of it (a merged, unpublished bump).
-            # Anything else (a tree far ahead, an unreadable version, a dispatch
-            # from a branch carrying some other version) needs an explicit input.
-            NEXT_OF_LATEST="$(echo "$LATEST" | cut -d. -f1-2).$(( $(echo "$LATEST" | cut -d. -f3) + 1 ))"
-            if [[ "$CURRENT" == "$LATEST" ]]; then
-              BASE="$LATEST"
-            elif [[ "$CURRENT" == "$NEXT_OF_LATEST" ]]; then
-              BASE="$CURRENT"
-            else
-              echo "::error::No version input, and the tree's version '$CURRENT' is neither crates.io's $LATEST nor one patch above it. Dispatch with an explicit version."
-              exit 1
-            fi
+            # Bump from crates.io alone, never from this tree. The tree is the
+            # dispatch ref, not the ship commit, and main's version lags a
+            # release until its merge-back lands, so it is routinely BEHIND
+            # crates.io. A Gate A block no longer leaves an unpublished bump on
+            # main either (the bump lives only on release/vX), so crates.io + 1
+            # is also the right re-cut of a blocked version. The pre-flight
+            # still checks the result against the ship commit and the latest
+            # published release.
+            BASE="$LATEST"
             MAJOR=$(echo "$BASE" | cut -d. -f1)
             MINOR=$(echo "$BASE" | cut -d. -f2)
             PATCH=$(echo "$BASE" | cut -d. -f3)
             NEW_PATCH=$((PATCH + 1))
             VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
-            echo "::notice::No version input; auto-bumping patch from $BASE (crates.io latest $LATEST, tree $CURRENT) → $VERSION"
+            echo "::notice::No version input; auto-bumping patch from crates.io latest $LATEST → $VERSION"
           else
             if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
               echo "::error::Version must be in format X.Y.Z (e.g., 0.1.31). Got: $VERSION"
@@ -224,30 +225,36 @@ jobs:
           fi
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "✅ Release version: freenet $VERSION (fdev is resolved with the ship commit, next)"
 
-          # Get current fdev version and increment patch
-          CURRENT_FDEV=$(grep "^version" crates/fdev/Cargo.toml | cut -d'"' -f2)
-          FDEV_MAJOR=$(echo "$CURRENT_FDEV" | cut -d. -f1)
-          FDEV_MINOR=$(echo "$CURRENT_FDEV" | cut -d. -f2)
-          FDEV_PATCH=$(echo "$CURRENT_FDEV" | cut -d. -f3)
-          FDEV_NEW_PATCH=$((FDEV_PATCH + 1))
-          FDEV_VERSION="${FDEV_MAJOR}.${FDEV_MINOR}.${FDEV_NEW_PATCH}"
-
-          echo "fdev_version=$FDEV_VERSION" >> $GITHUB_OUTPUT
-
-          echo "✅ Release versions:"
-          echo "  freenet: $VERSION"
-          echo "  fdev: $FDEV_VERSION"
+      # Which commit ships, and the fdev version. A live run refuses without
+      # ship_sha, or with one that is not on main or does not contain the
+      # previous release's ship commit; a dry run defaults to the dispatch
+      # commit and only warns. fdev = max(fdev at ship_sha, fdev at the latest
+      # published tag) + 1 patch, since main lags a release until its
+      # merge-back. Tests: scripts/resolve_release_ship_test.sh.
+      - name: Resolve and check the ship commit
+        id: ship
+        env:
+          # Via env, not `${{ }}` in the script, for the same reason as above.
+          SHIP_SHA_INPUT: ${{ inputs.ship_sha }}
+          RELEASE_LIVE: ${{ steps.mode.outputs.live }}
+          LAUNCH_SHA: ${{ github.sha }}
+          # Read-only API lookups; this job's token can only read.
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/resolve_release_ship.sh
 
       # Refuse, before anything is created, the cuts that would otherwise fail
-      # half-done: after the bump PR has merged (a tag that already exists, a
-      # version already on crates.io) or after a second bump PR has raced the
-      # first one into the queue (a concurrent cut). Live only; a dry run
-      # creates nothing, so it has nothing to collide with.
+      # half-done: a tag that already exists, a version already on crates.io or
+      # not above the ship commit's and the latest release's, or a concurrent
+      # cut. Live only; a dry run creates nothing, so it has nothing to collide
+      # with.
       - name: Refuse a version that is spent or already being cut
         if: steps.mode.outputs.live == 'true'
         env:
           RELEASE_VERSION: ${{ steps.validate.outputs.version }}
+          # The ship commit's manifest, not the dispatch ref's.
+          CARGO_TOML: ${{ steps.ship.outputs.ship_cargo_toml }}
           GH_TOKEN: ${{ github.token }}
         run: bash scripts/check_release_preflight.sh
 
@@ -273,15 +280,20 @@ jobs:
         run: bash scripts/check_quic_data_ramp_t0.sh --version "$RELEASE_VERSION" --live "$RELEASE_LIVE"
 
   # Runs in BOTH modes: the bump is computed and committed locally either way.
-  # Only a live run pushes it, opens the PR and enables auto-merge (#5936: a
-  # dry run used to do all three, landing the version bump on main).
+  # Only a live run pushes it (#5936: a dry run used to push, open a PR and
+  # auto-merge it, landing the version bump on main).
+  #
+  # The bump commit B is made on top of the SHIP commit, not the dispatch ref:
+  # B = ship_sha + version files, so what is tagged is exactly what was soaked.
   update_versions:
-    name: Update versions and create PR
+    name: Commit the version bump on the ship commit
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: validate
     outputs:
-      pr_number: ${{ steps.create_pr.outputs.pr_number }}
+      # The release commit B and its branch. wait_for_ci gates on B's CI.
+      bump_sha: ${{ steps.bump.outputs.bump_sha }}
+      branch: ${{ steps.bump.outputs.branch }}
       # Set only in a dry run: the unpushed bump commit, shipped to
       # `dry_run_rehearsal` as a git bundle artifact.
       dry_run_bump_sha: ${{ steps.dry_run_report.outputs.bump_sha }}
@@ -293,57 +305,43 @@ jobs:
         uses: actions/checkout@v7
         with:
           # Live: RELEASE_PAT when set (coalescing to GITHUB_TOKEN), exactly as
-          # before, so the push below fires downstream workflows. Dry run: the
-          # workflow token, used for the fetch only, because no credential is
-          # persisted to .git/config, so even a `git push` that slipped past
-          # every guard below cannot authenticate. The job still holds the
-          # workflow-level write token; Rule Lint forbids handing it, or any
-          # other secret, to a step that runs in a dry run here (this token
-          # line is the one exemption).
+          # before, so the push below fires ci.yml on the release branch. Dry
+          # run: the workflow token, used for the fetch only, because no
+          # credential is persisted to .git/config, so even a `git push` that
+          # slipped past every guard below cannot authenticate. The job still
+          # holds the workflow-level write token; Rule Lint forbids handing it,
+          # or any other secret, to a step that runs in a dry run here (this
+          # token line is the one exemption).
           token: ${{ (needs.validate.outputs.live == 'true' && secrets.RELEASE_PAT) || secrets.GITHUB_TOKEN }}
           persist-credentials: ${{ needs.validate.outputs.live == 'true' }}
+
+      # The release TOOLING comes from the dispatch ref (this checkout); the
+      # TREE being released is ship_sha, which may predate the tooling. So the
+      # bump script is copied out before the working tree moves to ship_sha.
+      - name: Check out the ship commit
+        env:
+          SHIP_SHA: ${{ needs.validate.outputs.ship_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          cp scripts/apply_version_bump.sh "$RUNNER_TEMP/release-tools/"
+          git fetch --no-tags --depth=1 origin "$SHIP_SHA"
+          git checkout --detach "$SHIP_SHA"
+          [ "$(git rev-parse HEAD)" = "$SHIP_SHA" ] || { echo "::error::Checkout is not at the ship commit $SHIP_SHA."; exit 1; }
 
       - name: Configure git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Update freenet version
-        run: |
-          VERSION="${{ needs.validate.outputs.version }}"
-          sed "s/^version = \".*\"/version = \"$VERSION\"/" crates/core/Cargo.toml > crates/core/Cargo.toml.tmp
-          mv crates/core/Cargo.toml.tmp crates/core/Cargo.toml
-
-      - name: Update fdev version
-        run: |
-          VERSION="${{ needs.validate.outputs.version }}"
-          FDEV_VERSION="${{ needs.validate.outputs.fdev_version }}"
-
-          sed "s/^version = \".*\"/version = \"$FDEV_VERSION\"/" crates/fdev/Cargo.toml > crates/fdev/Cargo.toml.tmp
-          mv crates/fdev/Cargo.toml.tmp crates/fdev/Cargo.toml
-
-          # Anchor on the version field, NOT a trailing ` }`. The line in
-          # crates/fdev/Cargo.toml carries a `, features = [...]` suffix so a
-          # pattern that requires the closing brace silently no-ops, leaving
-          # fdev's freenet-dep version pinned to the previous release (#4119).
-          # Mirror in `scripts/release.sh`; tests in
-          # `crates/fdev/tests/binstall_metadata.rs::release_sed_rewrite`
-          # (the `freenet_dep_*` cases) keep both copies in lockstep.
-          sed -E "s/(freenet = \\{ path = \"\\.\\.\\/core\", version = )\"[^\"]*\"/\\1\"$VERSION\"/" crates/fdev/Cargo.toml > crates/fdev/Cargo.toml.tmp2
-          mv crates/fdev/Cargo.toml.tmp2 crates/fdev/Cargo.toml
-
-          # The fdev crate version diverged from the freenet release tag, so
-          # `[package.metadata.binstall].pkg-url` embeds the freenet version
-          # literally (`v0.2.X`) rather than `v{ version }`. Re-point both the
-          # default and the Windows override to the new release tag so that
-          # `cargo binstall fdev` resolves to the actual GitHub release assets
-          # (issue #3995). The `/g` flag is load-bearing — there are two
-          # pkg-url lines that both need the rewrite. Mirror in
-          # `scripts/release.sh`; tests in
-          # `crates/fdev/tests/binstall_metadata.rs::release_sed_rewrite`
-          # keep both copies of the regex in lockstep.
-          sed -E "s|releases/download/v[0-9]+\.[0-9]+\.[0-9]+/fdev-|releases/download/v${VERSION}/fdev-|g" crates/fdev/Cargo.toml > crates/fdev/Cargo.toml.tmp3
-          mv crates/fdev/Cargo.toml.tmp3 crates/fdev/Cargo.toml
+      # One script for these rewrites, shared with release-sync.yml (the
+      # merge-back onto main), so the two cannot drift. It verifies every
+      # rewrite took (#4119, #3995).
+      - name: Apply the version bump
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+          FDEV_VERSION: ${{ needs.validate.outputs.fdev_version }}
+        run: bash "$RUNNER_TEMP/release-tools/apply_version_bump.sh" "$VERSION" "$FDEV_VERSION"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -361,12 +359,14 @@ jobs:
           cargo update --workspace
           cargo metadata --format-version 1 --manifest-path apps/freenet-ping/Cargo.toml > /dev/null
 
+      # `git add -u`: only files the ship commit already tracks. wait_for_ci
+      # refuses a release commit that changes anything but the version files.
       - name: Commit the version bump locally
         id: bump
         run: |
           BRANCH="release/v${{ needs.validate.outputs.version }}"
           git checkout -b "$BRANCH"
-          git add -A
+          git add -u
           git commit -m "chore: bump versions to ${{ needs.validate.outputs.version }}
 
           - freenet: → ${{ needs.validate.outputs.version }}
@@ -374,85 +374,29 @@ jobs:
 
           🤖 Automated release commit"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "bump_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # Composed once and used by both modes, so a dry run prints exactly the
-      # title and body a live run would open the PR with.
-      #
-      # NOTE: The PR title MUST start with "build: release " — squash-merge
-      # propagates the title to the merge_group head_commit.message, where
-      # ci.yml's `skip_check` keys off it to decide whether the merge_group
-      # entry is the pre-publish gate. Renaming this prefix without
-      # updating ci.yml will silently disable the full-suite release gate.
-      - name: Compose the release PR
-        id: pr_text
-        run: |
-          BODY_FILE="$RUNNER_TEMP/release_pr_body.md"
-          cat > "$BODY_FILE" <<'BODY'
-          **Automated release PR**
-
-          - freenet: → **${{ needs.validate.outputs.version }}**
-          - fdev: → **${{ needs.validate.outputs.fdev_version }}**
-
-          This PR will auto-merge once GitHub CI passes.
-          Generated by: `.github/workflows/release.yml`
-          BODY
-          echo "title=build: release ${{ needs.validate.outputs.version }}" >> "$GITHUB_OUTPUT"
-          echo "body_file=$BODY_FILE" >> "$GITHUB_OUTPUT"
-
+      # Forced: the branch carries only this release's bump commit and nothing
+      # else depends on it. A previous attempt at the same version (a re-cut
+      # after deleting its tag, or a re-run of this job) leaves the branch at
+      # an older B, which must be replaced. The validate pre-flight has already
+      # refused a version whose tag exists, and a concurrent release run.
       - name: Push the release branch
         if: needs.validate.outputs.live == 'true'
         env:
           RELEASE_BRANCH: ${{ steps.bump.outputs.branch }}
         run: |
           [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not pushing the release branch: this run is not live (#5936)."; exit 1; }
-          git push origin "$RELEASE_BRANCH"
+          git push --force origin "$RELEASE_BRANCH"
 
-      - name: Create Pull Request
-        id: create_pr
-        if: needs.validate.outputs.live == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-          RELEASE_BRANCH: ${{ steps.bump.outputs.branch }}
-          PR_TITLE: ${{ steps.pr_text.outputs.title }}
-          PR_BODY_FILE: ${{ steps.pr_text.outputs.body_file }}
-        run: |
-          [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not opening the release PR: this run is not live (#5936)."; exit 1; }
-          PR_URL=$(gh pr create \
-            --title "$PR_TITLE" \
-            --body-file "$PR_BODY_FILE" \
-            --base main \
-            --head "$RELEASE_BRANCH")
-
-          PR_NUMBER=$(echo "$PR_URL" | grep -o '[0-9]\+$')
-          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "✅ Created PR #$PR_NUMBER"
-
-      - name: Enable auto-merge
-        if: needs.validate.outputs.live == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ steps.create_pr.outputs.pr_number }}
-        run: |
-          [ "${RELEASE_LIVE:-}" = "true" ] || { echo "::error title=Refusing in a dry run::Not enabling auto-merge: this run is not live (#5936)."; exit 1; }
-          # The merge queue owns the merge strategy, so do NOT pass --squash
-          # here: it makes `gh pr merge` exit non-zero and, under `bash -e`,
-          # fails this step and skips the whole publish cascade (this is what
-          # broke the v0.2.93 release on 2026-07-07; the queue's strict-strategy
-          # enforcement was enabled between v0.2.92 and v0.2.93). Just enable
-          # auto-merge; the queue applies its configured strategy.
-          gh pr merge "$PR_NUMBER" --auto
-          echo "✅ Auto-merge enabled"
-
-      # The dry-run counterpart of the three steps above: say what they would
-      # have done, then hand the unpushed commit to `dry_run_rehearsal`.
+      # The dry-run counterpart of the push: say what a live run would do, then
+      # hand the unpushed commit to `dry_run_rehearsal`.
       - name: "Dry run: report what a live run would push"
         id: dry_run_report
         if: needs.validate.outputs.live != 'true'
         env:
           RELEASE_BRANCH: ${{ steps.bump.outputs.branch }}
-          PR_TITLE: ${{ steps.pr_text.outputs.title }}
-          PR_BODY_FILE: ${{ steps.pr_text.outputs.body_file }}
-          LAUNCH_SHA: ${{ github.sha }}
+          SHIP_SHA: ${{ needs.validate.outputs.ship_sha }}
         run: |
           set -o pipefail  # a failed `git diff` must not hide behind `tee`
           BUMP_SHA=$(git rev-parse HEAD)
@@ -460,16 +404,12 @@ jobs:
             echo "## 🏃 Release dry run: nothing was pushed"
             echo
             echo "A live run would now:"
-            echo "1. push branch \`$RELEASE_BRANCH\` at \`$BUMP_SHA\`"
-            echo "2. open a PR into \`main\` titled \`$PR_TITLE\`"
-            echo "3. enable auto-merge on it, landing the bump on \`main\` via the merge queue"
-            echo "4. tag the merge commit, create a DRAFT release, and let cross-compile.yml build, run Gate A, publish to crates.io and un-draft"
+            echo "1. push branch \`$RELEASE_BRANCH\` at \`$BUMP_SHA\` (the ship commit \`$SHIP_SHA\` plus this bump)"
+            echo "2. wait for ci.yml's full-suite push run on \`$BUMP_SHA\` to pass"
+            echo "3. tag \`$BUMP_SHA\`, create a DRAFT release, and let cross-compile.yml build, run Gate A, publish to crates.io and un-draft"
+            echo "4. on publish, release-sync.yml opens a PR syncing main's version to this release"
             echo
-            echo "PR body:"
-            echo
-            sed 's/^/> /' "$PR_BODY_FILE"
-            echo
-            echo "Version bump (\`$LAUNCH_SHA\` → \`$BUMP_SHA\`):"
+            echo "Version bump (\`$SHIP_SHA\` → \`$BUMP_SHA\`):"
             echo
             echo '```diff'
             git diff HEAD~1 HEAD -- crates/core/Cargo.toml crates/fdev/Cargo.toml
@@ -481,7 +421,7 @@ jobs:
           } | tee -a "$GITHUB_STEP_SUMMARY"
           # The commit exists only on this runner. A bundle carries it, with its
           # SHA intact, to the rehearsal job, which packages exactly this tree.
-          git bundle create "$RUNNER_TEMP/release-bump.bundle" "$RELEASE_BRANCH" "^$LAUNCH_SHA"
+          git bundle create "$RUNNER_TEMP/release-bump.bundle" "$RELEASE_BRANCH" "^$SHIP_SHA"
           echo "bump_sha=$BUMP_SHA" >> "$GITHUB_OUTPUT"
 
       - name: "Dry run: hand the bump commit to the rehearsal job"
@@ -498,7 +438,7 @@ jobs:
   # step, run against the unpushed bump commit, with a read-only token: the
   # checkout verifier, the crates.io packaging dry run, and the changelog the
   # release notes would be generated from. In a live run `verify_publishable`
-  # and `create_release` do this against the merged commit instead.
+  # and `create_release` do this against the release commit instead.
   dry_run_rehearsal:
     name: "Dry run: rehearse on the unpushed bump"
     runs-on: ubuntu-latest
@@ -514,6 +454,7 @@ jobs:
       # independent oracle is EXPECTED_VERSION, read from `validate`.
       RELEASE_SHA_RESOLVED: ${{ needs.update_versions.outputs.dry_run_bump_sha }}
       EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
+      SHIP_SHA: ${{ needs.validate.outputs.ship_sha }}
 
     steps:
       - name: Checkout the launch commit
@@ -527,13 +468,20 @@ jobs:
           name: release-dry-run-bump
           path: ${{ runner.temp }}/bump
 
+      # The bundle's prerequisite is the ship commit, which a dry run with an
+      # explicit ship_sha does not have checked out.
       - name: Check out the unpushed version-bump commit
         run: |
+          # The verifier comes from this (dispatch) checkout, not the bump
+          # commit's tree, which is the possibly older ship commit.
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          cp scripts/verify_release_checkout.sh "$RUNNER_TEMP/release-tools/"
+          git fetch --no-tags --depth=1 origin "$SHIP_SHA"
           git fetch --no-tags "$RUNNER_TEMP/bump/release-bump.bundle" "refs/heads/release/v$EXPECTED_VERSION"
           git checkout --detach "$RELEASE_SHA"
 
       - name: Verify the checkout is the bump commit
-        run: bash scripts/verify_release_checkout.sh
+        run: bash "$RUNNER_TEMP/release-tools/verify_release_checkout.sh"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -552,7 +500,6 @@ jobs:
       - name: Changelog since the previous release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only, contents:read job
-          LAUNCH_SHA: ${{ github.sha }}
         run: |
           set -o pipefail
           if ! PREV=$(gh release list --exclude-drafts --limit 50 --json tagName --jq '.[0].tagName // empty'); then
@@ -565,61 +512,59 @@ jobs:
             if [ -z "$PREV" ]; then
               echo "No previous release found."
             else
-              TOTAL=$(gh api "repos/$GITHUB_REPOSITORY/compare/$PREV...$LAUNCH_SHA" --jq '.total_commits')
-              echo "$TOTAL commit(s) on \`main\` since $PREV (the bump commit itself excluded; at most 250 listed):"
+              TOTAL=$(gh api "repos/$GITHUB_REPOSITORY/compare/$PREV...$SHIP_SHA" --jq '.total_commits')
+              echo "$TOTAL commit(s) up to the ship commit since $PREV (the bump commit itself excluded; at most 250 listed):"
               echo
-              gh api "repos/$GITHUB_REPOSITORY/compare/$PREV...$LAUNCH_SHA" \
+              gh api "repos/$GITHUB_REPOSITORY/compare/$PREV...$SHIP_SHA" \
                 --jq '.commits[] | "- \(.sha[0:9]) \(.commit.message | split("\n")[0])"'
             fi
             echo
             echo "A live run would tag \`v$EXPECTED_VERSION\` and create a DRAFT release with GitHub-generated notes for this range."
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-  wait_for_pr:
-    name: Wait for PR to merge
+  # The full-suite gate on the exact commit that ships. ci.yml runs on the push
+  # of `release/v*` (update_versions above); this waits for that run and
+  # refuses anything but success with every required job passed. It also
+  # checks B is ship_sha plus version files and nothing else. Replaces the old
+  # wait for the bump PR's merge queue, whose merge commit could carry commits
+  # nobody soaked.
+  wait_for_ci:
+    name: Wait for CI on the release commit
     runs-on: ubuntu-latest
-    # 75 min covers: merge-queue scheduling + full-suite release gate (test_unit
-    # + Simulation + NAT Validation in parallel, ~10-15 min each on busy
-    # Ubicloud runners) + branch-protection check propagation. Bumped from
-    # 60 min when the release merge_group started running the full suite (#3973).
-    timeout-minutes: 75
+    # The waiter's own budget is 75 min (MAX_WAIT): the full suite in parallel
+    # (Unit & Integration, Simulation, NAT Validation, Windows/macOS units,
+    # ~15-40 min on busy runners) plus scheduling.
+    timeout-minutes: 80
     needs: [validate, update_versions]
-    # Live only: a dry run opens no PR, so there is nothing to wait for. The
+    # Live only: a dry run pushes nothing, so there is no CI to wait for. The
     # dry-run counterpart of this job and the two after it is
     # `dry_run_rehearsal`.
     if: needs.validate.outputs.live == 'true'
     permissions:
       actions: read
       contents: read
-      pull-requests: read
     # The single immutable commit the rest of the pipeline builds, publishes
-    # and tags. Everything downstream MUST check this out explicitly instead of
-    # re-resolving `main`, which moves while this job waits (#5233).
+    # and tags. Everything downstream MUST check this out explicitly (#5233).
     outputs:
-      release_sha: ${{ steps.release_sha.outputs.sha }}
+      release_sha: ${{ steps.wait.outputs.release_sha }}
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      - name: Wait for PR to be merged
+      - name: Wait for the full CI suite on the release commit
+        id: wait
         env:
           # This job is read-only and has explicit least-privilege access above.
           # Use GITHUB_TOKEN here because a fine-grained RELEASE_PAT may not
-          # carry Actions: read even when it can create and enqueue the bump PR.
+          # carry Actions: read.
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only polling
-          PR_NUMBER: ${{ needs.update_versions.outputs.pr_number }}
-        run: scripts/wait_for_release_pr.sh
-
-      - name: Resolve the release commit
-        id: release_sha
-        env:
-          # Same least-privilege rationale as the waiter above: read-only PR and
-          # compare lookups that emit no workflow-triggering event.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # coalesce-exempt: read-only lookup
-          PR_NUMBER: ${{ needs.update_versions.outputs.pr_number }}
-          LAUNCH_SHA: ${{ github.sha }}
-        run: scripts/resolve_release_sha.sh
+          RELEASE_SHA: ${{ needs.update_versions.outputs.bump_sha }}
+          RELEASE_BRANCH: ${{ needs.update_versions.outputs.branch }}
+          SHIP_SHA: ${{ needs.validate.outputs.ship_sha }}
+        run: bash scripts/wait_for_release_ci.sh
 
   # The crates.io publish itself does NOT happen here. It happens in
   # cross-compile.yml's `attach-to-release` job, AFTER the blocking auto-update
@@ -648,35 +593,48 @@ jobs:
     name: Verify crates are publishable (dry run)
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [validate, wait_for_pr]
+    needs: [validate, wait_for_ci]
     # Live only. This used to also run on `|| inputs.dry_run`, which is how a
-    # dry run came to depend on the bump PR having really merged (#5936).
-    if: always() && needs.wait_for_pr.result == 'success' && needs.validate.outputs.live == 'true'
+    # dry run came to depend on a bump PR having really merged (#5936).
+    if: always() && needs.wait_for_ci.result == 'success' && needs.validate.outputs.live == 'true'
     env:
       # NEVER `ref: main` here — see #5233. The `|| github.sha` fallback is not
       # a convenience: an empty `ref:` makes actions/checkout default to the
       # branch, which would reinstate the bug. This job now runs only after
-      # `wait_for_pr` succeeded, and `resolve_release_sha.sh` fails closed
-      # rather than emit an empty SHA, so the fallback should be unreachable.
+      # `wait_for_ci` succeeded, and `wait_for_release_ci.sh` writes the SHA
+      # only on success, so the fallback should be unreachable.
       # If it ever engages it is NOT benign: the launch commit predates the
       # version bump, so the verifier below aborts on purpose rather than
       # dry-running the wrong tree.
-      RELEASE_SHA: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
+      RELEASE_SHA: ${{ needs.wait_for_ci.outputs.release_sha || github.sha }}
       # Resolved independently of RELEASE_SHA, so the verifier has an oracle
       # that does not just restate the value that drove the checkout.
       EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
       # Empty exactly when the `|| github.sha` fallback above engaged, so the
       # verifier can name that cause instead of reporting a version mismatch.
-      RELEASE_SHA_RESOLVED: ${{ needs.wait_for_pr.outputs.release_sha }}
+      RELEASE_SHA_RESOLVED: ${{ needs.wait_for_ci.outputs.release_sha }}
 
     steps:
+      # The checkout verifier comes from the dispatch ref, which carries the
+      # current release tooling. The release commit's tree is the ship commit,
+      # which may predate it.
+      - name: Check out the release tooling
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Keep the release tooling
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          cp scripts/verify_release_checkout.sh "$RUNNER_TEMP/release-tools/"
+
       - name: Checkout the validated release commit
         uses: actions/checkout@v7
         with:
-          ref: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
+          ref: ${{ needs.wait_for_ci.outputs.release_sha || github.sha }}
 
       - name: Verify the checkout is the validated release commit
-        run: bash scripts/verify_release_checkout.sh
+        run: bash "$RUNNER_TEMP/release-tools/verify_release_checkout.sh"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -697,9 +655,9 @@ jobs:
     name: Create GitHub release
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # `wait_for_pr` is in `needs` only to carry `release_sha` through; the
+    # `wait_for_ci` is in `needs` only to carry `release_sha` through; the
     # ordering it implies is already enforced via `verify_publishable`.
-    needs: [validate, wait_for_pr, verify_publishable]
+    needs: [validate, wait_for_ci, verify_publishable]
     # Live only, at job level AND on each mutating step below (#5936).
     if: always() && needs.verify_publishable.result == 'success' && needs.validate.outputs.live == 'true'
     env:
@@ -707,19 +665,33 @@ jobs:
       # The tag MUST land on the same commit that was published to crates.io.
       # `ref: main` here meant the tag could point at a tree nobody validated
       # and that no published artifact was built from (#5233).
-      RELEASE_SHA: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
+      RELEASE_SHA: ${{ needs.wait_for_ci.outputs.release_sha || github.sha }}
       # Resolved independently of RELEASE_SHA, so the verifier has an oracle
       # that does not just restate the value that drove the checkout.
       EXPECTED_VERSION: ${{ needs.validate.outputs.version }}
       # Empty exactly when the `|| github.sha` fallback above engaged, so the
       # verifier can name that cause instead of reporting a version mismatch.
-      RELEASE_SHA_RESOLVED: ${{ needs.wait_for_pr.outputs.release_sha }}
+      RELEASE_SHA_RESOLVED: ${{ needs.wait_for_ci.outputs.release_sha }}
 
     steps:
+      # The checkout verifier comes from the dispatch ref, which carries the
+      # current release tooling. The release commit's tree is the ship commit,
+      # which may predate it.
+      - name: Check out the release tooling
+        # No `persist-credentials: false` here: Rule Lint requires a pushing
+        # job's checkouts to persist, and the release-commit checkout below
+        # replaces this credential with RELEASE_PAT anyway.
+        uses: actions/checkout@v7
+
+      - name: Keep the release tooling
+        run: |
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          cp scripts/verify_release_checkout.sh "$RUNNER_TEMP/release-tools/"
+
       - name: Checkout the validated release commit
         uses: actions/checkout@v7
         with:
-          ref: ${{ needs.wait_for_pr.outputs.release_sha || github.sha }}
+          ref: ${{ needs.wait_for_ci.outputs.release_sha || github.sha }}
           fetch-depth: 0
           # `token:` is what `git push` uses later in this job to push the
           # `v$VERSION` tag. The tag push MUST use RELEASE_PAT (when set)
@@ -729,7 +701,7 @@ jobs:
           token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 
       - name: Verify the checkout is the validated release commit
-        run: bash scripts/verify_release_checkout.sh
+        run: bash "$RUNNER_TEMP/release-tools/verify_release_checkout.sh"
 
       - name: Generate release notes
         id: release_notes
@@ -839,7 +811,7 @@ jobs:
     name: Release summary
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [validate, update_versions, wait_for_pr, verify_publishable, dry_run_rehearsal, create_release]
+    needs: [validate, update_versions, wait_for_ci, verify_publishable, dry_run_rehearsal, create_release]
     if: always()
     permissions: {}  # it only prints
 
@@ -853,7 +825,7 @@ jobs:
           VERSION: ${{ needs.validate.outputs.version }}
           FDEV_VERSION: ${{ needs.validate.outputs.fdev_version }}
           BUMP: ${{ needs.update_versions.result }}
-          WAIT: ${{ needs.wait_for_pr.result }}
+          WAIT: ${{ needs.wait_for_ci.result }}
           VERIFY: ${{ needs.verify_publishable.result }}
           REHEARSAL: ${{ needs.dry_run_rehearsal.result }}
           CREATE_RELEASE: ${{ needs.create_release.result }}
@@ -864,22 +836,22 @@ jobs:
             exit 0
           fi
           if [ "$LIVE" != "true" ]; then
-            echo "🏃 DRY RUN for ${VERSION:-<unresolved version>}: nothing was pushed, merged, tagged or released."
+            echo "🏃 DRY RUN for ${VERSION:-<unresolved version>}: nothing was pushed, tagged or released."
             echo "   Version bump (local only): ${BUMP:-not run}; rehearsal on the unpushed bump commit: ${REHEARSAL:-not run}"
             echo "   What a live run would have created is in the update_versions and dry_run_rehearsal step summaries."
             exit 0
           fi
           if [ "$CREATE_RELEASE" != "success" ]; then
             echo "❌ Release $VERSION did NOT complete. Job results:"
-            echo "   update_versions=$BUMP wait_for_pr=$WAIT verify_publishable=$VERIFY create_release=$CREATE_RELEASE"
-            echo "   If update_versions failed, check whether it opened or merged the bump PR before re-running."
-            echo "   If the bump PR merged (wait_for_pr succeeded), see scripts/RELEASE_RECOVERY.md before re-running."
+            echo "   update_versions=$BUMP wait_for_ci=$WAIT verify_publishable=$VERIFY create_release=$CREATE_RELEASE"
+            echo "   Nothing reaches main from this workflow, so a failed run leaves at most the release/v$VERSION branch"
+            echo "   (and, if create_release got that far, the tag and a draft). See scripts/RELEASE_RECOVERY.md before re-running."
             exit 0
           fi
           echo "🎉 Release $VERSION is cut and tagged."
           echo
           echo "Done here:"
-          echo "  - version bump merged, tag v$VERSION pushed"
+          echo "  - release commit on release/v$VERSION passed CI, tag v$VERSION pushed on it"
           echo "  - DRAFT GitHub release created: https://github.com/$REPO/releases/tag/v$VERSION"
           echo
           echo "Still to happen, in cross-compile.yml (triggered by the tag):"
@@ -890,3 +862,5 @@ jobs:
           echo
           echo "The crates.io publish is deliberately downstream of Gate A: until it runs,"
           echo "nothing about this release is irreversible."
+          echo
+          echo "On publish, release-sync.yml opens a PR syncing main's version to $VERSION."

@@ -32,18 +32,24 @@ cat > "$STUBS/gh" <<'EOF'
 case "$1 $2" in
     "run list") f="$STUB_DIR/runs"; min=20 ;;
     "pr list") f="$STUB_DIR/prs"; min=1000 ;;
+    "api repos/freenet/freenet-core/releases/latest") f="$STUB_DIR/latest"; min=none ;;
     *) echo "unexpected gh $*" >&2; exit 99 ;;
 esac
 # A listing shorter than these could miss the run or PR that should refuse the
 # cut, so a smaller --limit is recorded (run_case fails on it) and refused.
 limit="" prev=""
 for a in "$@"; do [ "$prev" = --limit ] && limit="$a"; prev="$a"; done
-if ! [ "$limit" -ge "$min" ] 2>/dev/null; then
+if [ "$min" != none ] && ! [ "$limit" -ge "$min" ] 2>/dev/null; then
     echo "gh $1 $2 --limit '$limit' is below $min" >> "$STUB_DIR/limit_violations"
     exit 97
 fi
 [ "$(cat "$f")" = FAIL ] && exit 1
-cat "$f"
+if [ "$1" = api ]; then
+    # Apply the script's own --jq filter, so a wrong field name fails here.
+    jq -r "$4" "$f"
+else
+    cat "$f"
+fi
 EOF
 cat > "$STUBS/git" <<'EOF'
 #!/usr/bin/env bash
@@ -73,6 +79,7 @@ run_case() {
     echo '[{"number":1,"headRefName":"fix/x","title":"fix: x"}]' > "$dir/prs"
     : > "$dir/tags"
     echo 404 > "$dir/crates"
+    echo '{"tag_name":"v0.2.163","name":"v0.2.163"}' > "$dir/latest"
     printf '[package]\nname = "freenet"\nversion = "0.2.163"\n\n[dependencies]\nversion = "9.9.9"\n' > "$dir/Cargo.toml"
     local version=0.2.164
     for kv in "$@"; do
@@ -118,11 +125,23 @@ run_case "a failed tag lookup refuses" 1 "title=Could not list tags" tags=FAIL
 run_case "a version already on crates.io refuses" 1 "title=freenet 0.2.164 is already on crates.io" crates=200
 run_case "an unknown crates.io answer (403) refuses" 1 "title=Could not check crates.io" crates=403
 run_case "a curl failure refuses" 1 "title=Could not check crates.io" crates=FAIL
-run_case "a version equal to Cargo.toml refuses" 1 "title=main is already at 0.2.164" cargo=0.2.164
+run_case "a version equal to Cargo.toml refuses" 1 "title=The ship commit is already at 0.2.164" cargo=0.2.164
 run_case "a downgrade refuses" 1 "title=0.2.164 is a downgrade" cargo=0.2.170
-run_case "a numeric-not-lexical comparison passes (0.2.99 -> 0.2.100)" 0 "" cargo=0.2.99 version=0.2.100
+run_case "a numeric-not-lexical comparison passes (0.2.99 -> 0.2.100)" 0 "" cargo=0.2.99 version=0.2.100 latest='{"tag_name":"v0.2.98"}'
 run_case "an unreadable Cargo.toml version refuses" 1 "title=Could not read the current version" cargo=garbage
 run_case "a malformed version refuses" 1 "RELEASE_VERSION must be X.Y.Z" version=0.2
+# Check 5: main's Cargo version lags a release until its merge-back lands, so
+# the ship commit alone cannot say whether a version is already out.
+run_case "a version equal to the latest published release refuses (ship commit lagging)" 1 \
+    "title=0.2.164 is not above the latest release" cargo=0.2.163 latest='{"tag_name":"v0.2.164"}'
+run_case "a version below the latest published release refuses" 1 \
+    "title=0.2.161 is not above the latest release" cargo=0.2.160 version=0.2.161 latest='{"tag_name":"v0.2.163"}'
+run_case "a version above both the ship commit and the latest release passes" 0 "" \
+    cargo=0.2.162 latest='{"tag_name":"v0.2.163"}'
+run_case "numeric comparison against the latest release (0.2.99 -> 0.2.100)" 0 "" \
+    cargo=0.2.99 version=0.2.100 latest='{"tag_name":"v0.2.99"}'
+run_case "a failed latest-release lookup refuses" 1 "title=Could not read the latest release" latest=FAIL
+run_case "a non-version latest tag refuses" 1 "title=Could not read the latest release" latest='{"tag_name":"nightly"}'
 run_case "a [package] with no version refuses, even when [dependencies] has one" 1 \
     "title=Could not read the current version" \
     cargoraw='[package]\nname = "freenet"\n\n[dependencies]\nversion = "0.2.1"\n'

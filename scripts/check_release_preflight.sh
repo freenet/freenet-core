@@ -12,17 +12,21 @@
 #   3. freenet $VERSION is already on crates.io. The version is spent; the
 #      crates.io publish at the end of cross-compile.yml would fail after the
 #      whole build and Gate A.
-#   4. $VERSION is not above the version in crates/core/Cargo.toml. A lower
-#      version is a downgrade; an equal one makes the bump commit empty, so
-#      `update_versions` dies at `git commit`.
+#   4. $VERSION is not above the version in the SHIP commit's
+#      crates/core/Cargo.toml (CARGO_TOML, written by resolve_release_ship.sh).
+#      A lower version is a downgrade; an equal one makes the bump commit
+#      empty, so `update_versions` dies at `git commit`.
+#   5. $VERSION is not above the latest published release. main's Cargo
+#      version lags a release until its merge-back PR (release-sync.yml)
+#      lands, so check 4 alone would accept a version that is already out.
 #
 # Every lookup FAILS CLOSED: an answer this script cannot read refuses the run
 # with a message naming what it could not check. Nothing has been created yet,
 # so a refusal costs one re-dispatch.
 #
 # Inputs (env): RELEASE_VERSION (X.Y.Z), GITHUB_REPOSITORY, GH_TOKEN,
-# GITHUB_RUN_ID (this run, excluded from check 1). Optional for tests:
-# CARGO_TOML (default crates/core/Cargo.toml).
+# GITHUB_RUN_ID (this run, excluded from check 1), CARGO_TOML (the ship
+# commit's crates/core/Cargo.toml; defaults to the checkout's, for tests).
 # Tests: scripts/check_release_preflight_test.sh
 
 set -euo pipefail
@@ -101,9 +105,19 @@ CURRENT=$(awk '/^\[package\]/ {p = 1; next} /^\[/ {p = 0}
 if [[ ! "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     refuse "Could not read the current version" "No [package] version found in $CARGO_TOML (got '$CURRENT')."
 elif [ "$CURRENT" = "$VERSION" ]; then
-    refuse "main is already at $VERSION" "crates/core/Cargo.toml already says $VERSION: its bump merged without a published release, so this bump would be an empty commit. Cut the next patch, or re-cut $VERSION by hand per scripts/RELEASE_RECOVERY.md, 'Re-cutting the same version'."
+    refuse "The ship commit is already at $VERSION" "crates/core/Cargo.toml at the ship commit already says $VERSION, so this bump would be an empty commit. That version was synced to main after its release, or bumped there by the older PR flow; cut the next patch (scripts/RELEASE_RECOVERY.md)."
 elif [ "$(printf '%s\n%s\n' "$CURRENT" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
-    refuse "$VERSION is a downgrade" "crates/core/Cargo.toml is at $CURRENT, above the requested $VERSION."
+    refuse "$VERSION is a downgrade" "crates/core/Cargo.toml at the ship commit is at $CURRENT, above the requested $VERSION."
+fi
+
+# --- 5. version must be above the latest published release -------------------
+# releases/latest is the newest non-draft, non-prerelease release.
+LATEST_TAG=$(gh api "repos/$REPO/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+LATEST="${LATEST_TAG#v}"
+if [[ ! "$LATEST" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    refuse "Could not read the latest release" "GitHub's latest published release tag is '$LATEST_TAG', not vX.Y.Z, so whether $VERSION moves forward is unknown."
+elif [ "$LATEST" = "$VERSION" ] || [ "$(printf '%s\n%s\n' "$LATEST" "$VERSION" | sort -V | tail -1)" != "$VERSION" ]; then
+    refuse "$VERSION is not above the latest release" "The latest published release is $LATEST_TAG. Pick a version above it."
 fi
 
 if [ "$FAILED" -ne 0 ]; then

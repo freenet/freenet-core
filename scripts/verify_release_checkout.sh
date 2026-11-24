@@ -11,7 +11,7 @@
 #
 #   2. The checked-out manifest carries $EXPECTED_VERSION. This is the real
 #      oracle. It is derived independently of the SHA — from `validate`'s
-#      resolved version rather than from `wait_for_pr`'s output — so it fails
+#      resolved version rather than from `wait_for_ci`'s output — so it fails
 #      on ANY wrong tree, including the one case check 1 cannot see: the
 #      `|| github.sha` fallback silently engaging and putting us on the LAUNCH
 #      commit, which does not contain the version bump. Publishing or tagging
@@ -27,7 +27,7 @@ set -euo pipefail
 
 RELEASE_SHA="${RELEASE_SHA:?RELEASE_SHA is required}"
 EXPECTED_VERSION="${EXPECTED_VERSION:?EXPECTED_VERSION is required}"
-# Empty exactly when `wait_for_pr` produced no SHA and the job fell back to the
+# Empty exactly when `wait_for_ci` produced no SHA and the job fell back to the
 # launch commit. Reported separately so the failure names the real cause
 # instead of blaming the tree for a version mismatch it was always going to
 # have. Unset (rather than empty) means "not wired up", which is not an error.
@@ -36,7 +36,7 @@ RELEASE_SHA_RESOLVED="${RELEASE_SHA_RESOLVED-unset}"
 MANIFEST="${MANIFEST:-crates/core/Cargo.toml}"
 
 if [ -z "$RELEASE_SHA_RESOLVED" ]; then
-    echo "::error title=No validated release commit::wait_for_pr did not resolve a release commit, so this job fell back to the launch commit $RELEASE_SHA. That commit predates the version bump, so it is not the release. Fix whatever made wait_for_pr fail and re-run (#5233)."
+    echo "::error title=No validated release commit::wait_for_ci did not resolve a release commit, so this job fell back to the launch commit $RELEASE_SHA. That commit predates the version bump, so it is not the release. Fix whatever made wait_for_ci fail and re-run (#5233)."
     exit 1
 fi
 

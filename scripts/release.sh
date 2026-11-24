@@ -127,6 +127,20 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# This driver cuts through a `build: release X` PR merged into main and tags
+# the merge commit. release.yml no longer does: it ships an exact soaked
+# commit (`ship_sha`) plus a version bump on `release/vX`, gated by that
+# branch's push CI, and syncs main afterwards (release-sync.yml). A live cut
+# from here would put a bump on main that release-sync.yml and the next
+# release.yml pre-flight do not expect, so only a dry run is allowed.
+if [[ "$DRY_RUN" != "true" ]]; then
+    echo "Error: scripts/release.sh no longer cuts live releases. Its PR-and-merge-commit"
+    echo "flow does not match the pipeline. Cut through the freenet:release skill, which"
+    echo "dispatches .github/workflows/release.yml with the soaked commit as ship_sha"
+    echo "(docs/RELEASING.md). --dry-run still works here."
+    exit 1
+fi
+
 if [[ -z "$VERSION" ]]; then
     echo "Error: --version is required"
     show_help
@@ -1386,7 +1400,8 @@ create_github_release() {
     # The commit to tag is the bump PR's MERGE COMMIT, never local HEAD. HEAD
     # after `git pull` includes anything merged since the bump (the #5233 bug
     # release.yml fixed), and after a PR-wait timeout it was the unmerged
-    # release branch. Same rule as scripts/resolve_release_sha.sh.
+    # release branch. (release.yml no longer uses a bump PR: it tags the
+    # exact release commit on `release/vX`; see docs/RELEASING.md.)
     local release_sha
     release_sha=$(gh pr list --head "release/v$VERSION" --state merged --limit 1 \
         --json mergeCommit --jq '.[0].mergeCommit.oid // empty' 2>/dev/null || echo "")

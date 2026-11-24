@@ -368,9 +368,9 @@ if load_step "$RELEASE_YML" validate "Resolve + validate version" "$VALIDATE"; t
     # The raw input reaches the script through env, never templated into it.
     check "Resolve + validate version: no \${{ inputs.* }} in the script" \
         "$(grep -c '@@inputs\.' "$VALIDATE/step.sh")" "0"
-    # Auto-bump (blank input) bumps from the higher of crates.io and the tree:
-    # after a Gate A block main already carries the unpublished version, and
-    # bumping from crates.io alone would pick it again.
+    # Auto-bump (blank input) bumps from crates.io alone. The dispatch tree is
+    # not the ship commit, main lags a release until its merge-back, and a Gate
+    # A block leaves no bump on main, so the tree's version must not move it.
     mkdir -p "$VALIDATE/work/crates/core" "$VALIDATE/work/crates/fdev"
     # shellcheck disable=SC2016  # $CURL_OUT is expanded by the stub, not here
     printf '#!/usr/bin/env bash\nprintf %%s "$CURL_OUT"\n' > "$STUBS/curl"
@@ -383,10 +383,10 @@ if load_step "$RELEASE_YML" validate "Resolve + validate version" "$VALIDATE"; t
         check "auto-bump: $desc" "rc=$rc $(sed -n 's/^version=//p' "$VALIDATE/github_output")" "$want"
     }
     autobump_case "normal: tree equals crates.io" 0.2.163 0.2.163 "rc=0 0.2.164"
-    autobump_case "after a Gate A block: tree is ahead of crates.io" 0.2.163 0.2.164 "rc=0 0.2.165"
+    autobump_case "main lagging a release (merge-back not landed): tree behind crates.io" 0.2.163 0.2.162 "rc=0 0.2.164"
+    autobump_case "the tree's version is ignored even when ahead" 0.2.163 0.2.170 "rc=0 0.2.164"
+    autobump_case "numeric patch bump (0.2.99 -> 0.2.100)" 0.2.99 0.2.99 "rc=0 0.2.100"
     autobump_case "unreadable crates.io answer refuses" garbage 0.2.163 "rc=1 "
-    autobump_case "a tree far ahead of crates.io refuses (needs an explicit version)" 0.2.163 0.3.0 "rc=1 "
-    autobump_case "a tree behind crates.io refuses" 0.2.163 0.2.160 "rc=1 "
     rm -f "$STUBS/curl"
 fi
 

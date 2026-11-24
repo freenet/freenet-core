@@ -159,7 +159,8 @@ fn freenet_dep_matches_workspace_freenet_version() {
 }
 
 /// Sed expressions duplicated in `scripts/release.sh` (BRE) and
-/// `.github/workflows/release.yml` (ERE). The tests below verify both
+/// `scripts/apply_version_bump.sh` (ERE, run by `.github/workflows/release.yml`
+/// and `.github/workflows/release-sync.yml`). The tests below verify both
 /// produce the same output and that they correctly rewrite both the
 /// default and Windows-override pkg-url lines.
 mod release_sed_rewrite {
@@ -246,7 +247,8 @@ bin-dir = \"fdev.exe\"
     // Sed expressions that rewrite the `freenet = { path = "../core",
     // version = "X.Y.Z", ... }` path-dep version inside fdev/Cargo.toml.
     // Duplicated between `scripts/release.sh` (BRE) and
-    // `.github/workflows/release.yml` (ERE). Regression for issue #4119:
+    // `scripts/apply_version_bump.sh` (ERE, used by the release workflows).
+    // Regression for issue #4119:
     // the old ERE pattern tried to anchor on a trailing ` }`, which
     // silently failed once the line grew a `, features = [...]` suffix
     // and the freenet-dep version stayed pinned across releases.

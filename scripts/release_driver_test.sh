@@ -987,6 +987,46 @@ EOF
     ci_case "zero checks on main's HEAD refuses" '{"total_count":0,"check_runs":[]}' "rc=1" "no CI checks"
 fi
 
+# ---------------------------------------------------------------------------
+# release.sh refuses a LIVE cut
+# ---------------------------------------------------------------------------
+# Its bump-PR flow no longer matches release.yml (exact ship_sha, release/vX
+# branch, merge-back by release-sync.yml), so a live run must stop before it
+# touches anything, while --dry-run still runs. The script is run whole, as a
+# copy in a throwaway repo with no remote, so even a refusal that stopped
+# working could not act on this checkout; gh, cargo and curl are stubs that
+# record any call.
+LIVE_WORK="$(mktemp -d)"
+mkdir -p "$LIVE_WORK/repo/scripts" "$LIVE_WORK/bin"
+cp "$RELEASE_SH" "$LIVE_WORK/repo/scripts/release.sh"
+git -C "$LIVE_WORK/repo" init -q -b main
+for tool in gh cargo curl; do
+    printf '#!/usr/bin/env bash\necho "%s $*" >> "%s/calls"\nexit 1\n' "$tool" "$LIVE_WORK" > "$LIVE_WORK/bin/$tool"
+    chmod +x "$LIVE_WORK/bin/$tool"
+done
+: > "$LIVE_WORK/calls"
+live_rc=0
+PATH="$LIVE_WORK/bin:$PATH" bash "$LIVE_WORK/repo/scripts/release.sh" --version 9.9.9 \
+    > "$LIVE_WORK/out" 2>&1 || live_rc=$?
+if [[ "$live_rc" -ne 0 ]] && [[ ! -s "$LIVE_WORK/calls" ]] \
+    && grep -qF 'no longer cuts live releases' "$LIVE_WORK/out" \
+    && grep -qF 'release.yml' "$LIVE_WORK/out"; then
+    pass "release.sh refuses a live cut before calling anything, pointing at release.yml"
+else
+    fail "release.sh did not refuse a live cut cleanly" \
+        "rc=$live_rc calls=$(paste -sd';' "$LIVE_WORK/calls") out=$(head -c 400 "$LIVE_WORK/out")"
+fi
+: > "$LIVE_WORK/calls"
+PATH="$LIVE_WORK/bin:$PATH" bash "$LIVE_WORK/repo/scripts/release.sh" --version 9.9.9 --dry-run \
+    > "$LIVE_WORK/out" 2>&1 || true
+if ! grep -qF 'no longer cuts live releases' "$LIVE_WORK/out" && [[ -s "$LIVE_WORK/calls" ]]; then
+    pass "release.sh --dry-run gets past the live-cut refusal"
+else
+    fail "release.sh --dry-run was refused or stopped before doing anything" \
+        "out=$(head -c 400 "$LIVE_WORK/out")"
+fi
+rm -rf "$LIVE_WORK"
+
 echo
 if [[ "$FAILURES" -eq 0 ]]; then
     echo "All release driver behaviour assertions passed."
