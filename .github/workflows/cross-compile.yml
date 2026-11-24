@@ -845,8 +845,8 @@ jobs:
       # assets are already delivered whatever it decides.
       #
       # release.yml's `validate` job does the stronger check (it also asks
-      # crates.io whether the token is ACCEPTED) and does it before the bump PR
-      # exists. This one exists for the path where `validate` never ran: a bare
+      # crates.io whether the token is ACCEPTED) and does it before the release
+      # branch exists. This one exists for the path where `validate` never ran: a bare
       # tag push, or that same manual recovery. Presence only, no network call
       # -- deterministic, so it cannot fail a release for a reason that is not a
       # bug. A token that is present but DEAD still surfaces at the publish.
@@ -955,7 +955,8 @@ jobs:
       # The QUIC data ramp start (T0) is checked again here, against the tag's
       # version and the clock now, immediately before the irreversible publish
       # and the un-draft: release.yml's validate job checks it when the run
-      # starts, but the bump PR, the builds and the canary come between, and a
+      # starts, but the release-branch CI, the builds and the canary come
+      # between, and a
       # "re-run failed jobs" of this job hours later must check it again rather
       # than publish on the earlier verdict. A failure leaves the draft
       # unpublished, which is the safe state. Pinned by

@@ -23,8 +23,9 @@
 #      git/gh and its real `env:`, refuses before calling anything when not
 #      live, and when live reaches its command with no empty argument and the
 #      right expression feeding each argument;
-#   6. the real non-mutating steps of the dry path (bump, compose, report,
-#      bundle, rehearsal checkout, verifier) run end to end in throwaway repos;
+#   6. the real non-mutating steps of the dry path (ship checkout, bump,
+#      report, bundle, rehearsal checkout, verifier) run end to end in
+#      throwaway repos;
 #   7. the linter and this test are wired into CI, and not disabled in place.
 #
 # Run manually with: bash scripts/release_dry_run_test.sh
@@ -208,16 +209,16 @@ mutate_case "the push step loses its if: guard" "step \`Push the release branch\
     "s.replace(\"      - name: Push the release branch\n        if: needs.validate.outputs.live == 'true'\n\", \"      - name: Push the release branch\n\", 1)"
 mutate_case "the push step's guard is ORed away" "step \`Push the release branch\` mutates" \
     "s.replace(\"      - name: Push the release branch\n        if: needs.validate.outputs.live == 'true'\n\", \"      - name: Push the release branch\n        if: always() || needs.validate.outputs.live == 'true'\n\", 1)"
-mutate_case "the auto-merge step loses its in-script refusal" "does not refuse in its own script" \
-    "s.replace('          [ \"\${RELEASE_LIVE:-}\" = \"true\" ] || { echo \"::error title=Refusing in a dry run::Not enabling auto-merge: this run is not live (#5936).\"; exit 1; }\n', '', 1)"
+mutate_case "the push step loses its in-script refusal" "does not refuse in its own script" \
+    "s.replace('          [ \"\${RELEASE_LIVE:-}\" = \"true\" ] || { echo \"::error title=Refusing in a dry run::Not pushing the release branch: this run is not live (#5936).\"; exit 1; }\n', '', 1)"
 mutate_case "create_release loses its job-level live guard and the tag step its own" "step \`Create and push tag\` mutates" \
-    "s.replace(\" && needs.validate.outputs.live == 'true'\n    env:\n      RELEASE_LIVE\", \"\n    env:\n      RELEASE_LIVE\", 1).replace(\"      - name: Create and push tag\n        if: needs.validate.outputs.live == 'true'\n\", \"      - name: Create and push tag\n\", 1)"
+    "s.replace(\" && needs.validate.outputs.live == 'true'\n    permissions:\n      contents: write\", \"\n    permissions:\n      contents: write\", 1).replace(\"      - name: Create and push tag\n        if: needs.validate.outputs.live == 'true'\n\", \"      - name: Create and push tag\n\", 1)"
 mutate_case "a step goes back to reading inputs.dry_run" "read outside the mode step" \
     "s.replace(\"      - name: Create GitHub release\n        if: needs.validate.outputs.live == 'true'\", \"      - name: Create GitHub release\n        if: \${{ !inputs.dry_run }}\", 1)"
 mutate_case "a new unguarded step edits a release in a dry-run job" "step \`Sneaky\` mutates" \
-    "s.replace('      - name: Compose the release PR\n', '      - name: Sneaky\n        run: gh release edit v1 --draft=false\n\n      - name: Compose the release PR\n', 1)"
+    "s.replace('      - name: Configure git\n', '      - name: Sneaky\n        run: gh release edit v1 --draft=false\n\n      - name: Configure git\n', 1)"
 mutate_case "a new unguarded step hides a merge in bash -c" "step \`Sneaky\` mutates" \
-    "s.replace('      - name: Compose the release PR\n', '      - name: Sneaky\n        run: bash -c \"gh pr merge 1 --auto\"\n\n      - name: Compose the release PR\n', 1)"
+    "s.replace('      - name: Configure git\n', '      - name: Sneaky\n        run: bash -c \"gh pr merge 1 --auto\"\n\n      - name: Configure git\n', 1)"
 mutate_case "update_versions persists its push credential in a dry run" "persist-credentials" \
     "s.replace(\"          persist-credentials: \${{ needs.validate.outputs.live == 'true' }}\n\", '', 1)"
 mutate_case "the mode step stops using the tested resolver" "resolve_release_mode.sh" \
@@ -228,10 +229,12 @@ mutate_case "the rehearsal job gets a write token" "read-only \`permissions:\`" 
     "s.replace('    permissions:\n      contents: read\n    env:\n      RELEASE_SHA:', '    permissions:\n      contents: write\n    env:\n      RELEASE_SHA:', 1)"
 # Live-path plumbing: each of these left a live release broken while every
 # dry-run check stayed green.
-mutate_case "Create Pull Request stops writing pr_number" "never writes \`pr_number=\`" \
-    "s.replace('          echo \"pr_number=\$PR_NUMBER\" >> \"\$GITHUB_OUTPUT\"\n', '', 1)"
-mutate_case "update_versions stops exporting pr_number" "does not declare" \
-    "s.replace('      pr_number: \${{ steps.create_pr.outputs.pr_number }}\n', '', 1)"
+mutate_case "the bump step stops writing bump_sha" "never writes \`bump_sha=\`" \
+    "s.replace('          echo \"bump_sha=\$(git rev-parse HEAD)\" >> \"\$GITHUB_OUTPUT\"\n', '', 1)"
+mutate_case "update_versions stops exporting the release commit" "does not declare" \
+    "s.replace('      bump_sha: \${{ steps.bump.outputs.bump_sha }}\n', '', 1)"
+mutate_case "validate stops exporting ship_sha" "does not declare" \
+    "s.replace('      ship_sha: \${{ steps.ship.outputs.ship_sha }}\n', '', 1)"
 
 # --- 4. topology of both modes -------------------------------------------------
 
@@ -240,12 +243,11 @@ LIVE_RUN=$(simulate live)
 DRY_RUN=$(simulate dry)
 check "live: exactly these jobs run" \
     "$(grep -v ' / ' <<< "$LIVE_RUN" | paste -sd' ' -)" \
-    "validate update_versions wait_for_pr verify_publishable create_release summary"
+    "validate update_versions wait_for_ci verify_publishable create_release summary"
 check "dry: exactly these jobs run" \
     "$(grep -v ' / ' <<< "$DRY_RUN" | paste -sd' ' -)" \
     "validate update_versions dry_run_rehearsal summary"
-for step in "update_versions / Push the release branch" "update_versions / Create Pull Request" \
-            "update_versions / Enable auto-merge" "create_release / Create and push tag" \
+for step in "update_versions / Push the release branch" "create_release / Create and push tag" \
             "create_release / Create GitHub release" \
             "validate / Verify the crates.io token before anything is created"; do
     check "live runs '$step'" "$(grep -cxF "$step" <<< "$LIVE_RUN")" "1"
@@ -260,24 +262,24 @@ for step in "update_versions / Dry run: report what a live run would push" \
     check "dry runs '$step'" "$(grep -cxF "$step" <<< "$DRY_RUN")" "1"
     check "live does not run '$step'" "$(grep -cxF "$step" <<< "$LIVE_RUN")" "0"
 done
-# ORDER, not just membership, for every job in both modes: the PR is composed
-# before it is opened and the branch pushed before the PR names it; the
+# ORDER, not just membership, for every job in both modes: the tree moves to
+# the ship commit before the bump, which is committed before it is pushed; the
 # checkout verifier runs before the tag push and before each packaging check;
 # the bundle is fetched before it is checked out. A reordering that changes
 # behaviour must change this list deliberately.
 step_seq() { grep "^$2 / " <<< "$1" | sed "s|^$2 / ||" | paste -sd'|' -; }
 check "live: validate step order" "$(step_seq "$LIVE_RUN" validate)" \
-    "Checkout code|Resolve run mode (live or dry run)|Check RELEASE_PAT is configured|Verify the crates.io token before anything is created|Verify the release signing key before anything is created|Resolve + validate version|Refuse a version that is spent or already being cut|Check the QUIC data ramp start is near now"
+    "Checkout code|Resolve run mode (live or dry run)|Check RELEASE_PAT is configured|Verify the crates.io token before anything is created|Verify the release signing key before anything is created|Resolve + validate version|Resolve and check the ship commit|Refuse a version that is spent or already being cut|Check the QUIC data ramp start is near now"
 check "live: update_versions step order" "$(step_seq "$LIVE_RUN" update_versions)" \
-    "Checkout code|Configure git|Update freenet version|Update fdev version|Install Rust|Update Cargo.lock|Commit the version bump locally|Compose the release PR|Push the release branch|Create Pull Request|Enable auto-merge"
-check "live: wait_for_pr step order" "$(step_seq "$LIVE_RUN" wait_for_pr)" \
-    "Checkout code|Wait for PR to be merged|Resolve the release commit"
+    "Checkout code|Check out the ship commit|Configure git|Apply the version bump|Install Rust|Update Cargo.lock|Commit the version bump locally|Push the release branch"
+check "live: wait_for_ci step order" "$(step_seq "$LIVE_RUN" wait_for_ci)" \
+    "Checkout code|Wait for the full CI suite on the release commit"
 check "live: verify_publishable step order" "$(step_seq "$LIVE_RUN" verify_publishable)" \
-    "Checkout the validated release commit|Verify the checkout is the validated release commit|Install Rust|Verify freenet packages cleanly (dry run)"
+    "Check out the release tooling|Keep the release tooling|Checkout the validated release commit|Verify the checkout is the validated release commit|Install Rust|Verify freenet packages cleanly (dry run)"
 check "live: create_release step order" "$(step_seq "$LIVE_RUN" create_release)" \
-    "Checkout the validated release commit|Verify the checkout is the validated release commit|Generate release notes|Create and push tag|Create GitHub release"
+    "Check out the release tooling|Keep the release tooling|Checkout the validated release commit|Verify the checkout is the validated release commit|Generate release notes|Create and push tag|Create GitHub release"
 check "dry: update_versions step order" "$(step_seq "$DRY_RUN" update_versions)" \
-    "Checkout code|Configure git|Update freenet version|Update fdev version|Install Rust|Update Cargo.lock|Commit the version bump locally|Compose the release PR|Dry run: report what a live run would push|Dry run: hand the bump commit to the rehearsal job"
+    "Checkout code|Check out the ship commit|Configure git|Apply the version bump|Install Rust|Update Cargo.lock|Commit the version bump locally|Dry run: report what a live run would push|Dry run: hand the bump commit to the rehearsal job"
 check "dry: dry_run_rehearsal step order" "$(step_seq "$DRY_RUN" dry_run_rehearsal)" \
     "Checkout the launch commit|Fetch the bump bundle|Check out the unpushed version-bump commit|Verify the checkout is the bump commit|Install Rust|Verify freenet packages cleanly (dry run)|Changelog since the previous release"
 # Jobs that run in a dry run but need no write access hold none.
@@ -299,17 +301,18 @@ PY
 check "validate is read-only" "$(grep '^validate=' <<< "$PERMS")" "validate=[('actions', 'read'), ('contents', 'read'), ('pull-requests', 'read')]"
 check "summary holds no permissions" "$(grep '^summary=' <<< "$PERMS")" "summary=[('*', '{}')]"
 check "dry_run_rehearsal is read-only" "$(grep '^dry_run_rehearsal=' <<< "$PERMS")" "dry_run_rehearsal=[('contents', 'read')]"
-# ...and the live jobs keep what they need: push and PR in update_versions,
-# tag push and release in create_release, read access for the waiter.
-check "update_versions can push and open the PR" "$(grep '^effective:update_versions=' <<< "$PERMS")" \
-    "effective:update_versions=[('contents', 'write'), ('pull-requests', 'write')]"
+# ...and the live jobs keep what they need, and no more: push in
+# update_versions, tag push and release in create_release (no PR is opened any
+# more, so nothing holds pull-requests: write), read access for the waiter.
+check "update_versions can push" "$(grep '^effective:update_versions=' <<< "$PERMS")" \
+    "effective:update_versions=[('contents', 'write')]"
 check "create_release can push the tag and create the release" "$(grep '^effective:create_release=' <<< "$PERMS")" \
-    "effective:create_release=[('contents', 'write'), ('pull-requests', 'write')]"
-check "wait_for_pr can read the PR, its checks and the repo" "$(grep '^effective:wait_for_pr=' <<< "$PERMS")" \
-    "effective:wait_for_pr=[('actions', 'read'), ('contents', 'read'), ('pull-requests', 'read')]"
+    "effective:create_release=[('actions', 'read'), ('contents', 'write')]"
+check "wait_for_ci can read runs and the repo" "$(grep '^effective:wait_for_ci=' <<< "$PERMS")" \
+    "effective:wait_for_ci=[('actions', 'read'), ('contents', 'read')]"
 # Failure paths: nothing irreversible may follow a failed gate.
-check "live: a failed wait_for_pr stops publishing and tagging" \
-    "$(simulate live --fail wait_for_pr | grep -cE '^(verify_publishable|create_release)$')" "0"
+check "live: a failed wait_for_ci stops publishing and tagging" \
+    "$(simulate live --fail wait_for_ci | grep -cE '^(verify_publishable|create_release)$')" "0"
 check "live: a failed packaging check stops tagging" \
     "$(simulate live --fail verify_publishable | grep -cxF create_release)" "0"
 check "live: a failed version bump stops everything after it" \
@@ -342,6 +345,7 @@ fi
 # No release exists yet: create_release's re-run check must fall through to
 # the create. (git ls-remote prints nothing, so the tag is absent too.)
 if [[ "$(basename "$0")" == gh && "$1 $2" == "release view" ]]; then
+    echo "release not found" >&2
     exit 1
 fi
 exit 0
@@ -359,18 +363,18 @@ python3 "$LINTER" --extract-mutating-runs "$RELEASE_YML" "$RUNS"
 EXTRACTED=$(cat "$RUNS"/*.name 2>/dev/null || true)
 for expected in \
     "update_versions / Push the release branch" \
-    "update_versions / Create Pull Request" \
-    "update_versions / Enable auto-merge" \
     "create_release / Create and push tag" \
     "create_release / Create GitHub release"; do
     check "extractor finds mutating step '$expected'" \
         "$(grep -cxF "$expected" <<< "$EXTRACTED")" "1"
 done
-# Exactly those five. The extractor shares the linter's detector, so a step it
-# misses is neither guarded nor executed here; a new mutating step must be
-# added to the list above deliberately.
-check "extractor finds exactly the five known mutating steps" \
-    "$(grep -c . <<< "$EXTRACTED")" "5"
+# Exactly those three (the PR create and auto-merge left release.yml when it
+# stopped landing the bump on main; the merge-back PR is release-sync.yml's).
+# The extractor shares the linter's detector, so a step it misses is neither
+# guarded nor executed here; a new mutating step must be added to the list
+# above deliberately.
+check "extractor finds exactly the three known mutating steps" \
+    "$(grep -c . <<< "$EXTRACTED")" "3"
 
 run_step() {
     # run_step <script> <RELEASE_LIVE value|__unset__> -> "rc=<n> calls=<n>"
@@ -410,9 +414,8 @@ done
 # The commands a live release actually issues, and WHICH value feeds each:
 # every `${{ expr }}` is extracted as `@@expr@@`, so tagging the fdev version
 # or pushing a branch built from the wrong output fails here.
-for call in "git push origin @@steps.bump.outputs.branch@@" \
-            "gh pr create --title @@steps.pr_text.outputs.title@@ --body-file @@steps.pr_text.outputs.body_file@@ --base main --head @@steps.bump.outputs.branch@@" \
-            "gh pr merge @@steps.create_pr.outputs.pr_number@@ --auto" \
+for call in "git push origin --delete @@steps.bump.outputs.branch@@" \
+            "git push origin @@steps.bump.outputs.branch@@" \
             "git push origin v@@needs.validate.outputs.version@@" \
             "gh release create v@@needs.validate.outputs.version@@ --title v@@needs.validate.outputs.version@@ --notes-file @@steps.release_notes.outputs.notes_file@@ --draft"; do
     check "live issues '$call'" "$(grep -cxF "$call" <<< "$LIVE_CALLS")" "1"
@@ -430,7 +433,7 @@ check "live tags in order: identity, annotated tag, push" \
 # must not die at `git tag`: an existing tag on RELEASE_SHA is accepted and not
 # re-pushed, a tag anywhere else refuses, and an existing release is not
 # re-created. A stub git answers ls-remote from $LSREMOTE.
-REL_SHA='@@needs.wait_for_pr.outputs.release_sha || github.sha@@'
+REL_SHA='@@needs.wait_for_ci.outputs.release_sha || github.sha@@'
 TAG_REF='refs/tags/v@@needs.validate.outputs.version@@'
 RERUN_STUBS="$TEST_TMP/rerun-stubs"
 mkdir -p "$RERUN_STUBS"
@@ -462,27 +465,81 @@ check "re-run: tag on another commit refuses without pushing" \
 check "no tag yet: tags and pushes" "$(rerun_tag "")" "rc=0 pushes=1"
 REL_SCRIPT=$(grep -lxF "create_release / Create GitHub release" "$RUNS"/*.name)
 REL_SCRIPT="${REL_SCRIPT%.name}.sh"
+# The stub answers `release view` with $REL_CREATED (empty: no release;
+# ERROR: a failure other than "not found") and the run lookup with
+# $RUN_CREATED (FAIL: the API call fails). The run lookup must use the job
+# token ($RUN_LOOKUP_TOKEN), not the PAT.
 cat > "$RERUN_STUBS/gh" <<'SH'
 #!/usr/bin/env bash
 echo "gh $*" >> "$STUB_CALLS"
+case "$1 $2" in
+    "release view") [ -n "${REL_CREATED:-}" ] || { echo "release not found" >&2; exit 1; }
+                    [ "$REL_CREATED" = ERROR ] && { echo "HTTP 502: Bad Gateway" >&2; exit 1; }
+                    echo "$REL_CREATED" ;;
+    "api repos/"*) [[ "$2" == "repos/example/repo/actions/runs/4242" ]] || exit 3
+                   [ -n "${RUN_LOOKUP_TOKEN:-}" ] && [ "${GH_TOKEN:-}" = "$RUN_LOOKUP_TOKEN" ] || exit 4
+                   [ "${RUN_CREATED:-}" = FAIL ] && exit 1; echo "$RUN_CREATED" ;;
+esac
 exit 0
 SH
 REL_CALLS="$TEST_TMP/rel.calls"
-: > "$REL_CALLS"
 mapfile -t REL_ENVS < "${REL_SCRIPT%.sh}.env"
-REL_RC=0
-( builtin cd -- "$SCRATCH" && env "${REL_ENVS[@]}" PATH="$RERUN_STUBS:$PATH" STUB_CALLS="$REL_CALLS" \
-    RELEASE_LIVE=true bash -e "$REL_SCRIPT" ) > /dev/null 2>&1 || REL_RC=$?
-# All three: it reached its existence check, found the release, exited cleanly,
-# so a step that died before the check cannot pass as "did not re-create".
-check "re-run: an existing release is not re-created" \
-    "rc=$REL_RC views=$(grep -c '^gh release view' "$REL_CALLS") creates=$(grep -c '^gh release create' "$REL_CALLS")" \
-    "rc=0 views=1 creates=0"
+rel_case() {
+    # rel_case <release createdAt> <run created_at> -> "rc=N views=N creates=N"
+    local rc=0
+    : > "$REL_CALLS"
+    ( builtin cd -- "$SCRATCH" && env "${REL_ENVS[@]}" PATH="$RERUN_STUBS:$PATH" STUB_CALLS="$REL_CALLS" \
+        GITHUB_REPOSITORY=example/repo GITHUB_RUN_ID=4242 REL_CREATED="$1" RUN_CREATED="$2" \
+        RELEASE_LIVE=true bash -e "$REL_SCRIPT" ) > "$TEST_TMP/rel.out" 2>&1 || rc=$?
+    echo "rc=$rc views=$(grep -c '^gh release view' "$REL_CALLS") creates=$(grep -c '^gh release create' "$REL_CALLS")"
+}
+# A re-run of create_release after the create succeeded: the release is this
+# run's, so it is accepted (the view proves the check ran).
+check "re-run: a release this run created is accepted, not re-created" \
+    "$(rel_case 2026-11-23T10:05:00Z 2026-11-23T10:00:00Z)" "rc=0 views=1 creates=0"
+# A draft left by an earlier cut of the same version must not be reused: its
+# notes and assets describe another commit.
+check "a stale release from before this run refuses, and is not reused" \
+    "$(rel_case 2026-11-20T09:00:00Z 2026-11-23T10:00:00Z)" "rc=1 views=1 creates=0"
+check "the stale-release refusal says to delete it" "$(grep -c '^::error title=Stale release' "$TEST_TMP/rel.out")" "1"
+check "an unreadable run start refuses rather than reusing a release" \
+    "$(rel_case 2026-11-23T10:05:00Z FAIL)" "rc=1 views=1 creates=0"
+check "no release yet: creates the draft" "$(rel_case '' 2026-11-23T10:00:00Z)" "rc=0 views=1 creates=1"
+# The tag step refuses a stale release BEFORE its push: the tag push starts
+# cross-compile.yml, which would attach to that draft, publish and un-draft it.
+mapfile -t TAG_ENVS < "${TAG_SCRIPT%.sh}.env"
+tag_stale_case() {
+    # tag_stale_case <release createdAt> <run created_at> <ls-remote output> -> "rc=N pushes=N"
+    local rc=0
+    : > "$REL_CALLS"
+    ( builtin cd -- "$SCRATCH" && env "${TAG_ENVS[@]}" PATH="$RERUN_STUBS:$PATH" STUB_CALLS="$REL_CALLS" \
+        GITHUB_REPOSITORY=example/repo GITHUB_RUN_ID=4242 REL_CREATED="$1" RUN_CREATED="$2" \
+        LSREMOTE="$3" RELEASE_LIVE=true bash -e "$TAG_SCRIPT" ) > "$TEST_TMP/tagstale.out" 2>&1 || rc=$?
+    echo "rc=$rc pushes=$(grep -c '^git push' "$REL_CALLS")"
+}
+check "tag step: a stale release refuses before the tag push" \
+    "$(tag_stale_case 2026-11-20T09:00:00Z 2026-11-23T10:00:00Z '')" "rc=1 pushes=0"
+check "tag step: the stale refusal says nothing was pushed" \
+    "$(grep -c '^::error title=Stale release.*Nothing was pushed' "$TEST_TMP/tagstale.out")" "1"
+check "tag step: an unreadable run start refuses before the push" \
+    "$(tag_stale_case 2026-11-20T09:00:00Z FAIL '')" "rc=1 pushes=0"
+check "tag step: an empty run start refuses before the push" \
+    "$(tag_stale_case 2026-11-20T09:00:00Z '' '')" "rc=1 pushes=0"
+check "tag step: a release this run created does not block (re-run, tag in place)" \
+    "$(tag_stale_case 2026-11-23T10:05:00Z 2026-11-23T10:00:00Z "$REL_SHA\t$TAG_REF\n")" "rc=0 pushes=0"
+check "tag step: no release yet tags and pushes" \
+    "$(tag_stale_case '' 2026-11-23T10:00:00Z '')" "rc=0 pushes=1"
+check "tag step: a release lookup error other than not-found refuses before the push" \
+    "$(tag_stale_case ERROR 2026-11-23T10:00:00Z '')" "rc=1 pushes=0"
+check "tag step: the lookup-error refusal names it" \
+    "$(grep -c '^::error::Could not ask GitHub whether release' "$TEST_TMP/tagstale.out")" "1"
+check "a release lookup error other than not-found refuses rather than creating" \
+    "$(rel_case ERROR 2026-11-23T10:00:00Z)" "rc=1 views=1 creates=0"
+check "the release step's lookup-error refusal names it" \
+    "$(grep -c '^::error::Could not ask GitHub whether release' "$TEST_TMP/rel.out")" "1"
+check "an empty run start refuses rather than reusing a release" \
+    "$(rel_case 2026-11-20T09:00:00Z '')" "rc=1 views=1 creates=0"
 
-# The PR number a live run hands to auto-merge and wait_for_pr is the one in
-# the URL `gh pr create` printed (the stub prints .../pull/123).
-check "Create Pull Request writes the PR number from gh's URL" \
-    "$(grep -cxF 'pr_number=123' "$TEST_TMP/gh_output")" "1"
 # The packaging dry run checks freenet, the crate that is publishable before
 # the release exists (fdev resolves freenet from the registry).
 check "update_versions refreshes the lockfile for the new versions" \
@@ -493,17 +550,20 @@ for job in verify_publishable dry_run_rehearsal; do
     check "$job's publish line is the freenet dry run" \
         "$(python3 "$LINTER" --dump-step "$RELEASE_YML" "$job" "Verify freenet packages cleanly (dry run)" | grep -cxF 'cargo publish -p freenet --dry-run')" "1"
 done
-for step in "Wait for PR to be merged" "Resolve the release commit"; do
-    check "wait_for_pr / $step reads the bump PR's number" \
-        "$(python3 "$LINTER" --dump-step "$RELEASE_YML" wait_for_pr "$step" | grep -cxF 'PR_NUMBER=@@needs.update_versions.outputs.pr_number@@')" "1"
+# The waiter gates the commit update_versions made, on the ship commit
+# validate checked; each comes from the job that owns it.
+for envline in 'RELEASE_SHA=@@needs.update_versions.outputs.bump_sha@@' \
+               'RELEASE_BRANCH=@@needs.update_versions.outputs.branch@@' \
+               'SHIP_SHA=@@needs.validate.outputs.ship_sha@@'; do
+    check "wait_for_ci's waiter gets $envline" \
+        "$(python3 "$LINTER" --dump-step "$RELEASE_YML" wait_for_ci "Wait for the full CI suite on the release commit" | grep -cxF "$envline")" "1"
 done
 
 # --- 6. run the real non-mutating steps end to end ---------------------------
 #
-# The live and dry paths both depend on steps nothing above executes: the bump
-# commit and its branch name, the composed PR title (ci.yml's merge-queue
-# release gate keys off its `build: release ` prefix), the dry-run report and
-# its git bundle, and the rehearsal's checkout of that bundle. Run them, as
+# The live and dry paths both depend on steps nothing above executes: the
+# checkout of the ship commit, the bump commit and its branch name, the dry-run
+# report and its git bundle, and the rehearsal's checkout of that bundle. Run them, as
 # extracted from release.yml, in throwaway local repos with no remote they
 # could push to.
 
@@ -560,17 +620,25 @@ PY
 mkdir -p "$TEST_TMP/runner" "$TEST_TMP/origin/crates/core" "$TEST_TMP/origin/crates/fdev" "$TEST_TMP/origin/scripts"
 cp "$REPO_ROOT/crates/core/Cargo.toml" "$TEST_TMP/origin/crates/core/"
 cp "$REPO_ROOT/crates/fdev/Cargo.toml" "$TEST_TMP/origin/crates/fdev/"
-cp "$REPO_ROOT/scripts/verify_release_checkout.sh" "$TEST_TMP/origin/scripts/"
+cp "$REPO_ROOT/scripts/verify_release_checkout.sh" "$REPO_ROOT/scripts/apply_version_bump.sh" "$TEST_TMP/origin/scripts/"
+echo "# lock" > "$TEST_TMP/origin/Cargo.lock"
 git -C "$TEST_TMP/origin" init -q -b main
 git -C "$TEST_TMP/origin" add -A
 git -C "$TEST_TMP/origin" -c user.email=t@example.invalid -c user.name=t commit -q -m base
+SHIP_SHA=$(git -C "$TEST_TMP/origin" rev-parse HEAD)
+# The dispatch ref is a LATER commit than the ship commit: main moved on after
+# the soak. Its tooling is what runs; its tree must not be what ships.
+echo "landed after the soak" > "$TEST_TMP/origin/after-soak.txt"
+git -C "$TEST_TMP/origin" add -A
+git -C "$TEST_TMP/origin" -c user.email=t@example.invalid -c user.name=t commit -q -m "fix: after the soak"
 LAUNCH_SHA=$(git -C "$TEST_TMP/origin" rev-parse HEAD)
 echo "github.sha=$LAUNCH_SHA" >> "$VALUES"
+echo "needs.validate.outputs.ship_sha=$SHIP_SHA" >> "$VALUES"
 check "a depth-1 clone of the launch commit, as actions/checkout makes" \
     "$(git clone -q --depth 1 "file://$TEST_TMP/origin" "$TEST_TMP/bump" 2>&1 && echo cloned)" "cloned"
 
-for spec in "Configure git|-" "Update freenet version|-" "Update fdev version|-" \
-            "Commit the version bump locally|bump" "Compose the release PR|pr_text" \
+for spec in "Check out the ship commit|-" "Configure git|-" "Apply the version bump|-" \
+            "Commit the version bump locally|bump" \
             "Dry run: report what a live run would push|dry_run_report"; do
     rc=$(run_wf_step update_versions "${spec%|*}" "${spec#*|}" "$TEST_TMP/bump")
     check "dry path: update_versions / ${spec%|*} runs" "$rc" "0"
@@ -578,24 +646,23 @@ for spec in "Configure git|-" "Update freenet version|-" "Update fdev version|-"
 done
 value() { grep -m1 "^$1=" "$VALUES" | cut -d= -f2-; }
 check "the bump branch is release/v<version>" "$(value steps.bump.outputs.branch)" "release/v$WF_VERSION"
-check "the PR title keeps the 'build: release ' prefix ci.yml's release gate keys off" \
-    "$(value steps.pr_text.outputs.title)" "build: release $WF_VERSION"
-check "the PR body names both versions" \
-    "$(grep -cE "freenet: → \*\*$WF_VERSION\*\*|fdev: → \*\*$WF_FDEV\*\*" "$(value steps.pr_text.outputs.body_file)")" "2"
+check "the release commit's parent is the SHIP commit, not the dispatch commit" \
+    "$(git -C "$TEST_TMP/bump" rev-parse HEAD^)" "$SHIP_SHA"
+check "nothing that landed after the soak is in the release commit" \
+    "$(git -C "$TEST_TMP/bump" ls-tree --name-only HEAD | grep -c after-soak || true)" "0"
+check "the bump step exports the release commit" "$(value steps.bump.outputs.bump_sha)" "$(git -C "$TEST_TMP/bump" rev-parse HEAD)"
+check "the release commit changes only the version manifests here (no lockfile run)" \
+    "$(git -C "$TEST_TMP/bump" diff --name-only HEAD^ HEAD | paste -sd' ' -)" "crates/core/Cargo.toml crates/fdev/Cargo.toml"
 check "the bump commit carries the new freenet version" \
     "$(git -C "$TEST_TMP/bump" show HEAD:crates/core/Cargo.toml | grep -m1 '^version = ')" "version = \"$WF_VERSION\""
 check "the bump commit carries the new fdev version" \
     "$(git -C "$TEST_TMP/bump" show HEAD:crates/fdev/Cargo.toml | grep -m1 '^version = ')" "version = \"$WF_FDEV\""
 check "fdev's binstall URLs point at the new release tag (#3995)" \
     "$(git -C "$TEST_TMP/bump" show HEAD:crates/fdev/Cargo.toml | grep -c "releases/download/v$WF_VERSION/fdev-")" "2"
-# The backticks are the literal text being checked for.
-# shellcheck disable=SC2016
-check "the PR body keeps its literal Generated-by line (a quoted heredoc runs nothing)" \
-    "$(grep -cxF 'Generated by: `.github/workflows/release.yml`' "$(value steps.pr_text.outputs.body_file)")" "1"
 check "fdev's freenet dependency follows the release version" \
     "$(git -C "$TEST_TMP/bump" show HEAD:crates/fdev/Cargo.toml | grep -cE "^freenet = \{ path = \"\.\./core\", version = \"$WF_VERSION\"")" "1"
-check "the bundle carries only the bump commit (the launch commit is its prerequisite)" \
-    "$(git -C "$TEST_TMP/bump" bundle verify "$TEST_TMP/runner/release-bump.bundle" 2>&1 | grep -c "$LAUNCH_SHA")" "1"
+check "the bundle carries only the bump commit (the ship commit is its prerequisite)" \
+    "$(git -C "$TEST_TMP/bump" bundle verify "$TEST_TMP/runner/release-bump.bundle" 2>&1 | grep -c "$SHIP_SHA")" "1"
 check "the dry-run report hands over the bump commit" \
     "$(value steps.dry_run_report.outputs.bump_sha)" "$(git -C "$TEST_TMP/bump" rev-parse HEAD)"
 check "the dry-run report says nothing was pushed" "$(grep -c 'nothing was pushed' "$TEST_TMP/summary")" "1"
@@ -671,12 +738,12 @@ chmod +x "$GH_FAKE/gh"
 rc=$(GH_FAKE_LOG="$TEST_TMP/ghfake.log" STEP_PATH="$GH_FAKE:$PATH" \
     run_wf_step dry_run_rehearsal "Changelog since the previous release" - "$TEST_TMP/rehearse")
 check "rehearsal: the changelog preview runs" "$rc" "0"
-check "the changelog compares the previous release with the launch commit" \
-    "$(grep -c "compare/v9.9.8...$LAUNCH_SHA" "$TEST_TMP/ghfake.log")" "2"
+check "the changelog compares the previous release with the ship commit" \
+    "$(grep -c "compare/v9.9.8...$SHIP_SHA" "$TEST_TMP/ghfake.log")" "2"
 check "the changelog skips draft releases" "$(grep -c -- '--exclude-drafts' "$TEST_TMP/ghfake.log")" "1"
 check "the changelog preview lists each commit's subject line" \
     "$(grep -cxE -- '- aaaaaaaaa one|- bbbbbbbbb two' "$TEST_TMP/summary")" "2"
-check "the changelog preview reports the commit count" "$(grep -c '^2 commit(s) on ' "$TEST_TMP/summary")" "1"
+check "the changelog preview reports the commit count" "$(grep -c '^2 commit(s) up to the ship commit since v9.9.8' "$TEST_TMP/summary")" "1"
 rc=$(GH_FAKE_FAIL=1 GH_FAKE_LOG="$TEST_TMP/ghfake.log" STEP_PATH="$GH_FAKE:$PATH" \
     run_wf_step dry_run_rehearsal "Changelog since the previous release" - "$TEST_TMP/rehearse")
 check "a failed release listing fails the changelog step" "$([ "$rc" != 0 ] && echo failed || echo passed)" "failed"
@@ -708,7 +775,7 @@ summary_case() {
     { grep -v '^needs\.validate\.outputs\.live=' "$base"
       echo "needs.validate.result=$1"; echo "needs.validate.outputs.live=$2"
       echo "needs.create_release.result=$3"; echo "needs.dry_run_rehearsal.result=success"
-      echo "needs.update_versions.result=success"; echo "needs.wait_for_pr.result=success"
+      echo "needs.update_versions.result=success"; echo "needs.wait_for_ci.result=success"
       echo "needs.verify_publishable.result=success"
       echo "github.repository=example/repo"; } > "$VALUES"
     run_wf_step summary "Release summary" - "$TEST_TMP/rehearse" > /dev/null

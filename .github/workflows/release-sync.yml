@@ -1,0 +1,115 @@
+name: Release sync
+
+# Merge-back after a release. release.yml ships the soaked commit plus a
+# version bump on `release/vX.Y.Z` and tags that, so the bump never lands on
+# main by itself. When the release is PUBLISHED (cross-compile.yml un-drafts it
+# after Gate A and the crates.io publish), this regenerates the same bump on
+# the current main and opens `build: sync main to X after release`, with
+# auto-merge, through the normal merge queue. scripts/release_sync.sh has the
+# details; docs/RELEASING.md, "Merge-back", the operator view.
+#
+# It fires on publish, not on the tag, so a release blocked at Gate A (tag and
+# draft deleted, re-cut with the same version) never syncs main to a version
+# that did not ship.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Published release to sync main to (e.g. 0.2.165)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# One group PER VERSION, never cancelled. A single shared group would hold only
+# one pending run, so a third release published while one sync runs would
+# cancel the pending second one, whichever version it was. Per-version groups
+# never drop a sync; syncs for different versions may then overlap, and
+# release_sync.sh resolves that by superseding (the lower one closes, before
+# and after it opens its PR). A re-run for the same version waits its turn.
+# The key is normalised to `vX.Y.Z` whichever way the version arrives (the
+# release event's tag, or a dispatch input given as `X.Y.Z` or `vX.Y.Z`), so
+# a hand dispatch and the event for one version share a group.
+concurrency:
+  group: release-sync-${{ github.event.release.tag_name || (startsWith(inputs.version, 'v') && inputs.version) || format('v{0}', inputs.version) }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync main to the released version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # Without RELEASE_PAT the branch push and the PR are made with
+      # GITHUB_TOKEN, whose events start no workflow: the PR would get no
+      # checks and could never merge (#4118). Fail loudly instead.
+      - name: Check RELEASE_PAT is configured
+        env:
+          RELEASE_PAT_PRESENT: ${{ secrets.RELEASE_PAT != '' }}
+        run: |
+          if [ "$RELEASE_PAT_PRESENT" != "true" ]; then
+            echo "::error title=RELEASE_PAT not set::release-sync needs RELEASE_PAT: with GITHUB_TOKEN its PR would start no CI and never merge, leaving main's version behind the release. Configure the RELEASE_PAT secret (AGENTS.md, 'Release Workflow & RELEASE_PAT') and re-run, or dispatch release-sync.yml by hand once it is set."
+            exit 1
+          fi
+          echo "✅ RELEASE_PAT is configured."
+
+      - name: Resolve the released version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.event.release.tag_name }}
+          PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "release" ]; then
+            if [ "$PRERELEASE" = "true" ]; then
+              echo "Pre-release $TAG_NAME: main is not synced to pre-releases."
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            V="${TAG_NAME#v}"
+          else
+            V="${INPUT_VERSION#v}"
+          fi
+          if [[ ! "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Not a release version: '$V'"
+            exit 1
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout main
+        if: steps.version.outputs.skip != 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          # RELEASE_PAT so the branch push and the PR fire ci.yml (the step
+          # above refuses without it; the coalesce keeps the token-coalesce
+          # lint's form).
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        if: steps.version.outputs.skip != 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install Rust
+        if: steps.version.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.93.0
+
+      - name: Open or refresh the sync PR
+        if: steps.version.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+        run: bash scripts/release_sync.sh

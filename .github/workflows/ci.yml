@@ -16,7 +16,8 @@ name: CI
 #    a changed-files check — is a large, subtle diff on required checks, where a
 #    mistake makes them pass unconditionally. If docs-only PRs ever become
 #    frequent, that step-level version is the right answer, with data behind it.
-# 2. Skip expensive jobs on main push — PR already validated
+# 2. Skip expensive jobs on main push — PR already validated. A push to a
+#    `release/v*` branch is the exception: it is the release gate (see 7).
 # 3. Skip NAT validation for dependabot PRs — Test is sufficient for version bumps
 # 4. Run fast checks (Fmt, Clippy) in parallel with the heavy jobs. No test job
 #    `needs:` Fmt: a formatting slip must not suppress the test signal (#5621).
@@ -30,14 +31,22 @@ name: CI
 #      Simulation and NAT Validation are present-but-skipped to keep branch
 #      protection happy without contending for ubicloud-standard-16 slots.
 #    - Release merge_group (commit message starts with "build: release") runs
-#      the full suite as the pre-publish gate, so what ships is known-green.
+#      the full suite. release.yml no longer opens such a PR (only the older
+#      local scripts/release.sh does), so this tier is legacy.
+#    - Push to `release/v*` runs the full suite: release.yml pushes the exact
+#      commit it will tag (the soaked ship_sha plus the version bump) to that
+#      branch and waits for this run (scripts/wait_for_release_ci.sh), so what
+#      ships is known-green. Pinned by scripts/wait_for_release_ci_test.sh.
 # 8. Heavy jobs restore a main-scoped Rust cache and never save on PRs. The
 #    entries are written by ci-cache-warm.yml, which mirrors those jobs' ids,
 #    env and build commands; check_cache_warm_parity.py keeps them in step.
 
 on:
   push:
-    branches: [main]
+    # `release/v*` is the release gate (point 7 above). The paths-ignore below
+    # cannot skip a release push: the release commit always changes a Cargo
+    # manifest, and wait_for_release_ci_test.sh pins that no pattern matches one.
+    branches: [main, 'release/v*']
     # Skip CI for docs-only changes on main (saves ~$0.13/run)
     paths-ignore:
       - 'docs/**'
@@ -143,10 +152,10 @@ jobs:
       - name: Check code formatting
         run: cargo fmt -- --check
 
-      # Locks the bash predicate that the merge_group release-gate keys off
-      # (#3973). The actual release path is only exercised on a real release
-      # merge_group entry, so a regression in the matching logic would
-      # silently skip the pre-publish gate. This self-test catches predicate
+      # Locks the bash predicate the legacy merge_group release tier keys off
+      # (#3973; only release.sh's bump PR still produces such an entry). The
+      # pre-publish gate is now the push run on release/v*, pinned by
+      # scripts/wait_for_release_ci_test.sh. This self-test catches predicate
       # quoting, anchoring, and case-sensitivity bugs on every CI run.
       - name: Self-test merge_group release detector
         run: |
@@ -221,9 +230,11 @@ jobs:
       # Regression gate for the v0.2.93 release failure (2026-07-07): the
       # version-bump auto-merge step ran `gh pr merge --squash --auto`, but the
       # merge queue rejects --squash, so the step exited non-zero (under bash -e)
-      # and skipped the entire publish cascade. Pins that release.yml's merge
-      # invocation stays --auto and never re-adds --squash.
-      - name: Self-test release.yml merge-queue auto-merge
+      # and skipped the entire publish cascade. Pins that the release path's
+      # one auto-merge (the merge-back PR, scripts/release_sync.sh) stays
+      # --auto and never re-adds --squash, that release.yml merges nothing, and
+      # that the release jobs stay pinned to one commit (#5233).
+      - name: Self-test release merge-queue auto-merge
         run: bash scripts/release_mergequeue_test.sh
 
       # Regression gate for #5170: a merge_group-triggered workflow whose
@@ -357,6 +368,25 @@ jobs:
       - name: Self-test release publish steps
         run: bash scripts/release_publish_steps_test.sh
 
+      # The commit a release ships (ship_sha): live runs require it, it must be
+      # on main and contain the previous release's ship commit, and fdev's next
+      # version accounts for main lagging a release. Also the one version-bump
+      # script both release workflows share, on the real manifests.
+      - name: Self-test release ship commit and version bump
+        run: bash scripts/resolve_release_ship_test.sh
+
+      # The release gate: a push to release/v* must run the full suite (every
+      # job's `if:` evaluated for that push), and the waiter must refuse any
+      # run that is not a full pass. A condition that silently skips the heavy
+      # jobs would otherwise tag an untested commit behind a green run.
+      - name: Self-test release CI gate
+        run: bash scripts/wait_for_release_ci_test.sh
+
+      # The merge-back after a release: regenerated on main, idempotent,
+      # supersedes older sync PRs, never a `build: release` title.
+      - name: Self-test release sync
+        run: bash scripts/release_sync_test.sh
+
       # Regression gate for #5221/#5222: auto-update was broken fleet-wide for
       # TWO releases (v0.2.120, v0.2.121) and nothing noticed, because every
       # signal was one-sided — the release built, published, installed and ran.
@@ -408,7 +438,7 @@ jobs:
       # clean when they landed but were not actually in this list, so nothing
       # held them to it. `-x` because the two test scripts `source` the canary.
       - name: Lint install/uninstall scripts (shellcheck)
-        run: shellcheck -x scripts/check-x86-64-baseline.sh scripts/check-x86-64-baseline_test.sh scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/macos-url-scheme-e2e.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh scripts/resolve_release_mode.sh scripts/release_dry_run_test.sh nix/freenet-node.sh scripts/nix-node-wrapper_test.sh scripts/wan-bench-classify.sh scripts/wan-bench-classify_test.sh scripts/cache_warm_parity_test.sh scripts/simulation_schedule_test.sh scripts/check_quic_data_ramp_t0.sh scripts/check_quic_data_ramp_t0_test.sh scripts/check_release_preflight.sh scripts/check_release_preflight_test.sh scripts/release_publish_steps_test.sh
+        run: shellcheck -x scripts/check-x86-64-baseline.sh scripts/check-x86-64-baseline_test.sh scripts/install.sh scripts/uninstall.sh scripts/test-install-sh.sh scripts/test-uninstall-sh.sh scripts/macos-url-scheme-e2e.sh scripts/auto-update-canary.sh scripts/auto-update-canary_test.sh scripts/auto-update-canary_lifecycle_test.sh scripts/release_wait_for_binaries_test.sh scripts/release_canary_wiring_test.sh scripts/rule_lint_shell_assertion_counter_test.sh scripts/release.sh scripts/pr-backlog-sweep.sh scripts/pr-backlog-sweep_test.sh scripts/release-rollback.sh scripts/release_rollback_test.sh scripts/resolve_release_mode.sh scripts/release_dry_run_test.sh nix/freenet-node.sh scripts/nix-node-wrapper_test.sh scripts/wan-bench-classify.sh scripts/wan-bench-classify_test.sh scripts/cache_warm_parity_test.sh scripts/simulation_schedule_test.sh scripts/check_quic_data_ramp_t0.sh scripts/check_quic_data_ramp_t0_test.sh scripts/check_release_preflight.sh scripts/check_release_preflight_test.sh scripts/apply_version_bump.sh scripts/release_lib.sh scripts/resolve_release_ship.sh scripts/resolve_release_ship_test.sh scripts/wait_for_release_ci.sh scripts/wait_for_release_ci_test.sh scripts/release_sync.sh scripts/release_sync_test.sh scripts/verify_release_checkout.sh scripts/release_mergequeue_test.sh scripts/release_publish_steps_test.sh
       # The PR-backlog sweep reports stalled PRs (see
       # .github/workflows/pr-backlog-sweep.yml). Its self-test drives the ABORT
       # paths -- failed query, empty listing the REST probe contradicts,
@@ -942,7 +972,8 @@ jobs:
     name: Windows Check
     runs-on: windows-latest
     timeout-minutes: 40
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    # PRs, the merge queue, and the release gate (a push to `release/v*`).
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/v'))
 
     steps:
       - uses: actions/checkout@v7
@@ -970,13 +1001,16 @@ jobs:
     # The real fix (shrink or speed up the cache, or drop it and the warm job
     # deliberately) is tracked in #6346.
     timeout-minutes: 45
-    # Skip on push to main (PR already validated) and on release branches
-    # themselves (the release version-bump PR is gated by its merge_group entry,
-    # which runs the full suite). The release merge_group entry IS the
-    # pre-publish gate — it must run the full suite so we know what ships is
-    # green.
+    # Runs on PRs, the merge queue, and a push to `release/v*`, which is
+    # release.yml's pre-publish gate on the exact commit it tags: it must run
+    # the full suite so we know what ships is green, and
+    # scripts/wait_for_release_ci.sh refuses a run where this job did not pass.
+    # Skipped on push to main (the PR already validated it) and on a PR whose
+    # head is a release branch (the older scripts/release.sh bump PR, gated by
+    # its own release merge_group entry and its branch push).
     if: |
-      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group' ||
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/v'))) &&
       !startsWith(github.head_ref, 'release/v')
 
     env:
@@ -1189,9 +1223,10 @@ jobs:
     # The warm entry covers dependencies only: rust-cache cleans workspace-member
     # artifacts before saving, so `freenet` itself still compiles on every run.
     timeout-minutes: 45
-    # Same skip conditions as test_unit (see test_unit comment for details).
+    # Same conditions as test_unit (see test_unit comment for details).
     if: |
-      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group' ||
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/v'))) &&
       !startsWith(github.head_ref, 'release/v')
 
     env:
@@ -1299,9 +1334,10 @@ jobs:
     # this job at least once (cache only saves on `github.ref ==
     # refs/heads/main`, see the cache step below).
     timeout-minutes: 60
-    # Same skip conditions as test_unit (see test_unit comment for details).
+    # Same conditions as test_unit (see test_unit comment for details).
     if: |
-      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group' ||
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/v'))) &&
       !startsWith(github.head_ref, 'release/v')
 
     env:
@@ -1405,9 +1441,11 @@ jobs:
     # is gated off (see skip_check below).
     runs-on: "${{ (github.event_name == 'merge_group' && !startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-16' }}"
     timeout-minutes: 40
-    # Same skip conditions as test_unit (see test_unit comment for details)
+    # Same conditions as test_unit (see test_unit comment for details). On a
+    # release push the runner and skip_check below both resolve to the full run.
     if: |
-      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group' ||
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/v'))) &&
       !startsWith(github.head_ref, 'release/v')
 
     env:
@@ -1418,11 +1456,12 @@ jobs:
       # Skip every real step on non-release merge_group entries. PR-level CI
       # already exercised the same code; running heavy ubicloud-standard-16
       # simulations on every merge-queue entry contends for runner slots
-      # (issue #3973) without catching merge-time-specific regressions. The
-      # release merge_group entry (commit message starts with "build: release")
-      # still runs the full suite as the final pre-publish gate. The job
-      # remains present in the skipped case so branch-protection's required-
-      # check gate stays satisfied.
+      # (issue #3973) without catching merge-time-specific regressions. A
+      # legacy release merge_group entry (commit message starts with
+      # "build: release") still runs the full suite. The pre-publish gate is
+      # the push run on release/v*, where this step resolves to skip=false.
+      # The job remains present in the skipped case so branch-protection's
+      # required-check gate stays satisfied.
       - name: Detect skip
         id: skip_check
         env:
@@ -1678,12 +1717,14 @@ jobs:
     # rate costs a few minutes of wall clock nobody is waiting on.
     runs-on: "${{ (github.event_name == 'merge_group' && !startsWith(github.event.merge_group.head_commit.message, 'build: release')) && 'ubuntu-latest' || 'ubicloud-standard-8' }}"
     timeout-minutes: 30
-    # Skip on:
+    # Runs on PRs, the merge queue, and a push to `release/v*` (the release
+    # gate, see test_unit). Skip on:
     # - push to main: PR already validated code before merge
-    # - release branches: covered by the release merge_group gate
+    # - PRs from release branches: the older scripts/release.sh bump PR
     # - dependabot PRs: just version bumps, Test job is sufficient
     if: |
-      (github.event_name == 'pull_request' || github.event_name == 'merge_group') &&
+      (github.event_name == 'pull_request' || github.event_name == 'merge_group' ||
+       (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/v'))) &&
       !startsWith(github.head_ref, 'release/v') &&
       !startsWith(github.head_ref, 'dependabot/')
 
@@ -1701,10 +1742,11 @@ jobs:
       # already exercised the same code; running Ubicloud Docker NAT
       # validation on every merge-queue entry contends for runner
       # slots (issue #3973) without catching merge-time-specific regressions.
-      # The release merge_group entry (commit message starts with
-      # "build: release") still runs the full suite as the final pre-publish
-      # gate. The job remains present in the skipped case so branch-
-      # protection's required-check gate stays satisfied.
+      # A legacy release merge_group entry (commit message starts with
+      # "build: release") still runs the full suite. The pre-publish gate is
+      # the push run on release/v*, where this step resolves to skip=false.
+      # The job remains present in the skipped case so branch-protection's
+      # required-check gate stays satisfied.
       - name: Detect skip
         id: skip_check
         env:

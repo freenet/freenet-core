@@ -24,9 +24,20 @@ the Matrix/River announcements.
 > soak of the exact SHA, and a telemetry baseline. CI exercises neither a real
 > NATed peer nor the shipping binary's own updater. The trigger commands below
 > are the step that skill runs after its gates pass; they are not a standalone
-> procedure. A `dry_run=true` dispatch is safe only from a ref that contains
-> #5939. From an older ref it still pushes, opens and auto-merges the
-> version-bump PR (#5936), so it needs the same gates there.
+> procedure. A `dry_run=true` dispatch pushes nothing, because the workflow
+> file comes from the dispatched ref and every ref with this flow has the
+> #5939 dry-run guard. Do not dispatch a dry run with `--ref` pointing at a
+> tag or branch from before #5939 (v0.2.147 and older): there it still pushes,
+> opens and auto-merges a version-bump PR (#5936).
+
+**A release ships an exact commit.** `release.yml` takes a `ship_sha` input
+(required for a live run): the commit that was soaked. It commits the version
+bump on top of that commit (the release commit, B), pushes B as branch
+`release/vX.Y.Z`, waits for ci.yml's full suite on that push, and tags B. It
+never reads `main`'s tip, so **`main` stays open during a cut**: whatever
+merges meanwhile is simply not in this release. `main` gets the same version
+bump afterwards, from `release-sync.yml`, when the release is published (see
+"Merge-back").
 
 This doc covers how the pipeline works once triggered, and the few places
 things can go wrong.
@@ -39,8 +50,14 @@ skill triggers the workflow, always with an explicit version:
 ```bash
 gh workflow run release.yml \
     --repo freenet/freenet-core \
-    --field version=X.Y.Z
+    --field version=X.Y.Z \
+    --field ship_sha=<full 40-character SHA of the soaked commit on main>
 ```
+
+`ship_sha` must be a full SHA (not a branch or tag name, which could move
+between the soak and the cut), on `main`, and must contain the commit the
+previous release shipped. The `validate` job refuses anything else before
+creating anything (`scripts/resolve_release_ship.sh`).
 
 Watch progress at <https://github.com/freenet/freenet-core/actions/workflows/release.yml>.
 
@@ -52,11 +69,12 @@ explicit — they're not auto-decidable from commit history.
 
 Within ~30–60 minutes you should see:
 
-1. The `Release` workflow's `validate` → `update_versions` → `wait_for_pr` →
+1. The `Release` workflow's `validate` → `update_versions` → `wait_for_ci` →
    `verify_publishable` → `create_release` jobs complete.
-2. An auto-created bump PR titled `build: release X.Y.Z` that merges itself.
-3. A `vX.Y.Z` git tag pushed and a **draft** GitHub release created, which
-   triggers `Build and Cross-Compile`.
+2. Branch `release/vX.Y.Z` pushed at the release commit (ship_sha plus the
+   version bump), and ci.yml's full suite running on that push. No PR.
+3. A `vX.Y.Z` git tag pushed on the release commit and a **draft** GitHub
+   release created, which triggers `Build and Cross-Compile`.
 4. Cross-compile builds Linux musl + macOS (Intel + arm64) + Windows
    (Authenticode-signed) + signed DMG and attaches all 14 artifacts to the
    draft release.
@@ -69,6 +87,8 @@ Within ~30–60 minutes you should see:
    workflow polling `/version` after the update).
 8. A Matrix message lands in `#freenet-locutus:matrix.org`. A River chat
    announcement is sent via nova's release-agent.
+9. `Release sync` opens `build: sync main to X.Y.Z after release`, which
+   merges itself through the queue (see "Merge-back").
 
 ## Prerequisites
 
@@ -80,8 +100,8 @@ published.
 
 | Secret | Used by | Failure mode if missing |
 |---|---|---|
-| `RELEASE_PAT` | release.yml, cross-compile.yml | A LIVE `release.yml` run fails in `validate`, before anything is created: without it the bump PR gets no CI, the tag push does not start cross-compile.yml and `release.published` does not fire the downstream workflows, so the release would stall half-done. A dry run only warns. |
-| `CARGO_REGISTRY_TOKEN` | release.yml `validate` (checks it), cross-compile.yml `attach-to-release` (uses it) | **`validate` fails first**, before the bump PR exists — that is the intended place to find out, and where to look when a release dies immediately. If `validate` is bypassed (a bare tag push, or a manual `cross-compile.yml` dispatch), `attach-to-release` fails after the binaries are uploaded and the release stays a draft. The actual publish lives in cross-compile.yml, not release.yml, because it is deliberately downstream of Gate A — see "The crates.io publish is downstream of Gate A" below. |
+| `RELEASE_PAT` | release.yml, cross-compile.yml, release-sync.yml | A LIVE `release.yml` run fails in `validate`, before anything is created: without it the release-branch push gets no CI, the tag push does not start cross-compile.yml and `release.published` does not fire the downstream workflows, so the release would stall half-done. A dry run only warns. |
+| `CARGO_REGISTRY_TOKEN` | release.yml `validate` (checks it), cross-compile.yml `attach-to-release` (uses it) | **`validate` fails first**, before the release branch exists — that is the intended place to find out, and where to look when a release dies immediately. If `validate` is bypassed (a bare tag push, or a manual `cross-compile.yml` dispatch), `attach-to-release` fails after the binaries are uploaded and the release stays a draft. The actual publish lives in cross-compile.yml, not release.yml, because it is deliberately downstream of Gate A — see "The crates.io publish is downstream of Gate A" below. |
 | `MATRIX_HOMESERVER_URL` | release-announce.yml | Matrix job warns + skips (success, no post). |
 | `MATRIX_ACCESS_TOKEN` | release-announce.yml | Matrix job warns + skips. |
 | `RELEASE_AGENT_HMAC_NOVA` | gateway-update.yml, release-announce.yml | nova update + River announce fail (HTTP 401). |
@@ -666,12 +686,18 @@ When a NEW wire-gated feature first ships (not this one), set its floor to
 ## Dry run
 
 `gh workflow run release.yml --field dry_run=true` rehearses a cut without
-making one. It resolves the version, commits the bump on the runner, and runs
-the checkout verifier and `cargo publish -p freenet --dry-run` against that
-commit in a read-only `dry_run_rehearsal` job. It prints the branch, PR title
-and body a live run would open, and an approximate changelog. It pushes no
-branch, opens and merges no PR, and creates no tag or release, so `main` does
-not move.
+making one. `ship_sha` is optional in a dry run and defaults to the dispatch
+commit; pass it to rehearse the exact commit you mean to ship. It resolves the
+version and the ship commit, commits the bump on top of the ship commit on the
+runner, and runs the checkout verifier and `cargo publish -p freenet --dry-run`
+against that commit in a read-only `dry_run_rehearsal` job. It prints the
+branch a live run would push and an approximate changelog. It pushes no
+branch, opens no PR, and creates no tag or release.
+
+The ship-commit checks (on `main`, contains the previous release's ship
+commit) only warn in a dry run, so a dry run dispatched from a feature branch
+to rehearse a `release.yml` change still runs to the end. A live run refuses
+on them.
 
 Every mutating step is gated on the single `needs.validate.outputs.live`
 value and refuses in its own script when that is not `true`. No step that
@@ -692,8 +718,9 @@ Caveats:
   the branch and auto-merged the bump PR, so `--ref` pointing at an older tag
   or branch still does.
 - **It does not exercise the live-only half:** the `CARGO_REGISTRY_TOKEN`
-  presence check, the pre-flight below, waiting for the bump PR's merge queue (`wait_for_pr`,
-  `resolve_release_sha.sh`), GitHub's generated release notes, the tag push
+  presence check, the pre-flight below, the release-branch push and the wait
+  for its CI (`wait_for_ci`, `scripts/wait_for_release_ci.sh`), GitHub's
+  generated release notes, the tag push
   and the release creation, and everything the tag triggers in
   `cross-compile.yml` (binaries, Gate A, the crates.io publish). A green dry
   run says the bump and the packaging are sound, not that a cut will ship.
@@ -706,42 +733,76 @@ A live run's `validate` job runs `scripts/check_release_preflight.sh` before
 anything is created, and refuses when:
 
 - **another `release.yml` run is queued or in progress** (a dry run counts; a
-  run stuck waiting counts too, so cancel it), or **a version-bump PR is open**
-  (head `release/v*` or title `build: release`; a failed cut can leave one
-  behind, see `scripts/RELEASE_RECOVERY.md` Step 1). It does not check for a
+  run stuck waiting counts too, so cancel it), or **a legacy version-bump PR is
+  open** (head `release/v*` or title `build: release`, from the older
+  `scripts/release.sh` flow; see `scripts/RELEASE_RECOVERY.md` Step 1). An
+  open `release-sync/v*` merge-back PR does not block a cut. It does not check for a
   previous tag's still-running `cross-compile.yml` run; the `freenet:release`
   skill's P0 still does;
 - **tag `vX.Y.Z` already exists**, or **freenet X.Y.Z is already on crates.io**
   (an unreadable answer refuses too);
-- **X.Y.Z is not above `crates/core/Cargo.toml`** on the dispatched ref.
-  (A blank version auto-bumps from crates.io, or from the tree when it is one
-  patch ahead after a blocked cut. Dispatched while the previous release is
-  still building, before its crates.io upload, that skips a number, so always
-  pass the version explicitly, as the `freenet:release` skill does.) Equal
-  means the bump already merged without a published release: see
-  "Re-cutting the same version" in `scripts/RELEASE_RECOVERY.md`.
+- **X.Y.Z is not above `crates/core/Cargo.toml` at the ship commit**, or **not
+  above the latest published release**. The second matters because `main`'s
+  version lags a release until its merge-back PR lands, so a ship commit can
+  still say an older version than what is already out.
+  Always pass the version explicitly, as the `freenet:release` skill does;
+- **another release is unfinished**: a `vY` tag, or a `release/vY` branch
+  with no tag yet, for a Y above the latest published release and other
+  than X.Y.Z. Finish that release, or abandon it by deleting its tag and
+  branch, and its draft too so a later re-cut does not meet it
+  (`scripts/RELEASE_RECOVERY.md`, "Cleaning up release branches").
+  X.Y.Z's own branch is exempt on purpose: a same-version re-cut reuses it
+  (`update_versions` replaces it), and its tag must be gone first. Drafts are
+  not checked here (`validate`'s read-only token is not shown them); every
+  cut pushes its tag before its draft, and `create_release`'s tag step
+  refuses, before pushing the tag, a same-version draft older than its own
+  run. That refusal comes after the release branch's CI wait, so delete a
+  stale draft before dispatching.
 
-Each of these used to fail later, after the bump PR had merged.
+"The latest published release" is always the highest-semver published,
+non-prerelease release (`scripts/release_lib.sh`), never GitHub's
+`/releases/latest` marker, which can be moved by hand and which a recovery
+un-draft of an older tag deliberately leaves alone.
+
+Before it, `scripts/resolve_release_ship.sh` refuses a live run with no
+`ship_sha`, a `ship_sha` that is not a full SHA, not on `main`, that does not
+contain the previous release's ship commit (the latest published tag's commit
+if that is on `main`, else its first parent, which is the previous
+`ship_sha`), or whose tree predates this flow (no `release-sync.yml`, or a
+`ci.yml` push trigger without `release/v*`; see "Which tree runs what"). It
+also picks fdev's version: one patch above the highest of fdev at `ship_sha`,
+fdev at the highest-version release TAG (drafts and unfinished cuts
+included), and fdev's newest version on crates.io, so neither a cut made
+before the previous merge-back landed nor one made beside an unfinished
+release reuses an fdev version. Every lookup fails closed.
+
+Each of these used to fail later, after something had been created.
 
 ## What fires when
 
 ```
 gh workflow run release.yml
-    └─→ release.yml: validate   (resolves dry_run → outputs.live)
+    └─→ release.yml: validate   (resolves dry_run → outputs.live, checks
+                                 ship_sha, live pre-flight)
     └─→ release.yml: update_versions
-            └─→ dry run: commits the bump locally, prints what it would
-                push and bundles the commit; dry_run_rehearsal then verifies
-                and packages it. Of what follows, only the summary runs
-            └─→ (live only) creates "build: release X.Y.Z" PR
-            └─→ (live only) ci.yml runs on PR (using RELEASE_PAT scope)
-            └─→ (live only) PR auto-merges to main
-    └─→ release.yml: wait_for_pr   (this and everything below: live only)
-            └─→ resolves the bump PR's merge commit -> RELEASE_SHA
+            └─→ checks out ship_sha, applies scripts/apply_version_bump.sh,
+                refreshes the lockfiles, commits B (parent = ship_sha)
+            └─→ dry run: prints what it would push and bundles B;
+                dry_run_rehearsal then verifies and packages it. Of what
+                follows, only the summary runs
+            └─→ (live only) pushes branch release/vX.Y.Z at B (deleting
+                an older release/vX.Y.Z first, so the push is a new branch)
+                    └─→ ci.yml runs its FULL suite on the push (RELEASE_PAT)
+    └─→ release.yml: wait_for_ci   (this and everything below: live only)
+            └─→ checks B = ship_sha + version files only, then waits for
+                ci.yml's push run on B to succeed with every required job
+                passed -> RELEASE_SHA = B
                 (everything below checks out that exact commit; see #5233)
     └─→ release.yml: verify_publishable
             └─→ cargo publish -p freenet --dry-run   (packaging check only —
                 nothing is uploaded here; see the section below)
     └─→ release.yml: create_release
+            └─→ refuses a same-version draft older than this run
             └─→ git tag -a vX.Y.Z; git push
                     └─→ tag push triggers cross-compile.yml
             └─→ gh release create --draft (release exists but draft)
@@ -759,6 +820,10 @@ gh workflow run release.yml
                                     └─→ Matrix message
                                     └─→ POST /announce/river to nova
                                             └─→ nova runs riverctl locally
+                            └─→ release-sync.yml fires (merge-back)
+                                    └─→ PR "build: sync main to X.Y.Z after
+                                        release" on release-sync/vX.Y.Z,
+                                        auto-merge through the queue
 ```
 
 The un-draft makes the release latest only when it is the highest published
@@ -769,6 +834,68 @@ already published, while a manual `workflow_dispatch` always posts. Gate B
 (the self-update canary) is skipped for such a non-latest un-draft: nodes follow
 `/releases/latest`, so there is no transition to check.
 
+## Which tree runs what
+
+`release.yml` itself, and every script it runs, come from the ref you
+dispatch (normally `main`). Everything after the tag does not:
+`cross-compile.yml` runs on the tag push, and `release-announce.yml`,
+`gateway-update.yml` and `release-sync.yml` run on `release: published`, and
+GitHub runs all of them from the TAG's tree, which is `ship_sha` plus the
+version bump. The push CI on `release/vX` likewise runs `ci.yml` as it is at
+`ship_sha`. So a release ships with the cascade and the CI gate of its own
+`ship_sha`, and a fix to those workflows reaches a release only once
+`ship_sha` contains it. `validate` refuses a `ship_sha` that predates this flow
+for exactly that reason.
+
+### First release under this flow
+
+- `ship_sha` contains the release-tooling audit (#6361) and this flow (#6362);
+  `validate` refuses one that does not carry `release-sync.yml` and the
+  `release/v*` push trigger.
+- `RELEASE_PAT` is set and current. The release-branch push, the tag push and
+  the merge-back PR all need it; `release-sync.yml` refuses without it.
+- The `freenet:release` skill passes `ship_sha` (the soaked commit) to the
+  dispatch, and the soak-marker hook keys on that `ship_sha`, not on
+  `origin/main`. Both live outside this repo.
+- The previous release was cut with the PR flow, so its tag is on `main`;
+  `validate` then takes the tag's commit itself as the previous ship commit.
+  `main` already carries that version, so pick the next one.
+
+## Merge-back
+
+The release commit lives only on `release/vX.Y.Z` and its tag, so `main`'s
+version files do not change during a cut. `release-sync.yml` brings them up
+when the release is **published** (`release: published`, or
+`gh workflow run release-sync.yml --field version=X.Y.Z` by hand). It runs
+`scripts/release_sync.sh`, which:
+
+- does nothing when `main`'s `crates/core` version is already X.Y.Z or above
+  (a later release synced first);
+- otherwise regenerates the bump on the CURRENT `main` with the same
+  `scripts/apply_version_bump.sh` that `release.yml` uses (fdev's version is
+  read from the tag's tree), refreshes the lockfiles, and force-pushes branch
+  `release-sync/vX.Y.Z`. Regenerating rather than cherry-picking means it
+  cannot conflict, and a re-run simply rebuilds the branch on the `main` it
+  now sees;
+- opens `build: sync main to X.Y.Z after release` (or reuses the open one)
+  and enables auto-merge. The title must not start with `build: release`,
+  which ci.yml's merge-group tiering still treats as a release entry;
+- closes open `release-sync/v*` PRs for lower versions as superseded, and
+  does nothing (closing its own PR) when a sync PR for a HIGHER version is
+  already open. Syncs for different versions run in separate concurrency
+  groups, so a newer one is never cancelled while an older one runs; the
+  superseding pass runs again after the PR is opened, so of two overlapping
+  syncs the lower one ends up closed;
+- refuses, with an error, when `RELEASE_PAT` is not configured: a PR opened
+  with `GITHUB_TOKEN` would get no CI and could never merge.
+
+It fires on publish, not on the tag, so a cut blocked at Gate A never moves
+`main` to a version that did not ship. Until the sync PR merges, `main`'s
+`Cargo.toml` says the previous version. That is expected; the pre-flight and
+fdev selection above account for it. Tags are no longer on `main`'s
+first-parent history (`git log main` shows no `vX.Y.Z` decorations; `git log
+vX.Y.Z` works), and nothing in the repo uses `git describe`.
+
 ## How to monitor
 
 - **All in one place**:
@@ -777,9 +904,11 @@ already published, while a manual `workflow_dispatch` always posts. Gate B
   show up here in rough chronological order.
 - **Gateway versions**:
   - `curl https://nova.locut.us/release-agent/version`
-- **Bump PR**:
-  `gh pr list --repo freenet/freenet-core --search "build: release"` —
-  there should be exactly one open per release, gone within a few minutes.
+- **Release-branch CI**:
+  `gh run list --repo freenet/freenet-core --workflow ci.yml --branch release/vX.Y.Z`.
+- **Merge-back PR** (after publish):
+  `gh pr list --repo freenet/freenet-core --search "build: sync main to"` —
+  normally one per release, merged within the queue's usual time.
 - **crates.io propagation**:
   <https://crates.io/crates/freenet> and <https://crates.io/crates/fdev>.
 
@@ -788,18 +917,27 @@ already published, while a manual `workflow_dispatch` always posts. Gate B
 The workflow's failure annotations point to the broken step. The most common
 failure modes seen so far:
 
-### `wait_for_pr` timed out
+### `wait_for_ci` failed
 
-The bump PR is stuck in CI or the merge queue. Open the PR (linked from the
-release.yml run), unblock it (push a fix to the branch if needed), let it
-merge, then **re-run only the failed jobs** in the release.yml workflow:
+Nothing has been tagged and `main` is untouched. The annotation says which:
 
-```bash
-gh run rerun --failed <RUN_ID> --repo freenet/freenet-core
-```
-
-The re-run picks up where it left off — `wait_for_pr` will see the merged
-state and proceed to `verify_publishable`.
+- **ci.yml failed on the release commit.** The run is linked. A real failure
+  means the ship commit is not releasable: fix it on `main` through a normal
+  PR, soak the new commit, and dispatch again with the new `ship_sha` (the same
+  version is fine; the release branch is replaced). A failure you have
+  shown is not caused by the commit (a runner outage) can be re-run in the
+  ci.yml run, then `gh run rerun --failed <RELEASE_RUN_ID>` re-runs
+  `wait_for_ci`, which picks up the newest run on B.
+- **No CI run appeared.** The push was made without RELEASE_PAT, or ci.yml no
+  longer triggers on `release/v*`. Fix that, then re-dispatch.
+- **A required job did not pass although the run succeeded.** A ci.yml `if:`
+  skipped part of the release gate. That is a ci.yml bug; do not tag around
+  it. `scripts/wait_for_release_ci_test.sh` should have caught it.
+- **The release commit is not ship_sha + version files.** Something other
+  than `update_versions` moved `release/vX.Y.Z`. Find out what before
+  re-dispatching.
+- **Timeout** (75 min). Check the ci.yml run; re-run the failed job once it
+  concludes.
 
 ### `Check sampled C code for instructions above baseline x86-64` failed
 
@@ -923,7 +1061,15 @@ invisible to every test in the repo.
 
 ### `create_release` failed
 
-Most likely cause: tag push failed because git identity wasn't configured on
+**"Stale release vX.Y.Z"**: a release for this version, created before this
+run started, already exists: a draft left by an earlier cut. The tag step
+refuses before pushing, so cross-compile.yml has not started (the release
+branch's CI wait has already been spent; delete stale drafts before
+dispatching next time). Check crates.io
+(`scripts/RELEASE_RECOVERY.md`), delete the draft
+(`gh release delete vX.Y.Z --yes`), and re-run the job.
+
+Otherwise, the most likely cause: tag push failed because git identity wasn't configured on
 the runner. Fixed by [PR #4135] — if it recurs, check that the
 `Create and push tag` step still has `git config user.name` /
 `git config user.email`.
@@ -931,17 +1077,16 @@ the runner. Fixed by [PR #4135] — if it recurs, check that the
 To unblock manually:
 
 Tag the **release commit**, not `main`. The release is cut from one pinned
-commit — the version-bump PR's merge commit — and `main` may have moved past
-it since (that is #5233; tagging `main` reintroduces exactly the bug the
-pipeline now prevents). Resolve it the same way the workflow does:
+commit, the tip of `release/vX.Y.Z` that `wait_for_ci` passed, and `main` never
+contains it (that is #5233; tagging `main` reintroduces exactly the bug the
+pipeline now prevents). The run's `wait_for_ci` log names it:
 
 ```bash
-# The bump PR is the "build: release X.Y.Z" one; the run log also prints
-# "📌 Release pinned to <sha>".
-RELEASE_SHA=$(gh pr view <BUMP_PR> --repo freenet/freenet-core \
-  --json mergeCommit --jq '.mergeCommit.oid')
-
-# Sanity-check it really is the bump commit before tagging it.
+# "✅ ci.yml passed on <sha> with every required job" in wait_for_ci's log.
+RELEASE_SHA=<that sha>
+# It must still be the branch tip, and carry the version.
+git ls-remote origin refs/heads/release/vX.Y.Z
+git fetch origin "$RELEASE_SHA"
 git show "$RELEASE_SHA:crates/core/Cargo.toml" | grep '^version'
 
 git tag -a vX.Y.Z "$RELEASE_SHA" -m "Release vX.Y.Z"
@@ -1088,7 +1233,9 @@ when invoked directly, the agent doesn't.
 
 ## Skip mechanisms
 
-`scripts/release.sh` (the legacy local release script) honors two env vars:
+`scripts/release.sh` (the legacy local release script) now refuses a live
+cut, since its bump-PR flow no longer matches `release.yml`; only `--dry-run`
+runs. It honors two env vars:
 
 - `FREENET_RELEASE_SKIP_ANNOUNCEMENTS=1` — skip the local Matrix + River
   posts (the workflow handles them).
@@ -1326,10 +1473,12 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
 ```
 
 - **404 — the normal case after a Gate A block.** Nothing irreversible has
-  happened. Delete the tag and the draft, fix, and re-cut the SAME version on
-  the corrected commit. `release.yml` cannot do that re-cut (its bump already
-  merged, so its pre-flight refuses); `scripts/RELEASE_RECOVERY.md`, "Re-cutting
-  the same version", has the manual path, or cut the next patch.
+  happened. Delete the tag and the draft, fix on `main`, soak the fixed
+  commit, and dispatch `release.yml` again with the SAME version and the new
+  `ship_sha`. Nothing reached `main` (the merge-back fires only on publish), so
+  the pre-flight accepts it and `release/vX.Y.Z` is replaced with the new
+  release commit. `scripts/RELEASE_RECOVERY.md`, "Re-cutting the same
+  version", has the commands.
 - **200 — the version really is spent.** Only reachable if the publish step ran
   and something later failed. Do not re-tag it; cut the next patch instead, and
   note that `cargo binstall freenet` will 404 and the nightly
@@ -1357,7 +1506,8 @@ curl -sS -o /dev/null -w '%{http_code}\n' -A 'freenet-release-driver' \
    (`crates/core/src/bin/commands/auto_update.rs`). Then, per the check above:
 
    - **crates absent (404, the normal case)** — delete the tag and the draft and
-     re-cut the SAME version on the corrected commit. Nothing was published, so
+     re-cut the SAME version: dispatch `release.yml` again with the corrected
+     commit as `ship_sha`. Nothing was published, so
      the version number is not spent, and burning one here would be conceding
      the loss this ordering exists to prevent.
    - **crates present (200)** — the version is spent; cut the next patch and

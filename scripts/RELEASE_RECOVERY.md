@@ -1,21 +1,25 @@
 # Freenet Release Recovery Guide
 
-When a release fails mid-process (normally a `release.yml` run, or the legacy
-`scripts/release.sh` driver), use this guide to complete it.
+When a release fails mid-process (a `release.yml` run; the legacy
+`scripts/release.sh` driver now refuses live cuts), use this guide to complete it.
 
 ## Read this before running anything
 
 **Publication is gated, and the gate is not optional.** The order is:
 
 ```
-bump PR merges
-  -> tag vX.Y.Z pushed          (this is what triggers cross-compile.yml)
+release commit B (ship_sha + version bump) pushed as release/vX.Y.Z
+  -> ci.yml full suite passes on B   (release.yml's wait_for_ci)
+  -> tag vX.Y.Z pushed on B     (this is what triggers cross-compile.yml)
   -> DRAFT GitHub release created
   -> cross-compile.yml:  build -> attach binaries
                          -> Gate A: auto-update pre-flight   BLOCKING
                          -> cargo publish (crates.io)        IRREVERSIBLE
                          -> gh release edit --draft=false --latest=<newest?>
+  -> release-sync.yml:   PR "build: sync main to X.Y.Z after release"
 ```
+
+`main` is not touched until that last step, which fires only on publish.
 
 Two consequences for anyone recovering by hand. Both are about ORDER, not about
 never touching these commands — **Step 4 is the sanctioned way to do both by
@@ -69,25 +73,37 @@ git tag -d vX.Y.Z
 
 ### Re-cutting the same version
 
-`release.yml` cannot do this. Its bump PR for X.Y.Z already merged, so `main`
-already says X.Y.Z, the bump would be an empty commit, and the pre-flight in
-`validate` refuses the dispatch ("main is already at X.Y.Z"). Two ways on:
+`release.yml` does this natively. A blocked cut never reached `main` (the
+merge-back in `release-sync.yml` fires only when a release is published), so
+after deleting the tag and the draft as above:
 
-- **Cut the next patch** with `release.yml` as normal. Simplest; it costs a
-  version number but nothing else.
-- **Keep X.Y.Z** by tagging the corrected commit by hand. Land the fix on
-  `main` through a normal PR, soak that `main` HEAD (the `freenet:release`
-  skill's gates apply as for any cut), then follow Steps 2 and 3 below with
-  `RELEASE_SHA` set to that soaked commit, after checking that its
-  `crates/core/Cargo.toml` says X.Y.Z. This skips the merge queue's
-  full-suite release gate, so confirm the fix PR's own CI (which runs the
-  full suite) was green.
+1. Land the fix on `main` through a normal PR.
+2. Soak the fixed commit (the `freenet:release` skill's gates apply as for any
+   cut).
+3. Dispatch `release.yml` with the SAME `version` and the fixed commit as
+   `ship_sha`. The pre-flight accepts it (no tag, not on crates.io, above the
+   latest published release), `update_versions` replaces
+   `release/vX.Y.Z` with the new release commit, and the full suite runs on it
+   as for any cut.
+
+Delete the old draft before step 3. If it is still there, the run refuses at
+`create_release`'s tag step with "Stale release vX.Y.Z", before the tag is
+pushed, so cross-compile.yml has not started; but by then the release
+branch's whole CI wait has been spent. Delete the draft (after the crates.io
+check above) and re-run that job.
+
+A release cut with the older PR flow (a `build: release X.Y.Z` PR merged into
+`main`) left `main` at X.Y.Z, so a ship commit after it says X.Y.Z too and the
+pre-flight refuses that version ("The ship commit is already at X.Y.Z"). Cut
+the next patch in that case.
 
 ## Quick Reference
 
 ```bash
 # Check current state
-gh pr view <PR_NUMBER> --json state,mergedAt
+git ls-remote origin 'refs/heads/release/v*' | tail -5     # release commits
+gh run list --workflow ci.yml --branch release/vX.Y.Z --limit 3
+gh pr list --search "build: sync main to" --state all --limit 5   # merge-back
 git tag -l "v*" | tail -5
 gh release list --limit 5
 gh release view vX.Y.Z --json isDraft,assets --jq '{isDraft, assets: [.assets[].name]}'
@@ -113,50 +129,92 @@ gh run list --workflow=cross-compile.yml --branch vX.Y.Z --limit 3
 
 ## Release Steps & Recovery
 
-### Step 1: PR Created but Not Merged
+### Step 1: Release branch pushed, CI not passed
 
 **Symptoms:**
-- PR exists but isn't merged
-- CI may be failing
+- `release/vX.Y.Z` exists; `wait_for_ci` failed or timed out
+- No tag
 
 **Recovery:**
 
-An open bump PR also blocks every later live `release.yml` dispatch (the
-pre-flight refuses while one is open), so drive it to merged, or close it, before
-starting anything else.
+Nothing has been tagged and `main` is untouched, so this is cheap.
 
-1. Fix any CI failures
-2. If the conventional commits check failed, restore the title. It MUST start
-   with `build: release `: `ci.yml` keys the full-suite release gate in the
-   merge queue on that prefix, so any other title (`chore: release` included)
-   passes the title check while silently switching the release gate off.
+1. Read `wait_for_ci`'s annotation (docs/RELEASING.md, "`wait_for_ci`
+   failed", lists the cases).
+2. A real test failure means the ship commit is not releasable. Fix it on
+   `main` through a normal PR, soak the new commit, and dispatch again with
+   the new `ship_sha` (same version is fine; the branch is replaced).
+3. A red job that is not the commit's fault (a runner outage, a flake you
+   have diagnosed and filed): `wait_for_ci` has already failed, because it
+   stops at the first non-success conclusion. Re-run the failed jobs of the
+   ci.yml run on `release/vX.Y.Z`, wait for that run to conclude success,
+   then re-run `wait_for_ci`, which reads the newest run on B and its jobs
+   again:
    ```bash
-   gh pr edit <PR_NUMBER> --title "build: release X.Y.Z"
+   gh run list --repo freenet/freenet-core --workflow ci.yml --branch release/vX.Y.Z --limit 1
+   gh run rerun --failed <CI_RUN_ID> --repo freenet/freenet-core
+   gh run watch <CI_RUN_ID> --repo freenet/freenet-core
+   gh run rerun --failed <RELEASE_RUN_ID> --repo freenet/freenet-core
    ```
-3. If other CI failures, fix code and push to release branch
-4. Wait for PR to auto-merge or merge manually
+   Flaky tests are broken tests: do not use this to wave a real failure
+   through.
+4. Do not push anything else to `release/vX.Y.Z` by hand. `wait_for_ci`
+   refuses a branch tip that is not exactly ship_sha plus version files.
 
-### Step 2: PR Merged but Tag Not Created
+A same-version re-cut on the SAME `ship_sha` (say, after an infrastructure
+failure past the tag) makes a release commit with the same tree as the old
+branch tip. `update_versions` deletes the old `release/vX.Y.Z` and pushes it
+fresh, so the push is a new branch diffed against `ship_sha` and ci.yml's
+`paths-ignore` filter always sees a changed Cargo manifest. Do not replace
+the branch by force-pushing it by hand: a force-push with an identical tree
+changes no file, and whether GitHub then runs ci.yml at all is not something
+this flow relies on. If no CI run appears, `wait_for_ci` fails after 15
+minutes saying so; delete the branch and re-dispatch.
+
+### Cleaning up release branches
+
+`release/vX.Y.Z` branches are not deleted automatically: the branch is the
+only ref besides the tag that points at the release commit, and it is
+harmless once the release is published. One case needs action:
+
+- **An abandoned cut** (you decided to cut the next version instead): its
+  branch and its tag, if they exist, block every later live dispatch (the
+  pre-flight's "Another release is unfinished"). Its draft does not block a
+  dispatch for another version, but delete it too, so a later re-cut of that
+  version does not meet it. Delete them:
+  ```bash
+  gh release delete vX.Y.Z --repo freenet/freenet-core --yes   # only if a draft exists
+  git push --delete origin vX.Y.Z                              # only if the tag exists
+  git push --delete origin release/vX.Y.Z
+  ```
+  Check crates.io first (top of this file): a version already on crates.io
+  is spent, and its tag and draft stay.
+- **Old published releases**: optional housekeeping. Delete
+  `release/vX.Y.Z` for any published X.Y.Z if the branch list gets long;
+  the tag keeps the commit.
+
+A legacy `build: release X.Y.Z` PR (from `scripts/release.sh`) left open
+blocks every later live `release.yml` dispatch; merge or close it first.
+
+### Step 2: CI Passed but Tag Not Created
 
 **Symptoms:**
-- PR is merged to main
+- `wait_for_ci` succeeded
 - No git tag exists for version
 
 **Recovery:**
 
-Tag the **release commit**, not `main`. The release is cut from one pinned
-commit (the version-bump PR's merge commit), and `main` may have moved past it
-while the workflow was waiting on the merge queue. Tagging `main` by hand
-reintroduces #5233 — the bug the pipeline now prevents.
+Tag the **release commit**, not `main`. It is the tip of `release/vX.Y.Z` that
+`wait_for_ci` passed; `main` never contains it. Tagging `main` by hand
+reintroduces #5233, the bug the pipeline now prevents.
 
 ```bash
 cd ~/code/freenet/freenet-core/main
-git fetch origin
+git fetch origin release/vX.Y.Z
 
-# The bump PR is the "build: release X.Y.Z" one. The release.yml run log also
-# prints "📌 Release pinned to <sha>".
-RELEASE_SHA=$(gh pr view <BUMP_PR> --repo freenet/freenet-core \
-  --json mergeCommit --jq '.mergeCommit.oid')
+# wait_for_ci's log prints "ci.yml passed on <sha> with every required job".
+RELEASE_SHA=<that sha>
+git ls-remote origin refs/heads/release/vX.Y.Z   # must still be this sha
 
 # Confirm it really is the bump commit before tagging it.
 git show "$RELEASE_SHA:crates/core/Cargo.toml" | grep '^version'
@@ -498,20 +556,30 @@ sudo systemctl enable freenet-gateway freenet-peer-{01..10}
 sudo systemctl start freenet-gateway freenet-peer-{01..10}
 ```
 
-### Issue: Conventional Commits CI failure
+### Issue: Merge-back PR stuck (or missing)
 
-**Cause:** PR title doesn't follow conventional commit format
+**Symptoms:** vX.Y.Z is published, but `main`'s `crates/core/Cargo.toml`
+still says the previous version, and `build: sync main to X.Y.Z after release`
+is open, failing, or absent.
 
-**Solution:** restore the generated title. It must start with `build: release `,
-which is what `ci.yml` keys the full-suite merge-queue release gate on.
-```bash
-gh pr edit <PR_NUMBER> --title "build: release X.Y.Z"
+This does not block the next release: the pre-flight compares against the
+latest published release, and fdev's next version is taken from the higher of
+the ship commit and the latest tag. It does leave `main` reporting an old
+version, so fix it rather than leave it.
 
-# Trigger CI rerun
-git checkout release/vX.Y.Z
-git commit --allow-empty -m "chore: trigger CI rerun"
-git push origin release/vX.Y.Z
-```
+- **Absent**: `release-sync.yml` did not run (the publish was made without
+  RELEASE_PAT, or the run failed). Run it by hand:
+  ```bash
+  gh workflow run release-sync.yml --repo freenet/freenet-core --field version=X.Y.Z
+  ```
+- **Open and failing CI, or conflicting**: `main` moved after the PR was made
+  (usually a lockfile change). Re-run the workflow as above. It regenerates the
+  bump on the current `main` and force-pushes `release-sync/vX.Y.Z`; the open
+  PR picks it up. Do not edit that branch by hand.
+- **Superseded**: a later release's sync closes it, and a no-op run closes it
+  once `main` already has the version. Nothing to do.
+- The PR title must not start with `build: release`: ci.yml's merge-group
+  tiering would treat it as a legacy release entry and run the full suite.
 
 ### Issue: Crates.io publishing fails
 
@@ -548,23 +616,23 @@ release as a DRAFT, and let `cross-compile.yml` do the rest — it is the only
 path that runs Gate A before the irreversible publish.
 
 ```bash
-# 1. Create PR and merge
+# 1. Commit the bump on the soaked commit, push it as the release branch
 cd ~/code/freenet/freenet-core/main
-# Edit Cargo.toml versions manually
-git checkout -b release/v0.1.X
-git add -A
-git commit -m "build: release 0.1.X"
-git push origin release/v0.1.X
-# The title MUST start with "build: release ": ci.yml keys the full-suite
-# merge-queue release gate on it.
-gh pr create --title "build: release 0.1.X" --body "Release v0.1.X" --base main
-
-# 2. Wait for CI and merge (or use gh pr merge --auto)
-
-# 3. Create tag — on the bump PR's merge commit, NOT on main (see Step 2)
 git fetch origin
-RELEASE_SHA=$(gh pr view <BUMP_PR> --repo freenet/freenet-core \
-  --json mergeCommit --jq '.mergeCommit.oid')
+git checkout --detach <SHIP_SHA>
+bash scripts/apply_version_bump.sh 0.1.X <FDEV_VERSION>
+cargo update --workspace
+cargo metadata --format-version 1 --manifest-path apps/freenet-ping/Cargo.toml > /dev/null
+git checkout -b release/v0.1.X
+git add -u
+git commit -m "chore: bump versions to 0.1.X"
+git push origin release/v0.1.X   # ci.yml runs its full suite on this push
+
+# 2. Wait for that ci.yml push run to pass, every job (not just the run)
+gh run list --workflow ci.yml --branch release/v0.1.X --limit 1
+
+# 3. Create tag on the release commit, NOT on main (see Step 2)
+RELEASE_SHA=$(git rev-parse HEAD)
 git tag -a v0.1.X "$RELEASE_SHA" -m "Release v0.1.X"
 git push origin v0.1.X          # this is what triggers cross-compile.yml
 

@@ -205,12 +205,14 @@ secret to fire all the workflow events that keep releases zero-touch. GitHub's
 workflow run (anti-recursion safeguard). Two distinct failure modes hit the
 v0.2.57 release, and they have DIFFERENT remedies:
 
-1. **Bump PR gets 0 check-runs.** No `pull_request` event fires, so `ci.yml`
-   never runs and its required checks never turn green. `ci.yml` has no
-   `workflow_dispatch`, so it cannot be started by hand. The old workaround,
-   closing and reopening the PR, breaks the polling in `release.yml`'s
-   `wait_for_pr` job, whose `release_sha` output `verify_publishable` and
-   `create_release` depend on.
+1. **The release branch gets 0 check-runs.** No `push` event fires for
+   `release/vX.Y.Z`, so `ci.yml` never runs its full-suite release gate, and
+   `release.yml`'s `wait_for_ci` job (whose `release_sha` output
+   `verify_publishable` and `create_release` depend on) fails after its
+   no-run timeout. `ci.yml` has no `workflow_dispatch`, so it cannot be
+   started by hand. (In the v0.2.57 incident this was the bump PR; release.yml
+   no longer opens one.) The merge-back PR from `release-sync.yml` has the
+   same dependency.
 2. **`release.published` does not fire downstream workflows.** Those DO expose
    `workflow_dispatch`, so they can be triggered per step by hand.
 
@@ -220,14 +222,14 @@ v0.2.57 release, and they have DIFFERENT remedies:
 token with at minimum:
 
 - **`repo`** (Contents: read/write, Pull requests: read/write,
-  Metadata: read) for `gh pr create`, `gh release edit`, and push of
-  release branches.
+  Metadata: read) for `gh pr create` (the merge-back PR),
+  `gh release edit`, and push of `release/v*` and `release-sync/v*` branches.
 - **`workflow`** required for any token that lands on
   `.github/workflows/`-adjacent code paths.
 
 Add it under
 **Settings → Secrets and variables → Actions → Repository secrets**
-as `RELEASE_PAT`. Both `release.yml` and `cross-compile.yml`
+as `RELEASE_PAT`. `release.yml`, `cross-compile.yml` and `release-sync.yml`
 coalesce on it. The coalesce appears in two forms:
 
 ```yaml
@@ -241,11 +243,11 @@ env:
   GH_TOKEN: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
 ```
 
-When the secret is missing, the bump-PR CI, the tag-push →
-cross-compile trigger, and the release-published cascade won't
-auto-fire, so a live release would stall half-done after its bump
-merged. A live `release.yml` run therefore refuses in `validate`,
-before anything is created; a dry run only warns.
+When the secret is missing, the release-branch CI, the tag-push →
+cross-compile trigger, and the release-published cascade (including the
+merge-back) won't auto-fire, so a live release would stall half-done. A
+live `release.yml` run therefore refuses in `validate`, before anything is
+created; a dry run only warns.
 
 `.github/workflows/check-token-coalesce.yml` runs on every PR that
 touches a workflow file — it is path-filtered to
@@ -268,9 +270,16 @@ same rotation procedure applies.
 Cut releases only via the `freenet:release` skill. Its mandatory
 preconditions come first: the auto-update canaries, a 30-minute real-NAT
 soak of the exact SHA, and a telemetry baseline. Do not dispatch
-`release.yml` directly. A `dry_run=true` dispatch is safe only from a ref that
-contains #5939; from an older ref it still pushes, opens and auto-merges
-the version-bump PR (#5936).
+`release.yml` directly. A live dispatch must name that soaked commit as the
+`ship_sha` input: the release is that commit plus a version bump (pushed as
+`release/vX.Y.Z`, full CI on the push, then tagged), never `main`'s tip, so
+`main` does not need to be frozen during a cut. `main` gets the version bump
+afterwards from `release-sync.yml`'s `build: sync main to X after release`
+PR, when the release is published. A blocked cut (tag and draft deleted) is
+re-cut by dispatching again with the same version and the corrected
+`ship_sha`. A `dry_run=true` dispatch pushes nothing from any ref carrying
+this flow; never point `--ref` at a ref from before #5939, where a "dry run"
+still pushes, opens and auto-merges a version-bump PR (#5936).
 [`docs/RELEASING.md`](docs/RELEASING.md) describes how the pipeline works
 once triggered. The `RELEASE_PAT` section above is the prerequisite for the
 cascade to fire automatically.
