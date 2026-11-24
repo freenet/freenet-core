@@ -1995,6 +1995,26 @@ pub(crate) fn update_attempt_claimable_at(
     claim_decision_at(dir, current_version, now).is_ok()
 }
 
+/// Whether claiming an attempt now would durably spend a locked-out node's
+/// once-a-day retry (#3934). False when the claim would be free, and also
+/// when it would be refused. The handshake-failure check fires when the node
+/// is most likely offline, so it must not spend that retry on a fetch that
+/// cannot reach GitHub (the #6152 class of loss); it leaves a locked-out node
+/// to the boot check and the re-poll.
+pub fn update_attempt_would_spend_retry() -> bool {
+    state_dir().is_some_and(|dir| {
+        update_attempt_would_spend_retry_at(&dir, env!("CARGO_PKG_VERSION"), SystemTime::now())
+    })
+}
+
+pub(crate) fn update_attempt_would_spend_retry_at(
+    dir: &std::path::Path,
+    current_version: &str,
+    now: SystemTime,
+) -> bool {
+    claim_decision_at(dir, current_version, now) == Ok(ClaimNeeds::RecordedRetry)
+}
+
 /// [`claim_update_attempt_at`], refusing first, and writing nothing, when
 /// locked out and a newer release is cooling down.
 pub(crate) fn claim_update_attempt_unless_cooling_at(
@@ -2294,6 +2314,146 @@ pub fn repoll_deadline_while_cooling(
         return next_repoll;
     }
     cooldown_end + REPOLL_AFTER_COOLDOWN_JITTER.mul_f64(rand_unit.clamp(0.0, 1.0))
+}
+
+/// Consecutive bootstrap rounds, each sent to every known gateway with no ring
+/// connection since the last, after which a node with zero connections checks
+/// for an update at once (#5940, the update check on handshake failure).
+///
+/// A round is one CONNECT to each eligible gateway, and the pacer's backoff
+/// spaces them, so three rounds is about half a minute to a few minutes of
+/// failing to join. Fewer would fire on an ordinary slow start.
+pub const HANDSHAKE_FAILURE_ROUNDS: u32 = 3;
+
+/// The shortest time between two checks the handshake-failure rule starts.
+/// A node that cannot reach the network at all (offline, or behind a block)
+/// meets the rule every round, so this is what keeps it to one GitHub request
+/// an hour per process. The cap is in memory and a restart clears it; across
+/// restarts the on-disk node token bucket and the #5799 release cooldown and
+/// install gate bound the requests. Within a process that is well under the
+/// 60/hour/IP unauthenticated limit that the 6 h re-poll and the peer-signal
+/// checks share. Against the 7.5 h worst case of
+/// the re-poll alone, an hour still finds a release within about an hour of
+/// it being published for a node the network has left behind.
+pub const HANDSHAKE_FAILURE_CHECK_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// Number of update checks the handshake-failure rule has started in this
+/// process (the trigger counter; also logged at INFO when it fires).
+static HANDSHAKE_FAILURE_CHECKS: AtomicU32 = AtomicU32::new(0);
+
+/// How many update checks the handshake-failure rule has started.
+pub fn handshake_failure_checks_started() -> u32 {
+    HANDSHAKE_FAILURE_CHECKS.load(Ordering::Relaxed)
+}
+
+/// The rule that starts an update check when a node cannot join the network.
+///
+/// It only adds a check; the boot check and the 6 h re-poll are separate and
+/// unaffected. Whether a gateway refused on version needs no separate case:
+/// a version refusal already raises the version-mismatch signal that the
+/// peer-signal checks act on, and this rule covers every other reason the
+/// handshakes fail (a gateway that no longer speaks our protocol answers
+/// nothing we can read).
+#[derive(Debug, Default)]
+pub struct HandshakeFailureTrigger {
+    last_started: Option<std::time::Instant>,
+}
+
+impl HandshakeFailureTrigger {
+    /// Whether an update check is due: the node has no ring connection, at
+    /// least [`HANDSHAKE_FAILURE_ROUNDS`] bootstrap rounds in a row have
+    /// brought none, and no check from this rule started within
+    /// [`HANDSHAKE_FAILURE_CHECK_INTERVAL`]. Records nothing: the caller calls
+    /// [`Self::record_started`] once it is actually going to ask GitHub, so a
+    /// refused claim leaves the hour unused.
+    ///
+    /// `rounds_without_connection` restarts at zero with the first connection,
+    /// so a node that joined, however briefly, needs a fresh run of rounds.
+    pub fn due(
+        &self,
+        now: std::time::Instant,
+        open_connections: usize,
+        rounds_without_connection: u32,
+    ) -> bool {
+        if open_connections > 0 || rounds_without_connection < HANDSHAKE_FAILURE_ROUNDS {
+            return false;
+        }
+        self.last_started
+            .is_none_or(|t| now.saturating_duration_since(t) >= HANDSHAKE_FAILURE_CHECK_INTERVAL)
+    }
+
+    /// A boot check that ran (`ran`) at `now` starts the interval, without
+    /// counting as a trigger of this rule. A skipped boot check starts nothing.
+    pub fn seed_from_boot_check(&mut self, now: std::time::Instant, ran: bool) {
+        if ran {
+            self.last_started = Some(now);
+        }
+    }
+
+    /// A check is going ahead: start the interval and count it. An empty
+    /// node token bucket still lands here, since only the fetch can tell; the
+    /// hour then goes unused by the request but also keeps a node with an
+    /// empty bucket from asking again every tick.
+    pub fn record_started(&mut self, now: std::time::Instant) {
+        self.last_started = Some(now);
+        HANDSHAKE_FAILURE_CHECKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod handshake_failure_trigger_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn due_only_at_zero_connections_after_k_rounds() {
+        let now = Instant::now();
+        let t = HandshakeFailureTrigger::default();
+        assert!(!t.due(now, 0, HANDSHAKE_FAILURE_ROUNDS - 1));
+        assert!(!t.due(now, 1, HANDSHAKE_FAILURE_ROUNDS));
+        assert!(!t.due(now, 5, 100));
+        assert!(t.due(now, 0, HANDSHAKE_FAILURE_ROUNDS));
+    }
+
+    #[test]
+    fn is_rate_limited_and_rearms_after_the_interval() {
+        let now = Instant::now();
+        let mut t = HandshakeFailureTrigger::default();
+        assert!(t.due(now, 0, 10));
+        t.record_started(now);
+        let just_before = now + HANDSHAKE_FAILURE_CHECK_INTERVAL - Duration::from_secs(1);
+        assert!(!t.due(just_before, 0, 10), "within the interval");
+        assert!(t.due(now + HANDSHAKE_FAILURE_CHECK_INTERVAL, 0, 10));
+    }
+
+    #[test]
+    fn only_a_started_check_uses_up_the_interval() {
+        let now = Instant::now();
+        let t = HandshakeFailureTrigger::default();
+        // Asking is free, however often: a refused claim never records.
+        for _ in 0..5 {
+            assert!(t.due(now, 0, HANDSHAKE_FAILURE_ROUNDS));
+        }
+    }
+
+    #[test]
+    fn a_boot_check_starts_the_interval_without_counting() {
+        let now = Instant::now();
+        let mut t = HandshakeFailureTrigger::default();
+        t.seed_from_boot_check(now, false);
+        assert!(t.due(now, 0, 10), "a skipped boot check starts nothing");
+        t.seed_from_boot_check(now, true);
+        assert!(!t.due(now + Duration::from_secs(120), 0, 10));
+        assert!(t.due(now + HANDSHAKE_FAILURE_CHECK_INTERVAL, 0, 10));
+    }
+
+    #[test]
+    fn counts_the_checks_it_starts() {
+        let before = handshake_failure_checks_started();
+        let mut t = HandshakeFailureTrigger::default();
+        t.record_started(Instant::now());
+        assert!(handshake_failure_checks_started() > before);
+    }
 }
 
 #[cfg(test)]
@@ -3037,6 +3197,35 @@ mod tests {
             .split_whitespace()
             .collect();
         assert!(flat.contains("claim_update_attempt_unless_cooling_at(&dir,env!(\"CARGO_PKG_VERSION\"),SystemTime::now(),)"));
+    }
+
+    /// The handshake-failure check must not spend a locked-out node's daily
+    /// retry (#3934, the #6152 class): the helper it gates on says so exactly
+    /// when the claim would write it.
+    #[test]
+    fn the_handshake_check_gate_sees_a_claim_that_would_spend_the_retry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let now = SystemTime::now();
+        assert!(
+            !update_attempt_would_spend_retry_at(dir, "0.2.140", now),
+            "not locked out: the claim is free"
+        );
+        let stamp = lock_out(dir);
+        assert!(
+            !update_attempt_would_spend_retry_at(dir, "0.2.140", stamp),
+            "locked out within its cooldown: the claim is refused, nothing to spend"
+        );
+        let now = stamp + UPDATE_LOCKOUT_COOLDOWN + Duration::from_secs(3600);
+        assert!(update_attempt_claimable_at(dir, "0.2.140", now));
+        assert!(
+            update_attempt_would_spend_retry_at(dir, "0.2.140", now),
+            "locked out with its daily retry available: the claim would spend it"
+        );
+        assert!(
+            !dir.join(LOCKOUT_RETRY_FILE).exists(),
+            "asking spends nothing"
+        );
     }
 
     /// The shared-state-directory wrappers for the claim act on it (here a

@@ -214,7 +214,7 @@ check "unknown: check started but logged no outcome -> indeterminate, NOT ok" 2 
     "never logged an outcome"
 
 # --- the update-trigger detector --------------------------------------------
-# `node_decided_to_update` must fire for ALL FOUR "triggering auto-update"
+# `node_decided_to_update` must fire for ALL SIX "triggering auto-update"
 # sites in freenet.rs and must NOT fire for the #4073 refusal, which shares the
 # phrase ("...not triggering auto-update"). Two ways to get this wrong, both
 # found in review: the bare substring counts the refusal as a trigger, and
@@ -243,6 +243,10 @@ trigger_case "trigger: peer-signal confirm" yes \
     '2026-08-08T02:02:59Z  INFO freenet: Newer version confirmed on GitHub, triggering auto-update new_version=0.2.122'
 trigger_case "trigger: periodic re-poll" yes \
     '2026-08-08T02:02:59Z  INFO freenet: Periodic re-poll: newer version on GitHub, triggering auto-update new_version=0.2.122'
+trigger_case "trigger: handshake-failure check" yes \
+    '2026-08-08T02:02:59Z  INFO freenet: Handshake-failure check: newer version on GitHub, triggering auto-update new_version=0.2.122'
+trigger_case "NOT a trigger: handshake-failure check, locally blocked" no \
+    '2026-08-08T02:02:59Z  WARN freenet: Handshake-failure check: newer version is locally blocked; not triggering auto-update'
 # The FIFTH site, and the one the fixed-string marker silently missed: it says
 # "triggering IMMEDIATE auto-update", so `triggering auto-update` did not match
 # and a node that took the urgent path was reported as never having decided to
@@ -2623,8 +2627,8 @@ done
 # for auto-update", not "this release detected". `node_decided_to_update` does
 # not see them, which is correct for the gates: neither is reachable in a
 # canary run (both need hours of isolation with a version mismatch).
-EXPECTED_SEND_SITES=7
-EXPECTED_TRIGGER_SITES=5
+EXPECTED_SEND_SITES=8
+EXPECTED_TRIGGER_SITES=6
 # shellcheck disable=SC2016  # literal source text, must not expand
 total_sends="$(grep -cF 'update_tx.send(' "$SRC" 2>/dev/null || echo 0)"
 # shellcheck disable=SC2016

@@ -6793,6 +6793,12 @@ impl Ring {
             let current_conn_count = self.connection_manager.connection_count();
             // Expose to update check task for version mismatch decisions (#3204).
             crate::transport::set_open_connection_count(current_conn_count);
+            crate::transport::set_bootstrap_rounds_without_connection(
+                op_manager
+                    .bootstrap_pacer
+                    .lock()
+                    .rounds_without_connection(),
+            );
             // A connection gained by any path counts toward resetting the
             // bootstrap backoff (#5858).
             op_manager

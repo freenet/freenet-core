@@ -234,6 +234,11 @@ pub(crate) struct BootstrapPacer {
     connected_since: Option<Instant>,
     /// When the last round was issued.
     last_issued: Option<Instant>,
+    /// Rounds issued since this peer last had any ring connection. Unlike
+    /// `failures` it restarts at the first connection, not after
+    /// [`CONNECTION_PERSISTS`]: it answers "how many rounds in a row have
+    /// brought nothing", which the update check on handshake failure reads.
+    rounds_without_connection: u32,
 }
 
 impl BootstrapPacer {
@@ -251,7 +256,13 @@ impl BootstrapPacer {
             owned_reservations: HashMap::new(),
             connected_since: None,
             last_issued: None,
+            rounds_without_connection: 0,
         }
+    }
+
+    /// Rounds issued in a row with no ring connection in between.
+    pub(crate) fn rounds_without_connection(&self) -> u32 {
+        self.rounds_without_connection
     }
 
     /// Records whether this peer has a ring connection, however it got it.
@@ -262,6 +273,7 @@ impl BootstrapPacer {
             self.connected_since = None;
             return;
         }
+        self.rounds_without_connection = 0;
         let since = *self.connected_since.get_or_insert(now);
         if now.saturating_duration_since(since) >= CONNECTION_PERSISTS {
             self.failures = 0;
@@ -397,6 +409,7 @@ impl BootstrapPacer {
         self.issuing = false;
         self.last_issued = Some(now);
         self.failures = self.failures.saturating_add(1);
+        self.rounds_without_connection = self.rounds_without_connection.saturating_add(1);
         let jitter: f64 = GlobalRng::random_range(0.8_f64..=1.2_f64);
         let delay = self.backoff.delay_for_failures(self.failures);
         self.next_allowed = Some(now + delay.mul_f64(jitter));
@@ -566,6 +579,27 @@ mod tests {
         );
         drop(round);
         assert!(BootstrapRoundGuard::try_begin(&pacer, now).is_some());
+    }
+
+    #[test]
+    fn rounds_without_connection_count_issued_rounds_and_restart_at_any_connection() {
+        let mut p = BootstrapPacer::new(Duration::from_secs(30));
+        let t0 = Instant::now();
+        assert_eq!(p.rounds_without_connection(), 0);
+        for n in 1..=4u32 {
+            p.issue(t0);
+            assert_eq!(p.rounds_without_connection(), n);
+        }
+        // A round that issued nothing is not a failed round.
+        p.end(false);
+        assert_eq!(p.rounds_without_connection(), 4);
+        // A connection too brief to reset `failures` still restarts the run.
+        p.observe_connections(t0, true);
+        assert_eq!(p.rounds_without_connection(), 0);
+        assert!(p.failures > 0, "the backoff itself is untouched");
+        p.observe_connections(t0, false);
+        p.issue(t0);
+        assert_eq!(p.rounds_without_connection(), 1);
     }
 
     #[test]
