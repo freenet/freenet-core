@@ -775,6 +775,15 @@ function check(name, cond) {
     'invalid escape does not throw and is kept raw',
     keyFor('/v1/contract/web/Ab%ZZ/') === 'freenet_notify:Ab%ZZ',
   );
+  check(
+    'double-encoded spelling decodes once and stays distinct',
+    keyFor('/v1/contract/web/%2541bC123/') === 'freenet_notify:%41bC123' &&
+      keyFor('/v1/contract/web/%2541bC123/') !== plain,
+  );
+  check(
+    'invalid UTF-8 escape does not throw and is kept raw',
+    keyFor('/v1/contract/web/Ab%C3/') === 'freenet_notify:Ab%C3',
+  );
   check('non-contract path -> null', keyFor('/other/') === null);
 }
 
