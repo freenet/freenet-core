@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "freenet"
-version = "0.2.163"
+version = "0.2.164"
 dependencies = [
  "aes-gcm",
  "ahash",
@@ -1746,6 +1746,8 @@ dependencies = [
  "filetime",
  "flatbuffers 25.12.19",
  "flate2",
+ "freenet-quinn",
+ "freenet-quinn-proto",
  "freenet-stdlib 0.12.1",
  "futures",
  "headers",
@@ -1768,8 +1770,6 @@ dependencies = [
  "parking_lot",
  "pav_regression",
  "pin-project",
- "quinn",
- "quinn-proto",
  "rand 0.10.1",
  "rand 0.9.3",
  "rand_core 0.10.1",
@@ -1894,6 +1894,48 @@ dependencies = [
  "humantime",
  "humantime-serde",
  "serde",
+]
+
+[[package]]
+name = "freenet-quinn"
+version = "0.11.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ed6545c75f519ecb4373f0d51735c7df25fbc16f7e66166ac081395fd5b0a56"
+dependencies = [
+ "bytes",
+ "cfg_aliases",
+ "freenet-quinn-proto",
+ "pin-project-lite",
+ "quinn-udp",
+ "rustc-hash",
+ "rustls",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "web-time",
+]
+
+[[package]]
+name = "freenet-quinn-proto"
+version = "0.11.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "79fa5599b86e86471dd891860aa9a0b50b6c56f1363f31e5a0908aee68431c92"
+dependencies = [
+ "bytes",
+ "getrandom 0.4.2",
+ "lru-slab",
+ "rand 0.10.1",
+ "rand_pcg",
+ "ring",
+ "rustc-hash",
+ "rustls",
+ "rustls-pki-types",
+ "slab",
+ "thiserror 2.0.18",
+ "tinyvec",
+ "tracing",
+ "web-time",
 ]
 
 [[package]]
