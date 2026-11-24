@@ -1,0 +1,104 @@
+name: RustSec watch
+
+# Advisory watch for the QUIC/TLS stack (scripts/rustsec-watch.sh). Replaces the
+# old audit.yml, which was disabled in 2024 (its triggers were commented out
+# after it went red on advisories nobody was assigned to fix) and used
+# rustsec/audit-check, which cannot see advisories filed against the upstream
+# quinn crates behind the freenet-quinn fork.
+#
+#   schedule / push to main / manual: fail on a vulnerability or unsound
+#       advisory against a QUIC/TLS stack crate (in Cargo.lock or in the
+#       fork's upstream crates, scripts/rustsec-fork-upstream.map) that is not
+#       in scripts/rustsec-baseline.tsv, or whose baseline entry has expired.
+#       Advisories on other crates are listed in the log but do not fail the
+#       run. The run is therefore green while known advisories are being fixed
+#       and red on anything new.
+#   pull_request touching Cargo.lock: fail only on findings the PR introduces
+#       relative to the base branch, so an unrelated PR is never blocked by an
+#       existing advisory.
+#
+# Runbook for a failure: docs/quinn-rustls-bump.md.
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - scripts/rustsec-watch.sh
+      - scripts/rustsec-watch-fixture.lock
+      - scripts/rustsec-baseline.tsv
+      - scripts/rustsec-fork-upstream.map
+      - .github/workflows/rustsec-watch.yml
+  pull_request:
+    paths:
+      - Cargo.lock
+      - scripts/rustsec-watch.sh
+      - scripts/rustsec-watch-fixture.lock
+      - scripts/rustsec-baseline.tsv
+      - scripts/rustsec-fork-upstream.map
+      - .github/workflows/rustsec-watch.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A cancelled run is neither a failure nor notified, so only superseded PR runs
+# are cancelled; scheduled and main runs always finish.
+concurrency:
+  group: rustsec-watch-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  audit:
+    name: Audit QUIC/TLS stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          # Pinned: the script parses cargo-audit's JSON, and its self-test
+          # fails the run if the shape changes.
+          tool: cargo-audit@0.23.0
+
+      - name: Audit (pull request, new advisories only)
+        if: github.event_name == 'pull_request'
+        run: scripts/rustsec-watch.sh pr "origin/${{ github.base_ref }}"
+
+      - name: Audit (QUIC/TLS stack)
+        if: github.event_name != 'pull_request'
+        run: scripts/rustsec-watch.sh scheduled
+
+  # Same channel as the other scheduled failures (simulation-nightly.yml): the
+  # private freenet-dev room. Not the public room: an unfixed advisory should
+  # not be announced publicly.
+  notify-dev-room-failure:
+    name: Notify dev room on failure
+    runs-on: ubuntu-latest
+    needs: [audit]
+    if: failure() && github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+      # river-dev-notify no-ops with a warning when secrets are missing; here
+      # a notification that cannot be delivered must turn this job red.
+      - name: Require notification secrets
+        env:
+          BOT: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          ROOM: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          GW: ${{ secrets.RIVER_GATEWAY_URL }}
+        run: |
+          if [ -z "$BOT" ] || [ -z "$ROOM" ] || [ -z "$GW" ]; then
+            echo "::error::dev-room notification secrets are not configured; the RustSec watch failure above was NOT announced"
+            exit 1
+          fi
+      - uses: ./.github/actions/river-dev-notify
+        with:
+          message: "RustSec watch failed (QUIC/TLS stack advisory) - ${{ github.repository }} - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}

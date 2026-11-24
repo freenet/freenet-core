@@ -1,0 +1,9 @@
+# Self-test fixture for scripts/rustsec-watch.sh: an old quinn-proto with a
+# long-published advisory (RUSTSEC-2023-0063). If cargo-audit reports nothing for
+# this file, the watch cannot see advisories and must fail instead of passing.
+version = 3
+
+[[package]]
+name = "quinn-proto"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"

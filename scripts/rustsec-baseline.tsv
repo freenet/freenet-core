@@ -1,0 +1,12 @@
+# Known QUIC/TLS stack advisories that the scheduled RustSec watch tolerates
+# until they are fixed. Tab-separated:
+#   advisory id, crate, version, tracking link, expiry (YYYY-MM-DD)
+# The watch fails on a stack advisory NOT listed here, on an entry past its
+# expiry that is still present, and warns about an entry that no longer
+# matches (delete it). An entry needs a tracking link and an expiry; renew an
+# expiry only with a stated reason in the PR.
+RUSTSEC-2026-0538	quinn-udp	0.5.14	https://github.com/freenet/freenet-core/pull/6382	2026-12-08
+RUSTSEC-2026-0347	rustls	0.23.45	https://github.com/freenet/freenet-core/pull/6382	2026-12-08
+RUSTSEC-2026-0348	rustls	0.23.45	https://github.com/freenet/freenet-core/pull/6382	2026-12-08
+RUSTSEC-2026-0346	rustls	0.23.45	https://github.com/freenet/freenet-core/pull/6382	2026-12-08
+RUSTSEC-2026-0349	rustls	0.23.45	https://github.com/freenet/freenet-core/pull/6382	2026-12-08
