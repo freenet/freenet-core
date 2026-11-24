@@ -6,6 +6,7 @@
 // (`GetResult`) survive here because the drivers and external
 // crates consume them.
 
+mod first_hops_log;
 pub(crate) mod op_ctx_task;
 
 use freenet_stdlib::prelude::*;

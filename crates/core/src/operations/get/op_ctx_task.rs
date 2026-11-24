@@ -466,6 +466,7 @@ async fn drive_client_get_inner(
         guesses_exhausted: false,
         first_hop_pin: None,
         pinned_only: false,
+        first_hops: Default::default(),
     };
 
     let (loop_result, streaming_assembly) = drive_get_with_assembly_retry(
@@ -810,6 +811,20 @@ async fn drive_client_get_inner(
                 %cause,
                 "GET client: retry loop exhausted — returning NotFound to client"
             );
+            // Which peers were asked is DEBUG-only elsewhere; one rate-limited
+            // INFO line makes a repeated fast NotFound diagnosable on a release
+            // build. Sub-op GETs are not client-visible failures: skip them.
+            if !client_tx.is_sub_operation() {
+                super::first_hops_log::report_notfound_first_hops(
+                    &super::first_hops_log::FirstHopsContext {
+                        tx: client_tx,
+                        instance_id,
+                        own_loc: op_manager.ring.connection_manager.own_location().location(),
+                        cause: &cause,
+                    },
+                    &driver.first_hops,
+                );
+            }
             // Terminal event for the previously-silent exhaustion path
             // (only a `tracing::info!` fired before). `not_found` vs
             // `timeout_exhausted` is distinguished by whether any reachable
@@ -954,6 +969,9 @@ struct GetRetryDriver<'a> {
     /// onward. For a fetch from one specific holder, where routing toward the
     /// key is known to find nothing (#5846, stranded-holder recovery).
     pinned_only: bool,
+    /// Where each attempt of this GET was forwarded and how it ended, for the
+    /// one rate-limited INFO line emitted when the search ends NotFound.
+    first_hops: super::first_hops_log::FirstHopsLog,
 }
 
 /// Terminal value for the GET driver.
@@ -1223,6 +1241,7 @@ impl RetryDriver for GetRetryDriver<'_> {
     }
 
     fn on_not_found_hop(&mut self, hop: Option<&PeerKeyLocation>) {
+        self.first_hops.mark_not_found();
         if let Some(addr) = hop.and_then(|h| h.socket_addr()) {
             if !self.not_found_hops.contains(&addr) {
                 self.not_found_hops.push(addr);
@@ -1231,6 +1250,7 @@ impl RetryDriver for GetRetryDriver<'_> {
     }
 
     fn on_attempt_hop(&mut self, hop: Option<&PeerKeyLocation>) {
+        self.first_hops.record_attempt(hop);
         if let Some(addr) = hop.and_then(|h| h.socket_addr()) {
             match self.asked_hops.iter_mut().find(|(asked, _)| *asked == addr) {
                 Some((_, asks)) => *asks += 1,
@@ -3075,6 +3095,7 @@ fn sub_op_driver<'a>(
         guesses_exhausted: false,
         first_hop_pin,
         pinned_only,
+        first_hops: Default::default(),
     }
 }
 
@@ -6305,6 +6326,7 @@ mod tests {
             guesses_exhausted: false,
             first_hop_pin: None,
             pinned_only: false,
+            first_hops: Default::default(),
         };
 
         assert!(
@@ -9714,6 +9736,7 @@ mod route_attempt_driver_tests {
             guesses_exhausted: false,
             first_hop_pin: None,
             pinned_only: false,
+            first_hops: Default::default(),
         }
     }
 
