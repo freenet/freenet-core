@@ -767,6 +767,11 @@ const P_LE: [u8; 32] = {
     p[31] = 0x7f;
     p
 };
+/// DER prefix of an Ed25519 SubjectPublicKeyInfo (RFC 8410), written out
+/// here so the oracle does not share it with the code under test.
+const SPKI_PREFIX_LITERAL: [u8; 12] = [
+    0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+];
 const L_LE: [u8; 32] = [
     0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde, 0x14,
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x10,
@@ -798,7 +803,7 @@ fn oracle_accepts_transport_key(u: [u8; 32]) -> bool {
 /// are the canonical sign-bit-0 encoding of a point with neither small
 /// order nor a torsion component.
 fn oracle_accepts_presented(bytes: &[u8]) -> bool {
-    let Some(rest) = bytes.strip_prefix(&ED25519_SPKI_PREFIX[..]) else {
+    let Some(rest) = bytes.strip_prefix(&SPKI_PREFIX_LITERAL[..]) else {
         return false;
     };
     let Ok(y) = <[u8; 32]>::try_from(rest) else {
@@ -828,7 +833,7 @@ fn torsion_mixed() -> Vec<curve25519_dalek::edwards::EdwardsPoint> {
 }
 
 fn spki_with(key: &[u8; 32]) -> Vec<u8> {
-    [&ED25519_SPKI_PREFIX[..], &key[..]].concat()
+    [&SPKI_PREFIX_LITERAL[..], &key[..]].concat()
 }
 
 /// A transport key as an attacker may send it: arbitrary, or chosen at the
@@ -1047,7 +1052,7 @@ proptest::proptest! {
     /// checks. It is refused when a bit of it or of the message changes,
     /// when its length changes, when a different scheme is declared, when S
     /// is replaced by S + kL (the same signature mod L), when R is a
-    /// non-canonical encoding or has its sign bit flipped, and when it is
+    /// altered R (a non-canonical encoding of a small y, or the sign bit flipped), and when it is
     /// presented under another node's key. Another node's valid signature
     /// under its own key is accepted by the proven check only for that key.
     #[test]
@@ -1117,7 +1122,8 @@ proptest::proptest! {
         }
         proptest::prop_assert!(!both(&message, ed25519, &[&good[..32], &malleated[..]].concat()));
 
-        // R as a non-canonical encoding of a small y (y + p), and R with its
+        // R replaced by y + p for small y (a non-canonical encoding of a
+        // small-order point, with the original S), and R with its
         // sign bit flipped.
         let mut small = [0u8; 32];
         small[0] = small_y;

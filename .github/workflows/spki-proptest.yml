@@ -63,13 +63,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y mold
 
-      # A failing case is not printed: this repository is public, and a
-      # failure here may be a defect in an authentication check that is not
-      # fixed yet. The log keeps the names of the failing tests, the seed and
-      # the summary line; reproduce by running the same command locally with
-      # that seed. The job also fails when the filter ran fewer tests than
-      # expected or one of the property tests did not run, so a renamed or
-      # moved module cannot leave it green while testing nothing.
+      # The failing case itself is not printed, but the seed is, and with the
+      # same PROPTEST_CASES it lets anyone reproduce that case locally. That
+      # is on purpose: without it a failure seen once in 100,000 cases could
+      # not be reproduced. The output is kept short (failing test names, seed
+      # and summary line); it is minimal, not secret. The job also fails when
+      # the filter ran fewer tests than expected or one of the property tests
+      # did not run, so a renamed or moved module cannot leave it green while
+      # testing nothing.
       - name: Run the identity property tests
         timeout-minutes: 35
         run: |
@@ -87,7 +88,7 @@ jobs:
           cargo test -p freenet --lib -- transport::quic::identity > "$log" 2>&1 || status=$?
           grep -E '^(test .* (ok|FAILED)|test result:)' "$log" || true
           if [ "$status" -ne 0 ]; then
-            echo "::error::identity property tests failed (exit $status); output withheld. Rerun locally with PROPTEST_CASES=$PROPTEST_CASES PROPTEST_RNG_SEED=$PROPTEST_RNG_SEED"
+            echo "::error::identity property tests failed (exit $status); case not printed. Rerun locally with PROPTEST_CASES=$PROPTEST_CASES PROPTEST_RNG_SEED=$PROPTEST_RNG_SEED"
             exit "$status"
           fi
           passed=$(grep -cE '^test .* \.\.\. ok$' "$log" || true)
