@@ -2080,24 +2080,41 @@ async fn cache_contract_locally(
     // its read-recency refresh either way: the read is real demand, and the
     // size charged is that of the copy held, not of the rejected reply.
     let accepted = state_matches || put_persisted;
-    let held = match &local_state {
+    // The key the store holds the contract under, when the store has it. The
+    // executor verified it, unlike a key named by a code-less reply.
+    let stored_key = match &local_state {
         Ok(ContractHandlerEvent::GetResponse {
             key: Some(stored_key),
+            ..
+        }) => Some(*stored_key),
+        _ => None,
+    };
+    let held_size = match &local_state {
+        Ok(ContractHandlerEvent::GetResponse {
             response: Ok(StoreResponse {
                 state: Some(local), ..
             }),
             ..
-        }) if !accepted && op_manager.ring.is_hosting_contract(stored_key) => {
-            Some((*stored_key, local.size() as u64))
+        }) => Some(local.size() as u64),
+        _ => None,
+    };
+    let held = match (stored_key, held_size) {
+        (Some(stored_key), Some(size))
+            if !accepted && op_manager.ring.is_hosting_contract(&stored_key) =>
+        {
+            Some((stored_key, size))
         }
         _ => None,
     };
     if !accepted && held.is_none() {
         return false;
     }
-    let (key, state_size) = match held {
-        Some((stored_key, stored_size)) => (stored_key, stored_size),
-        None => (key, reply_state_size),
+    let (key, state_size) = match (held, stored_key) {
+        (Some((stored_key, stored_size)), _) => (stored_key, stored_size),
+        // Identical bytes already in the store: host under the stored key, not
+        // the one a code-less reply names.
+        (None, Some(stored_key)) if state_matches => (stored_key, reply_state_size),
+        _ => (key, reply_state_size),
     };
     let access_result = op_manager.ring.record_get_access(key, state_size, cause);
     // Sticky flag gating subscription renewal; only the client-originating
@@ -13959,6 +13976,66 @@ mod reply_hosting_gate_tests {
         )
         .await;
         assert!(accepted.client_access);
+    }
+
+    /// A code-less reply carrying the bytes the store already holds is hosted
+    /// under the key the store has, not the code hash the reply names.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn identical_bytes_are_hosted_under_the_stored_key() {
+        let (_, real) = contract(20);
+        let named = ContractKey::from_id_and_code(*real.id(), CodeHash::new([0x66; 32]));
+        let (op_manager, _rx, _peers, _guards, store) =
+            op_manager_with_peers_and_store("gate-stored-key", 1).await;
+        *store.lock() = Some((real, WrappedState::new(vec![5; 8])));
+        let stored = cache_contract_locally(
+            &op_manager,
+            real.id(),
+            named,
+            WrappedState::new(vec![5; 8]),
+            None,
+            false,
+            crate::ring::HostingCause::Other,
+        )
+        .await;
+        assert!(stored);
+        let hosted = op_manager.ring.hosting_contract_keys();
+        assert_eq!(hosted.len(), 1);
+        assert_eq!(
+            hosted[0].code_hash(),
+            real.code_hash(),
+            "hosted under the stored key, not the named one"
+        );
+    }
+
+    /// A rejected reply for a held contract refreshes the entry, charged at the
+    /// size of the copy held (4 bytes), not the size the entry had (2) or the
+    /// rejected reply's (16).
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_rejected_reply_refreshes_a_held_entry_at_the_held_size() {
+        let (code, key) = contract(21);
+        let (op_manager, _rx, _peers, _guards, store) =
+            op_manager_with_peers_and_store("gate-held-size", 1).await;
+        *store.lock() = Some((key, WrappedState::new(vec![1; 4])));
+        op_manager.ring.host_contract(
+            key,
+            2,
+            crate::ring::AccessType::Get,
+            crate::ring::HostingCause::Other,
+        );
+        assert_eq!(op_manager.ring.hosting_contract_size(&key), 2);
+        reject_stores("gate-held-size");
+        let held = cache_contract_locally(
+            &op_manager,
+            key.id(),
+            key,
+            WrappedState::new(vec![9; 16]),
+            Some(code),
+            false,
+            crate::ring::HostingCause::Other,
+        )
+        .await;
+        assert!(held);
+        assert_eq!(op_manager.ring.hosting_contract_size(&key), 4);
     }
 
     /// The streamed originator path compares the stream header with the id the
