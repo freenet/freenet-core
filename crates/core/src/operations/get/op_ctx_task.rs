@@ -8788,13 +8788,13 @@ mod tests {
             }
             assert_eq!(
                 args.len(),
-                6,
-                "relay callsite #{idx} should pass six arguments (op_manager, \
-                 key, state, contract, is_client_requester, cause). \
+                7,
+                "relay callsite #{idx} should pass seven arguments (op_manager, \
+                 requested, key, state, contract, is_client_requester, cause). \
                  Call text: {call}"
             );
             assert_eq!(
-                args[4], "false",
+                args[5], "false",
                 "Relay callsite #{idx} of cache_contract_locally must pass \
                  `false` for is_client_requester (relay is not the client). \
                  Call text: {call}"
@@ -8810,7 +8810,7 @@ mod tests {
             // value computed by `relay_get_hosting_cause` is what keeps that
             // impossible; a literal at any site re-opens it.
             assert_eq!(
-                args[5], "hosting_cause",
+                args[6], "hosting_cause",
                 "Relay callsite #{idx} of cache_contract_locally must pass the \
                  driver-computed `hosting_cause`, not a hardcoded variant — \
                  dispatch routes an originator-loopback GET through this same \
