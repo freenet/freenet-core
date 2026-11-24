@@ -799,3 +799,68 @@ fn a_quiet_proof_dates_the_last_acknowledgement_back() {
         "the hold at 12 s is past the credit after the acknowledgement at 1 s"
     );
 }
+
+/// Only a native path (no UDP session) that still takes data retries, only a send
+/// that waited out its open deadline for the peer's stream credit, and only
+/// `NOT_OPENED_RETRIES` times. Each retry is counted once.
+#[test]
+fn retry_not_opened_decides_by_path_outcome_and_attempt() {
+    use super::super::route::NOT_OPENED_RETRIES;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let no_credit = BoundedSend::Failed(SendFailure::NotOpened(NotOpened::NoCredit));
+        let native = paths_native("quic-retry-decision-native").await;
+        let a = &native.a;
+        let retried = || a.stats().send_event_count(QuicSendEvent::NotOpenedRetried);
+        for attempt in 0..NOT_OPENED_RETRIES {
+            assert!(a.retry_not_opened(&no_credit, attempt), "attempt {attempt}");
+        }
+        assert_eq!(retried(), u64::from(NOT_OPENED_RETRIES));
+        for attempt in [NOT_OPENED_RETRIES, NOT_OPENED_RETRIES + 1, u32::MAX] {
+            assert!(!a.retry_not_opened(&no_credit, attempt), "past the cap");
+        }
+        // A wait on this side's own resources, a pacer refusal, a lost connection,
+        // and every outcome that is not a send that never opened.
+        for outcome in [
+            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)),
+            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)),
+            BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(lost()))),
+            BoundedSend::Failed(SendFailure::TimedOut),
+            BoundedSend::Failed(SendFailure::Paced),
+            BoundedSend::Failed(SendFailure::Error(QuicSendError::Closed)),
+            stopped(stop_code::NOT_ACCEPTING_DATA),
+            BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut),
+            BoundedSend::Sent,
+        ] {
+            assert!(!a.retry_not_opened(&outcome, 0), "{outcome:?}");
+        }
+        assert_eq!(
+            retried(),
+            u64::from(NOT_OPENED_RETRIES),
+            "none of those counted"
+        );
+        // The peer refused data: it is not asked again.
+        a.settle(
+            SendKind::Stream,
+            &stopped(stop_code::NOT_ACCEPTING_DATA),
+            false,
+            0,
+        );
+        assert!(!a.sends_data());
+        assert!(
+            !a.retry_not_opened(&no_credit, 0),
+            "a path that refused data"
+        );
+
+        // An upgraded path has UDP to fall back to, and never retries.
+        let upgraded = paths("quic-retry-decision-udp", QuicPathLimits::DEFAULT).await;
+        assert!(!upgraded.a.retry_not_opened(&no_credit, 0));
+        assert_eq!(
+            upgraded
+                .a
+                .stats()
+                .send_event_count(QuicSendEvent::NotOpenedRetried),
+            0
+        );
+    })
+}

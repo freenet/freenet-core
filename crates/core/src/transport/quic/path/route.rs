@@ -11,6 +11,7 @@
 //! | `Sent` | done | done |
 //! | `MaybeDelivered` | done | done |
 //! | `Failed(NotOpened)` | UDP | UDP, same id |
+//! | `Failed(NotOpened(NoCredit))` on a native path | same path again, `NOT_OPENED_RETRIES` times, then dropped | same |
 //! | `Failed(NotOpened(Paced))` (the pacer refused it) | UDP, charged to the pacer | UDP, same id, charged to the pacer |
 //! | `Failed(TimedOut)` after open | UDP | give up |
 //! | `Failed(Paced)` after open | UDP, charged to the pacer | give up |
@@ -137,12 +138,31 @@ quic_outcomes! {
         /// `config::DATA_START_UNI_STREAMS` yet. Also counted under its
         /// kind's result.
         StreamLimitFull => "stream_limit_full",
+        /// A send on a native path (no UDP session) opened no stream within its
+        /// deadline, and was sent again on the same path instead of dropped
+        /// (`QuicPath::retry_not_opened`). Nothing reached the receiver, so the
+        /// second attempt cannot duplicate it.
+        NotOpenedRetried => "not_opened_retried",
+        /// A send that was retried after `NotOpenedRetried` then went through, so
+        /// the retry saved a message the first attempt would have dropped.
+        NotOpenedRetrySent => "not_opened_retry_sent",
+        /// A native connection's short was refused because its queue was full
+        /// (`DataRoute::queue_native_short`): the path is behind. Not a give-up
+        /// after the open deadline, which counts `short_dropped`.
+        NativeShortQueueFull => "native_short_queue_full",
         /// A native connection's route worker panicked (counted, then the panic
         /// is raised again). An upgrade's worker counts as
         /// `quic_upgrade_task_panicked` instead.
         NativeWorkerPanicked => "native_worker_panicked",
     }
 }
+
+/// Extra attempts a native path makes at a send that waited out its open deadline
+/// for the peer's stream credit. Each attempt waits the open deadline again for a stream credit, so
+/// the wait between attempts is the deadline itself and needs no timer of its own.
+/// Two keeps a send that cannot open from holding its slot for more than three
+/// open deadlines.
+pub(crate) const NOT_OPENED_RETRIES: u32 = 2;
 
 /// What to do after `outcome` of a send of `kind`, and how to count it.
 pub(crate) fn next_step(kind: SendKind, outcome: &BoundedSend) -> (NextStep, QuicSendResult) {
@@ -197,7 +217,7 @@ fn timed_out(outcome: &BoundedSend) -> bool {
     match outcome {
         BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut)
         | BoundedSend::Failed(SendFailure::TimedOut) => true,
-        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut | NotOpened::NoCredit))
         | BoundedSend::Sent
         | BoundedSend::MaybeDelivered(MaybeDelivered::ConnectionLost)
         | BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(_)))
@@ -433,6 +453,39 @@ impl QuicPath {
     #[cfg(test)]
     pub(crate) fn stall_state(&self) -> (u32, Option<QuietProof>) {
         (self.stall.lock().in_a_row(), *self.quiet.lock())
+    }
+
+    /// Whether a send that ended `outcome` on its `attempt`th try (from 0) should
+    /// be sent again on this path, and counts the retry if so. Only a native path
+    /// (no UDP session to fall back to) that still takes data retries, and only a
+    /// send that waited out its open deadline for the peer's stream credit
+    /// ([`NotOpened::NoCredit`]): `NotOpened` proves no stream existed and nothing
+    /// reached the receiver, so a second attempt cannot duplicate the message.
+    /// A closed connection, a pacer refusal or a wait on this side's own resources
+    /// would fail the same way again, and a peer that refused data is not asked
+    /// again. An upgraded path never retries: its fallback is UDP. Each attempt
+    /// counts `StreamLimitFull` once.
+    pub(crate) fn retry_not_opened(&self, outcome: &BoundedSend, attempt: u32) -> bool {
+        let retry = !self.udp_fallback
+            && self.sends_data()
+            && attempt < NOT_OPENED_RETRIES
+            && matches!(
+                outcome,
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::NoCredit))
+            );
+        if retry {
+            self.stats
+                .record_send_event(QuicSendEvent::NotOpenedRetried);
+        }
+        retry
+    }
+
+    /// Count a send that went through after `attempt` retries.
+    pub(crate) fn note_retry_outcome(&self, outcome: &BoundedSend, attempt: u32) {
+        if attempt > 0 && matches!(outcome, BoundedSend::Sent) {
+            self.stats
+                .record_send_event(QuicSendEvent::NotOpenedRetrySent);
+        }
     }
 
     /// Count `outcome` of a send of `kind` and say what to do with the message.

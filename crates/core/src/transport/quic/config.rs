@@ -222,8 +222,11 @@ pub(crate) const UNANNOUNCED_CREDIT_SLACK: u32 = MAX_UNI_STREAMS / 8;
 ///   at [`DATA_START_UNI_STREAMS`] and raises only once all its streams are
 ///   busy, so capping the permits below its limit would stop the raise.
 ///   Until it raises, the reserve does not hold: a send past its limit waits
-///   in `open_uni` until its open deadline and ends `NotOpened` (on UDP),
-///   never `MaybeDelivered`, counted `quic_data_event_stream_limit_full`.
+///   in `open_uni` until its open deadline and ends `NotOpened`, never
+///   `MaybeDelivered`, counted `quic_data_event_stream_limit_full`. An upgraded
+///   path then sends it on UDP. A native path has no UDP session, so it sends it
+///   again on the same path (`route::NOT_OPENED_RETRIES` times) and drops it only
+///   after that.
 pub(crate) const STREAMED_SEND_LIMIT: u32 =
     MAX_UNI_STREAMS - RESERVED_UNI_STREAMS - UNANNOUNCED_CREDIT_SLACK;
 const _: () = assert!(RESERVED_UNI_STREAMS > 0 && STREAMED_SEND_LIMIT > 0);

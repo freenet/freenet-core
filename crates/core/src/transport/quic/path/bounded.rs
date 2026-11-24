@@ -228,8 +228,15 @@ pub(crate) enum SendFailure {
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) enum NotOpened {
     /// The deadline passed waiting for the source's first chunk, a
-    /// streamed-message permit or a stream credit.
+    /// streamed-message permit or a control frame's turn: a wait on this side's
+    /// own resources, which a second attempt would only repeat.
     TimedOut,
+    /// The deadline passed in `open_uni`, waiting for the peer's stream credit:
+    /// its stream limit was full for the whole open deadline
+    /// ([`QuicSendEvent::StreamLimitFull`]). Credit may be back by the next try.
+    ///
+    /// [`QuicSendEvent::StreamLimitFull`]: super::route::QuicSendEvent::StreamLimitFull
+    NoCredit,
     /// The connection was lost first.
     ConnectionLost(quinn::ConnectionError),
     /// The connection's bandwidth-limit pacer refused the header's wait, which
@@ -274,6 +281,10 @@ struct ProgressState {
     /// The path's pacer refused a write, so the send ends as at its current
     /// deadline (`pacer` module).
     refused: AtomicBool,
+    /// The send is waiting in `open_uni` for the peer's stream credit
+    /// ([`SendProgress::set_credit_wait`]), so a deadline that ends it is
+    /// [`NotOpened::NoCredit`] and not a wait on this side's own resources.
+    credit_wait: AtomicBool,
     /// When the end of the stream was sent, on `now`; 0 before.
     finished_at: AtomicU64,
     /// [`SendProgress::ack_wait_ended`].
@@ -316,6 +327,7 @@ impl SendProgress {
             now: Box::new(|| 0),
             deadlines: None,
             refused: AtomicBool::new(false),
+            credit_wait: AtomicBool::new(false),
             finished_at: AtomicU64::new(0),
             ack_wait_ended: AtomicBool::new(false),
             ack_wait_due: AtomicU64::new(0),
@@ -340,6 +352,7 @@ impl SendProgress {
             now: Box::new(move || time.now_nanos()),
             deadlines: Some((deadlines, started)),
             refused: AtomicBool::new(false),
+            credit_wait: AtomicBool::new(false),
             finished_at: AtomicU64::new(0),
             ack_wait_ended: AtomicBool::new(false),
             ack_wait_due: AtomicU64::new(0),
@@ -348,6 +361,11 @@ impl SendProgress {
             later_backlog: std::sync::OnceLock::new(),
             later_read: AtomicBool::new(false),
         }))
+    }
+
+    /// Mark the send as waiting (or no longer) for the peer's stream credit.
+    pub(super) fn set_credit_wait(&self, waiting: bool) {
+        self.0.credit_wait.store(waiting, Ordering::Release);
     }
 
     /// The send is still opening and its open deadline has passed, so the
@@ -566,6 +584,9 @@ impl SendProgress {
 
     fn timed_out(&self) -> BoundedSend {
         match self.stage() {
+            STAGE_OPENING if self.0.credit_wait.load(Ordering::Acquire) => {
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::NoCredit))
+            }
             STAGE_OPENING => BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)),
             STAGE_OPENED => BoundedSend::Failed(SendFailure::TimedOut),
             _ => BoundedSend::MaybeDelivered(MaybeDelivered::TimedOut),

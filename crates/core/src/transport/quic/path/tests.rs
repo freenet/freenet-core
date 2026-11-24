@@ -6944,7 +6944,7 @@ fn bounded_sends_on_a_path_report_each_outcome() {
         assert!(
             matches!(
                 blocked,
-                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut))
+                BoundedSend::Failed(SendFailure::NotOpened(NotOpened::NoCredit))
             ),
             "{blocked:?}"
         );

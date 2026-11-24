@@ -2134,7 +2134,9 @@ impl QuicPath {
                 // stream limit was full for all of it.
                 let waiting = CreditWait(Some((&self.stats, &progress)));
                 let wanted = (opener == Opener::Data).then(|| self.writers.wait_for_stream());
+                progress.set_credit_wait(true);
                 let opened = open.await;
+                progress.set_credit_wait(false);
                 drop(wanted);
                 waiting.disarm();
                 opened

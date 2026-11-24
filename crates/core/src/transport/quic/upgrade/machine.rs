@@ -1163,7 +1163,7 @@ impl UpgradeMachine {
                 error @ (QuicSendError::ConnectionLost(_) | QuicSendError::Stopped(_)),
             )) => self.on_send_refused(cx, attempt, error),
             BoundedSend::Failed(
-                SendFailure::NotOpened(NotOpened::TimedOut)
+                SendFailure::NotOpened(NotOpened::TimedOut | NotOpened::NoCredit)
                 | SendFailure::TimedOut
                 // Control frames are never paced; read as a deadline if one were.
                 | SendFailure::NotOpened(NotOpened::Paced)
