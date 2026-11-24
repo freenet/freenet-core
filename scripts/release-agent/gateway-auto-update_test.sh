@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Regression test for the independent service-health gate in
-# gateway-auto-update.sh (#4492).
+# Regression tests for gateway-auto-update.sh: the independent service-health
+# gate (#4492), the companion restart (#6336), and the signed-checksum
+# verification that must pass before a downloaded release is installed.
 #
 # THE incident this pins: on 2026-06-18 (v0.2.78) nova ran a stale
 # deploy-local-gateway.sh that swallowed its own verify failure and exited 0
@@ -24,6 +25,10 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AUTO_UPDATE_SH="$SCRIPT_DIR/../gateway-auto-update.sh"
+# Captured before sourcing: the sourced script assigns its own SCRIPT_DIR.
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+UPDATE_RS="$REPO_ROOT/crates/core/src/bin/commands/update.rs"
+DOCKER_KEY_DER="$REPO_ROOT/docker/freenet-node/release-signing-key.der"
 
 if [[ ! -f "$AUTO_UPDATE_SH" ]]; then
     echo "FAIL: $AUTO_UPDATE_SH not found" >&2
@@ -87,6 +92,9 @@ source "$AUTO_UPDATE_SH"
 
 # Functions log to stderr; keep the test output readable by routing there.
 exec 3>&2
+
+# The trusted key as the script ships it, before any test replaces it.
+PROD_PUBKEY_HEX="$RELEASE_PUBKEY_HEX"
 
 # ── verify_service_active ────────────────────────────────────────────
 
@@ -236,6 +244,7 @@ exit 0
 EOF
 chmod +x "$SC/systemctl"
 sc_reset() { rm -f "$SC/has-unit" "$SC/started" "$SC/start-fails"; }
+# shellcheck disable=SC2030  # subshell-local on purpose
 sc_run() { ( PATH="$SC:$PATH"; SERVICE_NAME="${1:-freenet-gateway}"; ALL_INSTANCES="${2:-false}"; schedule_companion_restart >/dev/null 2>&1 ); }
 
 sc_reset; touch "$SC/has-unit"
@@ -272,6 +281,214 @@ if ! sc_run; then
 else
     fail "schedule_companion_restart: a failed queue must not be reported as success"
 fi
+
+# ── release key: one copy, matching the node's ───────────────────────
+
+# The key must live in exactly one assignment, and that assignment must not
+# read the environment (an env-supplied trusted key on a root script is a
+# bypass).
+key_lines=$(grep -cE '^RELEASE_PUBKEY_HEX=' "$AUTO_UPDATE_SH")
+if [[ "$key_lines" == 1 ]] && grep -qE '^RELEASE_PUBKEY_HEX="[0-9a-f]{64}"$' "$AUTO_UPDATE_SH"; then
+    pass "release key: one literal assignment, not taken from the environment"
+else
+    fail "release key: expected exactly one RELEASE_PUBKEY_HEX=\"<64 hex>\" line, found $key_lines (or a non-literal value)"
+fi
+
+# FREENET_RELEASE_PUBKEY's byte array in update.rs, as lowercase hex.
+rs_hex=$(awk '/^const FREENET_RELEASE_PUBKEY: \[u8; 32\] = \[/ { f = 1; next } f && /^\];/ { exit } f' "$UPDATE_RS" \
+    | grep -oE '0x[0-9a-fA-F]{2}' | sed 's/^0x//' | tr -d '\n' | tr 'A-F' 'a-f')
+if [[ ${#rs_hex} == 64 && "$rs_hex" == "$PROD_PUBKEY_HEX" ]]; then
+    pass "release key: matches FREENET_RELEASE_PUBKEY in update.rs"
+else
+    fail "release key: gateway-auto-update.sh has '$PROD_PUBKEY_HEX' but update.rs FREENET_RELEASE_PUBKEY is '$rs_hex'; a key rotation missed a copy"
+fi
+
+der_hex=$(tail -c 32 "$DOCKER_KEY_DER" 2>/dev/null | od -An -v -tx1 | tr -d ' \n')
+if [[ "$der_hex" == "$PROD_PUBKEY_HEX" ]]; then
+    pass "release key: matches docker/freenet-node/release-signing-key.der"
+else
+    fail "release key: docker release-signing-key.der carries '$der_hex', script has '$PROD_PUBKEY_HEX'"
+fi
+
+# ── signed-checksum verification, end to end through main ────────────
+#
+# Drives main() with a pinned target version against a stub curl serving
+# fixture release files, a fake deploy script that "installs" by copying the
+# binary to INSTALL_PATH, and the stub systemctl/sudo above. A refused update
+# must exit non-zero, never reach the deploy script, and leave INSTALL_PATH
+# untouched.
+#
+# Fixtures are signed with a throwaway ed25519 key generated here. The script's
+# trusted key is replaced by assigning RELEASE_PUBKEY_HEX in THIS shell after
+# sourcing; nothing a caller of the installed script controls can do that.
+
+E2E="$TMP/e2e"
+FIX="$E2E/release"
+mkdir -p "$E2E/bin" "$E2E/scriptdir" "$E2E/installed" "$E2E/build" "$FIX" \
+    || { echo "FAIL: could not create $E2E" >&2; exit 1; }
+
+if ! openssl genpkey -algorithm ed25519 -out "$E2E/test.key" 2>/dev/null \
+    || ! openssl genpkey -algorithm ed25519 -out "$E2E/other.key" 2>/dev/null; then
+    echo "FAIL: openssl cannot generate ed25519 keys; the verification tests cannot run" >&2
+    exit 1
+fi
+TEST_PUBKEY_HEX=$(openssl pkey -in "$E2E/test.key" -pubout -outform DER | tail -c 32 | od -An -v -tx1 | tr -d ' \n')
+[[ ${#TEST_PUBKEY_HEX} == 64 ]] || { echo "FAIL: could not derive the test public key" >&2; exit 1; }
+
+ASSET="freenet-$(detect_arch)-unknown-linux-musl.tar.gz"
+
+# The release binary the archive carries, and the one "installed" beforehand.
+printf '#!/bin/bash\necho "Freenet version: 0.2.999"\n' > "$E2E/build/freenet"
+chmod +x "$E2E/build/freenet"
+tar -czf "$E2E/good.tar.gz" -C "$E2E/build" freenet || { echo "FAIL: could not build the fixture archive" >&2; exit 1; }
+GOOD_SHA=$(sha256sum "$E2E/good.tar.gz" | awk '{print $1}')
+OTHER_LINE="$(printf '%064d' 0)  fdev-$(detect_arch)-unknown-linux-musl.tar.gz"
+
+# curl stub: copies $FIX/<basename of the URL> to the -o path, or fails like
+# `curl --fail` on a 404 when the fixture is absent.
+cat > "$E2E/bin/curl" <<EOF
+#!/bin/bash
+out=""; url=""
+while [[ \$# -gt 0 ]]; do
+    case "\$1" in
+        -o) out="\$2"; shift 2 ;;
+        -*) shift ;;
+        *) url="\$1"; shift ;;
+    esac
+done
+src="$FIX/\${url##*/}"
+[[ -f "\$src" ]] || exit 22
+cp "\$src" "\$out"
+EOF
+chmod +x "$E2E/bin/curl"
+
+cat > "$E2E/scriptdir/deploy-local-gateway.sh" <<EOF
+#!/bin/bash
+[[ "\$1" == "--binary" ]] || exit 2
+cp "\$2" "$E2E/installed/freenet" && touch "$E2E/deployed"
+EOF
+chmod +x "$E2E/scriptdir/deploy-local-gateway.sh"
+
+# write_release <sums content>: the archive plus a manifest signed by test.key.
+write_release() {
+    rm -f "$FIX"/*
+    cp "$E2E/good.tar.gz" "$FIX/$ASSET"
+    printf '%s\n' "$1" > "$FIX/SHA256SUMS.txt"
+    openssl pkeyutl -sign -inkey "$E2E/test.key" -rawin \
+        -in "$FIX/SHA256SUMS.txt" -out "$FIX/SHA256SUMS.txt.sig"
+}
+
+# run_update [key hex]: one full main() run. Prints its exit code.
+run_update() {
+    local key="${1:-$TEST_PUBKEY_HEX}"
+    printf '#!/bin/bash\necho "Freenet version: 0.2.1"\n' > "$E2E/installed/freenet"
+    chmod +x "$E2E/installed/freenet"
+    rm -f "$E2E/deployed"
+    : > "$E2E/log"
+    echo "active" > "$TMP/service-state"
+    (
+        # shellcheck disable=SC2031  # subshell-local on purpose
+        PATH="$E2E/bin:$PATH"
+        RELEASE_PUBKEY_HEX="$key"
+        SCRIPT_DIR="$E2E/scriptdir"
+        INSTALL_PATH="$E2E/installed/freenet"
+        DOWNLOAD_DIR=""
+        TARGET_VERSION="0.2.999"
+        FORCE_UPDATE=false CHECK_ONLY=false DRY_RUN=false ALL_INSTANCES=false
+        SERVICE_NAME="freenet-gateway"
+        export SYSTEMD_UNIT_ROOTS="$E2E/no-units"
+        main
+    ) > /dev/null 2> "$E2E/log"
+    echo $?
+}
+
+installed_version() { "$E2E/installed/freenet" --version; }
+
+# expect_refused <description>: the last run_update must have refused cleanly.
+expect_refused() {
+    local desc="$1" rc="$2"
+    if [[ "$rc" != 0 && ! -e "$E2E/deployed" ]] \
+        && [[ "$(installed_version)" == "Freenet version: 0.2.1" ]] \
+        && grep -qF "Release verification FAILED" "$E2E/log"; then
+        pass "verify: $desc -> refused, nothing installed"
+    else
+        fail "verify: $desc must refuse before installing (rc=$rc, deployed=$([[ -e "$E2E/deployed" ]] && echo yes || echo no), installed='$(installed_version)')"
+        sed 's/^/    | /' "$E2E/log" >&2
+    fi
+}
+
+# (1) Good signature + good hash: installs.
+write_release "$(printf '%s  %s\n%s' "$GOOD_SHA" "$ASSET" "$OTHER_LINE")"
+rc=$(run_update)
+if [[ "$rc" == 0 && -e "$E2E/deployed" ]] \
+    && [[ "$(installed_version)" == "Freenet version: 0.2.999" ]] \
+    && grep -qF "SHA256SUMS.txt signature verified" "$E2E/log" \
+    && grep -qF "sha256 matches the signed manifest" "$E2E/log"; then
+    pass "verify: good signature + good hash -> installed"
+else
+    fail "verify: good signature + good hash should install (rc=$rc)"
+    sed 's/^/    | /' "$E2E/log" >&2
+fi
+
+# (2) The same, correctly signed release under the SHIPPED key: refused. Proves
+# the trusted key is the production one unless this harness replaces it.
+rc=$(run_update "$PROD_PUBKEY_HEX")
+expect_refused "manifest signed by a key other than the release key" "$rc"
+
+# (3) Bad signature: signed by a different key.
+write_release "$(printf '%s  %s' "$GOOD_SHA" "$ASSET")"
+openssl pkeyutl -sign -inkey "$E2E/other.key" -rawin \
+    -in "$FIX/SHA256SUMS.txt" -out "$FIX/SHA256SUMS.txt.sig"
+rc=$(run_update)
+expect_refused "signature by the wrong key" "$rc"
+
+# (4) SHA256SUMS.txt altered after signing (hash rewritten to the tampered
+# archive's, which is what an attacker serving their own binary would do).
+write_release "$(printf '%s  %s' "$(printf '%064d' 1)" "$ASSET")"
+printf '%s  %s\n' "$GOOD_SHA" "$ASSET" > "$FIX/SHA256SUMS.txt"
+rc=$(run_update)
+expect_refused "SHA256SUMS.txt tampered after signing" "$rc"
+
+# (5) Validly signed manifest whose hash does not match the archive.
+write_release "$(printf '%s  %s' "$(printf '%064d' 7)" "$ASSET")"
+rc=$(run_update)
+expect_refused "archive hash mismatch" "$rc"
+
+# (6) Missing signature file.
+write_release "$(printf '%s  %s' "$GOOD_SHA" "$ASSET")"
+rm -f "$FIX/SHA256SUMS.txt.sig"
+rc=$(run_update)
+expect_refused "missing SHA256SUMS.txt.sig" "$rc"
+
+# (7) Signed manifest with no line for the archive. The near-miss names (a
+# suffix and a prefix of the real one) must not be taken as a match.
+write_release "$(printf '%s  %s.old\n%s  x%s\n%s' "$GOOD_SHA" "$ASSET" "$GOOD_SHA" "$ASSET" "$OTHER_LINE")"
+rc=$(run_update)
+expect_refused "no SHA256SUMS.txt line for the archive" "$rc"
+
+# (8) Two lines for the archive, even with the same correct hash.
+write_release "$(printf '%s  %s\n%s  %s' "$GOOD_SHA" "$ASSET" "$GOOD_SHA" "$ASSET")"
+rc=$(run_update)
+expect_refused "duplicate SHA256SUMS.txt lines for the archive" "$rc"
+
+# (9) Missing SHA256SUMS.txt.
+write_release "$(printf '%s  %s' "$GOOD_SHA" "$ASSET")"
+rm -f "$FIX/SHA256SUMS.txt"
+rc=$(run_update)
+expect_refused "missing SHA256SUMS.txt" "$rc"
+
+# (10) OpenSSL too old for `pkeyutl -rawin`: refused before verifying.
+write_release "$(printf '%s  %s' "$GOOD_SHA" "$ASSET")"
+REAL_OPENSSL=$(command -v openssl)
+cat > "$E2E/bin/openssl" <<EOF
+#!/bin/bash
+[[ "\$1" == version ]] && { echo "OpenSSL 1.1.1w  11 Sep 2023"; exit 0; }
+exec "$REAL_OPENSSL" "\$@"
+EOF
+chmod +x "$E2E/bin/openssl"
+rc=$(run_update)
+expect_refused "OpenSSL older than 3.0" "$rc"
+rm -f "$E2E/bin/openssl"
 
 # ── result ────────────────────────────────────────────────────────────
 

@@ -323,6 +323,9 @@ jobs:
         id: version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          # Read-only: lists releases to decide whether `latest` may move.
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           version="${RELEASE_TAG#v}"
@@ -335,7 +338,7 @@ jobs:
           # `!github.event.release.prerelease` is TRUE on a workflow_dispatch,
           # where that field is empty, so a dispatched prerelease tag would
           # otherwise take over `latest`. Decide from the version string too.
-          if [ "${{ github.event.release.prerelease }}" = "true" ]; then
+          if [ "${RELEASE_PRERELEASE:-}" = "true" ]; then
             is_stable=false
           elif printf '%s' "$version" | grep -q -- '-'; then
             is_stable=false
@@ -345,6 +348,34 @@ jobs:
           echo "is_stable=${is_stable}" >> "$GITHUB_OUTPUT"
           echo "stable release: ${is_stable}"
 
+          # `latest` additionally requires this tag to be the HIGHEST published
+          # non-prerelease release, the same definition cross-compile.yml's
+          # "Publish release" step uses for GitHub's latest marker. Without it,
+          # re-publishing an older tag (a workflow_dispatch to rebuild v0.2.140
+          # after v0.2.150 shipped) would move `latest` backwards and every new
+          # container would start on the old release. Fails closed: if the
+          # list cannot be read, or this tag is not in it as the highest,
+          # `latest` stays put; the versioned tags still publish.
+          is_latest=false
+          if [ "$is_stable" = true ]; then
+            if published=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 30 --exclude-drafts \
+                --json tagName,isPrerelease \
+                --jq '.[] | select(.isPrerelease | not) | .tagName'); then
+              highest=$(printf '%s\n' "$published" | sed '/^$/d' | sort -V | tail -1)
+              if [ -z "$highest" ]; then
+                echo "::warning::No published stable release found; not moving \`latest\` to ${RELEASE_TAG}."
+              elif [ "$highest" = "$RELEASE_TAG" ]; then
+                is_latest=true
+              else
+                echo "::notice::${RELEASE_TAG} is not the highest published release (${highest}); not moving \`latest\`."
+              fi
+            else
+              echo "::warning::Could not list published releases; not moving \`latest\` to ${RELEASE_TAG}."
+            fi
+          fi
+          echo "is_latest=${is_latest}" >> "$GITHUB_OUTPUT"
+          echo "moves latest: ${is_latest}"
+
       - uses: docker/metadata-action@v6
         id: metadata
         with:
@@ -353,7 +384,7 @@ jobs:
             type=raw,value=${{ steps.version.outputs.tag }}
             type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=${{ steps.version.outputs.minor }},enable=${{ steps.version.outputs.is_stable == 'true' }}
-            type=raw,value=latest,enable=${{ steps.version.outputs.is_stable == 'true' }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.is_latest == 'true' }}
           labels: |
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
 

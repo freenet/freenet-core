@@ -27,7 +27,7 @@ freenet-update ALL=(root) NOPASSWD: /usr/local/bin/gateway-auto-update.sh --forc
 
 # Allow the release-agent to invoke the River announcement script as the
 # user who owns the room signing key + Freenet node (typically `ian` on
-# nova; absent on vega — that install simply omits this entry).
+# nova; a gateway without a local node and room key simply omits this entry).
 #
 # The `*` after the script path is a sudoers wildcard matching the
 # entire argv: the message plus an optional trailing

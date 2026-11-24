@@ -20,6 +20,7 @@ LINTER="$REPO_ROOT/.github/scripts/check_release_dry_run.py"
 CROSS_YML="$REPO_ROOT/.github/workflows/cross-compile.yml"
 ANNOUNCE_YML="$REPO_ROOT/.github/workflows/release-announce.yml"
 RELEASE_YML="$REPO_ROOT/.github/workflows/release.yml"
+DOCKER_YML="$REPO_ROOT/.github/workflows/docker-publish.yml"
 # An ambient token or ref must not leak into a step under test.
 unset GH_TOKEN GITHUB_TOKEN GITHUB_REF
 TEST_TMP=$(mktemp -d)
@@ -389,6 +390,49 @@ if load_step "$RELEASE_YML" validate "Resolve + validate version" "$VALIDATE"; t
     autobump_case "unreadable crates.io answer refuses" garbage 0.2.163 "rc=1 "
     rm -f "$STUBS/curl"
 fi
+
+# --- 6. docker-publish.yml: Derive version tags --------------------------------
+#
+# `latest` moves only for the highest published non-prerelease release (the
+# same definition as cross-compile.yml's Publish release above), so re-publishing
+# an older tag cannot move it backwards. A failed or empty listing fails closed
+# (no `latest`) without failing the step, so the versioned tags still publish.
+DOCK="$TEST_TMP/docker-version"
+if load_step "$DOCKER_YML" publish "Derive version tags" "$DOCK"; then
+    # docker_case <desc> <tag> <prerelease flag> <expected "rc= stable= latest=">  [extra env...]
+    docker_case() {
+        local desc="$1" tag="$2" pre="$3" want="$4" rc
+        shift 4
+        rc=$(run_step "$DOCK" RELEASE_TAG="$tag" RELEASE_PRERELEASE="$pre" GITHUB_REPOSITORY=freenet/freenet-core "$@")
+        check "Docker version tags: $desc" \
+            "rc=$rc stable=$(sed -n 's/^is_stable=//p' "$DOCK/github_output") latest=$(sed -n 's/^is_latest=//p' "$DOCK/github_output")" \
+            "$want"
+    }
+    docker_case "the highest published release takes latest" v0.2.150 false \
+        "rc=0 stable=true latest=true" LIST_OUT='v0.2.150\nv0.2.149\n'
+    docker_case "re-publishing an older release does not move latest" v0.2.140 "" \
+        "rc=0 stable=true latest=false" LIST_OUT='v0.2.150\nv0.2.140\n'
+    docker_case "versions compare numerically (v0.2.100 over v0.2.99)" v0.2.100 false \
+        "rc=0 stable=true latest=true" LIST_OUT='v0.2.99\nv0.2.100\n'
+    docker_case "a failed listing fails closed: no latest, step still succeeds" v0.2.150 false \
+        "rc=0 stable=true latest=false" LIST_RC=1
+    docker_case "an empty listing fails closed" v0.2.150 false \
+        "rc=0 stable=true latest=false" LIST_OUT=''
+    docker_case "a tag absent from the published list (e.g. a draft) does not take latest" v0.2.151 "" \
+        "rc=0 stable=true latest=false" LIST_OUT='v0.2.150\n'
+    docker_case "a prerelease never takes latest" v0.3.0-rc1 true \
+        "rc=0 stable=false latest=false" LIST_OUT='v0.3.0-rc1\n'
+    docker_case "a dispatched prerelease (no event flag) never takes latest" v0.3.0-rc1 "" \
+        "rc=0 stable=false latest=false" LIST_OUT='v0.3.0-rc1\n'
+    # The step's own --jq runs here, so deleting its prerelease filter fails this.
+    docker_case "a newer PRERELEASE does not stop the highest stable taking latest" v0.2.150 false \
+        "rc=0 stable=true latest=true" \
+        LIST_JSON='[{"tagName":"v0.3.0-rc1","isPrerelease":true},{"tagName":"v0.2.150","isPrerelease":false}]'
+    check "Docker version tags: the listing excludes drafts" \
+        "$(grep -c '^release list .*--exclude-drafts' "$DOCK/calls")" "1"
+fi
+check "Docker metadata: latest is gated on is_latest, not is_stable" \
+    "$(grep -cF "type=raw,value=latest,enable=\${{ steps.version.outputs.is_latest == 'true' }}" "$DOCKER_YML")" "1"
 
 echo
 if [[ "$FAILURES" -ne 0 ]]; then

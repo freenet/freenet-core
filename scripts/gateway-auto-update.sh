@@ -10,6 +10,7 @@
 # - Safe update process using deploy-local-gateway.sh
 # - Manual trigger support with --force flag
 # - Dry-run mode for testing
+# - Refuses to install a download whose signed checksum does not verify
 #
 # Usage:
 #   ./gateway-auto-update.sh              # Check and update if newer version
@@ -24,8 +25,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Configuration
 INSTALL_PATH="${INSTALL_PATH:-/usr/local/bin/freenet}"
 GITHUB_REPO="${GITHUB_REPO:-freenet/freenet-core}"
-DOWNLOAD_DIR="${DOWNLOAD_DIR:-/tmp/freenet-update}"
+# Empty means "a fresh private directory from mktemp", created in main(). A
+# fixed path under /tmp would let any local user pre-create it and swap the
+# archive between verification and extraction, which would make the
+# signature check below worthless. sudo strips the environment, so the
+# release-agent's invocation always gets the private directory.
+DOWNLOAD_DIR="${DOWNLOAD_DIR:-}"
 LOG_FILE="${LOG_FILE:-/var/log/freenet-auto-update.log}"
+# Ed25519 public key that signs every release's SHA256SUMS.txt, as 64 hex
+# characters (the raw 32-byte key). The ONE copy in this script.
+#
+# It MUST equal FREENET_RELEASE_PUBKEY in crates/core/src/bin/commands/update.rs
+# (the key the node's own auto-updater trusts) and the key that
+# cross-compile.yml's "Sign SHA256SUMS.txt (ed25519)" step signs with (also
+# copied in docker/freenet-node/release-signing-key.der). Rotating the release
+# key means changing all of them; gateway-auto-update_test.sh fails if this
+# copy drifts from update.rs or the docker copy.
+#
+# Assigned unconditionally, never from the environment: a root script whose
+# trusted key could be supplied by an env var would accept any release an
+# attacker cared to sign. The test harness replaces it only after `source`-ing
+# this file into its own shell, which is not a path production can take.
+RELEASE_PUBKEY_HEX="eb2986604e34a3f985279a7e70852f3764d3347fe82074d92b1e4bc6336f8664"
+
 # systemd unit (without .service) this run deploys to AND independently
 # confirms is active afterwards. Used both as deploy-local-gateway.sh's
 # --service and by verify_service_active so the two always target the same
@@ -33,7 +55,7 @@ LOG_FILE="${LOG_FILE:-/var/log/freenet-auto-update.log}"
 #
 # Defaults to freenet-gateway (nova's unit, and the deploy-script default).
 #
-# A non-default instance (e.g. vega's freenet-gateway-hector) needs SERVICE_NAME
+# A non-default instance (e.g. a secondary freenet-gateway-foo) needs SERVICE_NAME
 # set, but the release-agent does NOT yet forward its `managed_service` config:
 # it spawns this script via `sudo --non-interactive <cmd> --force
 # --target-version vX.Y.Z` (updater.rs), and sudo strips the environment, so an
@@ -121,7 +143,7 @@ Options:
 Environment Variables:
   INSTALL_PATH      Path to installed freenet binary (default: /usr/local/bin/freenet)
   GITHUB_REPO       GitHub repository (default: freenet/freenet-core)
-  DOWNLOAD_DIR      Temporary download directory (default: /tmp/freenet-update)
+  DOWNLOAD_DIR      Temporary download directory (default: a fresh mktemp -d)
   LOG_FILE          Log file path (default: /var/log/freenet-auto-update.log)
   GITHUB_TOKEN      GitHub token for API requests (optional, increases rate limit)
 
@@ -150,6 +172,10 @@ Security:
   - Pull-based: Gateway initiates connections, no public attack surface
   - Uses authenticated GitHub API (5,000 requests/hour with token)
   - Downloads from official GitHub releases only
+  - Verifies the release's SHA256SUMS.txt signature against the release
+    signing key built into this script, then the archive's hash against it,
+    BEFORE extracting or installing anything (requires OpenSSL >= 3.0).
+    There is no flag to skip this.
   - Verifies architecture compatibility
 
 EOF
@@ -258,13 +284,15 @@ get_latest_version() {
     # Fall back to curl
     if [[ -z "$version" ]]; then
         local api_url="https://api.github.com/repos/$GITHUB_REPO/releases/latest"
-        local auth_header=""
+        # An array, so the header reaches curl as ONE argument. The old
+        # string form split it at spaces and sent the literal quotes.
+        local -a auth_header=()
 
         if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-            auth_header="-H 'Authorization: token $GITHUB_TOKEN'"
+            auth_header=(-H "Authorization: token $GITHUB_TOKEN")
         fi
 
-        version=$(curl -s $auth_header "$api_url" | jq -r '.tag_name // empty' 2>/dev/null || echo "")
+        version=$(curl -s "${auth_header[@]}" "$api_url" | jq -r '.tag_name // empty' 2>/dev/null || echo "")
     fi
 
     # Strip 'v' prefix if present
@@ -329,8 +357,9 @@ download_release() {
         return 0
     fi
 
-    # Download with progress
-    if ! curl -L --progress-bar -o "$archive_path" "$download_url"; then
+    # Download with progress. --fail: a 404 must be an error, not an HTML body
+    # saved under the archive's name.
+    if ! curl --fail -L --progress-bar -o "$archive_path" "$download_url"; then
         log ERROR "Failed to download release"
         return 1
     fi
@@ -338,6 +367,23 @@ download_release() {
     # Verify download
     if [[ ! -f "$archive_path" ]] || [[ ! -s "$archive_path" ]]; then
         log ERROR "Downloaded file is missing or empty"
+        return 1
+    fi
+
+    # The signed checksum manifest from the SAME release.
+    local release_base="https://github.com/$GITHUB_REPO/releases/download/v${version}"
+    local f
+    for f in SHA256SUMS.txt SHA256SUMS.txt.sig; do
+        if ! curl --fail -sSL -o "$DOWNLOAD_DIR/$f" "$release_base/$f"; then
+            log ERROR "Release verification FAILED: could not download $f from release v$version; refusing to install"
+            return 1
+        fi
+    done
+
+    # Nothing from the archive is extracted, let alone installed, until this
+    # passes. Fails closed on every error.
+    if ! verify_release_download "$DOWNLOAD_DIR" "$asset_name"; then
+        log ERROR "Release verification FAILED for v$version; refusing to install. The running gateway is unchanged."
         return 1
     fi
 
@@ -368,6 +414,102 @@ download_release() {
     echo "$binary_path"
 }
 
+# Write the trusted release key to <out> as a DER SubjectPublicKeyInfo: the
+# fixed 12-byte ed25519 header followed by the raw 32-byte key.
+write_release_pubkey_der() {
+    local out="$1"
+    if [[ ! "$RELEASE_PUBKEY_HEX" =~ ^[0-9a-f]{64}$ ]]; then
+        log ERROR "Release verification: built-in release public key is malformed"
+        return 1
+    fi
+    local hex="302a300506032b6570032100${RELEASE_PUBKEY_HEX}" esc="" i
+    for (( i = 0; i < ${#hex}; i += 2 )); do
+        esc+="\\x${hex:i:2}"
+    done
+    # shellcheck disable=SC2059  # esc is built only from validated hex digits
+    printf "$esc" > "$out"
+}
+
+# verify_release_download <dir> <asset_name>
+#
+# Returns 0 only when ALL of these hold:
+#   - OpenSSL >= 3.0 is installed (needed for raw ed25519 `pkeyutl -rawin`);
+#   - <dir>/SHA256SUMS.txt.sig is a valid ed25519 signature over the exact bytes
+#     of <dir>/SHA256SUMS.txt under RELEASE_PUBKEY_HEX (cross-compile.yml signs
+#     with `openssl pkeyutl -sign -rawin`);
+#   - the verified manifest has exactly one line naming <asset_name>;
+#   - the sha256 of <dir>/<asset_name> equals the hash on that line.
+# Every failure logs its reason and returns non-zero.
+verify_release_download() {
+    local dir="$1" asset="$2"
+    local sums="$dir/SHA256SUMS.txt" sig="$dir/SHA256SUMS.txt.sig" archive="$dir/$asset"
+
+    if ! command -v openssl &> /dev/null; then
+        log ERROR "Release verification: openssl not found (need OpenSSL >= 3.0); install it with: sudo apt install openssl"
+        return 1
+    fi
+    local ossl_name ossl_ver
+    read -r ossl_name ossl_ver _ <<< "$(openssl version 2>/dev/null)"
+    if [[ "$ossl_name" != "OpenSSL" ]] || [[ ! "$ossl_ver" =~ ^([0-9]+)\. ]] || (( BASH_REMATCH[1] < 3 )); then
+        log ERROR "Release verification: need OpenSSL >= 3.0 for raw ed25519 verification, found '${ossl_name:-?} ${ossl_ver:-?}'"
+        return 1
+    fi
+    if ! command -v sha256sum &> /dev/null; then
+        log ERROR "Release verification: sha256sum not found"
+        return 1
+    fi
+
+    if [[ ! -s "$sums" ]]; then
+        log ERROR "Release verification: SHA256SUMS.txt is missing or empty"
+        return 1
+    fi
+    if [[ ! -f "$sig" ]]; then
+        log ERROR "Release verification: SHA256SUMS.txt.sig is missing"
+        return 1
+    fi
+    local sig_size
+    sig_size=$(wc -c < "$sig")
+    if (( sig_size != 64 )); then
+        log ERROR "Release verification: SHA256SUMS.txt.sig is ${sig_size} bytes, expected a 64-byte ed25519 signature"
+        return 1
+    fi
+
+    local pub="$dir/.release-pubkey.der"
+    write_release_pubkey_der "$pub" || return 1
+    if ! openssl pkeyutl -verify -pubin -keyform DER -inkey "$pub" -rawin \
+            -in "$sums" -sigfile "$sig" > /dev/null 2>&1; then
+        log ERROR "Release verification: SHA256SUMS.txt signature is INVALID for release key $RELEASE_PUBKEY_HEX"
+        return 1
+    fi
+    log INFO "Release verification: SHA256SUMS.txt signature verified (release key ${RELEASE_PUBKEY_HEX:0:16}...)"
+
+    # Exact filename match on the second field (sha256sum's binary-mode `*`
+    # prefix tolerated). A substring or prefix match could pick up another
+    # asset's line.
+    local -a hashes=()
+    local line_hash
+    while IFS= read -r line_hash; do
+        hashes+=("$line_hash")
+    done < <(awk -v f="$asset" 'NF == 2 { n = $2; sub(/^\*/, "", n); if (n == f) print $1 }' "$sums")
+    if (( ${#hashes[@]} != 1 )); then
+        log ERROR "Release verification: expected exactly one SHA256SUMS.txt line for $asset, found ${#hashes[@]}"
+        return 1
+    fi
+    local expected="${hashes[0],,}"
+    if [[ ! "$expected" =~ ^[0-9a-f]{64}$ ]]; then
+        log ERROR "Release verification: malformed hash for $asset in SHA256SUMS.txt"
+        return 1
+    fi
+
+    local actual
+    actual=$(sha256sum "$archive" 2>/dev/null | awk '{print $1}')
+    if [[ "$actual" != "$expected" ]]; then
+        log ERROR "Release verification: sha256 MISMATCH for $asset (manifest $expected, downloaded ${actual:-unreadable})"
+        return 1
+    fi
+    log INFO "Release verification: $asset sha256 matches the signed manifest ($expected)"
+}
+
 # Deploy the update using existing deployment script
 deploy_update() {
     local binary_path="$1"
@@ -387,9 +529,9 @@ deploy_update() {
         deploy_args+=("--all-instances")
     else
         # Deploy (stop/swap/start/verify) the SAME unit the post-deploy gate
-        # below checks. Without this, a non-default instance (e.g. vega's
-        # freenet-gateway-hector) would deploy the default freenet-gateway
-        # while verify_service_active checks freenet-gateway-hector — two
+        # below checks. Without this, a non-default instance (e.g. a
+        # secondary freenet-gateway-foo) would deploy the default freenet-gateway
+        # while verify_service_active checks freenet-gateway-foo — two
         # different units, defeating the gate (#4492). --all-instances has its
         # own fixed unit list, so --service does not apply there.
         deploy_args+=("--service" "$SERVICE_NAME")
@@ -484,7 +626,7 @@ verify_service_active() {
         done
     done
 
-    # Only systemd is supported by the automated update path (nova/vega). On a
+    # Only systemd is supported by the automated update path (nova). On a
     # host without systemctl we cannot confirm liveness; fail closed so a
     # non-systemd gateway is never silently reported as a healthy update.
     if ! command -v systemctl &> /dev/null; then
@@ -591,6 +733,12 @@ main() {
 
     # Perform update if needed
     if [[ "$needs_update" == "true" ]]; then
+        if [[ -z "$DOWNLOAD_DIR" ]]; then
+            if ! DOWNLOAD_DIR=$(mktemp -d /tmp/freenet-update.XXXXXX); then
+                log ERROR "Could not create a private download directory"
+                exit 1
+            fi
+        fi
         trap cleanup EXIT
 
         local binary_path
