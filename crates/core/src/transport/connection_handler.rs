@@ -4937,10 +4937,10 @@ pub mod mock_transport {
     #[test]
     fn test_handle_ack_connection_error() {
         let err_msg =
-            "remote is using a different protocol version, expected version 999.2.3".to_string();
+            "remote is using a different protocol version, expected version 1.2.3".to_string();
         match handle_ack_connection_error(err_msg.into()) {
             TransportError::ProtocolVersionMismatch { expected, actual } => {
-                assert_eq!(expected, "999.2.3");
+                assert_eq!(expected, "1.2.3");
                 assert_eq!(actual, PCK_VERSION);
             }
             TransportError::ChannelClosed
@@ -4981,10 +4981,10 @@ pub mod mock_transport {
             );
         }
 
-        let ok = handle_ack_connection_error("expected version 999.2.3-rc.1+b5".to_string().into());
+        let ok = handle_ack_connection_error("expected version 1.2.3-rc.1+b5".to_string().into());
         assert!(matches!(
             &ok,
-            TransportError::ProtocolVersionMismatch { expected, .. } if expected == "999.2.3-rc.1+b5"
+            TransportError::ProtocolVersionMismatch { expected, .. } if expected == "1.2.3-rc.1+b5"
         ));
         // An OLDER peer refusing us is not a request for us to update: it must
         // not be reported as a version mismatch (which drives the "update

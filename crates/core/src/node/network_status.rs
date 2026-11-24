@@ -2720,10 +2720,7 @@ fn snapshot_at(now: Instant) -> Option<NetworkStatusSnapshot> {
         recent_successes: s.nat_stats.recent_successes(),
     };
 
-    // A recorded version mismatch means "update required" only while the node
-    // is cut off. With open connections the node works, and one peer's
-    // refusal must not turn the dashboard red.
-    let health = if open_connections == 0 && (has_version_mismatch || elapsed_secs > 60) {
+    let health = if has_version_mismatch || (open_connections == 0 && elapsed_secs > 60) {
         HealthLevel::Trouble
     } else if open_connections == 0 {
         HealthLevel::Connecting
@@ -2841,7 +2838,7 @@ pub fn classify_transport_error(error_msg: &str) -> FailureReason {
                 FailureReason::VersionMismatch { local, gateway }
             } else {
                 FailureReason::Other(format!(
-                    "peer runs an outdated version {gateway} (this node runs {local})"
+                    "peer runs an incompatible version {gateway} (this node runs {local})"
                 ))
             }
         } else {
@@ -3406,8 +3403,6 @@ mod tests {
         assert!(snap.failures[0].reason_html.contains("0.1.1"));
     }
 
-    const OLDER_PEER_REFUSAL: &str = "failed while establishing connection, reason: peer runs an outdated version 0.2.117 and refused this connection";
-
     fn status_addr(last: u8) -> SocketAddr {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 9, 8, last)), 31337)
     }
@@ -3463,30 +3458,28 @@ mod tests {
         let _lock = TEST_MUTEX.lock().unwrap();
         init(31340, HashSet::new(), "0.2.164".to_string());
         connect_peer(status_addr(1));
-        record_gateway_failure(status_addr(2), classify_transport_error(OLDER_PEER_REFUSAL));
-        let snap = get_snapshot().unwrap();
-        assert_ne!(snap.health, HealthLevel::Trouble);
-        assert!(!snap.failures[0].reason_html.contains("Version mismatch"));
-        assert!(!snap.failures[0].reason_html.contains("cargo install"));
-    }
-
-    /// A genuine must-update failure must not paint a WORKING node red, but
-    /// must still show when the node is cut off.
-    #[test]
-    fn version_mismatch_is_trouble_only_without_connections() {
-        let _lock = TEST_MUTEX.lock().unwrap();
-        let mismatch = || FailureReason::VersionMismatch {
-            local: "0.2.164".to_string(),
-            gateway: "0.2.170".to_string(),
-        };
-        init(31341, HashSet::new(), "0.2.164".to_string());
-        record_gateway_failure(status_addr(3), mismatch());
-        assert_eq!(get_snapshot().unwrap().health, HealthLevel::Trouble);
-
-        init(31342, HashSet::new(), "0.2.164".to_string());
-        connect_peer(status_addr(4));
-        record_gateway_failure(status_addr(3), mismatch());
-        assert_ne!(get_snapshot().unwrap().health, HealthLevel::Trouble);
+        // The real Display text of both errors an older peer's refusal can
+        // arrive as: the dedicated variant, and the legacy mismatch text with
+        // the remote older than us (the classifier guard).
+        let refusals = [
+            crate::transport::TransportError::PeerVersionOutdated {
+                peer_version: "0.2.117".into(),
+            },
+            crate::transport::TransportError::ProtocolVersionMismatch {
+                expected: "0.2.117".into(),
+                actual: "0.2.164".into(),
+            },
+        ];
+        for refusal in refusals {
+            record_gateway_failure(
+                status_addr(2),
+                classify_transport_error(&refusal.to_string()),
+            );
+            let snap = get_snapshot().unwrap();
+            assert_ne!(snap.health, HealthLevel::Trouble);
+            assert!(!snap.failures[0].reason_html.contains("Version mismatch"));
+            assert!(!snap.failures[0].reason_html.contains("cargo install"));
+        }
     }
 
     #[test]
