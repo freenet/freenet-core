@@ -821,6 +821,14 @@ impl QuicUpgrades {
             return GatewayAdmission::HandoffFull;
         };
         let remote = normalize_mapped_addr(joined.connection.inner().remote_address());
+        // The joiner proved its key in the handshake and its Hello completed:
+        // a later setup to it at this address and key draws on its allowance.
+        if let Some(key) =
+            crate::transport::quic::identity::proven_client_key(joined.connection.inner())
+        {
+            self.punch_budget
+                .mark_proven(remote, key.transport_key(), self.path_clock.now());
+        }
         let connection = self
             .native_connection(joined.connection, joined.version, remote)
             .with_joiner_charge(joined.charge);

@@ -3153,12 +3153,20 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 serde_json::json!(snapshot.connect_native_punch_allowance_used),
             );
             m.insert(
-                "connect_native_punch_allowance_exhausted".into(),
-                serde_json::json!(snapshot.connect_native_punch_allowance_exhausted),
+                "connect_native_punch_allowance_exhausted_peer".into(),
+                serde_json::json!(snapshot.connect_native_punch_allowance_exhausted_peer),
             );
             m.insert(
-                "connect_native_punch_allowance_refused".into(),
-                serde_json::json!(snapshot.connect_native_punch_allowance_refused),
+                "connect_native_punch_allowance_exhausted_node".into(),
+                serde_json::json!(snapshot.connect_native_punch_allowance_exhausted_node),
+            );
+            m.insert(
+                "connect_native_punch_refused_proven".into(),
+                serde_json::json!(snapshot.connect_native_punch_refused_proven),
+            );
+            m.insert(
+                "connect_native_punch_refused_unproven".into(),
+                serde_json::json!(snapshot.connect_native_punch_refused_unproven),
             );
             m.insert(
                 "connect_native_offer_level".into(),

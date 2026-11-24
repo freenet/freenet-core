@@ -2669,6 +2669,14 @@ mod tests {
         const NOT_SUMMED: &[(&str, &str)] = &[
             // Clamps and fallbacks consumed INSIDE a summed budget function.
             // Summing them as well would double-count.
+            (
+                "ALLOWANCE_BYTES",
+                "rate limit on punch bytes sent per minute, not memory",
+            ),
+            (
+                "NODE_ALLOWANCE_BYTES",
+                "rate limit on punch bytes sent per minute, not memory",
+            ),
             ("SUMMARY_CACHE_MIN_BYTES", "clamp inside summary_budget_for"),
             ("SUMMARY_CACHE_MAX_BYTES", "clamp inside summary_budget_for"),
             (
