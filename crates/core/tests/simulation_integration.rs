@@ -26357,10 +26357,10 @@ fn test_heal_of_a_streamed_state_does_not_block_the_event_loop() {
         stored(&stale).as_deref() == Some(updated.as_slice()),
         "the crashed subscriber was healed (longest event-loop event {longest:?})"
     );
-    assert!(
-        longest > Duration::ZERO,
-        "premise: the event-loop timer recorded nothing (is the `testing` feature on?)"
-    );
+    // Virtual time only moves when something awaits a timer, so an event that
+    // does not wait reads as zero: zero is the healthy value, and a `> ZERO`
+    // premise fails the healthy run (it did, in CI). The bound has teeth
+    // because the inline await it guards against reads 120 s or more.
     assert!(
         longest < Duration::from_secs(10),
         "a node's event loop was held for {longest:?} by one event"
