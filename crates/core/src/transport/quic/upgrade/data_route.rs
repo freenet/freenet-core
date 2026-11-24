@@ -203,7 +203,7 @@ pub(in crate::transport) enum ShortRefused {
     Closed,
 }
 
-type ShortSend = Pin<Box<dyn Future<Output = (SerializedMessage, BoundedSend)> + Send>>;
+type ShortSend = Pin<Box<dyn Future<Output = (SerializedMessage, BoundedSend, u32)> + Send>>;
 
 /// Send what the queue takes until the path has ended and nothing is left.
 /// A task, and no reference to the connection's receive state.
@@ -233,18 +233,26 @@ async fn run_worker(
                 queue.close();
             },
             settled = in_flight.next(), if !in_flight.is_empty() => {
-                if let Some((payload, outcome)) = settled {
+                if let Some((payload, outcome, attempt)) = settled {
                     note.note(|| format!("sent a short on the path: {outcome:?}"));
-                    let step = path.settle(SendKind::Short, &outcome, false, clock.now_nanos());
-                    if step == NextStep::SendOnUdp {
-                        send_elsewhere(&path, udp.as_deref(), &note, payload).await;
+                    if connected && path.sends_data() && path.retry_not_opened(&outcome, attempt) {
+                        // A native path has no UDP session: send it again on the
+                        // path rather than drop it. Not settled, so the attempt
+                        // that did not open is not counted as a drop.
+                        in_flight.push(send_on_path(&path, &clock, payload, attempt + 1));
+                    } else {
+                        path.note_retry_outcome(&outcome, attempt);
+                        let step = path.settle(SendKind::Short, &outcome, false, clock.now_nanos());
+                        if step == NextStep::SendOnUdp {
+                            send_elsewhere(&path, udp.as_deref(), &note, payload).await;
+                        }
                     }
                 }
             },
             message = queue.recv(), if queue_open && in_flight.len() < SHORTS_IN_FLIGHT => {
                 match message {
                     Some(payload) if connected && path.sends_data() && !path.is_suspect() => {
-                        in_flight.push(send_on_path(&path, &clock, payload));
+                        in_flight.push(send_on_path(&path, &clock, payload, 0));
                     }
                     Some(payload) => send_elsewhere(&path, udp.as_deref(), &note, payload).await,
                     None => queue_open = false,
@@ -254,13 +262,18 @@ async fn run_worker(
     }
 }
 
-fn send_on_path(path: &Arc<QuicPath>, clock: &PathClock, payload: SerializedMessage) -> ShortSend {
+fn send_on_path(
+    path: &Arc<QuicPath>,
+    clock: &PathClock,
+    payload: SerializedMessage,
+    attempt: u32,
+) -> ShortSend {
     let path = Arc::clone(path);
     let clock = clock.clone();
     Box::pin(async move {
         let deadlines = SendDeadlines::short(payload.len() as u64);
         let outcome = path.send_short_bounded(&clock, deadlines, &payload).await;
-        (payload, outcome)
+        (payload, outcome, attempt)
     })
 }
 

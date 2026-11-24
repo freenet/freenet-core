@@ -311,11 +311,19 @@ pub(super) async fn send_large_short_with<T: TimeSource>(
 ) -> OutboundStreamResult {
     let bytes = data.len() as u64;
     let transfer = PathTransfer::start(stream_id, remote_addr, bytes, time_source);
-    let outcome = route
-        .path()
-        .send_short_bounded(route.clock(), SendDeadlines::short(bytes), &data)
-        .await;
-    route.note(|| format!("sent a large short on the path: {outcome:?}"));
+    let mut attempt = 0;
+    let outcome = loop {
+        let outcome = route
+            .path()
+            .send_short_bounded(route.clock(), SendDeadlines::short(bytes), &data)
+            .await;
+        route.note(|| format!("sent a large short on the path: {outcome:?}"));
+        if !route.path().retry_not_opened(&outcome, attempt) {
+            break outcome;
+        }
+        attempt += 1;
+    };
+    route.path().note_retry_outcome(&outcome, attempt);
     match route.path().settle(
         SendKind::LargeShort,
         &outcome,
@@ -376,18 +384,26 @@ pub(super) async fn send_stream_with<T: TimeSource>(
 ) -> OutboundStreamResult {
     let bytes = data.len() as u64;
     let transfer = PathTransfer::start(stream_id, remote_addr, bytes, time_source);
-    let outcome = route
-        .path()
-        .send_stream_bounded(
-            route.clock(),
-            route.path().stream_deadlines(bytes),
-            stream_id,
-            metadata.as_deref(),
-            data.clone(),
-            progress.as_deref(),
-        )
-        .await;
-    route.note(|| format!("sent a stream on the path: {outcome:?}"));
+    let mut attempt = 0;
+    let outcome = loop {
+        let outcome = route
+            .path()
+            .send_stream_bounded(
+                route.clock(),
+                route.path().stream_deadlines(bytes),
+                stream_id,
+                metadata.as_deref(),
+                data.clone(),
+                progress.as_deref(),
+            )
+            .await;
+        route.note(|| format!("sent a stream on the path: {outcome:?}"));
+        if !route.path().retry_not_opened(&outcome, attempt) {
+            break outcome;
+        }
+        attempt += 1;
+    };
+    route.path().note_retry_outcome(&outcome, attempt);
     match route
         .path()
         .settle(SendKind::Stream, &outcome, false, route.clock().now_nanos())

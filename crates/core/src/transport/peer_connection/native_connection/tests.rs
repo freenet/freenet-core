@@ -938,3 +938,50 @@ fn a_native_connection_counts_in_the_shared_bandwidth_pool() {
         },
     );
 }
+
+/// A native path has no UDP session, so a short whose stream did not open within
+/// its deadline (the peer's stream limit is full, here because the peer's short
+/// channel is full and its readers hold their slots) used to be dropped. It is
+/// sent again on the same path, and arrives once the peer frees a slot.
+#[test]
+fn a_short_that_found_no_stream_credit_is_sent_again_not_dropped() {
+    run(
+        "native-conn-not-opened-retry",
+        QuicPathLimits {
+            start_streams: 4,
+            short_capacity: 1,
+            ..QuicPathLimits::DEFAULT
+        },
+        None,
+        |mut rig| async move {
+            let sent = 12usize;
+            for i in 0..sent {
+                rig.conn.send_bytes(vec![i as u8; 8]).await.unwrap();
+            }
+            // The peer's application reads nothing for 1.5 s, so the sends past the
+            // first two wait out their 1 s open deadline at least once.
+            let mut got = Vec::new();
+            rig.settle(Duration::from_millis(1500)).await;
+            for _ in 0..60 {
+                rig.settle(Duration::from_millis(400)).await;
+                while let Ok(short) = rig.peer.peer_inbound.shorts.try_recv() {
+                    got.push(short);
+                }
+                if got.len() == sent {
+                    break;
+                }
+            }
+            let stats = rig.conn.path().stats();
+            assert_eq!(
+                rig.sends(SendKind::Short, QuicSendResult::Dropped),
+                0,
+                "retried {}, got {}",
+                stats.send_event_count(QuicSendEvent::NotOpenedRetried),
+                got.len()
+            );
+            assert_eq!(got.len(), sent);
+            assert!(stats.send_event_count(QuicSendEvent::NotOpenedRetried) > 0);
+            assert!(stats.send_event_count(QuicSendEvent::NotOpenedRetrySent) > 0);
+        },
+    );
+}
