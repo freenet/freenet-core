@@ -204,7 +204,13 @@ jobs:
           cp target/debug/freenet mixed-version-head/freenet-n
           N1_VERSION="$(jq -r .n1.version mixed-version-bins/versions.json)"
           HEAD_VERSION="$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' crates/core/Cargo.toml | head -n 1)"
-          [ -n "$N1_VERSION" ] && [ -n "$HEAD_VERSION" ]
+          # `jq -r` prints "null" for a missing field, so treat that as empty too.
+          if [ -z "$N1_VERSION" ] || [ "$N1_VERSION" = "null" ]; then
+            echo "::error::no N-1 version in versions.json"; exit 1
+          fi
+          if [ -z "$HEAD_VERSION" ]; then
+            echo "::error::cannot read HEAD's version from crates/core/Cargo.toml"; exit 1
+          fi
           NPRIME_FLOOR="$(printf '%s\n%s\n' "$N1_VERSION" "$HEAD_VERSION" | sort -V | head -n 1)"
           echo "N' floor: $NPRIME_FLOOR (N-1 $N1_VERSION, HEAD $HEAD_VERSION)"
           printf '%s\n' "$NPRIME_FLOOR" > mixed-version-head/nprime-floor

@@ -96,6 +96,10 @@ const OP_TIMEOUT: Duration = Duration::from_secs(90);
 /// Window in which a refused node must stay unconnected, after the rest of the
 /// network is demonstrably up.
 const REFUSAL_WINDOW: Duration = Duration::from_secs(60);
+/// Upper bound on probe rounds in the refusal step (about 3 s apart, so the
+/// window gives at least 3 rounds and a stuck node ends the step before the
+/// job timeout).
+const MAX_REFUSAL_ROUNDS: u32 = 40;
 /// Bytes of padding in the large state. Above the 64 KiB streaming threshold and
 /// the 512 KiB single-message size.
 const LARGE_PADDING: usize = 600 * 1024;
@@ -415,36 +419,60 @@ fn container_running(name: &str) -> bool {
     docker(&["inspect", "-f", "{{.State.Running}}", name]).trim() == "true"
 }
 
-/// `connected_peer_count` with an overall bound, for use inside polling windows:
-/// an error or timeout is logged and reported as "no data yet".
-async fn probe(ws_url: &str) -> Option<usize> {
-    match tokio::time::timeout(Duration::from_secs(25), connected_peer_count(ws_url)).await {
-        Ok(Ok(n)) => Some(n),
-        Ok(Err(e)) => {
-            eprintln!("  probe of {ws_url} failed: {e:#}");
-            None
-        }
-        Err(_) => {
-            eprintln!("  probe of {ws_url} timed out");
-            None
-        }
-    }
-}
+/// Inner bounds of one probe. The outer bound in `probe` exceeds their sum, so a
+/// slow node is never misread as a timed-out probe.
+const PROBE_CONNECT_SECS: u64 = 20;
+const PROBE_REPLY_TIMEOUT: Duration = Duration::from_secs(15);
+const PROBE_OUTER_TIMEOUT: Duration = Duration::from_secs(45);
 
-async fn connected_peer_count(ws_url: &str) -> Result<usize> {
-    let mut client =
-        connect_ws_with_retry(&format!("{ws_url}?encodingProtocol=native"), "probe", 30)
-            .await
-            .context("client-api: cannot open a WebSocket")?;
-    client
-        .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
-        .await?;
-    let resp = tokio::time::timeout(Duration::from_secs(15), client.recv())
+/// Ask a node how many peers it is connected to, for use inside polling windows.
+///
+/// `Ok(None)` is "no data yet": the WebSocket could not be opened, the request
+/// could not be sent, or no reply arrived in time. Those are what a node that is
+/// starting, busy or restarting looks like. Anything else is a protocol break and
+/// is an `Err` that must fail the caller at once: an unexpected reply variant, or
+/// a reply that does not decode. Finding that kind of break is what this test is
+/// for, so it must not be absorbed as "no data".
+async fn probe(ws_url: &str) -> Result<Option<usize>> {
+    let attempt = async {
+        let mut client = match connect_ws_with_retry(
+            &format!("{ws_url}?encodingProtocol=native"),
+            "probe",
+            PROBE_CONNECT_SECS,
+        )
         .await
-        .context("client-api: no reply to ConnectedPeers")??;
-    match resp {
-        HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }) => Ok(peers.len()),
-        other => bail!("client-api: unexpected reply to ConnectedPeers: {other:?}"),
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("  probe of {ws_url}: cannot open a WebSocket: {e:#}");
+                return Ok(None);
+            }
+        };
+        if let Err(e) = client
+            .send(ClientRequest::NodeQueries(NodeQuery::ConnectedPeers))
+            .await
+        {
+            eprintln!("  probe of {ws_url}: cannot send: {e}");
+            return Ok(None);
+        }
+        match tokio::time::timeout(PROBE_REPLY_TIMEOUT, client.recv()).await {
+            Err(_) => {
+                eprintln!("  probe of {ws_url}: no reply within {PROBE_REPLY_TIMEOUT:?}");
+                Ok(None)
+            }
+            Ok(Err(e)) => bail!("client-api: reply to ConnectedPeers did not decode: {e}"),
+            Ok(Ok(HostResponse::QueryResponse(QueryResponse::ConnectedPeers { peers }))) => {
+                Ok(Some(peers.len()))
+            }
+            Ok(Ok(other)) => bail!("client-api: unexpected reply to ConnectedPeers: {other:?}"),
+        }
+    };
+    match tokio::time::timeout(PROBE_OUTER_TIMEOUT, attempt).await {
+        Ok(r) => r,
+        Err(_) => {
+            eprintln!("  probe of {ws_url} timed out after {PROBE_OUTER_TIMEOUT:?}");
+            Ok(None)
+        }
     }
 }
 
@@ -892,7 +920,7 @@ async fn run_checks(
                 // only the deadline fails this step.
                 let mut counts = Vec::new();
                 for (n, expected) in nodes.iter().zip(expect_connected) {
-                    counts.push((n, *expected, probe(&n.ws_url).await));
+                    counts.push((n, *expected, probe(&n.ws_url).await?));
                 }
                 let ready = counts
                     .iter()
@@ -928,34 +956,44 @@ async fn run_checks(
         report
             .timed("refusal", async {
                 let deadline = Instant::now() + REFUSAL_WINDOW;
-                // Successful probes per refused node: a window with no data at
-                // all would prove nothing, so each needs at least one.
-                let mut answered = vec![0u32; refused.len()];
-                while Instant::now() < deadline {
+                // Most recent probe per refused node. The LAST probe of the
+                // window must have answered and shown 0 connections: a node that
+                // answered 0 early, connected later and then went quiet must not
+                // pass.
+                let mut last: Vec<Option<usize>> = vec![None; refused.len()];
+                let mut round = 0u32;
+                loop {
                     for (i, n) in refused.iter().enumerate() {
-                        // A failed probe is "no data yet"; a connection is a failure.
-                        if let Some(c) = probe(&n.ws_url).await {
-                            answered[i] += 1;
-                            if c != 0 {
-                                bail!(
-                                    "{} {} should be refused by the gateway {} (floor {}) but has {c} connection(s)",
-                                    n.name,
-                                    n.build.label(),
-                                    gateway.label(),
-                                    gateway.floor,
-                                );
-                            }
+                        // `probe` errs on a protocol break; that fails the step.
+                        last[i] = probe(&n.ws_url).await?;
+                        if let Some(c) = last[i]
+                            && c != 0
+                        {
+                            bail!(
+                                "{} {} should be refused by the gateway {} (floor {}) but has {c} connection(s)",
+                                n.name,
+                                n.build.label(),
+                                gateway.label(),
+                                gateway.floor,
+                            );
                         }
                         if !container_running(&n.container) {
                             bail!("{} {} exited instead of staying out", n.name, n.build.label());
                         }
                     }
+                    round += 1;
+                    // Past the window, keep probing (a few extra rounds at most)
+                    // until every refused node's latest probe has answered.
+                    let answered = last.iter().all(Option::is_some);
+                    if Instant::now() >= deadline && (answered || round >= MAX_REFUSAL_ROUNDS) {
+                        break;
+                    }
                     tokio::time::sleep(Duration::from_secs(3)).await;
                 }
-                for (n, k) in refused.iter().zip(&answered) {
-                    if *k == 0 {
+                for (n, l) in refused.iter().zip(&last) {
+                    if l.is_none() {
                         bail!(
-                            "{} {} never answered a ConnectedPeers probe during the window",
+                            "{} {} did not answer its final ConnectedPeers probe",
                             n.name,
                             n.build.label()
                         );
@@ -968,7 +1006,7 @@ async fn run_checks(
                 let allowed = expect_connected.iter().filter(|c| **c).count() - 1;
                 let gw_deadline = Instant::now() + Duration::from_secs(30);
                 loop {
-                    match probe(&nodes[0].ws_url).await {
+                    match probe(&nodes[0].ws_url).await? {
                         Some(c) if c >= allowed => return Ok(()),
                         other if Instant::now() >= gw_deadline => bail!(
                             "gateway reports {other:?} connections, fewer than the {allowed} admitted nodes"
