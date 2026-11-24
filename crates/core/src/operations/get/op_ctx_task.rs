@@ -544,7 +544,7 @@ async fn drive_client_get_inner(
                         crate::ring::HostingCause::ClientGet,
                     )
                     .await;
-                    driver.note_stored_state(key, state_stored);
+                    driver.note_stored_state(key, state_stored.accepted_remote);
                     *key
                 }
                 Terminal::Streaming {
@@ -1890,6 +1890,21 @@ fn stored_state_and_code_match(
     )
 }
 
+/// What `cache_contract_locally` established. Two facts that must not be
+/// merged into one boolean: whether this node accepted STATE FROM THE REPLY
+/// (the only thing that says anything about a remote peer), and whether this
+/// node has a copy it can serve (which may be an older local copy).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CacheOutcome {
+    /// The reply's state matched the stored copy or the executor accepted it.
+    /// Only this may feed a routing existence proof.
+    accepted_remote: bool,
+    /// Current-or-older state is held locally after the call: the reply was
+    /// accepted, or an already hosted copy answered the read. Gates what needs
+    /// state on this node, such as registering a downstream subscriber.
+    local_copy: bool,
+}
+
 /// Count a GET reply that names a different contract than the one requested.
 /// The peer sets the rate, so log the 1st, 2nd, 4th, 8th, ... occurrence only.
 fn note_reply_not_for_request() {
@@ -1908,7 +1923,7 @@ fn note_reply_not_for_request() {
 /// the originator-side hosting side effects. Mirrors the legacy
 /// `process_message` Response{Found} branch at `get.rs:2218-2450`.
 ///
-/// Returns `true` when this node holds the contract's current state after the
+/// Returns a [`CacheOutcome`]. `local_copy` is `true` when this node holds the contract's current state after the
 /// call (`state_matches || put_persisted`, or an already hosted copy answered
 /// the read), and `false` for a reply that names another contract — D-CACHE-RET (step 10 §1a). Relay
 /// callers gate downstream-subscriber registration on this so a peer registers
@@ -1963,7 +1978,7 @@ async fn cache_contract_locally(
     contract: Option<ContractContainer>,
     is_client_requester: bool,
     cause: crate::ring::HostingCause,
-) -> bool {
+) -> CacheOutcome {
     // EXPERIMENT-ONLY (findability_probe): suppress RELAY-path GET-return caching
     // so the seeded copy cannot self-scatter along successful GET return paths
     // (the confound that invalidated an earlier lone-holder run). The client
@@ -1975,7 +1990,7 @@ async fn cache_contract_locally(
         // Experiment suppressed the relay-path store, so no state was cached
         // here — report not-present so a caller gating registration on the
         // return value does not register a downstream against uncached state.
-        return false;
+        return CacheOutcome::default();
     }
     // A reply for some other contract, or one whose code does not belong to
     // the key it names, is not this GET's answer: nothing about it reaches the
@@ -1988,7 +2003,7 @@ async fn cache_contract_locally(
         })
     {
         note_reply_not_for_request();
-        return false;
+        return CacheOutcome::default();
     }
     let reply_state_size = state.size() as u64;
 
@@ -2107,7 +2122,7 @@ async fn cache_contract_locally(
         _ => None,
     };
     if !accepted && held.is_none() {
-        return false;
+        return CacheOutcome::default();
     }
     let (key, state_size) = match (held, stored_key) {
         (Some((stored_key, stored_size)), _) => (stored_key, stored_size),
@@ -2219,7 +2234,10 @@ async fn cache_contract_locally(
     // just persisted it, or an already hosted copy answered the read. Relay
     // callers gate register_downstream_subscriber on this (register-after-state,
     // step 10 §1a).
-    accepted || held.is_some()
+    CacheOutcome {
+        accepted_remote: accepted,
+        local_copy: accepted || held.is_some(),
+    }
 }
 
 /// Await `phase`, calling `on_tick` at once and then once a second while
@@ -2489,7 +2507,7 @@ async fn assemble_and_cache_stream(
     Ok(StreamProgress {
         fragments_received,
         total_fragments,
-        state_stored,
+        state_stored: state_stored.accepted_remote,
     })
 }
 
@@ -5014,7 +5032,7 @@ where
                 // state held locally (`forms_host`), so first-time hosting at
                 // a relay is still broadcast (matches legacy `get.rs:2370`,
                 // which announces on any first-time relay cache).
-                let state_present = cache_contract_locally(
+                let cached = cache_contract_locally(
                     op_manager,
                     &instance_id,
                     key,
@@ -5024,9 +5042,11 @@ where
                     hosting_cause,
                 )
                 .await;
-                // Existence proof (#5657) requires state this node stored; it
-                // settles earlier NotFounds as failures.
-                if state_present
+                let state_present = cached.local_copy;
+                // Existence proof (#5657) requires state from THIS reply that
+                // this node accepted; an older local copy proves nothing about
+                // the peer. It settles earlier NotFounds as failures.
+                if cached.accepted_remote
                     && is_existence_proof(&instance_id, &key, reply_instance_id.as_ref())
                 {
                     recorder.contract_exists();
@@ -5169,7 +5189,8 @@ where
                                         false,
                                         hosting_cause,
                                     )
-                                    .await;
+                                    .await
+                                    .accepted_remote;
                                     // Existence proof (#5657) requires state
                                     // this node stored.
                                     if stored
@@ -5308,7 +5329,7 @@ where
                                 } else {
                                     None
                                 };
-                                let stored = cache_contract_locally(
+                                let cached = cache_contract_locally(
                                     op_manager,
                                     &instance_id,
                                     payload.key,
@@ -5318,9 +5339,9 @@ where
                                     hosting_cause,
                                 )
                                 .await;
-                                // Existence proof (#5657) requires state
-                                // this node stored.
-                                if stored
+                                // Existence proof (#5657) requires state from
+                                // this reply that this node accepted.
+                                if cached.accepted_remote
                                     && is_existence_proof(
                                         &instance_id,
                                         &payload.key,
@@ -5329,7 +5350,7 @@ where
                                 {
                                     recorder.contract_exists();
                                 }
-                                stored
+                                cached.local_copy
                             } else {
                                 tracing::warn!(
                                     tx = %incoming_tx,
@@ -10680,6 +10701,101 @@ mod route_attempt_driver_tests {
         }
     }
 
+    /// A rejected reply for a contract this node already hosts must not be read
+    /// as proof the contract exists at the peer that answered: the only copy
+    /// behind the `true` is this node's own older one (operations.md, existence
+    /// proofs). Driven through the client driver.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_rejected_reply_for_a_held_contract_is_no_existence_proof() {
+        let label = "get-held-rejected";
+        let (op_manager, rx, peers, _guards, store) =
+            op_manager_with_peers_and_store(label, 3).await;
+        let instance_id = coded_id();
+        let held_key = key_for(instance_id);
+        *store.lock() = Some((held_key, WrappedState::new(vec![8; 4])));
+        op_manager.ring.host_contract(
+            held_key,
+            4,
+            crate::ring::AccessType::Get,
+            crate::ring::HostingCause::Other,
+        );
+        reject_stores(label);
+        let (nf_hop, found_hop) = (peers[2].clone(), peers[1].clone());
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |i, msg, _| {
+                if !is_request(msg) {
+                    return Step {
+                        hop: None,
+                        answer: Answer::DropWaiter,
+                    };
+                }
+                if i == 0 {
+                    Step {
+                        hop: Some(nf_hop.clone()),
+                        answer: Answer::Reply(not_found(msg, instance_id)),
+                    }
+                } else {
+                    Step {
+                        hop: Some(found_hop.clone()),
+                        answer: Answer::Reply(found_with_code(msg, instance_id)),
+                    }
+                }
+            },
+        );
+        let _outcome = drive_client_get_inner(
+            &op_manager,
+            Transaction::new::<GetMsg>(),
+            instance_id,
+            false,
+            false,
+            false,
+        )
+        .await;
+        assert_eq!(failed_addrs(&op_manager), Vec::<SocketAddr>::new());
+    }
+
+    /// The same through the relay driver: the NotFound hop is not settled as a
+    /// failure by a rejected reply that a held older copy would otherwise back.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn relay_a_rejected_reply_for_a_held_contract_is_no_existence_proof() {
+        let label = "get-relay-held-rejected";
+        let (op_manager, rx, store, upstream, greedy, host, _guards) =
+            relay_fixture(label, true).await;
+        let instance_id = coded_id();
+        let held_key = key_for(instance_id);
+        *store.lock() = Some((held_key, WrappedState::new(vec![8; 4])));
+        op_manager.ring.host_contract(
+            held_key,
+            4,
+            crate::ring::AccessType::Get,
+            crate::ring::HostingCause::Other,
+        );
+        reject_stores(label);
+        let (greedy_addr, host_addr) = (addr(&greedy), addr(&host));
+        serve_attempts(
+            op_manager.clone(),
+            rx,
+            crate::message::TransactionType::Get,
+            move |_, msg, target| {
+                let answer = if !is_request(msg) {
+                    Answer::DropWaiter
+                } else if target == Some(greedy_addr) {
+                    Answer::Reply(not_found(msg, instance_id))
+                } else if target == Some(host_addr) {
+                    Answer::Reply(found_with_code(msg, instance_id))
+                } else {
+                    Answer::Never
+                };
+                Step { hop: None, answer }
+            },
+        );
+        run_relay(&op_manager, &upstream).await;
+        assert_eq!(failed_addrs(&op_manager), Vec::<SocketAddr>::new());
+    }
+
     /// A timeout is blamed on the recorded hop only if the hop had a meaningful
     /// share of the attempt (#5657): forwarded to early, it is labelled;
     /// forwarded to just before the deadline (an overloaded originator), not.
@@ -13796,7 +13912,7 @@ mod reply_hosting_gate_tests {
     }
 
     struct Delivery {
-        stored: bool,
+        outcome: CacheOutcome,
         reply_hosted: bool,
         incumbent_hosted: bool,
         hosted_count: usize,
@@ -13836,7 +13952,7 @@ mod reply_hosting_gate_tests {
         if reject {
             reject_stores(label);
         }
-        let stored = cache_contract_locally(
+        let outcome = cache_contract_locally(
             &op_manager,
             &requested,
             reply_key,
@@ -13849,7 +13965,7 @@ mod reply_hosting_gate_tests {
         let hosted_count = op_manager.ring.hosting_contracts_count();
         assert!(hosted_count >= before.min(2));
         Delivery {
-            stored,
+            outcome,
             reply_hosted: op_manager.ring.is_hosting_contract(&reply_key),
             incumbent_hosted: op_manager.ring.is_hosting_contract(&incumbent),
             hosted_count,
@@ -13870,7 +13986,8 @@ mod reply_hosting_gate_tests {
             false,
         )
         .await;
-        assert!(d.stored && d.reply_hosted && d.incumbent_hosted);
+        assert!(d.outcome.accepted_remote && d.outcome.local_copy);
+        assert!(d.reply_hosted && d.incumbent_hosted);
         assert_eq!(d.hosted_count, 2);
     }
 
@@ -13887,7 +14004,7 @@ mod reply_hosting_gate_tests {
             false,
         )
         .await;
-        assert!(!d.stored);
+        assert_eq!(d.outcome, CacheOutcome::default());
         assert!(
             !d.reply_hosted,
             "a rejected reply must not enter the hosting cache"
@@ -13910,7 +14027,7 @@ mod reply_hosting_gate_tests {
             false,
         )
         .await;
-        assert!(!d.stored);
+        assert_eq!(d.outcome, CacheOutcome::default());
         assert!(
             !d.reply_hosted,
             "a reply for another contract must not be hosted"
@@ -13934,7 +14051,7 @@ mod reply_hosting_gate_tests {
             false,
         )
         .await;
-        assert!(!d.stored);
+        assert_eq!(d.outcome, CacheOutcome::default());
         assert!(!d.reply_hosted);
         assert_eq!(d.hosted_count, 1);
     }
@@ -13945,7 +14062,11 @@ mod reply_hosting_gate_tests {
     async fn a_held_contract_stays_hosted_when_the_reply_is_rejected() {
         let (code, key) = contract(16);
         let d = deliver("gate-held", true, *key.id(), key, Some(code), true, true).await;
-        assert!(d.stored, "a held copy answers the read");
+        assert!(d.outcome.local_copy, "a held copy answers the read");
+        assert!(
+            !d.outcome.accepted_remote,
+            "an older local copy is not accepted remote state"
+        );
         assert!(d.reply_hosted && d.incumbent_hosted);
         assert_eq!(d.hosted_count, 2);
         assert!(d.client_access, "the client read of a held contract counts");
@@ -13987,7 +14108,7 @@ mod reply_hosting_gate_tests {
         let (op_manager, _rx, _peers, _guards, store) =
             op_manager_with_peers_and_store("gate-stored-key", 1).await;
         *store.lock() = Some((real, WrappedState::new(vec![5; 8])));
-        let stored = cache_contract_locally(
+        let outcome = cache_contract_locally(
             &op_manager,
             real.id(),
             named,
@@ -13997,7 +14118,7 @@ mod reply_hosting_gate_tests {
             crate::ring::HostingCause::Other,
         )
         .await;
-        assert!(stored);
+        assert!(outcome.accepted_remote && outcome.local_copy);
         let hosted = op_manager.ring.hosting_contract_keys();
         assert_eq!(hosted.len(), 1);
         assert_eq!(
@@ -14034,7 +14155,7 @@ mod reply_hosting_gate_tests {
             crate::ring::HostingCause::Other,
         )
         .await;
-        assert!(held);
+        assert!(held.local_copy && !held.accepted_remote);
         assert_eq!(op_manager.ring.hosting_contract_size(&key), 4);
     }
 
