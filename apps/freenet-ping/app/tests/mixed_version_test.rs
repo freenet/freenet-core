@@ -129,6 +129,8 @@ struct Builds {
     head: Build,
     n1: Build,
     n2: Option<Build>,
+    /// Newest published release strictly below N's floor, if one can be fetched.
+    below: Option<Build>,
 }
 
 fn load_builds() -> Result<Builds> {
@@ -169,9 +171,23 @@ fn load_builds() -> Result<Builds> {
     };
     let n1 = from_manifest("n1", "N-1")?.ok_or_else(|| anyhow!("manifest has no n1"))?;
     let n2 = from_manifest("n2", "N-2")?;
+    let below = from_manifest("below", "below-floor")?;
+    if let Some(b) = &below {
+        // The manifest picks it by N's floor; a mismatch means a stale manifest.
+        if b.version >= head.floor {
+            bail!(
+                "below-floor build {} is not below N's floor {}: stale manifest",
+                b.version,
+                head.floor
+            );
+        }
+    }
 
     // A floor above its own version would refuse the node itself: a wrong read.
-    for b in [Some(&head), Some(&n1), n2.as_ref()].into_iter().flatten() {
+    for b in [Some(&head), Some(&n1), n2.as_ref(), below.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         if b.floor > b.version {
             bail!("{}: floor {} is above its own version", b.label(), b.floor);
         }
@@ -183,7 +199,12 @@ fn load_builds() -> Result<Builds> {
             );
         }
     }
-    Ok(Builds { head, n1, n2 })
+    Ok(Builds {
+        head,
+        n1,
+        n2,
+        below,
+    })
 }
 
 // ---------------------------------------------------------------- scenario
@@ -617,18 +638,36 @@ async fn run_checks(
         .filter(|(_, ok)| **ok)
         .map(|(n, _)| n)
         .collect();
-    let pair = pick_cross_pair(&live).ok_or_else(|| {
-        anyhow!("step=setup: no connected pair of different builds in this scenario")
-    })?;
-    let (a, b) = pair;
-    report.note(format!(
-        "operations run between {} {} and {} {}",
-        a.name,
-        a.build.label(),
-        b.name,
-        b.build.label()
-    ));
+    let pairs = cross_pairs(&live);
+    if pairs.is_empty() {
+        bail!("step=setup: no connected pair of N and an older build in this scenario");
+    }
+    for (i, (a, b)) in pairs.into_iter().enumerate() {
+        report.note(format!(
+            "operations run between {} {} and {} {}",
+            a.name,
+            a.build.label(),
+            b.name,
+            b.build.label()
+        ));
+        run_pair_ops(report, a, b, i).await?;
+    }
 
+    // Nothing may have exited, or a replaced binary would pass unseen.
+    for n in nodes {
+        if !container_running(&n.container) {
+            bail!(
+                "step=liveness: {} {} is no longer running",
+                n.name,
+                n.build.label()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Interop operations between `a` (an older build) and `b` (N), both directions.
+async fn run_pair_ops(report: &mut Report, a: &Node<'_>, b: &Node<'_>, idx: usize) -> Result<()> {
     let mut ca = connect_ws_with_retry(
         &format!("{}?encodingProtocol=native", a.ws_url),
         &a.name,
@@ -644,7 +683,7 @@ async fn run_checks(
     .await
     .context("step=client-api")?;
 
-    let scenario = report.scenario;
+    let scenario = format!("{}-p{idx}", report.scenario);
     check_direction(
         report,
         (a, &mut ca),
@@ -661,32 +700,27 @@ async fn run_checks(
     .await?;
     check_large(report, a, b, &format!("{scenario}-large-ab")).await?;
     check_large(report, b, a, &format!("{scenario}-large-ba")).await?;
-
-    // Nothing may have exited, or a replaced binary would pass unseen.
-    for n in nodes {
-        if !container_running(&n.container) {
-            bail!(
-                "step=liveness: {} {} is no longer running",
-                n.name,
-                n.build.label()
-            );
-        }
-    }
     Ok(())
 }
 
-/// A connected pair whose builds differ, preferring peers over the gateway so
-/// peer-to-peer links between versions are exercised where the topology has them.
-fn pick_cross_pair<'a, 'b>(live: &'a [&'b Node<'b>]) -> Option<(&'b Node<'b>, &'b Node<'b>)> {
-    let ordered: Vec<&Node<'_>> = live.iter().rev().copied().collect();
-    for (i, x) in ordered.iter().enumerate() {
-        for y in &ordered[i + 1..] {
-            if x.build.version != y.build.version || x.build.binary != y.build.binary {
-                return Some((*x, *y));
-            }
+/// For each distinct older build among the connected nodes, a pair (older node, N
+/// node). N nodes that are peers are preferred over the gateway so peer-to-peer
+/// links between versions are exercised where the topology has them.
+fn cross_pairs<'a>(live: &[&'a Node<'a>]) -> Vec<(&'a Node<'a>, &'a Node<'a>)> {
+    let is_head = |n: &Node<'_>| n.build.role == "N";
+    let head_node = live.iter().rev().find(|n| is_head(n)).copied();
+    let Some(head_node) = head_node else {
+        return Vec::new();
+    };
+    let mut seen: Vec<&PathBuf> = Vec::new();
+    let mut out = Vec::new();
+    for n in live.iter().rev().filter(|n| !is_head(n)) {
+        if !seen.contains(&&n.build.binary) {
+            seen.push(&n.build.binary);
+            out.push((*n, head_node));
         }
     }
-    None
+    out
 }
 
 // ---------------------------------------------------------------- tests
@@ -750,15 +784,28 @@ async fn mixed_version_floor() -> Result<()> {
             b.n1.floor
         );
     }
-    let Some(n2) = b.n2.as_ref() else {
-        eprintln!("SKIPPED scenario C: there is no N-2 release yet");
+    // The control peer N-1 first, then N-2 (accepted when at or above the floor),
+    // then the newest release below the floor (refused). The below-floor build
+    // is what exercises the refusal path while the floor is still low.
+    let mut peers = vec![&b.n1];
+    peers.extend(b.n2.as_ref());
+    match b.below.as_ref() {
+        Some(below) => peers.push(below),
+        None => eprintln!(
+            "NOTE scenario C: no published release below N's floor {} has a verified \
+             musl asset, so the refusal path is exercised only if N-2 is itself below the floor",
+            b.head.floor
+        ),
+    }
+    if peers.len() == 1 {
+        eprintln!("SKIPPED scenario C: there is no N-2 or below-floor release to test");
         return Ok(());
-    };
+    }
     run_scenario(
         Spec {
             name: "C-floor",
             gateway: &b.head,
-            peers: vec![&b.n1, n2],
+            peers,
         },
         &b.head,
     )
