@@ -1774,9 +1774,8 @@ impl WasmtimeEngine {
             // Only here, for guest entries made through `call_typed_blocking`.
             // `create_instance` (module start function, `__frnt_set_id`) does
             // not convert: a start function that returns normally after a
-            // refused host call is accepted. It runs before any message is
-            // processed, so nothing it returns is delivered, and the cap still
-            // ends a start function that keeps calling by trap or backstop.
+            // refused host call is accepted. The cap still ends a start
+            // function that keeps calling, by trap or backstop.
             BlockingResult::Ok(_, store) if cap_was_spent(&meter) => {
                 identity(name);
                 self.store = Some(store);
@@ -3767,6 +3766,14 @@ mod tests {
     /// `freenet_test.boom`, which panics (a stand-in for any host-side panic).
     fn test_host_linker(engine: &Engine) -> Linker<HostState> {
         // Named fns for the reason given in `delegate_entry_captures_host_panic`.
+        // Spends the whole host-call cap at once, without sleeping: the waiter
+        // sees exactly `cap` of host time, below its cap + 50 ms bound, so no
+        // timing decides between the trap, the backstop and a normal return.
+        fn spend_cap(caller: Caller<'_, HostState>) {
+            let mut inner = caller.data().meter.lock();
+            let cap = inner.cap;
+            inner.host_total += cap;
+        }
         fn nap(_: Caller<'_, HostState>) {
             std::thread::sleep(NAP)
         }
@@ -3782,6 +3789,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(ms as u64))
         }
         let mut linker: Linker<HostState> = Linker::new(engine);
+        linker
+            .func_wrap("freenet_test", "spend_cap", spend_cap)
+            .expect("registering spend_cap must succeed");
         linker
             .func_wrap("freenet_test", "nap_ms", nap_ms)
             .expect("registering nap_ms must succeed");
@@ -4982,20 +4992,18 @@ mod tests {
     async fn guest_returning_after_a_refused_host_call_is_a_timeout() {
         const WAT: &str = r#"
             (module
+              (import "freenet_test" "spend_cap" (func $spend))
               (import "freenet_test" "nap_ms" (func $nap (param i32)))
               (func (export "__frnt__initiate_buffer") (param i32) (result i64)
-                (local $n i32)
-                (loop $calls
-                  (call $nap (i32.const 2))
-                  (local.set $n (i32.add (local.get $n) (i32.const 1)))
-                  (br_if $calls (i32.lt_u (local.get $n) (i32.const 1500))))
+                (call $spend)
+                (call $nap (i32.const 1))
                 (i64.const 7)))
         "#;
-        // Budget 1.0 s, cap 1.5 s: the first ~700 calls of 2 ms run, the rest are
-        // refused instantly, and the guest returns 7 at ~1.5 s: after the
-        // epoch deadline has been extended past it (host time is not charged),
-        // and before the backstop's cap + 50 ms. So only the result check can
-        // turn this into a timeout while the store survives.
+        // `spend_cap` uses the whole cap with no sleeping, so the next blocking
+        // call is refused and the guest returns 7 within microseconds, in one
+        // frame (no trap). The waiter sees host time == cap, under its
+        // cap + 50 ms bound, and the 1 s guest budget is nowhere near: nothing
+        // but the Ok-result check can turn this into a timeout.
         let mut engine = engine_with_test_host(1.0, epoch_deadline_ticks(1.0));
         const ID: i64 = i64::MAX - 54827;
         insert_raw_instance(&mut engine, ID, WAT);
@@ -5006,16 +5014,12 @@ mod tests {
             matches!(result, Err(WasmError::Timeout)),
             "a guest that returned after refused host calls must be a timeout, got {result:?}"
         );
-        assert_eq!(meter.snapshot().fired, Some(TimeoutCause::HostCallCap));
-        // The path taken: the guest returned normally and the Ok arm converted
-        // it, so the store survives. A trap would also keep it, but the guest
-        // never reaches a function entry; the backstop would have replaced the
-        // store and dropped the instance.
-        assert!(
-            engine.instances.contains_key(&ID),
-            "the result must be converted from a normal return, not abandoned by \
-             the backstop (which wins only if the guest overshoots the cap by 50 ms)"
-        );
+        let snap = meter.snapshot();
+        assert_eq!(snap.fired, Some(TimeoutCause::HostCallCap));
+        assert_eq!(snap.host_calls, 0, "the refused call must not have run");
+        // Converted from a normal return, so the store is kept; the backstop
+        // would have replaced it.
+        assert!(engine.instances.contains_key(&ID));
     }
 
     /// A single host call that outlives the cap cannot be trapped; the backstop
