@@ -1,0 +1,125 @@
+name: QUIC Identity Property Tests (Weekly)
+
+# The property tests on the QUIC peer-identity parsing and verification
+# (`transport/quic/identity/tests.rs`) run in PR CI at 256 cases each, which
+# finds a bug that shows up in the first few hundred inputs. This job runs the
+# same tests with 100,000 cases each, to find the ones that do not.
+#
+# Each run seeds proptest from its run id (printed in the log, or given as the
+# `seed` input), so a failure can be reproduced locally with the same
+# PROPTEST_CASES and PROPTEST_RNG_SEED.
+#
+# Weekly, not per PR: it adds about 15 minutes on a ubicloud-standard-8
+# (a few dollars a month) and nothing about it depends on the PR's diff.
+# Run it by hand (workflow_dispatch) to check a specific change.
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: "Cases per property test"
+        required: false
+        default: "100000"
+      seed:
+        description: "PROPTEST_RNG_SEED (decimal u64). Leave empty to use the run id."
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  spki-proptest:
+    name: QUIC identity property tests
+    runs-on: ubicloud-standard-8
+    timeout-minutes: 45
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      # Use mold linker to avoid rust-lld crashes
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
+      PROPTEST_CASES: ${{ github.event.inputs.cases || '100000' }}
+      PROPTEST_RNG_SEED: ${{ github.event.inputs.seed || github.run_id }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: spki-proptest
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install mold linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mold
+
+      # The failing case itself is not printed, but the seed is, and with the
+      # same PROPTEST_CASES it lets anyone reproduce that case locally. That
+      # is on purpose: without it a failure seen once in 100,000 cases could
+      # not be reproduced. The output is kept short (failing test names, seed
+      # and summary line); it is minimal, not secret. The job also fails when
+      # the filter ran fewer tests than expected or one of the property tests
+      # did not run, so a renamed or moved module cannot leave it green while
+      # testing nothing.
+      - name: Run the identity property tests
+        timeout-minutes: 35
+        run: |
+          if ! printf '%s' "$PROPTEST_CASES" | grep -Eq '^[1-9][0-9]{0,8}$'; then
+            echo "::error::PROPTEST_CASES is not a positive integer"
+            exit 1
+          fi
+          if ! printf '%s' "$PROPTEST_RNG_SEED" | grep -Eq '^[0-9]{1,19}$'; then
+            echo "::error::PROPTEST_RNG_SEED is not a decimal integer"
+            exit 1
+          fi
+          echo "PROPTEST_CASES=$PROPTEST_CASES PROPTEST_RNG_SEED=$PROPTEST_RNG_SEED"
+          log="$RUNNER_TEMP/proptest.log"
+          status=0
+          cargo test -p freenet --lib -- transport::quic::identity > "$log" 2>&1 || status=$?
+          grep -E '^(test .* (ok|FAILED)|test result:)' "$log" || true
+          if [ "$status" -ne 0 ]; then
+            echo "::error::identity property tests failed (exit $status); case not printed. Rerun locally with PROPTEST_CASES=$PROPTEST_CASES PROPTEST_RNG_SEED=$PROPTEST_RNG_SEED"
+            exit "$status"
+          fi
+          passed=$(grep -cE '^test .* \.\.\. ok$' "$log" || true)
+          if [ "$passed" -lt 23 ]; then
+            echo "::error::expected at least 23 identity tests to pass, saw $passed"
+            exit 1
+          fi
+          for name in peer_key_of_matches_the_independent_oracle \
+            peer_key_presented_matches_the_independent_oracle \
+            certificate_verifiers_take_any_presented_key \
+            signature_verifiers_refuse_arbitrary_signatures \
+            our_signatures_round_trip_and_nothing_else_verifies; do
+            if ! grep -qE "^test .*::$name \.\.\. ok$" "$log"; then
+              echo "::error::property test $name did not run"
+              exit 1
+            fi
+          done
+
+  # Tell the private freenet-dev room when the scheduled run fails (the public
+  # official room is not used: a failure here may be an unfixed defect).
+  notify-dev-room-failure:
+    name: Notify dev room on Failure
+    runs-on: ubuntu-latest
+    needs: [spki-proptest]
+    if: failure() && needs.spki-proptest.result == 'failure'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/river-dev-notify
+        with:
+          message: "QUIC identity property tests failed - ${{ github.repository }} - branch ${{ github.ref_name }} - commit ${{ github.sha }} - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          bot-config: ${{ secrets.RIVER_DEV_BOT_CONFIG }}
+          room-id: ${{ secrets.RIVER_DEV_ROOM_ID }}
+          gateway-url: ${{ secrets.RIVER_GATEWAY_URL }}
