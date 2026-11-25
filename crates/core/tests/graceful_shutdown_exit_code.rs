@@ -1284,6 +1284,7 @@ fn a_supervised_gateway_restarts_when_its_breaker_cooldown_ends() -> anyhow::Res
         logs.contains(QUIC_COOLING_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
         "QUIC off during the cooldown. Logs:\n{logs}"
     );
+    let started = Instant::now();
     let status = node.wait_for_exit(Duration::from_secs(150))?;
     let logs = node.logs();
     assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
@@ -1695,6 +1696,16 @@ const BIND_FAILURE_EXIT_MARKER: &str = "The QUIC endpoint could not be built and
 /// then says so instead of asking GitHub; a clean build must ask.
 #[cfg(feature = "testing")]
 fn assert_update_check_ran_before_exit(logs: &str, exit_marker: &str) {
+    // The log directory holds an error-only file beside the main one, so the
+    // concatenation is not in time order: compare the lines' own timestamps.
+    let (done, exit) = (
+        log_secs(logs, FATAL_CHECK_DONE_MARKER),
+        log_secs(logs, exit_marker),
+    );
+    assert!(
+        done.zip(exit).is_some_and(|(done, exit)| done <= exit),
+        "the check did not end before the exit (done {done:?}, exit {exit:?}). Logs:\n{logs}"
+    );
     // The tests keep the binary's own startup check out of the way
     // (`NO_STARTUP_CHECK`), so the fatal-exit check is the only claimant: a clean
     // build must ask GitHub, and only a dirty one (auto-update disabled) may
