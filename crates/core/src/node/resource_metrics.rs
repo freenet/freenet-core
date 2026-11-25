@@ -52,14 +52,18 @@ pub(crate) struct ResourceUtilization {
     /// QUIC upgrade paths active now (shadow mode), sampled with the RSS so
     /// the two can be regressed against each other for a per-path cost.
     pub quic_paths_active: u64,
-    /// Cumulative secret reads that failed on a blob that IS present (it did
-    /// not authenticate, or the read hit an I/O error other than not-found),
-    /// since start. The delegate sees these as "absent" (#6323), so a node
-    /// with a mismatched key-encryption-key shows a non-zero value here and
-    /// nowhere else (#6368). Aggregate only; nothing identifies a secret.
+    /// Cumulative delegate secret reads (and key-list reads) that failed to
+    /// authenticate a blob that IS present, since start. The delegate sees
+    /// these as "absent" (#6323), so a node with a mismatched
+    /// key-encryption-key shows a non-zero value here and nowhere else
+    /// (#6368). Aggregate only; nothing identifies a secret.
     pub secret_read_auth_failures: u64,
-    /// Distinct delegates behind `secret_read_auth_failures` (saturates at a
-    /// fixed bound).
+    /// Cumulative delegate secret reads that failed with an I/O error other
+    /// than not-found, since start. Separate from the authentication count so
+    /// a key mismatch can be told apart from disk trouble.
+    pub secret_read_io_failures: u64,
+    /// Distinct delegates behind the two counts above (saturates at a fixed
+    /// bound).
     pub secret_delegates_with_failures: u32,
 }
 
@@ -96,7 +100,8 @@ fn sample_from(
         cumulative_bytes_sent: transport.cumulative_bytes_sent(),
         cumulative_bytes_received: transport.cumulative_bytes_received(),
         quic_paths_active: transport.quic_paths_active(),
-        secret_read_auth_failures: secret_failures.total(),
+        secret_read_auth_failures: secret_failures.auth_total(),
+        secret_read_io_failures: secret_failures.io_total(),
         secret_delegates_with_failures: secret_failures.delegates_affected(),
     }
 }
@@ -197,6 +202,7 @@ mod tests {
         let failures = SecretReadFailures::new();
         let value = sample_from(&metrics, &failures).to_telemetry_value();
         assert_eq!(value["secret_read_auth_failures"], 0);
+        assert_eq!(value["secret_read_io_failures"], 0);
         assert_eq!(value["secret_delegates_with_failures"], 0);
 
         let now = std::time::Instant::now();
@@ -204,8 +210,25 @@ mod tests {
         failures.record(now, "delegate-a", "blob-1", FailureKind::Auth);
         failures.record(now, "delegate-b", "blob-2", FailureKind::Io);
         let value = sample_from(&metrics, &failures).to_telemetry_value();
-        assert_eq!(value["secret_read_auth_failures"], 3);
+        assert_eq!(value["secret_read_auth_failures"], 2);
+        assert_eq!(value["secret_read_io_failures"], 1);
         assert_eq!(value["secret_delegates_with_failures"], 2);
+    }
+
+    /// `sample()` reads the PROCESS-WIDE tracker. The tracker is shared with
+    /// parallel tests, so this asserts a delta of at least what it records.
+    #[test]
+    fn sample_reports_the_process_wide_secret_read_failures() {
+        use crate::wasm_runtime::{FailureKind, SECRET_READ_FAILURES};
+        let before = sample();
+        let now = std::time::Instant::now();
+        SECRET_READ_FAILURES.record(now, "sample-wiring-delegate", "b1", FailureKind::Auth);
+        SECRET_READ_FAILURES.record(now, "sample-wiring-delegate", "b2", FailureKind::Auth);
+        SECRET_READ_FAILURES.record(now, "sample-wiring-delegate", "b3", FailureKind::Io);
+        let after = sample();
+        assert!(after.secret_read_auth_failures >= before.secret_read_auth_failures + 2);
+        assert!(after.secret_read_io_failures >= before.secret_read_io_failures + 1);
+        assert!(after.secret_delegates_with_failures >= 1);
     }
 
     /// The sample reports the transport's active QUIC path count. Uses its own
@@ -249,6 +272,7 @@ mod tests {
             "cumulative_bytes_received",
             "quic_paths_active",
             "secret_read_auth_failures",
+            "secret_read_io_failures",
             "secret_delegates_with_failures",
         ] {
             assert!(obj.contains_key(key), "telemetry value missing key `{key}`");

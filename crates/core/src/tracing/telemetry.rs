@@ -6304,6 +6304,7 @@ mod tests {
             "cumulative_bytes_received",
             "quic_paths_active",
             "secret_read_auth_failures",
+            "secret_read_io_failures",
             "secret_delegates_with_failures",
         ] {
             assert!(obj.contains_key(key), "event_data missing key `{key}`");

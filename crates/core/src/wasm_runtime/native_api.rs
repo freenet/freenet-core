@@ -1404,9 +1404,11 @@ impl DelegateCallEnv {
                 return Ok(f(plaintext));
             }
         }
-        let plaintext =
-            self.secret_store()
-                .get_secret(&self.delegate_key, secret_id, self.secret_scope())?;
+        let plaintext = self.secret_store().get_secret_for_delegate(
+            &self.delegate_key,
+            secret_id,
+            self.secret_scope(),
+        )?;
         let out = f(&plaintext);
         *self.secret_read_memo.borrow_mut() = Some((*secret_id.hash(), plaintext));
         Ok(out)
