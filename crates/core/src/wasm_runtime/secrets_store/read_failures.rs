@@ -283,11 +283,12 @@ mod tests {
         let t = std::sync::Arc::new(SecretReadFailures::new());
         t.record(Instant::now(), "d", "k", FailureKind::Auth);
         let t2 = t.clone();
-        let _ = std::thread::spawn(move || {
+        let joined = std::thread::spawn(move || {
             let _guard = t2.state.lock().unwrap();
             panic!("poison the throttle lock");
         })
         .join();
+        assert!(joined.is_err());
         assert!(t.state.is_poisoned());
         assert_eq!(t.delegates_affected(), 1);
         t.record(Instant::now(), "d2", "k", FailureKind::Io);

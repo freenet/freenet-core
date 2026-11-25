@@ -227,7 +227,7 @@ mod tests {
         SECRET_READ_FAILURES.record(now, "sample-wiring-delegate", "b3", FailureKind::Io);
         let after = sample();
         assert!(after.secret_read_auth_failures >= before.secret_read_auth_failures + 2);
-        assert!(after.secret_read_io_failures >= before.secret_read_io_failures + 1);
+        assert!(after.secret_read_io_failures > before.secret_read_io_failures);
         assert!(after.secret_delegates_with_failures >= 1);
     }
 

@@ -6170,7 +6170,7 @@ mod test {
             Zeroizing::new(b"w".to_vec()),
         )?;
         // An export reads every blob by hash; the outcome is irrelevant here.
-        let _ = store.export_scope_entries(SecretScope::Local);
+        drop(store.export_scope_entries(SecretScope::Local));
 
         assert_eq!(
             (failures.auth_total(), failures.io_total()),
