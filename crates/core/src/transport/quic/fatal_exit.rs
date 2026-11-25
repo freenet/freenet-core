@@ -135,10 +135,6 @@ mod tests {
         assert!(!bind_failure_is_fatal_with(true, false));
         assert!(!bind_failure_is_fatal_with(false, false), "no binary");
         assert!(bind_failure_is_fatal_with(false, true));
-        assert!(
-            super::super::breaker::UDP_FALLBACK,
-            "this PR ships dark: the constant stays true until D"
-        );
         assert!(!bind_failure_is_fatal(), "nothing registers in a unit test");
     }
 
