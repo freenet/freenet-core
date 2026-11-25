@@ -23,9 +23,21 @@ use std::pin::Pin;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// How the registered check ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FatalExitCheckEnd {
+    /// It ran to its end (or skipped itself); the exit proceeds.
+    Finished,
+    /// An operator asked the process to stop while it ran. The process then
+    /// exits as for a stop (code 0), not with the code of the fault: a
+    /// service manager's wrapper reads 42 as "update and relaunch", and the
+    /// post-update rollback counts 45 as a crash.
+    Stopped,
+}
+
 /// The check the binary registers: look for a newer release and stage it.
 /// It reports through its own logs; the exit code is the caller's.
-pub type FatalExitUpdateCheck = fn() -> Pin<Box<dyn Future<Output = ()> + Send>>;
+pub type FatalExitUpdateCheck = fn() -> Pin<Box<dyn Future<Output = FatalExitCheckEnd> + Send>>;
 
 static CHECK: OnceLock<FatalExitUpdateCheck> = OnceLock::new();
 
@@ -52,6 +64,8 @@ pub(crate) enum CheckOutcome {
     NotRegistered,
     /// The check returned.
     Completed,
+    /// An operator's stop ended the check.
+    Stopped,
     /// The check was still running at the timeout and was dropped.
     TimedOut,
     /// The check panicked. The exit still happens with its planned code: a
@@ -71,7 +85,8 @@ pub(crate) async fn run_check(
     use futures::FutureExt;
     let guarded = std::panic::AssertUnwindSafe(async { check().await }).catch_unwind();
     match tokio::time::timeout(timeout, guarded).await {
-        Ok(Ok(())) => CheckOutcome::Completed,
+        Ok(Ok(FatalExitCheckEnd::Finished)) => CheckOutcome::Completed,
+        Ok(Ok(FatalExitCheckEnd::Stopped)) => CheckOutcome::Stopped,
         Ok(Err(_)) => CheckOutcome::Panicked,
         Err(_) => CheckOutcome::TimedOut,
     }
@@ -134,6 +149,22 @@ pub(crate) async fn check_before_exit(reason: &str) {
         ?outcome,
         "Update check before a transport-fatal exit finished"
     );
+    if outcome == CheckOutcome::Stopped {
+        exit_as_stopped();
+    }
+}
+
+/// An operator stopped the process during the check: exit as a stop. The QUIC
+/// crash-breaker marker is left as it is. For an endpoint death it already
+/// carries the noted exit, which is a real fault and still counts at the next
+/// start; for a bind failure no marker was armed. Clearing it, as a clean
+/// stop elsewhere does, would drop that note.
+fn exit_as_stopped() -> ! {
+    tracing::info!("Stopped during the update check before a transport-fatal exit; exiting 0");
+    // The file log is written by a background worker that `process::exit` does
+    // not wait for; see `node::p2p_impl::exit_for_gateway_quic_restart`.
+    std::thread::sleep(Duration::from_millis(500));
+    std::process::exit(0)
 }
 
 #[cfg(test)]
@@ -143,17 +174,22 @@ mod tests {
 
     static RAN: AtomicU32 = AtomicU32::new(0);
 
-    fn finishing() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn finishing() -> Pin<Box<dyn Future<Output = FatalExitCheckEnd> + Send>> {
         Box::pin(async {
             RAN.fetch_add(1, Ordering::SeqCst);
+            FatalExitCheckEnd::Finished
         })
     }
 
-    fn panicking() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn stopping() -> Pin<Box<dyn Future<Output = FatalExitCheckEnd> + Send>> {
+        Box::pin(async { FatalExitCheckEnd::Stopped })
+    }
+
+    fn panicking() -> Pin<Box<dyn Future<Output = FatalExitCheckEnd> + Send>> {
         Box::pin(async { panic!("test: the check panics") })
     }
 
-    fn never_finishing() -> Pin<Box<dyn Future<Output = ()> + Send>> {
+    fn never_finishing() -> Pin<Box<dyn Future<Output = FatalExitCheckEnd> + Send>> {
         Box::pin(std::future::pending())
     }
 
@@ -167,6 +203,10 @@ mod tests {
             CheckOutcome::Completed
         );
         assert_eq!(RAN.load(Ordering::SeqCst), before + 1, "the check ran");
+        assert_eq!(
+            run_check(Some(stopping), timeout).await,
+            CheckOutcome::Stopped
+        );
     }
 
     /// A panicking check is contained: the exit keeps its planned code.

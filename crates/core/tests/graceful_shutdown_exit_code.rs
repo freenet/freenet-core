@@ -216,7 +216,12 @@ impl NodeProcess {
             .env_remove("FREENET_SUPERVISED")
             .env_remove("INVOCATION_ID")
             .env_remove("FREENET_TEST_QUIC_PANIC")
-            .env_remove("FREENET_TEST_QUIC_ENDPOINT_DOWN_AFTER_SECS");
+            .env_remove("FREENET_TEST_QUIC_ENDPOINT_DOWN_AFTER_SECS")
+            .env_remove("FREENET_TEST_QUIC_BIND_FAILS")
+            .env_remove("FREENET_TEST_BREAKER_NO_UDP_FALLBACK")
+            .env_remove("FREENET_TEST_FATAL_EXIT_CHECK_HANGS")
+            .env_remove("FREENET_TEST_FATAL_EXIT_CHECK_PANICS")
+            .env_remove("FREENET_TEST_FATAL_EXIT_CHECK_TIMEOUT_SECS");
         command.envs(env.iter().copied());
         let child = command.spawn()?;
         Ok(Self {
@@ -1681,6 +1686,11 @@ const BIND_FAILURE_EXIT_MARKER: &str = "The QUIC endpoint could not be built and
 /// then says so instead of asking GitHub; a clean build must ask.
 #[cfg(feature = "testing")]
 fn assert_update_check_ran_before_exit(logs: &str, exit_marker: &str) {
+    // The binary's own update task found a newer release first and shut the
+    // node down for the update: that exit is not the one under test.
+    if logs.contains("Initiating graceful shutdown for auto-update") {
+        return;
+    }
     // The log directory holds an error-only file beside the main one, so the
     // concatenation is not in time order: compare the lines' own timestamps.
     let stamp = |marker: &str| {
@@ -1700,17 +1710,23 @@ fn assert_update_check_ran_before_exit(logs: &str, exit_marker: &str) {
         "the exit ({exit}) came before the check ended ({done}). Logs:\n{logs}"
     );
     // The binary's own update task may claim the attempt first (its first check
-    // waits 0 to 60 s), and a dirty build disables auto-update: the check then
-    // says so. Either way the registered check ran and ended before the exit.
+    // waits 0 to 60 s): the check then says so. A dirty build disables
+    // auto-update and the check says that instead, but a clean build must never
+    // say it, so the "asks GitHub" branch is not skipped on CI.
+    let dirty = !env!("GIT_DIRTY").is_empty();
+    let disabled = logs.contains("Fatal-exit update check skipped: auto-update is disabled");
+    assert_eq!(
+        disabled, dirty,
+        "auto-update is disabled exactly on a dirty build. Logs:\n{logs}"
+    );
     let skipped = [
-        "Fatal-exit update check skipped: auto-update is disabled",
         "Fatal-exit update check skipped: the update attempt claim was refused",
         "Fatal-exit update check skipped: a release is cooling down",
     ]
     .iter()
     .any(|line| logs.contains(line));
     assert!(
-        logs.contains(FATAL_CHECK_ASKS_MARKER) || skipped,
+        logs.contains(FATAL_CHECK_ASKS_MARKER) || disabled || skipped,
         "the check neither asked GitHub nor said why not. Logs:\n{logs}"
     );
     assert!(logs.contains(FATAL_CHECK_PREFIX));
@@ -1794,7 +1810,15 @@ fn with_udp_a_bind_failure_is_not_fatal_and_runs_no_fatal_exit_check() -> anyhow
         None,
         &[(BIND_FAILS_ENV, "1")],
     )?;
-    node.wait_for_logs(&[READY_MARKER], Duration::from_secs(120))?;
+    // The positive signal that the bind failure happened, then a wait for an
+    // exit that must not come.
+    node.wait_for_logs(
+        &[
+            READY_MARKER,
+            "Test build: the QUIC endpoint is treated as not built",
+        ],
+        Duration::from_secs(120),
+    )?;
     std::thread::sleep(Duration::from_secs(3));
     assert!(node.child.try_wait()?.is_none(), "Logs:\n{}", node.logs());
     assert!(
@@ -1871,6 +1895,7 @@ fn spawn_bind_failure(
 #[test]
 fn with_no_udp_a_check_that_hangs_is_dropped_at_its_bound() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
+    let started = Instant::now();
     let mut node = spawn_bind_failure(
         dir.path(),
         true,
@@ -1882,15 +1907,17 @@ fn with_no_udp_a_check_that_hangs_is_dropped_at_its_bound() -> anyhow::Result<()
     let status = node.wait_for_exit(Duration::from_secs(60))?;
     let logs = node.logs();
     assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
+    assert!(logs.contains("outcome=TimedOut"), "Logs:\n{logs}");
     assert!(
-        logs.contains("outcome=TimedOut") || logs.contains("TimedOut"),
-        "Logs:\n{logs}"
+        started.elapsed() >= Duration::from_secs(2),
+        "the check was not held for its 2 s bound. Logs:\n{logs}"
     );
     Ok(())
 }
 
-/// A stop during the check ends it at once: the exit does not wait out the
-/// bound, which the service manager's stop timeout would cut short.
+/// A stop during the check ends it at once and the process exits 0, as for a
+/// stop: the exit does not wait out the bound, which the service manager's stop
+/// timeout would cut short.
 ///
 /// FALSIFY: remove the `stop` arm of `check_for_update_before_fatal_exit`.
 #[cfg(all(feature = "testing", feature = "quic-panic-injection"))]
@@ -1918,8 +1945,11 @@ fn with_no_udp_a_stop_during_the_check_ends_it_at_once() -> anyhow::Result<()> {
         stop_sent.elapsed() < Duration::from_secs(10),
         "Logs:\n{logs}"
     );
-    assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
+    // A stop exits as a stop: 42 would be read as "update and relaunch" by a
+    // launchd wrapper, and 45 is counted as a crash by the rollback.
+    assert_eq!(status.code(), Some(0), "Logs:\n{logs}");
     assert!(logs.contains("stopped by a signal"), "Logs:\n{logs}");
+    assert!(logs.contains("exiting 0"), "Logs:\n{logs}");
     Ok(())
 }
 
@@ -1939,7 +1969,7 @@ fn with_no_udp_a_panicking_check_still_exits_with_its_planned_code() -> anyhow::
     let status = node.wait_for_exit(Duration::from_secs(60))?;
     let logs = node.logs();
     assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
-    assert!(logs.contains("Panicked"), "Logs:\n{logs}");
+    assert!(logs.contains("outcome=Panicked"), "Logs:\n{logs}");
     Ok(())
 }
 
@@ -1964,7 +1994,7 @@ fn with_no_udp_an_unsupervised_bind_failure_exits_at_once_with_advice() -> anyho
         "Logs:\n{logs}"
     );
     assert!(
-        logs.contains("nothing restarts this node: run `freenet update`"),
+        logs.contains("unless some other supervisor does, run `freenet update`"),
         "Logs:\n{logs}"
     );
     Ok(())

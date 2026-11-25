@@ -181,13 +181,20 @@ pub(crate) async fn exit_for_quic_bind_failure() -> ! {
         "the service manager restarts the node, and a newer release, if one exists, was staged \
          first"
     } else {
-        "nothing restarts this node: run `freenet update` and start it again, and check that \
-         the network port is free and the node may bind it"
+        "this node is not run under a Freenet service unit that restarts it, so unless some \
+         other supervisor does, run `freenet update` and start it again, and check that the \
+         network port is free and the node may bind it"
     };
-    eprintln!(
-        "CRITICAL: the QUIC endpoint could not be built and there is no UDP transport to fall \
-         back to. Exiting with code {exit_code}; {advice}."
-    );
+    // Not `eprintln!`, which panics when stderr cannot be written.
+    {
+        use std::io::Write as _;
+        #[allow(clippy::let_underscore_must_use)]
+        let _ = writeln!(
+            std::io::stderr(),
+            "CRITICAL: the QUIC endpoint could not be built and there is no UDP transport to \
+             fall back to. Exiting with code {exit_code}; {advice}."
+        );
+    }
     tracing::error!(
         exit_code,
         supervised,

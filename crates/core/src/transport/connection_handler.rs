@@ -471,7 +471,12 @@ pub(super) async fn bind_udp_listener<S: Socket>(
     // is staged first (`quic::fatal_exit`, W-S6).
     #[cfg(feature = "testing")]
     let quic_endpoint =
-        quic_endpoint.filter(|_| std::env::var_os(TEST_QUIC_BIND_FAILS_ENV).is_none());
+        if quic_endpoint.is_some() && std::env::var_os(TEST_QUIC_BIND_FAILS_ENV).is_some() {
+            tracing::warn!("Test build: the QUIC endpoint is treated as not built");
+            None
+        } else {
+            quic_endpoint
+        };
     if quic_settings.is_some()
         && quic_endpoint.is_none()
         && super::quic::fatal_exit::bind_failure_is_fatal()

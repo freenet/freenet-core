@@ -1383,7 +1383,8 @@ static FATAL_EXIT_UPDATE_DISABLED: std::sync::atomic::AtomicBool =
 
 /// The check registered with the library to run before a transport-fatal exit
 /// (`freenet::register_fatal_exit_update_check`).
-fn fatal_exit_update_check() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+fn fatal_exit_update_check()
+-> std::pin::Pin<Box<dyn std::future::Future<Output = freenet::FatalExitCheckEnd> + Send>> {
     Box::pin(check_for_update_before_fatal_exit())
 }
 
@@ -1399,29 +1400,32 @@ fn stop_signal() -> impl std::future::Future<Output = ()> {
     #[cfg(unix)]
     let sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).ok();
     async move {
-        #[cfg(unix)]
-        match sigterm {
-            Some(mut sigterm) => {
-                tokio::select! {
-                    _ = sigterm.recv() => {},
-                    _ = signal::ctrl_c() => {},
-                }
+        // Registered independently: a SIGTERM listener that could not be
+        // installed must not make Ctrl+C a no-op.
+        let term = async {
+            #[cfg(unix)]
+            if let Some(mut sigterm) = sigterm {
+                sigterm.recv().await;
+                return;
             }
-            None => std::future::pending::<()>().await,
+            std::future::pending::<()>().await;
+        };
+        tokio::select! {
+            () = term => {},
+            _ = signal::ctrl_c() => {},
         }
-        #[cfg(not(unix))]
-        drop(signal::ctrl_c().await);
     }
 }
 
 /// [`check_for_update_before_fatal_exit_steps`], abandoned when an operator
 /// asks the process to stop.
-async fn check_for_update_before_fatal_exit() {
+async fn check_for_update_before_fatal_exit() -> freenet::FatalExitCheckEnd {
     let stop = stop_signal();
     tokio::select! {
-        () = check_for_update_before_fatal_exit_steps() => {}
+        () = check_for_update_before_fatal_exit_steps() => freenet::FatalExitCheckEnd::Finished,
         () = stop => {
             tracing::info!("Fatal-exit update check: stopped by a signal, exiting now");
+            freenet::FatalExitCheckEnd::Stopped
         }
     }
 }
