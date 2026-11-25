@@ -1973,7 +1973,8 @@ fn late_ends_within_the_window_would_close_with_udp_and_close_without() {
         assert_eq!(watch.would_close(), 0, "not counted as ack-wait expiries");
         (would, None)
     };
-    let cases: Vec<(Box<dyn Fn(usize) -> u64>, Vec<usize>)> = vec![
+    type Late = Box<dyn Fn(usize) -> u64>;
+    let cases: Vec<(Late, Vec<usize>)> = vec![
         (Box::new(counted(vec![at(2), at(10), at(20)])), vec![at(20)]),
         (
             Box::new(counted((1..=6).map(|m| at(2 * m)).collect())),
