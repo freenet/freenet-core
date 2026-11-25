@@ -68,12 +68,13 @@
 //!    with no UDP session (a native one); on a path with one it only counts
 //!    (`quic_stall_would_close_<label>`) and the path stays open
 //!    ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
-//! 7. **Late ends** ([`Stall::LateEnds`]), observe-only on every path
-//!    ([`LATE_ENDS_CLOSE`]): [`ACK_WAIT_EXPIRY_LIMIT`] sends had their end
-//!    acknowledged late, or not at all, though the connection had
-//!    acknowledged enough bytes since the end to have carried it
-//!    (`path::LateEndCheck`), within [`ACK_WAIT_EXPIRY_WINDOW`]; counted
-//!    (`quic_stall_would_close_late_ends`), and the path stays open.
+//! 7. **Late ends** ([`Stall::LateEnds`]): [`ACK_WAIT_EXPIRY_LIMIT`] sends
+//!    had their end acknowledged late, or not at all, though the connection
+//!    had acknowledged enough bytes since the end to have carried it
+//!    (`path::LateEndCheck`), within [`ACK_WAIT_EXPIRY_WINDOW`]. Closes a
+//!    path with no UDP session (a native one); on a path with one it only
+//!    counts (`quic_stall_would_close_late_ends`) and the path stays open
+//!    ([`LATE_ENDS_CLOSES_WITH_UDP`]).
 //!
 //! What "acknowledged" is measured with. quinn's `ConnectionStats` has no
 //! counter of packets the peer newly acknowledged: `frame_rx.acks` counts
@@ -1240,7 +1241,8 @@ pub(crate) struct AckWatch {
     /// Times the ack-wait expiry rule would have closed the path, which has
     /// a UDP session ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
     would_close: u64,
-    /// Times the late-end rule would have closed the path ([`LATE_ENDS_CLOSE`]).
+    /// Times the late-end rule would have closed the path
+    /// ([`LATE_ENDS_CLOSES_WITH_UDP`]): counted on a path with a UDP session.
     late_would_close: u64,
     /// The path has a UDP session to fall back to, so the dark rule only
     /// counts ([`DARK_CLOSES_WITH_UDP`]).
@@ -1585,11 +1587,15 @@ impl AckWatch {
             self.would_close += 1;
             self.expiries_at.clear();
         }
-        // Observe only on every path until calibrated ([`LATE_ENDS_CLOSE`]).
+        // Not judged against the peer's timing either, so a cap hold does
+        // not suspend it (the check itself restarts its proof under one,
+        // `path::LateEndCheck`).
         if late {
-            if LATE_ENDS_CLOSE {
+            if !self.udp_fallback || LATE_ENDS_CLOSES_WITH_UDP {
                 return Some(Stall::LateEnds);
             }
+            // Observe only on a path with a UDP session: count it, and start
+            // the window afresh.
             if let Some(node) = self.dark_counts {
                 node.record_stall_would_close(Stall::LateEnds.index());
             }
@@ -1728,8 +1734,9 @@ pub(crate) enum Stall {
     /// [`ACK_WAIT_EXPIRY_LIMIT`] of this side's sends had their end
     /// acknowledged late, or not at all, though the connection had
     /// acknowledged enough bytes since the end to have carried it
-    /// (`path::LateEndCheck`), within [`ACK_WAIT_EXPIRY_WINDOW`]. Observe-only
-    /// on every path ([`LATE_ENDS_CLOSE`]): counted as a would-close.
+    /// (`path::LateEndCheck`), within [`ACK_WAIT_EXPIRY_WINDOW`]. Closes a
+    /// path with no UDP session; on one with a UDP session it is counted as a
+    /// would-close and the path is not closed ([`LATE_ENDS_CLOSES_WITH_UDP`]).
     LateEnds,
 }
 
@@ -1929,12 +1936,18 @@ pub(crate) const STREAM_CREDIT_FREED: u64 = super::config::MAX_UNI_STREAMS as u6
 /// ([`DARK_CLOSES_WITH_UDP`]).
 pub(crate) const ACK_WAITS_EXPIRED_CLOSES_WITH_UDP: bool = false;
 
-/// Whether the late-end rule ([`Stall::LateEnds`]) closes a path. It does
-/// not, on any path: each time [`ACK_WAIT_EXPIRY_LIMIT`] late ends come
-/// within [`ACK_WAIT_EXPIRY_WINDOW`] a would-close is counted
-/// (`quic_stall_would_close_late_ends`), until the field counts calibrate it
+/// Whether the late-end rule ([`Stall::LateEnds`]) closes a path that has a
+/// UDP session to fall back to. It does not: on such a path each time
+/// [`ACK_WAIT_EXPIRY_LIMIT`] late ends come within
+/// [`ACK_WAIT_EXPIRY_WINDOW`] a would-close is counted
+/// (`quic_stall_would_close_late_ends`) and the path stays open, as for the
+/// ack-wait rule ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]). A path with no UDP
+/// session (a native connection's) is closed, with
+/// `close_code::PEER_NOT_ACKNOWLEDGING`: a peer that acknowledges each
+/// stream's end just before its wait runs out would otherwise hold the
+/// path's stream permits and send epochs with nothing to fall back to
 /// (#6205).
-pub(crate) const LATE_ENDS_CLOSE: bool = false;
+pub(crate) const LATE_ENDS_CLOSES_WITH_UDP: bool = false;
 
 /// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that close a path with
 /// no UDP session ([`Stall::AckWaitsExpired`]; on one with a UDP session

@@ -1938,17 +1938,19 @@ fn ack_wait_expiries_within_the_window_close_only_a_path_without_udp() {
     }
 }
 
-/// The late-end rule only observes, on every path (`LATE_ENDS_CLOSE`): three
-/// late ends within 30 min count a would-close under `late_ends`, the window
-/// starting afresh, and the path is never closed, with a UDP session or
-/// without; two, or a third past the window, count none.
+/// Three late ends within 30 min are a would-close under `late_ends` on a path
+/// with a UDP session (`LATE_ENDS_CLOSES_WITH_UDP` is false), the window
+/// starting afresh, and that path is never closed; on a path without one the
+/// third closes it, under `late_ends`. Two, or a third past the window, count
+/// none and close nothing.
 #[test]
-fn late_ends_within_the_window_would_close_and_never_close() {
-    const _: () = assert!(!LATE_ENDS_CLOSE, "the late-end rule only observes");
+fn late_ends_within_the_window_would_close_with_udp_and_close_without() {
+    const _: () = assert!(!LATE_ENDS_CLOSES_WITH_UDP);
     let times: Vec<u64> = (0..=1200).map(|i| 2 * i).collect();
     let at = |minutes: u64| (minutes * 60 / 2) as usize;
     let counted =
         |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
+    // (would-close samples, the sample the watch closed at and why).
     let run = |late: &dyn Fn(usize) -> u64, udp_fallback: bool| {
         let record = Arc::default();
         let sample = |i: usize| {
@@ -1960,30 +1962,37 @@ fn late_ends_within_the_window_would_close_and_never_close() {
         let mut would = Vec::new();
         for (i, time) in times.iter().enumerate().skip(1) {
             let before = watch.late_would_close();
-            assert!(!watch.observe(time * SEC, sample(i)), "never closed");
+            if watch.observe(time * SEC, sample(i)) {
+                assert_eq!(watch.would_close(), 0, "not counted as ack-wait expiries");
+                return (would, Some((i, watch.stall())));
+            }
             if watch.late_would_close() > before {
                 would.push(i);
             }
         }
         assert_eq!(watch.would_close(), 0, "not counted as ack-wait expiries");
-        would
+        (would, None)
     };
-    for udp_fallback in [true, false] {
+    let cases: Vec<(Box<dyn Fn(usize) -> u64>, Vec<usize>)> = vec![
+        (Box::new(counted(vec![at(2), at(10), at(20)])), vec![at(20)]),
+        (
+            Box::new(counted((1..=6).map(|m| at(2 * m)).collect())),
+            vec![at(6), at(12)],
+        ),
+        (Box::new(counted(vec![at(2), at(10), at(33)])), vec![]),
+        (Box::new(counted(vec![at(2), at(10)])), vec![]),
+    ];
+    for (late, would) in &cases {
         assert_eq!(
-            run(&counted(vec![at(2), at(10), at(20)]), udp_fallback),
-            vec![at(20)]
+            run(late, true),
+            (would.clone(), None),
+            "with UDP: {would:?}"
         );
+        let (_, closed) = run(late, false);
         assert_eq!(
-            run(&counted((1..=6).map(|m| at(2 * m)).collect()), udp_fallback),
-            vec![at(6), at(12)]
-        );
-        assert_eq!(
-            run(&counted(vec![at(2), at(10), at(33)]), udp_fallback),
-            Vec::<usize>::new()
-        );
-        assert_eq!(
-            run(&counted(vec![at(2), at(10)]), udp_fallback),
-            Vec::<usize>::new()
+            closed,
+            would.first().map(|&i| (i, Some(Stall::LateEnds))),
+            "without UDP: {would:?}"
         );
     }
 }

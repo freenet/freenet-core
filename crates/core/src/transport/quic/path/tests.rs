@@ -1396,6 +1396,109 @@ fn ack_wait_expiries_count_a_would_close_whatever_else_is_acknowledged() {
     })
 }
 
+/// The late-end rule's verdict reaches the real path's acknowledgement watch
+/// (#6205): three late ends (`Writers::late_end`, which `late_end_watch`
+/// calls when `LateEndCheck` finds one) 10 s apart on a connected pair, with
+/// the peer acknowledging everything else, are
+/// - on a path with a UDP session, one would-close under `late_ends`, the
+///   path open;
+/// - on a native path, a close under `late_ends`, with no would-close; the
+///   peer is sent `PEER_NOT_ACKNOWLEDGING`.
+///
+/// Two late ends do not close either path, and a third more than 30 min
+/// after them does not either.
+///
+/// The detection itself (`LateEndCheck` on a stream whose end the peer
+/// withholds) is tested with a scripted acknowledgement record
+/// (`the_late_end_check_polls_until_the_end_is_late`,
+/// `a_late_end_is_counted_once_across_its_waits`), not on a real pair: this
+/// harness's peer acknowledges every packet it gets, and a packet that
+/// carries a stream's tail cannot be told on the wire, since quinn bundles
+/// its retransmissions with other frames. The field has had no late end
+/// since the counters shipped (0.2.160), so this pipeline is where the rule
+/// is shown to close.
+#[test]
+fn late_ends_reach_the_path_watch_and_close_a_native_path_only() {
+    use crate::transport::metrics::AckWaitKind;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (network, native, gap) in [
+            ("quic-path-late-ends-udp", false, 10),
+            ("quic-path-late-ends-native", true, 10),
+            ("quic-path-late-ends-native-spread", true, 16 * 60),
+        ] {
+            let counters = leaked_counters();
+            let limits = QuicPathLimits {
+                counters: Some(counters),
+                ..QuicPathLimits::DEFAULT
+            };
+            let a_base = if native {
+                QuicPathLimits::NATIVE
+            } else {
+                QuicPathLimits::DEFAULT
+            };
+            let p = paths_built(
+                network,
+                limits,
+                a_base,
+                None,
+                None,
+                Windows::default(),
+                true,
+            )
+            .await;
+            let b_addr = p.pair.b_addr;
+            let (a, time) = (p.a.clone(), p.time());
+            // Three late ends 16 min apart span 32 min, past the 30 min
+            // window, so virtual time runs longer than `LIMIT` there.
+            let closed_after = drive(&p.pair.time, Duration::from_secs(2 * 3600), async move {
+                let mut closed = None;
+                for i in 1..=3u32 {
+                    a.writers().late_end(counters, AckWaitKind::Stream);
+                    time.sleep(Duration::from_secs(gap)).await;
+                    if a.connection().inner().close_reason().is_some() {
+                        closed = Some(i);
+                        break;
+                    }
+                }
+                closed
+            })
+            .await;
+            let snapshot = counters.snapshot(false);
+            assert_eq!(snapshot.late_end, vec![3, 0, 0], "{network}");
+            assert_eq!(snapshot.ack_wait_expired, vec![0, 0, 0], "{network}");
+            if native && gap == 10 {
+                assert_eq!(closed_after, Some(3), "{network}: closed at the third");
+                assert_eq!(
+                    recycle::stalls_to(b_addr),
+                    vec![recycle::Stall::LateEnds],
+                    "{network}"
+                );
+                assert_eq!(snapshot.stall_closes, vec![0, 0, 0, 0, 0, 1], "{network}");
+                assert_eq!(snapshot.stall_would_close, vec![0; 6], "{network}");
+                assert_eq!(
+                    recycle_closes_to(b_addr),
+                    vec![QuicCloseCode::PeerNotAcknowledging],
+                    "{network}"
+                );
+            } else if native {
+                assert_eq!(closed_after, None, "{network}: spread past the window");
+                assert_eq!(snapshot.stall_closes, vec![0; 6], "{network}");
+                assert_eq!(snapshot.stall_would_close, vec![0; 6], "{network}");
+            } else {
+                assert_eq!(closed_after, None, "{network}: not closed");
+                assert_eq!(recycle::stalls_to(b_addr), vec![], "{network}");
+                assert_eq!(snapshot.stall_closes, vec![0; 6], "{network}");
+                assert_eq!(
+                    snapshot.stall_would_close,
+                    vec![0, 0, 0, 0, 0, 1],
+                    "{network}: one would-close, under late_ends"
+                );
+            }
+        }
+    })
+}
+
 /// The ack-wait expiry rule does not count this node's own throttling: with
 /// the egress cap holding the connection's transmits (a 100 kB/s
 /// `total-bandwidth-limit` under a bulk transfer, so the connection still

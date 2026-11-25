@@ -1457,9 +1457,9 @@ a test passes its own; tests read their own, never the global).
   stream_credit_withheld|ack_waits_expired|late_ends>: paths the acknowledgement
   watch closed, by why (recycle::Stall). quic_stall_would_close_<same
   labels>: times a rule that only observes would have closed a path:
-  ack_waits_expired and dark, each on paths with a UDP session
-  (recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP, DARK_CLOSES_WITH_UDP), and
-  late_ends on every path (recycle::LATE_ENDS_CLOSE).
+  ack_waits_expired, dark and late_ends, each on paths with a UDP session
+  (recycle::ACK_WAITS_EXPIRED_CLOSES_WITH_UDP, DARK_CLOSES_WITH_UDP,
+  LATE_ENDS_CLOSES_WITH_UDP).
   quic_late_end_<stream|short|control>: sends whose end was acknowledged
   late, or not at all, though the peer had wholly acknowledged enough
   data-stream bytes since the end to have carried it (path::LateEndCheck),
@@ -3195,10 +3195,12 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     late_end_grace (9 round trips and 75 ms, at least 2 s). An end still
     unacknowledged then is a LATE END: counted in
     quic_late_end_<stream|short|control> (the stream is not reset), and
-    three within 30 min count a would-close under late_ends
-    (quic_stall_would_close_late_ends). OBSERVE-ONLY on every path
-    (recycle::LATE_ENDS_CLOSE is false) until the field counts calibrate
-    it. Not judged while the egress cap holds a transmit or after a late
+    three within 30 min close a native path (no UDP session) under
+    late_ends, and on a path with a UDP session count a would-close
+    (quic_stall_would_close_late_ends; recycle::LATE_ENDS_CLOSES_WITH_UDP
+    is false). The field had no late end when this closed (no positive
+    for the rule), so its detection rests on the scripted-record tests and
+    its false-positive bound on the honest-path tests below. Not judged while the egress cap holds a transmit or after a late
     wake (the proof restarts), nor once the path was dark for the watch's
     window since the end. Honest paths see none
     (concurrent_large_streams_on_a_slow_path_see_no_expiry,
