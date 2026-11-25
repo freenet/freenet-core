@@ -3338,7 +3338,16 @@ mod tests {
         let binary = PathBuf::from("/usr/local/bin/freenet");
         let log_dir = PathBuf::from("/home/u/.local/state/freenet");
         let home = PathBuf::from("/home/svc");
-        let strip = |unit: &str| unit.replace("OOMPolicy=continue\n", "");
+        let strip = |unit: &str| {
+            // Remove the whole block (comment lines and directive) so the result is
+            // what a node installed before this change has.
+            let start = unit
+                .find("# Do not stop the unit when a process other than the main process is\n")
+                .expect("template must contain the OOMPolicy comment block");
+            let end = unit.find("OOMPolicy=continue\n").expect("directive")
+                + "OOMPolicy=continue\n".len();
+            format!("{}{}", &unit[..start], &unit[end..])
+        };
 
         let units = [
             generate_user_service_file(&binary, &log_dir),

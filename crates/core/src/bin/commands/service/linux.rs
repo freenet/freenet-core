@@ -726,9 +726,9 @@ LimitNOFILE=65536
 MemoryMax=2G
 # CPU quota (200% = 2 cores max)
 CPUQuota=200%
-# Keep the node running if a helper process in this cgroup is OOM-killed.
-# The default (stop) stops and restarts the whole unit, and the restart counts
-# toward StartLimitBurst and the post-update rollback logic.
+# Do not stop the unit when a process other than the main process is
+# OOM-killed. The default (stop) stops and restarts the whole unit, and the
+# restart counts toward StartLimitBurst and the post-update rollback logic.
 # OOMPolicy= requires systemd >= 243; older systemd logs and ignores it.
 OOMPolicy=continue
 
@@ -943,9 +943,9 @@ LimitNOFILE=65536
 MemoryMax=2G
 # CPU quota (200% = 2 cores max)
 CPUQuota=200%
-# Keep the node running if a helper process in this cgroup is OOM-killed.
-# The default (stop) stops and restarts the whole unit, and the restart counts
-# toward StartLimitBurst and the post-update rollback logic.
+# Do not stop the unit when a process other than the main process is
+# OOM-killed. The default (stop) stops and restarts the whole unit, and the
+# restart counts toward StartLimitBurst and the post-update rollback logic.
 # OOMPolicy= requires systemd >= 243; older systemd logs and ignores it.
 OOMPolicy=continue
 
