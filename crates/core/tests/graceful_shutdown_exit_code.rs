@@ -1683,19 +1683,19 @@ const BIND_FAILS_ENV: &str = "FREENET_TEST_QUIC_BIND_FAILS";
 /// line saying the check ended, which comes before the exit's own.
 #[cfg(feature = "testing")]
 const FATAL_CHECK_PREFIX: &str = "Fatal-exit update check";
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", feature = "quic-panic-injection"))]
 const FATAL_CHECK_ASKS_MARKER: &str = "Fatal-exit update check: asking GitHub";
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", feature = "quic-panic-injection"))]
 const FATAL_CHECK_START_MARKER: &str = "Transport-fatal exit: running the update check first";
 #[cfg(feature = "testing")]
 const FATAL_CHECK_DONE_MARKER: &str = "Update check before a transport-fatal exit finished";
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", feature = "quic-panic-injection"))]
 const BIND_FAILURE_EXIT_MARKER: &str = "The QUIC endpoint could not be built and there is no UDP";
 
 /// Assert that `logs` show the update check running to its end before the
 /// exit line `exit_marker`. A dirty build disables auto-update, and the check
 /// then says so instead of asking GitHub; a clean build must ask.
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", feature = "quic-panic-injection"))]
 fn assert_update_check_ran_before_exit(logs: &str, exit_marker: &str) {
     // The log directory holds an error-only file beside the main one, so the
     // concatenation is not in time order: compare the lines' own timestamps.
@@ -2004,7 +2004,7 @@ fn with_no_udp_an_unsupervised_bind_failure_exits_at_once_with_advice() -> anyho
 /// The time of the first log line containing `marker`, from its leading
 /// `YYYY-MM-DDTHH:MM:SS.ffffffZ` timestamp, as a full date and time so a span
 /// across UTC midnight still compares and subtracts correctly.
-#[cfg(feature = "testing")]
+#[cfg(all(feature = "testing", feature = "quic-panic-injection"))]
 fn log_time(logs: &str, marker: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let line = logs.lines().find(|line| line.contains(marker))?;
     let stamp = line.split_whitespace().next()?;
