@@ -1261,6 +1261,17 @@ impl std::ops::Deref for DelegateEnvSlot {
     }
 }
 
+/// The delegate key of the call running as `instance`, for timeout diagnostics
+/// only (river#1017). `None` if the call's env is not registered. Takes a
+/// shared `DELEGATE_ENV` reference for the duration of one `to_string`. Call it
+/// on the calling thread BEFORE the guest starts, never from a host function or
+/// after a timeout, where it could queue behind a stuck host call's `Ref`.
+pub(super) fn delegate_key_for_log(instance: InstanceId) -> Option<String> {
+    DELEGATE_ENV
+        .get(&instance)
+        .map(|env| env.delegate_key.to_string())
+}
+
 /// Typed errors from `DelegateCallEnv` contract operations.
 ///
 /// Replaces string-based error matching so `_impl` host functions can map

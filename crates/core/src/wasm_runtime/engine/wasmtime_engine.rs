@@ -156,8 +156,8 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use wasmtime::{
-    Cache, CacheConfig, Caller, Config, Engine, EngineWeak, Error as WasmtimeError, Instance,
-    Linker, Module, OptLevel, ResourceLimiter, Store,
+    AsContextMut, Cache, CacheConfig, Caller, Config, Engine, EngineWeak, Error as WasmtimeError,
+    Instance, Linker, Module, OptLevel, ResourceLimiter, Store,
 };
 
 use super::{InstanceHandle, WasmEngine, WasmError};
@@ -742,8 +742,16 @@ fn arm_epoch_deadline(
     calling_instance: Option<native_api::InstanceId>,
 ) {
     store.data_mut().calling_instance = calling_instance;
+    let meter = Arc::clone(&store.data().meter);
+    // `ticks` is `ceil(budget / tick) + 1`; the guest budget is the part
+    // before the phase-safety `+ 1`.
+    meter.arm(
+        EPOCH_TICK_PERIOD.saturating_mul(ticks.saturating_sub(1).try_into().unwrap_or(u32::MAX)),
+    );
     store.set_epoch_deadline(ticks);
-    store.epoch_deadline_trap();
+    // At the deadline, trap only if the guest has used its budget EXCLUDING
+    // time spent in host functions; otherwise extend (river#1017).
+    store.epoch_deadline_callback(move |_| Ok(meter.on_deadline()));
     // Piggyback a cheap dead-ticker health check on this already-per-call site.
     detect_stale_epoch_ticker();
 }
@@ -832,14 +840,295 @@ pub(crate) struct HostState {
     /// abandoned thread keeps its own store, so its value stays its own.
     /// `None` until the first entry.
     calling_instance: Option<native_api::InstanceId>,
+    /// Time this store's guest spends inside host functions, kept out of its
+    /// guest budget and bounded by its own cap. See [`HostCallMeter`].
+    meter: Arc<HostCallMeter>,
 }
 
 impl HostState {
+    /// A state with the default 5 s budget's host-call cap (tests that build
+    /// a store directly; the engine uses [`Self::with_meter`]).
+    #[cfg(test)]
     fn new(memory_limit_pages: u32) -> Self {
+        Self::with_meter(
+            memory_limit_pages,
+            HostCallMeter::new(host_call_cap_for(5.0)),
+        )
+    }
+
+    fn with_meter(memory_limit_pages: u32, meter: Arc<HostCallMeter>) -> Self {
         Self {
             memory_limit_bytes: memory_limit_pages as usize * WASM_PAGE_SIZE,
             calling_instance: None,
+            meter,
         }
+    }
+}
+
+/// Host-call cap, as a multiple of the guest budget (`max_execution_seconds`).
+///
+/// The guest budget measures guest time only: wall time the guest spends INSIDE
+/// a blocking host function (a secret read, a contract-state read) is not
+/// charged to it (river#1017). So that a delegate cannot stall forever inside
+/// host calls, the time it spends in them is capped SEPARATELY, at this
+/// multiple of the budget (7.5 s for the default 5 s budget). Total wall time
+/// for one execution is therefore bounded by `budget + cap` plus trap/backstop
+/// slack, about 12.7 s at the default (about 5.15 s before river#1017).
+///
+/// RESIDUAL, stated honestly: the discount is of WALL time, and a "blocking"
+/// host function also does CPU with no I/O (`get_contract_state` copies the
+/// state, `get_secret` on a memo hit is a memcpy, `set_secret` encrypts). A
+/// guest that loops on those can spend up to the cap in node CPU without
+/// timing out, so the worst case is `budget + cap` of CPU per execution, not
+/// `budget`. Discounting only off-CPU time needs a per-thread CPU clock on
+/// Linux, macOS and Windows, which this crate does not have; the factor is
+/// kept small instead, so the exposure is 1.5x the budget in extra CPU.
+const HOST_CALL_CAP_FACTOR: f64 = 1.5;
+
+/// The host-call cap for a guest budget of `max_execution_seconds`.
+fn host_call_cap_for(max_execution_seconds: f64) -> Duration {
+    Duration::from_secs_f64(max_execution_seconds.max(0.0) * HOST_CALL_CAP_FACTOR)
+}
+
+/// Which of the two separate limits ended a guest execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutCause {
+    /// The guest ran past its CPU budget (wall time minus host-call time).
+    GuestBudget,
+    /// The guest spent more than the host-call cap inside host functions.
+    HostCallCap,
+}
+
+impl TimeoutCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            TimeoutCause::GuestBudget => "guest_budget",
+            TimeoutCause::HostCallCap => "host_call_cap",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MeterInner {
+    /// Cap on host-call time per guest entry; set per job by
+    /// [`HostCallMeter::reset`] from the engine's current budget.
+    cap: Duration,
+    /// Host-call time since [`HostCallMeter::reset`], completed calls only.
+    host_total: Duration,
+    host_calls: u64,
+    /// Start of the host call in flight, if any.
+    in_flight: Option<Instant>,
+    /// Wall time, host-call time and guest budget at the most recent
+    /// [`arm_epoch_deadline`].
+    armed_at: Instant,
+    armed_host: Duration,
+    armed_budget: Duration,
+    /// Set by whichever mechanism ended the execution.
+    fired: Option<TimeoutCause>,
+}
+
+impl MeterInner {
+    /// Host-call time so far, including a call still in flight.
+    fn host_time(&self, now: Instant) -> Duration {
+        self.host_total
+            + self
+                .in_flight
+                .map_or(Duration::ZERO, |t| now.saturating_duration_since(t))
+    }
+}
+
+/// Measures the wall time one store's guest spends inside host functions.
+///
+/// Shared (`Arc`) between the store's [`HostState`] (host functions and the
+/// epoch-deadline callback write it) and the wall-clock waiter (reads it), so
+/// the waiter can discount a host call still in flight. One meter per `Store`:
+/// a guest abandoned by the backstop keeps its own store, and its own meter,
+/// so it cannot disturb the replacement store's accounting.
+#[derive(Debug)]
+pub(crate) struct HostCallMeter {
+    inner: Mutex<MeterInner>,
+}
+
+/// Snapshot of a [`HostCallMeter`] for timeout diagnostics.
+#[derive(Debug, Clone, Copy)]
+struct MeterSnapshot {
+    host_time: Duration,
+    host_calls: u64,
+    cap: Duration,
+    fired: Option<TimeoutCause>,
+}
+
+impl HostCallMeter {
+    fn new(cap: Duration) -> Arc<Self> {
+        let now = Instant::now();
+        Arc::new(Self {
+            inner: Mutex::new(MeterInner {
+                cap,
+                host_total: Duration::ZERO,
+                host_calls: 0,
+                in_flight: None,
+                armed_at: now,
+                armed_host: Duration::ZERO,
+                armed_budget: Duration::ZERO,
+                fired: None,
+            }),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, MeterInner> {
+        // Plain counters: a panic while holding the lock cannot leave them
+        // inconsistent, and a guest must not be able to wedge the meter.
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Start accounting a new job (one `execute_wasm_blocking`) under `cap`.
+    fn reset(&self, cap: Duration) {
+        let mut g = self.lock();
+        g.cap = cap;
+        g.host_total = Duration::ZERO;
+        g.host_calls = 0;
+        g.in_flight = None;
+        g.fired = None;
+    }
+
+    /// Record the start of one guest entry with `budget` of guest time.
+    fn arm(&self, budget: Duration) {
+        self.arm_at(Instant::now(), budget);
+    }
+
+    fn arm_at(&self, now: Instant, budget: Duration) {
+        let mut g = self.lock();
+        g.armed_at = now;
+        g.armed_host = g.host_time(now);
+        g.armed_budget = budget;
+    }
+
+    /// Host-call time so far in this job, including a call in flight.
+    fn host_time(&self) -> Duration {
+        self.lock().host_time(Instant::now())
+    }
+
+    /// Whether the current guest entry has spent its host-call cap.
+    fn over_cap(&self) -> bool {
+        let g = self.lock();
+        g.host_time(Instant::now()).saturating_sub(g.armed_host) >= g.cap
+    }
+
+    fn snapshot(&self) -> MeterSnapshot {
+        let g = self.lock();
+        MeterSnapshot {
+            host_time: g.host_time(Instant::now()),
+            host_calls: g.host_calls,
+            cap: g.cap,
+            fired: g.fired,
+        }
+    }
+
+    fn record_fired(&self, cause: TimeoutCause) {
+        let mut g = self.lock();
+        g.fired.get_or_insert(cause);
+    }
+
+    /// The epoch deadline was reached. Decide between trapping and giving the
+    /// guest the budget it has not yet used: the deadline is wall-clock, but
+    /// the budget is guest time, so time spent in host functions extends it.
+    fn on_deadline(&self) -> wasmtime::UpdateDeadline {
+        self.on_deadline_at(Instant::now())
+    }
+
+    fn on_deadline_at(&self, now: Instant) -> wasmtime::UpdateDeadline {
+        let mut g = self.lock();
+        let host_since_arm = g.host_time(now).saturating_sub(g.armed_host);
+        if host_since_arm >= g.cap {
+            g.fired.get_or_insert(TimeoutCause::HostCallCap);
+            return wasmtime::UpdateDeadline::Interrupt;
+        }
+        let guest_used = now
+            .saturating_duration_since(g.armed_at)
+            .saturating_sub(host_since_arm);
+        if guest_used >= g.armed_budget {
+            g.fired.get_or_insert(TimeoutCause::GuestBudget);
+            return wasmtime::UpdateDeadline::Interrupt;
+        }
+        // No `+ 1` phase margin here, unlike `epoch_deadline_ticks`: this check
+        // is exact, so a deadline that lands early only comes back here and is
+        // extended again. Without the margin the trap lands at most one tick
+        // past the remaining budget, which `WallBounds::guest` (one tick plus
+        // the backstop margin past the budget) covers; with it, it could land
+        // two ticks past and the backstop would win the race and discard the
+        // store.
+        let remaining = g.armed_budget - guest_used;
+        let ticks = (remaining.as_secs_f64() / EPOCH_TICK_PERIOD.as_secs_f64()).ceil() as u64;
+        wasmtime::UpdateDeadline::Continue(ticks.max(1))
+    }
+}
+
+/// The guest has spent its host-call cap; see [`HostCallGuard::enter`].
+struct HostCapSpent;
+
+/// Evaluates to a [`HostCallGuard`], or returns `$refused` from the host
+/// function when the guest has spent its host-call cap.
+macro_rules! metered {
+    ($caller:expr, $refused:expr) => {
+        match HostCallGuard::enter($caller) {
+            Ok(guard) => guard,
+            Err(HostCapSpent) => return $refused,
+        }
+    };
+}
+
+/// Held for the duration of one host function that can BLOCK on I/O or a lock
+/// (secret store, contract-state reads, delegate creation). Its time is not
+/// charged to the guest budget (river#1017) and is capped separately. These
+/// functions also do some CPU work, which is discounted with it; see the
+/// residual described at [`HOST_CALL_CAP_FACTOR`].
+///
+/// Host functions that only compute (log, rand, time, context copies,
+/// `fill_buffer`) must NOT take one: they can run for a long time at the
+/// guest's request (`rand_bytes` over the whole memory), so their time stays
+/// charged to the guest budget. Pinned by
+/// `host_function_metering_matches_its_class`.
+struct HostCallGuard {
+    meter: Arc<HostCallMeter>,
+    started: Instant,
+}
+
+impl HostCallGuard {
+    /// Begin a metered host call. If this entry has already spent its
+    /// host-call cap, also expire the epoch deadline, so the guest traps at its
+    /// next epoch check (see [`HostCallMeter::on_deadline`]) instead of
+    /// running on until the original deadline.
+    ///
+    /// REFUSES (`Err`) in that case: the host function must return an error
+    /// code WITHOUT running its side effect, since the guest is already over
+    /// its limit and is about to be trapped. The trap lands at the next wasm
+    /// function entry (wasmtime reloads a moved deadline there, not at a loop
+    /// back-edge inside the same frame); a guest that stays in one frame is
+    /// still ended by the epoch tick or, at the latest, by its guest budget,
+    /// so refused calls cannot extend a guest past `budget + cap`.
+    fn enter(caller: &mut Caller<'_, HostState>) -> Result<Self, HostCapSpent> {
+        let meter = Arc::clone(&caller.data().meter);
+        if meter.over_cap() {
+            meter.record_fired(TimeoutCause::HostCallCap);
+            caller.as_context_mut().set_epoch_deadline(0);
+            return Err(HostCapSpent);
+        }
+        Ok(Self::begin(meter))
+    }
+
+    fn begin(meter: Arc<HostCallMeter>) -> Self {
+        let started = Instant::now();
+        meter.lock().in_flight = Some(started);
+        Self { meter, started }
+    }
+}
+
+impl Drop for HostCallGuard {
+    fn drop(&mut self) {
+        let mut g = self.meter.lock();
+        g.host_total += self.started.elapsed();
+        g.host_calls += 1;
+        g.in_flight = None;
     }
 }
 
@@ -905,7 +1194,13 @@ impl WasmEngine for WasmtimeEngine {
 
         // Create the store with HostState
         let epoch_deadline_ticks = epoch_deadline_ticks(config.max_execution_seconds);
-        let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        let mut store = Store::new(
+            &engine,
+            HostState::with_meter(
+                DEFAULT_MAX_MEMORY_PAGES,
+                HostCallMeter::new(host_call_cap_for(config.max_execution_seconds)),
+            ),
+        );
         store.limiter(|state| state); // Enable ResourceLimiter
         if enabled_metering {
             store.set_fuel(max_fuel).map_err(|e| anyhow::anyhow!(e))?;
@@ -1028,6 +1323,8 @@ impl WasmEngine for WasmtimeEngine {
             .ok_or_else(|| WasmError::Other(anyhow::anyhow!("engine store not available")))?;
         let linker = Arc::clone(&self.linker);
         let module = module.clone();
+        let meter = Arc::clone(&store.data().meter);
+        meter.reset(host_call_cap_for(self.max_execution_seconds));
 
         // A module's start function and `__frnt_set_id` are guest code, so they
         // run off the calling thread under the wall-clock backstop, with a
@@ -1049,6 +1346,7 @@ impl WasmEngine for WasmtimeEngine {
             },
             WallBounds::for_entries(self.max_execution_seconds, INSTANCE_SETUP_GUEST_ENTRIES),
             self.max_execution_seconds,
+            Some(meter),
         );
         let outcome = match result {
             BlockingResult::Ok(Ok(instance), store) => {
@@ -1425,6 +1723,17 @@ impl WasmtimeEngine {
         // and the closure runs after this call has already returned.
         let live_guest = delegate_instance.map(LiveGuestRegistration::register);
 
+        // Captured HERE, on the calling thread before the guest runs, and never
+        // looked up again: the timeout path must not touch `DELEGATE_ENV`, where
+        // a stuck host call's shard `Ref` can have a writer queued behind it.
+        let delegate_label = delegate_instance.and_then(native_api::delegate_key_for_log);
+
+        // This job's host-call accounting starts from zero. The meter belongs to
+        // the store, so it is the one the guest's host functions write.
+        let meter = Arc::clone(&store.data().meter);
+        meter.reset(host_call_cap_for(self.max_execution_seconds));
+        let meter_for_wait = Arc::clone(&meter);
+
         let result = execute_wasm_blocking(
             move || {
                 // MOVED into the closure so it drops when the guest finishes,
@@ -1443,19 +1752,54 @@ impl WasmtimeEngine {
                 (r, store)
             },
             self.max_execution_seconds,
+            Some(meter_for_wait),
         );
 
+        let identity = |entry: &str| {
+            log_guest_timeout_identity(
+                handle.id,
+                delegate_label.as_deref(),
+                &meter,
+                self.max_execution_seconds,
+                entry,
+            );
+        };
         match result {
+            // A refused host call (host-call cap spent) returns an error code that
+            // the stdlib reads as "absent" or "not found", and the guest may
+            // return normally before it is trapped. Anything it computed after
+            // that is built on false answers, so the whole execution is a
+            // timeout, not a result (`HostCallGuard::enter`).
+            //
+            // Only here, for guest entries made through `call_typed_blocking`.
+            // `create_instance` (module start function, `__frnt_set_id`) does
+            // not convert: a start function that returns normally after a
+            // refused host call is accepted. It runs before any message is
+            // processed, so nothing it returns is delivered, and the cap still
+            // ends a start function that keeps calling by trap or backstop.
+            BlockingResult::Ok(_, store) if cap_was_spent(&meter) => {
+                identity(name);
+                self.store = Some(store);
+                Err(WasmError::Timeout)
+            }
             BlockingResult::Ok(value, store) => {
                 self.store = Some(store);
                 Ok(value)
             }
             BlockingResult::WasmError(err, mut store) => {
-                let wasm_err = classify(enabled_metering, &mut store, err);
+                let wasm_err = if cap_was_spent(&meter) {
+                    WasmError::Timeout
+                } else {
+                    classify(enabled_metering, &mut store, err)
+                };
+                if matches!(wasm_err, WasmError::Timeout) {
+                    identity(name);
+                }
                 self.store = Some(store);
                 Err(wasm_err)
             }
             BlockingResult::Timeout => {
+                identity(name);
                 self.recover_store();
                 Err(WasmError::Timeout)
             }
@@ -1543,7 +1887,13 @@ impl WasmtimeEngine {
         Self::register_host_functions(&mut linker)?;
 
         let epoch_deadline_ticks = epoch_deadline_ticks(config.max_execution_seconds);
-        let mut store = Store::new(&backend, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        let mut store = Store::new(
+            &backend,
+            HostState::with_meter(
+                DEFAULT_MAX_MEMORY_PAGES,
+                HostCallMeter::new(host_call_cap_for(config.max_execution_seconds)),
+            ),
+        );
         store.limiter(|state| state);
         if enabled_metering {
             store.set_fuel(max_fuel).map_err(|e| anyhow::anyhow!(e))?;
@@ -1804,7 +2154,15 @@ impl WasmtimeEngine {
     /// `lifetime_instances >= STORE_REFRESH_THRESHOLD` and no instances are live,
     /// and by `recover_store` after a timeout/panic.
     fn replace_store(&mut self) {
-        let mut store = Store::new(&self.engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
+        // A fresh meter too: a guest abandoned by the backstop keeps writing to
+        // the OLD store's meter, which must not leak into this store's accounting.
+        let mut store = Store::new(
+            &self.engine,
+            HostState::with_meter(
+                DEFAULT_MAX_MEMORY_PAGES,
+                HostCallMeter::new(host_call_cap_for(self.max_execution_seconds)),
+            ),
+        );
         store.limiter(|state| state);
         if self.enabled_metering {
             if let Err(e) = store.set_fuel(self.max_fuel) {
@@ -2070,6 +2428,8 @@ impl WasmtimeEngine {
                  key_len: i32,
                  out_ptr: i64,
                  out_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2083,6 +2443,8 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__get_secret_len",
                 |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2100,6 +2462,8 @@ impl WasmtimeEngine {
                  key_len: i32,
                  val_ptr: i64,
                  val_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2113,6 +2477,8 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__has_secret",
                 |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2126,6 +2492,8 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__remove_secret",
                 |mut caller: Caller<'_, HostState>, key_ptr: i64, key_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2139,6 +2507,8 @@ impl WasmtimeEngine {
                 "freenet_delegate_secrets",
                 "__frnt__delegate__list_secrets_len",
                 |mut caller: Caller<'_, HostState>, prefix_ptr: i64, prefix_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2156,6 +2526,8 @@ impl WasmtimeEngine {
                  prefix_len: i32,
                  out_ptr: i64,
                  out_len: i32| {
+                    let _host_call =
+                        metered!(&mut caller, native_api::error_codes::ERR_STORAGE_FAILED);
                     if let Err(code) = delegate_caller(&mut caller) {
                         return code;
                     }
@@ -2190,6 +2562,10 @@ impl WasmtimeEngine {
                  out_ptr: i64,
                  out_len: i64|
                  -> i64 {
+                    let _host_call = metered!(
+                        &mut caller,
+                        i64::from(crate::wasm_runtime::delegate_api::contract_error_codes::ERR_STORE_ERROR)
+                    );
                     if let Err(code) = delegate_caller(&mut caller) {
                         return i64::from(code);
                     }
@@ -2205,6 +2581,10 @@ impl WasmtimeEngine {
                 "freenet_delegate_contracts",
                 "__frnt__delegate__get_contract_state_len",
                 |mut caller: Caller<'_, HostState>, id_ptr: i64, id_len: i32| -> i64 {
+                    let _host_call = metered!(
+                        &mut caller,
+                        i64::from(crate::wasm_runtime::delegate_api::contract_error_codes::ERR_STORE_ERROR)
+                    );
                     if let Err(code) = delegate_caller(&mut caller) {
                         return i64::from(code);
                     }
@@ -2242,8 +2622,16 @@ impl WasmtimeEngine {
                     out_key_ptr,
                     out_hash_ptr,
                 ): (i64, i64, i64, i64, i64, i64, i64, i64)| {
+                    // Metered (it hashes and stores a module, which is I/O); moved into the
+                    // future so it is held for the whole of the creation. `None`
+                    // means the host-call cap is spent: refuse, run nothing.
+                    let host_call = HostCallGuard::enter(&mut caller).ok();
                     let refused = delegate_caller(&mut caller).err();
                     Box::new(async move {
+                        if host_call.is_none() {
+                            return crate::wasm_runtime::delegate_api::delegate_mgmt_error_codes::ERR_STORE_FAILED;
+                        }
+                        let _host_call = host_call;
                         if let Some(code) = refused {
                             return code;
                         }
@@ -2359,7 +2747,14 @@ fn classify_runtime_error(
     // `BlockingResult::Timeout` path. Checked first because it is a timeout
     // regardless of whether metering is on.
     if is_epoch_interrupt(&error) {
-        tracing::warn!("WASM execution timed out (epoch deadline exceeded)");
+        let snap = store.data().meter.snapshot();
+        tracing::warn!(
+            cause = snap.fired.map_or("epoch", TimeoutCause::as_str),
+            host_call_ms = snap.host_time.as_millis(),
+            host_calls = snap.host_calls,
+            host_cap_ms = snap.cap.as_millis(),
+            "WASM execution timed out (epoch deadline exceeded)"
+        );
         return WasmError::Timeout;
     }
     if enabled_metering {
@@ -2474,6 +2869,11 @@ enum WallVerdict {
     /// — transient scheduler overload the guest never entered. NOT a contract
     /// fault; must not be charged to the contract.
     QueuedTooLong,
+    /// The guest spent its whole host-call cap inside host functions
+    /// (river#1017: host-call time is NOT charged to the guest budget, so it is
+    /// bounded separately). Raised by the waiter for a host call that cannot be
+    /// interrupted, where the epoch callback cannot run.
+    HostCapOverran,
 }
 
 /// Guest entries `instantiate_and_init` makes, each with its own freshly armed
@@ -2507,6 +2907,10 @@ struct WallBounds {
     /// How long a STARTED guest may run, measured from its own start, before
     /// the backstop abandons it.
     guest: Duration,
+    /// How long the guest may spend INSIDE host functions, in total, across the
+    /// job's guest entries. Host-call time is excluded from `guest`, so this is
+    /// what keeps total wall time bounded: `guest + host_cap` plus slack.
+    host_cap: Duration,
 }
 
 impl WallBounds {
@@ -2541,6 +2945,18 @@ impl WallBounds {
             queue,
             guest: queue
                 .max(epoch_window)
+                .saturating_mul(entries.max(1))
+                .saturating_add(WALL_BACKSTOP_MARGIN),
+            // The margin lets the in-guest check (see `HostCallGuard::enter`) end
+            // a guest that makes many short host calls cleanly, with its store
+            // kept. The backstop only decides WHEN the call is reported as a
+            // timeout. It does not stop a host call that never returns: a
+            // delegate host function holds a `DELEGATE_ENV` shard `Ref` for its
+            // whole body, and `DelegateEnvGuard::drop` waits on that shard for
+            // writing, so a stuck delegate host call still blocks the executor
+            // thread (see `native_api::LIVE_DELEGATE_GUESTS`). Do not read this
+            // cap as a bound on such a call.
+            host_cap: host_call_cap_for(max_execution_seconds)
                 .saturating_mul(entries.max(1))
                 .saturating_add(WALL_BACKSTOP_MARGIN),
         }
@@ -2624,6 +3040,8 @@ enum GuestWait<T = i64> {
     Ended,
     /// The guest ran past its budget: [`WallVerdict::GuestOverran`].
     GuestOverran,
+    /// The guest spent its host-call cap: [`WallVerdict::HostCapOverran`].
+    HostCapOverran,
     /// The job never left the queue: [`WallVerdict::QueuedTooLong`].
     QueuedTooLong,
 }
@@ -2646,25 +3064,45 @@ fn wait_for_guest<T>(
     start: std::time::Instant,
     bounds: WallBounds,
     read_started_at: &dyn Fn() -> Option<Duration>,
+    read_host_time: &dyn Fn() -> Duration,
 ) -> GuestWait<T> {
     use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     loop {
         let started_at = read_started_at();
+        // Time inside host functions (a call still in flight included) is not
+        // charged to the guest budget (river#1017), so classify on the elapsed
+        // time net of it. It has its own cap.
+        let host_time = read_host_time();
         let elapsed = start.elapsed();
-        match classify_wall_timeout(started_at, elapsed, bounds) {
+        let net_elapsed = elapsed.saturating_sub(host_time);
+        let verdict = if host_time >= bounds.host_cap {
+            WallVerdict::HostCapOverran
+        } else {
+            classify_wall_timeout(started_at, net_elapsed, bounds)
+        };
+        match verdict {
             WallVerdict::KeepWaiting => {}
-            verdict @ (WallVerdict::GuestOverran | WallVerdict::QueuedTooLong) => {
+            verdict @ (WallVerdict::GuestOverran
+            | WallVerdict::QueuedTooLong
+            | WallVerdict::HostCapOverran) => {
                 return match rx.try_recv() {
                     Ok(result) => GuestWait::Done(result),
                     Err(TryRecvError::Disconnected) => GuestWait::Ended,
-                    Err(TryRecvError::Empty) if verdict == WallVerdict::GuestOverran => {
-                        GuestWait::GuestOverran
-                    }
-                    Err(TryRecvError::Empty) => GuestWait::QueuedTooLong,
+                    Err(TryRecvError::Empty) => match verdict {
+                        WallVerdict::HostCapOverran => GuestWait::HostCapOverran,
+                        WallVerdict::GuestOverran => GuestWait::GuestOverran,
+                        WallVerdict::QueuedTooLong => GuestWait::QueuedTooLong,
+                        WallVerdict::KeepWaiting => unreachable!("handled by the arm above"),
+                    },
                 };
             }
         }
-        match rx.recv_timeout(time_to_next_wall_bound(started_at, elapsed, bounds)) {
+        // While a host call is in flight the guest bound stands still (host
+        // time grows as fast as the clock), so the host cap is the nearer one;
+        // otherwise the guest bound is. Waking early only re-evaluates.
+        let wait = time_to_next_wall_bound(started_at, net_elapsed, bounds)
+            .min(bounds.host_cap.saturating_sub(host_time));
+        match rx.recv_timeout(wait) {
             Ok(result) => return GuestWait::Done(result),
             Err(RecvTimeoutError::Disconnected) => return GuestWait::Ended,
             Err(RecvTimeoutError::Timeout) => {}
@@ -2672,9 +3110,70 @@ fn wait_for_guest<T>(
     }
 }
 
+/// Whether the guest spent its host-call cap, so some of its host calls may
+/// have been refused. See [`HostCallGuard::enter`].
+fn cap_was_spent(meter: &HostCallMeter) -> bool {
+    meter.snapshot().fired == Some(TimeoutCause::HostCallCap)
+}
+
+/// Log a wall-clock backstop timeout with the numbers needed to tell a runaway
+/// guest from a slow host (river#1017): the budget, the host-call time and the
+/// cap. Fields are milliseconds. `cause` is which limit the backstop applied.
+fn log_backstop_timeout(
+    cause: TimeoutCause,
+    budget_secs: f64,
+    wall: Duration,
+    meter: Option<&HostCallMeter>,
+    message: &str,
+) {
+    if let Some(m) = meter {
+        m.record_fired(cause);
+    }
+    let snap = meter.map(HostCallMeter::snapshot);
+    let host = snap.map_or(Duration::ZERO, |s| s.host_time);
+    tracing::warn!(
+        cause = cause.as_str(),
+        timeout_secs = budget_secs,
+        elapsed_ms = wall.as_millis(),
+        host_call_ms = host.as_millis(),
+        guest_ms = wall.saturating_sub(host).as_millis(),
+        host_calls = snap.map_or(0, |s| s.host_calls),
+        host_cap_ms = snap.map_or(0, |s| s.cap.as_millis()),
+        "{message}"
+    );
+}
+
+/// Log, once per timed-out guest entry that has an identity, WHO timed out and
+/// which limit fired (river#1017). Complements the anonymous warnings from the
+/// epoch callback and the backstop, which do not know the delegate key.
+fn log_guest_timeout_identity(
+    instance_id: i64,
+    delegate: Option<&str>,
+    meter: &HostCallMeter,
+    budget_secs: f64,
+    entry: &str,
+) {
+    let snap = meter.snapshot();
+    tracing::warn!(
+        instance_id,
+        delegate_key = delegate.unwrap_or("<contract or allocator>"),
+        entry,
+        budget_secs,
+        host_call_ms = snap.host_time.as_millis(),
+        host_calls = snap.host_calls,
+        host_cap_ms = snap.cap.as_millis(),
+        cause = snap.fired.map_or("backstop", TimeoutCause::as_str),
+        "WASM guest timed out"
+    );
+}
+
 /// Run a job that makes ONE guest entry under the wall-clock backstop for
 /// `max_execution_seconds` of budget. See [`execute_wasm_blocking_within`].
-fn execute_wasm_blocking<T, F>(f: F, max_execution_seconds: f64) -> BlockingResult<T>
+fn execute_wasm_blocking<T, F>(
+    f: F,
+    max_execution_seconds: f64,
+    meter: Option<Arc<HostCallMeter>>,
+) -> BlockingResult<T>
 where
     T: Send + 'static,
     F: FnOnce() -> WasmResult<T> + Send + 'static,
@@ -2683,6 +3182,7 @@ where
         f,
         WallBounds::for_budget(max_execution_seconds),
         max_execution_seconds,
+        meter,
     )
 }
 
@@ -2691,10 +3191,16 @@ where
 /// SEPARATELY — see `WallBounds` and `classify_wall_timeout`. A panic in `f`
 /// is returned as [`BlockingResult::Panic`]. `max_execution_seconds` is only
 /// reported in the timeout logs.
+///
+/// `meter` is the store's [`HostCallMeter`]: host-call time it reports is not
+/// charged to the guest's bound, and is bounded by `bounds.host_cap` instead.
+/// `None` (stub jobs in tests) means no host calls. The caller must have
+/// `reset` it before this call.
 fn execute_wasm_blocking_within<T, F>(
     f: F,
     bounds: WallBounds,
     max_execution_seconds: f64,
+    meter: Option<Arc<HostCallMeter>>,
 ) -> BlockingResult<T>
 where
     T: Send + 'static,
@@ -2759,6 +3265,8 @@ where
             .load(Ordering::SeqCst)
             .then(|| Duration::from_nanos(started_at_ns.load(Ordering::SeqCst)))
     };
+    // Host-call time so far, including a call still in flight (river#1017).
+    let read_host_time = || meter.as_ref().map_or(Duration::ZERO, |m| m.host_time());
 
     // `block_in_place` (in the multi-thread arm below) is only legal on a
     // multi-threaded runtime; it PANICS on a current_thread runtime. Route a
@@ -2774,7 +3282,7 @@ where
             // poll slept on the worker itself, outside `block_in_place`, and so
             // took the core out of service without telling the runtime.
             tokio::task::block_in_place(|| {
-                match wait_for_guest(&result_rx, start, bounds, &read_started_at) {
+                match wait_for_guest(&result_rx, start, bounds, &read_started_at, &read_host_time) {
                     GuestWait::Done((Ok(value), store)) => BlockingResult::Ok(value, store),
                     GuestWait::Done((Err(err), store)) => BlockingResult::WasmError(err, store),
                     // The task is finishing or finished; join it for the cause.
@@ -2800,10 +3308,23 @@ where
                     },
                     GuestWait::GuestOverran => {
                         task_handle.abort();
-                        tracing::warn!(
-                            timeout_secs = max_execution_seconds,
-                            elapsed_ms = start.elapsed().as_millis(),
-                            "WASM execution timed out (guest running past its budget; epoch backstop)"
+                        log_backstop_timeout(
+                            TimeoutCause::GuestBudget,
+                            max_execution_seconds,
+                            start.elapsed(),
+                            meter.as_deref(),
+                            "WASM execution timed out (guest running past its budget; epoch backstop)",
+                        );
+                        BlockingResult::Timeout
+                    }
+                    GuestWait::HostCapOverran => {
+                        task_handle.abort();
+                        log_backstop_timeout(
+                            TimeoutCause::HostCallCap,
+                            max_execution_seconds,
+                            start.elapsed(),
+                            meter.as_deref(),
+                            "WASM execution timed out (guest spent its host-call cap inside host functions; backstop)",
                         );
                         BlockingResult::Timeout
                     }
@@ -2828,7 +3349,7 @@ where
             // Same wait and the same started-flag classification as the
             // multi-thread arm. On a deadline the detached thread is left to
             // finish and drop the store on its own (as before).
-            match wait_for_guest(&result_rx, start, bounds, &read_started_at) {
+            match wait_for_guest(&result_rx, start, bounds, &read_started_at, &read_host_time) {
                 GuestWait::Done((Ok(value), store)) => {
                     let _join = thread_handle.join();
                     BlockingResult::Ok(value, store)
@@ -2847,10 +3368,22 @@ where
                     )),
                 },
                 GuestWait::GuestOverran => {
-                    tracing::warn!(
-                        timeout_secs = max_execution_seconds,
-                        elapsed_ms = start.elapsed().as_millis(),
-                        "WASM execution timed out (guest running past its budget; epoch backstop, no tokio runtime)"
+                    log_backstop_timeout(
+                        TimeoutCause::GuestBudget,
+                        max_execution_seconds,
+                        start.elapsed(),
+                        meter.as_deref(),
+                        "WASM execution timed out (guest running past its budget; epoch backstop, no tokio runtime)",
+                    );
+                    BlockingResult::Timeout
+                }
+                GuestWait::HostCapOverran => {
+                    log_backstop_timeout(
+                        TimeoutCause::HostCallCap,
+                        max_execution_seconds,
+                        start.elapsed(),
+                        meter.as_deref(),
+                        "WASM execution timed out (guest spent its host-call cap inside host functions; backstop, no tokio runtime)",
                     );
                     BlockingResult::Timeout
                 }
@@ -3240,7 +3773,18 @@ mod tests {
         fn boom(_: Caller<'_, HostState>) {
             panic!("deliberate host-function panic (allocator / instance-setup test)");
         }
+        // A METERED host function, as every real one is: sleeps `ms`.
+        // Refuses, like the real blocking host functions, once the cap is spent.
+        fn nap_ms(mut caller: Caller<'_, HostState>, ms: i32) {
+            let Ok(_host_call) = HostCallGuard::enter(&mut caller) else {
+                return;
+            };
+            std::thread::sleep(Duration::from_millis(ms as u64))
+        }
         let mut linker: Linker<HostState> = Linker::new(engine);
+        linker
+            .func_wrap("freenet_test", "nap_ms", nap_ms)
+            .expect("registering nap_ms must succeed");
         linker
             .func_wrap("freenet_test", "nap", nap)
             .expect("registering nap must succeed");
@@ -4047,6 +4591,7 @@ mod tests {
         let budget = WallBounds {
             queue: Duration::from_millis(100),
             guest: Duration::from_millis(100),
+            host_cap: Duration::from_secs(60),
         };
 
         // Not started, under the queue bound → keep waiting.
@@ -4136,6 +4681,7 @@ mod tests {
         let bounds = WallBounds {
             queue: ms(100),
             guest: ms(170),
+            host_cap: Duration::from_secs(60),
         };
         let starts = [
             None,
@@ -4196,7 +4742,7 @@ mod tests {
         for started in [None, Some(Duration::ZERO)] {
             let (tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
             tx.send((Ok(5), stub_store())).expect("receiver alive");
-            let outcome = wait_for_guest(&rx, long_ago, bounds, &|| started);
+            let outcome = wait_for_guest(&rx, long_ago, bounds, &|| started, &|| Duration::ZERO);
             assert!(
                 matches!(outcome, GuestWait::Done((Ok(5), _))),
                 "a waiting result must win the deadline (started {started:?})"
@@ -4206,11 +4752,13 @@ mod tests {
         // No result: the bound decides, by whether the guest started.
         let (_tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
         assert!(matches!(
-            wait_for_guest(&rx, long_ago, bounds, &|| None),
+            wait_for_guest(&rx, long_ago, bounds, &|| None, &|| Duration::ZERO),
             GuestWait::QueuedTooLong
         ));
         assert!(matches!(
-            wait_for_guest(&rx, long_ago, bounds, &|| Some(Duration::ZERO)),
+            wait_for_guest(&rx, long_ago, bounds, &|| Some(Duration::ZERO), &|| {
+                Duration::ZERO
+            }),
             GuestWait::GuestOverran
         ));
 
@@ -4218,9 +4766,447 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
         drop(tx);
         assert!(matches!(
-            wait_for_guest(&rx, long_ago, bounds, &|| None),
+            wait_for_guest(&rx, long_ago, bounds, &|| None, &|| Duration::ZERO),
             GuestWait::Ended
         ));
+    }
+
+    // -------------------------------------------------------------------------
+    // river#1017: host-call time is not guest time, and is capped separately.
+    // -------------------------------------------------------------------------
+
+    /// Allocator that makes `calls` blocking host calls of `ms` each, with a
+    /// short guest function call after each. The call is what gives an epoch
+    /// check that sees a deadline moved by a host function: wasmtime caches the
+    /// deadline in a register per wasm frame and reloads it at function entry,
+    /// not at a loop back-edge in the same frame. A real delegate calls
+    /// functions between host calls.
+    fn host_calls_wat(calls: u32, ms: u32) -> String {
+        format!(
+            r#"(module
+              (import "freenet_test" "nap_ms" (func $nap (param i32)))
+              (func $work (local $i i32)
+                (local.set $i (i32.const 20000))
+                (loop $spin
+                  (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+                  (br_if $spin (local.get $i))))
+              (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+                (local $n i32)
+                (loop $calls
+                  (call $nap (i32.const {ms}))
+                  (call $work)
+                  (local.set $n (i32.add (local.get $n) (i32.const 1)))
+                  (br_if $calls (i32.lt_u (local.get $n) (i32.const {calls}))))
+                (i64.const 7)))"#
+        )
+    }
+
+    /// Guest that never makes a host call and never returns.
+    const ALLOCATOR_PURE_SPIN_WAT: &str = r#"
+        (module
+          (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+            (loop (br 0))
+            (i64.const 0)))
+    "#;
+
+    /// Budget 1.0 s (cap 1.5 s). Two 600 ms BLOCKING host calls take 1.2 s of
+    /// wall time, past the budget but 300 ms inside the cap: this must SUCCEED.
+    /// Before river#1017 the epoch deadline was wall-clock and trapped the guest
+    /// at its first epoch check after the budget, however it had spent the time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_call_time_is_not_charged_to_the_guest_budget() {
+        let mut engine = engine_with_test_host(1.0, epoch_deadline_ticks(1.0));
+        const ID: i64 = i64::MAX - 54820;
+        insert_raw_instance(&mut engine, ID, &host_calls_wat(2, 600));
+
+        let start = std::time::Instant::now();
+        let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Ok(7)),
+            "1.2 s inside host calls must not exhaust a 1.0 s guest budget \
+             (cap 1.5 s); got {result:?} after {elapsed:?}"
+        );
+        assert!(elapsed >= Duration::from_millis(1200), "ran {elapsed:?}");
+        let snap = engine.store.as_ref().unwrap().data().meter.snapshot();
+        assert_eq!(snap.host_calls, 2);
+        assert!(snap.host_time >= Duration::from_millis(1200));
+    }
+
+    /// A guest that burns CPU with no host calls still times out at its budget,
+    /// by the epoch trap (the store survives), and the cause is the guest budget.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guest_cpu_loop_still_times_out_at_the_guest_budget() {
+        let mut engine = engine_with_test_host(0.3, epoch_deadline_ticks(0.3));
+        const ID: i64 = i64::MAX - 54821;
+        insert_raw_instance(&mut engine, ID, ALLOCATOR_PURE_SPIN_WAT);
+        let meter = Arc::clone(&engine.store.as_ref().unwrap().data().meter);
+
+        let start = std::time::Instant::now();
+        let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(WasmError::Timeout)),
+            "a CPU loop must time out, got {result:?}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        assert_eq!(meter.snapshot().fired, Some(TimeoutCause::GuestBudget));
+    }
+
+    /// Host time followed by a CPU loop: the guest keeps only the budget it has
+    /// not used, and is ended by the epoch TRAP (store and instance kept), not
+    /// by the backstop. The extension must land inside the backstop's window
+    /// (codex P2: `ceil(rem/T) + 1` could land two ticks past it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_call_then_cpu_loop_is_trapped_not_abandoned() {
+        const WAT: &str = r#"
+            (module
+              (import "freenet_test" "nap_ms" (func $nap (param i32)))
+              (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+                (call $nap (i32.const 200))
+                (loop (br 0))
+                (i64.const 0)))
+        "#;
+        let mut engine = engine_with_test_host(0.3, epoch_deadline_ticks(0.3));
+        const ID: i64 = i64::MAX - 54824;
+        insert_raw_instance(&mut engine, ID, WAT);
+        let meter = Arc::clone(&engine.store.as_ref().unwrap().data().meter);
+
+        let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+        assert!(matches!(result, Err(WasmError::Timeout)), "got {result:?}");
+        assert_eq!(meter.snapshot().fired, Some(TimeoutCause::GuestBudget));
+        assert!(
+            engine.instances.contains_key(&ID),
+            "the epoch trap must keep the store; the backstop would have \
+             replaced it and dropped the instance"
+        );
+    }
+
+    /// CPU-bound host functions (here the UNMETERED `nap`, standing in for
+    /// `rand_bytes` over a whole memory, context copies, ...) stay charged to the
+    /// guest budget: the guest cannot hide CPU inside them (review F1).
+    #[test]
+    fn cpu_bound_host_time_is_charged_to_the_guest_budget() {
+        run_abandoning_guest_test(|| {
+            let mut engine = engine_with_test_host(0.3, epoch_deadline_ticks(0.3));
+            const ID: i64 = i64::MAX - 54825;
+            insert_raw_instance(&mut engine, ID, ALLOCATOR_SLOW_HOST_CALLS_WAT);
+            let meter = Arc::clone(&engine.store.as_ref().unwrap().data().meter);
+
+            let start = std::time::Instant::now();
+            let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+            let elapsed = start.elapsed();
+            assert!(matches!(result, Err(WasmError::Timeout)), "got {result:?}");
+            assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+            let snap = meter.snapshot();
+            assert_eq!(snap.fired, Some(TimeoutCause::GuestBudget));
+            assert_eq!(snap.host_calls, 0, "an unmetered call must not be metered");
+        });
+    }
+
+    /// Host-call time past the cap times out, however the guest budget stands:
+    /// total wall time per execution stays bounded (budget + cap + slack). The
+    /// guest here spends almost none of its budget (cap 0.45 s, calls of 20 ms).
+    /// The cause is asserted, not which mechanism ended it: the deterministic
+    /// trap-path test is `host_call_over_the_cap_is_refused_and_trapped`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_call_time_over_the_cap_times_out() {
+        let mut engine = engine_with_test_host(0.3, epoch_deadline_ticks(0.3));
+        const ID: i64 = i64::MAX - 54822;
+        // 1000 x 20 ms = 20 s if left alone.
+        insert_raw_instance(&mut engine, ID, &host_calls_wat(1000, 20));
+        let meter = Arc::clone(&engine.store.as_ref().unwrap().data().meter);
+
+        let start = std::time::Instant::now();
+        let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(WasmError::Timeout)),
+            "host-call time over the cap must time out, got {result:?}"
+        );
+        // cap = 1.5 x 0.3 s = 0.45 s; allow budget + cap + generous slack.
+        assert!(
+            elapsed >= Duration::from_millis(450) && elapsed < Duration::from_secs(5),
+            "took {elapsed:?}"
+        );
+        assert_eq!(meter.snapshot().fired, Some(TimeoutCause::HostCallCap));
+    }
+
+    /// Drives the guest DIRECTLY (no waiter, so no backstop to race): once the
+    /// cap is spent, `HostCallGuard::enter` refuses the next blocking host call
+    /// WITHOUT running it (review F4) and the guest is trapped at its next epoch
+    /// check, with the store kept.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn host_call_over_the_cap_is_refused_and_trapped() {
+        const WAT: &str = r#"
+            (module
+              (import "freenet_test" "nap_ms" (func $nap (param i32)))
+              (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+                (call $nap (i32.const 150))
+                (call $nap (i32.const 10))
+                (loop (call $work) (br 0))
+                (i64.const 0))
+              (func $work))
+        "#;
+        let mut engine = engine_with_test_host(5.0, epoch_deadline_ticks(5.0));
+        const ID: i64 = i64::MAX - 54826;
+        insert_raw_instance(&mut engine, ID, WAT);
+        let store = engine.store.as_mut().expect("store");
+        let meter = Arc::clone(&store.data().meter);
+        meter.reset(Duration::from_millis(100));
+        let func = engine
+            .instances
+            .get(&ID)
+            .expect("instance")
+            .get_typed_func::<u32, i64>(&mut *store, "__frnt__initiate_buffer")
+            .expect("export");
+        arm_epoch_deadline(store, epoch_deadline_ticks(5.0), Some(ID));
+
+        let err = block_on_async(func.call_async(&mut *store, 16))
+            .expect_err("a guest over its host-call cap must be trapped");
+        assert!(is_epoch_interrupt(&err), "got {err:?}");
+        let snap = meter.snapshot();
+        assert_eq!(snap.fired, Some(TimeoutCause::HostCallCap));
+        assert_eq!(
+            snap.host_calls, 1,
+            "the over-cap call must be refused, not run"
+        );
+    }
+
+    /// A guest that keeps going after its blocking host calls were REFUSED (cap
+    /// spent) and then RETURNS NORMALLY must still be a timeout, not a result:
+    /// the refusals read as "absent" to the stdlib, so anything it computed or
+    /// sent after them is built on false answers. The guest stays in one wasm
+    /// frame, so it is not trapped before it returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guest_returning_after_a_refused_host_call_is_a_timeout() {
+        const WAT: &str = r#"
+            (module
+              (import "freenet_test" "nap_ms" (func $nap (param i32)))
+              (func (export "__frnt__initiate_buffer") (param i32) (result i64)
+                (local $n i32)
+                (loop $calls
+                  (call $nap (i32.const 2))
+                  (local.set $n (i32.add (local.get $n) (i32.const 1)))
+                  (br_if $calls (i32.lt_u (local.get $n) (i32.const 1500))))
+                (i64.const 7)))
+        "#;
+        // Budget 1.0 s, cap 1.5 s: the first ~700 calls of 2 ms run, the rest are
+        // refused instantly, and the guest returns 7 at ~1.5 s: after the
+        // epoch deadline has been extended past it (host time is not charged),
+        // and before the backstop's cap + 50 ms. So only the result check can
+        // turn this into a timeout while the store survives.
+        let mut engine = engine_with_test_host(1.0, epoch_deadline_ticks(1.0));
+        const ID: i64 = i64::MAX - 54827;
+        insert_raw_instance(&mut engine, ID, WAT);
+        let meter = Arc::clone(&engine.store.as_ref().unwrap().data().meter);
+
+        let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+        assert!(
+            matches!(result, Err(WasmError::Timeout)),
+            "a guest that returned after refused host calls must be a timeout, got {result:?}"
+        );
+        assert_eq!(meter.snapshot().fired, Some(TimeoutCause::HostCallCap));
+        // The path taken: the guest returned normally and the Ok arm converted
+        // it, so the store survives. A trap would also keep it, but the guest
+        // never reaches a function entry; the backstop would have replaced the
+        // store and dropped the instance.
+        assert!(
+            engine.instances.contains_key(&ID),
+            "the result must be converted from a normal return, not abandoned by \
+             the backstop (which wins only if the guest overshoots the cap by 50 ms)"
+        );
+    }
+
+    /// A single host call that outlives the cap cannot be trapped; the backstop
+    /// reports it at the cap, with the host-call cause. (For a DELEGATE host
+    /// function this does not free the executor: see the note in
+    /// `WallBounds::for_entries`.)
+    #[test]
+    fn a_stuck_host_call_is_reported_by_the_backstop_at_the_cap() {
+        run_abandoning_guest_test(|| {
+            let mut engine = engine_with_test_host(0.3, epoch_deadline_ticks(0.3));
+            const ID: i64 = i64::MAX - 54823;
+            insert_raw_instance(&mut engine, ID, &host_calls_wat(1, 4000));
+            let meter = Arc::clone(&engine.store.as_ref().unwrap().data().meter);
+
+            let start = std::time::Instant::now();
+            let result = engine.initiate_buffer(&InstanceHandle { id: ID }, 16);
+            let elapsed = start.elapsed();
+            assert!(
+                matches!(result, Err(WasmError::Timeout)),
+                "got {result:?} after {elapsed:?}"
+            );
+            assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+            assert_eq!(meter.snapshot().fired, Some(TimeoutCause::HostCallCap));
+            assert_engine_still_usable(&mut engine, "a host-cap timeout");
+        });
+    }
+
+    /// The waiter discounts host time from the guest bound (including a call in
+    /// flight) and enforces the cap on host time itself. Deterministic: every
+    /// result is already in the channel and every bound is far from the clock.
+    #[test]
+    fn wait_for_guest_discounts_host_time_and_bounds_it() {
+        let long_ago = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .expect("the monotonic clock is more than 60 s past its origin");
+        let bounds = WallBounds {
+            queue: Duration::from_secs(10),
+            guest: Duration::from_secs(10),
+            host_cap: Duration::from_secs(120),
+        };
+        // 60 s of wall time, all of it host time: guest time ~0 of a 10 s bound,
+        // so the waiter keeps waiting and returns the result sent later. (With
+        // the host time not discounted it would return `GuestOverran` at once.)
+        // The payload is built before the thread starts, so the send is quick
+        // whatever the load.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
+        let payload = (Ok(1), stub_store());
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            tx.send(payload).expect("receiver alive");
+        });
+        let outcome = wait_for_guest(&rx, long_ago, bounds, &|| Some(Duration::ZERO), &|| {
+            Duration::from_secs(60)
+        });
+        sender.join().expect("sender");
+        assert!(
+            matches!(outcome, GuestWait::Done((Ok(1), _))),
+            "host time must be discounted"
+        );
+        // The same 60 s of wall time with NO host time is an overrun.
+        let (_tx, rx) = std::sync::mpsc::sync_channel::<WasmResult>(1);
+        assert!(matches!(
+            wait_for_guest(&rx, long_ago, bounds, &|| Some(Duration::ZERO), &|| {
+                Duration::ZERO
+            }),
+            GuestWait::GuestOverran
+        ));
+        // Host time at the cap is its own verdict.
+        assert!(matches!(
+            wait_for_guest(&rx, long_ago, bounds, &|| Some(Duration::ZERO), &|| {
+                Duration::from_secs(120)
+            }),
+            GuestWait::HostCapOverran
+        ));
+    }
+
+    /// `on_deadline`: extend by the guest budget not yet used; trap when the
+    /// guest budget or the host cap is spent. Time is injected, so nothing here
+    /// depends on the scheduler.
+    #[test]
+    fn deadline_callback_extends_for_host_time_and_traps_on_either_limit() {
+        let ms = Duration::from_millis;
+        let base = Instant::now();
+        let is_interrupt =
+            |u: wasmtime::UpdateDeadline| matches!(u, wasmtime::UpdateDeadline::Interrupt);
+        let continue_ticks = |u: wasmtime::UpdateDeadline| {
+            let wasmtime::UpdateDeadline::Continue(t) = u else {
+                panic!("expected the deadline to be extended");
+            };
+            t
+        };
+
+        // 150 ms of wall time, all in a completed host call: guest budget
+        // untouched (100 ms left of 100), extend by exactly one tick.
+        let meter = HostCallMeter::new(ms(1000));
+        meter.reset(ms(1000));
+        meter.arm_at(base, ms(100));
+        meter.lock().host_total = ms(150);
+        assert_eq!(continue_ticks(meter.on_deadline_at(base + ms(150))), 1);
+        // 250 ms of budget left rounds UP to 3 ticks, with no extra phase tick.
+        let meter2 = HostCallMeter::new(ms(1000));
+        meter2.reset(ms(1000));
+        meter2.arm_at(base, ms(250));
+        assert_eq!(continue_ticks(meter2.on_deadline_at(base)), 3);
+        // The guest then burns its budget outside host calls: trap, guest cause.
+        assert!(is_interrupt(meter.on_deadline_at(base + ms(270))));
+        assert_eq!(meter.snapshot().fired, Some(TimeoutCause::GuestBudget));
+
+        // Host time past the cap traps with the host cause, budget unspent.
+        let meter = HostCallMeter::new(ms(100));
+        meter.reset(ms(100));
+        meter.arm_at(base, ms(10_000));
+        meter.lock().host_total = ms(150);
+        assert!(meter.over_cap());
+        assert!(is_interrupt(meter.on_deadline_at(base + ms(150))));
+        assert_eq!(meter.snapshot().fired, Some(TimeoutCause::HostCallCap));
+
+        // A later guest entry (re-arm) starts its cap afresh within one job.
+        meter.arm_at(base + ms(200), ms(10_000));
+        assert!(!meter.over_cap());
+    }
+
+    /// Host-function metering matches each function's class (review F1): the
+    /// ones that BLOCK on I/O or a lock (secret store, contract-state reads,
+    /// delegate creation) are metered, with the over-cap refusal; the CPU-bound
+    /// ones (log, rand, time, context copies, `fill_buffer`) are not, so their
+    /// time stays charged to the guest. And no host function is registered
+    /// outside `register_host_functions`, where this pin could not see it.
+    /// FALSIFY: add or remove a `metered!` line, or register a function on a
+    /// linker elsewhere in production code.
+    #[test]
+    fn host_function_metering_matches_its_class() {
+        let src = include_str!("wasmtime_engine.rs");
+        let body = scrape_body(src, "fn register_host_functions(");
+        let (mut metered, mut cpu_bound) = (0, 0);
+        for block in body.split(".func_wrap").skip(1) {
+            let name = block
+                .split('"')
+                .find(|s| s.starts_with("__frnt"))
+                .unwrap_or("<unnamed>");
+            let code: String = block
+                .lines()
+                .map(|l| l.split_once("//").map_or(l, |(c, _)| c))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let blocks_on_io = [
+                "freenet_delegate_secrets",
+                "freenet_delegate_contracts",
+                "freenet_delegate_management",
+            ]
+            .iter()
+            .any(|ns| code.contains(&format!("\"{ns}\"")));
+            let squashed: String = code.split_whitespace().collect();
+            if blocks_on_io {
+                metered += 1;
+                assert!(
+                    squashed.contains("metered!(&mutcaller,")
+                        || squashed.contains("HostCallGuard::enter(&mutcaller).ok()"),
+                    "blocking host function {name} must be metered and must refuse \
+                     once the host-call cap is spent"
+                );
+            } else {
+                cpu_bound += 1;
+                assert!(
+                    !code.contains("metered!") && !code.contains("HostCallGuard"),
+                    "CPU-bound host function {name} must not be metered: its time \
+                     is CPU the guest uses, and stays charged to the guest budget"
+                );
+            }
+        }
+        assert!(
+            metered >= 10,
+            "found only {metered} blocking host functions"
+        );
+        assert!(
+            cpu_bound >= 7,
+            "found only {cpu_bound} CPU-bound host functions"
+        );
+
+        // Registered only here: every `.func_wrap` before the tests module is
+        // inside `register_host_functions`.
+        let production = src.split("\n#[cfg(test)]\nmod tests").next().unwrap();
+        let count = |text: &str| {
+            text.matches(".func_wrap(").count() + text.matches(".func_wrap_async(").count()
+        };
+        assert_eq!(
+            count(production),
+            count(body),
+            "a host function is registered outside `register_host_functions`, \
+             where its metering class is not checked"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -4260,7 +5246,7 @@ mod tests {
                 (Ok(42), store)
             };
             let start = std::time::Instant::now();
-            let BlockingResult::Ok(42, s) = execute_wasm_blocking(job, 5.0) else {
+            let BlockingResult::Ok(42, s) = execute_wasm_blocking(job, 5.0, None) else {
                 panic!("a short job must come back Ok(42)");
             };
             store = s;
@@ -4365,6 +5351,7 @@ mod tests {
                     (Ok(0), store)
                 },
                 0.2,
+                None,
             );
             let elapsed = start.elapsed();
             assert!(
@@ -4400,6 +5387,7 @@ mod tests {
                     (Ok(7), store)
                 },
                 0.3,
+                None,
             );
             assert!(
                 matches!(result, BlockingResult::Ok(7, _)),
@@ -4422,6 +5410,7 @@ mod tests {
                     (Ok(0), store)
                 },
                 0.15,
+                None,
             );
             let elapsed = start.elapsed();
             assert!(
@@ -4446,6 +5435,7 @@ mod tests {
                 (Ok(0), store)
             },
             0.15,
+            None,
         );
         let elapsed = start.elapsed();
         assert!(matches!(result, BlockingResult::Timeout));
@@ -4472,6 +5462,7 @@ mod tests {
                         panic!("stub job panic")
                     },
                     5.0,
+                    None,
                 )
             })
             .await
@@ -4486,6 +5477,7 @@ mod tests {
                 panic!("stub job panic (no runtime)")
             },
             5.0,
+            None,
         );
         assert!(matches!(no_runtime, BlockingResult::Panic(_)));
     }
@@ -4507,6 +5499,7 @@ mod tests {
                 (Ok(3), store)
             },
             0.1,
+            None,
         );
         assert!(matches!(result, BlockingResult::Ok(3, _)));
     }
@@ -4537,6 +5530,7 @@ mod tests {
                     (Ok(1), store)
                 },
                 5.0,
+                None,
             );
             assert!(matches!(result, BlockingResult::Ok(1, _)));
             dropped.load(Ordering::SeqCst)
@@ -4584,6 +5578,7 @@ mod tests {
                         (Ok(0), store)
                     },
                     0.2,
+                    None,
                 );
                 (result, start.elapsed())
             })
@@ -4635,6 +5630,7 @@ mod tests {
                         (Ok(7), store)
                     },
                     0.3,
+                    None,
                 )
             })
             .await
