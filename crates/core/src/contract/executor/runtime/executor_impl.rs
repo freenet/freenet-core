@@ -3725,8 +3725,12 @@ mod full_state_version_gate_pins {
         let body = upsert_body();
 
         let local_valid_pos = body
-            .find("let local_valid = self")
+            .find("let local_valid = trusted_stored")
             .expect("recovery path must validate the LOCAL state (#3109)");
+        assert!(
+            body[local_valid_pos..].contains("|| self\n                        .runtime\n                        .validate_state(&key, &params, &current_state"),
+            "only a trusted stored state may skip validating the LOCAL state"
+        );
         let keep_local_pos = body
             .find("if local_valid {")
             .expect("recovery must return the merge error when local state is valid");

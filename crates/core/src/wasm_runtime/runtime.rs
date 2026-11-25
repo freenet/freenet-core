@@ -1004,7 +1004,7 @@ pub struct Runtime {
     pub(crate) contract_store: ContractStore,
     /// LRU cache of compiled contract modules (shared across pool executors),
     /// keyed by the CODE hash rather than the contract instance — see
-    /// [`SharedModuleCache`] and `prepare_contract_call_inner`.
+    /// [`SharedModuleCache`] and `contract_module_inner`.
     pub(super) contract_modules: SharedModuleCache<CodeHash>,
 
     /// Optional state storage backend, read by the delegate
@@ -2907,7 +2907,7 @@ mod host_clock_warning_call_site_pin {
         out
     }
 
-    /// `prepare_contract_call_inner`'s body with whole-line comments stripped.
+    /// `contract_module_inner`'s body with whole-line comments stripped.
     ///
     /// Stripping is load-bearing: the call site carries a comment naming
     /// `warn_on_host_clock_import`, so a scrape over the raw body would be
@@ -2916,10 +2916,10 @@ mod host_clock_warning_call_site_pin {
     /// `fdev`'s `code_only`).
     fn call_site_code() -> String {
         let src = include_str!("runtime.rs");
-        let signature = "fn prepare_contract_call_inner(";
+        let signature = "fn contract_module_inner(";
         let start = src
             .find(signature)
-            .expect("prepare_contract_call_inner not found in runtime.rs");
+            .expect("contract_module_inner not found in runtime.rs");
         let first_test_mod = src
             .find("\n#[cfg(test)]")
             .expect("runtime.rs has no test module");
@@ -2981,7 +2981,7 @@ mod host_clock_warning_call_site_pin {
         let body = call_site_code();
         assert!(
             body.contains("self.engine.compile(&code)?"),
-            "the scraped region is not prepare_contract_call_inner's body any more"
+            "the scraped region is not contract_module_inner's body any more"
         );
         assert!(
             !body.contains("// Deprecation notice for #5465"),
