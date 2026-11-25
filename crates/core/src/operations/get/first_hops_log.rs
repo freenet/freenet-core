@@ -365,26 +365,139 @@ mod tests {
         assert_eq!(log.hops.len(), MAX_HOPS_RECORDED);
         assert!(log.render(Location::new(0.5)).contains("+3 more"));
     }
-
-    /// The exhausted arm of `drive_client_get_inner` must feed and emit the
-    /// log, and the driver hooks must feed it. A refactor that drops either
-    /// silences the line with no test failing otherwise.
+    /// A hop the loopback relay never recorded renders as unknowns, and an
+    /// unknown own location falls back to `?` on an empty log.
     #[test]
-    fn driver_feeds_and_exhausted_arm_emits_the_log() {
-        let src = include_str!("op_ctx_task.rs");
-        let compact = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
-        let src = compact(src);
+    fn unknown_hop_and_empty_log_render_placeholders() {
+        let mut log = FirstHopsLog::default();
+        log.record_attempt(None);
+        assert_eq!(log.render(Location::new(0.5)), "[?@?:no_reply]");
+        log.mark_not_found();
+        assert_eq!(log.render(Location::new(0.5)), "[?@?:not_found]");
+
+        let empty = FirstHopsLog::default();
+        assert_eq!(empty.render(Location::new(0.5)), "[]");
+        let limiter = LogLimiter::new(5, Duration::from_secs(20));
+        let mut c0 = ctx("x");
+        c0.own_loc = None;
+        let (logs, guard) = crate::util::test_log_capture::install();
+        report_with(&limiter, Instant::now(), &c0, &empty);
+        drop(guard);
+        let lines = info_lines(&logs);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].contains("own_loc=\"?\""), "{}", lines[0]);
+        assert!(lines[0].contains("hops_tried=0"), "{}", lines[0]);
+        assert!(lines[0].contains("hops=\"[]\""), "{}", lines[0]);
+    }
+
+    /// Past the cap, a later NotFound has no entry to upgrade and must not be
+    /// credited to the last stored hop.
+    #[test]
+    fn mark_not_found_after_the_cap_keeps_stored_outcomes() {
+        let mut log = FirstHopsLog::default();
+        for p in 0..MAX_HOPS_RECORDED as u16 {
+            log.record_attempt(Some(&hop(5000 + p)));
+        }
+        // All stored hops are NoReply; the omitted attempt answers NotFound.
+        log.record_attempt(Some(&hop(6000)));
+        log.mark_not_found();
+        assert_eq!(log.omitted, 1);
         assert!(
-            src.contains("self.first_hops.record_attempt(hop);"),
+            log.hops.iter().all(|h| h.outcome == HopOutcome::NoReply),
+            "an omitted attempt's NotFound must not upgrade a stored hop"
+        );
+    }
+
+    /// Production source of `op_ctx_task.rs`, cut before its test module so a
+    /// pin cannot match its own string literals.
+    fn production_source() -> &'static str {
+        let src = include_str!("op_ctx_task.rs");
+        let cut = src
+            .find("\n#[cfg(test)]\nmod ")
+            .expect("test module not located: this guard cannot verify anything");
+        &src[..cut]
+    }
+
+    /// Body of the function (free or method) starting at `signature`: from the
+    /// signature to the first closing brace at the same indentation. Panics if
+    /// the signature is absent or not unique.
+    fn fn_body<'a>(src: &'a str, signature: &str) -> &'a str {
+        assert_eq!(
+            src.matches(signature).count(),
+            1,
+            "`{signature}` must occur exactly once"
+        );
+        let at = src.find(signature).unwrap();
+        let line_start = src[..at].rfind('\n').map_or(0, |i| i + 1);
+        let indent = &src[line_start..at];
+        assert!(
+            indent.chars().all(|c| c == ' '),
+            "`{signature}` must start its line (got prefix {indent:?})"
+        );
+        let end = format!("\n{indent}}}\n");
+        let after = &src[at..];
+        let (body, _) = after
+            .split_once(end.as_str())
+            .unwrap_or_else(|| panic!("end of `{signature}` not found"));
+        body
+    }
+
+    fn compact(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// The driver hooks feed the log from inside the two `RetryDriver` methods.
+    #[test]
+    fn driver_hooks_feed_the_log() {
+        let src = production_source();
+        let attempt = compact(fn_body(
+            src,
+            "fn on_attempt_hop(&mut self, hop: Option<&PeerKeyLocation>) {",
+        ));
+        assert!(
+            attempt.contains("self.first_hops.record_attempt(hop);"),
             "on_attempt_hop must record"
         );
+        let not_found = compact(fn_body(
+            src,
+            "fn on_not_found_hop(&mut self, hop: Option<&PeerKeyLocation>) {",
+        ));
         assert!(
-            src.contains("self.first_hops.mark_not_found();"),
+            not_found.contains("self.first_hops.mark_not_found();"),
             "on_not_found_hop must mark"
         );
+    }
+
+    /// The `Exhausted` arm of `drive_client_get_inner` emits the line, only for
+    /// client-visible (non sub-operation) GETs, from that arm and not another.
+    #[test]
+    fn exhausted_arm_emits_for_client_gets_only() {
+        let inner = fn_body(production_source(), "async fn drive_client_get_inner(");
+        let start = inner
+            .find("RetryLoopOutcome::Exhausted(cause) => {")
+            .expect("Exhausted arm not found");
+        let rest = &inner[start..];
+        // The arm ends at the next sibling arm, or the end of the function.
+        let arm = rest
+            .find("\n        RetryLoopOutcome::")
+            .map_or(rest, |i| &rest[..i]);
+        let arm = compact(arm);
         assert!(
-            src.contains("report_notfound_first_hops(&super::first_hops_log::FirstHopsContext"),
-            "the Exhausted arm must emit the line"
+            arm.contains(
+                "if!client_tx.is_sub_operation(){super::first_hops_log::report_notfound_first_hops(&super::first_hops_log::FirstHopsContext{"
+            ),
+            "the Exhausted arm must emit the line behind the sub-op guard"
+        );
+        assert!(
+            arm.contains("&driver.first_hops"),
+            "the emit must pass the driver's log"
+        );
+        assert_eq!(
+            compact(inner)
+                .matches("report_notfound_first_hops(")
+                .count(),
+            1,
+            "emitted from exactly one place"
         );
     }
 }
