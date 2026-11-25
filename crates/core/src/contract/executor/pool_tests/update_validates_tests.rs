@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use crate::contract::executor::mock_wasm_runtime::{
     MockWasmRuntime, UpdateOverride, ValidateOverride,
 };
-use crate::contract::executor::{ContractExecutor, Executor, UpsertResult};
+use crate::contract::executor::{
+    ContractExecutor, Executor, SharedStoredStateVerified, StoredStateVerified, UpsertResult,
+};
 use crate::wasm_runtime::MockStateStorage;
 
 const STORED: [u8; 3] = [1, 2, 3];
@@ -569,4 +571,92 @@ fn the_skips_are_wired_to_the_trust_check() {
     assert!(!helper.contains("related_contracts"));
     assert!(helper.contains("matches!(verdict, Ok(ValidateResult::Valid))"));
     assert!(helper.contains(".invalidate(key)"));
+}
+
+fn key_n(n: usize) -> ContractKey {
+    container(&format!("uv_capacity_{n}")).key()
+}
+
+/// Recording more keys than the capacity never grows the record past it.
+#[test]
+fn the_verified_record_never_exceeds_its_capacity() {
+    let mut record = StoredStateVerified::with_capacity(3);
+    for n in 0..20 {
+        record.record(key_n(n), [n as u8; 32]);
+        assert!(
+            record.len() <= 3,
+            "{} entries after {} records",
+            record.len(),
+            n + 1
+        );
+    }
+    assert_eq!(record.len(), 3);
+}
+
+/// Re-recording a key the record already holds, at capacity, replaces its hash
+/// and evicts nothing.
+#[test]
+fn re_recording_a_held_key_at_capacity_evicts_nothing() {
+    let mut record = StoredStateVerified::with_capacity(3);
+    for n in 0..3 {
+        record.record(key_n(n), [n as u8; 32]);
+    }
+    for round in 1..=5u8 {
+        for n in 0..3 {
+            record.record(key_n(n), [100 + round; 32]);
+        }
+    }
+    assert_eq!(record.len(), 3);
+    for n in 0..3 {
+        assert!(
+            record.is_verified(&key_n(n), &[105; 32]),
+            "key {n} was evicted"
+        );
+    }
+}
+
+/// A key evicted from a full record is not trusted: its stored state is
+/// checked again before the opt-in is honoured.
+#[tokio::test(flavor = "current_thread")]
+async fn an_evicted_key_is_verified_again() {
+    let (mut executor, a) = executor_with_stored_state("uv_evict_a", true).await;
+    // A second contract in the same executor, on a record that holds one key.
+    let b_container = container("uv_evict_b");
+    let b = b_container.key();
+    executor.runtime.update_validates_ids.insert(*b.id());
+    executor
+        .upsert_contract_state(
+            b,
+            Either::Left(WrappedState::new(STORED.to_vec())),
+            RelatedContracts::default(),
+            Some(b_container),
+        )
+        .await
+        .expect("PUT of the second contract");
+    let small: SharedStoredStateVerified =
+        Arc::new(Mutex::new(StoredStateVerified::with_capacity(1)));
+    executor.set_stored_state_verified(small);
+    let log_a = record_validations(&mut executor, &a);
+    let log_b = record_validations(&mut executor, &b);
+
+    // `a`: checked once, then trusted on its own result.
+    delta(&mut executor, a, vec![7]).await;
+    delta(&mut executor, a, vec![8]).await;
+    assert_eq!(
+        seen(&log_a),
+        vec![STORED.to_vec()],
+        "checked once while held"
+    );
+
+    // `b` takes the only slot, evicting `a`.
+    delta(&mut executor, b, vec![7]).await;
+    assert_eq!(seen(&log_b), vec![STORED.to_vec()]);
+
+    // `a` is checked again, on the state it holds now.
+    delta(&mut executor, a, vec![9]).await;
+    assert_eq!(
+        seen(&log_a),
+        vec![STORED.to_vec(), vec![8]],
+        "an evicted key must be verified again"
+    );
 }

@@ -1397,9 +1397,18 @@ pub(crate) type CorruptedStateRecoveryGuard = Arc<std::sync::Mutex<HashSet<Contr
 ///
 /// Bounded by entry count; each value is a fixed 32-byte hash, so the count is
 /// also a memory bound.
-#[derive(Default)]
 pub(crate) struct StoredStateVerified {
     verified: HashMap<ContractKey, [u8; 32]>,
+    capacity: usize,
+}
+
+impl Default for StoredStateVerified {
+    fn default() -> Self {
+        Self {
+            verified: HashMap::new(),
+            capacity: Self::MAX_ENTRIES,
+        }
+    }
 }
 
 impl StoredStateVerified {
@@ -1411,7 +1420,7 @@ impl StoredStateVerified {
     }
 
     pub(crate) fn record(&mut self, key: ContractKey, state_hash: [u8; 32]) {
-        if !self.verified.contains_key(&key) && self.verified.len() >= Self::MAX_ENTRIES {
+        if !self.verified.contains_key(&key) && self.verified.len() >= self.capacity {
             if let Some(victim) = self.verified.keys().next().copied() {
                 self.verified.remove(&victim);
             }
@@ -1428,6 +1437,16 @@ impl StoredStateVerified {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.verified.len()
+    }
+
+    /// A record that holds at most `capacity` keys, so tests can reach the
+    /// eviction branch without recording [`Self::MAX_ENTRIES`] keys.
+    #[cfg(test)]
+    pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            verified: HashMap::new(),
+            capacity,
+        }
     }
 }
 
