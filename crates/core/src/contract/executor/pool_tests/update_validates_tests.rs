@@ -230,6 +230,58 @@ async fn a_stored_state_replaced_after_the_check_takes_the_full_path_for_a_full_
     );
 }
 
+/// The late validation of the incoming full state, when the stored state
+/// changed after it was verified, rejects an invalid state with the same error
+/// the normal path gives, and stores and records nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn an_invalid_incoming_state_is_rejected_when_the_stored_state_changed() {
+    fn not_nine_nine(s: &[u8]) -> bool {
+        s != [9, 9]
+    }
+    // The normal path's error, from a contract that does not opt in.
+    let (mut plain, plain_key) = executor_with_stored_state("uv_late_reject_plain", false).await;
+    plain
+        .runtime
+        .validate_overrides
+        .insert(*plain_key.id(), ValidateOverride::ValidWhen(not_nine_nine));
+    let expected = plain
+        .upsert_contract_state(
+            plain_key,
+            Either::Left(WrappedState::new(vec![9, 9])),
+            RelatedContracts::default(),
+            None,
+        )
+        .await
+        .expect_err("invalid incoming state is rejected")
+        .to_string();
+
+    let (mut executor, key) = executor_with_stored_state("uv_late_reject", true).await;
+    executor
+        .runtime
+        .validate_overrides
+        .insert(*key.id(), ValidateOverride::ValidWhen(not_nine_nine));
+    executor.test_replace_stored_after_gate = Some(vec![4, 4]);
+    let err = executor
+        .upsert_contract_state(
+            key,
+            Either::Left(WrappedState::new(vec![9, 9])),
+            RelatedContracts::default(),
+            None,
+        )
+        .await
+        .expect_err("the late check must reject the invalid incoming state");
+    // Same kind of error as the normal path (the text names the key, which
+    // differs between the two contracts).
+    assert_eq!(
+        err.to_string().replace(&key.to_string(), "K"),
+        expected.replace(&plain_key.to_string(), "K")
+    );
+    assert_eq!(stored(&executor, &key).await, vec![4, 4]);
+    let verified = executor.stored_state_verified.lock().unwrap();
+    assert!(!verified.is_verified(&key, blake3::hash(&[9, 9]).as_bytes()));
+    assert!(!verified.is_verified(&key, blake3::hash(&[4, 4]).as_bytes()));
+}
+
 /// The one-time check runs with no related contracts, so a verdict never
 /// depends on related state a caller supplied. A stored state that needs
 /// related contracts to validate stays untrusted, and the failed check is not

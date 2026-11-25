@@ -72,6 +72,14 @@ async fn harness(name: &'static str) -> Harness {
         )
         .await
         .expect("initial PUT");
+    // Every scenario below is meaningful only for the declaration it names.
+    {
+        use crate::wasm_runtime::ContractRuntimeInterface;
+        let declared = executor
+            .runtime
+            .update_validates(&key, &Parameters::from(vec![]));
+        assert_eq!(declared, name == OPTING_IN, "{name}");
+    }
     Harness {
         executor,
         key,
@@ -200,4 +208,37 @@ async fn a_fresh_store_of_an_invalid_state_is_rejected() {
             "{name}: {err}"
         );
     }
+}
+
+/// A stored state that does not validate is not trusted, even for a contract
+/// that declares the marker: the full path applies, so an update that would
+/// produce an invalid state is rejected, and an update the contract refuses
+/// recovers through the corrupted-state replacement.
+#[tokio::test]
+async fn an_invalid_stored_state_is_not_trusted() {
+    // Not trusted: a result that is invalid is rejected, not committed.
+    let mut h = harness(OPTING_IN).await;
+    h.executor
+        .state_store
+        .update(&h.key, WrappedState::new(POISON.to_vec()))
+        .await
+        .expect("plant an invalid stored state");
+    let err = h
+        .delta(&[0xFF, 3])
+        .await
+        .expect_err("validated on the full path and rejected");
+    assert!(err.to_lowercase().contains("invalid"), "{err}");
+    assert_eq!(h.stored().await, POISON.to_vec());
+
+    // Recovery: the contract refuses the incoming state and the stored state
+    // is invalid, so the stored state is replaced with the incoming one.
+    let mut h = harness(OPTING_IN).await;
+    h.executor
+        .state_store
+        .update(&h.key, WrappedState::new(POISON.to_vec()))
+        .await
+        .expect("plant an invalid stored state");
+    let r = h.full(&REFUSED).await;
+    assert!(matches!(r, Ok(UpsertResult::Updated(_))), "{r:?}");
+    assert_eq!(h.stored().await, REFUSED.to_vec());
 }

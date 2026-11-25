@@ -996,8 +996,20 @@ where
                         defer_related_fetch,
                     )
                     .await?;
-                if result != ValidateResult::Valid {
-                    return Err(Self::validation_error(key, result));
+                // Same rejections as the incoming-state validation on the
+                // normal path.
+                match result {
+                    ValidateResult::Valid => {}
+                    ValidateResult::Invalid => {
+                        return Err(ExecutorError::request(StdContractError::invalid_put(key)));
+                    }
+                    ValidateResult::RequestRelated(_) => {
+                        return Err(ExecutorError::request(StdContractError::Put {
+                            key,
+                            cause: "unexpected RequestRelated after related contract resolution"
+                                .into(),
+                        }));
+                    }
                 }
             }
         }
