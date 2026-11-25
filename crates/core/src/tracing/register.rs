@@ -430,6 +430,7 @@ impl<'a> NetEventLog<'a> {
         instance_id: ContractInstanceId,
         target: PeerKeyLocation,
         htl: usize,
+        upstream: Option<PeerKeyLocation>,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
@@ -443,6 +444,8 @@ impl<'a> NetEventLog<'a> {
                 target,
                 htl,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+                upstream,
+                key_location: Some(Location::from(&instance_id)),
             }),
         })
     }
@@ -480,6 +483,7 @@ impl<'a> NetEventLog<'a> {
         ring: &'a Ring,
         instance_id: ContractInstanceId,
         hop_count: Option<usize>,
+        downstream_wait: Option<(u64, u32)>,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
@@ -494,6 +498,9 @@ impl<'a> NetEventLog<'a> {
                 hop_count,
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+                key_location: Some(Location::from(&instance_id)),
+                downstream_wait_ms: downstream_wait.map(|(ms, _)| ms),
+                downstream_timeouts: downstream_wait.map(|(_, n)| n),
             }),
         })
     }
@@ -1133,7 +1140,12 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessage::V1(NetMessageV1::Get(GetMsg::Response { id, .. })) => {
+            NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+                id,
+                instance_id,
+                result,
+                ..
+            })) => {
                 // Track outbound Get response for message routing visibility
                 // Key may not be available for NotFound responses, but include if present
                 let key = match msg {
@@ -1152,6 +1164,8 @@ impl<'a> NetEventLog<'a> {
                     to,
                     key,
                     timestamp: chrono::Utc::now().timestamp() as u64,
+                    found: Some(matches!(result, GetMsgResult::Found { .. })),
+                    key_location: Some(Location::from(instance_id)),
                 })
             }
             NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response { id, .. })) => {
@@ -1297,6 +1311,8 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
+                let upstream = source_addr
+                    .and_then(|addr| op_manager.ring.connection_manager.get_peer_by_addr(addr));
                 EventKind::Get(GetEvent::Request {
                     id: *id,
                     requester: this_peer.clone(),
@@ -1304,6 +1320,8 @@ impl<'a> NetEventLog<'a> {
                     target: this_peer,
                     htl: *htl,
                     timestamp: chrono::Utc::now().timestamp() as u64,
+                    upstream,
+                    key_location: Some(Location::from(instance_id)),
                 })
             }
             NetMessageV1::Get(GetMsg::Response {
@@ -1358,6 +1376,9 @@ impl<'a> NetEventLog<'a> {
                     hop_count: Some((*hop_count).min(max_htl)),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
+                    key_location: Some(Location::from(instance_id)),
+                    downstream_wait_ms: None,
+                    downstream_timeouts: None,
                 })
             }
             NetMessageV1::Subscribe(SubscribeMsg::Request {

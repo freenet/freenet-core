@@ -1313,6 +1313,14 @@ pub(crate) enum GetEvent {
         /// Hops remaining before giving up.
         htl: usize,
         timestamp: u64,
+        /// Peer this node received the request from (the hop edge into this
+        /// node). `None` on the originator or when the sender is not a known
+        /// connection. Together with `target` on the forward event this lets
+        /// per-tx hop chains be reconstructed.
+        upstream: Option<PeerKeyLocation>,
+        /// Ring location of the requested contract instance (a float in
+        /// [0, 1)); derived from `instance_id`, which is already emitted.
+        key_location: Option<Location>,
     },
     /// Contract was successfully retrieved.
     GetSuccess {
@@ -1341,6 +1349,14 @@ pub(crate) enum GetEvent {
         /// Time elapsed since operation started (milliseconds).
         elapsed_ms: u64,
         timestamp: u64,
+        /// Ring location of the searched contract instance.
+        key_location: Option<Location>,
+        /// Relay hops only: total milliseconds this relay spent waiting on
+        /// downstream peers (replies, timeouts and send failures) before
+        /// giving up. `None` when no downstream wait applies (HTL exhausted).
+        downstream_wait_ms: Option<u64>,
+        /// Relay hops only: how many downstream attempts timed out.
+        downstream_timeouts: Option<u32>,
     },
     /// Get operation failed due to network or system error.
     GetFailure {
@@ -1370,6 +1386,10 @@ pub(crate) enum GetEvent {
         to: PeerKeyLocation,
         key: Option<ContractKey>,
         timestamp: u64,
+        /// `Some(true)` for a Found response, `Some(false)` for NotFound.
+        found: Option<bool>,
+        /// Ring location of the requested contract instance.
+        key_location: Option<Location>,
     },
     /// A relay peer sent a ForwardingAck to its upstream peer.
     ///

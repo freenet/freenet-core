@@ -4270,6 +4270,7 @@ where
             &op_manager.ring,
             instance_id,
             Some(op_manager.ring.max_hops_to_live),
+            None,
         ) {
             op_manager
                 .ring
@@ -4552,6 +4553,10 @@ where
     // consult waiter and bubble a false result — so we do NOT consult after a
     // failed forward (Codex P2). Reset by any forward that received a reply.
     let mut last_forward_failed = false;
+    // Telemetry only: time this relay spent waiting on downstream peers, and
+    // how many of those waits ended in a timeout (silent downstream peers).
+    let mut downstream_wait_ms: u64 = 0;
+    let mut downstream_timeouts: u32 = 0;
     // True once at least one location-routing forward has happened. When
     // `relay_advance_to_next_peer` returns None on the FIRST iteration (no
     // routing candidate at all), consulting is a no-op — every advertised host
@@ -4779,6 +4784,7 @@ where
                         &op_manager.ring,
                         instance_id,
                         Some(hop_count),
+                        Some((downstream_wait_ms, downstream_timeouts)),
                     ) {
                         op_manager
                             .ring
@@ -4833,6 +4839,10 @@ where
             instance_id,
             peer.clone(),
             new_htl,
+            op_manager
+                .ring
+                .connection_manager
+                .get_peer_by_addr(upstream_addr),
         ) {
             op_manager
                 .ring
@@ -4908,8 +4918,11 @@ where
             return Ok(());
         }
 
+        let wait_started = tokio::time::Instant::now();
         let round_trip =
             tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(peer_addr, request)).await;
+        downstream_wait_ms =
+            downstream_wait_ms.saturating_add(wait_started.elapsed().as_millis() as u64);
 
         // Always release the slot so the next retry can re-register.
         op_manager.release_pending_op_slot(incoming_tx).await;
@@ -4953,6 +4966,7 @@ where
                     timeout_secs = OPERATION_TTL.as_secs(),
                     "GET relay: attempt timed out; advancing to next peer"
                 );
+                downstream_timeouts = downstream_timeouts.saturating_add(1);
                 recorder.record_attempt(Some(&peer), AttemptFailure::Timeout, true);
                 // Timed out with no reply — the peer may reply late on the
                 // reused tx, so do NOT consult after this (Codex P2).
