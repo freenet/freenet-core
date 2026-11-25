@@ -1404,9 +1404,11 @@ impl DelegateCallEnv {
                 return Ok(f(plaintext));
             }
         }
-        let plaintext =
-            self.secret_store()
-                .get_secret(&self.delegate_key, secret_id, self.secret_scope())?;
+        let plaintext = self.secret_store().get_secret_for_delegate(
+            &self.delegate_key,
+            secret_id,
+            self.secret_scope(),
+        )?;
         let out = f(&plaintext);
         *self.secret_read_memo.borrow_mut() = Some((*secret_id.hash(), plaintext));
         Ok(out)
@@ -3749,6 +3751,41 @@ mod secret_read_memo_tests {
         assert_eq!(failed, error_codes::ERR_STORAGE_FAILED);
         assert!(poisoned, "the failed read must poison the call");
         assert_eq!(absent, error_codes::ERR_SECRET_NOT_FOUND);
+    }
+
+    /// #6368: the delegate-facing read (`with_secret`, behind `get_secret` and
+    /// `has_secret`) counts a present blob that fails to authenticate. Fails if
+    /// `with_secret` is changed to the uncounted `get_secret`.
+    #[tokio::test]
+    async fn with_secret_counts_a_corrupt_blob_as_an_auth_failure() {
+        let failures = crate::wasm_runtime::secrets_store::read_failures::install_test_tracker();
+        let mut f = fixture().await;
+        let id = SecretsId::new(b"corrupt".to_vec());
+        let blob = f
+            .secret_store
+            .scope_dir(&delegate_key(), &SecretScope::Local)
+            .join(id.encode());
+        // SAFETY: `env` is dropped at the end of this test, before `f`.
+        let env = unsafe { env_of(&mut f) };
+        env.secret_store_mut()
+            .store_secret(
+                &delegate_key(),
+                &id,
+                SecretScope::Local,
+                Zeroizing::new(b"v".to_vec()),
+            )
+            .unwrap();
+        // Healthy read: not counted.
+        assert_eq!(read(&env, &id), b"v".to_vec());
+        assert_eq!(failures.auth_total() + failures.io_total(), 0);
+        env.invalidate_secret_memo();
+
+        // Version byte, nonce and tag-sized garbage: present but unauthentic.
+        let mut bogus = vec![0x01u8];
+        bogus.extend_from_slice(&[0u8; 24 + 32]);
+        std::fs::write(&blob, &bogus).unwrap();
+        assert!(env.with_secret(&id, |_| ()).is_err());
+        assert_eq!((failures.auth_total(), failures.io_total()), (1, 0));
     }
 
     /// The memo is keyed on the secret's hash. Without that check a read of a

@@ -39,6 +39,7 @@ use super::super::secret_snapshots::{
 };
 
 use super::quota::{QuotaCommit, USER_QUOTA_TRACKER, apply_signed_delta};
+use super::read_failures;
 #[cfg(test)]
 use super::sweep::USERS_DIR;
 use super::sweep::{
@@ -1199,6 +1200,24 @@ impl SecretsStore {
         Ok(())
     }
 
+    /// [`get_secret`](Self::get_secret) for a read made on behalf of a
+    /// delegate, which counts a failure on a blob that is present (#6368).
+    /// Use this only where a failed read makes the delegate see the secret as
+    /// absent. Export, copy-forward, migration and operator reads use the
+    /// plain `get_secret`, so they cannot inflate the delegate-facing counters.
+    pub(crate) fn get_secret_for_delegate(
+        &self,
+        delegate: &DelegateKey,
+        key: &SecretsId,
+        scope: SecretScope<'_>,
+    ) -> Result<Zeroizing<Vec<u8>>, SecretStoreError> {
+        let result = self.get_secret(delegate, key, scope);
+        if let Err(e) = &result {
+            note_read_failure(delegate, || key.encode(), e);
+        }
+        result
+    }
+
     /// Read a secret under the given `scope`.
     ///
     /// `SecretScope::Local` is byte-for-byte the pre-#4381 read path (same
@@ -1561,8 +1580,24 @@ impl SecretsStore {
         // so the host function can fail the call.
         let mut keys = match self.read_key_registry(delegate, &scope) {
             Ok(keys) => keys,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Vec::new(),
-            Err(e) => return Err(e),
+            Err(e) => {
+                // Delegate-facing: a present registry that cannot be read.
+                // `InvalidData` (malformed header or AEAD failure; the two
+                // are not distinguishable here) is the "enumerates as empty"
+                // case, so it counts as an authentication failure. Any other
+                // error is an I/O failure.
+                let kind = if e.kind() == std::io::ErrorKind::InvalidData {
+                    read_failures::FailureKind::Auth
+                } else {
+                    read_failures::FailureKind::Io
+                };
+                read_failures::record_failure(&delegate.to_string(), KEY_REGISTRY_FILE, kind);
+                if kind == read_failures::FailureKind::Auth {
+                    Vec::new()
+                } else {
+                    return Err(e);
+                }
+            }
         };
         // Defense-in-depth (#4117 L2): never surface the reserved
         // `\0freenet-migrate/` coordination namespace to a delegate. These are
@@ -3783,6 +3818,28 @@ fn decrypt_secret_blob(
     ))
 }
 
+/// Count a failed secret read whose blob is present. Not-found is absence,
+/// not a failure, so it is never counted.
+fn note_read_failure(
+    delegate: &DelegateKey,
+    blob_hash: impl FnOnce() -> String,
+    e: &SecretStoreError,
+) {
+    let kind = match e {
+        SecretStoreError::Encryption(_) => read_failures::FailureKind::Auth,
+        SecretStoreError::IO(io) if io.kind() != std::io::ErrorKind::NotFound => {
+            read_failures::FailureKind::Io
+        }
+        SecretStoreError::IO(_)
+        | SecretStoreError::MissingCipher
+        | SecretStoreError::MissingSecret(_)
+        | SecretStoreError::SnapshotNotFound { .. }
+        | SecretStoreError::QuotaExceeded { .. } => return,
+    };
+    // Only now that a failure is being recorded is the hash worth computing.
+    read_failures::record_failure(&delegate.to_string(), &blob_hash(), kind);
+}
+
 fn log_legacy_decrypt(key: &str, idx: usize, is_migration: bool, format: &str) {
     if is_migration {
         tracing::warn!(
@@ -5954,6 +6011,213 @@ mod test {
             matches!(err, SecretStoreError::Encryption(_)),
             "expected Encryption error, got {err:?}"
         );
+        Ok(())
+    }
+
+    /// #6368: a present blob that fails to authenticate is counted, and a
+    /// missing or healthy one is not. The read results are unchanged (the
+    /// corrupt blob is still an `Encryption` error, which the host reports to
+    /// the delegate as absent).
+    ///
+    /// The counter is process-wide, so the test installs its own tracker for
+    /// this thread; sibling tests that corrupt blobs cannot disturb it.
+    #[tokio::test]
+    async fn present_blob_read_failures_are_counted_missing_and_healthy_are_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let failures = read_failures::install_test_tracker();
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![90].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+
+        // Healthy read: not counted.
+        let healthy = SecretsId::new(vec![91]);
+        store.store_secret(
+            delegate.key(),
+            &healthy,
+            SecretScope::Local,
+            Zeroizing::new(b"fine".to_vec()),
+        )?;
+        let got = store.get_secret_for_delegate(delegate.key(), &healthy, SecretScope::Local)?;
+        assert_eq!(got.as_slice(), b"fine");
+        assert_eq!(failures.auth_total() + failures.io_total(), 0);
+
+        // Missing: not counted.
+        let missing = SecretsId::new(vec![92]);
+        let err = store
+            .get_secret_for_delegate(delegate.key(), &missing, SecretScope::Local)
+            .expect_err("missing secret");
+        assert!(matches!(err, SecretStoreError::MissingSecret(_)), "{err:?}");
+        assert_eq!(failures.auth_total() + failures.io_total(), 0);
+
+        // Present but garbage AEAD: counted, and still an error (absent to
+        // the delegate).
+        let corrupt = SecretsId::new(vec![93]);
+        let mut bogus = vec![VERSION_V1];
+        bogus.extend_from_slice(&[0u8; 24]);
+        bogus.extend_from_slice(&[0u8; 32]);
+        let delegate_dir = secrets_dir.join(delegate.key().encode());
+        std::fs::write(delegate_dir.join(corrupt.encode()), &bogus)?;
+        let err = store
+            .get_secret_for_delegate(delegate.key(), &corrupt, SecretScope::Local)
+            .expect_err("corrupt blob must fail");
+        assert!(matches!(err, SecretStoreError::Encryption(_)), "{err:?}");
+        assert_eq!((failures.auth_total(), failures.io_total()), (1, 0));
+        assert_eq!(failures.delegates_affected(), 1);
+
+        // A directory where the blob should be is an I/O error, not absence:
+        // counted.
+        let unreadable = SecretsId::new(vec![94]);
+        std::fs::create_dir_all(delegate_dir.join(unreadable.encode()))?;
+        let err = store
+            .get_secret_for_delegate(delegate.key(), &unreadable, SecretScope::Local)
+            .expect_err("unreadable blob must fail");
+        assert!(matches!(err, SecretStoreError::IO(_)), "{err:?}");
+        assert_eq!((failures.auth_total(), failures.io_total()), (1, 1));
+        Ok(())
+    }
+
+    /// #6368: the key-list read a delegate makes (`list_secret_keys`) counts a
+    /// present registry that cannot be read, as an authentication failure,
+    /// and still enumerates as empty.
+    #[tokio::test]
+    async fn delegate_registry_read_failures_are_counted() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let failures = read_failures::install_test_tracker();
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let delegate = Delegate::from((&vec![95].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(vec![96]),
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+        assert_eq!(
+            store
+                .list_secret_keys(delegate.key(), SecretScope::Local, &[])?
+                .len(),
+            1
+        );
+        assert_eq!(failures.auth_total() + failures.io_total(), 0);
+
+        let mut bogus = vec![VERSION_V1];
+        bogus.extend_from_slice(&[0u8; 24]);
+        bogus.extend_from_slice(&[0u8; 32]);
+        let registry = store.key_registry_path(delegate.key(), &SecretScope::Local);
+        std::fs::write(&registry, &bogus)?;
+        let keys = store.list_secret_keys(delegate.key(), SecretScope::Local, &[])?;
+        assert!(keys.is_empty(), "a corrupt registry still enumerates empty");
+        assert_eq!((failures.auth_total(), failures.io_total()), (1, 0));
+        assert_eq!(failures.delegates_affected(), 1);
+        Ok(())
+    }
+
+    /// #6368: a registry that cannot be read for a reason other than bad
+    /// contents (here a directory in its place) counts as an I/O failure and
+    /// `list_secret_keys` returns the error rather than an empty list.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_registry_io_failures_are_counted_as_io()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let failures = read_failures::install_test_tracker();
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let delegate = Delegate::from((&vec![101].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(vec![102]),
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+        let registry = store.key_registry_path(delegate.key(), &SecretScope::Local);
+        std::fs::remove_file(&registry)?;
+        std::fs::create_dir(&registry)?;
+        let res = store.list_secret_keys(delegate.key(), SecretScope::Local, &[]);
+        assert!(
+            res.is_err(),
+            "an I/O failure must surface, not read as empty"
+        );
+        assert_eq!((failures.auth_total(), failures.io_total()), (0, 1));
+        Ok(())
+    }
+
+    /// #6368: reads that are not delegate-facing never count, even on an
+    /// unreadable blob or registry: the plain `get_secret`, a write that
+    /// updates the registry, and an export.
+    #[tokio::test]
+    async fn non_delegate_reads_of_unreadable_blobs_are_not_counted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let failures = read_failures::install_test_tracker();
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir.clone(), Default::default(), db)?;
+        let delegate = Delegate::from((&vec![97].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        let id = SecretsId::new(vec![98]);
+        store.store_secret(
+            delegate.key(),
+            &id,
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+
+        let mut bogus = vec![VERSION_V1];
+        bogus.extend_from_slice(&[0u8; 24]);
+        bogus.extend_from_slice(&[0u8; 32]);
+        // Corrupt both the value blob and the registry.
+        let delegate_dir = secrets_dir.join(delegate.key().encode());
+        std::fs::write(delegate_dir.join(id.encode()), &bogus)?;
+        std::fs::write(
+            store.key_registry_path(delegate.key(), &SecretScope::Local),
+            &bogus,
+        )?;
+
+        // The plain read (operator, export, migration) fails but is not counted.
+        assert!(
+            store
+                .get_secret(delegate.key(), &id, SecretScope::Local)
+                .is_err()
+        );
+        // A write reads the registry (register_key) and bails; not counted.
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(vec![99]),
+            SecretScope::Local,
+            Zeroizing::new(b"w".to_vec()),
+        )?;
+        // An export reads every blob by hash; the outcome is irrelevant here.
+        drop(store.export_scope_entries(SecretScope::Local));
+
+        assert_eq!(
+            (failures.auth_total(), failures.io_total()),
+            (0, 0),
+            "only delegate-facing reads may count"
+        );
+        // And the delegate-facing read of the same blob does count.
+        assert!(
+            store
+                .get_secret_for_delegate(delegate.key(), &id, SecretScope::Local)
+                .is_err()
+        );
+        assert_eq!(failures.auth_total(), 1);
         Ok(())
     }
 

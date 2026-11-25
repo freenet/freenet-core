@@ -52,6 +52,25 @@ pub(crate) struct ResourceUtilization {
     /// QUIC upgrade paths active now (shadow mode), sampled with the RSS so
     /// the two can be regressed against each other for a per-path cost.
     pub quic_paths_active: u64,
+    /// Cumulative delegate secret reads (and key-list reads) that failed to
+    /// authenticate a blob that IS present, since start. The delegate sees
+    /// these as "absent" (#6323), so a node with a mismatched
+    /// key-encryption-key shows a non-zero value here and nowhere else
+    /// (#6368). Aggregate only; nothing identifies a secret.
+    ///
+    /// Counts reads, not blobs. It also includes a key registry with a
+    /// malformed header (`InvalidData`, indistinguishable from an AEAD
+    /// failure) and a user-scope read made with a wrong `dek_secret`.
+    /// `list_secrets_len` followed by `list_secrets` reads the registry twice,
+    /// so one corrupt registry can count twice per enumeration.
+    pub secret_read_auth_failures: u64,
+    /// Cumulative delegate secret reads that failed with an I/O error other
+    /// than not-found, since start. Separate from the authentication count so
+    /// a key mismatch can be told apart from disk trouble.
+    pub secret_read_io_failures: u64,
+    /// Distinct delegates behind the two counts above (saturates at a fixed
+    /// bound).
+    pub secret_delegates_with_failures: u32,
 }
 
 impl ResourceUtilization {
@@ -70,10 +89,16 @@ impl ResourceUtilization {
 /// in-process [`TRANSPORT_METRICS`] cumulative byte counters. Never blocks on
 /// the network and never panics.
 pub(crate) fn sample() -> ResourceUtilization {
-    sample_from(&TRANSPORT_METRICS)
+    sample_from(
+        &TRANSPORT_METRICS,
+        &crate::wasm_runtime::SECRET_READ_FAILURES,
+    )
 }
 
-fn sample_from(transport: &crate::transport::metrics::TransportMetrics) -> ResourceUtilization {
+fn sample_from(
+    transport: &crate::transport::metrics::TransportMetrics,
+    secret_failures: &crate::wasm_runtime::SecretReadFailures,
+) -> ResourceUtilization {
     ResourceUtilization {
         memory_rss_bytes: rss_bytes(),
         memory_limit_bytes: crate::wasm_runtime::read_total_ram_bytes().map(|v| v as u64),
@@ -81,6 +106,9 @@ fn sample_from(transport: &crate::transport::metrics::TransportMetrics) -> Resou
         cumulative_bytes_sent: transport.cumulative_bytes_sent(),
         cumulative_bytes_received: transport.cumulative_bytes_received(),
         quic_paths_active: transport.quic_paths_active(),
+        secret_read_auth_failures: secret_failures.auth_total(),
+        secret_read_io_failures: secret_failures.io_total(),
+        secret_delegates_with_failures: secret_failures.delegates_affected(),
     }
 }
 
@@ -170,18 +198,66 @@ mod tests {
         }
     }
 
+    /// Secret read failures reach the `resource_utilization` event payload.
+    /// Uses its own tracker, since the process-wide one is shared with other
+    /// tests.
+    #[test]
+    fn telemetry_value_carries_secret_read_failures() {
+        use crate::wasm_runtime::{FailureKind, SecretReadFailures};
+        let metrics = crate::transport::metrics::TransportMetrics::new();
+        let failures = SecretReadFailures::new();
+        let value = sample_from(&metrics, &failures).to_telemetry_value();
+        assert_eq!(value["secret_read_auth_failures"], 0);
+        assert_eq!(value["secret_read_io_failures"], 0);
+        assert_eq!(value["secret_delegates_with_failures"], 0);
+
+        let now = std::time::Instant::now();
+        failures.record(now, "delegate-a", "blob-1", FailureKind::Auth);
+        failures.record(now, "delegate-a", "blob-1", FailureKind::Auth);
+        failures.record(now, "delegate-b", "blob-2", FailureKind::Io);
+        let value = sample_from(&metrics, &failures).to_telemetry_value();
+        assert_eq!(value["secret_read_auth_failures"], 2);
+        assert_eq!(value["secret_read_io_failures"], 1);
+        assert_eq!(value["secret_delegates_with_failures"], 2);
+    }
+
+    /// `sample()` reads the PROCESS-WIDE tracker. The tracker is shared with
+    /// parallel tests, so this asserts a delta of at least what it records.
+    #[test]
+    fn sample_reports_the_process_wide_secret_read_failures() {
+        use crate::wasm_runtime::{FailureKind, SECRET_READ_FAILURES};
+        let before = sample();
+        let now = std::time::Instant::now();
+        SECRET_READ_FAILURES.record(now, "sample-wiring-delegate", "b1", FailureKind::Auth);
+        SECRET_READ_FAILURES.record(now, "sample-wiring-delegate", "b2", FailureKind::Auth);
+        SECRET_READ_FAILURES.record(now, "sample-wiring-delegate", "b3", FailureKind::Io);
+        let after = sample();
+        assert!(after.secret_read_auth_failures >= before.secret_read_auth_failures + 2);
+        assert!(after.secret_read_io_failures > before.secret_read_io_failures);
+        assert!(after.secret_delegates_with_failures >= 1);
+    }
+
     /// The sample reports the transport's active QUIC path count. Uses its own
     /// metrics, since the process-wide ones are shared with other tests.
     #[test]
     fn sample_reports_the_active_quic_path_count() {
         let metrics = crate::transport::metrics::TransportMetrics::new();
         let remote: std::net::SocketAddr = "10.0.0.1:1".parse().unwrap();
-        assert_eq!(sample_from(&metrics).quic_paths_active, 0);
+        assert_eq!(
+            sample_from(&metrics, &Default::default()).quic_paths_active,
+            0
+        );
         metrics.quic_path_attempting(remote);
         metrics.quic_path_activated(remote);
-        assert_eq!(sample_from(&metrics).quic_paths_active, 1);
+        assert_eq!(
+            sample_from(&metrics, &Default::default()).quic_paths_active,
+            1
+        );
         metrics.quic_path_left(true, remote);
-        assert_eq!(sample_from(&metrics).quic_paths_active, 0);
+        assert_eq!(
+            sample_from(&metrics, &Default::default()).quic_paths_active,
+            0
+        );
     }
 
     /// The telemetry JSON carries every axis as a populated key, so the
@@ -201,6 +277,9 @@ mod tests {
             "cumulative_bytes_sent",
             "cumulative_bytes_received",
             "quic_paths_active",
+            "secret_read_auth_failures",
+            "secret_read_io_failures",
+            "secret_delegates_with_failures",
         ] {
             assert!(obj.contains_key(key), "telemetry value missing key `{key}`");
         }
