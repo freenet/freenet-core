@@ -249,6 +249,14 @@ pub(crate) use short_runs::QuicCode;
 /// trips at [`short_runs::SHORT_RUNS_TO_TRIP`] again. Everything that reads
 /// it takes it as a parameter, so tests cover both values; production reads
 /// it through [`udp_fallback`].
+///
+/// Flipping it also turns on `fatal_exit` (the update check before a
+/// transport-fatal exit, and a failed bind ending the process). That check
+/// logs `Preparing the update before exiting (#5790)` through
+/// `stage_latest_release` with no update trigger after it, which the release
+/// canary's Gate B (`scripts/auto-update-canary.sh`, `MARKER_STAGE_STARTED`)
+/// reads as a staging that began: re-read Gate B's staging assertions when
+/// flipping.
 pub const UDP_FALLBACK: bool = true;
 
 /// [`UDP_FALLBACK`], or `false` in a test build of the binary whose

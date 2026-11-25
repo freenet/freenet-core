@@ -210,6 +210,13 @@ pub(crate) fn gateway_supervisor_unverified() -> bool {
     SUPERVISOR_UNVERIFIED.load(Ordering::Relaxed)
 }
 
+/// Whether the binary enabled exits for QUIC ([`enable_gateway_quic_restarts`]),
+/// which it does only under our own supervisor: a supervisor that restarts the
+/// node and runs `freenet update` after the exit.
+pub(crate) fn supervised_exits_enabled() -> bool {
+    GATEWAY_QUIC_RESTARTS.load(Ordering::Relaxed)
+}
+
 /// Whether a node in this role exits to restore QUIC, and only when the
 /// binary enabled it ([`enable_gateway_quic_restarts`]): a gateway, and, once
 /// there is no UDP to fall back to (#6151, `breaker::udp_fallback`), a peer

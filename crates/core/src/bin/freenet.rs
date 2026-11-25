@@ -274,6 +274,20 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     // is built, because only this binary marks its clean exits (see `main`).
     freenet::enable_quic_crash_breaker();
 
+    // Before the node is built: a failed bind exits from inside `build`, and its
+    // exit code reads this opt-in (`exit_for_quic_bind_failure`).
+    // #4551: only emit the distinct fast-crash exit code (45) for a sub-60s fatal
+    // exit when the supervising unit actually understands it. The regenerated Freenet
+    // systemd unit advertises that via SYSTEMD_FAST_CRASH_ENV_VAR (it keeps 45 out of
+    // SuccessExitStatus, sets StartLimitAction=none, and runs `freenet update` on 42
+    // OR 45). A node running this binary under an OLD/custom systemd unit (auto-updated
+    // but not reinstalled), under the macOS/Windows run-wrapper (knows only 42), or
+    // unsupervised must keep exiting 42 so its existing exit-42 self-heal/limiting
+    // still works — so the marker, not a broad systemd heuristic, is the gate.
+    if std::env::var_os(commands::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR).is_some() {
+        freenet::enable_fast_crash_exit_code();
+    }
+
     // #5940: a gateway exits through the fatal listener path, for its
     // supervisor to restart it, when that restores QUIC: its QUIC endpoint
     // died, or a crash-breaker cooldown that kept QUIC off for the run ended.
@@ -285,6 +299,16 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
         GatewayQuicRestarts::OffUnverified => freenet::note_gateway_supervisor_unverified(),
         GatewayQuicRestarts::Off => {}
     }
+
+    // W-S6: once there is no UDP to fall back to, a transport-fatal exit (a QUIC
+    // endpoint that cannot be built or that died) runs this update check first,
+    // so the release that fixes the node is staged before the exit. Dark while
+    // `QUIC_BREAKER_UDP_FALLBACK` is true: the library does not call it.
+    FATAL_EXIT_UPDATE_DISABLED.store(
+        auto_update_is_disabled(build_info::GIT_DIRTY, disable_auto_update),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    freenet::register_fatal_exit_update_check(fatal_exit_update_check);
 
     let node_config = NodeConfig::new(config)
         .await
@@ -379,18 +403,6 @@ async fn run_network_node_with_signals(
     // (code 42) for a prompt systemd restart + auto-update, instead of risking a hang
     // in teardown that leaves the node network-dead and spinning.
     freenet::enable_abort_on_fatal_listener_exit();
-
-    // #4551: only emit the distinct fast-crash exit code (45) for a sub-60s fatal
-    // exit when the supervising unit actually understands it. The regenerated Freenet
-    // systemd unit advertises that via SYSTEMD_FAST_CRASH_ENV_VAR (it keeps 45 out of
-    // SuccessExitStatus, sets StartLimitAction=none, and runs `freenet update` on 42
-    // OR 45). A node running this binary under an OLD/custom systemd unit (auto-updated
-    // but not reinstalled), under the macOS/Windows run-wrapper (knows only 42), or
-    // unsupervised must keep exiting 42 so its existing exit-42 self-heal/limiting
-    // still works — so the marker, not a broad systemd heuristic, is the gate.
-    if std::env::var_os(commands::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR).is_some() {
-        freenet::enable_fast_crash_exit_code();
-    }
 
     // #4604: this is the real node process, so let the contract storage layer
     // exit-for-restart if redb gets poisoned by a transient I/O error (e.g. a disk
@@ -644,6 +656,14 @@ async fn run_network_node_with_signals(
             freenet::quic_crash_loop_update_now(),
             freenet::config::GlobalRng::random_u64(),
         );
+        // Test builds only: push the startup check out of the way, so a
+        // real-process test of the check before a fatal exit is the only
+        // claimant of the update attempt.
+        #[cfg(feature = "testing")]
+        let startup_jitter_secs = std::env::var("FREENET_TEST_STARTUP_UPDATE_JITTER_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(startup_jitter_secs);
         // `startup_check_ran` is true only if the claim, made after the
         // jitter, allowed the check.
         let (startup_check_ran, latest) = match startup_attempt {
@@ -1105,17 +1125,15 @@ async fn run_network_node_with_signals(
                         checks_started = commands::auto_update::handshake_failure_checks_started(),
                         "No connection after repeated gateway handshake failures: checking GitHub"
                     );
-                    if let Some(new_version) =
-                        startup_update_check(attempt, build_info::VERSION).await
-                    {
-                        if commands::rollback::is_version_pinned_bad(&new_version)
-                            || commands::rollback::is_version_install_gated(&new_version)
-                        {
+                    match detect_unblocked_release(attempt).await {
+                        ReleaseCheck::NoneNewer => {}
+                        ReleaseCheck::Blocked(new_version) => {
                             tracing::warn!(
                                 new_version = %new_version,
                                 "Handshake-failure check: newer version is locally blocked; not triggering auto-update"
                             );
-                        } else {
+                        }
+                        ReleaseCheck::Newer(new_version) => {
                             tracing::info!(
                                 new_version = %new_version,
                                 "Handshake-failure check: newer version on GitHub, triggering auto-update"
@@ -1337,6 +1355,163 @@ async fn run_network_node_with_signals(
     }
 
     result
+}
+
+/// What asking GitHub for a newer release found, after the local blocks.
+enum ReleaseCheck {
+    /// No release newer than this binary, or GitHub could not be reached.
+    NoneNewer,
+    /// A newer release this node must not install: pinned known-bad after a
+    /// crash-loop rollback, or its install repeatedly failed (#4073).
+    Blocked(String),
+    /// A newer release that may be installed.
+    Newer(String),
+}
+
+/// The one-shot GitHub check and the local-block gate shared by the
+/// handshake-failure trigger and the update check before a fatal exit: each
+/// logs and acts on the result its own way.
+async fn detect_unblocked_release(attempt: commands::auto_update::UpdateAttempt) -> ReleaseCheck {
+    let Some(new_version) =
+        commands::auto_update::startup_update_check(attempt, build_info::VERSION).await
+    else {
+        return ReleaseCheck::NoneNewer;
+    };
+    if commands::rollback::is_version_pinned_bad(&new_version)
+        || commands::rollback::is_version_install_gated(&new_version)
+    {
+        ReleaseCheck::Blocked(new_version)
+    } else {
+        ReleaseCheck::Newer(new_version)
+    }
+}
+
+/// Whether auto-update is off for this process (a dirty build or the operator's
+/// opt-out), so the update check before a fatal exit stays out.
+static FATAL_EXIT_UPDATE_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The check registered with the library to run before a transport-fatal exit
+/// (`freenet::register_fatal_exit_update_check`).
+fn fatal_exit_update_check()
+-> std::pin::Pin<Box<dyn std::future::Future<Output = freenet::FatalExitCheckEnd> + Send>> {
+    Box::pin(check_for_update_before_fatal_exit())
+}
+
+/// Wait for an operator's stop (SIGTERM, or Ctrl+C), which ends the update
+/// check before a fatal exit: the node's own signal handling is not running
+/// yet or any more at that point, and a stop that waits out the check can run
+/// into the service manager's stop timeout.
+///
+/// The SIGTERM listener is installed when this is called, not when the future
+/// is first polled, so a SIGTERM that arrives as the check starts is not
+/// missed. Ctrl+C's handler is installed on the first poll, which the caller's
+/// `select!` makes at once, before the check's own steps run.
+fn stop_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal;
+    #[cfg(unix)]
+    let sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).ok();
+    async move {
+        // Registered independently: a SIGTERM listener that could not be
+        // installed must not make Ctrl+C a no-op.
+        let term = async {
+            #[cfg(unix)]
+            if let Some(mut sigterm) = sigterm {
+                sigterm.recv().await;
+                return;
+            }
+            std::future::pending::<()>().await;
+        };
+        // A Ctrl+C handler that could not be installed is not a stop.
+        let interrupt = async {
+            if signal::ctrl_c().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::select! {
+            () = term => {},
+            () = interrupt => {},
+        }
+    }
+}
+
+/// [`check_for_update_before_fatal_exit_steps`], abandoned when an operator
+/// asks the process to stop.
+async fn check_for_update_before_fatal_exit() -> freenet::FatalExitCheckEnd {
+    let stop = stop_signal();
+    tokio::select! {
+        () = check_for_update_before_fatal_exit_steps() => freenet::FatalExitCheckEnd::Finished,
+        () = stop => {
+            tracing::info!("Fatal-exit update check: stopped by a signal, exiting now");
+            freenet::FatalExitCheckEnd::Stopped
+        }
+    }
+}
+
+/// Test builds only: make the check hang or panic, so a real-process test can
+/// drive the exit's bound, its reaction to a stop and to a panicking check.
+#[cfg(feature = "testing")]
+async fn test_fatal_exit_check_faults() {
+    if std::env::var_os("FREENET_TEST_FATAL_EXIT_CHECK_PANICS").is_some() {
+        panic!("test fault: the fatal-exit update check panics");
+    }
+    if std::env::var_os("FREENET_TEST_FATAL_EXIT_CHECK_HANGS").is_some() {
+        tracing::info!("Fatal-exit update check: test fault, hanging");
+        std::future::pending::<()>().await;
+    }
+}
+
+/// The steps of the handshake-failure check (cooling and retry-spend gates, the
+/// claim, `detect_unblocked_release`, `stage_latest_release`), without its
+/// `update_tx` send: the caller exits the
+/// process whatever this finds, and the supervisor's update hook installs what
+/// was staged. Bounded by the caller's timeout; fails open on every error.
+async fn check_for_update_before_fatal_exit_steps() {
+    #[cfg(feature = "testing")]
+    test_fatal_exit_check_faults().await;
+    use commands::auto_update::{claim_update_attempt, update_attempt_would_spend_retry};
+    use commands::update::stage_latest_release;
+    if FATAL_EXIT_UPDATE_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!("Fatal-exit update check skipped: auto-update is disabled on this node");
+        return;
+    }
+    if commands::rollback::update_cooldown_pending(build_info::VERSION).is_some()
+        || update_attempt_would_spend_retry()
+    {
+        tracing::warn!(
+            "Fatal-exit update check skipped: a release is cooling down or the update retry is \
+             locked out"
+        );
+        return;
+    }
+    let Ok(attempt) = claim_update_attempt() else {
+        tracing::warn!("Fatal-exit update check skipped: the update attempt claim was refused");
+        return;
+    };
+    tracing::info!(
+        current = build_info::VERSION,
+        "Fatal-exit update check: asking GitHub before the process exits"
+    );
+    let new_version = match detect_unblocked_release(attempt).await {
+        ReleaseCheck::NoneNewer => {
+            tracing::info!("Fatal-exit update check: no newer release found");
+            return;
+        }
+        ReleaseCheck::Blocked(new_version) => {
+            tracing::warn!(
+                new_version = %new_version,
+                "Fatal-exit update check: newer version is locally blocked; not staging it"
+            );
+            return;
+        }
+        ReleaseCheck::Newer(new_version) => new_version,
+    };
+    tracing::info!(
+        new_version = %new_version,
+        "Fatal-exit update check: newer version on GitHub, staging it before the exit"
+    );
+    let staged = stage_latest_release(build_info::VERSION, Some(&new_version)).await;
+    tracing::info!(new_version = %new_version, staged = ?staged, "Fatal-exit update check: finished");
 }
 
 /// The startup update check waits a random 0 to this many seconds first
@@ -3535,6 +3710,69 @@ mod tests {
             ),
             "connection_maintenance must publish BootstrapPacer::rounds_without_connection"
         );
+    }
+
+    /// The update check before a fatal exit takes the same gates as the
+    /// handshake-failure trigger, in the same order, and detects through the
+    /// function both share. The gates are written out in each place because the
+    /// trigger's are interleaved with its own state and pinned in order above,
+    /// so this pins the second copy: dropping any gate, or the claim, fails.
+    #[test]
+    fn the_fatal_exit_update_check_has_every_gate_in_order() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let body: String = fn_body(&src, "async fn check_for_update_before_fatal_exit_steps(")
+            .split_whitespace()
+            .collect();
+        let mut at = 0;
+        for step in [
+            "FATAL_EXIT_UPDATE_DISABLED.load(",
+            "update_cooldown_pending(build_info::VERSION)",
+            "update_attempt_would_spend_retry()",
+            "claim_update_attempt()",
+            "detect_unblocked_release(attempt)",
+            "stage_latest_release(build_info::VERSION,Some(&new_version))",
+        ] {
+            let found = body[at..]
+                .find(step)
+                .unwrap_or_else(|| panic!("`{step}` missing or out of order in {body}"));
+            at += found + step.len();
+        }
+        assert!(
+            !body.contains("update_tx"),
+            "the fatal-exit check exits the process itself and sends no update"
+        );
+        let detect: String = fn_body(&src, "async fn detect_unblocked_release(")
+            .split_whitespace()
+            .collect();
+        for needle in [
+            "startup_update_check(attempt,build_info::VERSION)",
+            "is_version_pinned_bad(&new_version)",
+            "is_version_install_gated(&new_version)",
+        ] {
+            assert!(
+                detect.contains(needle),
+                "detect_unblocked_release lacks {needle}"
+            );
+        }
+        let task: String = fn_body(&src, "async fn run_network_node_with_signals(")
+            .split_whitespace()
+            .collect();
+        assert!(
+            task.contains("matchdetect_unblocked_release(attempt).await{"),
+            "the handshake trigger must detect through the shared function"
+        );
+        // A stop ends the check, and the registration is in `run_network`.
+        let wrapper: String = fn_body(&src, "async fn check_for_update_before_fatal_exit(")
+            .split_whitespace()
+            .collect();
+        assert!(wrapper.contains("()=stop=>"), "{wrapper}");
+        let run: String = fn_body(&src, "async fn run_network(")
+            .split_whitespace()
+            .collect();
+        let register = run
+            .find("freenet::register_fatal_exit_update_check(fatal_exit_update_check)")
+            .expect("registration");
+        assert!(register < run.find(".build(clients)").expect("build"));
     }
 
     /// #5975: `run_network` records the updater's state BEFORE the node is

@@ -48,6 +48,10 @@ pub use transport::quic::breaker::{
     record_deliberate_stop as record_quic_breaker_deliberate_stop,
     wait_for_transport_open as wait_for_quic_transport_open,
 };
+pub use transport::quic::fatal_exit::{
+    FATAL_EXIT_UPDATE_CHECK_TIMEOUT, FatalExitCheckEnd, FatalExitUpdateCheck,
+    register_fatal_exit_update_check,
+};
 pub use transport::quic::liveness::{
     enable_gateway_quic_restarts, note_gateway_supervisor_unverified,
 };

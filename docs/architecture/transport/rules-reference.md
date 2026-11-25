@@ -3808,6 +3808,21 @@ Liveness ("alive" = the endpoint driver has not ENDED; it does not mean
     transport opens, cut short by a stop), the startup update check at once
     (quic_crash_loop_update_now; the update claim still applies), and a
     supervised peer exits on endpoint death like a gateway.
+    The same constant turns on quic/fatal_exit.rs (dark today; no runtime
+    switch). Before a transport-fatal exit (endpoint death, the quinn driver
+    death backstop, the planned restart at the end of a breaker cooldown) a
+    node run under our supervisor (FREENET_SUPERVISED) runs the update check
+    the binary registered (register_fatal_exit_update_check), bounded at 20 s
+    (FATAL_EXIT_UPDATE_CHECK_TIMEOUT, under the unit's 45 s TimeoutStopSec,
+    because a SIGKILL after it reaches ExecStopPost as KILL and counts as a
+    crash). It only pre-downloads: ExecStopPost already runs freenet update
+    on 42 and 45. A stop during it ends it and the process exits 0; a panic
+    in it is contained and the exit code is unchanged. A QUIC endpoint that
+    cannot be built also ends the node then (it stays up with QUIC off while
+    UDP exists): exit 45 when the supervisor opted in to the fast-crash code
+    (that opt-in is registered before the node is built, since the exit runs
+    inside build), 42 otherwise; an unsupervised node exits at once, without
+    the check, with a CRITICAL line saying what to do.
   → When the node drops its last handle, the availability is Released
     (final; the first final state stored wins, so a release and a
     driver return racing never overwrite each other) and the driver's

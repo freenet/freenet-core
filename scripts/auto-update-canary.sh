@@ -127,6 +127,10 @@ MARKER_DISABLED='Auto-update is DISABLED'
 # reword in the source cannot simply be mirrored here: keep accepting the old
 # string for one release, or Gate B is disarmed (STARTED) or fails a healthy
 # release (DONE, INSTALLED_STAGED) until the reworded binary is the previous one.
+# Note: once `breaker::UDP_FALLBACK` is false, a transport-fatal exit
+# (`transport/quic/fatal_exit.rs`) also logs this line, through the same
+# `stage_latest_release`, with no update trigger after it. Re-check this gate
+# when that flips.
 MARKER_STAGE_STARTED='Preparing the update before exiting'
 MARKER_STAGE_DOWNLOADING='Downloading the update before exiting'
 MARKER_STAGE_DONE='Update downloaded and verified'
