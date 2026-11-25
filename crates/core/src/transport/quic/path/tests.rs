@@ -164,6 +164,53 @@ async fn paths_native(network: &str) -> Paths {
     .await
 }
 
+/// `network` for a native variant of a test: a name of its own, since the
+/// simulated network is keyed by name.
+fn net(network: &'static str, native: bool) -> &'static str {
+    if native {
+        Box::leak(format!("{network}-native").into_boxed_str())
+    } else {
+        network
+    }
+}
+
+/// The base limits of `a`'s path: a native connection's (no UDP session) or not.
+fn native_base(native: bool) -> QuicPathLimits {
+    if native {
+        QuicPathLimits::NATIVE
+    } else {
+        QuicPathLimits::DEFAULT
+    }
+}
+
+/// [`paths`] with `a`'s path a native connection's if `native`.
+async fn paths_for(network: &str, b_limits: QuicPathLimits, native: bool) -> Paths {
+    paths_built(
+        network,
+        b_limits,
+        native_base(native),
+        None,
+        None,
+        Windows::default(),
+        true,
+    )
+    .await
+}
+
+/// [`paths_capped`] with `a`'s path a native connection's if `native`.
+async fn paths_capped_for(network: &str, a_cap: u64, native: bool) -> Paths {
+    paths_built(
+        network,
+        QuicPathLimits::DEFAULT,
+        native_base(native),
+        None,
+        Some(a_cap),
+        Windows::default(),
+        true,
+    )
+    .await
+}
+
 /// [`paths`] with each side's path taking its windows from a buffer budget.
 async fn paths_metered(network: &str, windows: Windows) -> Paths {
     paths_built(
@@ -1507,9 +1554,19 @@ fn late_ends_reach_the_path_watch_and_close_a_native_path_only() {
 /// not closed.
 #[test]
 fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes() {
-    bounded(|| async move {
+    ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes_on(false)
+}
+
+/// The same honest peer on a native path (no UDP session), where the late-end rule closes: the path must stay open with no late end.
+#[test]
+fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes_on_a_native_path() {
+    ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes_on(true)
+}
+
+fn ack_wait_expiries_under_this_nodes_egress_cap_are_not_strikes_on(native: bool) {
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let p = paths_capped("quic-path-expiries-capped", 100_000).await;
+        let p = paths_capped_for(net("quic-path-expiries-capped", native), 100_000, native).await;
         let (a, time) = (p.a.clone(), p.time());
         // The cap queues the bulk's bytes ahead of each end past the wait.
         let never = SendDeadlines {
@@ -1670,21 +1727,31 @@ fn a_one_packet_shorts_background_ack_wait_is_bounded() {
 /// (`[MaybeDelivered(TimedOut), Sent, Sent, ...]`).
 #[test]
 fn concurrent_large_streams_on_a_slow_path_see_no_expiry() {
+    concurrent_large_streams_on_a_slow_path_see_no_expiry_on(false)
+}
+
+/// The same honest peer on a native path (no UDP session), where the late-end rule closes: the path must stay open with no late end.
+#[test]
+fn concurrent_large_streams_on_a_slow_path_see_no_expiry_on_a_native_path() {
+    concurrent_large_streams_on_a_slow_path_see_no_expiry_on(true)
+}
+
+fn concurrent_large_streams_on_a_slow_path_see_no_expiry_on(native: bool) {
     use crate::transport::in_memory_socket::{
         PacketDeliveryDecision, set_packet_delivery_callback,
     };
     use std::sync::atomic::Ordering::Relaxed;
     const RATE: u64 = 40 * 1024;
-    bounded(|| async move {
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let network = "quic-path-slow-many";
+        let network = net("quic-path-slow-many", native);
         set_packet_delivery_callback(
             network,
             Some(Arc::new(|_, _, _, _| {
                 PacketDeliveryDecision::DelayedDelivery(Duration::from_millis(200))
             })),
         );
-        let mut p = paths(network, QuicPathLimits::DEFAULT).await;
+        let mut p = paths_for(network, QuicPathLimits::DEFAULT, native).await;
         let (a_addr, time) = (p.pair.a_addr, p.time());
         let free_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
         set_packet_delivery_callback(
@@ -2613,21 +2680,31 @@ fn an_expiry_whose_timer_woke_late_is_not_a_strike() {
 /// evidence holds, so they are not strikes and the path is not closed.
 #[test]
 fn ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes() {
+    ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes_on(false)
+}
+
+/// The same honest peer on a native path (no UDP session), where the late-end rule closes: the path must stay open with no late end.
+#[test]
+fn ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes_on_a_native_path() {
+    ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes_on(true)
+}
+
+fn ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes_on(native: bool) {
     use crate::transport::in_memory_socket::{
         PacketDeliveryDecision, set_packet_delivery_callback,
     };
     use std::sync::atomic::Ordering::Relaxed;
     const RATE: u64 = 8 * 1024;
-    bounded(|| async move {
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let network = "quic-path-expiries-slow";
+        let network = net("quic-path-expiries-slow", native);
         set_packet_delivery_callback(
             network,
             Some(Arc::new(|_, _, _, _| {
                 PacketDeliveryDecision::DelayedDelivery(Duration::from_secs(2))
             })),
         );
-        let mut p = paths(network, QuicPathLimits::DEFAULT).await;
+        let mut p = paths_for(network, QuicPathLimits::DEFAULT, native).await;
         let (a_addr, time) = (p.pair.a_addr, p.time());
         let free_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
         set_packet_delivery_callback(
@@ -2717,16 +2794,27 @@ fn ack_wait_expiries_on_a_congestion_limited_slow_path_are_not_strikes() {
 /// (`SHORT_ACK_WAIT`). None is reset and the path is not closed.
 #[test]
 fn one_packet_shorts_through_a_tolerated_outage_do_not_expire() {
+    one_packet_shorts_through_a_tolerated_outage_do_not_expire_on(false)
+}
+
+/// The same honest peer on a native path (no UDP session), where the late-end rule closes: the path must stay open with no late end.
+#[test]
+fn one_packet_shorts_through_a_tolerated_outage_do_not_expire_on_a_native_path() {
+    one_packet_shorts_through_a_tolerated_outage_do_not_expire_on(true)
+}
+
+fn one_packet_shorts_through_a_tolerated_outage_do_not_expire_on(native: bool) {
     use crate::transport::in_memory_socket::{
         PacketDeliveryDecision, set_packet_delivery_callback,
     };
     use std::sync::atomic::Ordering::Relaxed;
-    bounded(|| async move {
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
         for (network, one_way_ms, outage_s) in [
             ("quic-path-shorts-outage-fast", 0u64, 11u64),
             ("quic-path-shorts-outage-800", 400, 30),
         ] {
+            let network = net(network, native);
             let one_way = Duration::from_millis(one_way_ms);
             let dark = Arc::new(std::sync::atomic::AtomicBool::new(false));
             {
@@ -2748,7 +2836,16 @@ fn one_packet_shorts_through_a_tolerated_outage_do_not_expire() {
                 a: Some(test_budget(64 << 20, leaked_counters())),
                 b: Some(test_budget(64 << 20, leaked_counters())),
             };
-            let p = paths_metered(network, windows).await;
+            let p = paths_built(
+                network,
+                QuicPathLimits::DEFAULT,
+                native_base(native),
+                None,
+                None,
+                windows,
+                true,
+            )
+            .await;
             let b_addr = p.pair.b_addr;
             dark.store(true, Relaxed);
             let (a, time) = (p.a.clone(), p.time());
@@ -2804,21 +2901,31 @@ fn one_packet_shorts_through_a_tolerated_outage_do_not_expire() {
 /// is evicted by the receiver before any ack wait could run out, as on UDP.
 #[test]
 fn a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry() {
+    a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry_on(false)
+}
+
+/// The same honest peer on a native path (no UDP session), where the late-end rule closes: the path must stay open with no late end.
+#[test]
+fn a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry_on_a_native_path() {
+    a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry_on(true)
+}
+
+fn a_path_at_the_floor_rate_and_a_4_s_round_trip_sees_no_expiry_on(native: bool) {
     use crate::transport::in_memory_socket::{
         PacketDeliveryDecision, set_packet_delivery_callback,
     };
     use std::sync::atomic::Ordering::Relaxed;
     const RATE: u64 = 16 * 1024;
-    bounded(|| async move {
+    bounded(move || async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        let network = "quic-path-floor-4s";
+        let network = net("quic-path-floor-4s", native);
         set_packet_delivery_callback(
             network,
             Some(Arc::new(|_, _, _, _| {
                 PacketDeliveryDecision::DelayedDelivery(Duration::from_secs(2))
             })),
         );
-        let mut p = paths(network, QuicPathLimits::DEFAULT).await;
+        let mut p = paths_for(network, QuicPathLimits::DEFAULT, native).await;
         let (a_addr, time) = (p.pair.a_addr, p.time());
         let free_at = Arc::new(std::sync::atomic::AtomicU64::new(0));
         set_packet_delivery_callback(
