@@ -13,6 +13,11 @@
 //! failure there is not a delegate seeing a secret as absent. It changes no
 //! read result.
 //!
+//! "Authentication" here also covers a key registry with a malformed header
+//! (`InvalidData`) and a user-scope read with a wrong `dek_secret`. Counts are
+//! reads: `list_secrets_len` plus `list_secrets` may count one corrupt
+//! registry twice.
+//!
 //! Not-found never counts: an absent secret is normal.
 //!
 //! Privacy: the log carries the delegate key and the bs58 hash that names the
@@ -180,7 +185,7 @@ thread_local! {
 
 /// Route this thread's failures to a fresh tracker and return it.
 #[cfg(test)]
-pub(super) fn install_test_tracker() -> std::sync::Arc<SecretReadFailures> {
+pub(crate) fn install_test_tracker() -> std::sync::Arc<SecretReadFailures> {
     let t = std::sync::Arc::new(SecretReadFailures::new());
     TEST_TRACKER.with(|c| *c.borrow_mut() = Some(t.clone()));
     t

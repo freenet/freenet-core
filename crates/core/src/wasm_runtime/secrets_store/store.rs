@@ -6122,6 +6122,40 @@ mod test {
         Ok(())
     }
 
+    /// #6368: a registry that cannot be read for a reason other than bad
+    /// contents (here a directory in its place) counts as an I/O failure and
+    /// `list_secret_keys` returns the error rather than an empty list.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delegate_registry_io_failures_are_counted_as_io()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let failures = read_failures::install_test_tracker();
+        let temp_dir = tempfile::tempdir()?;
+        let secrets_dir = temp_dir.path().join("secrets-store-test");
+        std::fs::create_dir_all(&secrets_dir)?;
+        let db = create_test_db(temp_dir.path()).await;
+        let mut store = SecretsStore::new(secrets_dir, Default::default(), db)?;
+        let delegate = Delegate::from((&vec![101].into(), &vec![].into()));
+        let (cipher, nonce) = fresh_cipher();
+        store.register_delegate(delegate.key().clone(), cipher, nonce)?;
+        store.store_secret(
+            delegate.key(),
+            &SecretsId::new(vec![102]),
+            SecretScope::Local,
+            Zeroizing::new(b"v".to_vec()),
+        )?;
+        let registry = store.key_registry_path(delegate.key(), &SecretScope::Local);
+        std::fs::remove_file(&registry)?;
+        std::fs::create_dir(&registry)?;
+        let res = store.list_secret_keys(delegate.key(), SecretScope::Local, &[]);
+        assert!(
+            res.is_err(),
+            "an I/O failure must surface, not read as empty"
+        );
+        assert_eq!((failures.auth_total(), failures.io_total()), (0, 1));
+        Ok(())
+    }
+
     /// #6368: reads that are not delegate-facing never count, even on an
     /// unreadable blob or registry: the plain `get_secret`, a write that
     /// updates the registry, and an export.

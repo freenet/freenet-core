@@ -57,6 +57,12 @@ pub(crate) struct ResourceUtilization {
     /// these as "absent" (#6323), so a node with a mismatched
     /// key-encryption-key shows a non-zero value here and nowhere else
     /// (#6368). Aggregate only; nothing identifies a secret.
+    ///
+    /// Counts reads, not blobs. It also includes a key registry with a
+    /// malformed header (`InvalidData`, indistinguishable from an AEAD
+    /// failure) and a user-scope read made with a wrong `dek_secret`.
+    /// `list_secrets_len` followed by `list_secrets` reads the registry twice,
+    /// so one corrupt registry can count twice per enumeration.
     pub secret_read_auth_failures: u64,
     /// Cumulative delegate secret reads that failed with an I/O error other
     /// than not-found, since start. Separate from the authentication count so
