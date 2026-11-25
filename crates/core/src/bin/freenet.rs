@@ -1115,17 +1115,15 @@ async fn run_network_node_with_signals(
                         checks_started = commands::auto_update::handshake_failure_checks_started(),
                         "No connection after repeated gateway handshake failures: checking GitHub"
                     );
-                    if let Some(new_version) =
-                        startup_update_check(attempt, build_info::VERSION).await
-                    {
-                        if commands::rollback::is_version_pinned_bad(&new_version)
-                            || commands::rollback::is_version_install_gated(&new_version)
-                        {
+                    match detect_unblocked_release(attempt).await {
+                        ReleaseCheck::NoneNewer => {}
+                        ReleaseCheck::Blocked(new_version) => {
                             tracing::warn!(
                                 new_version = %new_version,
                                 "Handshake-failure check: newer version is locally blocked; not triggering auto-update"
                             );
-                        } else {
+                        }
+                        ReleaseCheck::Newer(new_version) => {
                             tracing::info!(
                                 new_version = %new_version,
                                 "Handshake-failure check: newer version on GitHub, triggering auto-update"
@@ -1349,6 +1347,35 @@ async fn run_network_node_with_signals(
     result
 }
 
+/// What asking GitHub for a newer release found, after the local blocks.
+enum ReleaseCheck {
+    /// No release newer than this binary, or GitHub could not be reached.
+    NoneNewer,
+    /// A newer release this node must not install: pinned known-bad after a
+    /// crash-loop rollback, or its install repeatedly failed (#4073).
+    Blocked(String),
+    /// A newer release that may be installed.
+    Newer(String),
+}
+
+/// The one-shot GitHub check and the local-block gate shared by the
+/// handshake-failure trigger and the update check before a fatal exit: each
+/// logs and acts on the result its own way.
+async fn detect_unblocked_release(attempt: commands::auto_update::UpdateAttempt) -> ReleaseCheck {
+    let Some(new_version) =
+        commands::auto_update::startup_update_check(attempt, build_info::VERSION).await
+    else {
+        return ReleaseCheck::NoneNewer;
+    };
+    if commands::rollback::is_version_pinned_bad(&new_version)
+        || commands::rollback::is_version_install_gated(&new_version)
+    {
+        ReleaseCheck::Blocked(new_version)
+    } else {
+        ReleaseCheck::Newer(new_version)
+    }
+}
+
 /// Whether auto-update is off for this process (a dirty build or the operator's
 /// opt-out), so the update check before a fatal exit stays out.
 static FATAL_EXIT_UPDATE_DISABLED: std::sync::atomic::AtomicBool =
@@ -1361,14 +1388,12 @@ fn fatal_exit_update_check() -> std::pin::Pin<Box<dyn std::future::Future<Output
 }
 
 /// The handshake-failure check's steps (cooling and retry-spend gates, the
-/// claim, `startup_update_check`, the blocked-version gate,
-/// `stage_latest_release`), without its `update_tx` send: the caller exits the
+/// claim, `detect_unblocked_release`, `stage_latest_release`), without its
+/// `update_tx` send: the caller exits the
 /// process whatever this finds, and the supervisor's update hook installs what
 /// was staged. Bounded by the caller's timeout; fails open on every error.
 async fn check_for_update_before_fatal_exit() {
-    use commands::auto_update::{
-        claim_update_attempt, startup_update_check, update_attempt_would_spend_retry,
-    };
+    use commands::auto_update::{claim_update_attempt, update_attempt_would_spend_retry};
     use commands::update::stage_latest_release;
     if FATAL_EXIT_UPDATE_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
         tracing::info!("Fatal-exit update check skipped: auto-update is disabled on this node");
@@ -1391,19 +1416,20 @@ async fn check_for_update_before_fatal_exit() {
         current = build_info::VERSION,
         "Fatal-exit update check: asking GitHub before the process exits"
     );
-    let Some(new_version) = startup_update_check(attempt, build_info::VERSION).await else {
-        tracing::info!("Fatal-exit update check: no newer release found");
-        return;
+    let new_version = match detect_unblocked_release(attempt).await {
+        ReleaseCheck::NoneNewer => {
+            tracing::info!("Fatal-exit update check: no newer release found");
+            return;
+        }
+        ReleaseCheck::Blocked(new_version) => {
+            tracing::warn!(
+                new_version = %new_version,
+                "Fatal-exit update check: newer version is locally blocked; not staging it"
+            );
+            return;
+        }
+        ReleaseCheck::Newer(new_version) => new_version,
     };
-    if commands::rollback::is_version_pinned_bad(&new_version)
-        || commands::rollback::is_version_install_gated(&new_version)
-    {
-        tracing::warn!(
-            new_version = %new_version,
-            "Fatal-exit update check: newer version is locally blocked; not staging it"
-        );
-        return;
-    }
     tracing::info!(
         new_version = %new_version,
         "Fatal-exit update check: newer version on GitHub, staging it before the exit"

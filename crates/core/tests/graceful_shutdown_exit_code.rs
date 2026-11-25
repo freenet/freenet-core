@@ -1681,15 +1681,23 @@ const BIND_FAILURE_EXIT_MARKER: &str = "The QUIC endpoint could not be built and
 /// then says so instead of asking GitHub; a clean build must ask.
 #[cfg(feature = "testing")]
 fn assert_update_check_ran_before_exit(logs: &str, exit_marker: &str) {
-    let done = logs
-        .find(FATAL_CHECK_DONE_MARKER)
-        .unwrap_or_else(|| panic!("the check did not finish before the exit. Logs:\n{logs}"));
-    let exit = logs
-        .find(exit_marker)
-        .unwrap_or_else(|| panic!("no exit line {exit_marker:?}. Logs:\n{logs}"));
+    // The log directory holds an error-only file beside the main one, so the
+    // concatenation is not in time order: compare the lines' own timestamps.
+    let stamp = |marker: &str| {
+        logs.lines()
+            .find(|line| line.contains(marker))
+            .map(|line| {
+                line.split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .unwrap_or_else(|| panic!("no log line with {marker:?}. Logs:\n{logs}"))
+    };
+    let (done, exit) = (stamp(FATAL_CHECK_DONE_MARKER), stamp(exit_marker));
     assert!(
-        done < exit,
-        "the exit came before the check ended. Logs:\n{logs}"
+        done <= exit,
+        "the exit ({exit}) came before the check ended ({done}). Logs:\n{logs}"
     );
     let skipped = logs.contains("Fatal-exit update check skipped: auto-update is disabled");
     assert!(
@@ -1780,11 +1788,42 @@ fn with_udp_a_bind_failure_is_not_fatal_and_runs_no_fatal_exit_check() -> anyhow
     std::thread::sleep(Duration::from_secs(3));
     assert!(node.child.try_wait()?.is_none(), "Logs:\n{}", node.logs());
     assert!(
-        !node.logs().contains(FATAL_CHECK_PREFIX),
+        !node.logs().contains(FATAL_CHECK_PREFIX) && !node.logs().contains(FATAL_CHECK_DONE_MARKER),
         "Logs:\n{}",
         node.logs()
     );
     node.send_sigterm()?;
     assert_eq!(node.wait_for_exit(Duration::from_secs(45))?.code(), Some(0));
+    Ok(())
+}
+
+/// Dark, endpoint death: with UDP still there, a supervised gateway exits 42
+/// as before and neither the registered check nor the library's line about it
+/// appears, with auto-update on.
+///
+/// FALSIFY: delete the `udp_fallback()` early return in
+/// `fatal_exit::check_before_exit`.
+#[cfg(feature = "testing")]
+#[test]
+fn with_udp_an_endpoint_death_exit_does_not_call_the_fatal_exit_check() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home)?;
+    let env = [("FREENET_SUPERVISED", "1"), (ENDPOINT_DOWN_ENV, "2")];
+    let mut node = spawn_quic_node_full(
+        dir.path(),
+        &dir.path().join("logs"),
+        &[AUTO_UPDATE_ON],
+        Some(&home),
+        &env,
+    )?;
+    let status = node.wait_for_exit(Duration::from_secs(60))?;
+    let logs = node.logs();
+    assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
+    assert!(logs.contains(ENDPOINT_DOWN_EXIT_MARKER), "Logs:\n{logs}");
+    assert!(
+        !logs.contains(FATAL_CHECK_PREFIX) && !logs.contains(FATAL_CHECK_DONE_MARKER),
+        "Logs:\n{logs}"
+    );
     Ok(())
 }
