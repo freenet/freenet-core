@@ -250,6 +250,13 @@ pub(crate) use short_runs::QuicCode;
 /// it takes it as a parameter, so tests cover both values; production reads
 /// it through [`udp_fallback`].
 ///
+/// Flipping it also makes every upgraded QUIC path act as a native one
+/// (`path::QuicPathLimits::effective_udp_fallback`): a send the path cannot
+/// carry is given up for the operation layer to retry, a quiet path is never
+/// suspect, and a route whose path ended drops what it holds. Connections with
+/// no QUIC path (plain UDP) and the connect-time UDP dial
+/// (`udp_fallback_dial`) are not changed by it.
+///
 /// Flipping it also turns on `fatal_exit` (the update check before a
 /// transport-fatal exit, and a failed bind ending the process). That check
 /// logs `Preparing the update before exiting (#5790)` through
@@ -259,16 +266,63 @@ pub(crate) use short_runs::QuicCode;
 /// flipping.
 pub const UDP_FALLBACK: bool = true;
 
-/// [`UDP_FALLBACK`], or `false` in a test build of the binary whose
-/// environment sets `FREENET_TEST_BREAKER_NO_UDP_FALLBACK` (the
+/// [`UDP_FALLBACK`], or `false` in a test build whose process environment sets
+/// `FREENET_TEST_NO_UDP_FALLBACK` (unit tests and simulations, see
+/// [`run_with_no_udp_fallback`]) or `FREENET_TEST_BREAKER_NO_UDP_FALLBACK` (the
 /// `quic-panic-injection` feature, which cannot be built without debug
-/// assertions), so a real-process test can run the post-UDP path.
+/// assertions), so a real-process test can run the post-UDP path. The one
+/// reader of the constant outside this module: every path, the breaker and the
+/// fatal-exit rules take the value from here (D-3). The environment is read
+/// once per process, and nothing in a process sets it, so a test cannot change
+/// what another test in the same process sees.
 pub(crate) fn udp_fallback() -> bool {
     #[cfg(feature = "quic-panic-injection")]
     if std::env::var_os("FREENET_TEST_BREAKER_NO_UDP_FALLBACK").is_some() {
         return false;
     }
+    #[cfg(any(test, feature = "testing"))]
+    if no_udp_fallback_process() {
+        return false;
+    }
     UDP_FALLBACK
+}
+
+/// Whether this process was started with `FREENET_TEST_NO_UDP_FALLBACK` set.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn no_udp_fallback_process() -> bool {
+    static SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| std::env::var_os("FREENET_TEST_NO_UDP_FALLBACK").is_some())
+}
+
+/// For a test that needs [`udp_fallback`] to be `false`. Called first in the
+/// test, it returns `true` when the test is running in a child process that has
+/// it (the caller goes on); otherwise it runs this one test again in a child
+/// with `FREENET_TEST_NO_UDP_FALLBACK` set, asserts the child ran it and passed,
+/// and returns `false` (the caller returns). A child process is used because
+/// the value is process-global and a test that changed it in place would change
+/// what concurrent tests of the same process see under plain `cargo test`.
+/// Pass `module_path!()` and the test's name.
+#[cfg(test)]
+#[must_use = "the test body runs only when this returns true"]
+pub(crate) fn run_with_no_udp_fallback(module: &str, test: &str) -> bool {
+    if no_udp_fallback_process() {
+        return true;
+    }
+    let (_, within_crate) = module.split_once("::").expect("a module path");
+    let name = format!("{within_crate}::{test}");
+    let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([name.as_str(), "--exact", "--test-threads=1"])
+        .env("FREENET_TEST_NO_UDP_FALLBACK", "1")
+        .output()
+        .expect("the child test process starts");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "`{name}` with no UDP fallback did not pass in its child process (a renamed test \
+         runs nothing and fails here):\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
 }
 
 /// How many short runs in a row trip the crash-loop breaker for a node, with
@@ -2243,6 +2297,106 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The child process of `run_with_no_udp_fallback` sees `false`; this
+    /// process does not, so nothing here depends on the order tests run in.
+    #[test]
+    fn the_no_udp_fallback_environment_is_per_process() {
+        if !run_with_no_udp_fallback(
+            module_path!(),
+            "the_no_udp_fallback_environment_is_per_process",
+        ) {
+            assert_eq!(udp_fallback(), UDP_FALLBACK);
+            return;
+        }
+        assert!(!udp_fallback());
+    }
+
+    /// One constant, one accessor (D-3). In production code, outside this
+    /// module: the accessor is called by `fatal_exit` (2), `liveness` (2) and
+    /// `path.rs` (1, `QuicPathLimits::effective_udp_fallback`, through which
+    /// every path reads it); a path's own value is read as a method
+    /// only in `upgrade/data_route.rs` (1); and the constant itself is named only
+    /// in `lib.rs` (the re-export). A new reader anywhere else fails this test:
+    /// route it through `effective_udp_fallback` (a path) or the accessor, and
+    /// add it here with the reason. Each file is scanned up to its test module,
+    /// with comments stripped, and a file that moves or stops matching fails
+    /// instead of passing with nothing scanned.
+    #[test]
+    fn only_the_known_sites_read_the_udp_fallback_constant() {
+        fn files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read_dir") {
+                let path = entry.expect("entry").path();
+                if path.is_dir() {
+                    files(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut all = Vec::new();
+        files(&root, &mut all);
+        let mut seen: std::collections::BTreeMap<(String, &'static str), usize> =
+            std::collections::BTreeMap::new();
+        for path in all {
+            let rel = path
+                .strip_prefix(&root)
+                .expect("under src")
+                .to_string_lossy()
+                .replace('\\', "/");
+            // Test-only files (`tests.rs`, `tests/`, `*_tests/`) are not production.
+            if rel.contains("tests") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("readable");
+            let cut = src
+                .match_indices("\n#[cfg(test)]\nmod ")
+                .next()
+                .map_or(src.len(), |(i, _)| i);
+            let production = crate::contract::source_pin_util::strip_comments(&src[..cut]);
+            let flat: String = production.split_whitespace().collect();
+            for (needle, kind) in [
+                ("breaker::udp_fallback()", "accessor"),
+                (".udp_fallback()", "path method"),
+                ("breaker::UDP_FALLBACK", "constant"),
+                ("UDP_FALLBACK", "constant"),
+                ("effective_udp_fallback()", "effective"),
+            ] {
+                let n = flat.matches(needle).count();
+                if n > 0 {
+                    *seen.entry((rel.clone(), kind)).or_default() += n;
+                }
+            }
+        }
+        // `breaker.rs` itself and `short_runs.rs` take the value as a parameter
+        // or are the definition; they are listed so a change there shows too.
+        let seen: Vec<(String, &str, usize)> = seen
+            .into_iter()
+            .map(|((file, kind), n)| (file, kind, n))
+            .collect();
+        let expected: Vec<(String, &str, usize)> = EXPECTED_READERS
+            .iter()
+            .map(|(f, k, n)| ((*f).to_string(), *k, *n))
+            .collect();
+        assert_eq!(
+            seen, expected,
+            "a read of the UDP-fallback constant outside the known sites (D-3: one constant, one accessor)"
+        );
+    }
+
+    /// See `only_the_known_sites_read_the_udp_fallback_constant`. Counted on
+    /// whitespace-free production text, so `breaker::UDP_FALLBACK` also counts
+    /// as the bare constant.
+    const EXPECTED_READERS: &[(&str, &str, usize)] = &[
+        ("lib.rs", "constant", 2),
+        ("transport/quic/breaker.rs", "constant", 5),
+        ("transport/quic/fatal_exit.rs", "accessor", 2),
+        ("transport/quic/liveness.rs", "accessor", 2),
+        ("transport/quic/path.rs", "accessor", 1),
+        ("transport/quic/path.rs", "effective", 2),
+        ("transport/quic/upgrade/data_route.rs", "path method", 1),
+    ];
 
     const PID: u32 = 4242;
     const OWN: u32 = 99;

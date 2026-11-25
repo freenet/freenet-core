@@ -864,3 +864,86 @@ fn retry_not_opened_decides_by_path_outcome_and_attempt() {
         );
     })
 }
+
+/// Outcomes that end `SendOnUdp` on a path with a UDP session, one per row of
+/// the table that reaches it.
+fn outcomes_that_would_go_on_udp() -> Vec<BoundedSend> {
+    vec![
+        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::TimedOut)),
+        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::Paced)),
+        BoundedSend::Failed(SendFailure::NotOpened(NotOpened::ConnectionLost(lost()))),
+        BoundedSend::Failed(SendFailure::TimedOut),
+        BoundedSend::Failed(SendFailure::Paced),
+        error(QuicSendError::ConnectionLost(lost())),
+        stopped(stop_code::NOT_ACCEPTING_DATA),
+    ]
+}
+
+/// With the build constant at its shipped value an upgraded path is what it was
+/// before the constant: its sends go on UDP, a quiet timeout makes it suspect,
+/// and nothing is retried on it (D-3, dark).
+#[test]
+fn an_upgraded_path_keeps_its_udp_fallback_while_the_constant_is_true() {
+    const { assert!(super::super::super::breaker::UDP_FALLBACK) };
+    assert!(QuicPathLimits::DEFAULT.effective_udp_fallback());
+    assert!(!QuicPathLimits::NATIVE.effective_udp_fallback());
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-route-constant-true", QuicPathLimits::DEFAULT).await;
+        let a = &p.a;
+        assert!(a.udp_fallback());
+        for outcome in outcomes_that_would_go_on_udp() {
+            let path = paths("quic-route-constant-true-row", QuicPathLimits::DEFAULT).await;
+            let step = path.a.settle(SendKind::Short, &outcome, false, 0);
+            assert_eq!(step, next_step(SendKind::Short, &outcome).0, "{outcome:?}");
+            assert_eq!(step, NextStep::SendOnUdp, "{outcome:?}");
+        }
+        let no_credit = BoundedSend::Failed(SendFailure::NotOpened(NotOpened::NoCredit));
+        assert!(!a.retry_not_opened(&no_credit, 0));
+        let built = p.time().now_nanos();
+        a.settle(SendKind::Short, &timeouts()[0], false, built + SECOND);
+        a.settle(SendKind::Short, &timeouts()[0], false, built + QUIET);
+        assert!(a.is_suspect());
+    });
+}
+
+/// With the build constant at `false` a path built on the default limits acts as
+/// a native one: what would go on UDP is given up (the operation layer retries),
+/// a send that found no stream credit is tried again on the path, and a quiet
+/// timeout never makes it suspect, since there is nowhere to divert to. The
+/// test runs in a child process with the constant off (`breaker::run_with_no_udp_fallback`).
+#[test]
+fn with_no_udp_fallback_an_upgraded_path_acts_as_a_native_one() {
+    if !super::super::super::breaker::run_with_no_udp_fallback(
+        module_path!(),
+        "with_no_udp_fallback_an_upgraded_path_acts_as_a_native_one",
+    ) {
+        return;
+    }
+    assert!(!QuicPathLimits::DEFAULT.effective_udp_fallback());
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-route-constant-false", QuicPathLimits::DEFAULT).await;
+        let a = &p.a;
+        assert!(!a.udp_fallback());
+        for outcome in outcomes_that_would_go_on_udp() {
+            let path = paths("quic-route-constant-false-row", QuicPathLimits::DEFAULT).await;
+            for kind in [SendKind::Short, SendKind::LargeShort, SendKind::Stream] {
+                assert_eq!(
+                    path.a.settle(kind, &outcome, false, 0),
+                    NextStep::GiveUp,
+                    "{kind:?} {outcome:?}"
+                );
+            }
+        }
+        let no_credit = BoundedSend::Failed(SendFailure::NotOpened(NotOpened::NoCredit));
+        assert!(a.retry_not_opened(&no_credit, 0));
+        let built = p.time().now_nanos();
+        a.settle(SendKind::Short, &timeouts()[0], false, built + SECOND);
+        for i in 1..4 {
+            a.settle(SendKind::Short, &timeouts()[0], false, built + QUIET * i);
+        }
+        assert!(!a.is_suspect());
+        assert_eq!(a.stats().send_event_count(QuicSendEvent::SuspectEntered), 0);
+    });
+}

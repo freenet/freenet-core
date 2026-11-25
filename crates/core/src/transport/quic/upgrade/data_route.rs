@@ -288,12 +288,14 @@ async fn send_elsewhere(
     payload: SerializedMessage,
 ) {
     match udp {
-        Some(udp) => send_on_udp(path, udp, note, payload).await,
-        None => {
+        // A path with no UDP fallback (`QuicPathLimits::effective_udp_fallback`)
+        // gives up what it cannot carry, whether or not a session exists.
+        Some(udp) if path.udp_fallback() => send_on_udp(path, udp, note, payload).await,
+        _ => {
             path.stats().record_send_dropped(SendKind::Short);
             note.note(|| {
                 "dropped a short: the native path does not take it (ended, or the peer \
-                 refused data) and there is no UDP session"
+                 refused data) and there is no UDP fallback"
                     .to_string()
             });
         }
