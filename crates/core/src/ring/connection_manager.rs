@@ -2509,7 +2509,6 @@ impl ConnectionManager {
     /// real public address, v4 vs v6) still replace each other in arrival
     /// order, as before #6378. `is_private_ip` is shared with other callers
     /// and is not widened here.
-    ///
     pub fn apply_observed_address(&self, addr: SocketAddr) -> ObservedAddrOutcome {
         let is_public = |a: &SocketAddr| !crate::server::is_private_ip(&a.ip());
         let mut own_addr = self.own_addr.lock();
