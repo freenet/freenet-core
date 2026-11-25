@@ -176,15 +176,23 @@ pub(crate) async fn exit_for_quic_bind_failure() -> ! {
     );
     crate::transport::quic::fatal_exit::check_before_exit("the QUIC endpoint could not be built")
         .await;
+    let supervised = crate::transport::quic::liveness::supervised_exits_enabled();
+    let advice = if supervised {
+        "the service manager restarts the node, and a newer release, if one exists, was staged \
+         first"
+    } else {
+        "nothing restarts this node: run `freenet update` and start it again, and check that \
+         the network port is free and the node may bind it"
+    };
     eprintln!(
         "CRITICAL: the QUIC endpoint could not be built and there is no UDP transport to fall \
-         back to. Exiting with code {exit_code}; the service manager restarts the node, and a \
-         newer release, if one exists, was staged first."
+         back to. Exiting with code {exit_code}; {advice}."
     );
     tracing::error!(
         exit_code,
+        supervised,
         "The QUIC endpoint could not be built and there is no UDP transport to fall back to; \
-         exiting after the update check"
+         exiting ({advice})"
     );
     // The file log is written by a background worker that `process::exit` does
     // not wait for; see `exit_for_gateway_quic_restart`.
@@ -778,7 +786,11 @@ impl NodeP2P {
                    // With no UDP to fall back to this exit leaves the node with
                    // no transport, so the update check runs first (bounded; a
                    // no-op while UDP exists, `transport::quic::fatal_exit`).
-                   crate::transport::quic::fatal_exit::check_before_exit(&e.to_string()).await;
+                   // Only for the transport-fatal cause: any other listener
+                   // fault keeps its immediate exit.
+                   if let Some(restart) = e.downcast_ref::<crate::transport::GatewayQuicRestart>() {
+                       crate::transport::quic::fatal_exit::check_before_exit(restart.reason).await;
+                   }
                    exit_for_gateway_quic_restart(&e, exit_code, uptime);
                    eprintln!("CRITICAL: Network event listener exited (fatal): {e}");
                    tracing::error!(
@@ -828,8 +840,7 @@ impl NodeP2P {
                     let restart = anyhow::Error::new(crate::transport::GatewayQuicRestart {
                         reason: "its QUIC endpoint died",
                     });
-                    crate::transport::quic::fatal_exit::check_before_exit(&restart.to_string())
-                        .await;
+                    crate::transport::quic::fatal_exit::check_before_exit("its QUIC endpoint died").await;
                     exit_for_gateway_quic_restart(
                         &restart,
                         QUIC_RESTART_EXIT_CODE,

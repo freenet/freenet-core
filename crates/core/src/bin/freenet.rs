@@ -1387,12 +1387,66 @@ fn fatal_exit_update_check() -> std::pin::Pin<Box<dyn std::future::Future<Output
     Box::pin(check_for_update_before_fatal_exit())
 }
 
-/// The handshake-failure check's steps (cooling and retry-spend gates, the
+/// Wait for an operator's stop (SIGTERM, or Ctrl+C), which ends the update
+/// check before a fatal exit: the node's own signal handling is not running
+/// yet or any more at that point, and a stop that waits out the check can run
+/// into the service manager's stop timeout.
+///
+/// The listener is installed when this is called, not when the future is first
+/// polled, so a stop that arrives as the check starts is not missed.
+fn stop_signal() -> impl std::future::Future<Output = ()> {
+    use tokio::signal;
+    #[cfg(unix)]
+    let sigterm = signal::unix::signal(signal::unix::SignalKind::terminate()).ok();
+    async move {
+        #[cfg(unix)]
+        match sigterm {
+            Some(mut sigterm) => {
+                tokio::select! {
+                    _ = sigterm.recv() => {},
+                    _ = signal::ctrl_c() => {},
+                }
+            }
+            None => std::future::pending::<()>().await,
+        }
+        #[cfg(not(unix))]
+        drop(signal::ctrl_c().await);
+    }
+}
+
+/// [`check_for_update_before_fatal_exit_steps`], abandoned when an operator
+/// asks the process to stop.
+async fn check_for_update_before_fatal_exit() {
+    let stop = stop_signal();
+    tokio::select! {
+        () = check_for_update_before_fatal_exit_steps() => {}
+        () = stop => {
+            tracing::info!("Fatal-exit update check: stopped by a signal, exiting now");
+        }
+    }
+}
+
+/// Test builds only: make the check hang or panic, so a real-process test can
+/// drive the exit's bound, its reaction to a stop and to a panicking check.
+#[cfg(feature = "testing")]
+async fn test_fatal_exit_check_faults() {
+    if std::env::var_os("FREENET_TEST_FATAL_EXIT_CHECK_PANICS").is_some() {
+        panic!("test fault: the fatal-exit update check panics");
+    }
+    if std::env::var_os("FREENET_TEST_FATAL_EXIT_CHECK_HANGS").is_some() {
+        tracing::info!("Fatal-exit update check: test fault, hanging");
+        std::future::pending::<()>().await;
+    }
+}
+
+/// The steps of the handshake-failure check (cooling and retry-spend gates, the
 /// claim, `detect_unblocked_release`, `stage_latest_release`), without its
 /// `update_tx` send: the caller exits the
 /// process whatever this finds, and the supervisor's update hook installs what
 /// was staged. Bounded by the caller's timeout; fails open on every error.
-async fn check_for_update_before_fatal_exit() {
+async fn check_for_update_before_fatal_exit_steps() {
+    #[cfg(feature = "testing")]
+    test_fatal_exit_check_faults().await;
     use commands::auto_update::{claim_update_attempt, update_attempt_would_spend_retry};
     use commands::update::stage_latest_release;
     if FATAL_EXIT_UPDATE_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3634,6 +3688,69 @@ mod tests {
             ),
             "connection_maintenance must publish BootstrapPacer::rounds_without_connection"
         );
+    }
+
+    /// The update check before a fatal exit takes the same gates as the
+    /// handshake-failure trigger, in the same order, and detects through the
+    /// function both share. The gates are written out in each place because the
+    /// trigger's are interleaved with its own state and pinned in order above,
+    /// so this pins the second copy: dropping any gate, or the claim, fails.
+    #[test]
+    fn the_fatal_exit_update_check_has_every_gate_in_order() {
+        let src = strip_line_comments(include_str!("freenet.rs"));
+        let body: String = fn_body(&src, "async fn check_for_update_before_fatal_exit_steps(")
+            .split_whitespace()
+            .collect();
+        let mut at = 0;
+        for step in [
+            "FATAL_EXIT_UPDATE_DISABLED.load(",
+            "update_cooldown_pending(build_info::VERSION)",
+            "update_attempt_would_spend_retry()",
+            "claim_update_attempt()",
+            "detect_unblocked_release(attempt)",
+            "stage_latest_release(build_info::VERSION,Some(&new_version))",
+        ] {
+            let found = body[at..]
+                .find(step)
+                .unwrap_or_else(|| panic!("`{step}` missing or out of order in {body}"));
+            at += found + step.len();
+        }
+        assert!(
+            !body.contains("update_tx"),
+            "the fatal-exit check exits the process itself and sends no update"
+        );
+        let detect: String = fn_body(&src, "async fn detect_unblocked_release(")
+            .split_whitespace()
+            .collect();
+        for needle in [
+            "startup_update_check(attempt,build_info::VERSION)",
+            "is_version_pinned_bad(&new_version)",
+            "is_version_install_gated(&new_version)",
+        ] {
+            assert!(
+                detect.contains(needle),
+                "detect_unblocked_release lacks {needle}"
+            );
+        }
+        let task: String = fn_body(&src, "async fn run_network_node_with_signals(")
+            .split_whitespace()
+            .collect();
+        assert!(
+            task.contains("matchdetect_unblocked_release(attempt).await{"),
+            "the handshake trigger must detect through the shared function"
+        );
+        // A stop ends the check, and the registration is in `run_network`.
+        let wrapper: String = fn_body(&src, "async fn check_for_update_before_fatal_exit(")
+            .split_whitespace()
+            .collect();
+        assert!(wrapper.contains("()=stop=>"), "{wrapper}");
+        let run: String = fn_body(&src, "async fn run_network(")
+            .split_whitespace()
+            .collect();
+        let register = run
+            .find("freenet::register_fatal_exit_update_check(fatal_exit_update_check)")
+            .expect("registration");
+        assert!(register < run.find(".build(clients)").expect("build"));
     }
 
     /// #5975: `run_network` records the updater's state BEFORE the node is

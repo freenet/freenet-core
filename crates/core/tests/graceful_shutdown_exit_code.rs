@@ -1699,17 +1699,26 @@ fn assert_update_check_ran_before_exit(logs: &str, exit_marker: &str) {
         done <= exit,
         "the exit ({exit}) came before the check ended ({done}). Logs:\n{logs}"
     );
-    let skipped = logs.contains("Fatal-exit update check skipped: auto-update is disabled");
+    // The binary's own update task may claim the attempt first (its first check
+    // waits 0 to 60 s), and a dirty build disables auto-update: the check then
+    // says so. Either way the registered check ran and ended before the exit.
+    let skipped = [
+        "Fatal-exit update check skipped: auto-update is disabled",
+        "Fatal-exit update check skipped: the update attempt claim was refused",
+        "Fatal-exit update check skipped: a release is cooling down",
+    ]
+    .iter()
+    .any(|line| logs.contains(line));
     assert!(
         logs.contains(FATAL_CHECK_ASKS_MARKER) || skipped,
-        "the check neither asked GitHub nor said it was disabled. Logs:\n{logs}"
+        "the check neither asked GitHub nor said why not. Logs:\n{logs}"
     );
     assert!(logs.contains(FATAL_CHECK_PREFIX));
 }
 
 /// W-S6: with no UDP to fall back to (switched on in this test build by
-/// `FREENET_TEST_BREAKER_NO_UDP_FALLBACK`), a peer whose QUIC endpoint cannot
-/// be built runs the update check before it exits, and exits with the
+/// `FREENET_TEST_BREAKER_NO_UDP_FALLBACK`), a supervised peer whose QUIC endpoint
+/// cannot be built runs the update check before it exits, and exits with the
 /// supervisor's restart code instead of running with no transport. The
 /// supervisor-less test node takes the plain fatal code 42.
 ///
@@ -1729,10 +1738,11 @@ fn with_no_udp_a_bind_failure_checks_for_an_update_before_exiting() -> anyhow::R
     args.extend_from_slice(&peer_args(&gateway));
     let env = [
         ("FREENET_TEST_BREAKER_NO_UDP_FALLBACK", "1"),
+        ("FREENET_SUPERVISED", "1"),
         (BIND_FAILS_ENV, "1"),
     ];
     let mut node = NodeProcess::spawn_full(dir.path(), &logs_dir, &args, Some(&home), &env)?;
-    // The check is bounded (45 s) and a dead network can use all of it.
+    // The check is bounded (20 s) and a dead network can use all of it.
     let status = node.wait_for_exit(Duration::from_secs(120))?;
     let logs = node.logs();
     assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
@@ -1823,6 +1833,138 @@ fn with_udp_an_endpoint_death_exit_does_not_call_the_fatal_exit_check() -> anyho
     assert!(logs.contains(ENDPOINT_DOWN_EXIT_MARKER), "Logs:\n{logs}");
     assert!(
         !logs.contains(FATAL_CHECK_PREFIX) && !logs.contains(FATAL_CHECK_DONE_MARKER),
+        "Logs:\n{logs}"
+    );
+    Ok(())
+}
+
+/// Spawn a no-UDP node whose QUIC endpoint is not built, with `extra_env`.
+#[cfg(all(feature = "testing", feature = "quic-panic-injection"))]
+fn spawn_bind_failure(
+    dir: &Path,
+    supervised: bool,
+    extra_env: &[(&str, &str)],
+) -> anyhow::Result<NodeProcess> {
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home)?;
+    let logs_dir = dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)?;
+    let gateway = unreachable_gateway();
+    let mut args = vec!["--transport-quic", "prefer"];
+    args.extend_from_slice(&peer_args(&gateway));
+    let mut env = vec![
+        ("FREENET_TEST_BREAKER_NO_UDP_FALLBACK", "1"),
+        (BIND_FAILS_ENV, "1"),
+    ];
+    if supervised {
+        env.push(("FREENET_SUPERVISED", "1"));
+    }
+    env.extend_from_slice(extra_env);
+    NodeProcess::spawn_full(dir, &logs_dir, &args, Some(&home), &env)
+}
+
+/// A check that never ends is dropped at the bound and the exit still happens
+/// with its planned code.
+///
+/// FALSIFY: remove the `tokio::time::timeout` in `fatal_exit::run_check`.
+#[cfg(all(feature = "testing", feature = "quic-panic-injection"))]
+#[test]
+fn with_no_udp_a_check_that_hangs_is_dropped_at_its_bound() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut node = spawn_bind_failure(
+        dir.path(),
+        true,
+        &[
+            ("FREENET_TEST_FATAL_EXIT_CHECK_HANGS", "1"),
+            ("FREENET_TEST_FATAL_EXIT_CHECK_TIMEOUT_SECS", "2"),
+        ],
+    )?;
+    let status = node.wait_for_exit(Duration::from_secs(60))?;
+    let logs = node.logs();
+    assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
+    assert!(
+        logs.contains("outcome=TimedOut") || logs.contains("TimedOut"),
+        "Logs:\n{logs}"
+    );
+    Ok(())
+}
+
+/// A stop during the check ends it at once: the exit does not wait out the
+/// bound, which the service manager's stop timeout would cut short.
+///
+/// FALSIFY: remove the `stop` arm of `check_for_update_before_fatal_exit`.
+#[cfg(all(feature = "testing", feature = "quic-panic-injection"))]
+#[test]
+fn with_no_udp_a_stop_during_the_check_ends_it_at_once() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut node = spawn_bind_failure(
+        dir.path(),
+        true,
+        &[
+            ("FREENET_TEST_FATAL_EXIT_CHECK_HANGS", "1"),
+            // Long enough that only the stop can end the check in time.
+            ("FREENET_TEST_FATAL_EXIT_CHECK_TIMEOUT_SECS", "120"),
+        ],
+    )?;
+    node.wait_for_logs(
+        &["Fatal-exit update check: test fault, hanging"],
+        Duration::from_secs(60),
+    )?;
+    let stop_sent = Instant::now();
+    node.send_sigterm()?;
+    let status = node.wait_for_exit(Duration::from_secs(15))?;
+    let logs = node.logs();
+    assert!(
+        stop_sent.elapsed() < Duration::from_secs(10),
+        "Logs:\n{logs}"
+    );
+    assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
+    assert!(logs.contains("stopped by a signal"), "Logs:\n{logs}");
+    Ok(())
+}
+
+/// A panic in the check does not change the exit code (101 would be counted
+/// as a crash by the post-update rollback).
+///
+/// FALSIFY: remove `catch_unwind` in `fatal_exit::run_check`.
+#[cfg(all(feature = "testing", feature = "quic-panic-injection"))]
+#[test]
+fn with_no_udp_a_panicking_check_still_exits_with_its_planned_code() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut node = spawn_bind_failure(
+        dir.path(),
+        true,
+        &[("FREENET_TEST_FATAL_EXIT_CHECK_PANICS", "1")],
+    )?;
+    let status = node.wait_for_exit(Duration::from_secs(60))?;
+    let logs = node.logs();
+    assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
+    assert!(logs.contains("Panicked"), "Logs:\n{logs}");
+    Ok(())
+}
+
+/// An unsupervised node with no UDP and no endpoint exits at once, without
+/// the check (nothing would install what it staged), and says what to do.
+///
+/// FALSIFY: drop the supervision condition in `fatal_exit::runs_before_exit`.
+#[cfg(all(feature = "testing", feature = "quic-panic-injection"))]
+#[test]
+fn with_no_udp_an_unsupervised_bind_failure_exits_at_once_with_advice() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut node = spawn_bind_failure(
+        dir.path(),
+        false,
+        &[("FREENET_TEST_FATAL_EXIT_CHECK_HANGS", "1")],
+    )?;
+    let status = node.wait_for_exit(Duration::from_secs(30))?;
+    let logs = node.logs();
+    assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
+    assert!(
+        !logs.contains(FATAL_CHECK_PREFIX) && !logs.contains(FATAL_CHECK_DONE_MARKER),
+        "Logs:\n{logs}"
+    );
+    assert!(
+        logs.contains("nothing restarts this node: run `freenet update`"),
         "Logs:\n{logs}"
     );
     Ok(())
