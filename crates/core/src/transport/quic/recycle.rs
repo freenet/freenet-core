@@ -1240,6 +1240,10 @@ pub(crate) struct AckWatch {
     /// [`ACK_WAIT_EXPIRY_WINDOW`] ([`Stall::LateEnds`]).
     late_seen: u64,
     late_at: VecDeque<u64>,
+    /// When the last late-end episode was counted. Kept apart from `late_at`,
+    /// which an observe-only would-close empties: the episode boundary must
+    /// survive that reset, or the next sample of the same episode counts again.
+    late_last_counted: Option<u64>,
     /// Times the ack-wait expiry rule would have closed the path, which has
     /// a UDP session ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
     would_close: u64,
@@ -1358,6 +1362,7 @@ impl AckWatch {
             expiries_at: VecDeque::new(),
             late_seen,
             late_at: VecDeque::new(),
+            late_last_counted: None,
             would_close: 0,
             late_would_close: 0,
             udp_fallback,
@@ -1452,10 +1457,10 @@ impl AckWatch {
         let gap = u64::try_from(LATE_END_EPISODE_GAP.as_nanos()).unwrap_or(u64::MAX);
         if new > 0
             && self
-                .late_at
-                .back()
-                .is_none_or(|&last| now_nanos.saturating_sub(last) >= gap)
+                .late_last_counted
+                .is_none_or(|last| now_nanos.saturating_sub(last) >= gap)
         {
+            self.late_last_counted = Some(now_nanos);
             self.late_at.push_back(now_nanos);
         }
         let window = u64::try_from(ACK_WAIT_EXPIRY_WINDOW.as_nanos()).unwrap_or(u64::MAX);

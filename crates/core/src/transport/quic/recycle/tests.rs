@@ -2080,6 +2080,61 @@ fn a_burst_of_late_ends_is_one_episode() {
     assert_eq!(run(&|i| b1(i) + b2(i)), None);
 }
 
+/// An observe-only would-close empties the strike window, but not the episode
+/// boundary: late ends at 100, 160, 220, 222, 282 and 342 s are five episodes
+/// (220 and 222 are one), so there is ONE would-close (at 220), not two, which
+/// the field's would-close rate would otherwise overstate. A burst of samples
+/// straight after a would-close is part of the same episode.
+#[test]
+fn a_would_close_reset_does_not_split_an_episode() {
+    let times: Vec<u64> = (0..=300).map(|i| 2 * i).collect();
+    let at = |seconds: u64| (seconds / 2) as usize;
+    let run = |late: &dyn Fn(usize) -> u64| {
+        let record = Arc::default();
+        let sample = |i: usize| {
+            let t = i as u64;
+            AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
+                .with_late_ends(late(i))
+        };
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), true);
+        let mut would = Vec::new();
+        for (i, time) in times.iter().enumerate().skip(1) {
+            let before = watch.late_would_close();
+            assert!(
+                !watch.observe(time * SEC, sample(i)),
+                "a UDP path is not closed"
+            );
+            if watch.late_would_close() > before {
+                would.push(i);
+            }
+        }
+        would
+    };
+    let marks =
+        |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
+    assert_eq!(
+        run(&marks(vec![
+            at(100),
+            at(160),
+            at(220),
+            at(222),
+            at(282),
+            at(342)
+        ])),
+        vec![at(220)]
+    );
+    // A late end at every sample from 100 s: one episode a minute, so a
+    // would-close every three minutes (220, 400, 580 s).
+    assert_eq!(
+        run(&|i| if i >= at(100) {
+            (i - at(100)) as u64 + 1
+        } else {
+            0
+        }),
+        vec![at(220), at(400), at(580)]
+    );
+}
+
 /// The labels `quic_stall_close_<label>` counts under are the stalls'
 /// labels, in their index order, so a close is counted under its own name.
 #[test]
