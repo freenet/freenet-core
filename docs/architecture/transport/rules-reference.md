@@ -3183,9 +3183,10 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     runs out holds the 48 permits (each for at least 5 min) and the 64
     one-packet Short epochs (about 150 s each) indefinitely, with no
     expiry and no abort; every further streamed send waits its 2 s open
-    deadline and goes on UDP (after UDP removal, it fails). The ack wait
-    cannot judge it (its threshold is the backlog-sized wait, hours on a
-    busy slow path), so a separate check judges the end by the
+    deadline and goes on UDP, or, on a native path, is sent again on the
+    same path (route::NOT_OPENED_RETRIES times) and then dropped. The ack
+    wait cannot judge it (its threshold is the backlog-sized wait, hours on
+    a busy slow path), so a separate check judges SOME such ends by the
     connection's progress (path::LateEndCheck, late_end_verdict): once
     the peer has wholly acknowledged data streams opened after the end
     totalling the bytes ahead of the
@@ -3194,9 +3195,12 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     packet has been sent, and an honest stack acknowledges it within
     late_end_grace (seven probe timeouts of at most 5 round trips and 25 ms
     each, at least 2 s), and then, the connection having acknowledged more
-    data streams since (the peer is alive: an outage that began after the
-    proof point acknowledges nothing), for a second grace. An end still
-    unacknowledged then is a LATE END: counted in
+    data streams since (the peer is alive), for a second grace in which it
+    must still be acknowledging (growth seen within the last half grace, at
+    least 4 s; growth coming back after a longer stall restarts the second
+    grace). An outage acknowledges nothing, so one that has outlasted that
+    is not counted. An end still unacknowledged then is a LATE END: counted
+    in
     quic_late_end_<stream|short|control> (the stream is not reset), and
     three EPISODES within 30 min (late ends within 60 s of the last counted
     one are one episode, recycle::LATE_END_EPISODE_GAP) close a native path
@@ -3214,6 +3218,13 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     acknowledgement count (the_late_end_check_polls_until_the_end_is_late),
     since the test harness's peer acknowledges every packet, and the calls
     that run it are pinned (the_late_end_watch_runs_wherever_an_end_waits).
+    NOT covered: an end is judged only once the later data streams
+    acknowledged outnumber the bytes ahead of it. With all 48 permits held
+    by withheld ends no new permit stream starts, so only one-packet Shorts
+    advance that, and a peer that acknowledges Shorts promptly and holds
+    large-stream ends until just before their ack wait runs out is caught
+    by neither this check nor the ack-wait rule (every further streamed send
+    on a native path is retried and then dropped).
     Residual: a peer that goes fully silent for at least the watch's window
     (10 s) after each end excuses that end from both the expiry strike and
     the late-end check, and on a path with a UDP session no dark close

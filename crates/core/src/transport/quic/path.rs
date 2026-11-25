@@ -2705,9 +2705,9 @@ impl LateEndCheck {
     async fn late(self, sleeper: Sleeper) {
         let tick = recycle::ACK_WATCH_TICK;
         let mut crossed = None;
-        // Past the grace the end is a candidate; it counts only once the peer
-        // is shown alive and the end is still unacknowledged a grace after
-        // that: (acknowledged bytes at the candidate, when they first grew).
+        // Past the grace the end is a candidate ([`Candidate`]); it counts
+        // only once the peer is shown alive, still acknowledging, and the end
+        // is still unacknowledged a grace after the liveness baseline.
         let mut candidate: Option<Candidate> = None;
         let mut last = (self.now)();
         let mut previous_cap = self.cap.read();
@@ -2762,16 +2762,25 @@ impl LateEndCheck {
                 alive_at: None,
                 grew_at: now,
             });
+            let recent = (grace / 2).max(nanos(recycle::ACK_WATCH_TICK) * 2);
             if reading.acked_since_end > c.acked {
                 c.acked = reading.acked_since_end;
-                c.alive_at.get_or_insert(now);
+                // The first growth, or growth coming back after a stall
+                // longer than `recent` (an outage that did not last the
+                // dark window, so nothing excused it): the baseline of the
+                // second grace restarts there, so the path coming out of the
+                // outage has a whole grace for its probes' acknowledgement.
+                if c.alive_at.is_none() || now.saturating_sub(c.grew_at) > recent {
+                    c.alive_at = Some(now);
+                }
                 c.grew_at = now;
             }
-            // Late only if the peer was shown alive a grace ago AND is still
-            // growing: the latest growth is after that first one and within
-            // the last half grace (two ticks at least), so an outage that
-            // began after the first growth cannot run the second grace out.
-            let recent = (grace / 2).max(nanos(recycle::ACK_WATCH_TICK) * 2);
+            // Late only if a grace has passed since the liveness baseline,
+            // the connection acknowledged more after it, and the latest
+            // growth was seen within `recent`: the last half grace, at least
+            // two ticks (4 s), that is at the current or the previous poll
+            // when the grace is at its 2 s floor. Silence longer than that
+            // is not counted here, whatever came before it.
             if c.alive_at.is_some_and(|alive| {
                 now.saturating_sub(alive) >= grace
                     && c.grew_at > alive
@@ -2788,7 +2797,9 @@ impl LateEndCheck {
 struct Candidate {
     /// Acknowledged data-stream bytes since the end, at the latest growth.
     acked: u64,
-    /// When the connection first acknowledged more than at the candidate.
+    /// The liveness baseline: when the connection first acknowledged more
+    /// than at the candidate, or when it did again after a stall longer than
+    /// the recency window.
     alive_at: Option<u64>,
     /// When it last did.
     grew_at: u64,

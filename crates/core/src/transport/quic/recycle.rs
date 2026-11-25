@@ -1985,8 +1985,10 @@ pub(crate) const ACK_WAITS_EXPIRED_CLOSES_WITH_UDP: bool = false;
 /// promptly and holds large-stream ends until just before their ack wait
 /// (at least 5 min) runs out is caught by neither this rule nor the
 /// ack-wait rule. It holds each permit for that wait, so the path streams at
-/// most 48 sends per wait, about one per 6 s at the 5 min minimum wait: the
-/// residual of #6205, not closed here.
+/// most 48 sends per wait, about one per 6 s at the 5 min minimum wait, and
+/// while all 48 are held a further streamed send on a native path is sent
+/// again on the same path (`route::NOT_OPENED_RETRIES` times) and then
+/// dropped: the residual of #6205, not closed here.
 pub(crate) const LATE_ENDS_CLOSES_WITH_UDP: bool = false;
 
 /// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that close a path with

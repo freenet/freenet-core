@@ -2324,13 +2324,21 @@ fn late_end_checks_three_episodes_apart_close_a_native_path() {
     })
 }
 
-/// Liveness is rechecked at the end of the second grace: an outage that
-/// begins after the connection first acknowledged more (after the candidate
-/// was shown alive) lets the second grace run out, and must not count the
-/// end. The acknowledged bytes grow until 16 s, then stop for good: the check
-/// never returns. The same check, with the growth continuing, returns.
+/// Liveness is rechecked through the second grace (`LateEndCheck::late`):
+/// - an outage that begins after the first growth, 50 ms round trip (grace
+///   2 s, so growth within the last 4 s is needed): the growth stops at 5 s
+///   and the check never returns;
+/// - a live peer: returns;
+/// - growth, then a stall longer than the recency window (an outage under the
+///   10 s dark window, so nothing excuses it), then growth again at 14 s: the
+///   second grace restarts there, so it returns at 16 s, not at 14 s, giving
+///   the end's probes a whole grace after the outage;
+/// - a 250 ms round trip (grace 8.9 s, recency window 4.5 s): growth goes on
+///   until 17 s and then stops, so the grace since the baseline (14 s) passes
+///   with the last growth 6 s old: never returns. Without the recency
+///   condition it would at 24 s.
 #[test]
-fn an_outage_after_the_liveness_proof_is_not_a_late_end() {
+fn a_late_end_needs_the_peer_still_acknowledging_through_the_second_grace() {
     use super::super::socket::CapHolds;
     use std::sync::atomic::Ordering::Relaxed;
     bounded(|| async move {
@@ -2340,12 +2348,20 @@ fn an_outage_after_the_liveness_proof_is_not_a_late_end() {
             let time = time.clone();
             Arc::new(move |duration| time.sleep_cancelable(duration))
         };
+        // (round trip ms, growth stops after second, growth resumes at second)
+        let cases: [(u64, Option<u64>, Option<u64>); 4] = [
+            (50, Some(5), None),
+            (50, None, None),
+            (50, Some(5), Some(12)),
+            (250, Some(17), None),
+        ];
         let results = drive(&time, LIMIT, async move {
             let mut results = Vec::new();
-            for outage in [true, false] {
+            for (rtt_ms, until, resume) in cases {
                 let acked = Arc::new(AtomicU64::new(128 * 1024));
+                let now_clock = clock.clone();
                 let check = {
-                    let (acked, clock, now_clock) = (acked.clone(), clock.clone(), clock.clone());
+                    let acked = acked.clone();
                     LateEndCheck {
                         reading: Arc::new(move || LaterReading {
                             in_flight: 1,
@@ -2355,7 +2371,7 @@ fn an_outage_after_the_liveness_proof_is_not_a_late_end() {
                             acked_since_end: acked.load(Relaxed),
                             window_at_end: 64 * 1024,
                         }),
-                        rtt: Arc::new(|| Duration::from_millis(50)),
+                        rtt: Arc::new(move || Duration::from_millis(rtt_ms)),
                         now: Arc::new(move || now_clock.now_nanos()),
                         cap: Arc::new(CapHolds::new(None)),
                         dark_at: Arc::default(),
@@ -2369,11 +2385,11 @@ fn an_outage_after_the_liveness_proof_is_not_a_late_end() {
                 let feeder = {
                     let (acked, clock) = (acked.clone(), clock.clone());
                     tokio::spawn(async move {
-                        // Proof point at the first tick; candidate at 2 s;
-                        // first growth seen at 4 s; the outage from 5 s on.
                         for second in 1..u64::MAX {
                             clock.sleep(Duration::from_secs(1)).await;
-                            if !outage || second <= 5 {
+                            let grows = until.is_none_or(|u| second <= u)
+                                || resume.is_some_and(|r| second >= r);
+                            if grows {
                                 acked.fetch_add(1024, Relaxed);
                             }
                         }
@@ -2391,9 +2407,18 @@ fn an_outage_after_the_liveness_proof_is_not_a_late_end() {
         .await;
         assert_eq!(
             results[0], None,
-            "outage after the liveness proof: not late"
+            "an outage after the first growth: not late"
         );
         assert!(results[1].is_some(), "a live peer: late");
+        assert!(
+            results[2].is_some_and(|d| d >= Duration::from_secs(16)),
+            "growth back after a stall restarts the second grace: {:?}",
+            results[2]
+        );
+        assert_eq!(
+            results[3], None,
+            "a grace on, the last growth is older than the recency window: not late"
+        );
     })
 }
 
