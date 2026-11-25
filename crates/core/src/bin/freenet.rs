@@ -286,6 +286,16 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
         GatewayQuicRestarts::Off => {}
     }
 
+    // W-S6: once there is no UDP to fall back to, a transport-fatal exit (a QUIC
+    // endpoint that cannot be built or that died) runs this update check first,
+    // so the release that fixes the node is staged before the exit. Dark while
+    // `QUIC_BREAKER_UDP_FALLBACK` is true: the library does not call it.
+    FATAL_EXIT_UPDATE_DISABLED.store(
+        auto_update_is_disabled(build_info::GIT_DIRTY, disable_auto_update),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    freenet::register_fatal_exit_update_check(fatal_exit_update_check);
+
     let node_config = NodeConfig::new(config)
         .await
         .with_context(|| "failed while loading node config")?;
@@ -1337,6 +1347,69 @@ async fn run_network_node_with_signals(
     }
 
     result
+}
+
+/// Whether auto-update is off for this process (a dirty build or the operator's
+/// opt-out), so the update check before a fatal exit stays out.
+static FATAL_EXIT_UPDATE_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// The check registered with the library to run before a transport-fatal exit
+/// (`freenet::register_fatal_exit_update_check`).
+fn fatal_exit_update_check() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(check_for_update_before_fatal_exit())
+}
+
+/// The handshake-failure check's steps (cooling and retry-spend gates, the
+/// claim, `startup_update_check`, the blocked-version gate,
+/// `stage_latest_release`), without its `update_tx` send: the caller exits the
+/// process whatever this finds, and the supervisor's update hook installs what
+/// was staged. Bounded by the caller's timeout; fails open on every error.
+async fn check_for_update_before_fatal_exit() {
+    use commands::auto_update::{
+        claim_update_attempt, startup_update_check, update_attempt_would_spend_retry,
+    };
+    use commands::update::stage_latest_release;
+    if FATAL_EXIT_UPDATE_DISABLED.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!("Fatal-exit update check skipped: auto-update is disabled on this node");
+        return;
+    }
+    if commands::rollback::update_cooldown_pending(build_info::VERSION).is_some()
+        || update_attempt_would_spend_retry()
+    {
+        tracing::warn!(
+            "Fatal-exit update check skipped: a release is cooling down or the update retry is \
+             locked out"
+        );
+        return;
+    }
+    let Ok(attempt) = claim_update_attempt() else {
+        tracing::warn!("Fatal-exit update check skipped: the update attempt claim was refused");
+        return;
+    };
+    tracing::info!(
+        current = build_info::VERSION,
+        "Fatal-exit update check: asking GitHub before the process exits"
+    );
+    let Some(new_version) = startup_update_check(attempt, build_info::VERSION).await else {
+        tracing::info!("Fatal-exit update check: no newer release found");
+        return;
+    };
+    if commands::rollback::is_version_pinned_bad(&new_version)
+        || commands::rollback::is_version_install_gated(&new_version)
+    {
+        tracing::warn!(
+            new_version = %new_version,
+            "Fatal-exit update check: newer version is locally blocked; not staging it"
+        );
+        return;
+    }
+    tracing::info!(
+        new_version = %new_version,
+        "Fatal-exit update check: newer version on GitHub, staging it before the exit"
+    );
+    let staged = stage_latest_release(build_info::VERSION, Some(&new_version)).await;
+    tracing::info!(new_version = %new_version, staged = ?staged, "Fatal-exit update check: finished");
 }
 
 /// The startup update check waits a random 0 to this many seconds first

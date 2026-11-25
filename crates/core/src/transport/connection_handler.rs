@@ -465,6 +465,20 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         }
     });
 
+    // A node whose QUIC endpoint cannot be built, with no UDP to fall back to
+    // (`breaker::UDP_FALLBACK` is true today, so this never fires), has no
+    // transport: it exits after the update check, so the release that fixes it
+    // is staged first (`quic::fatal_exit`, W-S6).
+    #[cfg(feature = "testing")]
+    let quic_endpoint =
+        quic_endpoint.filter(|_| std::env::var_os(TEST_QUIC_BIND_FAILS_ENV).is_none());
+    if quic_settings.is_some()
+        && quic_endpoint.is_none()
+        && super::quic::fatal_exit::bind_failure_is_fatal()
+    {
+        crate::node::exit_for_quic_bind_failure().await;
+    }
+
     // Gateway admission of native joins from sources nobody named (#5940
     // A7b), on the endpoint's clock. Dark: `admission::enabled_at` is false on
     // every node until phase B (a test can turn it on for one listener), and
@@ -916,6 +930,12 @@ pub(crate) async fn open_udp_transport<S: Socket>(
         restart,
     ))
 }
+
+/// Test builds only: when set, the QUIC endpoint is treated as not built, as
+/// a failed bind leaves it, so a real-process test can drive the node's
+/// reaction (`tests/graceful_shutdown_exit_code.rs`).
+#[cfg(feature = "testing")]
+const TEST_QUIC_BIND_FAILS_ENV: &str = "FREENET_TEST_QUIC_BIND_FAILS";
 
 /// The variable [`fail_endpoint_from_env`] reads: seconds after the bind.
 #[cfg(feature = "testing")]

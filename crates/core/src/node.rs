@@ -119,7 +119,7 @@ pub(crate) mod testing_impl;
 
 #[doc(hidden)]
 pub use p2p_impl::QUIC_RESTART_EXIT_CODE;
-pub(crate) use p2p_impl::abort_process_on_redb_poison;
+pub(crate) use p2p_impl::{abort_process_on_redb_poison, exit_for_quic_bind_failure};
 pub use p2p_impl::{
     enable_abort_on_fatal_listener_exit, enable_abort_on_redb_poison, enable_fast_crash_exit_code,
     listener_exit_is_graceful,
