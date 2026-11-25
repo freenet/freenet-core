@@ -2088,6 +2088,23 @@ Punches (native/punch.rs): byte 0x03 + 8 GlobalRng bytes, sent on the
   node (provisional); 4096 destinations remembered, and a new one replaces
   the least recently charged only once that one has refilled (else
   refused, PunchRefusal::Table), so forgetting never gives bytes back early.
+  Proven peers: a peer is proven by a completed native setup (Hello
+  exchanged, as dialer or acceptor) or a successful gateway hand-off
+  (`hand_off_join`; a failed hand-off proves nothing), never by a UDP
+  connection. A proof is keyed on (IPv4 address or IPv6 /64, peer key), so a
+  peer whose NAT rebinds its port keeps it, and lasts PROVEN_TTL (6 h) from
+  the last completion. A setup to a proven peer is charged to an allowance
+  instead of the shared budgets: ALLOWANCE_BYTES per peer (two client
+  dials a minute), IP_ALLOWANCE_BYTES for all proven peers at one address
+  together (four dials), NODE_ALLOWANCE_BYTES for the node (1 MiB). A spent
+  allowance falls back to the shared budgets, so a proven peer is never worse
+  off than an unproven one. Dialed proofs hold 1024 peers and joined proofs
+  a separate 256, so join volume cannot forget a dialed proof. A full set
+  forgets an expired proof, else the least recently used, only once its
+  allowance has refilled, and a joined peer that is later dialed moves
+  across with its allowance as it stands: forgetting or migrating a proof
+  never refills an allowance. All allowance figures are provisional until the
+  refusal counters (`connect_native_punch_*`) have field data.
   The silent-peer test checks a client sends no more than it was charged
   (twice CLIENT_BYTES_PER_DIAL, as its second attempt starts).
 Setup (native/setup.rs): one window, 8 s cut to the caller's deadline, not
@@ -2105,6 +2122,10 @@ Not decided here (A5): fairness between the requesters that steer setups,
   behind it; steering about 35 a minute (about 71 with one attempt each)
   empties the node budget (NODE_PUNCH_BUDGET_BYTES, 1 MiB), blocking native
   setups to every destination. Both must be fair before UDP is removed.
+  The proven-peer allowance changes who is starved, not whether: setups to
+  proven peers no longer draw on the shared budgets while their allowance
+  lasts, so steered setups starve unproven destinations first, and the
+  allowance pools are finite rate limits of their own.
 ```
 
 Native connection (`peer_connection/native_connection.rs`, A5a): the

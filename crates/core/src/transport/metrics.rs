@@ -2462,6 +2462,8 @@ impl TransportMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// As [`Self::record_connect_native_punch_allowance_exhausted_peer`], for
+    /// the node's allowance.
     pub(crate) fn record_connect_native_punch_allowance_exhausted_node(&self) {
         self.connect_native_punch_allowance_exhausted_node
             .fetch_add(1, Ordering::Relaxed);

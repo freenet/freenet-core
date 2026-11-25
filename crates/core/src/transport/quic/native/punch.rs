@@ -984,8 +984,11 @@ mod tests {
                 let (result, counts) = dial(&budget, &ip, k, t0);
                 if counts.used {
                     from_allowance += CLIENT_BYTES_PER_DIAL;
-                } else {
-                    assert!(result.is_err() || counts.exhausted_node || !counts.used);
+                } else if from_allowance + CLIENT_BYTES_PER_DIAL > NODE_ALLOWANCE_BYTES {
+                    // The node allowance is spent: the dial is reported as
+                    // such, and is served or refused by the shared budget.
+                    assert!(counts.exhausted_node);
+                    assert_eq!(counts.refused_proven, result.is_err());
                 }
             }
             if peers_to_drain == 0 && from_allowance + CLIENT_BYTES_PER_DIAL > NODE_ALLOWANCE_BYTES
