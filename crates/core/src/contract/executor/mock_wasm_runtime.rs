@@ -202,6 +202,9 @@ pub(crate) struct MockWasmRuntime {
     /// Per-contract update_state overrides for testing the
     /// `requires(missing)` fetch-and-retry path.
     pub(crate) update_overrides: HashMap<ContractInstanceId, UpdateOverride>,
+    /// Contracts that declare `__frnt__update_validates` (see
+    /// `ContractRuntimeInterface::update_validates`).
+    pub(crate) update_validates_ids: std::collections::HashSet<ContractInstanceId>,
     /// Scripted delegate runs (#5544). Each `execute_delegate_request` pops the
     /// next entry; an exhausted script returns no messages, which the caller
     /// reads as "the delegate is done".
@@ -493,6 +496,10 @@ fn inbound_kind(msg: &InboundDelegateMsg<'_>) -> &'static str {
 }
 
 impl ContractRuntimeInterface for MockWasmRuntime {
+    fn update_validates(&mut self, key: &ContractKey, _parameters: &Parameters<'_>) -> bool {
+        self.update_validates_ids.contains(key.id())
+    }
+
     fn validate_state(
         &mut self,
         key: &ContractKey,
@@ -1186,6 +1193,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             contract_store: contract_store.unwrap_or_default(),
             validate_overrides: HashMap::new(),
             update_overrides: HashMap::new(),
+            update_validates_ids: Default::default(),
             delegate_script: DelegateScript::default(),
             delegate_calls: DelegateCallLog::default(),
             delegate_contexts: DelegateContexts::default(),
@@ -1228,6 +1236,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             contract_store: InMemoryContractStore::default(),
             validate_overrides: HashMap::new(),
             update_overrides: HashMap::new(),
+            update_validates_ids: Default::default(),
             delegate_script: DelegateScript::default(),
             delegate_calls: DelegateCallLog::default(),
             delegate_contexts: DelegateContexts::default(),
@@ -1262,6 +1271,7 @@ impl Executor<MockWasmRuntime, MockStateStorage> {
             contract_store: InMemoryContractStore::default(),
             validate_overrides: HashMap::new(),
             update_overrides: HashMap::new(),
+            update_validates_ids: Default::default(),
             delegate_script: DelegateScript::default(),
             delegate_calls: DelegateCallLog::default(),
             delegate_contexts: DelegateContexts::default(),

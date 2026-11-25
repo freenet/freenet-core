@@ -59,6 +59,10 @@ pub(crate) const DEFAULT_MAX_MEMORY_PAGES: u32 = 4096;
 /// WASM page size in bytes (64 KiB).
 pub(crate) const WASM_PAGE_SIZE: usize = 65536;
 
+/// Export a contract defines, with type `() -> i32`, to declare that its
+/// `update_state` validates its own input and output.
+pub(crate) const UPDATE_VALIDATES_EXPORT: &str = "__frnt__update_validates";
+
 /// Opaque handle to a live WASM instance managed by the engine.
 ///
 /// Instances are created via [`WasmEngine::create_instance`] and must be
@@ -153,6 +157,13 @@ pub(crate) trait WasmEngine: Send {
     /// insert time by the runtime so the value is amortized across all later
     /// cache hits for that module.
     fn module_compiled_size(&self, module: &Self::Module) -> usize;
+
+    /// Whether the module declares `__frnt__update_validates` with the exact
+    /// type `() -> i32`. Presence of the export is the whole declaration; the
+    /// host never calls it. Read from the module's export table (a hash
+    /// lookup), so it costs nothing per call and lives and dies with the
+    /// cached module. A missing export or one of another type is `false`.
+    fn module_declares_update_validates(&self, module: &Self::Module) -> bool;
 
     // -- Instance lifecycle --
 

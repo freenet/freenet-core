@@ -1287,6 +1287,20 @@ impl WasmEngine for WasmtimeEngine {
         compiled_module_size(module)
     }
 
+    fn module_declares_update_validates(&self, module: &Module) -> bool {
+        match module.get_export(super::UPDATE_VALIDATES_EXPORT) {
+            Some(wasmtime::ExternType::Func(ty)) => {
+                ty.params().len() == 0
+                    && ty.results().len() == 1
+                    && ty
+                        .results()
+                        .next()
+                        .is_some_and(|r| r.matches(&wasmtime::ValType::I32))
+            }
+            _ => false,
+        }
+    }
+
     fn create_instance(
         &mut self,
         module: &Module,

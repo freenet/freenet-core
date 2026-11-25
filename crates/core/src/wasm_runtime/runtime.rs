@@ -1541,6 +1541,16 @@ impl Runtime {
         self.prepare_contract_call_inner(key, parameters, req_bytes, Some(already_fetched))
     }
 
+    /// The compiled module for `key`'s code, from the shared cache or compiled
+    /// now. Does not create an instance.
+    pub(super) fn contract_module(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters,
+    ) -> RuntimeResult<<Engine as WasmEngine>::Module> {
+        self.contract_module_inner(key, parameters, None)
+    }
+
     fn prepare_contract_call_inner(
         &mut self,
         key: &ContractKey,
@@ -1548,6 +1558,21 @@ impl Runtime {
         req_bytes: usize,
         already_fetched: Option<&ContractContainer>,
     ) -> RuntimeResult<RunningInstance> {
+        let module = self.contract_module_inner(key, parameters, already_fetched)?;
+        RunningInstance::new(
+            &mut self.engine,
+            &module,
+            Key::Contract(*key.id()),
+            req_bytes,
+        )
+    }
+
+    fn contract_module_inner(
+        &mut self,
+        key: &ContractKey,
+        parameters: &Parameters,
+        already_fetched: Option<&ContractContainer>,
+    ) -> RuntimeResult<<Engine as WasmEngine>::Module> {
         // Resolve the CODE hash this instance runs, which is what the compiled
         // module is keyed by (issue #5268). Compilation only ever sees the WASM
         // code — parameters are written into linear memory at call time — so N
@@ -1642,12 +1667,7 @@ impl Runtime {
                 module
             }
         };
-        RunningInstance::new(
-            &mut self.engine,
-            &module,
-            Key::Contract(*key.id()),
-            req_bytes,
-        )
+        Ok(module)
     }
 
     /// Refuse a run of `key` whose `params` do not derive it under

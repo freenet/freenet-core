@@ -269,6 +269,8 @@ struct ExecutorFactory {
     shared_backend_engine: BackendEngine,
     /// Shared recovery guard for corrupted-state self-healing across all pool executors.
     shared_recovery_guard: super::CorruptedStateRecoveryGuard,
+    /// Shared record of stored states already verified (see `StoredStateVerified`).
+    shared_stored_state_verified: super::SharedStoredStateVerified,
     /// The ONE summary fast-path cache every executor reads and writes (#5795),
     /// sized to `pool_size × per-executor budget` — the product the node already
     /// declared. Before this, each executor had its own, and because the
@@ -326,6 +328,7 @@ impl ExecutorFactory {
             self.shared_client_counts.clone(),
         );
         executor.set_recovery_guard(self.shared_recovery_guard.clone());
+        executor.set_stored_state_verified(self.shared_stored_state_verified.clone());
         executor.set_shared_fast_path_caches(
             self.shared_summary_cache.clone(),
             self.shared_delta_cache.clone(),
@@ -821,6 +824,8 @@ impl RuntimePool {
         // All pool executors share this so recovery tracking is consistent.
         let shared_recovery_guard: super::CorruptedStateRecoveryGuard =
             Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let shared_stored_state_verified: super::SharedStoredStateVerified =
+            Arc::new(std::sync::Mutex::new(super::StoredStateVerified::default()));
 
         // One summary cache and one delta cache for the whole pool (#5795),
         // each sized to the aggregate the node already declares for them
@@ -867,6 +872,7 @@ impl RuntimePool {
             shared_client_counts.clone(),
         );
         first_executor.set_recovery_guard(shared_recovery_guard.clone());
+        first_executor.set_stored_state_verified(shared_stored_state_verified.clone());
         first_executor
             .set_shared_fast_path_caches(shared_summary_cache.clone(), shared_delta_cache.clone());
         first_executor.set_delegate_notification_tx(delegate_notification_tx.clone());
@@ -894,6 +900,7 @@ impl RuntimePool {
                 shared_client_counts.clone(),
             );
             executor.set_recovery_guard(shared_recovery_guard.clone());
+            executor.set_stored_state_verified(shared_stored_state_verified.clone());
             executor.set_shared_fast_path_caches(
                 shared_summary_cache.clone(),
                 shared_delta_cache.clone(),
@@ -971,6 +978,7 @@ impl RuntimePool {
             shared_inherited_origins: shared_inherited_origins.clone(),
             shared_backend_engine: shared_backend_engine.clone(),
             shared_recovery_guard: shared_recovery_guard.clone(),
+            shared_stored_state_verified: shared_stored_state_verified.clone(),
             shared_summary_cache: shared_summary_cache.clone(),
             shared_delta_cache: shared_delta_cache.clone(),
             delegate_notification_tx: delegate_notification_tx.clone(),

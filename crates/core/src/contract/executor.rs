@@ -1384,6 +1384,57 @@ pub(crate) trait ContractExecutor: Send + 'static {
 /// if corruption happens again later.
 pub(crate) type CorruptedStateRecoveryGuard = Arc<std::sync::Mutex<HashSet<ContractKey>>>;
 
+/// Records, per contract key, the hash of the stored state that this process
+/// has already checked with the contract's own `validate_state`, or that came
+/// out of an update the contract vouches for.
+///
+/// A contract that exports `__frnt__update_validates` has its stored state
+/// reused as a starting point without re-validating every incoming state and
+/// every result. That is only done for a stored state recorded here, so the
+/// stored state is validated at most once per (key, stored-state hash) instead
+/// of on every update. A changed stored state has a different hash and is
+/// verified again.
+///
+/// Bounded by entry count; each value is a fixed 32-byte hash, so the count is
+/// also a memory bound.
+#[derive(Default)]
+pub(crate) struct StoredStateVerified {
+    verified: HashMap<ContractKey, [u8; 32]>,
+}
+
+impl StoredStateVerified {
+    /// Upper bound on the number of keys tracked.
+    pub(crate) const MAX_ENTRIES: usize = 8192;
+
+    pub(crate) fn is_verified(&self, key: &ContractKey, state_hash: &[u8; 32]) -> bool {
+        self.verified.get(key) == Some(state_hash)
+    }
+
+    pub(crate) fn record(&mut self, key: ContractKey, state_hash: [u8; 32]) {
+        if !self.verified.contains_key(&key) && self.verified.len() >= Self::MAX_ENTRIES {
+            if let Some(victim) = self.verified.keys().next().copied() {
+                self.verified.remove(&victim);
+            }
+        }
+        self.verified.insert(key, state_hash);
+    }
+
+    /// Forget `key`. Called when the stored state is replaced by a path that
+    /// did not go through an update the contract vouches for.
+    pub(crate) fn invalidate(&mut self, key: &ContractKey) {
+        self.verified.remove(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.verified.len()
+    }
+}
+
+/// Shared by every executor of a pool, so a stored state is verified once per
+/// process rather than once per executor.
+pub(crate) type SharedStoredStateVerified = Arc<std::sync::Mutex<StoredStateVerified>>;
+
 // Type alias for shared notification storage (used by RuntimePool).
 // Uses DashMap for fine-grained per-key locking instead of a global RwLock.
 type SharedNotifications =
@@ -1948,6 +1999,9 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     /// Shared guard for corrupted-state recovery, preventing infinite recovery loops.
     /// See [`CorruptedStateRecoveryGuard`] for details.
     pub(crate) recovery_guard: CorruptedStateRecoveryGuard,
+    /// Stored states already verified for contracts that opt in to
+    /// `__frnt__update_validates`. See [`StoredStateVerified`].
+    pub(crate) stored_state_verified: SharedStoredStateVerified,
 
     /// Cache of contract summaries keyed by ContractKey, storing (state_hash, summary).
     /// Avoids redundant WASM instantiations during the 5-minute interest heartbeat
@@ -2032,6 +2086,7 @@ where
             shared_summaries: None,
             shared_client_counts: None,
             recovery_guard: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            stored_state_verified: Arc::new(std::sync::Mutex::new(StoredStateVerified::default())),
             summary_cache,
             delta_cache,
             delegate_notification_tx: None,
@@ -2067,6 +2122,11 @@ where
     /// tracking is consistent regardless of which executor handles a request.
     pub(crate) fn set_recovery_guard(&mut self, guard: CorruptedStateRecoveryGuard) {
         self.recovery_guard = guard;
+    }
+
+    /// Share the pool-wide record of verified stored states.
+    pub(crate) fn set_stored_state_verified(&mut self, shared: SharedStoredStateVerified) {
+        self.stored_state_verified = shared;
     }
 
     /// Point this executor at the pool's shared summary and delta caches

@@ -32,6 +32,13 @@ pub(crate) trait ContractRuntimeInterface {
         update_data: &[UpdateData<'_>],
     ) -> RuntimeResult<UpdateModification<'static>>;
 
+    /// Whether this contract declares, by exporting `__frnt__update_validates`
+    /// with type `() -> i32`, that its `update_state` validates its own input
+    /// and output. Any failure to find the module answers `false`.
+    fn update_validates(&mut self, _key: &ContractKey, _parameters: &Parameters<'_>) -> bool {
+        false
+    }
+
     /// Generate a concise summary of a state.
     fn summarize_state(
         &mut self,
@@ -216,6 +223,16 @@ impl super::Runtime {
 }
 
 impl ContractRuntimeInterface for super::Runtime {
+    fn update_validates(&mut self, key: &ContractKey, parameters: &Parameters<'_>) -> bool {
+        match self.contract_module(key, parameters) {
+            Ok(module) => self.engine.module_declares_update_validates(&module),
+            Err(err) => {
+                tracing::debug!(contract = %key, error = %err, "update_validates: no module");
+                false
+            }
+        }
+    }
+
     fn validate_state(
         &mut self,
         key: &ContractKey,

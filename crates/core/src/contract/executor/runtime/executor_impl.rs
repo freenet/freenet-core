@@ -492,6 +492,17 @@ where
 
         let is_new_contract = self.state_store.get(&key).await.is_err();
 
+        // A contract that declares `__frnt__update_validates` checks its own
+        // input and output in `update_state`. For such a contract, with a state
+        // already stored that this process has verified, the checks the node
+        // would repeat around `update_state` are skipped (see
+        // `stored_state_trusted_for_opt_in`). A fresh store is always validated
+        // in full.
+        let trusted_stored = !is_new_contract
+            && self
+                .stored_state_trusted_for_opt_in(&key, &params, &related_contracts)
+                .await;
+
         // Applied-payload record (`crate::ring::applied_payloads`). The hash is
         // taken here, before `update` is consumed, and recorded ONLY at the
         // commit points below: a merge that committed a changed state, and an
@@ -597,7 +608,13 @@ where
                     }));
                 }
 
-                let result = self
+                let result = if trusted_stored {
+                    // The contract's `update_state` validates the incoming
+                    // state itself, and the stored state it merges into has
+                    // been verified.
+                    ValidateResult::Valid
+                } else {
+                    self
                     .fetch_related_for_validation(
                         &key,
                         &params,
@@ -626,7 +643,8 @@ where
                                 "Related contract validation failed, dropping queued operations"
                             );
                         }
-                    })?;
+                    })?
+                };
                 match result {
                     ValidateResult::Valid => {
                         tracing::debug!(
@@ -697,6 +715,10 @@ where
                             if let Some(set) = &applied_payloads {
                                 set.reset(&key);
                             }
+                            self.stored_state_verified
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .invalidate(&key);
                             self.state_store
                                 .store(key, state_to_store, params.clone())
                                 .await
@@ -1197,11 +1219,15 @@ where
                 // state is older and the contract's merge function correctly rejected
                 // it). Only trigger recovery when the local state itself fails
                 // validation. See issue #3109.
-                let local_valid = self
-                    .runtime
-                    .validate_state(&key, &params, &current_state, &related_contracts)
-                    .map(|r| r == ValidateResult::Valid)
-                    .unwrap_or(false);
+                //
+                // A trusted stored state is known valid, so the merge failure
+                // is legitimate and the stored state is not validated again.
+                let local_valid = trusted_stored
+                    || self
+                        .runtime
+                        .validate_state(&key, &params, &current_state, &related_contracts)
+                        .map(|r| r == ValidateResult::Valid)
+                        .unwrap_or(false);
 
                 // Local state is valid — the merge failure is legitimate, not corruption.
                 if local_valid {
@@ -1315,15 +1341,20 @@ where
             return Ok(UpsertResult::NoChange);
         }
 
-        let result = self
-            .fetch_related_for_validation(
+        let result = if trusted_stored && !recovery_performed {
+            // The contract's `update_state` returns an error unless its output
+            // is valid, so the result is not validated a second time.
+            ValidateResult::Valid
+        } else {
+            self.fetch_related_for_validation(
                 &key,
                 &params,
                 &updated_state,
                 &related_contracts,
                 defer_related_fetch,
             )
-            .await?;
+            .await?
+        };
 
         if result != ValidateResult::Valid {
             return Err(Self::validation_error(key, result));
@@ -1361,8 +1392,22 @@ where
                 set.reset(&key);
             }
         }
+        // Forget the verified record before the write so a failed commit cannot
+        // leave a record describing a state that was not stored.
+        self.stored_state_verified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .invalidate(&key);
         self.commit_state_update(&key, &params, &updated_state)
             .await?;
+        if trusted_stored && !recovery_performed {
+            // The new stored state came from an update the contract vouches
+            // for, on a stored state that was verified.
+            self.stored_state_verified
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record(key, *blake3::hash(updated_state.as_ref()).as_bytes());
+        }
         if !recovery_performed {
             record_absorbed(&applied_payloads);
         }
@@ -1780,6 +1825,57 @@ where
             return Ok(None);
         };
         Ok(Some(contract))
+    }
+
+    /// Whether the node may rely on `key`'s contract to validate its own
+    /// updates: the contract declares `__frnt__update_validates` AND the state
+    /// this node stores for it has been verified.
+    ///
+    /// The stored state is verified with the contract's own `validate_state`,
+    /// once per (key, stored-state hash) in this process (see
+    /// [`StoredStateVerified`]); an update that the contract vouches for
+    /// records its result, so the hot path does not repeat it. A stored state
+    /// that is not `Valid` (invalid, does not parse, needs related contracts,
+    /// or an error) is not trusted, and the caller takes the full validation
+    /// path including the corrupted-state recovery.
+    async fn stored_state_trusted_for_opt_in(
+        &mut self,
+        key: &ContractKey,
+        params: &Parameters<'_>,
+        related: &RelatedContracts<'_>,
+    ) -> bool {
+        if !self.runtime.update_validates(key, params) {
+            return false;
+        }
+        let Ok(stored) = self.state_store.get(key).await else {
+            return false;
+        };
+        let hash = *blake3::hash(stored.as_ref()).as_bytes();
+        if self
+            .stored_state_verified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_verified(key, &hash)
+        {
+            return true;
+        }
+        let verdict = self.runtime.validate_state(key, params, &stored, related);
+        let mut verified = self
+            .stored_state_verified
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if matches!(verdict, Ok(ValidateResult::Valid)) {
+            verified.record(*key, hash);
+            true
+        } else {
+            verified.invalidate(key);
+            tracing::debug!(
+                contract = %key,
+                event = "stored_state_not_verified",
+                "Stored state did not validate; using the full validation path"
+            );
+            false
+        }
     }
 
     pub(super) async fn attempt_state_update(
