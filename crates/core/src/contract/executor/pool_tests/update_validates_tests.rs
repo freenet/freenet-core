@@ -135,6 +135,12 @@ async fn an_opting_in_contract_skips_validation_on_delta_state_and_no_change() {
     );
 
     // Incoming bytes equal to the stored bytes: NoChange, nothing validated.
+    // The merge is replaced by one that would change the state, so NoChange can
+    // only come from the equal-bytes shortcut, which never calls `update_state`.
+    executor
+        .runtime
+        .update_overrides
+        .insert(*key.id(), UpdateOverride::MergeWith(|_, _| vec![0]));
     let r = full(&mut executor, key, vec![7, 9]).await;
     assert!(matches!(r, UpsertResult::NoChange), "{r:?}");
 
@@ -173,19 +179,100 @@ async fn a_changed_stored_state_is_verified_again() {
     );
 }
 
-/// The record is shared through `set_stored_state_verified`, so a second
-/// executor of a pool does not repeat the check.
+/// A stored state replaced between the one-time check and the merge is not
+/// trusted: the merge runs on bytes nobody verified, so the full path applies
+/// and nothing is recorded for the result.
 #[tokio::test(flavor = "current_thread")]
-async fn the_verified_record_can_be_shared_between_executors() {
-    let (mut a, key) = executor_with_stored_state("uv_shared", true).await;
-    let log = record_validations(&mut a, &key);
-    delta(&mut a, key, vec![7]).await;
-    assert_eq!(seen(&log), vec![STORED.to_vec()]);
-    assert_eq!(a.stored_state_verified.lock().unwrap().len(), 1);
+async fn a_stored_state_replaced_after_the_check_takes_the_full_path_for_a_delta() {
+    let (mut executor, key) = executor_with_stored_state("uv_replaced_delta", true).await;
+    let log = record_validations(&mut executor, &key);
+    executor.test_replace_stored_after_gate = Some(vec![4, 4]);
 
-    let mut b = new_executor("uv_shared_b").await;
-    b.set_stored_state_verified(a.stored_state_verified.clone());
-    assert_eq!(b.stored_state_verified.lock().unwrap().len(), 1);
+    let r = delta(&mut executor, key, vec![7]).await;
+    assert!(
+        matches!(&r, UpsertResult::Updated(s) if s.as_ref() == [7]),
+        "{r:?}"
+    );
+    assert_eq!(
+        seen(&log),
+        vec![STORED.to_vec(), vec![7]],
+        "the check, then the result is validated because the merged-into state was not verified"
+    );
+    assert!(
+        !executor
+            .stored_state_verified
+            .lock()
+            .unwrap()
+            .is_verified(&key, blake3::hash(&[7]).as_bytes()),
+        "a result built on an unverified state must not be recorded"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_stored_state_replaced_after_the_check_takes_the_full_path_for_a_full_state() {
+    let (mut executor, key) = executor_with_stored_state("uv_replaced_state", true).await;
+    let log = record_validations(&mut executor, &key);
+    executor
+        .runtime
+        .update_overrides
+        .insert(*key.id(), UpdateOverride::MergeWith(union));
+    executor.test_replace_stored_after_gate = Some(vec![4, 4]);
+
+    let r = full(&mut executor, key, vec![9]).await;
+    assert!(
+        matches!(&r, UpsertResult::Updated(s) if s.as_ref() == [4, 9]),
+        "{r:?}"
+    );
+    assert_eq!(
+        seen(&log),
+        vec![STORED.to_vec(), vec![9], vec![4, 9]],
+        "the incoming state and the result are validated after all"
+    );
+}
+
+/// The one-time check runs with no related contracts, so a verdict never
+/// depends on related state a caller supplied. A stored state that needs
+/// related contracts to validate stays untrusted, and the failed check is not
+/// remembered against a later check that can succeed.
+#[tokio::test(flavor = "current_thread")]
+async fn a_stored_state_needing_related_contracts_is_not_trusted() {
+    let (mut executor, key) = executor_with_stored_state("uv_related_gate", true).await;
+    let needed = ContractInstanceId::new([5; 32]);
+    executor
+        .runtime
+        .validate_overrides
+        .insert(*key.id(), ValidateOverride::RequestRelated(vec![needed]));
+
+    // The caller supplies the related state. Were it passed to the check, the
+    // stored state would validate and be trusted.
+    let supplied = RelatedContracts::from(std::collections::HashMap::from([(
+        needed,
+        Some(State::from(vec![1])),
+    )]));
+    let r = executor
+        .upsert_contract_state(
+            key,
+            Either::Right(StateDelta::from(vec![7])),
+            supplied,
+            None,
+        )
+        .await
+        .expect("the full path accepts the update");
+    assert!(
+        matches!(&r, UpsertResult::Updated(s) if s.as_ref() == [7]),
+        "{r:?}"
+    );
+    assert_eq!(
+        executor.stored_state_verified.lock().unwrap().len(),
+        0,
+        "a verdict that depended on caller-supplied related state was recorded"
+    );
+
+    // A later update, whose check can succeed, is trusted.
+    let log = record_validations(&mut executor, &key);
+    delta(&mut executor, key, vec![8]).await;
+    assert_eq!(seen(&log), vec![vec![7]], "only the one-time check ran");
+    assert_eq!(executor.stored_state_verified.lock().unwrap().len(), 1);
 }
 
 /// (2) An `update_state` error on a full state returns the error: the stored
@@ -358,50 +445,76 @@ async fn a_stored_state_that_does_not_parse_is_recovered() {
     assert_eq!(stored(&executor, &key).await, vec![5, 5]);
 }
 
-/// Source pins: each skip is gated on `trusted_stored`, which is computed only
-/// for a stored key, and the merge-error path has no validation of its own.
+/// `s` with every run of whitespace collapsed, so a pin does not depend on how
+/// rustfmt wraps a line.
+fn squash(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Source pins: each skip is gated on trust that is confirmed against the state
+/// being merged into, and a stored state replaced outside the trusted update is
+/// forgotten.
 #[test]
 fn the_skips_are_wired_to_the_trust_check() {
     let src = include_str!("../runtime/executor_impl.rs");
-    let body = src
-        .split("pub(in crate::contract::executor) async fn bridged_upsert_contract_state_inner(")
+    let body = squash(
+        src.split(
+            "pub(in crate::contract::executor) async fn bridged_upsert_contract_state_inner(",
+        )
         .nth(1)
         .expect("upsert body")
-        .split("\n    pub(in crate::contract::executor) fn bridged_register_contract_notifier(")
+        .split("pub(in crate::contract::executor) fn bridged_register_contract_notifier(")
         .next()
-        .expect("upsert body end");
+        .expect("upsert body end"),
+    );
 
     assert!(
-        body.contains("let trusted_stored = !is_new_contract"),
-        "trust must require a stored state"
+        body.contains("let verified_hash = if is_new_contract { None }"),
+        "a fresh store must never be trusted"
     );
-    assert!(body.contains("stored_state_trusted_for_opt_in("));
+    assert!(body.contains("self.verified_stored_state_hash(&key, &params)"));
     assert!(
-        body.contains("if trusted_stored {"),
+        body.contains("let result = if incoming_validation_skipped {"),
         "incoming pre-validate gate"
     );
     assert!(
-        body.contains("trusted_stored && !recovery_performed"),
-        "post-update validate gate"
+        body.contains("verified_hash .is_some_and(|hash| *blake3::hash(current_state.as_ref()).as_bytes() == hash)")
+            || body.contains("verified_hash.is_some_and(|hash| *blake3::hash(current_state.as_ref()).as_bytes() == hash)"),
+        "trust must be tied to the hash of the state that is merged into"
     );
     assert!(
-        body.contains("let local_valid = trusted_stored"),
+        body.contains("if incoming_validation_skipped && !trusted_stored {"),
+        "a skipped incoming validation must be performed when trust is not confirmed"
+    );
+    assert_eq!(
+        body.matches("if trusted_stored && !recovery_performed {")
+            .count(),
+        2,
+        "post-update validate skip and the verdict record"
+    );
+    assert!(
+        body.contains("let local_valid = trusted_stored || self .runtime .validate_state(&key, &params, &current_state"),
         "merge-error path must not validate a trusted stored state"
     );
-    assert!(
-        body.contains(".invalidate(&key)"),
-        "a stored state replaced outside the trusted update must be forgotten"
+    assert_eq!(
+        body.matches(".invalidate(&key)").count(),
+        2,
+        "initial install and the pre-commit forget"
     );
-    // The helper verifies through the contract's own validate_state and trusts
-    // only `Valid`.
-    let helper = src
-        .split("async fn stored_state_trusted_for_opt_in(")
-        .nth(1)
-        .expect("helper")
-        .split("\n    }\n")
-        .next()
-        .expect("helper end");
+
+    // The helper verifies through the contract's own validate_state with NO
+    // related contracts, trusts only `Valid`, and forgets a failed check.
+    let helper = squash(
+        src.split("async fn verified_stored_state_hash(")
+            .nth(1)
+            .expect("helper")
+            .split("\n    }\n")
+            .next()
+            .expect("helper end"),
+    );
     assert!(helper.contains("self.runtime.update_validates("));
-    assert!(helper.contains("self.runtime.validate_state("));
+    assert!(helper.contains("&RelatedContracts::default()"));
+    assert!(!helper.contains("related_contracts"));
     assert!(helper.contains("matches!(verdict, Ok(ValidateResult::Valid))"));
+    assert!(helper.contains(".invalidate(key)"));
 }

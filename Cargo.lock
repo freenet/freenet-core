@@ -6978,6 +6978,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "test-contract-update-validates"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "freenet-stdlib 0.12.1",
+]
+
+[[package]]
+name = "test-contract-update-validates-off"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "freenet-stdlib 0.12.1",
+]
+
+[[package]]
 name = "test-log"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"

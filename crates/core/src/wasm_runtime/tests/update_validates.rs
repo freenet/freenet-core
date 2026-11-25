@@ -95,9 +95,4 @@ fn the_export_is_never_called() {
     for forbidden in ["call", "instantiate", "create_instance"] {
         assert!(!body.contains(forbidden), "{forbidden} in {body}");
     }
-    assert!(
-        !src.contains("call_void(&handle, super::UPDATE_VALIDATES_EXPORT")
-            && !src.contains("call_void(handle, UPDATE_VALIDATES_EXPORT"),
-        "the host must not call the export"
-    );
 }

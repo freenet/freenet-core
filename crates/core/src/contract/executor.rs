@@ -2002,6 +2002,10 @@ pub struct Executor<R = Runtime, S: StateStorage = Storage> {
     /// Stored states already verified for contracts that opt in to
     /// `__frnt__update_validates`. See [`StoredStateVerified`].
     pub(crate) stored_state_verified: SharedStoredStateVerified,
+    /// Test hook: replace the stored state with these bytes right after the
+    /// one-time check, to model a write between the check and the merge.
+    #[cfg(test)]
+    pub(crate) test_replace_stored_after_gate: Option<Vec<u8>>,
 
     /// Cache of contract summaries keyed by ContractKey, storing (state_hash, summary).
     /// Avoids redundant WASM instantiations during the 5-minute interest heartbeat
@@ -2087,6 +2091,8 @@ where
             shared_client_counts: None,
             recovery_guard: Arc::new(std::sync::Mutex::new(HashSet::new())),
             stored_state_verified: Arc::new(std::sync::Mutex::new(StoredStateVerified::default())),
+            #[cfg(test)]
+            test_replace_stored_after_gate: None,
             summary_cache,
             delta_cache,
             delegate_notification_tx: None,
@@ -2122,6 +2128,30 @@ where
     /// tracking is consistent regardless of which executor handles a request.
     pub(crate) fn set_recovery_guard(&mut self, guard: CorruptedStateRecoveryGuard) {
         self.recovery_guard = guard;
+    }
+
+    /// Test hook: applies [`Self::test_replace_stored_after_gate`], if set.
+    #[cfg(test)]
+    pub(crate) async fn apply_test_replace_after_gate(
+        &mut self,
+        key: &ContractKey,
+    ) -> Result<(), ExecutorError> {
+        if let Some(bytes) = self.test_replace_stored_after_gate.take() {
+            self.state_store
+                .update(key, WrappedState::new(bytes))
+                .await
+                .map_err(ExecutorError::other)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(test))]
+    #[inline(always)]
+    pub(crate) async fn apply_test_replace_after_gate(
+        &mut self,
+        _key: &ContractKey,
+    ) -> Result<(), ExecutorError> {
+        Ok(())
     }
 
     /// Share the pool-wide record of verified stored states.

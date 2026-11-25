@@ -495,13 +495,25 @@ where
         // A contract that declares `__frnt__update_validates` checks its own
         // input and output in `update_state`. For such a contract, with a state
         // already stored that this process has verified, the checks the node
-        // would repeat around `update_state` are skipped (see
-        // `stored_state_trusted_for_opt_in`). A fresh store is always validated
-        // in full.
-        let trusted_stored = !is_new_contract
-            && self
-                .stored_state_trusted_for_opt_in(&key, &params, &related_contracts)
-                .await;
+        // would repeat around `update_state` are skipped. A fresh store is
+        // always validated in full.
+        //
+        // The one-time check of the stored state (see
+        // `verified_stored_state_hash`) is intentionally one extra
+        // `validate_state` per (key, stored-state hash) per process. It returns
+        // the hash of the bytes it verified, and every skip below also requires
+        // the state `update_state` merges into (`current_state`, read later) to
+        // hash to exactly that value; otherwise the full path runs.
+        let verified_hash = if is_new_contract {
+            None
+        } else {
+            self.verified_stored_state_hash(&key, &params).await
+        };
+        self.apply_test_replace_after_gate(&key).await?;
+        // Whether the incoming state's own validation is skipped. Confirmed
+        // against `current_state` below; if the stored state changed since it
+        // was verified, the validation is performed there instead.
+        let incoming_validation_skipped = verified_hash.is_some();
 
         // Applied-payload record (`crate::ring::applied_payloads`). The hash is
         // taken here, before `update` is consumed, and recorded ONLY at the
@@ -608,7 +620,7 @@ where
                     }));
                 }
 
-                let result = if trusted_stored {
+                let result = if incoming_validation_skipped {
                     // The contract's `update_state` validates the incoming
                     // state itself, and the stored state it merges into has
                     // been verified.
@@ -964,6 +976,31 @@ where
                 return Err(ExecutorError::other(err));
             }
         };
+
+        // Trust applies only to the exact bytes that were verified.
+        let trusted_stored = verified_hash
+            .is_some_and(|hash| *blake3::hash(current_state.as_ref()).as_bytes() == hash);
+        if incoming_validation_skipped && !trusted_stored {
+            tracing::debug!(
+                contract = %key,
+                event = "stored_state_changed_since_verified",
+                "Stored state changed after it was verified; using the full validation path"
+            );
+            if let Some(incoming) = &incoming_full_state {
+                let result = self
+                    .fetch_related_for_validation(
+                        &key,
+                        &params,
+                        incoming,
+                        &related_contracts,
+                        defer_related_fetch,
+                    )
+                    .await?;
+                if result != ValidateResult::Valid {
+                    return Err(Self::validation_error(key, result));
+                }
+            }
+        }
 
         for (id, state) in related_contracts
             .states()
@@ -1393,7 +1430,9 @@ where
             }
         }
         // Forget the verified record before the write so a failed commit cannot
-        // leave a record describing a state that was not stored.
+        // leave a record describing a state that was not stored. A stored
+        // state that the contract did not vouch for (full validation path,
+        // recovery, fresh store) is verified again by the one-time check.
         self.stored_state_verified
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1402,7 +1441,7 @@ where
             .await?;
         if trusted_stored && !recovery_performed {
             // The new stored state came from an update the contract vouches
-            // for, on a stored state that was verified.
+            // for, on exactly the stored bytes that were verified.
             self.stored_state_verified
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1827,28 +1866,35 @@ where
         Ok(Some(contract))
     }
 
-    /// Whether the node may rely on `key`'s contract to validate its own
-    /// updates: the contract declares `__frnt__update_validates` AND the state
-    /// this node stores for it has been verified.
+    /// The hash of the stored state for `key` when the node may rely on the
+    /// contract to validate its own updates for it: the contract declares
+    /// `__frnt__update_validates` AND the stored state has been verified.
+    /// `None` means the full validation path applies.
     ///
     /// The stored state is verified with the contract's own `validate_state`,
-    /// once per (key, stored-state hash) in this process (see
+    /// once per (key, stored-state hash) per process (see
     /// [`StoredStateVerified`]); an update that the contract vouches for
-    /// records its result, so the hot path does not repeat it. A stored state
-    /// that is not `Valid` (invalid, does not parse, needs related contracts,
-    /// or an error) is not trusted, and the caller takes the full validation
-    /// path including the corrupted-state recovery.
-    async fn stored_state_trusted_for_opt_in(
+    /// records its result, so the hot path does not repeat it. The check runs
+    /// with NO related contracts, so a verdict never depends on related state a
+    /// caller supplied. A stored state that is not `Valid` (invalid, does not
+    /// parse, needs related contracts, or an error) is not trusted and nothing
+    /// is cached for it; the caller takes the full validation path including
+    /// the corrupted-state recovery.
+    ///
+    /// A cached verdict lives for the life of the process. It relies on the
+    /// contract's `validate_state` being a function of the state and
+    /// parameters only; a contract whose `validate_state` reads the host clock
+    /// (imports deprecated, see `warn_on_host_clock_import`) is outside that.
+    async fn verified_stored_state_hash(
         &mut self,
         key: &ContractKey,
         params: &Parameters<'_>,
-        related: &RelatedContracts<'_>,
-    ) -> bool {
+    ) -> Option<[u8; 32]> {
         if !self.runtime.update_validates(key, params) {
-            return false;
+            return None;
         }
         let Ok(stored) = self.state_store.get(key).await else {
-            return false;
+            return None;
         };
         let hash = *blake3::hash(stored.as_ref()).as_bytes();
         if self
@@ -1857,16 +1903,18 @@ where
             .unwrap_or_else(|e| e.into_inner())
             .is_verified(key, &hash)
         {
-            return true;
+            return Some(hash);
         }
-        let verdict = self.runtime.validate_state(key, params, &stored, related);
+        let verdict =
+            self.runtime
+                .validate_state(key, params, &stored, &RelatedContracts::default());
         let mut verified = self
             .stored_state_verified
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         if matches!(verdict, Ok(ValidateResult::Valid)) {
             verified.record(*key, hash);
-            true
+            Some(hash)
         } else {
             verified.invalidate(key);
             tracing::debug!(
@@ -1874,7 +1922,7 @@ where
                 event = "stored_state_not_verified",
                 "Stored state did not validate; using the full validation path"
             );
-            false
+            None
         }
     }
 
@@ -3728,7 +3776,13 @@ mod full_state_version_gate_pins {
             .find("let local_valid = trusted_stored")
             .expect("recovery path must validate the LOCAL state (#3109)");
         assert!(
-            body[local_valid_pos..].contains("|| self\n                        .runtime\n                        .validate_state(&key, &params, &current_state"),
+            body[local_valid_pos..]
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .starts_with(
+                    "let local_valid = trusted_stored || self .runtime .validate_state(&key, &params, &current_state"
+                ),
             "only a trusted stored state may skip validating the LOCAL state"
         );
         let keep_local_pos = body

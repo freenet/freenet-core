@@ -2306,6 +2306,79 @@ mod tests {
         );
     }
 
+    /// Every pooled executor records stored states it has verified in the one
+    /// map the pool owns, so a stored state is verified once per process and
+    /// not once per executor.
+    ///
+    /// FALSIFY by giving an executor a map of its own in `RuntimePool::new`
+    /// (drop its `set_stored_state_verified` call): the matching assertion
+    /// fails.
+    #[cfg(feature = "wasmtime-backend")]
+    #[tokio::test]
+    async fn pooled_executors_share_one_verified_record() {
+        let config_args = ConfigArgs {
+            id: Some("pool-shared-stored-state-verified".to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let config = node_config.config.clone();
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        let pool = RuntimePool::new(
+            config,
+            op_manager,
+            NonZeroUsize::new(3).expect("nonzero pool size"),
+        )
+        .await
+        .expect("build RuntimePool");
+
+        for (i, executor) in pool.runtimes.iter().enumerate() {
+            let executor = executor.as_ref().expect("pool executor present");
+            assert!(
+                Arc::ptr_eq(
+                    &executor.stored_state_verified,
+                    &pool.delegate_runner.factory.shared_stored_state_verified
+                ),
+                "executor {i} has its own verified record instead of the pool's"
+            );
+        }
+
+        // A replacement executor built later shares it too.
+        let replacement = pool
+            .delegate_runner
+            .factory
+            .create()
+            .await
+            .expect("build a replacement executor");
+        assert!(
+            Arc::ptr_eq(
+                &replacement.stored_state_verified,
+                &pool.delegate_runner.factory.shared_stored_state_verified
+            ),
+            "a replacement executor has its own verified record"
+        );
+    }
+
     /// The pool's `take_delegate_context` and `restore_delegate_context` act on
     /// the one context cache every pooled executor's runs use, so a context
     /// put back through the pool is what a run on any executor reads, and a
