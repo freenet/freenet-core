@@ -821,11 +821,24 @@ impl QuicUpgrades {
             return GatewayAdmission::HandoffFull;
         };
         let remote = normalize_mapped_addr(joined.connection.inner().remote_address());
+        // The joiner proved its key in the handshake.
+        let proven = crate::transport::quic::identity::proven_client_key(joined.connection.inner());
         let connection = self
             .native_connection(joined.connection, joined.version, remote)
             .with_joiner_charge(joined.charge);
         match to_node.try_send(connection) {
-            Ok(()) => GatewayAdmission::Joined,
+            Ok(()) => {
+                // Handed over: a later setup to this peer, at this address
+                // and key, draws on its allowance.
+                if let Some(key) = proven {
+                    self.punch_budget.mark_proven_joined(
+                        remote,
+                        key.transport_key(),
+                        self.path_clock.now(),
+                    );
+                }
+                GatewayAdmission::Joined
+            }
             // Dropping the connection closes it and releases the charge.
             Err(_) => {
                 tracing::debug!(%remote, "No room to hand a native join to the node; closing it");

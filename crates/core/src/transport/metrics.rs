@@ -1240,6 +1240,14 @@ pub struct TransportMetrics {
     /// a native one holds the peer (reset each snapshot).
     connect_native_survivor_swapped: AtomicU64,
     connect_native_survivor_udp_dropped: AtomicU64,
+    /// Native setups to a proven destination charged to the punch allowance, those
+    /// that found the allowance spent and fell back to the shared budget, and
+    /// those the shared budget then refused (reset each snapshot).
+    connect_native_punch_allowance_used: AtomicU64,
+    connect_native_punch_allowance_exhausted_peer: AtomicU64,
+    connect_native_punch_allowance_exhausted_node: AtomicU64,
+    connect_native_punch_refused_proven: AtomicU64,
+    connect_native_punch_refused_unproven: AtomicU64,
     /// The last offer this node built: level, percent and whether it was
     /// ready to dial native (a state, never reset).
     connect_native_offer_level: AtomicU8,
@@ -1801,6 +1809,11 @@ impl TransportMetrics {
             connect_native_both_dials_connected_native_first: AtomicU64::new(0),
             connect_native_survivor_swapped: AtomicU64::new(0),
             connect_native_survivor_udp_dropped: AtomicU64::new(0),
+            connect_native_punch_allowance_used: AtomicU64::new(0),
+            connect_native_punch_allowance_exhausted_peer: AtomicU64::new(0),
+            connect_native_punch_allowance_exhausted_node: AtomicU64::new(0),
+            connect_native_punch_refused_proven: AtomicU64::new(0),
+            connect_native_punch_refused_unproven: AtomicU64::new(0),
             connect_native_offer_level: AtomicU8::new(0),
             connect_native_offer_percent: AtomicU8::new(0),
             connect_native_offer_ready: AtomicBool::new(false),
@@ -2432,6 +2445,39 @@ impl TransportMetrics {
             counts[usize::from(swapped)] += 1;
             count.set(counts);
         });
+    }
+
+    /// A native setup to a proven destination was charged to the punch
+    /// allowance.
+    pub(crate) fn record_connect_native_punch_allowance_used(&self) {
+        self.connect_native_punch_allowance_used
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A native setup to a proven peer found the punch allowance spent: the
+    /// peer's own (`exhausted_peer`) or the node's, and went to the shared
+    /// budget.
+    pub(crate) fn record_connect_native_punch_allowance_exhausted_peer(&self) {
+        self.connect_native_punch_allowance_exhausted_peer
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// As [`Self::record_connect_native_punch_allowance_exhausted_peer`], for
+    /// the node's allowance.
+    pub(crate) fn record_connect_native_punch_allowance_exhausted_node(&self) {
+        self.connect_native_punch_allowance_exhausted_node
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A native setup was refused by the shared punch budget: `proven` says
+    /// whether the peer had an allowance that was spent.
+    pub(crate) fn record_connect_native_punch_refused(&self, proven: bool) {
+        if proven {
+            &self.connect_native_punch_refused_proven
+        } else {
+            &self.connect_native_punch_refused_unproven
+        }
+        .fetch_add(1, Ordering::Relaxed);
     }
 
     /// This node turned its own QUIC-native connects off.
@@ -3523,6 +3569,17 @@ impl TransportMetrics {
             ),
             connect_native_survivor_swapped: get64(&self.connect_native_survivor_swapped),
             connect_native_survivor_udp_dropped: get64(&self.connect_native_survivor_udp_dropped),
+            connect_native_punch_allowance_used: get64(&self.connect_native_punch_allowance_used),
+            connect_native_punch_allowance_exhausted_peer: get64(
+                &self.connect_native_punch_allowance_exhausted_peer,
+            ),
+            connect_native_punch_allowance_exhausted_node: get64(
+                &self.connect_native_punch_allowance_exhausted_node,
+            ),
+            connect_native_punch_refused_proven: get64(&self.connect_native_punch_refused_proven),
+            connect_native_punch_refused_unproven: get64(
+                &self.connect_native_punch_refused_unproven,
+            ),
             connect_native_offer_level: self.connect_native_offer_level.load(Ordering::Relaxed),
             connect_native_offer_percent: self.connect_native_offer_percent.load(Ordering::Relaxed),
             connect_native_offer_ready: self.connect_native_offer_ready.load(Ordering::Relaxed),
@@ -4264,6 +4321,13 @@ pub struct TransportSnapshot {
     /// or a UDP connection dropped because a native one holds the peer.
     pub connect_native_survivor_swapped: u64,
     pub connect_native_survivor_udp_dropped: u64,
+    /// Punch allowance use: setups charged to it, setups that found it spent,
+    /// and setups refused after that.
+    pub connect_native_punch_allowance_used: u64,
+    pub connect_native_punch_allowance_exhausted_peer: u64,
+    pub connect_native_punch_allowance_exhausted_node: u64,
+    pub connect_native_punch_refused_proven: u64,
+    pub connect_native_punch_refused_unproven: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -4725,6 +4789,11 @@ impl TransportSnapshot {
             connect_native_both_dials_connected_native_first,
             connect_native_survivor_swapped,
             connect_native_survivor_udp_dropped,
+            connect_native_punch_allowance_used,
+            connect_native_punch_allowance_exhausted_peer,
+            connect_native_punch_allowance_exhausted_node,
+            connect_native_punch_refused_proven,
+            connect_native_punch_refused_unproven,
             connect_native_offer_level,
             connect_native_offer_percent,
             connect_native_offer_ready,
@@ -4914,6 +4983,13 @@ impl TransportSnapshot {
             connect_native_both_dials_connected_native_first;
         self.connect_native_survivor_swapped = connect_native_survivor_swapped;
         self.connect_native_survivor_udp_dropped = connect_native_survivor_udp_dropped;
+        self.connect_native_punch_allowance_used = connect_native_punch_allowance_used;
+        self.connect_native_punch_allowance_exhausted_peer =
+            connect_native_punch_allowance_exhausted_peer;
+        self.connect_native_punch_allowance_exhausted_node =
+            connect_native_punch_allowance_exhausted_node;
+        self.connect_native_punch_refused_proven = connect_native_punch_refused_proven;
+        self.connect_native_punch_refused_unproven = connect_native_punch_refused_unproven;
         self.connect_native_offer_level = connect_native_offer_level;
         self.connect_native_offer_percent = connect_native_offer_percent;
         self.connect_native_offer_ready = connect_native_offer_ready;
@@ -5181,6 +5257,13 @@ struct SnapshotExtras {
     /// or a UDP connection dropped because a native one holds the peer.
     pub connect_native_survivor_swapped: u64,
     pub connect_native_survivor_udp_dropped: u64,
+    /// Punch allowance use: setups charged to it, setups that found it spent,
+    /// and setups refused after that.
+    pub connect_native_punch_allowance_used: u64,
+    pub connect_native_punch_allowance_exhausted_peer: u64,
+    pub connect_native_punch_allowance_exhausted_node: u64,
+    pub connect_native_punch_refused_proven: u64,
+    pub connect_native_punch_refused_unproven: u64,
     /// The last offer built: level, percent, and whether the node could dial
     /// native. States, never reset, and not activity.
     pub connect_native_offer_level: u8,
@@ -5456,6 +5539,11 @@ impl SnapshotExtras {
             || self.connect_native_both_dials_connected_native_first != 0
             || self.connect_native_survivor_swapped != 0
             || self.connect_native_survivor_udp_dropped != 0
+            || self.connect_native_punch_allowance_used != 0
+            || self.connect_native_punch_allowance_exhausted_peer != 0
+            || self.connect_native_punch_allowance_exhausted_node != 0
+            || self.connect_native_punch_refused_proven != 0
+            || self.connect_native_punch_refused_unproven != 0
             || self.quic_close_sent_node_dropped_peer != 0
             || self.quic_close_sent_downgrade != 0
             || self.quic_close_sent_identity_mismatch != 0
@@ -8230,6 +8318,11 @@ mod tests {
             "connect_native_both_dials_connected_native_first",
             "connect_native_survivor_swapped",
             "connect_native_survivor_udp_dropped",
+            "connect_native_punch_allowance_used",
+            "connect_native_punch_allowance_exhausted_peer",
+            "connect_native_punch_allowance_exhausted_node",
+            "connect_native_punch_refused_proven",
+            "connect_native_punch_refused_unproven",
             "connect_native_offer_level",
             "connect_native_offer_percent",
             "connect_native_offer_ready",

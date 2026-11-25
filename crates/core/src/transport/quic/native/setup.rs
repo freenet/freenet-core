@@ -248,7 +248,13 @@ pub(in crate::transport) async fn connect_native<T: TimeSource>(
     let end = window_end(clock, deadline, NATIVE_WINDOW)?;
     PeerKey::of(peer.key).map_err(QuicConnectError::from)?;
     budget
-        .charge(peer.addr, CLIENT_BYTES_PER_DIAL, clock.now())
+        .charge_dial(
+            peer.addr,
+            peer.key,
+            CLIENT_BYTES_PER_DIAL,
+            clock.now(),
+            true,
+        )
         .map_err(NativeSetupError::OverBudget)?;
     // One attempt: a dial with the native ALPN, then the Hello exchange on
     // its connection. Each dial is a new connection (a new DCID).
@@ -259,7 +265,7 @@ pub(in crate::transport) async fn connect_native<T: TimeSource>(
     // `biased`: the race first, as the punch arm never completes.
     tokio::select! {
         biased;
-        done = race_attempts(attempt, budget, peer.addr, clock, end) => done,
+        done = race_attempts(attempt, budget, peer, clock, end) => done,
         never = punch_until(endpoint, peer.addr, clock, end) => match never {},
     }
 }
@@ -290,13 +296,19 @@ pub(in crate::transport) async fn join_native<T: TimeSource>(
     // The dial's Initials still go to the destination, so they are charged
     // as a client's are.
     budget
-        .charge(peer.addr, CLIENT_BYTES_PER_DIAL, clock.now())
+        .charge_dial(
+            peer.addr,
+            peer.key,
+            CLIENT_BYTES_PER_DIAL,
+            clock.now(),
+            true,
+        )
         .map_err(NativeSetupError::OverBudget)?;
     let attempt = || async {
         let connection = endpoint.dial_native(peer.addr, peer.key).await?;
         finish(connection, peer, caps, clock, end).await
     };
-    race_attempts(attempt, budget, peer.addr, clock, end).await
+    race_attempts(attempt, budget, peer, clock, end).await
 }
 
 /// The client's attempts: `attempt` runs at once, and a second `attempt`
@@ -310,7 +322,7 @@ pub(in crate::transport) async fn join_native<T: TimeSource>(
 async fn race_attempts<T, C, F, Fut>(
     attempt: F,
     budget: &PunchBudget,
-    addr: SocketAddr,
+    peer: NativePeer<'_>,
     clock: &T,
     end: Duration,
 ) -> Result<C, NativeSetupError>
@@ -320,6 +332,7 @@ where
     Fut: std::future::Future<Output = Result<C, NativeSetupError>>,
 {
     use futures::FutureExt;
+    let addr = peer.addr;
     let first = attempt().fuse();
     tokio::pin!(first);
     let mut second = std::pin::pin!(futures::future::OptionFuture::from(None));
@@ -349,7 +362,7 @@ where
             },
             () = clock.sleep_cancelable(until_second.unwrap_or_default()), if until_second.is_some() => {
                 second_due = None;
-                match budget.charge(addr, CLIENT_BYTES_PER_DIAL, clock.now()) {
+                match budget.charge_dial(addr, peer.key, CLIENT_BYTES_PER_DIAL, clock.now(), false) {
                     Ok(()) => second.set(Some(attempt().fuse()).into()),
                     Err(refusal) => tracing::debug!(%addr, ?refusal, "no overlapping native attempt: the punch budget is spent"),
                 }
@@ -384,7 +397,7 @@ pub(in crate::transport) async fn accept_native<T: TimeSource>(
     // Held until the handshake ends; the connection then keeps its own.
     let _permit = endpoint.allow_native_peer(peer.addr, peer.key)?;
     budget
-        .charge(peer.addr, PUNCH_BYTES_PER_DIAL, clock.now())
+        .charge_dial(peer.addr, peer.key, PUNCH_BYTES_PER_DIAL, clock.now(), true)
         .map_err(NativeSetupError::OverBudget)?;
     // Up to MAX_IN_FLIGHT attempts' handshakes run at once (a client whose
     // first attempt stalls starts a second, design 6.2); the first to
@@ -561,6 +574,18 @@ mod tests {
         });
     }
 
+    fn test_key() -> crate::transport::TransportPublicKey {
+        crate::transport::TransportKeypair::new().public().clone()
+    }
+
+    fn test_peer(addr: SocketAddr, key: &crate::transport::TransportPublicKey) -> NativePeer<'_> {
+        NativePeer {
+            addr,
+            key,
+            is_gateway: false,
+        }
+    }
+
     /// A budget with one client charge taken, as `connect_native` has taken
     /// before its first attempt, and how many more fit.
     fn charged_once(addr: SocketAddr, now: Duration) -> PunchBudget {
@@ -601,7 +626,8 @@ mod tests {
                         Err::<(), _>(NativeSetupError::AlreadyWaiting)
                     }
                 };
-                let result = race_attempts(attempt, &budget, addr, &c2, end).await;
+                let result =
+                    race_attempts(attempt, &budget, test_peer(addr, &test_key()), &c2, end).await;
                 (result, charges_left(&budget, addr, c2.now()))
             })
             .await;
@@ -648,7 +674,8 @@ mod tests {
                     }
                 }
             };
-            let result = race_attempts(attempt, &budget, addr, &clk, end).await;
+            let result =
+                race_attempts(attempt, &budget, test_peer(addr, &test_key()), &clk, end).await;
             let took = clk.now() - start;
             (result, took, charges_left(&budget, addr, clk.now()))
         })
@@ -798,7 +825,8 @@ mod tests {
                         Ok::<_, NativeSetupError>(probe)
                     }
                 };
-                let won = race_attempts(attempt, &budget, addr, &clk, end).await;
+                let won =
+                    race_attempts(attempt, &budget, test_peer(addr, &test_key()), &clk, end).await;
                 let left = charges_left(&budget, addr, clk.now());
                 (won.is_ok(), l.load(Ordering::SeqCst), left)
             })

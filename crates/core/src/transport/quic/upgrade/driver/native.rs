@@ -127,6 +127,12 @@ impl QuicUpgrades {
             tracing::debug!(addr = %dial.addr, %error, "A QUIC-native setup gave no connection");
             outcome_of(&error)
         })?;
+        // The Hello exchange completed under the dialed key: this peer is
+        // proven reachable. Only native completions prove a peer; a
+        // connection established over UDP does not (the UDP fallback covers
+        // those until the transport is retired).
+        self.punch_budget
+            .mark_proven(dial.addr, &dial.key, clock.now());
         Ok(self.native_connection(native.connection, native.peer.version, dial.addr))
     }
 
