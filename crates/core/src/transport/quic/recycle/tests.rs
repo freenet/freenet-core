@@ -1946,19 +1946,21 @@ fn ack_wait_expiries_within_the_window_close_only_a_path_without_udp() {
 #[test]
 fn late_ends_within_the_window_would_close_with_udp_and_close_without() {
     const _: () = assert!(!LATE_ENDS_CLOSES_WITH_UDP);
+    const _: () = assert!(!LATE_ENDS_CLOSE_NATIVE, "the rule ships dark");
     let times: Vec<u64> = (0..=1200).map(|i| 2 * i).collect();
     let at = |minutes: u64| (minutes * 60 / 2) as usize;
     let counted =
         |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
     // (would-close samples, the sample the watch closed at and why).
-    let run = |late: &dyn Fn(usize) -> u64, udp_fallback: bool| {
+    let run = |late: &dyn Fn(usize) -> u64, udp_fallback: bool, enforcing: bool| {
         let record = Arc::default();
         let sample = |i: usize| {
             let t = i as u64;
             AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
                 .with_late_ends(late(i))
         };
-        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), udp_fallback);
+        let mut watch =
+            AckWatch::new(ACK_WATCH_WINDOW, sample(0), udp_fallback).closing_late_ends(enforcing);
         let mut would = Vec::new();
         for (i, time) in times.iter().enumerate().skip(1) {
             let before = watch.late_would_close();
@@ -1985,11 +1987,18 @@ fn late_ends_within_the_window_would_close_with_udp_and_close_without() {
     ];
     for (late, would) in &cases {
         assert_eq!(
-            run(late, true),
+            run(late, true, true),
             (would.clone(), None),
             "with UDP: {would:?}"
         );
-        let (_, closed) = run(late, false);
+        // As shipped (`LATE_ENDS_CLOSE_NATIVE` false): a native path counts
+        // the same would-closes and is never closed.
+        assert_eq!(
+            run(late, false, false),
+            (would.clone(), None),
+            "native, rule dark: {would:?}"
+        );
+        let (_, closed) = run(late, false, true);
         assert_eq!(
             closed,
             would.first().map(|&i| (i, Some(Stall::LateEnds))),
@@ -2017,7 +2026,7 @@ fn a_burst_of_late_ends_is_one_episode() {
             AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
                 .with_late_ends(late(i))
         };
-        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), false);
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), false).closing_late_ends(true);
         for (i, time) in times.iter().enumerate().skip(1) {
             if watch.observe(time * SEC, sample(i)) {
                 return Some((i, watch.stall()));

@@ -149,13 +149,21 @@ struct Windows {
     b: Option<Arc<super::super::budget::QuicBudget>>,
 }
 
+/// A native connection's limits with the late-end rule closing
+/// (`recycle::LATE_ENDS_CLOSE_NATIVE` is false in production, so a test of the
+/// close, or of an honest peer staying open under it, asks for it).
+const NATIVE_ENFORCING: QuicPathLimits = QuicPathLimits {
+    late_ends_close_native: true,
+    ..QuicPathLimits::NATIVE
+};
+
 /// [`paths`] with `a`'s path a native connection's ([`QuicPathLimits::NATIVE`]):
 /// no UDP session, so its dark rule closes (`recycle::DARK_CLOSES_WITH_UDP`).
 async fn paths_native(network: &str) -> Paths {
     paths_built(
         network,
         QuicPathLimits::DEFAULT,
-        QuicPathLimits::NATIVE,
+        NATIVE_ENFORCING,
         None,
         None,
         Windows::default(),
@@ -177,7 +185,7 @@ fn net(network: &'static str, native: bool) -> &'static str {
 /// The base limits of `a`'s path: a native connection's (no UDP session) or not.
 fn native_base(native: bool) -> QuicPathLimits {
     if native {
-        QuicPathLimits::NATIVE
+        NATIVE_ENFORCING
     } else {
         QuicPathLimits::DEFAULT
     }
@@ -1470,12 +1478,14 @@ fn late_ends_reach_the_path_watch_and_close_a_native_path_only() {
     use crate::transport::metrics::AckWaitKind;
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
-        for (network, native, gap) in [
-            ("quic-path-late-ends-udp", false, 70),
-            ("quic-path-late-ends-native", true, 70),
+        for (network, native, enforcing, gap) in [
+            ("quic-path-late-ends-udp", false, true, 70),
+            ("quic-path-late-ends-native", true, true, 70),
+            // As shipped (`LATE_ENDS_CLOSE_NATIVE` false): counted, not closed.
+            ("quic-path-late-ends-native-dark", true, false, 70),
             // All three at once: one episode, so no close.
-            ("quic-path-late-ends-native-burst", true, 0),
-            ("quic-path-late-ends-native-spread", true, 16 * 60),
+            ("quic-path-late-ends-native-burst", true, true, 0),
+            ("quic-path-late-ends-native-spread", true, true, 16 * 60),
         ] {
             let counters = leaked_counters();
             let limits = QuicPathLimits {
@@ -1483,7 +1493,10 @@ fn late_ends_reach_the_path_watch_and_close_a_native_path_only() {
                 ..QuicPathLimits::DEFAULT
             };
             let a_base = if native {
-                QuicPathLimits::NATIVE
+                QuicPathLimits {
+                    late_ends_close_native: enforcing,
+                    ..QuicPathLimits::NATIVE
+                }
             } else {
                 QuicPathLimits::DEFAULT
             };
@@ -1522,7 +1535,7 @@ fn late_ends_reach_the_path_watch_and_close_a_native_path_only() {
             let snapshot = counters.snapshot(false);
             assert_eq!(snapshot.late_end, vec![3, 0, 0], "{network}");
             assert_eq!(snapshot.ack_wait_expired, vec![0, 0, 0], "{network}");
-            if native && gap == 70 {
+            if native && enforcing && gap == 70 {
                 assert_eq!(closed_after, Some(3), "{network}: closed at the third");
                 assert_eq!(
                     recycle::stalls_to(b_addr),
@@ -1536,7 +1549,7 @@ fn late_ends_reach_the_path_watch_and_close_a_native_path_only() {
                     vec![QuicCloseCode::PeerNotAcknowledging],
                     "{network}"
                 );
-            } else if native {
+            } else if native && enforcing {
                 assert_eq!(closed_after, None, "{network}: spread past the window");
                 assert_eq!(snapshot.stall_closes, vec![0; 6], "{network}");
                 assert_eq!(snapshot.stall_would_close, vec![0; 6], "{network}");
@@ -2113,16 +2126,8 @@ fn a_jittery_lossy_native_path_is_not_closed_smoke_test() {
                 a: Some(test_budget(64 << 20, leaked_counters())),
                 b: Some(test_budget(64 << 20, leaked_counters())),
             };
-            let mut p = paths_built(
-                network,
-                limits,
-                QuicPathLimits::NATIVE,
-                None,
-                None,
-                windows,
-                true,
-            )
-            .await;
+            let mut p =
+                paths_built(network, limits, NATIVE_ENFORCING, None, None, windows, true).await;
             // One draw per datagram from a fixed sequence: loss, then jitter.
             let state = Arc::new(std::sync::atomic::AtomicU64::new(seed));
             set_packet_delivery_callback(
@@ -2235,7 +2240,7 @@ fn late_end_checks_three_episodes_apart_close_a_native_path() {
         let p = paths_built(
             "quic-path-late-check-native",
             limits,
-            QuicPathLimits::NATIVE,
+            NATIVE_ENFORCING,
             None,
             None,
             Windows::default(),
@@ -2348,16 +2353,19 @@ fn a_late_end_needs_the_peer_still_acknowledging_through_the_second_grace() {
             let time = time.clone();
             Arc::new(move |duration| time.sleep_cancelable(duration))
         };
-        // (round trip ms, growth stops after second, growth resumes at second)
-        let cases: [(u64, Option<u64>, Option<u64>); 4] = [
-            (50, Some(5), None),
-            (50, None, None),
-            (50, Some(5), Some(12)),
-            (250, Some(17), None),
+        // (round trip ms, growth stops after second, growth resumes at second,
+        // growth only every this many seconds). Growth lands half a second
+        // after a poll, so the order of the feeder and the poll is not a tie.
+        let cases: [(u64, Option<u64>, Option<u64>, u64); 5] = [
+            (50, Some(5), None, 1),
+            (50, None, None, 1),
+            (50, Some(5), Some(12), 1),
+            (250, Some(17), None, 1),
+            (50, None, None, 8),
         ];
         let results = drive(&time, LIMIT, async move {
             let mut results = Vec::new();
-            for (rtt_ms, until, resume) in cases {
+            for (rtt_ms, until, resume, every) in cases {
                 let acked = Arc::new(AtomicU64::new(128 * 1024));
                 let now_clock = clock.clone();
                 let check = {
@@ -2385,10 +2393,12 @@ fn a_late_end_needs_the_peer_still_acknowledging_through_the_second_grace() {
                 let feeder = {
                     let (acked, clock) = (acked.clone(), clock.clone());
                     tokio::spawn(async move {
+                        clock.sleep(Duration::from_millis(500)).await;
                         for second in 1..u64::MAX {
                             clock.sleep(Duration::from_secs(1)).await;
-                            let grows = until.is_none_or(|u| second <= u)
-                                || resume.is_some_and(|r| second >= r);
+                            let grows = (until.is_none_or(|u| second <= u)
+                                || resume.is_some_and(|r| second >= r))
+                                && second % every == 0;
                             if grows {
                                 acked.fetch_add(1024, Relaxed);
                             }
@@ -2418,6 +2428,11 @@ fn a_late_end_needs_the_peer_still_acknowledging_through_the_second_grace() {
         assert_eq!(
             results[3], None,
             "a grace on, the last growth is older than the recency window: not late"
+        );
+        assert!(
+            results[4].is_some_and(|d| d < Duration::from_secs(40)),
+            "later streams acknowledged every 8 s (past the recency window) are still judged: {:?}",
+            results[4]
         );
     })
 }
@@ -2730,7 +2745,15 @@ fn the_late_end_rule_is_read_by_the_watch_and_documented() {
     };
     let recycle = code(include_str!("../recycle.rs"));
     assert!(recycle.contains("late_ends: writers.late_ends(),"));
-    assert!(recycle.contains("!self.udp_fallback || LATE_ENDS_CLOSES_WITH_UDP"));
+    assert!(
+        recycle.contains(
+            "LATE_ENDS_CLOSES_WITH_UDP || (!self.udp_fallback && self.late_close_native)"
+        )
+    );
+    assert!(recycle.contains("pub(crate) const LATE_ENDS_CLOSE_NATIVE: bool = false;"));
+    const _: () = assert!(
+        !recycle::LATE_ENDS_CLOSE_NATIVE && !QuicPathLimits::DEFAULT.late_ends_close_native
+    );
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
     for doc in [
         "docs/architecture/transport/rules-reference.md",
@@ -2739,8 +2762,8 @@ fn the_late_end_rule_is_read_by_the_watch_and_documented() {
     ] {
         let text = std::fs::read_to_string(format!("{root}/{doc}")).expect("a document");
         assert!(
-            text.contains("LATE_ENDS_CLOSES_WITH_UDP"),
-            "{doc} names the constant"
+            text.contains("LATE_ENDS_CLOSES_WITH_UDP") && text.contains("LATE_ENDS_CLOSE_NATIVE"),
+            "{doc} names the constants"
         );
         assert!(
             !text.contains("LATE_ENDS_CLOSE`") && !text.contains("LATE_ENDS_CLOSE "),

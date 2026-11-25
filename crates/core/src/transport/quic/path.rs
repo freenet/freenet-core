@@ -313,6 +313,10 @@ pub(crate) struct QuicPathLimits {
     /// UDP session: such a send is given up instead (`route::QuicPath::settle`),
     /// and the path never turns suspect, since there is nowhere to divert to.
     pub(crate) udp_fallback: bool,
+    /// Whether the late-end rule closes a path with no UDP session
+    /// ([`recycle::LATE_ENDS_CLOSE_NATIVE`], false in production; a test of
+    /// the close sets it).
+    pub(crate) late_ends_close_native: bool,
     /// Where the path's counts are also kept node-wide; `None` is
     /// `TRANSPORT_METRICS`. A test passes its own, since every test in a process
     /// writes the global one.
@@ -387,6 +391,7 @@ impl QuicPathLimits {
         // included; a test whose premise is the full limit sets it.
         start_streams: super::config::DATA_START_UNI_STREAMS,
         udp_fallback: true,
+        late_ends_close_native: recycle::LATE_ENDS_CLOSE_NATIVE,
         counters: None,
         #[cfg(test)]
         panic_in_receive: false,
@@ -1137,6 +1142,7 @@ impl QuicPath {
                     heard: heard.clone(),
                     carries_data: carries_data.clone(),
                     udp_fallback: limits.udp_fallback,
+                    late_ends_close_native: limits.late_ends_close_native,
                     dark: dark.clone(),
                     long_dark_at: long_dark_at.clone(),
                 },
@@ -2761,6 +2767,7 @@ impl LateEndCheck {
                 acked: reading.acked_since_end,
                 alive_at: None,
                 grew_at: now,
+                restarted: false,
             });
             let recent = (grace / 2).max(nanos(recycle::ACK_WATCH_TICK) * 2);
             if reading.acked_since_end > c.acked {
@@ -2770,7 +2777,15 @@ impl LateEndCheck {
                 // dark window, so nothing excused it): the baseline of the
                 // second grace restarts there, so the path coming out of the
                 // outage has a whole grace for its probes' acknowledgement.
-                if c.alive_at.is_none() || now.saturating_sub(c.grew_at) > recent {
+                // At most once per candidate, and only for a stall more than a
+                // tick past `recent` (a poll that slept a little long is not
+                // a stall): a path whose later streams are acknowledged at
+                // long gaps must still be judged.
+                if c.alive_at.is_none()
+                    || (!c.restarted
+                        && now.saturating_sub(c.grew_at) > recent + nanos(recycle::ACK_WATCH_TICK))
+                {
+                    c.restarted = c.alive_at.is_some();
                     c.alive_at = Some(now);
                 }
                 c.grew_at = now;
@@ -2803,6 +2818,8 @@ struct Candidate {
     alive_at: Option<u64>,
     /// When it last did.
     grew_at: u64,
+    /// The baseline was restarted after a stall (once per candidate).
+    restarted: bool,
 }
 
 /// The backlog ahead of a stream's end ([`QuicPath::backlog_wait`]): how long

@@ -3203,11 +3203,12 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     in
     quic_late_end_<stream|short|control> (the stream is not reset), and
     three EPISODES within 30 min (late ends within 60 s of the last counted
-    one are one episode, recycle::LATE_END_EPISODE_GAP) close a native path
-    (no UDP session) under
-    late_ends, and on a path with a UDP session count a would-close
-    (quic_stall_would_close_late_ends; recycle::LATE_ENDS_CLOSES_WITH_UDP
-    is false). The field had no late end when this closed (no positive
+    one are one episode, recycle::LATE_END_EPISODE_GAP) count a would-close
+    (quic_stall_would_close_late_ends) on every path. The rule closes a
+    native path (no UDP session) under late_ends only once
+    recycle::LATE_ENDS_CLOSE_NATIVE is set; it is NOT set yet (it ships dark
+    until the phase D-3 flag day), and recycle::LATE_ENDS_CLOSES_WITH_UDP is
+    false (a path with a UDP session is never closed by it). The field had no late end when this closed (no positive
     for the rule), so its detection rests on the scripted-record tests and
     its false-positive bound on the honest-path tests below. Not judged while the egress cap holds a transmit or after a late
     wake (the proof restarts), nor once the path was dark for the watch's
@@ -3218,7 +3219,9 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     acknowledgement count (the_late_end_check_polls_until_the_end_is_late),
     since the test harness's peer acknowledges every packet, and the calls
     that run it are pinned (the_late_end_watch_runs_wherever_an_end_waits).
-    NOT covered: an end is judged only once the later data streams
+    NOT covered: a path whose later streams are acknowledged at gaps longer
+    than the recency window is judged only after one restart of the
+    liveness baseline (sparse acknowledgements). An end is judged only once the later data streams
     acknowledged outnumber the bytes ahead of it. With all 48 permits held
     by withheld ends no new permit stream starts, so only one-packet Shorts
     advance that, and a peer that acknowledges Shorts promptly and holds
