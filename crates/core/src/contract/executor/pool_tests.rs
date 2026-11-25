@@ -18,5 +18,8 @@ mod sampled_probe_tests;
 mod subscriber_limit_tests;
 mod subscriber_stress_tests;
 mod summarize_delta_cache_tests;
+mod update_validates_tests;
+#[cfg(feature = "wasmtime-backend")]
+mod update_validates_wasm_tests;
 #[cfg(feature = "wasmtime-backend")]
 mod wasm_conformance_tests;

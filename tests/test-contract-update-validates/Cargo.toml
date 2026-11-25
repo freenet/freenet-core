@@ -1,0 +1,16 @@
+[package]
+name = "test-contract-update-validates"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+freenet-stdlib = { workspace = true, features = ["contract"] }
+blake3 = { workspace = true }
+
+[features]
+default = ["freenet-main-contract", "declares-update-validates"]
+freenet-main-contract = []
+declares-update-validates = []

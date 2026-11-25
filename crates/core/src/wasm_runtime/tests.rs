@@ -16,6 +16,7 @@ mod guest_memory;
 #[cfg(feature = "trace")]
 mod host_clock;
 mod time;
+mod update_validates;
 
 pub(crate) fn get_test_module(name: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let module_path = {

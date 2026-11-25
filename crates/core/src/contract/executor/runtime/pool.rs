@@ -269,6 +269,8 @@ struct ExecutorFactory {
     shared_backend_engine: BackendEngine,
     /// Shared recovery guard for corrupted-state self-healing across all pool executors.
     shared_recovery_guard: super::CorruptedStateRecoveryGuard,
+    /// Shared record of stored states already verified (see `StoredStateVerified`).
+    shared_stored_state_verified: super::SharedStoredStateVerified,
     /// The ONE summary fast-path cache every executor reads and writes (#5795),
     /// sized to `pool_size × per-executor budget` — the product the node already
     /// declared. Before this, each executor had its own, and because the
@@ -326,6 +328,7 @@ impl ExecutorFactory {
             self.shared_client_counts.clone(),
         );
         executor.set_recovery_guard(self.shared_recovery_guard.clone());
+        executor.set_stored_state_verified(self.shared_stored_state_verified.clone());
         executor.set_shared_fast_path_caches(
             self.shared_summary_cache.clone(),
             self.shared_delta_cache.clone(),
@@ -821,6 +824,8 @@ impl RuntimePool {
         // All pool executors share this so recovery tracking is consistent.
         let shared_recovery_guard: super::CorruptedStateRecoveryGuard =
             Arc::new(std::sync::Mutex::new(HashSet::new()));
+        let shared_stored_state_verified: super::SharedStoredStateVerified =
+            Arc::new(std::sync::Mutex::new(super::StoredStateVerified::default()));
 
         // One summary cache and one delta cache for the whole pool (#5795),
         // each sized to the aggregate the node already declares for them
@@ -867,6 +872,7 @@ impl RuntimePool {
             shared_client_counts.clone(),
         );
         first_executor.set_recovery_guard(shared_recovery_guard.clone());
+        first_executor.set_stored_state_verified(shared_stored_state_verified.clone());
         first_executor
             .set_shared_fast_path_caches(shared_summary_cache.clone(), shared_delta_cache.clone());
         first_executor.set_delegate_notification_tx(delegate_notification_tx.clone());
@@ -894,6 +900,7 @@ impl RuntimePool {
                 shared_client_counts.clone(),
             );
             executor.set_recovery_guard(shared_recovery_guard.clone());
+            executor.set_stored_state_verified(shared_stored_state_verified.clone());
             executor.set_shared_fast_path_caches(
                 shared_summary_cache.clone(),
                 shared_delta_cache.clone(),
@@ -971,6 +978,7 @@ impl RuntimePool {
             shared_inherited_origins: shared_inherited_origins.clone(),
             shared_backend_engine: shared_backend_engine.clone(),
             shared_recovery_guard: shared_recovery_guard.clone(),
+            shared_stored_state_verified: shared_stored_state_verified.clone(),
             shared_summary_cache: shared_summary_cache.clone(),
             shared_delta_cache: shared_delta_cache.clone(),
             delegate_notification_tx: delegate_notification_tx.clone(),
@@ -2295,6 +2303,79 @@ mod tests {
         assert_eq!(
             pool.delegate_code(&DelegateKey::new([1; 32], CodeHash::new([1; 32]))),
             None
+        );
+    }
+
+    /// Every pooled executor records stored states it has verified in the one
+    /// map the pool owns, so a stored state is verified once per process and
+    /// not once per executor.
+    ///
+    /// FALSIFY by giving an executor a map of its own in `RuntimePool::new`
+    /// (drop its `set_stored_state_verified` call): the matching assertion
+    /// fails.
+    #[cfg(feature = "wasmtime-backend")]
+    #[tokio::test]
+    async fn pooled_executors_share_one_verified_record() {
+        let config_args = ConfigArgs {
+            id: Some("pool-shared-stored-state-verified".to_string()),
+            mode: Some(OperationMode::Local),
+            ..Default::default()
+        };
+        let node_config =
+            crate::node::NodeConfig::new(config_args.build().await.expect("build Config"))
+                .await
+                .expect("build NodeConfig");
+        let config = node_config.config.clone();
+        let (_notification_rx, notification_tx) = crate::node::event_loop_notification_channel();
+        let (ops_ch_channel, _ch_channel, _wait_for_event) =
+            crate::contract::contract_handler_channel();
+        let connection_manager = crate::ring::ConnectionManager::new(&node_config);
+        let (result_router_tx, _result_router_rx) = tokio::sync::mpsc::channel(100);
+        let task_monitor = crate::node::background_task_monitor::BackgroundTaskMonitor::new();
+        let op_manager = Arc::new(
+            OpManager::new(
+                notification_tx,
+                ops_ch_channel,
+                &node_config,
+                crate::tracing::DynamicRegister::new(vec![]),
+                connection_manager,
+                result_router_tx,
+                &task_monitor,
+            )
+            .expect("build OpManager"),
+        );
+        let pool = RuntimePool::new(
+            config,
+            op_manager,
+            NonZeroUsize::new(3).expect("nonzero pool size"),
+        )
+        .await
+        .expect("build RuntimePool");
+
+        for (i, executor) in pool.runtimes.iter().enumerate() {
+            let executor = executor.as_ref().expect("pool executor present");
+            assert!(
+                Arc::ptr_eq(
+                    &executor.stored_state_verified,
+                    &pool.delegate_runner.factory.shared_stored_state_verified
+                ),
+                "executor {i} has its own verified record instead of the pool's"
+            );
+        }
+
+        // A replacement executor built later shares it too.
+        let replacement = pool
+            .delegate_runner
+            .factory
+            .create()
+            .await
+            .expect("build a replacement executor");
+        assert!(
+            Arc::ptr_eq(
+                &replacement.stored_state_verified,
+                &pool.delegate_runner.factory.shared_stored_state_verified
+            ),
+            "a replacement executor has its own verified record"
         );
     }
 

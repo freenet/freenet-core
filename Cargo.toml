@@ -8,6 +8,8 @@ members = [
 	"tests/test-contract-integration",
 	"tests/test-contract-update-nochange",
 	"tests/test-contract-mock-aligned",
+	"tests/test-contract-update-validates",
+	"tests/test-contract-update-validates-off",
 	"tests/test-contract-requires-related",
 	"tests/test-contract-delta-trap"
 ]

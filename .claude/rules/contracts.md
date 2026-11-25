@@ -332,6 +332,38 @@ If validation fails:
   → Do NOT store invalid state
 ```
 
+### WHEN a contract declares `__frnt__update_validates`
+
+```
+Contract exports may include the optional function
+`__frnt__update_validates` with type `() -> i32`. The node never calls it;
+the export (name and type) is the declaration, read from the compiled
+module's export table. A missing export, or one of another type, means the
+contract does not opt in and the rules above apply unchanged.
+
+The contract promises: update_state returns Err unless its output would pass
+its own validate_state, and it treats every UpdateData variant, including a
+full State, as untrusted input.
+
+For an opting-in contract, and only for a key that already has a stored state:
+  - the incoming full state is not validated before update_state
+  - the result of update_state is not validated again
+  - incoming bytes equal to the stored bytes are NoChange without validation
+  - an update_state error on a full state is returned as is (no
+    validate_state of the stored state, no replacement with the incoming state)
+
+Before honouring the declaration for a key, the node validates that key's
+stored state once per (key, stored-state hash) per process
+(StoredStateVerified, shared by the pool). The check runs with no related
+contracts. If it does not return Valid, the full validation path applies for
+that call, including the corrupted-state replacement. The check assumes the
+contract's validate_state depends only on the state and parameters. The state
+that update_state merges into must hash to the verified hash; otherwise the
+full path applies.
+
+A fresh store (no stored state for the key) is always validated in full.
+```
+
 ### WHEN merging states
 
 ```
