@@ -3192,10 +3192,15 @@ Path recycling (quic/recycle.rs, #5940 step M6): besides the send-reset
     end's last byte under quinn's round-robin (path::bytes_ahead) plus the
     congestion window when the end was sent (at least 64 KiB), the last
     packet has been sent, and an honest stack acknowledges it within
-    late_end_grace (9 round trips and 75 ms, at least 2 s). An end still
+    late_end_grace (seven probe timeouts of at most 5 round trips and 25 ms
+    each, at least 2 s), and then, the connection having acknowledged more
+    data streams since (the peer is alive: an outage that began after the
+    proof point acknowledges nothing), for a second grace. An end still
     unacknowledged then is a LATE END: counted in
     quic_late_end_<stream|short|control> (the stream is not reset), and
-    three within 30 min close a native path (no UDP session) under
+    three EPISODES within 30 min (late ends within 60 s of the last counted
+    one are one episode, recycle::LATE_END_EPISODE_GAP) close a native path
+    (no UDP session) under
     late_ends, and on a path with a UDP session count a would-close
     (quic_stall_would_close_late_ends; recycle::LATE_ENDS_CLOSES_WITH_UDP
     is false). The field had no late end when this closed (no positive

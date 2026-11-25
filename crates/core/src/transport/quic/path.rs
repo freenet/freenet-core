@@ -2610,11 +2610,18 @@ pub(crate) fn bytes_ahead(reading: &LaterReading) -> u64 {
 }
 
 /// How long after the proof point an honest peer's acknowledgement of a
-/// stream's end may still take ([`late_end_verdict`]): three probe timeouts
-/// (quinn's at most 3 round trips plus 25 ms each, so a lost copy is resent
-/// and acknowledged), at least [`LATE_END_GRACE_MIN`].
+/// stream's end may still take ([`late_end_verdict`]): the first three
+/// probe timeouts, at least [`LATE_END_GRACE_MIN`]. quinn's probe timeout is
+/// `srtt + max(4 x rttvar, 1 ms) + max_ack_delay` and doubles with each
+/// probe, so three probes take seven timeouts in all. quinn's connection
+/// stats give the smoothed round trip only, not the variance, so the
+/// variance is bounded by the round trip itself (`rttvar <= srtt`, a jittery
+/// Wi-Fi or cellular path; an unjittery one has far less): a timeout is at
+/// most `5 x srtt + 25 ms`. So a tail whose first two probes were lost is
+/// still acknowledged within the grace (7 x (5 x srtt + 25 ms), 35 round
+/// trips and 175 ms).
 pub(crate) fn late_end_grace(rtt: Duration) -> Duration {
-    (rtt * 9 + Duration::from_millis(75)).max(LATE_END_GRACE_MIN)
+    ((rtt * 5 + Duration::from_millis(25)) * 7).max(LATE_END_GRACE_MIN)
 }
 
 /// The least [`late_end_grace`].
@@ -2675,6 +2682,12 @@ struct LateEndCheck {
     /// The end was counted late: shared by the send's wait and the
     /// background wait that may take over from it, so one end counts once.
     counted: Arc<AtomicBool>,
+    /// The end reached the proof point (`quic_late_end_judged_<label>`),
+    /// counted once, shared like `counted`.
+    judged: Arc<AtomicBool>,
+    /// Counts an end that reached the proof point; `None` where nothing is
+    /// counted (tests).
+    on_judged: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl LateEndCheck {
@@ -2684,6 +2697,10 @@ impl LateEndCheck {
     async fn late(self, sleeper: Sleeper) {
         let tick = recycle::ACK_WATCH_TICK;
         let mut crossed = None;
+        // Past the grace the end is a candidate; it counts only once the peer
+        // is shown alive and the end is still unacknowledged a grace after
+        // that: (acknowledged bytes at the candidate, when they first grew).
+        let mut candidate: Option<(u64, Option<u64>)> = None;
         let mut last = (self.now)();
         let mut previous_cap = self.cap.read();
         let mut hold_unchanged_since = None;
@@ -2703,17 +2720,46 @@ impl LateEndCheck {
             previous_cap = cap;
             if woke_late || held {
                 crossed = None;
+                candidate = None;
                 continue;
             }
             let reading = (self.reading)();
-            if late_end_verdict(
+            let proved = crossed.is_some();
+            let verdict = late_end_verdict(
                 &mut crossed,
                 bytes_ahead(&reading).saturating_add(reading.window_at_end),
                 reading.acked_since_end,
                 now,
                 || (self.rtt)(),
-            ) {
-                return;
+            );
+            if !proved && crossed.is_some() && !self.judged.swap(true, Ordering::AcqRel) {
+                if let Some(count) = &self.on_judged {
+                    count();
+                }
+            }
+            if !verdict {
+                continue;
+            }
+            // A dark spell is excused only once the watch has seen it last
+            // its window (`dark_at`), so one that began after the proof
+            // point can pass the grace unseen. An outage acknowledges
+            // nothing, a peer withholding only this end acknowledges the
+            // rest: wait for the connection to acknowledge more data streams
+            // than at the grace, then give the end another grace, so that a
+            // path coming out of an outage has its probes' acknowledgement
+            // first.
+            match &mut candidate {
+                None => candidate = Some((reading.acked_since_end, None)),
+                Some((acked, alive_at @ None)) => {
+                    if reading.acked_since_end > *acked {
+                        *alive_at = Some(now);
+                    }
+                }
+                Some((_, Some(alive_at))) => {
+                    if now.saturating_sub(*alive_at) >= nanos(late_end_grace((self.rtt)())) {
+                        return;
+                    }
+                }
             }
         }
     }
@@ -3130,6 +3176,11 @@ impl Outgoing {
                 later,
                 reading,
             }) => {
+                let kind = self.kind();
+                let judged_counter: Option<Arc<dyn Fn() + Send + Sync>> = self.node.map(|node| {
+                    Arc::new(move || node.record_late_end_judged(kind))
+                        as Arc<dyn Fn() + Send + Sync>
+                });
                 self.late = self
                     .strike
                     .as_ref()
@@ -3142,6 +3193,8 @@ impl Outgoing {
                         dark_at: check.dark_at.clone(),
                         end_at: mark.at,
                         counted: Arc::default(),
+                        judged: Arc::default(),
+                        on_judged: judged_counter,
                     });
                 self.progress.mark_finished_after(wait, Some(later));
             }

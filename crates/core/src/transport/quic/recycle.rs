@@ -68,10 +68,11 @@
 //!    with no UDP session (a native one); on a path with one it only counts
 //!    (`quic_stall_would_close_<label>`) and the path stays open
 //!    ([`ACK_WAITS_EXPIRED_CLOSES_WITH_UDP`]).
-//! 7. **Late ends** ([`Stall::LateEnds`]): [`ACK_WAIT_EXPIRY_LIMIT`] sends
-//!    had their end acknowledged late, or not at all, though the connection
-//!    had acknowledged enough bytes since the end to have carried it
-//!    (`path::LateEndCheck`), within [`ACK_WAIT_EXPIRY_WINDOW`]. Closes a
+//! 7. **Late ends** ([`Stall::LateEnds`]): sends had their end acknowledged
+//!    late, or not at all, though the connection had acknowledged enough
+//!    bytes since the end to have carried it (`path::LateEndCheck`), in
+//!    [`ACK_WAIT_EXPIRY_LIMIT`] separate episodes
+//!    ([`LATE_END_EPISODE_GAP`]) within [`ACK_WAIT_EXPIRY_WINDOW`]. Closes a
 //!    path with no UDP session (a native one); on a path with one it only
 //!    counts (`quic_stall_would_close_late_ends`) and the path stays open
 //!    ([`LATE_ENDS_CLOSES_WITH_UDP`]).
@@ -1431,9 +1432,33 @@ impl AckWatch {
         )
     }
 
-    /// The same for late ends ([`Stall::LateEnds`]), in a window of their own.
+    /// The same for late ends ([`Stall::LateEnds`]), in a window of their
+    /// own and counting EPISODES, not ends: late ends seen within
+    /// [`LATE_END_EPISODE_GAP`] of the last counted one are the same
+    /// episode and add nothing. One loss burst or outage onset can leave
+    /// many sends' ends late at once (up to 48 permits and 64 Shorts wait),
+    /// and that is one piece of evidence, not three.
     fn late_ends_reached(&mut self, now_nanos: u64, late: u64) -> bool {
-        strikes_in_window(&mut self.late_seen, &mut self.late_at, now_nanos, late)
+        let new = late.saturating_sub(self.late_seen);
+        self.late_seen = late;
+        let gap = u64::try_from(LATE_END_EPISODE_GAP.as_nanos()).unwrap_or(u64::MAX);
+        if new > 0
+            && self
+                .late_at
+                .back()
+                .is_none_or(|&last| now_nanos.saturating_sub(last) >= gap)
+        {
+            self.late_at.push_back(now_nanos);
+        }
+        let window = u64::try_from(ACK_WAIT_EXPIRY_WINDOW.as_nanos()).unwrap_or(u64::MAX);
+        while self
+            .late_at
+            .front()
+            .is_some_and(|&first| now_nanos.saturating_sub(first) > window)
+        {
+            self.late_at.pop_front();
+        }
+        self.late_at.len() >= ACK_WAIT_EXPIRY_LIMIT as usize
     }
 
     /// Count dark episodes in `node`, and let the dark-path rule close the
@@ -1960,6 +1985,16 @@ pub(crate) const LATE_ENDS_CLOSES_WITH_UDP: bool = false;
 /// or one end in three, is still counted.
 pub(crate) const ACK_WAIT_EXPIRY_LIMIT: u32 = 3;
 
+/// Late ends within this long of the last counted one are one episode for the
+/// late-end rule ([`Stall::LateEnds`]): a loss burst or an outage onset can
+/// leave many ends late together, and a path that closes needs
+/// [`ACK_WAIT_EXPIRY_LIMIT`] separate episodes, so at least twice this long
+/// in all. A design choice, not a measurement: long enough that one event
+/// (an outage the dark rule has not yet excused, a loss burst) is one
+/// episode, short enough that a peer withholding every end is closed within
+/// minutes.
+pub(crate) const LATE_END_EPISODE_GAP: Duration = Duration::from_secs(60);
+
 /// The window [`ACK_WAIT_EXPIRY_LIMIT`] expiries must fall in.
 pub(crate) const ACK_WAIT_EXPIRY_WINDOW: Duration = Duration::from_secs(30 * 60);
 
@@ -2163,7 +2198,8 @@ pub(crate) async fn watch_acknowledgements<T: TimeSource>(
                     remote = %connection.remote_address(),
                     stall = watch.stall().map_or("", Stall::label),
                     "QUIC path: the peer stopped delivering on this path (see the stall \
-                     reason); closing the path so the connection falls back to UDP"
+                     reason); closing the path (a connection with a UDP session \
+                     falls back to UDP)"
                 );
             }
             return;

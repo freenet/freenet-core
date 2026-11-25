@@ -1998,6 +1998,60 @@ fn late_ends_within_the_window_would_close_with_udp_and_close_without() {
     }
 }
 
+/// The late-end rule counts episodes, not ends (`LATE_END_EPISODE_GAP`): any
+/// number of late ends seen within a minute of the last counted one are the
+/// same episode, so one event that leaves many sends' ends late together (a
+/// loss burst, an outage onset: up to 48 permits and 64 Shorts wait) is one
+/// strike and cannot close a path. Three episodes more than a minute apart,
+/// within 30 min, do.
+#[test]
+fn a_burst_of_late_ends_is_one_episode() {
+    let times: Vec<u64> = (0..=900).map(|i| 2 * i).collect();
+    let at = |seconds: u64| (seconds / 2) as usize;
+    let counted =
+        |marks: Vec<usize>| move |i: usize| marks.iter().filter(|&&m| i >= m).count() as u64;
+    let run = |late: &dyn Fn(usize) -> u64| {
+        let record = Arc::default();
+        let sample = |i: usize| {
+            let t = i as u64;
+            AckSample::synthetic(&record, t * 7, t * 7, 30_000, t * 9, t * 11, NO_CAP)
+                .with_late_ends(late(i))
+        };
+        let mut watch = AckWatch::new(ACK_WATCH_WINDOW, sample(0), false);
+        for (i, time) in times.iter().enumerate().skip(1) {
+            if watch.observe(time * SEC, sample(i)) {
+                return Some((i, watch.stall()));
+            }
+        }
+        None
+    };
+    // 112 late ends (every permit and Short) in one sample: no close.
+    assert_eq!(run(&|i| if i >= at(100) { 112 } else { 0 }), None);
+    // Three ends in successive samples, then three more within a minute: still
+    // one episode.
+    assert_eq!(
+        run(&counted(vec![
+            at(100),
+            at(102),
+            at(104),
+            at(120),
+            at(130),
+            at(158)
+        ])),
+        None
+    );
+    // Three episodes a minute and a bit apart, each with a burst: the third
+    // closes.
+    let burst = |from: usize| move |i: usize| if i >= from { 50 } else { 0 };
+    let (b1, b2, b3) = (burst(at(100)), burst(at(170)), burst(at(240)));
+    assert_eq!(
+        run(&|i| b1(i) + b2(i) + b3(i)),
+        Some((at(240), Some(Stall::LateEnds)))
+    );
+    // Two episodes do not.
+    assert_eq!(run(&|i| b1(i) + b2(i)), None);
+}
+
 /// The labels `quic_stall_close_<label>` counts under are the stalls'
 /// labels, in their index order, so a close is counted under its own name.
 #[test]
