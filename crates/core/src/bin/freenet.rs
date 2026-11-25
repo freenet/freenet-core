@@ -280,6 +280,20 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     // Only under our own unit's marker: a gateway started by hand, or by a
     // systemd unit that may not restart it, would stay down, so it keeps
     // running over UDP instead. Peers never exit for this.
+    // Before the node is built: a failed bind exits from inside `build`, and its
+    // exit code reads this opt-in (`exit_for_quic_bind_failure`).
+    // #4551: only emit the distinct fast-crash exit code (45) for a sub-60s fatal
+    // exit when the supervising unit actually understands it. The regenerated Freenet
+    // systemd unit advertises that via SYSTEMD_FAST_CRASH_ENV_VAR (it keeps 45 out of
+    // SuccessExitStatus, sets StartLimitAction=none, and runs `freenet update` on 42
+    // OR 45). A node running this binary under an OLD/custom systemd unit (auto-updated
+    // but not reinstalled), under the macOS/Windows run-wrapper (knows only 42), or
+    // unsupervised must keep exiting 42 so its existing exit-42 self-heal/limiting
+    // still works — so the marker, not a broad systemd heuristic, is the gate.
+    if std::env::var_os(commands::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR).is_some() {
+        freenet::enable_fast_crash_exit_code();
+    }
+
     match gateway_quic_restarts(commands::auto_update::supervisor_status()) {
         GatewayQuicRestarts::Enabled => freenet::enable_gateway_quic_restarts(),
         GatewayQuicRestarts::OffUnverified => freenet::note_gateway_supervisor_unverified(),
@@ -389,18 +403,6 @@ async fn run_network_node_with_signals(
     // (code 42) for a prompt systemd restart + auto-update, instead of risking a hang
     // in teardown that leaves the node network-dead and spinning.
     freenet::enable_abort_on_fatal_listener_exit();
-
-    // #4551: only emit the distinct fast-crash exit code (45) for a sub-60s fatal
-    // exit when the supervising unit actually understands it. The regenerated Freenet
-    // systemd unit advertises that via SYSTEMD_FAST_CRASH_ENV_VAR (it keeps 45 out of
-    // SuccessExitStatus, sets StartLimitAction=none, and runs `freenet update` on 42
-    // OR 45). A node running this binary under an OLD/custom systemd unit (auto-updated
-    // but not reinstalled), under the macOS/Windows run-wrapper (knows only 42), or
-    // unsupervised must keep exiting 42 so its existing exit-42 self-heal/limiting
-    // still works — so the marker, not a broad systemd heuristic, is the gate.
-    if std::env::var_os(commands::auto_update::SYSTEMD_FAST_CRASH_ENV_VAR).is_some() {
-        freenet::enable_fast_crash_exit_code();
-    }
 
     // #4604: this is the real node process, so let the contract storage layer
     // exit-for-restart if redb gets poisoned by a transient I/O error (e.g. a disk
@@ -654,6 +656,14 @@ async fn run_network_node_with_signals(
             freenet::quic_crash_loop_update_now(),
             freenet::config::GlobalRng::random_u64(),
         );
+        // Test builds only: push the startup check out of the way, so a
+        // real-process test of the check before a fatal exit is the only
+        // claimant of the update attempt.
+        #[cfg(feature = "testing")]
+        let startup_jitter_secs = std::env::var("FREENET_TEST_STARTUP_UPDATE_JITTER_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(startup_jitter_secs);
         // `startup_check_ran` is true only if the claim, made after the
         // jitter, allowed the check.
         let (startup_check_ran, latest) = match startup_attempt {
@@ -1410,9 +1420,15 @@ fn stop_signal() -> impl std::future::Future<Output = ()> {
             }
             std::future::pending::<()>().await;
         };
+        // A Ctrl+C handler that could not be installed is not a stop.
+        let interrupt = async {
+            if signal::ctrl_c().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::select! {
             () = term => {},
-            _ = signal::ctrl_c() => {},
+            () = interrupt => {},
         }
     }
 }

@@ -66,6 +66,12 @@ const AS_PEER: &str = "<as-peer>";
 /// machine's real update state.
 const AUTO_UPDATE_ON: &str = "<auto-update-on>";
 
+/// Environment for a test with auto-update on: the binary's startup update
+/// check waits an hour, so it cannot claim the update attempt, reach a newer
+/// release first and end the node by the update path.
+#[cfg(feature = "testing")]
+const NO_STARTUP_CHECK: (&str, &str) = ("FREENET_TEST_STARTUP_UPDATE_JITTER_SECS", "3600");
+
 /// Emitted by the signal task in `run_network_node_with_signals` on SIGTERM /
 /// SIGINT. Asserted after exit so a status of 0 cannot be credited to some other
 /// clean-exit path (`run_disabled_idle`, an early return) — the test must prove
@@ -221,7 +227,9 @@ impl NodeProcess {
             .env_remove("FREENET_TEST_BREAKER_NO_UDP_FALLBACK")
             .env_remove("FREENET_TEST_FATAL_EXIT_CHECK_HANGS")
             .env_remove("FREENET_TEST_FATAL_EXIT_CHECK_PANICS")
-            .env_remove("FREENET_TEST_FATAL_EXIT_CHECK_TIMEOUT_SECS");
+            .env_remove("FREENET_TEST_FATAL_EXIT_CHECK_TIMEOUT_SECS")
+            .env_remove("FREENET_TEST_STARTUP_UPDATE_JITTER_SECS")
+            .env_remove("FREENET_SYSTEMD_FAST_CRASH");
         command.envs(env.iter().copied());
         let child = command.spawn()?;
         Ok(Self {
@@ -1276,7 +1284,6 @@ fn a_supervised_gateway_restarts_when_its_breaker_cooldown_ends() -> anyhow::Res
         logs.contains(QUIC_COOLING_MARKER) && !logs.contains(QUIC_BUILT_MARKER),
         "QUIC off during the cooldown. Logs:\n{logs}"
     );
-    let started = Instant::now();
     let status = node.wait_for_exit(Duration::from_secs(150))?;
     let logs = node.logs();
     assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
@@ -1677,6 +1684,8 @@ const FATAL_CHECK_PREFIX: &str = "Fatal-exit update check";
 #[cfg(feature = "testing")]
 const FATAL_CHECK_ASKS_MARKER: &str = "Fatal-exit update check: asking GitHub";
 #[cfg(feature = "testing")]
+const FATAL_CHECK_START_MARKER: &str = "Transport-fatal exit: running the update check first";
+#[cfg(feature = "testing")]
 const FATAL_CHECK_DONE_MARKER: &str = "Update check before a transport-fatal exit finished";
 #[cfg(feature = "testing")]
 const BIND_FAILURE_EXIT_MARKER: &str = "The QUIC endpoint could not be built and there is no UDP";
@@ -1686,48 +1695,19 @@ const BIND_FAILURE_EXIT_MARKER: &str = "The QUIC endpoint could not be built and
 /// then says so instead of asking GitHub; a clean build must ask.
 #[cfg(feature = "testing")]
 fn assert_update_check_ran_before_exit(logs: &str, exit_marker: &str) {
-    // The binary's own update task found a newer release first and shut the
-    // node down for the update: that exit is not the one under test.
-    if logs.contains("Initiating graceful shutdown for auto-update") {
-        return;
-    }
-    // The log directory holds an error-only file beside the main one, so the
-    // concatenation is not in time order: compare the lines' own timestamps.
-    let stamp = |marker: &str| {
-        logs.lines()
-            .find(|line| line.contains(marker))
-            .map(|line| {
-                line.split_whitespace()
-                    .next()
-                    .unwrap_or_default()
-                    .to_string()
-            })
-            .unwrap_or_else(|| panic!("no log line with {marker:?}. Logs:\n{logs}"))
-    };
-    let (done, exit) = (stamp(FATAL_CHECK_DONE_MARKER), stamp(exit_marker));
-    assert!(
-        done <= exit,
-        "the exit ({exit}) came before the check ended ({done}). Logs:\n{logs}"
-    );
-    // The binary's own update task may claim the attempt first (its first check
-    // waits 0 to 60 s): the check then says so. A dirty build disables
-    // auto-update and the check says that instead, but a clean build must never
-    // say it, so the "asks GitHub" branch is not skipped on CI.
+    // The tests keep the binary's own startup check out of the way
+    // (`NO_STARTUP_CHECK`), so the fatal-exit check is the only claimant: a clean
+    // build must ask GitHub, and only a dirty one (auto-update disabled) may
+    // skip. There is no other way to pass, so a missing check fails.
     let dirty = !env!("GIT_DIRTY").is_empty();
     let disabled = logs.contains("Fatal-exit update check skipped: auto-update is disabled");
     assert_eq!(
         disabled, dirty,
         "auto-update is disabled exactly on a dirty build. Logs:\n{logs}"
     );
-    let skipped = [
-        "Fatal-exit update check skipped: the update attempt claim was refused",
-        "Fatal-exit update check skipped: a release is cooling down",
-    ]
-    .iter()
-    .any(|line| logs.contains(line));
     assert!(
-        logs.contains(FATAL_CHECK_ASKS_MARKER) || disabled || skipped,
-        "the check neither asked GitHub nor said why not. Logs:\n{logs}"
+        logs.contains(FATAL_CHECK_ASKS_MARKER) || disabled,
+        "the check neither asked GitHub nor said it was disabled. Logs:\n{logs}"
     );
     assert!(logs.contains(FATAL_CHECK_PREFIX));
 }
@@ -1756,6 +1736,7 @@ fn with_no_udp_a_bind_failure_checks_for_an_update_before_exiting() -> anyhow::R
         ("FREENET_TEST_BREAKER_NO_UDP_FALLBACK", "1"),
         ("FREENET_SUPERVISED", "1"),
         (BIND_FAILS_ENV, "1"),
+        NO_STARTUP_CHECK,
     ];
     let mut node = NodeProcess::spawn_full(dir.path(), &logs_dir, &args, Some(&home), &env)?;
     // The check is bounded (20 s) and a dead network can use all of it.
@@ -1781,6 +1762,7 @@ fn with_no_udp_an_endpoint_death_checks_for_an_update_before_exiting() -> anyhow
         ("FREENET_TEST_BREAKER_NO_UDP_FALLBACK", "1"),
         ("FREENET_SUPERVISED", "1"),
         (ENDPOINT_DOWN_ENV, "2"),
+        NO_STARTUP_CHECK,
     ];
     let logs_dir = dir.path().join("logs");
     let mut node =
@@ -1843,7 +1825,11 @@ fn with_udp_an_endpoint_death_exit_does_not_call_the_fatal_exit_check() -> anyho
     let dir = tempfile::tempdir()?;
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home)?;
-    let env = [("FREENET_SUPERVISED", "1"), (ENDPOINT_DOWN_ENV, "2")];
+    let env = [
+        ("FREENET_SUPERVISED", "1"),
+        (ENDPOINT_DOWN_ENV, "2"),
+        NO_STARTUP_CHECK,
+    ];
     let mut node = spawn_quic_node_full(
         dir.path(),
         &dir.path().join("logs"),
@@ -1895,7 +1881,6 @@ fn spawn_bind_failure(
 #[test]
 fn with_no_udp_a_check_that_hangs_is_dropped_at_its_bound() -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
-    let started = Instant::now();
     let mut node = spawn_bind_failure(
         dir.path(),
         true,
@@ -1908,9 +1893,13 @@ fn with_no_udp_a_check_that_hangs_is_dropped_at_its_bound() -> anyhow::Result<()
     let logs = node.logs();
     assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
     assert!(logs.contains("outcome=TimedOut"), "Logs:\n{logs}");
+    // Measured from the log line that starts the check, not from the spawn.
+    let held = log_secs(&logs, FATAL_CHECK_START_MARKER)
+        .zip(log_secs(&logs, FATAL_CHECK_DONE_MARKER))
+        .map(|(start, done)| done - start);
     assert!(
-        started.elapsed() >= Duration::from_secs(2),
-        "the check was not held for its 2 s bound. Logs:\n{logs}"
+        held.is_some_and(|held| held >= 1.9),
+        "the check was not held for its 2 s bound ({held:?}). Logs:\n{logs}"
     );
     Ok(())
 }
@@ -1997,5 +1986,35 @@ fn with_no_udp_an_unsupervised_bind_failure_exits_at_once_with_advice() -> anyho
         logs.contains("unless some other supervisor does, run `freenet update`"),
         "Logs:\n{logs}"
     );
+    Ok(())
+}
+
+/// The seconds-of-day of the first log line containing `marker`, from its
+/// leading `YYYY-MM-DDTHH:MM:SS.ffffffZ` timestamp.
+#[cfg(feature = "testing")]
+fn log_secs(logs: &str, marker: &str) -> Option<f64> {
+    let line = logs.lines().find(|line| line.contains(marker))?;
+    let time = line.split_whitespace().next()?.split('T').nth(1)?;
+    let mut parts = time.trim_end_matches('Z').split(':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+/// A supervised unit that advertises the fast-crash exit code gets 45 from a
+/// bind failure, which the post-update rollback counts as a crash. The opt-in
+/// is read from inside `build`, so it must be made before the node is built.
+///
+/// FALSIFY: move `enable_fast_crash_exit_code` back after the node is built
+/// (the exit is 42).
+#[cfg(all(feature = "testing", feature = "quic-panic-injection"))]
+#[test]
+fn with_no_udp_a_bind_failure_under_a_fast_crash_unit_exits_45() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut node = spawn_bind_failure(dir.path(), true, &[("FREENET_SYSTEMD_FAST_CRASH", "1")])?;
+    let status = node.wait_for_exit(Duration::from_secs(60))?;
+    let logs = node.logs();
+    assert_eq!(status.code(), Some(45), "Logs:\n{logs}");
     Ok(())
 }
