@@ -490,6 +490,16 @@ impl PeerHealthTracker {
     }
 }
 
+/// Result of [`ConnectionManager::apply_observed_address`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservedAddrOutcome {
+    /// A private observation was refused because a public address is held.
+    Ignored,
+    /// `own_addr` was replaced. `location_changed` is false when the ring
+    /// location was left as it was (configured, or already set).
+    Applied { location_changed: bool },
+}
+
 #[derive(Clone)]
 pub(crate) struct ConnectionManager {
     /// Pending connection reservations, keyed by socket address.
@@ -508,6 +518,9 @@ pub(crate) struct ConnectionManager {
     own_location: Arc<AtomicU64>,
     /// Our own socket address, set once we know it (e.g., from gateway observation).
     own_addr: Arc<Mutex<Option<SocketAddr>>>,
+    /// Whether `own_location` was set from an observed address, as opposed to
+    /// configuration (#6378).
+    location_from_observation: Arc<std::sync::atomic::AtomicBool>,
     is_gateway: bool,
     /// Test-only override for the placement-migration version floor. `None` in
     /// production (the real `SUBSCRIBE_HINT_MIN_VERSION` applies); `Some(floor)`
@@ -823,6 +836,7 @@ impl ConnectionManager {
             topology_manager,
             own_location: own_location.into(),
             own_addr: Arc::new(Mutex::new(own_addr)),
+            location_from_observation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_gateway,
             // Default off; `new(config)` overrides from config after init.
             subscribe_hint_floor_override: None,
@@ -2428,8 +2442,9 @@ impl ConnectionManager {
         }
     }
 
-    /// Sets the own address unconditionally.
-    /// Used when a peer behind NAT learns their external address from ObservedAddress.
+    /// Sets the own address unconditionally. Production code goes through
+    /// `apply_observed_address`, which guards against private overwrites (#6378).
+    #[cfg(test)]
     pub fn set_own_addr(&self, addr: SocketAddr) {
         // Hold the `own_addr` mutex across the `network_status::set_external_address`
         // call so the two state writes are atomic with respect to each other.
@@ -2463,6 +2478,70 @@ impl ConnectionManager {
             new_addr = %addr,
             "set_own_addr called"
         );
+    }
+
+    /// Applies an address a gateway observed for us (`ObservedAddress`) to
+    /// `own_addr` and the ring location, unless that would replace a public
+    /// address with a private one.
+    ///
+    /// A joiner behind the same NAT as a gateway is told its LAN-side address
+    /// (e.g. `192.168.1.1:60454`) by that gateway, and its public address by
+    /// every other gateway. A private or loopback observation is therefore
+    /// accepted only while no public address is known; otherwise `own_addr`
+    /// and the location would flip with whichever gateway answered last
+    /// (#6378). All-LAN and loopback networks never see a public address, so
+    /// they still adopt the private one.
+    ///
+    /// Known limit: a node that moves from a public network to a LAN-only one
+    /// keeps its public `own_addr` until restart. A time-based switch was
+    /// rejected because public observations only arrive with a direct join
+    /// through a gateway's first hop, so a stable public node would see none
+    /// for long stretches and then flip on its next same-NAT join.
+    ///
+    /// When the address changes between private and public (either way), a
+    /// location that an observation set follows it. A configured location, or
+    /// one set by an earlier observation of the same kind, is left alone (as
+    /// `update_location` always did).
+    ///
+    /// "Public" means "not [`crate::server::is_private_ip`]". That treats
+    /// CGNAT (100.64/10) as public, and does not compare an IPv4 with an IPv6
+    /// public address, so two differing public observations (CGNAT vs the
+    /// real public address, v4 vs v6) still replace each other in arrival
+    /// order, as before #6378. `is_private_ip` is shared with other callers
+    /// and is not widened here.
+    pub fn apply_observed_address(&self, addr: SocketAddr) -> ObservedAddrOutcome {
+        let is_public = |a: &SocketAddr| !crate::server::is_private_ip(&a.ip());
+        let mut own_addr = self.own_addr.lock();
+        let previous = *own_addr;
+        if !is_public(&addr) && previous.as_ref().is_some_and(is_public) {
+            return ObservedAddrOutcome::Ignored;
+        }
+        // Same atomicity discipline as `set_own_addr`: hold the lock across
+        // the mirror write.
+        *own_addr = Some(addr);
+        crate::node::network_status::set_external_address(addr);
+        let before = self.get_stored_location();
+        let new_location = Location::from_address(&addr);
+        // Only a location that an observation set may follow a change between
+        // public and private; a configured location never moves, and a second
+        // observation of the same kind keeps the first location
+        // (`update_location`).
+        let crossed = previous.is_some_and(|p| is_public(&p) != is_public(&addr));
+        if crossed && self.location_from_observation.load(Ordering::Acquire) {
+            self.own_location.store(
+                u64::from_le_bytes(new_location.as_f64().to_le_bytes()),
+                Ordering::Release,
+            );
+        } else {
+            self.update_location(Some(new_location));
+            if before.is_none() && self.get_stored_location().is_some() {
+                self.location_from_observation
+                    .store(true, Ordering::Release);
+            }
+        }
+        ObservedAddrOutcome::Applied {
+            location_changed: self.get_stored_location() != before,
+        }
     }
 
     /// Outbound requests the topology manager recorded for `peer`. Test-only.
@@ -3564,6 +3643,183 @@ mod tests {
 
     fn make_addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
+    }
+
+    /// Applies an observation under `TEST_GLOBAL_STATE_LOCK`:
+    /// `apply_observed_address` writes the process-global
+    /// `network_status::external_address` mirror, which races
+    /// `test_set_own_addr_atomic_with_network_status` under plain `cargo test`
+    /// (#4918).
+    fn observe(cm: &ConnectionManager, addr: SocketAddr) -> ObservedAddrOutcome {
+        let _global = crate::node::network_status::TEST_GLOBAL_STATE_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // GLOBAL-ADDR-WRITE-OK: test helper, holds TEST_GLOBAL_STATE_LOCK (#4918).
+        cm.apply_observed_address(addr)
+    }
+
+    fn v4(a: u8, b: u8, c: u8, d: u8) -> SocketAddr {
+        SocketAddr::from(([a, b, c, d], 60454))
+    }
+
+    fn loc(a: &SocketAddr) -> Option<Location> {
+        Some(Location::from_address(a))
+    }
+
+    const APPLIED_MOVED: ObservedAddrOutcome = ObservedAddrOutcome::Applied {
+        location_changed: true,
+    };
+
+    /// #6378: a joiner behind the same NAT as a gateway is told its LAN-side
+    /// address by that gateway and its public address by the others. The
+    /// private answer must not replace the public one or move the location,
+    /// whichever order they arrive in. Fails without the guard.
+    #[test]
+    fn private_observed_address_never_displaces_a_public_one() {
+        let (public, private) = (v4(136, 62, 52, 28), v4(192, 168, 1, 1));
+        assert_ne!(loc(&public), loc(&private));
+
+        // Public first, private later (and repeatedly, a flapping gateway).
+        let cm = ConnectionManager::test_default();
+        assert_eq!(observe(&cm, public), APPLIED_MOVED);
+        for _ in 1..4 {
+            let out = observe(&cm, private);
+            assert_eq!(out, ObservedAddrOutcome::Ignored);
+            assert_eq!(cm.get_own_addr(), Some(public));
+            assert_eq!(cm.get_stored_location(), loc(&public));
+        }
+
+        // Private first, public later: public wins and the location follows it.
+        let cm = ConnectionManager::test_default();
+        assert_eq!(observe(&cm, private), APPLIED_MOVED);
+        assert_eq!(cm.get_own_addr(), Some(private));
+        assert_eq!(observe(&cm, public), APPLIED_MOVED);
+        assert_eq!(cm.get_own_addr(), Some(public));
+        assert_eq!(cm.get_stored_location(), loc(&public));
+        assert_eq!(observe(&cm, private), ObservedAddrOutcome::Ignored);
+        assert_eq!(cm.get_own_addr(), Some(public));
+    }
+
+    /// All-LAN and loopback networks never see a public address, so a private
+    /// observation must still be adopted there. NOTE: this passes without the
+    /// guard; it pins the "no public address known" half of the contract, it
+    /// is not the regression test.
+    #[test]
+    fn private_observed_address_is_adopted_when_no_public_one_exists() {
+        let v6 = |s: &str| SocketAddr::new(s.parse().unwrap(), 60454);
+        for addr in [
+            v4(192, 168, 1, 1),
+            v4(127, 0, 0, 1),
+            v4(10, 0, 0, 7),
+            v4(169, 254, 3, 4),
+            v6("fd12:3456::1"),
+            v6("fe80::1"),
+            v6("::1"),
+        ] {
+            let cm = ConnectionManager::test_default();
+            assert_eq!(observe(&cm, addr), APPLIED_MOVED);
+            assert_eq!(cm.get_own_addr(), Some(addr));
+            assert_eq!(cm.get_stored_location(), loc(&addr));
+        }
+    }
+
+    /// IPv6 private ranges are guarded like IPv4 ones. Fails without the guard.
+    #[test]
+    fn private_ipv6_observed_address_never_displaces_a_public_one() {
+        let v6 = |s: &str| SocketAddr::new(s.parse().unwrap(), 60454);
+        let public = v6("2001:db8::7");
+        for private in [v6("fd12:3456::1"), v6("fe80::1"), v6("::1")] {
+            let cm = ConnectionManager::test_default();
+            observe(&cm, public);
+            assert_eq!(observe(&cm, private), ObservedAddrOutcome::Ignored);
+            assert_eq!(cm.get_own_addr(), Some(public));
+        }
+    }
+
+    /// A flapping gateway that keeps reporting the private address never
+    /// displaces a public `own_addr`, however many times it does so. There is
+    /// deliberately no time-based switch (see `apply_observed_address`).
+    /// Fails without the guard.
+    #[test]
+    fn repeated_private_observations_never_displace_a_public_one() {
+        let (public, private) = (v4(136, 62, 52, 28), v4(192, 168, 1, 1));
+        let cm = ConnectionManager::test_default();
+        observe(&cm, public);
+        for _ in 0..1000 {
+            assert_eq!(observe(&cm, private), ObservedAddrOutcome::Ignored);
+        }
+        assert_eq!(cm.get_own_addr(), Some(public));
+        assert_eq!(cm.get_stored_location(), loc(&public));
+    }
+
+    /// A configured public `own_addr` (never observed) is not replaced by
+    /// private observations, however late they arrive.
+    #[test]
+    fn configured_public_address_is_kept_against_private_observations() {
+        let (public, private) = (v4(136, 62, 52, 28), v4(192, 168, 1, 1));
+        let cm = make_connection_manager(Some(public), 1, 10, false);
+        assert_eq!(observe(&cm, private), ObservedAddrOutcome::Ignored);
+        assert_eq!(cm.get_own_addr(), Some(public));
+    }
+
+    /// A configured location is never overwritten, including when a public
+    /// observation replaces a private `own_addr`. `update_location` keeps the
+    /// first location set, so a second differing PUBLIC observation also
+    /// changes the address but not the location.
+    #[test]
+    fn observed_addresses_keep_a_configured_or_existing_location() {
+        let (public, private) = (v4(136, 62, 52, 28), v4(192, 168, 1, 1));
+        let other_public = v4(8, 8, 8, 8);
+        let configured = Location::new(0.123);
+
+        let cm = ConnectionManager::test_default();
+        cm.update_location(Some(configured));
+        assert_eq!(
+            observe(&cm, private),
+            ObservedAddrOutcome::Applied {
+                location_changed: false
+            }
+        );
+        assert_eq!(
+            observe(&cm, public),
+            ObservedAddrOutcome::Applied {
+                location_changed: false
+            }
+        );
+        assert_eq!(cm.get_own_addr(), Some(public));
+        assert_eq!(cm.get_stored_location(), Some(configured));
+
+        // public -> a different public: the address follows the latest
+        // observation (unchanged behaviour), the location keeps the first.
+        let cm = ConnectionManager::test_default();
+        observe(&cm, public);
+        assert_eq!(
+            observe(&cm, other_public),
+            ObservedAddrOutcome::Applied {
+                location_changed: false
+            }
+        );
+        assert_eq!(cm.get_own_addr(), Some(other_public));
+        assert_eq!(cm.get_stored_location(), loc(&public));
+    }
+
+    /// Documents what the guard does NOT cover (#6378 follow-up): CGNAT
+    /// (100.64/10) and an IPv6 address count as "public" for
+    /// `is_private_ip`, so they replace one another and a real public
+    /// address in arrival order, as before the fix.
+    #[test]
+    fn public_vs_public_observations_still_replace_each_other() {
+        let cgnat = v4(100, 64, 1, 2);
+        let public = v4(136, 62, 52, 28);
+        let public_v6 = SocketAddr::new("2001:db8::7".parse().unwrap(), 60454);
+        let cm = ConnectionManager::test_default();
+        observe(&cm, public);
+        observe(&cm, cgnat);
+        assert_eq!(cm.get_own_addr(), Some(cgnat));
+        observe(&cm, public_v6);
+        assert_eq!(cm.get_own_addr(), Some(public_v6));
+        observe(&cm, public);
+        assert_eq!(cm.get_own_addr(), Some(public));
     }
 
     fn make_connection_manager_with_transient_budget(budget: usize) -> ConnectionManager {
@@ -6053,6 +6309,7 @@ mod tests {
         // Built at runtime so this file's own source does not contain the
         // literal being searched for (which would match the guard itself).
         let bare = format!(".set_own_addr{}", "(");
+        let bare_observed = format!(".apply_observed_address{}", "(");
         // An annotation on the call line, or anywhere in the comment block
         // immediately above it, marks a write to the process-global mirror as
         // deliberate and justified. The whole block is searched so a
@@ -6060,7 +6317,7 @@ mod tests {
         // naturally.
         const MARKER: &str = "GLOBAL-ADDR-WRITE-OK";
 
-        fn visit(dir: &Path, out: &mut Vec<(String, usize, String)>, bare: &str) {
+        fn visit(dir: &Path, out: &mut Vec<(String, usize, String)>, bare: &[&str]) {
             let entries = std::fs::read_dir(dir).expect("read crate source dir");
             for entry in entries.flatten() {
                 let path = entry.path();
@@ -6070,7 +6327,7 @@ mod tests {
                     let src = std::fs::read_to_string(&path).expect("read source file");
                     let lines: Vec<&str> = src.lines().collect();
                     for (i, line) in lines.iter().enumerate() {
-                        if !line.contains(bare) {
+                        if !bare.iter().any(|b| line.contains(b)) {
                             continue;
                         }
                         // Walk back over the contiguous comment block directly
@@ -6097,7 +6354,7 @@ mod tests {
 
         let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut unannotated = Vec::new();
-        visit(&src_root, &mut unannotated, &bare);
+        visit(&src_root, &mut unannotated, &[&bare, &bare_observed]);
 
         assert!(
             unannotated.is_empty(),

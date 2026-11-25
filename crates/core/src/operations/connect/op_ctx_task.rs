@@ -36,7 +36,7 @@ use tokio::time::Instant;
 use crate::message::{NetMessage, NetMessageV1, NodeEvent, Transaction};
 use crate::node::{OpManager, WaiterReply};
 use crate::operations::OpError;
-use crate::ring::{ConnectionFailureReason, Location, PeerKeyLocation};
+use crate::ring::{ConnectionFailureReason, Location, ObservedAddrOutcome, PeerKeyLocation};
 use crate::tracing::NetEventLog;
 
 use super::{
@@ -1193,21 +1193,27 @@ async fn drive_client_connect(
                 // diagnostics) and `own_location` (for routing).
                 // Only the first ObservedAddress per transaction is applied
                 // (see the guard arm above); repeats are ignored.
-                let location = Location::from_address(&address);
+                let connection_manager = &op_manager.ring.connection_manager;
                 // GLOBAL-ADDR-WRITE-OK: production. A real node learning its
                 // peer-observed address is exactly what the external_address
-                // mirror is for (#4918).
-                op_manager.ring.connection_manager.set_own_addr(address);
-                op_manager
-                    .ring
-                    .connection_manager
-                    .update_location(Some(location));
-                tracing::info!(
-                    tx = %tx,
-                    observed_address = %address,
-                    location = %location,
-                    "connect driver: updated own_addr and location from ObservedAddress"
-                );
+                // mirror is for (#4918). A private observation (a gateway
+                // behind our own NAT) never displaces a fresh public own_addr
+                // (#6378).
+                let outcome = connection_manager.apply_observed_address(address);
+                match outcome {
+                    ObservedAddrOutcome::Applied { location_changed } => tracing::info!(
+                        tx = %tx,
+                        observed_address = %address,
+                        location_changed,
+                        location = ?connection_manager.get_stored_location(),
+                        "connect driver: updated own_addr from ObservedAddress"
+                    ),
+                    ObservedAddrOutcome::Ignored => tracing::info!(
+                        tx = %tx,
+                        observed_address = %address,
+                        "connect driver: ignoring private ObservedAddress, a public own_addr is known"
+                    ),
+                }
             }
             other @ ConnectMsg::Request { .. } | other @ ConnectMsg::ConnectFailed { .. } => {
                 // Bypass at node.rs forwards Response/Rejected/
@@ -2392,11 +2398,22 @@ mod tests {
             "the ignoring arm must precede the applying arm"
         );
         let body_end = SOURCE[apply..]
-            .find("set_own_addr(address)")
-            .expect("set_own_addr call");
+            .find("apply_observed_address(address)")
+            .expect("apply_observed_address call");
         assert!(
             body_end < 2000,
-            "set_own_addr must stay in the applying arm"
+            "apply_observed_address must stay in the applying arm"
+        );
+        // The outcome must be consumed, not dropped: the log says whether the
+        // address and location were really applied.
+        let after_call = &SOURCE[apply + body_end..];
+        let arm_end = after_call
+            .find("other @ ConnectMsg::Request")
+            .expect("arm after the ObservedAddress arm");
+        assert!(
+            after_call[..arm_end].contains("match outcome")
+                && after_call[..arm_end].contains("ObservedAddrOutcome::Ignored"),
+            "the apply outcome must be matched in the applying arm"
         );
     }
 

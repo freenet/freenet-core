@@ -1382,7 +1382,7 @@ impl P2pConnManager {
         // Initialize our peer identity before any connection attempts so join requests can
         // reference the correct address.
         // Note: For peers behind NAT, this initial address is a fallback - the correct
-        // external address is learned via ObservedAddress and updated via set_own_addr().
+        // external address is learned via ObservedAddress and updated via ConnectionManager::apply_observed_address().
         // The ring location should be computed from the observed external address,
         // not from this initial fallback.
         let advertised_addr = {
