@@ -621,6 +621,21 @@ fn service_logs(_error_only: bool) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// `OOMPolicy=continue` must sit inside `[Service]` (not `[Unit]` or
+    /// `[Install]`, where systemd would ignore it).
+    #[cfg(target_os = "linux")]
+    fn assert_oom_policy_in_service_section(unit: &str) {
+        let service_start = unit.find("\n[Service]\n").expect("[Service] section");
+        let install_start = unit.find("\n[Install]\n").expect("[Install] section");
+        let pos = unit
+            .find("\nOOMPolicy=continue\n")
+            .expect("unit must contain OOMPolicy=continue");
+        assert!(
+            service_start < pos && pos < install_start,
+            "OOMPolicy=continue must be inside [Service]"
+        );
+    }
+
     /// Regression guard for the service.rs submodule split: it dropped
     /// `spawn_first_run_dashboard_opener` entirely (only the call site
     /// survived) and left several Windows-only items unimported, breaking the
@@ -1592,6 +1607,7 @@ mod tests {
         assert!(service_content.contains("LimitNOFILE=65536"));
         assert!(service_content.contains("MemoryMax=2G"));
         assert!(service_content.contains("CPUQuota=200%"));
+        assert_oom_policy_in_service_section(&service_content);
 
         // Verify restart configuration (always restart for auto-update support)
         assert!(service_content.contains("Restart=always"));
@@ -1729,6 +1745,7 @@ mod tests {
 
         // Verify it still has all the standard settings
         assert!(service_content.contains("Restart=always"));
+        assert_oom_policy_in_service_section(&service_content);
         assert!(service_content.contains("StartLimitBurst=5"));
         assert!(service_content.contains("StartLimitIntervalSec=120"));
         // StartLimitBurst/IntervalSec [Unit] placement is asserted by #4570's linux.rs

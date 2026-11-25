@@ -3326,6 +3326,66 @@ mod tests {
         );
     }
 
+    /// Linux-only: a unit written by the previous template (the current
+    /// template without `OOMPolicy=continue`) is detected as stale and
+    /// rewritten, with or without a sidecar, while a hand-edited unit
+    /// (differs from both old and new template, sidecar records the old
+    /// hash) is skipped.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn previous_template_without_oom_policy_is_rewritten_user_edit_is_skipped() {
+        use std::path::PathBuf;
+        let binary = PathBuf::from("/usr/local/bin/freenet");
+        let log_dir = PathBuf::from("/home/u/.local/state/freenet");
+        let home = PathBuf::from("/home/svc");
+        let strip = |unit: &str| {
+            // Remove the whole block (comment lines and directive) so the result is
+            // what a node installed before this change has.
+            let start = unit
+                .find("# Do not stop the unit when a process other than the main process is\n")
+                .expect("template must contain the OOMPolicy comment block");
+            let end = unit.find("OOMPolicy=continue\n").expect("directive")
+                + "OOMPolicy=continue\n".len();
+            format!("{}{}", &unit[..start], &unit[end..])
+        };
+
+        let units = [
+            generate_user_service_file(&binary, &log_dir),
+            generate_system_service_file(&binary, &log_dir, "svc", &home),
+        ];
+        for new_unit in units {
+            assert!(new_unit.contains("OOMPolicy=continue\n"));
+            let previous = strip(&new_unit);
+            assert_ne!(previous, new_unit);
+            let previous_hash = wrapper_content_hash(&previous);
+            let new_hash = wrapper_content_hash(&new_unit);
+
+            // Sidecar records the previous template: stale, rewrite.
+            assert_eq!(
+                decide_wrapper_action(&new_unit, Some(&previous), Some(&previous_hash)),
+                WrapperAction::WriteOurs {
+                    new_hash: new_hash.clone()
+                }
+            );
+            // No sidecar (installs that predate it): treated as ours, rewrite.
+            assert_eq!(
+                decide_wrapper_action(&new_unit, Some(&previous), None),
+                WrapperAction::WriteOurs {
+                    new_hash: new_hash.clone()
+                }
+            );
+            // Hand-edited unit: sidecar still records the previous template.
+            let edited = previous.replace("MemoryMax=2G", "MemoryMax=4G");
+            assert_ne!(edited, previous);
+            assert_eq!(
+                decide_wrapper_action(&new_unit, Some(&edited), Some(&previous_hash)),
+                WrapperAction::UserModified {
+                    on_disk_hash: wrapper_content_hash(&edited)
+                }
+            );
+        }
+    }
+
     /// Linux-only: `render_current_systemd_unit` must reproduce the
     /// exact bytes of an installed system unit when fed that unit back
     /// as `existing` (it re-extracts `User=` / `Environment=HOME=`). If
