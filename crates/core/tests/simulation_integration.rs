@@ -25968,3 +25968,593 @@ fn simulation_data_dirs_are_private_to_this_process() {
         "the gateway's data dir is not under this process's root {own_root}"
     );
 }
+
+// =============================================================================
+// PUT-then-GET findability + latency (fresh contracts, distant requester)
+// =============================================================================
+//
+// Field measurements on release builds (2026-11) showed that a GET issued a few
+// seconds after a PUT, from a different and distant node, is often slow: ~27% of
+// first GETs took >= 10 s, and the slowness tracked the KEY (when the contract
+// became reachable), not the requester. This test reproduces the same schedule in
+// the deterministic harness: PUT fresh contracts from regular nodes, then GET each
+// from a distant node at three fixed ages, and report per-GET success, sim-time to
+// find, hop count, relay-internal retries, PUT-route vs GET-route overlap and the
+// ring distance (to the key) of the first holder that answered.
+//
+// Event details (`GetEvent` / `PutEvent`) are `pub(crate)`, so the analysis parses
+// the `Debug` rendering of each logged event. `run_controlled_simulation` runs one
+// op per `controlled_op_interval`, so "age" is set by interleaving PUT and GET ops
+// on a fixed-slot timeline; the age actually achieved is re-measured from the
+// event timestamps (`datetime` is virtual time).
+
+/// First `ContractInstanceId("...")` in a rendered event.
+fn fa_instance(d: &str) -> Option<&str> {
+    let rest = d.split("ContractInstanceId(\"").nth(1)?;
+    rest.split('"').next()
+}
+
+/// The text following `pat`, up to the first of `, ` / ` ` / `}` / `)`.
+fn fa_field<'a>(d: &'a str, pat: &str) -> Option<&'a str> {
+    let rest = d.split(pat).nth(1)?;
+    let end = rest.find([',', ' ', '}', ')']).unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Short peer key (the part before `@`) following `pat`.
+fn fa_peer<'a>(d: &'a str, pat: &str) -> Option<&'a str> {
+    let rest = d.split(pat).nth(1)?;
+    rest.split('@').next()
+}
+
+/// Ring location of the peer following `pat` (rendered `KEY@ADDR (@ LOC)`).
+fn fa_peer_loc(d: &str, pat: &str) -> Option<f64> {
+    let rest = d.split(pat).nth(1)?;
+    let loc = rest.split("(@ ").nth(1)?;
+    loc.split(')').next()?.parse().ok()
+}
+
+fn fa_ring_dist(a: f64, b: f64) -> f64 {
+    let d = (a - b).abs();
+    d.min(1.0 - d)
+}
+
+fn fa_pct(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return f64::NAN;
+    }
+    let idx = ((sorted.len() as f64 - 1.0) * q).round() as usize;
+    sorted[idx]
+}
+
+/// One scheduled contract in the findability experiment.
+#[derive(Clone)]
+struct FaContract {
+    cohort: usize,
+    instance: String,
+    put_node: usize,
+    get_node: usize,
+    key_loc: f64,
+}
+
+/// Measured outcome of the first GET of one contract.
+#[derive(Debug, Clone, Default)]
+struct FaGet {
+    cohort: usize,
+    found: bool,
+    local_hit: bool,
+    /// Sim seconds from the first GET request event to the client terminal.
+    latency_s: f64,
+    /// Sim seconds between the first PUT request and the first GET request.
+    age_s: f64,
+    /// Sim seconds between the last PUT-tx event and the first GET request.
+    age_after_put_settled_s: f64,
+    hops: Option<usize>,
+    client_attempts: usize,
+    wire_txs: usize,
+    relay_internal_retries: usize,
+    /// Forwards whose target never logged the request: no reply and no error.
+    silent_forwards: usize,
+    put_route: usize,
+    get_route: usize,
+    route_overlap: usize,
+    /// Ring distance (to the key) of the first peer that answered with the state.
+    holder_dist: Option<f64>,
+    holder_on_put_route: Option<bool>,
+}
+
+struct FaRun {
+    gets: Vec<FaGet>,
+    cohort_ages: Vec<&'static str>,
+}
+
+fn fa_run(
+    seed: u64,
+    network: &str,
+    num_gateways: usize,
+    num_nodes: usize,
+    contracts_per_cohort: usize,
+) -> FaRun {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimOperation};
+
+    // Slot length and the GET delay (in slots) of each cohort: ~0.25 s, 1 s, 10 s
+    // after the PUT was issued.
+    const OP_INTERVAL_MS: u64 = 250;
+    const COHORT_DELAY_SLOTS: [usize; 3] = [1, 4, 40];
+    const COHORT_NAMES: [&str; 3] = ["+0.25s", "+1s", "+10s"];
+
+    setup_deterministic_state(seed);
+    let nn_guard = NnLatticeTestGuard;
+    freenet::dev_tool::set_nn_lattice_enabled(true);
+
+    let rt = create_runtime();
+    let (sim, logs_handle) = rt.block_on(async {
+        let mut sim = SimNetwork::new(network, num_gateways, num_nodes, 10, 7, 12, 4, seed).await;
+        // Measure against a formed ring, not a forming one.
+        sim.wait_for_join_convergence_before_ops(0.95, Duration::from_secs(900));
+        sim.with_controlled_op_interval(Duration::from_millis(OP_INTERVAL_MS));
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+    let locs = sim.get_peer_locations();
+    assert_eq!(locs.len(), num_gateways + num_nodes);
+
+    // Build the contracts. PUT origins are a handful of regular nodes; the GET
+    // requester is a random regular node at ring distance >= 0.25 from the key.
+    let node_nos: Vec<usize> = (num_gateways..num_gateways + num_nodes).collect();
+    let mut rng_state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next_rand = move || {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (rng_state >> 33) as usize
+    };
+    let mut contracts = Vec::new();
+    let mut containers = Vec::new();
+    let total = COHORT_DELAY_SLOTS.len() * contracts_per_cohort;
+    assert!(total <= 200, "create_test_contract takes a u8 seed");
+    for n in 0..total {
+        let cohort = n % COHORT_DELAY_SLOTS.len();
+        let container = SimOperation::create_test_contract(n as u8 + 1);
+        let key = container.key();
+        let key_loc = Location::from(&key).as_f64();
+        let put_node = node_nos[next_rand() % node_nos.len()];
+        let candidates: Vec<usize> = node_nos
+            .iter()
+            .copied()
+            .filter(|&c| c != put_node && fa_ring_dist(locs[c], key_loc) >= 0.25)
+            .collect();
+        let get_node = candidates[next_rand() % candidates.len()];
+        contracts.push(FaContract {
+            cohort,
+            instance: key.id().to_string(),
+            put_node,
+            get_node,
+            key_loc,
+        });
+        containers.push(container);
+    }
+
+    // Timeline: one op per slot. A GET becomes due `delay` slots after its PUT.
+    let mut ops = Vec::new();
+    let mut pending_gets: Vec<(usize, usize)> = Vec::new(); // (due slot, contract)
+    let mut next_put = 0usize;
+    let mut slot = 0usize;
+    while next_put < contracts.len() || !pending_gets.is_empty() {
+        if let Some(pos) = pending_gets.iter().position(|(due, _)| *due <= slot) {
+            let (_, ci) = pending_gets.remove(pos);
+            let c = &contracts[ci];
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, c.get_node),
+                SimOperation::Get {
+                    contract_id: *containers[ci].key().id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        } else if next_put < contracts.len() {
+            let ci = next_put;
+            next_put += 1;
+            let c = &contracts[ci];
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, c.put_node),
+                SimOperation::Put {
+                    contract: containers[ci].clone(),
+                    state: vec![ci as u8; 64],
+                    subscribe: true,
+                },
+            ));
+            pending_gets.push((slot + COHORT_DELAY_SLOTS[c.cohort], ci));
+        } else {
+            // Nothing due yet and nothing left to PUT: idle slot. Re-GET nothing;
+            // just advance by issuing the earliest-due GET.
+            let (idx, _) = pending_gets
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (due, _))| *due)
+                .expect("pending");
+            let (_, ci) = pending_gets.remove(idx);
+            let c = &contracts[ci];
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, c.get_node),
+                SimOperation::Get {
+                    contract_id: *containers[ci].key().id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        }
+        slot += 1;
+    }
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        ops,
+        Duration::from_secs(2400),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "findability sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+    drop(nn_guard);
+
+    // ---- Analysis ----
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    struct Ev {
+        dt_ns: i128,
+        tx: String,
+        peer: String,
+        d: String,
+    }
+    let t0 = logs
+        .iter()
+        .map(|l| l.datetime)
+        .min()
+        .expect("events logged");
+    let mut by_instance: HashMap<String, Vec<Ev>> = HashMap::new();
+    for l in logs.iter() {
+        // `GetEvent` / `PutEvent` are `pub(crate)`, so classify by rendering.
+        let d = format!("{:?}", l.kind);
+        if !d.starts_with("Get(") && !d.starts_with("Put(") {
+            continue;
+        }
+        let Some(inst) = fa_instance(&d).map(str::to_owned) else {
+            continue;
+        };
+        let peer = l
+            .peer_id
+            .to_string()
+            .split('@')
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        by_instance.entry(inst).or_default().push(Ev {
+            dt_ns: (l.datetime - t0).num_nanoseconds().unwrap_or(0) as i128,
+            tx: l.tx.to_string(),
+            peer,
+            d,
+        });
+    }
+
+    let mut gets = Vec::new();
+    let mut slow_traces = 0usize;
+    for c in &contracts {
+        let evs = by_instance
+            .get(&c.instance)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        let mut g = FaGet {
+            cohort: c.cohort,
+            ..Default::default()
+        };
+        let puts: Vec<&Ev> = evs.iter().filter(|e| e.d.starts_with("Put(")).collect();
+        let getev: Vec<&Ev> = evs.iter().filter(|e| e.d.starts_with("Get(")).collect();
+        let put_start = puts.iter().map(|e| e.dt_ns).min().unwrap_or(0);
+        let put_end = puts.iter().map(|e| e.dt_ns).max().unwrap_or(0);
+        let put_peers: HashSet<&str> = puts.iter().map(|e| e.peer.as_str()).collect();
+        g.put_route = put_peers.len();
+
+        let variant = |e: &Ev| -> String {
+            e.d["Get(".len()..]
+                .split([' ', '{'])
+                .next()
+                .unwrap_or_default()
+                .to_owned()
+        };
+        // The client's op: the earliest non-sub-op terminal after the PUT.
+        let term = getev
+            .iter()
+            .filter(|e| variant(e) == "ClientTerminal" && e.d.contains("is_sub_op: false"))
+            .min_by_key(|e| e.dt_ns);
+        // The client op's start: its own loopback Request (same tx as its terminal).
+        // Not the earliest Request for the contract, which can be a sub-op GET
+        // (repair / related fetch) started when the PUT lands.
+        let get_start = term.and_then(|t| {
+            getev
+                .iter()
+                .filter(|e| variant(e) == "Request" && e.tx == t.tx)
+                .map(|e| e.dt_ns)
+                .min()
+        });
+        if let Some(t) = term {
+            g.found = t.d.contains("outcome: Success");
+            g.client_attempts = fa_field(&t.d, "attempts: ")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            g.hops = fa_field(&t.d, "hop_count: Some(").and_then(|v| v.parse().ok());
+            let start = get_start.unwrap_or(t.dt_ns);
+            g.local_hit = get_start.is_none() || g.client_attempts == 0;
+            g.latency_s = (t.dt_ns - start).max(0) as f64 / 1e9;
+            g.age_s = (start - put_start).max(0) as f64 / 1e9;
+            g.age_after_put_settled_s = (start - put_end) as f64 / 1e9;
+        }
+        let reqs: Vec<&&Ev> = getev.iter().filter(|e| variant(e) == "Request").collect();
+        let txs: HashSet<&str> = reqs.iter().map(|e| e.tx.as_str()).collect();
+        g.wire_txs = txs.len();
+        // Relay-internal retries: forwards beyond the first, per (tx, peer).
+        let mut fwd: HashMap<(&str, &str), usize> = HashMap::new();
+        for e in &reqs {
+            let me = fa_peer(&e.d, "requester: ");
+            let target = fa_peer(&e.d, "target: ");
+            if me.is_some() && target.is_some() && me != target {
+                *fwd.entry((e.tx.as_str(), e.peer.as_str())).or_default() += 1;
+            }
+        }
+        g.silent_forwards = reqs
+            .iter()
+            .filter(|e| {
+                let me = fa_peer(&e.d, "requester: ");
+                let tgt = fa_peer(&e.d, "target: ");
+                me != tgt
+                    && !reqs
+                        .iter()
+                        .any(|o| o.tx == e.tx && Some(o.peer.as_str()) == tgt)
+            })
+            .count();
+        g.relay_internal_retries = fwd.values().map(|n| n.saturating_sub(1)).sum();
+        let get_peers: HashSet<&str> = reqs.iter().map(|e| e.peer.as_str()).collect();
+        g.get_route = get_peers.len();
+        g.route_overlap = get_peers.intersection(&put_peers).count();
+        // First holder to answer: earliest ResponseSent carrying a key.
+        if let Some(rs) = getev
+            .iter()
+            .filter(|e| variant(e) == "ResponseSent" && e.d.contains("key: Some("))
+            .min_by_key(|e| e.dt_ns)
+        {
+            if let Some(loc) = fa_peer_loc(&rs.d, "from: ") {
+                g.holder_dist = Some(fa_ring_dist(loc, c.key_loc));
+            }
+            g.holder_on_put_route = Some(put_peers.contains(rs.peer.as_str()));
+        }
+        if g.latency_s >= 10.0 && slow_traces < 4 {
+            slow_traces += 1;
+            let base = get_start.unwrap_or(0);
+            eprintln!(
+                "FA slow-trace contract={} cohort={} put_node={} get_node={} put_route={} latency={:.1}s",
+                c.instance, c.cohort, c.put_node, c.get_node, g.put_route, g.latency_s
+            );
+            let mut all: Vec<&&Ev> = getev.iter().collect();
+            all.sort_by_key(|e| e.dt_ns);
+            for e in all.iter().filter(|e| e.dt_ns >= base - 1_000_000_000) {
+                let v = variant(e);
+                let extra = if v == "Request" {
+                    format!(
+                        "target={} htl={}",
+                        fa_peer(&e.d, "target: ").unwrap_or("?"),
+                        fa_field(&e.d, "htl: ").unwrap_or("?")
+                    )
+                } else if v == "ResponseSent" {
+                    format!(
+                        "to={} found={}",
+                        fa_peer(&e.d, "to: ").unwrap_or("?"),
+                        e.d.contains("key: Some(")
+                    )
+                } else {
+                    String::new()
+                };
+                if v == "Request" {
+                    let me = fa_peer(&e.d, "requester: ");
+                    let tgt = fa_peer(&e.d, "target: ");
+                    let silent = me != tgt
+                        && !getev.iter().any(|o| {
+                            o.tx == e.tx && variant(o) == "Request" && Some(o.peer.as_str()) == tgt
+                        });
+                    if silent {
+                        eprintln!(
+                            "FA   ^ silent forward: target {:.6} never logged this tx (on PUT route: {})",
+                            tgt.unwrap_or("?"),
+                            put_peers.iter().any(|pp| Some(*pp) == tgt)
+                        );
+                    }
+                }
+                eprintln!(
+                    "FA   t={:+9.3}s {:>16} peer={:.6} tx=..{} {}",
+                    (e.dt_ns - base) as f64 / 1e9,
+                    v,
+                    e.peer,
+                    &e.tx[e.tx.len().saturating_sub(5)..],
+                    extra
+                );
+            }
+        }
+        gets.push(g);
+    }
+    FaRun {
+        gets,
+        cohort_ages: COHORT_NAMES.to_vec(),
+    }
+}
+
+/// Aggregate view used by the assertions.
+struct FaSummary {
+    contracts: usize,
+    put_not_dispatched: usize,
+    found: usize,
+    network_gets: usize,
+    slow_10s: usize,
+    max_cohort_median_s: f64,
+}
+
+fn fa_summarize(run: &FaRun) -> FaSummary {
+    let mut max_cohort_median_s = 0.0f64;
+    for ci in 0..run.cohort_ages.len() {
+        let mut lat: Vec<f64> = run
+            .gets
+            .iter()
+            .filter(|g| g.cohort == ci && g.found && !g.local_hit)
+            .map(|g| g.latency_s)
+            .collect();
+        lat.sort_by(f64::total_cmp);
+        max_cohort_median_s = max_cohort_median_s.max(fa_pct(&lat, 0.5));
+    }
+    FaSummary {
+        contracts: run.gets.len(),
+        put_not_dispatched: run.gets.iter().filter(|g| g.put_route == 0).count(),
+        found: run
+            .gets
+            .iter()
+            .filter(|g| g.put_route > 0 && g.found)
+            .count(),
+        network_gets: run.gets.iter().filter(|g| !g.local_hit).count(),
+        slow_10s: run
+            .gets
+            .iter()
+            .filter(|g| !g.local_hit && g.latency_s >= 10.0)
+            .count(),
+        max_cohort_median_s,
+    }
+}
+
+fn fa_report(run: &FaRun) {
+    for (ci, name) in run.cohort_ages.iter().enumerate() {
+        let g: Vec<&FaGet> = run.gets.iter().filter(|g| g.cohort == ci).collect();
+        let net: Vec<&&FaGet> = g.iter().filter(|g| !g.local_hit).collect();
+        let found = g.iter().filter(|g| g.found).count();
+        let mut lat: Vec<f64> = net
+            .iter()
+            .filter(|g| g.found)
+            .map(|g| g.latency_s)
+            .collect();
+        lat.sort_by(f64::total_cmp);
+        let mut age: Vec<f64> = g.iter().map(|g| g.age_s).collect();
+        age.sort_by(f64::total_cmp);
+        let slow10 = net.iter().filter(|g| g.latency_s >= 10.0).count();
+        let slow1 = net.iter().filter(|g| g.latency_s >= 1.0).count();
+        let retried = net.iter().filter(|g| g.client_attempts > 1).count();
+        let relay_retried = net.iter().filter(|g| g.relay_internal_retries > 0).count();
+        let silent = net.iter().filter(|g| g.silent_forwards > 0).count();
+        let no_put = g.iter().filter(|g| g.put_route == 0).count();
+        let overlap = net.iter().filter(|g| g.route_overlap > 1).count();
+        let holder_off = net
+            .iter()
+            .filter(|g| g.holder_on_put_route == Some(false))
+            .count();
+        let mut hops: Vec<f64> = net
+            .iter()
+            .filter_map(|g| g.hops.map(|h| h as f64))
+            .collect();
+        hops.sort_by(f64::total_cmp);
+        let mut hd: Vec<f64> = net.iter().filter_map(|g| g.holder_dist).collect();
+        hd.sort_by(f64::total_cmp);
+        eprintln!(
+            "FA cohort {name}: n={} found={} network_gets={} local_hits={} | achieved_age_s med={:.2} \
+             | latency_s med={:.3} p90={:.3} max={:.3} | >=1s:{} >=10s:{} | client_retried={} \
+             relay_retried={} silent_forward_gets={} put_not_dispatched={} | hops med={:.0} p90={:.0} | route_overlap>1:{} | holder_off_put_route={} \
+             holder_ring_dist med={:.3} p90={:.3}",
+            g.len(),
+            found,
+            net.len(),
+            g.len() - net.len(),
+            fa_pct(&age, 0.5),
+            fa_pct(&lat, 0.5),
+            fa_pct(&lat, 0.9),
+            lat.last().copied().unwrap_or(f64::NAN),
+            slow1,
+            slow10,
+            retried,
+            relay_retried,
+            silent,
+            no_put,
+            fa_pct(&hops, 0.5),
+            fa_pct(&hops, 0.9),
+            overlap,
+            holder_off,
+            fa_pct(&hd, 0.5),
+            fa_pct(&hd, 0.9),
+        );
+    }
+    for g in run
+        .gets
+        .iter()
+        .filter(|g| !g.found || g.latency_s >= 1.0 || g.client_attempts > 1)
+    {
+        eprintln!("FA outlier: {g:?}");
+    }
+}
+
+// Long-running diagnostic test (~6 min in a debug build). Runs in nightly CI.
+//
+// MEASURED on current main (3 gateways + 60 nodes, 102 contracts, seed below):
+// every GET is found and the median is ~20 ms, but 13 of 100 network GETs take
+// 100-111 s. All 13 had a forward to a peer that never logged the request (no
+// reply and no error); the relay then waits its full 60 s `OPERATION_TTL` for it
+// (`get/op_ctx_task.rs`, `send_to_and_await` under `timeout(OPERATION_TTL)`)
+// before the client retries via another first hop and succeeds in ~10 ms. The thresholds
+// below are RATCHETS taken from that measurement with margin for run-to-run
+// variation (the run is not bit-exact); tighten them when the tail is fixed.
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_put_then_get_findability_latency() {
+    const SEED: u64 = 0xF1ED_0002;
+    let env = |k: &str, d: usize| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let run = fa_run(
+        SEED,
+        "findability-put-get",
+        3,
+        env("FA_NODES", 60),
+        env("FA_PER_COHORT", 34),
+    );
+    fa_report(&run);
+    let sum = fa_summarize(&run);
+    eprintln!(
+        "FA summary: contracts={} found={} network_gets={} slow_10s={} ({:.1}%) max_cohort_median_s={:.3}",
+        sum.contracts,
+        sum.found,
+        sum.network_gets,
+        sum.slow_10s,
+        100.0 * sum.slow_10s as f64 / sum.network_gets.max(1) as f64,
+        sum.max_cohort_median_s
+    );
+
+    assert!(
+        sum.put_not_dispatched <= sum.contracts / 20,
+        "{} of {} PUTs never produced a PUT event: the harness did not dispatch them",
+        sum.put_not_dispatched,
+        sum.contracts
+    );
+    let dispatched = sum.contracts - sum.put_not_dispatched;
+    assert!(
+        sum.found as f64 >= 0.97 * dispatched as f64,
+        "only {} of {} freshly PUT contracts were found by a distant GET",
+        sum.found,
+        dispatched
+    );
+    assert!(
+        sum.max_cohort_median_s < 1.0,
+        "median time-to-find of a fresh contract is {:.3}s in some cohort (expected well under 1s)",
+        sum.max_cohort_median_s
+    );
+    assert!(
+        (sum.slow_10s as f64) <= 0.25 * sum.network_gets as f64,
+        "{} of {} network GETs of fresh contracts took >= 10s (ratchet: 25%; measured ~13%)",
+        sum.slow_10s,
+        sum.network_gets
+    );
+}
