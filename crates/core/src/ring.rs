@@ -91,7 +91,9 @@ pub(crate) mod contract_exec_metrics;
 pub(crate) mod delta_incompat;
 /// Shadow-mode detector for repairs that never converge (see the module docs).
 pub(crate) mod futile_repair;
-pub(crate) use connection_manager::{ConnectionManager, TransientRefusal, TransientTtlOutcome};
+pub(crate) use connection_manager::{
+    ConnectionManager, ObservedAddrOutcome, TransientRefusal, TransientTtlOutcome,
+};
 // Nearest-neighbor ring lattice (successor+predecessor base edges).
 // `nn_lattice_active_for` is the full activation gate — the flag AND the
 // minimum-degree floor (`NN_LATTICE_MIN_MAX_CONNECTIONS`) — used by the
