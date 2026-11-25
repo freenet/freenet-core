@@ -2040,6 +2040,25 @@ fn a_burst_of_late_ends_is_one_episode() {
         ])),
         None
     );
+    // The gap is pinned at 60 s, `>=`: late ends at 100, 160 and 220 s are three
+    // episodes (close at 220); at 100, 158 and 216 s the second is 58 s after
+    // the first, so it is the same episode and only two count.
+    assert_eq!(
+        run(&counted(vec![at(100), at(160), at(220)])),
+        Some((at(220), Some(Stall::LateEnds)))
+    );
+    assert_eq!(run(&counted(vec![at(100), at(158), at(216)])), None);
+    // A late end at every sample for minutes is one strike a minute: closes
+    // at the third, two minutes after the first.
+    assert_eq!(
+        run(&|i| if i >= at(100) {
+            (i - at(100)) as u64 + 1
+        } else {
+            0
+        }),
+        Some((at(220), Some(Stall::LateEnds)))
+    );
+    assert_eq!(LATE_END_EPISODE_GAP, Duration::from_secs(60));
     // Three episodes a minute and a bit apart, each with a burst: the third
     // closes.
     let burst = |from: usize| move |i: usize| if i >= from { 50 } else { 0 };

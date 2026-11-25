@@ -2613,13 +2613,16 @@ pub(crate) fn bytes_ahead(reading: &LaterReading) -> u64 {
 /// stream's end may still take ([`late_end_verdict`]): the first three
 /// probe timeouts, at least [`LATE_END_GRACE_MIN`]. quinn's probe timeout is
 /// `srtt + max(4 x rttvar, 1 ms) + max_ack_delay` and doubles with each
-/// probe, so three probes take seven timeouts in all. quinn's connection
-/// stats give the smoothed round trip only, not the variance, so the
-/// variance is bounded by the round trip itself (`rttvar <= srtt`, a jittery
-/// Wi-Fi or cellular path; an unjittery one has far less): a timeout is at
-/// most `5 x srtt + 25 ms`. So a tail whose first two probes were lost is
-/// still acknowledged within the grace (7 x (5 x srtt + 25 ms), 35 round
-/// trips and 175 ms).
+/// probe, so the third probe is SENT seven timeouts after the tail and its
+/// acknowledgement comes about a round trip and an ack delay later. quinn's
+/// connection stats give the smoothed round trip only, not the variance, so
+/// the variance is taken to be at most the round trip (`rttvar <= srtt`, a
+/// jittery Wi-Fi or cellular path; an unjittery one has far less): a timeout
+/// is at most `5 x srtt + 25 ms`, and the grace is seven of them (35 round
+/// trips and 175 ms). The bound is an assumption, not an invariant (a path
+/// at 50 ms with one 1 s sample has `rttvar` 245 ms for a while, a timeout of
+/// 1.17 s against the 0.87 s taken): the second grace
+/// ([`LateEndCheck::late`]) absorbs a shortfall like that.
 pub(crate) fn late_end_grace(rtt: Duration) -> Duration {
     ((rtt * 5 + Duration::from_millis(25)) * 7).max(LATE_END_GRACE_MIN)
 }
@@ -2641,7 +2644,9 @@ pub(crate) const LATE_END_MARGIN_MIN: u64 = 64 * 1024;
 /// `ahead` (set here). quinn shares the link round-robin, so
 /// by then the end's last packet had been sent; an honest peer's QUIC stack
 /// acknowledges it like every other packet, within [`late_end_grace`] even
-/// when a copy is lost. Late once the grace has passed since `crossed`.
+/// when a copy is lost. True once the grace has passed since `crossed`; that
+/// makes the end a candidate only ([`LateEndCheck::late`] also needs the
+/// peer shown alive and a second grace).
 pub(crate) fn late_end_verdict(
     crossed: &mut Option<u64>,
     ahead: u64,
@@ -2660,7 +2665,10 @@ pub(crate) fn late_end_verdict(
 /// Judges whether a sent stream's end is late (#6205): the peer has wholly
 /// acknowledged enough data-stream bytes since the end to have carried its
 /// last packet,
-/// and the end is still unacknowledged past the grace ([`late_end_verdict`]).
+/// and the end is still unacknowledged past the grace ([`late_end_verdict`]):
+/// then only a candidate, which is late once the connection has acknowledged
+/// more data streams since (the peer is alive), is still acknowledging, and
+/// the end is still unacknowledged a second grace after that first growth.
 /// A late end is counted (`quic_late_end_<label>`) and the send waits on as
 /// before: the stream is not reset. Nothing is judged while the egress cap
 /// holds a transmit (the proof restarts), after a poll more than
@@ -2700,7 +2708,7 @@ impl LateEndCheck {
         // Past the grace the end is a candidate; it counts only once the peer
         // is shown alive and the end is still unacknowledged a grace after
         // that: (acknowledged bytes at the candidate, when they first grew).
-        let mut candidate: Option<(u64, Option<u64>)> = None;
+        let mut candidate: Option<Candidate> = None;
         let mut last = (self.now)();
         let mut previous_cap = self.cap.read();
         let mut hold_unchanged_since = None;
@@ -2748,21 +2756,42 @@ impl LateEndCheck {
             // than at the grace, then give the end another grace, so that a
             // path coming out of an outage has its probes' acknowledgement
             // first.
-            match &mut candidate {
-                None => candidate = Some((reading.acked_since_end, None)),
-                Some((acked, alive_at @ None)) => {
-                    if reading.acked_since_end > *acked {
-                        *alive_at = Some(now);
-                    }
-                }
-                Some((_, Some(alive_at))) => {
-                    if now.saturating_sub(*alive_at) >= nanos(late_end_grace((self.rtt)())) {
-                        return;
-                    }
-                }
+            let grace = nanos(late_end_grace((self.rtt)()));
+            let c = candidate.get_or_insert(Candidate {
+                acked: reading.acked_since_end,
+                alive_at: None,
+                grew_at: now,
+            });
+            if reading.acked_since_end > c.acked {
+                c.acked = reading.acked_since_end;
+                c.alive_at.get_or_insert(now);
+                c.grew_at = now;
+            }
+            // Late only if the peer was shown alive a grace ago AND is still
+            // growing: the latest growth is after that first one and within
+            // the last half grace (two ticks at least), so an outage that
+            // began after the first growth cannot run the second grace out.
+            let recent = (grace / 2).max(nanos(recycle::ACK_WATCH_TICK) * 2);
+            if c.alive_at.is_some_and(|alive| {
+                now.saturating_sub(alive) >= grace
+                    && c.grew_at > alive
+                    && now.saturating_sub(c.grew_at) <= recent
+            }) {
+                return;
             }
         }
     }
+}
+
+/// Where a late-end check stands once an end is past its grace
+/// ([`LateEndCheck::late`]).
+struct Candidate {
+    /// Acknowledged data-stream bytes since the end, at the latest growth.
+    acked: u64,
+    /// When the connection first acknowledged more than at the candidate.
+    alive_at: Option<u64>,
+    /// When it last did.
+    grew_at: u64,
 }
 
 /// The backlog ahead of a stream's end ([`QuicPath::backlog_wait`]): how long

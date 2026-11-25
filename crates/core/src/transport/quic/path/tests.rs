@@ -1949,16 +1949,29 @@ fn the_late_end_check_polls_until_the_end_is_late() {
 
             // A long dark episode since the end: never late.
             let dark_at = Arc::new(AtomicU64::new(0));
+            // The peer keeps acknowledging (the acknowledged bytes grow), so
+            // only the dark mark can excuse the end.
+            let alive = Arc::new(AtomicU64::new(proof));
             let check = make(
-                Arc::new(AtomicU64::new(proof)),
+                alive.clone(),
                 Arc::new(CapHolds::new(None)),
                 dark_at.clone(),
             );
+            let feeder = {
+                let clock = clock.clone();
+                tokio::spawn(async move {
+                    loop {
+                        clock.sleep(Duration::from_secs(1)).await;
+                        alive.fetch_add(1024, Relaxed);
+                    }
+                })
+            };
             dark_at.store(clock.now_nanos() + 1, Relaxed);
             let excused = tokio::select! {
                 () = check.late(s2.clone()) => false,
                 () = clock.sleep(Duration::from_secs(120)) => true,
             };
+            feeder.abort();
             (plain, excused)
         })
         .await;
@@ -2056,20 +2069,23 @@ fn an_outage_after_the_proof_point_is_not_a_late_end() {
     })
 }
 
-/// A jittery, lossy path at a mid round trip, on a native path (where the
-/// late-end rule closes): 12% loss and a one-way delay of 60 to 140 ms drawn
-/// per datagram (a 120 to 280 ms round trip, where a probe timeout can pass
-/// three round trips and the 2 s grace floor does not apply), 60 streams of
-/// 64 KiB with at most 12 in flight, over several seeds. Every send ends
-/// `Sent`, the path is not closed, and no end is late. It does not show that
-/// the check was exercised: an end reaches the proof point only when the
-/// connection wholly acknowledged more later data than the bytes ahead of it
-/// while the end itself was unacknowledged, which honest traffic with sends in
-/// flight seldom does (`quic_late_end_judged_*` counts it in the field). The
-/// grace on such a path is pinned by its derivation
-/// (`a_late_end_needs_the_bytes_ahead_acknowledged_and_the_grace`).
+/// A no-false-positive smoke test, not evidence for the grace: a lossy,
+/// jittery native path (where the late-end rule closes), 12% loss and a
+/// one-way delay of 60 to 140 ms drawn per datagram (a 120 to 280 ms round
+/// trip), with a small Short then three 64 KiB streams, 20 times, over 8
+/// loss patterns (the seeds vary only the loss sequence; the protocol's own
+/// randomness is one fixed seed). Every stream is `Sent`, the path stays
+/// open and no end is late. It does NOT show that the check was exercised:
+/// in this traffic no end reached the proof point (0 ends judged, printed),
+/// because loss recovery (fast retransmit after the later packets are
+/// acknowledged) completes a lost Short's acknowledgement before 64 KiB of
+/// later streams do. No test here reaches the proof point on an honest path,
+/// so the grace formula is pinned only by its derivation and by
+/// `a_late_end_needs_the_bytes_ahead_acknowledged_and_the_grace`;
+/// `quic_late_end_judged_*` will say how often honest ends are judged in the
+/// field.
 #[test]
-fn a_jittery_lossy_path_at_a_mid_round_trip_stays_open_on_a_native_path() {
+fn a_jittery_lossy_native_path_is_not_closed_smoke_test() {
     use crate::transport::in_memory_socket::{
         PacketDeliveryDecision, set_packet_delivery_callback,
     };
@@ -2091,13 +2107,19 @@ fn a_jittery_lossy_path_at_a_mid_round_trip_stays_open_on_a_native_path() {
                 counters: Some(counters),
                 ..QuicPathLimits::DEFAULT
             };
+            // A budget each, so a Short holds a send epoch and its wait goes
+            // on in the background (`Outgoing`'s drop).
+            let windows = Windows {
+                a: Some(test_budget(64 << 20, leaked_counters())),
+                b: Some(test_budget(64 << 20, leaked_counters())),
+            };
             let mut p = paths_built(
                 network,
                 limits,
                 QuicPathLimits::NATIVE,
                 None,
                 None,
-                Windows::default(),
+                windows,
                 true,
             )
             .await;
@@ -2122,42 +2144,51 @@ fn a_jittery_lossy_path_at_a_mid_round_trip_stays_open_on_a_native_path() {
             );
             let mut streams =
                 std::mem::replace(&mut p.b_in.streams, tokio::sync::mpsc::channel(1).1);
+            let mut shorts = std::mem::replace(&mut p.b_in.shorts, tokio::sync::mpsc::channel(1).1);
             let drain = tokio::spawn(async move {
                 let mut kept = Vec::new();
-                while let Some(stream) = streams.recv().await {
-                    kept.push(stream);
+                loop {
+                    tokio::select! {
+                        Some(stream) = streams.recv() => kept.push(stream),
+                        Some(short) = shorts.recv() => drop(short),
+                        else => break,
+                    }
                 }
             });
             let (a, time) = (p.a.clone(), p.time());
             let outcomes = p
                 .drive(async move {
-                    // 60 streams, at most 12 in flight (the peer first allows
-                    // 16), so each end has more later data than the window
-                    // to be judged against.
-                    let slots = Arc::new(tokio::sync::Semaphore::new(12));
-                    let mut sends = Vec::new();
-                    for _ in 0..60 {
-                        let slot = slots.clone().acquire_owned().await.expect("open");
-                        let (path, clock) = (a.clone(), time.clone());
-                        sends.push(tokio::spawn(async move {
+                    // 20 rounds of one small Short, then three 64 KiB streams
+                    // one after the other. A lost Short waits on a probe timeout
+                    // while the streams behind it complete, so its end can reach
+                    // the proof point on an honest path.
+                    let mut outcomes = Vec::new();
+                    for _ in 0..20 {
+                        let short = payload(100);
+                        a.send_short_bounded(
+                            &time,
+                            SendDeadlines {
+                                open: Duration::from_secs(30),
+                                gap: Some(Duration::from_secs(30)),
+                                ..SendDeadlines::short(100)
+                            },
+                            &short[..],
+                        )
+                        .await;
+                        for _ in 0..3 {
                             let len = 64 * 1024;
-                            let sent = path
-                                .send_stream_bounded(
-                                    &clock,
-                                    path.stream_deadlines(len as u64),
+                            outcomes.push(
+                                a.send_stream_bounded(
+                                    &time,
+                                    a.stream_deadlines(len as u64),
                                     StreamId::next(),
                                     None,
                                     Bytes::from(payload(len)),
                                     None,
                                 )
-                                .await;
-                            drop(slot);
-                            sent
-                        }));
-                    }
-                    let mut outcomes = Vec::new();
-                    for send in sends {
-                        outcomes.push(send.await.expect("the send task ran"));
+                                .await,
+                            );
+                        }
                     }
                     time.sleep(Duration::from_secs(60)).await;
                     outcomes
@@ -2177,12 +2208,192 @@ fn a_jittery_lossy_path_at_a_mid_round_trip_stays_open_on_a_native_path() {
             assert!(recycle::stalls_to(p.pair.b_addr).is_empty(), "seed {seed}");
             judged += counters.snapshot(false).late_end_judged.iter().sum::<u64>();
         }
-        // Informational: an end reaches the proof point only when more than
-        // the bytes ahead of it (every send in flight, at their rest) were
-        // wholly acknowledged while it was not, which on an honest path with
-        // sends in flight is rare, so this guards the rule's false positives
-        // without proving that the check was exercised.
         eprintln!("jittery lossy native path: {judged} ends reached the proof point");
+    })
+}
+
+/// End to end on a native pair: three real late-end checks (`LateEndCheck`
+/// with a scripted acknowledgement record of a live peer, driven through
+/// `late_end_watch` into the path's `Writers` and the node counters), whose
+/// ends are never acknowledged, spawned 70 s apart, are three episodes: each
+/// is judged (`quic_late_end_judged_stream`), counted late
+/// (`quic_late_end_stream`), and the third closes the path under `late_ends`.
+/// The peer here is a script, not a real peer withholding ends (the harness
+/// cannot make one), so this is the wiring from the check to the close.
+#[test]
+fn late_end_checks_three_episodes_apart_close_a_native_path() {
+    use super::super::socket::CapHolds;
+    use crate::transport::metrics::AckWaitKind;
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let counters = leaked_counters();
+        let limits = QuicPathLimits {
+            counters: Some(counters),
+            ..QuicPathLimits::DEFAULT
+        };
+        let p = paths_built(
+            "quic-path-late-check-native",
+            limits,
+            QuicPathLimits::NATIVE,
+            None,
+            None,
+            Windows::default(),
+            true,
+        )
+        .await;
+        let b_addr = p.pair.b_addr;
+        let (a, time) = (p.a.clone(), p.time());
+        let writers = a.writers.clone();
+        let sleeper: Sleeper = {
+            let time = time.clone();
+            Arc::new(move |duration| time.sleep_cancelable(duration))
+        };
+        let closed_at = p
+            .drive(async move {
+                let mut watches = Vec::new();
+                let mut closed = None;
+                for i in 1..=3u32 {
+                    let acked = Arc::new(AtomicU64::new(128 * 1024));
+                    let check = {
+                        let (acked, clock, judged) = (acked.clone(), time.clone(), counters);
+                        LateEndCheck {
+                            reading: Arc::new(move || LaterReading {
+                                in_flight: 1,
+                                rest: 64 * 1024,
+                                started: 0,
+                                started_bytes: 0,
+                                acked_since_end: acked.load(Relaxed),
+                                window_at_end: 64 * 1024,
+                            }),
+                            rtt: Arc::new(|| Duration::from_millis(50)),
+                            now: {
+                                let clock = clock.clone();
+                                Arc::new(move || clock.now_nanos())
+                            },
+                            cap: Arc::new(CapHolds::new(None)),
+                            dark_at: Arc::default(),
+                            end_at: clock.now_nanos().max(1),
+                            counted: Arc::default(),
+                            judged: Arc::default(),
+                            on_judged: Some(Arc::new(move || {
+                                judged.record_late_end_judged(AckWaitKind::Stream);
+                            })),
+                        }
+                    };
+                    // A live peer: it acknowledges more every second.
+                    let feeder = {
+                        let clock = time.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                clock.sleep(Duration::from_secs(1)).await;
+                                acked.fetch_add(1024, Relaxed);
+                            }
+                        })
+                    };
+                    watches.push(feeder);
+                    watches.push(tokio::spawn(late_end_watch(
+                        Some(check),
+                        Some(sleeper.clone()),
+                        Some(writers.clone()),
+                        Some(counters),
+                        AckWaitKind::Stream,
+                    )));
+                    time.sleep(Duration::from_secs(70)).await;
+                    if i < 3 {
+                        assert!(
+                            a.connection().inner().close_reason().is_none(),
+                            "{i} episodes do not close"
+                        );
+                    } else if a.connection().inner().close_reason().is_some() {
+                        closed = Some(i);
+                    }
+                }
+                for task in watches {
+                    task.abort();
+                }
+                closed
+            })
+            .await;
+        assert_eq!(closed_at, Some(3));
+        let snapshot = counters.snapshot(false);
+        assert_eq!(snapshot.late_end_judged, vec![3, 0, 0]);
+        assert_eq!(snapshot.late_end, vec![3, 0, 0]);
+        assert_eq!(snapshot.stall_closes, vec![0, 0, 0, 0, 0, 1]);
+        assert_eq!(recycle::stalls_to(b_addr), vec![recycle::Stall::LateEnds]);
+    })
+}
+
+/// Liveness is rechecked at the end of the second grace: an outage that
+/// begins after the connection first acknowledged more (after the candidate
+/// was shown alive) lets the second grace run out, and must not count the
+/// end. The acknowledged bytes grow until 16 s, then stop for good: the check
+/// never returns. The same check, with the growth continuing, returns.
+#[test]
+fn an_outage_after_the_liveness_proof_is_not_a_late_end() {
+    use super::super::socket::CapHolds;
+    use std::sync::atomic::Ordering::Relaxed;
+    bounded(|| async move {
+        let time = VirtualTime::new();
+        let clock = time.clone();
+        let sleeper: Sleeper = {
+            let time = time.clone();
+            Arc::new(move |duration| time.sleep_cancelable(duration))
+        };
+        let results = drive(&time, LIMIT, async move {
+            let mut results = Vec::new();
+            for outage in [true, false] {
+                let acked = Arc::new(AtomicU64::new(128 * 1024));
+                let check = {
+                    let (acked, clock, now_clock) = (acked.clone(), clock.clone(), clock.clone());
+                    LateEndCheck {
+                        reading: Arc::new(move || LaterReading {
+                            in_flight: 1,
+                            rest: 64 * 1024,
+                            started: 0,
+                            started_bytes: 0,
+                            acked_since_end: acked.load(Relaxed),
+                            window_at_end: 64 * 1024,
+                        }),
+                        rtt: Arc::new(|| Duration::from_millis(50)),
+                        now: Arc::new(move || now_clock.now_nanos()),
+                        cap: Arc::new(CapHolds::new(None)),
+                        dark_at: Arc::default(),
+                        end_at: clock.now_nanos().max(1),
+                        counted: Arc::default(),
+                        judged: Arc::default(),
+                        on_judged: None,
+                    }
+                };
+                let start = clock.now();
+                let feeder = {
+                    let (acked, clock) = (acked.clone(), clock.clone());
+                    tokio::spawn(async move {
+                        // Proof point at the first tick; candidate at 2 s;
+                        // first growth seen at 4 s; the outage from 5 s on.
+                        for second in 1..u64::MAX {
+                            clock.sleep(Duration::from_secs(1)).await;
+                            if !outage || second <= 5 {
+                                acked.fetch_add(1024, Relaxed);
+                            }
+                        }
+                    })
+                };
+                let finished = tokio::select! {
+                    () = check.late(sleeper.clone()) => Some(clock.now() - start),
+                    () = clock.sleep(Duration::from_secs(100)) => None,
+                };
+                feeder.abort();
+                results.push(finished);
+            }
+            results
+        })
+        .await;
+        assert_eq!(
+            results[0], None,
+            "outage after the liveness proof: not late"
+        );
+        assert!(results[1].is_some(), "a live peer: late");
     })
 }
 
@@ -2511,6 +2722,25 @@ fn the_late_end_rule_is_read_by_the_watch_and_documented() {
             "{doc} names the retired constant"
         );
     }
+    // The episode gap and the grace, as the documents state them
+    // (`LATE_END_EPISODE_GAP` is 60 s, the grace seven probe timeouts).
+    for (doc, needles) in [
+        (
+            "docs/architecture/transport/rules-reference.md",
+            &["LATE_END_EPISODE_GAP", "60 s", "seven probe timeouts"][..],
+        ),
+        (".claude/rules/transport.md", &["60 s"][..]),
+        (
+            "crates/core/src/transport/metrics/quic_data.rs",
+            &["LATE_END_EPISODE_GAP"][..],
+        ),
+    ] {
+        let text = std::fs::read_to_string(format!("{root}/{doc}")).expect("a document");
+        for needle in needles {
+            assert!(text.contains(needle), "{doc} states {needle}");
+        }
+    }
+    assert_eq!(recycle::LATE_END_EPISODE_GAP, Duration::from_secs(60));
 }
 
 /// The late-end check is polled wherever a sent end waits for its

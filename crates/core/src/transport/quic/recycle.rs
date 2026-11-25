@@ -1435,9 +1435,11 @@ impl AckWatch {
     /// The same for late ends ([`Stall::LateEnds`]), in a window of their
     /// own and counting EPISODES, not ends: late ends seen within
     /// [`LATE_END_EPISODE_GAP`] of the last counted one are the same
-    /// episode and add nothing. One loss burst or outage onset can leave
-    /// many sends' ends late at once (up to 48 permits and 64 Shorts wait),
-    /// and that is one piece of evidence, not three.
+    /// episode and add nothing. One loss burst or outage onset that lasts
+    /// less than that can leave many sends' ends late at once (up to 48
+    /// permits and 64 Shorts wait), and that is one piece of evidence, not
+    /// three; a spell of lateness that lasts two minutes or more counts
+    /// three.
     fn late_ends_reached(&mut self, now_nanos: u64, late: u64) -> bool {
         let new = late.saturating_sub(self.late_seen);
         self.late_seen = late;
@@ -1972,6 +1974,19 @@ pub(crate) const ACK_WAITS_EXPIRED_CLOSES_WITH_UDP: bool = false;
 /// stream's end just before its wait runs out would otherwise hold the
 /// path's stream permits and send epochs with nothing to fall back to
 /// (#6205).
+///
+/// What this covers is traffic-conditional. An end is judged only once the
+/// connection has wholly acknowledged more later data streams than the bytes
+/// ahead of it (every send in flight times what it had left, at most the send
+/// window each, plus the congestion window). With all 48 stream permits held
+/// by ends the peer withholds, no new permit stream starts, so only
+/// one-packet Shorts can advance that, and with large streams in flight
+/// the proof point is out of reach. A peer that acknowledges Shorts
+/// promptly and holds large-stream ends until just before their ack wait
+/// (at least 5 min) runs out is caught by neither this rule nor the
+/// ack-wait rule. It holds each permit for that wait, so the path streams at
+/// most 48 sends per wait, about one per 6 s at the 5 min minimum wait: the
+/// residual of #6205, not closed here.
 pub(crate) const LATE_ENDS_CLOSES_WITH_UDP: bool = false;
 
 /// Ack-wait expiries within [`ACK_WAIT_EXPIRY_WINDOW`] that close a path with
@@ -1990,9 +2005,10 @@ pub(crate) const ACK_WAIT_EXPIRY_LIMIT: u32 = 3;
 /// leave many ends late together, and a path that closes needs
 /// [`ACK_WAIT_EXPIRY_LIMIT`] separate episodes, so at least twice this long
 /// in all. A design choice, not a measurement: long enough that one event
-/// (an outage the dark rule has not yet excused, a loss burst) is one
-/// episode, short enough that a peer withholding every end is closed within
-/// minutes.
+/// under that long (an outage the dark rule has not yet excused, a loss
+/// burst) is one episode, short enough that a peer withholding every end is
+/// closed within minutes. An event of two minutes or more counts as
+/// separate episodes.
 pub(crate) const LATE_END_EPISODE_GAP: Duration = Duration::from_secs(60);
 
 /// The window [`ACK_WAIT_EXPIRY_LIMIT`] expiries must fall in.
