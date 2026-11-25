@@ -229,7 +229,8 @@ impl NodeProcess {
             .env_remove("FREENET_TEST_FATAL_EXIT_CHECK_PANICS")
             .env_remove("FREENET_TEST_FATAL_EXIT_CHECK_TIMEOUT_SECS")
             .env_remove("FREENET_TEST_STARTUP_UPDATE_JITTER_SECS")
-            .env_remove("FREENET_SYSTEMD_FAST_CRASH");
+            .env_remove("FREENET_SYSTEMD_FAST_CRASH")
+            .env_remove("XDG_STATE_HOME");
         command.envs(env.iter().copied());
         let child = command.spawn()?;
         Ok(Self {
@@ -1699,8 +1700,8 @@ fn assert_update_check_ran_before_exit(logs: &str, exit_marker: &str) {
     // The log directory holds an error-only file beside the main one, so the
     // concatenation is not in time order: compare the lines' own timestamps.
     let (done, exit) = (
-        log_secs(logs, FATAL_CHECK_DONE_MARKER),
-        log_secs(logs, exit_marker),
+        log_time(logs, FATAL_CHECK_DONE_MARKER),
+        log_time(logs, exit_marker),
     );
     assert!(
         done.zip(exit).is_some_and(|(done, exit)| done <= exit),
@@ -1905,11 +1906,11 @@ fn with_no_udp_a_check_that_hangs_is_dropped_at_its_bound() -> anyhow::Result<()
     assert_eq!(status.code(), Some(42), "Logs:\n{logs}");
     assert!(logs.contains("outcome=TimedOut"), "Logs:\n{logs}");
     // Measured from the log line that starts the check, not from the spawn.
-    let held = log_secs(&logs, FATAL_CHECK_START_MARKER)
-        .zip(log_secs(&logs, FATAL_CHECK_DONE_MARKER))
+    let held = log_time(&logs, FATAL_CHECK_START_MARKER)
+        .zip(log_time(&logs, FATAL_CHECK_DONE_MARKER))
         .map(|(start, done)| done - start);
     assert!(
-        held.is_some_and(|held| held >= 1.9),
+        held.is_some_and(|held| held >= chrono::Duration::milliseconds(1900)),
         "the check was not held for its 2 s bound ({held:?}). Logs:\n{logs}"
     );
     Ok(())
@@ -2000,17 +2001,16 @@ fn with_no_udp_an_unsupervised_bind_failure_exits_at_once_with_advice() -> anyho
     Ok(())
 }
 
-/// The seconds-of-day of the first log line containing `marker`, from its
-/// leading `YYYY-MM-DDTHH:MM:SS.ffffffZ` timestamp.
+/// The time of the first log line containing `marker`, from its leading
+/// `YYYY-MM-DDTHH:MM:SS.ffffffZ` timestamp, as a full date and time so a span
+/// across UTC midnight still compares and subtracts correctly.
 #[cfg(feature = "testing")]
-fn log_secs(logs: &str, marker: &str) -> Option<f64> {
+fn log_time(logs: &str, marker: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     let line = logs.lines().find(|line| line.contains(marker))?;
-    let time = line.split_whitespace().next()?.split('T').nth(1)?;
-    let mut parts = time.trim_end_matches('Z').split(':');
-    let hours: f64 = parts.next()?.parse().ok()?;
-    let minutes: f64 = parts.next()?.parse().ok()?;
-    let seconds: f64 = parts.next()?.parse().ok()?;
-    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+    let stamp = line.split_whitespace().next()?;
+    chrono::DateTime::parse_from_rfc3339(stamp)
+        .ok()
+        .map(|time| time.with_timezone(&chrono::Utc))
 }
 
 /// A supervised unit that advertises the fast-crash exit code gets 45 from a

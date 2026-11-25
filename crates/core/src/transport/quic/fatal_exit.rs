@@ -82,6 +82,9 @@ pub(crate) async fn run_check(
     let Some(check) = check else {
         return CheckOutcome::NotRegistered;
     };
+    // `tokio::time::timeout`, not a `TimeSource`: the exit is process-level
+    // and real-time (the service manager's stop timeout is wall-clock), and
+    // only the binary registers a check, so simulated time never applies.
     use futures::FutureExt;
     let guarded = std::panic::AssertUnwindSafe(async { check().await }).catch_unwind();
     match tokio::time::timeout(timeout, guarded).await {

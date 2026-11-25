@@ -274,12 +274,6 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
     // is built, because only this binary marks its clean exits (see `main`).
     freenet::enable_quic_crash_breaker();
 
-    // #5940: a gateway exits through the fatal listener path, for its
-    // supervisor to restart it, when that restores QUIC: its QUIC endpoint
-    // died, or a crash-breaker cooldown that kept QUIC off for the run ended.
-    // Only under our own unit's marker: a gateway started by hand, or by a
-    // systemd unit that may not restart it, would stay down, so it keeps
-    // running over UDP instead. Peers never exit for this.
     // Before the node is built: a failed bind exits from inside `build`, and its
     // exit code reads this opt-in (`exit_for_quic_bind_failure`).
     // #4551: only emit the distinct fast-crash exit code (45) for a sub-60s fatal
@@ -294,6 +288,12 @@ async fn run_network(config: Config) -> anyhow::Result<()> {
         freenet::enable_fast_crash_exit_code();
     }
 
+    // #5940: a gateway exits through the fatal listener path, for its
+    // supervisor to restart it, when that restores QUIC: its QUIC endpoint
+    // died, or a crash-breaker cooldown that kept QUIC off for the run ended.
+    // Only under our own unit's marker: a gateway started by hand, or by a
+    // systemd unit that may not restart it, would stay down, so it keeps
+    // running over UDP instead. Peers never exit for this.
     match gateway_quic_restarts(commands::auto_update::supervisor_status()) {
         GatewayQuicRestarts::Enabled => freenet::enable_gateway_quic_restarts(),
         GatewayQuicRestarts::OffUnverified => freenet::note_gateway_supervisor_unverified(),
@@ -1403,8 +1403,10 @@ fn fatal_exit_update_check()
 /// yet or any more at that point, and a stop that waits out the check can run
 /// into the service manager's stop timeout.
 ///
-/// The listener is installed when this is called, not when the future is first
-/// polled, so a stop that arrives as the check starts is not missed.
+/// The SIGTERM listener is installed when this is called, not when the future
+/// is first polled, so a SIGTERM that arrives as the check starts is not
+/// missed. Ctrl+C's handler is installed on the first poll, which the caller's
+/// `select!` makes at once, before the check's own steps run.
 fn stop_signal() -> impl std::future::Future<Output = ()> {
     use tokio::signal;
     #[cfg(unix)]
