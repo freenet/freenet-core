@@ -21077,11 +21077,17 @@ struct QuicSimTrace {
     /// (`SimNetwork::probe_quic_endpoints_at`): `["not_allowed"]` when the
     /// node had a live QUIC endpoint, `["no_ingress"]` when it had none.
     endpoint_probe: Vec<(SocketAddr, Vec<&'static str>)>,
+    /// The gateways' addresses: with native admission on in production, a
+    /// gateway's endpoint takes a stranger's datagram into the admission
+    /// queue (`"forwarded"`) where every other node refuses it.
+    gateway_addrs: Vec<SocketAddr>,
 }
 
 impl QuicSimTrace {
     /// Asserts the probe covered all `QUIC_HARNESS_NODES` and every one
-    /// answered it with `expected`.
+    /// answered it with `expected`; a gateway, which admits native joins
+    /// from unknown sources, answers `"forwarded"` instead when `expected`
+    /// is `"not_allowed"` (a live endpoint).
     fn assert_probe(&self, expected: &str) {
         assert_eq!(
             self.endpoint_probe.len(),
@@ -21089,7 +21095,12 @@ impl QuicSimTrace {
             "the probe covered every node"
         );
         for (node, outcomes) in &self.endpoint_probe {
-            assert_eq!(outcomes.as_slice(), [expected], "probe of {node}");
+            let want = if expected == "not_allowed" && self.gateway_addrs.contains(node) {
+                "forwarded"
+            } else {
+                expected
+            };
+            assert_eq!(outcomes.as_slice(), [want], "probe of {node}");
         }
     }
 }
@@ -21103,12 +21114,18 @@ const QUIC_HARNESS_NODES: usize = 6;
 fn run_quic_harness_sim(name: &str, seed: u64, quic: Option<&str>) -> QuicSimTrace {
     setup_deterministic_state(seed);
     let rt = create_runtime();
-    let (sim, logs_handle, probe) = rt.block_on(async {
+    let (sim, logs_handle, probe, gateway_addrs) = rt.block_on(async {
         let mut sim = SimNetwork::new(name, 2, 4, 10, 3, 10, 3, seed).await;
         sim.with_transport_quic(quic.unwrap_or("off"));
         let probe = sim.probe_quic_endpoints_at(Duration::from_secs(2));
+        let gateway_addrs: Vec<SocketAddr> = sim
+            .all_node_addresses()
+            .iter()
+            .filter(|(label, _)| label.is_gateway())
+            .map(|(_, addr)| *addr)
+            .collect();
         let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle, probe)
+        (sim, logs_handle, probe, gateway_addrs)
     });
     drop(rt);
     sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 6, 20, Duration::from_millis(200))
@@ -21144,6 +21161,7 @@ fn run_quic_harness_sim(name: &str, seed: u64, quic: Option<&str>) -> QuicSimTra
             event_sequence,
             event_keys,
             endpoint_probe: probe.outcomes(),
+            gateway_addrs,
         }
     })
 }

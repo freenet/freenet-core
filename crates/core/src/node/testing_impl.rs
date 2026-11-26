@@ -2899,14 +2899,16 @@ impl QuicEndpointProbe {
             .collect()
     }
 
-    /// Whether the probe covered at least one node and every node refused
-    /// it as `not_allowed`, i.e. had a live QUIC endpoint.
+    /// Whether the probe covered at least one node and every node had a live
+    /// QUIC endpoint: it refused the probe as `not_allowed`, or (a gateway,
+    /// which admits native joins from unknown sources) took it into the
+    /// admission queue as `forwarded`.
     pub fn every_node_has_a_live_endpoint(&self) -> bool {
         let outcomes = self.outcomes();
         !outcomes.is_empty()
-            && outcomes
-                .iter()
-                .all(|(_, labels)| labels.as_slice() == ["not_allowed"])
+            && outcomes.iter().all(|(_, labels)| {
+                labels.as_slice() == ["not_allowed"] || labels.as_slice() == ["forwarded"]
+            })
     }
 }
 
