@@ -13426,30 +13426,66 @@ mod route_attempt_driver_tests {
         let best_peer = by_addr(best);
 
         // A NotFound is an answer and a PUT is not a GET: neither marks the peer.
-        report(&best_peer, &id, AttemptFailure::NotFound, crate::node::network_status::OpType::Get);
-        report(&best_peer, &id, AttemptFailure::Timeout, crate::node::network_status::OpType::Put);
+        report(
+            &best_peer,
+            &id,
+            AttemptFailure::NotFound,
+            crate::node::network_status::OpType::Get,
+        );
+        report(
+            &best_peer,
+            &id,
+            AttemptFailure::Timeout,
+            crate::node::network_status::OpType::Put,
+        );
         assert_eq!(pick(&id, &[]), Some(best), "no GET timeout recorded yet");
 
         // A GET timeout does.
-        report(&best_peer, &id, AttemptFailure::Timeout, crate::node::network_status::OpType::Get);
-        assert_eq!(pick(&id, &[]), Some(alt), "the silent peer is routed around");
+        report(
+            &best_peer,
+            &id,
+            AttemptFailure::Timeout,
+            crate::node::network_status::OpType::Get,
+        );
+        assert_eq!(
+            pick(&id, &[]),
+            Some(alt),
+            "the silent peer is routed around"
+        );
 
         // It also survives alongside the retry loop's own first-hop exclusions.
-        assert_ne!(pick(&id, &[alt]), Some(best), "an exclusion on the alternative does not bring the silent peer back while a third exists or falls back safely");
+        assert_ne!(
+            pick(&id, &[alt]),
+            Some(best),
+            "an exclusion on the alternative does not bring the silent peer back while a third exists or falls back safely"
+        );
 
         // A message from the peer clears it.
         op_manager.ring.connection_manager.clear_silent_peer(best);
         assert_eq!(pick(&id, &[]), Some(best), "a peer that talked is alive");
 
         // The window expires.
-        report(&best_peer, &id, AttemptFailure::Timeout, crate::node::network_status::OpType::Get);
+        report(
+            &best_peer,
+            &id,
+            AttemptFailure::Timeout,
+            crate::node::network_status::OpType::Get,
+        );
         assert_eq!(pick(&id, &[]), Some(alt));
         tokio::time::advance(crate::ring::silent_peers::SILENT_PEER_WINDOW).await;
         assert_eq!(pick(&id, &[]), Some(best), "the record expired");
 
         // Connection removal clears it.
-        report(&best_peer, &id, AttemptFailure::Timeout, crate::node::network_status::OpType::Get);
-        op_manager.ring.connection_manager.prune_alive_connection(best);
+        report(
+            &best_peer,
+            &id,
+            AttemptFailure::Timeout,
+            crate::node::network_status::OpType::Get,
+        );
+        op_manager
+            .ring
+            .connection_manager
+            .prune_alive_connection(best);
         assert!(op_manager.ring.silent_get_peers().is_empty());
 
         // Never the last candidate: with every peer silent, the pick is the
@@ -13488,10 +13524,26 @@ mod route_attempt_driver_tests {
         use crate::ring::Location;
         let key = Location::new(0.5);
         let own = Some(Location::new(0.3));
-        assert!(is_strictly_closer_than_us(own, Some(Location::new(0.45)), key));
-        assert!(!is_strictly_closer_than_us(own, Some(Location::new(0.3)), key));
-        assert!(!is_strictly_closer_than_us(own, Some(Location::new(0.1)), key));
-        assert!(!is_strictly_closer_than_us(None, Some(Location::new(0.45)), key));
+        assert!(is_strictly_closer_than_us(
+            own,
+            Some(Location::new(0.45)),
+            key
+        ));
+        assert!(!is_strictly_closer_than_us(
+            own,
+            Some(Location::new(0.3)),
+            key
+        ));
+        assert!(!is_strictly_closer_than_us(
+            own,
+            Some(Location::new(0.1)),
+            key
+        ));
+        assert!(!is_strictly_closer_than_us(
+            None,
+            Some(Location::new(0.45)),
+            key
+        ));
         assert!(!is_strictly_closer_than_us(own, None, key));
     }
 

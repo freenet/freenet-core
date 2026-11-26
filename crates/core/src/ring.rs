@@ -4574,8 +4574,7 @@ impl Ring {
     /// Peers that recently did not answer a GET (see [`silent_peers`]), for
     /// GET next-hop and first-hop selection to route around when it can.
     pub(crate) fn silent_get_peers(&self) -> Vec<std::net::SocketAddr> {
-        self.connection_manager
-            .silent_peers(self.time_source.now())
+        self.connection_manager.silent_peers(self.time_source.now())
     }
 
     pub fn routing_finished(&self, event: crate::router::RouteEvent) {
