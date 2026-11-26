@@ -38,6 +38,18 @@ pub struct LiveTransactionTracker {
     /// leak, and tying cleanup to completion alone keeps the gauge race-free
     /// under concurrent rebinds.
     acquisition_txs: Arc<DashSet<Transaction>>,
+    /// SECOND relation: transactions this node is *awaiting a reply from* a
+    /// given peer (tx -> peer). Unlike `tx_per_peer`, which means "involving
+    /// this peer" and feeds the topology neighbour filter, this is written
+    /// only for request-class sends, never for replies or acks. A relay that
+    /// acks upstream while still waiting on its downstream peer must stay
+    /// bound to the downstream peer, because this is the relation a
+    /// disconnect uses to wake parked drivers (`prune_connection_transactions`).
+    /// Cleaned on completion (`remove_finished_transaction`) and on
+    /// connection removal, like the maps above.
+    awaiting_peer_for_tx: Arc<DashMap<Transaction, SocketAddr>>,
+    /// Reverse index of `awaiting_peer_for_tx` for O(1) per-peer pruning.
+    awaiting_by_peer: Arc<DashMap<SocketAddr, Vec<Transaction>>>,
 }
 
 impl LiveTransactionTracker {
@@ -61,7 +73,47 @@ impl LiveTransactionTracker {
         self.tx_per_peer.entry(peer_addr).or_default().push(tx);
     }
 
+    /// Record that `tx` now awaits a reply from `peer_addr` (request-class
+    /// sends only). Re-requesting the same tx from another peer MOVES the
+    /// binding, so a peer we no longer wait on cannot orphan it.
+    pub fn add_awaiting(&self, peer_addr: SocketAddr, tx: Transaction) {
+        let previous = self.awaiting_peer_for_tx.insert(tx, peer_addr);
+        if previous == Some(peer_addr) {
+            return;
+        }
+        if let Some(old) = previous {
+            self.awaiting_by_peer.remove_if_mut(&old, |_, v| {
+                v.retain(|otx| otx != &tx);
+                v.is_empty()
+            });
+        }
+        self.awaiting_by_peer.entry(peer_addr).or_default().push(tx);
+    }
+
+    /// Connection removal: clear BOTH relations for `peer_addr` and return the
+    /// transactions that were awaiting a reply from it, i.e. the ones whose
+    /// drivers must be woken.
+    pub(crate) fn prune_connection_transactions(&self, peer_addr: SocketAddr) -> Vec<Transaction> {
+        // The "involving" relation is cleared exactly as before; its result is
+        // not what orphans drivers.
+        let _involving = self.prune_transactions_from_peer(peer_addr);
+        let Some((_, txs)) = self.awaiting_by_peer.remove(&peer_addr) else {
+            return Vec::new();
+        };
+        for tx in &txs {
+            self.awaiting_peer_for_tx
+                .remove_if(tx, |_, addr| *addr == peer_addr);
+        }
+        txs
+    }
+
     pub fn remove_finished_transaction(&self, tx: Transaction) {
+        if let Some((_, peer_addr)) = self.awaiting_peer_for_tx.remove(&tx) {
+            self.awaiting_by_peer.remove_if_mut(&peer_addr, |_, v| {
+                v.retain(|otx| otx != &tx);
+                v.is_empty()
+            });
+        }
         // Clear the acquisition gauge in lockstep with the live-tx removal so a
         // completed acquisition frees its maintenance-throttle slot. No-op for
         // relayed CONNECTs (never registered as acquisitions).
@@ -87,6 +139,8 @@ impl LiveTransactionTracker {
             tx_per_peer: Arc::new(DashMap::default()),
             peer_for_tx: Arc::new(DashMap::default()),
             acquisition_txs: Arc::new(DashSet::default()),
+            awaiting_peer_for_tx: Arc::new(DashMap::default()),
+            awaiting_by_peer: Arc::new(DashMap::default()),
         }
     }
 
@@ -126,6 +180,12 @@ impl LiveTransactionTracker {
         self.tx_per_peer.len()
     }
 
+    /// Number of transactions currently awaiting a reply (second relation).
+    #[cfg(test)]
+    pub(crate) fn awaiting_count(&self) -> usize {
+        self.awaiting_peer_for_tx.len()
+    }
+
     /// Returns the total number of active transactions across all peers.
     #[cfg(test)]
     pub(crate) fn active_transaction_count(&self) -> usize {
@@ -154,6 +214,42 @@ mod tests {
     use crate::operations::connect::ConnectMsg;
     use crate::operations::get::GetMsg;
     use crate::operations::put::PutMsg;
+
+    #[test]
+    fn awaiting_relation_is_separate_and_cleaned_on_both_exits() {
+        let tracker = LiveTransactionTracker::new();
+        let up: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let down: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let tx = Transaction::new::<GetMsg>();
+        let tx2 = Transaction::new::<GetMsg>();
+
+        tracker.add_transaction(down, tx);
+        tracker.add_awaiting(down, tx);
+        tracker.add_awaiting(down, tx); // idempotent
+        tracker.add_transaction(up, tx); // involving rebind (reply)
+        // involving relation moved to `up`; awaiting stays on `down`.
+        assert!(tracker.has_live_connection(up));
+        assert_eq!(tracker.awaiting_count(), 1);
+        assert_eq!(
+            tracker.prune_connection_transactions(up),
+            Vec::<Transaction>::new()
+        );
+        assert_eq!(tracker.prune_connection_transactions(down), vec![tx]);
+        assert_eq!(tracker.awaiting_count(), 0);
+        assert!(tracker.awaiting_by_peer.is_empty());
+
+        // completion path
+        tracker.add_awaiting(up, tx2);
+        tracker.remove_finished_transaction(tx2);
+        assert_eq!(tracker.awaiting_count(), 0);
+        assert!(tracker.awaiting_by_peer.is_empty());
+
+        // re-request from another peer moves the binding
+        tracker.add_awaiting(up, tx2);
+        tracker.add_awaiting(down, tx2);
+        assert!(tracker.prune_connection_transactions(up).is_empty());
+        assert_eq!(tracker.prune_connection_transactions(down), vec![tx2]);
+    }
 
     #[test]
     fn active_transaction_count_empty() {

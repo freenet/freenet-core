@@ -1995,9 +1995,7 @@ impl OpManager {
                 .record_request(peer.clone(), target_loc, transaction.transaction_type());
         }
         if let Some(peer_addr) = peer.socket_addr() {
-            self.ring
-                .live_tx_tracker
-                .add_transaction(peer_addr, *transaction);
+            bind_outbound_transaction(&self.ring.live_tx_tracker, peer_addr, msg);
         }
     }
 
@@ -2459,6 +2457,25 @@ async fn release_pending_op_slot_on(
                  reclaimed by 60s sweep"
             );
         }
+    }
+}
+
+/// Record an outbound message in the live-transaction tracker.
+///
+/// Every send is recorded in the "involving this peer" relation (topology
+/// neighbour filter). Only a request-class send also records "awaiting a
+/// reply from this peer", the relation a disconnect uses to wake drivers: a
+/// reply or ack to the requester must not move it, because a relay that acks
+/// upstream is still waiting on its downstream peer.
+fn bind_outbound_transaction(
+    tracker: &LiveTransactionTracker,
+    peer_addr: SocketAddr,
+    msg: &NetMessage,
+) {
+    let tx = *msg.id();
+    tracker.add_transaction(peer_addr, tx);
+    if !msg.is_reply() && tx != *Transaction::NULL {
+        tracker.add_awaiting(peer_addr, tx);
     }
 }
 
@@ -3059,6 +3076,98 @@ mod tests {
     use crate::node::network_bridge::EventLoopNotificationsReceiver;
     use either::Either;
     use tokio::time::{Duration, Instant, timeout};
+
+    fn get_request(id: Transaction, n: u8) -> NetMessage {
+        NetMessage::V1(NetMessageV1::Get(crate::operations::get::GetMsg::Request {
+            id,
+            instance_id: freenet_stdlib::prelude::ContractInstanceId::new([n; 32]),
+            fetch_contract: false,
+            htl: 5,
+            visited: crate::operations::VisitedPeers::new(&id),
+            subscribe: false,
+        }))
+    }
+
+    fn get_forwarding_ack(id: Transaction, n: u8) -> NetMessage {
+        NetMessage::V1(NetMessageV1::Get(
+            crate::operations::get::GetMsg::ForwardingAck {
+                id,
+                instance_id: freenet_stdlib::prelude::ContractInstanceId::new([n; 32]),
+            },
+        ))
+    }
+
+    fn subscribe_forwarding_ack(id: Transaction, n: u8) -> NetMessage {
+        NetMessage::V1(NetMessageV1::Subscribe(
+            crate::operations::subscribe::SubscribeMsg::ForwardingAck {
+                id,
+                instance_id: freenet_stdlib::prelude::ContractInstanceId::new([n; 32]),
+            },
+        ))
+    }
+
+    /// A reply sent to the peer that asked must not make us look as if we
+    /// were awaiting a reply from it (the awaiting relation is what a
+    /// disconnect uses to wake parked drivers), yet the topology filter's
+    /// "involving" relation still sees the peer.
+    #[test]
+    fn reply_to_requester_is_involving_but_not_awaited() {
+        let tracker = LiveTransactionTracker::new();
+        let requester: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        let sub_tx = Transaction::new::<crate::operations::subscribe::SubscribeMsg>();
+
+        bind_outbound_transaction(&tracker, requester, &get_forwarding_ack(tx, 1));
+        bind_outbound_transaction(&tracker, requester, &subscribe_forwarding_ack(sub_tx, 1));
+
+        assert!(
+            tracker.has_live_connection(requester),
+            "topology filter behaviour must be unchanged"
+        );
+        assert_eq!(tracker.awaiting_count(), 0);
+        assert!(tracker.prune_connection_transactions(requester).is_empty());
+    }
+
+    /// Relay shape: request forwarded to the downstream peer, then a
+    /// ForwardingAck to the upstream peer while still waiting on downstream.
+    /// The downstream's disconnect must orphan the transaction promptly (the
+    /// driver is woken instead of waiting out its 60s TTL); the upstream's
+    /// must not.
+    #[test]
+    fn relay_ack_upstream_keeps_awaiting_on_downstream() {
+        let tracker = LiveTransactionTracker::new();
+        let upstream: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+        let downstream: SocketAddr = "127.0.0.1:9002".parse().unwrap();
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+
+        bind_outbound_transaction(&tracker, downstream, &get_request(tx, 1));
+        bind_outbound_transaction(&tracker, upstream, &get_forwarding_ack(tx, 1));
+
+        assert!(
+            tracker.prune_connection_transactions(upstream).is_empty(),
+            "upstream disconnect must not wake a driver waiting on downstream"
+        );
+        assert_eq!(
+            tracker.prune_connection_transactions(downstream),
+            vec![tx],
+            "downstream disconnect must orphan the awaiting transaction"
+        );
+        assert_eq!(tracker.awaiting_count(), 0);
+    }
+
+    /// Requests are awaited, and the NULL transaction (neighbour/interest
+    /// traffic) never is.
+    #[test]
+    fn request_is_awaited_and_null_tx_is_not() {
+        let tracker = LiveTransactionTracker::new();
+        let target: SocketAddr = "127.0.0.1:9003".parse().unwrap();
+        let tx = Transaction::new::<crate::operations::get::GetMsg>();
+        bind_outbound_transaction(&tracker, target, &get_request(tx, 2));
+        let ready = NetMessage::V1(NetMessageV1::ReadyState { ready: true });
+        bind_outbound_transaction(&tracker, target, &ready);
+        assert_eq!(tracker.awaiting_count(), 1);
+        assert_eq!(tracker.prune_connection_transactions(target), vec![tx]);
+    }
 
     /// ANT-2026-OZWLXLHH: `OpManager::completed` used to insert every finished
     /// transaction into a set that nothing read and nothing removed from (the

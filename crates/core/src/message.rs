@@ -1191,6 +1191,59 @@ impl Display for NodeEvent {
     }
 }
 
+impl NetMessage {
+    /// True for a message that answers a request this node received (a
+    /// `Response`, an ack or a rejection), as opposed to one that asks the
+    /// target for something.
+    ///
+    /// The live-transaction tracker records which peer a transaction is
+    /// *awaiting a reply from*. Sending a reply to the requester must not
+    /// rebind the transaction to the requester: a relay that sends a
+    /// `ForwardingAck` upstream is still waiting on its downstream peer, and
+    /// rebinding would make the downstream's disconnect wake nothing while
+    /// the upstream's disconnect woke a driver that was not waiting on it.
+    pub(crate) fn is_reply(&self) -> bool {
+        use crate::operations::connect::ConnectMsg;
+        use crate::operations::get::GetMsg;
+        use crate::operations::put::PutMsg;
+        use crate::operations::subscribe::SubscribeMsg;
+        let NetMessage::V1(msg) = self;
+        match msg {
+            NetMessageV1::Get(m) => matches!(
+                m,
+                GetMsg::Response { .. }
+                    | GetMsg::ResponseStreaming { .. }
+                    | GetMsg::ResponseStreamingAck { .. }
+                    | GetMsg::ForwardingAck { .. }
+            ),
+            NetMessageV1::Put(m) => matches!(
+                m,
+                PutMsg::Response { .. }
+                    | PutMsg::ResponseStreaming { .. }
+                    | PutMsg::ForwardingAck { .. }
+                    | PutMsg::Error { .. }
+                    | PutMsg::ProbeResponse { .. }
+            ),
+            NetMessageV1::Subscribe(m) => matches!(
+                m,
+                SubscribeMsg::Response { .. } | SubscribeMsg::ForwardingAck { .. }
+            ),
+            NetMessageV1::Connect(m) => matches!(
+                m,
+                ConnectMsg::Response { .. }
+                    | ConnectMsg::ObservedAddress { .. }
+                    | ConnectMsg::Rejected { .. }
+            ),
+            NetMessageV1::Update(_)
+            | NetMessageV1::Aborted(_)
+            | NetMessageV1::NeighborHosting { .. }
+            | NetMessageV1::InterestSync { .. }
+            | NetMessageV1::ReadyState { .. }
+            | NetMessageV1::SubscribeHint(_) => false,
+        }
+    }
+}
+
 impl MessageStats for NetMessage {
     fn id(&self) -> &Transaction {
         match self {

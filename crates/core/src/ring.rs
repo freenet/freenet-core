@@ -6213,7 +6213,7 @@ impl Ring {
         self.connection_manager.drop_transient(peer.socket_addr());
         let orphaned_transactions = self
             .live_tx_tracker
-            .prune_transactions_from_peer(peer.socket_addr());
+            .prune_connection_transactions(peer.socket_addr());
 
         if !orphaned_transactions.is_empty() {
             tracing::debug!(
