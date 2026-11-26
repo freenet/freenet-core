@@ -396,9 +396,13 @@ impl StaleLinkSweep {
 
     /// The timer deadline for the next tick, for the event loop's wake-up.
     /// `None` while the sweep is inactive, so a node without it runs the same
-    /// event loop as before the sweep.
-    pub(super) fn deadline(&self) -> Option<Instant> {
-        self.active.then_some(self.next_due)
+    /// event loop as before the sweep, and while no transaction is in flight:
+    /// with nothing awaiting a reply there is nothing to judge, and an armed
+    /// timer on an idle node keeps a simulation from skipping ahead (a
+    /// 63-node run was 5 to 8 times slower with it armed). The first event
+    /// after an idle spell finds the tick due and runs it at once.
+    pub(super) fn deadline(&self, any_in_flight: bool) -> Option<Instant> {
+        (self.active && any_in_flight).then_some(self.next_due)
     }
 
     /// Whether a tick is due at `now`.
@@ -800,9 +804,13 @@ mod tests {
         assert!(sweep.due(c.now()));
         sweep.tick(c.now(), &[]);
         assert!(!sweep.due(c.now()));
-        assert_eq!(sweep.deadline(), Some(c.now() + STALE_LINK_SWEEP_INTERVAL));
+        assert_eq!(
+            sweep.deadline(true),
+            Some(c.now() + STALE_LINK_SWEEP_INTERVAL)
+        );
+        assert_eq!(sweep.deadline(false), None, "no timer while idle");
         let off = StaleLinkSweep::new(c.now(), false);
-        assert_eq!(off.deadline(), None);
+        assert_eq!(off.deadline(true), None);
         c.advance_time(STALE_LINK_SWEEP_INTERVAL * 10);
         assert!(!off.due(c.now()));
     }

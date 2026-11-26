@@ -1658,19 +1658,17 @@ impl NetLogMessage {
 
 #[cfg(any(test, feature = "testing"))]
 thread_local! {
-    static EVENT_CLOCK_ANCHOR: std::cell::Cell<Option<std::time::Instant>> =
-        const { std::cell::Cell::new(None) };
+    static EVENT_CLOCK_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Test-only, per thread: stamp the events this thread logs with the tokio
-/// clock the simulated nodes run on (paused, so it advances in simulated time),
-/// as the time since the guard was created counted from the Unix epoch, instead
-/// of the wall clock, until the guard is dropped. Latencies read from event
-/// timestamps are then simulated latencies; with the wall clock they measure
-/// how fast the host ran the simulation. (`turmoil::sim_elapsed` is not that
-/// clock: it does not follow the nodes' timers.) Events logged by another
-/// thread keep the wall clock, so a test that uses this should check each
-/// timestamp it reads with [`EventClockGuard::is_virtual`].
+/// Test-only, per thread: stamp the events this thread logs with the running
+/// turmoil simulation's elapsed time (`turmoil::sim_elapsed`, counted from the
+/// Unix epoch) instead of the wall clock, until the guard is dropped. Latencies
+/// read from event timestamps are then simulated latencies, and the clock is
+/// the same for every node; with the wall clock they measure how fast the host
+/// ran the simulation. Events logged outside a running simulation, or by
+/// another thread, keep the wall clock, so a test that uses this should check
+/// each timestamp it reads with [`EventClockGuard::is_virtual`].
 #[cfg(any(test, feature = "testing"))]
 #[must_use = "the clock reverts when the guard is dropped"]
 pub struct EventClockGuard(());
@@ -1678,7 +1676,7 @@ pub struct EventClockGuard(());
 #[cfg(any(test, feature = "testing"))]
 impl EventClockGuard {
     pub fn simulation() -> Self {
-        EVENT_CLOCK_ANCHOR.with(|c| c.set(Some(std::time::Instant::now())));
+        EVENT_CLOCK_ON.with(|c| c.set(true));
         Self(())
     }
 
@@ -1692,17 +1690,16 @@ impl EventClockGuard {
 #[cfg(any(test, feature = "testing"))]
 impl Drop for EventClockGuard {
     fn drop(&mut self) {
-        EVENT_CLOCK_ANCHOR.with(|c| c.set(None));
+        EVENT_CLOCK_ON.with(|c| c.set(false));
     }
 }
 
 pub(crate) fn event_timestamp() -> DateTime<Utc> {
     #[cfg(any(test, feature = "testing"))]
-    if let Some(anchor) = EVENT_CLOCK_ANCHOR.with(|c| c.get()) {
-        let elapsed = tokio::time::Instant::now()
-            .into_std()
-            .saturating_duration_since(anchor);
-        return DateTime::<Utc>::from_timestamp_nanos(elapsed.as_nanos() as i64);
+    if EVENT_CLOCK_ON.with(|c| c.get()) {
+        if let Some(elapsed) = turmoil::sim_elapsed() {
+            return DateTime::<Utc>::from_timestamp_nanos(elapsed.as_nanos() as i64);
+        }
     }
     Utc::now()
 }

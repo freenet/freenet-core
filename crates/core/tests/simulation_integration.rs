@@ -13098,8 +13098,11 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
     const SEED: u64 = 0x57A1_E11C_0001;
     const NETWORK_NAME: &str = "get-dead-first-hop";
     // VirtualTime has no keepalive, so the sweep is off by default in sims;
-    // this one makes a link truly dead and needs it.
-    let _sweep_on = freenet::dev_tool::StaleLinkSweepGuard::force(true);
+    // this one makes a link truly dead and needs it. DEAD_SWEEP=0 measures
+    // the same run without it (it then fails the limit, at 121 s).
+    let _sweep_on = freenet::dev_tool::StaleLinkSweepGuard::force(
+        std::env::var("DEAD_SWEEP").map_or(true, |v| v != "0"),
+    );
     // The retry goes through a relay that is also connected to the dead host
     // (it is closest to the key), so the GET pays the silence window twice:
     // once at the requester and once at that relay, each 14 s plus up to one
@@ -26604,11 +26607,14 @@ fn fa_run(
     setup_deterministic_state(seed);
     let nn_guard = NnLatticeTestGuard;
     freenet::dev_tool::set_nn_lattice_enabled(true);
-    // The stale-link sweep is what ships; FA_SWEEP=0 measures without it.
-    // Caveat: VirtualTime has no keepalive, so in this sim "silent" means
-    // "idle", which is harsher than production. Reverts when `fa_run` returns.
+    // The sweep is off in sims by default (VirtualTime has no keepalive).
+    // FA_SWEEP=1 turns it on to measure its effect. Caveat: with no keepalive
+    // "silent" means "idle" here, so it also drops live links whose requests
+    // wait on a slow relay, which causes reconnect storms and makes the run
+    // several times slower (60 nodes did not finish in 2 hours). Reverts when
+    // `fa_run` returns.
     let _sweep_guard = freenet::dev_tool::StaleLinkSweepGuard::force(
-        std::env::var("FA_SWEEP").map_or(true, |v| v != "0"),
+        std::env::var("FA_SWEEP").is_ok_and(|v| v == "1"),
     );
 
     let rt = create_runtime();
@@ -27033,14 +27039,21 @@ fn fa_report(run: &FaRun) {
 
 // Long-running diagnostic test (~6 min in a debug build). Runs in nightly CI.
 //
-// MEASURED on current main (3 gateways + 60 nodes, 102 contracts, seed below):
-// every GET is found and the median is ~20 ms, but 13 of 100 network GETs take
-// 100-111 s. All 13 had a forward to a peer that never logged the request (no
-// reply and no error); the relay then waits its full 60 s `OPERATION_TTL` for it
-// (`get/op_ctx_task.rs`, `send_to_and_await` under `timeout(OPERATION_TTL)`)
-// before the client retries via another first hop and succeeds in ~10 ms. The thresholds
-// below are RATCHETS taken from that measurement with margin for run-to-run
-// variation (the run is not bit-exact); tighten them when the tail is fixed.
+// Latencies are SIMULATED time (event timestamps come from the simulation
+// clock, see `EventClockGuard`; an earlier version of this comment quoted
+// wall-clock numbers, which measure the host and not the network).
+//
+// MEASURED on main at 28cc85d1c, sweep off (3 gateways + 60 nodes, 102
+// contracts, seed below): every GET is found, the median is ~2 ms, and 0 of 99
+// network GETs take 10 s or more. The same seed at FA_NODES=20 FA_PER_COHORT=6
+// has 2 of 16 at exactly 60.0 s: each had a forward to a peer that never
+// logged the request (no reply and no error), and the relay waits its full 60 s
+// `OPERATION_TTL` for it (`get/op_ctx_task.rs`, `send_to_and_await` under
+// `timeout(OPERATION_TTL)`) before the client retries through another first
+// hop. With FA_SWEEP=1 those two take 14.3 s and 18.2 s (the stale-link sweep's
+// window plus a tick), not under 10 s: the silent receiver is bounded by the
+// sweep, removed only by the liveness ack. The thresholds below are RATCHETS
+// with margin; the run is not bit-exact.
 #[cfg(feature = "nightly_tests")]
 #[test_log::test]
 fn test_put_then_get_findability_latency() {
@@ -27090,7 +27103,7 @@ fn test_put_then_get_findability_latency() {
     );
     assert!(
         (sum.slow_10s as f64) <= 0.25 * sum.network_gets as f64,
-        "{} of {} network GETs of fresh contracts took >= 10s (ratchet: 25%; measured ~13%)",
+        "{} of {} network GETs of fresh contracts took >= 10s (ratchet: 25%; measured 0% at 60 nodes, 12% at 20)",
         sum.slow_10s,
         sum.network_gets
     );

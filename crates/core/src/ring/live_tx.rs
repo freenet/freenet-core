@@ -123,7 +123,13 @@ impl LiveTransactionTracker {
     ///
     /// Counted through the reverse index, so a transaction rebound to another
     /// peer counts only for the peer it was last sent to, not for the stale
-    /// entry left in the older peer's list.
+    /// entry left in the older peer's list. Known limit: that is the last peer
+    /// the transaction was *sent* to, which is not always the peer its waiter
+    /// waits on (a fire-and-forget re-send by a relay driver on the originator,
+    /// `dispatch.rs`, re-registers it). The sweep needs the peer to be silent
+    /// as well, and a live peer is not, so the cost of a misattribution is a
+    /// drop delayed or aimed at a peer that is dead anyway. The caller passes
+    /// `is_awaiting_reply` so only a waiter that is still alive counts.
     pub(crate) fn awaiting_by_peer(
         &self,
         mut is_awaiting_reply: impl FnMut(&Transaction) -> bool,

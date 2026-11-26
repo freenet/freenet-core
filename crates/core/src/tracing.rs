@@ -212,7 +212,15 @@ pub(super) mod test {
             let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
             let NetEventLog { peer_id, kind, .. } = log;
             let msg_log = NetLogMessage {
-                datetime: register::event_timestamp(),
+                // Only the events the latency tests read carry the simulation
+                // clock when a test asks for it: the connection bookkeeping above
+                // compares event times across nodes, and nodes' event times
+                // would then tie or reorder (`EventClockGuard`).
+                datetime: if matches!(kind, EventKind::Get(_) | EventKind::Put(_)) {
+                    register::event_timestamp()
+                } else {
+                    chrono::Utc::now()
+                },
                 tx: *log.tx,
                 peer_id,
                 kind,
