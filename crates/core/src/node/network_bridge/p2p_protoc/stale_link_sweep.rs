@@ -32,7 +32,6 @@
 //! Wire-compatible: purely local policy, no new message.
 
 use super::*;
-use crate::util::time_source::TimeSource;
 use std::collections::HashMap;
 
 /// How often the sweep runs. Much shorter than the 30 s stats tick, which
@@ -351,7 +350,7 @@ impl StaleLinkSweep {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::time_source::SharedMockTimeSource;
+    use crate::util::time_source::{SharedMockTimeSource, TimeSource};
 
     fn addr(n: u8) -> SocketAddr {
         SocketAddr::from(([10, 0, 0, n], 4000))
