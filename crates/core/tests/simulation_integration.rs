@@ -26706,11 +26706,19 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
             })
             .collect();
         assert!(!cand.is_empty(), "no requesters below key {kl}");
-        get_nodes.push([
-            cand[next_rand() % cand.len()],
-            cand[next_rand() % cand.len()],
-            cand[next_rand() % cand.len()],
-        ]);
+        // Three DISTINCT requesters, so a later GET is never a local hit from
+        // an earlier one by the same node.
+        let mut pick: Vec<usize> = Vec::new();
+        while pick.len() < 3.min(cand.len()) {
+            let n = cand[next_rand() % cand.len()];
+            if !pick.contains(&n) {
+                pick.push(n);
+            }
+        }
+        while pick.len() < 3 {
+            pick.push(pick[0]);
+        }
+        get_nodes.push([pick[0], pick[1], pick[2]]);
     }
 
     // Timeline, one op per slot.
@@ -26774,14 +26782,13 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
 
     // ---- Analysis ----
     let logs = rt.block_on(async { logs_handle.lock().await.clone() });
-    let t0 = logs.iter().map(|l| l.datetime).min().expect("events");
+    assert!(!logs.is_empty());
     struct Ev {
         dt_ns: i128,
-        tx: String,
         d: String,
     }
     let mut by_instance: HashMap<String, Vec<Ev>> = HashMap::new();
-    for l in logs.iter() {
+    for (seq, l) in logs.iter().enumerate() {
         let d = format!("{:?}", l.kind);
         if !d.starts_with("Get(") {
             continue;
@@ -26790,8 +26797,7 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
             continue;
         };
         by_instance.entry(inst).or_default().push(Ev {
-            dt_ns: (l.datetime - t0).num_nanoseconds().unwrap_or(0) as i128,
-            tx: l.tx.to_string(),
+            dt_ns: seq as i128, // log order (datetime is wall clock)
             d,
         });
     }
@@ -26806,6 +26812,7 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
     let mut found_by_delay = [0usize; 3];
     let mut total_by_delay = [0usize; 3];
     let mut found_any = 0usize;
+    let mut missing_terminal = [0usize; 3];
     let mut never = Vec::new();
     let mut hops: Vec<f64> = Vec::new();
     let mut holder_counts: Vec<f64> = Vec::new();
@@ -26820,32 +26827,30 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
         let kl = key_locs[ci];
         let inst = key.id().to_string();
         let evs = by_instance.get(&inst).map(Vec::as_slice).unwrap_or(&[]);
-        let mut terms: Vec<(i128, bool, Option<usize>)> = evs
-            .iter()
-            .filter(|e| variant(e) == "ClientTerminal" && e.d.contains("is_sub_op: false"))
-            .filter_map(|t| {
-                let start = evs
-                    .iter()
-                    .filter(|e| variant(e) == "Request" && e.tx == t.tx)
-                    .map(|e| e.dt_ns)
-                    .min()?;
-                let ok = t.d.contains("outcome: Success");
-                let h = fa_field(&t.d, "hop_count: Some(").and_then(|v| v.parse().ok());
-                Some((start, ok, h))
-            })
-            .collect();
-        terms.sort_by_key(|t| t.0);
+        // Attribute each client terminal to its delay slot by REQUESTER
+        // location (the requester differs per delay), not by wall-clock order,
+        // and do not require a Request event (a local hit has none).
         let mut any = false;
         for di in 0..3 {
             total_by_delay[di] += 1;
-            if let Some((_, ok, h)) = terms.get(di) {
-                if *ok {
+            let rloc = locs[get_nodes[ci][di]];
+            let term = evs.iter().find(|e| {
+                variant(e) == "ClientTerminal"
+                    && e.d.contains("is_sub_op: false")
+                    && fa_peer_loc(&e.d, "requester: ").is_some_and(|l| (l - rloc).abs() < 1e-6)
+            });
+            match term {
+                Some(t) if t.d.contains("outcome: Success") => {
                     found_by_delay[di] += 1;
                     any = true;
-                    if let Some(h) = h {
-                        hops.push(*h as f64);
+                    if let Some(h) =
+                        fa_field(&t.d, "hop_count: Some(").and_then(|v| v.parse::<f64>().ok())
+                    {
+                        hops.push(h);
                     }
                 }
+                Some(_) => {}
+                None => missing_terminal[di] += 1,
             }
         }
         if any {
@@ -26924,6 +26929,70 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
             );
         }
     }
+    // Trace: every event mentioning the key, for the first 3 never-found keys
+    // (log order; peer shown as logged).
+    // Observed ring edges: any event naming a `target:`/`to:` peer is a use of
+    // a live connection between the logging peer and that peer.
+    {
+        let mut edges: std::collections::BTreeSet<(i64, i64)> = Default::default();
+        let q = |x: f64| (x * 1000.0).round() as i64;
+        for l in logs.iter() {
+            let pd = format!("{:?}", l.peer_id);
+            let Some(a) = pd
+                .split("(@ ")
+                .nth(1)
+                .and_then(|r| r.split(')').next())
+                .and_then(|v| v.parse::<f64>().ok())
+            else {
+                continue;
+            };
+            let d = format!("{:?}", l.kind);
+            for pat in ["target: ", "to: "] {
+                if let Some(b) = fa_peer_loc(&d, pat) {
+                    if (a - b).abs() > 1e-6 {
+                        let (x, y) = (q(a), q(b));
+                        edges.insert((x.min(y), x.max(y)));
+                    }
+                }
+            }
+        }
+        for &nloc in locs.iter() {
+            let a = q(nloc);
+            if !(400..=720).contains(&a) {
+                continue;
+            }
+            let nb: Vec<String> = edges
+                .iter()
+                .filter_map(|&(x, y)| {
+                    if x == a {
+                        Some(y)
+                    } else if y == a {
+                        Some(x)
+                    } else {
+                        None
+                    }
+                })
+                .map(|v| format!("{:.3}", v as f64 / 1000.0))
+                .collect();
+            eprintln!("PG EDGES {:.3}: {}", nloc, nb.join(" "));
+        }
+    }
+    let trace_keys: Vec<usize> = if never.is_empty() {
+        vec![0, 1]
+    } else {
+        never.iter().take(3).copied().collect()
+    };
+    for &ci in trace_keys.iter() {
+        let inst = containers[ci].key().id().to_string();
+        eprintln!("PG TRACE key#{ci} loc={:.3} inst={inst}", key_locs[ci]);
+        for (seq, l) in logs.iter().enumerate() {
+            let d = format!("{:?}", l.kind);
+            if d.contains(&inst) {
+                let short: String = d.chars().take(420).collect();
+                eprintln!("PG TRACE #{seq} tx={} peer={:?} {short}", l.tx, l.peer_id);
+            }
+        }
+    }
     let med = |v: &mut Vec<f64>| {
         v.sort_by(f64::total_cmp);
         fa_pct(v, 0.5)
@@ -26935,7 +27004,7 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
         "PG config: sparse={sparse} origin={origin:?} p1={env_p1} g={g:.3} c={c:.3} origin_loc={origin_loc:.3} peers_in_band(+-0.075)={band_peers} keys={KEYS}"
     );
     eprintln!(
-        "PG RESULT: found@1s={}/{} found@10s={}/{} found@60s={}/{} never_found_any={} | hops med={:.0} | served_by_dist med={:.3}",
+        "PG RESULT: missing_terminal={missing_terminal:?} found@1s={}/{} found@10s={}/{} found@60s={}/{} never_found_any={} | hops med={:.0} | served_by_dist med={:.3}",
         found_by_delay[0],
         total_by_delay[0],
         found_by_delay[1],
