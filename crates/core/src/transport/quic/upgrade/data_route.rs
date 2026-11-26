@@ -178,21 +178,36 @@ impl DataRoute {
     }
 
     /// Take `payload` for the path, or hand it back for UDP: the queue is full,
-    /// or the path has ended. Never waits.
+    /// or the path has ended. Never waits. On a path with no UDP fallback
+    /// (`QuicPathLimits::effective_udp_fallback`) nothing is handed back: a
+    /// payload the queue cannot take is dropped and counted, as every other
+    /// send the path cannot carry is, and the caller sees it taken.
     pub(in crate::transport) fn queue_short(
         &self,
         payload: SerializedMessage,
     ) -> Result<(), SerializedMessage> {
-        match self.shorts.try_send(payload) {
-            Ok(()) => Ok(()),
+        let refused = match self.shorts.try_send(payload) {
+            Ok(()) => return Ok(()),
             Err(mpsc::error::TrySendError::Full(payload)) => {
-                self.path
-                    .stats()
-                    .record_send_event(QuicSendEvent::ShortOverflowUdp);
-                Err(payload)
+                if self.path.udp_fallback() {
+                    self.path
+                        .stats()
+                        .record_send_event(QuicSendEvent::ShortOverflowUdp);
+                }
+                payload
             }
-            Err(mpsc::error::TrySendError::Closed(payload)) => Err(payload),
+            Err(mpsc::error::TrySendError::Closed(payload)) => payload,
+        };
+        if self.path.udp_fallback() {
+            return Err(refused);
         }
+        self.path.stats().record_send_dropped(SendKind::Short);
+        self.note(|| {
+            "dropped a short: the queue is full or the path has ended, and there is no UDP \
+             fallback"
+                .to_string()
+        });
+        Ok(())
     }
 }
 

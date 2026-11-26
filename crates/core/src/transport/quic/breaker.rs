@@ -253,7 +253,8 @@ pub(crate) use short_runs::QuicCode;
 /// Flipping it also removes the path-level UDP fallback of every upgraded
 /// QUIC path (`path::QuicPathLimits::effective_udp_fallback`): a send the path
 /// cannot carry is given up for the operation layer to retry, a quiet path is
-/// never suspect, and a route whose path ended drops what it holds. It does
+/// never suspect, and a route whose path ended or whose queue is full drops
+/// what it cannot take. It does
 /// not remove the connection's own UDP session: a connection with no route
 /// (no path, or the path closed) still sends on UDP, and so does the
 /// connect-time UDP dial (`udp_fallback_dial`). Those go with the UDP deletion
@@ -2478,8 +2479,8 @@ mod tests {
         ("transport/quic/path.rs", "effective", 2),
         ("transport/quic/path.rs", "field", 3),
         ("transport/quic/path/route.rs", "field", 5),
-        ("transport/quic/recycle.rs", "field", 2),
-        ("transport/quic/upgrade/data_route.rs", "path method", 1),
+        ("transport/quic/recycle.rs", "field", 3),
+        ("transport/quic/upgrade/data_route.rs", "path method", 3),
     ];
 
     const PID: u32 = 4242;
