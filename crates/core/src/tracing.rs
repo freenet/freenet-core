@@ -632,6 +632,9 @@ mod get_outcome_summary_tests {
                 hop_count: Some(0),
                 elapsed_ms,
                 timestamp: 100,
+                key_location: None,
+                downstream_wait_ms: None,
+                downstream_timeout_attempts: None,
             }),
         }
     }

@@ -430,6 +430,7 @@ impl<'a> NetEventLog<'a> {
         instance_id: ContractInstanceId,
         target: PeerKeyLocation,
         htl: usize,
+        upstream: Option<PeerKeyLocation>,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
@@ -443,6 +444,8 @@ impl<'a> NetEventLog<'a> {
                 target,
                 htl,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+                upstream,
+                key_location: Some(Location::from(&instance_id)),
             }),
         })
     }
@@ -480,6 +483,7 @@ impl<'a> NetEventLog<'a> {
         ring: &'a Ring,
         instance_id: ContractInstanceId,
         hop_count: Option<usize>,
+        downstream_wait: Option<(u64, u32)>,
     ) -> Option<Self> {
         let peer_id = Self::get_own_peer_id(ring)?;
         let own_loc = ring.connection_manager.own_location();
@@ -494,6 +498,9 @@ impl<'a> NetEventLog<'a> {
                 hop_count,
                 elapsed_ms: tx.elapsed().as_millis() as u64,
                 timestamp: chrono::Utc::now().timestamp() as u64,
+                key_location: Some(Location::from(&instance_id)),
+                downstream_wait_ms: downstream_wait.map(|(ms, _)| ms),
+                downstream_timeout_attempts: downstream_wait.map(|(_, n)| n),
             }),
         })
     }
@@ -1133,7 +1140,12 @@ impl<'a> NetEventLog<'a> {
                     timestamp: chrono::Utc::now().timestamp() as u64,
                 })
             }
-            NetMessage::V1(NetMessageV1::Get(GetMsg::Response { id, .. })) => {
+            NetMessage::V1(NetMessageV1::Get(GetMsg::Response {
+                id,
+                instance_id,
+                result,
+                ..
+            })) => {
                 // Track outbound Get response for message routing visibility
                 // Key may not be available for NotFound responses, but include if present
                 let key = match msg {
@@ -1152,6 +1164,29 @@ impl<'a> NetEventLog<'a> {
                     to,
                     key,
                     timestamp: chrono::Utc::now().timestamp() as u64,
+                    found: Some(matches!(result, GetMsgResult::Found { .. })),
+                    key_location: Some(Location::from(instance_id)),
+                })
+            }
+            NetMessage::V1(NetMessageV1::Get(GetMsg::ResponseStreaming {
+                id,
+                instance_id,
+                key,
+                ..
+            })) => {
+                // Streaming (large-state) Found header: same event as the
+                // inline Found response, so big-state GETs are not invisible.
+                let to = target_addr
+                    .and_then(|addr| ring.connection_manager.get_peer_by_addr(addr))
+                    .unwrap_or_else(|| own_loc.clone());
+                EventKind::Get(GetEvent::ResponseSent {
+                    id: *id,
+                    from: own_loc,
+                    to,
+                    key: Some(*key),
+                    timestamp: chrono::Utc::now().timestamp() as u64,
+                    found: Some(true),
+                    key_location: Some(Location::from(instance_id)),
                 })
             }
             NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response { id, .. })) => {
@@ -1297,6 +1332,8 @@ impl<'a> NetEventLog<'a> {
                 ..
             }) => {
                 let this_peer = op_manager.ring.connection_manager.own_location();
+                let upstream = source_addr
+                    .and_then(|addr| op_manager.ring.connection_manager.get_peer_by_addr(addr));
                 EventKind::Get(GetEvent::Request {
                     id: *id,
                     requester: this_peer.clone(),
@@ -1304,6 +1341,8 @@ impl<'a> NetEventLog<'a> {
                     target: this_peer,
                     htl: *htl,
                     timestamp: chrono::Utc::now().timestamp() as u64,
+                    upstream,
+                    key_location: Some(Location::from(instance_id)),
                 })
             }
             NetMessageV1::Get(GetMsg::Response {
@@ -1358,6 +1397,9 @@ impl<'a> NetEventLog<'a> {
                     hop_count: Some((*hop_count).min(max_htl)),
                     elapsed_ms: id.elapsed().as_millis() as u64,
                     timestamp: chrono::Utc::now().timestamp() as u64,
+                    key_location: Some(Location::from(instance_id)),
+                    downstream_wait_ms: None,
+                    downstream_timeout_attempts: None,
                 })
             }
             NetMessageV1::Subscribe(SubscribeMsg::Request {
@@ -2461,5 +2503,107 @@ mod span_completed_tests {
             !request.span_completed(),
             "UpdateEvent::Request is not terminal and must not close the span"
         );
+    }
+}
+
+#[cfg(test)]
+mod get_hop_telemetry_pins {
+    //! Source-scrape pins (the real emit paths need a live `Ring`): the GET
+    //! hop-diagnostic fields must keep being populated at their emit sites.
+    //!
+    //! Fail-closed by construction: the search text is only the production
+    //! part of this file (everything before the first top-level test module,
+    //! so this module's own literals can never satisfy an anchor), each
+    //! region is scoped to the body of the enclosing production function, and
+    //! a missing anchor panics rather than passing. Comment lines are stripped
+    //! so commented-out code cannot satisfy a pin.
+
+    fn production_source() -> &'static str {
+        const SOURCE: &str = include_str!("register.rs");
+        let end = SOURCE
+            .find("\n#[cfg(test)]\n")
+            .expect("register.rs must have a top-level test module");
+        &SOURCE[..end]
+    }
+
+    /// Code (comments stripped) of the production fn starting at `sig`.
+    fn fn_body(sig: &str) -> String {
+        let src = production_source();
+        let start = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("production fn `{sig}` not found"));
+        let open = start + src[start..].find('{').expect("fn body");
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, b) in src.bytes().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        src[open..end.expect("unterminated fn body")]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Text of `body` from `start` up to the next `end` (both must exist).
+    fn region<'a>(body: &'a str, start: &str, end: &str) -> &'a str {
+        let a = body
+            .find(start)
+            .unwrap_or_else(|| panic!("anchor `{start}` not found in fn body"));
+        let b = a + body[a..]
+            .find(end)
+            .unwrap_or_else(|| panic!("anchor `{end}` not found after `{start}`"));
+        &body[a..b]
+    }
+
+    #[test]
+    fn outbound_get_response_records_result_for_inline_and_streaming() {
+        let body = fn_body("pub fn from_outbound_msg(");
+        let inline = region(
+            &body,
+            "NetMessage::V1(NetMessageV1::Get(GetMsg::Response {",
+            "GetMsg::ResponseStreaming {",
+        );
+        assert!(
+            inline.contains("found: Some(matches!(result, GetMsgResult::Found { .. }))"),
+            "inline get_response_sent must record found/not_found from the message"
+        );
+        assert!(inline.contains("key_location: Some(Location::from(instance_id))"));
+        let streaming = region(
+            &body,
+            "NetMessage::V1(NetMessageV1::Get(GetMsg::ResponseStreaming {",
+            "NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response",
+        );
+        assert!(
+            streaming.contains("EventKind::Get(GetEvent::ResponseSent {")
+                && streaming.contains("found: Some(true)")
+                && streaming.contains("key_location: Some(Location::from(instance_id))"),
+            "streaming Found header must emit get_response_sent with result found"
+        );
+    }
+
+    #[test]
+    fn inbound_get_request_records_upstream() {
+        let body = fn_body("pub fn from_inbound_msg_v1(");
+        let arm = region(
+            &body,
+            "NetMessageV1::Get(GetMsg::Request {",
+            "NetMessageV1::Get(GetMsg::Response {",
+        );
+        assert!(
+            arm.contains("source_addr") && arm.contains("get_peer_by_addr(addr)"),
+            "inbound get_request must resolve the sender into `upstream`"
+        );
+        assert!(arm.contains("upstream,") && arm.contains("key_location: Some("));
     }
 }

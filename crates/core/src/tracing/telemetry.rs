@@ -2148,8 +2148,10 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     target,
                     htl,
                     timestamp,
+                    upstream,
+                    key_location,
                 } => {
-                    serde_json::json!({
+                    let mut json = serde_json::json!({
                         "type": "get_request",
                         "id": id.to_string(),
                         "requester": requester.to_string(),
@@ -2157,7 +2159,16 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "target": target.to_string(),
                         "htl": htl,
                         "timestamp": timestamp,
-                    })
+                    });
+                    // Additive fields: absent when unknown, so consumers that
+                    // predate them keep working.
+                    if let Some(up) = upstream {
+                        json["upstream"] = serde_json::Value::String(up.to_string());
+                    }
+                    if let Some(loc) = key_location {
+                        json["key_location"] = serde_json::json!(loc.as_f64());
+                    }
+                    json
                 }
                 GetEvent::GetSuccess {
                     id,
@@ -2192,8 +2203,11 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     hop_count,
                     elapsed_ms,
                     timestamp,
+                    key_location,
+                    downstream_wait_ms,
+                    downstream_timeout_attempts,
                 } => {
-                    serde_json::json!({
+                    let mut json = serde_json::json!({
                         "type": "get_not_found",
                         "id": id.to_string(),
                         "requester": requester.to_string(),
@@ -2202,7 +2216,17 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                         "hop_count": hop_count,
                         "elapsed_ms": elapsed_ms,
                         "timestamp": timestamp,
-                    })
+                    });
+                    if let Some(loc) = key_location {
+                        json["key_location"] = serde_json::json!(loc.as_f64());
+                    }
+                    if let Some(ms) = downstream_wait_ms {
+                        json["downstream_wait_ms"] = serde_json::json!(ms);
+                    }
+                    if let Some(n) = downstream_timeout_attempts {
+                        json["downstream_timeout_attempts"] = serde_json::json!(n);
+                    }
+                    json
                 }
                 GetEvent::GetFailure {
                     id,
@@ -2232,6 +2256,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     to,
                     key,
                     timestamp,
+                    found,
+                    key_location,
                 } => {
                     let mut json = serde_json::json!({
                         "type": "get_response_sent",
@@ -2242,6 +2268,14 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     });
                     if let Some(k) = key {
                         json["key"] = serde_json::Value::String(k.to_string());
+                    }
+                    if let Some(f) = found {
+                        json["result"] = serde_json::Value::String(
+                            if *f { "found" } else { "not_found" }.to_string(),
+                        );
+                    }
+                    if let Some(loc) = key_location {
+                        json["key_location"] = serde_json::json!(loc.as_f64());
                     }
                     json
                 }
@@ -6043,6 +6077,101 @@ mod tests {
         // Test ignored event (simplest case that doesn't require PeerId construction)
         let ignored = EventKind::Ignored;
         assert_eq!(event_kind_to_string(&ignored), "ignored");
+    }
+
+    /// The GET hop-diagnostic fields must reach the exported JSON, and must be
+    /// ABSENT (not null) when unknown so older consumers see the old shape.
+    #[test]
+    fn get_hop_diagnostic_fields_reach_json_and_round_trip() {
+        use crate::operations::get::GetMsg;
+        use crate::ring::{Location, PeerKeyLocation};
+        use crate::tracing::GetEvent;
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        let id = Transaction::new::<GetMsg>();
+        let instance_id = ContractInstanceId::new([7u8; 32]);
+        let loc = Location::from(&instance_id);
+        let up = PeerKeyLocation::random();
+        let me = PeerKeyLocation::random();
+
+        let request = EventKind::Get(GetEvent::Request {
+            id,
+            requester: me.clone(),
+            instance_id,
+            target: me.clone(),
+            htl: 5,
+            timestamp: 1,
+            upstream: Some(up.clone()),
+            key_location: Some(loc),
+        });
+        let not_found = EventKind::Get(GetEvent::GetNotFound {
+            id,
+            requester: me.clone(),
+            instance_id,
+            target: me.clone(),
+            hop_count: Some(2),
+            elapsed_ms: 10,
+            timestamp: 1,
+            key_location: Some(loc),
+            downstream_wait_ms: Some(60_000),
+            downstream_timeout_attempts: Some(1),
+        });
+        let sent = |found| {
+            EventKind::Get(GetEvent::ResponseSent {
+                id,
+                from: me.clone(),
+                to: up.clone(),
+                key: None,
+                timestamp: 1,
+                found,
+                key_location: Some(loc),
+            })
+        };
+
+        // Round-trip through a JSON string, as the collector receives it.
+        let rt = |k: &EventKind| -> serde_json::Value {
+            serde_json::from_str(&event_kind_to_json(k).to_string()).expect("json round trip")
+        };
+
+        let j = rt(&request);
+        assert_eq!(j["type"], "get_request");
+        assert_eq!(j["upstream"], up.to_string());
+        assert_eq!(j["key_location"].as_f64(), Some(loc.as_f64()));
+
+        let j = rt(&not_found);
+        assert_eq!(j["downstream_wait_ms"], 60_000);
+        assert_eq!(j["downstream_timeout_attempts"], 1);
+        assert_eq!(j["key_location"].as_f64(), Some(loc.as_f64()));
+
+        assert_eq!(rt(&sent(Some(true)))["result"], "found");
+        assert_eq!(rt(&sent(Some(false)))["result"], "not_found");
+        assert_eq!(
+            rt(&sent(Some(true)))["key_location"].as_f64(),
+            Some(loc.as_f64())
+        );
+
+        // Unknown values are omitted, keeping the pre-existing shape.
+        let bare = EventKind::Get(GetEvent::Request {
+            id,
+            requester: me.clone(),
+            instance_id,
+            target: me.clone(),
+            htl: 5,
+            timestamp: 1,
+            upstream: None,
+            key_location: None,
+        });
+        let j = rt(&bare);
+        assert!(j.get("upstream").is_none() && j.get("key_location").is_none());
+        let j = rt(&sent(None));
+        assert!(j.get("result").is_none() && j.get("key_location").is_some());
+
+        // The AOF path serialises the same enum with bincode.
+        for k in [&request, &not_found, &sent(Some(false))] {
+            let bytes = bincode::serialize(k).expect("bincode");
+            let back: EventKind = bincode::deserialize(&bytes).expect("bincode back");
+            assert_eq!(bincode::serialize(&back).expect("re-encode"), bytes);
+        }
     }
 
     #[test]

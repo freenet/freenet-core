@@ -1819,4 +1819,70 @@ mod tests {
         assert!(segment.exists(), "existing segment must be left in place");
         Ok(())
     }
+
+    /// Upgrade behaviour: a GET record written before the hop-diagnostic
+    /// fields were added has a shorter bincode layout. `read_all_events` must
+    /// skip it (warn) and still return the records around it, not fail.
+    #[tokio::test]
+    async fn old_layout_get_record_is_skipped_not_fatal() -> anyhow::Result<()> {
+        use crate::operations::get::GetMsg;
+        use crate::ring::PeerKeyLocation;
+        use crate::tracing::GetEvent;
+        use freenet_stdlib::prelude::ContractInstanceId;
+
+        ensure_records_ts();
+        let dir = tempfile::tempdir()?;
+        let log_path = dir.path().join("event_log");
+
+        let tx = Transaction::new::<GetMsg>();
+        let me = PeerKeyLocation::random();
+        let record = |kind| NetLogMessage {
+            tx,
+            datetime: chrono::Utc::now() + chrono::Duration::seconds(5),
+            peer_id: PeerId::random(),
+            kind,
+        };
+        let not_found = |k| {
+            EventKind::Get(GetEvent::GetNotFound {
+                id: tx,
+                requester: me.clone(),
+                instance_id: ContractInstanceId::new([1u8; 32]),
+                target: me.clone(),
+                hop_count: Some(1),
+                elapsed_ms: 1,
+                timestamp: 1,
+                key_location: k,
+                downstream_wait_ms: None,
+                downstream_timeout_attempts: None,
+            })
+        };
+
+        let good = record(not_found(None));
+        let (good_header, good_bytes) = LogFile::encode_log(&good)?;
+
+        // Old layout == the new record minus its three trailing `None`
+        // option tags (the new fields are the last bytes of the record).
+        let (mut old_header, mut old_bytes) = LogFile::encode_log(&record(not_found(None)))?;
+        old_bytes.truncate(old_bytes.len() - 3);
+        DefaultEndian::write_u32(&mut old_header, old_bytes.len() as u32);
+
+        let mut payload = Vec::new();
+        for (h, b) in [
+            (good_header, good_bytes.clone()),
+            (old_header, old_bytes),
+            (good_header, good_bytes),
+        ] {
+            payload.extend_from_slice(&h);
+            payload.extend_from_slice(&b);
+        }
+        std::fs::write(&log_path, &payload)?;
+
+        let events = LogFile::read_all_events(&log_path).await?;
+        assert_eq!(
+            events.len(),
+            2,
+            "the old-layout record is skipped, its neighbours are read"
+        );
+        Ok(())
+    }
 }
