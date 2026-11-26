@@ -616,6 +616,42 @@ impl LocalSubscribers {
     }
 }
 
+/// Why a node counts as receiving updates for a contract (see
+/// [`HostingManager::receiving_updates_source`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReceivingUpdatesSource {
+    /// Age of the live network subscription lease (since its first subscribe,
+    /// preserved across renewals), or `None` when there is no live lease.
+    pub lease_age: Option<Duration>,
+    /// Time until the live lease expires unless renewed.
+    pub lease_remaining: Option<Duration>,
+    /// The live lease is provisional (empty-ring bootstrap-gateway answer).
+    pub lease_provisional: bool,
+    /// Local WebSocket clients subscribed to the contract.
+    pub local_clients: usize,
+    /// Local delegate subscriptions, counted as local demand (#4669).
+    pub local_delegates: usize,
+}
+
+impl ReceivingUpdatesSource {
+    pub(crate) fn is_receiving(&self) -> bool {
+        self.lease_age.is_some() || self.local_clients + self.local_delegates > 0
+    }
+
+    /// Which condition fired: a network lease, local demand, both, or neither.
+    pub(crate) fn label(&self) -> &'static str {
+        match (
+            self.lease_age.is_some(),
+            self.local_clients + self.local_delegates > 0,
+        ) {
+            (true, true) => "lease_and_local_subscription",
+            (true, false) => "subscription_lease",
+            (false, true) => "local_subscription",
+            (false, false) => "none",
+        }
+    }
+}
+
 /// Manages contract hosting and subscription state.
 ///
 /// # Subscription Model
@@ -3173,6 +3209,40 @@ impl HostingManager {
         self.is_subscribed(contract) || self.has_client_subscriptions(contract.id())
     }
 
+    /// Which of the conditions behind [`Self::is_receiving_updates`] hold, for
+    /// diagnostics. Read-only: [`Self::is_receiving_updates`] does not use it,
+    /// so its behaviour is unchanged. `is_receiving()` on the result agrees with
+    /// it (pinned by `receiving_updates_source_agrees_with_is_receiving_updates`).
+    pub(crate) fn receiving_updates_source(
+        &self,
+        contract: &ContractKey,
+    ) -> ReceivingUpdatesSource {
+        let now = self.time_source.now();
+        let lease = self
+            .active_subscriptions
+            .get(contract)
+            .filter(|lease| lease.expires_at > now)
+            .map(|lease| {
+                (
+                    now.saturating_duration_since(lease.subscribed_since),
+                    lease.expires_at.saturating_duration_since(now),
+                    lease.provisional,
+                )
+            });
+        let (local_clients, local_delegates) = self
+            .client_subscriptions
+            .get(contract.id())
+            .map(|s| (s.clients.len(), s.delegates))
+            .unwrap_or((0, 0));
+        ReceivingUpdatesSource {
+            lease_age: lease.map(|l| l.0),
+            lease_remaining: lease.map(|l| l.1),
+            lease_provisional: lease.is_some_and(|l| l.2),
+            local_clients,
+            local_delegates,
+        }
+    }
+
     /// Mark a contract as accessed by a local client (HTTP/WebSocket).
     ///
     /// Only contracts with this flag get subscription renewal and trusted
@@ -5041,6 +5111,42 @@ mod tests {
         // Add active subscription — now is_receiving_updates should be true
         manager.subscribe(contract);
         assert!(manager.is_receiving_updates(&contract));
+    }
+
+    /// `receiving_updates_source` is a diagnostic view of `is_receiving_updates`
+    /// and must agree with it in every state.
+    #[test]
+    fn receiving_updates_source_agrees_with_is_receiving_updates() {
+        let manager = HostingManager::new(DEFAULT_HOSTING_BUDGET_BYTES);
+        let contract = make_contract_key(1);
+        let check = |m: &HostingManager, label: &str| {
+            let src = m.receiving_updates_source(&contract);
+            assert_eq!(
+                src.is_receiving(),
+                m.is_receiving_updates(&contract),
+                "{label}"
+            );
+            src
+        };
+        assert_eq!(check(&manager, "idle").label(), "none");
+        manager.record_contract_access(contract, 1000, AccessType::Put, HostingCause::Other);
+        assert_eq!(check(&manager, "cache only").label(), "none");
+        manager.subscribe(contract);
+        let src = check(&manager, "lease");
+        assert_eq!(src.label(), "subscription_lease");
+        assert!(src.lease_age.is_some() && src.lease_remaining.is_some());
+        let client_id = crate::client_events::ClientId::next();
+        manager.add_client_subscription(contract.id(), client_id);
+        assert_eq!(
+            check(&manager, "both").label(),
+            "lease_and_local_subscription"
+        );
+        let other = make_contract_key(2);
+        manager.add_client_subscription(other.id(), crate::client_events::ClientId::next());
+        let src = manager.receiving_updates_source(&other);
+        assert_eq!(src.label(), "local_subscription");
+        assert_eq!(src.local_clients, 1);
+        assert!(manager.is_receiving_updates(&other));
     }
 
     /// Regression test for #3340: is_receiving_updates with client subscriptions.

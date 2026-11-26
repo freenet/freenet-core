@@ -10,6 +10,7 @@
 //! consume them.
 
 pub(crate) mod op_ctx_task;
+mod path_log;
 pub(crate) mod stream_admission;
 
 pub(crate) use self::messages::{PutMsg, PutStreamingPayload};

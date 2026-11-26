@@ -135,6 +135,7 @@ pub(crate) use hosting::MAX_DEFAULT_HOSTING_BUDGET_BYTES;
 pub(crate) use hosting::MIN_DEFAULT_HOSTING_BUDGET_BYTES;
 #[cfg(test)]
 pub(crate) use hosting::PROVISIONAL_RETRY_INTERVAL;
+pub(crate) use hosting::ReceivingUpdatesSource;
 /// Single source of truth for the default hosted-contract-state budget.
 /// `config::default_max_hosting_storage()` resolves to this so the
 /// operator-facing default and the in-code fallback can never drift. The
@@ -5162,6 +5163,14 @@ impl Ring {
     /// since cached state may be stale after subscription expiry.
     pub fn is_receiving_updates(&self, contract: &ContractKey) -> bool {
         self.hosting_manager.is_receiving_updates(contract)
+    }
+
+    /// Diagnostic breakdown of [`Self::is_receiving_updates`].
+    pub(crate) fn receiving_updates_source(
+        &self,
+        contract: &ContractKey,
+    ) -> ReceivingUpdatesSource {
+        self.hosting_manager.receiving_updates_source(contract)
     }
 
     /// Get contracts that need subscription renewal.
