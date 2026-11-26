@@ -675,6 +675,9 @@ impl RelayState {
         let holds = ctx.holds_transport_to(&self.request.joiner);
         let mut decision = native::decide_native(Some(offer), readiness, bucket, holds);
         let mut arm = native::acceptor_arm(Some(offer), readiness, bucket, holds);
+        #[cfg(any(test, feature = "testing"))]
+        let arm_cause = native::acceptor_verdict(Some(offer), readiness, bucket, holds)
+            .map_or("native", |(_, cause)| cause.label());
         // A `Native` decision holds a native setup slot and an allow-set slot
         // here for up to the server's window. Admit it first; with no room
         // (or too many pending from the joiner's source) decide `Udp`, so the
@@ -712,20 +715,10 @@ impl RelayState {
                     own,
                     native: decision == native::NativeDecision::Native,
                     in_slice: !holds && bucket < offer.effective_percent(),
-                    cause: if decision == native::NativeDecision::Native {
-                        "native"
-                    } else if holds {
-                        "held"
-                    } else if readiness.demoted {
-                        "demoted"
-                    } else if !readiness.ready {
-                        "not_ready"
-                    } else if setup_refused {
+                    cause: if setup_refused {
                         "setup_refused"
-                    } else if bucket >= offer.effective_percent().min(readiness.percent) {
-                        "outside_slice"
                     } else {
-                        "unexplained"
+                        arm_cause
                     },
                 },
             );

@@ -95,22 +95,28 @@ pub(crate) fn enabled(is_gateway: bool) -> bool {
 /// gateway on a release before admission); in a build without tests
 /// or the `testing` feature it is [`enabled`].
 pub(crate) fn enabled_at(is_gateway: bool, bind_addr: SocketAddr) -> bool {
-    #[cfg(test)]
-    if is_gateway && FORCED_ON.contains(&bind_addr) {
-        return true;
-    }
     #[cfg(any(test, feature = "testing"))]
-    if is_gateway && crate::transport::in_memory_socket::gateway_native_admission_forced(bind_addr)
     {
-        return true;
-    }
-    #[cfg(any(test, feature = "testing"))]
-    if crate::transport::in_memory_socket::gateway_native_admission_forced_off(bind_addr) {
+        let forced_on = {
+            #[cfg(test)]
+            let by_test = FORCED_ON.contains(&bind_addr);
+            #[cfg(not(test))]
+            let by_test = false;
+            by_test
+                || crate::transport::in_memory_socket::gateway_native_admission_forced(bind_addr)
+        };
+        let forced_off =
+            crate::transport::in_memory_socket::gateway_native_admission_forced_off(bind_addr);
         assert!(
-            !crate::transport::in_memory_socket::gateway_native_admission_forced(bind_addr),
+            !(forced_on && forced_off),
             "a simulation turned admission both on and off for {bind_addr}"
         );
-        return false;
+        if is_gateway && forced_on {
+            return true;
+        }
+        if forced_off {
+            return false;
+        }
     }
     let _ = bind_addr;
     enabled(is_gateway)

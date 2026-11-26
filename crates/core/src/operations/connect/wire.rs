@@ -409,7 +409,7 @@ pub mod sim_trace {
             in_slice: bool,
             /// Why the decision was what it was (`native`, or the cause of a
             /// UDP decision: `held`, `demoted`, `not_ready`, `setup_refused`,
-            /// `outside_slice`, else `unexplained`).
+            /// `offered_zero`, `outside_slice`), as `native::ArmCause` labels them.
             cause: &'static str,
         },
         /// The node `own` stopped deciding `Native` as acceptor after native
@@ -826,7 +826,7 @@ pub mod sim_trace {
             self.0.decisions.lock().clone()
         }
         /// Acceptors' decisions counted by cause: `native`, or why a decision
-        /// was UDP (see [`NativeWireEvent::Decided`]). `unexplained` must be 0.
+        /// was UDP (see [`NativeWireEvent::Decided`]). The labels come from `native::acceptor_verdict`.
         pub fn decision_causes(&self) -> std::collections::BTreeMap<&'static str, u64> {
             self.0.decision_causes.lock().clone()
         }

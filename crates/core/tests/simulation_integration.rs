@@ -23841,8 +23841,8 @@ fn test_quic_native_gateway_join_without_admission_falls_back_to_udp() {
 /// (`established + failed`, one per side), against `joiner_decisions` decided
 /// joins, which differs from the decision share: seeded, 33 of 45 decisions
 /// are native and the 12 UDP ones are pairs that already held a transport
-/// (`decision_causes`), while failed native dials each add to `treated`, so
-/// the read share is about 0.68 rather than 1.
+/// (`decision_causes`), while `treated` is half the native dials (each pair is two dials,
+/// established or failed), so the read share is `treated / decided`, not the 33/45 decision share.
 #[test_log::test]
 fn test_quic_native_at_the_shipped_percent_decides_most_pairs_native() {
     const SEED: u64 = 0x0059_40A5_0010;
@@ -23855,25 +23855,21 @@ fn test_quic_native_at_the_shipped_percent_decides_most_pairs_native() {
     println!("SHIPPED decided={decided} native_dials={native_dials} treated={treated}");
     assert!(decided >= 20, "premise: enough decisions to read a share");
     assert!(native_dials > 0, "some pairs decided native");
-    // Every acceptor decision has a counted cause. At 100 percent the slice
-    // is the whole bucket range, so a UDP decision is a pair that already
-    // held a transport (not in the slice), a refused setup, a demotion, or an
-    // endpoint not up; none may be unexplained.
+    // Every acceptor decision has a cause, produced where the arm is chosen
+    // (`native::acceptor_verdict`). At 100 percent the slice is the whole
+    // bucket range, and nothing in this sim refuses a setup, demotes a node
+    // or holds an endpoint down, so each decision is native or a pair that
+    // already held a transport: nothing else is counted.
     let causes = t.decision_causes();
     println!("SHIPPED decision causes: {causes:?}");
-    assert_eq!(
-        causes.get("unexplained").copied().unwrap_or(0),
-        0,
-        "every UDP decision has a counted cause: {causes:?}"
-    );
-    assert_eq!(
-        causes.get("outside_slice").copied().unwrap_or(0),
-        0,
-        "at 100 percent no bucket is outside the slice: {causes:?}"
-    );
     let all = t.decisions();
-    assert_eq!(all.len() as u64, causes.values().sum::<u64>());
     let held = causes.get("held").copied().unwrap_or(0);
+    let native_count = causes.get("native").copied().unwrap_or(0);
+    assert_eq!(
+        native_count + held,
+        all.len() as u64,
+        "every decision is native or held; any other cause is a regression: {causes:?}"
+    );
     assert_eq!(
         all.iter().filter(|(_, _, _, in_slice)| !in_slice).count() as u64,
         held,

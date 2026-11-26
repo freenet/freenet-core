@@ -9030,7 +9030,9 @@ mod tests {
 
     /// In a running simulation a node with `transport-quic = "shadow"`
     /// has a QUIC ingress on its socket (a QUIC-class datagram from a
-    /// stranger is refused as not allowed), and a node left off has none.
+    /// stranger is refused as not allowed, or on a gateway, which admits
+    /// native joins from unknown sources, queued as forwarded), and a node
+    /// left off has none.
     #[tokio::test(flavor = "current_thread")]
     async fn transport_quic_builds_the_endpoint_of_a_running_simulated_node() {
         use crate::transport::in_memory_socket::deliver_packet_to_network;
@@ -9045,8 +9047,11 @@ mod tests {
         let _handles = sim
             .start_with_rand_gen::<rand::rngs::SmallRng>(0x5940_E5A1_0012, 1, 1)
             .await;
+        // `labels[0]` is the gateway (one gateway, one node): with admission
+        // on in production it queues a stranger's datagram instead.
+        assert!(labels[0].is_gateway(), "premise: labels[0] is the gateway");
         let targets: Vec<(SocketAddr, SocketAddr, QuicIngressOutcome)> = [
-            (&labels[0], 1, QuicIngressOutcome::NotAllowed),
+            (&labels[0], 1, QuicIngressOutcome::Forwarded),
             (&labels[1], 2, QuicIngressOutcome::NoIngress),
         ]
         .into_iter()

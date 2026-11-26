@@ -119,8 +119,9 @@ pub(crate) const ACCEPTOR_DEMOTION_FAILURES: usize = 3;
 /// strikes spread thinly over days (a node that rarely uses native) do not
 /// add up to a demotion. Equal to [`DEMOTION_COOLDOWN`]: a node whose native
 /// path is broken collects its strikes at its rate of UDP-rescued native
-/// setups, which at 25% is several an hour for a node that accepts or joins
-/// at all, so three fall well inside 6 h; and a fault that does not recur
+/// setups, which at 25% was several an hour for a node that accepts or joins
+/// at all (and is about four times that at 100%), so three fall well inside
+/// 6 h; and a fault that does not recur
 /// within one cooldown would not have kept native off for long either.
 pub(crate) const STRIKE_WINDOW: Duration = DEMOTION_COOLDOWN;
 
@@ -458,14 +459,69 @@ pub(crate) fn acceptor_arm(
     bucket: u8,
     holds_transport: bool,
 ) -> Option<ConnectArm> {
+    acceptor_verdict(offer, own, bucket, holds_transport).and_then(|(arm, _)| arm)
+}
+
+/// Why an acceptor's arm is what it is, produced by the same branch that picks
+/// the arm so the label cannot disagree with it. Read only by the simulation
+/// trace (`decision_causes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArmCause {
+    /// In the slice, ready: decides `Native`.
+    Native,
+    /// This node already held a transport to the joiner.
+    Held,
+    /// Either demotion streak holds native off.
+    Demoted,
+    /// In the slice but the build or endpoint is not ready.
+    NotReady,
+    /// The joiner offered percent 0 (it is not ready, demoted or below the
+    /// floor), so no bucket is in the slice.
+    OfferedZero,
+    /// The bucket is at or above the lower of the two percents.
+    OutsideSlice,
+}
+
+impl ArmCause {
+    /// The label the simulation trace counts this cause under.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Held => "held",
+            Self::Demoted => "demoted",
+            Self::NotReady => "not_ready",
+            Self::OfferedZero => "offered_zero",
+            Self::OutsideSlice => "outside_slice",
+        }
+    }
+}
+
+/// [`acceptor_arm`] with the cause of the answer: `None` when the request
+/// carried no offer.
+pub(crate) fn acceptor_verdict(
+    offer: Option<NativeOffer>,
+    own: NativeReadiness,
+    bucket: u8,
+    holds_transport: bool,
+) -> Option<(Option<ConnectArm>, ArmCause)> {
     let offered = offer?.effective_percent();
-    if holds_transport || own.demoted {
-        return None;
+    if holds_transport {
+        return Some((None, ArmCause::Held));
+    }
+    if own.demoted {
+        return Some((None, ArmCause::Demoted));
     }
     if bucket < offered.min(own.percent.min(100)) {
-        own.ready.then_some(ConnectArm::Treated)
+        Some(if own.ready {
+            (Some(ConnectArm::Treated), ArmCause::Native)
+        } else {
+            (None, ArmCause::NotReady)
+        })
+    } else if offered == 0 {
+        Some((Some(ConnectArm::Control), ArmCause::OfferedZero))
     } else {
-        Some(ConnectArm::Control)
+        Some((Some(ConnectArm::Control), ArmCause::OutsideSlice))
     }
 }
 
