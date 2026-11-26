@@ -242,6 +242,14 @@ pub mod dev_tool {
     #[cfg(any(test, feature = "testing"))]
     pub use ring::{set_nn_lattice_enabled, set_nn_lattice_force_active};
 
+    // Experiment-only: next-hop policy switch and virtual-time event clock.
+    #[cfg(any(test, feature = "testing"))]
+    pub use crate::tracing::EventClockGuard;
+    #[cfg(any(test, feature = "testing"))]
+    pub use ring::hop_policy::{
+        HopPolicy, HopPolicyGuard, choice_counts, event_timeline, rank_stats,
+    };
+
     // Test hook: connection identity decisions since process start, by kind
     // (labels as in the `conn_identity_*` telemetry). Never reset.
     #[cfg(any(test, feature = "testing"))]

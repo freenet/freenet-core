@@ -1656,10 +1656,65 @@ impl NetLogMessage {
     }
 }
 
+#[cfg(any(test, feature = "testing"))]
+thread_local! {
+    static EVENT_CLOCK_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only, per thread: stamp the events this thread logs with the running
+/// turmoil simulation's elapsed time (`turmoil::sim_elapsed`, counted from the
+/// Unix epoch) instead of the wall clock, until the guard is dropped. Latencies
+/// read from event timestamps are then simulated latencies, and the clock is
+/// the same for every node; with the wall clock they measure how fast the host
+/// ran the simulation. Events logged outside a running simulation, or by
+/// another thread, keep the wall clock, so a test that uses this should check
+/// each timestamp it reads with [`EventClockGuard::is_virtual`].
+#[cfg(any(test, feature = "testing"))]
+#[must_use = "the clock reverts when the guard is dropped"]
+pub struct EventClockGuard(());
+
+#[cfg(any(test, feature = "testing"))]
+impl EventClockGuard {
+    pub fn simulation() -> Self {
+        EVENT_CLOCK_ON.with(|c| c.set(true));
+        Self(())
+    }
+
+    /// Whether `at` was stamped from the simulation clock and not from the wall
+    /// clock: a simulation's elapsed time counted from the Unix epoch is under a
+    /// year, a present-day wall-clock reading is about 56 years.
+    pub fn is_virtual(at: DateTime<Utc>) -> bool {
+        (0..366 * 24 * 3600).contains(&at.timestamp())
+    }
+}
+
+#[cfg(any(test, feature = "testing"))]
+impl Drop for EventClockGuard {
+    fn drop(&mut self) {
+        EVENT_CLOCK_ON.with(|c| c.set(false));
+    }
+}
+
+/// The timestamp for an event of `kind`. Only Get and Put events carry the
+/// simulation clock when a test asks for it (`EventClockGuard`): the
+/// connection bookkeeping in `tracing.rs` compares event times across nodes,
+/// and other kinds would tie or reorder under it. Every constructor of
+/// `NetLogMessage` goes through here, so the rule is one rule.
+pub(crate) fn event_timestamp(kind: &EventKind) -> DateTime<Utc> {
+    let _ = kind; // read only when a test can ask for the simulation clock
+    #[cfg(any(test, feature = "testing"))]
+    if matches!(kind, EventKind::Get(_) | EventKind::Put(_)) && EVENT_CLOCK_ON.with(|c| c.get()) {
+        if let Some(elapsed) = turmoil::sim_elapsed() {
+            return DateTime::<Utc>::from_timestamp_nanos(elapsed.as_nanos() as i64);
+        }
+    }
+    Utc::now()
+}
+
 impl<'a> From<NetEventLog<'a>> for NetLogMessage {
     fn from(log: NetEventLog<'a>) -> NetLogMessage {
         NetLogMessage {
-            datetime: Utc::now(),
+            datetime: event_timestamp(&log.kind),
             tx: *log.tx,
             kind: log.kind,
             peer_id: log.peer_id,
@@ -2091,7 +2146,7 @@ impl NetEventRegister for EventRegister {
     ) -> BoxFuture<'_, ()> {
         let log_msg = NetLogMessage {
             tx,
-            datetime: Utc::now(),
+            datetime: Utc::now(),      // a Timeout event is never Get or Put
             peer_id: PeerId::random(), // Timeout events don't have a specific peer context
             kind: EventKind::Timeout {
                 id: tx,
@@ -2397,7 +2452,7 @@ mod span_completed_tests {
 
     fn msg(kind: EventKind) -> NetLogMessage {
         NetLogMessage {
-            datetime: Utc::now(),
+            datetime: event_timestamp(&kind),
             tx: *Transaction::NULL,
             peer_id: PeerId::random(),
             kind,
@@ -2605,5 +2660,38 @@ mod get_hop_telemetry_pins {
             "inbound get_request must resolve the sender into `upstream`"
         );
         assert!(arm.contains("upstream,") && arm.contains("key_location: Some("));
+    }
+}
+
+#[cfg(test)]
+mod event_clock_tests {
+    use super::*;
+
+    /// The latency tests read `is_virtual` to detect an event that fell back to
+    /// the wall clock, so a present-day reading must not pass it.
+    #[test]
+    fn a_wall_clock_timestamp_is_not_virtual() {
+        assert!(!EventClockGuard::is_virtual(Utc::now()));
+        assert!(!EventClockGuard::is_virtual(
+            Utc::now() - chrono::Duration::days(365 * 30)
+        ));
+        assert!(EventClockGuard::is_virtual(
+            DateTime::<Utc>::from_timestamp_nanos(39_000_000_000)
+        ));
+        assert!(EventClockGuard::is_virtual(
+            DateTime::<Utc>::from_timestamp_nanos(0)
+        ));
+    }
+
+    /// Outside a running simulation the guard falls back to the wall clock,
+    /// and other kinds never use the simulation clock.
+    #[test]
+    fn event_timestamp_is_the_wall_clock_without_a_simulation() {
+        let _guard = EventClockGuard::simulation();
+        let wall = event_timestamp(&EventKind::Ignored);
+        assert!(!EventClockGuard::is_virtual(wall));
+        assert!(!EventClockGuard::is_virtual(event_timestamp(
+            &EventKind::Ignored
+        )));
     }
 }

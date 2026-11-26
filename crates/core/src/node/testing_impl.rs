@@ -563,6 +563,19 @@ fn fault_injection_delivery_decision(
                 }
             }
         }
+        if let Some((peer, pct)) = inj.lossy_peer {
+            if from == peer || to == peer {
+                inj.lossy_peer_counter += 1;
+                let mut x = inj.lossy_peer_counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                x ^= x >> 29;
+                x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                x ^= x >> 32;
+                if (x % 100) < u64::from(pct) {
+                    inj.stats.messages_dropped_quic_datagram += 1;
+                    return PacketDeliveryDecision::Drop;
+                }
+            }
+        }
         if let Some(delay) = inj.quic_datagram_delay {
             use crate::transport::demux::classify;
             use crate::transport::metrics::DemuxClass;
@@ -2742,6 +2755,22 @@ impl SimNetwork {
     #[cfg(any(test, feature = "testing"))]
     pub fn without_native_probes(&mut self) -> &mut Self {
         crate::operations::connect::native_wire_trace::suppress_native_probe(&self.name);
+        self
+    }
+
+    /// Experiment-only: drop `pct` percent of every datagram to or from node
+    /// `label`, deterministically. Call after the nodes exist and before the
+    /// run; do not combine with `with_fault_injection` (it replaces the injector).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_lossy_peer(&mut self, label: &NodeLabel, pct: u32) -> &mut Self {
+        let addr = *self
+            .node_addresses
+            .get(label)
+            .unwrap_or_else(|| panic!("no node {label}"));
+        let injector = crate::node::network_bridge::get_fault_injector(&self.name)
+            .expect("SimNetwork::new registers a fault injector");
+        injector.lock().unwrap().lossy_peer = Some((addr, pct));
+        self.install_fault_delivery_callback();
         self
     }
 

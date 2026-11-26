@@ -106,6 +106,8 @@ pub(crate) use connection_manager::nn_lattice_active_for;
 #[cfg(any(test, feature = "testing"))]
 pub use connection_manager::{set_nn_lattice_enabled, set_nn_lattice_force_active};
 mod connection;
+#[cfg(any(test, feature = "testing"))]
+pub mod hop_policy;
 mod hosting;
 #[cfg(test)]
 pub(crate) use broken_invariants::{BROKEN_INVARIANT_TTL, EMITTED_FLAG_EVENTS};
@@ -4352,14 +4354,41 @@ impl Ring {
         let target = Location::from(contract_key);
         self.connection_manager
             .routing_with(target, None, skip_list, move |candidates| {
+                #[cfg(any(test, feature = "testing"))]
+                let policy_window = match log_as {
+                    crate::router::dataset::DecisionLog::Joinable(op) => {
+                        let w = hop_policy::narrow(
+                            op,
+                            self.connection_manager.get_stored_location(),
+                            target,
+                            candidates,
+                        );
+                        Some((op, w))
+                    }
+                    _ => None,
+                };
+                #[cfg(any(test, feature = "testing"))]
+                let window: &[PeerKeyLocation] = policy_window
+                    .as_ref()
+                    .map_or(candidates, |(_, w)| w.as_slice());
+                #[cfg(not(any(test, feature = "testing")))]
+                let window: &[PeerKeyLocation] = candidates;
                 let (selected, decision, capture) = router.select_k_best_peers_capturing(
-                    candidates.iter(),
+                    window.iter(),
                     target,
                     1,
                     log.as_ref().is_some_and(|(log, _)| log.capture),
                     routes,
                 );
                 drop(router);
+                #[cfg(any(test, feature = "testing"))]
+                if let Some((op, _)) = &policy_window {
+                    hop_policy::record_rank(*op, target, candidates, selected.first().copied());
+                    hop_policy::record_events(
+                        self.connection_manager.get_stored_location(),
+                        decision.total_routing_events,
+                    );
+                }
                 if let Some((log, op)) = log {
                     log.record(
                         op,
@@ -4528,13 +4557,40 @@ impl Ring {
 
         let routes = matches!(log_as, crate::router::dataset::DecisionLog::Joinable(_));
         let log = self.candidate_log_for(log_as);
+        #[cfg(any(test, feature = "testing"))]
+        let policy_window = match log_as {
+            crate::router::dataset::DecisionLog::Joinable(op) => {
+                let w = hop_policy::narrow(
+                    op,
+                    self.connection_manager.get_stored_location(),
+                    target_location,
+                    &candidates,
+                );
+                Some((op, w))
+            }
+            _ => None,
+        };
+        #[cfg(any(test, feature = "testing"))]
+        let window: &[PeerKeyLocation] = policy_window
+            .as_ref()
+            .map_or(candidates.as_slice(), |(_, w)| w.as_slice());
+        #[cfg(not(any(test, feature = "testing")))]
+        let window: &[PeerKeyLocation] = candidates.as_slice();
         let (selected, decision, capture) = self.router.read().select_k_best_peers_capturing(
-            candidates.iter(),
+            window.iter(),
             target_location,
             k,
             log.as_ref().is_some_and(|(log, _)| log.capture),
             routes,
         );
+        #[cfg(any(test, feature = "testing"))]
+        if let Some((op, _)) = &policy_window {
+            hop_policy::record_rank(*op, target_location, &candidates, selected.first().copied());
+            hop_policy::record_events(
+                self.connection_manager.get_stored_location(),
+                decision.total_routing_events,
+            );
+        }
         // `selected` and `capture` borrow from `candidates`, not from the
         // router guard, so the read lock is released at the end of the
         // statement above, before the dataset write.

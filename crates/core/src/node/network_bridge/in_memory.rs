@@ -119,6 +119,12 @@ pub struct FaultInjectorState {
     /// One-way delay added to every legacy UDP intro datagram, the packets
     /// that open a UDP connection (`SimNetwork::delay_udp_intros`), if any.
     pub udp_intro_delay: Option<std::time::Duration>,
+    /// Experiment-only: a peer whose every datagram (both directions) is
+    /// dropped with probability `drop_pct`/100 (deterministic counter hash),
+    /// `SimNetwork::with_lossy_peer`.
+    pub lossy_peer: Option<(std::net::SocketAddr, u32)>,
+    /// Datagrams seen by the lossy-peer rule.
+    pub lossy_peer_counter: u64,
 }
 
 impl FaultInjectorState {
@@ -135,6 +141,8 @@ impl FaultInjectorState {
             quic_datagram_cuts: Vec::new(),
             quic_datagram_delay: None,
             udp_intro_delay: None,
+            lossy_peer: None,
+            lossy_peer_counter: 0,
         }
     }
 

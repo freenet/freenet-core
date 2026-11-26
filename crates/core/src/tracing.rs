@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use chrono::Utc;
 use either::Either;
 use freenet_stdlib::prelude::*;
 use futures::{FutureExt, future::BoxFuture};
@@ -98,6 +97,8 @@ pub(crate) use register::{
 };
 // `NetLogMessage` and `EventFlushHandle` are part of the public `tracing` API
 // (used by external crates, e.g. crates/core/tests), so they must stay `pub`.
+#[cfg(any(test, feature = "testing"))]
+pub use register::EventClockGuard;
 pub use register::{EventFlushHandle, NetLogMessage};
 // NEW_RECORDS_TS is needed by metrics_client's opentelemetry_tracer
 pub(crate) use event_kind::{
@@ -211,7 +212,7 @@ pub(super) mod test {
             let log_id = ListenerLogId(LOG_ID.fetch_add(1, SeqCst));
             let NetEventLog { peer_id, kind, .. } = log;
             let msg_log = NetLogMessage {
-                datetime: Utc::now(),
+                datetime: register::event_timestamp(&kind),
                 tx: *log.tx,
                 peer_id,
                 kind,
