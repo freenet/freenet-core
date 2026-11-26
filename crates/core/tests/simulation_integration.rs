@@ -27123,6 +27123,55 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
                 }
             }
         }
+        // Established peers of the subject's true successor, with lattice-edge marks.
+        {
+            let mut nb: Vec<f64> = links
+                .iter()
+                .filter_map(|&(x, y)| {
+                    if x == q(succ_of) {
+                        Some(y as f64 / 1000.0)
+                    } else if y == q(succ_of) {
+                        Some(x as f64 / 1000.0)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            nb.sort_by(f64::total_cmp);
+            let sd = |b: f64| {
+                let d = pg_wrap(b - succ_of);
+                if d > 0.5 { d - 1.0 } else { d }
+            };
+            let nearest_succ = nb
+                .iter()
+                .copied()
+                .filter(|&b| sd(b) > 0.0)
+                .min_by(|a, b| sd(*a).total_cmp(&sd(*b)));
+            let nearest_pred = nb
+                .iter()
+                .copied()
+                .filter(|&b| sd(b) < 0.0)
+                .max_by(|a, b| sd(*a).total_cmp(&sd(*b)));
+            let desc: Vec<String> = nb
+                .iter()
+                .map(|&b| {
+                    let mark = if Some(b) == nearest_succ {
+                        " [LATTICE succ]"
+                    } else if Some(b) == nearest_pred {
+                        " [LATTICE pred]"
+                    } else {
+                        ""
+                    };
+                    format!("{b:.3}(sd {:+.3}){mark}", sd(b))
+                })
+                .collect();
+            eprintln!(
+                "PG LATTICE succ-peers n={} (subject {subject:.3} sd {:+.3}): {}",
+                nb.len(),
+                sd(subject),
+                desc.join(", ")
+            );
+        }
         // Ring successor/predecessor link completeness over all peers.
         let (mut succ_ok, mut pred_ok) = (0, 0);
         let mut missing: Vec<String> = Vec::new();
