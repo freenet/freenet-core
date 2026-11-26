@@ -4556,7 +4556,7 @@ where
     // Telemetry only: time this relay spent waiting on downstream peers, and
     // how many of those waits ended in a timeout (silent downstream peers).
     let mut downstream_wait_ms: u64 = 0;
-    let mut downstream_timeouts: u32 = 0;
+    let mut downstream_timeout_attempts: u32 = 0;
     // True once at least one location-routing forward has happened. When
     // `relay_advance_to_next_peer` returns None on the FIRST iteration (no
     // routing candidate at all), consulting is a no-op — every advertised host
@@ -4784,7 +4784,7 @@ where
                         &op_manager.ring,
                         instance_id,
                         Some(hop_count),
-                        Some((downstream_wait_ms, downstream_timeouts)),
+                        Some((downstream_wait_ms, downstream_timeout_attempts)),
                     ) {
                         op_manager
                             .ring
@@ -4966,7 +4966,7 @@ where
                     timeout_secs = OPERATION_TTL.as_secs(),
                     "GET relay: attempt timed out; advancing to next peer"
                 );
-                downstream_timeouts = downstream_timeouts.saturating_add(1);
+                downstream_timeout_attempts = downstream_timeout_attempts.saturating_add(1);
                 recorder.record_attempt(Some(&peer), AttemptFailure::Timeout, true);
                 // Timed out with no reply — the peer may reply late on the
                 // reused tx, so do NOT consult after this (Codex P2).
@@ -6528,6 +6528,70 @@ mod tests {
             i += 1;
         }
         panic!("unterminated fn body for {signature_prefix}");
+    }
+
+    /// GET hop diagnostics: the relay driver must pass its upstream into the
+    /// forward `get_request` event and its accumulated downstream wait /
+    /// timeout-attempt counters into the exhaustion `get_not_found` event, and
+    /// count timeouts only in the timeout arm. Fields reach production only
+    /// through these call sites.
+    #[test]
+    fn relay_get_hop_telemetry_is_populated_at_emit_sites() {
+        let body = extract_fn_body(production_source(), "async fn drive_relay_get_inner<CB>(");
+        let code: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let window = |from: usize, to_marker: &str| -> String {
+            let rest = &code[from..];
+            rest[..rest.find(to_marker).expect("window end")].to_string()
+        };
+
+        let req = window(
+            code.find("NetEventLog::get_request(")
+                .expect("get_request call"),
+            "register_events",
+        );
+        assert!(
+            req.contains("get_peer_by_addr(upstream_addr)"),
+            "forward get_request must carry the upstream peer"
+        );
+
+        // The exhaustion NotFound is the LAST get_not_found call; the HTL=0
+        // one legitimately has no downstream wait.
+        let nf = window(
+            code.rfind("NetEventLog::get_not_found(")
+                .expect("get_not_found call"),
+            "register_events",
+        );
+        assert!(
+            nf.contains("Some((downstream_wait_ms, downstream_timeout_attempts))"),
+            "exhaustion get_not_found must carry the downstream wait counters"
+        );
+
+        let timeout_arm = window(
+            code.find("Err(_elapsed) =>").expect("timeout arm"),
+            "continue;",
+        );
+        assert!(
+            timeout_arm.contains("downstream_timeout_attempts =")
+                && timeout_arm.contains("saturating_add(1)"),
+            "timeout arm must count the timed-out attempt"
+        );
+        let send_err_arm = window(
+            code.find("Ok(Err(err)) =>").expect("send-error arm"),
+            "continue;",
+        );
+        assert!(
+            !send_err_arm.contains("downstream_timeout_attempts"),
+            "send errors must not be counted as timeouts"
+        );
+        let wait = window(
+            code.find("let wait_started").expect("wait start"),
+            "release_pending_op_slot",
+        );
+        assert!(wait.contains("downstream_wait_ms =") && wait.contains("wait_started.elapsed()"));
     }
 
     /// Isolate a single `match` arm's brace-delimited block, returning

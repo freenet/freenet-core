@@ -1355,8 +1355,11 @@ pub(crate) enum GetEvent {
         /// downstream peers (replies, timeouts and send failures) before
         /// giving up. `None` when no downstream wait applies (HTL exhausted).
         downstream_wait_ms: Option<u64>,
-        /// Relay hops only: how many downstream attempts timed out.
-        downstream_timeouts: Option<u32>,
+        /// Relay hops only: how many downstream attempts hit the per-attempt
+        /// deadline (`OPERATION_TTL`) with no reply. Send errors and
+        /// disconnects are NOT counted here; they still add to
+        /// `downstream_wait_ms`.
+        downstream_timeout_attempts: Option<u32>,
     },
     /// Get operation failed due to network or system error.
     GetFailure {
@@ -1386,7 +1389,8 @@ pub(crate) enum GetEvent {
         to: PeerKeyLocation,
         key: Option<ContractKey>,
         timestamp: u64,
-        /// `Some(true)` for a Found response, `Some(false)` for NotFound.
+        /// `Some(true)` for a Found response (inline or the streaming
+        /// header), `Some(false)` for NotFound.
         found: Option<bool>,
         /// Ring location of the requested contract instance.
         key_location: Option<Location>,

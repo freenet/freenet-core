@@ -2205,7 +2205,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     timestamp,
                     key_location,
                     downstream_wait_ms,
-                    downstream_timeouts,
+                    downstream_timeout_attempts,
                 } => {
                     let mut json = serde_json::json!({
                         "type": "get_not_found",
@@ -2223,8 +2223,8 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                     if let Some(ms) = downstream_wait_ms {
                         json["downstream_wait_ms"] = serde_json::json!(ms);
                     }
-                    if let Some(n) = downstream_timeouts {
-                        json["downstream_timeouts"] = serde_json::json!(n);
+                    if let Some(n) = downstream_timeout_attempts {
+                        json["downstream_timeout_attempts"] = serde_json::json!(n);
                     }
                     json
                 }
@@ -6114,7 +6114,7 @@ mod tests {
             timestamp: 1,
             key_location: Some(loc),
             downstream_wait_ms: Some(60_000),
-            downstream_timeouts: Some(1),
+            downstream_timeout_attempts: Some(1),
         });
         let sent = |found| {
             EventKind::Get(GetEvent::ResponseSent {
@@ -6140,7 +6140,7 @@ mod tests {
 
         let j = rt(&not_found);
         assert_eq!(j["downstream_wait_ms"], 60_000);
-        assert_eq!(j["downstream_timeouts"], 1);
+        assert_eq!(j["downstream_timeout_attempts"], 1);
         assert_eq!(j["key_location"].as_f64(), Some(loc.as_f64()));
 
         assert_eq!(rt(&sent(Some(true)))["result"], "found");

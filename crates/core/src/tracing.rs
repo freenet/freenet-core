@@ -634,7 +634,7 @@ mod get_outcome_summary_tests {
                 timestamp: 100,
                 key_location: None,
                 downstream_wait_ms: None,
-                downstream_timeouts: None,
+                downstream_timeout_attempts: None,
             }),
         }
     }
