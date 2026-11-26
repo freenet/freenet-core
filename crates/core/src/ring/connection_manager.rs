@@ -1740,7 +1740,9 @@ impl ConnectionManager {
     /// Install the in-flight transaction map (called once by `Ring::new`).
     /// Displacement stays disabled until it is set.
     pub(crate) fn set_live_tx_tracker(&self, tracker: super::LiveTransactionTracker) {
-        let _ = self.live_tx.set(tracker);
+        if self.live_tx.set(tracker).is_err() {
+            tracing::debug!("live transaction tracker already installed");
+        }
     }
 
     /// Victims chosen by lattice displacement that the caller must now drop
@@ -1765,16 +1767,22 @@ impl ConnectionManager {
 
     /// LATTICE DISPLACEMENT. A CONNECT arrives from a peer that would be this
     /// node's new nearest ring neighbour on its side (the caller has checked
-    /// that), and the node already holds `max_connections + LATTICE_OVERMAX_SLACK`
-    /// established links, so the over-cap predicate refuses it. Without this the
+    /// that), and the node is full: the over-cap predicate refuses it. Without this the
     /// true neighbour can never link to a saturated peer, and a key that sits
     /// between them is unreachable from that side (see #4760's findability gap).
+    ///
+    /// The caller reaches here only after the over-cap predicate refused the
+    /// candidate. That predicate counts pending reservations, including the
+    /// candidate's own, so it refuses at 13 established links of 14 as well; the
+    /// trace of a refused neighbour in the placement sim showed 3,300 such
+    /// refusals at 12 and 13 links against a handful at 14. So the trigger is "at
+    /// or over `max_connections` and refused", not only "at the ceiling".
     ///
     /// Instead of refusing, drop exactly ONE existing link and admit the
     /// candidate. The victim is the one a topology swap would pick (least-routed,
     /// via `TopologyManager::select_displacement_victim`), never:
     ///  - either side's current nearest ring neighbour (a lattice edge);
-    ///  - a peer with transactions in flight (`LiveTransactionTracker`);
+    ///  - a peer with an operation in flight (`LiveTransactionTracker::has_in_flight_operation`);
     ///  - a configured gateway, unless the node would still hold at least
     ///    `min_connections` non-gateway links afterwards.
     ///
@@ -1804,8 +1812,9 @@ impl ConnectionManager {
         let snapshot: BTreeMap<Location, Vec<Connection>> =
             self.connections_by_location.read().clone();
         let established: usize = snapshot.values().map(Vec::len).sum();
-        if established < self.max_connections + LATTICE_OVERMAX_SLACK {
-            // Below the ceiling the ordinary over-cap path decides.
+        if established < self.max_connections {
+            // Below max the ordinary path decides; displacement is for a node that
+            // is full, or that the over-cap predicate counts as full.
             return false;
         }
         let gateway_links = snapshot
@@ -1825,7 +1834,7 @@ impl ConnectionManager {
                     match peer.socket_addr() {
                         None => true,
                         Some(a) => {
-                            live_tx.has_live_connection(a)
+                            live_tx.has_in_flight_operation(a)
                                 || (self.gateway_addrs.contains(&a) && !gateway_displaceable)
                         }
                     }
@@ -1835,6 +1844,7 @@ impl ConnectionManager {
                 candidate = %candidate,
                 candidate_location = %candidate_loc,
                 established,
+                gateway_links,
                 "lattice displacement: no eligible victim, refusing"
             );
             return false;
@@ -8547,11 +8557,28 @@ mod tests {
         (cm, tracker, long_links)
     }
 
+    /// An operation (a GET) awaiting `addr`.
     fn busy(tracker: &crate::ring::LiveTransactionTracker, addr: SocketAddr) {
         tracker.add_transaction(
             addr,
-            crate::message::Transaction::new::<crate::operations::connect::ConnectMsg>(),
+            crate::message::Transaction::new::<crate::operations::get::GetMsg>(),
         );
+    }
+
+    /// Relayed-CONNECT bookkeeping on every long link does not protect it: the
+    /// joiner's driver retries, and these entries leak until the peer drops.
+    #[test]
+    fn displacement_ignores_connect_bookkeeping_on_a_link() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        let (cm, tracker, long_links) = displacement_fixture(2);
+        for (_, a) in &long_links {
+            tracker.add_transaction(
+                *a,
+                crate::message::Transaction::new::<crate::operations::connect::ConnectMsg>(),
+            );
+        }
+        assert!(cm.should_accept(Location::new(0.51), make_addr(9210)));
+        assert_eq!(cm.take_displacement_victims().len(), 1);
     }
 
     /// A strictly closer true neighbour at a node already at the over-cap ceiling:
@@ -8658,6 +8685,42 @@ mod tests {
         );
         assert_eq!(cm.take_displacement_victims().len(), 1);
         assert_eq!(cm.lattice_displacements(), 2);
+    }
+
+    /// The over-cap predicate counts pending reservations (the candidate's own
+    /// included), so it refuses a true neighbour at 13 of 14 links too. A full
+    /// node (at or over max) must displace then as well, not only at the ceiling.
+    #[test]
+    fn displacement_triggers_when_pending_reservations_crowd_a_full_node() {
+        let _nn_guard = NnLatticeOverrideGuard;
+        set_nn_lattice_enabled(true);
+        let cm = make_connection_manager(None, 2, 4, false);
+        cm.update_location(Some(Location::new(0.5)));
+        cm.set_live_tx_tracker(crate::ring::LiveTransactionTracker::new());
+        let kp = TransportKeypair::new();
+        // Exactly max (4) established: edges 0.52 and 0.45, long links 0.7, 0.2.
+        for (i, l) in [0.7_f64, 0.2, 0.52, 0.45].into_iter().enumerate() {
+            assert!(cm.add_connection(
+                Location::new(l),
+                make_addr(9400 + i as u16),
+                kp.public().clone(),
+                false
+            ));
+        }
+        assert_eq!(cm.connection_count(), 4);
+        // Two unrelated handshakes in flight.
+        for i in 0..2u16 {
+            cm.pending_reservations
+                .write()
+                .insert(make_addr(9410 + i), (Location::new(0.9), Instant::now()));
+        }
+        let cand = make_addr(9420);
+        assert!(
+            !cm.admits_lattice_edge_over_cap(Location::new(0.51)),
+            "4 established + 2 pending is full by the predicate's count"
+        );
+        assert!(cm.should_accept(Location::new(0.51), cand));
+        assert_eq!(cm.take_displacement_victims().len(), 1);
     }
 
     /// A candidate that is not strictly closer than the current nearest on its

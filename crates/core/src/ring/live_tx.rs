@@ -122,6 +122,27 @@ impl LiveTransactionTracker {
         self.tx_per_peer.contains_key(&peer_addr)
     }
 
+    /// Whether an operation a client may be waiting on is still in flight to
+    /// `peer_addr`: a registered, non-CONNECT transaction younger than
+    /// `OPERATION_TTL`.
+    ///
+    /// Not `has_live_connection`, which is true for almost every link of a busy
+    /// node: relayed CONNECTs are registered per peer and, once rebound to a
+    /// second peer, stay on the first until it disconnects (see
+    /// `add_transaction`), and nothing sweeps entries older than the operation
+    /// TTL. A displacement test over 14 links counted 4,004 CONNECT entries and
+    /// found every link "live". A CONNECT through a dropped link is retried by
+    /// the joiner's driver, so it does not make the link worth keeping; and an
+    /// operation older than `OPERATION_TTL` has already timed out.
+    pub(crate) fn has_in_flight_operation(&self, peer_addr: SocketAddr) -> bool {
+        use crate::message::TransactionType;
+        self.tx_per_peer.get(&peer_addr).is_some_and(|txs| {
+            txs.iter().any(|tx| {
+                !matches!(tx.transaction_type(), TransactionType::Connect) && !tx.timed_out()
+            })
+        })
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.tx_per_peer.len()
     }

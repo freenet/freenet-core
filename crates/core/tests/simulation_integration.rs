@@ -27461,28 +27461,34 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
         }
     }
     {
-        // Churn: connections dropped and CONNECT requests sent, per node per
-        // simulated minute, over the operation phase. The denominator is the
-        // scheduled op timeline (one op per OP_INTERVAL_MS), a lower bound on
-        // the virtual time the phase ran; compare on/off at the same seed.
-        let (mut disconnects, mut connect_requests, mut connected) = (0usize, 0usize, 0usize);
-        for l in logs.iter().skip(pre_len) {
-            let d = format!("{:?}", l.kind);
-            if d.starts_with("Disconnected") {
-                disconnects += 1;
-            } else if d.starts_with("Connect(RequestSent") {
-                connect_requests += 1;
-            } else if d.starts_with("Connect(Connected") {
-                connected += 1;
+        // Churn: connections dropped, connections made and CONNECT requests sent,
+        // per node, in two windows: the join phase (log entries before the first
+        // scheduled op) and the operation phase. Rates use the op phase's
+        // scheduled length (one op per OP_INTERVAL_MS plus the 60 s settle wait),
+        // so they are comparable between runs of one seed, not absolute.
+        let count = |range: std::ops::Range<usize>| {
+            let (mut disconnects, mut connect_requests, mut connected) = (0usize, 0usize, 0usize);
+            for l in &logs[range] {
+                let d = format!("{:?}", l.kind);
+                if d.starts_with("Disconnected") {
+                    disconnects += 1;
+                } else if d.starts_with("Connect(RequestSent") {
+                    connect_requests += 1;
+                } else if d.starts_with("Connect(Connected") {
+                    connected += 1;
+                }
             }
-        }
-        let minutes = (op_phase_slots as f64 * OP_INTERVAL_MS as f64 / 1000.0) / 60.0;
+            (disconnects, connect_requests, connected)
+        };
+        let (jd, jr, jc) = count(0..pre_len);
+        let (od, or, oc) = count(pre_len..logs.len());
+        let minutes = (op_phase_slots as f64 * OP_INTERVAL_MS as f64 / 1000.0 + 60.0) / 60.0;
         let per_node_min = |n: usize| n as f64 / (NODES + 1) as f64 / minutes;
         eprintln!(
-            "PG CHURN: displace={displace} seed={seed:#x} op_phase_minutes={minutes:.1} disconnects={disconnects} ({:.3}/node/min) connect_requests={connect_requests} ({:.3}/node/min) connected={connected} ({:.3}/node/min) displacements op_phase={op_phase_displacements} join_phase={join_phase_displacements}",
-            per_node_min(disconnects),
-            per_node_min(connect_requests),
-            per_node_min(connected),
+            "PG CHURN: displace={displace} seed={seed:#x} join_phase[disconnects={jd} connect_requests={jr} connected={jc} displacements={join_phase_displacements}] op_phase[minutes={minutes:.1} disconnects={od} ({:.3}/node/min) connect_requests={or} ({:.3}/node/min) connected={oc} ({:.3}/node/min) displacements={op_phase_displacements}]",
+            per_node_min(od),
+            per_node_min(or),
+            per_node_min(oc),
         );
     }
     let trace_keys: Vec<usize> = if never.is_empty() {
