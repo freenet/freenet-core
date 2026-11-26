@@ -13076,6 +13076,196 @@ fn test_get_retry_reaches_single_host_after_one_timeout() {
     );
 }
 
+/// A GET whose first hop is a peer that died without telling anyone must fail
+/// over after about the stale-link window, not after the 60 s attempt deadline.
+///
+/// Two hosts hold the contract. The one at the key is the requester's closest
+/// connected candidate, so it is the first hop; it is crashed (every packet to
+/// and from it is dropped, and nobody is told) just before the GET. Under
+/// `VirtualTime` the transport keepalive is off and the idle timeout is hours,
+/// so nothing in the transport ever notices the dead link: only the
+/// operation's own 60 s deadline can, which is the production shape of a
+/// topology swap that closes a link on one side only. The stale-link sweep
+/// notices after its window (14 s on UDP) because a request is waiting and no
+/// packet has arrived, drops the link, and the GET retries through the second
+/// host.
+///
+/// The latency is read from the requester's own `ClientTerminal` event, minus
+/// its loopback `Request`, as in the findability harness.
+#[test_log::test]
+fn test_get_fails_over_from_a_silently_dead_first_hop() {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimNetwork, SimOperation};
+
+    const SEED: u64 = 0x57A1_E11C_0001;
+    const NETWORK_NAME: &str = "get-dead-first-hop";
+    // Silence window (14 s on UDP) plus one retry, with headroom. The
+    // un-swept behaviour is the 60 s attempt deadline plus the retry.
+    const MAX_LATENCY_S: f64 = 25.0;
+    setup_deterministic_state(SEED);
+
+    let contract = SimOperation::create_test_contract(0x59);
+    let contract_id = *contract.key().id();
+    let contract_key = contract.key();
+    let key_loc = Location::from(&contract_key).as_f64();
+    let wrap = |x: f64| x.rem_euclid(1.0);
+    // Node 1 (crashed) sits AT the key, node 2 (second host) a little away;
+    // node 4 is the requester, far from both.
+    let node_locations: Vec<f64> = [0.0, 0.08, 0.30, 0.50, 0.70, 0.85]
+        .iter()
+        .map(|o| wrap(key_loc + o))
+        .collect();
+    let num_nodes = node_locations.len();
+
+    let rt = create_runtime();
+    let (mut sim, logs_handle) = rt.block_on(async {
+        let mut sim = SimNetwork::new_with_node_locations(
+            NETWORK_NAME,
+            1,
+            num_nodes,
+            6,
+            4,
+            8,
+            5,
+            SEED,
+            &node_locations,
+        )
+        .await;
+        sim.disable_placement_migration();
+        sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
+        sim.with_controlled_op_interval(Duration::from_secs(5));
+        let logs = sim.event_logs_handle();
+        (sim, logs)
+    });
+
+    let dead = NodeLabel::node(NETWORK_NAME, 1);
+    let second_host = NodeLabel::node(NETWORK_NAME, 2);
+    let requester = NodeLabel::node(NETWORK_NAME, 4);
+    let dead_addr = sim.node_address(&dead).expect("dead host address");
+    let requester_addr = sim.node_address(&requester).expect("requester address");
+    let mut operations = Vec::new();
+    for host in [&dead, &second_host] {
+        operations.push(ScheduledOperation::new(
+            host.clone(),
+            SimOperation::SeedHostedContract {
+                contract: contract.clone(),
+                state: vec![5, 6, 5, 7],
+            },
+        ));
+    }
+    // Let the small ring fill in so the requester is connected to the hosts.
+    let filler = *SimOperation::create_test_contract(0x5A).key().id();
+    let filler_get = || {
+        ScheduledOperation::new(
+            NodeLabel::gateway(NETWORK_NAME, 0),
+            SimOperation::Get {
+                contract_id: filler,
+                return_contract_code: false,
+                subscribe: false,
+            },
+        )
+    };
+    for _ in 0..24 {
+        operations.push(filler_get());
+    }
+    operations.push(ScheduledOperation::new(dead.clone(), SimOperation::CrashNode));
+    operations.push(ScheduledOperation::new(
+        requester.clone(),
+        SimOperation::Get {
+            contract_id,
+            return_contract_code: true,
+            subscribe: false,
+        },
+    ));
+    // Keep the simulation running past the 60 s attempt deadline so the
+    // un-swept behaviour completes and can be measured, not cut off.
+    for _ in 0..16 {
+        operations.push(filler_get());
+    }
+
+    let result = sim.run_controlled_simulation(
+        SEED,
+        operations,
+        Duration::from_secs(900),
+        Duration::from_secs(120),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "simulation failed: {:?}",
+        result.turmoil_result.err()
+    );
+    assert!(
+        result.crash_packets_dropped() > 0,
+        "precondition: the crash must have dropped traffic"
+    );
+
+    // ---- Analysis ----
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let instance = contract_id.to_string();
+    let mine: Vec<(chrono::DateTime<chrono::Utc>, String, String)> = logs
+        .iter()
+        .filter(|l| l.peer_id.to_string().contains(&format!("@{requester_addr}")))
+        .map(|l| (l.datetime, l.tx.to_string(), format!("{:?}", l.kind)))
+        .filter(|(_, _, d)| d.starts_with("Get(") && d.contains(&instance))
+        .collect();
+    let variant = |d: &str| -> String {
+        d["Get(".len()..]
+            .split([' ', '{'])
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let terminal = mine
+        .iter()
+        .filter(|(_, _, d)| variant(d) == "ClientTerminal" && d.contains("is_sub_op: false"))
+        .min_by_key(|(t, _, _)| *t)
+        .expect("the requester's GET reached a client terminal");
+    let start = mine
+        .iter()
+        .filter(|(_, tx, d)| variant(d) == "Request" && *tx == terminal.1)
+        .map(|(t, _, _)| *t)
+        .min()
+        .expect("the requester's GET has a Request event");
+    let latency_s = (terminal.0 - start).num_milliseconds() as f64 / 1000.0;
+    let first_target_is_dead = mine
+        .iter()
+        .filter(|(_, tx, d)| variant(d) == "Request" && *tx == terminal.1)
+        .min_by_key(|(t, _, _)| *t)
+        .map(|(_, _, d)| {
+            d.split("target: ")
+                .nth(1)
+                .is_some_and(|rest| rest.split(')').next().unwrap_or("").contains(&format!("@{dead_addr}")))
+        });
+    eprintln!(
+        "DEAD-FIRST-HOP latency_s={latency_s:.1} outcome_success={} first_hop_is_dead_peer={first_target_is_dead:?}",
+        terminal.2.contains("outcome: Success")
+    );
+    for (t, tx, d) in &mine {
+        if variant(d) == "Request" || variant(d) == "ClientTerminal" {
+            eprintln!(
+                "DEAD-FIRST-HOP   t={:+8.3}s tx=..{} {}",
+                (*t - start).num_milliseconds() as f64 / 1000.0,
+                &tx[tx.len().saturating_sub(5)..],
+                d.chars().take(300).collect::<String>()
+            );
+        }
+    }
+
+    assert_eq!(
+        first_target_is_dead,
+        Some(true),
+        "precondition: the GET's first hop must be the crashed host"
+    );
+    assert!(
+        terminal.2.contains("outcome: Success"),
+        "the GET must be found through the second host"
+    );
+    assert!(
+        latency_s < MAX_LATENCY_S,
+        "the GET waited {latency_s:.1}s on a dead first hop (limit {MAX_LATENCY_S}s): \
+         nothing noticed that the link was dead"
+    );
+}
+
 /// A finished close-cluster run and the contract it placed.
 type CloseClusterRun = (
     freenet::dev_tool::ControlledSimulationResult,

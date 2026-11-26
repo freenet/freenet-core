@@ -59,6 +59,7 @@ mod identity;
 #[cfg(all(test, not(feature = "simulation_tests")))]
 mod large_state_fanout_tests;
 mod migration;
+mod stale_link_sweep;
 mod zombie_sweep;
 
 use connection_map::ConnectionMap;
