@@ -2257,6 +2257,11 @@ fn log_umask_override() {
 fn log_umask_override() {}
 
 fn main() {
+    // A compile worker is this binary started with a hidden first argument. It
+    // must run before anything else here (no logging, no config, no runtime) and
+    // never returns; for any other start this returns at once.
+    freenet::run_compile_worker_if_requested();
+
     // Anchor the bootstrap-latency clock at process start, before anything
     // else, so `freenet.bootstrap.time_to_min_connections_seconds` measures
     // what its name says — including config load, storage open and the

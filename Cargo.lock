@@ -2145,6 +2145,7 @@ dependencies = [
  "rand 0.10.1",
  "rand 0.9.4",
  "rand_core 0.10.1",
+ "rayon",
  "redb",
  "regex",
  "reqwest",
@@ -2188,7 +2189,7 @@ dependencies = [
  "turmoil",
  "ulid",
  "url",
- "wasmparser 0.258.0",
+ "wasmparser 0.254.2",
  "wasmtime",
  "wat",
  "which",
@@ -8119,19 +8120,6 @@ dependencies = [
 
 [[package]]
 name = "wasmparser"
-version = "0.258.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d9a61719f93a87b16d325921e251800c4833f8fab50fa21c7de73aed50086313"
-dependencies = [
- "bitflags 2.11.1",
- "hashbrown 0.17.1",
- "indexmap 2.14.0",
- "semver",
- "serde",
-]
-
-[[package]]
-name = "wasmparser"
 version = "0.260.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4c94519d78304dc4a4bb5925eda6ff153bf06167467cff9233dc9593bae28fdd"
@@ -8199,7 +8187,6 @@ dependencies = [
  "wasmtime-internal-jit-icache-coherence",
  "wasmtime-internal-unwinder",
  "wasmtime-internal-versioned-export-macros",
- "wat",
  "windows-sys 0.61.2",
 ]
 

@@ -352,6 +352,31 @@ mod tests {
     use crate::transport::metrics::TransportSnapshot;
     use std::net::SocketAddr;
 
+    #[test]
+    fn compile_isolation_banners_say_exactly_what_is_happening() {
+        // Startup fail-open: compiles run unchecked.
+        let mut snap = base_snapshot();
+        snap.compile_isolation_degraded = true;
+        let html = build_status_card(&Some(snap));
+        assert!(html.contains("compiled without its CPU and memory limits"));
+        assert!(!html.contains("short of memory"));
+
+        // Runtime headroom shortage: isolation is on and compiles are refused.
+        let mut snap = base_snapshot();
+        snap.compile_isolation_refusing_for_memory = true;
+        let html = build_status_card(&Some(snap));
+        assert!(html.contains("short of memory under its service limit"));
+        assert!(html.contains("refused for now"));
+        assert!(
+            !html.contains("without its CPU and memory limits"),
+            "isolation is still on, so the page must not say compiles are unchecked"
+        );
+
+        // Neither state: no compile-isolation banner.
+        let html = build_status_card(&Some(base_snapshot()));
+        assert!(!html.contains("Compile isolation"));
+    }
+
     fn base_snapshot() -> NetworkStatusSnapshot {
         NetworkStatusSnapshot {
             failures: Vec::new(),
@@ -377,6 +402,8 @@ mod tests {
             governance: Default::default(),
             ban_list: Default::default(),
             hosting: Default::default(),
+            compile_isolation_degraded: false,
+            compile_isolation_refusing_for_memory: false,
         }
     }
 

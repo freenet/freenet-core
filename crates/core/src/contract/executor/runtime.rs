@@ -552,6 +552,12 @@ impl Executor<Runtime> {
             // `default_wasmtime_cache_size_bytes_for_dir`.
             wasmtime_cache_dir: Some(wasmtime_cache_dir),
             wasmtime_cache_size_bytes,
+            compile_isolation: config.compile_isolation,
+            // On a hosted node delegate code is covered like contract code.
+            compile_isolation_delegates: config.ws_api.hosted_mode,
+            compile_metrics: op_manager
+                .as_ref()
+                .map(|o| o.ring.module_cache_metrics().compile()),
             ..RuntimeConfig::default()
         };
         let mut rt = Runtime::build_with_shared_module_caches(
@@ -566,9 +572,17 @@ impl Executor<Runtime> {
             inherited_origins,
             shared_backend.unwrap_or_else(|| {
                 // First executor — create a fresh backend engine; RuntimePool
-                // will extract and share it with subsequent executors.
-                crate::wasm_runtime::engine::Engine::create_backend_engine(&runtime_config)
-                    .expect("Failed to create WASM backend engine")
+                // will extract and share it with subsequent executors. The
+                // refusals it remembers expire on the node's own clock.
+                let compile_time: crate::util::time_source::DynTimeSource = match &op_manager {
+                    Some(op_manager) => op_manager.interest_manager.time_source(),
+                    None => Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+                };
+                crate::wasm_runtime::engine::Engine::create_backend_engine(
+                    &runtime_config,
+                    compile_time,
+                )
+                .expect("Failed to create WASM backend engine")
             }),
             &runtime_config,
         )
@@ -1474,7 +1488,8 @@ mod executor_pin_tests {
         // the backend engine is now built from `runtime_config`, not a fresh
         // `RuntimeConfig::default()`.
         assert!(
-            body.contains("Engine::create_backend_engine(&runtime_config)"),
+            body.contains("Engine::create_backend_engine(\n                    &runtime_config,")
+                || body.contains("Engine::create_backend_engine(&runtime_config,"),
             "backend engine must be built from the threaded runtime_config"
         );
         // The wasmtime ON-DISK compile cache's soft limit must be derived from

@@ -160,7 +160,23 @@ use wasmtime::{
     Instance, Linker, Module, OptLevel, ResourceLimiter, Store,
 };
 
+use super::compile_verdicts::CompileVerdictCache;
+use super::compile_worker::metrics::Outcome;
+use super::compile_worker::{CodeKind, Isolation};
+
+/// Identity of the compiler behind `engine`: wasmtime's own compatibility hash,
+/// which covers the wasmtime version, the compiler target and flags and the
+/// enabled WebAssembly features. Remembered compile refusals are keyed by it, so
+/// a wasmtime upgrade or a changed engine configuration never answers from a
+/// verdict another compiler recorded.
+pub(crate) fn engine_compat_id(engine: &Engine) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    engine.precompile_compatibility_hash().hash(&mut hasher);
+    hasher.finish()
+}
 use super::{InstanceHandle, WasmEngine, WasmError};
+use crate::util::time_source::{DynTimeSource, InstantTimeSrc};
 use crate::wasm_runtime::ContractError;
 use crate::wasm_runtime::native_api::{self, MEM_ADDR};
 use crate::wasm_runtime::runtime::RuntimeConfig;
@@ -191,13 +207,255 @@ fn compile_coalesce_map() -> &'static DashMap<[u8; 32], Arc<Mutex<()>>> {
 /// then get a near-instant disk-cache hit from `Module::new()`. Runs
 /// synchronously on the calling thread — the offload decision is made one level
 /// up in `compile()`.
-fn compile_coalesced(engine: &Engine, code: &[u8]) -> Result<Module, WasmError> {
-    let hash = *blake3::hash(code).as_bytes();
+fn compile_coalesced(
+    engine: &Engine,
+    verdicts: &CompileVerdictCache,
+    isolation: &Isolation,
+    kind: CodeKind,
+    code: &[u8],
+) -> Result<Module, WasmError> {
+    compile_coalesced_with(engine, verdicts, isolation, kind, code, &|engine, code| {
+        #[cfg(test)]
+        MODULE_NEW_CALLS.with(|calls| calls.set(calls.get() + 1));
+        run_in_compile_pool(|| {
+            #[cfg(test)]
+            POOL_THREADS_SEEN.store(rayon::current_num_threads(), Ordering::SeqCst);
+            Module::new(engine, code)
+        })
+    })
+}
+
+/// Threads of the pool every compile runs on: the cores, at most 4. wasmtime
+/// compiles a module's functions in parallel and each thread holds one
+/// function's compiler state, so the pool size, not the machine's core count,
+/// bounds the compiler's working memory.
+pub(crate) fn compile_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .clamp(1, 4)
+}
+
+/// The pool all compiles share.
+fn compile_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(compile_threads())
+            .thread_name(|i| format!("wasm-compile-{i}"))
+            .build()
+            .expect("the compile thread pool starts")
+    })
+}
+
+/// Compile `code` on the shared compile pool, exactly as the node does.
+#[cfg(target_os = "linux")]
+pub(crate) fn compile_module_in_pool(engine: &Engine, code: &[u8]) -> wasmtime::Result<Module> {
+    run_in_compile_pool(|| Module::new(engine, code))
+}
+
+/// Run `f` so that wasmtime's parallel compilation uses [`compile_pool`].
+fn run_in_compile_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    compile_pool().install(f)
+}
+
+// Test seam: the size of the pool the last compile ran in.
+#[cfg(test)]
+static POOL_THREADS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Most Cranelift compiles allowed to run at once on this node: a quarter of
+/// the cores, at least 1 and at most 4. Each compile may itself use every core
+/// (wasmtime compiles a module's functions in parallel), so this bounds the
+/// node-wide CPU and memory that compiles use.
+pub(crate) fn compile_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get() / 4)
+        .clamp(1, 4)
+}
+
+/// A counting semaphore over compiles.
+pub(crate) struct CompileGate {
+    free: Mutex<usize>,
+    freed: std::sync::Condvar,
+}
+
+/// Held while a compile runs; releases its slot on drop.
+pub(crate) struct CompilePermit<'a>(&'a CompileGate);
+
+impl CompileGate {
+    pub(crate) fn new(permits: usize) -> Self {
+        Self {
+            free: Mutex::new(permits),
+            freed: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Wait for a free slot.
+    pub(crate) fn acquire(&self) -> CompilePermit<'_> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        while *free == 0 {
+            free = self.freed.wait(free).unwrap_or_else(|e| e.into_inner());
+        }
+        *free -= 1;
+        CompilePermit(self)
+    }
+
+    /// Take a free slot if there is one.
+    #[cfg(test)]
+    pub(crate) fn try_acquire(&self) -> Option<CompilePermit<'_>> {
+        let mut free = self.free.lock().unwrap_or_else(|e| e.into_inner());
+        if *free == 0 {
+            return None;
+        }
+        *free -= 1;
+        Some(CompilePermit(self))
+    }
+}
+
+impl Drop for CompilePermit<'_> {
+    fn drop(&mut self) {
+        *self.0.free.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        self.0.freed.notify_one();
+    }
+}
+
+/// The node-wide compile gate.
+fn compile_gate() -> &'static CompileGate {
+    static GATE: OnceLock<CompileGate> = OnceLock::new();
+    GATE.get_or_init(|| CompileGate::new(compile_concurrency()))
+}
+
+/// How a failed compile of an accepted module is handled.
+enum CompileFailure {
+    /// The engine finds the module invalid: a property of the bytes.
+    Invalid(super::compile_limits::CompileRefusal),
+    /// Any other failure (an allocation or disk error while compiling).
+    Other(String),
+}
+
+/// `validated` is the engine's own validation of the module whose compile
+/// failed with `error`. Only an invalid module is a property of the bytes; every
+/// other failure may be transient and is not remembered.
+fn classify_compile_failure(
+    validated: wasmtime::Result<()>,
+    error: &wasmtime::Error,
+) -> CompileFailure {
+    use super::compile_limits::{CompileRefusal, bounded_text};
+    match validated {
+        Err(invalid) => CompileFailure::Invalid(CompileRefusal::Malformed(bounded_text(&invalid))),
+        Ok(()) => CompileFailure::Other(bounded_text(error)),
+    }
+}
+
+/// The counter a scan refusal falls under. The other forty-odd variants are
+/// structural limits and count together.
+#[allow(clippy::wildcard_enum_match_arm)]
+fn prefilter_outcome(refusal: &super::compile_limits::CompileRefusal) -> Outcome {
+    use super::compile_limits::CompileRefusal as R;
+    match refusal {
+        R::ModuleTooLarge { .. } => Outcome::RefusedSize,
+        R::NotBinary(_) => Outcome::RefusedText,
+        R::Malformed(_) => Outcome::RefusedFeature,
+        _ => Outcome::RefusedLimit,
+    }
+}
+
+// Test seam: counts calls to the compiler on this thread.
+#[cfg(test)]
+thread_local! {
+    static MODULE_NEW_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// [`compile_coalesced`] with the compiler call supplied by the caller (the
+/// tests substitute a failing one).
+fn compile_coalesced_with(
+    engine: &Engine,
+    verdicts: &CompileVerdictCache,
+    isolation: &Isolation,
+    kind: CodeKind,
+    code: &[u8],
+    new_module: &dyn Fn(&Engine, &[u8]) -> wasmtime::Result<Module>,
+) -> Result<Module, WasmError> {
+    use super::compile_limits::{check_input_size, check_module};
+    // Bound the input before hashing or converting it.
+    if let Err(refusal) = check_input_size(code) {
+        isolation.metrics().count(Outcome::RefusedSize);
+        return Err(refusal.into());
+    }
+    let input_hash = *blake3::hash(code).as_bytes();
+    if let Some(refusal) = verdicts.get(&input_hash) {
+        isolation.metrics().count_cached_refusal(&refusal);
+        return Err(WasmError::CompileRefused(refusal));
+    }
+    // Refuse modules outside the acceptance rule before any compile work (see
+    // `compile_limits`). Only the binary format is accepted from here on: the
+    // text format is converted by a parser that runs before any limit, so it is
+    // not taken from this path. A caller that holds text converts it first.
+    match check_module(code) {
+        Ok(shape) => {
+            // Early warning, once per code hash: a module this close to a
+            // limit may be refused by a release that tightens it.
+            if let Some((limit_name, value, limit)) = super::compile_limits::nearest_limit(&shape) {
+                if verdicts.first_near_limit_report(&input_hash) {
+                    tracing::info!(
+                        code_hash = %blake3::Hash::from(input_hash),
+                        limit_name,
+                        value,
+                        limit,
+                        "WASM module is close to a compile limit"
+                    );
+                }
+            }
+        }
+        Err(refusal) => {
+            tracing::info!(reason = %refusal, "WASM module refused before compilation");
+            isolation.metrics().count(prefilter_outcome(&refusal));
+            verdicts.insert(input_hash, refusal.clone());
+            return Err(WasmError::CompileRefused(refusal));
+        }
+    }
+    // The input is the binary that is compiled, so one hash serves both the
+    // verdict cache and the coalescing map.
+    let hash = input_hash;
     let map = compile_coalesce_map();
     let mutex = map.entry(hash).or_default().clone();
     let _guard = mutex.lock().unwrap_or_else(|e| e.into_inner());
+    // At most `compile_concurrency()` compiles run at once on this node, so they
+    // cannot take every core. The permit is
+    // taken after the per-hash mutex: a thread waiting on a sibling compile of
+    // the same bytes holds no permit, and a permit holder never waits on
+    // another, so the two cannot deadlock.
+    //
+    // The compile worker, when the node runs one, judges the module first and
+    // holds its own slot (taken before this one, always in this order) until the
+    // node's compile below has ended. It never changes what is compiled: a module
+    // it accepts is compiled here exactly as without it.
+    let ticket = match isolation.admit(&hash, code, kind, verdicts) {
+        Ok(ticket) => ticket,
+        Err(refusal) => {
+            if Arc::strong_count(&mutex) == 1 {
+                map.remove(&hash);
+            }
+            return Err(refusal);
+        }
+    };
+    let _permit = compile_gate().acquire();
 
-    let result = Module::new(engine, code).map_err(|e| WasmError::Compile(e.to_string()));
+    let result = match new_module(engine, code) {
+        Ok(module) => Ok(module),
+        // Only a module the engine itself finds invalid is remembered: that is a
+        // property of the bytes. Any other failure is not, so a transient fault
+        // never refuses valid code.
+        Err(error) => match classify_compile_failure(Module::validate(engine, code), &error) {
+            CompileFailure::Invalid(refusal) => {
+                tracing::info!(reason = %refusal, "WASM module refused before compilation");
+                verdicts.insert(input_hash, refusal.clone());
+                Err(WasmError::CompileRefused(refusal))
+            }
+            CompileFailure::Other(message) => Err(WasmError::Compile(message)),
+        },
+    };
+
+    ticket.finish(result.is_ok());
 
     // Clean up when no other thread holds or is waiting on this entry.
     // If another thread grabbed a clone between our entry() and lock(),
@@ -244,14 +502,22 @@ fn compile_coalesced(engine: &Engine, code: &[u8]) -> Result<Module, WasmError> 
 /// The result is the same compiled `Module` regardless of which path runs; only
 /// *where* the Cranelift work happens differs. This means offload can never
 /// panic and is inherently inline off the multi-thread path.
-fn compile_offloaded(engine: Engine, code: Vec<u8>) -> Result<Module, WasmError> {
+fn compile_offloaded(
+    engine: Engine,
+    verdicts: Arc<CompileVerdictCache>,
+    isolation: Arc<Isolation>,
+    kind: CodeKind,
+    code: Vec<u8>,
+) -> Result<Module, WasmError> {
     use tokio::runtime::RuntimeFlavor;
 
     match tokio::runtime::Handle::try_current() {
         // Only a multi-threaded runtime can legally run `block_in_place`; it is
         // also the only context (production) where offloading actually helps.
         Ok(handle) if handle.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            let join = tokio::task::spawn_blocking(move || compile_coalesced(&engine, &code));
+            let join = tokio::task::spawn_blocking(move || {
+                compile_coalesced(&engine, &verdicts, &isolation, kind, &code)
+            });
             match tokio::task::block_in_place(|| handle.block_on(join)) {
                 Ok(result) => result,
                 Err(e) if e.is_panic() => {
@@ -264,7 +530,7 @@ fn compile_offloaded(engine: Engine, code: Vec<u8>) -> Result<Module, WasmError>
         // No runtime, or a current_thread runtime: compile inline on the calling
         // thread. block_in_place would PANIC on a current_thread runtime, and
         // both this and the no-runtime case want a deterministic inline compile.
-        _ => compile_coalesced(&engine, &code),
+        _ => compile_coalesced(&engine, &verdicts, &isolation, kind, &code),
     }
 }
 
@@ -756,6 +1022,17 @@ fn arm_epoch_deadline(
     detect_stale_epoch_ticker();
 }
 
+/// The backend engine shared by every executor of a pool, with the cache of
+/// remembered refusals that goes with it. Compiled modules belong to the engine
+/// that compiled them, and a refusal is a property of the bytes, so both are
+/// shared: one compile, one refusal, one memory bound for the whole pool.
+#[derive(Clone)]
+pub(crate) struct SharedBackend {
+    engine: Engine,
+    verdicts: Arc<CompileVerdictCache>,
+    isolation: Arc<Isolation>,
+}
+
 /// Wasmtime 27.x backend implementation.
 pub(crate) struct WasmtimeEngine {
     /// The wasmtime Engine (shared, Arc-wrapped internally).
@@ -820,6 +1097,12 @@ pub(crate) struct WasmtimeEngine {
     /// offload can never panic regardless of this flag. See
     /// `RuntimeConfig::offload_compilation`.
     offload_compilation: bool,
+    /// Remembered refusals and failures, so a repeat of the same code bytes is
+    /// answered without scanning again. Shared by every engine built on the
+    /// same backend (see [`SharedBackend`]).
+    verdicts: Arc<CompileVerdictCache>,
+    /// The compile worker of this node (see `compile_worker`).
+    isolation: Arc<Isolation>,
 }
 
 /// Host state for wasmtime Store, implementing ResourceLimiter for memory limits.
@@ -1182,11 +1465,66 @@ impl ResourceLimiter for HostState {
     }
 }
 
+impl WasmtimeEngine {
+    #[cfg(test)]
+    pub(crate) fn engine_identity_for_tests(&self) -> u64 {
+        engine_compat_id(&self.engine)
+    }
+
+    /// Compile `code` of `kind`; see `compile_worker` for what `kind` changes.
+    fn compile_kind(&mut self, code: &[u8], kind: CodeKind) -> Result<Module, WasmError> {
+        if self.offload_compilation {
+            // PRODUCTION opt-in: ask to offload the Cranelift compile to a
+            // blocking thread. `compile_offloaded` itself decides whether that
+            // is actually safe and useful based on the live runtime flavor —
+            // it only offloads on a MULTI-THREAD runtime and otherwise compiles
+            // inline (a current_thread runtime would panic at block_in_place;
+            // a missing runtime has nowhere to offload). The wasmtime `Engine`
+            // is `Clone` (Arc internally), so the spawned closure compiles
+            // against the same backend and the resulting `Module` is valid in
+            // this engine's Stores. The per-hash coalescing mutex (a
+            // process-global map) still de-duplicates concurrent compiles of
+            // the same bytes across threads.
+            //
+            // What the offload buys (issue #4441's HANG): on a multi-thread
+            // runtime, `block_in_place` hands the current worker thread back to
+            // the scheduler so its OTHER tasks (the WS API, diagnostics, logging,
+            // connection handling) keep running while Cranelift compiles on a
+            // blocking thread. That cures the user-visible whole-node hang. It
+            // does NOT let the single-threaded `contract_handling` loop process
+            // the NEXT contract event during this compile — that loop is parked
+            // at its own block_on awaiting this call. Per-contract throughput
+            // parallelism is a separate, deferred change (B2).
+            let engine = self.engine.clone();
+            let code = code.to_vec();
+            compile_offloaded(
+                engine,
+                self.verdicts.clone(),
+                self.isolation.clone(),
+                kind,
+                code,
+            )
+        } else {
+            // SIMULATION / TEST: compile inline (synchronously) on the caller's
+            // thread. The direct sim runner is `current_thread` + paused-clock
+            // and pins event traces for determinism; `spawn_blocking` would
+            // introduce real-thread completion ordering that breaks those
+            // determinism assertions. Inline compile is deterministic.
+            compile_coalesced(&self.engine, &self.verdicts, &self.isolation, kind, code)
+        }
+    }
+}
+
 impl WasmEngine for WasmtimeEngine {
     type Module = Module;
 
     fn new(config: &RuntimeConfig, host_mem: bool) -> Result<Self, ContractError> {
         let (engine, max_fuel, enabled_metering) = Self::create_engine(config)?;
+        let verdicts = Arc::new(CompileVerdictCache::new(
+            Arc::new(InstantTimeSrc::new()),
+            engine_compat_id(&engine),
+        ));
+        let isolation = Self::create_isolation(config, &engine);
         let mut linker = Linker::new(&engine);
 
         // Register all host functions into the linker
@@ -1235,6 +1573,8 @@ impl WasmEngine for WasmtimeEngine {
             last_cadence_warn: None,
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
+            verdicts,
+            isolation,
         })
     }
 
@@ -1248,39 +1588,11 @@ impl WasmEngine for WasmtimeEngine {
     }
 
     fn compile(&mut self, code: &[u8]) -> Result<Module, WasmError> {
-        if self.offload_compilation {
-            // PRODUCTION opt-in: ask to offload the Cranelift compile to a
-            // blocking thread. `compile_offloaded` itself decides whether that
-            // is actually safe and useful based on the live runtime flavor —
-            // it only offloads on a MULTI-THREAD runtime and otherwise compiles
-            // inline (a current_thread runtime would panic at block_in_place;
-            // a missing runtime has nowhere to offload). The wasmtime `Engine`
-            // is `Clone` (Arc internally), so the spawned closure compiles
-            // against the same backend and the resulting `Module` is valid in
-            // this engine's Stores. The per-hash coalescing mutex (a
-            // process-global map) still de-duplicates concurrent compiles of
-            // the same bytes across threads.
-            //
-            // What the offload buys (issue #4441's HANG): on a multi-thread
-            // runtime, `block_in_place` hands the current worker thread back to
-            // the scheduler so its OTHER tasks (the WS API, diagnostics, logging,
-            // connection handling) keep running while Cranelift compiles on a
-            // blocking thread. That cures the user-visible whole-node hang. It
-            // does NOT let the single-threaded `contract_handling` loop process
-            // the NEXT contract event during this compile — that loop is parked
-            // at its own block_on awaiting this call. Per-contract throughput
-            // parallelism is a separate, deferred change (B2).
-            let engine = self.engine.clone();
-            let code = code.to_vec();
-            compile_offloaded(engine, code)
-        } else {
-            // SIMULATION / TEST: compile inline (synchronously) on the caller's
-            // thread. The direct sim runner is `current_thread` + paused-clock
-            // and pins event traces for determinism; `spawn_blocking` would
-            // introduce real-thread completion ordering that breaks those
-            // determinism assertions. Inline compile is deterministic.
-            compile_coalesced(&self.engine, code)
-        }
+        self.compile_kind(code, CodeKind::Delegate)
+    }
+
+    fn compile_contract(&mut self, code: &[u8]) -> Result<Module, WasmError> {
+        self.compile_kind(code, CodeKind::Contract)
     }
 
     fn module_compiled_size(&self, module: &Module) -> usize {
@@ -1872,16 +2184,74 @@ impl WasmtimeEngine {
     }
 
     /// Create a new backend engine that can be shared across multiple Runtime instances.
-    pub(crate) fn create_backend_engine(config: &RuntimeConfig) -> Result<Engine, ContractError> {
+    ///
+    /// `time` drives the expiry of the refusals the backend remembers; the
+    /// executors sharing the backend share that one cache.
+    pub(crate) fn create_backend_engine(
+        config: &RuntimeConfig,
+        time: DynTimeSource,
+    ) -> Result<SharedBackend, ContractError> {
         let (engine, _, _) = Self::create_engine(config)?;
-        Ok(engine)
+        let engine_id = engine_compat_id(&engine);
+        let isolation = Self::create_isolation(config, &engine);
+        Ok(SharedBackend {
+            engine,
+            verdicts: Arc::new(CompileVerdictCache::new(time, engine_id)),
+            isolation,
+        })
+    }
+
+    /// The compile worker setup for `config` (inert unless the mode is on).
+    #[cfg(target_os = "linux")]
+    fn create_isolation(config: &RuntimeConfig, engine: &Engine) -> Arc<Isolation> {
+        use super::compile_worker::{IsolationConfig, metrics::CompileMetrics};
+        let metrics = config
+            .compile_metrics
+            .clone()
+            .unwrap_or_else(|| Arc::new(CompileMetrics::default()));
+        // The accepted-modules file sits beside the wasmtime cache directory.
+        let accepted_dir = config
+            .wasmtime_cache_dir
+            .as_ref()
+            .and_then(|d| d.parent())
+            .map(|p| p.join("compile-accepted"));
+        #[cfg(test)]
+        let test_seam = config.compile_worker_test.clone();
+        #[cfg(not(test))]
+        let test_seam = None;
+        Arc::new(Isolation::for_node(
+            test_seam,
+            &IsolationConfig {
+                mode: config.compile_isolation,
+                isolate_delegates: config.compile_isolation_delegates,
+                accepted_dir,
+                consume_fuel: config.enable_metering,
+            },
+            engine_compat_id(engine),
+            metrics,
+        ))
+    }
+
+    /// Other platforms have no compile worker.
+    #[cfg(not(target_os = "linux"))]
+    fn create_isolation(config: &RuntimeConfig, _engine: &Engine) -> Arc<Isolation> {
+        use super::compile_worker::metrics::CompileMetrics;
+        let metrics = config
+            .compile_metrics
+            .clone()
+            .unwrap_or_else(|| Arc::new(CompileMetrics::default()));
+        Arc::new(Isolation::inert(config.compile_isolation, metrics))
     }
 
     /// Clone the backend engine for sharing with other runtimes.
     ///
     /// Wasmtime's Engine is Arc-wrapped internally, so this is a cheap refcount bump.
-    pub(crate) fn clone_backend_engine(&self) -> Engine {
-        self.engine.clone()
+    pub(crate) fn clone_backend_engine(&self) -> SharedBackend {
+        SharedBackend {
+            engine: self.engine.clone(),
+            verdicts: self.verdicts.clone(),
+            isolation: self.isolation.clone(),
+        }
     }
 
     /// Create a new WasmtimeEngine using a shared backend engine.
@@ -1891,8 +2261,13 @@ impl WasmtimeEngine {
     pub(crate) fn new_with_shared_backend(
         config: &RuntimeConfig,
         host_mem: bool,
-        backend: Engine,
+        backend: SharedBackend,
     ) -> Result<Self, ContractError> {
+        let SharedBackend {
+            engine: backend,
+            verdicts,
+            isolation,
+        } = backend;
         let max_fuel = Self::compute_max_fuel(config);
         let enabled_metering = config.enable_metering;
 
@@ -1938,14 +2313,18 @@ impl WasmtimeEngine {
             last_cadence_warn: None,
             store_created_at: Instant::now(),
             offload_compilation: config.offload_compilation,
+            verdicts,
+            isolation,
         })
     }
 
-    fn create_engine(config: &RuntimeConfig) -> Result<(Engine, u64, bool), ContractError> {
+    /// The wasmtime configuration every engine of this node uses, without the
+    /// compile cache. The compile worker builds its engine from the same function,
+    /// so a module the worker accepts is judged by the engine that compiles it.
+    pub(crate) fn base_wasmtime_config(config: &RuntimeConfig) -> Config {
         let mut wasmtime_config = Config::new();
 
         // Enable fuel metering if requested
-        let max_fuel = Self::compute_max_fuel(config);
         if config.enable_metering {
             wasmtime_config.consume_fuel(true);
         }
@@ -1959,6 +2338,25 @@ impl WasmtimeEngine {
         // part of the engine's compile-cache key, so enabling it recompiles
         // cached modules once on upgrade.
         wasmtime_config.epoch_interruption(true);
+
+        // Accept exactly the WebAssembly proposals the scan accepts (see
+        // `compile_limits::accepted_features`); every other proposal is refused
+        // as invalid, both by the scan and by this engine.
+        wasmtime_config
+            .wasm_exceptions(false)
+            .wasm_gc(false)
+            .wasm_function_references(false)
+            .wasm_tail_call(false)
+            .wasm_threads(false)
+            .wasm_shared_everything_threads(false)
+            .wasm_memory64(false)
+            .wasm_multi_memory(false)
+            .wasm_relaxed_simd(false)
+            .wasm_extended_const(false)
+            .wasm_wide_arithmetic(false)
+            .wasm_stack_switching(false)
+            .wasm_custom_page_sizes(false)
+            .wasm_component_model(false);
 
         // Set memory limits via config
         // async_stack_size must exceed max_wasm_stack
@@ -2045,6 +2443,25 @@ impl WasmtimeEngine {
         // from `Engine::new`), so leave it at its default there.
         #[cfg(not(target_os = "windows"))]
         wasmtime_config.native_unwind_info(false);
+
+        wasmtime_config
+    }
+
+    /// The engine of the compile worker: the node's configuration without the
+    /// compile cache (the worker must not write the node's cache directory) and
+    /// without epoch registration (it never runs guest code).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn create_worker_engine(enable_metering: bool) -> Result<Engine, String> {
+        let config = RuntimeConfig {
+            enable_metering,
+            ..RuntimeConfig::default()
+        };
+        Engine::new(&Self::base_wasmtime_config(&config)).map_err(|e| e.to_string())
+    }
+
+    fn create_engine(config: &RuntimeConfig) -> Result<(Engine, u64, bool), ContractError> {
+        let mut wasmtime_config = Self::base_wasmtime_config(config);
+        let max_fuel = Self::compute_max_fuel(config);
 
         // Enable disk-based compilation cache (#3456). Wasmtime caches compiled
         // modules keyed by (engine config + WASM bytes hash). On cache hit,
@@ -3441,8 +3858,553 @@ mod tests {
     #[test]
     fn test_wasmtime_engine_creation() {
         let config = RuntimeConfig::default();
-        let result = WasmtimeEngine::create_backend_engine(&config);
+        let result = WasmtimeEngine::create_backend_engine(
+            &config,
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+        );
         assert!(result.is_ok(), "Failed to create wasmtime engine");
+    }
+
+    fn module_new_calls() -> u64 {
+        MODULE_NEW_CALLS.with(|calls| calls.get())
+    }
+
+    /// Every limit is enforced by `compile`: the module at the limit compiles and
+    /// the first one past it is refused with that limit's variant, without the
+    /// compiler being called for it.
+    #[test]
+    fn every_limit_is_enforced_through_engine_compile() {
+        use crate::wasm_runtime::engine::compile_limits::test_support::limit_cases;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        for case in limit_cases() {
+            let (name, at) = (case.name, case.at_limit());
+            let before = module_new_calls();
+            match &case.shadowed_by {
+                None => {
+                    engine
+                        .compile(&(case.build)(at))
+                        .unwrap_or_else(|e| panic!("{name}: the limit itself must compile: {e}"));
+                    assert_eq!(module_new_calls(), before + 1, "{name}: compiled once");
+                }
+                Some(first) => {
+                    // Another limit refuses a module at this one first.
+                    match engine.compile(&(case.build)(at)) {
+                        Err(WasmError::CompileRefused(got)) => assert_eq!(&got, first, "{name}"),
+                        other => panic!("{name}: expected a refusal, got {:?}", other.err()),
+                    }
+                    assert_eq!(module_new_calls(), before, "{name}: refused before compile");
+                }
+            }
+            let before = module_new_calls();
+            match engine.compile(&(case.build)(at + 1)) {
+                Err(WasmError::CompileRefused(got)) => assert_eq!(got, case.refusal, "{name}"),
+                other => panic!("{name}: expected a refusal, got {:?}", other.err()),
+            }
+            assert_eq!(
+                module_new_calls(),
+                before,
+                "{name}: a refused module must not reach the compiler"
+            );
+        }
+    }
+
+    /// A remembered verdict is consulted before the scan: seeding the cache
+    /// for the hash of a valid module makes `compile` refuse it, and the compiler
+    /// is not called.
+    #[test]
+    fn a_remembered_refusal_is_returned_without_scanning_or_compiling() {
+        use crate::wasm_runtime::engine::compile_limits::CompileRefusal;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let code = crate::wasm_runtime::engine::compile_limits::test_support::nested_blocks(3);
+        engine.verdicts.insert(
+            *blake3::hash(&code).as_bytes(),
+            CompileRefusal::NestingTooDeep { limit: 1 },
+        );
+        let before = module_new_calls();
+        assert!(matches!(
+            engine.compile(&code),
+            Err(WasmError::CompileRefused(CompileRefusal::NestingTooDeep {
+                limit: 1
+            }))
+        ));
+        assert_eq!(module_new_calls(), before);
+    }
+
+    /// A module that passes the scan but is past half of some limit is reported
+    /// once per code hash; an ordinary module is not reported at all.
+    #[test]
+    fn a_module_near_a_limit_is_reported_once_and_an_ordinary_one_not() {
+        use crate::wasm_runtime::engine::compile_limits::test_support::nested_blocks;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        // 600 nested blocks is 59% of the nesting limit of 1,024.
+        let near = nested_blocks(600);
+        let near_hash = *blake3::hash(&near).as_bytes();
+        engine.compile(&near).expect("inside every limit");
+        assert!(
+            !engine.verdicts.first_near_limit_report(&near_hash),
+            "compiling the module did not report it"
+        );
+        let ordinary = nested_blocks(3);
+        let ordinary_hash = *blake3::hash(&ordinary).as_bytes();
+        engine.compile(&ordinary).expect("ordinary");
+        assert!(
+            engine.verdicts.first_near_limit_report(&ordinary_hash),
+            "an ordinary module was reported as near a limit"
+        );
+        // A second compile of the near module reports nothing new.
+        engine.compile(&near).expect("inside every limit");
+        assert!(!engine.verdicts.first_near_limit_report(&near_hash));
+    }
+
+    /// A refusal is remembered, so the second request for the same bytes is
+    /// answered from the cache.
+    #[test]
+    fn a_refused_module_is_remembered() {
+        use crate::wasm_runtime::engine::compile_limits::test_support::nested_blocks;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let code = nested_blocks(2_000);
+        let hash = *blake3::hash(&code).as_bytes();
+        assert!(engine.verdicts.get(&hash).is_none());
+        assert!(engine.compile(&code).is_err());
+        assert!(
+            engine.verdicts.get(&hash).is_some(),
+            "the refusal was not remembered"
+        );
+    }
+
+    /// Repeated requests for refused bytes are counted, under the reason, not
+    /// only the first.
+    #[test]
+    fn repeated_requests_for_a_refused_module_are_counted() {
+        use crate::wasm_runtime::engine::compile_limits::test_support::nested_blocks;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let code = nested_blocks(2_000);
+        let cached = |e: &WasmtimeEngine| {
+            let s = e.isolation.metrics().snapshot();
+            [
+                Outcome::CachedRefusedSize,
+                Outcome::CachedRefusedText,
+                Outcome::CachedRefusedFeature,
+                Outcome::CachedRefusedLimit,
+            ]
+            .iter()
+            .map(|o| s.outcome(*o))
+            .sum::<u64>()
+        };
+        assert!(engine.compile(&code).is_err());
+        assert_eq!(cached(&engine), 0, "the first refusal is not a cached one");
+        for _ in 0..3 {
+            assert!(engine.compile(&code).is_err());
+        }
+        assert_eq!(cached(&engine), 3);
+    }
+
+    /// A compile failure that is not a property of the bytes is reported but
+    /// never remembered, so valid code is not refused for the cache lifetime.
+    #[test]
+    fn a_transient_compile_failure_is_not_remembered() {
+        use crate::wasm_runtime::engine::compile_limits::test_support::nested_blocks;
+        let engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let code = nested_blocks(3);
+        let hash = *blake3::hash(&code).as_bytes();
+        let failing = |_: &Engine, _: &[u8]| -> wasmtime::Result<Module> {
+            Err(wasmtime::Error::msg("out of memory"))
+        };
+        let result = compile_coalesced_with(
+            &engine.engine,
+            &engine.verdicts,
+            &engine.isolation,
+            CodeKind::Contract,
+            &code,
+            &failing,
+        );
+        assert!(
+            matches!(result, Err(WasmError::Compile(_))),
+            "a failure of a valid module is a compile error, not a refusal"
+        );
+        assert!(
+            engine.verdicts.get(&hash).is_none(),
+            "a transient failure must not be remembered"
+        );
+        // The same bytes compile once the fault is gone.
+        let ok = |e: &Engine, c: &[u8]| Module::new(e, c);
+        assert!(
+            compile_coalesced_with(
+                &engine.engine,
+                &engine.verdicts,
+                &engine.isolation,
+                CodeKind::Contract,
+                &code,
+                &ok
+            )
+            .is_ok()
+        );
+    }
+
+    /// Only a module the engine finds invalid is classified as a refusal.
+    #[test]
+    fn compile_failures_are_classified_by_whether_the_module_is_invalid() {
+        use crate::wasm_runtime::engine::compile_limits::CompileRefusal;
+        let error = wasmtime::Error::msg("compile failed");
+        assert!(matches!(
+            classify_compile_failure(Err(wasmtime::Error::msg("bad function")), &error),
+            CompileFailure::Invalid(CompileRefusal::Malformed(_))
+        ));
+        assert!(matches!(
+            classify_compile_failure(Ok(()), &error),
+            CompileFailure::Other(_)
+        ));
+    }
+
+    /// The refusal text of a malformed text module is bounded whatever the input.
+    #[test]
+    fn a_huge_malformed_text_module_is_refused_with_a_small_message() {
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let input = format!("(module (x{}", "\t".repeat(1024 * 1024));
+        match engine.compile(input.as_bytes()) {
+            Err(WasmError::CompileRefused(refusal)) => {
+                assert!(
+                    refusal.to_string().len() < 1024,
+                    "{}",
+                    refusal.to_string().len()
+                );
+            }
+            other => panic!("expected a refusal, got {:?}", other.err()),
+        }
+        let hash = *blake3::hash(input.as_bytes()).as_bytes();
+        let kept = engine
+            .verdicts
+            .get(&hash)
+            .expect("the refusal is remembered");
+        assert!(kept.to_string().len() < 1024);
+    }
+
+    /// A text module over a limit is refused after conversion through `compile`.
+    #[test]
+    fn a_text_module_over_a_limit_is_refused_by_compile() {
+        use crate::wasm_runtime::engine::compile_limits::{
+            CompileRefusal, MAX_FUNCTION_CONTROL_FRAMES, test_support::loops_text,
+        };
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let text = loops_text(MAX_FUNCTION_CONTROL_FRAMES as usize + 1);
+        assert!(matches!(
+            engine.compile(&wat::parse_str(&text).unwrap()),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::TooManyControlFrames { .. }
+            ))
+        ));
+    }
+
+    /// The offloaded compile path (multi-thread runtime, `spawn_blocking`)
+    /// refuses an over-limit module the same way, and remembers it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_over_limit_module_is_refused_on_the_offloaded_path() {
+        use crate::wasm_runtime::engine::compile_limits::{
+            CompileRefusal, test_support::nested_blocks,
+        };
+        let config = RuntimeConfig {
+            offload_compilation: true,
+            ..RuntimeConfig::default()
+        };
+        let mut engine = WasmtimeEngine::new(&config, false).unwrap();
+        assert!(engine.offload_compilation);
+        let code = nested_blocks(2_000);
+        assert!(matches!(
+            engine.compile(&code),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::NestingTooDeep { .. }
+            ))
+        ));
+        assert!(
+            engine
+                .verdicts
+                .get(blake3::hash(&code).as_bytes())
+                .is_some()
+        );
+    }
+
+    /// Executors built on one shared backend (the pool constructor) share one
+    /// cache: a refusal found by one is answered by the others, and each
+    /// refusal is held once however many executors there are.
+    #[test]
+    fn executors_on_a_shared_backend_share_one_verdict_cache() {
+        use crate::wasm_runtime::engine::compile_limits::{
+            CompileRefusal, test_support::nested_blocks,
+        };
+        let config = RuntimeConfig::default();
+        let backend = WasmtimeEngine::create_backend_engine(
+            &config,
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+        )
+        .unwrap();
+        let mut a =
+            WasmtimeEngine::new_with_shared_backend(&config, false, backend.clone()).unwrap();
+        let mut b = WasmtimeEngine::new_with_shared_backend(&config, false, backend).unwrap();
+        assert!(Arc::ptr_eq(&a.verdicts, &b.verdicts));
+        let code = nested_blocks(2_000);
+        assert!(matches!(
+            a.compile(&code),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::NestingTooDeep { .. }
+            ))
+        ));
+        let before = module_new_calls();
+        assert!(matches!(
+            b.compile(&code),
+            Err(WasmError::CompileRefused(
+                CompileRefusal::NestingTooDeep { .. }
+            ))
+        ));
+        assert_eq!(module_new_calls(), before);
+        // A clone of an executor's backend carries the same cache.
+        assert!(Arc::ptr_eq(&a.clone_backend_engine().verdicts, &a.verdicts));
+    }
+
+    /// Remembered refusals expire on the clock the backend was built with.
+    #[test]
+    fn remembered_refusals_expire_on_the_injected_clock() {
+        use crate::util::time_source::SharedMockTimeSource;
+        use crate::wasm_runtime::engine::compile_limits::test_support::nested_blocks;
+        use crate::wasm_runtime::engine::compile_verdicts::VERDICT_TTL;
+        let config = RuntimeConfig::default();
+        let clock = SharedMockTimeSource::new();
+        let backend =
+            WasmtimeEngine::create_backend_engine(&config, Arc::new(clock.clone())).unwrap();
+        let mut engine = WasmtimeEngine::new_with_shared_backend(&config, false, backend).unwrap();
+        let code = nested_blocks(2_000);
+        let hash = *blake3::hash(&code).as_bytes();
+        assert!(engine.compile(&code).is_err());
+        assert!(engine.verdicts.get(&hash).is_some());
+        clock.advance_time(VERDICT_TTL + Duration::from_secs(1));
+        assert!(
+            engine.verdicts.get(&hash).is_none(),
+            "the refusal must expire on the injected clock"
+        );
+    }
+
+    /// The engine identity that keys remembered refusals is stable for one
+    /// configuration and differs when the compiler configuration differs (the
+    /// same hash carries the wasmtime version, so a bump changes it too).
+    #[test]
+    fn the_engine_identity_follows_the_compiler_configuration() {
+        let a = RuntimeConfig::default();
+        let b = RuntimeConfig {
+            enable_metering: !a.enable_metering,
+            ..RuntimeConfig::default()
+        };
+        let id = |c: &RuntimeConfig| engine_compat_id(&WasmtimeEngine::create_engine(c).unwrap().0);
+        assert_eq!(id(&a), id(&a));
+        assert_ne!(id(&a), id(&b));
+    }
+
+    /// Text-format input is not accepted on the compile path: it is refused as
+    /// not binary before any conversion or compile, and remembered.
+    #[test]
+    fn text_format_input_is_refused_before_conversion() {
+        use crate::wasm_runtime::engine::compile_limits::CompileRefusal;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let text = b"(module (func (export \"f\")))".to_vec();
+        let before = module_new_calls();
+        match engine.compile(&text) {
+            Err(WasmError::CompileRefused(CompileRefusal::NotBinary(_))) => {}
+            other => panic!("expected a not-binary refusal, got {:?}", other.err()),
+        }
+        assert_eq!(module_new_calls(), before, "the compiler was called");
+        // The same module in binary form compiles.
+        let binary = wat::parse_bytes(&text).unwrap().into_owned();
+        engine.compile(&binary).expect("the binary form compiles");
+    }
+
+    /// The compile gate admits at most its capacity and releases a slot when a
+    /// permit is dropped.
+    #[test]
+    fn the_compile_gate_admits_only_its_capacity() {
+        let gate = CompileGate::new(2);
+        let a = gate.try_acquire().expect("first slot");
+        let b = gate.try_acquire().expect("second slot");
+        assert!(gate.try_acquire().is_none(), "a third slot was granted");
+        drop(a);
+        let c = gate.try_acquire().expect("the released slot");
+        assert!(gate.try_acquire().is_none());
+        drop((b, c));
+    }
+
+    /// A blocked `acquire` proceeds once a permit is dropped.
+    #[test]
+    fn a_waiting_compile_proceeds_when_a_permit_is_released() {
+        let gate = Arc::new(CompileGate::new(1));
+        let held = gate.try_acquire().expect("the only slot");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let gate = gate.clone();
+            std::thread::spawn(move || {
+                let _permit = gate.acquire();
+                tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "acquire returned while the only slot was held"
+        );
+        drop(held);
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("acquire did not proceed after the release");
+        waiter.join().unwrap();
+    }
+
+    /// Many distinct modules compiled at once never run more compiles than the
+    /// node-wide gate allows.
+    #[test]
+    fn concurrent_compiles_never_exceed_the_gate() {
+        use std::sync::atomic::AtomicUsize;
+        let capacity = compile_concurrency();
+        let backend = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let (wt_engine, verdicts) = (backend.engine.clone(), backend.verdicts.clone());
+        let isolation = backend.isolation.clone();
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..(capacity * 3).max(6))
+            .map(|i| {
+                let (wt_engine, verdicts) = (wt_engine.clone(), verdicts.clone());
+                let isolation = isolation.clone();
+                let (running, peak) = (running.clone(), peak.clone());
+                std::thread::spawn(move || {
+                    // A distinct module per thread, so the compiles do not coalesce.
+                    let code = wat::parse_str(format!(
+                        "(module (func (export \"f\") (result i32) (i32.const {i})))"
+                    ))
+                    .unwrap();
+                    let result = compile_coalesced_with(
+                        &wt_engine,
+                        &verdicts,
+                        &isolation,
+                        CodeKind::Contract,
+                        &code,
+                        &|engine, code| {
+                            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak.fetch_max(now, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_millis(40));
+                            running.fetch_sub(1, Ordering::SeqCst);
+                            Module::new(engine, code)
+                        },
+                    );
+                    assert!(result.is_ok());
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(peak >= 1);
+        assert!(
+            peak <= capacity,
+            "{peak} compiles ran at once, the gate allows {capacity}"
+        );
+    }
+
+    /// Compiles run on the bounded pool, not on one thread per core.
+    #[test]
+    fn compiles_run_on_the_bounded_pool() {
+        assert_eq!(
+            compile_threads(),
+            std::thread::available_parallelism()
+                .map_or(1, |n| n.get())
+                .clamp(1, 4)
+        );
+        assert_eq!(
+            run_in_compile_pool(rayon::current_num_threads),
+            compile_threads()
+        );
+        let backend = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let code = wat::parse_str("(module (func (export \"f\")))").unwrap();
+        POOL_THREADS_SEEN.store(0, Ordering::SeqCst);
+        compile_coalesced(
+            &backend.engine,
+            &backend.verdicts,
+            &backend.isolation,
+            CodeKind::Contract,
+            &code,
+        )
+        .expect("compiles");
+        assert_eq!(POOL_THREADS_SEEN.load(Ordering::SeqCst), compile_threads());
+    }
+
+    /// The capacity is a quarter of the cores, between 1 and 4.
+    #[test]
+    fn the_compile_capacity_is_a_quarter_of_the_cores_within_bounds() {
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert_eq!(compile_concurrency(), (cores / 4).clamp(1, 4));
+    }
+
+    /// Every proposal the scan refuses is refused by the engine itself too, so
+    /// the engine's feature set cannot drift wider than the scan's.
+    #[test]
+    fn the_engine_refuses_the_proposals_the_scan_refuses() {
+        let config = RuntimeConfig::default();
+        let (engine, _, _) = WasmtimeEngine::create_engine(&config).unwrap();
+        for (name, text) in [
+            (
+                "tail calls",
+                "(module (func $g) (func (export \"f\") (return_call $g)))",
+            ),
+            (
+                "exceptions",
+                "(module (func (export \"f\") (try_table (nop))))",
+            ),
+            (
+                "GC",
+                "(module (type $s (struct (field i32))) (func (export \"f\") (drop (struct.new_default $s))))",
+            ),
+            (
+                "function references",
+                "(module (type $t (func)) (func $g) (elem declare func $g) (func (export \"f\") (call_ref $t (ref.func $g))))",
+            ),
+            (
+                "threads",
+                "(module (memory 1 1 shared) (func (export \"f\") (drop (i32.atomic.load (i32.const 0)))))",
+            ),
+            ("64-bit memory", "(module (memory i64 1))"),
+            ("multiple memories", "(module (memory 1) (memory 1))"),
+            (
+                "relaxed SIMD",
+                "(module (func (export \"f\") (param v128) (result v128) (i8x16.relaxed_swizzle (local.get 0) (local.get 0))))",
+            ),
+            (
+                "wide arithmetic",
+                "(module (func (export \"f\") (param i64 i64) (result i64 i64) (i64.add128 (local.get 0) (local.get 1) (local.get 0) (local.get 1))))",
+            ),
+            (
+                "extended constants",
+                "(module (global i32 (i32.add (i32.const 1) (i32.const 2))))",
+            ),
+        ] {
+            let binary = wat::parse_str(text).unwrap();
+            assert!(
+                Module::validate(&engine, &binary).is_err(),
+                "{name}: the engine accepts a proposal the scan refuses"
+            );
+        }
+    }
+
+    /// Modules shipped or built in this tree scan clean and compile on the
+    /// production engine, so the limits cannot lock out the node's own
+    /// contracts.
+    #[test]
+    fn in_tree_modules_scan_and_compile() {
+        use crate::wasm_runtime::engine::compile_limits::check_module;
+        let mut engine = WasmtimeEngine::new(&RuntimeConfig::default(), false).unwrap();
+        let website: &[u8] = include_bytes!("../../../../fdev/resources/website_contract.wasm");
+        let test_contract = crate::wasm_runtime::tests::get_test_module("test_contract_1").unwrap();
+        for (name, code) in [
+            ("website_contract", website),
+            ("test_contract_1", &test_contract[..]),
+        ] {
+            check_module(code).unwrap_or_else(|e| panic!("{name}: {e}"));
+            engine
+                .compile(code)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+        }
     }
 
     #[test]
@@ -3528,8 +4490,13 @@ mod tests {
             enable_metering: false,
             ..RuntimeConfig::default()
         };
-        let engine = WasmtimeEngine::create_backend_engine(&config).unwrap();
-        let module = Module::new(&engine, INFINITE_LOOP_WAT.as_bytes())
+        let engine = WasmtimeEngine::create_backend_engine(
+            &config,
+            Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+        )
+        .unwrap()
+        .engine;
+        let module = Module::new(&engine, wat::parse_str(INFINITE_LOOP_WAT).unwrap())
             .expect("infinite-loop WAT must compile");
 
         let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
@@ -3644,7 +4611,8 @@ mod tests {
         // exports that `create_instance` requires of a real contract.
         let store = engine.store.as_mut().expect("engine store present");
         let eng = store.engine().clone();
-        let module = Module::new(&eng, INFINITE_LOOP_WAT.as_bytes()).expect("WAT must compile");
+        let module = Module::new(&eng, wat::parse_str(INFINITE_LOOP_WAT).unwrap())
+            .expect("WAT must compile");
         let instance = block_on_async(Linker::new(&eng).instantiate_async(&mut *store, &module))
             .expect("instantiation must succeed");
         engine.instances.insert(id, instance);
@@ -3739,7 +4707,8 @@ mod tests {
         const ID: i64 = i64::MAX - 54805;
         let store = engine.store.as_mut().expect("engine store present");
         let eng = store.engine().clone();
-        let module = Module::new(&eng, HOST_PANIC_WAT.as_bytes()).expect("WAT must compile");
+        let module =
+            Module::new(&eng, wat::parse_str(HOST_PANIC_WAT).unwrap()).expect("WAT must compile");
         let mut linker: Linker<HostState> = Linker::new(&eng);
         // A named fn, not a closure: a closure whose body diverges infers `!`
         // as its return type, and wasmtime's `IntoFunc` has no `WasmTy` impl for
@@ -3837,7 +4806,7 @@ mod tests {
     fn insert_raw_instance(engine: &mut WasmtimeEngine, id: i64, wat: &str) {
         let store = engine.store.as_mut().expect("engine store present");
         let eng = store.engine().clone();
-        let module = Module::new(&eng, wat.as_bytes()).expect("WAT must compile");
+        let module = Module::new(&eng, wat::parse_str(wat).unwrap()).expect("WAT must compile");
         let instance =
             block_on_async(test_host_linker(&eng).instantiate_async(&mut *store, &module))
                 .expect("instantiation must succeed");
@@ -4008,7 +4977,9 @@ mod tests {
     /// Drive `create_instance` on `wat` and return the error, failing if it
     /// succeeded.
     fn create_instance_err(engine: &mut WasmtimeEngine, wat: &str) -> (WasmError, Duration) {
-        let module = engine.compile(wat.as_bytes()).expect("WAT must compile");
+        let module = engine
+            .compile(&wat::parse_str(wat).unwrap())
+            .expect("WAT must compile");
         let start = std::time::Instant::now();
         let result = engine.create_instance(&module, 0);
         let elapsed = start.elapsed();
@@ -4152,7 +5123,7 @@ mod tests {
             let budget = NAP.as_secs_f64() / 0.6;
             let mut engine = engine_with_test_host(budget, epoch_deadline_ticks(budget));
             let module = engine
-                .compile(SETUP_ONE_NAP_EACH_WAT.as_bytes())
+                .compile(&wat::parse_str(SETUP_ONE_NAP_EACH_WAT).unwrap())
                 .expect("WAT must compile");
             match engine.create_instance(&module, 0) {
                 Ok(handle) => engine.drop_instance(&handle),
@@ -4312,7 +5283,7 @@ mod tests {
         };
         let mut engine = WasmtimeEngine::new(&config, false).expect("engine creation");
         let module = engine
-            .compile(START_LOOP_WAT.as_bytes())
+            .compile(&wat::parse_str(START_LOOP_WAT).unwrap())
             .expect("compile start-loop module");
 
         let start = std::time::Instant::now();
@@ -5696,7 +6667,8 @@ mod tests {
             let id: i64 = i64::MAX - 54806;
             let store = engine.store.as_mut().expect("engine store present");
             let eng = store.engine().clone();
-            let module = Module::new(&eng, INFINITE_LOOP_WAT.as_bytes()).expect("WAT must compile");
+            let module = Module::new(&eng, wat::parse_str(INFINITE_LOOP_WAT).unwrap())
+                .expect("WAT must compile");
             let instance =
                 block_on_async(Linker::new(&eng).instantiate_async(&mut *store, &module))
                     .expect("instantiation must succeed");
@@ -5927,10 +6899,10 @@ mod tests {
     fn compile_honors_offload_gate_in_source() {
         let src = include_str!("wasmtime_engine.rs");
         let body = src
-            .split("fn compile(&mut self, code: &[u8]) -> Result<Module, WasmError> {")
+            .split("fn compile_kind(&mut self, code: &[u8], kind: CodeKind) -> Result<Module, WasmError> {")
             .nth(1)
             .expect("compile must exist")
-            .split("\n    fn module_compiled_size(")
+            .split("\n}\n\nimpl WasmEngine for WasmtimeEngine")
             .next()
             .expect("end of compile");
         assert!(
@@ -5948,7 +6920,7 @@ mod tests {
 
         // And the offload helper actually uses spawn_blocking.
         let offload_body = src
-            .split("fn compile_offloaded(engine: Engine, code: Vec<u8>)")
+            .split("fn compile_offloaded(")
             .nth(1)
             .expect("compile_offloaded must exist")
             .split("\nfn compiled_module_size(")
@@ -5981,7 +6953,7 @@ mod tests {
         // signature and the next fn restricts the scrape to production code.
         let src = include_str!("wasmtime_engine.rs");
         let after_sig = src
-            .split("fn create_backend_engine(config: &RuntimeConfig) -> Result<Engine, ContractError> {")
+            .split("fn create_backend_engine(\n        config: &RuntimeConfig,\n        time: DynTimeSource,\n    ) -> Result<SharedBackend, ContractError> {")
             .nth(1)
             .expect("create_backend_engine must exist");
         // Truncate at the NEXT function so the scrape sees only production code,
@@ -6155,7 +7127,8 @@ mod tests {
         let mut linker = Linker::new(&engine);
         WasmtimeEngine::register_host_functions(&mut linker).expect("host function registration");
 
-        let module = Module::new(&engine, wat).expect("WAT compilation failed");
+        let module =
+            Module::new(&engine, wat::parse_str(wat).unwrap()).expect("WAT compilation failed");
         let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
 
         let result = block_on_async(linker.instantiate_async(&mut store, &module));
@@ -6180,7 +7153,7 @@ mod tests {
           (func (export "answer") (result i32) i32.const 42)
         )
         "#;
-        let module = Module::new(&engine, wat).unwrap();
+        let module = Module::new(&engine, wat::parse_str(wat).unwrap()).unwrap();
         let mut store = Store::new(&engine, HostState::new(DEFAULT_MAX_MEMORY_PAGES));
         let linker = Linker::new(&engine);
         let instance = block_on_async(linker.instantiate_async(&mut store, &module)).unwrap();
@@ -6335,7 +7308,7 @@ mod tests {
             call $local_state_len))
         "#;
 
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
         let handle = engine
             .create_instance(&module, 1024)
             .expect("create instance");
@@ -6391,11 +7364,11 @@ mod tests {
 
         let control = engine
             .compile(
-                module_importing(
+                &wat::parse_str(module_importing(
                     "__frnt__delegate__get_contract_state",
                     "(param i64 i32 i64 i64) (result i64)",
-                )
-                .as_bytes(),
+                ))
+                .unwrap(),
             )
             .unwrap();
         let handle = engine
@@ -6418,7 +7391,7 @@ mod tests {
             ),
         ] {
             let module = engine
-                .compile(module_importing(name, sig).as_bytes())
+                .compile(&wat::parse_str(module_importing(name, sig)).unwrap())
                 .unwrap();
             let result = engine.create_instance(&module, 1024);
             if let Ok(handle) = &result {
@@ -6546,7 +7519,7 @@ mod tests {
             i64.const 0))
         "#;
 
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
         let handle = engine
             .create_instance(&module, 1024)
             .expect("create instance");
@@ -6699,7 +7672,7 @@ mod tests {
             i64.const 0)
           (func (export "__frnt_set_id") (param i64)))
         "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
         engine.set_arena_budget_for_test(1024 * 1024);
 
         for i in 0..12 {
@@ -7058,7 +8031,7 @@ mod tests {
           (func (export "validate_state") (param i64 i64 i64) (result i64)
             i64.const 0))
         "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
         assert!(
             !engine.module_has_streaming_io(&module),
             "Legacy module should not have freenet_contract_io imports"
@@ -7079,7 +8052,7 @@ mod tests {
           (func (export "validate_state") (param i64 i64 i64) (result i64)
             i64.const 0))
         "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
         assert!(
             engine.module_has_streaming_io(&module),
             "Module with freenet_contract_io import should be detected as streaming"
@@ -7124,7 +8097,7 @@ mod tests {
           (func (export "validate_state") (param i64 i64 i64) (result i64)
             i64.const 0))
         "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
 
         let result = engine.create_instance(&module, 1024);
         assert!(
@@ -7366,7 +8339,9 @@ mod tests {
     fn host_functions_ignore_an_instance_id_naming_another_instance() {
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
-        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let module = engine
+            .compile(&wat::parse_str(NAMES_OTHER_INSTANCE_WAT).unwrap())
+            .unwrap();
         // Caller first, victim last: the store's last guest entry is the
         // victim's, so the caller's own entry has to record the caller.
         let caller = engine.create_instance(&module, 1024).unwrap();
@@ -7425,7 +8400,9 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
-        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let module = engine
+            .compile(&wat::parse_str(NAMES_OTHER_INSTANCE_WAT).unwrap())
+            .unwrap();
         let caller = engine.create_instance(&module, 1024).unwrap();
         let victim = engine.create_instance(&module, 1024).unwrap();
         record_mem_addr(&mut engine, &caller);
@@ -7486,7 +8463,9 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
-        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let module = engine
+            .compile(&wat::parse_str(NAMES_OTHER_INSTANCE_WAT).unwrap())
+            .unwrap();
         let caller = engine.create_instance(&module, 1024).unwrap();
         // Deliberately no MEM_ADDR record.
         CONTRACT_IO.insert(
@@ -7544,7 +8523,7 @@ mod tests {
             call $now)
           (start $start))
         "#;
-        let module = engine.compile(start_wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(start_wat).unwrap()).unwrap();
         let handle = engine
             .create_instance(&module, 1024)
             .expect("a start function's host calls must not fail instantiation");
@@ -7560,7 +8539,9 @@ mod tests {
     fn every_guest_entry_records_its_own_instance() {
         let config = RuntimeConfig::default();
         let mut engine = WasmtimeEngine::new(&config, false).unwrap();
-        let module = engine.compile(NAMES_OTHER_INSTANCE_WAT.as_bytes()).unwrap();
+        let module = engine
+            .compile(&wat::parse_str(NAMES_OTHER_INSTANCE_WAT).unwrap())
+            .unwrap();
         let a = engine.create_instance(&module, 1024).unwrap();
         let a_mem = record_mem_addr(&mut engine, &a);
 
@@ -7578,7 +8559,7 @@ mod tests {
             call $rand)
           (start $start))
         "#;
-        let start_module = engine.compile(start_wat.as_bytes()).unwrap();
+        let start_module = engine.compile(&wat::parse_str(start_wat).unwrap()).unwrap();
         let s = engine.create_instance(&start_module, 1024).unwrap();
         assert_eq!(
             mem_addr_of(a.id),
@@ -7604,7 +8585,9 @@ mod tests {
             i32.const 8
             call $rand))
         "#;
-        let set_id_module = engine.compile(set_id_wat.as_bytes()).unwrap();
+        let set_id_module = engine
+            .compile(&wat::parse_str(set_id_wat).unwrap())
+            .unwrap();
         let s = engine.create_instance(&set_id_module, 1024).unwrap();
         assert_eq!(
             mem_addr_of(a.id),
@@ -7690,7 +8673,7 @@ mod tests {
             call $ctx_len
             i32.store))
         "#;
-        let module = engine.compile(wat.as_bytes()).unwrap();
+        let module = engine.compile(&wat::parse_str(wat).unwrap()).unwrap();
         let victim = engine.create_instance(&module, 1024).unwrap();
         let victim_mem = record_mem_addr(&mut engine, &victim);
 

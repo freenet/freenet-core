@@ -3728,6 +3728,7 @@ fn event_kind_to_json(kind: &EventKind) -> serde_json::Value {
                 "delegate_module_cache_total_bytes": snapshot.delegate_module_cache_total_bytes,
                 "delegate_module_cache_budget_bytes": snapshot.delegate_module_cache_budget_bytes,
                 "delegate_module_cache_evictions_total": snapshot.delegate_module_cache_evictions_total,
+                "compile": snapshot.compile,
                 "broadcast_stream_attempts_total": snapshot.broadcast_stream_attempts_total,
                 "broadcast_stream_failures_total": snapshot.broadcast_stream_failures_total,
                 "broadcast_stream_failures_last_snapshot": snapshot.broadcast_stream_failures_last_snapshot,

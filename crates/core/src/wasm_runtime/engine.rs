@@ -25,6 +25,9 @@
 #[cfg(not(feature = "wasmtime-backend"))]
 compile_error!("The wasmtime-backend feature must be enabled.");
 
+pub(crate) mod compile_limits;
+mod compile_verdicts;
+pub(crate) mod compile_worker;
 #[cfg(feature = "wasmtime-backend")]
 mod wasmtime_engine;
 
@@ -79,6 +82,12 @@ pub(crate) enum WasmError {
     /// Module compilation failed (syntax error, unsupported features).
     #[error("compile: {0}")]
     Compile(String),
+
+    /// The module was refused before compilation because its shape is outside
+    /// the limits in `compile_limits`. A property of the module bytes, so
+    /// permanent for that module.
+    #[error("compile refused: {0}")]
+    CompileRefused(#[from] compile_limits::CompileRefusal),
 
     /// Requested export not found in the WASM module.
     #[error("export not found: {0}")]
@@ -146,11 +155,20 @@ pub(crate) trait WasmEngine: Send {
 
     /// Compile WASM bytecode into an executable module.
     ///
-    /// May offload the compile to a blocking thread (see
-    /// `RuntimeConfig::offload_compilation`) so a cold-contract compile does
-    /// not pin the single-threaded contract-handling loop. The call is
-    /// synchronous from the caller's perspective regardless.
+    /// May run the compile on a blocking thread (see
+    /// `RuntimeConfig::offload_compilation`) so it does not occupy a tokio
+    /// worker. The call is synchronous from the caller's perspective
+    /// regardless: the contract-handling loop still waits for the result, so
+    /// the cost of one compile is bounded by the acceptance rule in
+    /// `compile_limits` (checked before any compile), not by the offload.
     fn compile(&mut self, code: &[u8]) -> Result<Self::Module, WasmError>;
+
+    /// [`WasmEngine::compile`] for contract code. With
+    /// the compile worker on, this is the entry that always goes through it;
+    /// delegate code goes through it only on hosted nodes.
+    fn compile_contract(&mut self, code: &[u8]) -> Result<Self::Module, WasmError> {
+        self.compile(code)
+    }
 
     /// Approximate compiled byte size of a module, used to bound the module
     /// cache by total compiled bytes rather than entry count. Measured once at
@@ -252,4 +270,4 @@ pub(crate) type Engine = wasmtime_engine::WasmtimeEngine;
 /// modules store references to the compiling engine's internal data structures.
 /// Using a Module compiled by one Engine with a different Engine can cause errors.
 #[cfg(feature = "wasmtime-backend")]
-pub(crate) type BackendEngine = wasmtime::Engine;
+pub(crate) type BackendEngine = wasmtime_engine::SharedBackend;

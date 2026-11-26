@@ -2891,6 +2891,91 @@ mod tests {
             ("MAX_EVIDENCE_INPUT_BYTES", "per-request input limit"),
             ("MAX_IMPORT_BUNDLE_BYTES", "per-request import limit"),
             (
+                "MAX_MODULE_BYTES",
+                "input size limit on WASM code offered for compilation, not retained \
+                 memory; the compiled result is held in the module caches, which are \
+                 budgeted",
+            ),
+            (
+                "MAX_FUNCTION_BODY_BYTES",
+                "input shape limit on one function in WASM code offered for compilation, \
+                 not retained memory",
+            ),
+            (
+                "MAX_DIAGNOSTIC_BYTES",
+                "length cut applied to a parser or compiler error text before it is kept \
+                 or logged; it bounds the entries of the compile-refusal cache, whose \
+                 total is the next two rows",
+            ),
+            (
+                "VERDICT_ENTRY_MAX_BYTES",
+                "largest entry of the compile-refusal cache (key, expiry, refusal, cut \
+                 text); with the entry capacity it gives the row below",
+            ),
+            (
+                "VERDICT_CACHE_MAX_BYTES",
+                "the compile-refusal cache at its entry capacity, under 2 MiB at any \
+                 host size (4,096 entries, each cut to a few hundred bytes), so there is \
+                 no host-size scaling to sum; pinned by \
+                 the_largest_entry_fits_the_byte_bound",
+            ),
+            (
+                "DEFAULT_DATA_FLOOR_BYTES",
+                "memory limit given to a separate compile-check process, not node memory; the node-side figure is reserved from the service memory limit, less the node's current resident memory and the other reservations, by compile_worker::budget, which keeps the whole service under 90% of it",
+            ),
+            (
+                "DEFAULT_DATA_CEILING_BYTES",
+                "the most memory one compile-check process is given; see DEFAULT_DATA_FLOOR_BYTES",
+            ),
+            (
+                "usable",
+                "90% of the service memory limit: the share that the node and the compile-check processes together may reach (compile_worker::caps); the memory term for the compile-check processes, held by separate processes and not by node caches",
+            ),
+            (
+                "available",
+                "what a new compile-check reservation can still take: usable, less the node's resident memory and the reservations held (compile_worker::caps, enforced by compile_worker::budget); not a node cache budget",
+            ),
+            (
+                "LARGE_MODULE_BYTES",
+                "input size above which an in-process compile of an already accepted module reserves memory from the compile-check budget; a size threshold, not a memory budget",
+            ),
+            (
+                "MAX_REASON_BYTES",
+                "length cap on the reason text in one compile-check reply, not a memory budget",
+            ),
+            (
+                "MAX_REQUEST_WASM_BYTES",
+                "the node's module size limit applied to one compile-check request, not a memory budget",
+            ),
+            (
+                "MAX_RESPONSE_BYTES",
+                "largest compile-check reply frame, not a memory budget",
+            ),
+            (
+                "REQUEST_HEADER_BYTES",
+                "fixed size of a compile-check request header, not a memory budget",
+            ),
+            (
+                "STDERR_TAIL_BYTES",
+                "last bytes kept of a compile-check process's error output, per run",
+            ),
+            (
+                "MAX_PREFIX_BYTES",
+                "bytes skipped before a reply in test launchers only",
+            ),
+            (
+                "HEADER_BYTES",
+                "fixed size of the accepted-modules file header, not a memory budget",
+            ),
+            (
+                "RECORD_BYTES",
+                "fixed size of one accepted-modules file record, not a memory budget",
+            ),
+            (
+                "MAX_FILE_BYTES",
+                "largest accepted-modules file that is read (about 2 MiB), an on-disk bound",
+            ),
+            (
                 "MAX_HOP_REPLY_BYTES",
                 "size cap on one inter-delegate reply, held for one delegate \
                  iteration (or charged to the park budget, which is summed, while \

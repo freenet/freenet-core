@@ -555,6 +555,11 @@ pub(crate) struct RouterSnapshotInfo {
     pub delegate_module_cache_total_bytes: Option<u64>,
     pub delegate_module_cache_budget_bytes: Option<u64>,
     pub delegate_module_cache_evictions_total: Option<u64>,
+    /// Counters and log2 histograms of the compile path (verdicts, worker wall,
+    /// CPU and memory, slot wait, accepted-set hits). Aggregates only: no code
+    /// hashes, no peer or contract identifiers, sizes in log2 buckets.
+    #[serde(default)]
+    pub compile: Option<crate::wasm_runtime::CompileTelemetry>,
     /// Capability-relative hosting-budget gauges (#4642 A2), populated by `Ring`
     /// from the `HostingManager` on the snapshot cadence. `hosting_budget_bytes`
     /// is the RAM-scaled default (or operator override); `hosting_current_bytes`
@@ -3573,6 +3578,7 @@ impl Router {
             delegate_module_cache_total_bytes: None,
             delegate_module_cache_budget_bytes: None,
             delegate_module_cache_evictions_total: None,
+            compile: None,
             // Capability-relative hosting-budget gauges populated by Ring on the
             // snapshot cadence (#4642 A2).
             hosting_budget_bytes: None,

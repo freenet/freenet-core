@@ -260,7 +260,6 @@ mod tests {
         for payload in wasmparser::Parser::new(0).parse_all(wasm) {
             if let Ok(wasmparser::Payload::ImportSection(reader)) = payload {
                 let range = reader.range();
-                let range = (range.start as usize)..(range.end as usize);
                 let mut out = vec![0x02];
                 let mut len = (range.end - range.start) as u32;
                 loop {

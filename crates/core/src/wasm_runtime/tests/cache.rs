@@ -505,7 +505,10 @@ async fn concurrent_calls_on_one_code_converge_to_one_cached_module()
         Arc::new(Mutex::new(super::super::ModuleCache::new(
             config.module_cache_budget_bytes,
         )));
-    let backend = Engine::create_backend_engine(&config)?;
+    let backend = Engine::create_backend_engine(
+        &config,
+        std::sync::Arc::new(crate::util::time_source::InstantTimeSrc::new()),
+    )?;
     let delegate_contexts = super::super::new_delegate_context_cache();
     let delegate_counter = super::super::new_delegate_counter();
     let inherited_origins = super::super::new_inherited_origins();

@@ -1605,6 +1605,15 @@ impl<T: TimeSource + Sync> InterestManager<T> {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// The manager's time source, for components that must expire entries on
+    /// the same clock (the WASM engine's remembered refusals).
+    pub fn time_source(&self) -> T
+    where
+        T: Clone,
+    {
+        self.time_source.clone()
+    }
+
     /// Get the current time from the configured `TimeSource`.
     ///
     /// Use this to pass DST-compatible timestamps to components that need

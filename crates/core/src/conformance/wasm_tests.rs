@@ -98,7 +98,8 @@ async fn a_module_that_is_not_a_contract_fails_to_load_rather_than_reading_incon
     // the contract entry points, which is what leaves `missing_contract_exports_for`
     // something to find. A bare eight-byte header would be rejected earlier, for
     // lacking the memory export, and would never reach the ABI check at all.
-    let not_a_contract = br#"(module (memory (export "memory") 1))"#.to_vec();
+    // The runtime takes binary modules only, so the text is assembled first.
+    let not_a_contract = wat::parse_str(r#"(module (memory (export "memory") 1))"#).unwrap();
 
     let err = RuntimeOracle::standalone(not_a_contract, vec![])
         .await

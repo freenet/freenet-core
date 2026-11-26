@@ -37,3 +37,11 @@ The integration test at `tests/redb_migration.rs` uses this database to verify:
 1. Automatic detection of v2 format
 2. Backup creation before migration
 3. Successful migration to v3 format
+
+## compile_worker/
+
+Real, published artifacts for `compile_worker_binary.rs`: the River room
+contract and chat delegate as shipped in the River repository's
+`ui/public/contracts/`. The test runs them through the production compile worker
+under its default caps, so a cap change that would refuse a real artifact fails
+CI. Replace them with newer builds when the caps are re-measured.

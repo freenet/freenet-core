@@ -8,6 +8,8 @@ description = "Freenet core software"
 license-file = "LICENSE.md"
 repository = "https://github.com/freenet/freenet-core"
 readme = "README.md"
+# Test data for the compile-limit tests; not needed to build the crate.
+exclude = ["src/wasm_runtime/engine/reference_shapes.json"]
 
 [package.metadata.freenet]
 # Minimum compatible protocol version. Peers older than this are rejected at
@@ -105,6 +107,10 @@ tower-http = { workspace = true }
 ulid = { workspace = true }
 zeroize = { workspace = true }
 wasmtime = { workspace = true, optional = true }
+# Compiles run on a small dedicated pool (see `compile_pool`), so a module's
+# parallel compile cannot take every core or hold one function's compiler state
+# per core.
+rayon = { workspace = true, optional = true }
 # Always enabled (not gated on wasmtime-backend): debug-section rejection at
 # PUT time must run regardless of which WASM execution backend is compiled in.
 wasmparser = { workspace = true }
@@ -356,7 +362,7 @@ nightly_tests = []
 # Enable with MALLOC_CONF="prof:true,lg_prof_sample:19" and send SIGUSR1 to dump heap profiles.
 jemalloc-prof = ["tikv-jemallocator/profiling", "dep:tikv-jemalloc-ctl"]
 # WASM runtime backend
-wasmtime-backend = ["dep:wasmtime"]
+wasmtime-backend = ["dep:wasmtime", "dep:rayon"]
 # Test builds only, never a release: `FREENET_TEST_QUIC_PANIC` injects a panic
 # in QUIC code, to exercise the Windows QUIC crash-loop breaker through the
 # real binary (transport/quic/panic_injection.rs, #6031).

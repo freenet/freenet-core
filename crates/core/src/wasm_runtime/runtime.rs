@@ -426,6 +426,13 @@ pub enum ContractExecError {
     /// difference matters to any caller that treats "could not judge" as benign.
     #[error("module is not a contract: missing required export(s): {missing}")]
     MissingContractExports { missing: String },
+
+    /// The module's code was refused before compilation (outside the shape
+    /// limits) or failed to compile. A property of the code, so permanent for
+    /// it. Produced only by the host's `classify_compile_result`; classification
+    /// is by typed provenance on `ExecutorError`, not by this text.
+    #[error("module rejected: {0}")]
+    InvalidModule(String),
 }
 
 pub struct RuntimeConfig {
@@ -469,6 +476,21 @@ pub struct RuntimeConfig {
     /// the memory the node may use AND the disk actually free on the cache's
     /// mount, instead of pinning a flat constant or a RAM-only figure.
     pub wasmtime_cache_size_bytes: Option<u64>,
+    /// How the node bounds the compile of contract code (config
+    /// `compile-isolation`). Default `off`: the compile path is unchanged.
+    pub compile_isolation: crate::config::CompileIsolationMode,
+    /// Whether delegate code is covered too when enforcing (set on hosted nodes).
+    pub compile_isolation_delegates: bool,
+    /// Where the compile counters are published; `None` keeps them private to
+    /// the engine.
+    pub(crate) compile_metrics:
+        Option<std::sync::Arc<super::engine::compile_worker::metrics::CompileMetrics>>,
+    /// Test seam: the process that plays the worker.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) compile_worker_test: Option<(
+        super::engine::compile_worker::supervisor::Launcher,
+        super::engine::compile_worker::caps::Policy,
+    )>,
 }
 
 /// Lower clamp for the node-relative wasmtime **on-disk compile cache** soft
@@ -971,6 +993,11 @@ impl Default for RuntimeConfig {
             // it, so tests and sims see unchanged wasmtime cache behavior.
             wasmtime_cache_dir: None,
             wasmtime_cache_size_bytes: None,
+            compile_isolation: crate::config::CompileIsolationMode::Off,
+            compile_isolation_delegates: false,
+            compile_metrics: None,
+            #[cfg(all(test, target_os = "linux"))]
+            compile_worker_test: None,
         }
     }
 }
@@ -1652,7 +1679,7 @@ impl Runtime {
             // see `warn_on_host_clock_import` for why here and not
             // `store_contract`, and for the once-per-code-hash bound.
             warn_on_host_clock_import(key, &code_hash, &code);
-            let module = self.engine.compile(&code)?;
+            let module = super::classify_compile_result(self.engine.compile_contract(&code))?;
             let compiled_size = self.engine.module_compiled_size(&module);
             // Re-check cache: the lock was released before compilation, so
             // another executor may have compiled and cached this contract
@@ -1730,7 +1757,7 @@ impl Runtime {
                 .fetch_delegate(key, params)
                 .ok_or_else(|| RuntimeInnerError::DelegateNotFound(key.clone()))?;
             let code = delegate.code().as_ref().to_vec();
-            let module = self.engine.compile(&code)?;
+            let module = super::classify_compile_result(self.engine.compile(&code))?;
             let compiled_size = self.engine.module_compiled_size(&module);
             // Re-check cache: the lock was released before compilation, so
             // another executor may have compiled and cached this delegate.
@@ -2980,7 +3007,7 @@ mod host_clock_warning_call_site_pin {
     fn the_scrape_sees_real_code() {
         let body = call_site_code();
         assert!(
-            body.contains("self.engine.compile(&code)?"),
+            body.contains("self.engine.compile_contract(&code)"),
             "the scraped region is not contract_module_inner's body any more"
         );
         assert!(

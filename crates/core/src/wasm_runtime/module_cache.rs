@@ -727,6 +727,8 @@ pub(crate) struct ModuleCacheMetrics {
     /// `SubscribeHint`s gets a fresh read per hint without inflating the
     /// throttle-sampled divergence counter (Codex review).
     interest_gauges_refresher: std::sync::OnceLock<Arc<dyn Fn() + Send + Sync>>,
+    /// Counters of the compile path, published by the engine that compiles.
+    compile: Arc<super::engine::compile_worker::metrics::CompileMetrics>,
 }
 
 /// A point-in-time read of [`ModuleCacheMetrics`] for telemetry emission.
@@ -763,7 +765,13 @@ impl ModuleCacheMetrics {
             migration_admission_recovered_total: AtomicU64::new(0),
             interest_shadow_refresher: std::sync::OnceLock::new(),
             interest_gauges_refresher: std::sync::OnceLock::new(),
+            compile: Arc::new(Default::default()),
         }
+    }
+
+    /// The compile-path counters of this node.
+    pub(crate) fn compile(&self) -> Arc<super::engine::compile_worker::metrics::CompileMetrics> {
+        self.compile.clone()
     }
 
     /// Install the on-demand interest-split refresher (see the field docs).
