@@ -24,8 +24,8 @@ on:
 
 jobs:
   mirror:
-    # Pinned to the merge SHA of freenet-git#17 (with the
-    # deterministic-snapshot fix from #18) rather than `@main`. An
+    # Pinned to freenet-git main at 7a85b99 (includes freenet-git#57, which
+    # stops transient gateway backpressure from paging Matrix) rather than `@main`. An
     # unpinned ref + `secrets: inherit` would let any commit to
     # freenet-git/main exfiltrate this repo's secrets (Apple
     # notarization keys, Claude OAuth, OpenAI key, Matrix tokens,
@@ -40,7 +40,7 @@ jobs:
     # under this caller's secrets. Acceptable today because we control
     # crates.io publishing for that crate; if that changes, override
     # `freenet_git_version` here with a pinned semver.
-    uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@61d5fea7631091ffc4493b6dfb4655d35496cf1f
+    uses: freenet/freenet-git/.github/workflows/mirror-repo.yml@7a85b99204395bbd9ac9c5bf029a6cd14d3b0721
     with:
       freenet_repo: "3GEERif5ihbf/freenet-core"
       mode: snapshot
