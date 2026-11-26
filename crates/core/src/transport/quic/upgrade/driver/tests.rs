@@ -935,6 +935,7 @@ fn a_route_ends_with_its_path_and_what_it_holds_goes_on_udp() {
 #[test]
 fn with_no_udp_fallback_what_a_route_holds_when_its_path_ends_is_dropped() {
     use crate::transport::quic::control::caps;
+    use crate::transport::quic::path::{QuicSendResult, SendKind};
     if !crate::transport::quic::breaker::run_with_no_udp_fallback(
         module_path!(),
         "with_no_udp_fallback_what_a_route_holds_when_its_path_ends_is_dropped",
@@ -958,6 +959,7 @@ fn with_no_udp_fallback_what_a_route_holds_when_its_path_ends_is_dropped() {
         ready_ack(&session, attempt, caps::DATA);
         let route = session.data_route().expect("both bits");
         assert!(!route.path().udp_fallback());
+        let path = route.path_handle();
         for i in 0..10u8 {
             route.queue_short(vec![i]).expect("the queue has room");
         }
@@ -970,6 +972,12 @@ fn with_no_udp_fallback_what_a_route_holds_when_its_path_ends_is_dropped() {
             assert!(
                 udp.shorts.lock().unwrap().is_empty(),
                 "nothing goes on UDP when there is no UDP fallback"
+            );
+            assert_eq!(
+                path.stats()
+                    .send_count(SendKind::Short, QuicSendResult::Dropped),
+                10,
+                "each held short is counted dropped"
             );
         })
         .await;
