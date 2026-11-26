@@ -484,15 +484,23 @@ pub(super) async fn bind_udp_listener<S: Socket>(
         crate::node::exit_for_quic_bind_failure().await;
     }
 
+    // Native joins carry application data at once, which `shadow` promises to
+    // keep on UDP, so only a node whose configured mode is `prefer` admits
+    // them (a shadow or off node is never native-ready, gateway joins included).
+    let admits_native = config
+        .quic_policy
+        .as_ref()
+        .is_some_and(|policy| policy.mode() == super::quic::QuicMode::Prefer);
     // Gateway admission of native joins from sources nobody named (#5940
-    // A7b), on the endpoint's clock. Dark: `admission::enabled_at` is false on
-    // every node until phase B (a test can turn it on for one listener), and
-    // with it off the only additions are an idle queue and its poll, one
-    // atomic load per datagram from a source not on the allow-set, and
-    // counters that stay 0.
+    // A7b), on the endpoint's clock. On for every gateway since the floor
+    // release (`admission::enabled_at`; a test can turn it off or on for one
+    // listener). On a non-gateway, or with admission off, the only additions
+    // are an idle queue and its poll, one atomic load per datagram from a
+    // source not on the allow-set, and counters that stay 0.
     admit_native_joins_if_on(
         quic_endpoint.as_ref(),
         is_gateway,
+        admits_native,
         bind_addr,
         quic_virtual_time.clone(),
     );
@@ -507,6 +515,7 @@ pub(super) async fn bind_udp_listener<S: Socket>(
                 bind_addr,
                 keypair.clone(),
                 is_gateway,
+                admits_native,
                 settings,
                 quic_virtual_time.clone(),
             )
@@ -548,14 +557,17 @@ pub(super) async fn bind_udp_listener<S: Socket>(
 }
 
 /// Admit native joins from sources nobody named on `endpoint`, on the
-/// endpoint's clock, when this gateway does (`quic::admission`).
+/// endpoint's clock, when this gateway does (`quic::admission`) and its mode is
+/// `prefer` (`prefer`): native joins carry application data, which `shadow`
+/// keeps on UDP.
 fn admit_native_joins_if_on(
     endpoint: Option<&super::quic::QuicEndpoint>,
     is_gateway: bool,
+    prefer: bool,
     bind_addr: SocketAddr,
     quic_virtual_time: Option<VirtualTime>,
 ) {
-    if let Some(endpoint) = endpoint {
+    if let Some(endpoint) = endpoint.filter(|_| prefer) {
         if super::quic::admission::enabled_at(is_gateway, bind_addr) {
             let enabled = match quic_virtual_time {
                 Some(time) => endpoint.enable_gateway_admission(time),
@@ -577,6 +589,7 @@ fn endpoint_rebuilder<S: Socket>(
     bind_addr: SocketAddr,
     keypair: TransportKeypair,
     is_gateway: bool,
+    prefer: bool,
     settings: super::quic::QuicSettings,
     quic_virtual_time: Option<VirtualTime>,
 ) -> super::quic::rebuild::EndpointFactory {
@@ -604,6 +617,7 @@ fn endpoint_rebuilder<S: Socket>(
         admit_native_joins_if_on(
             Some(&endpoint),
             is_gateway,
+            prefer,
             bind_addr,
             quic_virtual_time.clone(),
         );

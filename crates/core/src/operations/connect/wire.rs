@@ -291,6 +291,7 @@ pub mod sim_trace {
         /// Decisions on an offered request, as (acceptor, `seq` when it
         /// decided, native, in the slice).
         decisions: parking_lot::Mutex<Vec<(SocketAddr, u64, bool, bool)>>,
+        decision_causes: parking_lot::Mutex<std::collections::BTreeMap<&'static str, u64>>,
         /// Acceptor-role demotions, as (node, `seq`).
         acceptor_demotions: parking_lot::Mutex<Vec<(SocketAddr, u64)>>,
         /// The longest acceptor failure streak each node reached.
@@ -406,6 +407,10 @@ pub mod sim_trace {
             own: SocketAddr,
             native: bool,
             in_slice: bool,
+            /// Why the decision was what it was (`native`, or the cause of a
+            /// UDP decision: `held`, `demoted`, `not_ready`, `setup_refused`,
+            /// `offered_zero`, `outside_slice`), as `native::ArmCause` labels them.
+            cause: &'static str,
         },
         /// The node `own` stopped deciding `Native` as acceptor after native
         /// failures with distinct joiners.
@@ -557,7 +562,9 @@ pub mod sim_trace {
                 own,
                 native,
                 in_slice,
+                cause,
             } => {
+                *c.decision_causes.lock().entry(cause).or_insert(0) += 1;
                 let seq = c.seq.fetch_add(1, Ordering::Relaxed);
                 c.decisions.lock().push((own, seq, native, in_slice));
                 return;
@@ -817,6 +824,11 @@ pub mod sim_trace {
         /// native, in the slice), in the order made.
         pub fn decisions(&self) -> Vec<(SocketAddr, u64, bool, bool)> {
             self.0.decisions.lock().clone()
+        }
+        /// Acceptors' decisions counted by cause: `native`, or why a decision
+        /// was UDP (see [`NativeWireEvent::Decided`]). The labels come from `native::acceptor_verdict`.
+        pub fn decision_causes(&self) -> std::collections::BTreeMap<&'static str, u64> {
+            self.0.decision_causes.lock().clone()
         }
         /// Acceptor-role demotions, as (node, order), on the same order as
         /// [`Self::decisions`].

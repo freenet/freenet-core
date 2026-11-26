@@ -275,6 +275,28 @@ pub(crate) fn gateway_native_admission_forced(addr: SocketAddr) -> bool {
         .is_ok_and(|network| GATEWAY_NATIVE_ADMISSION.contains(&(network, addr)))
 }
 
+/// Gateways whose QUIC listener does NOT admit native joins in a simulation
+/// (`SimNetwork::with_gateway_native_admission_off`), as a gateway on a
+/// release before admission was switched on. Keyed like
+/// [`GATEWAY_NATIVE_ADMISSION`].
+#[cfg(any(test, feature = "testing"))]
+static GATEWAY_NATIVE_ADMISSION_OFF: LazyLock<dashmap::DashSet<(String, SocketAddr)>> =
+    LazyLock::new(dashmap::DashSet::new);
+
+/// Turns native-join admission off for the gateway at `addr` in `network`.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn force_gateway_native_admission_off(network: &str, addr: SocketAddr) {
+    GATEWAY_NATIVE_ADMISSION_OFF.insert((network.to_string(), addr));
+}
+
+/// Whether a simulation turned native-join admission off for the listener
+/// bound at `addr` (resolved as [`gateway_native_admission_forced`] does).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn gateway_native_admission_forced_off(addr: SocketAddr) -> bool {
+    resolve_address_network(&addr)
+        .is_ok_and(|network| GATEWAY_NATIVE_ADMISSION_OFF.contains(&(network, addr)))
+}
+
 /// Gateways that close every completed native join after its Hello in a
 /// simulation, as a release before the hand-off to the node did
 /// (`SimNetwork::with_gateway_closing_native_joins`), keyed by `(network,
@@ -471,6 +493,7 @@ pub(crate) fn clear_quic_endpoint_clocks(network: &str) {
     QUIC_ACCEPT_LOOPS.retain(|(owner, _)| owner != network);
     QUIC_ENDPOINT_CLOCKS.retain(|(owner, _), _| owner != network);
     GATEWAY_NATIVE_ADMISSION.retain(|(owner, _)| owner != network);
+    GATEWAY_NATIVE_ADMISSION_OFF.retain(|(owner, _)| owner != network);
     GATEWAY_CLOSES_NATIVE_JOINS.retain(|(owner, _)| owner != network);
     #[cfg(test)]
     EGRESS_CAP_PROBES.retain(|(owner, _), _| owner != network);
@@ -1310,6 +1333,26 @@ impl Socket for SimulationSocket {
 mod tests {
     use super::*;
     use crate::simulation::VirtualTime;
+
+    /// A simulation's forced-admission marks (on and off) are forgotten when
+    /// its network is torn down, so a later simulation of the same name and
+    /// address does not inherit them.
+    #[test]
+    fn admission_marks_do_not_outlive_their_network() {
+        let network = "admission-marks-teardown";
+        let addr: SocketAddr = "127.0.0.1:10201".parse().unwrap();
+        force_gateway_native_admission(network, addr);
+        force_gateway_native_admission_off(network, addr);
+        let key = (network.to_string(), addr);
+        assert!(GATEWAY_NATIVE_ADMISSION.contains(&key), "premise");
+        assert!(GATEWAY_NATIVE_ADMISSION_OFF.contains(&key), "premise");
+        clear_quic_endpoint_clocks(network);
+        assert!(!GATEWAY_NATIVE_ADMISSION.contains(&key));
+        assert!(
+            !GATEWAY_NATIVE_ADMISSION_OFF.contains(&key),
+            "a recreated simulation of the same name inherited the off mark"
+        );
+    }
 
     /// Delivery callbacks are scoped per network (#5673): installing one
     /// network's callback does not replace another's, and removing one (as

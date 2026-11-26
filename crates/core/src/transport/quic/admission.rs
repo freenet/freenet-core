@@ -1,8 +1,18 @@
 //! Gateway admission of native joins from sources nobody named (#5940,
-//! phase B; A7b). **Dark**: [`GATEWAY_NATIVE_ADMISSION`] is false, so no
-//! node turns any of this on in production; tests turn it on per endpoint
-//! ([`super::QuicEndpoint::enable_gateway_admission`]) or per listener
-//! ([`force_on_for_test`]).
+//! phase B; A7b). **On** since the floor release: [`GATEWAY_NATIVE_ADMISSION`]
+//! is true, so every node that is a gateway (published in the index or not)
+//! and configured `transport-quic = "prefer"` (the default) admits native
+//! joins from unknown sources from release day. A `shadow` or `off` gateway
+//! does not: native joins carry application data, which `shadow` keeps on
+//! UDP. The index mark (`GatewayConfig::native`) only steers which gateways
+//! default joiners dial natively; no gateway reads its own mark. There is no
+//! switch in the binary; an operator turns it off on one gateway with
+//! `transport-quic = "off"` (or `"shadow"`), which stays possible only while
+//! UDP exists ([`super::breaker::UDP_FALLBACK`] is true; the UDP-removal
+//! release drops it), and reversing it for everyone takes a release. Tests
+//! also turn it on
+//! per endpoint ([`super::QuicEndpoint::enable_gateway_admission`]) or per
+//! listener ([`force_on_for_test`]).
 //!
 //! Every other QUIC attempt a node accepts comes from an address it allowed
 //! first, with the key it expects there. A gateway admitting a joiner it
@@ -54,8 +64,7 @@ use crate::transport::metrics::GatewayAdmission;
 use crate::transport::normalize_mapped_addr;
 
 /// Whether a gateway admits native joins from sources it was not told
-/// about. The change that turns it on is a one-line change here, and it
-/// waits for:
+/// about. True since the floor release. Turning it on waited for:
 ///
 /// - (done, A7b PR 6) joiners counted inside the node's connection cap at
 ///   the handshake-phase charge, and all unpromoted joiners held to one small
@@ -64,8 +73,18 @@ use crate::transport::normalize_mapped_addr;
 /// - (done, phase B PR 2) the node takes the admitted connection
 ///   (`QuicUpgrades::hand_off_join`): its ConnectRequest arrives on it, and
 ///   the connect op promotes it;
-/// - the rest of the B prerequisites (QUIC-NATIVE-CONNECT 3.7).
-pub(crate) const GATEWAY_NATIVE_ADMISSION: bool = false;
+/// - (done) the rest of the B prerequisites: the endpoint restart or exit on
+///   `Down`, the gateway breaker action, the update check on repeated
+///   handshake failure and before a fatal exit, the `ProvenClientKey`
+///   property tests, and the RustSec watch.
+///
+/// Every gateway admits from release day, whether or not the index marks it
+/// native: `enabled_at` reads only `is_gateway` and this constant. The mark
+/// (an operations step after a gateway runs this build) only steers which
+/// gateways default joiners dial natively. Accepted ordering: the unknown-source
+/// lane is exposed while UDP fallback still exists, rather than at the
+/// UDP-removal release, where it is mandatory.
+pub(crate) const GATEWAY_NATIVE_ADMISSION: bool = true;
 
 /// Whether a node in this role admits native joins from unknown sources: a
 /// gateway, and only while [`GATEWAY_NATIVE_ADMISSION`] is on.
@@ -75,17 +94,33 @@ pub(crate) fn enabled(is_gateway: bool) -> bool {
 
 /// [`enabled`] for the listener bound at `bind_addr`, which a test can turn
 /// on for that one listener ([`force_on_for_test`]), as a simulation can
-/// (`SimNetwork::with_gateway_native_admission`); in a build without tests
+/// (`SimNetwork::with_gateway_native_admission`), or a simulation can turn it
+/// off for one gateway (`SimNetwork::with_gateway_native_admission_off`, a
+/// gateway on a release before admission); in a build without tests
 /// or the `testing` feature it is [`enabled`].
 pub(crate) fn enabled_at(is_gateway: bool, bind_addr: SocketAddr) -> bool {
-    #[cfg(test)]
-    if is_gateway && FORCED_ON.contains(&bind_addr) {
-        return true;
-    }
     #[cfg(any(test, feature = "testing"))]
-    if is_gateway && crate::transport::in_memory_socket::gateway_native_admission_forced(bind_addr)
     {
-        return true;
+        let forced_on = {
+            #[cfg(test)]
+            let by_test = FORCED_ON.contains(&bind_addr);
+            #[cfg(not(test))]
+            let by_test = false;
+            by_test
+                || crate::transport::in_memory_socket::gateway_native_admission_forced(bind_addr)
+        };
+        let forced_off =
+            crate::transport::in_memory_socket::gateway_native_admission_forced_off(bind_addr);
+        assert!(
+            !(forced_on && forced_off),
+            "a simulation turned admission both on and off for {bind_addr}"
+        );
+        if is_gateway && forced_on {
+            return true;
+        }
+        if forced_off {
+            return false;
+        }
     }
     let _ = bind_addr;
     enabled(is_gateway)
@@ -421,14 +456,15 @@ pub(in crate::transport::quic) mod tests {
 
     const SECOND: u64 = 1_000_000_000;
 
-    /// Admission is on only for a gateway with the switch on, and the switch
-    /// ships off.
+    /// Admission is on for a gateway and never for a peer; the switch ships
+    /// on in the floor release.
     #[test]
-    fn admission_is_dark_and_gateway_only() {
-        // A compile-time check: turning the switch on fails this build.
-        const { assert!(!GATEWAY_NATIVE_ADMISSION, "ships dark until phase B") };
-        assert!(!enabled(true));
-        assert!(!enabled(false));
+    fn admission_is_on_for_gateways_only() {
+        // A compile-time check: turning the switch off fails this build, so
+        // reversing the floor is a deliberate edit of this pin.
+        const { assert!(GATEWAY_NATIVE_ADMISSION, "on since the floor release") };
+        assert!(enabled(true));
+        assert!(!enabled(false), "never on a peer");
         assert!(enabled_with(true, true));
         assert!(!enabled_with(false, true), "never on a peer");
         assert!(!enabled_with(true, false));

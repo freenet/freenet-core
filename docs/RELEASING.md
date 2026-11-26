@@ -527,7 +527,17 @@ Current wire-gated floors:
   but were cut with the floor raised past them, so they never emitted the
   native variants. In 0.2.163 every offer carries percent 0.
   A+ step 1 (0.2.164) sets `NATIVE_DIAL_READY` true and
-  `QUIC_NATIVE_PERCENT` 25 and does not touch the floor. The
+  `QUIC_NATIVE_PERCENT` 25 and does not touch the floor. The floor release sets
+  `QUIC_NATIVE_PERCENT` 100, `GATEWAY_NATIVE_JOIN_PERCENT` 100 and
+  `GATEWAY_NATIVE_ADMISSION` true, also without touching the wire floor.
+  Every gateway configured `transport-quic = "prefer"` (the default) admits
+  unknown-source native joins from release day, marked in the index or not;
+  a `shadow` or `off` gateway does not. The operator emergency lever for a
+  quinn or rustls advisory is `transport-quic = "off"` in that gateway's
+  config (no QUIC endpoint is built; the gateway serves UDP as before). It
+  works only while UDP exists (`breaker::UDP_FALLBACK` is true); the
+  UDP-removal release drops it. Reversing the constants for everyone takes a
+  release. The
   acceptor decides on `min(offered, own)`, so a reversal takes effect for a
   pair once either the acceptor or the joiner has updated; there is no
   runtime kill switch. Do not raise the floor again unless the V2 layout

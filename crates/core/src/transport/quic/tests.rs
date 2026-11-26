@@ -6782,14 +6782,13 @@ fn a_joiner_with_no_room_in_the_cap_is_ignored_until_one_is_released() {
     })
 }
 
-/// Off by default: with gateway admission off (as it is on every node while
-/// `GATEWAY_NATIVE_ADMISSION` is false) an unknown source is ignored whether
+/// Off on an endpoint that was not given admission (a peer, or a test
+/// endpoint that did not ask): an unknown source is ignored whether
 /// or not the cap is attached, no joiner is ever charged, and the hub is
 /// what attaches the cap.
 #[test]
 fn with_admission_off_no_joiner_is_charged() {
     use super::upgrade::policy::QuicPathPermits;
-    const { assert!(!super::admission::GATEWAY_NATIVE_ADMISSION) };
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let net = crate::transport::test_net::subnet();
@@ -6871,7 +6870,7 @@ fn a_gateway_listener_with_admission_hands_a_join_to_the_node() {
         let wait = tokio::spawn(monitor.wait_for_any_exit());
         let mut network_config: crate::config::NetworkApiConfig =
             toml::from_str("").expect("default network config");
-        network_config.transport_quic = Some("shadow".to_string());
+        network_config.transport_quic = Some("prefer".to_string());
         let gateway_keys = TransportKeypair::new();
         let (outbound, mut inbound, listener) = bind_udp_listener::<SimulationSocket>(
             gateway_keys.clone(),

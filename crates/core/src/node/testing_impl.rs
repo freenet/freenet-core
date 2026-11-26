@@ -2365,7 +2365,7 @@ impl SimNetwork {
 
     /// Turns QUIC-native connects on for every node, at `percent` (the share
     /// of joins an acceptor decides native), in place of this release's
-    /// `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, which are on (25) in
+    /// `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, which are on (100) in
     /// production. Pair it with [`Self::with_quic_native_floor`], since without the native wire
     /// variants no decision reaches a joiner, and with
     /// [`Self::with_transport_quic`], since a node without a QUIC endpoint
@@ -2380,7 +2380,7 @@ impl SimNetwork {
 
     /// Turns on admission of native joins (`transport::quic::admission`) at
     /// the gateway `label`'s QUIC listener, in place of this release's
-    /// `GATEWAY_NATIVE_ADMISSION`, which is off. A joiner reaches it with
+    /// `GATEWAY_NATIVE_ADMISSION`, which is on in production. A joiner reaches it with
     /// [`Self::with_native_gateway_join`] when the gateway is marked native.
     /// Call before the simulation starts.
     #[cfg(any(test, feature = "testing"))]
@@ -2391,6 +2391,22 @@ impl SimNetwork {
             .get(label)
             .expect("the gateway must have an address in this network");
         crate::transport::in_memory_socket::force_gateway_native_admission(&self.name, addr);
+        self
+    }
+
+    /// Turns admission of native joins OFF at the gateway `label`'s QUIC
+    /// listener, standing in for a gateway on a release before admission was
+    /// switched on (it is on in production). A joiner that finds it marked
+    /// native times out and falls back to the UDP join. Call before the
+    /// simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_gateway_native_admission_off(&mut self, label: &NodeLabel) -> &mut Self {
+        assert!(label.is_gateway(), "only a gateway admits native joins");
+        let addr = *self
+            .node_addresses
+            .get(label)
+            .expect("the gateway must have an address in this network");
+        crate::transport::in_memory_socket::force_gateway_native_admission_off(&self.name, addr);
         self
     }
 
@@ -2411,8 +2427,8 @@ impl SimNetwork {
 
     /// Turns native gateway joins (phase B) on for every node, at `percent`
     /// (the share of joiner-gateway pairs that dial native first), in place of
-    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, which are off,
-    /// and marks every gateway each node knows native, as the published index
+    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, which are on (100)
+    /// in production, and marks every gateway each node knows native, as the published index
     /// does for a gateway that admits native joins. A joiner with a QUIC
     /// endpoint (see [`Self::with_transport_quic`]) then tries a native join
     /// first, and falls back to the UDP join when it fails. Call before the
@@ -2881,16 +2897,6 @@ impl QuicEndpointProbe {
                 (*node, labels)
             })
             .collect()
-    }
-
-    /// Whether the probe covered at least one node and every node refused
-    /// it as `not_allowed`, i.e. had a live QUIC endpoint.
-    pub fn every_node_has_a_live_endpoint(&self) -> bool {
-        let outcomes = self.outcomes();
-        !outcomes.is_empty()
-            && outcomes
-                .iter()
-                .all(|(_, labels)| labels.as_slice() == ["not_allowed"])
     }
 }
 
@@ -9024,28 +9030,59 @@ mod tests {
 
     /// In a running simulation a node with `transport-quic = "shadow"`
     /// has a QUIC ingress on its socket (a QUIC-class datagram from a
-    /// stranger is refused as not allowed), and a node left off has none.
+    /// stranger is refused as not allowed, or on a gateway, which admits
+    /// native joins from unknown sources, queued as forwarded), and a node
+    /// left off has none.
     #[tokio::test(flavor = "current_thread")]
     async fn transport_quic_builds_the_endpoint_of_a_running_simulated_node() {
+        quic_endpoint_of_a_running_simulated_node(
+            "shadow",
+            "quic-running-endpoint-e5a1",
+            crate::transport::metrics::QuicIngressOutcome::NotAllowed,
+        )
+        .await;
+    }
+
+    /// A `prefer` gateway admits native joins from unknown sources, so it
+    /// queues a stranger's datagram (`Forwarded`); the `shadow` gateway of the
+    /// test above, which keeps application data on UDP, does not.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_prefer_gateway_queues_a_strangers_datagram_for_admission() {
+        quic_endpoint_of_a_running_simulated_node(
+            "prefer",
+            "quic-running-endpoint-prefer-e5a2",
+            crate::transport::metrics::QuicIngressOutcome::Forwarded,
+        )
+        .await;
+    }
+
+    async fn quic_endpoint_of_a_running_simulated_node(
+        mode: &'static str,
+        network: &'static str,
+        gateway_outcome: crate::transport::metrics::QuicIngressOutcome,
+    ) {
         use crate::transport::in_memory_socket::deliver_packet_to_network;
         use crate::transport::metrics::{QuicIngressOutcome, TRANSPORT_METRICS};
-        const NETWORK: &str = "quic-running-endpoint-e5a1";
-        let mut sim = SimNetwork::new(NETWORK, 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0012).await;
+        let mut sim = SimNetwork::new(network, 1, 1, 7, 3, 6, 1, 0x5940_E5A1_0012).await;
         let labels = labels_in_order(&sim);
-        sim.with_node_transport_quic(&labels[0], "shadow");
+        sim.with_node_transport_quic(&labels[0], mode);
         // The second node must have no QUIC endpoint, which is no longer the
         // simulation default.
         sim.with_node_transport_quic(&labels[1], "off");
         let _handles = sim
             .start_with_rand_gen::<rand::rngs::SmallRng>(0x5940_E5A1_0012, 1, 1)
             .await;
+        // `labels[0]` is the gateway (one gateway, one node): a `prefer` one
+        // queues a stranger's datagram for admission, a `shadow` one refuses it.
+        assert!(labels[0].is_gateway(), "premise: labels[0] is the gateway");
         let targets: Vec<(SocketAddr, SocketAddr, QuicIngressOutcome)> = [
-            (&labels[0], 1, QuicIngressOutcome::NotAllowed),
+            (&labels[0], 1, gateway_outcome),
             (&labels[1], 2, QuicIngressOutcome::NoIngress),
         ]
         .into_iter()
         .map(|(label, port, expected)| {
-            let stranger = SocketAddr::from(([10, 201, 39, 1], port));
+            let stranger =
+                SocketAddr::from(([10, 201, if mode == "prefer" { 40 } else { 39 }, 1], port));
             (sim.all_node_addresses()[label], stranger, expected)
         })
         .collect();
@@ -9061,7 +9098,7 @@ mod tests {
                     tokio::time::Instant::now() < deadline,
                     "{target} never read the datagram"
                 );
-                deliver_packet_to_network(NETWORK, target, initial.clone(), stranger);
+                deliver_packet_to_network(network, target, initial.clone(), stranger);
                 sim.advance_time(Duration::from_millis(100));
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }

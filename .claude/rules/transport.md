@@ -293,7 +293,7 @@ Intro packet rate limiting:
 
 Mechanism detail: docs/architecture/transport/rules-reference.md § WHEN using token bucket
 
-### WHEN admitting native joiners at a gateway (#5940, A7b; dark behind `GATEWAY_NATIVE_ADMISSION`)
+### WHEN admitting native joiners at a gateway (#5940, A7b; on since the floor release, `GATEWAY_NATIVE_ADMISSION`)
 
 - A joiner is charged against the QUIC path cap from admission (`JoinerCharge`). Do not add a parallel joiner counter: paths and joiners share ONE unit total in `QuicPathPermits`.
 - Joiners together hold at most 1/`JOINER_SHARE_DIVISOR` of the units; the join window counts from the hub queueing the join.
@@ -302,9 +302,9 @@ Mechanism detail: docs/architecture/transport/rules-reference.md § WHEN using t
 - Unpromoted joiners share one slice of the ingress queue (`QUIC_INGRESS_JOINER_DATAGRAMS`), not per-source or per-IP; record the slot per datagram (`joiner_slot`).
 - Never `std::mem::forget` a charge or a mark: a leaked charge shrinks the cap for the process life.
 
-Mechanism detail: docs/architecture/transport/rules-reference.md § WHEN admitting native joiners at a gateway (#5940, A7b; dark behind `GATEWAY_NATIVE_ADMISSION`)
+Mechanism detail: docs/architecture/transport/rules-reference.md § WHEN admitting native joiners at a gateway (#5940, A7b; on since the floor release, `GATEWAY_NATIVE_ADMISSION`)
 
-### WHEN a joiner dials a gateway natively (#5940, phase B; dark behind `GATEWAY_NATIVE_JOIN_PERCENT`)
+### WHEN a joiner dials a gateway natively (#5940, phase B; on since the floor release, `GATEWAY_NATIVE_JOIN_PERCENT`)
 
 - The joiner alone decides, in the handshake driver (`plan_gateway_join`); not in the connect op or event loop.
 - Fallback to the ordinary UDP dial is unconditional and immediate; nothing is sticky. Gateway join failures must never count toward the peer-to-peer demotion.
@@ -312,7 +312,7 @@ Mechanism detail: docs/architecture/transport/rules-reference.md § WHEN admitti
 - A gateway hands a completed native join to the node (`QuicUpgrades::hand_off_join`): a full queue or no node closes it (`quic_gateway_admission_handoff_full`), and so does a join that finished after an endpoint rebuild replaced its stack (`stack_gone`). Every stack the listener builds, the first and each rebuilt one, gets the same hand-off. The handed-over connection holds the joiner's charge until the node promotes it under the proven key (`set_peer_identity` calls `JoinerCharge::promote`) and drops it with the connection; never leak it. Do not mark a gateway in the index before it runs a release with this hand-off: an older gateway closes a completed join after the Hello, and a joiner whose setup succeeded has no fallback.
 - The node binds a native join to its proven key WITHOUT promoting it (`connection_lifecycle::accept_native_join`): the connect op promotes it at ConnectPeer, and a ConnectRequest naming another key closes it. Never pass a native join to `handle_successful_connection` with `Some(peer)` (on a gateway that promotes it into the ring before CONNECT accepts it). A proven native join skips the UDP survivor rule (a newer native join for the same key replaces the older; one beside a UDP entry is held, `hold_native`), and one that sends no request within `NATIVE_JOIN_REQUEST_WITHIN` (5 s, a one-shot timer: the zombie sweep's 30 s tick is too coarse) is closed.
 
-Mechanism detail: docs/architecture/transport/rules-reference.md § WHEN a joiner dials a gateway natively (#5940, phase B; dark behind `GATEWAY_NATIVE_JOIN_PERCENT`)
+Mechanism detail: docs/architecture/transport/rules-reference.md § WHEN a joiner dials a gateway natively (#5940, phase B; on since the floor release, `GATEWAY_NATIVE_JOIN_PERCENT`)
 
 ## Backoff, Jitter, and Recovery Rules
 
@@ -397,7 +397,7 @@ update this section.
 - Fill the ingress queue with `try_reserve`, never a waiting send, so a slow endpoint cannot stall the listener; keep `QUIC_INGRESS_QUEUE_BYTES` in `declared_cache_ceiling`.
 - Queue only allow-set sources (`allow_quic_source`) so probers get no QUIC reply; per-source cap and `QUIC_INGRESS_QUIET_RESERVE` keep one source from starving others; native joiners use `QUIC_INGRESS_JOINER_DATAGRAMS`, never the reserve.
 - `QuicSourcePermit` keeps an address allowed; set capped at `QUIC_ALLOWED_SOURCES_MAX`; `allow_existing_quic_source` only for an address allowed now, so `accept` cannot resurrect a dropped one. The endpoint holds one permit per connection until quinn reports it closed (#5922).
-- Gateway native admission (`quic/admission.rs`, #5940 A7b) is DARK: call `enable_gateway_admission` ONLY inside `admission::enabled_at` (`the_node_enables_admission_only_behind_the_switch`); off, behaviour is unchanged.
+- Gateway native admission (`quic/admission.rs`, #5940 A7b) is ON since the floor release (`GATEWAY_NATIVE_ADMISSION` true, no runtime kill switch): call `enable_gateway_admission` ONLY inside `admission::enabled_at` (`the_node_enables_admission_only_behind_the_switch`). EVERY gateway configured `prefer` admits from release day, in the index or not (a `shadow` or `off` gateway does not: native joins carry data, `shadow` keeps data on UDP; `admit_native_joins_if_on` takes the mode from `quic_policy`): `enabled_at` reads only `is_gateway` and the constant, and no gateway reads its own `GatewayConfig.native`. The index mark only steers which gateways default joiners dial natively. Operator lever for a quinn advisory: `transport-quic = "off"` on that gateway (no QUIC endpoint is built), available only while `breaker::UDP_FALLBACK` is true.
 - `EndpointCore::accept_attempt`: Retry first, then rate limits, then charge the joiner to the path cap (`try_acquire_joiner`), then `allow_joiner`. A ticket dropped before handshake MUST be `refunded`; a panicking join is counted, never kills `quic_gateway_joins`.
 - The listener calls `RecvErrorTracker::on_success` for `Diverted` datagrams too (`Socket::recv_classified`), or diverted QUIC traffic would end it.
 - The wrapper charges outbound to the egress cap; a new send site must not wait unless it is a pacing point.
@@ -493,13 +493,13 @@ Mechanism detail: docs/architecture/transport/rules-reference.md § QUIC rollout
 - The expected key comes from the node's own record, NEVER from an upgrade message. A transport holds the key it dialled (outbound) or, only with a QUIC endpoint, the key sent by `ConnEvent::SetPeerIdentity` at ring promotion.
 - `conn_identity_promotion_key_mismatch` and `transport_key_refused` MUST stay 0 (`test_quic_prefer_forms_a_mesh_of_the_same_peers_as_quic_off`).
 - The upgrade (e5a-5b) MUST treat a transport with no key as not eligible, never "any key"; an inbound transport's key is the peer's claim, checked only by the QUIC handshake.
-- `ProvenClientKey` (gateway native join, A7b, dark): accept only exact Ed25519 SPKI, sign bit 0, a key `PeerKey::of` accepts. Read `proven_client_key` only on a fully established connection, NEVER from `into_0rtt()`. `server_tls_proven` offers `freenet-quic/2` only.
+- `ProvenClientKey` (gateway native join, A7b): accept only exact Ed25519 SPKI, sign bit 0, a key `PeerKey::of` accepts. Read `proven_client_key` only on a fully established connection, NEVER from `into_0rtt()`. `server_tls_proven` offers `freenet-quic/2` only.
 
 Mechanism detail: docs/architecture/transport/rules-reference.md § QUIC identity (`transport/quic/identity.rs`, #5940 step c3)
 
 #### QUIC-native setup (`quic/native/`, #5940 QUIC-native connect, A4)
 
-- `setup::connect_native`/`accept_native`/`join_native` are `pub(in crate::transport)`, called only by `QuicUpgrades::setup_native`; the endpoint's native side stays `pub(in crate::transport::quic::native)`. Since A+ step 1 the connect op asks for a setup for ready pairs whose bucket is below `QUIC_NATIVE_PERCENT` (25), gated on `NATIVE_DIAL_READY` (true); native gateway joins stay off (`GATEWAY_NATIVE_JOIN_PERCENT` 0). There is no runtime kill switch: the acceptor decides on `min(offered, own)`, so a reversal reaches a pair only once either side has updated.
+- `setup::connect_native`/`accept_native`/`join_native` are `pub(in crate::transport)`, called only by `QuicUpgrades::setup_native`; the endpoint's native side stays `pub(in crate::transport::quic::native)`. Since the floor release the connect op asks for a setup for every ready pair (`QUIC_NATIVE_PERCENT` 100; 25 in A+ step 1), gated on `NATIVE_DIAL_READY` (true), and every join to a gateway marked native tries native first (`GATEWAY_NATIVE_JOIN_PERCENT` 100). There is no runtime kill switch: the acceptor decides on `min(offered, own)`, so a reversal reaches a pair only once either side has updated.
 - ALPN: native-allowed addresses get `freenet-quic/2` only, others `/1`; one kind per address. Attempts from a native-allowed address go only to `native::waiters`, never an upgrade session; the only registration is in `accept_native`.
 - Hello layout (`native/hello.rs`) is frozen. Malformed closes HELLO_REFUSED; incompatible version closes VERSION_INCOMPATIBLE with this node's 8 version bytes; rules are `connection_handler::native_version`.
 - Every punch/Initial is charged to `PunchBudget` BEFORE it is sent; a destination slot is replaced only once refilled, so forgetting never refunds early.

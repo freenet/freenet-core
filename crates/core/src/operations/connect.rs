@@ -675,6 +675,9 @@ impl RelayState {
         let holds = ctx.holds_transport_to(&self.request.joiner);
         let mut decision = native::decide_native(Some(offer), readiness, bucket, holds);
         let mut arm = native::acceptor_arm(Some(offer), readiness, bucket, holds);
+        #[cfg(any(test, feature = "testing"))]
+        let arm_cause = native::acceptor_verdict(Some(offer), readiness, bucket, holds)
+            .map_or("no_offer", |(_, cause)| cause.label());
         // A `Native` decision holds a native setup slot and an allow-set slot
         // here for up to the server's window. Admit it first; with no room
         // (or too many pending from the joiner's source) decide `Udp`, so the
@@ -683,10 +686,16 @@ impl RelayState {
         // other than the slice, and a control pair at an acceptor with no room
         // leaves the control arm the same way.
         let mut admission = None;
+        #[cfg(any(test, feature = "testing"))]
+        let mut setup_refused = false;
         if decision == native::NativeDecision::Native {
             match ctx.admit_native_setup(&self.request.joiner) {
                 Ok(ticket) => admission = Some(ticket),
                 Err(_) => {
+                    #[cfg(any(test, feature = "testing"))]
+                    {
+                        setup_refused = true;
+                    }
                     decision = native::NativeDecision::Udp;
                     arm = None;
                 }
@@ -706,6 +715,11 @@ impl RelayState {
                     own,
                     native: decision == native::NativeDecision::Native,
                     in_slice: !holds && bucket < offer.effective_percent(),
+                    cause: if setup_refused {
+                        "setup_refused"
+                    } else {
+                        arm_cause
+                    },
                 },
             );
         }

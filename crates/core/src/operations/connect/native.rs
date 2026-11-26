@@ -10,8 +10,8 @@
 //! On `Native` the joiner and the acceptor each dial a native connection
 //! ([`DialTransport::Native`]), and a failed setup falls back to today's UDP
 //! dial. In production [`NATIVE_DIAL_READY`] is true and
-//! [`QUIC_NATIVE_PERCENT`] is 25 (A+ step 1), so a ready pair whose bucket is
-//! below 25 decides `Native`; a simulation sets both per node
+//! [`QUIC_NATIVE_PERCENT`] is 100 (the floor release), so a ready pair
+//! decides `Native`; a simulation sets both per node
 //! ([`NativeConnectState`]). A `Native` the joiner cannot honour fails that
 //! attempt ([`joiner_response_action`]).
 //!
@@ -46,17 +46,19 @@ pub(crate) const NATIVE_DIAL_READY: bool = true;
 /// decides, and it decides on `min(offered, own)`, so a pair goes native only
 /// if both releases allow it: a reversal takes effect for any pair where either
 /// the acceptor or the joiner has updated, as nodes update. There is no runtime
-/// kill switch. 25 is A+ step 1.
-pub(crate) const QUIC_NATIVE_PERCENT: u8 = 25;
+/// kill switch. 25 was A+ step 1; 100 is the floor release.
+pub(crate) const QUIC_NATIVE_PERCENT: u8 = 100;
 
 /// This release's share, 0 to 100, of (joiner, gateway) pairs whose join
 /// tries a native connection to the gateway first (#5940, phase B), when the
 /// gateway is marked native in the gateway index and this node can dial
 /// native. Any failure falls back at once to today's join. The joiner alone
 /// decides (there is no connection to the gateway yet to ask it), so the
-/// joiner's release governs. At 0 no join tries native. `NATIVE_DIAL_READY`
-/// is true since A+ step 1, so this 0 alone keeps gateway-native off.
-pub(crate) const GATEWAY_NATIVE_JOIN_PERCENT: u8 = 0;
+/// joiner's release governs. At 0 no join tries native. 100 is the floor
+/// release: every join to a gateway marked native tries native first. There is
+/// no runtime kill switch; a reversal takes effect as joiners update, and the
+/// gateway index mark is what a gateway operator controls.
+pub(crate) const GATEWAY_NATIVE_JOIN_PERCENT: u8 = 100;
 
 /// After a native join with a gateway fails, joins to that gateway go
 /// straight to today's join for this long (provisional). The gateway index
@@ -117,8 +119,9 @@ pub(crate) const ACCEPTOR_DEMOTION_FAILURES: usize = 3;
 /// strikes spread thinly over days (a node that rarely uses native) do not
 /// add up to a demotion. Equal to [`DEMOTION_COOLDOWN`]: a node whose native
 /// path is broken collects its strikes at its rate of UDP-rescued native
-/// setups, which at 25% is several an hour for a node that accepts or joins
-/// at all, so three fall well inside 6 h; and a fault that does not recur
+/// setups, which at 25% was several an hour for a node that accepts or joins
+/// at all (and is about four times that at 100%), so three fall well inside
+/// 6 h; and a fault that does not recur
 /// within one cooldown would not have kept native off for long either.
 pub(crate) const STRIKE_WINDOW: Duration = DEMOTION_COOLDOWN;
 
@@ -456,14 +459,69 @@ pub(crate) fn acceptor_arm(
     bucket: u8,
     holds_transport: bool,
 ) -> Option<ConnectArm> {
+    acceptor_verdict(offer, own, bucket, holds_transport).and_then(|(arm, _)| arm)
+}
+
+/// Why an acceptor's arm is what it is, produced by the same branch that picks
+/// the arm so the label cannot disagree with it. Read only by the simulation
+/// trace (`decision_causes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArmCause {
+    /// In the slice, ready: decides `Native`.
+    Native,
+    /// This node already held a transport to the joiner.
+    Held,
+    /// Either demotion streak holds native off.
+    Demoted,
+    /// In the slice but the build or endpoint is not ready.
+    NotReady,
+    /// The joiner offered percent 0 (it is not ready, demoted or below the
+    /// floor), so no bucket is in the slice.
+    OfferedZero,
+    /// The bucket is at or above the lower of the two percents.
+    OutsideSlice,
+}
+
+impl ArmCause {
+    /// The label the simulation trace counts this cause under.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Native => "native",
+            Self::Held => "held",
+            Self::Demoted => "demoted",
+            Self::NotReady => "not_ready",
+            Self::OfferedZero => "offered_zero",
+            Self::OutsideSlice => "outside_slice",
+        }
+    }
+}
+
+/// [`acceptor_arm`] with the cause of the answer: `None` when the request
+/// carried no offer.
+pub(crate) fn acceptor_verdict(
+    offer: Option<NativeOffer>,
+    own: NativeReadiness,
+    bucket: u8,
+    holds_transport: bool,
+) -> Option<(Option<ConnectArm>, ArmCause)> {
     let offered = offer?.effective_percent();
-    if holds_transport || own.demoted {
-        return None;
+    if holds_transport {
+        return Some((None, ArmCause::Held));
+    }
+    if own.demoted {
+        return Some((None, ArmCause::Demoted));
     }
     if bucket < offered.min(own.percent.min(100)) {
-        own.ready.then_some(ConnectArm::Treated)
+        Some(if own.ready {
+            (Some(ConnectArm::Treated), ArmCause::Native)
+        } else {
+            (None, ArmCause::NotReady)
+        })
+    } else if offered == 0 {
+        Some((Some(ConnectArm::Control), ArmCause::OfferedZero))
     } else {
-        Some(ConnectArm::Control)
+        Some((Some(ConnectArm::Control), ArmCause::OutsideSlice))
     }
 }
 
@@ -1544,25 +1602,26 @@ mod tests {
         );
     }
 
-    /// A+ step 1: this build dials native and offers 25 once its endpoint is
-    /// up. A node whose endpoint is down offers 0 and decides UDP; an up node
-    /// decides `Native` exactly for buckets below 25.
+    /// Floor release: this build dials native and offers 100 once its
+    /// endpoint is up. A node whose endpoint is down offers 0 and decides UDP;
+    /// an up node decides `Native` for every bucket. The only path to UDP is a
+    /// down endpoint, a demotion, or a peer that offers less.
     #[test]
-    fn this_release_offers_25_when_up_and_decides_native_below_25() {
+    fn this_release_offers_100_when_up_and_decides_native_in_every_bucket() {
         const { assert!(NATIVE_DIAL_READY) };
-        const { assert!(QUIC_NATIVE_PERCENT == 25) };
+        const { assert!(QUIC_NATIVE_PERCENT == 100) };
         let down = NativeReadiness::from_inputs(NATIVE_DIAL_READY, false, false);
         assert!(!down.ready);
         assert_eq!(down.offer(), NativeOffer::capable(0));
         let up = NativeReadiness::from_inputs(NATIVE_DIAL_READY, true, false);
         assert!(up.ready);
-        assert_eq!(up.offer(), NativeOffer::capable(25));
+        assert_eq!(up.offer(), NativeOffer::capable(100));
         for bucket in 0..100 {
             assert_eq!(
                 decide_native(Some(NativeOffer::capable(100)), down, bucket, false),
                 NativeDecision::Udp
             );
-            let want = if bucket < 25 {
+            let want = if bucket < QUIC_NATIVE_PERCENT {
                 NativeDecision::Native
             } else {
                 NativeDecision::Udp
@@ -2001,10 +2060,13 @@ mod tests {
         assert_eq!(state.pending_acceptor_setups(), 0);
     }
 
-    /// Phase B ships dark: no join tries native in this release.
+    /// Floor release: every join to a gateway marked native in the index
+    /// tries native first, with the production state (endpoint up, dial ready,
+    /// 100 percent). A gateway NOT marked native stays on the legacy join: the
+    /// index mark, not this constant, is what a gateway operator controls.
     #[test]
-    fn this_release_joins_no_gateway_natively() {
-        const { assert!(GATEWAY_NATIVE_JOIN_PERCENT == 0) };
+    fn this_release_joins_every_marked_gateway_natively() {
+        const { assert!(GATEWAY_NATIVE_JOIN_PERCENT == 100) };
         use crate::transport::{QuicAvailability, QuicAvailabilityWatch};
         let (_endpoint, watch) = QuicAvailabilityWatch::for_test(QuicAvailability::Up);
         // Production state, with every other condition met.
@@ -2012,9 +2074,15 @@ mod tests {
         state.set_endpoint(watch, true);
         let gateway = "192.0.2.1:31337".parse().unwrap();
         state.set_native_gateways([gateway]);
+        let unmarked = "192.0.2.2:31337".parse().unwrap();
         for seed in 0..200 {
             assert_eq!(
                 state.plan_gateway_join(&key(seed), gateway, &key(10_000)),
+                GatewayJoinPlan::NativeFirst,
+                "seed {seed}"
+            );
+            assert_eq!(
+                state.plan_gateway_join(&key(seed), unmarked, &key(10_000)),
                 GatewayJoinPlan::Legacy
             );
         }

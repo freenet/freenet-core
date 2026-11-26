@@ -21077,11 +21077,17 @@ struct QuicSimTrace {
     /// (`SimNetwork::probe_quic_endpoints_at`): `["not_allowed"]` when the
     /// node had a live QUIC endpoint, `["no_ingress"]` when it had none.
     endpoint_probe: Vec<(SocketAddr, Vec<&'static str>)>,
+    /// The gateways' addresses: with native admission on in production, a
+    /// gateway's endpoint takes a stranger's datagram into the admission
+    /// queue (`"forwarded"`) where every other node refuses it.
+    gateway_addrs: Vec<SocketAddr>,
 }
 
 impl QuicSimTrace {
     /// Asserts the probe covered all `QUIC_HARNESS_NODES` and every one
-    /// answered it with `expected`.
+    /// answered it with `expected`; a gateway, which admits native joins
+    /// from unknown sources, answers `"forwarded"` instead when `expected`
+    /// is `"not_allowed"` (a live endpoint).
     fn assert_probe(&self, expected: &str) {
         assert_eq!(
             self.endpoint_probe.len(),
@@ -21089,7 +21095,12 @@ impl QuicSimTrace {
             "the probe covered every node"
         );
         for (node, outcomes) in &self.endpoint_probe {
-            assert_eq!(outcomes.as_slice(), [expected], "probe of {node}");
+            let want = if expected == "not_allowed" && self.gateway_addrs.contains(node) {
+                "forwarded"
+            } else {
+                expected
+            };
+            assert_eq!(outcomes.as_slice(), [want], "probe of {node}");
         }
     }
 }
@@ -21103,12 +21114,18 @@ const QUIC_HARNESS_NODES: usize = 6;
 fn run_quic_harness_sim(name: &str, seed: u64, quic: Option<&str>) -> QuicSimTrace {
     setup_deterministic_state(seed);
     let rt = create_runtime();
-    let (sim, logs_handle, probe) = rt.block_on(async {
+    let (sim, logs_handle, probe, gateway_addrs) = rt.block_on(async {
         let mut sim = SimNetwork::new(name, 2, 4, 10, 3, 10, 3, seed).await;
         sim.with_transport_quic(quic.unwrap_or("off"));
         let probe = sim.probe_quic_endpoints_at(Duration::from_secs(2));
+        let gateway_addrs: Vec<SocketAddr> = sim
+            .all_node_addresses()
+            .iter()
+            .filter(|(label, _)| label.is_gateway())
+            .map(|(_, addr)| *addr)
+            .collect();
         let logs_handle = sim.event_logs_handle();
-        (sim, logs_handle, probe)
+        (sim, logs_handle, probe, gateway_addrs)
     });
     drop(rt);
     sim.run_simulation_direct::<rand::rngs::SmallRng>(seed, 6, 20, Duration::from_millis(200))
@@ -21144,6 +21161,7 @@ fn run_quic_harness_sim(name: &str, seed: u64, quic: Option<&str>) -> QuicSimTra
             event_sequence,
             event_keys,
             endpoint_probe: probe.outcomes(),
+            gateway_addrs,
         }
     })
 }
@@ -23761,8 +23779,9 @@ fn test_quic_native_connections_form_and_carry_messages() {
     assert!(connected);
 }
 
-/// A gateway the index marks native, whose side is not built yet (native
-/// admission is off, so it ignores a joiner it does not know): each joiner's
+/// A gateway the index marks native, on a release before native admission
+/// (forced off here, since it is on in production, so it ignores a joiner it
+/// does not know): each joiner's
 /// native join times out in its window and falls back to the UDP join, which
 /// joins as it does today, and every fallback that connects is counted as a
 /// rescue. Fails closed: native joins must have been tried and failed, and
@@ -23773,6 +23792,16 @@ fn test_quic_native_gateway_join_without_admission_falls_back_to_udp() {
     // Longer than the native window (8 s), which every join pays once.
     let run = run_native_connect_sim("native-gateway-join-off", SEED, 300, |sim| {
         sim.with_native_gateway_join(100);
+        let gateways: Vec<_> = sim
+            .all_node_addresses()
+            .keys()
+            .filter(|label| label.is_gateway())
+            .cloned()
+            .collect();
+        assert!(!gateways.is_empty(), "premise: the sim has a gateway");
+        for gateway in &gateways {
+            sim.with_gateway_native_admission_off(gateway);
+        }
     });
     let t = &run.wire.trace;
     tracing::info!(
@@ -23806,14 +23835,16 @@ fn test_quic_native_gateway_join_without_admission_falls_back_to_udp() {
 }
 
 /// The shipped default: no override, so each node runs this release's
-/// `QUIC_NATIVE_PERCENT` (25) with its endpoint up. Native-decided and
+/// `QUIC_NATIVE_PERCENT` (100) with its endpoint up. Native-decided and
 /// UDP-decided connects coexist in one mesh, and every node joins. The treated
 /// share is read from the sim: each native pair is two native dials
 /// (`established + failed`, one per side), against `joiner_decisions` decided
-/// joins. It is compared with the 25% bucket share loosely, since a pair that
-/// already holds a transport is decided UDP whatever its bucket.
+/// joins, which differs from the decision share: seeded, 33 of 45 decisions
+/// are native and the 12 UDP ones are pairs that already held a transport
+/// (`decision_causes`), while `treated` is half the native dials (each pair is two dials,
+/// established or failed), so the read share is `treated / decided`, not the 33/45 decision share.
 #[test_log::test]
-fn test_quic_native_at_the_shipped_percent_mixes_native_and_udp() {
+fn test_quic_native_at_the_shipped_percent_decides_most_pairs_native() {
     const SEED: u64 = 0x0059_40A5_0010;
     let run = run_native_connect_sim("native-connect-shipped", SEED, 60, |_| {});
     log_native_connect("shipped", &run);
@@ -23824,10 +23855,34 @@ fn test_quic_native_at_the_shipped_percent_mixes_native_and_udp() {
     println!("SHIPPED decided={decided} native_dials={native_dials} treated={treated}");
     assert!(decided >= 20, "premise: enough decisions to read a share");
     assert!(native_dials > 0, "some pairs decided native");
+    // Every acceptor decision has a cause, produced where the arm is chosen
+    // (`native::acceptor_verdict`). At 100 percent the slice is the whole
+    // bucket range, and nothing in this sim refuses a setup, demotes a node
+    // or holds an endpoint down, so each decision is native or a pair that
+    // already held a transport: nothing else is counted.
+    let causes = t.decision_causes();
+    println!("SHIPPED decision causes: {causes:?}");
+    let all = t.decisions();
+    let held = causes.get("held").copied().unwrap_or(0);
+    let native_count = causes.get("native").copied().unwrap_or(0);
+    assert_eq!(
+        native_count + held,
+        all.len() as u64,
+        "every decision is native or held; any other cause is a regression: {causes:?}"
+    );
+    assert_eq!(
+        all.iter().filter(|(_, _, _, in_slice)| !in_slice).count() as u64,
+        held,
+        "the only decisions outside the slice are pairs that held a transport: {causes:?}"
+    );
+    assert_eq!(
+        all.iter().filter(|(_, _, native, _)| *native).count() as u64,
+        causes.get("native").copied().unwrap_or(0)
+    );
     let share = treated / decided as f64;
     assert!(
-        (0.05..=0.50).contains(&share),
-        "native share {share:.2} of {decided} decisions is far from the 25% bucket share"
+        (0.5..=1.0).contains(&share),
+        "native share {share:.2} of {decided} decisions: at 100% most decided pairs go native"
     );
     assert_eq!(t.undecodable_closes(), 0);
     let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);
