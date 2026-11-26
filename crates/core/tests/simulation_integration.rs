@@ -26678,9 +26678,7 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
     assert_eq!(containers.len(), KEYS, "not enough keys in the band");
 
     let origin_node = (1..=NODES)
-        .min_by(|&a, &b| {
-            fa_ring_dist(locs[a], g).total_cmp(&fa_ring_dist(locs[b], g))
-        })
+        .min_by(|&a, &b| fa_ring_dist(locs[a], g).total_cmp(&fa_ring_dist(locs[b], g)))
         .unwrap();
     let origin_label = match origin {
         PgOrigin::Gateway => NodeLabel::gateway(network, 0),
@@ -26870,12 +26868,8 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
             NodeLabel::gateway(network, 0),
             locs[0],
         )];
-        for n in 1..=NODES {
-            peers.push((
-                fa_ring_dist(locs[n], kl),
-                NodeLabel::node(network, n),
-                locs[n],
-            ));
+        for (n, &loc) in locs.iter().enumerate().skip(1) {
+            peers.push((fa_ring_dist(loc, kl), NodeLabel::node(network, n), loc));
         }
         peers.sort_by(|a, b| a.0.total_cmp(&b.0));
         let holders: Vec<(usize, &(f64, NodeLabel, f64))> = peers
@@ -26901,22 +26895,20 @@ fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool
             holder_rank.push((*r + 1) as f64);
             holder_dist.push(p.0);
         }
-        let above = non_origin
-            .iter()
-            .any(|(_, p)| pg_wrap(p.2 - kl) < 0.5);
-        let below = non_origin
-            .iter()
-            .any(|(_, p)| pg_wrap(p.2 - kl) >= 0.5);
+        let above = non_origin.iter().any(|(_, p)| pg_wrap(p.2 - kl) < 0.5);
+        let below = non_origin.iter().any(|(_, p)| pg_wrap(p.2 - kl) >= 0.5);
         if above && below {
             both_sides += 1;
         }
         if never.last() == Some(&ci) {
             let desc: Vec<String> = holders
                 .iter()
-                .map(|(r, p)| format!("rank{}@{:+.3}", r + 1, {
-                    let o = pg_wrap(p.2 - kl);
-                    if o > 0.5 { o - 1.0 } else { o }
-                }))
+                .map(|(r, p)| {
+                    format!("rank{}@{:+.3}", r + 1, {
+                        let o = pg_wrap(p.2 - kl);
+                        if o > 0.5 { o - 1.0 } else { o }
+                    })
+                })
                 .collect();
             eprintln!(
                 "PG never-found key_loc={kl:.3} closest3={:?} holders=[{}]",
