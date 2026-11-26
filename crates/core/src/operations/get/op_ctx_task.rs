@@ -8206,6 +8206,56 @@ mod tests {
         );
     }
 
+    /// A relay that holds a servable copy answers Found whatever the request's
+    /// HTL: HTL only bounds forwarding. A GET that reached the holder with
+    /// HTL = 0 used to get NotFound because the `htl == 0` guard ran before the
+    /// local lookup (sim trace, placement-gap TRACE.md). The guard must come
+    /// after the local-hit arm, so a held copy is served by the same
+    /// `check_local_with_interest_gate` path (and its interest/freshness rule)
+    /// as at any other HTL, and only a node with nothing to serve answers
+    /// NotFound. HTL = 0 still never forwards.
+    ///
+    /// Source-scrape pin: the relay driver needs a full `OpManager`, which no
+    /// unit harness builds. Mutation check: moving the guard back above the
+    /// local lookup turns this red (run when written; see the commit message).
+    #[test]
+    fn htl_zero_relay_serves_a_held_copy_before_answering_not_found() {
+        let body = code_only(extract_fn_body(
+            production_source(),
+            "async fn drive_relay_get_inner<CB>(",
+        ));
+        let guard = body
+            .find("ifhtl==0{")
+            .expect("htl==0 guard must exist at statement position");
+        let lookup = body
+            .find("check_local_with_interest_gate(")
+            .expect("local lookup must exist");
+        let serve = body
+            .find("iflet Some((key,state,contract))=local_value{"
+                .replace(' ', "")
+                .as_str())
+            .expect("local-hit arm must exist");
+        assert!(
+            lookup < guard && serve < guard,
+            "the `htl == 0` guard must come AFTER the local lookup and the \
+             local-hit arm, or a peer holding the contract answers NotFound \
+             when the request arrives with HTL 0"
+        );
+        // The not-held branch keeps the NotFound frame and never forwards.
+        let tail = &body[guard..];
+        let guard_end = tail.find("return Ok(());").expect("guard returns early");
+        let guard_block = &tail[..guard_end];
+        assert!(
+            guard_block.contains("relay_send_not_found("),
+            "the HTL=0 not-held branch must still send NotFound upstream"
+        );
+        assert!(
+            !guard_block.contains("relay_advance_to_next_peer")
+                && !guard_block.contains("send_to_and_await"),
+            "HTL=0 must never forward"
+        );
+    }
+
     // ── G/R10: Exhaustion path — NotFound vs stale-cache fallback ──────────
 
     /// Exhaustion (None from `relay_advance_to_next_peer`) must branch on
