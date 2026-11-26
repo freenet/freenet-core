@@ -19,7 +19,15 @@ readme = "README.md"
 # the raw "v"-prefixed release tag as semver and drop every update, #5221,
 # fixed in 0.2.122 by #5225). 0.2.122 is the first release after them. The
 # floor is a single threshold, so it also refuses every older release.
-min-compatible-version = "0.2.122"
+#
+# D-8 (flag day): the floor becomes the first release that dials QUIC-native
+# connections (the "floor release"), because after D there is no UDP transport
+# for an older peer to use. A peer below it is refused at the native Hello
+# (`quic/native/hello.rs`) and the UDP handshake.
+# TODO(d8-floor-tag): PLACEHOLDER. Set this to the floor release's actual tag
+# (it must not exceed the package version, build.rs checks) before the D
+# release; the floor release is not cut yet.
+min-compatible-version = "0.2.166"
 
 [package.metadata.binstall]
 pkg-url = "{ repo }/releases/download/v{ version }/freenet-{ target }.tar.gz"
