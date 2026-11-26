@@ -223,8 +223,6 @@ impl P2pConnManager {
             return;
         }
         if !enabled_for_thread() {
-            // Keep the timer moving so the loop does not spin on a due deadline.
-            sweep.tick(now, &[]);
             return;
         }
         let awaiting = self
@@ -300,8 +298,10 @@ impl StaleLinkSweep {
     }
 
     /// The timer deadline for the next tick, for the event loop's wake-up.
-    pub(super) fn deadline(&self) -> Instant {
-        self.next_due
+    /// `None` while the sweep is off for this thread (simulations), so a sim
+    /// that did not opt in runs the same event loop as before the sweep.
+    pub(super) fn deadline(&self) -> Option<Instant> {
+        enabled_for_thread().then_some(self.next_due)
     }
 
     /// Whether a tick is due at `now`.
@@ -683,6 +683,9 @@ mod tests {
         assert!(sweep.due(c.now()));
         sweep.tick(c.now(), &[]);
         assert!(!sweep.due(c.now()));
-        assert_eq!(sweep.deadline(), c.now() + STALE_LINK_SWEEP_INTERVAL);
+        set_stale_link_sweep_enabled(true);
+        assert_eq!(sweep.deadline(), Some(c.now() + STALE_LINK_SWEEP_INTERVAL));
+        set_stale_link_sweep_enabled(false);
+        assert_eq!(sweep.deadline(), None);
     }
 }

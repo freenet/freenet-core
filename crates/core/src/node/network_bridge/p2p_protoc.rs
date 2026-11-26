@@ -1831,7 +1831,7 @@ impl P2pConnManager {
                                 .deadline(ctx.addr_by_pub_key.may_have_pending_claims()),
                             zombie_sweep::earliest(
                                 ctx.held_native_deadline(),
-                                Some(stale_link_sweep.deadline()),
+                                stale_link_sweep.deadline(),
                             ),
                         ),
                     ),
