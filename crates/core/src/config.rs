@@ -6127,6 +6127,8 @@ std::thread_local! {
     // Count + bytes for the new-contract case (no holder found; full state
     // ships hop-by-hop via the existing `PutMsg::Request` path).
     static GLOBAL_PUT_PROBE_NEW_CONTRACT_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_CLIENT_PUT_SUCCESSES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static GLOBAL_CLIENT_PUT_FAILURES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static GLOBAL_PUT_PROBE_NEW_CONTRACT_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     // Count + bytes for the existing-mesh case (holder found; only a
     // `StateDelta` ships via `ProbeReconcile`).
@@ -6234,6 +6236,8 @@ impl GlobalTestMetrics {
         GLOBAL_TERMINAL_CONSULT_RESOLVED_FOUND.with(|c| c.set(0));
         GLOBAL_TERMINAL_CONSULT_STILL_NOT_FOUND.with(|c| c.set(0));
         GLOBAL_PUT_PROBE_NEW_CONTRACT_COUNT.with(|c| c.set(0));
+        GLOBAL_CLIENT_PUT_SUCCESSES.with(|c| c.set(0));
+        GLOBAL_CLIENT_PUT_FAILURES.with(|c| c.set(0));
         GLOBAL_PUT_PROBE_NEW_CONTRACT_BYTES.with(|c| c.set(0));
         GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_COUNT.with(|c| c.set(0));
         GLOBAL_PUT_PROBE_EXISTING_MESH_DELTA_BYTES.with(|c| c.set(0));
@@ -6682,6 +6686,28 @@ impl GlobalTestMetrics {
     // record_put_probe_outcome`) so this thread-local counter and the
     // per-node `node::network_status` dashboard counter never drift
     // relative to each other.
+
+    /// Record the terminal outcome the client PUT driver published to its
+    /// client. Fed from `put::op_ctx_task::deliver_outcome`, the single funnel
+    /// every client PUT outcome passes through, so a simulation can assert what
+    /// the client was TOLD (not just what the network ended up holding).
+    pub fn record_client_put_outcome(success: bool) {
+        if success {
+            GLOBAL_CLIENT_PUT_SUCCESSES.with(|c| c.set(c.get() + 1));
+        } else {
+            GLOBAL_CLIENT_PUT_FAILURES.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// Client PUTs reported to the client as success since the last reset.
+    pub fn client_put_successes() -> u64 {
+        GLOBAL_CLIENT_PUT_SUCCESSES.with(|c| c.get())
+    }
+
+    /// Client PUTs reported to the client as failure since the last reset.
+    pub fn client_put_failures() -> u64 {
+        GLOBAL_CLIENT_PUT_FAILURES.with(|c| c.get())
+    }
 
     /// Record a summary-first PUT probe that found no holder (genuinely new
     /// contract): `bytes` is the full-state payload size about to ship

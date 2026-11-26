@@ -1588,6 +1588,7 @@ fn deliver_outcome(op_manager: &OpManager, client_tx: Transaction, outcome: Driv
     // user-facing dashboard counter.
     if !client_tx.is_sub_operation() {
         let success = classify_put_outcome_for_op_stats(&outcome);
+        crate::config::GlobalTestMetrics::record_client_put_outcome(success);
         crate::node::network_status::record_op_result(
             crate::node::network_status::OpType::Put,
             success,

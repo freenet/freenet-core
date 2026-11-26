@@ -26497,3 +26497,139 @@ fn test_every_origins_second_large_put_starts() {
         "a node's event loop was held for {longest:?} by one event"
     );
 }
+
+// =============================================================================
+// Client PUT whose first hop is dead after the local store (P4)
+// =============================================================================
+
+/// What a dead-first-hop PUT scenario ended with.
+struct DeadFirstHopRun {
+    /// Client PUTs reported to the client as success / failure.
+    successes: u64,
+    failures: u64,
+    /// Labels of the peers (not the originating gateway) holding the contract.
+    remote_hosts: Vec<freenet::dev_tool::NodeLabel>,
+    /// The scripted crash actually blocked traffic.
+    crash_packets_dropped: u64,
+}
+
+/// Gateway + two peers, streaming-size state. The listed peers are crashed
+/// (silently, as `CrashNode` does) before the gateway's client PUT, so
+/// whichever peer the PUT picks as its first hop is dead. The gateway stores
+/// locally first, then forwards; the dead hop's connection is later pruned
+/// (`PeerDisconnected`, which beats the 240 s stream-stall watchdog).
+fn run_dead_first_hop_put(
+    network: &'static str,
+    seed: u64,
+    crash_node_numbers: &[usize],
+) -> DeadFirstHopRun {
+    use freenet::dev_tool::{NodeLabel, ScheduledOperation, SimOperation};
+
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+    let gateway = NodeLabel::gateway(network, 0);
+    let contract = SimOperation::create_test_contract(0x44);
+    let contract_key = contract.key();
+    // Above the 64 KiB production streaming threshold: the shape of a River
+    // room (contract code + state), which is the live-network case.
+    let state = SimOperation::create_large_state(96 * 1024, 0x44);
+
+    let mut sim = rt.block_on(async { SimNetwork::new(network, 1, 2, 7, 3, 10, 2, seed).await });
+    sim.with_streaming_threshold(64 * 1024);
+    sim.with_controlled_op_interval(Duration::from_secs(5));
+    sim.wait_for_join_convergence_before_ops(1.0, Duration::from_secs(120));
+
+    let mut operations: Vec<ScheduledOperation> = crash_node_numbers
+        .iter()
+        .map(|n| ScheduledOperation::new(NodeLabel::node(network, *n), SimOperation::CrashNode))
+        .collect();
+    operations.push(ScheduledOperation::new(
+        gateway.clone(),
+        SimOperation::Put {
+            contract,
+            state,
+            subscribe: false,
+        },
+    ));
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        operations,
+        Duration::from_secs(900),
+        Duration::from_secs(30),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "dead-first-hop sim failed: {:?}",
+        result.turmoil_result.err()
+    );
+    let remote_hosts = result
+        .captured_node_labels()
+        .into_iter()
+        .filter(|l| *l != gateway && result.is_node_hosting(l, &contract_key))
+        .collect();
+    DeadFirstHopRun {
+        successes: GlobalTestMetrics::client_put_successes(),
+        failures: GlobalTestMetrics::client_put_failures(),
+        remote_hosts,
+        crash_packets_dropped: result.crash_packets_dropped(),
+    }
+}
+
+/// P4 test 1: the first hop is dead, so the forward never leaves the node. The
+/// PUT must be retried to the other peer and the contract must reach it.
+///
+/// Run twice, crashing each peer in turn: whichever one the PUT picks first is
+/// dead in exactly one of the runs, so the dead-first-hop case is exercised
+/// without depending on ring geometry. Before the fix the dead-first-hop run
+/// reported success (#5458) while the contract never left the gateway.
+#[test_log::test]
+fn test_put_dead_first_hop_is_retried_to_another_peer() {
+    for (idx, (crashed, survivor)) in [(1usize, 2usize), (2, 1)].into_iter().enumerate() {
+        let run = run_dead_first_hop_put(
+            "put-dead-first-hop-retry",
+            0x5E4_0000_0001 + idx as u64,
+            &[crashed],
+        );
+        assert!(
+            run.crash_packets_dropped > 0,
+            "premise: the crash blocked traffic (crashed node {crashed})"
+        );
+        let survivor_label =
+            freenet::dev_tool::NodeLabel::node("put-dead-first-hop-retry", survivor);
+        assert!(
+            run.remote_hosts.contains(&survivor_label),
+            "node {crashed} is dead, so the PUT must be retried to node {survivor} and \
+             the contract must reach it; remote hosts: {:?} (client saw {} success, {} failure)",
+            run.remote_hosts,
+            run.successes,
+            run.failures
+        );
+        assert_eq!(
+            (run.successes, run.failures),
+            (1, 0),
+            "once the retry lands, the client is told success (crashed node {crashed})"
+        );
+    }
+}
+
+/// P4 test 2: no peer can be reached. The contract is stored locally and goes
+/// nowhere, so the client must be told the PUT failed, not that it succeeded.
+#[test_log::test]
+fn test_put_no_reachable_peer_reports_failure_not_success() {
+    let run = run_dead_first_hop_put("put-no-reachable-peer", 0x5E4_0000_0010, &[1, 2]);
+    assert!(
+        run.crash_packets_dropped > 0,
+        "premise: the crashes blocked traffic"
+    );
+    assert!(
+        run.remote_hosts.is_empty(),
+        "premise: every peer is dead, so none can hold the contract: {:?}",
+        run.remote_hosts
+    );
+    assert_eq!(
+        (run.successes, run.failures),
+        (0, 1),
+        "the contract never left the originator; the client must see a failure, not success"
+    );
+}
