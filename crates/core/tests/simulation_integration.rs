@@ -26577,7 +26577,10 @@ fn test_put_then_get_findability_latency() {
 /// Contract whose key depends on a u16 seed (`create_test_contract` takes a u8,
 /// which yields too few keys inside one narrow band).
 #[cfg(feature = "nightly_tests")]
-fn pg_contract(seed: u16) -> ContractContainer {
+fn pg_contract(seed: u16) -> freenet_stdlib::prelude::ContractContainer {
+    use freenet_stdlib::prelude::{
+        ContractCode, ContractWasmAPIVersion, Parameters, WrappedContract,
+    };
     let s = seed.to_le_bytes();
     let code: Vec<u8> = (0..32u8)
         .map(|i| s[(i % 2) as usize].wrapping_add(i).wrapping_mul(7) ^ s[1])
