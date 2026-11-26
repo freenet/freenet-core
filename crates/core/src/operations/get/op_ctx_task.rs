@@ -4918,6 +4918,8 @@ where
             return Ok(());
         }
 
+        // Telemetry only (`downstream_wait_ms`): not read by any decision, so
+        // not simulation-visible.
         let wait_started = tokio::time::Instant::now();
         let round_trip =
             tokio::time::timeout(OPERATION_TTL, ctx.send_to_and_await(peer_addr, request)).await;

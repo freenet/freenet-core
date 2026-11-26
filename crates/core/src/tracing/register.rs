@@ -2510,22 +2510,67 @@ mod span_completed_tests {
 mod get_hop_telemetry_pins {
     //! Source-scrape pins (the real emit paths need a live `Ring`): the GET
     //! hop-diagnostic fields must keep being populated at their emit sites.
-    //! Comment lines are stripped so commented-out code cannot satisfy them.
+    //!
+    //! Fail-closed by construction: the search text is only the production
+    //! part of this file (everything before the first top-level test module,
+    //! so this module's own literals can never satisfy an anchor), each
+    //! region is scoped to the body of the enclosing production function, and
+    //! a missing anchor panics rather than passing. Comment lines are stripped
+    //! so commented-out code cannot satisfy a pin.
 
-    fn code_between(start: &str, end: &str) -> String {
+    fn production_source() -> &'static str {
         const SOURCE: &str = include_str!("register.rs");
-        let a = SOURCE.find(start).unwrap_or_else(|| panic!("no {start}"));
-        let b = a + SOURCE[a..].find(end).unwrap_or_else(|| panic!("no {end}"));
-        SOURCE[a..b]
+        let end = SOURCE
+            .find("\n#[cfg(test)]\n")
+            .expect("register.rs must have a top-level test module");
+        &SOURCE[..end]
+    }
+
+    /// Code (comments stripped) of the production fn starting at `sig`.
+    fn fn_body(sig: &str) -> String {
+        let src = production_source();
+        let start = src
+            .find(sig)
+            .unwrap_or_else(|| panic!("production fn `{sig}` not found"));
+        let open = start + src[start..].find('{').expect("fn body");
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, b) in src.bytes().enumerate().skip(open) {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        src[open..end.expect("unterminated fn body")]
             .lines()
             .filter(|l| !l.trim_start().starts_with("//"))
             .collect::<Vec<_>>()
             .join("\n")
     }
 
+    /// Text of `body` from `start` up to the next `end` (both must exist).
+    fn region<'a>(body: &'a str, start: &str, end: &str) -> &'a str {
+        let a = body
+            .find(start)
+            .unwrap_or_else(|| panic!("anchor `{start}` not found in fn body"));
+        let b = a + body[a..]
+            .find(end)
+            .unwrap_or_else(|| panic!("anchor `{end}` not found after `{start}`"));
+        &body[a..b]
+    }
+
     #[test]
     fn outbound_get_response_records_result_for_inline_and_streaming() {
-        let inline = code_between(
+        let body = fn_body("pub fn from_outbound_msg(");
+        let inline = region(
+            &body,
             "NetMessage::V1(NetMessageV1::Get(GetMsg::Response {",
             "GetMsg::ResponseStreaming {",
         );
@@ -2534,12 +2579,14 @@ mod get_hop_telemetry_pins {
             "inline get_response_sent must record found/not_found from the message"
         );
         assert!(inline.contains("key_location: Some(Location::from(instance_id))"));
-        let streaming = code_between(
+        let streaming = region(
+            &body,
             "NetMessage::V1(NetMessageV1::Get(GetMsg::ResponseStreaming {",
             "NetMessage::V1(NetMessageV1::Subscribe(SubscribeMsg::Response",
         );
         assert!(
-            streaming.contains("found: Some(true)")
+            streaming.contains("EventKind::Get(GetEvent::ResponseSent {")
+                && streaming.contains("found: Some(true)")
                 && streaming.contains("key_location: Some(Location::from(instance_id))"),
             "streaming Found header must emit get_response_sent with result found"
         );
@@ -2547,7 +2594,9 @@ mod get_hop_telemetry_pins {
 
     #[test]
     fn inbound_get_request_records_upstream() {
-        let arm = code_between(
+        let body = fn_body("pub fn from_inbound_msg_v1(");
+        let arm = region(
+            &body,
             "NetMessageV1::Get(GetMsg::Request {",
             "NetMessageV1::Get(GetMsg::Response {",
         );
