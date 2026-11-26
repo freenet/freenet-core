@@ -63,6 +63,8 @@ mod stale_link_sweep;
 mod zombie_sweep;
 
 use connection_map::ConnectionMap;
+#[cfg(any(test, feature = "testing"))]
+pub use stale_link_sweep::set_stale_link_sweep_disabled;
 use zombie_sweep::ZombieSweepState;
 #[cfg(test)]
 use zombie_sweep::{TransportActivity, is_zombie};

@@ -12940,6 +12940,18 @@ fn test_get_retry_reaches_single_host_after_one_timeout() {
     const NETWORK_NAME: &str = "get-retry-single-host-timeout";
     setup_deterministic_state(SEED);
 
+    // This test needs the first attempt to hit the 60 s attempt deadline
+    // against a link that stays up. Under VirtualTime nothing keeps an idle
+    // link's receipt stamp fresh, so the stale-link sweep would drop the link
+    // after about 14 s instead. Turn it off for this thread's simulation.
+    struct SweepOff;
+    impl Drop for SweepOff {
+        fn drop(&mut self) {
+            freenet::dev_tool::set_stale_link_sweep_disabled(false);
+        }
+    }
+    freenet::dev_tool::set_stale_link_sweep_disabled(true);
+    let _sweep_off = SweepOff;
     let contract = SimOperation::create_test_contract(0x57);
     let contract_id = *contract.key().id();
     let contract_key = contract.key();
@@ -13065,7 +13077,6 @@ fn test_get_retry_reaches_single_host_after_one_timeout() {
         "precondition: the requester's own GET must have timed out against its first hop \
          (originator timeout labels: {own_timeouts})"
     );
-
     let requester_has_state = result
         .node_storages
         .get(&requester)
@@ -13285,9 +13296,12 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
                     != d.split("requester: ").nth(1).map(|r| r.split('@').next())
         })
         .map(|(_, _, _, d)| {
-            d.split("target: ")
-                .nth(1)
-                .is_some_and(|rest| rest.split(')').next().unwrap_or("").contains(&format!("@{dead_addr}")))
+            d.split("target: ").nth(1).is_some_and(|rest| {
+                rest.split(')')
+                    .next()
+                    .unwrap_or("")
+                    .contains(&format!("@{dead_addr}"))
+            })
         });
     let found = terminal_d.contains("outcome: Success");
     eprintln!(

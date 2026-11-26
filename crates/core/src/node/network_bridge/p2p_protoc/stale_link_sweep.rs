@@ -67,6 +67,32 @@ pub(super) const MAX_DROPS_PER_TICK: usize = 2;
 /// before it can judge a fraction of them.
 pub(super) const MAJORITY_GUARD_MIN_PEERS: usize = 3;
 
+#[cfg(any(test, feature = "testing"))]
+thread_local! {
+    static DISABLED_FOR_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only, per thread: turn the sweep off for simulations run on this
+/// thread. Under `VirtualTime` nothing keeps an idle link's receipt stamp
+/// fresh, so a scenario that needs a request to outlive the silence window
+/// against a link that stays up (the 60 s attempt deadline path) cannot be
+/// built with the sweep on. Other sims on other threads are unaffected.
+#[cfg(any(test, feature = "testing"))]
+pub fn set_stale_link_sweep_disabled(disabled: bool) {
+    DISABLED_FOR_THREAD.with(|d| d.set(disabled));
+}
+
+fn disabled_for_thread() -> bool {
+    #[cfg(any(test, feature = "testing"))]
+    {
+        DISABLED_FOR_THREAD.with(|d| d.get())
+    }
+    #[cfg(not(any(test, feature = "testing")))]
+    {
+        false
+    }
+}
+
 /// Which transport carries a link; sets its keepalive and so its window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LinkKind {
@@ -191,6 +217,11 @@ impl P2pConnManager {
     ) {
         let now = Instant::now();
         if !sweep.due(now) {
+            return;
+        }
+        if disabled_for_thread() {
+            // Keep the timer moving so the loop does not spin on a due deadline.
+            sweep.tick(now, &[]);
             return;
         }
         let awaiting = self
