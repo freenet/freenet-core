@@ -1950,6 +1950,33 @@ fn windows_never_exceed_the_reassembly_allowance() {
     }
 }
 
+/// D-8: in a release (`honor_off` false) every `transport-quic` value, known
+/// or not, reads as `prefer`, so a node cannot turn QUIC off, which would
+/// leave it with no transport. Test builds honour the value (the test above).
+#[test]
+fn a_release_ignores_transport_quic_off() {
+    for value in [
+        None,
+        Some("off"),
+        Some("shadow"),
+        Some("prefer"),
+        Some("bogus"),
+    ] {
+        assert_eq!(
+            QuicMode::from_config_value_with(value, false),
+            QuicMode::Prefer,
+            "{value:?}"
+        );
+    }
+    assert_eq!(
+        QuicMode::from_config_value_with(Some("off"), true),
+        QuicMode::Off
+    );
+    // The public reader passes the build's own switch: honoured here, in a
+    // test build.
+    assert_eq!(QuicMode::from_config_value(Some("off")), QuicMode::Off);
+}
+
 /// `transport-quic` values: unset is the platform default, `off` is off,
 /// `shadow` and `prefer` (any case) are themselves, and anything else is off,
 /// never an error, so a value a later release adds cannot stop this binary from

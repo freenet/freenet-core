@@ -168,6 +168,31 @@ impl QuicMode {
     /// an error: a value a later release added must not stop an older binary
     /// (a crash-loop rollback reinstalls one) from starting.
     pub fn from_config_value(value: Option<&str>) -> Self {
+        Self::from_config_value_with(value, cfg!(any(test, feature = "testing")))
+    }
+
+    /// [`Self::from_config_value`] with `honor_off` given. Since D-8 a release
+    /// has no UDP transport to fall back to, so QUIC cannot be turned off:
+    /// every value but `prefer` is read, warned about once and ignored (the
+    /// key stays accepted, as the UDP-only keys do, so a config written by an
+    /// older release still starts). A test build honours the value, since the
+    /// simulations run QUIC off until D-9 deletes them.
+    pub(crate) fn from_config_value_with(value: Option<&str>, honor_off: bool) -> Self {
+        let mode = Self::parse_config_value(value);
+        if honor_off || mode == Self::Prefer {
+            return mode;
+        }
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                transport_quic = ?value,
+                "transport-quic has no effect: this release has no UDP transport, so QUIC is always on"
+            );
+        });
+        Self::Prefer
+    }
+
+    fn parse_config_value(value: Option<&str>) -> Self {
         match value.map(|v| v.trim().to_ascii_lowercase()) {
             None => Self::default_mode(),
             Some(v) if v == Self::OFF => Self::Off,

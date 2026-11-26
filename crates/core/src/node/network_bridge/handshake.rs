@@ -693,6 +693,18 @@ async fn join_gateway_native(
     result
 }
 
+/// `Some(error)` when this build does not dial UDP (`enabled` false, D-8): the
+/// dial fails as `FailedConnectOp`, is counted (`connect_udp_dial_refused`)
+/// and logged. `None` when it may dial.
+fn refuse_udp_dial(enabled: bool, addr: SocketAddr) -> Option<ConnectionError> {
+    if enabled {
+        return None;
+    }
+    crate::transport::TRANSPORT_METRICS.record_connect_udp_dial_refused();
+    tracing::debug!(%addr, "outbound UDP dial refused: this release has no UDP transport");
+    Some(ConnectionError::FailedConnectOp)
+}
+
 /// Run one outbound connect to `peer` and report it as the event the driver
 /// emits. Sets `peer_ready` only on success.
 ///
@@ -702,6 +714,25 @@ async fn join_gateway_native(
 /// names the transport that connected, so a native join reaches the event
 /// loop as a native connection.
 async fn connect_outbound(
+    outbound: &dyn OutboundConnector,
+    dial: OutboundDial,
+    peer_ready: Option<&std::sync::atomic::AtomicBool>,
+    gateway_join: Option<&GatewayJoinPolicy>,
+) -> Event {
+    connect_outbound_with(
+        crate::operations::connect::native::udp_dial_enabled(),
+        outbound,
+        dial,
+        peer_ready,
+        gateway_join,
+    )
+    .await
+}
+
+/// [`connect_outbound`] with the UDP switch given (`udp_dial`), so a test can
+/// run it as a release does.
+async fn connect_outbound_with(
+    udp_dial: bool,
     outbound: &dyn OutboundConnector,
     dial: OutboundDial,
     peer_ready: Option<&std::sync::atomic::AtomicBool>,
@@ -738,17 +769,25 @@ async fn connect_outbound(
                     Ok(connection)
                 }
                 joined => {
-                    let connect_future = outbound.connect(peer.pub_key.clone(), addr, origin).await;
-                    // After a native attempt the fallback shares the join's
-                    // budget (`GATEWAY_JOIN_BUDGET`).
-                    let connect_within = match joined {
-                        Some(_) => OUTBOUND_CONNECT_TIMEOUT
-                            .min(GATEWAY_JOIN_BUDGET.saturating_sub(started.elapsed())),
-                        None => OUTBOUND_CONNECT_TIMEOUT,
-                    };
-                    let result = match tokio::time::timeout(connect_within, connect_future).await {
-                        Ok(res) => res.map_err(|err| err.into()),
-                        Err(_) => Err(ConnectionError::Timeout),
+                    // D-8: no UDP dial in a release. The connect op sees a
+                    // failed dial, as for any other, and tries another peer.
+                    let result = match refuse_udp_dial(udp_dial, addr) {
+                        Some(refused) => Err(refused),
+                        None => {
+                            let connect_future =
+                                outbound.connect(peer.pub_key.clone(), addr, origin).await;
+                            // After a native attempt the fallback shares the join's
+                            // budget (`GATEWAY_JOIN_BUDGET`).
+                            let connect_within = match joined {
+                                Some(_) => OUTBOUND_CONNECT_TIMEOUT
+                                    .min(GATEWAY_JOIN_BUDGET.saturating_sub(started.elapsed())),
+                                None => OUTBOUND_CONNECT_TIMEOUT,
+                            };
+                            match tokio::time::timeout(connect_within, connect_future).await {
+                                Ok(res) => res.map_err(|err| err.into()),
+                                Err(_) => Err(ConnectionError::Timeout),
+                            }
+                        }
                     };
                     if joined.is_some() {
                         use crate::transport::metrics::GatewayNativeJoin;
@@ -1317,6 +1356,51 @@ mod tests {
             elapsed: start.elapsed(),
             origins: connector.origins.into_inner(),
         }
+    }
+
+    /// D-8: a release dials no UDP. Through the real `connect_outbound_with`
+    /// the connector is never asked to connect, the event is a failed dial
+    /// the connect op retries, and the peer is not marked ready.
+    #[tokio::test(start_paused = true)]
+    async fn a_release_refuses_every_outbound_udp_dial() {
+        const { assert!(!crate::operations::connect::native::UDP_DIAL) };
+        let connector = ScriptedConnector {
+            enqueue: Duration::ZERO,
+            handshake: Handshake::Succeeds,
+            origins: Default::default(),
+            native_dials: Default::default(),
+        };
+        let ready = std::sync::atomic::AtomicBool::new(false);
+        let event = connect_outbound_with(
+            false,
+            &connector,
+            super::OutboundDial {
+                peer: make_peer(4300),
+                transaction: Transaction::new::<ConnectMsg>(),
+                transient: true,
+                origin: RUN_ORIGIN,
+                transport: crate::operations::connect::native::DialTransport::Udp,
+                join: false,
+            },
+            Some(&ready),
+            None,
+        )
+        .await;
+        assert!(matches!(event, Event::OutboundFailed { .. }));
+        assert!(connector.origins.lock().is_empty(), "UDP connect was asked");
+        assert!(!ready.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// The one production `outbound.connect(` UDP call sits behind the
+    /// refusal; a second one, or one before it, fails this scan.
+    #[test]
+    fn the_only_udp_dial_is_behind_the_refusal() {
+        let src = include_str!("handshake.rs");
+        let prod = src.split("#[cfg(test)]\nmod tests").next().expect("source");
+        assert_eq!(prod.matches("outbound.connect(").count(), 1);
+        let guard = prod.find("refuse_udp_dial(udp_dial, addr)").expect("guard");
+        let dial = prod.find("outbound.connect(").expect("dial");
+        assert!(guard < dial);
     }
 
     /// A connector whose native setup gives a connection or `TimedOut`.

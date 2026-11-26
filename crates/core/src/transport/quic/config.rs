@@ -69,6 +69,19 @@ pub(crate) const ALPN: &[u8] = b"freenet-quic/1";
 /// the upgrade suites run until D-9 deletes them.
 pub(crate) const UPGRADE_DIAL: bool = false;
 
+/// Whether a node negotiates the upgrade of a UDP session (the server's
+/// `Offer`, the client's `Accept`/`Decline`; machine `upgrade::machine`).
+/// `false` since D-8: a connection is native from birth, so no session is
+/// offered an upgrade and an `Offer` from a peer is declined `Disabled`. The
+/// message variants stay in the wire enum until D-9. A test build
+/// ([`upgrade_negotiation_enabled`]) still negotiates.
+pub(crate) const UPGRADE_NEGOTIATION: bool = false;
+
+/// [`UPGRADE_NEGOTIATION`], or `true` in a test build (`cfg(test)`).
+pub(crate) fn upgrade_negotiation_enabled() -> bool {
+    UPGRADE_NEGOTIATION || cfg!(test)
+}
+
 /// [`UPGRADE_DIAL`], or `true` in a test build (`cfg(test)`).
 pub(crate) fn upgrade_dial_enabled() -> bool {
     UPGRADE_DIAL || cfg!(test)

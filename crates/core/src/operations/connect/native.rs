@@ -88,6 +88,21 @@ pub(crate) enum GatewayJoinPlan {
     LegacyCoolingDown,
 }
 
+/// Whether this build dials a peer over UDP at all. `false` since D-8: every
+/// connection is native, so an outbound UDP dial ends as a failed dial
+/// (counted `connect_udp_dial_refused`) that the connect op retries
+/// elsewhere. The single place that acts on it is
+/// `node::network_bridge::handshake::connect_outbound`. A test build
+/// ([`udp_dial_enabled`]) still dials UDP, because the simulation and
+/// mock-transport suites run on it until D-9 deletes them.
+pub(crate) const UDP_DIAL: bool = false;
+
+/// [`UDP_DIAL`], or `true` in a test build (`cfg(test)` or the `testing`
+/// feature).
+pub(crate) fn udp_dial_enabled() -> bool {
+    UDP_DIAL || cfg!(any(test, feature = "testing"))
+}
+
 /// Offer level: the joiner can set up a native connection, and also UDP.
 pub(crate) const LEVEL_NATIVE_CAPABLE: u8 = 1;
 

@@ -950,6 +950,10 @@ impl UpgradeMachine {
     }
 
     fn try_offer(&mut self, cx: Inputs<'_>) -> Vec<Action> {
+        // D-8: no session is offered an upgrade; the machine ends `Off`.
+        if !crate::transport::quic::config::upgrade_negotiation_enabled() {
+            return self.shut_off(cx, Ending::Local);
+        }
         match cx.policy.admit() {
             Err(PathRefusal::Disabled(_)) => self.shut_off(cx, Ending::Local),
             // At the limit the server does not offer.
@@ -988,6 +992,9 @@ impl UpgradeMachine {
                 DeclineReason::NotReady
             }
             State::Idle if self.role.is_none() => DeclineReason::NotReady,
+            State::Idle if !crate::transport::quic::config::upgrade_negotiation_enabled() => {
+                DeclineReason::Disabled
+            }
             State::Idle if !cx.policy.allowed() => DeclineReason::Disabled,
             State::Idle if cx.now < self.retry_at => DeclineReason::Backoff,
             State::Idle => match cx.policy.admit() {
