@@ -118,6 +118,25 @@ impl LiveTransactionTracker {
         }
     }
 
+    /// Per peer, how many transactions are awaiting a reply from it, where
+    /// `is_awaiting_reply` says whether a transaction still has a waiter.
+    ///
+    /// Counted through the reverse index, so a transaction rebound to another
+    /// peer counts only for the peer it was last sent to, not for the stale
+    /// entry left in the older peer's list.
+    pub(crate) fn awaiting_by_peer(
+        &self,
+        mut is_awaiting_reply: impl FnMut(&Transaction) -> bool,
+    ) -> std::collections::HashMap<SocketAddr, usize> {
+        let mut counts = std::collections::HashMap::new();
+        for entry in self.peer_for_tx.iter() {
+            if is_awaiting_reply(entry.key()) {
+                *counts.entry(*entry.value()).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
     pub(crate) fn has_live_connection(&self, peer_addr: SocketAddr) -> bool {
         self.tx_per_peer.contains_key(&peer_addr)
     }
@@ -154,6 +173,24 @@ mod tests {
     use crate::operations::connect::ConnectMsg;
     use crate::operations::get::GetMsg;
     use crate::operations::put::PutMsg;
+
+    #[test]
+    fn awaiting_by_peer_counts_only_waiting_txs_at_their_latest_peer() {
+        let tracker = LiveTransactionTracker::new();
+        let a: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:8081".parse().unwrap();
+        let waiting = Transaction::new::<GetMsg>();
+        let done = Transaction::new::<GetMsg>();
+        let rebound = Transaction::new::<GetMsg>();
+        tracker.add_transaction(a, waiting);
+        tracker.add_transaction(a, done);
+        tracker.add_transaction(a, rebound);
+        tracker.add_transaction(b, rebound);
+        let counts = tracker.awaiting_by_peer(|tx| *tx != done);
+        assert_eq!(counts.get(&a), Some(&1));
+        assert_eq!(counts.get(&b), Some(&1));
+        assert_eq!(counts.len(), 2);
+    }
 
     #[test]
     fn active_transaction_count_empty() {

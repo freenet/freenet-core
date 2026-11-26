@@ -13167,7 +13167,10 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
     for _ in 0..24 {
         operations.push(filler_get());
     }
-    operations.push(ScheduledOperation::new(dead.clone(), SimOperation::CrashNode));
+    operations.push(ScheduledOperation::new(
+        dead.clone(),
+        SimOperation::CrashNode,
+    ));
     operations.push(ScheduledOperation::new(
         requester.clone(),
         SimOperation::Get {
@@ -13203,7 +13206,11 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
     let instance = contract_id.to_string();
     let mine: Vec<(chrono::DateTime<chrono::Utc>, String, String)> = logs
         .iter()
-        .filter(|l| l.peer_id.to_string().contains(&format!("@{requester_addr}")))
+        .filter(|l| {
+            l.peer_id
+                .to_string()
+                .contains(&format!("@{requester_addr}"))
+        })
         .map(|l| (l.datetime, l.tx.to_string(), format!("{:?}", l.kind)))
         .filter(|(_, _, d)| d.starts_with("Get(") && d.contains(&instance))
         .collect();
@@ -13231,9 +13238,12 @@ fn test_get_fails_over_from_a_silently_dead_first_hop() {
         .filter(|(_, tx, d)| variant(d) == "Request" && *tx == terminal.1)
         .min_by_key(|(t, _, _)| *t)
         .map(|(_, _, d)| {
-            d.split("target: ")
-                .nth(1)
-                .is_some_and(|rest| rest.split(')').next().unwrap_or("").contains(&format!("@{dead_addr}")))
+            d.split("target: ").nth(1).is_some_and(|rest| {
+                rest.split(')')
+                    .next()
+                    .unwrap_or("")
+                    .contains(&format!("@{dead_addr}"))
+            })
         });
     eprintln!(
         "DEAD-FIRST-HOP latency_s={latency_s:.1} outcome_success={} first_hop_is_dead_peer={first_target_is_dead:?}",

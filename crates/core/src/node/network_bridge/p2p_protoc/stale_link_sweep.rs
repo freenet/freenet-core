@@ -132,8 +132,120 @@ pub(super) struct Decision {
 
 /// Decide which links to drop at `now`. `last_tick` is the previous tick, if
 /// any.
-pub(super) fn decide(_now: Instant, _last_tick: Option<Instant>, _peers: &[PeerSample]) -> Decision {
-    Decision::default()
+pub(super) fn decide(now: Instant, last_tick: Option<Instant>, peers: &[PeerSample]) -> Decision {
+    let waiting: Vec<&PeerSample> = peers.iter().filter(|p| p.outstanding > 0).collect();
+    let mut stale: Vec<&PeerSample> = waiting.iter().copied().filter(|p| p.is_stale()).collect();
+    if stale.is_empty() {
+        return Decision::default();
+    }
+
+    // Tick gap: judged against the shortest window among the peers waited on,
+    // so a stall that could fool any one of them suppresses the tick.
+    if let Some(last) = last_tick {
+        let gap = now.saturating_duration_since(last);
+        let min_window = waiting
+            .iter()
+            .map(|p| silence_window(p.kind))
+            .min()
+            .unwrap_or(MIN_WINDOW);
+        if gap > min_window / 2 {
+            return Decision {
+                drops: Vec::new(),
+                suppressed: Some(Suppressed::TickGap),
+            };
+        }
+    }
+
+    // Majority: strictly more than half of the peers with requests waiting.
+    if waiting.len() >= MAJORITY_GUARD_MIN_PEERS && stale.len() * 2 > waiting.len() {
+        return Decision {
+            drops: Vec::new(),
+            suppressed: Some(Suppressed::Majority),
+        };
+    }
+
+    // Longest silent first; address as a deterministic tie-break.
+    stale.sort_by(|a, b| b.silence().cmp(&a.silence()).then(a.addr.cmp(&b.addr)));
+    Decision {
+        drops: stale
+            .into_iter()
+            .take(MAX_DROPS_PER_TICK)
+            .map(|p| p.addr)
+            .collect(),
+        suppressed: None,
+    }
+}
+
+impl P2pConnManager {
+    /// Run one stale-link tick when due: drop at most [`MAX_DROPS_PER_TICK`]
+    /// links that [`decide`] judges silent while requests wait on them.
+    ///
+    /// Runs on the event-loop task and calls `drop_connection_by_addr`
+    /// directly, the same path the `NodeEvent::DropConnection` handler takes
+    /// (prune, `handle_orphaned_transactions`, remove). No channel is sent on.
+    pub(super) async fn run_stale_link_sweep(
+        &mut self,
+        sweep: &mut StaleLinkSweep,
+        handshake_cmd_sender: &HandshakeCommandSender,
+        is_awaiting_reply: impl FnMut(&crate::message::Transaction) -> bool,
+    ) {
+        let now = Instant::now();
+        if !sweep.due(now) {
+            return;
+        }
+        let awaiting = self
+            .bridge
+            .op_manager
+            .ring
+            .live_tx_tracker
+            .awaiting_by_peer(is_awaiting_reply);
+        let observed: Vec<(SocketAddr, LinkKind, Duration, usize)> = self
+            .connections
+            .iter()
+            .filter_map(|(addr, entry)| {
+                // A transport that reports no receipt time cannot be judged.
+                let since = entry.receipt.as_ref()?.since_last_receipt();
+                let kind = if entry.native {
+                    LinkKind::Quic
+                } else {
+                    LinkKind::Udp
+                };
+                Some((*addr, kind, since, awaiting.get(addr).copied().unwrap_or(0)))
+            })
+            .collect();
+        let decision = sweep.tick(now, &observed);
+        if let Some(why) = decision.suppressed {
+            tracing::warn!(
+                ?why,
+                connections = observed.len(),
+                "STALE_LINK_SWEEP skipped a tick: not dropping silent links"
+            );
+        }
+        for addr in decision.drops {
+            let (kind, since, waiting) = observed
+                .iter()
+                .find(|o| o.0 == addr)
+                .map(|o| (o.1, o.2, o.3))
+                .unwrap_or((LinkKind::Udp, Duration::ZERO, 0));
+            tracing::warn!(
+                peer_addr = %addr,
+                ?kind,
+                silent_for_s = since.as_secs(),
+                window_s = silence_window(kind).as_secs(),
+                requests_waiting = waiting,
+                "STALE_LINK_SWEEP dropping a link that went silent with requests waiting"
+            );
+            // Integration point for fix B (recently-silent peer record,
+            // branch fix/get-skip-recently-silent-peer, not merged): mark
+            // `addr` silent here once it lands. Not marked in this change.
+            self.drop_connection_by_addr(
+                addr,
+                handshake_cmd_sender,
+                crate::tracing::DisconnectReason::Unresponsive,
+            )
+            .await;
+        }
+    }
 }
 
 /// Per-node sweep state: the tick clock and, per peer, since when requests
@@ -170,8 +282,35 @@ impl StaleLinkSweep {
         now: Instant,
         observed: &[(SocketAddr, LinkKind, Duration, usize)],
     ) -> Decision {
-        let _ = (now, observed);
-        Decision::default()
+        let samples: Vec<PeerSample> = observed
+            .iter()
+            .map(|&(addr, kind, since_last_receipt, outstanding)| {
+                let outstanding_for = if outstanding == 0 {
+                    Duration::ZERO
+                } else {
+                    let since = *self.outstanding_since.entry(addr).or_insert(now);
+                    now.saturating_duration_since(since)
+                };
+                PeerSample {
+                    addr,
+                    kind,
+                    since_last_receipt,
+                    outstanding,
+                    outstanding_for,
+                }
+            })
+            .collect();
+        // Forget peers with nothing waiting and peers that are gone, so a
+        // later request starts a fresh wait.
+        self.outstanding_since
+            .retain(|addr, _| observed.iter().any(|(a, _, _, n)| a == addr && *n > 0));
+        let decision = decide(now, self.last_tick, &samples);
+        self.last_tick = Some(now);
+        self.next_due = now + STALE_LINK_SWEEP_INTERVAL;
+        for addr in &decision.drops {
+            self.outstanding_since.remove(addr);
+        }
+        decision
     }
 }
 
@@ -190,7 +329,12 @@ mod tests {
 
     /// A UDP peer with `outstanding` requests waiting for `outstanding_for`,
     /// last heard from `silent_for` ago.
-    fn peer(n: u8, silent_for: Duration, outstanding: usize, outstanding_for: Duration) -> PeerSample {
+    fn peer(
+        n: u8,
+        silent_for: Duration,
+        outstanding: usize,
+        outstanding_for: Duration,
+    ) -> PeerSample {
         PeerSample {
             addr: addr(n),
             kind: LinkKind::Udp,
@@ -239,7 +383,11 @@ mod tests {
     fn no_outstanding_request_never_drops() {
         let c = clock();
         let (now, last) = normal_tick(&c);
-        let d = decide(now, last, &[peer(1, Duration::from_secs(600), 0, Duration::ZERO)]);
+        let d = decide(
+            now,
+            last,
+            &[peer(1, Duration::from_secs(600), 0, Duration::ZERO)],
+        );
         assert_eq!(d, Decision::default());
     }
 
@@ -247,7 +395,11 @@ mod tests {
     fn fresh_stamp_never_drops() {
         let c = clock();
         let (now, last) = normal_tick(&c);
-        let d = decide(now, last, &[peer(1, Duration::from_secs(1), 3, Duration::from_secs(300))]);
+        let d = decide(
+            now,
+            last,
+            &[peer(1, Duration::from_secs(1), 3, Duration::from_secs(300))],
+        );
         assert_eq!(d, Decision::default());
     }
 
@@ -256,7 +408,10 @@ mod tests {
         let c = clock();
         let (now, last) = normal_tick(&c);
         let just_under = udp_w() - Duration::from_nanos(1);
-        assert_eq!(decide(now, last, &[stale_for(1, just_under)]), Decision::default());
+        assert_eq!(
+            decide(now, last, &[stale_for(1, just_under)]),
+            Decision::default()
+        );
         let d = decide(now, last, &[stale_for(1, udp_w())]);
         assert_eq!(d.drops, vec![addr(1)]);
         assert_eq!(d.suppressed, None);
@@ -349,7 +504,12 @@ mod tests {
         let (now, last) = normal_tick(&c);
         let big = Duration::from_secs(600);
         assert_eq!(decide(now, last, &[stale_for(1, big)]).drops, vec![addr(1)]);
-        assert_eq!(decide(now, last, &[stale_for(1, big), stale_for(2, big)]).drops.len(), 2);
+        assert_eq!(
+            decide(now, last, &[stale_for(1, big), stale_for(2, big)])
+                .drops
+                .len(),
+            2
+        );
     }
 
     /// Peers with no outstanding request do not dilute the majority: they are
@@ -363,7 +523,10 @@ mod tests {
         for n in 10..40 {
             peers.push(peer(n, Duration::from_secs(1), 0, Duration::ZERO));
         }
-        assert_eq!(decide(now, last, &peers).suppressed, Some(Suppressed::Majority));
+        assert_eq!(
+            decide(now, last, &peers).suppressed,
+            Some(Suppressed::Majority)
+        );
     }
 
     #[test]
@@ -388,7 +551,11 @@ mod tests {
 
     // ---- StaleLinkSweep state ----
 
-    fn obs(n: u8, silent_for: Duration, outstanding: usize) -> (SocketAddr, LinkKind, Duration, usize) {
+    fn obs(
+        n: u8,
+        silent_for: Duration,
+        outstanding: usize,
+    ) -> (SocketAddr, LinkKind, Duration, usize) {
         (addr(n), LinkKind::Udp, silent_for, outstanding)
     }
 
@@ -410,8 +577,15 @@ mod tests {
         }
         let at = dropped_at.expect("the dead link is dropped");
         // First observed at tick 1 (5 s); waited W by tick with 5 s steps.
-        assert!(at >= udp_w(), "dropped at {at:?}, before the window {:?}", udp_w());
-        assert!(at <= udp_w() + STALE_LINK_SWEEP_INTERVAL * 2, "dropped late: {at:?}");
+        assert!(
+            at >= udp_w(),
+            "dropped at {at:?}, before the window {:?}",
+            udp_w()
+        );
+        assert!(
+            at <= udp_w() + STALE_LINK_SWEEP_INTERVAL * 2,
+            "dropped late: {at:?}"
+        );
     }
 
     /// When the requests finish, the wait clock resets: a later request does

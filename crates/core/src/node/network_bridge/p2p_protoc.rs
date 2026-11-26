@@ -1799,6 +1799,7 @@ impl P2pConnManager {
             PENDING_CLAIM_RETRY_INTERVAL,
         );
         const STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
+        let mut stale_link_sweep = stale_link_sweep::StaleLinkSweep::new(Instant::now());
         let mut zombie_sweep_state = ZombieSweepState::new(Instant::now());
         const SLOW_EVENT_THRESHOLD: Duration = Duration::from_millis(100);
 
@@ -1826,7 +1827,10 @@ impl P2pConnManager {
                         zombie_sweep::earliest(
                             pending_claim_retry
                                 .deadline(ctx.addr_by_pub_key.may_have_pending_claims()),
-                            ctx.held_native_deadline(),
+                            zombie_sweep::earliest(
+                                ctx.held_native_deadline(),
+                                Some(stale_link_sweep.deadline()),
+                            ),
                         ),
                     ),
                 ) => {
@@ -1975,6 +1979,13 @@ impl P2pConnManager {
                 ctx.sweep_zombie_transports(&handshake_cmd_sender, &mut zombie_sweep_state, false)
                     .await;
             }
+
+            // Links gone silent while requests wait on them (see
+            // `stale_link_sweep`); a no-op until its interval has passed.
+            ctx.run_stale_link_sweep(&mut stale_link_sweep, &handshake_cmd_sender, |tx| {
+                state.pending_op_results.contains_key(tx)
+            })
+            .await;
 
             // Native connections kept beside a UDP entry that waited too long
             // for a frame (`HeldNative`); a no-op when none is held.
