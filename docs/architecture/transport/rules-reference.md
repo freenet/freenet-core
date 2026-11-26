@@ -1845,8 +1845,10 @@ seeded GlobalRng repeat the same event trace; the bytes differ, because
 rustls's key exchange and the XEdDSA nonce use the OS RNG.
 
 In SimNetwork: `with_transport_quic` / `with_node_transport_quic` set the
-config value per node (off unless set, whatever the node default: the
-harness writes `off` into every node's config; an unknown value panics;
+config value per node (`prefer` at a 100% data share unless set, whatever the
+node default: the harness writes both into every node's config and pins native
+connect and native gateway join at 0%; `"off"` opts a test back to legacy UDP,
+`with_release_quic_data_share` reads the release's own share instead; an unknown value panics;
 tests that start nodes outside SimNetwork, in `crates/core/tests` and through
 freenet-test-network, get the platform default on purpose, as production does,
 except where a restart after SIGKILL would trip a gateway's breaker on Linux or macOS; a
