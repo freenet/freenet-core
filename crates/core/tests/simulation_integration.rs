@@ -26558,3 +26558,424 @@ fn test_put_then_get_findability_latency() {
         sum.network_gets
     );
 }
+
+// ---------------------------------------------------------------------------
+// PUT-bracket-gap experiment: gateway-originated PUTs into a sparse band of
+// the ring, fetched from requesters on the far side of the key.
+//
+// Real-network symptom (2026-11): rooms created through a gateway at ring
+// location 0.92 were persistently "not found" from requesters at 0.41 when the
+// key sat at 0.54-0.69, where the ring is sparse. Hypothesis: the PUT's greedy
+// chain arrives from above and ends at a peer on the gateway side of the key,
+// while a GET from below ends at the closer peer on the other side, which does
+// not forward "away" from the key to the holder.
+//
+// Test-only scenario: every location is relative to the gateway's derived
+// location `g`; the key band centre is `c = g - 0.31`.
+// ---------------------------------------------------------------------------
+
+/// Contract whose key depends on a u16 seed (`create_test_contract` takes a u8,
+/// which yields too few keys inside one narrow band).
+#[cfg(feature = "nightly_tests")]
+fn pg_contract(seed: u16) -> ContractContainer {
+    let s = seed.to_le_bytes();
+    let code: Vec<u8> = (0..32u8)
+        .map(|i| s[(i % 2) as usize].wrapping_add(i).wrapping_mul(7) ^ s[1])
+        .collect();
+    let params: Vec<u8> = (0..16u8)
+        .map(|i| s[(i % 2) as usize].wrapping_add(i.wrapping_mul(3)))
+        .collect();
+    ContractWasmAPIVersion::V1(WrappedContract::new(
+        Arc::new(ContractCode::from(code)),
+        Parameters::from(params),
+    ))
+    .into()
+}
+
+#[cfg(feature = "nightly_tests")]
+fn pg_wrap(x: f64) -> f64 {
+    x.rem_euclid(1.0)
+}
+
+#[cfg(feature = "nightly_tests")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PgOrigin {
+    Gateway,
+    /// Ordinary node nearest the gateway's ring location.
+    NodeNearGateway,
+}
+
+#[cfg(feature = "nightly_tests")]
+fn pg_run(seed: u64, network: &str, sparse: bool, origin: PgOrigin, env_p1: bool) {
+    use freenet::dev_tool::{Location, NodeLabel, ScheduledOperation, SimOperation};
+    const OP_INTERVAL_MS: u64 = 250;
+    const NODES: usize = 60;
+    const KEYS: usize = 66;
+    // GET delays in slots after the PUT: 1 s, 10 s, 60 s.
+    const DELAYS: [usize; 3] = [4, 40, 240];
+
+    // Probe the gateway's derived location.
+    setup_deterministic_state(seed);
+    let rt = create_runtime();
+    let g = rt.block_on(async {
+        let probe = SimNetwork::new(network, 1, 1, 10, 7, 12, 4, seed).await;
+        probe.get_peer_locations()[0]
+    });
+    drop(rt);
+    let c = pg_wrap(g - 0.31);
+
+    // Node targets (regular nodes).
+    let mut targets: Vec<f64> = Vec::new();
+    if sparse {
+        for off in [-0.065, -0.02, 0.012, 0.05] {
+            targets.push(pg_wrap(c + off));
+        }
+    } else {
+        for i in 0..24 {
+            targets.push(pg_wrap(c - 0.075 + 0.15 * (i as f64 + 0.5) / 24.0));
+        }
+    }
+    let rest = NODES - targets.len();
+    // The rest spread evenly over the arc outside c +/- 0.15.
+    for i in 0..rest {
+        targets.push(pg_wrap(c + 0.15 + 0.70 * (i as f64 + 0.5) / rest as f64));
+    }
+
+    setup_deterministic_state(seed);
+    let nn_guard = NnLatticeTestGuard;
+    freenet::dev_tool::set_nn_lattice_enabled(true);
+    let rt = create_runtime();
+    let (sim, logs_handle) = rt.block_on(async {
+        let mut sim =
+            SimNetwork::new_with_node_locations(network, 1, NODES, 10, 7, 12, 4, seed, &targets)
+                .await;
+        sim.wait_for_join_convergence_before_ops(0.95, Duration::from_secs(900));
+        sim.with_controlled_op_interval(Duration::from_millis(OP_INTERVAL_MS));
+        let logs_handle = sim.event_logs_handle();
+        (sim, logs_handle)
+    });
+    let locs = sim.get_peer_locations(); // gateway first
+    assert_eq!(locs.len(), 1 + NODES);
+    assert!((locs[0] - g).abs() < 1e-9, "gateway location changed");
+
+    // Keys inside c +/- 0.075.
+    let mut containers = Vec::new();
+    let mut key_locs = Vec::new();
+    for s in 0..u16::MAX {
+        let ct = pg_contract(s);
+        let kl = Location::from(&ct.key()).as_f64();
+        if fa_ring_dist(kl, c) <= 0.075 {
+            containers.push(ct);
+            key_locs.push(kl);
+            if containers.len() == KEYS {
+                break;
+            }
+        }
+    }
+    assert_eq!(containers.len(), KEYS, "not enough keys in the band");
+
+    let origin_node = (1..=NODES)
+        .min_by(|&a, &b| {
+            fa_ring_dist(locs[a], g).total_cmp(&fa_ring_dist(locs[b], g))
+        })
+        .unwrap();
+    let origin_label = match origin {
+        PgOrigin::Gateway => NodeLabel::gateway(network, 0),
+        PgOrigin::NodeNearGateway => NodeLabel::node(network, origin_node),
+    };
+    let origin_loc = match origin {
+        PgOrigin::Gateway => g,
+        PgOrigin::NodeNearGateway => locs[origin_node],
+    };
+
+    let mut rng_state = seed ^ 0x9E37_79B9_7F4A_7C15;
+    let mut next_rand = move || {
+        rng_state = rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (rng_state >> 33) as usize
+    };
+    // Requesters: below the key, ring distance 0.18..0.40 from it.
+    let mut get_nodes: Vec<[usize; 3]> = Vec::new();
+    for kl in &key_locs {
+        let cand: Vec<usize> = (1..=NODES)
+            .filter(|&n| {
+                let below = pg_wrap(kl - locs[n]);
+                (0.18..=0.40).contains(&below)
+            })
+            .collect();
+        assert!(!cand.is_empty(), "no requesters below key {kl}");
+        get_nodes.push([
+            cand[next_rand() % cand.len()],
+            cand[next_rand() % cand.len()],
+            cand[next_rand() % cand.len()],
+        ]);
+    }
+
+    // Timeline, one op per slot.
+    let mut ops = Vec::new();
+    let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (due, contract, delay idx)
+    let mut next_put = 0usize;
+    let mut slot = 0usize;
+    while next_put < KEYS || !pending.is_empty() {
+        let due_pos = pending.iter().position(|(due, _, _)| *due <= slot);
+        let pick = if due_pos.is_some() {
+            due_pos
+        } else if next_put >= KEYS {
+            pending
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (due, _, _))| *due)
+                .map(|(i, _)| i)
+        } else {
+            None
+        };
+        if let Some(pos) = pick {
+            let (_, ci, di) = pending.remove(pos);
+            ops.push(ScheduledOperation::new(
+                NodeLabel::node(network, get_nodes[ci][di]),
+                SimOperation::Get {
+                    contract_id: *containers[ci].key().id(),
+                    return_contract_code: true,
+                    subscribe: false,
+                },
+            ));
+        } else {
+            let ci = next_put;
+            next_put += 1;
+            ops.push(ScheduledOperation::new(
+                origin_label.clone(),
+                SimOperation::Put {
+                    contract: containers[ci].clone(),
+                    state: vec![ci as u8; 64],
+                    subscribe: true,
+                },
+            ));
+            for (di, d) in DELAYS.iter().enumerate() {
+                pending.push((slot + d, ci, di));
+            }
+        }
+        slot += 1;
+    }
+
+    let result = sim.run_controlled_simulation(
+        seed,
+        ops,
+        Duration::from_secs(2400),
+        Duration::from_secs(60),
+    );
+    assert!(
+        result.turmoil_result.is_ok(),
+        "sim failed: {:?}",
+        result.turmoil_result.as_ref().err()
+    );
+    drop(nn_guard);
+
+    // ---- Analysis ----
+    let logs = rt.block_on(async { logs_handle.lock().await.clone() });
+    let t0 = logs.iter().map(|l| l.datetime).min().expect("events");
+    struct Ev {
+        dt_ns: i128,
+        tx: String,
+        d: String,
+    }
+    let mut by_instance: HashMap<String, Vec<Ev>> = HashMap::new();
+    for l in logs.iter() {
+        let d = format!("{:?}", l.kind);
+        if !d.starts_with("Get(") {
+            continue;
+        }
+        let Some(inst) = fa_instance(&d).map(str::to_owned) else {
+            continue;
+        };
+        by_instance.entry(inst).or_default().push(Ev {
+            dt_ns: (l.datetime - t0).num_nanoseconds().unwrap_or(0) as i128,
+            tx: l.tx.to_string(),
+            d,
+        });
+    }
+    let variant = |e: &Ev| -> String {
+        e.d["Get(".len()..]
+            .split([' ', '{'])
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    let mut found_by_delay = [0usize; 3];
+    let mut total_by_delay = [0usize; 3];
+    let mut found_any = 0usize;
+    let mut never = Vec::new();
+    let mut hops: Vec<f64> = Vec::new();
+    let mut holder_counts: Vec<f64> = Vec::new();
+    let mut nearest_holds = 0usize;
+    let mut both_sides = 0usize;
+    let mut holder_rank: Vec<f64> = Vec::new();
+    let mut holder_dist: Vec<f64> = Vec::new();
+    let mut zero_holders = 0usize;
+    let mut served_dist: Vec<f64> = Vec::new();
+    for (ci, ct) in containers.iter().enumerate() {
+        let key = ct.key();
+        let kl = key_locs[ci];
+        let inst = key.id().to_string();
+        let evs = by_instance.get(&inst).map(Vec::as_slice).unwrap_or(&[]);
+        let mut terms: Vec<(i128, bool, Option<usize>)> = evs
+            .iter()
+            .filter(|e| variant(e) == "ClientTerminal" && e.d.contains("is_sub_op: false"))
+            .filter_map(|t| {
+                let start = evs
+                    .iter()
+                    .filter(|e| variant(e) == "Request" && e.tx == t.tx)
+                    .map(|e| e.dt_ns)
+                    .min()?;
+                let ok = t.d.contains("outcome: Success");
+                let h = fa_field(&t.d, "hop_count: Some(").and_then(|v| v.parse().ok());
+                Some((start, ok, h))
+            })
+            .collect();
+        terms.sort_by_key(|t| t.0);
+        let mut any = false;
+        for di in 0..3 {
+            total_by_delay[di] += 1;
+            if let Some((_, ok, h)) = terms.get(di) {
+                if *ok {
+                    found_by_delay[di] += 1;
+                    any = true;
+                    if let Some(h) = h {
+                        hops.push(*h as f64);
+                    }
+                }
+            }
+        }
+        if any {
+            found_any += 1;
+        } else {
+            never.push(ci);
+        }
+        if let Some(rs) = evs
+            .iter()
+            .filter(|e| variant(e) == "ResponseSent" && e.d.contains("key: Some("))
+            .min_by_key(|e| e.dt_ns)
+        {
+            if let Some(loc) = fa_peer_loc(&rs.d, "from: ") {
+                served_dist.push(fa_ring_dist(loc, kl));
+            }
+        }
+        // Holders at end of run, by ring distance to the key.
+        let mut peers: Vec<(f64, NodeLabel, f64)> = vec![(
+            fa_ring_dist(locs[0], kl),
+            NodeLabel::gateway(network, 0),
+            locs[0],
+        )];
+        for n in 1..=NODES {
+            peers.push((
+                fa_ring_dist(locs[n], kl),
+                NodeLabel::node(network, n),
+                locs[n],
+            ));
+        }
+        peers.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let holders: Vec<(usize, &(f64, NodeLabel, f64))> = peers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| result.is_node_hosting(&p.1, &key))
+            .collect();
+        holder_counts.push(holders.len() as f64);
+        if holders.is_empty() {
+            zero_holders += 1;
+        }
+        // Exclude the PUT originator (always hosts its own copy) from placement stats.
+        let non_origin: Vec<_> = holders
+            .iter()
+            .filter(|(_, p)| p.1 != origin_label)
+            .collect();
+        if let Some((r, _)) = non_origin.first() {
+            if *r == 0 {
+                nearest_holds += 1;
+            }
+        }
+        for (r, p) in &non_origin {
+            holder_rank.push((*r + 1) as f64);
+            holder_dist.push(p.0);
+        }
+        let above = non_origin
+            .iter()
+            .any(|(_, p)| pg_wrap(p.2 - kl) < 0.5);
+        let below = non_origin
+            .iter()
+            .any(|(_, p)| pg_wrap(p.2 - kl) >= 0.5);
+        if above && below {
+            both_sides += 1;
+        }
+        if never.last() == Some(&ci) {
+            let desc: Vec<String> = holders
+                .iter()
+                .map(|(r, p)| format!("rank{}@{:+.3}", r + 1, {
+                    let o = pg_wrap(p.2 - kl);
+                    if o > 0.5 { o - 1.0 } else { o }
+                }))
+                .collect();
+            eprintln!(
+                "PG never-found key_loc={kl:.3} closest3={:?} holders=[{}]",
+                peers
+                    .iter()
+                    .take(3)
+                    .map(|p| {
+                        let o = pg_wrap(p.2 - kl);
+                        format!("{:+.3}", if o > 0.5 { o - 1.0 } else { o })
+                    })
+                    .collect::<Vec<_>>(),
+                desc.join(" ")
+            );
+        }
+    }
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        fa_pct(v, 0.5)
+    };
+    let band_peers = (0..=NODES)
+        .filter(|&n| fa_ring_dist(locs[n], c) <= 0.075)
+        .count();
+    eprintln!(
+        "PG config: sparse={sparse} origin={origin:?} p1={env_p1} g={g:.3} c={c:.3} origin_loc={origin_loc:.3} peers_in_band(+-0.075)={band_peers} keys={KEYS}"
+    );
+    eprintln!(
+        "PG RESULT: found@1s={}/{} found@10s={}/{} found@60s={}/{} never_found_any={} | hops med={:.0} | served_by_dist med={:.3}",
+        found_by_delay[0],
+        total_by_delay[0],
+        found_by_delay[1],
+        total_by_delay[1],
+        found_by_delay[2],
+        total_by_delay[2],
+        never.len(),
+        med(&mut hops),
+        med(&mut served_dist)
+    );
+    eprintln!(
+        "PG PLACEMENT: found_any={found_any} zero_holders={zero_holders} holders/key med={:.0} | nearest_peer_holds={nearest_holds}/{KEYS} | both_sides={both_sides}/{KEYS} | non-origin holder rank med={:.0} dist med={:.3}",
+        med(&mut holder_counts),
+        med(&mut holder_rank),
+        med(&mut holder_dist)
+    );
+}
+
+#[cfg(feature = "nightly_tests")]
+const PG_SEED: u64 = 0xF1ED_0A11;
+
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_put_bracket_gap_sparse_gateway() {
+    pg_run(PG_SEED, "pg-sg", true, PgOrigin::Gateway, false);
+}
+
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_put_bracket_gap_dense_gateway_control() {
+    pg_run(PG_SEED, "pg-dg", false, PgOrigin::Gateway, false);
+}
+
+#[cfg(feature = "nightly_tests")]
+#[test_log::test]
+fn test_put_bracket_gap_sparse_node_control() {
+    pg_run(PG_SEED, "pg-sn", true, PgOrigin::NodeNearGateway, false);
+}
