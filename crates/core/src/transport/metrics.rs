@@ -36,7 +36,7 @@ pub use quic_data::QuicDataSnapshot;
 pub(crate) use quic_data::STALL_CLOSE_LABELS;
 pub(crate) use quic_data::{
     AckWaitKind, DarkEnd, PathGateWindow, PathLossWindow, PipeDropCause, QuicDataCounters,
-    ShareSource, StreamsOpenPeak,
+    SHORT_DROP_LABELS, ShareSource, ShortDropCause, StreamsOpenPeak,
 };
 
 /// Global transport metrics instance.

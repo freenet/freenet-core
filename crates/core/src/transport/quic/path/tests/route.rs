@@ -993,3 +993,178 @@ fn with_no_udp_fallback_an_upgraded_path_gives_up_instead_of_going_on_udp() {
         assert_eq!(a.stats().send_event_count(QuicSendEvent::SuspectEntered), 0);
     });
 }
+
+/// What `short_dropped_<cause>` a path's counters hold, as `(label, count)` for
+/// the non-zero ones.
+fn short_drop_counts(path: &QuicPath) -> Vec<(&'static str, u64)> {
+    crate::transport::metrics::ShortDropCause::ALL
+        .iter()
+        .enumerate()
+        .map(|(i, cause)| {
+            (
+                crate::transport::metrics::SHORT_DROP_LABELS[i],
+                path.stats().short_drop_count(*cause),
+            )
+        })
+        .filter(|(_, n)| *n != 0)
+        .collect()
+}
+
+/// The labels of `SHORT_DROP_LABELS` are in the order of the cause enum, so a
+/// cause lands under the label it names.
+#[test]
+fn short_drop_causes_follow_their_labels() {
+    use crate::transport::metrics::SHORT_DROP_LABELS;
+    assert_eq!(
+        SHORT_DROP_LABELS.len(),
+        crate::transport::metrics::ShortDropCause::ALL.len()
+    );
+    for (i, cause) in crate::transport::metrics::ShortDropCause::ALL
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(*cause as usize, i, "{cause:?}");
+    }
+}
+
+/// A Short a native path gives up is counted dropped under exactly one cause, the
+/// one its outcome names, and the causes sum to the dropped count. A path with
+/// no UDP session gives up what would have gone on UDP, so every outcome of the
+/// table lands somewhere. A stream's drop has no cause.
+#[test]
+fn a_dropped_short_is_counted_under_the_cause_of_its_outcome() {
+    use QuicSendError as E;
+    let not_opened = |n| BoundedSend::Failed(SendFailure::NotOpened(n));
+    let rows: Vec<(BoundedSend, &str)> = vec![
+        (not_opened(NotOpened::TimedOut), "not_opened_exhausted"),
+        (not_opened(NotOpened::NoCredit), "not_opened_exhausted"),
+        (not_opened(NotOpened::Paced), "paced"),
+        (
+            not_opened(NotOpened::ConnectionLost(lost())),
+            "connection_lost",
+        ),
+        (BoundedSend::Failed(SendFailure::TimedOut), "timed_out"),
+        (BoundedSend::Failed(SendFailure::Paced), "paced"),
+        (error(E::ConnectionLost(lost())), "connection_lost"),
+        (error(E::Closed), "connection_lost"),
+        (
+            error(E::InvalidFrame(framing_error_for_tests())),
+            "invalid_frame",
+        ),
+        (
+            error(E::LengthMismatch {
+                declared: 2,
+                delivered: 1,
+            }),
+            "source_error",
+        ),
+        (stopped(stop_code::NOT_ACCEPTING_DATA), "peer_refused_data"),
+        (stopped(stop_code::BUDGET_REFUSED), "budget_refused"),
+        (stopped(stop_code::CHANNEL_FULL), "stopped_other"),
+        (stopped(0x1f), "stopped_other"),
+    ];
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        for (i, (outcome, label)) in rows.iter().enumerate() {
+            let name: &'static str =
+                Box::leak(format!("quic-short-drop-cause-{i}").into_boxed_str());
+            let p = paths_native(name).await;
+            assert_eq!(
+                p.a.settle(SendKind::Short, outcome, false, 0),
+                NextStep::GiveUp,
+                "{outcome:?}"
+            );
+            assert_eq!(
+                p.a.stats()
+                    .send_count(SendKind::Short, QuicSendResult::Dropped),
+                1
+            );
+            assert_eq!(short_drop_counts(&p.a), vec![(*label, 1)], "{outcome:?}");
+
+            // The same outcome for a Stream or a large short is dropped without
+            // a short cause.
+            let q = paths_native(Box::leak(format!("{name}-other").into_boxed_str())).await;
+            q.a.settle(SendKind::Stream, outcome, false, 0);
+            q.a.settle(SendKind::LargeShort, outcome, false, 0);
+            assert!(short_drop_counts(&q.a).is_empty(), "{outcome:?}");
+        }
+    });
+}
+
+/// A path with a UDP session gives up only what UDP cannot carry, and counts it
+/// the same way; what goes on UDP is not a drop and has no cause.
+#[test]
+fn a_path_with_a_udp_session_counts_only_what_it_gives_up() {
+    bounded(|| async move {
+        let _seed = GlobalRng::seed_guard(SEED);
+        let p = paths("quic-short-drop-cause-udp", QuicPathLimits::DEFAULT).await;
+        assert!(p.a.udp_fallback());
+        assert_eq!(
+            p.a.settle(SendKind::Short, &stopped(0x1f), false, 0),
+            NextStep::GiveUp
+        );
+        assert_eq!(
+            p.a.settle(
+                SendKind::Short,
+                &BoundedSend::Failed(SendFailure::TimedOut),
+                false,
+                0
+            ),
+            NextStep::SendOnUdp
+        );
+        assert_eq!(
+            p.a.stats()
+                .send_count(SendKind::Short, QuicSendResult::Dropped),
+            1
+        );
+        assert_eq!(short_drop_counts(&p.a), vec![("stopped_other", 1)]);
+    });
+}
+
+/// Nothing counts a Short as dropped except `record_short_dropped`, which counts
+/// its cause with it, so the causes cannot drift from `short_dropped`. The pin
+/// reads the source: a new caller of the uncaused counter fails here. The one
+/// `stats.record_send(` is `settle`'s, which sends a dropped Short to
+/// `record_short_dropped` first (and `record_send` asserts that in debug).
+#[test]
+fn only_record_short_dropped_counts_a_dropped_short() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/transport");
+    let mut dirs = vec![root];
+    let (mut plain, mut files_scanned) = (Vec::new(), 0);
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("transport source dir") {
+            let path = entry.expect("entry").path();
+            let name = path.to_string_lossy().to_string();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if name.ends_with(".rs") && !name.contains("test") {
+                files_scanned += 1;
+                let text = std::fs::read_to_string(&path).expect("source");
+                for (n, line) in text.lines().enumerate() {
+                    let code = line.trim_start();
+                    if code.starts_with("//") {
+                        continue;
+                    }
+                    assert!(
+                        !code.contains("record_send_dropped("),
+                        "{name}:{}: a dropped Short has a cause",
+                        n + 1
+                    );
+                    if code.contains("record_send_unchecked(") && !name.ends_with("quic/path.rs") {
+                        panic!(
+                            "{name}:{}: the uncaused counter is private to path.rs",
+                            n + 1
+                        );
+                    }
+                    if code.contains("stats.record_send(") || code.contains("stats().record_send(")
+                    {
+                        plain.push(format!("{name}:{}", n + 1));
+                    }
+                }
+            }
+        }
+    }
+    assert!(files_scanned > 20, "the scan found {files_scanned} files");
+    assert_eq!(plain.len(), 1, "{plain:#?}");
+    assert!(plain[0].contains("quic/path/route.rs"), "{plain:#?}");
+}
