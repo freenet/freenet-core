@@ -275,6 +275,28 @@ pub(crate) fn gateway_native_admission_forced(addr: SocketAddr) -> bool {
         .is_ok_and(|network| GATEWAY_NATIVE_ADMISSION.contains(&(network, addr)))
 }
 
+/// Gateways whose QUIC listener does NOT admit native joins in a simulation
+/// (`SimNetwork::with_gateway_native_admission_off`), as a gateway on a
+/// release before admission was switched on. Keyed like
+/// [`GATEWAY_NATIVE_ADMISSION`].
+#[cfg(any(test, feature = "testing"))]
+static GATEWAY_NATIVE_ADMISSION_OFF: LazyLock<dashmap::DashSet<(String, SocketAddr)>> =
+    LazyLock::new(dashmap::DashSet::new);
+
+/// Turns native-join admission off for the gateway at `addr` in `network`.
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn force_gateway_native_admission_off(network: &str, addr: SocketAddr) {
+    GATEWAY_NATIVE_ADMISSION_OFF.insert((network.to_string(), addr));
+}
+
+/// Whether a simulation turned native-join admission off for the listener
+/// bound at `addr` (resolved as [`gateway_native_admission_forced`] does).
+#[cfg(any(test, feature = "testing"))]
+pub(crate) fn gateway_native_admission_forced_off(addr: SocketAddr) -> bool {
+    resolve_address_network(&addr)
+        .is_ok_and(|network| GATEWAY_NATIVE_ADMISSION_OFF.contains(&(network, addr)))
+}
+
 /// Gateways that close every completed native join after its Hello in a
 /// simulation, as a release before the hand-off to the node did
 /// (`SimNetwork::with_gateway_closing_native_joins`), keyed by `(network,

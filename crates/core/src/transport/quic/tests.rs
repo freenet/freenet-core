@@ -6782,14 +6782,13 @@ fn a_joiner_with_no_room_in_the_cap_is_ignored_until_one_is_released() {
     })
 }
 
-/// Off by default: with gateway admission off (as it is on every node while
-/// `GATEWAY_NATIVE_ADMISSION` is false) an unknown source is ignored whether
+/// Off on an endpoint that was not given admission (a peer, or a test
+/// endpoint that did not ask): an unknown source is ignored whether
 /// or not the cap is attached, no joiner is ever charged, and the hub is
 /// what attaches the cap.
 #[test]
 fn with_admission_off_no_joiner_is_charged() {
     use super::upgrade::policy::QuicPathPermits;
-    const { assert!(!super::admission::GATEWAY_NATIVE_ADMISSION) };
     bounded(|| async move {
         let _seed = GlobalRng::seed_guard(SEED);
         let net = crate::transport::test_net::subnet();

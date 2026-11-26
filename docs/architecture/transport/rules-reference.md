@@ -912,7 +912,7 @@ Token reservation:
     giving it back if the fragment is not sent; see "Node-wide egress cap"
 ```
 
-### WHEN admitting native joiners at a gateway (#5940, A7b; dark behind `GATEWAY_NATIVE_ADMISSION`)
+### WHEN admitting native joiners at a gateway (#5940, A7b; on since the floor release, `GATEWAY_NATIVE_ADMISSION`)
 
 - **A joiner is charged against the node's QUIC path cap from its admission.** `JoinerIncoming` holds a `JoinerCharge` (a `QuicJoinerPermit` from `QuicPathPermits::try_acquire_joiner`, plus a `QuicJoinerMark`). Dropping it releases both, which covers every exit: the handshake failing, the 8 s window passing (the `establish` future is dropped), the connection closing (end of the join, or of the handed-over connection) and an ignored attempt. `JoinerCharge::promote` re-charges at the full path rate (`QuicJoinerPermit::promote`, one atomic step; on no room the joiner keeps its charge). Do not add a parallel joiner counter: paths and joiners take from ONE unit total in `QuicPathPermits` (`config::PATH_PERMIT_UNITS` for a path, `config::JOINER_PERMIT_UNITS` for the handshake-phase charge, `config::QUIC_HANDSHAKE_PHASE_CHARGE_BYTES`).
 - **Joiners together hold at most 1/`JOINER_SHARE_DIVISOR` (a quarter) of the cap's units**, so established peers' path upgrades always keep the rest; refused joiners are ignored as when the cap is full. **The join window counts from the hub queueing the join** (`JoinerIncoming::stamp`, read by `establish_gateway_join`), so waiting for a join slot does not extend the hold. Promotion moves the `Arc` to the path permit (`QuicJoinerPermit` holds an `Option`); never `mem::forget` it.
@@ -921,7 +921,7 @@ Token reservation:
 - **Unpromoted joiners share one slice of the established ingress queue** (`demux::QUIC_INGRESS_JOINER_DATAGRAMS`, 64 of 1024), not a per-source share and not per-IP keying (QUIC-NATIVE-CONNECT 10.2 item 23, decided in A7b PR 6): one host on many ports cannot take more than 64 slots, and established peers keep the rest. A joiner never uses the quiet reserve. The slot is recorded per datagram (`QuicDatagram::joiner_slot`) so promotion or release cannot leak it. Overflow counts `quic_gateway_admission_joiner_share_full` and `quic_ingress_source_full`.
 - **Never `std::mem::forget` a charge or a mark.** A leaked charge shrinks the cap for the life of the process.
 
-### WHEN a joiner dials a gateway natively (#5940, phase B; dark behind `GATEWAY_NATIVE_JOIN_PERCENT`)
+### WHEN a joiner dials a gateway natively (#5940, phase B; on since the floor release, `GATEWAY_NATIVE_JOIN_PERCENT`)
 
 - **The joiner alone decides**, in the handshake driver (`handshake::connect_outbound`, `GatewayJoinPolicy`): a UDP dial with origin `Gateway` tries a native join first only if `NativeConnectState::plan_gateway_join` says `NativeFirst` (can dial native, gateway marked `native = true` in the index, pair bucket below the percent, gateway not cooling down). Do not move the decision into the connect op or the event loop.
 - **Fallback is unconditional and immediate.** Any native failure runs the ordinary UDP dial in the same task; nothing is sticky. A failure cools that gateway down for `GATEWAY_NATIVE_FAILURE_COOLDOWN` (the index is read at startup, so un-marking does not reach running nodes). Gateway join failures must never count toward the peer-to-peer demotion.
@@ -996,8 +996,8 @@ endpoint enables the ingress through `with_quic_ingress`, which disables it
 again (allow-set emptied and closed) if the endpoint cannot be built, so a
 failed `shadow`/`prefer` bind leaves the socket as with QUIC off.
 
-Gateway admission of native joins (`quic/admission.rs`, #5940 A7b). DARK:
-`admission::GATEWAY_NATIVE_ADMISSION` is false, and `bind_udp_listener` calls
+Gateway admission of native joins (`quic/admission.rs`, #5940 A7b). ON since the
+floor release (no runtime kill switch): `admission::GATEWAY_NATIVE_ADMISSION` is true, and `bind_udp_listener` calls
 `QuicEndpoint::enable_gateway_admission` only inside
 `admission::enabled_at(is_gateway, bind_addr)` (pinned across every source
 file of the crate by `the_node_enables_admission_only_behind_the_switch`; a
@@ -2029,7 +2029,7 @@ no extra message, no exporter proof.
     bound from the peer's claim, not one the transport authenticated; the
     QUIC handshake is what checks it.
   → A client nobody named (a gateway admitting a native join, A7b; called
-    only from the gateway admission path, which is dark): ProvenClientKey takes the key the client
+    only from the gateway admission path): ProvenClientKey takes the key the client
     presents instead of pinning one. peer_key_presented accepts only an
     exact Ed25519 SPKI (prefix + 32 bytes) with sign bit 0, no chain, a key
     PeerKey::of accepts, in its canonical encoding; the signature must be
@@ -2059,8 +2059,8 @@ upgrades hub's
 `QuicUpgrades::setup_native` (A5b, below); the endpoint's native side
 (`native/endpoint.rs`: `allow_native_peer`, `dial_native`, `send_punch`)
 stays `pub(in crate::transport::quic::native)`, and registering a native
-waiter is private to `setup`. Since A+ step 1 the connect op asks for a
-setup for ready pairs whose bucket is below `QUIC_NATIVE_PERCENT` (25), gated
+waiter is private to `setup`. Since the floor release the connect op asks
+for a setup for every ready pair (`QUIC_NATIVE_PERCENT` 100; it was 25 in A+ step 1), gated
 on `operations::connect::native::NATIVE_DIAL_READY` (true). There is no
 runtime kill switch: the acceptor decides on `min(offered, own)`, so a
 reversal takes effect for a pair once either side has updated.
@@ -2188,11 +2188,12 @@ The transient-send warn in peer_connection_listener is throttled per
 
 Native connect (`operations/connect/native.rs`, `quic/upgrade/driver/native.rs`,
 A5b): the connect op asks for a native connection when the acceptor decides
-`Native`. On in production since A+ step 1 at `QUIC_NATIVE_PERCENT` (25), for
+`Native`. On in production at `QUIC_NATIVE_PERCENT` 100 (25 in A+ step 1), for
 `transport-quic = prefer` nodes only (gates above); a simulation sets the
 percent per node with `SimNetwork::with_native_connect` /
 `with_node_native_connect` (`NodeConfig::native_connect_override`). Native
-gateway joins stay off (`GATEWAY_NATIVE_JOIN_PERCENT` 0).
+gateway joins to a gateway marked native in the index are on
+(`GATEWAY_NATIVE_JOIN_PERCENT` 100).
 
 ```
 Readiness: NativeConnectState, one per node in the ConnectionManager. Ready

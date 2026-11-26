@@ -23761,8 +23761,9 @@ fn test_quic_native_connections_form_and_carry_messages() {
     assert!(connected);
 }
 
-/// A gateway the index marks native, whose side is not built yet (native
-/// admission is off, so it ignores a joiner it does not know): each joiner's
+/// A gateway the index marks native, on a release before native admission
+/// (forced off here, since it is on in production, so it ignores a joiner it
+/// does not know): each joiner's
 /// native join times out in its window and falls back to the UDP join, which
 /// joins as it does today, and every fallback that connects is counted as a
 /// rescue. Fails closed: native joins must have been tried and failed, and
@@ -23773,6 +23774,16 @@ fn test_quic_native_gateway_join_without_admission_falls_back_to_udp() {
     // Longer than the native window (8 s), which every join pays once.
     let run = run_native_connect_sim("native-gateway-join-off", SEED, 300, |sim| {
         sim.with_native_gateway_join(100);
+        let gateways: Vec<_> = sim
+            .all_node_addresses()
+            .keys()
+            .filter(|label| label.is_gateway())
+            .cloned()
+            .collect();
+        assert!(!gateways.is_empty(), "premise: the sim has a gateway");
+        for gateway in &gateways {
+            sim.with_gateway_native_admission_off(gateway);
+        }
     });
     let t = &run.wire.trace;
     tracing::info!(
@@ -23806,14 +23817,14 @@ fn test_quic_native_gateway_join_without_admission_falls_back_to_udp() {
 }
 
 /// The shipped default: no override, so each node runs this release's
-/// `QUIC_NATIVE_PERCENT` (25) with its endpoint up. Native-decided and
+/// `QUIC_NATIVE_PERCENT` (100) with its endpoint up. Native-decided and
 /// UDP-decided connects coexist in one mesh, and every node joins. The treated
 /// share is read from the sim: each native pair is two native dials
 /// (`established + failed`, one per side), against `joiner_decisions` decided
-/// joins. It is compared with the 25% bucket share loosely, since a pair that
+/// joins. It is compared with the 100% bucket share loosely, since a pair that
 /// already holds a transport is decided UDP whatever its bucket.
 #[test_log::test]
-fn test_quic_native_at_the_shipped_percent_mixes_native_and_udp() {
+fn test_quic_native_at_the_shipped_percent_decides_most_pairs_native() {
     const SEED: u64 = 0x0059_40A5_0010;
     let run = run_native_connect_sim("native-connect-shipped", SEED, 60, |_| {});
     log_native_connect("shipped", &run);
@@ -23826,8 +23837,8 @@ fn test_quic_native_at_the_shipped_percent_mixes_native_and_udp() {
     assert!(native_dials > 0, "some pairs decided native");
     let share = treated / decided as f64;
     assert!(
-        (0.05..=0.50).contains(&share),
-        "native share {share:.2} of {decided} decisions is far from the 25% bucket share"
+        (0.5..=1.0).contains(&share),
+        "native share {share:.2} of {decided} decisions: at 100% most decided pairs go native"
     );
     assert_eq!(t.undecodable_closes(), 0);
     let (peers, connected) = quic_mesh_peers_and_connected(&run.wire.mesh);

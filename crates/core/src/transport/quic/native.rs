@@ -11,7 +11,7 @@
 //! are visible to this module only, and the only way to register a waiter is
 //! private to `setup`. Widening any of them is a visible diff. The connect op
 //! also gates on `connect::native::NATIVE_DIAL_READY`, which is true since
-//! A+ step 1 (`QUIC_NATIVE_PERCENT` 25).
+//! A+ step 1 (`QUIC_NATIVE_PERCENT` is 100 since the floor release).
 //!
 //! The `dead_code` allows below go when A5 calls the setup.
 

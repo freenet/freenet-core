@@ -2365,7 +2365,7 @@ impl SimNetwork {
 
     /// Turns QUIC-native connects on for every node, at `percent` (the share
     /// of joins an acceptor decides native), in place of this release's
-    /// `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, which are on (25) in
+    /// `NATIVE_DIAL_READY` and `QUIC_NATIVE_PERCENT`, which are on (100) in
     /// production. Pair it with [`Self::with_quic_native_floor`], since without the native wire
     /// variants no decision reaches a joiner, and with
     /// [`Self::with_transport_quic`], since a node without a QUIC endpoint
@@ -2380,7 +2380,7 @@ impl SimNetwork {
 
     /// Turns on admission of native joins (`transport::quic::admission`) at
     /// the gateway `label`'s QUIC listener, in place of this release's
-    /// `GATEWAY_NATIVE_ADMISSION`, which is off. A joiner reaches it with
+    /// `GATEWAY_NATIVE_ADMISSION`, which is on in production. A joiner reaches it with
     /// [`Self::with_native_gateway_join`] when the gateway is marked native.
     /// Call before the simulation starts.
     #[cfg(any(test, feature = "testing"))]
@@ -2391,6 +2391,22 @@ impl SimNetwork {
             .get(label)
             .expect("the gateway must have an address in this network");
         crate::transport::in_memory_socket::force_gateway_native_admission(&self.name, addr);
+        self
+    }
+
+    /// Turns admission of native joins OFF at the gateway `label`'s QUIC
+    /// listener, standing in for a gateway on a release before admission was
+    /// switched on (it is on in production). A joiner that finds it marked
+    /// native times out and falls back to the UDP join. Call before the
+    /// simulation starts.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn with_gateway_native_admission_off(&mut self, label: &NodeLabel) -> &mut Self {
+        assert!(label.is_gateway(), "only a gateway admits native joins");
+        let addr = *self
+            .node_addresses
+            .get(label)
+            .expect("the gateway must have an address in this network");
+        crate::transport::in_memory_socket::force_gateway_native_admission_off(&self.name, addr);
         self
     }
 
@@ -2411,8 +2427,8 @@ impl SimNetwork {
 
     /// Turns native gateway joins (phase B) on for every node, at `percent`
     /// (the share of joiner-gateway pairs that dial native first), in place of
-    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, which are off,
-    /// and marks every gateway each node knows native, as the published index
+    /// `NATIVE_DIAL_READY` and `GATEWAY_NATIVE_JOIN_PERCENT`, which are on (100)
+    /// in production, and marks every gateway each node knows native, as the published index
     /// does for a gateway that admits native joins. A joiner with a QUIC
     /// endpoint (see [`Self::with_transport_quic`]) then tries a native join
     /// first, and falls back to the UDP join when it fails. Call before the
