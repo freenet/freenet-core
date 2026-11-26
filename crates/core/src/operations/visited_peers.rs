@@ -75,7 +75,11 @@ const CHECK_REPAIRED_INDICES: bool = repaired_check_enabled(
 /// alone decides [`CHECK_REPAIRED_INDICES`], and the test stops the floor
 /// reaching it as a side effect of a raise made for another reason.
 #[cfg_attr(not(test), allow(dead_code))]
-const REPAIRED_CHECK_FLOOR_CONFIRMED: bool = false;
+///
+/// `true` since D-8, which raised the floor to the floor release (well past
+/// [`REPAIRED_INDICES_MIN_VERSION`]): every release that marked only the
+/// unrepaired indices is refused at the handshake.
+const REPAIRED_CHECK_FLOOR_CONFIRMED: bool = true;
 
 const fn repaired_check_enabled(
     shipped: Option<(u8, u8, u16)>,
