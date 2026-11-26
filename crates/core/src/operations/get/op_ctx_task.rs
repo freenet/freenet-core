@@ -4465,8 +4465,63 @@ where
     // so HTL = 0 never forwards but must not hide a copy this node serves at
     // any other HTL (the sim trace in ~/code/scratch/placement-gap/TRACE.md:
     // a GET reached the holder exactly at HTL 0 and got NotFound). Reaching
-    // here means the local arm found nothing servable, so NotFound is right.
+    // here means the local arm found no FRESH copy. A stale-but-hosted copy
+    // (`local_fallback`: no local interest, still in the update mesh) is served
+    // as well, exactly as the exhaustion arm below serves it: at HTL 0 routing
+    // is exhausted by definition (this node cannot forward), so the same rule
+    // applies. Fresh copy first, fallback second, NotFound only with neither.
     if htl == 0 {
+        if let Some((key, state, contract)) = local_fallback {
+            tracing::info!(
+                tx = %incoming_tx,
+                %instance_id,
+                contract = %key,
+                htl = 0,
+                "GET relay: HTL exhausted — serving local fallback"
+            );
+            // Forward upstream first, cache after (#4155), as at R4 and R10.
+            let hop_count = op_manager.ring.max_hops_to_live;
+            // EXPERIMENT-ONLY (findability_probe), as at R4: record that a GET
+            // reached a live local copy. NOT for ship.
+            #[cfg(any(test, feature = "testing"))]
+            {
+                let visited = new_visited.clone();
+                crate::operations::findability_probe::record_terminus(
+                    &op_manager.ring,
+                    crate::operations::findability_probe::ProbeOpKind::Get,
+                    &incoming_tx,
+                    crate::ring::Location::from(&instance_id),
+                    htl,
+                    hop_count,
+                    crate::operations::findability_probe::ProbeStopReason::Found,
+                    move |addr| visited.probably_visited(addr),
+                );
+            }
+            let send_result = relay_send_found(
+                op_manager,
+                conn_manager,
+                incoming_tx,
+                instance_id,
+                upstream_addr,
+                key,
+                state.clone(),
+                contract.clone(),
+                hop_count,
+            )
+            .await;
+            cache_contract_locally(
+                op_manager,
+                &instance_id,
+                key,
+                state,
+                contract,
+                false,
+                hosting_cause,
+            )
+            .await;
+            send_result?;
+            return Ok(());
+        }
         tracing::warn!(
             tx = %incoming_tx,
             %instance_id,
@@ -7908,28 +7963,32 @@ mod tests {
             .collect();
         assert_eq!(
             send_positions.len(),
-            3,
-            "drive_relay_get_inner should have exactly three \
-             `relay_send_found(` callsites (R4 immediate, R10 fallback, \
-             R12a bubble-up). Found {} — a refactor has changed the shape.",
+            4,
+            "drive_relay_get_inner should have exactly four \
+             `relay_send_found(` callsites (R4 immediate, the HTL-0 stale \
+             fallback, R10 exhaustion fallback, R12a bubble-up). The HTL-0 \
+             site exists because at HTL 0 routing is exhausted by definition \
+             (the node cannot forward), so a stale-but-hosted copy is served \
+             exactly as R10 serves it. Found {} — a refactor has changed the \
+             shape.",
             send_positions.len(),
         );
         assert_eq!(
             cache_positions.len(),
-            5,
-            "drive_relay_get_inner should have exactly five \
-             `cache_contract_locally(` callsites (R4, R10, R12a, plus the \
-             two #4307 streaming-arm caches). Found {} — a refactor has \
-             changed the shape.",
+            6,
+            "drive_relay_get_inner should have exactly six \
+             `cache_contract_locally(` callsites (R4, HTL-0 fallback, R10, \
+             R12a, plus the two #4307 streaming-arm caches). Found {} — a \
+             refactor has changed the shape.",
             cache_positions.len(),
         );
-        // Pair the three `relay_send_found` callsites (R4, R10, R12a) with
+        // Pair the four `relay_send_found` callsites (R4, HTL-0, R10, R12a) with
         // their corresponding inline-Found caches and verify each `send`
         // comes before its `cache`. The streaming-arm caches (positions
-        // 4 and 5) forward via `pipe_stream` rather than `relay_send_found`
+        // 5 and 6) forward via `pipe_stream` rather than `relay_send_found`
         // and are covered by `relay_streaming_arm_forwards_before_caching`,
         // so they are intentionally excluded from this positional pairing.
-        // The three sends all precede the streaming arm in source order, so
+        // The four sends all precede the streaming arm in source order, so
         // zipping against the first three caches is correct.
         for (idx, (send_pos, cache_pos)) in send_positions
             .iter()
@@ -8245,14 +8304,24 @@ mod tests {
              local-hit arm, or a peer holding the contract answers NotFound \
              when the request arrives with HTL 0"
         );
-        // The not-held branch keeps the NotFound frame and never forwards.
+        // Fresh copy first, then the stale-but-hosted fallback (routing is
+        // exhausted at HTL 0), then NotFound; and HTL 0 never forwards.
         let tail = &body[guard..];
-        let guard_end = tail.find("returnOk(());").expect("guard returns early");
-        let guard_block = &tail[..guard_end];
+        let fallback = tail
+            .find("ifletSome((key,state,contract))=local_fallback{")
+            .expect("HTL 0 must serve a stale-but-hosted local_fallback");
+        let not_found = tail
+            .find("relay_send_not_found(")
+            .expect("the not-held branch must send NotFound upstream");
         assert!(
-            guard_block.contains("relay_send_not_found("),
-            "the HTL=0 not-held branch must still send NotFound upstream"
+            fallback < not_found,
+            "the HTL-0 fallback must be tried before NotFound is sent"
         );
+        let guard_end = not_found
+            + tail[not_found..]
+                .find("returnOk(());")
+                .expect("guard returns early");
+        let guard_block = &tail[..guard_end];
         assert!(
             !guard_block.contains("relay_advance_to_next_peer")
                 && !guard_block.contains("send_to_and_await"),
@@ -9015,13 +9084,14 @@ mod tests {
 
     /// All relay-driver cache callsites must pass `false`.
     /// Relay caches forwarded Found payloads but MUST NOT flag them as
-    /// client-accessed on the relay's own hosting cache. There are five
+    /// client-accessed on the relay's own hosting cache. There are six
     /// relay cache callsites in `drive_relay_get_inner`:
     ///   1. Active-interest local Found (R4, immediate serve)
-    ///   2. Exhaustion fallback (R10, stale local state)
-    ///   3. Downstream Found bubble-up (R12a, forwarded payload)
-    ///   4. Streaming loopback safety-net (#4307, upstream == own_addr)
-    ///   5. Streaming forward best-effort cache (#4307, after pipe_stream)
+    ///   2. HTL-0 fallback (stale local state, routing exhausted at HTL 0)
+    ///   3. Exhaustion fallback (R10, stale local state)
+    ///   4. Downstream Found bubble-up (R12a, forwarded payload)
+    ///   5. Streaming loopback safety-net (#4307, upstream == own_addr)
+    ///   6. Streaming forward best-effort cache (#4307, after pipe_stream)
     #[test]
     fn all_relay_callsites_pass_is_client_requester_false() {
         let src = production_source();
@@ -9032,10 +9102,11 @@ mod tests {
             .collect();
         assert_eq!(
             callsites.len(),
-            5,
-            "drive_relay_get_inner should have exactly five \
-             cache_contract_locally callsites (R4 immediate, R10 fallback, \
-             R12a bubble-up, plus the two #4307 streaming-arm caches). \
+            6,
+            "drive_relay_get_inner should have exactly six \
+             cache_contract_locally callsites (R4 immediate, HTL-0 fallback, \
+             R10 fallback, R12a bubble-up, plus the two #4307 streaming-arm \
+             caches). \
              Found {} — a refactor has changed the shape.",
             callsites.len(),
         );
